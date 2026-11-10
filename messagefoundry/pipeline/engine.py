@@ -15,7 +15,7 @@ import logging
 import os
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -110,7 +110,6 @@ from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
 from messagefoundry.store.crypto import Cipher
 from messagefoundry.store.store import (
-    AUDIT_PREFIX_BREAK_MARKER,
     REINGRESS_TARGET_PREFIX,
     AuditAnchorError,
     AuditAppend,
@@ -207,10 +206,10 @@ class ConfigDigestMismatch(Exception):
     """A released reload's config is not the config its approval named (vault BACKLOG #2596).
 
     :meth:`Engine.reload_detail` raises it before anything is swapped. ``approved`` is the digest
-    the hold captured, or ``None`` when it captured none; ``current`` is the digest of the directory
-    now, or ``None`` when it could not be read. Both are content digests, never file content.
-    ``value_file`` is True when the two digests match and the environment value file is not the
-    one the approval bound, which neither digest covers."""
+    the release is bound to, or ``None``, which no config matches; ``current`` is the digest of
+    the directory now, or ``None`` when it could not be read. Both are content digests, never file
+    content. ``value_file`` is True when the two digests match and the environment value file is
+    not the one the approval bound, which neither digest covers."""
 
     def __init__(
         self, approved: str | None, current: str | None, *, value_file: bool = False
@@ -279,9 +278,8 @@ def _log_abandoned_config_write(task: asyncio.Task[None]) -> None:
 @dataclass(frozen=True, slots=True)
 class ApprovedConfig:
     """The config a dual-control approval released, which :meth:`Engine.reload_detail` binds a
-    reload to (vault BACKLOG #2596, step 3). ``fingerprint`` is the digest the hold captured at
-    request time, or ``None`` when it captured none; a reload bound to ``None`` refuses every
-    config.
+    reload to (vault BACKLOG #2596, step 3). ``fingerprint`` is the digest the release is bound
+    to; a reload bound to ``None`` refuses every config.
 
     ``value_file`` binds the environment value file the engine reads from outside the config
     directory, which ``fingerprint`` leaves out because that digest is published unkeyed: the
@@ -409,6 +407,16 @@ class ReloadOutcome:
     ``None`` at least on a single node, on a dry run, when the bump failed, and on any
     ``propagate=False`` reload until :meth:`Engine._converge_reload` sets it.
 
+    ``initiator_digest`` is, on a convergence reload, the digest the initiating node stored with
+    ``config_version`` when it bumped it (:func:`~messagefoundry.config.fingerprint.shared_digest_of`
+    reads it), so the row can set the operator's bytes beside this node's own ``fingerprint`` (vault
+    BACKLOG #3109). What pairs it with the version is the stamp the bump stores beside it
+    (:func:`~messagefoundry.pipeline.cluster.stamped_config_digest`) and the coordinator's
+    version-equality check
+    (:meth:`~messagefoundry.pipeline.cluster.ClusterCoordinator.config_digest_cached`). ``None``
+    when not known: on every other reload, when the initiator stored none, when the cache had
+    already moved on to a later bump, or when what was stored is not a digest.
+
     ``restart_required`` names each settings trust anchor the settings preflight found changed on
     disk since its consumer loaded it. The reload checked the new file but does not apply it, so
     those take a restart (BACKLOG #2185, #3015). ``None`` means not checked: a dry run skips the
@@ -422,7 +430,13 @@ class ReloadOutcome:
     failures: tuple[ReloadStepFailure, ...] = ()
     fingerprint: Mapping[str, object] | None = None
     config_version: int | None = None
+    initiator_digest: Mapping[str, object] | None = None
     restart_required: tuple[str, ...] | None = None
+    #: The ``env()`` values an applied reload swapped in with ``registry``, so an audit row reads
+    #: that graph's loosenings against the values it builds with, whatever the runner holds by then
+    #: (vault BACKLOG #3814). ``None`` for a dry run. They include secret values, so they are kept
+    #: out of the repr and of equality.
+    env_values: Mapping[str, Any] | None = field(default=None, repr=False, compare=False)
 
     @property
     def degraded(self) -> bool:
@@ -508,7 +522,7 @@ class Engine:
         engine_version: str = "",
         api_tls_cert_file: str | None = None,
         api_tls_client_cert_files: Sequence[str] = (),
-        settings_crls: Sequence[MonitoredCert] = (),
+        settings_monitored_files: Sequence[MonitoredCert] = (),
         api_listener: tuple[str, int] | None = None,
         reference_settings: ReferenceSettings | None = None,
         egress_settings: EgressSettings,
@@ -662,8 +676,9 @@ class Engine:
         # BACKLOG #299: the CRL files the service settings configure (crls_from_settings), mostly for
         # OUTBOUND hops. No connection carries them, so the registry scan cannot see them, and a stale
         # one would otherwise stay silent until the next context build failed. Vault BACKLOG #2223: the
-        # serve path also passes the SQL Server store pin here (certs_from_settings), a kind="cert" row.
-        self._settings_crls = tuple(settings_crls)
+        # serve path passes monitored_files_from_settings here, which adds the certificate settings
+        # (certs_from_settings) as kind="cert" rows.
+        self._settings_monitored_files = tuple(settings_monitored_files)
         # The engine's own API listener (host, port), reserved so no inbound listener can steal it (it
         # would collide with uvicorn at bind). None (embedding/tests with no API socket) → nothing
         # reserved. Rendered into the (label, host, port) tuples every runner consults for port-conflict
@@ -890,6 +905,9 @@ class Engine:
             Callable[[Exception, int, set[str]], Awaitable[None]] | None
         ) = None
         self._convergence_failures: tuple[int, set[str]] | None = None
+        # vault BACKLOG #3109: the shared version whose stored initiator's digest was last logged
+        # as unreadable, so a version the runner retries every tick logs it once.
+        self._initiator_digest_warned: int | None = None
 
     def _engine_owned_dirs(self) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
         """The engine's own directories and trees for the ``.processed`` sweep's guard (BACKLOG
@@ -965,7 +983,7 @@ class Engine:
         update_check_settings: UpdateCheckSettings | None = None,
         api_tls_cert_file: str | None = None,
         api_tls_client_cert_files: Sequence[str] = (),
-        settings_crls: Sequence[MonitoredCert] = (),
+        settings_monitored_files: Sequence[MonitoredCert] = (),
         api_listener: tuple[str, int] | None = None,
         reference_settings: ReferenceSettings | None = None,
         egress_settings: EgressSettings,
@@ -1029,7 +1047,7 @@ class Engine:
             update_check_settings=update_check_settings,
             api_tls_cert_file=api_tls_cert_file,
             api_tls_client_cert_files=api_tls_client_cert_files,
-            settings_crls=settings_crls,
+            settings_monitored_files=settings_monitored_files,
             api_listener=api_listener,
             reference_settings=reference_settings,
             egress_settings=egress_settings,
@@ -1628,15 +1646,16 @@ class Engine:
         return runner.latest if runner is not None else None
 
     def _monitored_certs(self) -> list[MonitoredCert]:
-        """The TLS certs the engine serves with right now: the ``[api]`` cert + the wired graph's MLLP
-        ``tls_cert_file`` certs (read live off the registry, so a config reload is reflected). Passed to
-        the :class:`CertExpiryRunner` as its cert source so each scan reflects the current graph. The
-        settings-level CRL files (BACKLOG #299) ride along, since they are fixed for the process."""
+        """The files the expiry monitor watches right now: what :func:`certs_from_registry` returns
+        for the live registry (so a config reload of the graph is reflected) and the ``[api]`` cert
+        and service-caller certs fixed at construction, then the settings-level CRL and pin files
+        (BACKLOG #299, vault #2223), also fixed for the process. Passed to the
+        :class:`CertExpiryRunner` as its cert source so each scan reflects the current graph."""
         registry = self._registry_runner.registry if self._registry_runner is not None else None
         certs = certs_from_registry(
             registry, self._api_tls_cert_file, self._api_tls_client_cert_files
         )
-        certs.extend(self._settings_crls)
+        certs.extend(self._settings_monitored_files)
         return certs
 
     def _tracked_secrets(self) -> list[MonitoredSecret]:
@@ -1892,9 +1911,9 @@ class Engine:
         **THEY ARE NOT INDEPENDENT, AND A ``"audit-chain"`` ALERT DOES NOT MEAN THE TAIL IS INTACT.**
         ``verify_audit_chain`` returns on the chain break BEFORE the prefix comparator runs, so when a
         row is edited AND the tail is cut — the likeliest real shape, an edit plus its cover-up — only
-        the break is reported and the truncation is never named. Lifting that needs the store to return a
-        structured verdict carrying both instead of one ``(ok, message)`` pair, across all three
-        backends; it is not done here. Read a break as *"at least* a break"."""
+        the break is reported and the truncation is never named. The verdict's ``prefix_break`` flag
+        separates the two, but lifting this needs the walk to run the comparator past a break too;
+        it is not done here. Read a break as *"at least* a break"."""
         expected_prefix = await self._load_audit_anchor()
         try:
             verdict = await self.store.verify_audit_chain(expected_prefix=expected_prefix)
@@ -1926,9 +1945,9 @@ class Engine:
                 "An engine runs with no key only under the audited keyless opt-out, where a chain "
                 "never names one: either the chain was altered, or the engine lost its key"
             )
-        # verify_audit_chain folds both verdicts into one (ok, message) and reports a chain break FIRST,
-        # so the marker is the only thing that separates them without walking the log a second time.
-        truncated = AUDIT_PREFIX_BREAK_MARKER in reason
+        # The flag, never the message text (vault BACKLOG #3054, item 11). Read as `key_unavailable`
+        # is, so a store returning a plain (ok, message) pair files a chain break, never fails start.
+        truncated = bool(getattr(verdict, "prefix_break", False))
         subject = "audit-chain-truncated" if truncated else "audit-chain"
         log.warning(
             "startup audit-chain verification FAILED (alert-only, %s): %s",
@@ -2062,8 +2081,8 @@ class Engine:
         # reloads, and NOT leader-gated: whichever node runs the graph pauses its own listeners
         # against the one shared backlog. Built and measured ONCE here, BEFORE the graph comes up, so
         # a restart onto a backlog already over the bound binds its listeners paused rather than
-        # reading until the first tick. A no-op (no task) when the depth bound is off and the disk
-        # floor does not apply.
+        # reading until the first tick. With the depth bound off and no disk floor, its task only
+        # sweeps stale intake alerts, and only when a sink is wired (BACKLOG #3269).
         if self._intake_monitor is None:
             self._intake_monitor = IntakeBoundMonitor(
                 self.store,
@@ -2711,7 +2730,13 @@ class Engine:
         later start compared against the wrong digest. A fault in that writer is logged and goes no
         further: the graph has swapped, and a raise would make the runner retry a reload that already
         ran. A reload that raises is passed to :attr:`convergence_reload_failed` with the rows
-        already written for ``version``, and then re-raised, so the runner still retries it."""
+        already written for ``version``, and then re-raised, so the runner still retries it.
+
+        The row also carries the initiating node's digest for ``version``, read from the
+        coordinator's cache before anything here awaits (vault BACKLOG #3109). The runner read
+        ``version`` from that cache with no await since, so the two come from one read of the
+        shared row; read after the reload, a refresh could have moved the cache to a later bump."""
+        initiator_digest = self._initiator_digest(version)
         try:
             outcome = await self.reload_detail(propagate=False)
         except Exception as exc:
@@ -2726,13 +2751,43 @@ class Engine:
             raise
         # A version that failed and then converged is reported again if it ever fails again.
         self._convergence_failures = None
-        outcome = replace(outcome, config_version=version)
+        outcome = replace(outcome, config_version=version, initiator_digest=initiator_digest)
         if self.convergence_reload_audit is None:
             return
         try:
             await self.convergence_reload_audit(outcome)
         except Exception:  # noqa: BLE001 - see the docstring; the API's writer already logs its own
             log.exception("cluster: the convergence reload swapped the graph, but its audit failed")
+
+    def _initiator_digest(self, version: int) -> Mapping[str, object] | None:
+        """The initiating node's digest stored with shared config ``version``, as a convergence row
+        names it, or ``None`` when it is not known (vault BACKLOG #3109).
+
+        The digest is an advisory field on the row, so no fault in reading it reaches the reload: a
+        stored value that is not a digest, or a coordinator that raises, reads as unknown. Either is
+        logged at WARNING once per version, since the runner retries a failing version every tick;
+        a raise is logged with its traceback, as it is a fault in this code rather than in the row."""
+        from messagefoundry.config.fingerprint import shared_digest_of
+
+        fault: str | None = None
+        error: Exception | None = None
+        try:
+            stored = self._coordinator.config_digest_cached(version)
+            digest = shared_digest_of(stored)
+            if stored is not None and digest is None:
+                fault = "is not a digest"
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            digest, fault, error = None, f"could not be read ({type(exc).__name__})", exc
+        if fault is not None and self._initiator_digest_warned != version:
+            self._initiator_digest_warned = version
+            log.warning(
+                "cluster: the initiator's digest stored with shared config version %d %s, so it "
+                "reads as unknown",
+                version,
+                fault,
+                exc_info=error,
+            )
+        return digest
 
     async def set_connection_flag(
         self,
@@ -3580,15 +3635,37 @@ class Engine:
         # leave the cluster converging on a graph the initiator never took.
         config_version: int | None = None
         if propagate and self._coordinator.is_clustered():
+            from messagefoundry.config.fingerprint import digest_coverage, shared_digest_text
+
+            # The bump stores this node's digest with the new version, so a follower's
+            # convergence row can name the operator's bytes beside its own (vault BACKLOG #3109).
             try:
-                config_version = await self._coordinator.bump_config_version()
-                self._applied_config_version = config_version
+                digest_text = shared_digest_text(fingerprint)
+                unshared = digest_text is None and digest_coverage(fingerprint) is not None
+            except Exception as exc:  # noqa: BLE001 - past the swap, an advisory fault fails no reload
+                log.warning(
+                    "cluster: this reload's digest could not be prepared to share (%s), so it is "
+                    "shared as unknown",
+                    type(exc).__name__,
+                    exc_info=exc,
+                )
+                digest_text, unshared = None, False
+            try:
+                config_version = await self._coordinator.bump_config_version(digest=digest_text)
             except Exception as exc:
                 # This node IS running the new graph; only the cluster-wide announcement is missing, so
                 # the other nodes stay on the old config until the next bump or an operator reload
                 # there. That is a partial apply across the cluster, not a failed one here.
                 log.warning("cluster config-version bump after reload failed: %s", safe_exc(exc))
                 failures.append(ReloadStepFailure("cluster_propagate", safe_exc(exc)))
+            else:
+                self._applied_config_version = config_version
+                if unshared:
+                    # Said here, since a follower reads the NULL as "the initiator took none".
+                    log.warning(
+                        "cluster: this reload's digest is not in a shape another node can "
+                        "compare, or is too long to share, so the version bump stored it as unknown"
+                    )
         if failures:
             log.warning(
                 "config reload APPLIED with %d incomplete follow-on step(s): %s",
@@ -3603,6 +3680,10 @@ class Engine:
             fingerprint=fingerprint,
             config_version=config_version,
             restart_required=restart_required,
+            # The values this reload applied, not copied again. On a first load, or with no
+            # provider, this is the engine's own dict, which nothing changes in place: a reload
+            # rebinds it.
+            env_values=env_values,
         )
 
     def _resolve_reload_target(self, config_dir: str | Path | None) -> Path:
@@ -3926,59 +4007,98 @@ class Engine:
             await self._registry_runner.stop()
         # After the graph, so the listeners are already closed when the monitor opens the gate on its
         # way out; stopping it first would let a paused listener read again during shutdown.
+        # A count, not a flag, as in IntakeBoundMonitor.stop: a cancel of this stop from any step
+        # below is held until the store has closed, then raised in place of any error.
+        me = asyncio.current_task()
+        baseline = me.cancelling() if me is not None else 0
+        monitor_cancelled = False
         if self._intake_monitor is not None:
-            await self._intake_monitor.stop()
-            self._intake_monitor = None
-        # Vault BACKLOG #2613: after the graph, so a clear raised here does not say a graph that is
-        # still serving has gone, and ahead of the alert-state drain, which gives its write a chance.
-        if self.on_graph_stopped is not None:
+            monitor, self._intake_monitor = self._intake_monitor, None
             try:
-                self.on_graph_stopped()
-            except Exception as exc:  # noqa: BLE001 - a stop must go on to close the store
-                log.warning("a graph-stopped callback failed: %s", type(exc).__name__)
-        # Vault BACKLOG #2742: after the graph, so a script refused during the drain is still
-        # reported by the watch's last pass. That pass may write an audit row and raise an alert,
-        # so it runs while the store is open, and ahead of the alert-state drain at the end.
-        if self._remote_debug_watch is not None:
-            await self._remote_debug_watch.stop()
-            self._remote_debug_watch = None
-        # Settle the GCM invocation bound only AFTER the message graph has quiesced. stop() spends the
-        # unused remainder of this process's reserved block and unhooks the refill signal, so anything
-        # that encrypts after it runs is charged against no reservation with no checkpointer left to
-        # refill one. The registry runner is what drives those encrypts, so settling ahead of it would
-        # silently under-count every write performed during the shutdown drain.
-        if self._gcm_invocation_runner is not None:
-            await self._gcm_invocation_runner.stop()
-            self._gcm_invocation_runner = None
-        self._disarm_cipher_refusal_alert()
-        # Deregister cluster membership after the runner has quiesced but before the store closes (the
-        # coordinator marks its node left over the same pool). stop() is idempotent and safe even if
-        # start() raised (then there's just nothing to cancel). NullCoordinator is a no-op.
-        # ADR 0157 Inc 5: drop the edge-trigger BEFORE stopping the coordinator, so a clean
-        # step-down cannot fire a wake into a supervisor that is already gone.
-        if isinstance(self._coordinator, _SupportsDemoteHook):
-            self._coordinator.set_on_demote(None)
-        await self._coordinator.stop()
-        # Cancel the background pool warm-up if still running (best-effort; the store is about to close).
-        # It releases any connections it holds in its own finally, but at shutdown the pool closes anyway.
-        if self._warm_pool_task is not None:
-            self._warm_pool_task.cancel()
-            await asyncio.gather(self._warm_pool_task, return_exceptions=True)
-            self._warm_pool_task = None
-        # A config write whose caller was cancelled is still running, and its row needs the store
-        # (BACKLOG #2623). Under the managed API lifespan a drain has already run, bounded by its
-        # shutdown budget (BACKLOG #3191), and closed the gate. A write it left running gets only
-        # the short late wait here, inside this step's reserve; with none running it costs nothing.
-        # A caller whose shutdown ran no drain gets the fixed bound.
-        await self.drain_config_writes(
-            _CONFIG_WRITE_LATE_DRAIN_SECONDS
-            if self._config_writes_closed
-            else _CONFIG_WRITE_DRAIN_SECONDS
-        )
-        # Clears raised on the way out are background writes: an unpinned cluster node's intake
-        # alerts (BACKLOG #2272) and the coordinator's leadership release. Give them a bounded chance
-        # to land before the store closes. Last, so it covers every stop step above.
-        drain = getattr(self._alert_sink, "drain_state", None)
-        if drain is not None:
-            await drain(_ALERT_STATE_DRAIN_SECONDS)
-        await self.store.close()
+                await monitor.stop()
+            except asyncio.CancelledError:
+                # The monitor passes a cancel of this stop on once its gate is open (BACKLOG
+                # #3269). Finish the teardown below first, so the store still drains and closes.
+                monitor_cancelled = True
+        # The rest of the teardown is guarded (BACKLOG #3269): the store closes even if a later step
+        # raises or is cancelled. A pending cancel is raised last, in place of any error a step or the
+        # close raised, which is then logged. A SystemExit or KeyboardInterrupt is never replaced.
+        cancelled = monitor_cancelled
+        failure: BaseException | None = None
+        try:
+            # Vault BACKLOG #2613: after the graph, so a clear raised here does not say a graph that is
+            # still serving has gone, and ahead of the alert-state drain, which gives its write a chance.
+            if self.on_graph_stopped is not None:
+                try:
+                    self.on_graph_stopped()
+                except Exception as exc:  # noqa: BLE001 - a stop must go on to close the store
+                    log.warning("a graph-stopped callback failed: %s", type(exc).__name__)
+            # Vault BACKLOG #2742: after the graph, so a script refused during the drain is still
+            # reported by the watch's last pass. That pass may write an audit row and raise an alert,
+            # so it runs while the store is open, and ahead of the alert-state drain at the end.
+            if self._remote_debug_watch is not None:
+                await self._remote_debug_watch.stop()
+                self._remote_debug_watch = None
+            # Settle the GCM invocation bound only AFTER the message graph has quiesced. stop() spends the
+            # unused remainder of this process's reserved block and unhooks the refill signal, so anything
+            # that encrypts after it runs is charged against no reservation with no checkpointer left to
+            # refill one. The registry runner is what drives those encrypts, so settling ahead of it would
+            # silently under-count every write performed during the shutdown drain.
+            if self._gcm_invocation_runner is not None:
+                await self._gcm_invocation_runner.stop()
+                self._gcm_invocation_runner = None
+            self._disarm_cipher_refusal_alert()
+            # Deregister cluster membership after the runner has quiesced but before the store closes (the
+            # coordinator marks its node left over the same pool). stop() is idempotent and safe even if
+            # start() raised (then there's just nothing to cancel). NullCoordinator is a no-op.
+            # ADR 0157 Inc 5: drop the edge-trigger BEFORE stopping the coordinator, so a clean
+            # step-down cannot fire a wake into a supervisor that is already gone.
+            if isinstance(self._coordinator, _SupportsDemoteHook):
+                self._coordinator.set_on_demote(None)
+            await self._coordinator.stop()
+            # Cancel the background pool warm-up if still running (best-effort; the store is about to close).
+            # It releases any connections it holds in its own finally, but at shutdown the pool closes anyway.
+            if self._warm_pool_task is not None:
+                self._warm_pool_task.cancel()
+                await asyncio.gather(self._warm_pool_task, return_exceptions=True)
+                self._warm_pool_task = None
+            # A config write whose caller was cancelled is still running, and its row needs the store
+            # (BACKLOG #2623). Under the managed API lifespan a drain has already run, bounded by its
+            # shutdown budget (BACKLOG #3191), and closed the gate. A write it left running gets only
+            # the short late wait here, inside this step's reserve; with none running it costs nothing.
+            # A caller whose shutdown ran no drain gets the fixed bound.
+            await self.drain_config_writes(
+                _CONFIG_WRITE_LATE_DRAIN_SECONDS
+                if self._config_writes_closed
+                else _CONFIG_WRITE_DRAIN_SECONDS
+            )
+            # Clears raised on the way out are background writes: an unpinned cluster node's intake
+            # alerts (BACKLOG #2272) and the coordinator's leadership release. Give them a bounded chance
+            # to land before the store closes. Last, so it covers every stop step above.
+            drain = getattr(self._alert_sink, "drain_state", None)
+            if drain is not None:
+                await drain(_ALERT_STATE_DRAIN_SECONDS)
+        except asyncio.CancelledError:
+            cancelled = True
+        except BaseException as exc:  # noqa: BLE001 - held until the store closes, then re-raised
+            failure = exc
+        try:
+            await self.store.close()
+        except Exception as exc:
+            if failure is None:
+                failure = exc
+            else:
+                log.exception("the store close failed after an engine stop step failed")
+        cancelled = cancelled or (me is not None and me.cancelling() > baseline)
+        if failure is not None and not isinstance(failure, Exception):
+            raise failure  # SystemExit, KeyboardInterrupt: never swallowed by a cancel
+        if cancelled:
+            if failure is not None:
+                # The cancel replaces this error, so it is logged here or not at all.
+                log.error(
+                    "an engine stop step or the store close failed after the stop was cancelled",
+                    exc_info=failure,
+                )
+            raise asyncio.CancelledError
+        if failure is not None:
+            raise failure

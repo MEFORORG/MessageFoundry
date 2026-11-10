@@ -65,7 +65,7 @@ from pydantic import (
 )
 
 from messagefoundry.api_tls_source import api_tls_source
-from messagefoundry.childenv import outside_engine_namespace
+from messagefoundry.childenv import pass_environment_refusal
 from messagefoundry.config.ai_policy import (
     AiDataScope,
     AiMode,
@@ -520,15 +520,15 @@ def insecure_config_source_escape_permitted(environ: Mapping[str, str] | None = 
     ``MEFOR_ALLOW_INSECURE_TLS`` has its own clamp, honoured only on an instance at
     ``[security].enforcement = warn`` (:func:`weakened_tls_escape_permitted`).
 
-    **Why the dial is read from the environment and not from loaded settings.** The check runs inside
-    ``load_config``, in every process that executes config: ``serve``, a reload, the sandbox worker's
-    boot load, and offline commands. At least ``check`` and ``dryrun`` load config before they read
-    any settings, and the worker never reads a settings file. A posture handed down by each caller
-    would be missed by the caller nobody remembered (the lesson of vault BACKLOG #2354). The escape is
-    an environment variable, so the dial that unlocks it is read from the same place, the same way in
-    every one of those processes. The sandbox worker's environment is an allowlist, so
-    ``pipeline/sandbox.py`` carries both into it by name: the escape, and every spelling of the dial
-    that :func:`security_enforcement_env_names` finds. The worker then reads what the engine read.
+    **Why the dial is read from the environment and not from loaded settings.** The check runs in every
+    process that reads a config directory, through ``load_config`` or ``read_trusted_snapshot``:
+    ``serve``, a reload, a sandbox session that reads its own directory, and offline commands. At least ``check`` and ``dryrun``
+    load config before they read any settings. A posture handed down by each caller would be missed
+    by the caller nobody remembered (the lesson of vault BACKLOG #2354). The escape is an environment
+    variable, so the dial that unlocks it is read from the same place, the same way in every one of
+    those processes. The sandbox worker is not one of them: it loads the snapshot its parent read
+    and checked, sent in the boot frame (vault BACKLOG #2596), so neither variable is in its
+    environment (vault BACKLOG #2587).
 
     **Where "never under enforce" holds.** For a process whose settings come from
     :func:`load_settings` over this same environment, which is ``serve``, ``supervise`` and every CLI
@@ -560,8 +560,7 @@ def security_enforcement_env_names(environ: Mapping[str, str] | None = None) -> 
 
     ``_env_overrides`` lowercases what follows the prefix, so ``MEFOR_SECURITY_enforcement`` is the
     same setting as :data:`SECURITY_ENFORCEMENT_ENV`, and on a case-sensitive platform both can be
-    set. The sandbox hands exactly these names to its worker, beside the escape, so the worker's
-    config-source check reads what the engine's read."""
+    set. The escape's clamp reads every one of them."""
     env = os.environ if environ is None else environ
     key = SECURITY_ENFORCEMENT_ENV[len(_ENV_PREFIX) :].lower()
     return tuple(
@@ -780,9 +779,9 @@ class StoreSettings(_Section):
     # KeyProvider seam (ADR 0019, ASVS 13.3.3): selects HOW the active/retired DEK bytes are *sourced* —
     # never how they are used (the cipher, keyring, and `mfenc:v1` format are unchanged). `auto` (the
     # default) is the env-then-DPAPI ladder, BYTE-IDENTICAL to the pre-seam behavior; `env`/`dpapi` pin a
-    # single built-in source; `aws_kms`|`azure_kv`|`gcp_kms`|`vault`|`pkcs11` are external HSM/KMS/Vault
-    # envelope-decrypt providers (lazy, optional extras; `vault` ships in store/keyprovider_vault.py, the
-    # rest are not built yet and fail closed if selected). Every external provider counts as a
+    # single built-in source; `vault` is the one external envelope-decrypt provider (a lazy, optional
+    # extra, store/keyprovider_vault.py). Any other name fails closed (vault BACKLOG #2595 slice D
+    # removed the external names nobody built). Every external provider counts as a
     # configured key for the keyless at-rest gate, before it resolves (BACKLOG #1998). This
     # names a *provider*, not key material, so it is NOT a secret — it must never be added to
     # `_FILE_SECRET_KEYS`. Unknown/unresolvable values fail closed at `open_store` (store/keyprovider.py).
@@ -2515,8 +2514,9 @@ def _checked_pass_environment(names: tuple[str, ...], key: str, receiver: str) -
     For the two ``pass_environment`` settings: ``[sandbox]``'s, read by the sandbox worker, and
     ``[dr]``'s, read by the DR hooks. Each child gets an allowlist
     (:mod:`messagefoundry.childenv`), and this keeps the engine's own names off both lists: no
-    ``MEFOR_*`` variable at all, and no secret a library reads on the engine's behalf
-    (:func:`messagefoundry.childenv.outside_engine_namespace`, reused so the two cannot drift).
+    ``MEFOR_*`` variable at all, no secret a library reads on the engine's behalf, and no
+    interpreter variable that starts a console
+    (:func:`messagefoundry.childenv.pass_environment_refusal`, reused so the rules cannot drift).
     Refusing the whole namespace, not a list of secret names, cannot go stale when a secret is
     added. The text never echoes an entry that is not a name, since ``NAME=value`` typed by
     mistake would carry the value (vault BACKLOG #2600). Nor does it number one: the env form drops
@@ -2525,16 +2525,9 @@ def _checked_pass_environment(names: tuple[str, ...], key: str, receiver: str) -
     A secret reference under ``[secrets].provider = "env"`` is refused once the model is built,
     by :func:`_reject_passed_secret_references`, which sees every section."""
     for name in names:
-        if not (name.isascii() and name.isidentifier()):
-            raise ValueError(
-                f"{key}: an entry is not an environment variable name; "
-                "list names only, never NAME=value"
-            )
-        if not outside_engine_namespace(name):
-            raise ValueError(
-                f"{key}: {name} is one of the engine's own variables; "
-                f"it may not be passed to {receiver}"
-            )
+        refusal = pass_environment_refusal(name)
+        if refusal:
+            raise ValueError(f"{key}: {refusal}; it may not be passed to {receiver}")
     return names
 
 
@@ -4838,7 +4831,7 @@ def alert_revocation_attestations(
     """Each ``[alerts]`` revocation attestation that is set: its switch name, the hop it covers,
     what that hop's own handshake can check, and its reason (BACKLOG #2193). The ``[alerts]``
     sibling of :func:`vault_revocation_attestations`, read by :func:`security_loosenings`. A CRL
-    reaches the SMTP hop's context; none can reach the webhook's import-time opener."""
+    reaches the SMTP hop's context; none can reach the webhook's shared opener."""
     pairs = (
         (
             "alerts.email_tls_revocation_attested",
@@ -5247,8 +5240,9 @@ class EgressSettings(_Section):
     is empty refuses every destination of that type; once a transport's list is set, a destination of
     that transport not on it is **refused at config load/reload** (fail-closed), checked against the
     resolved (``env()``-substituted) destination. With ``deny_by_default`` off, each list is opt-in and
-    an empty one is unrestricted. The webhook/SMTP *alert* sinks carry no PHI bodies and keep
-    their own ``[alerts]`` host allowlists.
+    an empty one is unrestricted. The webhook/SMTP *alert* sinks keep their own ``[alerts]`` host
+    allowlists. They send no message body, but some alerts carry free-text detail (the docs/PHI.md
+    logging-inventory rows for the ``[alerts]`` webhook and SMTP transports, rows 10 and 11).
 
     The comment on ``deny_by_default`` says what else it covers and how operators set it.
     """
@@ -5520,6 +5514,9 @@ _ALERT_EVENT_TYPES = frozenset(
         # BACKLOG #305 (ASVS 13.2.2): the store privilege preflight found the store principal
         # over-granted, or could not read it, at start.
         "store_privilege_warning",
+        # BACKLOG #2903 (ADR 0216): the Vault privilege preflight found a Vault token over-granted,
+        # or could not read it, at start.
+        "vault_privilege_warning",
         "leadership_acquired",  # #145 (ADR 0014 amendment): a node went non-leader→leader (HA failover / election)
         "dr_activated",  # #145 (ADR 0014 amendment, ADR 0048): a third-tier DR standby was promoted
         # ASVS 6.4.5 (BACKLOG #1141): an admin-issued temporary password is UNCLAIMED and near the
@@ -5557,6 +5554,9 @@ _ALERT_EVENT_TYPES = frozenset(
         # `approval:listing` (vault BACKLOG #3747). Since vault BACKLOG #2254 also an
         # inline config reload's lost config_reload_attempted row, keyed `config_reload:inline`.
         "audit_write_failed",
+        # vault BACKLOG #3193 N1: an approval audit row whose write the gate read back as
+        # committed, whose off-box copy was never sent. Keyed `approval:<id>`, as above.
+        "audit_offbox_copy_missing",
         # ADR 0079 mechanism 2: the directory reconciler's two audited outcomes, each routable apart:
         # a pass left accounts unrevoked, and one principal's sessions were revoked. The first is
         # raised for at least a breaker trip, a referral (BACKLOG #2538), a configuration refusal
@@ -5881,8 +5881,9 @@ class AlertsSettings(_Section):
 
     A transport is *enabled* when its essentials are present: ``webhook_url`` for the webhook;
     ``email_smtp_host`` + ``email_from`` + at least one ``email_to`` for email. The SMTP password is a
-    secret — supply it via ``MEFOR_ALERTS_EMAIL_PASSWORD``, never the file. Payloads carry only the
-    connection name + queue shape (no PHI)."""
+    secret — supply it via ``MEFOR_ALERTS_EMAIL_PASSWORD``, never the file. Payloads have no
+    message-body field, but they are not PHI-free: some events still send free-text detail off the
+    box, and docs/PHI.md row 10 names at least some of them."""
 
     # --- webhook (generic HTTP POST; fronts Slack/Teams/PagerDuty/custom) ----
     webhook_url: str | None = None
@@ -5895,7 +5896,7 @@ class AlertsSettings(_Section):
     # the webhook host's certificate is covered outside the engine. The POST carries the webhook's
     # path token over https the engine verifies and checks no CRL or OCSP on, so an off-box https
     # webhook on an enforcing instance is refused at build unless this is true, with its mandatory
-    # reason. It is the only way across: the webhook rides one opener built at import, which no CRL
+    # reason. It is the only way across: the webhook rides one shared opener, which no CRL
     # can reach. A loosening, named in security_loosenings(). It never lifts the cleartext refusal.
     webhook_tls_revocation_attested: bool = False
     webhook_tls_revocation_attested_reason: str | None = None
@@ -6379,9 +6380,11 @@ class ClusterSettings(_Section):
     # take over until the lease it just re-extended expires again.
     #
     # SCOPE, stated because a control that claims more than it covers is worse than none: on POSTGRES
-    # it bounds every maintenance-loop statement with its borrow (BACKLOG #2523); on SQL SERVER only
-    # the claim/renew, as SqlServerStore._fetchone_clamped describes, and a value under 1 s is refused
-    # there (ServiceSettings._sqlserver_renew_clamp_whole_seconds).
+    # it bounds every maintenance-loop statement with its borrow (BACKLOG #2523); on SQL SERVER the
+    # heartbeat, the claim/renew, the config-version refresh and a stepdown's release (BACKLOG #5064),
+    # and the paused tick's owner read at the smaller of this and half its own budget, at least,
+    # each borrow and statement separately, as SqlServerStore._fetchone_clamped describes, and a value
+    # under 1 s is refused there (ServiceSettings._sqlserver_renew_clamp_whole_seconds).
     #
     # UNSET (the default) means DERIVED from the detection margin, not a fixed number: half the margin,
     # capped at 5.0 s and floored at 1.0 s. The floor is a LIVENESS bound the margin cannot express --
@@ -9044,9 +9047,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       Their ``[auth]`` spellings are refused at load, so the entries carry the ``[security]`` names.
       They are read off the ``[auth]`` copy, since this function is handed no ``[security]``. A
       caller whose two disagree reports the ``[auth]`` value, so it can miss a new loosening or
-      keep one just removed: at least the ``security set`` preview, which pairs the edited
-      ``[security]`` with the ``[auth]`` it loaded before the edit, and a ``security show`` that
-      could not load the whole file and fell back to a default ``[auth]``.
+      keep one just removed. A caller that pairs a ``[security]`` with an ``[auth]`` from another
+      read must copy the two in first, as ``messagefoundry security`` does (vault BACKLOG #2600).
       ``SessionRecord.is_live`` refuses a session idle past the first or older than the second (its
       expiry is stamped from it at sign-in), so a longer one is looser, and 0 or less
       ends every session at once, which is stricter.
@@ -10119,11 +10121,16 @@ def security_loosenings(
     SQLite store (vault BACKLOG #2619),
     ``[auth].ad_session_recheck_seconds``, ``[auth].admin_new_ip_step_up`` (#288),
     ``[auth].require_action_step_up`` and the three ``[auth].password_check_*`` screens (vault
-    BACKLOG #2600), the ``[auth]``
-    sign-in rate-limit, lockout, PHI-read, admin-write, time-floor, session-cap, OIDC flow-cache,
-    AD timeout, step-up window, TOTP skew and temporary-password life
-    settings :func:`_auth_limit_loosenings` lists, each set looser than its shipped default (#1131),
-    the ``[approvals]`` dwell and expiry :func:`_approvals_loosenings` lists, read the same way
+    BACKLOG #2600), the ``[auth]`` settings :func:`_auth_limit_loosenings` lists, each named only
+    when set looser than its shipped default (#1131, vault BACKLOG #2600 step 4): at least the
+    sign-in, PHI-read and admin-write limiters, the lockout, the time floors, the session cap, the
+    ``[security]`` session limits (read off their ``[auth]`` copies), the step-up window, TOTP
+    skew, temporary-password life, recovery-code count, password length floor, AD timeouts, the
+    directory reconciler and federated sign-in (that function's docstring reads each field, and
+    the numeric census in ``tests/test_security_posture_defaults.py`` is the field list, red on a
+    numeric ``[auth]`` field neither named nor exempt with a reason, so these groups name no
+    field to fall behind), the ``[approvals]`` dwell and expiry :func:`_approvals_loosenings`
+    lists, read the same way
     (#2489), an ``[approvals].operations`` list that leaves out a default operation (vault BACKLOG
     #3123), any ``[api].trusted_proxies`` entry covering more than one address, with its own
     wording where the entries together cover every peer of a family (#1131),

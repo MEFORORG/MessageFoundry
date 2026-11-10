@@ -168,17 +168,97 @@ def test_the_exit_code_is_named_only_when_it_is_an_integer() -> None:
     assert "PID" not in str(UserCodeCalledSysExit.from_exit(SystemExit("PID-5 was DOE^JANE")))
 
 
-@pytest.mark.parametrize("code", [None, 0, 3, -1, True, "PID-5 was DOE^JANE", 2.5])
-def test_the_dry_run_names_a_sys_exit_in_the_live_runners_words(code: object) -> None:
-    """The dry-run converts a ``sys.exit()`` in Router or Handler code with its own class, because
-    ``wiring_runner`` imports ``dryrun`` and the reverse import would be a cycle. A preview must still
-    read as the engine's dead-letter reason does, for every kind of exit code."""
+def test_the_dry_run_names_a_sys_exit_in_the_live_runners_words() -> None:
+    """A preview must read as the engine's dead-letter reason does, for every kind of exit code.
+    This was a drift test over two copies of the class; since vault BACKLOG #5105 there is one,
+    defined in ``dryrun`` (which cannot import ``wiring_runner``) and re-exported by it, so the
+    words cannot drift and the test pins that the two names are the one class."""
     from messagefoundry.pipeline import dryrun
 
-    exc = SystemExit(code)
-    assert str(dryrun.UserCodeCalledSysExit.from_exit(exc)) == str(
-        UserCodeCalledSysExit.from_exit(exc)
-    )
+    assert dryrun.UserCodeCalledSysExit is UserCodeCalledSysExit
+
+
+class _LoudInt(int):
+    """An exit code whose own conversions are user code that would print a field, or exit again."""
+
+    def __str__(self) -> str:
+        return "PID-5 was DOE^JANE"
+
+    def __repr__(self) -> str:
+        return "PID-5 was DOE^JANE"
+
+    def __format__(self, spec: str) -> str:
+        return "PID-5 was DOE^JANE"
+
+    def __int__(self) -> int:
+        sys.exit("PID-5 was DOE^JANE")
+
+
+class _FakeInt:
+    """Not an int, but a ``__class__`` that tells ``isinstance`` it is one."""
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:
+        raise AssertionError("from_exit consulted the code's own __class__")
+
+
+@pytest.mark.parametrize(
+    ("code", "named"),
+    [
+        (None, ""),
+        (0, " with code 0"),
+        (3, " with code 3"),
+        (-1, " with code -1"),
+        (True, ""),
+        ("PID-5 was DOE^JANE", ""),
+        (2.5, ""),
+        # vault BACKLOG #5105 step 2: the plain integer, never the subclass's own text.
+        (_LoudInt(7), " with code 7"),
+    ],
+)
+def test_the_exit_code_is_formatted_as_a_plain_int(code: object, named: str) -> None:
+    text = str(UserCodeCalledSysExit.from_exit(SystemExit(code)))
+    assert text == f"Router or Handler code raised SystemExit{named} (sys.exit() at run time)"
+
+
+def test_a_system_exit_overriding_its_code_is_not_asked_for_it() -> None:
+    class Quit(SystemExit):
+        @property
+        def code(self) -> Any:  # type: ignore[override]
+            sys.exit("PID-5 was DOE^JANE")
+
+    text = str(UserCodeCalledSysExit.from_exit(Quit(4)))
+    assert text == "Router or Handler code raised SystemExit with code 4 (sys.exit() at run time)"
+
+
+def test_a_non_exit_faking_the_system_exit_class_names_no_code() -> None:
+    class Liar(ValueError):
+        @property  # type: ignore[misc]
+        def __class__(self) -> type:
+            return SystemExit
+
+    exc: Any = Liar("PID-5 was DOE^JANE")
+    text = str(UserCodeCalledSysExit.from_exit(exc))
+    assert text == "Router or Handler code raised SystemExit (sys.exit() at run time)"
+
+
+def test_an_exit_code_faking_its_class_names_no_code() -> None:
+    # Built here, not in a parametrize list: collection itself would read its __class__.
+    text = str(UserCodeCalledSysExit.from_exit(SystemExit(_FakeInt())))
+    assert text == "Router or Handler code raised SystemExit (sys.exit() at run time)"
+
+
+def test_an_exit_code_too_long_to_print_does_not_raise() -> None:
+    # Past sys.get_int_max_str_digits() str() of an int raises ValueError; from_exit is called
+    # inside an except arm that converts a fault, and must not raise one of its own.
+    limit = sys.get_int_max_str_digits()
+    if not limit:
+        pytest.skip("this interpreter converts an int of any length to text")
+    huge = 10 ** (limit + 10)
+    with pytest.raises(ValueError):  # the control: this int does refuse to print
+        str(huge)
+    text = str(UserCodeCalledSysExit.from_exit(SystemExit(huge)))
+    assert "too long to print" in text and "SystemExit" in text
 
 
 def _write_config(cfg: Path, *, inbox: Path, outdir: Path, top_level: str = "") -> None:

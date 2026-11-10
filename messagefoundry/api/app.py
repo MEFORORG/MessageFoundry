@@ -78,6 +78,7 @@ from messagefoundry.api.approvals import (
     ApprovalError,
     ApprovalGate,
     IdentityResolver,
+    held_fingerprint,
     named_requester,
 )
 from messagefoundry.api.auth_routes import add_auth_routes
@@ -242,6 +243,7 @@ from messagefoundry.api.security import (
     ConfigWriteNotRecorded,
     ExportStopped,
     StandingRefusal,
+    WebSocketAcceptGate,
     alert_sink_for,
     answers_before_body,
     authorize_ws,
@@ -549,6 +551,7 @@ from messagefoundry.transports.base import (
     DestinationConnector,
     TestNotSupportedError,
 )
+from messagefoundry.transports.http_listener import TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS
 from messagefoundry.uploads import (
     UploadContentError,
     UploadedFileMeta,
@@ -559,6 +562,7 @@ from messagefoundry.uploads import (
     UploadRetentionRunner,
     UploadStore,
     UploadTooLargeError,
+    UploadUnavailableError,
     UploadUnreadableError,
     browse_messages,
     split_uploaded,
@@ -1827,14 +1831,15 @@ def _build_approval_gate(
                 "name who ran it; it was not run",
             )
         # Vault BACKLOG #2596, step 3: the release loads only the bytes the approval named. A hold
-        # whose params carry no digest (none is filed that way now) binds to None, which matches
-        # nothing, so it is refused as a mismatch once its directory resolves. On a store that holds
-        # a key the params are sealed with the rest of the request, so a writer to pending_approvals
-        # who changes the digest leaves a request the gate refuses (vault BACKLOG #2592).
-        approved = p.get("fingerprint")
-        approval = ApprovedConfig(
-            approved if isinstance(approved, str) else None, p.get("value_file")
-        )
+        # with no usable digest (held_fingerprint) binds to None, which matches nothing. The gate
+        # refuses such a hold before its claim (requires_fingerprint below, release_blocked
+        # 'params_no_fingerprint', vault BACKLOG #3192), so None reaches this only if that flag is
+        # dropped. It is then refused, with reason no_approved_digest where the release reaches
+        # the digest check.
+        # On a store that holds a key the params are sealed with the rest of the request, so a
+        # writer to pending_approvals who changes the digest leaves a request the gate refuses
+        # (vault BACKLOG #2592).
+        approval = ApprovedConfig(held_fingerprint(p), p.get("value_file"))
         # reload_detail for parity with the inline route (BACKLOG #1111): a released reload that
         # swapped the graph and then failed a follow-on step must report the same degraded outcome
         # the inline path reports, or dual control would be the quieter of the two.
@@ -1909,6 +1914,7 @@ def _build_approval_gate(
         permission=Permission.CONFIG_DEPLOY,
         in_scope=lambda identity, _p: _cross_channel_in_scope(identity),
         requires_requester=True,
+        requires_fingerprint=True,
     )
     return gate
 
@@ -2193,6 +2199,11 @@ _RELOAD_AUDIT_STEP = "audit"
 #: account to match.
 _CONVERGENCE_ACTOR = "system:cluster-convergence"
 _CONVERGENCE_INITIATOR = "cluster_convergence"
+#: The key on a convergence row's detail naming the digest the initiating node stored with the
+#: row's ``config_version``: its ``fingerprint``, ``scheme`` and any ``unreadable_files``, so a
+#: reader can compare it with the row's own ``fingerprint`` as a start compares two digests. Absent
+#: when that digest is not known (vault BACKLOG #3109).
+_INITIATOR_DIGEST = "initiator_digest"
 
 
 @dataclass(frozen=True, slots=True)
@@ -2211,8 +2222,9 @@ class _LoadedConfig:
     directory or digest at the write. What a row does read at the write includes at least the
     cluster node id, which is fixed for the life of the process, and, for the ``superseded``
     checks, which ask about the live state on purpose, the loaded fingerprint's identity (a
-    reload's row) and the live graph's identity (the start's row). The start row also reads the
-    settings the app stashed, for its loosenings; a reload changes none of them."""
+    reload's row) and the live graph's identity (the start's row). The start row and a cluster
+    convergence reload's row also read the settings the app stashed, and the store's audit-chain
+    keying, for their loosenings (vault BACKLOG #3814); a reload changes none of the settings."""
 
     directory: str | None
     shard: str | None
@@ -2454,8 +2466,13 @@ async def _record_reload_audit(
     client: str | None = None,
     failed_steps: Sequence[str] = (),
     extra: Mapping[str, object] | None = None,
+    loosenings: Callable[[], Awaitable[list[str] | None]] | None = None,
 ) -> list[str]:
     """Write the ``config_reload`` audit row with the ADR 0041 D1 content fingerprint of what loaded.
+
+    ``loosenings``, when passed, is awaited inside the write and its result recorded under the
+    ``loosenings`` key, after ``extra``. A cluster convergence reload passes it (vault BACKLOG
+    #3814), so the read waits out a cancel with the row rather than losing the row before it.
 
     The start writes its ``config_loaded`` row through here too (vault BACKLOG #2597), passing the
     action and its ``loosenings`` in ``extra``. Every row names its cluster node, and the
@@ -2482,7 +2499,9 @@ async def _record_reload_audit(
 
     A reload passes its :class:`~messagefoundry.pipeline.ReloadOutcome`, and the row names what
     that reload loaded (vault BACKLOG #2257), with the shared cluster ``config_version`` it carries
-    when it has one (vault BACKLOG #3109). An operator reload and a convergence reload both do. The
+    when it has one (vault BACKLOG #3109). An operator reload and a convergence reload both do. A
+    convergence reload's also carries, as :data:`_INITIATOR_DIGEST`, the initiating node's digest
+    stored with that version, when it is known (vault BACKLOG #3109). The
     row is written after the swap, and nothing holds the graph still until
     then, so a second reload can move the engine on first. The row then
     still names this reload's config, but marks itself ``superseded`` and
@@ -2522,12 +2541,27 @@ async def _record_reload_audit(
 
     async def write() -> None:
         nonlocal detail
+        listed: dict[str, object] = {}
+        if loosenings is not None:
+            # A first build before the read, so a row the read's cancel cuts off still has its
+            # detail on the lost-row line. Rebuilt below with the list.
+            detail = build(listed)
+            # Before the superseded check in the rebuild, so no await falls between it and the
+            # write.
+            listed = {"loosenings": await loosenings()}
+        detail = build(listed)
+        await engine.store.record_audit(action, actor=actor, detail=detail, client=client)
+
+    def build(listed: Mapping[str, object]) -> str:
         superseded = False
         config_version: int | None = None
+        initiator_digest: Mapping[str, object] | None = None
         state: _LoadedConfig | None
         if isinstance(loaded, ReloadOutcome):
             state = _LoadedConfig.of(loaded)
+            # Read together, as the coordinator read them (vault BACKLOG #3109).
             config_version = loaded.config_version
+            initiator_digest = loaded.initiator_digest
             # Only a COMMITTED reload rebinds the loaded fingerprint. The graph
             # object is no test: a reload part way through its swap, which then fails and rolls back
             # to this graph, would mark a row that still names the running config.
@@ -2547,18 +2581,23 @@ async def _record_reload_audit(
             }
         )
         digest = (state.fingerprint or {}) if state is not None else {}
-        detail = json.dumps(
+        return json.dumps(
             {
                 **named,
                 "dry_run": False,
                 **({"config_version": config_version} if config_version is not None else {}),
+                **(
+                    {_INITIATOR_DIGEST: dict(initiator_digest)}
+                    if initiator_digest is not None
+                    else {}
+                ),
                 **({"degraded": True, "failed_steps": list(failed_steps)} if failed_steps else {}),
                 **(extra or {}),
+                **listed,
                 **({"superseded": True, _BASELINE_UNCHECKED: True} if superseded else {}),
                 **digest,
             }
         )
-        await engine.store.record_audit(action, actor=actor, detail=detail, client=client)
 
     written = await write_audit_soft(
         # A shutdown drain's cancel waits a bounded time for the row (BACKLOG #3157).
@@ -2664,9 +2703,11 @@ async def _audit_refused_reload(
     filter sees both, and ``invalid_config`` otherwise. A trust-anchor check the store stopped, by
     refusing its audit read or write, writes reason ``store_unavailable`` and answers 503 (BACKLOG
     #3091); it is neither a refused anchor nor a bad graph. A released reload whose config is not the
-    one its approval named writes ``config_reload_failed`` with reason ``digest_mismatch``, or
-    ``no_approved_digest`` when the hold took none, with both digests, and answers 422 (vault
-    BACKLOG #2596); only the executor meets it. One whose digest could not be taken now writes
+    one its approval named writes ``config_reload_failed`` with ``approved_fingerprint`` and
+    ``current_fingerprint`` and reason ``digest_mismatch``, or ``no_approved_digest`` when the hold
+    carries no usable digest (:func:`held_fingerprint`), whose ``approved_fingerprint`` is then
+    null, and answers 422 (vault BACKLOG #2596); only the
+    executor meets it. One whose digest could not be taken now writes
     reason ``digest_unavailable`` and answers 422; the engine logged why at WARNING. A gated
     request whose digest cannot be taken is refused the same way, with no hold filed. A release
     refused before its digest check (:class:`ConfigRefusedBeforeApprovalCheck`) keeps its reason
@@ -2723,7 +2764,7 @@ async def _audit_refused_reload(
         action, detail["reason"] = "config_reload_failed", "not_found"
         status, answer = 404, "config directory not found"
     elif isinstance(exc, ConfigDigestMismatch):
-        # A hold that took no digest is told apart, so nobody goes looking for an edit that
+        # A hold with no usable digest is told apart, so nobody goes looking for an edit that
         # never happened.
         unbound = exc.approved is None
         warn(
@@ -3362,6 +3403,40 @@ async def _record_a_restore(store: Store, sink: AlertSink) -> None:
         _log.warning("the store_restored alert could not be raised: %s", safe_exc(exc))
 
 
+async def _graph_loosenings(
+    state: Any,
+    engine: Engine,
+    graph: Registry,
+    env_values: Mapping[str, Any] | None,
+    action: str,
+) -> list[str] | None:
+    """The names of the loosenings ``graph`` runs under, as ``GET /security/posture`` lists them
+    for an unscoped reader, for an audit row's ``loosenings`` key. The start's ``config_loaded``
+    row and a cluster convergence reload's ``config_reload`` row record them (vault BACKLOG #2597,
+    #3814).
+
+    It raises no ``Exception``, a cancellation aside: both rows are written after the graph is
+    live. A list it cannot read is
+    ``None``, which says unknown, never an empty list, which would say none are active. ``action``
+    names the row in the log line for that case."""
+    try:
+        pairs, _scope = _posture_loosenings(
+            state,
+            engine,
+            None,
+            graph=graph,
+            graph_env_values=env_values,
+            remote_debug=remote_debug_posture(),
+            startup=await asyncio.to_thread(startup_posture),
+            service_env=await asyncio.to_thread(service_env_posture),
+            security=_posture_security(state),
+        )
+        return [name for name, _risk in pairs]
+    except Exception:  # noqa: BLE001 - a live graph's audit row must not fail on its list
+        _log.exception("the loosenings list could not be read; %s records None", action)
+        return None
+
+
 async def _record_start_audit(
     app: FastAPI,
     engine: Engine,
@@ -3402,25 +3477,13 @@ async def _record_start_audit(
     swap check marks the row degraded with the ``start_swap_check`` step and unchecked, and never
     ``superseded``. Either way its ``loosenings`` stand: they are read off the graph the snapshot
     took, not the live one, so a swap cannot change them (vault BACKLOG #3076, #3109)."""
-    switches: list[str] | None = None
-    if loaded is not None and loaded.registry is not None:
-        try:
-            pairs, _scope = _posture_loosenings(
-                app.state,
-                engine,
-                None,
-                graph=loaded.registry,
-                graph_env_values=loaded.env_values,
-                remote_debug=remote_debug_posture(),
-                startup=await asyncio.to_thread(startup_posture),
-                service_env=await asyncio.to_thread(service_env_posture),
-                security=_posture_security(app.state),
-            )
-            switches = [name for name, _risk in pairs]
-        except Exception:  # noqa: BLE001 - a start must not fail on its own audit row (step 5)
-            _log.exception(
-                "the start's loosenings list could not be read; config_loaded records None"
-            )
+    switches = (
+        await _graph_loosenings(
+            app.state, engine, loaded.registry, loaded.env_values, "config_loaded"
+        )
+        if loaded is not None and loaded.registry is not None
+        else None
+    )
     # Nothing awaits between here and the row's detail. A reload that swaps the graph later is
     # not caught.
     superseded = swap_unknown = False
@@ -3900,6 +3963,13 @@ _INGRESS_GUARD_STATUS: dict[str, int] = {
     "parse": 422,
     "strict": 422,
 }
+
+#: The edit-resend refusals that spend the step-up proof even before the store write: at least a
+#: target out of scope, an unknown message or target, and a target or origin that cannot take the
+#: write (owner ruling 2026-11-07, #3241 added item 1, which supersedes R1 for these three
+#: statuses). Every other refusal before the write refunds, so a new refusal raised before the
+#: write in ``_edit_resend_core`` is checked against this set.
+_EDIT_RESEND_SPENDING_REFUSALS = frozenset({403, 404, 409})
 
 
 async def _guard_resubmission(
@@ -4786,6 +4856,13 @@ def create_app(
 
         return middleware
 
+    def _refuse_body(request: Request, status: int, detail: str, what: str) -> JSONResponse:
+        _log.warning("rejected %s on %s from %s", what, request.url.path, client_ip(request))
+        # `Connection: close` makes the server drop the connection after every refusal, so bytes
+        # it framed one way and a proxy another (RFC 9112 §6.1, §6.3), or a refused body the
+        # client never sent, are never read as a next request.
+        return JSONResponse({"detail": detail}, status_code=status, headers={"Connection": "close"})
+
     def _body_refusal(request: Request) -> JSONResponse | None:
         """The response refusing ``request``'s body before any route runs, or None to admit it."""
         # The HTTP API carries only small JSON (HL7 payloads arrive via MLLP/file, not here), so a
@@ -4793,39 +4870,45 @@ def create_app(
         # Rejections are logged (ASVS 16.3.3) — these are control-bypass attempts (a pre-auth memory
         # DoS probe) and were previously dropped silently. We log to the rotating general log rather
         # than the audit_log: it's pre-auth (no actor) and a flood must not grow the audit DB.
-        client = client_ip(request)
-        length = request.headers.get("content-length")
-        transfer_encoding = request.headers.get("transfer-encoding", "").lower()
-        # A request carrying BOTH Content-Length and Transfer-Encoding is ambiguously framed (RFC 9112
-        # §6.1 — TE overrides CL) and is the classic CL.TE request-smuggling vector (ASVS 4.2.1). Under
-        # serve the pinned llhttp parser refuses the pair with its own 400 before this runs (BACKLOG
-        # #1125, protocol_headers.pinned_http_protocol_base). This check covers any other server that
-        # hosts the app: h11, for one, frames the pair by Transfer-Encoding and passes it on.
-        if length is not None and "chunked" in transfer_encoding:
-            _log.warning(
-                "rejected request with both Content-Length and Transfer-Encoding on %s from %s",
-                request.url.path,
-                client,
-            )
-            return JSONResponse(
-                {
-                    "detail": "ambiguous framing: Content-Length with Transfer-Encoding is not accepted"
-                },
-                status_code=400,
-            )
-        if length is None:
-            # No Content-Length means a chunked body (HTTP/1.1 requires one or the other), which the
-            # Content-Length cap can't bound up front — Starlette would buffer it unbounded, a pre-auth
-            # memory DoS. We only accept small JSON, so require a Content-Length (review M-19).
-            if "chunked" in transfer_encoding:
-                _log.warning(
-                    "rejected chunked request body on %s from %s", request.url.path, client
+        lengths = request.headers.getlist("content-length")
+        # The API takes only Content-Length bodies, so ANY Transfer-Encoding is refused, by presence
+        # on any line and whatever its value, and the connection is closed. Beside a Content-Length
+        # the request is ambiguously framed (RFC 9112 §6.1, the CL.TE smuggling vector, ASVS 4.2.1).
+        # Under serve llhttp refuses most such pairs itself (BACKLOG #1125); h11, for one, passes
+        # them on. Without a Content-Length, a coding list that does not end in `chunked` leaves the
+        # body length undetermined (§6.3 rule 4), and a chunked body has no length the cap can
+        # bound up front (review M-19).
+        te_lines = request.headers.getlist("transfer-encoding")
+        if te_lines:
+            if lengths:
+                return _refuse_body(
+                    request,
+                    400,
+                    "ambiguous framing: Content-Length with Transfer-Encoding is not accepted",
+                    "request with both Content-Length and Transfer-Encoding",
                 )
-                return JSONResponse(
-                    {"detail": "chunked request bodies are not accepted; send a Content-Length"},
-                    status_code=411,
+            codings = [c.strip(" \t").lower() for line in te_lines for c in line.split(",")]
+            # RFC 9112 §7: chunked is the final coding and is applied once.
+            if codings[-1] != "chunked" or "chunked" in codings[:-1]:
+                return _refuse_body(
+                    request,
+                    400,
+                    "invalid framing: Transfer-Encoding must end in a single chunked",
+                    "Transfer-Encoding not ending in a single chunked",
                 )
+            return _refuse_body(
+                request,
+                411,
+                "Transfer-Encoding is not accepted; send a Content-Length",
+                "chunked request body",
+            )
+        if not lengths:
             return None
+        # One line holding `1*DIGIT` (RFC 9112 §6.2), not int(): int() takes `+2`, `-5` and `0_2`,
+        # and a repeated line is a second framing claim (an invalid length closes, §6.3 item 5).
+        value = lengths[0].strip(" \t")
+        if len(lengths) > 1 or not (value.isascii() and value.isdigit()):
+            return _refuse_body(request, 400, "invalid Content-Length", "invalid Content-Length")
         # ADR 0134: the uploaded-logs upload routes admit up to [store].max_upload_bytes; all else 1 MiB.
         upload_store = getattr(request.app.state, "upload_store", None)
         cap = (
@@ -4833,14 +4916,10 @@ def create_app(
             if upload_store is not None and request.url.path in _UPLOAD_BODY_PATHS
             else _MAX_REQUEST_BODY_BYTES
         )
-        try:
-            too_big = int(length) > cap
-        except ValueError:
-            _log.warning("rejected invalid Content-Length on %s from %s", request.url.path, client)
-            return JSONResponse({"detail": "invalid Content-Length"}, status_code=400)
-        if too_big:
-            _log.warning("rejected oversized request body on %s from %s", request.url.path, client)
-            return JSONResponse({"detail": "request body too large"}, status_code=413)
+        # Digit count first: int() raises past 4300 digits, and a longer number is over any cap.
+        digits = value.lstrip("0") or "0"
+        if len(digits) > len(str(cap)) or int(digits) > cap:
+            return _refuse_body(request, 413, "request body too large", "oversized request body")
         return None
 
     # add_middleware inserts at index 0, so registering in this order keeps _limit_request_body
@@ -4848,6 +4927,9 @@ def create_app(
     # through _security_headers, and the outermost floor (registered below) is what covers them.
     app.add_middleware(_security_headers)
     app.add_middleware(_limit_request_body)
+    # Vault BACKLOG #2955: an in-body WebSocket is accepted only once a gate admitted its caller.
+    # Inside the header floor, so its refusal close gets the floor's 403 like a gate's own refusal.
+    app.add_middleware(WebSocketAcceptGate)
 
     @app.get("/health", response_model=Health)
     @public_route("liveness must answer a tokenless probe; the version needs a session")
@@ -4948,8 +5030,10 @@ def create_app(
         # the broker's revocation refusal. An off-box endpoint with no [ai].endpoint_revocation_attested
         # pair is refused under enforce, and a None posture counts as enforcing there. The cleartext-
         # http refusal takes no posture: it refuses in every one (vault BACKLOG #3533 item 5).
+        # Off the event loop: the constructor builds rest.py's shared opener on first use, a TLS
+        # context that reads the system trust store, under a lock a worker thread may hold.
         try:
-            broker = ai_broker_from_settings(ai, posture=_phi_read_posture)
+            broker = await asyncio.to_thread(ai_broker_from_settings, ai, posture=_phi_read_posture)
         except AiBrokerError as exc:
             _log.warning("engine AI broker misconfigured: %s", exc)
             raise HTTPException(503, "engine-brokered AI assistance is not available") from exc
@@ -7290,7 +7374,7 @@ def create_app(
             # BACKLOG #1111 -- without this the route answers a degraded apply as clean success.
             if req.dry_run:
                 outcome = await engine.reload_detail(req.config_dir, dry_run=True, propagate=False)
-                failures = [f.step for f in outcome.failures]
+                failures = outcome.failed_steps
             else:
                 outcome, failures = await _reload_and_record(
                     engine, req.config_dir, actor=user.username, client=client_ip(request)
@@ -8426,7 +8510,9 @@ def create_app(
 
         The step-up proof is spent in this route, after FastAPI has validated the body, so a 422
         costs no proof (owner ruling 2026-10-13, #3241 R1 and R2); a refusal raised before the
-        store write gives the proof back."""
+        store write gives the proof back, except one whose status
+        :data:`_EDIT_RESEND_SPENDING_REFUSALS` names, which spends it (owner ruling 2026-11-07,
+        #3241 added item 1)."""
         await spend_step_up_action(request, STEP_UP_ACTION_MESSAGE_EDIT_RESEND)
         return await _edit_resend_core(
             message_id, body=body, engine=engine, identity=identity, request=request
@@ -8453,10 +8539,11 @@ def create_app(
         The console calls this in-process after its own spend."""
         # Owner ruling 2026-10-13 (#3241 R1): a refusal raised BEFORE the store write gives back the
         # proof the gate spent (ADR 0197 Amendment C), so an edit the engine refused costs the
-        # operator no password and the console can re-open the editor without a re-auth. `written`
-        # turns true just before the store call: a refusal from there on keeps the spend, because the
-        # store may have committed. The console calls this handler in-process after its own spend,
-        # so the refund reaches both planes.
+        # operator no password and the console can re-open the editor without a re-auth, except a
+        # status in _EDIT_RESEND_SPENDING_REFUSALS, which keeps the spend. `written` turns true
+        # just before the store call: a refusal from there on keeps the spend, because the store
+        # may have committed. The console calls this handler in-process after its own spend, so the
+        # refund reaches both planes.
         written = False
         try:
             # 404 (not 403) outside the caller's channel scope (mirrors resend/replay/get_message).
@@ -8468,6 +8555,20 @@ def create_app(
                 if not identity.can_access_channel(body.to):
                     await _audit_channel_denied(engine, identity, body.to, client_ip(request))
                     raise HTTPException(403, f"not authorized to resend to outbound {body.to!r}")
+                # BACKLOG #1911: an outbound row has no inbound whose declared type to sniff against, so
+                # only the engine-wide guards apply here (the NUL rule and the 16 MiB ceiling). They
+                # read nothing from the target, and where they sit in the order is ADR 0197
+                # Amendment D, "The order of the checks", which says what their refusal tells.
+                admitted = await _guard_resubmission(
+                    engine,
+                    identity,
+                    request,
+                    raw=body.raw,
+                    inbound=None,
+                    action="message_edit_resend_reject",
+                    channel_id=row["channel_id"],
+                    detail={"message_id": message_id, "mode": "direct", "to": body.to},
+                )
                 rr = engine.registry_runner
                 if rr is None or body.to not in rr.registry.outbound:
                     raise HTTPException(404, f"no such outbound connection: {body.to}")
@@ -8489,18 +8590,6 @@ def create_app(
                         raise HTTPException(409, _outbound_down_detail(rr, body.to))
                 except KeyError:
                     raise HTTPException(404, f"no such outbound connection: {body.to}") from None
-                # BACKLOG #1911: an outbound row has no inbound whose declared type to sniff against, so
-                # only the engine-wide guards apply here (the NUL rule and the 16 MiB ceiling).
-                admitted = await _guard_resubmission(
-                    engine,
-                    identity,
-                    request,
-                    raw=body.raw,
-                    inbound=None,
-                    action="message_edit_resend_reject",
-                    channel_id=row["channel_id"],
-                    detail={"message_id": message_id, "mode": "direct", "to": body.to},
-                )
                 _refuse_head_only(message_id, row)
                 client = client_ip(request)
 
@@ -8619,9 +8708,13 @@ def create_app(
                 reroute=True,
                 new_message_id=outcome.new_message_id,
             )
-        except HTTPException:
+        except HTTPException as exc:
             auth = get_auth(request)
-            if not written and auth is not None:
+            if (
+                not written
+                and exc.status_code not in _EDIT_RESEND_SPENDING_REFUSALS
+                and auth is not None
+            ):
                 auth.refund_action_step_up(STEP_UP_ACTION_MESSAGE_EDIT_RESEND)
             raise
 
@@ -8692,6 +8785,39 @@ def create_app(
         "rotate-key reports it as unsealable, an operator can only delete it"
     )
 
+    _UPLOAD_UNAVAILABLE = (
+        "the store's key service could not complete the request, so nothing was read, stored or "
+        "removed. Try again shortly"
+    )
+
+    class _UploadUnavailable(HTTPException):
+        """BACKLOG #3734: the store cipher's key service (Vault Transit) gave no verdict on the
+        file, so nothing was read, stored or removed and a later try may succeed. 503 with the
+        ``Retry-After`` of the engine's other temporary refusals, where 423 would send an operator
+        to rotate-key or a delete for a file that is fine. Like the 423, the body names no file
+        and no cipher detail.
+
+        Built by :func:`_upload_unavailable`, which logs the store's error TEXT and keeps it off
+        the 503, so the 503 holds no link to the Transit chain, whose request can carry a body.
+        Each raise in this module comes after its ``except`` clause has ended. ``args`` is set to
+        ``(503, detail)`` here, because Starlette's ``__init__`` leaves it as the call's own
+        arguments; a copy rebuilds it through ``cls(*args)``, which logs nothing."""
+
+        def __init__(self, *_rebuilt: object) -> None:
+            super().__init__(
+                503,
+                _UPLOAD_UNAVAILABLE,
+                headers={"Retry-After": str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)},
+            )
+            self.args = (503, _UPLOAD_UNAVAILABLE)
+
+    def _upload_unavailable(cause: str, op: str) -> _UploadUnavailable:
+        """The outage 503, logged once at WARNING with the operation, so an outage that blocks
+        every upload is on the record. ``cause`` is the cipher's outage text, the key id and an
+        exception type name (``crypto_transit._transit_failure``); it goes to the log only."""
+        _log.warning("upload %s answered 503: %s", op, cause)
+        return _UploadUnavailable()
+
     class _UploadSidecarRefused(HTTPException):
         """The 423 an override holder gets when an upload's sidecar is refused. Every other route
         answers it as is. DELETE alone catches it and asks ``UploadStore.delete``. That call can
@@ -8718,22 +8844,26 @@ def create_app(
         the check has to sit in the handler BODY, not in a ``Depends`` gate, because the web console
         invokes these handlers directly through the CoreHandlers seam and never runs their gates.
         One exception: DELETE catches :class:`_UploadSidecarRefused`, which only an override holder
-        gets, and lets ``UploadStore.delete`` decide (BACKLOG #2322)."""
+        gets, and lets ``UploadStore.delete`` decide (BACKLOG #2322). An override holder whose read
+        met a key-service outage gets the 503 instead, which DELETE does not catch (BACKLOG #3734)."""
+        override_answer: Callable[[], HTTPException] | None = None
         try:
             meta = await us.get_meta(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnavailableError as exc:
+            # BACKLOG #3734: an outage, not the 423. Only its text is kept past this clause.
+            override_answer = partial(_upload_unavailable, str(exc), op)
         except UploadUnreadableError:
-            unreadable = True
-        else:
-            unreadable = False
-        if unreadable:
+            override_answer = _UploadSidecarRefused
+        if override_answer is not None:
             # The owner cannot be read, so ownership cannot be checked. Keep the 404 contract above
             # for everyone but an override holder, who may see any file anyway and is the one who
-            # can act on it; the refused sidecar is not an existence oracle for anyone else. Both
-            # raises sit after the handler ends, so neither chain carries the cipher's error.
+            # can act on it; neither a refused sidecar nor an outage is an existence oracle for
+            # anyone else. Both raises sit after the handler ends, so neither chain carries the
+            # cipher's error.
             if identity.has(Permission.FILES_ACCESS_ANY):
-                raise _UploadSidecarRefused()
+                raise override_answer()
             raise HTTPException(404, "no such uploaded file")
         if not _may_access_upload(identity, meta):
             await engine.store.record_audit(
@@ -8820,6 +8950,7 @@ def create_app(
                 client=client_ip(request),
             )
             raise HTTPException(415, nontext) from None
+        outage: str | None = None
         try:
             # uploader_id (the immutable account id) is the ownership + quota key; uploader (the
             # username) rides along as the display/audit label. See uploads.UploadedFileMeta.
@@ -8853,6 +8984,13 @@ def create_app(
                 client=client_ip(request),
             )
             raise HTTPException(409, str(exc)) from None
+        except UploadUnavailableError as exc:
+            outage = str(exc)
+        if outage is not None:
+            # BACKLOG #3734: nothing was written, so a retry stores the file once. Not audited as a
+            # reject, because the file was not refused. Raised after the handler, from the text
+            # alone, so no chain link reaches the Transit request (see _UploadUnavailable).
+            raise _upload_unavailable(outage, "save")
         # Vault BACKLOG #3178: the creation row outlives the request, so a deadline that fires now
         # still leaves the stored file with its row. A row that cannot be written removes the file.
         #
@@ -9004,12 +9142,17 @@ def create_app(
             except ContentSearchError as exc:
                 raise HTTPException(400, str(exc)) from exc
         meta = await _authorized_upload_meta(request, engine, us, identity, file_id, "browse")
+        outage: str | None = None
         try:
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnavailableError as exc:
+            outage = str(exc)
         except UploadUnreadableError:
             raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
+        if outage is not None:
+            raise _upload_unavailable(outage, "browse")  # after the handler: no chain link
         result = await asyncio.to_thread(
             browse_messages,
             data,
@@ -9160,12 +9303,17 @@ def create_app(
             raise HTTPException(404, f"no such inbound connection: {body.to}") from None
         # Object-level authorization on the SOURCE file, in ADDITION to the target-channel check above.
         await _authorized_upload_meta(request, engine, us, identity, file_id, "resend")
+        outage: str | None = None
         try:
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnavailableError as exc:
+            outage = str(exc)
         except UploadUnreadableError:
             raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
+        if outage is not None:
+            raise _upload_unavailable(outage, "resend")  # after the handler: no chain link
         parts = await asyncio.to_thread(split_uploaded, data)
         if body.index >= len(parts):
             raise HTTPException(
@@ -9256,7 +9404,12 @@ def create_app(
                 nonlocal detail
                 try:
                     removed = await us.delete(file_id, sidecar_refused=refused)
-                except (UploadPathError, UploadNotFoundError, UploadUnreadableError) as exc:
+                except (
+                    UploadPathError,
+                    UploadNotFoundError,
+                    UploadUnavailableError,
+                    UploadUnreadableError,
+                ) as exc:
                     # Each is raised before any unlink, so no row is owed, and a cancel landing
                     # meanwhile must not log one as lost. Returned, so the route still answers it.
                     return exc
@@ -9282,12 +9435,17 @@ def create_app(
         # Vault BACKLOG #3178: the unlink and its row run as one operation that outlives the
         # request, so a deadline can no longer land between them and leave a removed file with no
         # row.
+        outage: str | None = None
         try:
             meta = await outliving.run(_delete_and_record(), "upload delete")
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnavailableError as exc:
+            outage = str(exc)
         except UploadUnreadableError:
             raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
+        if outage is not None:
+            raise _upload_unavailable(outage, "delete")  # after the handler: no chain link
         return UploadDeleteResult(file_id=meta.file_id, filename=meta.filename, deleted=True)
 
     # --- saved / layered Log-Search filter presets (BACKLOG #151, ADR 0136) --
@@ -10698,7 +10856,9 @@ def create_app(
             identity = await authorize_ws(websocket, Permission.MONITORING_READ)
             token = ws_token(websocket)
         # The three refusals below happen BEFORE accept, so each is the handshake's HTTP answer
-        # (BACKLOG #1120; see header_floor.refuse_websocket).
+        # (BACKLOG #1120; see header_floor.refuse_websocket). The first runs with no gate admitted,
+        # so WebSocketAcceptGate refuses its denial response and the client gets a bodyless 403
+        # (vault BACKLOG #2955); the two 503s run after a gate admitted the caller.
         if identity is None:
             await refuse_websocket(
                 websocket,
@@ -11023,7 +11183,7 @@ def create_app(
     # ASVS 3.4.4/3.4.5 — registered LAST, so Starlette makes it the OUTERMOST user middleware
     # (add_middleware inserts at index 0; the stack is built from reversed(user_middleware)) and its
     # response-path send wrapper runs after every other emitter. That position is the whole point:
-    # _security_headers is the INNERMOST user middleware, so the body cap's four short-circuits above
+    # _security_headers is the INNERMOST user middleware, so the body cap's short-circuits above
     # shipped with no baseline headers at all, and both middlewares that hand-copy the baseline
     # (client_networks._DENIAL_HEADERS, request_timeout._TIMEOUT_HEADERS) omit HSTS. The floor
     # setdefaults, never assigns, so the attachment sandbox CSP re-asserted above and every other
@@ -11295,7 +11455,9 @@ async def _directory_reconciler(
                 if found:
                     # Once, at the read that fixes the set (BACKLOG #3084): every clear of these
                     # instances is dropped for this process's life, and without this line only
-                    # docs/CONFIGURATION.md would say so. Keys only; an instance carries no PHI.
+                    # docs/CONFIGURATION.md would say so. Keys only: the line names each instance's
+                    # event type and connection, never its stored reason, which can hold free text
+                    # (docs/PHI.md, the alert_instance.reason row).
                     # "When this process first read", not "before its first pass": a first read
                     # that failed lets this process's own early trip or hold land in the set.
                     _log.warning(
@@ -11899,7 +12061,7 @@ def create_managed_app(
     api_tls_cert_file: str | None = None,
     api_tls_replacements: Sequence[GeneratedPairReplaced] = (),
     api_tls_client_cert_files: Sequence[str] = (),
-    settings_crls: Sequence[MonitoredCert] = (),
+    settings_monitored_files: Sequence[MonitoredCert] = (),
     api_listener: tuple[str, int] | None = None,
     reference_settings: ReferenceSettings | None = None,
     egress_settings: EgressSettings,
@@ -12214,7 +12376,8 @@ def create_managed_app(
         # on an administrative path refuses unless [security].allow_over_granted_vault_token accepts
         # it (audited), and so does a probe failure that is not a network failure, a timeout or a
         # 403, which the opt-out does not lift; every other finding warns and audits
-        # (vault_preflight_outcome). It names the consumers from the
+        # (vault_preflight_outcome). Every finding raises vault_privilege_warning, and a clean read
+        # can resolve it (see docs/SECURITY.md). It names the consumers from the
         # resolved service settings, which serve always passes; an embedding that passes none has
         # no Vault consumer this lifespan could name.
         _security = security_settings or SecuritySettings()
@@ -12241,6 +12404,8 @@ def create_managed_app(
                     probe=partial(
                         probe_vault, settings=static_credential_settings, posture=_hop_posture
                     ),
+                    # #2903 slice B: each hop pages, or can resolve its page, through the same sink.
+                    alert_sink=notifier or LoggingAlertSink(),
                 )
         except BaseException:
             if notifier is not None:
@@ -12313,8 +12478,8 @@ def create_managed_app(
             engine_version=__version__,
             api_tls_cert_file=api_tls_cert_file,
             api_tls_client_cert_files=api_tls_client_cert_files,
-            # BACKLOG #299: the settings-level CRL files, mostly outbound, for the same expiry scan.
-            settings_crls=settings_crls,
+            # BACKLOG #299, vault #2223: the settings-level CRL and pin files, for the same scan.
+            settings_monitored_files=settings_monitored_files,
             api_listener=api_listener,
             reference_settings=reference_settings,
             egress_settings=egress_settings,
@@ -12394,6 +12559,8 @@ def create_managed_app(
         # against the newest row that did land, normally the initiator's, which names the same
         # bytes where every node shares one config directory. A change goes unreported only if
         # that row was lost too; otherwise the cost is at most a false config_changed.
+        posture_stashed = False  # set once the loosenings reader's settings are stashed
+
         async def _audit_convergence_reload(outcome: ReloadOutcome) -> None:
             failed = outcome.failed_steps
             # A row with no digest would be the newest baseline and leave the next start nothing
@@ -12404,6 +12571,20 @@ def create_managed_app(
             no_digest = (
                 "config_fingerprint" in failed or digest_coverage(outcome.fingerprint) is None
             )
+
+            # The loosenings of the graph this reload loaded, read against the env() values it
+            # swapped in, as a start row records its own (vault BACKLOG #3814). Read inside the
+            # row's write, so a cancel waits for the row as it does for the write. A convergence
+            # before the lifespan has stashed the settings the reader needs, at least one inside
+            # engine.start(), would leave settings-scoped loosenings out, so it is recorded as
+            # unknown.
+            async def _loosenings() -> list[str] | None:
+                if not posture_stashed:
+                    return None
+                return await _graph_loosenings(
+                    app.state, engine, outcome.registry, outcome.env_values, "config_reload"
+                )
+
             # The row names the digest judged above, not the engine's at the write: a later
             # reload marks it superseded instead (vault BACKLOG #3765, item 19).
             await _record_reload_audit(
@@ -12415,6 +12596,7 @@ def create_managed_app(
                     "initiator": _CONVERGENCE_INITIATOR,
                     **({_BASELINE_UNCHECKED: True} if no_digest else {}),
                 },
+                loosenings=_loosenings,
             )
 
         async def _audit_convergence_failure(
@@ -12724,6 +12906,8 @@ def create_managed_app(
             # fallback for an app that sets the stash with no service attached.
             if auth_settings is not None:
                 app.state.auth_settings = auth_settings
+            # A convergence row reads the same stashes for its loosenings (vault BACKLOG #3814).
+            posture_stashed = True
             # The start's config_loaded row (vault BACKLOG #2597), as early as its readers allow: the
             # last stash the loosenings reader needs is the one above, and the graph is already
             # serving, so a later startup step that aborts must not leave the start unrecorded.

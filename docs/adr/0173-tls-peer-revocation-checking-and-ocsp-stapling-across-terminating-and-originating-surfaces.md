@@ -742,7 +742,9 @@ site could set, until BACKLOG #2987 removed it.) So
 `refuse_unrevoked_verified_hop` takes `ways_across`, and both ECH callers pass the fixed text
 `ECH_HOP_WAYS_ACROSS`. Where the guard runs, a non-loopback ECH hop on an enforcing instance
 crosses on the attestation alone. On the REST destination the guard runs only with `verify_tls`
-true, as before; with `verify_tls=false` the hop is the verify-off gate's (#200), ECH or not.
+true, as before. *(Corrected 2026-11-09, vault BACKLOG #2977 item 8: this read "as before; with
+`verify_tls=false` the hop is the verify-off gate's (#200), ECH or not". A REST destination with
+`ech_egress` and `verify_tls=false` is now refused at construction, before that gate.)*
 
 The REST destination's ECH arm takes the same value, under BACKLOG #2188. That item moved the guard
 in the REST, SOAP, FHIR and DICOMweb destinations below the last statement that builds or replaces
@@ -835,9 +837,7 @@ an attested hop its record says no certificate revocation checking (OCSP/CRL) is
 the guard credits a CRL that the handshake still consults. That record and that ALLOW contradict
 each other. Whether such a context's CRL should admit the hop is not decided here. The AI broker writes its own records, not the
 guard's, and its line keeps the unrelaxed words: no context that skips time validity reaches it,
-because it dials rest.py's shared opener, which never relaxes. The
-REST, SOAP and FHIR hops pass no such flag, so their line keeps the partial over-statement this
-paragraph describes; their refusal text is left open in §13 too. *(Note 2026-11-04: the open limit above is closed by
+because it dials rest.py's shared opener, which never relaxes. *(Note 2026-11-04: the open limit above is closed by
 vault BACKLOG #5086. `capture()` reads the time-validity flag off any context it is handed, so a
 context that skips time validity earns no CRL credit without the flag either, takes the relaxed
 words and, where the caller passes no remedy, `EXPIRY_RELAXED_WAYS_ACROSS`; "Only the flag sets
@@ -1068,7 +1068,7 @@ proposed accept, and only an owner ruling makes it one.
 | `auth/ldap.py`, `ad_tls_verify=false` | the same passwords | **Verify-off** | refused in every posture, with no escape (vault BACKLOG #3230, CORRECTED 2026-10-12: this read "refused on an enforcing instance (#329)") |
 | `config/tls_policy.py`, `assert_ldap3_tls_suites` | the same passwords | **Not a separate hop** | since BACKLOG #2494 it builds the context the LDAPS row above handshakes on; it was a replica that never handshook (CORRECTED 2026-09-30). Since BACKLOG #2193 it also loads `[auth].ad_tls_crl_file` onto that context |
 | `pipeline/alert_sinks.py`, `send_plain_email`, through `build_smtp_tls_context` | alert bodies and per-user security-event notices (`pipeline/security_notify.py` sends through it too), the SMTP AUTH credential | **Guarded when it carries a login; declined without one, by owner ruling 2026-10-27** | `RevocationHopGuard.capture` in `_refuse_alert_smtp_revocation`, which `EmailTransport.__init__` and `SecurityEventNotifier.__init__` each call when `[alerts].email_username` is set, handing it a context built by the recipe every send runs, from the same arguments. `[tls].crl_file` reaches that context through the trust anchor, so a CRL that loads relaxes the refusal; the other lever is the `[alerts].email_tls_revocation_attested` pair. Built outside the connector gate, so the API lifespan, the alerts test send and the offline notifier pass the posture. **Declined: a hop with no login**, which carries no credential, so it takes no guard. *(Graded "Needs a guard, tracked by #2193" until 2026-10-30, when BACKLOG #2193 slice (c) built it. It read: "a verifying credential hop with no revocation guard, built outside the connector gate".)* |
-| `pipeline/alert_sinks.py`, `_build_no_redirect_opener`, through `build_asserted_https_handler` (the alert webhook) | alert bodies; a Slack or Teams hook carries its secret in the URL | **Guarded by attestation, by owner ruling 2026-10-27; no CRL lever is built** | `RevocationHopGuard.capture` in `_refuse_webhook_revocation`, which `WebhookTransport.__init__` calls for an https URL, with no context: the opener is built at import and no CRL can reach it. The only lever is the `[alerts].webhook_tls_revocation_attested` pair. *(Graded "Needs a guard, tracked by #2193" until 2026-10-30, when BACKLOG #2193 slice (d) built it. It read: "a verifying credential hop with no revocation guard".)* |
+| `pipeline/alert_sinks.py`, `_build_no_redirect_opener`, through `build_asserted_https_handler` (the alert webhook) | alert bodies; a Slack or Teams hook carries its secret in the URL | **Guarded by attestation, by owner ruling 2026-10-27; no CRL lever is built** | `RevocationHopGuard.capture` in `_refuse_webhook_revocation`, which `WebhookTransport.__init__` calls for an https URL, with no context: no CRL can reach the opener. The only lever is the `[alerts].webhook_tls_revocation_attested` pair. *(Graded "Needs a guard, tracked by #2193" until 2026-10-30, when BACKLOG #2193 slice (d) built it. It read: "a verifying credential hop with no revocation guard".)* |
 | `transports/direct.py`, through `build_smtp_tls_context` | S/MIME-protected bodies, the SMTP AUTH credential | **Guarded** | `RevocationHopGuard.capture` in `DirectDestination.__init__`, taken when a username is set, called after the context is built and handed it. That is the AUTH credential leg. A DIRECT hop with no username sends no credential and takes no guard: the shipped comment's S/MIME reasoning covers that case, and its wording now says so. *(Graded "Owner question" until 2026-10-04, when BACKLOG #2193 built the credential leg. It read: "a shipped comment declines the guard because S/MIME protects the body. That reason covers the body. It does not cover the AUTH credential when a username is set. (Added 2026-10-02.) #2193 tracks this row with a checklist line: guard the AUTH credential leg, and leave the S/MIME decline as it is. Manager batch 164 chose that line, as #2193 records. Building it reverses the shipped decline for the credential leg, and the grade then moves to Guarded. Declining it is an accept, which needs an owner ruling".)* |
 | `apiclient/client.py`, `_build_verify_context`, `truststore` branch | session credentials | **Scoped out by this ADR** | §5 and §9: the OS verifier builds the chain |
 | `apiclient/client.py`, `_build_verify_context`, `cacert` branch | the login password, session tokens, message views | **Accepted by the owner (owner ruling 2026-09-27)** | a stdlib context, so §5 does not reach it. `RevocationHopGuard` keys on the engine's hop posture, which a client process does not hold, so no existing guard fits. Pinned to the engine's own self-signed certificate (ADR 0172), it has no issuer to revoke it. Pinned to a CA bundle, a revoked engine certificate would still verify. The owner accepted that CA-bundle gap. The ruling was an AskUserQuestion answer in Manager session `1a2e1f9a-6106-48d4-b09f-4f97d75d8780`. **Re-score trigger, in the ruling's words: "when the engine binds beyond loopback or a CA-bundle pin becomes the documented setup".** Both already exist as opt-ins. Remote access is supported and off by default (`docs/REMOTE-CONSOLE.md`). The `_build_verify_context` docstring says `cacert` takes a CA bundle or a self-signed engine certificate. The ruling does not say whether a site taking an opt-in fires the trigger. *(Graded Owner question at `ad41441ec`.)* |
@@ -1123,7 +1123,36 @@ this table as a count of verifying hops.** Per SDS-3.6, it is "at least these".
 
 The counts paragraph above names the alert SMTP hop and the alert webhook among its seven. The webhook is now guarded; the SMTP hop is guarded only when it carries a login, and the hop with no login is declined, not guarded. The AI broker, also among the seven, is guarded too, as the next note says. This note does not re-check the paragraph's other counts.
 
-**Note 2026-10-30: the AI broker endpoint is guarded by attestation (BACKLOG #2193 slice (e), owner ruling 2026-10-27, on the §12 pattern).** The AI broker row of the table above says how. The ruling, as the batch 453 Manager recorded it under the owner's delegation: the webhook and the AI broker "get attestation-pair guards on the ADR 0173 section 12 pattern". So the lever is a settings pair, `[ai].endpoint_revocation_attested` with `[ai].endpoint_revocation_attested_reason`, refused at load unless the two travel together; the hop refuses under enforce unless it is set; an unknown posture counts as enforcing; `security_loosenings()` names a set pair with its reason; and no CRL lever is built. Four facts the row does not carry. The broker is built per request, so the refusal comes at `POST /ai/chat`, answered 503, and not at start; `messagefoundry check` builds no broker and has no leg for this pair. Each crossing line is written once per process for each endpoint host. `MEFOR_TLS_REVOCATION_ATTESTED` does not cross this hop under an enforcing or unknown posture (BACKLOG #299). A later CRL lever could start at the context the guard already reads, but it would need a context of its own: the shared opener is built at import and is never handed a CRL. The counts paragraph above names the AI broker as one of its seven hops; it no longer needs a guard. The alert webhook and the alert and security-notice SMTP hop with a login are guarded too, as the note above says; that SMTP hop with no login is declined there. This note does not re-check the paragraph's other counts.
+**Note 2026-10-30: the AI broker endpoint is guarded by attestation (BACKLOG #2193 slice (e), owner ruling 2026-10-27, on the §12 pattern).** The AI broker row of the table above says how. The ruling, as the batch 453 Manager recorded it under the owner's delegation: the webhook and the AI broker "get attestation-pair guards on the ADR 0173 section 12 pattern". So the lever is a settings pair, `[ai].endpoint_revocation_attested` with `[ai].endpoint_revocation_attested_reason`, refused at load unless the two travel together; the hop refuses under enforce unless it is set; an unknown posture counts as enforcing; `security_loosenings()` names a set pair with its reason; and no CRL lever is built. Four facts the row does not carry. The broker is built per request, so the refusal comes at `POST /ai/chat`, answered 503, and not at start; `messagefoundry check` builds no broker and has no leg for this pair. Each crossing line is written once per process for each endpoint host. `MEFOR_TLS_REVOCATION_ATTESTED` does not cross this hop under an enforcing or unknown posture (BACKLOG #299). A later CRL lever could start at the context the guard already reads, but it would need a context of its own: the shared opener is never handed a CRL. The counts paragraph above names the AI broker as one of its seven hops; it no longer needs a guard. The alert webhook and the alert and security-notice SMTP hop with a login are guarded too, as the note above says; that SMTP hop with no login is declined there. This note does not re-check the paragraph's other counts.
+
+**Note 2026-11-10: the SMTP decline does not rest on an alert body being PHI-free, and an alert
+body is not PHI-free in the shipped code (BACKLOG #5021).** The decline in the 2026-10-30 note on
+slices (c) and (d) rests on no credential crossing the hop. What a body carries is in the [PHI.md
+logging inventory](../PHI.md#logging-inventory-1611--1623): its row for the `[alerts]` SMTP
+transport (row 11) and its row for the security-event notifier (row 12). The owner ruled on
+2026-11-09 (decision record `d20261110T081839838-3120c4`, stamped in UTC on 2026-11-10) that the
+decline stands, and that alerts are to be made PHI-free by routing every off-box alert through
+one key allowlist. That allowlist is not built in the shipped code; it is the off-box alert key
+allowlist row, unallocated. The same ruling holds that the PHI-free alert claims in
+[ADR 0133](0133-alert-escalation-tiers-schedule-aware-thresholds-and-content-triggered-alerts-the-56-remainder.md)
+and [ADR 0044](0044-operator-alert-state.md), false in the shipped code, become true again once
+that allowlist is built. A key allowlist filters only the alert copies routed through it, so
+those claims can become true only for those copies. The allowlist's own row has to say which
+copies it routes. The other copies of an alert's text are not made PHI-free by it, and at least
+these stay as the shipped code has them: the stored `alert_instance.reason` and
+`connection_event.reason`, which a remote store or an audited reveal can still carry off the box,
+and the `LoggingAlertSink` line, which goes into the application log and from there wherever that
+log goes, unless the allowlist is built to cover that path too. The PHI.md logging inventory rows
+7, 8 and 13 and the [data-at-rest inventory](../PHI.md#2-where-phi-lives--data-at-rest-inventory)
+rows for those two columns say what each holds and where it goes. That limit is a reading of
+what a key allowlist can do, set by the Manager 30df8519 brief under BACKLOG #5021; it is not
+part of the owner ruling. Separately, a Manager decision (class B, Manager 30df8519, decision
+record `d20261110T082816880-1913c6`), not the owner ruling, names two exemptions stated beside,
+or justified by, a PHI-free alert body, to be re-checked against that allowlist once it is built:
+[ADR 0029](0029-email-smtp-destination.md)'s decline to gate the sender domain of the `[alerts]`
+sink and the security notifier, and the `[alerts]` sinks sitting outside `[egress]`
+deny-by-default ([DEPLOYMENT.md](../DEPLOYMENT.md)). This note does not establish that no other
+exemption rests on that premise.
 
 **Note 2026-10-04: the hops outside the reads, graded by name (BACKLOG #2194).** Read at engine
 `76355472a`. This note grades the hops the list above left ungraded. It builds no guard, documents
@@ -1615,6 +1644,3 @@ refused with a CRL on the relaxed context, admitted and audited on the attestati
 credit, warned when not enforcing, and admitted by the same CRL without the relaxation, for each
 hop.
 
-**Left open.** The REST, SOAP and FHIR refusals on this shape still name the default remedy, which
-offers `[tls].crl_file`; they hand the guard no opener, so that lever cannot cross them. This
-amendment does not change those three call sites.

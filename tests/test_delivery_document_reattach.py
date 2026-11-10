@@ -30,7 +30,7 @@ import hashlib
 import logging
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
@@ -59,6 +59,8 @@ from messagefoundry.parsing.binary import (
     reattach_documents_in_hl7,
 )
 from messagefoundry.parsing.message import Message
+from messagefoundry.pipeline import wiring_runner
+from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.store import MessageStore, OutboxStatus
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
@@ -483,7 +485,7 @@ async def test_a_stored_cr_takes_the_outbound_internal_error_policy(
     mid = await store.enqueue_message(
         channel_id="c1", raw=skeleton, deliveries=[(DEST, skeleton)], now=100.0
     )
-    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    runner, sink = _stop_runner(store)
     col = _Collector()
     runner._destinations[DEST] = col
     runner._internal_error[DEST] = policy
@@ -496,6 +498,7 @@ async def test_a_stored_cr_takes_the_outbound_internal_error_policy(
     ((status, last_error),) = await _outbox_rows(store, mid)
     if policy is InternalErrorPolicy.STOP:
         assert outcome is _ItemOutcome.STOPPED
+        assert [name for name, _ in sink.stopped] == [DEST]
         assert status == OutboxStatus.PENDING.value  # kept for the operator, not dead-lettered
     else:
         assert outcome is not _ItemOutcome.STOPPED
@@ -534,7 +537,7 @@ async def test_batch_hydrates_every_member(store: MessageStore) -> None:
 
 class _FramingCollector(_Collector):
     """A collector that frames (defines ``check_frame``), so the batch takes the framing branch,
-    where re-attach refusals join the frame split's. It refuses nothing, and counts its checks."""
+    where re-attach refusals join the frame check's. It refuses nothing, and counts its checks."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -574,7 +577,7 @@ async def test_a_batch_member_whose_reattach_breaks_is_dead_lettered_alone(
     assert len(col.deliveries) == 1
     assert [Message.parse(m).field("OBX-5.5") for m in split_batch(col.deliveries[0])] == [a]
     if isinstance(col, _FramingCollector):
-        assert col.checked == 1  # only the survivor reached the frame split
+        assert col.checked == 1  # only the survivor reached the frame check
     stats = await store.stats()
     assert stats.get(OutboxStatus.DEAD.value, 0) == 1
     assert stats.get(OutboxStatus.DONE.value, 0) == 1
@@ -589,6 +592,30 @@ def _engine_value_error(*_args: object, **_kwargs: object) -> str:
     raise ValueError("engine bug in the re-attach")
 
 
+class _StopRecorder(LoggingAlertSink):
+    """Records each ``connection_stopped`` alert, so a STOP test reads the alert, not only the
+    outcome (vault BACKLOG #5100)."""
+
+    def __init__(self) -> None:
+        self.stopped: list[tuple[str, str]] = []
+
+    def connection_stopped(self, name: str, *, detail: str) -> None:
+        self.stopped.append((name, detail))
+
+
+def _stop_runner(store: MessageStore) -> tuple[RegistryRunner, _StopRecorder]:
+    sink = _StopRecorder()
+    runner = RegistryRunner(
+        Registry(), store, egress=EgressSettings(deny_by_default=False), alert_sink=sink
+    )
+    return runner, sink
+
+
+async def _outbox_id(store: MessageStore, message_id: str) -> str:
+    (row,) = await store.outbox_for(message_id)
+    return str(row["id"])
+
+
 async def test_an_engine_value_error_in_the_reattach_still_stops_a_stop_lane(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -600,7 +627,7 @@ async def test_an_engine_value_error_in_the_reattach_still_stops_a_stop_lane(
     await store.enqueue_message(
         channel_id="c1", raw=skeleton, deliveries=[(DEST, skeleton)], now=100.0
     )
-    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    runner, sink = _stop_runner(store)
     col = _Collector()
     runner._destinations[DEST] = col
     runner._internal_error[DEST] = InternalErrorPolicy.STOP
@@ -611,6 +638,7 @@ async def test_an_engine_value_error_in_the_reattach_still_stops_a_stop_lane(
     outcome, _ = await runner._process_delivery_item(DEST, item)
 
     assert outcome is _ItemOutcome.STOPPED
+    assert [name for name, _ in sink.stopped] == [DEST]
     assert col.deliveries == []
     assert (await store.stats()).get(OutboxStatus.DEAD.value, 0) == 0
 
@@ -630,7 +658,7 @@ async def test_a_parser_fault_in_the_reattach_still_stops_a_stop_lane(
     await store.enqueue_message(
         channel_id="c1", raw=skeleton, deliveries=[(DEST, skeleton)], now=100.0
     )
-    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    runner, sink = _stop_runner(store)
     runner._destinations[DEST] = _Collector()
     runner._internal_error[DEST] = InternalErrorPolicy.STOP
     monkeypatch.setattr(_builtin_hl7, "parse", _faulting_parse)
@@ -640,7 +668,34 @@ async def test_a_parser_fault_in_the_reattach_still_stops_a_stop_lane(
     outcome, _ = await runner._process_delivery_item(DEST, item)
 
     assert outcome is _ItemOutcome.STOPPED
+    assert [name for name, _ in sink.stopped] == [DEST]
     assert (await store.stats()).get(OutboxStatus.DEAD.value, 0) == 0
+
+
+class _RefusingFramer(_Collector):
+    """A framing collector that refuses, permanently, any payload holding ``FRAMEBAD``."""
+
+    def check_frame(self, payload: str, *, rewrite: bool = True) -> None:
+        if "FRAMEBAD" in payload:
+            raise NegativeAckError("frame refused", code="framing", permanent=True)
+
+
+def _batch_runner(
+    store: MessageStore, connector: _Collector
+) -> tuple[RegistryRunner, _StopRecorder]:
+    runner, sink = _stop_runner(store)
+    runner._destinations[DEST] = connector
+    runner._batch[DEST] = BatchConfig(max_count=5, max_wait_ms=1)
+    runner._retry[DEST] = RetryPolicy()
+    runner._simulate[DEST] = False
+    return runner, sink
+
+
+async def _run_batch(runner: RegistryRunner, store: MessageStore) -> _ItemOutcome:
+    head = await store.claim_next_fifo(DEST)
+    assert head is not None
+    outcome, _ = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    return outcome
 
 
 async def test_an_engine_value_error_in_a_batch_reattach_still_stops_a_stop_lane(
@@ -650,30 +705,47 @@ async def test_an_engine_value_error_in_a_batch_reattach_still_stops_a_stop_lane
     # whole batch takes the internal-error policy, and STOP stops the lane (vault BACKLOG #2809).
     ref = await _store_doc(store, _big_b64(600))
     skeleton = _hl7_with_value(make_doc_ref(ref, "application/pdf"))
-    await store.enqueue_message(
+    mid = await store.enqueue_message(
         channel_id="c1", raw=skeleton, deliveries=[(DEST, skeleton)], now=100.0
     )
-    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
     col = _Collector()
-    runner._destinations[DEST] = col
-    runner._batch[DEST] = BatchConfig(max_count=5, max_wait_ms=1)
-    runner._retry[DEST] = RetryPolicy()
-    runner._simulate[DEST] = False
+    runner, sink = _batch_runner(store, col)
     runner._internal_error[DEST] = InternalErrorPolicy.STOP
     monkeypatch.setattr(Message, "encode", _engine_value_error)
 
-    head = await store.claim_next_fifo(DEST)
-    assert head is not None
-    outcome, _ = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    outcome = await _run_batch(runner, store)
 
     assert outcome is _ItemOutcome.STOPPED
+    # The alert names the member by its outbox id (vault BACKLOG #5100).
+    ((name, detail),) = sink.stopped
+    assert name == DEST
+    assert detail.endswith(f"; batch member {await _outbox_id(store, mid)}")
     assert col.deliveries == []
     assert (await store.stats()).get(OutboxStatus.DEAD.value, 0) == 0
 
 
+async def _enqueue(store: MessageStore, payloads: Sequence[str]) -> tuple[list[str], list[str]]:
+    """Enqueue one member per payload, in claim order, and return the message ids and the outbox
+    ids, so a test can tell a middle member from the head and the last."""
+    mids = [
+        await store.enqueue_message(channel_id="c1", raw=sk, deliveries=[(DEST, sk)], now=100.0)
+        for sk in payloads
+    ]
+    return mids, [await _outbox_id(store, m) for m in mids]
+
+
+def _three(middle: str) -> list[str]:
+    return [_hl7_with_value(v) for v in ("clean one", middle, "clean three")]
+
+
+async def _rows(store: MessageStore, mids: Sequence[str]) -> list[tuple[str, str]]:
+    return [row for m in mids for row in await _outbox_rows(store, m)]
+
+
+@pytest.mark.parametrize("corrupt_head", [False, True], ids=["corrupt-second", "corrupt-head"])
 @pytest.mark.parametrize("policy", [InternalErrorPolicy.STOP, InternalErrorPolicy.CONTINUE])
 async def test_a_batch_member_with_a_stored_cr_takes_the_whole_batch_to_the_policy(
-    store: MessageStore, policy: InternalErrorPolicy
+    store: MessageStore, policy: InternalErrorPolicy, corrupt_head: bool
 ) -> None:
     # The batch twin of the stored-CR case (vault BACKLOG #2809): not the member's own refusal, so
     # the whole batch takes the internal-error policy, sibling included. STOP stops the lane and
@@ -682,34 +754,286 @@ async def test_a_batch_member_with_a_stored_cr_takes_the_whole_batch_to_the_poli
     ref_a, ref_bad = await _store_doc(store, a), await _store_doc_with_a_cr(store)
     sk_a = _hl7_with_value(make_doc_ref(ref_a, "application/pdf"))
     sk_bad = _hl7_with_value(make_doc_ref(ref_bad, "application/pdf"))
-    mid_bad = await store.enqueue_message(
-        channel_id="c1", raw=sk_bad, deliveries=[(DEST, sk_bad)], now=100.0
-    )
-    mid_a = await store.enqueue_message(
-        channel_id="c1", raw=sk_a, deliveries=[(DEST, sk_a)], now=101.0
-    )
-    runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+    # Both orders. claim_next_fifo claims in insert order, not by `now`, so the corrupt member is
+    # the head only when it is enqueued first. With it last, naming the head instead fails; with it
+    # first, naming the last member instead fails.
+    if corrupt_head:
+        (mid_bad, mid_a), _ = await _enqueue(store, [sk_bad, sk_a])
+    else:
+        (mid_a, mid_bad), _ = await _enqueue(store, [sk_a, sk_bad])
     col = _Collector()
-    runner._destinations[DEST] = col
-    runner._batch[DEST] = BatchConfig(max_count=5, max_wait_ms=1)
-    runner._retry[DEST] = RetryPolicy()
-    runner._simulate[DEST] = False
+    runner, sink = _batch_runner(store, col)
     runner._internal_error[DEST] = policy
 
-    head = await store.claim_next_fifo(DEST)
-    assert head is not None
-    outcome, _ = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    outcome = await _run_batch(runner, store)
 
     assert col.deliveries == []
     rows = await _outbox_rows(store, mid_bad) + await _outbox_rows(store, mid_a)
     assert len(rows) == 2
+    # Every member's error names the corrupt member by its outbox id, and only that one, so an
+    # operator can find it among the clean siblings it took along (vault BACKLOG #5100).
+    named = f"; batch member {await _outbox_id(store, mid_bad)}"
+    stored = f"batch member {await _outbox_id(store, mid_bad)}: "
+    assert all(err.startswith(stored) for _, err in rows)
+    assert await _outbox_id(store, mid_a) not in rows[0][1]
     if policy is InternalErrorPolicy.STOP:
         assert outcome is _ItemOutcome.STOPPED
         assert [status for status, _ in rows] == [OutboxStatus.PENDING.value] * 2
+        ((name, detail),) = sink.stopped
+        assert name == DEST and detail.endswith(named)
     else:
         assert outcome is not _ItemOutcome.STOPPED
+        assert sink.stopped == []
         assert [status for status, _ in rows] == [OutboxStatus.DEAD.value] * 2
-        assert all(err.startswith("internal error: ValueError") for _, err in rows)
+        assert all(err.startswith(f"{stored}internal error: ValueError") for _, err in rows)
+
+
+async def test_a_stored_cr_in_the_middle_member_names_the_middle_member(
+    store: MessageStore,
+) -> None:
+    # Vault BACKLOG #5100: with the corrupt member neither the head nor the last, naming either of
+    # those instead fails. CONTINUE still dead-letters all three (option (a), ADR 0105).
+    ref_bad = await _store_doc_with_a_cr(store)
+    mids, ids = await _enqueue(store, _three(make_doc_ref(ref_bad, "application/pdf")))
+    col = _Collector()
+    runner, _ = _batch_runner(store, col)
+
+    await _run_batch(runner, store)
+
+    assert col.deliveries == []
+    rows = await _rows(store, mids)
+    assert [status for status, _ in rows] == [OutboxStatus.DEAD.value] * 3
+    assert all(err.startswith(f"batch member {ids[1]}: internal error:") for _, err in rows)
+    assert not any(ids[0] in err or ids[2] in err for _, err in rows)
+
+
+@pytest.mark.parametrize(
+    ("fault", "blames", "logs"),
+    [
+        (lambda: DeliveryError("attachment missing"), True, False),
+        (lambda: wiring_runner._StoreReadFault("attachment read failed"), False, True),
+        # A NegativeAckError is a DeliveryError, but its own arm comes first and marks no down edge.
+        (lambda: _transient_refusal(), False, False),
+    ],
+    ids=["delivery-error", "store-read-fault", "transient-refusal"],
+)
+async def test_a_retryable_fault_in_the_middle_members_reattach_names_that_member(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fault: Callable[[], Exception],
+    blames: bool,
+    logs: bool,
+) -> None:
+    # Vault BACKLOG #5100: the arms that re-pend the batch name the member whose re-attach raised,
+    # in every member's stored error; a DeliveryError blames it in the lane's down edge, and a store
+    # read fault names it in its log line.
+    caplog.set_level(logging.DEBUG, logger="messagefoundry")
+    mids, ids = await _enqueue(store, _three("FAULT"))
+    runner, _ = _batch_runner(store, _Collector())
+    real = runner._hydrate_payload
+
+    async def _hydrate(payload: str, message_id: str) -> str:
+        if "FAULT" in payload:
+            raise fault()
+        return await real(payload, message_id)
+
+    monkeypatch.setattr(runner, "_hydrate_payload", _hydrate)
+    blamed: list[str] = []
+    monkeypatch.setattr(runner, "_note_lane_unhealthy", lambda _n, mid, _e: blamed.append(mid))
+
+    await _run_batch(runner, store)
+
+    named = f"; batch member {ids[1]}"
+    rows = await _rows(store, mids)
+    assert [status for status, _ in rows] == [OutboxStatus.PENDING.value] * 3
+    lead = f"store read during batch member {ids[1]}: " if logs else f"batch member {ids[1]}: "
+    assert all(err.startswith(lead) for _, err in rows)
+    assert blamed == ([ids[1]] if blames else [])
+    if logs:
+        # The store-fault line's own text, not the retry-cap line, which also says "before sending".
+        assert any(f"row(s){named};" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_long_error_still_names_the_member(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Vault BACKLOG #5100: the store bounds last_error at 200 characters and keeps the head, so the
+    # member is named first; a suffix after a long error was the part the cut dropped.
+    mids, ids = await _enqueue(store, _three("FAULT"))
+    runner, _ = _batch_runner(store, _Collector())
+    real = runner._hydrate_payload
+
+    async def _hydrate(payload: str, message_id: str) -> str:
+        if "FAULT" in payload:
+            # Many short tokens, so safe_exc keeps about 200 characters and the store cuts again.
+            raise DeliveryError("document re-attach failed: " + "xx " * 150)
+        return await real(payload, message_id)
+
+    monkeypatch.setattr(runner, "_hydrate_payload", _hydrate)
+
+    await _run_batch(runner, store)
+
+    rows = await _rows(store, mids)
+    assert all(err.startswith(f"batch member {ids[1]}: DeliveryError") for _, err in rows)
+    # Positive control: the store's cut ran, so a suffix would have been the part it dropped.
+    assert all(err.endswith(" chars)") for _, err in rows)
+
+
+async def test_a_non_hl7_head_names_the_head(store: MessageStore) -> None:
+    # Vault BACKLOG #5100: the head's parse for BHS-11 is that member's own step, so a non-HL7 head
+    # names the head, not the last member.
+    mids, ids = await _enqueue(store, ["not an HL7 message at all", _hl7_with_value("clean")])
+    col = _Collector()
+    runner, _ = _batch_runner(store, col)
+
+    await _run_batch(runner, store)
+
+    assert col.deliveries == []
+    rows = await _rows(store, mids)
+    assert [status for status, _ in rows] == [OutboxStatus.DEAD.value] * 2
+    assert all(err.startswith(f"batch member {ids[0]}: internal error:") for _, err in rows)
+
+
+async def test_an_encode_batch_fault_names_no_member(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Vault BACKLOG #5100: encode_batch frames every member at once, so its fault names none rather
+    # than the last member whose own step ran.
+    mids, _ = await _enqueue(store, _three("clean two"))
+    runner, _ = _batch_runner(store, _Collector())
+
+    def _faulting_encode(*_args: object, **_kwargs: object) -> str:
+        raise ValueError("encode bug")
+
+    monkeypatch.setattr(wiring_runner, "encode_batch", _faulting_encode)
+
+    await _run_batch(runner, store)
+
+    rows = await _rows(store, mids)
+    assert [status for status, _ in rows] == [OutboxStatus.DEAD.value] * 3
+    assert not any("batch member" in err for _, err in rows)
+
+
+async def test_a_send_fault_names_no_member_and_blames_the_envelope_head(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Vault BACKLOG #5100: the send is the whole envelope's, so no member is named, and the lane's
+    # down edge blames the envelope's head, as before members were named.
+    mids, ids = await _enqueue(store, _three("clean two"))
+    runner, _ = _batch_runner(store, _Collector(fail_times=1))
+    blamed: list[str] = []
+    monkeypatch.setattr(runner, "_note_lane_unhealthy", lambda _n, mid, _e: blamed.append(mid))
+
+    await _run_batch(runner, store)
+
+    rows = await _rows(store, mids)
+    assert [status for status, _ in rows] == [OutboxStatus.PENDING.value] * 3
+    assert not any("batch member" in err for _, err in rows)
+    assert blamed == [ids[0]]
+
+
+async def test_a_batch_with_both_kinds_of_refused_member_logs_them_in_claim_order(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Vault BACKLOG #5100: a frame-refused member claimed BEFORE a re-attach-refused one is logged
+    # first, in the lane's FIFO order, though the re-attach refusals are found first; each is
+    # dead-lettered alone, and the clean member goes out.
+    caplog.set_level(logging.DEBUG, logger="messagefoundry")
+    clean = _big_b64(600)
+    ref_bad, ref_clean = await _store_doc(store, _big_b64(700)), await _store_doc(store, clean)
+    sk_frame = _hl7_with_value("FRAMEBAD")
+    sk_reattach = _with_a_bad_msh2(_hl7_with_value(make_doc_ref(ref_bad, "application/pdf")))
+    sk_clean = _hl7_with_value(make_doc_ref(ref_clean, "application/pdf"))
+    mids = [
+        await store.enqueue_message(channel_id="c1", raw=sk, deliveries=[(DEST, sk)], now=t)
+        for sk, t in ((sk_frame, 100.0), (sk_reattach, 101.0), (sk_clean, 102.0))
+    ]
+    col = _RefusingFramer()
+    runner, _ = _batch_runner(store, col)
+
+    await _run_batch(runner, store)
+
+    assert len(col.deliveries) == 1
+    frame_id, reattach_id, _ = [await _outbox_id(store, m) for m in mids]
+    lines = [r.getMessage() for r in caplog.records if "dead-lettered alone" in r.getMessage()]
+    named = [m[1] for line in lines if (m := re.search(r"batch member (\S+) refused", line))]
+    assert named == [frame_id, reattach_id]
+    assert "code 'framing'" in lines[0] and "code 'reattach'" in lines[1]
+    statuses = [status for m in mids for status, _ in await _outbox_rows(store, m)]
+    assert statuses == [OutboxStatus.DEAD.value, OutboxStatus.DEAD.value, OutboxStatus.DONE.value]
+
+
+class _FaultingFramer(_Collector):
+    """A framing collector whose check raises an internal error on any payload holding
+    ``FRAMEBUG``: a connector fault, not a refusal of the member."""
+
+    def check_frame(self, payload: str, *, rewrite: bool = True) -> None:
+        if "FRAMEBUG" in payload:
+            raise ValueError("connector bug in the frame check")
+
+
+async def test_an_internal_error_in_a_members_frame_check_names_that_member(
+    store: MessageStore,
+) -> None:
+    # Vault BACKLOG #5100: a frame check's internal error takes the whole batch to the policy, as a
+    # re-attach's does, and names the member, here not the head, by its outbox id.
+    mids = []
+    for t, value in ((100.0, "clean"), (101.0, "FRAMEBUG")):
+        sk = _hl7_with_value(value)
+        mids.append(
+            await store.enqueue_message(channel_id="c1", raw=sk, deliveries=[(DEST, sk)], now=t)
+        )
+    col = _FaultingFramer()
+    runner, _ = _batch_runner(store, col)
+
+    await _run_batch(runner, store)
+
+    assert col.deliveries == []
+    named = f"batch member {await _outbox_id(store, mids[1])}: internal error: ValueError"
+    rows = await _rows(store, mids)
+    assert [status for status, _ in rows] == [OutboxStatus.DEAD.value] * 2
+    assert all(err.startswith(named) for _, err in rows)
+
+
+def _credential_fault() -> NegativeAckError:
+    return NegativeAckError("bad password", code="reattach", permanent=True, credential_fault=True)
+
+
+def _transient_refusal() -> NegativeAckError:
+    return NegativeAckError("try later", code="reattach", permanent=False)
+
+
+@pytest.mark.parametrize(
+    ("refusal", "stops"),
+    [(_credential_fault, True), (_transient_refusal, False)],
+    ids=["lane-stopping", "transient"],
+)
+async def test_a_batch_reattach_refusal_that_is_not_the_members_own_keeps_every_member(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    refusal: Callable[[], NegativeAckError],
+    stops: bool,
+) -> None:
+    # Vault BACKLOG #5100: the hydration catch re-raises as the frame check does. A refusal that
+    # must stop the lane (a credential fault) stops it, and one that is not permanent re-pends the
+    # batch; either way every member is kept rather than one dead-lettered as its own refusal.
+    for t in (100.0, 101.0):
+        sk = _hl7_with_value(f"plain {t}")
+        await store.enqueue_message(channel_id="c1", raw=sk, deliveries=[(DEST, sk)], now=t)
+    runner, sink = _batch_runner(store, _Collector())
+
+    async def _refuse(*_args: object) -> str:
+        raise refusal()
+
+    monkeypatch.setattr(runner, "_hydrate_payload", _refuse)
+    outcome = await _run_batch(runner, store)
+
+    assert (outcome is _ItemOutcome.STOPPED) is stops
+    assert [name for name, _ in sink.stopped] == ([DEST] if stops else [])
+    stats = await store.stats()
+    assert stats.get(OutboxStatus.DEAD.value, 0) == 0
+    assert stats.get(OutboxStatus.PENDING.value, 0) == 2
 
 
 # --- end-to-end Shape A: doc present at ingress → detach → pass-through → delivery hydrates --------

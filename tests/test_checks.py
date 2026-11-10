@@ -532,12 +532,12 @@ def test_check_json_shape(capsys: pytest.CaptureFixture[str]) -> None:
 # --- executable acceptance criteria: <fixture>.expect (Secure Development Standards §5 / R2) -------
 
 
-def _delivering_config(tmp_path: Path) -> Path:
+def _delivering_config(tmp_path: Path, inbound_kwargs: str = "") -> Path:
     cfg = tmp_path / "config"
     cfg.mkdir()
     (cfg / "c.py").write_text(
         "from messagefoundry import inbound, outbound, router, handler, File, Send\n"
-        "inbound('IB_X', File(directory='in'), router='r')\n"
+        f"inbound('IB_X', File(directory='in'), router='r'{inbound_kwargs})\n"
         "outbound('OB_X', File(directory='out'))\n"
         "@router('r')\n"
         "def r(m): return ['h']\n"
@@ -614,6 +614,243 @@ def test_expect_error_passes_for_malformed_message(tmp_path: Path) -> None:
     msgs = _feed_fixture(tmp_path, b"NOT-AN-HL7-MESSAGE\r", "ERROR")
     dr = _run_dryrun(cfg, msgs)
     assert dr.ok and dr.required, dr.detail
+
+
+def _strict_config(tmp_path: Path) -> Path:
+    return _delivering_config(tmp_path, ", strict=True, hl7_version='2.5.1', strict_timeout_s=30.0")
+
+
+def _slow_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every read of the dry-run's monotonic clock advances it 31 s, so each strict validate
+    measures past the config's 30 s timeout without the test sleeping."""
+    import itertools
+    import time
+    from types import SimpleNamespace
+
+    from messagefoundry.pipeline import dryrun
+
+    ticks = itertools.count()
+    # The module's own `time` name only, so the patched clock reaches nothing outside dryrun.
+    monkeypatch.setattr(
+        dryrun, "time", SimpleNamespace(time=time.time, monotonic=lambda: next(ticks) * 31.0)
+    )
+
+
+def _late_validate(monkeypatch: pytest.MonkeyPatch, outcome: str) -> None:
+    """Replace the dry run's strict validate with one that passes (``"pass"``) or raises
+    (``"raise"``); with :func:`_slow_clock` it then finishes after the timeout either way."""
+    from messagefoundry.parsing.validate import ValidationResult
+    from messagefoundry.pipeline import dryrun
+
+    def late(*args: object, **kwargs: object) -> ValidationResult:
+        if outcome == "raise":
+            raise RuntimeError("validator fault")
+        return ValidationResult(True, "2.5.1", [])
+
+    monkeypatch.setattr(dryrun, "validate", late)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expect"),
+    # The reason form fails too, on a reason the timeout text lacks, and on one it holds that does
+    # not name the timeout, which a content-refusal fixture could carry.
+    [
+        ("pass", "ERROR\n"),
+        ("raise", "ERROR\n"),
+        ("pass", "ERROR PV1"),
+        ("raise", "ERROR PV1"),
+        ("pass", "ERROR strict-validation"),
+    ],
+)
+def test_expect_error_does_not_pass_on_a_strict_validation_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str, expect: str
+) -> None:
+    # BACKLOG #5107: a timeout is the validator's clock, not the message, so a fixture that expects
+    # ERROR must not pass on one whose validate, late, found nothing wrong or raised, unless its
+    # reason names the timeout text (the test below).
+    _slow_clock(monkeypatch)
+    _late_validate(monkeypatch, outcome)
+    cfg = _strict_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), expect)
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
+    if expect.startswith("ERROR "):
+        assert "reason does not match" in dr.detail, dr.detail
+        assert expect.split(" ", 1)[1] not in dr.detail, dr.detail
+    else:
+        assert "expected ERROR, got a strict-validation timeout" in dr.detail, dr.detail
+
+
+@pytest.mark.parametrize("outcome", ["pass", "raise"])
+def test_expect_error_reason_naming_the_timeout_text_passes_on_a_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    # BACKLOG #5107: the listener records a begun validate that runs past the timeout as a final
+    # AR (docs/HL7-VALIDATION.md), so a fixture may pin that DoS backstop: a valid but slow body,
+    # or one whose late validate raised, passes `ERROR <reason>` when the timeout text has it.
+    _slow_clock(monkeypatch)
+    _late_validate(monkeypatch, outcome)
+    cfg = _strict_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "ERROR strict-validation timed out\n")
+    dr = _run_dryrun(cfg, msgs)
+    assert dr.ok and "expectation-checked" in dr.detail, dr.detail
+    # The control: the same run under a bare ERROR fails, so the reason is what passed it.
+    Path(f"{msgs / 'IB_X' / 'a.hl7'}.expect").write_text("ERROR\n", encoding="utf-8")
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
+    assert "expected ERROR, got a strict-validation timeout" in dr.detail, dr.detail
+
+
+@pytest.mark.parametrize(("reason", "passes"), [("timed out", True), ("PV1", False)])
+def test_expect_error_reason_beside_an_empty_late_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason: str, passes: bool
+) -> None:
+    # A late refusal whose text is empty is still a verdict, and the run's error is still the
+    # timeout text: a reason in either passes, a reason in neither fails.
+    from messagefoundry.parsing.validate import ValidationResult
+    from messagefoundry.pipeline import dryrun
+
+    _slow_clock(monkeypatch)
+    monkeypatch.setattr(dryrun, "validate", lambda *a, **k: ValidationResult(False, "2.5.1", [""]))
+    cfg = _strict_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), f"ERROR {reason}")
+    if passes:
+        dr = _run_dryrun(cfg, msgs)
+        assert dr.ok and "expectation-checked" in dr.detail, dr.detail
+    else:
+        dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
+        assert "reason does not match" in dr.detail, dr.detail
+
+
+# The reason form is matched against the validator's verdict, not the timeout text in the error.
+@pytest.mark.parametrize("expect", ["ERROR\n", "ERROR PV1"])
+def test_expect_error_passes_on_a_late_strict_content_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, expect: str
+) -> None:
+    # BACKLOG #5107: a slow runner must not fail a correct fixture. ADT_A01 has no PV1, so the real
+    # validate refuses its content; on the fake clock that refusal arrives after the timeout, and
+    # it still satisfies ERROR.
+    _slow_clock(monkeypatch)
+    cfg = _strict_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), expect)
+    dr = _run_dryrun(cfg, msgs)
+    assert dr.ok and "expectation-checked" in dr.detail, dr.detail
+    # The control: the run did time out, so without an .expect it fails on the timeout text.
+    Path(f"{msgs / 'IB_X' / 'a.hl7'}.expect").unlink()
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
+    assert "timed out" in dr.detail, dr.detail
+
+
+def test_expect_error_passes_on_a_strict_validation_content_refusal(tmp_path: Path) -> None:
+    # The control for the test above: the same fixture and config, validated inside the timeout,
+    # is refused for its content, and that ERROR still satisfies the bare ERROR form.
+    cfg = _strict_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "ERROR")
+    dr = _run_dryrun(cfg, msgs)
+    assert dr.ok and "expectation-checked" in dr.detail, dr.detail
+    # And the refusal is the content one: with no .expect the same fixture fails on hl7apy's text.
+    Path(f"{msgs / 'IB_X' / 'a.hl7'}.expect").unlink()
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
+    assert "timed out" not in dr.detail and "PV1" in dr.detail, dr.detail
+
+
+def test_expect_error_reason_passes_when_the_error_contains_it(tmp_path: Path) -> None:
+    # BACKLOG #5107: `ERROR <reason>` pins why the run failed. ADT_A01 has no PV1, and hl7apy's
+    # refusal names it.
+    cfg = _strict_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "ERROR PV1\n")
+    dr = _run_dryrun(cfg, msgs)
+    assert dr.ok and "expectation-checked" in dr.detail, dr.detail
+
+
+@pytest.mark.parametrize(("reason", "passes"), [("bad ZZ1", True), ("bad ZZ2", False)])
+def test_expect_error_reason_is_matched_against_a_handler_fault(
+    tmp_path: Path, reason: str, passes: bool
+) -> None:
+    # The run's error is the candidate for every non-strict ERROR, a Handler raise among them.
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "c.py").write_text(
+        "from messagefoundry import inbound, router, handler, File\n"
+        "inbound('IB_X', File(directory='in'), router='r')\n"
+        "@router('r')\n"
+        "def r(m): return ['h']\n"
+        "@handler('h')\n"
+        "def h(m): raise ValueError('bad ZZ1')\n",
+        encoding="utf-8",
+    )
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), f"ERROR {reason}")
+    if passes:
+        dr = _run_dryrun(cfg, msgs)
+        assert dr.ok and "expectation-checked" in dr.detail, dr.detail
+    else:
+        dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
+        assert "reason does not match" in dr.detail, dr.detail
+
+
+def test_expect_reason_joined_without_a_space_is_not_echoed(tmp_path: Path) -> None:
+    cfg = _delivering_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "ERROR:DOE^JOHN")
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
+    assert "invalid .expect disposition" in dr.detail, dr.detail
+    assert "DOE" not in dr.detail, dr.detail
+
+
+def test_invalid_expect_disposition_text_survives_redaction(tmp_path: Path) -> None:
+    # BACKLOG #5107: a comma-joined run of upper-case names ("ERROR, FILTERED") reads to the PHI
+    # redaction as a family-comma-given name. check appends this advice to its errors raw and
+    # prints it unredacted today, so this pins that the bare advice text survives redact() and
+    # safe_text() unchanged, rather than turning to [redacted] on a path that redacts it.
+    from messagefoundry.redaction import redact, safe_text
+
+    fixture = tmp_path / "m.hl7"
+    Path(f"{fixture}.expect").write_text("FOO\n", encoding="utf-8")
+    with pytest.raises(ValueError) as excinfo:
+        checks._expected_disposition(fixture, cap=4096)
+    msg = str(excinfo.value)
+    assert "NOT_DEPLOYED" in msg and "alias RECEIVED" in msg, msg
+    assert redact(msg) == msg
+    assert safe_text(msg) == msg
+
+
+def test_expect_sidecar_with_a_utf8_bom_is_read(tmp_path: Path) -> None:
+    cfg = _strict_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "\ufeffERROR PV1")
+    dr = _run_dryrun(cfg, msgs)
+    assert dr.ok and "expectation-checked" in dr.detail, dr.detail
+
+
+@pytest.mark.parametrize("reason", ["ZZ9-not-in-the-error", "pv1"])
+def test_expect_error_reason_fails_when_the_error_lacks_it(tmp_path: Path, reason: str) -> None:
+    # A different reason fails, and the match is case-sensitive. The detail prints neither the
+    # error nor the reason: both can quote message content, and the detail lands in a CI log.
+    cfg = _strict_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), f"ERROR {reason}\n")
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
+    assert "reason does not match" in dr.detail, dr.detail
+    assert reason not in dr.detail and "PV1" not in dr.detail, dr.detail
+
+
+@pytest.mark.parametrize(
+    ("expect", "says"),
+    [
+        ("FILTERED some reason", "only ERROR takes a reason"),
+        ("ERROR first line\nsecond line", "holds one line"),
+        ("ERROR\tsome reason", "with one space"),
+        ("ERROR  some reason", "with one space"),
+        ("RECEIVED\n# some reason", "holds one line"),
+        # A stray second line under a bare word is named as such, not as a separator fault.
+        ("ERROR\n# some reason", "holds one line"),
+        ("ERROR\r\nsome reason", "holds one line"),
+    ],
+)
+def test_expect_reason_form_refuses_a_malformed_sidecar(
+    tmp_path: Path, expect: str, says: str
+) -> None:
+    cfg = _delivering_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), expect)
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
+    assert says in dr.detail, dr.detail
+    # The refusal names the word, never the reason, which can quote message content.
+    assert "some reason" not in dr.detail and "first line" not in dr.detail, dr.detail
 
 
 def test_expect_unrouted_is_case_insensitive(tmp_path: Path) -> None:

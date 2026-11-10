@@ -210,12 +210,13 @@ def _walk(db: Path, **kw: Any) -> store_mod.AuditVerdict:
 
 
 def test_the_prefix_alone_keeps_its_own_message(tmp_path: Path) -> None:
-    # The engine routes a prefix failure on its marker (BACKLOG #328); merging the prefix into the
-    # witness set must not change the message it reads.
+    # The engine routes a prefix failure on its flag (BACKLOG #328, vault BACKLOG #3054 item 11), and
+    # an operator reads its message; merging the prefix into the witness set must change neither.
     db = tmp_path / "h.db"
     pairs = _seed(db, 3)
     ok, msg = _walk(db, expected_prefix=(5, pairs[0][1]))
     assert not ok and msg is not None and store_mod.AUDIT_PREFIX_BREAK_MARKER in msg
+    assert _walk(db, expected_prefix=(5, pairs[0][1])).prefix_break
     assert "expected audit row" not in msg, msg
 
 

@@ -117,12 +117,7 @@ from messagefoundry.config.db_lookup import is_available as db_lookup_available
 from messagefoundry.config.fhir_lookup import FhirLookupError, fhir_lookup
 from messagefoundry.config.fhir_lookup import is_available as fhir_lookup_available
 from messagefoundry.config.run_context import RunContext
-from messagefoundry.config.settings import (
-    INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
-    EgressSettings,
-    SandboxSettings,
-    security_enforcement_env_names,
-)
+from messagefoundry.config.settings import EgressSettings, SandboxSettings
 from messagefoundry.config.snapshot import ConfigSnapshot
 from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.pipeline import _sandbox_codec as codec
@@ -295,7 +290,7 @@ class SandboxPolicy:
     CPU that admin code spends outside a call has no bound (ADR 0087, amendment of 2026-10-07).
     ``mem_mb`` adds a POSIX memory backstop *inside* the child where the ``resource`` module exists
     (a no-op on Windows). On Linux it is headroom above the loaded graph: ``RLIMIT_DATA`` at the
-    worker's ``VmData`` once ``load_config`` has run, plus ``mem_mb``. Elsewhere on POSIX it is an
+    worker's ``VmData`` once ``load_snapshot`` has run, plus ``mem_mb``. Elsewhere on POSIX it is an
     absolute ``RLIMIT_AS`` cap. A call that hits it is reported as the memory cap, and its worker is
     recycled (ADR 0087, amendment of 2026-10-11). ``startup_seconds`` bounds the one-time child
     bootstrap (config load)."""
@@ -508,7 +503,7 @@ class _StderrRelay:
     lives here rather than on the session: a respawn replaces the session's thread list and the stale
     relay goes with it, unable to write into the live generation's state -- the same stale-generation
     isolation the fresh :class:`queue.Queue` gives the frame reader. The notice budget therefore resets
-    on respawn; accepted, because a respawn costs a full ``load_config()``.
+    on respawn; accepted, because a respawn costs a full ``load_snapshot()``.
 
     PHI redaction is deliberately NOT re-implemented here. It is a property of the engine's log
     HANDLERS (:func:`~messagefoundry.logging_setup._install_phi_filters`), which this parent-side call
@@ -994,34 +989,13 @@ class SandboxSession:
             raise SandboxWorkerRefused(
                 self._refused[1], first=False, content_only=self._refused[2], graph=engine_graph
             )
-        # The boot frame is built BEFORE the child exists, so a snapshot that cannot be read (a
-        # session given none reads its directory here) or a frame that cannot be encoded leaves no
-        # live child, job handle or drain thread behind.
-        try:
-            boot = codec.encode_boot(
-                snapshot=self._config_snapshot(),
-                forbidden=self.policy.forbidden_modules,
-                mem_mb=self.policy.mem_mb,
-                code_sets=self._code_sets,
-                broker=self.policy.mode is SandboxMode.ISOLATED,
-            )
-            if len(boot) > _MAX_FRAME:
-                raise SandboxError(f"sandbox frame too large: {len(boot)} bytes")
-        except (OSError, ValueError, SandboxError) as exc:  # WiringError is a ValueError
-            raise SandboxError(f"failed to bootstrap sandbox worker: {exc}") from exc
-        # A fresh response queue per spawn so a prior (killed) worker's trailing EOF can't leak into
-        # this generation's reads.
-        self._responses = queue.Queue()
-        self._generation += 1
         # NAMED, not inherited: an allowlist, so the engine's secrets are not in the child's
-        # environment (vault BACKLOG #2587). Two engine variables cross, and they are one
-        # decision: the config-source escape and the enforcement dial that unlocks it (vault
-        # BACKLOG #2599). They crossed because the child ran ``load_config`` on the directory
-        # itself, and with only the escape it would refuse a directory its parent loaded at
-        # ``warn``. Since vault BACKLOG #2596 the child loads the snapshot it is sent and runs no
-        # trust check of its own, so no code in it reads either; dropping them is a separate
-        # change. The dial is a posture switch, not a secret. The operator's
-        # ``[sandbox].pass_environment`` names cross with them.
+        # environment (vault BACKLOG #2587). No engine variable crosses. The config-source escape
+        # and the enforcement dial that unlocks it (vault BACKLOG #2599) used to, because the child
+        # ran ``load_config`` on the directory itself. Since vault BACKLOG #2596 the parent makes
+        # that decision when it reads the snapshot, the boot frame carries the bytes it vetted, and
+        # the child runs no trust check of its own, so nothing in it reads either. The operator's
+        # ``[sandbox].pass_environment`` names cross.
         # At most one glibc malloc arena besides the main one, where the worker's memory cap is
         # RLIMIT_DATA. An arena keeps its peak writable size counted in VmData after its threads
         # exit, so with one per thread, the threads a Handler starts would spend [sandbox].mem_mb
@@ -1033,14 +1007,28 @@ class SandboxSession:
             if self.policy.mem_mb is not None and sys.platform.startswith("linux")
             else {}
         )
-        env = worker_environment(
-            extra_names=(
-                INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
-                *security_enforcement_env_names(),
-                *self.policy.pass_environment,
-            ),
-            defaults=arena,
-        )
+        # The boot frame and the environment are built BEFORE the child exists, so a snapshot that
+        # cannot be read (a session given none reads its directory here), a frame that cannot be
+        # encoded or is over the frame cap, or a pass_environment name the builder refuses leaves no
+        # live child, job handle or drain thread behind, and is a SandboxError like any other failed
+        # spawn.
+        try:
+            boot = codec.encode_boot(
+                snapshot=self._config_snapshot(),
+                forbidden=self.policy.forbidden_modules,
+                mem_mb=self.policy.mem_mb,
+                code_sets=self._code_sets,
+                broker=self.policy.mode is SandboxMode.ISOLATED,
+            )
+            if len(boot) > _MAX_FRAME:
+                raise SandboxError(f"sandbox frame too large: {len(boot)} bytes")
+            env = worker_environment(extra_names=self.policy.pass_environment, defaults=arena)
+        except (OSError, ValueError, SandboxError) as exc:  # WiringError is a ValueError
+            raise SandboxError(f"failed to bootstrap sandbox worker: {exc}") from exc
+        # A fresh response queue per spawn so a prior (killed) worker's trailing EOF can't leak into
+        # this generation's reads.
+        self._responses = queue.Queue()
+        self._generation += 1
         # Fixed argv (this interpreter + our own worker module), no shell, no
         # untrusted input in the command line — so B603 does not apply. ``start_new_session`` puts the
         # worker in its own POSIX process group so ``_kill`` can ``killpg`` its whole tree; it is a
@@ -1062,7 +1050,7 @@ class SandboxSession:
         # BOTH drains start before anything that can raise between here and the boot frame write. For
         # fd 1 that ordering is pre-existing; for fd 2 it is a REQUIREMENT this change creates. A PIPE
         # nobody drains blocks its writer once the fixed OS buffer fills (tens of KiB), and the boot frame
-        # below triggers ``load_config()`` -- top-level admin config, the earliest untrusted code and
+        # below triggers ``load_snapshot()`` -- top-level admin config, the earliest untrusted code and
         # the first thing that can print. Undrained, every spawn would hang to ``startup_seconds`` and
         # report a startup timeout naming the wrong cause. Starting them before the job assignment also
         # closes the window in which that assignment raising would leave a live child with an undrained
@@ -1087,7 +1075,7 @@ class SandboxSession:
         for thread in self._threads:
             thread.start()
         # Assign the Windows kill-on-close job BEFORE the boot frame. The boot frame triggers
-        # ``load_config()``, which runs top-level admin config — the earliest untrusted code and the
+        # ``load_snapshot()``, which runs top-level admin config — the earliest untrusted code and the
         # first chance to spawn a grandchild. Until then the worker parks on its first stdin read, so
         # assigning here is race-free: any process the worker later spawns is already in the job. The
         # drains above do not disturb that argument, which turns on the CHILD's first stdin read and
@@ -1143,7 +1131,9 @@ class SandboxSession:
                     else "Config code most likely reads an environment variable the worker is "
                     "not given, because the worker runs the config again under an allowlisted "
                     "environment: name each such variable in [sandbox].pass_environment and "
-                    "restart."
+                    "restart. Settings load refuses an engine variable there, any MEFOR_* name "
+                    "among them, so config must read such a value under another name. Every "
+                    "Router and Handler can read what is listed, so never list a secret."
                 )
                 # Short before the differences: a dead-lettered message keeps about the first 200
                 # characters of this, behind its stage prefix and the exception's type name.

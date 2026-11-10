@@ -804,6 +804,7 @@ SITES: dict[str, Site] = {
     "messagefoundry/pipeline/supervisor.py::_shard_db_path": Site(
         1, OPERATOR, "A shard tag from the operator's config on the operator's --db path."
     ),
+    "messagefoundry_toolkit/scaffold.py::<module>": Site(1, INTERNAL, "Package resource literal."),
     "messagefoundry_toolkit/scaffold.py::scaffold": Site(
         1, INTERNAL, "Template paths from the module's own table, under the operator's target."
     ),
@@ -986,6 +987,9 @@ SITES: dict[str, Site] = {
         "A 32-hex id the store generated, refused by regex if malformed. `_paths` adds a parent "
         "check; the reseal instead opens only a regular file, by lstat.",
     ),
+    "messagefoundry/uploads.py::UploadStore._reseal_to_active_sync": Site(
+        1, INTERNAL, "The fixed pair lock file name (`LOCK_FILE_NAME`) under the uploads root."
+    ),
     "messagefoundry/uploads.py::_atomic_write_text": Site(
         1, INTERNAL, "A random-token temp name beside a path the store built."
     ),
@@ -1068,15 +1072,17 @@ SCRIPT_SITES: dict[str, Site] = {
         7, OPERATOR, "Fixed names under the repo root, the helper source and the install directory."
     ),
     "scripts/service/install-service.ps1": Site(
-        38,
+        42,
         OPERATOR,
         "Fixed names under paths the operator passes or the script derives (repo root, install "
         "root and its site-packages, dist-info, wheelhouse and buildtemp folders, the engine "
         "wheel's folder, "
         "the base interpreter's folder and the one above it, "
-        "project root, data directory, NSSM directory, temp), the leaf name of the engine wheel "
+        "project root, data directory and the folder above it, ProgramData, NSSM directory, temp), "
+        "the data directory's own leaf name with -secrets after it, the leaf name of the engine wheel "
         "the operator passes, which must match messagefoundry-<version>-*.whl, plus registry keys "
-        "named after the service's own images.",
+        "named after the service's own images, and the fixed Parameters key under each key the "
+        "registry lists below Services.",
     ),
     "scripts/service/measure-store-access.ps1": Site(
         17,

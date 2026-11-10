@@ -58,7 +58,7 @@ from signal import SIGINT, default_int_handler, getsignal
 from types import CodeType, MappingProxyType, ModuleType
 from typing import Any, Final, Literal, NamedTuple, NoReturn, TypeIs
 
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from messagefoundry.author_output import author_code_stdout
 from messagefoundry.config.code_sets import (
@@ -221,6 +221,7 @@ __all__ = [
     "path_form_fhir_updates_without_if_match",
     "query_credential_hops",
     "revocation_attested_hops",
+    "odbc_hops",
     "unverified_generic_db_hops",
     "refused_generic_db_drivers",
     "POSSIBLY_GENERIC_DB_HOP",
@@ -1649,7 +1650,8 @@ def resolve_env_settings(
     the failure is loud and actionable, not a raw traceback that names nothing and aborts on the
     first bad value (fail loud, never blank; review M-22). A cast is an arbitrary callable, so
     **every** exception it raises is caught and redacted, not just ``ValueError``/``TypeError``
-    (BACKLOG #1656; see the handler)."""
+    (BACKLOG #1656), and so is a ``SystemExit`` from ``sys.exit()`` in it (vault BACKLOG #5105; see
+    the handler)."""
     resolved: dict[str, Any] = {}
     missing: list[str] = []
     bad: list[str] = []
@@ -1679,7 +1681,7 @@ def resolve_env_settings(
                 if name in bool_defaults:
                     want = "bool"
                     got = _read_bool_setting(got, bool_defaults[name])
-            except Exception as exc:
+            except (Exception, SystemExit) as exc:
                 # BACKLOG #1656 limb 2: `Exception`, not `(ValueError, TypeError)`. A cast is
                 # an arbitrary callable, so it can raise anything -- a `KeyError` from a
                 # lookup-table cast was the measured case -- and a non-(ValueError, TypeError)
@@ -1687,8 +1689,14 @@ def resolve_env_settings(
                 # text. That re-opened, for every other exception type, exactly the leak
                 # BACKLOG #1183 closed for the ValueError arm. The redaction below is the
                 # whole point of catching it, so it has to cover every way a cast can fail.
-                # NEVER `BaseException`: a KeyboardInterrupt or SystemExit is not a cast
-                # failure and must keep propagating.
+                #
+                # `SystemExit` too (vault BACKLOG #5105): a cast that calls `sys.exit()` is a
+                # script habit in a setting reader, not a request to stop. Uncaught, it left a
+                # reload, and `messagefoundry check` ended with the cast's code, 0 included,
+                # which reads as a pass; `sys.exit("...")` can also carry the value it was
+                # handed. It is refused here like any other cast failure, its code and text
+                # withheld. NEVER `BaseException`: a KeyboardInterrupt is an operator stopping
+                # the work, not a cast failure, and must keep propagating.
                 #
                 # NEVER the raw value: a MEFOR_VALUE_* env() setting carries store passwords
                 # and connector keys, and this string is raised at startup into the operator
@@ -3117,8 +3125,8 @@ def Http(
     (vault BACKLOG #2606): behind a reverse proxy every partner arrives from one address, so a cap
     would become the listener's whole capacity. Set one only where the listener sees real client
     addresses. ``max_handshakes_per_host`` (32) **ships on**: it caps only the sockets one address
-    holds a connection slot with while still in their TLS handshake, which happens where the engine
-    runs on a stdlib event loop with ``tls=True`` (vault BACKLOG #4888). See ``docs/DEPLOYMENT.md``
+    holds a connection slot with while still in their TLS handshake, which happens with
+    ``tls=True`` on every event loop (vault BACKLOG #4888, BACKLOG #2479). See ``docs/DEPLOYMENT.md``
     for the L4 load-balancer case.
 
     **Message-rate pacing (BACKLOG #1114).** ``max_messages_per_second`` bounds how fast this listener
@@ -3766,7 +3774,7 @@ def Rest(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared, and in every case with a credential or a static header off the allowlist; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared (never beside ech_egress, which refuses it whatever is attested), and in every case with a credential or a static header off the allowlist; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain signatures+hostname still verified, not validity windows; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
@@ -5851,7 +5859,11 @@ def _resolve_port(raw: Any, env_values: Mapping[str, Any]) -> int | None:
         if raw.cast is not None:
             try:
                 value = raw.cast(value)
-            except (ValueError, TypeError):
+            except (Exception, SystemExit):  # noqa: BLE001
+                # Any cast failure, a sys.exit() in it included (vault BACKLOG #5105), is skipped
+                # here unread: its text can carry the value, and resolve_env_settings refuses the
+                # same ref loud and redacted when the connector is built. Not BaseException: a
+                # KeyboardInterrupt is not the cast's failure.
                 return None
         raw = value
     try:
@@ -5981,7 +5993,9 @@ def _resolve_one_env_value(ref: EnvRef, values: Mapping[str, Any]) -> Any:
             return raw
         try:
             return ref.cast(raw)
-        except Exception as exc:  # noqa: BLE001 - BACKLOG #1656: any cast error can quote the value
+        # BACKLOG #1656: any cast error can quote the value; a sys.exit() in the cast is a cast
+        # failure too (vault BACKLOG #5105), as resolve_env_settings treats it.
+        except (Exception, SystemExit) as exc:  # noqa: BLE001
             _logger.debug(
                 "env() value %r: its cast raised %s; skipped by this probe",
                 ref.key,
@@ -6575,7 +6589,7 @@ def accepted_cleartext_hops(registry: Registry) -> list[tuple[str, str]]:
     out = [
         (oc.name, oc.cleartext_reason or "(none recorded)")
         for oc in registry.outbound.values()
-        if oc.cleartext_accepted
+        if _declares(oc.cleartext_accepted)
     ]
     # A lookup's typed fields, not its settings: the read executor trusts only the typed declaration
     # (wiring_runner._fhir_lookup_settings strips a raw key), so this reports exactly what crosses.
@@ -6606,6 +6620,35 @@ class AttestedHop:
 # and a reason that must be a str (or None).
 _LAX_BOOL: Final = TypeAdapter(bool)
 _MODEL_REASON: Final = TypeAdapter(str | None)
+
+
+def read_lax_flag(value: object, where: str, key: str) -> bool:
+    """``value`` read as the typed models read a declaration flag: pydantic's lax ``bool``, so a
+    false spelling such as ``"off"`` or ``b"false"`` is ``False`` (vault BACKLOG #5286).
+
+    A value that lax ``bool`` refuses is a :class:`WiringError` naming ``where`` and ``key``, never
+    the value: pydantic's own error quotes its input, so it is raised after the handler ends,
+    with neither a cause nor a context."""
+    try:
+        return _LAX_BOOL.validate_python(value)
+    except ValidationError:
+        pass
+    raise WiringError(f"{where}: {key} must be a boolean")
+
+
+def _declares(flag: object) -> bool:
+    """Whether a connection's typed declaration flag is set, for a report. A report lists a flag
+    lax ``bool`` reads as true, as :func:`read_lax_flag` reads it and the build and the settings
+    mirror honour it, and does not list one it reads as false, so a falsy string such as ``"no"``
+    is not listed (vault BACKLOG #5286). ``None`` is not listed, as
+    :func:`attested_secure_hop_records` reads it. Every other value lax ``bool`` refuses is listed
+    although the build refuses it, because a report fails toward listing (vault BACKLOG #2232)."""
+    if flag is None:
+        return False
+    try:
+        return _LAX_BOOL.validate_python(flag)
+    except ValidationError:
+        return True
 
 
 def _attested_reason_text(value: object) -> str | None:
@@ -6680,17 +6723,17 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
         # is a lax pydantic bool and each reason a pydantic str. So an int 1 or the string "false"
         # is the flag the typed Source or Destination holds, the build builds it and it is no
         # refusal, and a reason of another type is refused as the model refuses it, never passed to
-        # the pair rule's .strip(). The mark answers only "does the build refuse this hop". It does
-        # not say the build reads one value: _dest_config's settings mirror tests the raw flag by
-        # truthiness, so for a string "false" the settings-driven seams can read the flag set.
+        # the pair rule's .strip(). The mark answers only "does the build refuse this hop". The
+        # flags go through read_lax_flag, the reader _dest_config's settings mirror uses too, so a
+        # string "false" reads unset in both (vault BACKLOG #5286).
         try:
             refuse_raw_hop_attestation(settings, "")
-            accepted_flag = _LAX_BOOL.validate_python(accepted)
+            accepted_flag = read_lax_flag(accepted, "", "cleartext_accepted")
             _check_cleartext_acceptance(
                 accepted_flag, _MODEL_REASON.validate_python(cleartext_reason)
             )
             _check_revocation_attestation(
-                _LAX_BOOL.validate_python(revocation),
+                read_lax_flag(revocation, "", "tls_revocation_attested"),
                 _MODEL_REASON.validate_python(revocation_reason),
             )
         except (WiringError, ValueError):
@@ -7138,12 +7181,12 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = [
         (oc.name, oc.tls_revocation_attested_reason or "(none recorded)")
         for oc in registry.outbound.values()
-        if oc.tls_revocation_attested
+        if _declares(oc.tls_revocation_attested)
     ]
     out.extend(
         (inbound_record_name(ic.name), ic.tls_revocation_attested_reason or "(none recorded)")
         for ic in registry.inbound.values()
-        if ic.tls_revocation_attested
+        if _declares(ic.tls_revocation_attested)
     )
     # Typed fields, as for cleartext_accepted: the executor strips a raw key (BACKLOG #2050).
     out.extend(
@@ -7281,6 +7324,56 @@ def _dark_env_dialect(conn: InboundConnection | OutboundConnection) -> bool:
     unresolved, so neither reader lists a connection that is not built because of a value it never
     reads. A not-deployed connection with a literal dialect resolves nothing and is read as before."""
     return not conn.deployed and isinstance(conn.spec.settings.get("dialect"), EnvRef)
+
+
+def odbc_hops(registry: Registry) -> list[tuple[str, str, str | None, str | None]]:
+    """Entries of the graph that open an ODBC connection, as ``(kind, record name, dialect,
+    driver)``, for ``messagefoundry verify``'s ``host.odbc`` and ``host.ciphers`` rows (BACKLOG
+    #3803 R3).
+
+    Kept beside the factories that write the settings it reads, so the verifier does not re-derive
+    them. The entries are each deployed ``DATABASE`` connection, on either dialect, each
+    database-backed reference set and each database lookup; the last two are always on the
+    ``sqlserver`` preset. ``dialect`` is that preset or ``generic``, in lower case, and ``driver``
+    the ``odbc_driver`` setting as written, the factories' ``ODBC Driver 18 for SQL Server`` when
+    unset; either is ``None`` when it is an ``env()`` reference, read with no values. Which driver
+    a name is, and so which TLS the hop takes, is the caller's to judge. A connection that is not
+    deployed is left out, since the engine never builds it (ADR 0111). A connection is named by its
+    record name, as the other readers here name it, so an inbound and an outbound of one name stay
+    apart. The connections come first, then the reference sets, then the lookups, each by name."""
+
+    # Imported lazily: messagefoundry.transports imports this module at its top level.
+    from messagefoundry.transports.db_endpoint import SQLSERVER_DEFAULT_DRIVER
+
+    def driver(settings: Mapping[str, Any]) -> str | None:
+        value = _db_setting(settings, "odbc_driver", SQLSERVER_DEFAULT_DRIVER, None)
+        return None if value is _UNRESOLVED else str(value)
+
+    connections = [
+        (
+            "DATABASE connection",
+            record_name(conn.name),
+            _db_dialect(conn.spec.settings, None),
+            driver(conn.spec.settings),
+        )
+        for record_name, table in (
+            (_outbound_record_name, registry.outbound),
+            (inbound_record_name, registry.inbound),
+        )
+        for conn in table.values()
+        if conn.spec.type is ConnectorType.DATABASE and conn.deployed
+    ]
+    connections.sort(key=lambda hop: hop[1])
+    references = [
+        ("DatabaseRef reference set", name, "sqlserver", driver(ref.source.settings))
+        for name, ref in sorted(registry.references.items())
+        if ref.source.kind == "database"
+    ]
+    lookups = [
+        ("DatabaseLookup", name, "sqlserver", driver(spec.settings))
+        for name, spec in sorted(registry.lookups.items())
+    ]
+    return [*connections, *references, *lookups]
 
 
 def unverified_generic_db_hops(
@@ -10917,8 +11010,9 @@ def _run_author_code(path: Path, module: ModuleType, helpers: _HelperImporter) -
     leave the loader with its text (vault BACKLOG #3765 item 4).
 
     A module that calls ``sys.exit()`` at import is a bad config, not a request to end the process
-    (vault BACKLOG #3134). The setting cast and the config diagnostics elsewhere in this module leave
-    ``SystemExit`` alone because it is not their kind of failure; this runs the author's module: on a
+    (vault BACKLOG #3134). The config diagnostics elsewhere in this module leave ``SystemExit``
+    alone because it is not their kind of failure, though the ``env()`` cast readers refuse it since
+    vault BACKLOG #5105, a cast being the author's code too; this runs the author's module: on a
     serving engine (at least a reload) it would leave the event loop and stop every connection, and
     at ``check`` it would end the run as if it had passed. So it is refused like any
     failing module, by its real type, because ``isinstance`` would run a ``__class__`` of the

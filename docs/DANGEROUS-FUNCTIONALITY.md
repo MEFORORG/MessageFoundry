@@ -407,8 +407,8 @@ and the builders, and a test checks that each module named calls each builder na
   through either.
   No other variable reaches these starts.
 - The sandbox worker, in `pipeline/sandbox.py`, gets an allowlist (`worker_environment`): the
-  platform's start-up names, the interpreter's own variables, the engine switches its own code
-  reads, and the names `[sandbox].pass_environment` lists. No other inherited variable crosses. On
+  platform's start-up names, the interpreter's own variables, and the names
+  `[sandbox].pass_environment` lists. No other inherited variable crosses, and no `MEFOR_*` one. On
   Linux with `[sandbox].mem_mb` set, the engine also sets `MALLOC_ARENA_MAX=2` where the operator
   passed none.
 - The disaster-recovery hook, in `pipeline/dr.py`, gets an allowlist (`hook_environment`), which
@@ -424,11 +424,12 @@ and the builders, and a test checks that each module named calls each builder na
   `OPENSSL_ENGINES`. No other
   variable reaches them, and no Python variable, since `openssl` is not Python. Both start
   through one call, so they find the same `openssl` on the same `PATH`.
-- The `pip` and `pip-audit` starts in `security/audit_all_platforms.py` get everything outside
-  the engine's `MEFOR_*` namespace, less the few secret names the module lists outside it and any
-  empty or relative `PYTHONPATH` entry (`non_engine_environment` over `engine_environment`). So
-  they keep the index, proxy and certificate settings they read from the environment, and any
-  other variable the runner set, a CI token among them, reaches them too.
+- The `pip` and `pip-audit` starts in `security/audit_all_platforms.py` get an allowlist
+  (`auditor_environment`): what a Python child needs to start, as the sandbox worker gets it, less
+  any empty or relative `PYTHONPATH` entry; pip's own `PIP_*` variables; and the proxy,
+  certificate, `NETRC` and XDG folder variables that pip and pip-audit read to reach an index;
+  and each name the auditor's `--pass-environment` lists, which refuses an engine variable. No
+  other variable is in their environment, a CI token or an engine secret among them.
 
 At least these pass on the environment they run with, on purpose: `checks.py`, which adds one
 variable, and the tray's opens, where starting VS Code drops the two variables VS Code's own
@@ -671,8 +672,10 @@ these:
 A hit inside a codec package under `parsing/`, such as `parsing/xml/`, counts for the whole package.
 Every parse site the scan finds sits in exactly one of the first two tables below. The first holds
 the modules where any code reads input from outside the engine, whichever call the scan matched.
-The second holds the ones that read only what the engine wrote itself or an operator supplied. The
-third table lists hand-written parsers the patterns cannot see, found by reading the code.
+The second holds the ones that read only what the engine wrote itself, what an operator supplied,
+or, for the dependency audit, a requirements lock from the repository being checked. On a pull
+request run that lock comes from whoever opened the pull request. The third table lists
+hand-written parsers the patterns cannot see, found by reading the code.
 
 **One rule decides a hand-over.** Some modules only hand outside input to other code. Such a module
 is in the first table when it hands the input to a parser. A parser here is a format library, a
@@ -744,14 +747,16 @@ The scan leaves some parsing out on purpose, and it has limits:
 | Web console requests | The form bodies a browser posts, and the Content Security Policy reports it sends | `messagefoundry_webconsole/routes/_common.py`, `messagefoundry_webconsole/routes/connection_writes.py`, `messagefoundry_webconsole/routes/core.py`, `messagefoundry_webconsole/routes/monitoring_writes.py`, `messagefoundry_webconsole/routes/oidc.py` |
 | A file from another system | A Corepoint export, read with `defusedxml` (section 2) | `messagefoundry_toolkit/corepoint_import.py` |
 | A backup | The manifest and encrypted blocks `messagefoundry restore` reads. The archive list below says what bounds them. | `pipeline/dr_backup.py`, `store/backup_codec.py` |
+| A config digest in the shared cluster store | Unsigned JSON in `cluster_config.config_digest`, which a node writes when it bumps the shared config version. A convergence reload reads it back through `shared_digest_of`, which caps its length before parsing and checks its keys and the types of its values. Nothing authenticates it. | `config/fingerprint.py` |
 
 **Parse sites left out, and why.**
 
 | Why it is left out | Modules |
 |---|---|
-| It reads rows or files the engine wrote itself: its store, the key custody host blob and the recovery wrap kept in its store (no command reads a wrap from an archive yet), audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches | `store/metadata.py`, `store/crypto.py`, `store/custody.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py`, `pipeline/security_signals.py` |
+| It reads rows or files the engine wrote itself: its store, the key custody host blob and the recovery wrap kept in its store (no command reads a wrap from an archive yet), audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches | `store/metadata.py`, `store/crypto.py`, `store/custody.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/audit_visibility.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py`, `pipeline/security_signals.py` |
 | It reads the responses the engine's own HTTP server writes | `api/protocol_headers.py`, `api/protocol_floor_selftest.py` |
 | It reads what an operator supplies: service settings, the code sets in the config directory and edits to them, private key files, command-line JSON, the install's package metadata, a restore token file, the trust anchor files it chooses to trust, a systemd credential and a recovery key a person types | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `cli_common.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py`, `store/custody.py` |
+| It reads a hashed requirements lock from the repository being checked, never a received message: the engine's own locks in `security.yml`, a released line's lock at the tag a release names, an adopter's `requirements.lock` in the `audit-pin` job `messagefoundry-toolkit init` generates, or a lock a person names when running it by hand. On a pull request run the lock comes from whoever opened the pull request, and so do the workflow and the script that read it. It decodes the file as pip does, so a coding declaration in the lock picks the codec, which can be any text codec this Python knows; a declaration naming a codec that is not a text codec, such as `zlib`, `hex` or `rot13`, is refused. It splits each requirement line into its pin, marker, options and comment, to write a copy with the markers removed for `pip-audit`. It is a command run in CI or by hand; the engine never calls it. | `security/audit_all_platforms.py` |
 | It is an inbound whose own code reads nothing. The timer emits a body an operator configured. The loopback and pass-through inbounds take bodies the engine hands over: a partner's captured reply, or a Handler's output. Those bodies are outside input, and the parsers in the first table read them. | `transports/timer.py`, `transports/loopback.py`, `transports/passthrough.py` |
 | It parses no input. It builds messages or reads `hl7apy`'s own schema tables. | `messagefoundry_toolkit/generators/_core.py`, `messagefoundry_toolkit/generators/siu.py`, `messagefoundry_toolkit/hl7schema.py`, `messagefoundry_toolkit/hl7structures.py` |
 | It reads a URL an operator configures, never a received body: an outbound's or a `FhirLookup`'s `url` setting, the value its `env()` reference resolves to, and, for the settings views, any URL-named setting such as `proxy_url` and an `env()` default. It splits the query string with `urllib.parse` to name the parameters that look like credentials. At least the ASVS 14.2.1 warning and loosening entry, the `verify_tls = false` credential refusal (vault BACKLOG #3230) and the off-box cleartext credential refusal (vault BACKLOG #3533) use those names. For the settings views it also splits the whole URL by hand, with one regular expression, at every `?`, `&`, `#` and `;`, and percent-decodes each segment's name; a URL it finds a credential name in is withheld whole. It runs at least when a `Rest`, `Soap`, `FHIR`, `DICOMweb` or `FhirLookup` connection is built, in `messagefoundry check`, on `GET /security/posture` on a running engine and on each settings view (`GET /metadata`, `graph --json`). The warning, the reports and the views put no bound on the URL's length, because the operator wrote it. Some refusals read it only after `enforce_outbound_length_limits` has refused one over `MAX_OUTBOUND_URL_LEN`, and some before, at least a `FhirLookup`'s off-box cleartext refusal. It returns parameter names, never values, and returns nothing rather than raising on a URL it cannot parse. | `secretscrub.py` |

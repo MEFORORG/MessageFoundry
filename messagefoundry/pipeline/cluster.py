@@ -65,7 +65,7 @@ import math
 import os
 import socket
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple, Protocol, runtime_checkable
 from uuid import uuid4
@@ -402,7 +402,8 @@ async def stop_tasks_within(
     tombstone, so the row reads ``active`` and leading until ``node_timeout_seconds`` passes. For
     that time a sibling's stepdown can count this stopped node as a promotable sibling.
 
-    Both are bounded by the cancelled statement's own timeout, the renew clamp on Postgres, and the
+    Both are bounded by the cancelled statement's own timeout, the renew clamp on both backends
+    (on SQL Server since BACKLOG #5064, and there short of a COMMIT nothing is known to bound), and the
     abandoned task holds its connection that long, so the store's pool close can wait for it.
 
     Never raises. A task's stored error is read and logged here rather than raised, because the
@@ -648,10 +649,14 @@ def paused_read_budget_seconds(fence_timeout_seconds: float) -> float:
 
     * Postgres: :func:`_call_within` at ``min(renew clamp, budget / 2)``, because that helper costs
       at most twice its timeout. The halving applies only when the clamp is the larger term.
-    * SQL Server: an ``asyncio.timeout`` of the whole budget around the store read. The store's own
-      ``command_timeout`` still ends the statement cleanly when it is the shorter of the two, so the
-      client-side cancel, which quarantines a pooled connection, fires only when the store's limit
-      would overrun the budget. A cancel that lands during the stalled statement unwinds at once:
+    * SQL Server: an ``asyncio.timeout`` of the whole budget around a store read clamped at
+      ``min(renew clamp, budget / 2)`` (BACKLOG #5064), halved because the clamped borrow and
+      statement each take up to the clamp. The driver's statement timeout, the smaller of that
+      clamp rounded down to whole seconds and the store's ``command_timeout``, ends the statement
+      cleanly, so the client-side cancel, which quarantines a pooled connection, fires at least
+      when the borrow, the statement and a rollback after it together overrun the budget, when the
+      1 s floor on the clamp exceeds half a short budget, or when a COMMIT that nothing is known to
+      bound stalls (``SqlServerStore._fetchone_clamped``). A cancel that lands during the stalled statement unwinds at once:
       the store hands the close to that statement rather than waiting on it. One that lands between
       two driver calls can wait up to the store's ``_DIRTY_CLOSE_TIMEOUT`` (5 s) for the close, and
       at the shipped 20 s fence that is enough to reach the fence. The quarter of the fence this
@@ -795,12 +800,33 @@ class ClusterCoordinator(Protocol):
         synchronous. :class:`NullCoordinator` returns 0."""
         ...
 
-    async def bump_config_version(self) -> int:
+    def config_digest_cached(self, version: int) -> str | None:
+        """The digest the initiating node stored with shared config ``version``, as
+        :meth:`bump_config_version` wrote it, or ``None`` when it is not known here (vault BACKLOG
+        #3109).
+
+        The cache holds the digest read in the same statement as :meth:`config_version_cached`'s
+        value, so the two are one pair. ``version`` must be the cached version for the digest to be
+        returned: once a refresh has moved the cache on to a later bump, the digest stored with
+        ``version`` is gone, and this answers ``None`` rather than the later bump's. So a convergence
+        reload reads it at once, beside the version it is handed. ``None`` also when the initiator
+        stored none, when what is stored is not stamped with the cached version
+        (:func:`stamped_config_digest`), and always on :class:`NullCoordinator`. Cheap +
+        synchronous."""
+        ...
+
+    async def bump_config_version(self, *, digest: str | None) -> int:
         """Atomically increment the cluster-wide config version and return the new value (Track B
         Step 6). Called when an OPERATOR reload succeeds on this node, so every OTHER node's convergence
         loop sees the higher version and reloads its own config dir. :class:`DbCoordinator` does an
         ``INSERT ... ON CONFLICT DO UPDATE ... RETURNING`` and updates its cache; :class:`NullCoordinator`
-        is a no-op returning 0 (single-node has nothing to coordinate)."""
+        is a no-op returning 0 (single-node has nothing to coordinate).
+
+        ``digest`` is this node's digest of what it applied, which the same statement stores with
+        the new version, replacing the previous bump's (vault BACKLOG #3109). ``None`` stores it as
+        unknown. It has no default, so a caller that forgets it fails rather than storing a
+        known digest as unknown. It is opaque text here; the engine writes
+        :func:`~messagefoundry.config.fingerprint.shared_digest_text`."""
         ...
 
     async def cluster_members(self) -> list[ClusterMember]:
@@ -899,6 +925,50 @@ class ClusterCoordinator(Protocol):
         ...
 
 
+def stamped_config_digest(row: Mapping[str, Any], version: int) -> tuple[str | None, str | None]:
+    """A ``cluster_config`` row's ``config_digest`` and the fault that voided it, if any (vault
+    BACKLOG #3109). The digest is returned when its ``config_digest_version`` stamp is
+    ``version``, the row's ``config_version`` as the caller parsed it, else ``None``.
+
+    A bump writes the digest and the stamp in the same statement as the version. An engine that
+    does not write the digest still moves the version, and leaves the previous bump's digest and
+    stamp behind: the stamp then names an older version, so that digest is not set beside the new
+    one, and that is no fault. Both coordinators read the pair through here. It never raises: the
+    digest is advisory, so anything else that voids it reads as unknown, is named as the fault
+    for :func:`note_stamp_fault`, and never stops the version from being cached. The stamp is
+    read as the store reads its audit ``seq``: an int that is not a bool."""
+    try:
+        stamp = row["config_digest_version"]
+        digest = row["config_digest"]
+    except KeyError as exc:
+        return None, f"has no {exc.args[0]} column"
+    if stamp is None:
+        return None, None
+    if not isinstance(stamp, int) or isinstance(stamp, bool):
+        return None, f"has a stamp that is not an integer ({type(stamp).__name__})"
+    if stamp < version:
+        return None, None
+    if stamp > version:
+        return None, f"has a stamp ({stamp}) newer than its version"
+    if digest is None or isinstance(digest, str):
+        return digest, None
+    return None, f"has a digest that is not text ({type(digest).__name__})"
+
+
+def note_stamp_fault(fault: str | None, version: int, warned: int | None) -> int | None:
+    """Log a :func:`stamped_config_digest` fault at WARNING, once per ``version``: ``warned`` is
+    the version last logged, and the return value is the one to keep (vault BACKLOG #3109)."""
+    if fault is None or warned == version:
+        return warned
+    log.warning(
+        "cluster: the cluster_config row for shared config version %d %s, so its initiator's "
+        "digest reads as unknown",
+        version,
+        fault,
+    )
+    return version
+
+
 class NullCoordinator:
     """The single-node default (SQLite and single-node Postgres). Every gate is ``True``, there is no
     DB and no background task, so the engine behaves exactly as it did before this seam existed.
@@ -946,7 +1016,11 @@ class NullCoordinator:
         # Single-node: no shared config token.
         return 0
 
-    async def bump_config_version(self) -> int:
+    def config_digest_cached(self, version: int) -> str | None:
+        # Single-node: no shared config token, so no initiator's digest beside one.
+        return None
+
+    async def bump_config_version(self, *, digest: str | None) -> int:
         # Single-node: nothing to coordinate (no other node converges), so this is a no-op.
         return 0
 
@@ -1178,6 +1252,11 @@ class DbCoordinator:
         # tick and updated immediately by bump_config_version() (so the node that bumps sees its own new
         # value at once and does not re-converge). 0 until the first read/refresh.
         self._config_version: int = 0
+        # The initiator's digest stored with _config_version, read by the same statement and set with
+        # it, so the two are always one pair (vault BACKLOG #3109). None when unknown.
+        self._config_digest: str | None = None
+        # The version whose stamp fault was last logged, so a refresh every tick logs it once.
+        self._stamp_fault_warned: int | None = None
 
     async def start(self) -> None:
         """Register this node and begin heartbeating. Idempotent: a second call is a no-op while the
@@ -1305,42 +1384,60 @@ class DbCoordinator:
         # bump_config_version updates immediately on this node). No DB round-trip on the poll path.
         return self._config_version
 
+    def config_digest_cached(self, version: int) -> str | None:
+        # The digest read with the cached version, only while that is still the version asked about.
+        return self._config_digest if version == self._config_version else None
+
     async def config_version(self) -> int:
         """Read (and cache) the current shared config version, initializing the single ``cluster_config``
         row to 0 if absent. Used at engine startup to seed ``_applied_config_version`` so a fresh node
-        doesn't immediately self-reload, and as the maintenance-tick refresh of the cached value."""
+        doesn't immediately self-reload, and as the maintenance-tick refresh of the cached value. The
+        initiator's digest is read in the same statement and cached with it (vault BACKLOG #3109)."""
         row = await self._call_tick(
             "fetchrow",
             "INSERT INTO cluster_config (id, config_version, updated_at) VALUES (1, 0, $1) "
             "ON CONFLICT (id) DO UPDATE SET id = cluster_config.id "  # no-op update → RETURNING current
-            "RETURNING config_version",
+            "RETURNING config_version, config_digest, config_digest_version",
             time.time(),
         )
         # An INSERT ... ON CONFLICT ... RETURNING always yields a row; a None here is an impossible
         # state. Assert rather than fall back to 0 — a silent 0 would RESET the cached version
         # mid-cluster (worse than raising, since it could trigger redundant follower reloads).
         assert row is not None, "cluster_config upsert returned no row"
-        self._config_version = int(row["config_version"])
-        return self._config_version
+        return self._cache_config_row(row)
 
-    async def bump_config_version(self) -> int:
+    async def bump_config_version(self, *, digest: str | None) -> int:
         """Atomically increment the shared config version and return the new value. Called when an
         operator reload succeeds on THIS node, so every other node's convergence loop sees the higher
         version and reloads its own config dir. Updates the cache immediately so this node's own loop
-        sees no change (feedback-avoidance — the initiator does not re-reload)."""
+        sees no change (feedback-avoidance — the initiator does not re-reload). ``digest`` replaces
+        the stored one in the same statement, stamped with the new version (vault BACKLOG #3109);
+        :func:`stamped_config_digest` says why."""
         row = await self._call(
             "fetchrow",
-            "INSERT INTO cluster_config (id, config_version, updated_at) VALUES (1, 1, $1) "
-            "ON CONFLICT (id) DO UPDATE SET "
-            "config_version = cluster_config.config_version + 1, updated_at = excluded.updated_at "
-            "RETURNING config_version",
+            "INSERT INTO cluster_config "
+            "(id, config_version, config_digest, config_digest_version, updated_at) "
+            "VALUES (1, 1, $2, 1, $1) ON CONFLICT (id) DO UPDATE SET "
+            "config_version = cluster_config.config_version + 1, "
+            "config_digest = excluded.config_digest, "
+            "config_digest_version = cluster_config.config_version + 1, "
+            "updated_at = excluded.updated_at "
+            "RETURNING config_version, config_digest, config_digest_version",
             time.time(),
+            digest,
         )
         # RETURNING always yields a row; assert rather than fall back to 0 (a silent 0 would reset the
         # cached version mid-cluster — see :meth:`config_version`).
         assert row is not None, "cluster_config upsert returned no row"
-        self._config_version = int(row["config_version"])
-        return self._config_version
+        return self._cache_config_row(row)
+
+    def _cache_config_row(self, row: Any) -> int:
+        """Cache a ``cluster_config`` row's version and digest together, and return the version."""
+        version = int(row["config_version"])
+        digest, fault = stamped_config_digest(row, version)
+        self._stamp_fault_warned = note_stamp_fault(fault, version, self._stamp_fault_warned)
+        self._config_version, self._config_digest = version, digest
+        return version
 
     async def cluster_members(self) -> list[ClusterMember]:
         """Read the shared ``nodes`` table and return one :class:`ClusterMember` per node (Track B
@@ -1869,8 +1966,9 @@ class DbCoordinator:
                 # ARMED A SECOND TIME, from the instant the write RETURNED, taking whichever expiry is
                 # LATER. The arm above is measured from before the write, so the write's own duration
                 # comes out of the pause. Since BACKLOG #2523 that duration is bounded, at the borrow
-                # wait plus twice the renew clamp; the SQL Server twin's has only
-                # `[store].command_timeout`, and a bound
+                # wait plus twice the renew clamp; the SQL Server twin's borrow and statement are
+                # bounded by the clamp too since BACKLOG #5064, but its COMMIT is not known to be
+                # bounded at all (SqlServerStore._fetchone_clamped), and a bound
                 # is still a cost taken out of the pause. The window that matters starts when the row
                 # becomes takeable, which is the
                 # commit, not the call: measuring from before it would hand a sibling (the pause - write
@@ -2132,7 +2230,7 @@ def build_coordinator(
             leader_fence_timeout_seconds=getattr(
                 cluster_settings, "leader_fence_timeout_seconds", 20.0
             ),
-            # ADR 0157 Inc 0, as for DbCoordinator below: the claim/renew statement's own timeout.
+            # ADR 0157 Inc 0, as for DbCoordinator below: the loop's and stepdown's statement clamp.
             lease_renew_timeout_seconds=_renew_timeout_or_default(cluster_settings),
             acquire_delay_seconds=getattr(cluster_settings, "acquire_delay_seconds", 0.0),
             promotable=getattr(cluster_settings, "promotable", True),
@@ -2149,7 +2247,8 @@ def build_coordinator(
             cluster_settings, "leader_fence_timeout_seconds", 20.0
         ),
         # ADR 0157 Inc 0. Threaded to both coordinators; SqlServerCoordinator applies it as the
-        # claim/renew statement's own ODBC timeout (SqlServerStore._fetchone_clamped).
+        # ODBC timeout and borrow bound of the heartbeat, the claim/renew, the config-version
+        # refresh and a stepdown's release (BACKLOG #5064; SqlServerStore._fetchone_clamped).
         #
         # ClusterSettings resolves the UNSET case (derive it from the detection margin) inside its own
         # validator, so a real settings object always hands over a concrete float and the derivation

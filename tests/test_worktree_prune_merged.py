@@ -753,6 +753,33 @@ def test_occupied_worktree_is_never_pruned(fx: Fixture, sleeper: int) -> None:
     assert by_leaf(res, "clean")["Outcome"] == "removed"
 
 
+@pytest.mark.parametrize("case", ["hidden", "bracketed-name"])
+def test_a_record_the_registry_skipped_or_read_as_a_pattern_still_vetoes(
+    fx: Fixture, sleeper: int, case: str
+) -> None:
+    """Vault BACKLOG #2985. The session registry listed records without -Force, so it skipped a hidden
+    one, and read each with a positional Get-Content, so [1].json was read as 1.json. At 0a7ccdca1c
+    either one pruned an occupied tree. The registry lists with -Force and reads literally now."""
+    sessions = fx.cfg / "sessions"
+    fx.write_session(pid=sleeper, cwd=fx.sibling("gone"), session_id="bbbbbbbb-2222")
+    occupant = sessions / ("2.json" if case == "hidden" else "[1].json")
+    (sessions / f"{sleeper}.json").rename(occupant)
+    live_record(fx, sleeper, fx.primary)
+    if case == "hidden":
+        subprocess.run(["attrib", "+h", str(occupant)], check=True, capture_output=True)
+    else:
+        shutil.copyfile(sessions / f"{sleeper}.json", sessions / "1.json")
+
+    res = run(fx, "-Apply", "-IdleHours", "0")
+    d = by_leaf(res, "gone")
+    assert d["Decision"] == "SKIP", d
+    assert d["Occupants"][0]["Short"] == "bbbbbbbb", d
+    assert d["Occupants"][0]["State"] == "LIVE", d
+    assert fx.sibling("gone").exists()
+    # Positive control in the same invocation: the run was capable of removing something.
+    assert by_leaf(res, "clean")["Outcome"] == "removed"
+
+
 def test_vscode_session_vetoes_exactly_like_a_desktop_one(fx: Fixture, sleeper: int) -> None:
     """The fence is path-based; the launching surface is irrelevant to it."""
     fx.write_session(

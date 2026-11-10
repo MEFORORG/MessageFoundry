@@ -50,7 +50,9 @@ never began (no worker thread ran it inside the timeout) is temporary, an ``AE``
 dry-run stays synchronous: it runs the same validate inline, measures its elapsed time against the
 same timeout, and reports a validate that took longer as an ``ERROR`` preview carrying the
 listener's text (BACKLOG #1689). Unlike the listener it does not abandon the validate at the
-timeout, so a slow fixture still takes its full validate time. The operator resend
+timeout, so a slow fixture still takes its full validate time, and its clock does not count
+the cold ``hl7apy`` loads a listener's first validate does (``dryrun._strict_validation_error``
+says which). The operator resend
 (:func:`admit_resubmission`) honours the timeout too.
 
 **At least these live guards are deliberately NOT mirrored for the dry-run, each by design:**
@@ -581,12 +583,12 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
     The committed form is the ``\\r``-normalized text for HL7, the text verbatim for another text
     type, and canonical ``mfb64:v1:`` carriage for a binary type.
 
-    ``ic`` is ``None`` when there is no inbound to guard for: the edit-resend direct path writes an
-    outbound row, and a re-route whose origin inbound is no longer registered has no declared type. Only
-    the engine-wide rules apply then, the NUL rule and the engine ceiling, and ``raw`` is returned as
-    is. Strict validation is an inbound's setting, so it never applies there either. Both callers today
-    already bound that body below the ceiling (``EditResendRequest.raw`` and the API's 1 MiB request
-    cap), so the ceiling there is a backstop.
+    ``ic`` is ``None`` only on the edit-resend direct path, which writes an outbound row and so has no
+    inbound to guard for; a re-route whose origin inbound is not registered is refused with a 409
+    before this runs. Only the engine-wide rules apply then, the NUL rule and the engine ceiling, and
+    ``raw`` is returned as is. Strict validation is an inbound's setting, so it never applies there
+    either. Under ``serve`` the API's 1 MiB request cap bounds that body below the ceiling (the
+    rule is ``docs/SECURITY.md`` control 5), so the ceiling is a backstop.
 
     **Not mirrored, and a resubmission can therefore still differ from a sender's body:** document
     detach. A streaming inbound raises ``max_message_bytes`` to pay for a detach this path does not do,

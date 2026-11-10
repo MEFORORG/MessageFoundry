@@ -1329,7 +1329,8 @@ class _FakeSqlLeaseStore:
     async def _fetchone_clamped(
         self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
     ) -> dict[str, object] | None:
-        return await self._fetchone(sql, params)  # the claim; the clamp is not modelled here
+        # The claim and the paused owner read (BACKLOG #5064); the clamp is not modelled here.
+        return await self._fetchone(sql, params)
 
     async def _execute(self, sql: str, params: tuple[object, ...]) -> int:
         if self.yield_in_execute:
@@ -1348,6 +1349,11 @@ class _FakeSqlLeaseStore:
         ), "the release must write the DB clock's now, never later (BACKLOG #1986)"
         _lease_key, owner = params
         return self._db.release(owner)  # the store's _execute returns the driver's row count
+
+    async def _execute_clamped(
+        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
+    ) -> int:
+        return await self._execute(sql, params)  # the release; the clamp is not modelled here
 
 
 def _sql_coord(

@@ -125,7 +125,10 @@ from messagefoundry.auth import (
 )
 from messagefoundry.auth.audit_visibility import (
     AUDIT_WITHHELD_HEADER,
+    CHANNEL_LIST_ACTIONS,
+    audit_detail_for,
     audit_exclusion_for,
+    narrows_scope_rows_for,
     withholds_rows_from,
 )
 from messagefoundry.auth.ldap import LdapError, canonical_group_dn
@@ -456,12 +459,14 @@ def _user_summary(
     *,
     credential_expires_at: float | None = None,
     lock_state_at: float | None = None,
-    show_scope: bool = True,
+    show_scope: bool = False,
 ) -> UserSummary:
     """``lock_state_at`` is the instant to evaluate the account's locks at, and passing it is what
     DISCLOSES them: pass it only on a ``users:manage`` surface (BACKLOG #1131). Left ``None``, the
     summary carries ``lock_state=None``, which reads as "not shown", never as "not locked".
-    ``show_scope=False`` withholds the channel scope and its source the same way (BACKLOG #3189)."""
+    The channel scope and its source are withheld the same way unless ``show_scope=True`` is
+    passed, again only on a ``users:manage`` surface (BACKLOG #3189). Withholding is the default,
+    so a new caller that forgets the argument discloses nothing (vault BACKLOG #3748 item 5)."""
     return UserSummary(
         id=user.id,
         username=user.username,
@@ -476,6 +481,29 @@ def _user_summary(
         channel_scope_withheld=not show_scope,
         credential_expires_at=credential_expires_at,
         lock_state=None if lock_state_at is None else _lock_state(user, lock_state_at),
+    )
+
+
+def _console_user_summary(
+    user: UserRecord,
+    role_ids: list[str],
+    *,
+    show_scope: bool,
+    credential_expires_at: float | None = None,
+    lock_state_at: float | None = None,
+) -> UserSummary:
+    """:func:`_user_summary` as the console seam hands it on, with ``show_scope`` REQUIRED (vault
+    BACKLOG #3748 item 5). Each console page decides, and one that forgets raises rather than
+    discloses, where a withholding default would read a real scope as deny-all and offer to save
+    that over it. The seam field is named ``user_summary_scoped`` so the rename moves the seam
+    digest: a console from before the keyword refuses to mount, rather than mounting and failing on
+    its user pages (``_ui_seam.py`` history)."""
+    return _user_summary(
+        user,
+        role_ids,
+        credential_expires_at=credential_expires_at,
+        lock_state_at=lock_state_at,
+        show_scope=show_scope,
     )
 
 
@@ -1431,6 +1459,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             sorted(body.roles),
             credential_expires_at=pending_credential_deadline(service, user),
             lock_state_at=time.time(),
+            show_scope=True,  # users:manage, under step-up
         )
         return UserCreatedResponse(
             **summary.model_dump(), temp_password=created.credential.password
@@ -1473,7 +1502,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         user = await service.store.get_user(user_id)
         assert user is not None
-        return _user_summary(user, [], lock_state_at=time.time())
+        return _user_summary(user, [], lock_state_at=time.time(), show_scope=True)
 
     @app.patch("/users/{user_id}", response_model=SimpleMessage)
     async def update_user(
@@ -2174,8 +2203,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         ``offset`` is the numbered pager's position (BACKLOG #2438).
 
         Every filter value is passed as a keyword to the store, which binds it as a SQL parameter
-        across all three backends (BACKLOG #170) -- never string-interpolated into the query."""
-        return await service.store.list_audit(
+        across all three backends (BACKLOG #170) -- never string-interpolated into the query.
+
+        Each row's ``detail`` is the one ``identity`` may read (:func:`audit_detail_for`), so the
+        channel lists and scope sources of the rows ``CHANNEL_LIST_ACTIONS`` names are withheld
+        here, for every caller without ``users:manage``, on all three reads (vault BACKLOG #3748)."""
+        rows = await service.store.list_audit(
             limit=limit,
             actor=actor,
             action=action,
@@ -2185,6 +2218,16 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             before_id=before_id,
             offset=offset,
         )
+        if not narrows_scope_rows_for(identity):
+            return rows
+        # A row of a CHANNEL_LIST_ACTIONS action is copied with its narrowed detail, whether or not
+        # the narrowing changed it; every other row is returned as stored, uncopied.
+        return [
+            {**row, "detail": audit_detail_for(identity, row["action"], row["detail"])}
+            if row["action"] in CHANNEL_LIST_ACTIONS
+            else row
+            for row in rows
+        ]
 
     async def _count_audit(
         service: AuthService,
@@ -2576,7 +2619,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         list_audit=_audit_ui_list,
         export_audit=export_audit,
         my_security_events=my_security_events,
-        user_summary=_user_summary,
+        user_summary_scoped=_console_user_summary,
         federated_identity_view=_federated_identity_view,
         current_user=_current_user,
     )

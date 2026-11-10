@@ -8,6 +8,7 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
+import os
 import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -33,6 +34,7 @@ from messagefoundry.uploads import (
     sanitize_filename,
     validate_upload_content,
 )
+from tests._upload_root import upload_entries
 
 _ADT = "MSH|^~\\&|A|B|C|D|202601011200||ADT^A01|MSGID1|P|2.5\rPID|1||MRN123^^^HOSP||DOE^JOHN\r"
 _BATCH = _ADT + "MSH|^~\\&|A|B|C|D|202601011201||ADT^A04|MSGID2|P|2.5\rPID|1||MRN999\r"
@@ -348,8 +350,10 @@ async def test_concurrent_uploads_cannot_double_book_the_quota(
 
     real_scan = store._scan_metas_sync
 
-    def _slow_scan(held: list[Any] | None = None) -> list[UploadedFileMeta]:
-        out = real_scan(held)
+    def _slow_scan(
+        held: list[Any] | None = None, *, outage_raises: bool = False
+    ) -> list[UploadedFileMeta]:
+        out = real_scan(held, outage_raises=outage_raises)
         time.sleep(0.05)  # widen the window so an unlocked check-then-write WOULD lose the race
         return out
 
@@ -690,11 +694,13 @@ async def test_a_stuck_sweep_that_deleted_nothing_logs_no_audit_gap(
     paused, release, scanned = threading.Event(), threading.Event(), threading.Event()
     real_scan = store._scan_metas_sync
 
-    def _stuck_scan(held: list[Any] | None = None) -> list[UploadedFileMeta]:
+    def _stuck_scan(
+        held: list[Any] | None = None, *, outage_raises: bool = False
+    ) -> list[UploadedFileMeta]:
         paused.set()
         release.wait(timeout=10)
         try:
-            return real_scan(held)
+            return real_scan(held, outage_raises=outage_raises)
         finally:
             scanned.set()
 
@@ -802,7 +808,7 @@ async def test_a_refused_sidecar_unlink_reports_the_pair_once(tmp_path: Path) ->
 
     assert [m.file_id for m in first.pruned] == [meta.file_id]
     assert second.pruned == []
-    assert list((tmp_path / "uploads").iterdir()) == []
+    assert upload_entries(tmp_path / "uploads") == []
 
 
 async def test_a_pair_another_pass_already_removed_is_not_reported_twice(tmp_path: Path) -> None:
@@ -812,7 +818,7 @@ async def test_a_pair_another_pass_already_removed_is_not_reported_twice(tmp_pat
     await store.save(data=b"aging\n", filename="a.txt", uploader="op", uploader_id="u-op")
     seen = store._scan_metas_sync()
     first = await store.prune_expired(now=time.time() + 31 * 86_400)
-    store._scan_metas_sync = lambda held=None: seen  # type: ignore[method-assign]
+    store._scan_metas_sync = lambda held=None, *, outage_raises=False: seen  # type: ignore[method-assign]
     second = await store.prune_expired(now=time.time() + 31 * 86_400)
 
     assert len(first.pruned) == 1
@@ -968,8 +974,10 @@ def _hold_after_the_sidecar_lands(
     landed, finish = threading.Event(), threading.Event()
     real = uploads_mod._atomic_write_text
 
-    def _write_then_hold(root: Path, path: Path, text: str) -> None:
-        real(root, path, text)
+    def _write_then_hold(
+        root: Path, path: Path, text: str, *, seen: os.stat_result | None = None
+    ) -> None:
+        real(root, path, text, seen=seen)
         if path.suffix == ".meta":
             landed.set()
             finish.wait(10)
@@ -1003,7 +1011,7 @@ async def test_a_save_cancelled_after_its_file_lands_leaves_no_file(tmp_path: Pa
     store = _store(tmp_path, key=True)
     with pytest.MonkeyPatch.context() as mp:
         await _cancel_once_landed(store, mp)
-    assert list((tmp_path / "uploads").iterdir()) == []
+    assert upload_entries(tmp_path / "uploads") == []
     assert await store.list_files() == []
 
 
@@ -1032,7 +1040,7 @@ async def test_an_anyio_scope_cancel_still_removes_the_landed_file(tmp_path: Pat
             finally:
                 finish.set()
     await _removals_settled(store)
-    assert list((tmp_path / "uploads").iterdir()) == []
+    assert upload_entries(tmp_path / "uploads") == []
 
 
 async def test_a_cancel_in_the_reservation_release_still_removes_the_landed_file(
@@ -1063,7 +1071,7 @@ async def test_a_cancel_in_the_reservation_release_still_removes_the_landed_file
     finish.set()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(save, 10)
-    assert list(root.iterdir()) == []
+    assert upload_entries(root) == []
     assert ledger.metas_at_release == [1], "the cancelled release never paid the slot back"
 
 
@@ -1146,7 +1154,7 @@ async def test_a_reserve_cancelled_after_its_commit_pays_the_slot_back(
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(save, 10)
     assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
-    assert not root.exists() or list(root.iterdir()) == []
+    assert not root.exists() or upload_entries(root) == []
 
 
 @pytest.mark.parametrize("hold", ["reserve", "release"])
@@ -1176,7 +1184,7 @@ async def test_an_anyio_scope_cancel_at_either_ledger_call_pays_the_slot_back(
             ledger.gate.set()
     await _removals_settled(store)
     assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
-    assert not root.exists() or list(root.iterdir()) == []
+    assert not root.exists() or upload_entries(root) == []
 
 
 async def test_a_deadline_mid_write_still_pays_the_reservation_back(
@@ -1206,7 +1214,7 @@ async def test_a_deadline_mid_write_still_pays_the_reservation_back(
                 finish.set()
     await _removals_settled(store)
     assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
-    assert list(root.iterdir()) == []
+    assert upload_entries(root) == []
 
 
 @pytest.mark.parametrize("hold", ["reserve", "release"])
@@ -1240,7 +1248,7 @@ async def test_a_ledger_call_stuck_past_the_bound_lets_the_cancellation_through(
                 await asyncio.wait_for(save, 10)
             assert not store._quota_lock.locked()
             assert f"upload {hold} for u-op did not finish" in caplog.text, caplog.text
-            assert not root.exists() or list(root.iterdir()) == []
+            assert not root.exists() or upload_entries(root) == []
         finally:
             ledger.gate.set()  # let the abandoned call finish before the store closes
             await _drain_stragglers(store)
@@ -1293,7 +1301,7 @@ async def test_a_cancel_absorbed_by_the_write_still_bounds_the_release(
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(save, 10)
             assert not store._quota_lock.locked()
-            assert list(root.iterdir()) == []
+            assert upload_entries(root) == []
         finally:
             ledger.gate.set()
             await _drain_stragglers(store)

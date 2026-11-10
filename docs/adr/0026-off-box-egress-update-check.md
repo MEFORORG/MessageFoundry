@@ -75,6 +75,11 @@ The result surfaces through **two existing, authoritative engine signals** — n
    - `NotifierAlertSink.update_available(...)` — enqueue the event (the `cert_expiry`/`storage_threshold` `_emit` pattern; `connection` keyed to a stable label like the package name so the re-alert throttle works) ([alert_sinks.py:368-404](../../messagefoundry/pipeline/alert_sinks.py));
    - `_ALERT_EVENT_TYPES` in [config/settings.py:932-934](../../messagefoundry/config/settings.py) — add `"update_available"` so an `[alerts].rules` `event_type` may match it (the `frozenset` and the `AlertSink` methods must mirror each other, by the comment there).
    - (`_subject` in [alert_sinks.py:119-121](../../messagefoundry/pipeline/alert_sinks.py) needs no change — it reads `event["type"]`/`["connection"]`/`["severity"]` generically — but the lockstep set is named so the build re-verifies it; the new event carries **only** version strings, so the webhook JSON / email subject stay PHI-free, like every other alert.)
+     *(Note 2026-11-10, BACKLOG #5021: "like every other alert" was false for the webhook JSON; in
+     the shipped code some alerts carry free-text detail off the box in the webhook JSON and the
+     email body, as the [PHI.md logging inventory](../PHI.md#logging-inventory-1611--1623) rows
+     for the `[alerts]` transports say. The email subject half holds: the default subject carries
+     only the severity, the type and the `connection` key.)*
 
 The event is **best-effort and advisory** (the sink contract — never raises, never blocks delivery); a missing alert never affects message flow, and the `/status` field is the authoritative signal.
 

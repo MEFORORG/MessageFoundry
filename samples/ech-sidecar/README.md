@@ -126,8 +126,9 @@ cleartext note under `[egress]` in [CONFIGURATION.md](../../docs/CONFIGURATION.m
 `127.0.0.1` in full: a short form such as `127.1` is refused. It is **mutually exclusive** with the `proxy_url` settings key
 (the sidecar *is* that connection's egress proxy) — refused in `RestDestination.__init__`
 ([`transports/rest.py`](../../messagefoundry/transports/rest.py); named by symbol rather than by line,
-because a line number goes stale silently and a wrong one reads as a working reference forever). It
-composes with the connection's TLS verify/allowlist/signing posture.
+because a line number goes stale silently and a wrong one reads as a working reference forever).
+`verify_tls = false` beside it is refused there too (vault BACKLOG #2977). It composes with the
+connection's allowlist/signing posture.
 
 **Both of the connection's outbound hops take the sidecar.** The delivery request and — when the
 connection uses OAuth2 client-credentials or SMART Backend Services — the **token-endpoint POST** are

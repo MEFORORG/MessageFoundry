@@ -32,12 +32,14 @@ from __future__ import annotations
 import asyncio
 import re
 import types
+from collections.abc import Coroutine
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from messagefoundry.config.settings import StoreSettings
+from messagefoundry.redaction import safe_exc
 from messagefoundry.store.base import (
     DEFAULT_STORE_ACQUIRE_TIMEOUT,
     StoreAcquireTimeout,
@@ -271,10 +273,127 @@ async def test_salvage_swallows_a_release_failure() -> None:
     await _settle()  # no unhandled exception escapes
 
 
+#: How many event-loop turns a borrow from a ready pool may take. Measured 2026-11-06 on 3.14: it
+#: finishes in 4: the task's first step, the borrow task, the shield's callback, and the wake of
+#: the waiting task.
+#: A path that waits on a timer cannot finish inside them while they take microseconds, as they do
+#: idle: 20 turns read 37 to 69 us on 2026-11-06 on Windows. Under contention they can span far
+#: longer: beside a GIL-holding thread at ``sys.setswitchinterval(0.1)`` the same 20 turns read
+#: 0.435 to 0.869 s, and a timer shorter than that span can come due within them. So on a loaded
+#: runner this catches only a wait longer than the turns took, not every wait.
+_HEALTHY_BORROW_TURNS = 20
+
+
+class _SlowReadyPool(_ReadyPool):
+    """Hands its connection over after a timer: the shape of a path that waits one out. An hour,
+    so that no stall the turn budget could span brings it due on a loaded runner."""
+
+    async def acquire(self) -> Any:
+        await asyncio.sleep(3600)
+        return self.conn
+
+
+#: How long the cleanup may wait for a cancelled borrow to unwind, in wall seconds. A bound on a
+#: hang, not a timing: ``acquire_pooled`` cancels its inner borrow and re-raises, leaving the salvage
+#: to a callback, so the unwind takes a few turns. A regression that awaited the salvage instead
+#: would wait out ``_SlowReadyPool``'s hour, and this turns that into a failure.
+_UNWIND_SECONDS = 10.0
+
+
+async def _finished_within_turns(work: Coroutine[Any, Any, Any]) -> asyncio.Task[Any] | None:
+    """``work`` as a task, if it finished within ``_HEALTHY_BORROW_TURNS`` loop turns; otherwise
+    ``None``, with the task cancelled and waited for, for at most ``_UNWIND_SECONDS``, and a failure
+    if it is still unwinding then. ``asyncio.wait`` rather than an await, so a cancellation aimed at
+    the test itself still propagates; that path cancels the task too, and re-raises what it caught
+    rather than a failure of its own. A pool's own inner acquire is cancelled by ``acquire_pooled``
+    but not awaited here, so it finishes on a later turn of this loop."""
+    task = asyncio.create_task(work)
+    try:
+        for _ in range(_HEALTHY_BORROW_TURNS):
+            if task.done():
+                return task
+            await asyncio.sleep(0)
+        if task.done():
+            return task
+    except BaseException:
+        task.cancel()
+        await asyncio.wait({task}, timeout=_UNWIND_SECONDS)
+        raise
+    task.cancel()
+    await asyncio.wait({task}, timeout=_UNWIND_SECONDS)
+    if not task.done():
+        pytest.fail(
+            f"a cancelled borrow was still unwinding after {_UNWIND_SECONDS}s -- its cancel path "
+            "waits on something, the late borrow's salvage or a release, instead of returning"
+        )
+    if not task.cancelled() and task.exception() is not None:
+        # It ended another way during the unwind; surface that rather than the turn count.
+        task.result()
+    return None
+
+
+async def _borrow_within_turns(pool: Any) -> asyncio.Task[Any] | None:
+    """The borrow, if it finished within ``_HEALTHY_BORROW_TURNS`` loop turns at the shipped timeout,
+    as :func:`_finished_within_turns` gives it."""
+    return await _finished_within_turns(
+        acquire_pooled(pool, timeout=DEFAULT_STORE_ACQUIRE_TIMEOUT, backend="sqlserver")
+    )
+
+
+async def _store_call_within_turns(work: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
+    """A store call over a ready pool, which must finish within ``_HEALTHY_BORROW_TURNS`` turns.
+
+    **For the tests that read what a healthy borrow leaves behind, not how fast it is (BACKLOG
+    #3456).** They built their store at ``FAST``, so a runner that held the loop off the core for
+    0.05 s let the timer win over a ready pool, the same race :func:`test_a_healthy_borrow_is_unaffected`
+    describes. Built at ``DEFAULT_STORE_ACQUIRE_TIMEOUT`` instead, the timer cannot come due, and the
+    turn budget keeps a regression to a waiting borrow a quick failure rather than a 30 s hang.
+    Measured 2026-11-06 on Windows, Python 3.14, ten runs of each of the four tests that use this:
+    each store call finished within 4 turns; beside a spinning thread at
+    ``sys.setswitchinterval(0.1)`` the old shape raised StoreAcquireTimeout in 40 of 40 runs and this
+    one passed 40 of 40; idle, both passed 40 of 40."""
+    task = await _finished_within_turns(work)
+    assert task is not None, (
+        f"a store call over a ready pool was still waiting after {_HEALTHY_BORROW_TURNS} turns"
+    )
+    return task
+
+
 async def test_a_healthy_borrow_is_unaffected() -> None:
-    """Positive control: the bound must not change the ordinary path."""
+    """Positive control: the bound must not change the ordinary path.
+
+    **Counted in loop turns, at the shipped timeout, not raced against a 0.05 s timer (BACKLOG
+    #3130, #3456).** The timer and the borrow share the loop, so a runner that kept the loop off
+    the core for 0.05 s after arming the timer let it come due before the borrow's result reached
+    the waiting task, and the timer won: windows-2022 on 2026-10-06 and windows-2025 on 2026-10-12
+    raised StoreAcquireTimeout from a pool that was never empty. A GIL-holding neighbour thread
+    does the same here on demand: measured 2026-11-06 on Windows, Python 3.14, with a spinning
+    thread and ``sys.setswitchinterval(0.1)``, the old shape failed 49 of 50 runs and this one 0
+    of 50; idle, both passed 50 of 50. What this asks instead is that a ready connection comes back
+    within a few turns, unreleased. Idle, a path that waits out a timer cannot do that; on a loaded
+    runner it can if the timer is shorter than the turns took (``_HEALTHY_BORROW_TURNS`` gives the
+    span), so this catches a long wait everywhere and a short one only on a quiet runner. The
+    control arm shows the discrimination on this loop: a borrow behind an hour-long timer is still
+    waiting after the same turns."""
+    control = await _borrow_within_turns(_SlowReadyPool())
+    if control is not None:
+        if control.cancelled():
+            ended = "cancelled"
+        elif control.exception() is not None:
+            ended = f"raised {control.exception()!r}"
+        else:
+            ended = f"returned {control.result()!r}"
+        pytest.fail(
+            f"a borrow behind an hour-long timer finished inside the turn budget ({ended}) -- either "
+            "it no longer discriminates or the helper ended the borrow early"
+        )
     pool = _ReadyPool()
-    assert await acquire_pooled(pool, timeout=FAST, backend="sqlserver") is pool.conn
+    borrow = await _borrow_within_turns(pool)
+    assert borrow is not None, (
+        f"a borrow from a ready pool was still waiting after {_HEALTHY_BORROW_TURNS} turns"
+    )
+    assert borrow.result() is pool.conn
+    await _settle()  # a release the helper scheduled on its success path would run here
     assert pool.released == []  # the CALLER releases, not the helper
 
 
@@ -286,6 +405,69 @@ async def test_sqlserver_store_acquire_is_bounded() -> None:
     with pytest.raises(StoreAcquireTimeout):
         async with store._acquire():
             pytest.fail("the body must never run on a wedged pool")
+
+
+async def test_sqlserver_clamped_borrow_points_to_the_cluster_paragraph() -> None:
+    """BACKLOG #5064: a borrow cut at the cluster clamp advises one fixed text, pointing to the
+    docs/CONFIGURATION.md [cluster] paragraph that says which setting sets each clamp, since
+    raising ``[store].acquire_timeout`` would not lengthen it and no one setting sets every clamp.
+    Driven through a real clamped statement, so the store's 1 s floor sets the rendered limit."""
+    from messagefoundry.store.sqlserver import CLAMPED_BORROW_ADVICE
+
+    store = _sqlserver_store(_HangingPool(), timeout=30.0)
+    with pytest.raises(StoreAcquireTimeout) as clamped:
+        await store._execute_clamped("UPDATE nodes SET status = ?", ("x",), timeout_clamp=0.2)
+    message = str(clamped.value)
+    assert " after 1s " in message, message
+    assert message.endswith(f"; retune with {CLAMPED_BORROW_ADVICE}"), message
+    assert "[store].acquire_timeout" not in message
+    assert "docs/CONFIGURATION.md [cluster]" in CLAMPED_BORROW_ADVICE
+    # A logged error passes through safe_exc, whose default limit must keep the whole message. The
+    # worst case renders the limit in the most characters ``:g`` uses for a finite value of at least
+    # the 1 s floor, 12 for a three-digit exponent, so render the message at that limit too.
+    worst = StoreAcquireTimeout(message.replace(" after 1s ", f" after {1.23456789e100:g}s "))
+    assert len(str(worst)) == len(message) + len(f"{1.23456789e100:g}") - 1
+    assert safe_exc(worst) == f"StoreAcquireTimeout: {worst}", safe_exc(worst)
+    assert safe_exc(clamped.value) == f"StoreAcquireTimeout: {message}", safe_exc(clamped.value)
+    # A tie advises the same text: raising [store].acquire_timeout alone would not lengthen it.
+    store = _sqlserver_store(_HangingPool(), timeout=FAST)
+    with pytest.raises(StoreAcquireTimeout) as tie:
+        async with store._acquire_clamped(FAST):
+            pytest.fail("the body must never run on a wedged pool")
+    assert str(tie.value).endswith(CLAMPED_BORROW_ADVICE), str(tie.value)
+    store = _sqlserver_store(_HangingPool(), timeout=FAST)
+    with pytest.raises(StoreAcquireTimeout, match=r"retune with \[store\]\.acquire_timeout$"):
+        async with store._acquire_clamped(5.0):
+            pytest.fail("the body must never run on a wedged pool")
+
+
+def test_the_clamped_borrow_advice_points_to_a_paragraph_that_exists() -> None:
+    """BACKLOG #5064: the paragraph the advice points to is under [cluster] in
+    docs/CONFIGURATION.md, and names each bound a clamped borrow can be cut at."""
+    from messagefoundry.store.sqlserver import CLAMPED_BORROW_ADVICE
+
+    doc = (Path(__file__).resolve().parent.parent / "docs" / "CONFIGURATION.md").read_text(
+        encoding="utf-8"
+    )
+    start = doc.index("### `[cluster]`")
+    section = doc[start : doc.index("\n### ", start + 1)]
+    heading = "**Which setting sets a clamped SQL Server borrow's bound.**"
+    assert heading in section
+    paragraph = section[section.index(heading) : section.index("#### `[cluster.vip]`")]
+    for term in (
+        "lease_renew_timeout_seconds",
+        "leader_fence_timeout_seconds",
+        "half the paused-read budget",
+        "1 s floor",
+        "fixed 2 s",
+    ):
+        assert term in paragraph, term
+    # The paragraph quotes the message's ending exactly.
+    assert f"`retune with {CLAMPED_BORROW_ADVICE}`" in paragraph
+    # The paragraph's "fixed 2 s" is stop()'s bound, which no setting changes.
+    from messagefoundry.pipeline.cluster import STOP_WRITE_TIMEOUT_SECONDS
+
+    assert STOP_WRITE_TIMEOUT_SECONDS == 2.0
 
 
 async def test_postgres_store_acquire_is_bounded() -> None:
@@ -545,17 +727,23 @@ async def test_sqlserver_post_commit_borrow_keeps_the_cancellation_quarantine() 
     """ADR 0159 on the post-commit borrow: a cancellation mid-body still quarantines the connection
     before it is released, so it is never lent again with its transaction open."""
     pool = _ReadyPool()
-    store = _sqlserver_store(pool)
+    store = _sqlserver_store(pool, timeout=DEFAULT_STORE_ACQUIRE_TIMEOUT)
     order: list[str] = []
 
     async def quarantine(conn: Any) -> None:
         order.append(f"quarantine {pool.released!r}")
 
     store._release_dirty = quarantine
-    with pytest.raises(asyncio.CancelledError):
+
+    async def cancelled_mid_body() -> None:
         async with store._acquire_after_commit() as conn:
             assert conn is pool.conn
             raise asyncio.CancelledError
+
+    task = await _store_call_within_turns(cancelled_mid_body())
+    if not task.cancelled():
+        task.result()  # an ordinary failure in the body surfaces as itself
+        pytest.fail("the body's CancelledError did not propagate out of the borrow")
     assert order == ["quarantine []"], "the cancelled connection was released before quarantine"
     assert pool.released == [pool.conn]
 
@@ -563,17 +751,25 @@ async def test_sqlserver_post_commit_borrow_keeps_the_cancellation_quarantine() 
 async def test_sqlserver_store_releases_a_healthy_borrow() -> None:
     """Positive control for the acquire/release restructure: the connection still goes back."""
     pool = _ReadyPool()
-    store = _sqlserver_store(pool)
-    async with store._acquire() as conn:
-        assert conn is pool.conn
+    store = _sqlserver_store(pool, timeout=DEFAULT_STORE_ACQUIRE_TIMEOUT)
+
+    async def borrow_and_return() -> None:
+        async with store._acquire() as conn:
+            assert conn is pool.conn
+
+    (await _store_call_within_turns(borrow_and_return())).result()
     assert pool.released == [pool.conn]
 
 
 async def test_postgres_store_releases_a_healthy_borrow() -> None:
     pool = _ReadyPool()
-    store = _postgres_store(pool)
-    async with store._timed_acquire() as conn:
-        assert conn is pool.conn
+    store = _postgres_store(pool, timeout=DEFAULT_STORE_ACQUIRE_TIMEOUT)
+
+    async def borrow_and_return() -> None:
+        async with store._timed_acquire() as conn:
+            assert conn is pool.conn
+
+    (await _store_call_within_turns(borrow_and_return())).result()
     assert pool.released == [pool.conn]
 
 
@@ -589,12 +785,15 @@ async def test_postgres_convenience_reads_stay_out_of_the_worker_acquire_wait_cu
         async def fetch(self, sql: str, *params: Any) -> list[Any]:
             return []
 
-    store = _postgres_store(_P())
-    await store._fetchall("SELECT 1")
+    store = _postgres_store(_P(), timeout=DEFAULT_STORE_ACQUIRE_TIMEOUT)
+    (await _store_call_within_turns(store._fetchall("SELECT 1"))).result()
     assert store._acquire_wait.summary().count == 0
 
-    async with store._timed_acquire():
-        pass
+    async def worker_borrow() -> None:
+        async with store._timed_acquire():
+            pass
+
+    (await _store_call_within_turns(worker_borrow())).result()
     assert store._acquire_wait.summary().count == 1  # the worker path IS still recorded
 
 
@@ -747,8 +946,9 @@ def test_sqlserver_longer_post_commit_borrow_has_exactly_its_two_writes() -> Non
     """BACKLOG #3023: the SQL Server counterpart of the Postgres pin above. The longer post-commit
     borrow is reached from ``revoke_user_sessions`` directly and from ``rotate_session`` through
     ``_write_session_txn(after_commit=True)``, the only call passing that keyword; nothing else.
-    ``_borrow`` is called only by ``_acquire``, ``_acquire_after_commit`` and, for the cluster lease
-    claim's SHORTER limit (BACKLOG #1497), ``_acquire_clamped``; strict mypy keeps
+    ``_borrow`` is called only by ``_acquire``, ``_acquire_after_commit`` and, for the SHORTER limit
+    of the cluster coordinator's clamped statements (the lease claim since BACKLOG #1497, the
+    loop's other statements and the release writes since #5064), ``_acquire_clamped``; strict mypy keeps
     ``None`` out of its ``float`` limit. A third write moved onto the longer limit would pass every offline test, so
     its callers are pinned by name."""
     assert _sqlserver_functions_referencing("_acquire_after_commit") == [
@@ -759,13 +959,16 @@ def test_sqlserver_longer_post_commit_borrow_has_exactly_its_two_writes() -> Non
         " it too follows a committed write nothing retries, then update this pin"
     )
     assert _sqlserver_functions_referencing("after_commit") == ["rotate_session"]
-    # BACKLOG #1497 added a SHORTER borrow for the cluster lease claim alone; pinned the same way.
+    # BACKLOG #1497 added a SHORTER borrow for the cluster lease claim, which #5064 widened to the
+    # coordinator's other clamped statements; pinned the same way.
     assert _sqlserver_functions_referencing("_borrow") == [
         "_acquire",
         "_acquire_after_commit",
         "_acquire_clamped",
     ]
-    assert _sqlserver_functions_referencing("_acquire_clamped") == ["_fetch_rows"]
+    # BACKLOG #5064 moved it behind _clamp_bounds, shared by the clamped read and the clamped write.
+    assert _sqlserver_functions_referencing("_acquire_clamped") == ["_clamp_bounds"]
+    assert _sqlserver_functions_referencing("_clamp_bounds") == ["_fetch_rows", "_write_rows"]
 
 
 # --- the setting -------------------------------------------------------------

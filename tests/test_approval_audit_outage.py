@@ -36,7 +36,7 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import AuditAppend, MessageStore
 from tests._pending_approval_store_contract import (
     _REQUESTER_ID,
     _request,
@@ -95,11 +95,15 @@ class _Faulty(_StandingStore):
 class _Sink(LoggingAlertSink):
     def __init__(self) -> None:
         self.lost: list[tuple[str, str]] = []
+        self.copy_missing: list[tuple[str, str]] = []
         self.too_early: list[str] = []
         self.stale: list[str] = []
 
     def audit_write_failed(self, name: str, *, action: str) -> None:
         self.lost.append((name, action))
+
+    def audit_offbox_copy_missing(self, name: str, *, action: str) -> None:
+        self.copy_missing.append((name, action))
 
     def approval_too_early(self, name: str, *, operation: str) -> None:
         self.too_early.append(name)
@@ -295,7 +299,199 @@ async def test_a_combined_outcome_write_whose_reply_is_lost_writes_no_second_row
     assert runs == ["ran"] and await _status(store, approval_id) == "approved"
     assert len(await store.list_audit(action="approval.approved")) == 1
     # Paged (vault BACKLOG #3193): the store teed nothing, so the row's off-box copy is missing.
+    # The page says so, not that the row was lost (N1).
+    assert sink.copy_missing == [(f"approval:{approval_id}", "approval.approved")]
+    assert sink.lost == []
+
+
+class _SiblingMoved(_StandingStore):
+    """The gate's combined ``outcome`` write fails WITHOUT committing, after a sibling sharing its
+    claim owner moved the row to 'interrupted' with that sibling's own row, as its restart
+    reconcile does, keeping the approver the claim wrote."""
+
+    def __init__(self, store: Any, *, outcome: str) -> None:
+        super().__init__(store)
+        self.outcome = outcome
+        self.sibling_moved = False
+
+    async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+        audit = kw.get("audit")
+        if audit is not None and audit.action == self.outcome:
+            # Recorded rather than asserted: _settle catches any exception raised here.
+            self.sibling_moved = await self._store.decide_pending_approval(
+                approval_id,
+                status="interrupted",
+                approver=kw["approver"],
+                decided_at=2.0,
+                from_status="executing",
+                audit=AuditAppend("approval.interrupted", actor="system", detail="{}"),
+            )
+            raise sqlite3.OperationalError(_FAULT)
+        return bool(await self._store.decide_pending_approval(approval_id, **kw))
+
+
+class _ReadBackFails(_StandingStore):
+    """The gate's combined ``outcome`` write COMMITS and then raises, as a lost reply does, and
+    every read of the row after it raises too."""
+
+    def __init__(self, store: Any, *, outcome: str) -> None:
+        super().__init__(store)
+        self.outcome = outcome
+        self.settled = False
+
+    async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+        moved = bool(await self._store.decide_pending_approval(approval_id, **kw))
+        audit = kw.get("audit")
+        if audit is not None and audit.action == self.outcome:
+            self.settled = True
+            raise sqlite3.OperationalError("connection reset after COMMIT")
+        return moved
+
+    async def get_pending_approval(self, approval_id: str) -> Any:
+        if self.settled:
+            raise sqlite3.OperationalError(_FAULT)
+        return await self._store.get_pending_approval(approval_id)
+
+
+async def test_an_outcome_row_moved_by_a_sibling_pages_audit_write_failed(
+    store: MessageStore,
+) -> None:
+    """The status-only write finds the row moved, but by the sibling, so the approval.approved
+    row was never written and the read-back must not page copy-only (vault BACKLOG #3193 N1)."""
+    sink = _Sink()
+    runs: list[str] = []
+    sibling = _SiblingMoved(store, outcome="approval.approved")
+    gate = _gate(sibling, sink, runs=runs)
+    approval_id = await _request(gate)
+    await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
+    assert sibling.sibling_moved
+    assert runs == ["ran"] and await _status(store, approval_id) == "interrupted"
+    assert await store.list_audit(action="approval.approved") == []
     assert sink.lost == [(f"approval:{approval_id}", "approval.approved")]
+    assert sink.copy_missing == []
+
+
+async def test_an_interrupted_outcome_moved_by_a_sibling_pages_audit_write_failed(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The sibling leaves the row at the very status and approver this write would have, so only
+    the write's own decision time tells the two apart (vault BACKLOG #3193 N1)."""
+    sink = _Sink()
+    sibling = _SiblingMoved(store, outcome="approval.interrupted")
+    gate = _gate(sibling, sink)
+    approval_id = await _request(gate)
+    assert await store.decide_pending_approval(
+        approval_id, status="executing", approver="checker", decided_at=1.0
+    )
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"):
+        await gate._record_interrupted_execution(
+            approval_id,
+            operation="dead_letter_replay",
+            approver="checker",
+            requester="r",
+            client=None,
+        )
+    # The read-back found the row moved by another caller, so the lost detail says so.
+    [lost] = [r.getMessage() for r in caplog.records if "Lost detail" in r.getMessage()]
+    assert '"recorded": false' in lost, lost
+    assert sibling.sibling_moved
+    assert await _status(store, approval_id) == "interrupted"
+    rows = await store.list_audit(action="approval.interrupted")
+    assert [r["actor"] for r in rows] == ["system"]  # only the sibling's row
+    assert sink.lost == [(f"approval:{approval_id}", "approval.interrupted")]
+    assert sink.copy_missing == []
+
+
+async def test_an_outcome_read_back_that_fails_pages_audit_write_failed(
+    store: MessageStore,
+) -> None:
+    """The combined write commits with its reply lost, as above, but the read-back raises, so the
+    gate cannot say the row is stored and pages audit_write_failed (vault BACKLOG #3193 N1)."""
+    sink = _Sink()
+    runs: list[str] = []
+    gate = _gate(_ReadBackFails(store, outcome="approval.approved"), sink, runs=runs)
+    approval_id = await _request(gate)
+    await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
+    assert runs == ["ran"] and await _status(store, approval_id) == "approved"
+    assert len(await store.list_audit(action="approval.approved")) == 1
+    assert sink.lost == [(f"approval:{approval_id}", "approval.approved")]
+    assert sink.copy_missing == []
+
+
+async def test_an_interrupted_outcome_read_back_that_fails_logs_the_flag_unknown(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A read-back that raises cannot say whether another caller moved the row, so the lost
+    detail logs the ``recorded`` flag as unknown rather than false (vault BACKLOG #3193 N1)."""
+    sink = _Sink()
+    gate = _gate(_ReadBackFails(store, outcome="approval.interrupted"), sink)
+    approval_id = await _request(gate)
+    assert await store.decide_pending_approval(
+        approval_id, status="executing", approver="checker", decided_at=1.0
+    )
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"):
+        await gate._record_interrupted_execution(
+            approval_id,
+            operation="dead_letter_replay",
+            approver="checker",
+            requester="r",
+            client=None,
+        )
+    [lost] = [r.getMessage() for r in caplog.records if "Lost detail" in r.getMessage()]
+    assert '"recorded": "unknown"' in lost, lost
+    # The committed write's row is the only one: "unknown" never reaches a written row.
+    [row] = await store.list_audit(action="approval.interrupted")
+    assert json.loads(str(row["detail"]))["recorded"] is True
+    assert sink.lost == [(f"approval:{approval_id}", "approval.interrupted")]
+    assert sink.copy_missing == []
+
+
+async def test_an_interrupted_outcome_resolved_before_its_read_back_logs_the_flag_unknown(
+    store: MessageStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The combined 'interrupted' write commits, an operator resolves the row before the reply
+    arrives, and the reply is lost. The read-back finds 'resolved_applied', which this write's
+    own row may have led to, so the lost detail logs the flag unknown and no second row is
+    written (vault BACKLOG #3193 N1)."""
+
+    class _ResolvedFirst(_StandingStore):
+        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+            moved = bool(await self._store.decide_pending_approval(approval_id, **kw))
+            audit = kw.get("audit")
+            if audit is not None and audit.action == "approval.interrupted":
+                # Not asserted: _settle catches any exception raised here. The status check
+                # below shows the resolve landed.
+                await self._store.decide_pending_approval(
+                    approval_id,
+                    status="resolved_applied",
+                    approver="resolver",
+                    decided_at=3.0,
+                    from_status="interrupted",
+                )
+                raise sqlite3.OperationalError("connection reset after COMMIT")
+            return moved
+
+    sink = _Sink()
+    gate = _gate(_ResolvedFirst(store), sink)
+    approval_id = await _request(gate)
+    assert await store.decide_pending_approval(
+        approval_id, status="executing", approver="checker", decided_at=1.0
+    )
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.approvals"):
+        await gate._record_interrupted_execution(
+            approval_id,
+            operation="dead_letter_replay",
+            approver="checker",
+            requester="r",
+            client=None,
+        )
+    assert await _status(store, approval_id) == "resolved_applied"
+    [lost] = [r.getMessage() for r in caplog.records if "Lost detail" in r.getMessage()]
+    assert '"recorded": "unknown"' in lost, lost
+    [row] = await store.list_audit(action="approval.interrupted")
+    assert json.loads(str(row["detail"]))["recorded"] is True
+    assert sink.lost == [(f"approval:{approval_id}", "approval.interrupted")]
+    assert sink.copy_missing == []
 
 
 async def test_an_unencodable_result_still_settles_the_release(store: MessageStore) -> None:
@@ -412,7 +608,28 @@ async def test_the_notifier_emits_audit_write_failed_keyed_on_the_request() -> N
             "type": "audit_write_failed",
             "connection": "approval:abc",
             "action": "approval.approved",
-            "reason": "the approval.approved audit row was not written",
+            "reason": "the approval.approved audit row was not written, or its write's outcome "
+            "is unknown",
+        }
+    ]
+
+
+async def test_the_notifier_emits_audit_offbox_copy_missing_as_its_own_alert() -> None:
+    """Vault BACKLOG #3193 N1: a row the gate read back as stored pages its own type, routable
+    apart from a lost row, and its reason does not say the row was not written."""
+    assert "audit_offbox_copy_missing" in _ALERT_EVENT_TYPES
+    assert "audit_offbox_copy_missing" not in _ALERT_CONTROL_EVENT_TYPES
+    AlertRule(event_type="audit_offbox_copy_missing")  # a rule may target it
+    sink = NotifierAlertSink([])
+    events: list[dict[str, Any]] = []
+    sink._emit = events.append  # type: ignore[method-assign,assignment]
+    sink.audit_offbox_copy_missing("approval:abc", action="approval.requested")
+    assert events == [
+        {
+            "type": "audit_offbox_copy_missing",
+            "connection": "approval:abc",
+            "action": "approval.requested",
+            "reason": "the approval.requested audit row's off-box copy was not written",
         }
     ]
 
@@ -420,8 +637,14 @@ async def test_the_notifier_emits_audit_write_failed_keyed_on_the_request() -> N
 def test_the_logging_sink_logs_audit_write_failed(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.WARNING):
         LoggingAlertSink().audit_write_failed("approval:abc", action="approval.approved")
+        LoggingAlertSink().audit_offbox_copy_missing("approval:abc", action="approval.requested")
     assert any(
         "ALERT audit_write_failed" in r.getMessage() and "approval.approved" in r.getMessage()
+        for r in caplog.records
+    )
+    assert any(
+        "ALERT audit_offbox_copy_missing" in r.getMessage()
+        and "approval.requested" in r.getMessage()
         for r in caplog.records
     )
 
@@ -541,8 +764,10 @@ async def test_a_request_whose_commit_landed_answers_its_id(
     assert approval_id is not None
     assert [str(r["id"]) for r in await store.list_pending_approvals(now=0.0)] == [approval_id]
     assert len(await store.list_audit(action="approval.requested")) == 1
-    # Paged still: the off-box copy of its row was never written.
-    assert sink.lost == [(f"approval:{approval_id}", "approval.requested")]
+    # Paged still: the off-box copy of its row was never written, and the page says only that
+    # (vault BACKLOG #3193 N1).
+    assert sink.copy_missing == [(f"approval:{approval_id}", "approval.requested")]
+    assert sink.lost == []
     assert any("reading it back found it held" in r.getMessage() for r in caplog.records)
     # The retry the caller would have made joins it, through the real store's repeat rule.
     assert await _guard(_gate(store, _Sink())) == approval_id

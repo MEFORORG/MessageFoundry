@@ -86,7 +86,7 @@ from messagefoundry.odbc_call_gate import raw_cursor as _raw_cursor
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
-from messagefoundry.redaction import codec_safe_str, safe_text
+from messagefoundry.redaction import codec_safe_str, safe_exc, safe_text
 from messagefoundry.store import server_schema_verify
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
@@ -238,6 +238,7 @@ from messagefoundry.store.store import (
     AdminGrant,
     AdminHolderTest,
     AdminRemoval,
+    AlertGeneration,
     AlertInstance,
     AlertSummary,
     AppendedAuditRow,
@@ -1034,9 +1035,18 @@ def _applock_timeout_ms(command_timeout: int) -> int:
     return int(command_timeout * 1000) if command_timeout else -1
 
 
+#: What a clamped borrow's :class:`StoreAcquireTimeout` advises when the clamp, not
+#: ``[store].acquire_timeout``, was the limit (:meth:`SqlServerStore._acquire_clamped`). One fixed
+#: text for every clamped borrow, because no single setting sets every clamp: the
+#: docs/CONFIGURATION.md [cluster] paragraph it points to says which does, and stop()'s writes run
+#: at a fixed bound that none does. It stays short enough that ``safe_exc``'s default limit keeps
+#: the whole rendered message, at any timeout (BACKLOG #5064).
+CLAMPED_BORROW_ADVICE = "its [cluster] clamp's setting, if any (docs/CONFIGURATION.md [cluster])"
+
+
 def _clamped_statement_timeout(clamp_seconds: float, command_timeout: int) -> int:
     """The whole-second pyodbc statement timeout for a statement clamped below ``command_timeout``
-    (ADR 0157 Inc 0: the cluster lease claim/renew).
+    (ADR 0157 Inc 0: the cluster coordinator's maintenance loop and stepdown, BACKLOG #5064).
 
     pyodbc's ``Connection.timeout`` is an integer, so the clamp rounds DOWN, never up: a bound that
     rounded up could land past the detection margin the clamp was checked against. It never drops
@@ -1985,10 +1995,18 @@ CLUSTER_SCHEMA: tuple[str, ...] = (
     "IF COL_LENGTH(N'leader_lease', N'leader_epoch') IS NULL"
     " ALTER TABLE leader_lease ADD leader_epoch BIGINT NOT NULL"
     " CONSTRAINT DF_leader_lease_epoch DEFAULT 0;",
+    # config_digest is the initiating node's digest of what it applied, and config_digest_version
+    # the version it was stored with, both written by the same bump as the version, so a follower
+    # reads them as one pair (vault BACKLOG #3109; stamped_config_digest). NULL is unknown.
     "IF OBJECT_ID(N'cluster_config', N'U') IS NULL"
     " CREATE TABLE cluster_config ("
     " id INT NOT NULL PRIMARY KEY, config_version INT NOT NULL,"
+    " config_digest NVARCHAR(MAX) NULL, config_digest_version INT NULL,"
     " updated_at FLOAT NOT NULL);",
+    "IF COL_LENGTH(N'cluster_config', N'config_digest') IS NULL"
+    " ALTER TABLE cluster_config ADD config_digest NVARCHAR(MAX) NULL;",
+    "IF COL_LENGTH(N'cluster_config', N'config_digest_version') IS NULL"
+    " ALTER TABLE cluster_config ADD config_digest_version INT NULL;",
 )
 
 
@@ -2202,7 +2220,7 @@ _SCHEMA: list[str] = [
         status NVARCHAR(16) NOT NULL, first_seen FLOAT NOT NULL, last_seen FLOAT NOT NULL,
         [count] BIGINT NOT NULL, reason NVARCHAR(MAX) NULL, acked_by NVARCHAR(256) NULL,
         acked_at FLOAT NULL, resolved_at FLOAT NULL, suspended_until FLOAT NULL,
-        escalation_tier INT NOT NULL DEFAULT 0)""",
+        escalation_tier INT NOT NULL DEFAULT 0, raised_by NVARCHAR(64) NULL)""",
     # #143: windowed NOTIFICATION-mute end-epoch (NULL/past = not suspended). COL_LENGTH-gated ADD for a
     # pre-existing (from #56) alert_instance table; a no-op on a fresh DB (the CREATE above already has it).
     """IF COL_LENGTH('alert_instance','suspended_until') IS NULL
@@ -2211,6 +2229,9 @@ _SCHEMA: list[str] = [
     # a pre-existing alert_instance; NOT NULL DEFAULT 0 backfills existing rows. No-op on a fresh DB.
     """IF COL_LENGTH('alert_instance','escalation_tier') IS NULL
         ALTER TABLE alert_instance ADD escalation_tier INT NOT NULL DEFAULT 0""",
+    # #4916: the notifier that wrote the newest raise (a per-process random id); NULL on old rows.
+    """IF COL_LENGTH('alert_instance','raised_by') IS NULL
+        ALTER TABLE alert_instance ADD raised_by NVARCHAR(64) NULL""",
     """IF INDEXPROPERTY(OBJECT_ID('alert_instance'),'ux_alert_instance_open','IndexID') IS NULL
         CREATE UNIQUE INDEX ux_alert_instance_open ON alert_instance(event_type, connection)
         WHERE status <> 'resolved'""",
@@ -5559,17 +5580,26 @@ class SqlServerStore:
 
     def _acquire_clamped(self, clamp_seconds: float) -> AbstractAsyncContextManager[Any]:
         """:meth:`_acquire` with a SHORTER acquire limit: the smaller of ``[store].acquire_timeout``
-        and ``clamp_seconds``. Only the cluster lease claim/renew borrows this way
-        (:meth:`_fetchone_clamped` says why)."""
-        return self._borrow(min(self._settings.acquire_timeout, clamp_seconds))
+        and ``clamp_seconds``. Only the cluster coordinator's clamped statements borrow this way
+        (:meth:`_fetchone_clamped` says why). When the clamp is the shorter limit, a borrow that
+        times out advises :data:`CLAMPED_BORROW_ADVICE` rather than ``[store].acquire_timeout``,
+        which would not help; at a tie raising ``[store].acquire_timeout`` would not help either.
+        Otherwise it advises ``[store].acquire_timeout``, as :meth:`_acquire` does (BACKLOG
+        #5064)."""
+        if clamp_seconds <= self._settings.acquire_timeout:
+            return self._borrow(clamp_seconds, retune=CLAMPED_BORROW_ADVICE)
+        return self._borrow(self._settings.acquire_timeout)
 
     @asynccontextmanager
-    async def _borrow(self, timeout: float) -> AsyncIterator[Any]:
+    async def _borrow(
+        self, timeout: float, *, retune: str = "[store].acquire_timeout"
+    ) -> AsyncIterator[Any]:
         """The body of :meth:`_acquire`, :meth:`_acquire_after_commit` and :meth:`_acquire_clamped`,
         and the sole place this store borrows from its pool. ``timeout`` is the acquire limit, never
-        ``None``."""
+        ``None``; ``retune`` is the advice a timed-out borrow's message ends with
+        (:func:`~messagefoundry.store.base.acquire_pooled`)."""
         t0 = perf_counter()
-        conn = await acquire_pooled(self._pool, timeout=timeout, backend="sqlserver")
+        conn = await acquire_pooled(self._pool, timeout=timeout, backend="sqlserver", retune=retune)
         self._acquire_wait.record((perf_counter() - t0) * 1000.0)
         try:
             _install_call_gate(conn)  # BACKLOG #2049: one pyodbc call at a time on this connection
@@ -5656,14 +5686,17 @@ class SqlServerStore:
         duplicate key and 2628 the truncated value.
 
         ``within`` bounds the rollback, in seconds; ``None``, which every caller but
-        :meth:`_fetch_rows` on a clamped read passes, leaves it unbounded and enters no timeout at
-        all. A rollback that runs past the bound is treated as one that failed: the connection is
-        discarded. Where the call gate already marks the rollback as running, the close is handed
+        :meth:`_fetch_rows` and :meth:`_write_rows` on a clamped statement passes, leaves it
+        unbounded and enters no timeout at all. A rollback that runs past the bound is treated as
+        one that failed: the connection is discarded. Where the call gate already marks the rollback as running, the close is handed
         to it and lands as it returns (BACKLOG #2049). A rollback the bound cancelled before it
         entered the gate never runs (BACKLOG #2394), so the separate close that follows takes the
         gate's lock with no rollback left to race it, and the close ends the transaction.
         :meth:`_fetch_rows` passes the lease claim's clamp, so a stalled rollback
-        after a failed claim cannot hold ``_leadership_lock`` past it (BACKLOG #5066).
+        after a failed claim cannot hold ``_leadership_lock`` past it (BACKLOG #5066), and
+        :meth:`_write_rows` passes it for every clamped write (BACKLOG #5064): a stepdown's release
+        write, which holds the same lock, the heartbeat, which runs in series with the renew, and
+        stop()'s two writes at the shutdown bound.
 
         The discard is :func:`_detach_connection`, the same detach :meth:`_release_dirty` uses, and
         unlike that method it does NOT wait for the close.
@@ -5825,49 +5858,71 @@ class SqlServerStore:
     async def _fetchall(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         return await self._fetch_rows(sql, params)
 
+    def _clamp_bounds(
+        self, timeout_clamp: float | None
+    ) -> tuple[AbstractAsyncContextManager[Any], int | None, float | None]:
+        """``(borrow, statement timeout, rollback bound)`` for one statement. ``timeout_clamp`` is
+        ``None`` for every caller outside the SQL Server cluster coordinator, and ``None`` keeps the :meth:`_acquire` borrow and ``[store].command_timeout``. One value sets
+        the borrow, the statement and the rollback bounds, so none can be set without the others; a
+        shorter ``[store].command_timeout`` still ends the statement first, and bounds neither of
+        the other two."""
+        if timeout_clamp is None:
+            return self._acquire(), None, None
+        # The borrow is floored at 1 s like the statement, so a sub-second clamp runs as 1 s on
+        # both, as the coordinator's warning says, and a 0 clamp never refuses every borrow. The
+        # rollback after a failure gets the same floored clamp (BACKLOG #5066).
+        floored_clamp = max(1.0, timeout_clamp)
+        return (
+            self._acquire_clamped(floored_clamp),
+            _clamped_statement_timeout(timeout_clamp, self._settings.command_timeout),
+            floored_clamp,
+        )
+
     async def _fetch_rows(
         self, sql: str, params: tuple[Any, ...], timeout_clamp: float | None = None
     ) -> list[dict[str, Any]]:
-        """The body of :meth:`_fetchall` and :meth:`_fetchone_clamped`. ``timeout_clamp`` is
-        ``None`` for every caller but the cluster lease claim/renew, and ``None`` keeps the
-        :meth:`_acquire` borrow and ``[store].command_timeout``. One value sets the borrow, the
-        statement and the rollback bounds, so none can be set without the others; a shorter
-        ``[store].command_timeout`` still ends the statement first, and bounds neither of the
-        other two."""
-        if timeout_clamp is None:
-            borrow, statement_timeout, floored_clamp = self._acquire(), None, None
-        else:
-            # The borrow is floored at 1 s like the statement, so a sub-second clamp runs as 1 s on
-            # both, as the coordinator's warning says, and a 0 clamp never refuses every borrow. The
-            # rollback after a failure gets the same floored clamp (BACKLOG #5066).
-            floored_clamp = max(1.0, timeout_clamp)
-            borrow = self._acquire_clamped(floored_clamp)
-            statement_timeout = _clamped_statement_timeout(
-                timeout_clamp, self._settings.command_timeout
-            )
-        async with borrow as conn:
-            try:
-                async with (
-                    self._statement_timeout(conn, statement_timeout),
-                    self._cursor(conn) as cur,
-                ):
-                    await cur.execute(sql, params) if params else await cur.execute(sql)
-                    columns = [c[0] for c in cur.description]
-                    rows = await cur.fetchall()
-                    # Read-snapshot release, NOT a durable write — commit without counting (A1). This is
-                    # the single read helper (_fetchall, _fetchone and _fetchone_clamped delegate here);
-                    # routing every read through _commit was what made committed_txns a superset of the
-                    # write cost model on a live SQL Server.
-                    await self._commit_read(conn)
-            except Exception:
-                # autocommit=False: a failed read otherwise leaves the pooled connection mid-txn (and
-                # under RCSI an open snapshot pins the version store / bloats tempdb). Roll back before
-                # it returns to the pool so the next borrower starts clean (M-6). After the cursor has
-                # closed and the timeout is restored, so a discard races neither; _rollback_or_discard
-                # says why it is bounded and discards (BACKLOG #5066).
-                await self._rollback_or_discard(conn, within=floored_clamp)
+        """The body of :meth:`_fetchall` and :meth:`_fetchone_clamped`; :meth:`_clamp_bounds`
+        says what ``timeout_clamp`` sets. A failure of the pool release alone, after the commit,
+        keeps the result, as :meth:`_write_rows` does: the lease claim and the config-version
+        refresh are MERGEs that come through here, so a claim that committed must not read as a
+        failed renew (BACKLOG #5064)."""
+        borrow, statement_timeout, floored_clamp = self._clamp_bounds(timeout_clamp)
+        result: list[dict[str, Any]] | None = None
+        try:
+            async with borrow as conn:
+                try:
+                    async with (
+                        self._statement_timeout(conn, statement_timeout),
+                        self._cursor(conn) as cur,
+                    ):
+                        await cur.execute(sql, params) if params else await cur.execute(sql)
+                        columns = [c[0] for c in cur.description]
+                        rows = await cur.fetchall()
+                        # Read-snapshot release, NOT a durable write — commit without counting (A1).
+                        # This is the single read helper (_fetchall, _fetchone and _fetchone_clamped
+                        # delegate here); routing every read through _commit was what made
+                        # committed_txns a superset of the write cost model on a live SQL Server.
+                        await self._commit_read(conn)
+                except Exception:
+                    # autocommit=False: a failed read otherwise leaves the pooled connection mid-txn
+                    # (and under RCSI an open snapshot pins the version store / bloats tempdb). Roll
+                    # back before it returns to the pool so the next borrower starts clean (M-6).
+                    # After the cursor has closed and the timeout is restored, so a discard races
+                    # neither; _rollback_or_discard says why it is bounded and discards (BACKLOG
+                    # #5066).
+                    await self._rollback_or_discard(conn, within=floored_clamp)
+                    raise
+                # Set only once the body finished cleanly, as in _write_rows.
+                result = [dict(zip(columns, row)) for row in rows]  # noqa: B905
+                return result
+        except Exception as exc:
+            if result is None:
                 raise
-        return [dict(zip(columns, row)) for row in rows]  # noqa: B905
+            log.warning(
+                "sqlserver store: a statement committed, then its pool release failed: %s",
+                safe_exc(exc),
+            )
+            return result
 
     async def _fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
         rows = await self._fetchall(sql, params)
@@ -5877,10 +5932,12 @@ class SqlServerStore:
         self, sql: str, params: tuple[Any, ...], *, timeout_clamp: float
     ) -> dict[str, Any] | None:
         """:meth:`_fetchone` bounded by ``timeout_clamp`` (ADR 0157 Inc 0). The cluster lease
-        claim/renew is its only caller.
+        claim/renew and the config-version refresh are at least its callers (BACKLOG #5064);
+        :meth:`_execute_clamped` is its twin for a write. A borrow that times out at the clamp
+        advises :data:`CLAMPED_BORROW_ADVICE` (:meth:`_acquire_clamped`).
 
         Two windows before the statement returns, each at most the clamp floored at 1 s. The wait
-        for a pooled connection is the smaller of ``max(1.0, clamp)`` and ``[store].acquire_timeout`` (:meth:`_fetch_rows` applies
+        for a pooled connection is the smaller of ``max(1.0, clamp)`` and ``[store].acquire_timeout`` (:meth:`_clamp_bounds` applies
         the floor, :meth:`_acquire_clamped` the minimum): a renew that waited out a saturated pool past the
         fence would otherwise still extend the lease after this node self-fenced. The statement's
         own timeout is :func:`_clamped_statement_timeout`, applied by :meth:`_statement_timeout`.
@@ -5892,7 +5949,9 @@ class SqlServerStore:
         clamp after it is issued, while ``ClusterSettings._renew_fits_the_margin`` compares the
         clamp alone with the margin. The COMMIT after the statement is a call on the connection, not a
         statement, so neither the clamp nor ``[store].command_timeout`` is known to bound it, by a
-        reading of pyodbc's documentation, not a measurement.
+        reading of pyodbc's documentation, not a measurement. Whether msodbcsql bounds
+        ``SQLEndTran`` needs a live SQL Server, and BACKLOG #6621 measures it; until then the COMMIT
+        is outside both windows (BACKLOG #5064 keeps that as a stated reason, not a bound).
 
         **The ROLLBACK after a failure has its own bound (BACKLOG #5066):** the clamp floored at
         1 s, applied on the event loop by :meth:`_rollback_or_discard`. One that fails or runs past
@@ -5909,21 +5968,64 @@ class SqlServerStore:
     async def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:
         """Run a single write statement (or T-SQL batch) in its own committed transaction, and return
         the driver's row count (``-1`` when it reports none). Most callers ignore it; the cluster
-        stepdown reads it to say truthfully whether its owner-scoped release matched a row."""
-        async with self._acquire() as conn:
-            try:
-                async with self._cursor(conn) as cur:
-                    await cur.execute(sql, params)
-                    # getattr: some test cursors model no row count, and -1 is the DB-API 'unknown'.
-                    count = getattr(cur, "rowcount", -1)
-                    rows = count if isinstance(count, int) else -1
-                    await self._commit(conn)
-            except Exception:
-                # A rollback that fails would otherwise recycle a connection still holding the
-                # write's X locks; _rollback_or_discard discards it instead. After the cursor block,
-                # so a detached close cannot race the cursor's own close.
-                await self._rollback_or_discard(conn)
+        stepdown reads it, through :meth:`_execute_clamped`, to say truthfully whether its
+        owner-scoped release matched a row."""
+        return await self._write_rows(sql, params)
+
+    async def _execute_clamped(
+        self, sql: str, params: tuple[Any, ...], *, timeout_clamp: float
+    ) -> int:
+        """:meth:`_execute` bounded by ``timeout_clamp`` exactly as :meth:`_fetchone_clamped` bounds
+        a read, whose docstring says what that leaves unbounded, the COMMIT included, and what a
+        timed-out borrow advises (BACKLOG #5064). The cluster heartbeat and the lease release are
+        at least its callers. The
+        heartbeat runs in series with the renew and a stepdown's release under
+        ``_leadership_lock``, so ``[store].command_timeout`` there would delay the renew (BACKLOG
+        #6472); ``stop()`` passes its own bound instead of the renew clamp."""
+        return await self._write_rows(sql, params, timeout_clamp)
+
+    async def _write_rows(
+        self, sql: str, params: tuple[Any, ...], timeout_clamp: float | None = None
+    ) -> int:
+        """The body of :meth:`_execute` and :meth:`_execute_clamped`; :meth:`_clamp_bounds` says
+        what ``timeout_clamp`` sets.
+
+        A failure of the pool release alone, after the write committed, is logged and the row count
+        returned, as ``cluster._call_within`` does on Postgres: reporting that write as failed would
+        tell the cluster stepdown its release is unconfirmed when it landed (BACKLOG #5064). Before
+        #5064, :meth:`_execute` lost the count the same way."""
+        borrow, statement_timeout, floored_clamp = self._clamp_bounds(timeout_clamp)
+        committed: int | None = None
+        try:
+            async with borrow as conn:
+                try:
+                    async with (
+                        self._statement_timeout(conn, statement_timeout),
+                        self._cursor(conn) as cur,
+                    ):
+                        await cur.execute(sql, params)
+                        # getattr: some test cursors model no row count, and -1 is the DB-API
+                        # 'unknown'.
+                        count = getattr(cur, "rowcount", -1)
+                        rows = count if isinstance(count, int) else -1
+                        await self._commit(conn)
+                except Exception:
+                    # A rollback that fails would otherwise recycle a connection still holding the
+                    # write's X locks; _rollback_or_discard discards it instead. After the cursor
+                    # block, so a detached close cannot race the cursor's own close.
+                    await self._rollback_or_discard(conn, within=floored_clamp)
+                    raise
+                # Set only once the body finished cleanly, so an exception past here is the borrow's
+                # exit, the pool release, and never the write itself.
+                committed = rows
+        except Exception as exc:
+            if committed is None:
                 raise
+            log.warning(
+                "sqlserver store: a write committed, then its pool release failed: %s",
+                safe_exc(exc),
+            )
+            return committed
         return rows
 
     async def _execute_output(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
@@ -8131,6 +8233,7 @@ class SqlServerStore:
         reason: str | None = None,
         escalation_tier: int = 0,
         now: float | None = None,
+        raised_by: str | None = None,
     ) -> None:
         # Pure observer (ADR 0044 D2): no queue row, no finalizer. De-dup grain = ADR 0014's
         # (event_type, connection) key. UPDATE-then-conditional-INSERT in one serializable transaction
@@ -8152,7 +8255,8 @@ class SqlServerStore:
             try:
                 await cur.execute(
                     "UPDATE alert_instance SET last_seen=?, [count]=[count]+1, severity=?, reason=?,"
-                    " escalation_tier=CASE WHEN escalation_tier < ? THEN ? ELSE escalation_tier END"
+                    " escalation_tier=CASE WHEN escalation_tier < ? THEN ? ELSE escalation_tier END,"
+                    " raised_by=?"
                     " WHERE event_type=? AND connection=? AND status<>'resolved'",
                     (
                         now,
@@ -8160,6 +8264,7 @@ class SqlServerStore:
                         reason_enc,
                         escalation_tier,
                         escalation_tier,
+                        raised_by,
                         event_type,
                         connection,
                     ),
@@ -8168,8 +8273,18 @@ class SqlServerStore:
                     await cur.execute(
                         "INSERT INTO alert_instance"
                         " (event_type, connection, severity, status, first_seen, last_seen,"
-                        " [count], reason, escalation_tier) VALUES (?,?,?,'open',?,?,1,?,?)",
-                        (event_type, connection, severity, now, now, reason_enc, escalation_tier),
+                        " [count], reason, escalation_tier, raised_by)"
+                        " VALUES (?,?,?,'open',?,?,1,?,?,?)",
+                        (
+                            event_type,
+                            connection,
+                            severity,
+                            now,
+                            now,
+                            reason_enc,
+                            escalation_tier,
+                            raised_by,
+                        ),
                     )
                 await self._commit(conn)
             except Exception:
@@ -8427,6 +8542,63 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
         return int(changed)
+
+    async def open_alert_generations(
+        self, *, event_type: str, connection: str | None = None
+    ) -> list[AlertGeneration]:
+        # BACKLOG #3269: (id, connection, count) of the live instances of one type. No reason read.
+        # status<>'resolved' is the live predicate spelled as ux_alert_instance_open's filter, so
+        # the read seeks that index.
+        where = ["event_type=?", "status<>'resolved'"]
+        params: list[Any] = [event_type]
+        if connection is not None:
+            where.append("connection=?")
+            params.append(connection)
+        rows = await self._fetchall(
+            "SELECT id, connection, [count] AS count FROM alert_instance WHERE "
+            + " AND ".join(where)
+            + " ORDER BY id",
+            tuple(params),
+        )
+        return [AlertGeneration(int(r["id"]), str(r["connection"]), int(r["count"])) for r in rows]
+
+    async def resolve_alert_instances_fenced(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        raised_by: str,
+        seen: AlertGeneration | None,
+        now: float | None = None,
+    ) -> int:
+        # BACKLOG #4916: close the key's live instance only when its newest raise is one this writer
+        # saw at the clear (seen_id/seen_count) or is this writer's own (raised_by). Clock-free.
+        # OUTPUT, not rowcount: the sink reads a zero as "a newer raise kept it open", and SET
+        # NOCOUNT ON cannot hide an output rowset.
+        now = time.time() if now is None else now
+        seen_id, seen_count = (seen.id, seen.count) if seen is not None else (-1, -1)
+        closed = await self._execute_output(
+            "UPDATE alert_instance SET status='resolved', resolved_at=? OUTPUT inserted.id"
+            " WHERE event_type=? AND connection=? AND status<>'resolved'"
+            " AND (raised_by=? OR (id=? AND [count]<=?))",
+            (now, event_type, connection, raised_by, seen_id, seen_count),
+        )
+        return len(closed)
+
+    async def resolve_alert_generation(
+        self, *, alert_id: int, through_count: int, now: float | None = None
+    ) -> int:
+        # BACKLOG #3269: resolve one live instance only while no raise has folded in past
+        # through_count. Clock-free.
+        # OUTPUT, not rowcount: the caller acts on whether the row closed, and SET NOCOUNT ON
+        # cannot hide an output rowset.
+        now = time.time() if now is None else now
+        closed = await self._execute_output(
+            "UPDATE alert_instance SET status='resolved', resolved_at=? OUTPUT inserted.id"
+            " WHERE id=? AND [count]<=? AND status<>'resolved'",
+            (now, alert_id, through_count),
+        )
+        return len(closed)
 
     async def suspend_alert_instance(
         self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None

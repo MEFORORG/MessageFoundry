@@ -43,6 +43,7 @@ from messagefoundry.config.wiring import (
     env,
     load_config,
 )
+from messagefoundry.pipeline.wiring_runner import FailedLine
 from messagefoundry.store import MessageStore
 from tests.test_trust_anchors import _block, _path_ok
 
@@ -996,7 +997,7 @@ async def test_a_marked_lane_with_a_live_connector_is_still_checked(
         runner = await _start_like_serve(engine, cfg)
         assert "OUT" in runner._destinations
         runner._anchor_refused[("outbound", "OUT")] = (str(ca), pin)
-        runner._failed[("outbound", "OUT")] = "planted"
+        runner._failed[("outbound", "OUT")] = FailedLine("planted", store_fault=False)
         ca.write_bytes(_block(b"substitute"))
         with pytest.raises(WiringError, match=_PIN_MISMATCH):
             await engine.reload_detail(cfg)
@@ -1017,7 +1018,7 @@ async def test_a_marked_poller_that_is_bound_is_still_checked(
     try:
         assert runner.inbound_running("IB_FTPS")
         runner._anchor_refused[("inbound", "IB_FTPS")] = (str(ca), pin)
-        runner._failed[("inbound", "IB_FTPS")] = "planted"
+        runner._failed[("inbound", "IB_FTPS")] = FailedLine("planted", store_fault=False)
         ca.write_bytes(_block(b"substitute"))
         with pytest.raises(WiringError, match=_PIN_MISMATCH):
             await runner.reload(_ftps_poller_registry(ca, pin=pin))

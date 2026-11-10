@@ -509,10 +509,20 @@ false premise.
 - **Where it is reported:** `security_loosenings()` names a value above `30` minutes or `12` hours
   (vault BACKLOG #2600), so the serve-time warning, `messagefoundry security show` and
   `GET /security/posture` list it. A value of `0` or less ends every session at once, which is
-  stricter, and is not named. The registry reads the value the load copied into `[auth]`, so the
-  preview `messagefoundry security set` prints reflects the value from before the edit, and can
-  miss a new loosening or keep one just removed. The next `security show` is right, when it can
-  load the whole file.
+  stricter, and is not named. `messagefoundry security show` and the `security set` preview read
+  both limits from the file's `[security]`, the authored values `show` prints. When a
+  `MEFOR_SECURITY_*` variable in the operator's shell sets a limit to a value other than the
+  file's, and that value is itself a loosening, it is named too, after the authored entries and
+  beside any entry for the file's own value, with a risk that starts by naming the variable. Where
+  the load and the `[security]` read disagree with no such variable set, as a concurrent edit
+  between the two reads leaves them, the entry says the two reads disagreed instead. A
+  variable equal to the file's value, or one whose value is no loosening, adds no entry. Only the
+  two session limits get this: a `MEFOR_SECURITY_*` variable for another switch, at least
+  `require_mfa` and `block_unlisted_outbound`, is not named. It needs a whole-file load that ran
+  and succeeded, so a report the failed load left partial names none, and so does `security show` on a file that does
+  not exist yet; `security set` on a new file loads what it wrote, and names it. The variable also
+  feeds that load, so one the load refuses makes the report partial, or refuses the edit. The IDE
+  security editor marks a value above the default it is shown.
 
 ### `block_unlisted_outbound = false` — allow-any outbound egress
 - **What you lose:** deny-by-default egress; a transform may send to **any** destination (PHI exfiltration
@@ -1636,9 +1646,9 @@ count is above `0` (vault BACKLOG #2613).
 > same environment. Under `enforce` it is inert: a safe config directory loads as usual, and an
 > unsafe one is refused with an error that names the variable.
 > **`warn` set only in the settings file does not unlock it.** The check runs in every process that
-> loads config, and some of those read no settings file: at least the sandbox worker, and the
-> offline commands that load config before any settings. So the dial has to sit where the escape
-> does.
+> loads config, and some of those read no settings file: at least the offline commands that load
+> config before any settings. So the dial has to sit where the escape does. The sandbox worker is
+> not one of them: it runs the config its parent read and checked, and neither variable reaches it.
 > **The dial in the environment is the instance's dial, not a switch for this check alone.** A
 > `messagefoundry check` run with both variables judges every posture gate at `warn`. To check a
 > config at `enforce`, lock its directory instead.
@@ -1732,8 +1742,9 @@ count is above `0` (vault BACKLOG #2613).
 - **What you lose:** the engine stops protecting that hop and takes your word that something else does.
   A cleartext or verify-off hop the enforcing gates would refuse is **allowed**: this is the one per-hop
   declaration that yields ALLOW rather than WARN. The crossing is logged, but the hop is recorded as
-  secure, not as an accepted risk. That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a verify-off HTTP-family egress hop that carries no credential (at least the MLLP, FTPS and email verify-off refusals do not read it) and a weakened database TLS
-  hop. If the claim is false, the payload and any credential the connection carries cross in the
+  secure, not as an accepted risk. That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a weakened database TLS hop, and a verify-off HTTP-family
+  egress hop that carries no credential (at least the MLLP, FTPS and email verify-off refusals do not
+  read the attestation) and sets no `ech_egress` (why: the `refuse_verify_off` docstring in [`transports/rest.py`](../messagefoundry/transports/rest.py)). If the claim is false, the payload and any credential the connection carries cross in the
   clear, and nothing about the hop looks wrong afterwards. The exception is an HTTP-family
   credential the refusal recognizes over cleartext `http` to a
   host off this machine. It stays refused, attested or not (vault BACKLOG #3533 item 4). A secret
@@ -1827,8 +1838,7 @@ count is above `0` (vault BACKLOG #2613).
   the shapes its own controls pin. It reads call shapes by name, not what the code evaluates to, so
   some such call sites pass it; ADR 0173 §4.3's note of 2026-11-04 and the docstrings of that
   file's relaxed-hop census say what it reads. REST, SOAP
-  and FHIR hand the guard no context there, so their refusal names the `[tls].crl_file` default
-  (ADR 0173 §13, *Left open*).)* The engine will tell you *which* connections have it set,
+  and FHIR hand the guard no context there.)* The engine will tell you *which* connections have it set,
   for as long as they have it set; it has no notion of *until when*, so the removal date belongs in your
   own risk register. Where it is NOT reported is the same list as `cleartext_accepted` above —
   `messagefoundry security show` and a graphless `GET /security/posture` say so in `loosenings_scope`.
@@ -2162,7 +2172,11 @@ count is above `0` (vault BACKLOG #2613).
 - **When acceptable:** on a lab box run with a Vault dev-server root token. Not as a steady state.
 - **It is never silent:** a WARNING line starting `AUDIT:` at every start it lets through,
   `over_grant_accepted: true` on the `vault_privilege_preflight` audit row, and an entry here and in
-  `GET /security/posture`.
+  `GET /security/posture`. The warning and the `vault_privilege_warning` alert still fire, but the
+  alert is keyed on the hop alone, so where engine processes share one store, another process's
+  clean start can resolve it while this accepted over-grant still runs, so a closed alert does not
+  prove the over-grant is gone (what an operator checks:
+  [docs/SECURITY.md](SECURITY.md#each-backend-hops-least-privilege-the-engine-probes-the-store-vault-and-ldap)). The audit row of each start is the record that stays.
 - **What it does not do:** it lifts that one refusal only. Every other Vault over-grant, such as a
   token shared by two hops or an extra capability on a path the engine calls, and a probe that could
   not read the token because of a network failure, a timeout or a 403, only warn, so there is
