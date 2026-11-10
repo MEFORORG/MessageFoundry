@@ -402,7 +402,8 @@ async def stop_tasks_within(
     tombstone, so the row reads ``active`` and leading until ``node_timeout_seconds`` passes. For
     that time a sibling's stepdown can count this stopped node as a promotable sibling.
 
-    Both are bounded by the cancelled statement's own timeout, the renew clamp on Postgres, and the
+    Both are bounded by the cancelled statement's own timeout, the renew clamp on both backends
+    (on SQL Server since BACKLOG #5064, and there short of a COMMIT nothing is known to bound), and the
     abandoned task holds its connection that long, so the store's pool close can wait for it.
 
     Never raises. A task's stored error is read and logged here rather than raised, because the
