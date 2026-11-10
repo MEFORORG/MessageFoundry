@@ -194,11 +194,8 @@ def test_an_outage_on_encrypt_and_decrypt_is_cipher_unavailable(exc: Exception) 
     ):
         with pytest.raises(CipherUnavailableError) as info:
             call()
-        # No plaintext. Type-only, as before, except a refusal of the reply, whose fixed text
-        # vault_failure_text keeps whole.
-        text = str(info.value)
-        assert "MRN123" not in text
-        assert type(exc).__name__ in text or str(exc) in text
+        # Type-only: the key id and the type name, a reply refusal's fixed text left out too.
+        assert str(info.value).endswith(f"(key={_KEY!r}): {type(exc).__name__}")
 
 
 @pytest.mark.parametrize("exc", _REFUSALS, ids=lambda e: type(e).__name__)
@@ -396,6 +393,104 @@ async def test_the_upload_routes_answer_an_outage_503_and_a_refusal_423(
         transit.fail = None
         assert sorted(os.listdir(root)) == sorted([f"{fid}.blob", f"{fid}.meta"])
         assert [f["file_id"] for f in (await c.get("/uploads", headers=h)).json()["files"]] == [fid]
+
+
+_CHAIN_MARKER = "MARKER-TRANSIT-CHAIN-3734"
+
+
+def _exceptions_held_by(raised: BaseException) -> list[BaseException]:
+    """Every exception object the raised 503 reaches through its args, its chain links and the
+    locals of every frame on its traceback, the 503 itself left out."""
+    seen: list[object] = [*raised.args, raised.__cause__, raised.__context__]
+    tb = raised.__traceback__
+    while tb is not None:
+        seen += list(tb.tb_frame.f_locals.values())
+        tb = tb.tb_next
+    return [v for v in seen if isinstance(v, BaseException) and v is not raised]
+
+
+async def test_the_outage_503_holds_no_link_to_the_transit_chain(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """The 503 is built from the cause's text and raised after the handler, so its args, its
+    ``__cause__`` and ``__context__`` and its traceback's frame locals hold no exception, and none
+    whose repr carries the marker every failing Transit call puts in its own text (BACKLOG #3734).
+    Covers the override holder's sidecar read, the owner's body read and a save that reaches the
+    encrypt (an empty root, so the quota scan reads nothing first)."""
+    pytest.importorskip("psutil")
+    from fastapi.exception_handlers import http_exception_handler
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+
+    from messagefoundry.api import create_app
+
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    await _add_user(service, Role.ADMINISTRATOR, name="root")
+    root = tmp_path / "uploads"
+    root.mkdir(parents=True, exist_ok=True)
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    cipher, transit = _cipher()
+    app.state.upload_store = UploadStore(root, cipher, max_bytes=10**6, max_files_per_user=100)
+    caught: list[BaseException] = []
+
+    async def spy(request: Any, exc: Exception) -> Any:
+        assert isinstance(exc, StarletteHTTPException)
+        if exc.status_code == 503:
+            caught.append(exc)
+        return await http_exception_handler(request, exc)
+
+    app.add_exception_handler(StarletteHTTPException, spy)
+
+    def failing(**kw: Any) -> dict[str, Any]:
+        raise requests.exceptions.ConnectionError(f"{_CHAIN_MARKER} {sorted(kw.items())!r}")
+
+    async with httpx.AsyncClient(
+        transport=reproving_transport(PW, app=app), base_url="http://t"
+    ) as c:
+        h = await _login(c, "op")
+        ha = await _login(c, "root")
+        r = await c.post("/uploads", files={"file": ("a.hl7", BATCH, "text/plain")}, headers=h)
+        assert r.status_code == 200, r.text
+        fid = r.json()["file_id"]
+
+        # The override holder: the sidecar read meets the outage.
+        transit.decrypt_data = failing  # type: ignore[method-assign]
+        for call in (
+            c.get(f"/uploads/{fid}/messages", headers=ha),
+            c.post(f"/uploads/{fid}/resend", json={"index": 0, "to": "in1"}, headers=ha),
+            c.delete(f"/uploads/{fid}", headers=ha),
+        ):
+            assert (await call).status_code == 503
+        # The owner: the sidecar reads, the body read meets the outage.
+        real_decrypt = _RealAeadTransit.decrypt_data
+
+        def body_fails(**kw: Any) -> dict[str, Any]:
+            if kw.get("associated_data") == _assoc("body", fid):
+                failing(**kw)
+            return real_decrypt(transit, **kw)
+
+        transit.decrypt_data = body_fails  # type: ignore[method-assign]
+        for call in (
+            c.get(f"/uploads/{fid}/messages", headers=h),
+            c.post(f"/uploads/{fid}/resend", json={"index": 0, "to": "in1"}, headers=h),
+        ):
+            assert (await call).status_code == 503
+        # A save that reaches the encrypt.
+        empty = tmp_path / "empty-uploads"
+        empty.mkdir()
+        app.state.upload_store = UploadStore(empty, cipher, max_bytes=10**6)
+        transit.encrypt_data = failing  # type: ignore[method-assign]
+        r = await c.post("/uploads", files={"file": ("b.hl7", BATCH, "text/plain")}, headers=h)
+        assert r.status_code == 503, r.text
+
+    assert len(caught) == 6
+    for raised in caught:
+        assert raised.__cause__ is None and raised.__context__ is None
+        held = _exceptions_held_by(raised)
+        assert not [e for e in held if _CHAIN_MARKER in repr(e)]
+        assert held == [], [type(e).__name__ for e in held]
+        assert all(isinstance(a, str | int) for a in raised.args), raised.args
 
 
 # --- the web console --------------------------------------------------------------------------

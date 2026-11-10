@@ -8737,11 +8737,14 @@ def create_app(
         to rotate-key or a delete for a file that is fine. Like the 423, the body names no file
         and no cipher detail.
 
-        Built from the store's error, which it logs at WARNING with the operation, so an outage
-        that blocks every upload is on the record. That text is the cipher's own, which carries
-        only the key id and an exception type, never a value."""
+        Built from the TEXT of the store's error, never the error itself, so the 503 holds no link
+        to the Transit chain, whose request can carry a body. The text is logged at WARNING with
+        the operation, so an outage that blocks every upload is on the record. It is the cipher's
+        outage text, the key id and an exception type name (``crypto_transit._transit_failure``).
+        Every caller raises it after its ``except`` clause has ended, so ``__context__`` is empty
+        too."""
 
-        def __init__(self, cause: UploadUnavailableError, op: str) -> None:
+        def __init__(self, cause: str, op: str) -> None:
             _log.warning("upload %s answered 503: %s", op, cause)
             super().__init__(
                 503,
@@ -8785,9 +8788,8 @@ def create_app(
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnavailableError as exc:
-            # BACKLOG #3734: an outage, not the 423. Bound now, so the 503 logs its cause.
-            outage = exc
-            override_answer = lambda: _UploadUnavailable(outage, op)  # noqa: E731
+            # BACKLOG #3734: an outage, not the 423. Only its text is kept past this clause.
+            override_answer = partial(_UploadUnavailable, str(exc), op)
         except UploadUnreadableError:
             override_answer = _UploadSidecarRefused
         if override_answer is not None:
@@ -8884,6 +8886,7 @@ def create_app(
                 client=client_ip(request),
             )
             raise HTTPException(415, nontext) from None
+        outage: str | None = None
         try:
             # uploader_id (the immutable account id) is the ownership + quota key; uploader (the
             # username) rides along as the display/audit label. See uploads.UploadedFileMeta.
@@ -8918,9 +8921,12 @@ def create_app(
             )
             raise HTTPException(409, str(exc)) from None
         except UploadUnavailableError as exc:
+            outage = str(exc)
+        if outage is not None:
             # BACKLOG #3734: nothing was written, so a retry stores the file once. Not audited as a
-            # reject, because the file was not refused.
-            raise _UploadUnavailable(exc, "save") from None
+            # reject, because the file was not refused. Raised after the handler, from the text
+            # alone, so no chain link reaches the Transit request (see _UploadUnavailable).
+            raise _UploadUnavailable(outage, "save")
         # Vault BACKLOG #3178: the creation row outlives the request, so a deadline that fires now
         # still leaves the stored file with its row. A row that cannot be written removes the file.
         #
@@ -9072,14 +9078,17 @@ def create_app(
             except ContentSearchError as exc:
                 raise HTTPException(400, str(exc)) from exc
         meta = await _authorized_upload_meta(request, engine, us, identity, file_id, "browse")
+        outage: str | None = None
         try:
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnavailableError as exc:
-            raise _UploadUnavailable(exc, "browse") from None
+            outage = str(exc)
         except UploadUnreadableError:
             raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
+        if outage is not None:
+            raise _UploadUnavailable(outage, "browse")  # after the handler: no chain link
         result = await asyncio.to_thread(
             browse_messages,
             data,
@@ -9230,14 +9239,17 @@ def create_app(
             raise HTTPException(404, f"no such inbound connection: {body.to}") from None
         # Object-level authorization on the SOURCE file, in ADDITION to the target-channel check above.
         await _authorized_upload_meta(request, engine, us, identity, file_id, "resend")
+        outage: str | None = None
         try:
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnavailableError as exc:
-            raise _UploadUnavailable(exc, "resend") from None
+            outage = str(exc)
         except UploadUnreadableError:
             raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
+        if outage is not None:
+            raise _UploadUnavailable(outage, "resend")  # after the handler: no chain link
         parts = await asyncio.to_thread(split_uploaded, data)
         if body.index >= len(parts):
             raise HTTPException(
@@ -9359,14 +9371,17 @@ def create_app(
         # Vault BACKLOG #3178: the unlink and its row run as one operation that outlives the
         # request, so a deadline can no longer land between them and leave a removed file with no
         # row.
+        outage: str | None = None
         try:
             meta = await outliving.run(_delete_and_record(), "upload delete")
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnavailableError as exc:
-            raise _UploadUnavailable(exc, "delete") from None
+            outage = str(exc)
         except UploadUnreadableError:
             raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
+        if outage is not None:
+            raise _UploadUnavailable(outage, "delete")  # after the handler: no chain link
         return UploadDeleteResult(file_id=meta.file_id, filename=meta.filename, deleted=True)
 
     # --- saved / layered Log-Search filter presets (BACKLOG #151, ADR 0136) --
