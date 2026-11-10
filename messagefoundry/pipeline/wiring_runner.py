@@ -3927,7 +3927,8 @@ class RegistryRunner:
         keeps one open, escalating, throttled instance (BACKLOG #1741).
 
         An engine restart whose start fails records the inbound failed and alerts through
-        :meth:`_record_failed`, as :meth:`start` does, once while the record stands. Its stop half
+        :meth:`_record_failed`, as :meth:`start` does, once while the record stands and its class,
+        a store fault or not, holds (:meth:`_repeats_failed_class`). Its stop half
         already ran, so without the record a restart queued behind an operator's resolving start
         could leave the inbound down with no record and no open alert. Either way the error still
         reaches the caller; an operator's restart records nothing, as before."""
@@ -4301,7 +4302,8 @@ class RegistryRunner:
                     exc_info=not refused,
                 )
                 line = _lane_anchor_line(direction, name, settings, exc, passive=True)
-                self._record_failed(name, line, kind=direction, store_fault=_is_store_fault(exc))
+                line.__cause__ = exc  # as a start raises it, so the line's class reads off it
+                self._record_failed(name, line, kind=direction)
 
     def engine_parked_outbounds(self) -> frozenset[str]:
         """The outbounds the ENGINE holds down by design: those the DR run-profile parks, and those
@@ -5021,9 +5023,9 @@ class RegistryRunner:
         another process took meanwhile is first found here, after the reload has committed. Before
         this, the error reached :meth:`_schedule_worker`, which logged a traceback every tick and
         recorded nothing an operator reads as status. The next tick still retries, and a bind that
-        succeeds clears the record. While the record stands, a retry that fails is logged at DEBUG
-        only, whatever its reason: keying on the reason text would re-alert every tick on an error
-        whose message varies. A reload clears the record (see :meth:`reload`), so the next window
+        succeeds clears the record. While the record stands, a retry that fails in the same class,
+        a store fault or not (:meth:`_repeats_failed_class`), is logged at DEBUG only: keying on
+        the reason text would re-alert every tick on an error whose message varies. A reload clears the record (see :meth:`reload`), so the next window
         open alerts afresh.
 
         :meth:`_checked_inbound_start` records a failed start before this runs (BACKLOG #3859), so
@@ -5396,9 +5398,7 @@ class RegistryRunner:
         if source is not None:
             await source.stop()
 
-    def _record_failed(
-        self, name: str, exc: BaseException, *, kind: Direction, store_fault: bool | None = None
-    ) -> None:
+    def _record_failed(self, name: str, exc: BaseException, *, kind: Direction) -> None:
         """Isolate a connection that failed to build/bind (ADR 0031): record the reason, log it
         loudly, and alert — the engine keeps the rest of the graph running. Reuses the AlertSink
         ``connection_stopped`` signal: its meaning ("this connection is down until an operator
@@ -5408,12 +5408,11 @@ class RegistryRunner:
         bare name: an alert row is addressed to the operator's connection, and the detail says which
         direction failed to start.
 
-        The line's class (:class:`FailedLine`) is read off ``exc``'s cause chain, unless
-        ``store_fault`` names it for a line raised with no cause (vault BACKLOG #5146)."""
+        The line's class (:class:`FailedLine`) is read off ``exc``'s explicit cause chain, so a
+        fixed line must carry its cause (vault BACKLOG #5146)."""
         fixed = isinstance(exc, TrustAnchorError) and exc.fixed_text
         reason = safe_exc(exc, limit=_ANCHOR_LINE_LIMIT) if fixed else safe_exc(exc)
-        if store_fault is None:
-            store_fault = _is_store_fault(exc)
+        store_fault = _is_store_fault(exc)
         if store_fault:
             # A store fault's line replaces a refusal's, so the refusal's mark goes with it: the
             # lane no longer reads as held on a refused CA, and the next reload reads the CA

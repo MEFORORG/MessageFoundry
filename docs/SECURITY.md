@@ -2625,8 +2625,11 @@ test (vault BACKLOG #3746).** A start or restart whose CA check the store stoppe
 **503**, not the **409** a refused CA answers on an inbound, and its `connection_control` row would
 carry `reason` `store_unavailable`. A restart would have stopped the lane before the check ran, so
 its 503 would say the connection is left stopped until the next start. The lane would read
-`failed`, and a lane with no earlier failure on record would show a line saying the CA could not be
-checked. An outbound checks its CA at a start only when it has no connector. An operator start of
+`failed`, with a line saying the CA could not be checked. That line would replace one recorded
+earlier for any other reason, and a refused CA found once the store is back would replace it in
+turn, each with one alert; a repeat of the same kind of failure keeps the line and alerts no
+more (vault BACKLOG #5146). A refused-CA lane whose line a store fault replaced is no longer kept
+failed across a reload, so the next reload reads its CA again. An outbound checks its CA at a start only when it has no connector. An operator start of
 such a lane that was paused would leave it paused with its rows pending, because a resumed lane
 with no connector charges each row it claims an attempt, and a finite `max_attempts` would
 dead-letter it with nothing known against the CA.

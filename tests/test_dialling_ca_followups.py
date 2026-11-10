@@ -922,6 +922,10 @@ async def test_a_refused_row_cannot_read_as_a_completed_action(
         await engine.stop()
 
 
+def _store_down() -> AnchorStoreUnavailable:
+    return AnchorStoreUnavailable("the store refused the trust-anchor audit read")
+
+
 def _store_fault_line() -> TrustAnchorError:
     """What a start raises for a check the store stopped: the lane's fixed line, from the fault."""
     line = TrustAnchorError("inbound connection: its tls_ca_file could not be checked")
@@ -1233,10 +1237,6 @@ class _Switch:
         raise self.exc
 
 
-def _store_down() -> AnchorStoreUnavailable:
-    return AnchorStoreUnavailable("the store refused the trust-anchor audit read")
-
-
 def _refused() -> TrustAnchorError:
     return TrustAnchorError("the CA does not match its configured SHA-256 pin")
 
@@ -1285,32 +1285,25 @@ async def test_an_outbound_line_follows_its_class_in_both_directions(
         await runner.stop()
 
 
-async def test_an_inbound_line_follows_its_class_in_both_directions(
+async def test_an_inbound_start_line_follows_its_class_in_both_directions(
     store: MessageStore, tmp_path: Path, judged: None
 ) -> None:
-    """The inbound twin, through the scheduler's window opens and an engine restart, the doors
-    that retry on their own. Red under: ``_checked_inbound_start``, ``restart_inbound`` or
-    ``_record_window_open_failure`` keyed on membership again."""
-    schedule = _day_schedule()
+    """The inbound twin, through the start door, which records before either retrying door
+    looks. Red under: ``_checked_inbound_start`` keyed on membership again."""
     switch = _Switch(_store_down())
     sink = _CountingSink()
     runner = _runner(
-        store,
-        _poller_graph(_ca(tmp_path), _WRONG_PIN),
-        lane_anchor_check=switch,
-        alert_sink=sink,
-        schedule_clock=lambda: _at(9),
+        store, _poller_graph(_ca(tmp_path), _WRONG_PIN), lane_anchor_check=switch, alert_sink=sink
     )
     await runner.start()
     try:
         assert runner.failed_on_store_fault("inbound", _IB)
         assert sink.stopped == [_IB]
-        await runner._reconcile_schedule(_IB, "inbound", schedule)
-        assert sink.stopped == [_IB]
 
         switch.exc = _refused()
         for _ in range(2):
-            await runner._reconcile_schedule(_IB, "inbound", schedule)
+            with pytest.raises(TrustAnchorError):
+                await runner.start_inbound(_IB)
         assert _LANE_REFUSED in (runner.inbound_failed(_IB) or "")
         assert not runner.failed_on_store_fault("inbound", _IB)
         assert sink.stopped == [_IB, _IB]
@@ -1318,8 +1311,61 @@ async def test_an_inbound_line_follows_its_class_in_both_directions(
         switch.exc = _store_down()
         for _ in range(2):
             with pytest.raises(TrustAnchorError):
-                await runner.restart_inbound(_IB)
+                await runner.start_inbound(_IB)
         assert _UNCHECKED_LINE in (runner.inbound_failed(_IB) or "")
+        assert runner.failed_on_store_fault("inbound", _IB)
+        assert sink.stopped == [_IB, _IB, _IB]
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("door", ["window_open", "engine_restart"])
+async def test_each_retrying_inbound_door_records_a_class_change_once(
+    store: MessageStore,
+    tmp_path: Path,
+    judged: None,
+    door: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The scheduler's window open and an engine restart each guard on the class themselves, for
+    a failure the start door left unrecorded. The start is stubbed so it records nothing, which
+    is what isolates the door. Red under: that door's guard keyed on membership again, one door
+    per case."""
+    sink = _CountingSink()
+    runner = _runner(
+        store,
+        _poller_graph(_ca(tmp_path), _WRONG_PIN),
+        lane_anchor_check=_Switch(_store_down()),
+        alert_sink=sink,
+    )
+    await runner.start()
+    try:
+        assert runner.failed_on_store_fault("inbound", _IB)
+        failure: list[Exception] = [_store_fault_line()]
+
+        async def unrecorded_start(_name: str, *, resolve: bool) -> None:
+            raise failure[0]
+
+        async def fail_once() -> None:
+            if door == "window_open":
+                runner._record_window_open_failure(_IB, failure[0])
+                return
+            with pytest.raises(TrustAnchorError):
+                await runner.restart_inbound(_IB)
+
+        monkeypatch.setattr(runner, "_resolving_start", unrecorded_start)
+        await fail_once()  # the same class: silent
+        assert sink.stopped == [_IB]
+
+        failure[0] = _refused()
+        await fail_once()
+        await fail_once()
+        assert not runner.failed_on_store_fault("inbound", _IB)
+        assert sink.stopped == [_IB, _IB]
+
+        failure[0] = _store_fault_line()
+        await fail_once()
+        await fail_once()
         assert runner.failed_on_store_fault("inbound", _IB)
         assert sink.stopped == [_IB, _IB, _IB]
     finally:
@@ -1329,8 +1375,8 @@ async def test_an_inbound_line_follows_its_class_in_both_directions(
 async def test_a_passive_line_keeps_its_store_fault_class(
     store: MessageStore, tmp_path: Path
 ) -> None:
-    """The passive start records a fixed line with no cause, so it names the class itself. Red
-    under: ``_preflight_passive_lanes`` not passing ``store_fault``."""
+    """The passive start builds its fixed line rather than raise it, so it links the line to its
+    cause itself. Red under: ``_preflight_passive_lanes`` not setting the line's ``__cause__``."""
     runner = _runner(
         store,
         _poller_graph(_ca(tmp_path), _WRONG_PIN),

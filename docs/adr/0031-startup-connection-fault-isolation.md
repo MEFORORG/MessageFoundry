@@ -314,7 +314,9 @@ Context above names: feed #21's downstream cert should not stop the other 20.
    - an `Ftp` poller outside its schedule window;
    - a lane its CA refused, whose config has not changed since. The reload leaves it failed, so
      §4's reload self-heal does not apply to it. A config change rebuilds it, and the reload
-     checks it then. An operator start, or a restart, checks and builds it too.
+     checks it then. An operator start, or a restart, checks and builds it too. A later start
+     whose check the store stopped ends this: its line replaces the refusal's, and the next
+     reload reads the lane's CA again (vault BACKLOG #5146).
 
    So the pin, permission and path checks of an idle lane never refuse a reload, a DR activation
    or a follower convergence. Each idle lane is checked when it is built, under rule 1. **One
