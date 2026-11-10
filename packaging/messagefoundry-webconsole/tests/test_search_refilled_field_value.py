@@ -11,6 +11,7 @@ sides: the leftover is not sent, and a value the operator typed still reaches th
 
 from __future__ import annotations
 
+import re
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -23,6 +24,8 @@ from messagefoundry.auth import Role
 from messagefoundry.pipeline import Engine
 
 _REFUSAL = "field_value applies only to an HL7 field path, not to content"
+#: The result note for no match, anchored so "10 match(es)" does not satisfy it.
+_NO_MATCH = re.compile(r">0 match\(es\) after")
 
 
 class _FormInputs(HTMLParser):
@@ -99,6 +102,14 @@ async def test_a_typed_field_value_beside_a_substring_is_refused_not_dropped(
         )
         assert again.status_code == 400, again.text
         assert _REFUSAL in again.text
+        # A Field path of only spaces is no path, so its refusal page carries no marker either.
+        r = await c.post("/ui/messages/search/run", data={"field_path": "  ", "field_value": "100"})
+        assert r.status_code == 400, r.text
+        form = _refilled(r.text, "/ui/messages/search/run")
+        form.update(content="DOE^JANE")
+        r = await c.post("/ui/messages/search/run", data=form)
+        assert r.status_code == 400, r.text
+        assert _REFUSAL in r.text
 
         # Changed on a refilled page: the posted value differs from the one the page refilled.
         first = await c.post(
@@ -122,12 +133,12 @@ async def test_a_refilled_field_value_with_its_field_path_still_searches(engine:
         first = await c.post(
             "/ui/messages/search/run", data={"field_path": "PID-3", "field_value": "999"}
         )
-        assert "0 match(es)" in first.text  # control: 999 matches nothing
+        assert _NO_MATCH.search(first.text)  # control: 999 matches nothing
         again = await c.post(
             "/ui/messages/search/run", data=_refilled(first.text, "/ui/messages/search/run")
         )
         assert again.status_code == 200, again.text
-        assert "0 match(es)" in again.text, "the refilled Field value was dropped"
+        assert _NO_MATCH.search(again.text), "the refilled Field value was dropped"
 
 
 async def test_an_uploaded_log_substring_filter_from_a_refilled_page_succeeds(
@@ -154,3 +165,11 @@ async def test_an_uploaded_log_substring_filter_from_a_refilled_page_succeeds(
         third = await c.post(action, data=form)
         assert third.status_code == 400, third.text
         assert _REFUSAL in third.text
+
+        # Another criterion refused first: the page shows the value the run would have used, so
+        # the dropped leftover does not come back without its marker.
+        form = _refilled(first.text, action)
+        form.update(field_path="", content="MRN123", control_id="C" * 300)
+        fourth = await c.post(action, data=form)
+        assert fourth.status_code == 400, fourth.text
+        assert _refilled(fourth.text, action)["field_value"] == ""

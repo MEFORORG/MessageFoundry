@@ -221,9 +221,10 @@ def posted_field_value(form: Mapping[str, str]) -> str | None:
     field-path search and then clears Field path to search on a substring posts the old Field value
     beside the new substring. The engine refuses that pair, so that leftover is not sent: it is the
     case where Field path is blank, a substring is given, and the Field value is unchanged from the
-    one the page rendered beside a Field path. A value the operator typed or changed, or one the page
-    echoed back from a refusal, is sent as posted, so the engine's refusal of it reaches the page
-    rather than the value being dropped."""
+    one the page rendered beside a Field path, whether that page showed results or a refusal. A
+    value the operator typed or changed, or one a refusal page echoed back with no Field path, is
+    sent as posted, so the engine's refusal of it reaches the page rather than the value being
+    dropped."""
     value = form.get("field_value") or None
     if (
         value is not None

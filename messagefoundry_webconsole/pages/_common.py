@@ -38,7 +38,8 @@ def _refilled_field_value(field_path: str, field_value: str) -> Markup:
     only with a path: a page re-rendered from a refused value-without-path holds no marker, so
     resubmitting that refusal sends the value again rather than dropping it. It holds the same value
     as the visible box beside it and travels in the POST body, as the box does."""
-    value = field_value if field_path else ""
+    # Blank as posted_field_value and the engine read it: a path of only spaces is no path.
+    value = field_value if field_path.strip() else ""
     return el("input", type="hidden", name=REFILLED_FIELD_VALUE, value=value or None)
 
 
