@@ -219,6 +219,48 @@ async def test_post_swap_cluster_propagate_failure_reports_degraded_and_new_grap
         await eng.stop()
 
 
+async def test_a_replaced_connector_whose_close_fails_reports_degraded_and_new_graph_is_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reload that rebuilds an outbound and cannot close the connector it replaced applies, and
+    names the step. Red (engine PR 2815): the close raised into the runner's rollback, so the
+    reload failed while the mapping kept the connector built from the new graph."""
+    inbox = tmp_path / "in"
+    old_cfg, new_cfg = tmp_path / "old", tmp_path / "new"
+    _write_config(
+        old_cfg, inbound_name="IB_T", outbound_name="OUT_T", inbox=inbox, outdir=tmp_path / "o1"
+    )
+    _write_config(
+        new_cfg, inbound_name="IB_T", outbound_name="OUT_T", inbox=inbox, outdir=tmp_path / "o2"
+    )
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
+    eng.add_registry(load_config(old_cfg))
+    await eng.start()
+    try:
+        runner = eng.registry_runner
+        assert runner is not None
+        stale: Any = runner._destinations["OUT_T"]
+        real_close = type(stale).aclose
+
+        async def close(self: Any) -> None:
+            if self is stale:
+                raise OSError("synthetic close failure")
+            await real_close(self)
+
+        monkeypatch.setattr(type(stale), "aclose", close)
+        outcome = await eng.reload_detail(new_cfg)
+
+        assert outcome.applied is True
+        assert [f.step for f in outcome.failures] == ["outbound_close"]
+        assert "OUT_T" in outcome.failures[0].detail
+        assert runner._destinations["OUT_T"] is not stale
+        assert await _delivers(inbox, tmp_path / "o2", name="CLOSEFAIL")
+    finally:
+        await eng.stop()
+
+
 async def test_unreadable_bundle_applies_and_names_the_fingerprint_step(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -298,9 +340,9 @@ async def test_fingerprint_is_taken_before_the_swap(
             order.append("fingerprint")
             return {"fingerprint": "deadbeef", "files": 1}
 
-        async def _recording_swap(new_registry: Any, env_values: Any = None) -> None:
+        async def _recording_swap(new_registry: Any, env_values: Any = None) -> Any:
             order.append("swap")
-            await original_reload(new_registry, env_values)
+            return await original_reload(new_registry, env_values)
 
         monkeypatch.setattr(
             "messagefoundry.config.fingerprint.config_fingerprint_detail", _recording_fingerprint

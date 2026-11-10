@@ -443,9 +443,8 @@ def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
     (:func:`~messagefoundry.store.sqlserver.connection_string` / ``store.postgres._build_ssl``), the MLLP
     and the anonymous FTPS ``tls_verify=false`` context, **and — since #329 —** the SFTP
     unknown-host-key acceptance for a login with no ``password``
-    (:mod:`messagefoundry.transports.remotefile`), and the webhook-alert-sink and AI-broker
-    cleartext-``http`` hops. The credential hops it no longer reaches are named once, in
-    docs/SECURITY-LOOSENING.md, *No escape sends a credential to an unverified peer*. Pass the construction-time
+    (:mod:`messagefoundry.transports.remotefile`). The credential hops it no longer reaches are
+    named once, in docs/SECURITY-LOOSENING.md, *No escape sends a credential to an unverified peer*. Pass the construction-time
     :func:`~messagefoundry.config.tls_policy.current_hop_posture` (in-gate transport cells, via
     :func:`weakened_tls_escape_permitted_here`) or an explicitly-threaded posture (the store hop and the
     out-of-gate #329 cells, whose construction never stamps the contextvar). Semantics: the escape must
@@ -787,6 +786,8 @@ class StoreSettings(_Section):
     # configured key for the keyless at-rest gate, before it resolves (BACKLOG #1998). This
     # names a *provider*, not key material, so it is NOT a secret — it must never be added to
     # `_FILE_SECRET_KEYS`. Unknown/unresolvable values fail closed at `open_store` (store/keyprovider.py).
+    # `host` reads the key custody host blob the engine mints with the store, and pins the store id
+    # at every open (vault BACKLOG #3411, store/custody_host.py); it refuses any other key beside it.
     key_provider: str = "auto"
     # Store CIPHER provider (ADR 0138, ASVS 13.3.3): selects the at-rest cipher ITSELF — distinct from
     # `key_provider` above, which only *sources* DEK bytes for the in-process AES-GCM cipher. `aesgcm` (the
@@ -3625,9 +3626,10 @@ class AuthSettings(_Section):
     # How many CONSECUTIVE passes must fail to find a principal before its sessions are revoked. A
     # single ambiguous result never revokes: "the search returned nothing" cannot tell deleted from
     # moved out of the search base, and a set disabled bit or an unreadable userAccountControl strikes
-    # the same way, so requiring two agreeing probes costs at most one extra interval of exposure and
-    # buys immunity to a single flaky search. Strike state is process-local (the rate-limiter
-    # precedent), so a restart resets it — biased toward NOT revoking.
+    # the same way, so requiring two agreeing probes costs at most one extra interval of exposure
+    # within one process's life, and buys immunity to a single flaky search. Strike state is
+    # process-local (the rate-limiter precedent); what a restart loses is stated once, in
+    # docs/SECURITY.md, "What a restart loses" (vault BACKLOG #3689).
     ad_session_recheck_strikes: int = 2
     # Per-pass bind budget. A pass probes at most this many distinct users; the remainder are picked up
     # by the following passes (least-recently-probed first), so a very large estate degrades to a longer
@@ -4836,7 +4838,7 @@ def alert_revocation_attestations(
     """Each ``[alerts]`` revocation attestation that is set: its switch name, the hop it covers,
     what that hop's own handshake can check, and its reason (BACKLOG #2193). The ``[alerts]``
     sibling of :func:`vault_revocation_attestations`, read by :func:`security_loosenings`. A CRL
-    reaches the SMTP hop's context; none can reach the webhook's import-time opener."""
+    reaches the SMTP hop's context; none can reach the webhook's shared opener."""
     pairs = (
         (
             "alerts.email_tls_revocation_attested",
@@ -5555,9 +5557,14 @@ _ALERT_EVENT_TYPES = frozenset(
         # `approval:listing` (vault BACKLOG #3747). Since vault BACKLOG #2254 also an
         # inline config reload's lost config_reload_attempted row, keyed `config_reload:inline`.
         "audit_write_failed",
+        # vault BACKLOG #3193 N1: an approval audit row whose write the gate read back as
+        # committed, whose off-box copy was never sent. Keyed `approval:<id>`, as above.
+        "audit_offbox_copy_missing",
         # ADR 0079 mechanism 2: the directory reconciler's two audited outcomes, each routable apart:
-        # a pass left accounts unrevoked (the breaker tripped, or probes were referred, BACKLOG
-        # #2538), and one principal's sessions were revoked.
+        # a pass left accounts unrevoked, and one principal's sessions were revoked. The first is
+        # raised for at least a breaker trip, a referral (BACKLOG #2538), a configuration refusal
+        # (#3010), a probe fault (#3100), a paging refusal (vault #3696), a lasting outage (#3709)
+        # and an account the directory keeps failing for (#3100), each under its own source.
         "ad_reconcile_aborted",
         "ad_session_revoked",
         # ADR 0195: the reconciler held accounts whose userAccountControl it could not read.
@@ -5891,7 +5898,7 @@ class AlertsSettings(_Section):
     # the webhook host's certificate is covered outside the engine. The POST carries the webhook's
     # path token over https the engine verifies and checks no CRL or OCSP on, so an off-box https
     # webhook on an enforcing instance is refused at build unless this is true, with its mandatory
-    # reason. It is the only way across: the webhook rides one opener built at import, which no CRL
+    # reason. It is the only way across: the webhook rides one shared opener, which no CRL
     # can reach. A loosening, named in security_loosenings(). It never lifts the cleartext refusal.
     webhook_tls_revocation_attested: bool = False
     webhook_tls_revocation_attested_reason: str | None = None
@@ -8003,6 +8010,18 @@ def environment_named_by_env(environ: Mapping[str, str] | None = None) -> str | 
     return value if isinstance(value, str) and value.strip() else None
 
 
+def environments_dir_named_by_env(environ: Mapping[str, str] | None = None) -> str | None:
+    """The ``[environments].dir`` that ``MEFOR_ENVIRONMENTS_DIR`` sets, or ``None`` when it is unset.
+
+    Read through :func:`_env_overrides`, as :func:`load_settings` reads it, and returned as given, a
+    blank value included, since the loader takes that too. The offline subcommands locate
+    ``<dir>/<env>.toml`` without loading settings, so they need the variable that beats the file's
+    ``dir`` in ``serve``'s settings (vault BACKLOG #2355)."""
+    environ = os.environ if environ is None else environ
+    value = _env_overrides(environ).get("environments", {}).get("dir")
+    return value if isinstance(value, str) else None
+
+
 def insecure_bind_escape(settings: ServiceSettings, *, flag: bool = False) -> bool:
     """The cleartext-listener escape, folded the one way every caller folds it (ADR 0118, BACKLOG
     #1672): ``serve --allow-insecure-bind`` OR ``[security].require_encryption_for_remote = false``.
@@ -9608,7 +9627,9 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"the directory reconciler runs every {interval} s, less often than the "
                     f"default of {_auth_default('ad_session_recheck_seconds')} s, so {late}. The "
                     f"interval also delays the page about a directory outage, which comes after "
-                    f"{floor}",
+                    f"{floor}, and the page about one account the directory keeps failing for, "
+                    f"which comes after at least {run} of that account's own probes running "
+                    f"fail, at least {(run - 1) * interval} s after its first such probe",
                 )
             )
         if run > _auth_default("ad_reconcile_outage_passes"):
@@ -9620,7 +9641,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"{_auth_default('ad_reconcile_outage_passes')}: it comes after {floor} at the "
                     "configured interval. Until it does, a directory account disabled or deleted "
                     "meanwhile keeps its live engine sessions with only a WARNING and an audit row "
-                    "per pass to show for it",
+                    "per pass to show for it. The same count bounds one account the directory "
+                    "keeps failing for, so that page waits longer too",
                 )
             )
         strikes = auth.ad_session_recheck_strikes
@@ -9642,7 +9664,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     "a reconciler pass probes fewer accounts than the default of "
                     f"{_auth_default('ad_session_recheck_max_users')}, so a larger estate takes "
                     f"more passes to cover, and {late}. The smaller sample is also the breaker's "
-                    "denominator, so a smaller wave of revocations aborts the pass",
+                    "denominator, so a smaller wave of revocations aborts the pass. In an estate "
+                    "larger than the sample each account is probed less often, so the page about "
+                    "one account the directory keeps failing for, which counts that account's "
+                    "probes, comes more passes later too",
                 )
             )
         brake = (
@@ -10146,6 +10171,12 @@ def security_loosenings(
     so 0 unbounds every such credential. :func:`_auth_limit_loosenings` names it at 0 or less and
     above its default. This paragraph once recorded it as unreported.
 
+    **Two entries are read from the PROCESS (vault BACKLOG #3411):** ``recovery_key_unproved`` and
+    ``key_custody_non_local_account``, from what this process's latest open of a key custody host
+    blob found (:func:`messagefoundry.custody_posture.observed_key_custody`), and only under
+    ``[store].key_provider = 'host'``. A process that opened none, ``messagefoundry security show``
+    among them, names neither. ``store_id_not_pinned`` is read from ``store``.
+
     **One entry is read from the process environment and from no argument:**
     ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` (vault BACKLOG #2599), named while
     :func:`insecure_config_source_escape_permitted` says the loader honours it. It reports the
@@ -10225,7 +10256,8 @@ def security_loosenings(
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
     ``tls_allow_expired`` (#129 / ADR 0094), ``hostname_unchecked_hops`` declares
     ``tls_check_hostname=false`` (ASVS 12.3.2), ``query_credential_hops`` is an outbound or
-    ``FhirLookup`` whose literal ``url`` carries a credential-like query parameter (ASVS 14.2.1),
+    ``FhirLookup`` whose ``url`` carries a credential-like query parameter (ASVS 14.2.1), read as
+    ``config.wiring.query_credential_hops`` says,
     ``unverified_db_hops`` is a
     generic-ODBC ``DATABASE``
     connection whose ``odbc_params`` set no usable TLS mode its driver family reads, or set one to
@@ -10238,9 +10270,9 @@ def security_loosenings(
     ``attested_hops`` declares ``tls_hop_attested`` (ADR 0092, owner ruling 2026-09-24),
     ``revocation_attested_hops`` declares ``tls_revocation_attested`` (ADR 0173), and
     ``path_form_fhir_hops`` is an outbound ``FHIR()`` connection that sets
-    ``update_url_form="path"`` (vault BACKLOG #2571), and ``ech_cleartext_sidecar_hops`` is a
-    ``REST`` outbound whose ECH sidecar is an ``http://`` URL (ADR 0139). They arrive as
-    plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
+    ``update_url_form="path"``, or may through an ``env()`` value (vault BACKLOG #2571), and
+    ``ech_cleartext_sidecar_hops`` is a ``REST`` outbound whose ECH sidecar is an ``http://`` URL
+    (ADR 0139). They arrive as plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
     caller resolves them through the shared readers in ``config.wiring``
     (``accepted_cleartext_hops``, which walks both outbound connections and ``FhirLookup`` read
     connections; ``expiry_relaxed_hops``, which walks outbound and the inbound REMOTEFILE pollers;
@@ -10248,8 +10280,11 @@ def security_loosenings(
     which walks outbound and ``FhirLookup``; ``unverified_generic_db_hops``, which walks inbound as well as
     outbound; ``attested_secure_hops``, which walks every carrier a hop gate reads;
     ``revocation_attested_hops``, which walks inbound, outbound and ``FhirLookup``;
-    ``path_form_fhir_updates``, which walks outbound and already returns plain names;
-    ``ech_cleartext_sidecar_hops``, which walks the ``REST`` outbounds). A caller that
+    ``path_form_fhir_updates``, which walks the ``FHIR()`` outbounds;
+    ``ech_cleartext_sidecar_hops``, which walks the ``REST`` outbounds). At least the path-form,
+    ECH and generic-DATABASE names can carry a ``possibly`` marker in parentheses after the name,
+    where the caller could not resolve an ``env()`` value, so an entry is not always a bare
+    connection name. A caller that
     genuinely has no graph — ``messagefoundry security show``, which reads a
     settings file and never loads the connection config — passes empty sequences and SAYS SO in its
     output, rather than reporting a subset as if it were everything.
@@ -10900,11 +10935,12 @@ def security_loosenings(
         out.append(
             (
                 "update_url_form",
-                f"{len(path_form_fhir_hops)} FHIR connection(s) send updates in the PATH form "
-                f"({named}) — each update puts the message's resource id in the request URL, "
-                "so the receiving server's access log, and any proxy log on the path, holds "
-                "it; an id can be a medical record number or another identifier. The shipped "
-                "transaction form keeps the id out of the URL",
+                f"{len(path_form_fhir_hops)} FHIR connection(s) send updates in the PATH form, "
+                f"or may where marked possibly ({named}) — each such update puts the message's "
+                "resource id in the request URL, so the receiving server's access log, and any "
+                "proxy log on the path, holds it; an id can be a medical record number or "
+                "another identifier. The shipped transaction form keeps the id out of the URL. "
+                "A name marked possibly has an env() value this reading could not resolve",
             )
         )
     # ADR 0139: the engine-to-sidecar hop of an ECH connection. docs/SECURITY-LOOSENING.md,
@@ -10982,6 +11018,18 @@ def security_loosenings(
     # secret in the service's registry-held NSSM list, and a list that could not be read.
     if service_env is not None:
         out.extend(service_env_loosenings(service_env))
+    # --- the store key's custody (vault BACKLOG #3411, key custody slice S3). `store_id_not_pinned`
+    # is read from the settings; the other two from what this process's own open of a host blob
+    # found, read from the process as the docstring says, with their wording beside that record.
+    from messagefoundry.custody_posture import key_custody_loosenings, observed_key_custody
+
+    out.extend(
+        key_custody_loosenings(
+            key_provider=store.key_provider,
+            cipher_provider=store.cipher_provider,
+            observed=observed_key_custody(),
+        )
+    )
     # --- [store].schema_management = auto on a server backend (#305, ASVS 13.2.2). External is the
     # server-DB default; auto hands the schema DDL back to the runtime principal, which then needs
     # standing DDL rights. SQLite resolves to auto by construction and is never reported.

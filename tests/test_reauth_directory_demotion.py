@@ -72,8 +72,11 @@ async def store() -> AsyncIterator[MessageStore]:
     await s.close()
 
 
-async def _signed_in(store: MessageStore, *groups: str) -> _Session:
-    """A directory session whose roles the sign-in wrote from ``groups``, under a two-group map."""
+async def _signed_in(
+    store: MessageStore, *groups: str, scope_map: tuple[tuple[str, str], ...] = ()
+) -> _Session:
+    """A directory session whose roles the sign-in wrote from ``groups``, under a two-group map,
+    and whose channel scope it wrote under ``scope_map`` when one is given."""
     directory = RebindDirectory(_principal(*groups))
     settings = AuthSettings(
         ad_enabled=True,
@@ -86,6 +89,8 @@ async def _signed_in(store: MessageStore, *groups: str) -> _Session:
     service = AuthService(store, settings, ldap=directory)  # type: ignore[arg-type]
     await service.initialize()
     await service.set_ad_group_map([(_OPERATORS, "operator"), (_VIEWERS, "viewer")], actor="admin")
+    if scope_map:
+        await service.set_ad_group_scope_map(scope_map, actor="admin")
     out = await service._complete_ad_login(_principal(*groups), None, mfa_verified=True)
     assert out.ok and out.identity is not None and out.token is not None, out.error
     return _Session(service, directory, out.identity, out.token)
@@ -202,6 +207,146 @@ async def test_a_role_map_that_fails_its_seal_is_no_demotion_on_the_re_bind(
     reasons = await _reauth_reasons(store)
     assert any(f'"reason": "{DIRECTORY_ROLE_MAP_UNSEALED}"' in d for d in reasons), reasons
     assert not any(f'"reason": "{DIRECTORY_ROLES_DEMOTED}"' in d for d in reasons), reasons
+
+
+_SCOPE_AB = "cn=mf-scope-ab,ou=groups,dc=test,dc=invalid"
+_SCOPE_B = "cn=mf-scope-b,ou=groups,dc=test,dc=invalid"
+_SCOPE_ALL = "cn=mf-scope-all,ou=groups,dc=test,dc=invalid"
+_SCOPE_MAP = (
+    (_SCOPE_AB, "IB_A"),
+    (_SCOPE_AB, "IB_B"),
+    (_SCOPE_B, "IB_B"),
+    (_SCOPE_ALL, "*"),
+)
+
+
+@pytest.mark.parametrize(
+    "now_in", [(_SCOPE_B,), ()], ids=["one-channel-lost", "every-channel-lost"]
+)
+async def test_a_directory_account_whose_scope_narrowed_is_refused_the_re_bind_step_up(
+    store: MessageStore, now_in: tuple[str, ...]
+) -> None:
+    """Vault BACKLOG #3081 item 4. The roles are unchanged, but the directory groups now map fewer
+    channels than the scope the sign-in wrote, which the reconciler would revoke for. RED when
+    ``reauth`` renews the window, or mints the action grant, of that account. The refusal charges
+    nothing and writes no scope; its fix is a new sign-in, as for a lost role."""
+    from messagefoundry.auth.service import DIRECTORY_SCOPE_NARROWED
+
+    s = await _signed_in(store, _VIEWERS, _SCOPE_AB, scope_map=_SCOPE_MAP)
+    stored = await store.get_user(s.identity.user_id)
+    assert stored is not None and stored.channel_scope == '["IB_A", "IB_B"]'
+    token_hash = hash_token(s.token)
+    before = await store.get_session(token_hash)
+    assert before is not None
+    s.directory.bound = _principal(_VIEWERS, *now_in)
+
+    refused = await s.service.reauth(
+        s.identity, _GOOD, token=s.token, purpose=STEP_UP_ACTION_MFA_DISABLE
+    )
+
+    assert not refused.ok and refused.token is None
+    assert refused.directory_refusal is DirectoryRefusal.DEMOTED and refused.session_lost is False
+    after = await store.get_session(token_hash)
+    assert after is not None and after.reauth_at == before.reauth_at, "the window was renewed"
+    assert not s.service._action_step_up_grants, "a narrowed account was minted an action grant"
+    user = await store.get_user(s.identity.user_id)
+    assert user is not None and user.failed_attempts == 0
+    assert user.channel_scope == '["IB_A", "IB_B"]', "the refusal wrote the scope"
+    reasons = await _reauth_reasons(store)
+    assert any(f'"reason": "{DIRECTORY_SCOPE_NARROWED}"' in d for d in reasons), reasons
+
+    # CONTROL: once the directory gives the group back, the same session steps up.
+    s.directory.bound = _principal(_VIEWERS, _SCOPE_AB)
+    granted = await s.service.reauth(s.identity, _GOOD, token=s.token)
+    assert granted.ok and granted.token is not None
+
+
+@pytest.mark.parametrize(
+    ("signed_in", "now_in"),
+    [
+        ((_VIEWERS, _SCOPE_B), (_VIEWERS, _SCOPE_AB)),  # widened: never a refusal
+        ((_VIEWERS, _SCOPE_B), (_VIEWERS, _SCOPE_ALL)),  # widened to every channel
+        ((_OPERATORS, _VIEWERS), (_OPERATORS, _VIEWERS)),  # no scope stored: nothing to narrow
+    ],
+    ids=["widened", "widened-to-all", "no-scope"],
+)
+async def test_a_directory_account_whose_scope_did_not_narrow_still_steps_up(
+    store: MessageStore, signed_in: tuple[str, ...], now_in: tuple[str, ...]
+) -> None:
+    """The control for item 4: a scope the groups would widen, or no stored scope at all, is no
+    refusal. A widening still waits for a sign-in to write it, as the reconciler leaves it."""
+    s = await _signed_in(store, *signed_in, scope_map=_SCOPE_MAP)
+    s.directory.bound = _principal(*now_in)
+
+    elevation = await s.service.reauth(s.identity, _GOOD, token=s.token)
+
+    assert elevation.ok and elevation.token is not None
+    assert not any("directory_scope_narrowed" in d for d in await _reauth_reasons(store))
+
+
+async def test_the_scope_test_skips_an_administrator_and_keeps_a_manual_scope(
+    store: MessageStore,
+) -> None:
+    """Item 4's rule, asked directly: an Administrator is not asked about scope; a scope an
+    administrator set is kept when no group maps a channel, as the reconciler keeps it; and a
+    wildcard directory grant can narrow, since it reads as every channel."""
+    from messagefoundry.auth.service import DIRECTORY_SCOPE_NARROWED
+    from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL
+
+    s = await _signed_in(store, _VIEWERS, scope_map=_SCOPE_MAP)
+    user_id = s.identity.user_id
+
+    async def judged(scope: str | None, source: str, *groups: str) -> str | None:
+        await store.set_user_channel_scope(user_id, scope, source=source)  # type: ignore[arg-type]
+        fresh = await s.service._load_user(user_id)
+        assert fresh is not None
+        return await s.service._directory_roles_lost(fresh, frozenset(groups))
+
+    assert await judged('["IB_A"]', SCOPE_SOURCE_MANUAL, _VIEWERS) is None
+    assert await judged('["IB_A"]', SCOPE_SOURCE_AD, _VIEWERS) == DIRECTORY_SCOPE_NARROWED
+    assert await judged('["*"]', SCOPE_SOURCE_AD, _VIEWERS, _SCOPE_B) == DIRECTORY_SCOPE_NARROWED
+    assert await judged('["*"]', SCOPE_SOURCE_AD, _VIEWERS, _SCOPE_ALL) is None
+    assert await judged("[]", SCOPE_SOURCE_AD, _VIEWERS) is None
+    # Groups that newly grant Administrator are not asked about scope, though the stored roles do
+    # not hold it yet: the short-circuit is decided from the roles the groups grant, as sign-in
+    # and the reconciler decide it.
+    await s.service.set_ad_group_map(
+        [(_OPERATORS, "administrator"), (_VIEWERS, "viewer")], actor="admin"
+    )
+    assert await judged('["IB_A"]', SCOPE_SOURCE_AD, _VIEWERS, _OPERATORS) is None
+    await store.set_user_roles(user_id, ["administrator"])
+    assert await judged('["IB_A"]', SCOPE_SOURCE_AD, _OPERATORS) is None
+
+
+async def test_a_scope_map_that_fails_its_seal_is_no_demotion(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 4, the twin of BACKLOG #3082: a failing scope map maps no channel, so every scope
+    would read as withdrawn, but a new sign-in reads the same map. An account holding a scope is
+    refused as ``directory_scope_map_unsealed``, whose fix is UNCONFIRMED, never sign out, even
+    when its scope would not narrow. The role map is left sealed, so the role test passes."""
+    from messagefoundry.auth import service as service_module
+    from messagefoundry.auth.service import (
+        DIRECTORY_SCOPE_MAP_UNSEALED,
+        DIRECTORY_SCOPE_NARROWED,
+    )
+    from messagefoundry.store.store import AD_SCOPE_MAP, ad_map_seal_ok
+
+    s = await _signed_in(store, _VIEWERS, _SCOPE_AB, scope_map=_SCOPE_MAP)
+    real = ad_map_seal_ok
+    monkeypatch.setattr(
+        service_module,
+        "ad_map_seal_ok",
+        lambda sealer, current: current.name != AD_SCOPE_MAP and real(sealer, current),
+    )
+
+    refused = await s.service.reauth(s.identity, _GOOD, token=s.token)
+
+    assert not refused.ok and refused.token is None and refused.session_lost is False
+    assert refused.directory_refusal is DirectoryRefusal.UNCONFIRMED
+    reasons = await _reauth_reasons(store)
+    assert any(f'"reason": "{DIRECTORY_SCOPE_MAP_UNSEALED}"' in d for d in reasons), reasons
+    assert not any(f'"reason": "{DIRECTORY_SCOPE_NARROWED}"' in d for d in reasons), reasons
 
 
 async def test_a_row_re_pointed_during_the_bind_is_refused_not_judged(

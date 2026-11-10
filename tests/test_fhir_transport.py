@@ -32,7 +32,7 @@ from _fhir_fixtures import (
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
-from messagefoundry.config.wiring import FHIR, WiringError
+from messagefoundry.config.wiring import FHIR, WiringError, env, resolve_env_settings
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, DeliveryResponse, NegativeAckError
@@ -1898,9 +1898,184 @@ def test_path_form_is_refused_where_it_would_do_nothing(over: dict[str, str]) ->
         )
 
 
+@pytest.mark.parametrize(
+    "over",
+    [
+        # The form known only at build, beside a create: the build checks it.
+        {"update_url_form": env("form"), "interaction": "create"},
+        # The interaction known only at build, beside a literal path form. This was refused.
+        {"update_url_form": "path", "interaction": env("kind")},
+        {"update_url_form": "path", "conditional": env("cond")},
+        # An interaction known only at build, beside entry lists. This was refused too.
+        {"interaction": env("kind"), "allowed_entry_methods": ["POST"]},
+        # Defaults that make a coherent connection.
+        {
+            "update_url_form": env("form", default="path"),
+            "interaction": env("kind", default="update"),
+        },
+    ],
+    ids=["env-form", "env-interaction", "env-conditional", "env-interaction-lists", "defaults"],
+)
+def test_the_factory_leaves_an_env_value_it_cannot_read_to_the_build(
+    over: dict[str, object],
+) -> None:
+    """Vault BACKLOG #2571, #5330: an ``env()`` with no default is known only at build, where
+    ``FhirDestination`` checks it, so the factory does not refuse it on a guess."""
+    FHIR(url=BASE, **over)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"update_url_form": env("form", default="path"), "interaction": "create"},
+        {"update_url_form": "path", "interaction": env("kind", default="create")},
+        {"interaction": env("kind", default="create"), "allowed_entry_methods": ["POST"]},
+    ],
+    ids=["form-default", "interaction-default", "lists-beside-default"],
+)
+def test_the_factory_does_not_refuse_on_an_env_default(over: dict[str, object]) -> None:
+    """A set key overrides a default, so the factory does not refuse on one: the build reads the
+    value the environment gives, and refuses there if it is incoherent. The resolved build is the
+    control that the refusal still happens, once the value is known."""
+    spec = FHIR(url=BASE, **over)  # type: ignore[arg-type]
+    settings = resolve_env_settings(spec.settings, {})
+    with pytest.raises(ValueError, match="applies only"):
+        build_destination(
+            Destination(name="OB_FHIR", type=ConnectorType.FHIR, settings=settings),
+            egress=EgressSettings(deny_by_default=False),
+        )
+
+
+def test_a_known_non_update_conditional_rules_out_the_path_form_alone() -> None:
+    """A conditional other than if-match is not an update whatever the interaction, so an env()
+    interaction beside it does not keep a literal path form from being refused at load."""
+    with pytest.raises(ValueError, match="update_url_form='path' applies only"):
+        FHIR(
+            url=BASE,
+            update_url_form="path",
+            interaction=env("kind"),
+            conditional="if-none-exist",
+            conditional_query="a=b",
+        )
+
+
+def test_a_bundle_interaction_rules_out_the_path_form_beside_an_env_conditional() -> None:
+    """A transaction or batch interaction is never an update: the build refuses a conditional
+    beside it, and without one it is not an update. So an env() conditional does not keep a literal
+    path form from being refused at load."""
+    for kind in ("transaction", "batch"):
+        with pytest.raises(ValueError, match="update_url_form='path' applies only"):
+            FHIR(
+                url=BASE,
+                interaction=kind,
+                update_url_form="path",
+                conditional=env("cond"),
+                allowed_entry_methods=["POST"],
+            )
+
+
+def test_literal_entry_items_are_checked_beside_an_env_interaction() -> None:
+    """With the interaction known only at build, the lists' literal items are still checked at load.
+    A valid list beside the same env() is the control."""
+    with pytest.raises(ValueError, match="allowed_entry_methods items must each be"):
+        FHIR(url=BASE, interaction=env("kind"), allowed_entry_methods=["BOGUS"])
+    with pytest.raises(ValueError, match="allowed_entry_types items must each be"):
+        FHIR(
+            url=BASE,
+            interaction=env("kind"),
+            allowed_entry_methods=["POST"],
+            allowed_entry_types=["$expunge"],
+        )
+    FHIR(url=BASE, interaction=env("kind"), allowed_entry_methods=["POST"])
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"update_url_form": "path"},
+        {"conditional": "if-match"},
+        {"conditional": "if-none-exist", "conditional_query": "a=b"},
+    ],
+    ids=["path-form", "if-match", "if-none-exist"],
+)
+def test_entry_lists_beside_an_env_interaction_refuse_what_no_interaction_builds(
+    over: dict[str, str],
+) -> None:
+    """The entry lists need a Bundle interaction, which takes neither a conditional nor the path
+    form, so no value of the env() interaction builds beside both: refused at load. The same
+    settings without the lists are the control."""
+    with pytest.raises(ValueError, match="apply only to interaction='transaction' or 'batch'"):
+        FHIR(url=BASE, interaction=env("kind"), allowed_entry_methods=["POST"], **over)  # type: ignore[arg-type]
+    FHIR(url=BASE, interaction=env("kind"), **over)  # type: ignore[arg-type]
+
+
+def test_entry_types_alone_beside_an_env_interaction_are_refused_at_load() -> None:
+    """A Bundle requires allowed_entry_methods and any other interaction refuses
+    allowed_entry_types, so no value of the env() interaction builds with the types alone. The
+    types beside the methods are the control, and so is a methods env() whose default is unset,
+    which a set key may still supply."""
+    with pytest.raises(ValueError, match="which also require allowed_entry_methods"):
+        FHIR(url=BASE, interaction=env("kind"), allowed_entry_types=["Patient"])
+    FHIR(
+        url=BASE,
+        interaction=env("kind"),
+        allowed_entry_methods=["POST"],
+        allowed_entry_types=["Patient"],
+    )
+    FHIR(
+        url=BASE,
+        interaction=env("kind"),
+        allowed_entry_methods=env("m", default=None),  # type: ignore[arg-type]
+        allowed_entry_types=["Patient"],
+    )
+
+
+@pytest.mark.parametrize("form", ["path", "transaction"])
+def test_a_conditional_beside_a_bundle_is_refused_at_load_with_its_own_reason(form: str) -> None:
+    """A literal conditional beside a literal Bundle interaction is refused for that cause, never
+    with the path-form text, which would tell the operator to set the if-match they already set."""
+    with pytest.raises(ValueError, match="incompatible with interaction='transaction'"):
+        FHIR(
+            url=BASE,
+            interaction="transaction",
+            conditional="if-match",
+            update_url_form=form,  # type: ignore[arg-type]
+            allowed_entry_methods=["POST"],
+        )
+
+
 def test_unknown_update_url_form_is_refused() -> None:
     with pytest.raises(ValueError, match="update_url_form must be one of"):
         _dest(interaction="update", update_url_form="query")
+
+
+# Synthetic only: a URL carrying a password and a token= pair, the shape a wrongly bound env() key
+# can hold when it reaches these build-time refusals.
+_SECRET_SHAPED = "https://svc-user:Synth3ticPassw0rd@fhir.invalid/r?token=synthTok-0000"
+
+
+@pytest.mark.parametrize(
+    ("setting", "extra", "allowed"),
+    [
+        ("interaction", {}, ("create", "update", "transaction", "batch")),
+        ("conditional", {}, ("if-none-exist", "conditional-update", "if-match")),
+        ("update_url_form", {"interaction": "update"}, ("transaction", "path")),
+        ("format", {}, ("json",)),
+    ],
+)
+def test_a_refused_setting_does_not_echo_its_value(
+    setting: str, extra: dict[str, str], allowed: tuple[str, ...]
+) -> None:
+    """The refusal names the setting and its allowed values, never the received value (#1183)."""
+    settings = {**FHIR(url=BASE).settings, **extra, setting: _SECRET_SHAPED}
+    with pytest.raises(ValueError) as exc:
+        FhirDestination(Destination(name="OB_FHIR", type=ConnectorType.FHIR, settings=settings))
+    text = str(exc.value)
+    for part in ("Synth3ticPassw0rd", "synthTok-0000", "svc-user", "fhir.invalid"):
+        assert part not in text
+    assert f"{setting} must be one of" in text
+    for value in allowed:
+        assert repr(value) in text
 
 
 def _write_feed(tmp_path: Any, body: str) -> Any:
@@ -1919,11 +2094,52 @@ def test_check_names_every_path_form_connection(tmp_path: Any) -> None:
         f'outbound("OB_EPIC", FHIR(url="{BASE}", interaction="update", update_url_form="path"))\n'
         f'outbound("OB_DEFAULT", FHIR(url="{BASE}", interaction="update"))\n',
     )
-    assert path_form_fhir_updates(load_config(cfg)) == ["OB_EPIC"]
+    assert path_form_fhir_updates(load_config(cfg)) == [("OB_EPIC", "")]
     [r] = [r for r in run_checks(cfg, run_lint=False).results if r.name == "fhir-update-path-form"]
     assert r.ok and not r.required and not r.skipped
     assert "OB_EPIC" in r.detail and "OB_DEFAULT" not in r.detail
     assert "owner ruling R3" in r.detail
+
+
+def test_check_names_an_env_path_form_connection_as_possibly(tmp_path: Any) -> None:
+    """Vault BACKLOG #2571: ``check`` resolves no ``env()``, so it names a connection whose form
+    comes from one, marked possibly. The env() form beside a create, which the build refuses with
+    the path form, is the control."""
+    from messagefoundry.checks import run_checks
+
+    cfg = _write_feed(
+        tmp_path,
+        "from messagefoundry import env\n"
+        f'outbound("OB_ENV", FHIR(url="{BASE}", interaction="update", '
+        'update_url_form=env("epic_form")))\n'
+        f'outbound("OB_CREATE", FHIR(url="{BASE}", update_url_form=env("epic_form")))\n',
+    )
+    [r] = [r for r in run_checks(cfg, run_lint=False).results if r.name == "fhir-update-path-form"]
+    assert "OB_ENV (possibly: an env() value" in r.detail
+    assert "OB_CREATE" not in r.detail
+
+
+def test_the_reader_leaves_off_a_connection_whose_entry_lists_rule_the_path_form_out(
+    tmp_path: Any,
+) -> None:
+    """Set entry lists need a Bundle interaction, which the build refuses the path form on, so the
+    reader does not name such a connection even with the form and interaction unresolved, nor once
+    they resolve to the path form on an update. The same connection without the lists is the
+    control."""
+    from messagefoundry.config.wiring import load_config, path_form_fhir_updates
+
+    cfg = _write_feed(
+        tmp_path,
+        "from messagefoundry import env\n"
+        f'outbound("OB_LISTS", FHIR(url="{BASE}", interaction=env("kind"), '
+        'update_url_form=env("form"), allowed_entry_methods=["POST"]))\n'
+        f'outbound("OB_BARE", FHIR(url="{BASE}", interaction=env("kind"), '
+        'update_url_form=env("form")))\n',
+    )
+    reg = load_config(cfg)
+    assert [name for name, _ in path_form_fhir_updates(reg)] == ["OB_BARE"]
+    values = {"kind": "update", "form": "path"}
+    assert path_form_fhir_updates(reg, env_values=values) == [("OB_BARE", "")]
 
 
 def test_check_says_none_when_no_connection_takes_the_path_form(tmp_path: Any) -> None:
@@ -1931,7 +2147,7 @@ def test_check_says_none_when_no_connection_takes_the_path_form(tmp_path: Any) -
 
     cfg = _write_feed(tmp_path, f'outbound("OB", FHIR(url="{BASE}", interaction="update"))\n')
     [r] = [r for r in run_checks(cfg, run_lint=False).results if r.name == "fhir-update-path-form"]
-    assert "no FHIR connection sets update_url_form='path'" in r.detail
+    assert "no FHIR connection sends updates in the path form" in r.detail
 
 
 # --- the Bundle entry screen on transaction/batch (vault BACKLOG #2804) ---------------------------

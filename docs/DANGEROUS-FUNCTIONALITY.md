@@ -257,10 +257,46 @@ handles. The launcher was also started through `ShellExecuteExW`, the Windows sh
 opening a file. With neither variable set, each start ran the stand-in, with no stderr. With
 `PYTHONFAULTHANDLER=1`, and again with `PYTHONDEVMODE=1`, each exited 1 without running it.
 `pythonw -m` that inherited its parent's handles, as from a terminal that hands its own on, had a
-stderr and ran under each variable. Not measured, at least: the installed `messagefoundry-tray`
-launcher itself, a real click in Explorer or the Start menu, a `.lnk` shortcut, a start typed
-into an interactive console window, and other `PYTHON*` variables. `docs/TRAY.md` gives the
-operator's remedy.
+stderr and ran under each variable.
+
+The installed launcher was measured on 2026-11-05, on Windows 11 build 26300 with Python 3.14.7,
+by hand. No test or script in the tree repeats it. The launcher was the `messagefoundry-tray.exe`
+that pip wrote for `[project.gui-scripts]` into the `Scripts` folder of a venv inside a git
+worktree, holding an editable install, so a "checkout" in the terms above. It is a GUI-subsystem
+program. Each start was a Python `subprocess` call with `close_fds` set and no standard handles
+passed, with every other `PYTHON*` variable removed, and with its own `LOCALAPPDATA`, `APPDATA`,
+`TEMP` and `TMP`. `pythonw -m messagefoundry.tray`, run with the same venv's `pythonw.exe` the same
+way, was measured beside it.
+
+The measuring process held the tray's single-instance mutex, so that a start which got as far as
+the tray's mutex check would stop there rather than add an icon. By the code, not by this run, the
+chain is: pip's GUI launcher, then the venv's `pythonw.exe` redirector, then the base interpreter,
+which runs the tray code; `pythonw -m` starts at the redirector. The instruments were each start's
+exit code, a listing of processes from the venv taken after it exited, and the contents of its own
+`tray.log`. Which code path ended each process is not recorded. After the launcher's neither-set
+start exited, the listing still showed a `MessageFoundryTray.exe` from the venv, and its
+`tray.log` was empty; read again after that process had gone, it held the start line.
+
+| Start, no standard handles | `PYTHONFAULTHANDLER=1` | `PYTHONDEVMODE=1` | Neither set |
+|---|---|---|---|
+| `messagefoundry-tray.exe` | exit 1, no `tray.log` | exit 1, no `tray.log` | exit 0, start line in `tray.log` |
+| `pythonw -m messagefoundry.tray` | exit 1, no `tray.log` | exit 1, no `tray.log` | exit 0, start line in `tray.log` |
+
+Where a start line was written, so was the line saying another tray instance was running. A
+`MessageFoundryTray.exe` copy and four runtime DLLs appeared in the venv's `Scripts` folder,
+which every start shared, between a listing taken before the first start and one after the last.
+
+So under either variable no start reached `tray.log`. A `tray.log` cannot show that no code ran at
+all, since the tray opens it only after its imports and its branded relaunch. The readings that
+show the exit coming before any code are the 2026-10-16 ones above, taken with the throwaway
+ScriptMaker stand-in launcher, not with the installed launcher. As a contrast, in the 2026-11-05
+run the installed launcher, started by a process that handed it a pipe as its stderr, exited 0 and
+wrote its start line under each variable. That is not a terminal start, and in that run
+`pythonw -m` was not started with a pipe. Not measured, at least: a real click
+in Explorer or the Start menu, a `.lnk` shortcut, the installed launcher through `ShellExecuteExW`,
+a start typed into an interactive console window, a tray left to run on to its icon, a
+non-editable install, the installed launcher's import path, and other `PYTHON*` variables.
+`docs/TRAY.md` gives the operator's remedy.
 
 Shipping a hand start that carries `-E` was rejected. The project cannot add `-E` to the
 `messagefoundry-tray` launcher: pip writes the interpreter line from the interpreter's path alone,
@@ -271,9 +307,9 @@ command, which also turns remote debugging off, uses the bootstrap script in a c
 install it runs from.
 
 The `messagefoundry-tray` command is a launcher the installer writes. It was not run to measure its
-import path, because that starts a real tray; the stand-in measurement above covers only the
-exit. Its console twin from the same install,
-`messagefoundry.exe`, has the same form: a small program with the entry-point script archived
+import path, which the not-measured list above names. In a reading taken on 2026-10-02 with
+Python 3.14.6, not in the 2026-11-05 run, its console twin from one install, `messagefoundry.exe`,
+had the same form: a small program with the entry-point script archived
 inside it. Run from a working directory holding a decoy `messagefoundry` package,
 `messagefoundry.exe --version` loaded the real package, while `python -m messagefoundry --version`
 loaded the decoy. Measured 2026-10-02 on Windows, Python 3.14.6. Either way that start keeps remote
@@ -1194,6 +1230,7 @@ key, the account's second factor is a key the caller chose rather than one the e
 | An engine's replies to what the harness sends | The engine under test | `drivers/dimse.py`, `drivers/http.py`, `load/sender.py` |
 | What an engine delivers to a harness sink | The engine under test, and anything else that connects on loopback | `scenarios/http.py`, `sinks/dimse.py`, `sinks/email.py` |
 | Files a run or its operator wrote | A path on the command line, or a folder the run's processes share | `__main__.py`, `acceptance/runner.py`, `load/connscale/batchbox.py`, `load/coord.py`, `load/corpus.py`, `reconcile/compare.py` |
+| The self-test probe servers' answers, read before the HTTP sink binds its port | One throwaway server per `SELF_TEST_CASES` entry, each started by `_probe` in the same process on the `LOOPBACK` address in `sinks/__init__.py`. They start every time an HTTP sink starts. The self-test sends each one fixed request on its own connection and reads the answer. Every HTTP sink runs its own self-test before it binds. With several HTTP sinks live in one process, a later sink's probes can run while earlier sinks still listen. A local process with no foothold beyond its own loopback connection can make the self-test fail, but not pass. At least these footholds let a process make it pass: reaching the harness process, writing a file the harness imports, and reading, injecting into, resetting or redirecting loopback connections. A process running as the same user usually has one. On a default Windows box it can reach the harness process. It can write the files the harness imports wherever that user owns the install or the working directory. Another user may have one too, at least as Administrator or root. At least two other reads in `sinks/_http.py` take input any local peer chooses, and the six patterns find neither. One is what reaches the sink's own port, the other what reaches a probe's port. Both are parsed mostly through the standard library's `http.server`. Neither read stops when its server closes. At least on CPython 3.14.7, the handler threads are daemon threads, and `server_close` does not join them. So a connection accepted while a server was open can still be parsed after that server closes, after `HttpSink.stop` too. Each read on it times out on its own, so a peer that sends a little at a time can keep it going long after the close. | `sinks/_http.py` |
 | Nothing | These only build or write the format | `acceptance/report.py`, `load/connscale/report.py`, `load/report.py`, `scenarios/_dimse_dataset.py` |
 
 `acceptance/runner.py` reads the JUnit file its own `pytest` child wrote, with the standard

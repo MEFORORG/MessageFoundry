@@ -203,7 +203,7 @@ def store_hop(report: StorePrivilegeReport, store: StoreSettings) -> HopPrivileg
         state=state,
         identity=_store_identity(store, report),
         minimal=_store_minimal(store),
-        detail=report.summary(),
+        detail=report.summary(quote=_quoted),
     )
 
 
@@ -459,9 +459,10 @@ def vault_hop(
         else:
             ttl = f"ttl {reading.ttl}s"
         renew = {True: "renewable", False: "not renewable", None: "renewability not reported"}
-        seen.append(
-            f"token policies [{', '.join(reading.policies)}], {ttl}, {renew[reading.renewable]}"
-        )
+        # Each name quoted: a server-chosen name holding ", " or "], no expiry" would otherwise
+        # read as two policies, or end the list and append a verdict of its own (BACKLOG #2891).
+        names = ", ".join(_quoted(p) for p in reading.policies)
+        seen.append(f"token policies [{names}], {ttl}, {renew[reading.renewable]}")
     checked = [p for p in reading.required if p in reading.capabilities]
     if checked:
         seen.append("; ".join(f"{p}: {_caps(reading.capabilities[p])}" for p in checked))
@@ -483,9 +484,9 @@ def vault_hop(
             "paths the engine does not call were read only for the administrative ones; "
             "attest the rest of the policy by hand"
         )
-    # Kept as the server sent it: render_text escapes every printed line once, which reaches a
-    # policy name inside an administrative PATH as well as in the policy list, and the JSON output
-    # carries the value itself (json.dumps escapes it there).
+    # No control escaped here: render_text escapes every printed line once, which reaches a
+    # policy name inside an administrative PATH as well as in the quoted policy list, and the JSON
+    # output carries the text itself (json.dumps escapes it there).
     detail = ". ".join(parts)
     return HopPrivilege(
         consumer.hop,

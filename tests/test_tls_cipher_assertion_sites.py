@@ -69,10 +69,10 @@ from messagefoundry.transports.http_auth import with_http_digest
 from tests._ast_sites import call_sites, find_funcs
 from tests._extras_probe import OPTIONAL_EXTRAS, extra_is_installed
 
-# Imported at module scope ON PURPOSE. `rest` and `alert_sinks` build their shared opener AT IMPORT,
-# so a first import inside the every_suite_looks_weak fixture would raise during module execution and
-# fail the test for the wrong reason. Importing here puts them in sys.modules before any patch runs,
-# which also means the assertions below exercise the same module objects the engine uses.
+# Imported at module scope ON PURPOSE, so the assertions below exercise the same module objects the
+# engine uses. Their shared openers are built on first use (BACKLOG #2484); a session fixture in
+# tests/conftest.py builds them before any test, so none is first built inside the
+# every_suite_looks_weak fixture, where the build would raise and fail a test for the wrong reason.
 
 
 def _cipher_names(ctx: ssl.SSLContext) -> list[str]:
@@ -221,7 +221,7 @@ def test_without_the_patch_the_same_context_is_silent() -> None:
 
 def test_rest_shared_verifying_opener_asserts(every_suite_looks_weak: None) -> None:
     """``_no_redirect_opener`` — the default REST / FHIR / DICOMweb / fhir_lookup egress path, and the
-    construction the module-level ``_NO_REDIRECT_OPENER`` is itself built from."""
+    construction ``_shared_no_redirect_opener()`` is itself built from."""
 
     with pytest.raises(ValueError, match="HTTP-family destination"):
         rest._no_redirect_opener()
@@ -272,7 +272,7 @@ def test_the_rest_opener_handshake_is_unchanged_by_the_assertion() -> None:
     asserts urllib's own context instead of replacing it; this pins that, on the one half of the
     difference that is readable back (ALPN is write-only).
     """
-    engine = _opener_context(rest._NO_REDIRECT_OPENER)
+    engine = _opener_context(rest._shared_no_redirect_opener())
     stock = _opener_context(urllib.request.build_opener(rest._NoRedirectHandler))
     assert engine is not None and stock is not None
     assert engine.post_handshake_auth == stock.post_handshake_auth, (
@@ -437,8 +437,14 @@ def test_postgres_pinned_ca_context_asserts(every_suite_looks_weak: None, tmp_pa
 
     cert, _key = _self_signed(tmp_path)
     settings = _pg_settings(ssl_root_cert=str(cert))
-    with pytest.raises(ValueError, match="Postgres store"):
+    # The open's refusal text is fixed (engine PR 2818's seventh hold) and raised after its
+    # handler has exited (the eighth hold), so the assertion's error is on neither chain link.
+    with pytest.raises(ValueError, match="suites must narrow to the approved list") as caught:
         postgres._build_ssl(settings)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    # The control: the unwrapped builder fails on this arm's own assertion.
+    with pytest.raises(ValueError, match=r"Postgres store \(pinned CA\)"):
+        postgres._verifying_context(settings)
 
 
 def test_postgres_trust_server_certificate_context_asserts(
@@ -460,8 +466,14 @@ def test_postgres_default_arm_context_asserts(every_suite_looks_weak: None) -> N
     object existed in engine code for the assertion to run against. The engine builds it now, so the
     arm is asserted like its two siblings."""
 
-    with pytest.raises(ValueError, match=r"Postgres store \(system trust\)"):
+    # The open's refusal text is fixed (engine PR 2818's seventh hold) and raised after its
+    # handler has exited (the eighth hold), so the assertion's error is on neither chain link.
+    with pytest.raises(ValueError, match="suites must narrow to the approved list") as caught:
         postgres._build_ssl(_pg_settings())
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    # The control: the unwrapped builder fails on this arm's own assertion.
+    with pytest.raises(ValueError, match=r"Postgres store \(system trust\)"):
+        postgres._verifying_context(_pg_settings())
 
 
 # --- the AD LDAPS bind: auth/ldap.py --------------------------------------------------------------

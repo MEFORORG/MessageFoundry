@@ -74,10 +74,13 @@ from __future__ import annotations
 import ast
 import importlib.util
 import re
+import re._constants as sre_constants
+import re._parser as sre_parser
 import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -684,6 +687,46 @@ _UNSCANNABLE_RE_PATTERNS = {
     "messagefoundry/uploads.py": (
         r"f'^\\.[0-9a-f]{{32}}(?:{re.escape(_BLOB_SUFFIX)}|{re.escape(_META_SUFFIX)})\\.[0-9a-f]{{{_TMP_TOKEN_BYTES * 2}}}\\.tmp\\Z'",
     ),
+    # BACKLOG #2420 -- the DR staging refusal's trailing checks. Unresolvable BY CONSTRUCTION: the
+    # matcher is spliced from constants the refusal also writes with (_CHECKS_LEAD, _TEST_PATH,
+    # _PS_QUOTES), so the scanner cannot read it. Its literal form, the possessive pattern it
+    # compiles to, passes the nested-quantifier detector, and the literal-form test below checks
+    # that. The detector fires only when two nested levels are both greedy and unbounded, so that
+    # test also walks the parsed pattern, read with the flags it was compiled with. The walk fails
+    # on a greedy or lazy repetition whose count is not fixed, and on an opcode it does not know
+    # that holds a sub-pattern. It still reads inside a possessive repetition. It does not judge
+    # at least these: the possessive repetition itself, and a fixed count such as ``{4}`` or
+    # ``{4}+``. Nor does it judge a lazy repetition alone inside an atomic group, such as
+    # ``(?>a*?)``, which it reads as possessive. Neither the detector nor the walk models
+    # overlapping alternation.
+    #
+    # Its three kinds of unbounded repetition are possessive: the quoted run, the ' + ' parts and
+    # the ' ; ' checks. Possessive does not change what it matches here, because giving an
+    # iteration back does not yield a match. A quoted run given back ends at a character the ASCII
+    # closing quote cannot match, or at the first quote of a doubled '' pair, whose second quote
+    # is not ' ; ', ' + ', ')' or the end. A ' + ' or ' ; ' iteration given back leaves a space
+    # where ')' or the end must follow. The branches of each choice differ at their first
+    # character. No test checks that now. On 2026-11-07 UTC, against the greedy form of the
+    # pattern at commit 1ecac0d9fd, span and group did not differ on 300,000 seeded random texts
+    # from a script not kept in the tree. Nor did they differ on the 12 texts either form matched
+    # among the 36 calls to ``_split_checks`` made on Windows by 4 of the 17 DR test files run:
+    # test_b2420_staging_truncate.py, test_backup_runner.py, test_dr_backup_staging.py and
+    # test_dr_seeding.py, as they stood from 1ecac0d9fd to f35be88801. None of the 12 held a
+    # [char] part or a doubled Unicode quote; the b2420 tests that split such texts came later and
+    # were not part of that comparison. A seeded differential test, since removed, also compared
+    # the two forms from c6daab9250 to 3de33f4f7b. The caller uses the unanchored ``.search``,
+    # which starts again only where the literal lead occurs.
+    #
+    # At least these spellings are NOT coupled: the [char] spelling, the parentheses and ' + ' of
+    # _ps_path, the quote around a literal, the space after the check, and the ' ; '
+    # join_before_checks writes. Each is spelled on both sides by hand and can drift apart. The
+    # b2420 staging tests split checks on plain, [char] and doubled-Unicode-quote paths, so a
+    # drift that stops one of those splits fails there. That covers at least the [char] spelling,
+    # the parentheses, the ' + ', the quote around a literal and the space after the check. It
+    # does not cover the ' ; ' join, or a regex that reads a Unicode quote as plain text.
+    "messagefoundry/pipeline/dr_backup.py": (
+        "f'{re.escape(_CHECKS_LEAD)}({_CHECK}(?: ; {_CHECK})*+)\\\\Z'",
+    ),
     # BACKLOG #1142 -- the icacls line-1 path echo. Unresolvable BY CONSTRUCTION: the pattern is built
     # from the trust-anchor path being checked, which is runtime configuration, so there is no literal
     # to write. The per-character template is written inside the call, so it is part of this pin and
@@ -725,6 +768,172 @@ def test_the_scanners_blind_spots_are_the_recorded_ones() -> None:
         if unresolved:
             actual[path.relative_to(_REPO).as_posix()] = tuple(unresolved)
     assert actual == _UNSCANNABLE_RE_PATTERNS
+
+
+def _holds_subpattern(arg: Any) -> bool:
+    """Whether ``arg`` holds a parsed sub-pattern at any depth of nested tuples and lists."""
+    if isinstance(arg, sre_parser.SubPattern):
+        return True
+    return isinstance(arg, (tuple, list)) and any(_holds_subpattern(a) for a in arg)
+
+
+def _repeats(pattern: str, flags: int = 0) -> list[tuple[str, str]]:
+    """Every repetition in ``pattern`` whose count is not fixed, read from its parsed form, as
+    ``(kind, description)``: kind ``possessive`` or ``backtracking`` (greedy or lazy). The pin for
+    ``messagefoundry/pipeline/dr_backup.py`` above says what that covers. An atomic group whose
+    whole body is one repetition is that repetition made possessive."""
+    found: list[tuple[str, str]] = []
+    repeat_ops = (
+        sre_constants.MAX_REPEAT,
+        sre_constants.MIN_REPEAT,
+        sre_constants.POSSESSIVE_REPEAT,
+    )
+
+    def walk(seq: Any) -> None:
+        for op, arg in seq:
+            if op in repeat_ops:
+                low, high, body = arg
+                if low != high:
+                    kind = "possessive" if op == sre_constants.POSSESSIVE_REPEAT else "backtracking"
+                    found.append((kind, f"{op} {{{low},{high}}} over {list(body)}"))
+                walk(body)
+            elif op == sre_constants.SUBPATTERN:
+                walk(arg[3])
+            elif op == sre_constants.ATOMIC_GROUP:
+                if len(arg) == 1 and arg[0][0] in repeat_ops:
+                    _op, (low, high, body) = arg[0]
+                    walk([(sre_constants.POSSESSIVE_REPEAT, (low, high, body))])
+                else:
+                    walk(arg)
+            elif op == sre_constants.BRANCH:
+                for option in arg[1]:
+                    walk(option)
+            elif op in (sre_constants.ASSERT, sre_constants.ASSERT_NOT):
+                walk(arg[1])
+            elif op == sre_constants.GROUPREF_EXISTS:
+                walk(arg[1])
+                if arg[2] is not None:
+                    walk(arg[2])
+            else:
+                # An opcode this does not know, holding a sub-pattern, would hide what is in it.
+                assert not _holds_subpattern(arg), op
+
+    walk(sre_parser.parse(pattern, flags))
+    return found
+
+
+def _backtracking_repeats(pattern: str, flags: int = 0) -> list[str]:
+    """Every greedy or lazy repetition in ``pattern`` whose count is not fixed (:func:`_repeats`)."""
+    return [what for kind, what in _repeats(pattern, flags) if kind == "backtracking"]
+
+
+def test_the_dr_staging_check_matcher_passes_the_detector_in_literal_form() -> None:
+    # The pin above exempts _CHECKS_AT_END from the scan only because it is spliced. The pattern
+    # it compiles to, written out as a literal, must pass the same detector, so a sub-pattern edit
+    # that nests two greedy unbounded quantifiers reds here rather than hiding behind the pin.
+    from messagefoundry.pipeline import dr_backup
+
+    pattern = dr_backup._CHECKS_AT_END.pattern
+    source = f"import re\nre.compile({pattern!r})\n"
+    assert _regex_literals(source) == [pattern]
+    assert find_nested_quantifiers(source) == []
+    # The detector passes a pattern with only one greedy level, so it alone would not notice one
+    # repetition made greedy again.
+    flags = dr_backup._CHECKS_AT_END.flags
+    assert _backtracking_repeats(pattern, flags) == []
+    # The detector's control: the pattern with its ``)*+`` repetitions made greedy is flagged.
+    greedy = pattern.replace(")*+", ")*")
+    assert greedy != pattern
+    assert find_nested_quantifiers(f"import re\nre.compile({greedy!r})\n") == [greedy]
+
+
+def _one_edit(pattern: str, old: str, new: str) -> str:
+    """``pattern`` with its first ``old`` replaced by ``new``, which must be there."""
+    assert old in pattern
+    return pattern.replace(old, new, 1)
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        pytest.param((")*+", "){0,}"), id="greedy-brace-zero"),
+        pytest.param(("[0-9A-F]{4}", "[0-9A-F]{4,}"), id="greedy-brace-four"),
+        pytest.param(("\\Z", "\\\\+\\Z"), id="greedy-escaped-backslash-plus"),
+        pytest.param((")*+", ")*"), id="greedy-star"),
+        pytest.param((")*+", ")*?"), id="lazy-star"),
+        pytest.param(
+            (")*+)", f"){{0,{int(sre_constants.MAXREPEAT) - 1}}})"), id="greedy-large-bound"
+        ),
+        pytest.param(("[0-9A-F]{4}", "[0-9A-F]{4,8}"), id="greedy-small-bound"),
+    ],
+)
+def test_the_dr_staging_check_matcher_walk_fails_on_one_greedy_repetition(
+    edit: tuple[str, str],
+) -> None:
+    # Red before the parsed walk: the string check it replaced passed every case here but the two
+    # star ones, since it looked only for `*` and `+` and stripped every `\+`, the quantifier
+    # after `\\` included.
+    from messagefoundry.pipeline import dr_backup
+
+    pattern = _one_edit(dr_backup._CHECKS_AT_END.pattern, *edit)
+    re.compile(pattern)
+    assert len(_backtracking_repeats(pattern)) == 1
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        pytest.param(("\\Z", "\\+\\*\\Z"), id="escaped-plus-and-star-are-literals"),
+        pytest.param(("[0-9A-F]{4}", "[0-9A-F]{6}"), id="fixed-count"),
+    ],
+)
+def test_the_dr_staging_check_matcher_walk_passes_what_cannot_backtrack(
+    edit: tuple[str, str],
+) -> None:
+    # The control: the pattern with a literal or fixed-count edit passes.
+    from messagefoundry.pipeline import dr_backup
+
+    pattern = _one_edit(dr_backup._CHECKS_AT_END.pattern, *edit)
+    re.compile(pattern)
+    assert _backtracking_repeats(pattern) == []
+
+
+@pytest.mark.parametrize(
+    ("opcode", "pattern"),
+    [
+        pytest.param("BRANCH", "x(?:a|b*)y", id="branch"),
+        pytest.param("SUBPATTERN", "(b*)", id="subpattern"),
+        pytest.param("ASSERT_NOT", "(?!b*)c", id="assert-not"),
+        pytest.param("ATOMIC_GROUP", "(?>a*b*)", id="atomic-group"),
+        pytest.param("GROUPREF_EXISTS", "(a)?(?(1)b*|c)", id="conditional"),
+    ],
+)
+def test_the_parsed_walk_fails_on_a_container_it_does_not_know(
+    opcode: str, pattern: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The control for the fail-closed branch: the walk is made not to know one container opcode,
+    # as a change to the private parser could do, and must raise rather than read it as clean.
+    monkeypatch.setattr(sre_constants, opcode, object())
+    with pytest.raises(AssertionError):
+        _repeats(pattern)
+
+
+@pytest.mark.parametrize(
+    ("pattern", "backtracking"),
+    [
+        pytest.param("(?=a*)b", 1, id="lookahead"),
+        pytest.param("(?<!a)(?!b*)c", 1, id="negative-lookahead"),
+        pytest.param("(a)?(?(1)b|c*)", 2, id="conditional-else"),
+        pytest.param("(a)?(?(1)b*|c)", 2, id="conditional-then"),
+        pytest.param("(?>a*)b", 0, id="atomic-repeat-is-possessive"),
+        pytest.param("(?>a*b*)c", 2, id="atomic-group-of-two-is-not"),
+        pytest.param("x*+(?:y*+)", 0, id="possessive"),
+    ],
+)
+def test_the_parsed_walk_descends_every_container(pattern: str, backtracking: int) -> None:
+    # The real matcher has no lookaround, conditional or atomic group, so these plant one each, to
+    # show the walk reads inside them.
+    assert len(_backtracking_repeats(pattern)) == backtracking
 
 
 def test_the_blind_spot_pin_records_expressions_not_just_counts() -> None:
