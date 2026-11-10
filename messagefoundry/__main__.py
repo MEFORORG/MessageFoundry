@@ -7333,10 +7333,11 @@ def _discard_minted_custody(
     could not be created, so a second run can mint again, but only where this run can prove the
     open wrote nothing under it: the store id pin refused before the open's first write
     (:class:`~messagefoundry.store.store.StoreIdPinRefusedBeforeWrite`; a pin refusal raised later,
-    once the salt bind may have run, does not count), a server open that failed before its pin
-    check passed, its create batch's failure before the commit included
+    once the salt bind may have run, does not count), a server create batch that failed before its
+    commit, or a server open that failed building its pool with a class only a failed dial raises
     (:class:`~messagefoundry.store.store.StoreCreateBatchFailedBeforeKeyUse`, PR 2804 hold 17 and
-    vault BACKLOG #8119 item 2), or a SQLite store whose file was never made.
+    vault BACKLOG #8119 item 2; any other failure before the pin check, a ``RuntimeError``
+    included, keeps the key), or a SQLite store whose file was never made.
 
     Otherwise the file is kept, and the warning names it and says to keep it and the recovery key
     shown, deleting neither: the store may hold data sealed under it, and no check this run or an
@@ -9127,7 +9128,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
             raise HostCustodyRefused(
                 "this login resolves no store schema, and [store].schema_management is 'external' "
                 "(the default on a server store), under which this command builds none, so no key "
-                f"was minted. {_sentence(missing)} Then run the command again"
+                f"was minted. {_sentence(missing)} Under the host key provider, serve does not "
+                "build a store before its key exists: under 'auto' this command builds it as it "
+                "mints. Then run the command again"
             )
         return "none"
 

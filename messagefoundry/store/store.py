@@ -5723,10 +5723,10 @@ class StoreChainNeverStarted(StoreIdPinRefusedBeforeWrite):
 
 class StoreCreateBatchFailedBeforeKeyUse(Exception):
     """A minting server open failed before anything was sealed under the store key: its create
-    batch failed before its commit (PR 2804 hold 17), or, before its store id pin check passed, it
-    failed in a way only a connection's establishment fails, at least the hop's TLS settings, a
-    refused address or a refused login (vault BACKLOG #8119 item 2; ``store.base``'s
-    ``_failed_before_connecting`` names them). The batch is one transaction on each server
+    batch failed before its commit (PR 2804 hold 17), or it failed while building its pool, before
+    the store that holds the cipher existed, with a class only a failed dial raises, at least the
+    hop's TLS settings, a refused address or a refused login (vault BACKLOG #8119 item 2;
+    ``store.base``'s ``_failed_before_connecting`` names them). The batch is one transaction on each server
     backend, and the first seal follows ``bind_store_salt``, after the batch and after the pin
     check, which only reads. So nothing was sealed under the key, and a minting command may remove
     the key it minted, as for :class:`StoreIdPinRefusedBeforeWrite`. ``failure`` is the open's own

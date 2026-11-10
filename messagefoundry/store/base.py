@@ -4496,23 +4496,50 @@ def _absent_sqlite_store(settings: StoreSettings) -> Path | None:
     return None
 
 
-#: SQLSTATEs a server driver reports only while it establishes a connection, never on one it
-#: already holds: 08001 (unable to establish one) and 08004 (the server rejected it). The
-#: invalid-authorization class, 28, a refused login, is matched by its prefix.
+#: SQLSTATEs a server driver reports for a connection it could not establish: 08001 (unable to
+#: establish one) and 08004 (the server rejected it). The invalid-authorization class, 28, a
+#: refused login, is matched by its prefix. Each names a failed dial, not that no earlier dial in
+#: the same open succeeded, so :func:`_failed_before_connecting` asks where it was raised too.
 _CONNECT_ONLY_SQLSTATES: Final = frozenset({"08001", "08004"})
+#: The modules whose ``_create_pool`` builds a server store's pool. Each backend's open calls it
+#: once, first among the calls that can reach the database, and hands the cipher to the store only
+#: after it returns.
+_POOL_CREATION_MODULES: Final = frozenset(
+    {"messagefoundry.store.postgres", "messagefoundry.store.sqlserver"}
+)
+
+
+def _raised_creating_the_pool(exc: BaseException) -> bool:
+    """Whether ``exc``'s traceback passes through a server backend's ``_create_pool``, so it was
+    raised before the store that holds the cipher was built. A backend that catches such an error
+    and raises another outside that call answers ``False``, which keeps the key."""
+    tb = exc.__traceback__
+    while tb is not None:
+        frame = tb.tb_frame
+        if (
+            frame.f_code.co_name == "_create_pool"
+            and frame.f_globals.get("__name__") in _POOL_CREATION_MODULES
+        ):
+            return True
+        tb = tb.tb_next
+    return False
 
 
 def _failed_before_connecting(exc: Exception) -> bool:
-    """Whether ``exc`` is a failure that happens only before the open holds a connection to the
-    database, so it can have written nothing, under any key (vault BACKLOG #8119 item 2). At
-    least: the hop's own TLS settings refused (``InsecureHopRefused``, which the backends raise
-    while building the connection), a refused or unresolvable address (``ConnectionRefusedError``,
-    ``socket.gaierror``), and a driver's connection or login refusal named by its SQLSTATE
-    (:data:`_CONNECT_ONLY_SQLSTATES`, class 28). Every other class answers ``False``, at least a
-    connection lost mid-open, a timeout, a schema refusal and any ``RuntimeError``, so a minting
-    open that fails with one keeps its key (the Manager's ruling of 2026-11-10 on #8119)."""
+    """Whether a minting server open's ``exc`` proves it wrote nothing under its key (vault BACKLOG
+    #8119 item 2, the Manager's ruling of 2026-11-10): raised while the backend built its pool,
+    before the store that holds the cipher existed (:func:`_raised_creating_the_pool`), AND of a
+    class only a failed dial raises: the hop's own TLS settings refused (``InsecureHopRefused``), a
+    refused or unresolvable address (``ConnectionRefusedError``, ``socket.gaierror``), or a
+    driver's connection or login refusal named by its SQLSTATE (:data:`_CONNECT_ONLY_SQLSTATES`,
+    class 28). Anything else answers ``False``, and the minting command keeps the key: at least
+    any failure after the pool was built, a timeout, a ``RuntimeError``, and a dial failure a
+    backend wraps in another class, such as SQL Server's database-options connection under
+    ``auto``, a TLS verification error, or asyncio's combined error for several addresses."""
     import socket
 
+    if not _raised_creating_the_pool(exc):
+        return False
     if isinstance(exc, (InsecureHopRefused, ConnectionRefusedError, socket.gaierror)):
         return True
     state = driver_sqlstate(exc)
@@ -4657,11 +4684,10 @@ async def open_store(
     # The pin rides a context variable to the genesis read every backend shares (vault BACKLOG
     # #3411); reset at once, so no later open in this context inherits it.
     pinned = OPEN_STORE_PIN.set(pin)
-    # A minting server open learns whether its pin check passed. A failure that is one only a
-    # connection's establishment raises, and that came before the pin check, is typed as one that
-    # sealed nothing under the minted key, so the minting command removes it; every other failure
-    # keeps the key (vault BACKLOG #8119 item 2). The batch failures a backend typed itself, and the
-    # pin refusals, are re-raised as they are.
+    # A minting server open's failure is typed as one that sealed nothing under the minted key, so
+    # the minting command removes it, only where _failed_before_connecting proves it, and only
+    # before the pin check passed; every other failure keeps the key (vault BACKLOG #8119 item 2).
+    # The batch failures a backend typed itself, and the pin refusals, are re-raised as they are.
     check = PinCheck() if minting_open() and settings.backend is not StoreBackend.SQLITE else None
     checking = OPEN_STORE_PIN_CHECK.set(check)
     try:

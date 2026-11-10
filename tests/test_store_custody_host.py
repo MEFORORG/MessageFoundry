@@ -3459,16 +3459,49 @@ class _EmptyChain:
         return []
 
 
-def _failing_backend(failure: Exception, *, after_the_pin: bool) -> Any:
-    """A backend open that raises ``failure``, after passing the pin check when asked."""
+class _Pool:
+    """An asyncpg pool stand-in that the open closes on its way out."""
+
+    async def close(self) -> None:
+        return None
+
+
+@pytest.fixture
+def fake_postgres(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
+    """Run the real ``PostgresStore.open`` against a stand-in ``asyncpg``, failing where asked:
+    ``pool`` inside the real ``_create_pool``, ``schema`` in the schema step once the pool and the
+    store exist, and ``after the pin`` once the pin check has passed. The driver-error cache is
+    cleared after, so the stand-in classes reach no later test."""
+    from messagefoundry.store import base, postgres
     from messagefoundry.store.store import check_open_store_pin
 
-    async def _open_backend(_settings: StoreSettings, **_kwargs: object) -> Store:
-        if after_the_pin:
-            await check_open_store_pin(_EmptyChain())  # type: ignore[arg-type]
-        raise failure
+    def arm(failure: Exception, where: str) -> None:
+        async def create_pool(**_kwargs: object) -> _Pool:
+            if where == "pool":
+                raise failure
+            return _Pool()
 
-    return _open_backend
+        driver = types.ModuleType("asyncpg")
+        driver.create_pool = create_pool  # type: ignore[attr-defined]
+        for name in ("PostgresError", "InterfaceError", "InternalClientError"):
+            setattr(driver, name, type(name, (Exception,), {}))
+        monkeypatch.setitem(sys.modules, "asyncpg", driver)
+        monkeypatch.setattr(postgres, "_build_ssl", lambda _settings, posture=None: None)
+
+        async def ensure_schema(_store: object, **_kwargs: object) -> None:
+            if where == "schema":
+                raise failure
+
+        async def pin(_store: object) -> None:
+            await check_open_store_pin(_EmptyChain())  # type: ignore[arg-type]
+            raise failure
+
+        monkeypatch.setattr(postgres.PostgresStore, "_ensure_schema", ensure_schema)
+        monkeypatch.setattr(postgres, "check_open_store_pin", pin)
+
+    base.store_call_errors.cache_clear()
+    yield arm
+    base.store_call_errors.cache_clear()
 
 
 class _DriverError(Exception):
@@ -3514,28 +3547,32 @@ _BEFORE_CONNECTING = (
 
 
 @pytest.mark.parametrize(
-    "case",
+    ("case", "where"),
     [
-        *_BEFORE_CONNECTING,
-        "lost mid-open",
-        "connection reset",
-        "runtime",
-        "after the pin",
-        "not minting",
-        "sqlite",
-        "pin refusal",
-        "batch",
+        *((case, "pool") for case in _BEFORE_CONNECTING),
+        ("lost mid-open", "pool"),
+        ("connection reset", "pool"),
+        ("runtime", "pool"),
+        ("runtime", "schema"),
+        ("refused address", "schema"),  # a later dial in the same open, once the pool was built
+        ("login refused", "schema"),
+        ("refused address", "after the pin"),
+        ("not minting", "pool"),
+        ("sqlite", "pool"),
+        ("pin refusal", "schema"),
+        ("batch", "schema"),
     ],
 )
 def test_only_a_failure_before_connecting_is_typed_on_a_minting_server_open(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_postgres: Any, case: str, where: str
 ) -> None:
     # Vault BACKLOG #8119 item 2, under the Manager's ruling of 2026-11-10: removing a minted key
-    # rests on the failure's own class, never on an ordering nothing enforces end to end. Only a
-    # failure a connection's establishment alone raises, before the pin check passed, is typed as
-    # one that sealed nothing, so provision-admin removes the void key. Every other failure, a
-    # RuntimeError or a connection lost mid-open among them, keeps the error, and the key, as it
-    # was; so does every other open, and every failure once the pin check passed.
+    # rests on where and how the open failed, never on an ordering nothing enforces end to end.
+    # Only a failure raised while the backend built its pool, before the store that holds the
+    # cipher existed, and of a class only a failed dial raises, is typed as one that sealed
+    # nothing, so provision-admin removes the void key. Every other failure keeps the error, and
+    # the key, as it was: a RuntimeError, a connection lost or reset, the same dial classes once
+    # the pool was built, every other open, and every failure once the pin check passed.
     import asyncio
 
     from messagefoundry.store import base
@@ -3543,16 +3580,20 @@ def test_only_a_failure_before_connecting_is_typed_on_a_minting_server_open(
 
     monkeypatch.setenv("MEFOR_SECRETS_DIRECTORY", str(tmp_path))
     failure = _open_failure(case)
+    fake_postgres(failure, where)
     backend = StoreBackend.SQLITE if case == "sqlite" else StoreBackend.POSTGRES
     settings = _settings(tmp_path, backend=backend, server="db.invalid", database="mefor")
-    monkeypatch.setattr(
-        base, "_open_backend", _failing_backend(failure, after_the_pin=case == "after the pin")
-    )
+    if case == "sqlite":
+
+        async def _sqlite_open(_settings: StoreSettings, **_kwargs: object) -> Store:
+            raise failure
+
+        monkeypatch.setattr(base, "_open_backend", _sqlite_open)
     blob = HostBlob(MasterKey.mint(), StoreId.mint())
     wrap = b"" if case == "not minting" else b"wrap"
     with pytest.raises(Exception) as raised:
         asyncio.run(open_store(settings, create=True, custody=blob, recovery_wrap=wrap))
-    if case in _BEFORE_CONNECTING:
+    if case in _BEFORE_CONNECTING and where == "pool":
         assert isinstance(raised.value, StoreCreateBatchFailedBeforeKeyUse), raised.value
         assert raised.value.failure is failure and raised.value.__cause__ is failure
     else:
@@ -3567,18 +3608,19 @@ def test_a_server_create_that_fails_before_connecting_removes_the_minted_key(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    fake_postgres: Any,
     after_the_pin: bool,
     schema: str,
     failure: str,
 ) -> None:
-    # Vault BACKLOG #8119 item 2, through provision-admin and the real open: a hop refusal at the
-    # create, a failure only a connection's establishment raises, wrote nothing under the minted
-    # key, so the key is removed and the next run mints a new one rather than stop at the file.
-    # Kept, as before: an arbitrary RuntimeError before the pin check, whose class proves nothing
-    # (the Manager's ruling of 2026-11-10), and any failure after the pin check passed, where the
-    # open may have written. Under auto the probe finds no store schema; under external, the
-    # server default, it finds a provisioned schema with an empty chain and no data, the
-    # default's one way to a mint.
+    # Vault BACKLOG #8119 item 2, through provision-admin and the real open down to the real
+    # PostgresStore._create_pool: a hop refusal while the pool is built, before the store that
+    # holds the cipher exists, wrote nothing under the minted key, so the key is removed and the
+    # next run mints a new one rather than stop at the file. Kept, as before: an arbitrary
+    # RuntimeError there, whose class proves nothing (the Manager's ruling of 2026-11-10), and a
+    # failure after the pin check passed, where the open may have written. Under auto the probe
+    # finds no store schema; under external, the server default, it finds a provisioned schema
+    # with an empty chain and no data, the default's one way to a mint.
     from messagefoundry import __main__ as cli
     from messagefoundry.__main__ import main
     from messagefoundry.store import base
@@ -3590,14 +3632,15 @@ def test_a_server_create_that_fails_before_connecting_removes_the_minted_key(
         secrets.chmod(0o700)
     monkeypatch.setenv("MEFOR_SECRETS_DIRECTORY", str(secrets))
     host_file = secrets / custody_host.HOST_FILE_NAME
-    create = _failing_backend(_open_failure(failure), after_the_pin=after_the_pin)
+    fake_postgres(_open_failure(failure), "after the pin" if after_the_pin else "pool")
+    real_open_backend = base._open_backend
 
-    async def _open_backend(settings: StoreSettings, **kwargs: object) -> Any:
+    async def _open_backend(settings: StoreSettings, **kwargs: Any) -> Any:
         if kwargs.get("read_only"):  # the pre-check's probe
             if schema == "external":
                 return _EmptyProvisionedStore()
             raise base.StoreNotFoundError.server_schema(StoreBackend.POSTGRES, "mefor")
-        return await create(settings, **kwargs)
+        return await real_open_backend(settings, **kwargs)
 
     def _ceremony(*_args: object, **_kwargs: object) -> MintedCustody:
         host_file.write_bytes(b"minted (stand-in)")
