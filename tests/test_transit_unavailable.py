@@ -10,6 +10,7 @@ into the app, as ``tests/test_upload_api.py`` swaps a keyed one in. Synthetic HL
 from __future__ import annotations
 
 import base64
+import logging
 import os
 import ssl
 from collections.abc import Callable
@@ -251,19 +252,30 @@ def test_a_classifier_fault_keeps_plain_cipher_error(monkeypatch: pytest.MonkeyP
 # --- the upload store -------------------------------------------------------------------------
 
 
-async def test_an_outage_in_the_quota_scan_refuses_the_save(tmp_path: Path) -> None:
+async def test_an_outage_in_the_quota_scan_refuses_the_save(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """A sidecar the scan could not read is not left out of the count: the save answers 503 rather
     than admit a file past the quota."""
     cipher, transit = _cipher()
     store = UploadStore(tmp_path, cipher, max_bytes=1 << 20, max_files_per_user=1)
-    await store.save(data=BATCH.encode(), filename="a.hl7", uploader="op", uploader_id="u-1")
+    first = await store.save(
+        data=BATCH.encode(), filename="a.hl7", uploader="op", uploader_id="u-1"
+    )
 
     def down(**_kw: Any) -> dict[str, Any]:
         raise requests.exceptions.ConnectionError("connection refused")
 
     transit.decrypt_data = down  # type: ignore[method-assign]
-    with pytest.raises(UploadUnavailableError):
+    with (
+        caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"),
+        pytest.raises(UploadUnavailableError),
+    ):
         await store.save(data=BATCH.encode(), filename="b.hl7", uploader="op", uploader_id="u-1")
+    # The sidecar that stopped the count is named by its upload id, never its path or content.
+    named = [r.getMessage() for r in caplog.records if "key service unavailable" in r.getMessage()]
+    assert named == [named[0]] and named[0].startswith(f"uploaded-file sidecar {first.file_id}:")
+    assert str(tmp_path) not in named[0] and "MRN" not in named[0]
     assert len([p for p in tmp_path.iterdir() if p.name.endswith(".meta")]) == 1
 
 
@@ -300,13 +312,14 @@ async def test_the_upload_store_still_raises_unreadable_for_a_refusal(tmp_path: 
 
 
 async def test_the_upload_routes_answer_an_outage_503_and_a_refusal_423(
-    engine: Engine, tmp_path: Path
+    engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """* An override holder whose sidecar read meets an outage gets 503 with ``Retry-After`` on
       browse, resend and delete, where a refused sidecar gets 423.
     * The owner, who cannot be told apart from anyone else while the sidecar is unread, keeps 404.
     * A readable sidecar over a body read that meets an outage gets the owner 503.
-    * An upload during an outage answers 503 and stores nothing."""
+    * An upload during an outage answers 503 and stores nothing.
+    * Each 503 is logged at WARNING with its operation and the cipher's type-only cause."""
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
 
@@ -340,7 +353,17 @@ async def test_the_upload_routes_answer_an_outage_503_and_a_refusal_423(
             return out
 
         transit.fail = requests.exceptions.ConnectionError("connection refused")
-        for r in await _by_id(ha):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
+            answers = await _by_id(ha)
+        logged = [rec.getMessage() for rec in caplog.records if "answered 503" in rec.getMessage()]
+        assert [m.split(" answered")[0] for m in logged] == [
+            "upload browse",
+            "upload resend",
+            "upload delete",
+        ]
+        assert all("ConnectionError" in m and "a.hl7" not in m for m in logged)
+        for r in answers:
             assert r.status_code == 503, r.text
             assert r.headers.get("retry-after") == "5"
             assert "key service" in r.text and "a.hl7" not in r.text and "MRN" not in r.text
@@ -361,8 +384,13 @@ async def test_the_upload_routes_answer_an_outage_503_and_a_refusal_423(
 
         transit.when = lambda _assoc: True
         transit.fail = VaultDown("Vault is sealed")
-        r = await c.post("/uploads", files={"file": ("b.hl7", BATCH, "text/plain")}, headers=h)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.api.app"):
+            r = await c.post("/uploads", files={"file": ("b.hl7", BATCH, "text/plain")}, headers=h)
         assert r.status_code == 503, r.text
+        assert any(
+            rec.getMessage().startswith("upload save answered 503") for rec in caplog.records
+        )
         assert r.headers.get("retry-after") == "5"
 
         transit.fail = None

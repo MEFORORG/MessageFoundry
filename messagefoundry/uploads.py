@@ -984,6 +984,11 @@ class UploadStore:
         log), so a rotated-away key can neither sink the listing nor silently drop a quota/retention
         pass. Pure filesystem read — the caller runs it off the event loop.
 
+        **An outage is the exception (BACKLOG #3734).** A sidecar the key service gave no verdict
+        on is logged with its upload id on a line of its own. With ``outage_raises`` it then raises
+        :class:`UploadUnavailableError`, ending the scan, so a quota count is never taken with the
+        sidecar left out; without it, it is skipped like the rest.
+
         **Each failure class is caught on its own and logged distinctly (BACKLOG #1169, CLAUDE.md
         §6).** One blanket ``except Exception`` used to fold all three into a single
         "skipping unreadable sidecar" line, which made three unrelated conditions indistinguishable
@@ -1034,11 +1039,12 @@ class UploadStore:
                 out.append(self._decrypt_meta(entry.read_text(encoding="utf-8"), fid))
             except CipherError as exc:
                 if isinstance(exc, CipherUnavailableError):
-                    # A count with a sidecar it could not read is not a count (BACKLOG #3734).
-                    if outage_raises:
-                        raise UploadUnavailableError(str(exc)) from exc
-                    # Its own line, so an outage never reads as the refusal logged below.
+                    # Its own line, so an outage never reads as the refusal logged below. Logged
+                    # before the raise too, so the sidecar that stopped a count is named.
                     _log.warning("uploaded-file sidecar %s: key service unavailable: %s", fid, exc)
+                    if outage_raises:
+                        # A count with a sidecar it could not read is not a count (BACKLOG #3734).
+                        raise UploadUnavailableError(str(exc)) from exc
                     continue
                 # The cipher declined the value: a wrong/rotated-away key, a blob relocated into
                 # another cell, or the refusal of an unmarked (legacy, planted or downgraded)

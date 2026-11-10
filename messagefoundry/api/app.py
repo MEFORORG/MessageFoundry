@@ -8735,9 +8735,14 @@ def create_app(
         file, so nothing was read, stored or removed and a later try may succeed. 503 with the
         ``Retry-After`` of the engine's other temporary refusals, where 423 would send an operator
         to rotate-key or a delete for a file that is fine. Like the 423, the body names no file
-        and no cipher detail."""
+        and no cipher detail.
 
-        def __init__(self) -> None:
+        Built from the store's error, which it logs at WARNING with the operation, so an outage
+        that blocks every upload is on the record. That text is the cipher's own, which carries
+        only the key id and an exception type, never a value."""
+
+        def __init__(self, cause: UploadUnavailableError, op: str) -> None:
+            _log.warning("upload %s answered 503: %s", op, cause)
             super().__init__(
                 503,
                 "the store's key service could not complete the request, so nothing was read, "
@@ -8779,8 +8784,10 @@ def create_app(
             meta = await us.get_meta(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
-        except UploadUnavailableError:
-            override_answer = _UploadUnavailable  # BACKLOG #3734: an outage, not the 423
+        except UploadUnavailableError as exc:
+            # BACKLOG #3734: an outage, not the 423. Bound now, so the 503 logs its cause.
+            outage = exc
+            override_answer = lambda: _UploadUnavailable(outage, op)  # noqa: E731
         except UploadUnreadableError:
             override_answer = _UploadSidecarRefused
         if override_answer is not None:
@@ -8910,10 +8917,10 @@ def create_app(
                 client=client_ip(request),
             )
             raise HTTPException(409, str(exc)) from None
-        except UploadUnavailableError:
+        except UploadUnavailableError as exc:
             # BACKLOG #3734: nothing was written, so a retry stores the file once. Not audited as a
             # reject, because the file was not refused.
-            raise _UploadUnavailable() from None
+            raise _UploadUnavailable(exc, "save") from None
         # Vault BACKLOG #3178: the creation row outlives the request, so a deadline that fires now
         # still leaves the stored file with its row. A row that cannot be written removes the file.
         #
@@ -9069,8 +9076,8 @@ def create_app(
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
-        except UploadUnavailableError:
-            raise _UploadUnavailable() from None
+        except UploadUnavailableError as exc:
+            raise _UploadUnavailable(exc, "browse") from None
         except UploadUnreadableError:
             raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
         result = await asyncio.to_thread(
@@ -9227,8 +9234,8 @@ def create_app(
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
-        except UploadUnavailableError:
-            raise _UploadUnavailable() from None
+        except UploadUnavailableError as exc:
+            raise _UploadUnavailable(exc, "resend") from None
         except UploadUnreadableError:
             raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
         parts = await asyncio.to_thread(split_uploaded, data)
@@ -9356,8 +9363,8 @@ def create_app(
             meta = await outliving.run(_delete_and_record(), "upload delete")
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
-        except UploadUnavailableError:
-            raise _UploadUnavailable() from None
+        except UploadUnavailableError as exc:
+            raise _UploadUnavailable(exc, "delete") from None
         except UploadUnreadableError:
             raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
         return UploadDeleteResult(file_id=meta.file_id, filename=meta.filename, deleted=True)
