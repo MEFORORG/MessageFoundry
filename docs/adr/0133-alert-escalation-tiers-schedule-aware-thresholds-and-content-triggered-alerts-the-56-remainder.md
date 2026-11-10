@@ -103,7 +103,9 @@ Two invariants bound the design and **must not** be relaxed:
 - **Alerts are PHI-free (CLAUDE.md §9, ADR 0044).** Every emitted event carries "the connection name +
   queue shape only — no PHI". A content-triggered event is the risky one: it is *born from inspecting a
   message body*, so it must carry **only** the connection + a rule id + a boolean/label — **never the
-  matched field value**.
+  matched field value**. *(Note 2026-11-10, BACKLOG #5021: the quoted premise was false; some events
+  carry free-text detail, as the [PHI.md logging inventory](../PHI.md#logging-inventory-1611--1623)
+  rows for the `[alerts]` transports say.)*
 - **Routers and transforms must be pure (ADR 0001).** A Handler that emits a content-triggered alert
   performs a **side effect**; under at-least-once a stage re-run **re-emits** it. This must be reconciled
   (below), not silently broken. **CORRECTED 2026-09-30:** it was not reconciled, and D3 is retracted

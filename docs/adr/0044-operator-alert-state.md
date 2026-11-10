@@ -59,7 +59,11 @@ Two [CLAUDE.md](../../CLAUDE.md) invariants bound the design and **must not** be
   "the connection name + queue shape only — **no PHI**" ([`alert_sinks.py`](../../messagefoundry/pipeline/alert_sinks.py)
   module docstring); the alert-instance row stores only those same metadata fields (type, connection, severity,
   a `safe_text`-scrubbed reason), so it introduces **no** new PHI classification — like `connection_event`,
-  it sits in the existing metadata tier.
+  it sits in the existing metadata tier. *(Note 2026-11-10, BACKLOG #5021: the quoted docstring no
+  longer says this, and the quoted claim was false: some events carry free-text detail. The
+  [PHI.md logging inventory](../PHI.md#logging-inventory-1611--1623) rows for the `[alerts]`
+  transports say what an event carries, and PHI.md's `alert_instance.reason` at-rest row grades the
+  stored reason **Possibly** PHI.)*
 
 ## Decision
 
