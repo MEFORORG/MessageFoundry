@@ -386,3 +386,107 @@ def test_writer_header_stays_far_under_the_cap() -> None:
     (hdrlen,) = _U32.unpack(enc.getvalue()[off : off + _U32.size])
     assert hdrlen < 160  # the "well under 160 bytes" the MAX_HEADER_BYTES note cites
     assert hdrlen * 8 < bc.MAX_HEADER_BYTES  # and the cap keeps room for future additive fields
+
+
+# --- BACKLOG #6686: chunk_size is validated as given, never coerced by truthiness ------------------
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, False, 1024.0])
+def test_writer_refuses_a_chunk_size_that_is_not_a_positive_int(bad: int) -> None:
+    # `chunk_size or DEFAULT_CHUNK_SIZE` turned 0 (and False) into 1 MiB, so the documented 1..MAX
+    # guard never saw it; True passed it as a 1-byte chunk, and a float reached the header. Only
+    # None selects the default.
+    with pytest.raises(bc.BackupCodecError, match="chunk_size"):
+        bc.encrypt_stream(io.BytesIO(b"x"), io.BytesIO(), os.urandom(32), chunk_size=bad)
+
+
+def test_writer_none_chunk_size_selects_the_default() -> None:
+    enc = io.BytesIO()
+    bc.encrypt_stream(io.BytesIO(b"x"), enc, os.urandom(32), chunk_size=None)
+    assert bc.read_header(io.BytesIO(enc.getvalue())).chunk_size == bc.DEFAULT_CHUNK_SIZE
+
+
+# --- BACKLOG #6687: a short read that is not EOF is not a truncation -------------------------------
+
+
+class _Trickle(io.BytesIO):
+    """A source that serves at most ``step`` bytes per read, as a raw pipe or socket may.
+
+    A short read from such a source is legal and is NOT end of stream; only an empty read is. With
+    ``would_block`` set, every read reports "no data yet" as ``None``, as a non-blocking raw stream
+    does."""
+
+    def __init__(self, data: bytes, *, step: int = 1, would_block: bool = False) -> None:
+        super().__init__(data)
+        self._step = step
+        self._would_block = would_block
+
+    def read(self, size: int | None = -1, /) -> bytes:
+        if self._would_block:
+            return None  # type: ignore[return-value]  # what a non-blocking raw stream returns
+        if size is None or size < 0:
+            size = self._step
+        return super().read(min(size, self._step))
+
+
+def test_the_trickle_source_actually_short_reads() -> None:
+    # Positive control: without it, every test below could pass on a source that never short-reads.
+    src = _Trickle(b"abcdef", step=2)
+    assert src.read(5) == b"ab"
+
+
+@pytest.mark.parametrize("step", [1, 7, 1000])
+def test_decrypt_and_read_header_fill_short_reads(step: int) -> None:
+    key = os.urandom(32)
+    payload = os.urandom(5000)
+    enc = io.BytesIO()
+    bc.encrypt_stream(io.BytesIO(payload), enc, key, chunk_size=1024)
+    blob = enc.getvalue()
+    assert bc.read_header(_Trickle(blob, step=step)).chunk_size == 1024
+    out = io.BytesIO()
+    bc.decrypt_stream(_Trickle(blob, step=step), out, key)
+    assert out.getvalue() == payload
+
+
+@pytest.mark.parametrize("cut", [3, 20, 60, -1])
+def test_a_truncated_archive_still_fails_through_short_reads(cut: int) -> None:
+    # Looping to fill must stop at true EOF: a cut archive is still refused, as a truncation.
+    key = os.urandom(32)
+    enc = io.BytesIO()
+    bc.encrypt_stream(io.BytesIO(os.urandom(3000)), enc, key, chunk_size=1024)
+    blob = enc.getvalue()[:cut]
+    with pytest.raises(bc.BackupCodecError, match="truncated"):
+        bc.decrypt_stream(_Trickle(blob, step=5), io.BytesIO(), key)
+
+
+def test_encrypt_fills_each_frame_from_a_short_reading_source() -> None:
+    # Every frame but the last carries a full chunk_size of plaintext, so the declared header
+    # chunk_size describes the archive whatever the source's read granularity.
+    key = os.urandom(32)
+    payload = os.urandom(5000)
+    enc = io.BytesIO()
+    bc.encrypt_stream(_Trickle(payload, step=100), enc, key, chunk_size=1024)
+    src = io.BytesIO(enc.getvalue())
+    bc.read_header(src)
+    lengths = []
+    while nonce := src.read(_NONCE_BYTES):
+        assert len(nonce) == _NONCE_BYTES
+        (ctlen,) = _U32.unpack(src.read(_U32.size))
+        src.read(ctlen)
+        lengths.append(ctlen - bc._TAG_BYTES)
+    assert lengths == [1024, 1024, 1024, 1024, 5000 - 4 * 1024]
+    out = io.BytesIO()
+    bc.decrypt_stream(io.BytesIO(enc.getvalue()), out, key)
+    assert out.getvalue() == payload
+
+
+def test_a_source_with_no_data_ready_is_refused_not_read_as_eof() -> None:
+    # A non-blocking raw stream returns None for "nothing yet". Reading that as EOF would let the
+    # writer seal a silently truncated backup as a complete, authentic archive.
+    key = os.urandom(32)
+    with pytest.raises(bc.BackupCodecError, match="no data"):
+        bc.encrypt_stream(_Trickle(b"x" * 10, would_block=True), io.BytesIO(), key)
+    enc = io.BytesIO()
+    bc.encrypt_stream(io.BytesIO(b"x" * 10), enc, key)
+    with pytest.raises(bc.BackupCodecError, match="no data"):
+        bc.read_header(_Trickle(enc.getvalue(), would_block=True))
