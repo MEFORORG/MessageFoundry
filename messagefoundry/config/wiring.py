@@ -58,7 +58,7 @@ from signal import SIGINT, default_int_handler, getsignal
 from types import CodeType, MappingProxyType, ModuleType
 from typing import Any, Final, Literal, NamedTuple, NoReturn, TypeIs
 
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from messagefoundry.author_output import author_code_stdout
 from messagefoundry.config.code_sets import (
@@ -6588,7 +6588,7 @@ def accepted_cleartext_hops(registry: Registry) -> list[tuple[str, str]]:
     out = [
         (oc.name, oc.cleartext_reason or "(none recorded)")
         for oc in registry.outbound.values()
-        if oc.cleartext_accepted
+        if _declares(oc.cleartext_accepted)
     ]
     # A lookup's typed fields, not its settings: the read executor trusts only the typed declaration
     # (wiring_runner._fhir_lookup_settings strips a raw key), so this reports exactly what crosses.
@@ -6619,6 +6619,34 @@ class AttestedHop:
 # and a reason that must be a str (or None).
 _LAX_BOOL: Final = TypeAdapter(bool)
 _MODEL_REASON: Final = TypeAdapter(str | None)
+
+
+def read_lax_flag(value: object, where: str, key: str) -> bool:
+    """``value`` read as the typed models read a declaration flag: pydantic's lax ``bool``, so a
+    false spelling such as ``"off"`` or ``b"false"`` is ``False`` (vault BACKLOG #5286).
+
+    A value that lax ``bool`` refuses is a :class:`WiringError` naming ``where`` and ``key``, never
+    the value: pydantic's own error quotes its input, so it is raised after the handler ends,
+    with neither a cause nor a context."""
+    try:
+        return _LAX_BOOL.validate_python(value)
+    except ValidationError:
+        pass
+    raise WiringError(f"{where}: {key} must be a boolean")
+
+
+def _declares(flag: object) -> bool:
+    """Whether a connection's typed declaration flag is set, read as :func:`read_lax_flag` reads
+    it, so a report lists only what the build and the settings mirror honour (vault BACKLOG #5286).
+    ``None`` is not set, as :func:`attested_secure_hop_records` reads it. Any other value lax
+    ``bool`` refuses is listed: the build refuses it, and a report fails toward listing (vault
+    BACKLOG #2232)."""
+    if flag is None:
+        return False
+    try:
+        return _LAX_BOOL.validate_python(flag)
+    except ValidationError:
+        return True
 
 
 def _attested_reason_text(value: object) -> str | None:
@@ -6693,17 +6721,17 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
         # is a lax pydantic bool and each reason a pydantic str. So an int 1 or the string "false"
         # is the flag the typed Source or Destination holds, the build builds it and it is no
         # refusal, and a reason of another type is refused as the model refuses it, never passed to
-        # the pair rule's .strip(). The mark answers only "does the build refuse this hop". It does
-        # not say the build reads one value: _dest_config's settings mirror tests the raw flag by
-        # truthiness, so for a string "false" the settings-driven seams can read the flag set.
+        # the pair rule's .strip(). The mark answers only "does the build refuse this hop". The
+        # flags go through read_lax_flag, the reader _dest_config's settings mirror uses too, so a
+        # string "false" reads unset in both (vault BACKLOG #5286).
         try:
             refuse_raw_hop_attestation(settings, "")
-            accepted_flag = _LAX_BOOL.validate_python(accepted)
+            accepted_flag = read_lax_flag(accepted, "", "cleartext_accepted")
             _check_cleartext_acceptance(
                 accepted_flag, _MODEL_REASON.validate_python(cleartext_reason)
             )
             _check_revocation_attestation(
-                _LAX_BOOL.validate_python(revocation),
+                read_lax_flag(revocation, "", "tls_revocation_attested"),
                 _MODEL_REASON.validate_python(revocation_reason),
             )
         except (WiringError, ValueError):
@@ -7151,12 +7179,12 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = [
         (oc.name, oc.tls_revocation_attested_reason or "(none recorded)")
         for oc in registry.outbound.values()
-        if oc.tls_revocation_attested
+        if _declares(oc.tls_revocation_attested)
     ]
     out.extend(
         (inbound_record_name(ic.name), ic.tls_revocation_attested_reason or "(none recorded)")
         for ic in registry.inbound.values()
-        if ic.tls_revocation_attested
+        if _declares(ic.tls_revocation_attested)
     )
     # Typed fields, as for cleartext_accepted: the executor strips a raw key (BACKLOG #2050).
     out.extend(

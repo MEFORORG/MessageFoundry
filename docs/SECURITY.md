@@ -2641,8 +2641,21 @@ test (vault BACKLOG #3746).** A start or restart whose CA check the store stoppe
 **503**, not the **409** a refused CA answers on an inbound, and its `connection_control` row would
 carry `reason` `store_unavailable`. A restart would have stopped the lane before the check ran, so
 its 503 would say the connection is left stopped until the next start. The lane would read
-`failed`, and a lane with no earlier failure on record would show a line saying the CA could not be
-checked. An outbound checks its CA at a start only when it has no connector. An operator start of
+`failed`, with a line saying the CA could not be checked. That line would replace one recorded
+earlier for any other reason, with one alert. It is written only for a CA its file checks did not
+refuse (the `store_unavailable` reason for a reload, vault BACKLOG #3091, says why), so it does
+not hide a refusal: a later start failure that is not a store fault, a CA refused once the file
+changed included, replaces it in turn, with one alert. The class compared is only whether the line
+is a store fault (vault BACKLOG #5146). A later failure in the class the line already records keeps
+the line and alerts no more. So a refused CA after an unrelated line, such as a failed bind or
+build, keeps that line, and the refusal is named only in the server log and the
+`auth.trust_anchor` rows, while the lane is still held failed across a reload that leaves its
+config unchanged. On an inbound the rule holds for any start failure. On an outbound it holds for a
+failure raised as a `TrustAnchorError`, as a refused or store-stopped CA check is; any other
+outbound start failure records its line and alerts each time. A refused-CA lane whose line a store
+fault replaced is no longer kept failed across a reload, so the next reload reads its CA again. An
+outbound checks its CA at a
+start only when it has no connector. An operator start of
 such a lane that was paused would leave it paused with its rows pending, because a resumed lane
 with no connector charges each row it claims an attempt, and a finite `max_attempts` would
 dead-letter it with nothing known against the CA.
