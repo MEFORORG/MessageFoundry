@@ -412,7 +412,8 @@ class ReloadOutcome:
     ``initiator_digest`` is, on a convergence reload, the digest the initiating node stored with
     ``config_version`` when it bumped it (:func:`~messagefoundry.config.fingerprint.shared_digest_of`
     reads it), so the row can set the operator's bytes beside this node's own ``fingerprint`` (vault
-    BACKLOG #3109). It is read with the version, never separately, so the two are one pair. ``None``
+    BACKLOG #3109). What pairs it with the version is the coordinator's version-equality check
+    (:meth:`~messagefoundry.pipeline.cluster.ClusterCoordinator.config_digest_cached`). ``None``
     when not known: on every other reload, when the initiator stored none, when the cache had
     already moved on to a later bump, or when what was stored is not a digest.
 
@@ -3632,15 +3633,15 @@ class Engine:
             # The bump stores this node's digest with the new version, so a follower's
             # convergence row can name the operator's bytes beside its own (vault BACKLOG #3109).
             digest_text = shared_digest_text(fingerprint)
-            if digest_text is None and digest_coverage(fingerprint) is not None:
-                # Said here, since a follower reads the NULL as "the initiator took none".
-                log.warning(
-                    "cluster: this reload's digest is not in a shape another node can compare, or "
-                    "is too long to share, so the version bump stores it as unknown"
-                )
             try:
                 config_version = await self._coordinator.bump_config_version(digest=digest_text)
                 self._applied_config_version = config_version
+                if digest_text is None and digest_coverage(fingerprint) is not None:
+                    # Said here, since a follower reads the NULL as "the initiator took none".
+                    log.warning(
+                        "cluster: this reload's digest is not in a shape another node can "
+                        "compare, or is too long to share, so the version bump stored it as unknown"
+                    )
             except Exception as exc:
                 # This node IS running the new graph; only the cluster-wide announcement is missing, so
                 # the other nodes stay on the old config until the next bump or an operator reload

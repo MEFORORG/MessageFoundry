@@ -1467,14 +1467,43 @@ async def test_a_digest_the_bump_cannot_share_is_stored_as_unknown_and_logged(
         with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
             await eng.reload_detail(propagate=True)
         assert coord.bumps == 1 and coord.config_digest_cached(1) is not None, "control"
-        assert "stores it as unknown" not in caplog.text
+        assert "stored it as unknown" not in caplog.text
         monkeypatch.setattr(fingerprint_module, "shared_digest_text", lambda detail: None)
         with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
             await eng.reload_detail(propagate=True)
         assert coord.bumps == 2 and coord.config_digest_cached(2) is None
-        assert "stores it as unknown" in caplog.text
+        assert "stored it as unknown" in caplog.text
+
+        # A bump that fails stores nothing, so nothing is said to be stored.
+        async def _fails(*, digest: str | None) -> int:
+            raise RuntimeError("cluster_config is unreachable")
+
+        monkeypatch.setattr(coord, "bump_config_version", _fails)
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
+            await eng.reload_detail(propagate=True)
+        assert "bump after reload failed" in caplog.text, "control: the bump was tried"
+        assert "stored it as unknown" not in caplog.text
     finally:
         await eng.stop()
+
+
+@pytest.mark.parametrize("backend", ["DbCoordinator", "SqlServerCoordinator"])
+def test_a_config_row_that_cannot_be_read_leaves_the_cached_pair_intact(backend: str) -> None:
+    """vault BACKLOG #3109: the cache sets the version and its digest together. A row whose
+    digest read raises sets neither, so the old version is never left beside a new digest, nor
+    the new version beside the old one."""
+    from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
+
+    coord: DbCoordinator | SqlServerCoordinator = (
+        DbCoordinator(None, "n") if backend == "DbCoordinator" else SqlServerCoordinator(None, "n")
+    )
+    good = {"config_version": 4, "config_digest": "d4", "config_digest_version": 4}
+    assert coord._cache_config_row(good) == 4, "control"
+    assert coord.config_digest_cached(4) == "d4"
+    with pytest.raises(KeyError):
+        coord._cache_config_row({"config_version": 5, "config_digest": "d5"})  # no stamp key
+    assert coord.config_version_cached() == 4 and coord.config_digest_cached(4) == "d4"
 
 
 def test_a_stored_digest_belongs_only_to_the_version_stamped_beside_it() -> None:

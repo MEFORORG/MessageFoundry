@@ -327,10 +327,12 @@ class SqlServerCoordinator:
         return self._cache_config_row(row)
 
     def _cache_config_row(self, row: dict[str, Any]) -> int:
-        """Cache a ``cluster_config`` row's version and digest together, and return the version."""
-        self._config_version = int(row["config_version"])
-        self._config_digest = stamped_config_digest(row)
-        return self._config_version
+        """Cache a ``cluster_config`` row's version and digest together, and return the version.
+        Both are read before either is set, so a raise leaves the previous pair intact."""
+        version = int(row["config_version"])
+        digest = stamped_config_digest(row)
+        self._config_version, self._config_digest = version, digest
+        return version
 
     # --- observability -------------------------------------------------------
 
