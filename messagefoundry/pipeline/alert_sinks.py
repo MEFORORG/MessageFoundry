@@ -188,9 +188,8 @@ class _ResolveFence:
 
     Each raise stamps the instance with its writer's random id (``raised_by``), and the resolve
     closes only what that id and a snapshot of the key allow. ``docs/adr/0044-operator-alert-state.md``,
-    the BACKLOG #4916 amendment, is the one statement of how it behaves: what the snapshot is, when
-    its read starts and runs, what a retry reuses, the verdict re-read, and how a resolve fails.
-    Only a store without the fence methods resolves unfenced."""
+    the BACKLOG #4916 amendment, states the rule. Only a store without the fence methods resolves
+    unfenced."""
 
     def __init__(
         self,

@@ -2176,7 +2176,7 @@ count is above `0` (vault BACKLOG #2613).
   alert is keyed on the hop alone, so where engine processes share one store, another process's
   clean start can resolve it;
   [SECURITY.md](SECURITY.md#each-backend-hops-least-privilege-the-engine-probes-the-store-vault-and-ldap),
-  *When a clean start resolves the warning*, says when it does not. The audit row of each start is the record that stays.
+  *When a clean start resolves the warning*, says what to do with a warning still open. The audit row of each start is the record that stays.
 - **What it does not do:** it lifts that one refusal only. Every other Vault over-grant, such as a
   token shared by two hops or an extra capability on a path the engine calls, and a probe that could
   not read the token because of a network failure, a timeout or a 403, only warn, so there is

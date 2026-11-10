@@ -1879,8 +1879,8 @@ Every engine process with an alert sink checks the open `intake_paused` alerts o
 processes once a minute, and resolves one whose occurrence count has not moved for 20 minutes, four
 reminder intervals, of its own clock. A check whose read fails stretches that: none of the time
 from the last good read to the next one counts, and at that next good read what was already
-counted is held to at most 13 minutes 40 seconds, so 6 minutes 20 seconds more must be counted
-before the alert can expire. That 6 minutes 20 seconds is `GAP_GRACE_SECONDS`: one reminder
+counted is held to at most 13 minutes 40 seconds, so at least 6 minutes 20 seconds more must be
+counted before the alert can expire. That 6 minutes 20 seconds is `GAP_GRACE_SECONDS`: one reminder
 interval, one check interval and twice the 10-second read timeout, which gives a live process's
 next reminder time to land. A second failed read inside it holds the count to the same bound
 again. With checks a minute apart, a failed read in every 8 checks, or more often, keeps the
@@ -1889,11 +1889,10 @@ minutes, so its alert stays open while those writes reach the store. **The expir
 whether a reminder landed, by design: a process that is still paused but whose reminders stop
 reaching the store has its alert resolved while its intake stays paused.** At least a process cut
 off from the store, one whose reminder writes keep failing, and one whose intake check keeps
-raising do that. Its first reminder that lands again opens a new alert. Such a process keeps its
-in-memory alert state for the old alert (vault BACKLOG #8190). It keeps the escalation tier it had
-reached, so its later reminders go on at that tier. It also keeps a suspend it holds in memory,
-which mutes that process's notifications until the suspend's own window ends, while the new alert
-shows no suspend. So an alert expires only while some other engine process with an
+raising do that. Its first reminder that lands again opens a new alert. A process whose alert
+the sweep resolved keeps that alert's in-memory suspend and occurrence count, so its later
+notifications for that alert can be muted until the suspend ends, or escalate, though the new row
+shows neither (vault BACKLOG #8190). So an alert expires only while some other engine process with an
 alert sink runs on the same store; no process expires its own. A process stopped for longer than 20
 minutes, plus any stretch failed checks add, while another runs finds its pause resolved, and a pause that still holds when it starts
 opens a new alert. An operator's acknowledgement on the old alert goes with it, as it does on any

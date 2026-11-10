@@ -3,5 +3,5 @@
   the alert through the configured notifier, keyed on `vault:store` or `vault:secrets`, before any
   refusal, so a refused start still pages. An alert rule can match the new event type, and a later
   start that reads that hop's token clean can resolve the open alert; `docs/SECURITY.md`, *When a
-  clean start resolves the warning*, says when it does not. ADR 0216 Amendment A says what
+  clean start resolves the warning*, says what to do with a warning still open. ADR 0216 Amendment A says what
   the payload holds. (`BACKLOG #2903`)

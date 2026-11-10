@@ -1250,28 +1250,17 @@ about the token, because a fix is usually a new token: so engine processes that 
 share each hop's alert, and a clean start by one can resolve a warning another raised on a
 different token.
 
-**When a clean start resolves the warning.** Other pages link here for this. A clean start can
-leave another process's warning open. At least these do that: the start's process has no
-`[alerts]` notifier (the logging sink it then gets resolves nothing); it does not probe that hop,
-or does not read it clean; the warning's newest raise is one the fenced auto-resolve does not
-speak for ([ADR 0044, the vault BACKLOG #4916 amendment](adr/0044-operator-alert-state.md#amendment-2026-11-09----an-auto-resolve-is-fenced-to-the-raises-it-speaks-for-backlog-4916), which states how the fence
-behaves); and the resolve fails every attempt or is cancelled before it lands.
+**When a clean start resolves the warning.** A clean start can leave another process's warning
+open ([ADR 0044, the vault BACKLOG #4916 amendment](adr/0044-operator-alert-state.md#amendment-2026-11-09----an-auto-resolve-is-fenced-to-the-raises-it-speaks-for-backlog-4916)).
+Treat an open warning as live until every engine process that probes that hop has started clean
+since its token was fixed, and its start was handled by a resolving notifier, meaning an
+`[alerts]` transport such as a webhook or email. With no transport configured, a start gets the
+logging sink, which resolves nothing. To check, at least:
 
-**Treat a warning still open after a clean start as a live finding until you have checked it:**
-another engine process on the same store may still be running on an over-granted or unread token.
-To check, at least:
-
-- Read the clean start's own log. `alert-instance resolve for ... closed nothing` (INFO or
-  WARNING) means the resolve did not close it; an ERROR starting `alert-instance resolve gave up` or
-  `alert-instance resolve was cancelled before it landed` means the resolve did not land.
-- Check that the clean start's process has an `[alerts]` notifier.
-- Read each node's own log, where cluster nodes run on separate hosts: a start's finding is a
-  WARNING starting `vault privilege preflight: <hop> <state>`. Engine shards share one log, and
-  neither that line nor the audit row's detail names the process that wrote it, so for them check
-  the Vault token each engine process is configured with.
+- Each start logs a line starting `vault privilege preflight: <hop> <state>` for each hop it
+  judged, at WARNING when the hop is over-granted or could not be read.
 - The check runs only at start, so a token fixed since a process started is judged only at that
-  process's next start. Restart it after you fix the token, or, for an unread one, whatever kept
-  its grants from being read, which may be reachability or the probe paths rather than the token.
+  process's next start.
 
 The log line and the audit row of every start stay the record.
 
