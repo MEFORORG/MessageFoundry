@@ -22,7 +22,6 @@ import re
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
-from urllib.parse import unquote
 
 import httpx
 import pytest
@@ -52,8 +51,7 @@ from messagefoundry.auth.service import (
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
-from messagefoundry.controlchars import log_field_token
-from messagefoundry.logging_setup import _install_phi_filters, redact_log_value
+from messagefoundry.logging_setup import _install_phi_filters, redacted_log_field
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_admin, create_local_user_chosen
@@ -273,8 +271,8 @@ async def test_each_refused_request_writes_its_own_warning(
         assert len(warnings) == repeats + len(past_cap)
         assert sum("already flagged" in line for line in warnings) == repeats
         over = [line for line in warnings if "past the per-session" in line]
-        assert [line.rsplit("seen_ip=", 1)[1] for line in over] == [
-            log_field_token(seen, _NEW_IP_LOG_FIELD_MAX) for seen in past_cap
+        assert [line.split("seen_ip=", 1)[1].split(" path=", 1)[0] for line in over] == [
+            redacted_log_field(seen, _NEW_IP_LOG_FIELD_MAX) for seen in past_cap
         ]
         assert not any("\n" in line for line in over)
         assert await _new_ip_rows(store) == reported
@@ -289,13 +287,22 @@ async def test_each_refused_request_writes_its_own_warning(
 #: inside a value.
 _FIELD = r'([a-z_]+)="([^"]*)"'
 
+#: What the HL7 field-run redaction leaves of a whitespace-delimited run holding two or more
+#: separators, encoded ones included (``%7C`` and the like). It replaces the run whole, label and
+#: all, so a path such as ``/a|b c|d`` logs as this in place of its field.
+_ERASED = "[redacted]"
+
 
 def _logged_fields(line: str) -> list[tuple[str, str]]:
     """The ``key="value"`` fields after the colon of a new-address WARNING, in order, read as a
-    log reader would. Refuses a line that is anything but such fields joined by single spaces."""
+    log reader would. Refuses a line that is anything but such fields joined by single spaces,
+    except that the LAST field may be one a filter erased whole, read as ``("", _ERASED)``."""
     rest = line.split(": ", 1)[1]
-    assert re.fullmatch(f"{_FIELD}(?: {_FIELD})*", rest), line
-    return re.findall(_FIELD, rest)
+    erased = rest == _ERASED or rest.endswith(" " + _ERASED)
+    if erased:
+        rest = rest[: -len(_ERASED)].rstrip(" ")
+    assert rest == "" or re.fullmatch(f"{_FIELD}(?: {_FIELD})*", rest), line
+    return re.findall(_FIELD, rest) + ([("", _ERASED)] if erased else [])
 
 
 #: Paths that tried to write a field of their own (BACKLOG #3770). The second is the one the review
@@ -318,7 +325,11 @@ _FORGING_PATHS = (
     "/x;pwd={abc",
     "/x/password={a",
     "/MEFOR_X=abc",
-    "/plain/path-with.dots_and~tilde",
+    "/plain/path-with.dots_and:colon",
+    "/a&" + "b" * 300,
+    "/a~b c~d",
+    "/a|b c|d",
+    "/x 19-01-01",
     "/u" + "\U0001f600" * 300,
     "/u" + "x" * 5000,
 )
@@ -363,20 +374,24 @@ async def test_a_path_cannot_forge_a_field_of_the_new_address_warnings() -> None
         await store.close()
     lines = [ln for ln in stream.getvalue().splitlines() if ln]
     assert len(lines) == 2 * len(_FORGING_PATHS)
-    for i, path in enumerate(_FORGING_PATHS):
+    for i in range(len(_FORGING_PATHS)):
         repeat, over = (_logged_fields(line) for line in lines[2 * i : 2 * i + 2])
-        assert [key for key, _ in repeat] == ["path"], lines[2 * i]
-        assert [key for key, _ in over] == ["path", "seen_ip"], lines[2 * i + 1]
-        assert over[1][1] == f"10.9.9.{i}"
+        # The seen address comes first and is exactly the real one; the caller-supplied path
+        # comes last, so a filter that rewrites or erases it cannot reach another field.
+        assert [key for key, _ in over] in (["seen_ip", "path"], ["seen_ip", ""]), lines[2 * i + 1]
+        assert over[0][1] == f"10.9.9.{i}"
+        assert lines[2 * i + 1].count("seen_ip=") == 1, lines[2 * i + 1]
+        assert [key for key, _ in repeat] in (["path"], [""]), lines[2 * i]
         for _, value in (*repeat, *over):
             assert len(value) <= _NEW_IP_LOG_FIELD_MAX
-        # A field within its bound reads back as the path after the redaction the filters would
-        # have applied, so the escape neither mangles a path nor lets PHI or a credential through.
-        if "%~crc32:" not in over[0][1]:
-            assert unquote(over[0][1], errors="surrogatepass") == redact_log_value(path)
     assert "SECRETVALUE" not in stream.getvalue()
-    plain = _FORGING_PATHS.index("/plain/path-with.dots_and~tilde")
-    assert _logged_fields(lines[2 * plain + 1])[0][1] == _FORGING_PATHS[plain]
+    plain = _FORGING_PATHS.index("/plain/path-with.dots_and:colon")
+    assert _logged_fields(lines[2 * plain + 1]) == [
+        ("seen_ip", f"10.9.9.{plain}"),
+        ("path", _FORGING_PATHS[plain]),
+    ]
+    longest = _FORGING_PATHS.index("/u" + "x" * 5000)
+    assert "%%crc32-" in _logged_fields(lines[2 * longest + 1])[1][1]
 
 
 async def test_alternating_new_addresses_audit_once_each() -> None:
@@ -656,8 +671,8 @@ async def test_long_address_text_is_bounded_in_the_dedupe_and_the_past_cap_recor
             for r in caplog.records
             if r.levelno == logging.WARNING and "past the per-session" in r.getMessage()
         ]
-        assert [line.rsplit("seen_ip=", 1)[1] for line in over] == [
-            log_field_token(_bounded_address_text(texts[-1]), _NEW_IP_LOG_FIELD_MAX)
+        assert [line.split("seen_ip=", 1)[1].split(" path=", 1)[0] for line in over] == [
+            redacted_log_field(_bounded_address_text(texts[-1]), _NEW_IP_LOG_FIELD_MAX)
         ]
     finally:
         await store.close()
@@ -1231,3 +1246,17 @@ async def test_each_step_up_factory_refuses_a_new_address_holding_a_fresh_proof(
         assert r.headers.get("X-Step-Up-Action") == action, name
     assert isinstance(engine.store, MessageStore)
     assert await _new_ip_rows(engine.store) == ["10.9.9.9"], name
+
+
+def test_a_redaction_that_raises_logs_a_placeholder_not_an_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: a redaction pass that raises escapes ``redacted_log_field``, so a log argument
+    built inside the new-address gate fails the request it was only describing."""
+    import messagefoundry.logging_setup as logging_setup
+
+    def _boom(text: str) -> str:
+        raise RuntimeError(text)
+
+    monkeypatch.setattr(logging_setup, "redact_log_value", _boom)
+    assert redacted_log_field("/users", _NEW_IP_LOG_FIELD_MAX) == '"[unloggable: RuntimeError]"'

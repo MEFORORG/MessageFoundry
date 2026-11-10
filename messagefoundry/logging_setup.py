@@ -57,7 +57,11 @@ from messagefoundry.config.tls_policy import (
 # controlchars, which imports only the standard library and is therefore reachable from
 # ``logging_guard`` too. That
 # module's docstring carries the reasoning; this is now an ordinary import of a leaf.
-from messagefoundry.controlchars import escape_lone_surrogates, scrub_control_chars
+from messagefoundry.controlchars import (
+    escape_lone_surrogates,
+    log_field_token,
+    scrub_control_chars,
+)
 from messagefoundry.keywrap import load_checked_cert_chain
 from messagefoundry.log_spool import LogSpool, SpoolEntry, SpoolUnavailable
 from messagefoundry.logging_guard import (
@@ -98,6 +102,7 @@ __all__ = [
     "CredentialQueryScrubFilter",
     "CredentialScrubFilter",
     "redact_log_value",
+    "redacted_log_field",
     "SyslogForward",
     "ForwarderStatus",
     "FORWARD_LOSS_COUNTERS",
@@ -397,14 +402,27 @@ def _scrub_credential_query(text: str) -> str:
 
 def redact_log_value(text: str) -> str:
     """``text`` through the three text passes :func:`_install_phi_filters` applies, in its order:
-    PHI redaction, the credential query scrub, the credential scrub (BACKLOG #3770).
-
-    For a value a caller escapes before logging, with
-    :func:`~messagefoundry.controlchars.log_field_token`. The escape hides every character the
-    handler filters anchor on, so they cannot read a value inside the token; this runs the same
-    passes on the value first, so nothing they would have hidden prints. The filters still run on
-    the whole line afterwards, as on every record."""
+    PHI redaction, the credential query scrub, the credential scrub (BACKLOG #3770). The list is
+    copied from that function by hand; a pass added there must be added here too."""
     return scrub_credentials(_scrub_credential_query(redact_untrusted(text)))
+
+
+def redacted_log_field(text: str, limit: int) -> str:
+    """``text`` as one ``key="value"`` field value of a log line: redacted by
+    :func:`redact_log_value`, then escaped and bounded by
+    :func:`~messagefoundry.controlchars.log_field_token` (BACKLOG #3770).
+
+    The escape hides most of what the handler filters anchor on, so they read less inside the
+    field than in raw text; redacting first means a PHI or credential value they would have hidden
+    is hidden anyway. The filters still run on the whole line afterwards, and may rewrite the field
+    further, so put a caller-supplied field last on its line, where a rewrite cannot reach another.
+
+    A log argument must never raise, as in :class:`RedactionFilter`: a failing pass gives a fixed
+    placeholder rather than the value."""
+    try:
+        return log_field_token(redact_log_value(text), limit)
+    except Exception as exc:  # noqa: BLE001 -- a log argument must never raise
+        return f'"[unloggable: {type(exc).__name__}]"'
 
 
 class CredentialQueryScrubFilter(logging.Filter):

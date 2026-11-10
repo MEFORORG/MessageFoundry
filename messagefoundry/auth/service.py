@@ -156,11 +156,11 @@ from messagefoundry.config.tls_policy import (
     RevocationHopGuard,
     hop_url_host,
 )
-from messagefoundry.controlchars import log_field_token, scrub_log_argument
+from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.keyed_lock import KeyedLock as _KeyedLock
 from messagefoundry.keyed_lock import hold_keyed_lock as _hold_keyed_lock
-from messagefoundry.logging_setup import redact_log_value
+from messagefoundry.logging_setup import redacted_log_field
 from messagefoundry.store.base import (
     AdminStore,
     audit_write_errors,
@@ -510,8 +510,8 @@ _NEW_IP_PER_SESSION_MAX = 8
 
 # BACKLOG #3772: the longest client-address text the new-address signal keeps as it is, in its dedupe
 # keys, the seen_ip, known_ip and client of its audit row, its notice, and the text its past-cap log
-# line escapes (``_NEW_IP_LOG_FIELD_MAX`` below; so ``%`` and ``:`` in an address log as ``%25`` and
-# ``%3A`` there). Every
+# line escapes (``_NEW_IP_LOG_FIELD_MAX`` below; a ``%`` in an address logs as ``%25`` there).
+# Every
 # IPv4 or IPv6 address without a zone id fits, the longest being 45 characters; only text that does
 # not parse, or an IPv6 address with a long zone id, is longer. That text is caller-supplied on a
 # proxied hop, and without a bound each session could hold nine copies of it. Longer text keeps a
@@ -521,7 +521,7 @@ _NEW_IP_PER_SESSION_MAX = 8
 _NEW_IP_TEXT_MAX = 64
 _NEW_IP_TEXT_PREFIX = 24
 # BACKLOG #3770: the longest value, counted after its escape, that each request field of the
-# new-address WARNINGs logs (``controlchars.log_field_token``). The path is caller-supplied and
+# new-address WARNINGs logs (``logging_setup.redacted_log_field``). The path is caller-supplied and
 # bounded only by the HTTP server's request-line limit, and the seen address is caller-supplied text
 # on a proxied hop.
 _NEW_IP_LOG_FIELD_MAX = 256
@@ -13952,12 +13952,16 @@ class AuthService:
         # addresses, so a replayed token cannot amplify the audit log / notifications even when it
         # alternates between addresses (BACKLOG #2159).
         flag = self._first_new_ip_flag(token_hash, seen_key)
+        # Each logged request field is redacted, escaped and bounded (BACKLOG #3770), and the
+        # path comes last, so even a handler filter that rewrites it cannot reach a field after it.
+        # Only when the line will be written: this branch is the one a replayed token loops on.
         if flag == "repeat":
-            _log.warning(
-                "a request from a new client address must re-verify; the address was already "
-                "flagged since the session's last re-verification (audit suppressed): path=%s",
-                log_field_token(redact_log_value(path), _NEW_IP_LOG_FIELD_MAX),
-            )
+            if _log.isEnabledFor(logging.WARNING):
+                _log.warning(
+                    "a request from a new client address must re-verify; the address was already "
+                    "flagged since the session's last re-verification (audit suppressed): path=%s",
+                    redacted_log_field(path, _NEW_IP_LOG_FIELD_MAX),
+                )
             return True
         # What the row, the notice and the past-cap log line carry. Text within _NEW_IP_TEXT_MAX,
         # which is every address without a long zone id, is unchanged, so a search by address still
@@ -13968,13 +13972,14 @@ class AuthService:
         if flag == "over_cap":
             # Past the cap no new-address row is written, so this line carries the address. The
             # address is attacker-supplied text on a proxied hop.
-            _log.warning(
-                "a request from a new client address must re-verify; the address is past the "
-                "per-session cap of %d (audit suppressed): path=%s seen_ip=%s",
-                _NEW_IP_PER_SESSION_MAX,
-                log_field_token(redact_log_value(path), _NEW_IP_LOG_FIELD_MAX),
-                log_field_token(redact_log_value(seen_text), _NEW_IP_LOG_FIELD_MAX),
-            )
+            if _log.isEnabledFor(logging.WARNING):
+                _log.warning(
+                    "a request from a new client address must re-verify; the address is past the "
+                    "per-session cap of %d (audit suppressed): seen_ip=%s path=%s",
+                    _NEW_IP_PER_SESSION_MAX,
+                    redacted_log_field(seen_text, _NEW_IP_LOG_FIELD_MAX),
+                    redacted_log_field(path, _NEW_IP_LOG_FIELD_MAX),
+                )
             return True
         known_text = _bounded_address_text(session.client)
         detail: dict[str, object] = {

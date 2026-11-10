@@ -49,11 +49,12 @@ escape, not on the predicate:
   * QUOTE -- one ``key=value`` field of a log line, :func:`log_field_token`. ESCAPE keeps a
     value on one line but leaves its spaces, quotes and ``=`` alone, so a value logged before
     another field can still write a field of its own. QUOTE percent-escapes everything but a safe
-    alphabet and wraps the result in quotes, so the value cannot end its field, even after the
-    shipped handler filters (BACKLOG #3770). :func:`quote_log_text` is the JSON-quoted variant for
-    a value at the end of a check line; a credential scrub can close it early, so it is not for a
-    field that others follow. QUOTE changes the value's spelling, so it does not replace ESCAPE
-    on a whole line.
+    alphabet and wraps the result in quotes, so the value holds no space, quote or ``=`` with which
+    to end its field or write another (BACKLOG #3770). A handler filter may still rewrite the
+    field, so a caller puts it last on its line. :func:`quote_log_text` is a separate JSON-quoted
+    form for text printed to a terminal, such as a check line, which no handler filter reads; a
+    credential scrub can close it early, so it is not for a logged field. QUOTE changes the
+    value's spelling, so it does not replace ESCAPE on a whole line.
 
 WHY ESCAPE LIVES HERE, WHICH IS THE ONE FACT WORTH STATING ONCE (BACKLOG #1591). It was defined in
 ``logging_setup`` until ``logging_guard`` needed it, and ``logging_setup`` imports
@@ -347,15 +348,16 @@ def quote_log_text(text: str) -> str:
     return scrub_log_argument(json.dumps(text))
 
 
-#: The characters :func:`log_field_token` writes as they are: the URL "unreserved" set and ``/``.
-#: Every character a shipped handler filter anchors on is outside it, at least the space, both
-#: quotes, the backslash, ``=``, ``:``, ``|``, ``<``, ``{`` and ``;``, so no filter pattern can start
-#: inside the token and run past its closing quote (BACKLOG #3770).
-_LOG_FIELD_KEPT = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/")
+#: The characters :func:`log_field_token` writes as they are: letters, digits and ``-._/:``. At
+#: least the space, both quotes, the backslash, ``=``, ``|``, ``^``, ``&``, ``~``, ``<``, ``{`` and
+#: ``;`` are escaped, so the value cannot end its field or start a field of its own (BACKLOG #3770).
+#: ``:`` stays, so an IPv6 address still reads and greps as itself.
+_LOG_FIELD_KEPT = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._/:")
 
 #: What :func:`log_field_token` puts in place of the cut tail of a token over its bound. It starts
-#: with "%~", which the escape never writes, so a bounded token cannot read as a kept one.
-_LOG_FIELD_CUT_MARK = "%~crc32:"
+#: with "%%", which the escape never writes, so a bounded token cannot read as a kept one, and it
+#: holds no HL7 separator, so a cut head cannot gain one.
+_LOG_FIELD_CUT_MARK = "%%crc32-"
 _LOG_FIELD_CUT_LENGTH = len(_LOG_FIELD_CUT_MARK) + 8
 
 
@@ -370,10 +372,11 @@ def log_field_token(text: str, limit: int) -> str:
     ``text`` can close or extend, before or after the shipped handler filters (BACKLOG #3770).
 
     Every character outside :data:`_LOG_FIELD_KEPT` is written as the ``%XX`` escapes of its UTF-8
-    bytes, a lone surrogate by ``surrogatepass``, so the token is reversible by a percent-decode
-    and holds nothing a handler filter anchors on. Those filters therefore cannot read a value
-    inside the token either, so a caller logging text that may hold PHI or a credential redacts it
-    FIRST (``logging_setup.redact_log_value``) and passes the result here.
+    bytes, a lone surrogate by ``surrogatepass``, so the token holds no space, quote or backslash
+    and a percent-decode gives ``text`` back. The handler filters still run over the line and may
+    rewrite or erase the field, so that holds only for a field they leave alone. The escape also
+    hides most of what they anchor on, so a caller does not call this directly: it calls
+    ``logging_setup.redacted_log_field``, which redacts first.
 
     The escaped text is at most ``limit`` characters, counted after the escape, so the field is at
     most ``limit`` plus its two quotes whatever ``text`` holds. Longer text keeps the escapes of
@@ -396,7 +399,7 @@ def log_field_token(text: str, limit: int) -> str:
         pieces.append(piece)
         if length > limit:
             break
-    if length <= limit and len(text) <= limit:
+    if length <= limit:
         return scrub_log_argument(f'"{"".join(pieces)}"')
     import binascii  # lazily, for the reason quote_log_text imports json lazily
 
