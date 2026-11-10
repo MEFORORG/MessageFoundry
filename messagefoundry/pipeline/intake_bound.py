@@ -38,7 +38,8 @@ became several engine shards, an engine shard dropped from a shrinking engine sh
 renamed or retired ``[cluster].node_id``. Every
 monitor with a sink therefore sweeps the store's open ``intake_paused`` instances for subjects that
 are not its own. One whose occurrence count has not moved for :data:`STALE_SECONDS` of this
-monitor's own clock is resolved, bounded by the count it saw. A live paused process raises a
+monitor's own clock is resolved, bounded by the count it saw; a failed sweep read stretches that by
+the gap and up to :data:`GAP_GRACE_SECONDS`, as :meth:`IntakeBoundMonitor.sweep_once` says. A live paused process raises a
 reminder every :data:`REALERT_SECONDS`, which moves the count, so its alert stays open while those
 writes land. A paused process cut off from the store cannot remind, so another process's sweep
 expires its alert while it is still paused; its first reminder that lands again opens a new
@@ -69,6 +70,7 @@ from messagefoundry.transports.base import IntakeGate
 __all__ = [
     "DEPTH_REASON",
     "DISK_REASON",
+    "GAP_GRACE_SECONDS",
     "INTAKE_SUBJECT_MAX_LENGTH",
     "PAUSE_EFFECT",
     "STALE_SECONDS",
@@ -123,11 +125,12 @@ STALE_SECONDS = 4 * REALERT_SECONDS
 #: How often a monitor sweeps for expired subjects. Coarse on purpose: the read is store-wide.
 SWEEP_SECONDS = 60.0
 
-#: What the first good sweep read after a failed one leaves uncounted, on top of the gap itself:
-#: a live process's reminder the outage ate is followed by its next within one reminder interval,
-#: and a sweep sees it within one sweep spacing. Without it, staleness counted before the outage
-#: could expire a live alert after the store returns, before that next reminder lands.
-_GAP_GRACE_SECONDS = REALERT_SECONDS + SWEEP_SECONDS
+#: What a failed sweep read leaves a watch, at least, once reads succeed again: its counted
+#: staleness is held to :data:`STALE_SECONDS` minus this. A live process whose reminder the outage
+#: ate raises its next within one reminder interval, and a sweep sees it within one sweep spacing;
+#: twice the probe timeout covers a slow read on each side. Without it, staleness counted before the
+#: outage could expire a live alert before that next reminder lands.
+GAP_GRACE_SECONDS = REALERT_SECONDS + SWEEP_SECONDS + 2 * PROBE_TIMEOUT_SECONDS
 
 #: The reminder clock, a module name so a test can move it without moving the event loop's.
 _monotonic = time.monotonic
@@ -331,7 +334,8 @@ class IntakeBoundMonitor:
         a process whose next start uses a different subject: it clears its open pauses here, since
         nothing else ever will. A process that dies without stopping still leaves them open, and so
         does one that stops: another process's sweep resolves them once nobody has raised them for
-        :data:`STALE_SECONDS` (BACKLOG #3269). A process stopped for longer than that therefore
+        :data:`STALE_SECONDS`, longer after a failed sweep read (:meth:`sweep_once`; BACKLOG
+        #3269). A process stopped for longer than that therefore
         finds its pause resolved, and a pause that still holds at its next start opens a new
         instance."""
         self._stop.set()
@@ -430,13 +434,14 @@ class IntakeBoundMonitor:
         the instance at its current count, so no other process's clock enters it. The resolve is
         bounded by that count (``resolve_alert_generation``): a reminder that lands between the read
         and the write moves the count past it, and the row stays open. A subject this process owns
-        is skipped, since its own measurement raises and clears it. A failed read keeps every
-        watch, and the next good read moves each one's start forward by the whole time since the
-        last good read plus :data:`_GAP_GRACE_SECONDS`, one reminder interval and one sweep
-        spacing: a live process whose reminder the outage ate raises its next one inside that
-        grace, which moves the count and resets the watch. So staleness counts only time between
-        two good reads in a row, outside the grace after a gap, and a single failed read costs a
-        watch that gap and the grace, not what it had already counted. A failed
+        is skipped, since its own measurement raises and clears it. A failed read counts none of
+        the time from the last good read to the next one, and keeps every watch: what a watch had
+        counted stays counted, held to at most :data:`STALE_SECONDS` minus
+        :data:`GAP_GRACE_SECONDS` at that next good read, so a live process whose reminder the
+        outage ate has the grace to land its next one. Graces do not stack: a second failure
+        inside one holds the watch to the same bound again. So a dead subject still expires once
+        a run of good reads spans the grace, and stays open while reads fail more often than
+        that. A failed
         resolve keeps that instance watched and the pass goes on to the rest. Each step's failure
         is logged once per failing streak.
 
@@ -453,11 +458,8 @@ class IntakeBoundMonitor:
             return 0
         self._sweep_failing.discard("read")
         now = _monotonic()
-        gap = (
-            now - self._last_read + _GAP_GRACE_SECONDS
-            if self._read_gap and self._last_read is not None
-            else 0.0
-        )
+        # The time since the last good read, when a read failed in between: none of it counts.
+        gap = now - self._last_read if self._read_gap and self._last_read is not None else None
         self._last_read, self._read_gap = now, False
         watched: dict[int, tuple[int, float]] = {}
         expired = 0
@@ -466,7 +468,14 @@ class IntakeBoundMonitor:
             if gen.connection in self._own_subjects:
                 continue
             prev = self._watched.get(gen.id)
-            since = prev[1] + gap if prev is not None and prev[0] == gen.count else now
+            if prev is None or prev[0] != gen.count:
+                since = now
+            elif gap is None:
+                since = prev[1]
+            else:
+                # Held, not stacked: a second failure inside an earlier grace cannot push the
+                # watch's start past where one grace would put it.
+                since = max(prev[1] + gap, now + GAP_GRACE_SECONDS - STALE_SECONDS)
             if now - since < STALE_SECONDS:
                 watched[gen.id] = (gen.count, since)
                 continue

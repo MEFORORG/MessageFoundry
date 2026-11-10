@@ -361,7 +361,13 @@ no inverse that could ever fire. Every `IntakeBoundMonitor` with a sink now reso
 of its own monotonic clock. That rule reads only whether a reminder landed, by design: a process
 still paused whose reminders stop reaching the store (cut off, failing writes, or a check that keeps
 raising) has its alert resolved while its intake stays paused, a false clear accepted as the cost of
-a time-to-live. The resolve is bounded by the `(id, count)` it read
+a time-to-live. Such a process, still live, keeps its in-memory suspend and occurrence state for
+the resolved instance: its later raises keep the escalation tier it had reached, and a suspend set
+on the old instance keeps muting its notifications until that window ends, although the new
+instance carries none (vault BACKLOG #8190). A failed sweep read counts none of the time from the
+last good read to the next, and holds what was counted to `STALE_SECONDS` minus
+`GAP_GRACE_SECONDS`, so a live process whose reminder an outage ate has time to land its next one;
+the graces do not stack. The resolve is bounded by the `(id, count)` it read
 (`resolve_alert_generation`, all three backends), so a raise that lands first keeps the row open, and
 no clock is compared across processes. It closes an acknowledged instance too, as every auto-resolve
 does; retention then treats it as any other resolved row. Other subjects that name a process, or a
