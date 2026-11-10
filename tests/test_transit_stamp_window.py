@@ -243,15 +243,20 @@ async def test_the_federated_callback_after_its_stamp_answers_session_lost(
 # --- decision d20261109T200352805-599b24, item 3: the lost step-up's auth.reauth row ---------------
 
 
-def _refuse_audit(monkeypatch: pytest.MonkeyPatch, store: MessageStore, action: str) -> None:
+def _refuse_audit(monkeypatch: pytest.MonkeyPatch, store: MessageStore, action: str) -> list[str]:
+    """Refuse ``action``'s audit write; the returned list grows by one per refused write, so a
+    test asserting the row is absent can first show the write was attempted."""
     record_audit = store.record_audit
+    refusals: list[str] = []
 
     async def refused(name: str, **kwargs: Any) -> Any:
         if name == action:
+            refusals.append(name)
             raise CipherError("synthetic audit MAC outage")
         return await record_audit(name, **kwargs)
 
     monkeypatch.setattr(store, "record_audit", refused)
+    return refusals
 
 
 @pytest.mark.parametrize("audit_up", [True, False], ids=["audit_up", "audit_refused"])
@@ -264,8 +269,9 @@ async def test_a_lost_reauth_writes_its_row_softly_with_no_grant_verdict(
         monkeypatch.setattr(
             service, "_factor_binding_is_blocked", _raising(TransitSealUnavailableError())
         )
+        refusals: list[str] = []
         if not audit_up:
-            _refuse_audit(monkeypatch, store, "auth.reauth")
+            refusals = _refuse_audit(monkeypatch, store, "auth.reauth")
         lost = await service.reauth(
             identity, password, token=token, purpose=STEP_UP_ACTION_SESSION_TERMINATE
         )
@@ -274,7 +280,8 @@ async def test_a_lost_reauth_writes_its_row_softly_with_no_grant_verdict(
         if audit_up:
             assert rows[-1]["session_lost"] is True and rows[-1]["grant_refused"] is None
         else:
-            assert rows == []
+            assert len(refusals) >= 1  # the soft write was attempted and refused
+            assert await store.list_audit(action="auth.reauth") == []
     finally:
         await store.close()
 
@@ -293,15 +300,17 @@ async def test_a_lost_federated_step_up_writes_its_row_softly_with_no_grant_verd
         monkeypatch.setattr(
             service, "_factor_binding_is_blocked_hash", _raising(TransitSealUnavailableError())
         )
+        refusals: list[str] = []
         if not audit_up:
-            _refuse_audit(monkeypatch, store, "auth.reauth")
+            refusals = _refuse_audit(monkeypatch, store, "auth.reauth")
         out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id, auth_time=time.time())
         assert out.elevation.session_lost and out.elevation.token is None
         rows = [json.loads(str(r["detail"])) for r in await store.list_audit(action="auth.reauth")]
         if audit_up:
             assert rows[-1]["session_lost"] is True and rows[-1]["grant_refused"] is None
         else:
-            assert rows == []
+            assert len(refusals) >= 1  # the soft write was attempted and refused
+            assert await store.list_audit(action="auth.reauth") == []
     finally:
         await store.close()
 

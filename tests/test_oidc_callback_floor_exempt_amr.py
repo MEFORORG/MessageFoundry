@@ -743,6 +743,9 @@ _KEYWORD_WRITERS = {
     "_directory_reject_audit": "extra",
     "_refuse_directory_row": "extra",
     "_complete_ad_login": "outcome_extra",
+    # ADR 0217 item 3: the step-up's auth.reauth row goes through this helper, which writes the
+    # call site's ``detail`` whole, so the marker is checked where that detail is built.
+    "_write_reauth_row": "detail",
 }
 #: The writers that put a keyword into the row they write, checked by
 #: :func:`test_each_writer_puts_the_marker_keyword_into_its_row`.
