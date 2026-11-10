@@ -97,14 +97,17 @@ def encode_response_headers(headers: Mapping[str, str] | None) -> str | None:
     return json.dumps(clean)
 
 
-def _load_object(text: str | None) -> dict[str, Any]:
+def _load_object(text: str | bytes | bytearray | None) -> dict[str, Any]:
     """The JSON object ``text`` holds, or ``{}`` for ``None``, empty, malformed or non-object text.
 
     It decodes a ``str`` through :func:`~messagefoundry.redaction.json_loads_or_refusal`, so json's
     depth-limit ``RecursionError`` on deeply nested input reads as malformed like any other decode
-    failure (BACKLOG #6712). A refusal is logged with json's content-free hint, never the text. A
-    value that is not a ``str`` reads as ``{}`` too, as the ``TypeError`` arm this replaced did."""
-    if not isinstance(text, str) or not text:
+    failure (BACKLOG #6712). A refusal is logged with json's content-free hint, never the text.
+    ``bytes``/``bytearray`` decode as ``json.loads`` decoded them before; any other type reads as
+    ``{}``, as the ``TypeError`` arm this replaced did."""
+    if isinstance(text, bytearray):
+        text = bytes(text)
+    if not isinstance(text, str | bytes) or not text:
         return {}
     value, refusal = json_loads_or_refusal(text)
     if refusal is not None:

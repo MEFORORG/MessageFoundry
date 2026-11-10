@@ -173,6 +173,25 @@ def test_a_non_str_cell_reads_as_empty() -> None:
     assert json.loads(merge_user_metadata(cell, [("k", "v")])) == {"user": {"k": "v"}}
 
 
+@pytest.mark.parametrize("wrap", [bytes, bytearray], ids=["bytes", "bytearray"])
+def test_a_bytes_cell_keeps_its_lineage_through_merge(wrap: Any) -> None:
+    """``json.loads`` parsed a bytes cell before this branch; it still must, or the merge below would
+    write the ops alone over the lineage."""
+    cell: Any = wrap(json.dumps({"correlation_id": "c", "user": {"old": "x"}}).encode("utf-8"))
+    assert json.loads(merge_user_metadata(cell, [("k", "v")])) == {
+        "correlation_id": "c",
+        "user": {"old": "x", "k": "v"},
+    }
+    assert json.loads(user_metadata(cell) or "null") == {"old": "x"}
+    assert decode_response_headers(wrap(b'{"Location": "/x"}')) == {"Location": "/x"}
+
+
+def test_a_malformed_bytes_cell_reads_as_empty() -> None:
+    """The hardening still holds for bytes: deep nesting and a bad UTF-8 byte read as malformed."""
+    assert user_metadata(_DEEP.encode("ascii")) is None  # type: ignore[arg-type]
+    assert user_metadata(b'{"user": {"k": "\xff"}}') is None  # type: ignore[arg-type]
+
+
 def test_an_unreadable_cell_is_logged_without_its_content(caplog: pytest.LogCaptureFixture) -> None:
     marker = "SYNTHETIC-MRN-5550199"
     with caplog.at_level("WARNING", logger="messagefoundry.store.metadata"):
