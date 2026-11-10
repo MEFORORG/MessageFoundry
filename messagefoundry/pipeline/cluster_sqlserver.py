@@ -73,21 +73,7 @@ from messagefoundry.redaction import safe_exc
 
 log = logging.getLogger(__name__)
 
-#: What a clamped statement's borrow advises if it times out at its clamp
-#: (``SqlServerStore._acquire_clamped``): each call site below names the setting that sets its
-#: clamp, so the advice never points at one that cannot lengthen it (BACKLOG #5064).
-CLUSTER_RENEW_RETUNE = "[cluster].lease_renew_timeout_seconds"
-CLUSTER_FENCE_RETUNE = "[cluster].leader_fence_timeout_seconds"
-#: stop()'s two writes. Their clamp is a fixed bound, and each runs inside an event-loop timeout of
-#: the same length, which starts first and so fires first: in practice this text is never seen.
-CLUSTER_STOP_RETUNE = "nothing: stop()'s shutdown bound is fixed"
-
-__all__ = [
-    "CLUSTER_FENCE_RETUNE",
-    "CLUSTER_RENEW_RETUNE",
-    "CLUSTER_STOP_RETUNE",
-    "SqlServerCoordinator",
-]
+__all__ = ["SqlServerCoordinator"]
 
 if TYPE_CHECKING:
     from messagefoundry.pipeline.cluster import ClusterCoordinator
@@ -276,7 +262,6 @@ class SqlServerCoordinator:
                     "UPDATE nodes SET status=?, last_seen=?, is_leader=0 WHERE node_id=?",
                     ("left", time.time(), self.node_id),
                     timeout_clamp=self._stop_write_timeout,
-                    retune=CLUSTER_STOP_RETUNE,
                 )
         except Exception as exc:  # pool may already be closing on shutdown — log, don't raise
             log.warning("cluster: failed to mark node %s left: %s", self.node_id, safe_exc(exc))
@@ -334,7 +319,6 @@ class SqlServerCoordinator:
             " inserted.config_digest_version AS config_digest_version;",
             (time.time(),),
             timeout_clamp=self._renew_timeout,
-            retune=CLUSTER_RENEW_RETUNE,
         )
         assert row is not None, "cluster_config upsert returned no row"
         return self._cache_config_row(row)
@@ -472,7 +456,6 @@ class SqlServerCoordinator:
             "UPDATE nodes SET last_seen=?, status=?, is_leader=? WHERE node_id=?",
             (time.time(), "active", 1 if self._is_leader else 0, self.node_id),
             timeout_clamp=self._renew_timeout,
-            retune=CLUSTER_RENEW_RETUNE,
         )
 
     async def _heartbeat_loop(self) -> None:
@@ -561,13 +544,11 @@ class SqlServerCoordinator:
             # executor thread for [store].command_timeout (BACKLOG #5064). Half the budget, as on
             # Postgres, because the clamped borrow and statement each take up to the clamp; the
             # loop's bound stays as the backstop for the rollback and the 1 s floor.
-            clamp, retune = self._paused_read_clamp()
             async with asyncio.timeout(self._paused_read_budget):
                 current = await self._store._fetchone_clamped(
                     "SELECT owner FROM leader_lease WHERE lease_key = ?",
                     (self._lease_key,),
-                    timeout_clamp=clamp,
-                    retune=retune,
+                    timeout_clamp=self._paused_read_clamp(),
                 )
             if current is not None and current["owner"] != self.node_id:
                 self._no_claim_until = 0.0
@@ -598,7 +579,6 @@ class SqlServerCoordinator:
                 self._lease_ttl,  # INSERT lease_expires_at
             ),
             timeout_clamp=self._renew_timeout,
-            retune=CLUSTER_RENEW_RETUNE,
         )
         if row is None or row["owner"] != self.node_id:
             # The DB saw another owner's live lease; see DbCoordinator._claim_or_renew_lease (#1508).
@@ -608,18 +588,11 @@ class SqlServerCoordinator:
         self._leader_epoch = int(row["leader_epoch"])
         return True
 
-    def _paused_read_clamp(self) -> tuple[float, str]:
-        """The paused owner read's driver clamp, the smaller of the renew clamp and half the
-        paused-read budget, and the setting that sets it, decided together so neither can change
-        alone (BACKLOG #5064). The terms are compared as the store runs them, floored at 1 s
-        (``SqlServerStore._clamp_bounds``), so a budget term the floor lifts to the renew clamp's
-        length does not name the fence. At such a tie, or any other, the renew setting is named,
-        though raising either alone would not lengthen the clamp."""
-        budget_term = self._paused_read_budget / 2.0
-        clamp = min(self._renew_timeout, budget_term)
-        if max(1.0, budget_term) < max(1.0, self._renew_timeout):
-            return clamp, CLUSTER_FENCE_RETUNE
-        return clamp, CLUSTER_RENEW_RETUNE
+    def _paused_read_clamp(self) -> float:
+        """The paused owner read's driver clamp: the smaller of the renew clamp and half the
+        paused-read budget (BACKLOG #5064). docs/CONFIGURATION.md, [cluster], says which setting
+        sets each term."""
+        return min(self._renew_timeout, self._paused_read_budget / 2.0)
 
     async def _fence_watchdog_loop(self) -> None:
         while not self._stop.is_set():
@@ -733,11 +706,7 @@ class SqlServerCoordinator:
             # own bound, as DbCoordinator._release_leadership gives it, applied on the event loop
             # and to the driver alike (BACKLOG #5064), since the loop's bound alone cannot stop a
             # write the server already took.
-            clamp, retune = (
-                (self._renew_timeout, CLUSTER_RENEW_RETUNE)
-                if timeout is None
-                else (timeout, CLUSTER_STOP_RETUNE)
-            )
+            clamp = self._renew_timeout if timeout is None else timeout
             async with asyncio.timeout(timeout):
                 # The expiry is the DB clock's now, read by the same _DB_NOW expression the MERGE's
                 # take-over predicate reads, so each sibling waits its own acquire_delay (BACKLOG
@@ -750,7 +719,6 @@ class SqlServerCoordinator:
                     " WHERE lease_key = ? AND owner = ?",
                     (self._lease_key, self.node_id),
                     timeout_clamp=clamp,
-                    retune=retune,
                 )
         except Exception as exc:
             log.warning(

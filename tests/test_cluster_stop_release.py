@@ -162,7 +162,7 @@ class _SqlStore:
         return self._lease.claim(params[1])
 
     async def _fetchone_clamped(
-        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float, retune: str
+        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
     ) -> dict[str, object] | None:
         return await self._fetchone(sql, params)
 
@@ -171,7 +171,7 @@ class _SqlStore:
         return await self.writes.run(sql, owner)
 
     async def _execute_clamped(
-        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float, retune: str
+        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
     ) -> int:
         return await self._execute(sql, params)  # the release; the clamp is not modelled here
 

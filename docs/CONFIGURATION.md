@@ -2945,6 +2945,30 @@ nodes automatically:
 | `acquire_delay_seconds` | num | 0 | **leader-preference handicap** (ADR 0096, per-node). Seconds this node waits PAST the lease-expiry time before it may take over an **expired** lease, so a preferred (`0`) node wins the routine take-over race. NEVER delays a renewal by the current leader, and only ever makes a node claim later — so it can't open a two-leader window. Governs take-over of an expired lease only (the first election on an empty table is a plain race). Must be between `0` and `3600` (an hour); the engine refuses anything outside that, including `inf` and `nan`, because a planned stepdown pauses the drained node for the longest sibling delay (BACKLOG #2539). Surfaced per-node in `/cluster/nodes` |
 | `promotable` | bool | true | **non-promotable standby** flag (ADR 0096, per-node). `false` = this node may never become leader (never inserts/takes-over/renews the lease); a node that somehow already leads steps down cleanly. Use for a warm, passive DR engine. **At least one promotable node must exist** or no node ever acquires the lease. `[dr].enabled` cannot be combined with `[cluster].enabled` (a warm DR node is a non-promotable member, not a `[dr]` box). Surfaced per-node in `/cluster/nodes` |
 
+**Which setting sets a clamped SQL Server borrow's bound.** On SQL Server the coordinator's clamped
+statements wait for a pooled connection for at most their clamp, or `[store].acquire_timeout` if
+that is shorter. A borrow that times out at its clamp raises `StoreAcquireTimeout`, whose message
+ends `retune with the setting that sets its [cluster] clamp, if any` and points here, because no
+one setting sets every clamp (BACKLOG #5064). At least these set them:
+
+- **The renew clamp**, for the claim and renew, the heartbeat, the config-version refresh and a
+  stepdown's release write. It is `lease_renew_timeout_seconds` when set. Left unset, it is derived
+  from `leader_fence_timeout_seconds` and `leader_lease_ttl_seconds`, as half the detection margin,
+  capped at 5 s and floored at 1 s (the `lease_renew_timeout_seconds` row above). Raising the fence
+  timeout narrows that margin, so it shortens a derived clamp.
+- **The paused tick's owner read**, which runs while a stepdown pause holds. Its clamp is the
+  smaller of two terms: the renew clamp, and half the paused-read budget. The budget is 75 percent
+  of `leader_fence_timeout_seconds`, so the second term is 37.5 percent of it. The two terms move in
+  opposite directions when the fence timeout rises: the budget term grows, and a derived renew
+  clamp shrinks. So raising the fence timeout can shorten this clamp rather than lengthen it. To
+  lengthen it, set `lease_renew_timeout_seconds` explicitly, and keep the fence timeout high enough
+  that the budget term is not the smaller one. At the shipped 10/20/30 the terms are 4.5 s and
+  7.5 s, so the renew clamp binds.
+- **The store's 1 s floor.** The store runs any clamp under 1 s as 1 s, for the borrow and the
+  statement alike, so no setting can make a borrow shorter than that.
+- **`stop()`'s two writes**, the lease release and the `left` write. They run at a fixed 2 s
+  shutdown bound that no setting changes, inside an event-loop timeout of the same length.
+
 #### `[cluster.vip]` — engine-managed virtual IP (ADR 0056, Windows-only)
 
 **Windows-only.** Engine-managed VIP is a Windows feature at v1, and IPv4 only; IPv6 is deferred on every

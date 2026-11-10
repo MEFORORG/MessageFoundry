@@ -38,12 +38,7 @@ from messagefoundry.config.settings import (
     load_settings,
 )
 from messagefoundry.pipeline.cluster import build_coordinator
-from messagefoundry.pipeline.cluster_sqlserver import (
-    CLUSTER_FENCE_RETUNE,
-    CLUSTER_RENEW_RETUNE,
-    CLUSTER_STOP_RETUNE,
-    SqlServerCoordinator,
-)
+from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
 from messagefoundry.store.sqlserver import _clamped_statement_timeout
 from tests._log_absence import assert_capture_sees
@@ -206,9 +201,7 @@ def _store(conn: _Conn, command_timeout: int = 30, acquire_timeout: float = 30.0
 async def test_the_clamped_read_runs_under_the_clamp_and_restores_command_timeout() -> None:
     conn = _Conn()
     store = _store(conn)
-    row = await store._fetchone_clamped(
-        "MERGE leader_lease ...", ("k",), timeout_clamp=4.5, retune=CLUSTER_RENEW_RETUNE
-    )
+    row = await store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=4.5)
     assert row == {"owner": "A", "leader_epoch": 7}
     assert conn.statement_timeouts == [4]
     # _borrow applies command_timeout, the clamp replaces it for the statement, and it is put back.
@@ -219,9 +212,7 @@ async def test_the_clamped_read_runs_under_the_clamp_and_restores_command_timeou
 async def test_a_shorter_command_timeout_still_ends_the_claim_first() -> None:
     conn = _Conn()
     store = _store(conn, command_timeout=2)
-    await store._fetchone_clamped(
-        "MERGE leader_lease ...", ("k",), timeout_clamp=4.5, retune=CLUSTER_RENEW_RETUNE
-    )
+    await store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=4.5)
     assert conn.statement_timeouts == [2]
     assert conn.raw.timeout == 2
 
@@ -233,9 +224,7 @@ async def test_the_timeout_is_restored_when_the_statement_raises() -> None:
     conn.fail = RuntimeError("HYT00 query timeout expired")
     store = _store(conn)
     with pytest.raises(RuntimeError, match="HYT00"):
-        await store._fetchone_clamped(
-            "MERGE leader_lease ...", ("k",), timeout_clamp=4.5, retune=CLUSTER_RENEW_RETUNE
-        )
+        await store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=4.5)
     assert conn.statement_timeouts == [4]
     assert conn.rolled_back == 1
     assert conn.raw.assigned == [30, 4, 30]
@@ -251,9 +240,7 @@ async def test_a_cancelled_claim_quarantines_and_does_not_touch_the_timeout() ->
     conn.hang = asyncio.Event()
     store = _store(conn)
     task = asyncio.create_task(
-        store._fetchone_clamped(
-            "MERGE leader_lease ...", ("k",), timeout_clamp=4.5, retune=CLUSTER_RENEW_RETUNE
-        )
+        store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=4.5)
     )
     while not conn.statement_timeouts and not task.done():
         await asyncio.sleep(0)
@@ -275,9 +262,7 @@ async def test_the_claim_waits_for_a_pooled_connection_at_most_the_clamp() -> No
     store._pool = _HangingPool()
     started = time.monotonic()
     with pytest.raises(StoreAcquireTimeout):
-        await store._fetchone_clamped(
-            "MERGE leader_lease ...", ("k",), timeout_clamp=1.0, retune=CLUSTER_RENEW_RETUNE
-        )
+        await store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=1.0)
     clamped = time.monotonic() - started
     started = time.monotonic()
     with pytest.raises(StoreAcquireTimeout):
@@ -304,9 +289,7 @@ async def test_a_failed_restore_does_not_fail_a_claim_that_returned() -> None:
 
     conn = _Conn()
     conn._conn = conn.raw = _RefusingRaw()
-    row = await _store(conn)._fetchone_clamped(
-        "MERGE leader_lease ...", ("k",), timeout_clamp=4.5, retune=CLUSTER_RENEW_RETUNE
-    )
+    row = await _store(conn)._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=4.5)
     assert row == {"owner": "A", "leader_epoch": 7}
     assert conn.raw.assigned == [30, 4]
 
@@ -337,9 +320,7 @@ async def test_a_failed_rollback_discards_the_connection_and_raises_the_original
     store = _store(conn)
     with pytest.raises(RuntimeError, match="HYT00"):
         if clamped:
-            await store._fetchone_clamped(
-                "MERGE leader_lease ...", ("k",), timeout_clamp=4.5, retune=CLUSTER_RENEW_RETUNE
-            )
+            await store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=4.5)
         else:
             await store._fetchone("SELECT 1", ())
     assert conn.rolled_back == 1
@@ -362,9 +343,7 @@ async def test_a_hung_rollback_ends_at_the_clamp_and_discards_the_connection(met
     store = _store(conn)
     started = time.monotonic()
     with pytest.raises(RuntimeError, match="HYT00"):
-        await getattr(store, method)(
-            "UPDATE leader_lease ...", ("k",), timeout_clamp=1.0, retune=CLUSTER_RENEW_RETUNE
-        )
+        await getattr(store, method)("UPDATE leader_lease ...", ("k",), timeout_clamp=1.0)
     elapsed = time.monotonic() - started
     assert 0.9 <= elapsed < 3.0, elapsed
     assert conn.rolled_back == 1
@@ -427,11 +406,7 @@ async def test_a_failed_rollback_after_a_failed_write_discards_the_connection(me
     conn.rollback_fail = RuntimeError("08S01 communication link failure during rollback")
     conn.fail = RuntimeError("HYT00 query timeout expired")
     store = _store(conn)
-    kwargs: dict[str, Any] = (
-        {"timeout_clamp": 3.0, "retune": CLUSTER_RENEW_RETUNE}
-        if method == "_execute_clamped"
-        else {}
-    )
+    kwargs = {"timeout_clamp": 3.0} if method == "_execute_clamped" else {}
     with pytest.raises(RuntimeError, match="HYT00"):
         await getattr(store, method)("UPDATE leader_lease SET owner = NULL", ("A",), **kwargs)
     assert conn.rolled_back == 1
@@ -567,9 +542,7 @@ async def test_a_rollback_past_its_bound_logs_no_stored_value_or_traceback_at_wa
         caplog.at_level(logging.WARNING, logger="messagefoundry.store.sqlserver"),
         pytest.raises(_DriverError),
     ):
-        await _store(conn)._fetchone_clamped(
-            "MERGE leader_lease ...", ("k",), timeout_clamp=1.0, retune=CLUSTER_RENEW_RETUNE
-        )
+        await _store(conn)._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=1.0)
     assert conn.closed is True
     for record in caplog.records:
         assert record.exc_info is None and record.exc_text is None, record.getMessage()
@@ -584,9 +557,7 @@ async def test_a_rollback_that_succeeds_still_recycles_the_connection() -> None:
     conn.fail = RuntimeError("HYT00 query timeout expired")
     store = _store(conn)
     with pytest.raises(RuntimeError, match="HYT00"):
-        await store._fetchone_clamped(
-            "MERGE leader_lease ...", ("k",), timeout_clamp=1.0, retune=CLUSTER_RENEW_RETUNE
-        )
+        await store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=1.0)
     assert conn.rolled_back == 1
     assert conn.closed is False
 
@@ -609,47 +580,40 @@ async def test_the_paused_owner_read_is_clamped_at_the_smaller_of_clamp_and_budg
     """The paused tick's owner read reaches the driver clamped, like the tick's other statements
     (BACKLOG #5064), at the smaller of the renew clamp and half its own BACKLOG #2540 budget. Before,
     it went through the plain ``_fetchone`` and was bounded on the event loop alone. Half the
-    budget, as on Postgres, because the borrow and the statement each take up to the clamp. At the
-    defaults the renew clamp is the smaller term, so a borrow that times out names the renew setting
-    alone: raising the fence would not lengthen it."""
+    budget, as on Postgres, because the borrow and the statement each take up to the clamp."""
     clamps: list[float] = []
-    advice: list[str] = []
 
     class _Store:
         async def _fetchone(self, sql: str, params: tuple[object, ...]) -> dict[str, object]:
             raise AssertionError("the paused read must be clamped at the driver")
 
         async def _fetchone_clamped(
-            self, sql: str, params: tuple[object, ...], *, timeout_clamp: float, retune: str
+            self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
         ) -> dict[str, object]:
             assert sql.startswith("SELECT owner"), "a paused node must not send the claim"
             clamps.append(timeout_clamp)
-            advice.append(retune)
             return {"owner": "A"}
 
     coord = SqlServerCoordinator(_Store(), "A", monotonic=lambda: 0.0)
     coord._no_claim_until = 10.0
     assert await coord._claim_or_renew_lease() is False
-    assert coord._renew_timeout < coord._paused_read_budget / 2.0, "the renew term must bind here"
-    assert clamps == [coord._renew_timeout]
-    assert advice == [CLUSTER_RENEW_RETUNE]
+    assert clamps == [min(coord._renew_timeout, coord._paused_read_budget / 2.0)]
 
 
 @pytest.mark.parametrize(
     ("fence", "renew", "expected"),
     [
-        (4.0, 5.0, (1.5, CLUSTER_FENCE_RETUNE)),  # half the budget binds
-        (20.0, 5.0, (5.0, CLUSTER_RENEW_RETUNE)),  # the renew clamp binds
-        (8.0, 3.0, (3.0, CLUSTER_RENEW_RETUNE)),  # a tie names the renew setting
-        (2.0, 1.0, (0.75, CLUSTER_RENEW_RETUNE)),  # the 1 s floor lifts the budget term to a tie
+        (4.0, 5.0, 1.5),  # half the budget is the smaller term
+        (20.0, 5.0, 5.0),  # the renew clamp is the smaller term
+        (8.0, 3.0, 3.0),  # a tie
+        (2.0, 1.0, 0.75),  # below the store's 1 s floor, which the store applies, not this
     ],
 )
-def test_the_paused_read_names_the_term_that_sets_its_floored_clamp(
-    fence: float, renew: float, expected: tuple[float, str]
+def test_the_paused_read_clamp_is_the_smaller_term(
+    fence: float, renew: float, expected: float
 ) -> None:
-    """BACKLOG #5064: the paused read's clamp is unchanged, the smaller of the two terms, and its
-    advice names the fence only when half the budget is the smaller term as the store runs it,
-    floored at 1 s; raising the fence cannot lengthen a clamp the floor or the renew clamp sets."""
+    """BACKLOG #5064: the paused read's clamp is the smaller of the renew clamp and half the
+    paused-read budget, whichever setting sets each term (docs/CONFIGURATION.md, [cluster])."""
     coord = SqlServerCoordinator(
         object(),
         "A",
@@ -663,18 +627,14 @@ def test_the_paused_read_names_the_term_that_sets_its_floored_clamp(
 async def test_a_short_fence_halves_the_paused_read_budget_below_the_renew_clamp() -> None:
     """The budget term on its own: at a 4 s fence the budget is 3 s, so the read is clamped at
     1.5 s, below a 5 s renew clamp. Clamping at the renew clamp, or at the unhalved budget, would
-    let the borrow and the statement together overrun the event-loop budget. The budget term binds,
-    so a borrow that times out names the fence setting alone: raising the renew clamp would not
-    lengthen it (BACKLOG #5064)."""
+    let the borrow and the statement together overrun the event-loop budget."""
     clamps: list[float] = []
-    advice: list[str] = []
 
     class _Store:
         async def _fetchone_clamped(
-            self, sql: str, params: tuple[object, ...], *, timeout_clamp: float, retune: str
+            self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
         ) -> dict[str, object]:
             clamps.append(timeout_clamp)
-            advice.append(retune)
             return {"owner": "A"}
 
     coord = SqlServerCoordinator(
@@ -687,46 +647,6 @@ async def test_a_short_fence_halves_the_paused_read_budget_below_the_renew_clamp
     coord._no_claim_until = 10.0
     assert await coord._claim_or_renew_lease() is False
     assert clamps == [1.5]
-    assert advice == [CLUSTER_FENCE_RETUNE]
-
-
-async def test_each_renew_clamped_statement_names_the_renew_setting_alone() -> None:
-    """BACKLOG #5064: the heartbeat, the lease claim, the config-version refresh and a stepdown's
-    release are clamped at ``[cluster].lease_renew_timeout_seconds`` alone, so a borrow that times
-    out names that setting, never the fence, which on the default derived clamp would shrink it.
-    The lease release under ``stop()``'s fixed bound, the path its first write takes, names no
-    setting; its ``left`` write is not driven here."""
-    seen: list[tuple[str, str]] = []
-
-    class _Store:
-        async def _fetchone_clamped(
-            self, sql: str, params: tuple[object, ...], *, timeout_clamp: float, retune: str
-        ) -> dict[str, object]:
-            seen.append((sql.split(" WITH ")[0][-20:], retune))
-            if "cluster_config" in sql:
-                return {"config_version": 1}
-            return {"owner": "A", "leader_epoch": 1}
-
-        async def _execute_clamped(
-            self, sql: str, params: tuple[object, ...], *, timeout_clamp: float, retune: str
-        ) -> int:
-            seen.append((sql.split(" SET ")[0], retune))
-            return 1
-
-    coord = SqlServerCoordinator(_Store(), "A", monotonic=lambda: 0.0)
-    await coord.heartbeat_once()
-    assert await coord.config_version() == 1
-    assert await coord._claim_or_renew_lease() is True
-    assert all(retune == CLUSTER_RENEW_RETUNE for _, retune in seen), seen
-    assert len(seen) == 3, seen
-    seen.clear()
-    coord._is_leader = True
-    await coord._release_leadership()
-    assert seen == [("UPDATE leader_lease", CLUSTER_RENEW_RETUNE)]
-    seen.clear()
-    coord._is_leader = True
-    await coord._release_leadership(force_write=True, timeout=2.0)
-    assert seen == [("UPDATE leader_lease", CLUSTER_STOP_RETUNE)]
 
 
 async def test_a_stalled_paused_owner_read_ends_at_the_driver_not_at_command_timeout() -> None:
@@ -877,10 +797,7 @@ async def test_a_failed_pool_release_after_a_committed_write_keeps_its_row_count
             rows = await store._execute("UPDATE leader_lease SET owner = ?", ("A",))
         else:
             rows = await store._execute_clamped(
-                "UPDATE leader_lease SET owner = ?",
-                ("A",),
-                timeout_clamp=clamp,
-                retune=CLUSTER_RENEW_RETUNE,
+                "UPDATE leader_lease SET owner = ?", ("A",), timeout_clamp=clamp
             )
     assert rows == 1
     assert conn.rolled_back == 0
@@ -896,9 +813,7 @@ async def test_a_failed_write_still_raises_when_its_pool_release_also_fails() ->
     store = _store(conn)
     store._pool = _FailingReleasePool(conn)
     with pytest.raises(RuntimeError, match="pool release failed") as caught:
-        await store._execute_clamped(
-            "UPDATE nodes SET status = ?", ("x",), timeout_clamp=3.0, retune=CLUSTER_RENEW_RETUNE
-        )
+        await store._execute_clamped("UPDATE nodes SET status = ?", ("x",), timeout_clamp=3.0)
     assert caught.value.__context__ is conn.fail
     assert conn.rolled_back == 1
 
@@ -910,9 +825,7 @@ async def test_a_committed_claim_keeps_its_row_when_only_its_pool_release_fails(
     conn = _Conn()
     store = _store(conn)
     store._pool = _FailingReleasePool(conn)
-    row = await store._fetchone_clamped(
-        "MERGE leader_lease ...", ("k",), timeout_clamp=3.0, retune=CLUSTER_RENEW_RETUNE
-    )
+    row = await store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=3.0)
     assert row == {"owner": "A", "leader_epoch": 7}
     assert conn.rolled_back == 0
 
@@ -1122,10 +1035,7 @@ async def test_the_driver_ends_a_slow_claim_at_the_clamp() -> None:
         # StoreAcquireTimeout a clamped borrow raises, which is not the bound under test.
         with pytest.raises(Exception, match="HYT00"):
             await store._fetchone_clamped(
-                "WAITFOR DELAY '00:00:04'; SELECT 1 AS x",
-                (),
-                timeout_clamp=1.5,
-                retune=CLUSTER_RENEW_RETUNE,
+                "WAITFOR DELAY '00:00:04'; SELECT 1 AS x", (), timeout_clamp=1.5
             )
         assert time.monotonic() - started < 3.5, "the clamp did not end the statement"
         assert await store._fetchone("SELECT 1 AS x") == {"x": 1}

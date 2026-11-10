@@ -1327,7 +1327,7 @@ class _FakeSqlLeaseStore:
         return self._db.claim(owner, float(ttl), float(delay))  # type: ignore[arg-type]
 
     async def _fetchone_clamped(
-        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float, retune: str
+        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
     ) -> dict[str, object] | None:
         # The claim and the paused owner read (BACKLOG #5064); the clamp is not modelled here.
         return await self._fetchone(sql, params)
@@ -1351,7 +1351,7 @@ class _FakeSqlLeaseStore:
         return self._db.release(owner)  # the store's _execute returns the driver's row count
 
     async def _execute_clamped(
-        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float, retune: str
+        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
     ) -> int:
         return await self._execute(sql, params)  # the release; the clamp is not modelled here
 
