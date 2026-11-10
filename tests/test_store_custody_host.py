@@ -3470,10 +3470,23 @@ class _Pool:
 def fake_postgres(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
     """Run the real ``PostgresStore.open`` against a stand-in ``asyncpg``, failing where asked:
     ``pool`` inside the real ``_create_pool``, ``schema`` in the schema step once the pool and the
-    store exist, and ``after the pin`` once the pin check has passed. The driver-error cache is
-    cleared after, so the stand-in classes reach no later test."""
+    store exist, and ``after the pin`` once the pin check has passed. Where the real driver is
+    installed only its ``create_pool`` is replaced, so no cached tuple of driver errors can hold a
+    stand-in class; the cached tuples are cleared before and after all the same."""
+    import importlib.util
+
+    from messagefoundry.auth import service
     from messagefoundry.store import base, postgres
     from messagefoundry.store.store import check_open_store_pin
+
+    def clear_cached_errors() -> None:
+        for cached in (
+            base.store_call_errors,
+            base.audit_write_errors,
+            service._session_write_errors,
+            service._passkey_read_errors,
+        ):
+            cached.cache_clear()
 
     def arm(failure: Exception, where: str) -> None:
         async def create_pool(**_kwargs: object) -> _Pool:
@@ -3481,11 +3494,16 @@ def fake_postgres(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
                 raise failure
             return _Pool()
 
-        driver = types.ModuleType("asyncpg")
-        driver.create_pool = create_pool  # type: ignore[attr-defined]
-        for name in ("PostgresError", "InterfaceError", "InternalClientError"):
-            setattr(driver, name, type(name, (Exception,), {}))
-        monkeypatch.setitem(sys.modules, "asyncpg", driver)
+        if importlib.util.find_spec("asyncpg") is not None:
+            import asyncpg
+
+            monkeypatch.setattr(asyncpg, "create_pool", create_pool)
+        else:
+            driver = types.ModuleType("asyncpg")
+            driver.create_pool = create_pool  # type: ignore[attr-defined]
+            for name in ("PostgresError", "InterfaceError", "InternalClientError"):
+                setattr(driver, name, type(name, (Exception,), {}))
+            monkeypatch.setitem(sys.modules, "asyncpg", driver)
         monkeypatch.setattr(postgres, "_build_ssl", lambda _settings, posture=None: None)
 
         async def ensure_schema(_store: object, **_kwargs: object) -> None:
@@ -3499,9 +3517,9 @@ def fake_postgres(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
         monkeypatch.setattr(postgres.PostgresStore, "_ensure_schema", ensure_schema)
         monkeypatch.setattr(postgres, "check_open_store_pin", pin)
 
-    base.store_call_errors.cache_clear()
+    clear_cached_errors()
     yield arm
-    base.store_call_errors.cache_clear()
+    clear_cached_errors()
 
 
 class _DriverError(Exception):
