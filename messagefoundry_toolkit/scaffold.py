@@ -170,10 +170,10 @@ _VSCODE_SETTINGS = """\
 #
 # Where the workflow's comments or _CHECK_STALE's messages name pip's `-c` or `-e` flag, a backtick
 # sits right before the flag, as in `-c FILE`. A flag that _SCRIPT_TEXT_FLAG_RE in
-# tests/test_threat_model_doc_drift.py matches in a string literal is read as one that hands a shell
-# its script text, which makes this module a shell-execution site there. That backtick keeps the
-# flag from matching. Backticks around a longer command do not, so a flag inside one, such as the
-# `-c` in `uv pip compile -c FILE`, still matches.
+# tests/test_threat_model_doc_drift.py matches in a string literal is read as one that hands an
+# interpreter its script text, which makes this module a shell-execution site there. That backtick
+# keeps the flag from matching. Backticks around a longer command do not, so a flag inside one, such
+# as the `-c` in `uv pip compile -c FILE`, still matches.
 _CI_WORKFLOW = """\
 name: check
 on:
