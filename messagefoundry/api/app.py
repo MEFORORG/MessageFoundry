@@ -4777,9 +4777,14 @@ def create_app(
 
         return middleware
 
-    def _refuse_body(request: Request, status: int, detail: str, what: str) -> JSONResponse:
+    def _refuse_body(
+        request: Request, status: int, detail: str, what: str, *, close: bool = False
+    ) -> JSONResponse:
         _log.warning("rejected %s on %s from %s", what, request.url.path, client_ip(request))
-        return JSONResponse({"detail": detail}, status_code=status)
+        # `Connection: close` makes the server drop the connection after the refusal, so bytes it
+        # framed one way and a proxy another are never read as a next request (RFC 9112 §6.1, §6.3).
+        headers = {"Connection": "close"} if close else None
+        return JSONResponse({"detail": detail}, status_code=status, headers=headers)
 
     def _body_refusal(request: Request) -> JSONResponse | None:
         """The response refusing ``request``'s body before any route runs, or None to admit it."""
@@ -4790,22 +4795,37 @@ def create_app(
         # than the audit_log: it's pre-auth (no actor) and a flood must not grow the audit DB.
         lengths = request.headers.getlist("content-length")
         # The API takes only Content-Length bodies, so ANY Transfer-Encoding is refused, by presence
-        # on any line and whatever its value. Beside a Content-Length the request is ambiguously
-        # framed (RFC 9112 §6.1, the CL.TE smuggling vector, ASVS 4.2.1); without one its body has
-        # no length the cap can bound up front (review M-19).
-        if "transfer-encoding" in request.headers:
+        # on any line and whatever its value, and the connection is closed. Beside a Content-Length
+        # the request is ambiguously framed (RFC 9112 §6.1, the CL.TE smuggling vector, ASVS 4.2.1).
+        # Under serve llhttp refuses most such pairs itself (BACKLOG #1125); h11, for one, passes
+        # them on. Without a Content-Length, a coding list that does not end in `chunked` leaves the
+        # body length undetermined (§6.3 rule 4), and a chunked body has no length the cap can
+        # bound up front (review M-19).
+        te_lines = request.headers.getlist("transfer-encoding")
+        if te_lines:
             if lengths:
                 return _refuse_body(
                     request,
                     400,
                     "ambiguous framing: Content-Length with Transfer-Encoding is not accepted",
                     "request with both Content-Length and Transfer-Encoding",
+                    close=True,
+                )
+            codings = [c.strip(" \t").lower() for line in te_lines for c in line.split(",")]
+            if codings[-1] != "chunked":
+                return _refuse_body(
+                    request,
+                    400,
+                    "invalid framing: Transfer-Encoding does not end in chunked",
+                    "Transfer-Encoding not ending in chunked",
+                    close=True,
                 )
             return _refuse_body(
                 request,
                 411,
                 "Transfer-Encoding is not accepted; send a Content-Length",
-                "Transfer-Encoding request body",
+                "chunked request body",
+                close=True,
             )
         if not lengths:
             return None

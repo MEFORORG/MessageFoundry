@@ -8,8 +8,9 @@
   also reached a route. On a server other than the one `serve` pins, which refuses these first, the
   limit also took `+2`, `-5` and `0_2` as lengths through `int()`, and read only the first of
   several `Content-Length` lines. Now the limit refuses any
-  `Transfer-Encoding` line, whatever its value, **411**, or **400** beside a `Content-Length`, where
-  llhttp has not refused it first with its own **400**; a `Content-Length` must be one line of plain
+  `Transfer-Encoding` line, whatever its value, where llhttp has not refused it first with its own
+  **400**, and closes the connection: **411** for a coding list ending in `chunked` with no
+  `Content-Length`, otherwise **400**; a `Content-Length` must be one line of plain
   decimal digits or the request is refused **400**; and the cap on the declared length, 1 MiB or
   `[store].max_upload_bytes` on the upload routes, is unchanged. [SECURITY.md](../docs/SECURITY.md)
   control 5 states the rule, and [DEPLOYMENT.md](../docs/DEPLOYMENT.md) tells a proxy in front of the

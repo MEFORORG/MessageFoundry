@@ -29,7 +29,8 @@ _ADMITTED = 422
 @pytest.mark.parametrize(
     ("request_headers", "expected_status"),
     [
-        # Transfer-Encoding is refused by presence: 411 alone, 400 beside a Content-Length.
+        # Transfer-Encoding is refused by presence, with the connection closed: 411 for a coding
+        # list ending in chunked, 400 for any other or beside a Content-Length.
         pytest.param(
             (("transfer-encoding", "gzip"), ("transfer-encoding", "chunked")),
             411,
@@ -59,7 +60,7 @@ _ADMITTED = 422
         ),
         pytest.param(
             (("transfer-encoding", "gzip"), ("transfer-encoding", "identity")),
-            411,
+            400,
             id="split gzip then identity, no Content-Length",
         ),
         pytest.param(
@@ -71,7 +72,9 @@ _ADMITTED = 422
             400,
             id="split gzip then identity, with a Content-Length",
         ),
-        pytest.param((("transfer-encoding", ""),), 411, id="empty, no Content-Length"),
+        pytest.param((("transfer-encoding", ""),), 400, id="empty, no Content-Length"),
+        pytest.param((("transfer-encoding", "chunked,"),), 400, id="ends in an empty element"),
+        pytest.param((("transfer-encoding", "chunked, gzip"),), 400, id="ends in gzip"),
         pytest.param(
             (("content-length", "1"), ("transfer-encoding", "")),
             400,
@@ -114,7 +117,7 @@ _ADMITTED = 422
 async def test_the_body_limit_admits_only_one_plain_content_length(
     request_headers: tuple[tuple[str, str], ...], expected_status: int
 ) -> None:
-    status, _ = await _drive_raw(
+    status, response_headers = await _drive_raw(
         create_app(allow_no_auth=True),
         method="POST",
         path="/auth/login",
@@ -122,3 +125,22 @@ async def test_the_body_limit_admits_only_one_plain_content_length(
         body=b"{",
     )
     assert status == expected_status
+    carries_te = any(name == "transfer-encoding" for name, _ in request_headers)
+    assert (
+        ("connection", "close") in response_headers
+        if carries_te
+        else ("connection" not in dict(response_headers))
+    )
+
+
+async def test_a_latin_1_digit_is_not_a_content_length() -> None:
+    """Header bytes are read as Latin-1, where byte 0xB2 is a superscript two. ``isdigit()``
+    takes it, and ``int()`` then raises, so only the ASCII test keeps it from a 500."""
+    status, _ = await _drive_raw(
+        create_app(allow_no_auth=True),
+        method="POST",
+        path="/auth/login",
+        headers=(("content-length", b"\xb2"),),
+        body=b"{",
+    )
+    assert status == 400

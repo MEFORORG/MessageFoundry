@@ -91,8 +91,9 @@ _REFUSED: dict[str, bytes] = {
     "chunk lines ended by bare LF": _POST + b"Transfer-Encoding: chunked\r\n\r\n2\n{}\n0\n\n",
 }
 
-#: Shapes that frame one way only. The answers name what the app said about the first request and
-#: then the smuggled one, so the second answer proves the parser consumed the body exactly.
+#: Shapes that frame one way only, and that the app admits. The answers name what the app said
+#: about the first request and then the smuggled one, so the second answer proves the parser
+#: consumed the body exactly.
 _FRAMED: dict[str, tuple[bytes, list[int]]] = {
     # Controls: plainly framed, so both requests are answered. POST /health is a 405.
     "content-length alone": (_POST + b"Content-Length: 2\r\n\r\n{}", [405, 200]),
@@ -100,46 +101,58 @@ _FRAMED: dict[str, tuple[bytes, list[int]]] = {
         b"GET /health HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello",
         [200, 200],
     ),
-    # Legal chunked framing, which llhttp reads. The app refuses any Transfer-Encoding with a 411
-    # (BACKLOG #5345); the 200 after it shows the chunked body was read to its last chunk, not to
-    # Content-Length or to EOF.
-    "transfer-encoding gzip, chunked": (
-        _POST + b"Transfer-Encoding: gzip, chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
-        [411, 200],
-    ),
-    # BACKLOG #5345: llhttp frames a split header as chunked, and the app refuses it by presence.
-    "transfer-encoding gzip, then chunked on a second line": (
-        _POST
-        + b"Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
-        [411, 200],
-    ),
-    "transfer-encoding empty, then chunked on a second line": (
-        _POST + b"Transfer-Encoding: \r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
-        [411, 200],
-    ),
-    "transfer-encoding with case and whitespace": (
-        _POST + b"Transfer-Encoding:  CHUNKED \r\n\r\n0\r\n\r\n",
-        [411, 200],
-    ),
-    # BACKLOG #5345: an empty Transfer-Encoding ahead of any Content-Length passes llhttp, which
-    # frames by Content-Length or reads no body. The refusal is the app's, by the header's
-    # presence: 411 alone, 400 beside a Content-Length. The 200 after it shows the body was read
-    # to the length it declared.
-    "transfer-encoding empty": (_POST + b"Transfer-Encoding: \r\n\r\n", [411, 200]),
-    "transfer-encoding empty, then a content-length": (
-        _POST + b"Transfer-Encoding: \r\nContent-Length: 2\r\n\r\n{}",
-        [400, 200],
-    ),
     # Not a framing header at all, so Content-Length frames the request.
     "transfer_encoding with an underscore": (
         _POST + b"Transfer_Encoding: chunked\r\nContent-Length: 2\r\n\r\n{}",
         [405, 200],
     ),
-    # RFC 9112 6.1: Transfer-Encoding in HTTP/1.0 is faulty framing, and the connection closes
-    # after the message, so the smuggled request is never read.
+}
+
+_TE_CHUNKED = b"Transfer-Encoding is not accepted; send a Content-Length"
+_TE_NOT_CHUNKED = b"Transfer-Encoding does not end in chunked"
+_TE_BESIDE_CL = b"ambiguous framing: Content-Length with Transfer-Encoding"
+
+#: Shapes llhttp passes and the app refuses (BACKLOG #5345), each with the status and the detail
+#: the app answers. The app refuses any Transfer-Encoding with `Connection: close`, and the server
+#: closes the connection, so the smuggled request behind it is never answered. A coding list ending
+#: in `chunked` gets 411; one that does not, with no Content-Length, gets 400 (RFC 9112 6.3 rule
+#: 4); and any Transfer-Encoding beside a Content-Length gets 400.
+_APP_REFUSED: dict[str, tuple[bytes, int, bytes]] = {
+    "transfer-encoding gzip, chunked": (
+        _POST + b"Transfer-Encoding: gzip, chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
+        411,
+        _TE_CHUNKED,
+    ),
+    # llhttp frames a split header as chunked.
+    "transfer-encoding gzip, then chunked on a second line": (
+        _POST
+        + b"Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
+        411,
+        _TE_CHUNKED,
+    ),
+    "transfer-encoding empty, then chunked on a second line": (
+        _POST + b"Transfer-Encoding: \r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
+        411,
+        _TE_CHUNKED,
+    ),
+    "transfer-encoding with case and whitespace": (
+        _POST + b"Transfer-Encoding:  CHUNKED \r\n\r\n0\r\n\r\n",
+        411,
+        _TE_CHUNKED,
+    ),
+    # An empty Transfer-Encoding ahead of any Content-Length passes llhttp, which frames by
+    # Content-Length or reads no body.
+    "transfer-encoding empty": (_POST + b"Transfer-Encoding: \r\n\r\n", 400, _TE_NOT_CHUNKED),
+    "transfer-encoding empty, then a content-length": (
+        _POST + b"Transfer-Encoding: \r\nContent-Length: 2\r\n\r\n{}",
+        400,
+        _TE_BESIDE_CL,
+    ),
+    # RFC 9112 6.1: Transfer-Encoding in HTTP/1.0 is faulty framing.
     "transfer-encoding on HTTP/1.0": (
         b"POST /health HTTP/1.0\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
-        [411],
+        411,
+        _TE_CHUNKED,
     ),
 }
 
@@ -422,6 +435,27 @@ def test_a_close_that_fails_after_a_failed_400_degrades(
     )
 
 
+async def test_the_api_refuses_transfer_encoding_and_closes(engine: Engine) -> None:
+    misses = []
+    async with _served(create_app(engine), http=floored_http_protocol_class()) as port:
+        for shape, (request, status, detail) in _APP_REFUSED.items():
+            statuses, raw = await _answers(port, request)
+            head = raw.split(b"\r\n\r\n", 1)[0].lower()
+            if statuses != [status] or detail not in raw or b"connection: close" not in head:
+                misses.append(f"{shape}: expected [{status}] from the app, got {statuses}: {raw!r}")
+    assert not misses, "\n".join(misses)
+
+
+async def test_a_late_bad_chunk_after_the_411_gets_no_second_answer(engine: Engine) -> None:
+    """The head arrives first and a malformed chunk later. The app answers the head with its 411
+    and closes, so llhttp never parses the bad chunk and no 400 follows: one answer per request."""
+    head = _POST + b"Transfer-Encoding: chunked\r\n\r\n"
+    async with _served(create_app(engine), http=floored_http_protocol_class()) as port:
+        for body in (b"0x2\r\n{}\r\n0\r\n\r\n", b"2\n{}\n0\n\n"):
+            statuses, raw, closed = await _split(port, head, body)
+            assert statuses == [411] and closed, raw
+
+
 async def test_the_api_frames_unambiguous_requests_exactly(engine: Engine) -> None:
     misses = []
     async with _served(create_app(engine), http=floored_http_protocol_class()) as port:
@@ -439,9 +473,11 @@ async def test_the_probe_sees_the_shapes_h11_would_accept(engine: Engine) -> Non
     async with _served(create_app(engine), http=h11) as port:
         for shape in _H11_ACCEPTS:
             statuses, raw = await _answers(port, _REFUSED[shape])
-            # Two answers: the first request reached the app (a 405, or a 411 for the unfolded
-            # chunked one), and the request behind it was read too.
-            assert len(statuses) == 2 and statuses[0] != 400, f"{shape}: {raw!r}"
+            # The first request reached the app: a 405 and then the request behind it, or, for
+            # the unfolded chunked one, the app's 411, after which it closes the connection.
+            assert statuses in ([405, 200], [411]) and _PARSER_400_BODY not in raw, (
+                f"{shape}: {raw!r}"
+            )
 
 
 async def _split(port: int, head: bytes, body: bytes) -> tuple[list[int], bytes, bool]:
@@ -471,10 +507,22 @@ async def _split(port: int, head: bytes, body: bytes) -> tuple[list[int], bytes,
     return [int(s) for s in re.findall(rb"HTTP/1\.[01] (\d{3}) ", raw)], raw, closed
 
 
-async def test_a_400_writer_that_raises_still_closes_the_connection(engine: Engine) -> None:
-    """On h11, a bad body that arrives after the app has answered the head makes uvicorn's own 400
+async def _answer_from_the_head(scope: Any, receive: Any, send: Any) -> None:
+    """Answer 411 from the head and leave the connection open: what the API did before it closed
+    on every Transfer-Encoding (BACKLOG #5345), kept so the floor's close is still exercised."""
+    if scope["type"] != "http":
+        return
+    await send(
+        {"type": "http.response.start", "status": 411, "headers": [(b"content-length", b"0")]}
+    )
+    await send({"type": "http.response.body", "body": b""})
+
+
+async def test_a_400_writer_that_raises_still_closes_the_connection() -> None:
+    """On h11, a bad body that arrives after an app has answered the head makes uvicorn's own 400
     writer raise, because h11 has already sent a response. On the proactor loop over plaintext,
-    asyncio then leaves the connection open, so the floor closes it.
+    asyncio then leaves the connection open, so the floor closes it. The API itself now closes
+    after its 411, so a stub app that leaves the connection open stands in for it.
 
     The control is uvicorn's own h11 protocol, which must leave it open, or this run shows
     nothing. The selector loop closes such a transport itself, so there is nothing to see there."""
@@ -482,11 +530,11 @@ async def test_a_400_writer_that_raises_still_closes_the_connection(engine: Engi
         pytest.skip("only the proactor loop leaves this connection open")
     head = _POST + b"Transfer-Encoding: chunked\r\n\r\n"
     body = b"0x2\r\n{}\r\n0\r\n\r\n"
-    async with _served(create_app(engine), http=H11Protocol) as port:
+    async with _served(_answer_from_the_head, http=H11Protocol) as port:
         _, raw, closed = await _split(port, head, body)
     assert not closed, f"control: uvicorn's own h11 closed the connection: {raw!r}"
     h11 = floored_http_protocol_class(base=H11Protocol)
-    async with _served(create_app(engine), http=h11) as port:
+    async with _served(_answer_from_the_head, http=h11) as port:
         statuses, raw, closed = await _split(port, head, body)
     assert closed, f"the connection stayed open: {raw!r}"
     assert statuses == [411], raw

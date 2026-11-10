@@ -151,25 +151,25 @@ client request first, so its parser decides for the whole chain. The engine's ow
 only the hop it can see, and it cannot see what your proxy accepted from the client.
 
 The engine API parses requests with llhttp, through `httptools`, which `serve` pins (BACKLOG
-#1125). That parser refuses at least the shapes below with a `400`, and the engine closes the
-connection. For most shapes llhttp refuses the request head before any engine code runs, so the
-`400` is the only response.
+#1125). Sent in one write, each shape below gets a `400` and a closed connection. For most of
+them llhttp refuses the request head before any engine code runs, so the `400` is the only
+response. llhttp passes an empty `Transfer-Encoding` that comes before any `Content-Length`, and
+the engine refuses it itself.
 
 The two chunk shapes in the last row fail in the body instead. The engine starts handling a request
-once its head is read, and it answers a request carrying `Transfer-Encoding` and no
-`Content-Length` with `411` from the head alone. When the bad body arrives in the same read as
-the head, the engine writes only the `400`, and nothing after it.
-When the head arrives first and the bad body later, the engine can send its `411` and then the
-`400`: two responses to one request. Rule 1 below keeps a proxy clear of this, because a proxy that
-sends one `Content-Length` never forwards a chunked body.
+once its head is read, and it answers a chunked request with no `Content-Length` with `411`
+from the head alone, then closes the connection. When the bad body arrives in the same read as
+the head, the engine writes only the `400`, and nothing after it. When the head arrives first
+and the bad body later, the engine sends its `411` and closes, so the bad body is never parsed
+and no `400` follows.
 
 llhttp refuses more than this table lists, so treat it
 as the shapes that were measured, not as the whole set. `tests/test_api_request_framing_wire.py` sends each one on a real
-socket, and its `_REFUSED` table holds the exact bytes.
+socket, and its `_REFUSED` and `_APP_REFUSED` tables hold the exact bytes.
 
 | A request that carries | What your proxy must do |
 |---|---|
-| Both `Content-Length` and `Transfer-Encoding` | Refuse it. Do not forward it with either header removed. llhttp passes an empty `Transfer-Encoding` that comes before the `Content-Length`; the engine then answers `400` itself and keeps the connection open. |
+| Both `Content-Length` and `Transfer-Encoding` | Refuse it. Do not forward it with either header removed. |
 | `Transfer-Encoding: chunked` on two lines, or `Transfer-Encoding` as a list whose last coding is not `chunked`, or `identity`, or a list ending in an empty element | Refuse it. |
 | `Content-Length` twice, even with equal values, or as a list such as `2, 2`, or holding anything but digits, such as `+2` or `0_2` | Refuse it. |
 | Whitespace between a field name and its colon, such as `Content-Length : 2` | Refuse it. |
@@ -192,8 +192,9 @@ Your proxy must also meet at least these four rules.
    (`proxy_request_buffering on`).
 2. **Do not reuse a connection to the engine after an error.** After an engine `400`, or a response
    the proxy could not read to its framed end, drop that connection. The engine closes it after
-   its parser's `400`. One request per connection to the engine is the simplest safe setting. nginx works that way unless
-   you configure keep-alive to the upstream.
+   its parser's `400` and after refusing a `Transfer-Encoding`. One request per connection to
+   the engine is the simplest safe setting. nginx works that way unless you configure keep-alive
+   to the upstream.
 3. **Re-check requests that arrive over HTTP/2 or HTTP/3.** If the proxy speaks HTTP/1.1 to the
    engine, it must refuse such a request when it carries `Transfer-Encoding`, or a `content-length`
    that does not match the body it received. It must also refuse a CR, LF or NUL in any field name
@@ -207,8 +208,8 @@ Your proxy must also meet at least these four rules.
 **Check your proxy, because nothing in the engine can.** Replay each shape in `_REFUSED` through the
 proxy with a second request appended, in one write, as that test does. The client must get exactly one response,
 an error, and the appended request must never be answered. Two responses mean the proxy and the
-engine framed the bytes differently. For the two chunk shapes, a `411` then a `400` instead means
-the proxy forwarded a chunked body, which breaks rule 1. Passing this check covers only the shapes in that table. A copy of a reference terminator config (see
+engine framed the bytes differently. For the two chunk shapes, a `411` instead means the proxy
+forwarded a chunked body, which breaks rule 1. Passing this check covers only the shapes in that table. A copy of a reference terminator config (see
 [REMOTE-CONSOLE.md](REMOTE-CONSOLE.md#option-b--tls-terminated-upstream-reverse-proxy--load-balancer))
 needs the same check.
 

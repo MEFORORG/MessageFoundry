@@ -11,7 +11,7 @@ nothing about it.
 
 Every short-circuit is driven through a hand-built ASGI scope rather than a client, because two of the
 four are unreachable through one: no HTTP client will emit `Content-Length` together with
-`Transfer-Encoding`, or a non-integer `Content-Length`.
+`Transfer-Encoding`, or a `Content-Length` that is not one plain decimal number.
 
 Two later requirements are pinned here as well, because both are properties of the same floor:
 
@@ -69,7 +69,7 @@ async def _drive_raw(
     *,
     method: str = "GET",
     path: str = "/health",
-    headers: tuple[tuple[str, str], ...] = (),
+    headers: tuple[tuple[str, str | bytes], ...] = (),
     scheme: str = "http",
     host: str = _DNS_HOST,
     client: tuple[str, int] = ("127.0.0.1", 50000),
@@ -96,7 +96,9 @@ async def _drive_raw(
         "raw_path": path.encode(),
         "query_string": b"",
         "root_path": "",
-        "headers": [(k.lower().encode(), v.encode()) for k, v in raw_headers],
+        "headers": [
+            (k.lower().encode(), v if isinstance(v, bytes) else v.encode()) for k, v in raw_headers
+        ],
         "client": client,
         "server": ("127.0.0.1", 8765),
     }
@@ -318,7 +320,7 @@ def test_csp_names_frame_ancestors_parses_directives_not_substrings() -> None:
             400,
         ),
         (
-            "the chunked-without-length refusal",
+            "the Transfer-Encoding-without-length refusal",
             "POST",
             "/messages",
             (("transfer-encoding", "chunked"),),
@@ -441,8 +443,12 @@ async def test_an_attachment_response_through_the_floor_stays_one_policy_with_ba
             (("content-length", "10"), ("transfer-encoding", "chunked")),
             400,
         ),
-        ("chunked without a Content-Length", (("transfer-encoding", "chunked"),), 411),
-        ("non-integer Content-Length", (("content-length", "not-a-number"),), 400),
+        (
+            "chunked Transfer-Encoding without a Content-Length",
+            (("transfer-encoding", "chunked"),),
+            411,
+        ),
+        ("Content-Length not a plain decimal", (("content-length", "not-a-number"),), 400),
         ("oversized Content-Length", (("content-length", "99999999"),), 413),
     ],
 )
