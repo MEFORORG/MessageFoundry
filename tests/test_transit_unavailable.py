@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import os
+import ssl
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from typing import Any
 import httpx
 import pytest
 import requests
+import urllib3.exceptions
 from hvac.exceptions import (  # type: ignore[import-untyped]
     BadGateway,
     Forbidden,
@@ -33,7 +35,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store.crypto import CipherError, CipherUnavailableError, cell_aad
 from messagefoundry.store.crypto_transit import TransitCipher
 from messagefoundry.store.keyprovider_vault import is_vault_unavailable
-from messagefoundry.transports.bounded_read import MalformedReplyHeadError
+from messagefoundry.transports.bounded_read import MalformedReplyHeadError, TruncatedResponseError
 from messagefoundry.transports.strict_requests import VaultHopRefused
 from messagefoundry.uploads import (
     UploadStore,
@@ -69,8 +71,24 @@ def _malformed_head() -> requests.exceptions.ConnectionError:
         return exc
 
 
+def _tls_error(*inner: BaseException) -> requests.exceptions.SSLError:
+    """The shape requests raises for a TLS failure: urllib3's ``SSLError`` in ``args``, the ``ssl``
+    error inside that, and anything else ``inner`` names beside it."""
+    return requests.exceptions.SSLError(urllib3.exceptions.SSLError(inner[0]), *inner[1:])
+
+
+def _cut_off() -> TruncatedResponseError:
+    return TruncatedResponseError("vault closed the connection part-way through the response body")
+
+
 _OUTAGES: list[Exception] = [
     requests.exceptions.ConnectionError("connection refused"),
+    # A TLS session the peer closed is a dropped connection, not a refused certificate.
+    _tls_error(ssl.SSLEOFError(8, "EOF occurred in violation of protocol")),
+    _tls_error(ssl.SSLZeroReturnError(6, "TLS/SSL connection has been closed")),
+    # A reply cut off mid-body: bare, as the strict adapter lets it out, and wrapped.
+    _cut_off(),
+    requests.exceptions.ConnectionError(_cut_off()),
     requests.exceptions.ConnectTimeout("connect timed out"),
     requests.exceptions.ReadTimeout("read timed out"),
     VaultDown("Vault is sealed"),
@@ -83,6 +101,12 @@ _REFUSALS: list[Exception] = [
     Forbidden("permission denied"),
     InvalidPath("no such key"),
     requests.exceptions.SSLError("certificate verify failed"),
+    _tls_error(ssl.SSLCertVerificationError(1, "certificate verify failed")),
+    # A dropped session or a cut-off reply beside a refusal is still a refusal.
+    _tls_error(ssl.SSLEOFError(8, "EOF"), VaultHopRefused("store: the Vault hop is refused")),
+    requests.exceptions.ConnectionError(
+        _cut_off(), MalformedReplyHeadError("vault framed its reply head", reason="bare-cr")
+    ),
     VaultHopRefused("store: the Vault hop is refused"),
     RuntimeError("anything else"),
     _malformed_head(),
@@ -156,8 +180,11 @@ def test_an_outage_on_encrypt_and_decrypt_is_cipher_unavailable(exc: Exception) 
     ):
         with pytest.raises(CipherUnavailableError) as info:
             call()
-        # Type-only, as before: no plaintext and no Vault text.
-        assert "MRN123" not in str(info.value) and type(exc).__name__ in str(info.value)
+        # No plaintext. Type-only, as before, except a refusal of the reply, whose fixed text
+        # vault_failure_text keeps whole.
+        text = str(info.value)
+        assert "MRN123" not in text
+        assert type(exc).__name__ in text or str(exc) in text
 
 
 @pytest.mark.parametrize("exc", _REFUSALS, ids=lambda e: type(e).__name__)

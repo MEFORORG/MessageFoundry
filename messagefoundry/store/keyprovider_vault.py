@@ -289,18 +289,24 @@ def is_vault_bad_request(exc: BaseException) -> bool:
     return isinstance(exc, InvalidRequest)
 
 
-def is_vault_unavailable(exc: BaseException) -> bool:
-    """Whether ``exc`` says Vault gave no verdict on the request, so a later try may succeed
-    (BACKLOG #3734). Shared with ``crypto_transit.py`` for the same reason as
-    :func:`is_vault_bad_request`.
+#: The ``ssl`` errors that are a TLS session the peer closed, not a refusal of the hop (BACKLOG
+#: #3734). Named rather than imported, so this module adds no ``ssl`` use to the crypto inventory.
+_TLS_SESSION_DROPS = frozenset({"SSLEOFError", "SSLZeroReturnError"})
 
-    True for a connection that failed or timed out, and for Vault's HTTP 429, 500, 502 and 503,
-    which hvac raises as ``RateLimitExceeded``, ``InternalServerError``, ``BadGateway`` and
-    ``VaultDown`` (a sealed or standby node answers 503). False for everything else, at least a 400
-    (a value whose tag Transit refused), a 403, a 404, a TLS failure, and a refusal of the hop or of
-    its reply, since each of those answers the same way when it is tried again. A connection error that
-    carries such a refusal in its chain is a refusal too: the strict reply adapter wraps a reply
-    head it would not read in one."""
+
+def is_vault_unavailable(exc: BaseException) -> bool:
+    """Whether ``exc`` says Vault could not serve the request, so a later try may succeed (BACKLOG
+    #3734). Shared with ``crypto_transit.py`` for the same reason as :func:`is_vault_bad_request`.
+
+    True for a connection that failed, timed out or was dropped (a TLS session closed mid-handshake,
+    or a reply cut off mid-body), and for Vault's HTTP 429, 500, 502 and 503, which hvac raises as
+    ``RateLimitExceeded``, ``InternalServerError``, ``BadGateway`` and ``VaultDown`` (a sealed or
+    standby node answers 503). False for everything else, at least a 400 (a value whose tag Transit
+    refused), a 403, a 404, any other status hvac raises as ``UnexpectedError`` (a 504 among them),
+    any other TLS failure (a certificate the hop refuses), and a refusal of the hop or of its reply.
+    A connection error that carries such a refusal anywhere in its chain is a refusal too: the
+    strict reply adapter wraps a reply head it would not read in one. A refusal keeps the 423 it
+    had before this split, which is the safe side of a wrong guess."""
     try:
         import requests  # noqa: PLC0415
         from hvac.exceptions import (  # noqa: PLC0415
@@ -311,26 +317,35 @@ def is_vault_unavailable(exc: BaseException) -> bool:
         )
     except ImportError:  # no [vault] extra, so no hvac client raised it
         return False
-    if isinstance(exc, (BadGateway, InternalServerError, RateLimitExceeded, VaultDown)):
-        return True
-    if not isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
-        return False
-    if isinstance(exc, requests.exceptions.SSLError):
-        return False  # a certificate the hop refuses is refused again on the next try
     from messagefoundry.exception_origin import (  # noqa: PLC0415
         ExceptionChainTooLong,
         exception_chain,
     )
-    from messagefoundry.transports.bounded_read import EgressReplyError  # noqa: PLC0415
+    from messagefoundry.transports.bounded_read import (  # noqa: PLC0415
+        EgressReplyError,
+        TruncatedResponseError,
+    )
 
-    # Every link, its context too: a refusal anywhere keeps the 423 it had before, the safe side.
+    if isinstance(exc, (BadGateway, InternalServerError, RateLimitExceeded, VaultDown)):
+        return True
+    if isinstance(exc, TruncatedResponseError):
+        return True  # bounded_read documents it as a connection cut mid-body, transient
+    if not isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+        return False
     try:
-        return not any(
-            isinstance(link, (EgressReplyError, InsecureHopRefused))
-            for link in exception_chain(exc)
-        )
+        chain = list(exception_chain(exc))
     except ExceptionChainTooLong:
         return False
+    if isinstance(exc, requests.exceptions.SSLError) and not any(
+        type(link).__module__ == "ssl" and type(link).__name__ in _TLS_SESSION_DROPS
+        for link in chain
+    ):
+        return False  # a certificate or protocol the hop refuses is refused again on the next try
+    return not any(
+        isinstance(link, (EgressReplyError, InsecureHopRefused))
+        and not isinstance(link, TruncatedResponseError)
+        for link in chain
+    )
 
 
 # --- Transit key-TYPE validation (BACKLOG #1166, owner ruling 2026-08-22, ASVS 11.2.3) -------------
