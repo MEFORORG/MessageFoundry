@@ -732,8 +732,11 @@ it supersedes, and only where it disagrees; the earlier text is kept as it was.
   it records no seal failure. Its reason is not `seal_unavailable`, which (b) reserves for the
   Vault-wide abort. The row is best-effort: it is written softly, and on `vault_transit` the audit
   chain's MAC itself goes through Transit, so during the Outage it reports may be written by
-  nothing; the WARNING line and the page are then the record. Every other Outage keeps the table's
-  row.
+  nothing; the WARNING line and the page are then the record. Other Outages keep the table's row,
+  with at least the exceptions the 2026-11-08 rulings above make: an Outage that refuses a
+  rotation revokes the session, and under "Revoke, then report" an Outage in the session loader's
+  retired-key lookup ends the session and reports it as an integrity failure
+  (`integrity.authority_seal_failed`, `key_changed=False`).
 - **What that ruling leaves unbuilt, filed under vault #8202.** At least: step 2 (the groups-moved
   set and its sealed group digest); the Forged map's change from `main`; the sealed empty map; a
   failing user row's probing for revocation, and an Unverifiable user row read by `_load_user` or

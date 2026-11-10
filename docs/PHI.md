@@ -112,15 +112,19 @@ audit row and raises an `integrity_drift` alert, with at least these exceptions.
 `vault_transit`, a cell that fails its tag keeps the cipher's own error, with no integrity audit
 row or alert. On most of the read path, each process reports a row that keeps failing again only
 after an interval: five minutes for a sealed row, and an hour for a message or saved-search cell.
-A directory reconcile pass is an exception: it reports an AD map Vault transit cannot verify or
-reach on every pass that meets it, with no interval (ADR 0217). A session revoke is not throttled
-either. `RevokeSealOutcome._report` audits and pages each Forged or Unverifiable refusal it holds,
-on every revoke; an Outage is paged but not audited. An exit that cannot await
-(`_report_unawaited`) writes no audit rows, only log lines and pages. After a revoke's first
-Outage it calls Transit no more, so a later account's seal is not checked and records no refusal.
-`SealPager.forged` pages a Forged row with no interval, and `SealPager.unverifiable` pages an
-Unverifiable one every time too, its five-minute window choosing only the page's subject. So a
-sealed session row that keeps failing is reported on each revoke that meets it. That is a filed residual (vault #8202). What each refusal does
+A directory reconcile pass is an exception: the engine itself reports an AD map Vault transit
+cannot verify or reach on every pass that meets it, with no interval of its own (ADR 0217). A
+session revoke has no engine-side interval either. `RevokeSealOutcome._report` audits and pages
+each Forged or Unverifiable refusal it holds, on every revoke; an Outage is paged but not audited.
+An exit that cannot await (`_report_unawaited`) writes no audit rows, only log lines and pages.
+After a revoke's first Outage it makes no more seal checks through Transit, so a later account's
+seal is not checked and records no refusal; the audit rows it writes after the commit still go
+through Transit for the audit chain's MAC on `vault_transit`. `SealPager.forged` pages a Forged row
+with no interval, and `SealPager.unverifiable` pages an Unverifiable one every time too, its
+five-minute window choosing only the page's subject. So a sealed session row that keeps failing is
+reported on each revoke that meets it. Every one of these pages is still an `integrity_drift`
+alert, which the notifier sink throttles per subject for `[alerts].realert_seconds` (300 seconds by
+default), so an operator is notified at most once per subject in that window. That is a filed residual (vault #8202). What each refusal does
 is in the changelog entries for vault BACKLOG #2592, #2593 and #3510 (in `changelog.d/` until the
 next release, then [CHANGELOG.md](../CHANGELOG.md)). The seal format is
 in [`store/row_seal.py`](../messagefoundry/store/row_seal.py).

@@ -238,6 +238,29 @@ async def test_a_holding_map_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> No
         await store.close()
 
 
+@pytest.mark.parametrize("kind", ["unverifiable", "outage"])
+async def test_an_audit_defect_still_lets_the_map_page_go_and_raises(
+    monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """The page goes before the audit write, so a defect-class raise from the write cannot skip it;
+    the defect itself still raises (round-3 item 1, owner ruling 2026-11-10 "One narrow repair")."""
+    store, _, service, _, pages = await _estate(("jdoe",))
+    try:
+        _refuse(monkeypatch, AD_ROLE_MAP, kind)
+
+        async def defect(*_args: Any, **_kwargs: Any) -> None:
+            raise NotImplementedError("synthetic audit defect")
+
+        monkeypatch.setattr(service, "_audit", defect)
+        with pytest.raises(NotImplementedError):
+            await service._reconcile_ad_map(AD_ROLE_MAP)
+        _, _, subject = _EXPECT[kind]
+        expected = subject + (AD_ROLE_MAP if kind == "unverifiable" else "")
+        assert [p.split("|")[0] for p in pages] == [expected]
+    finally:
+        await store.close()
+
+
 # --- Postgres and SQL Server twins ----------------------------------------------------------------
 
 
