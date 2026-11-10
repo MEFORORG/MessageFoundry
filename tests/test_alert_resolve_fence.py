@@ -270,14 +270,21 @@ async def test_a_clear_with_nothing_open_settles_as_landed(tmp_path: Path) -> No
         await store.close()
 
 
-async def test_a_failed_snapshot_resolves_unfenced_and_says_so(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize("other_raised_last", [False, True], ids=["own-raise", "other-raise"])
+async def test_a_failed_snapshot_closes_only_the_own_raise_and_says_so_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, other_raised_last: bool
 ) -> None:
+    """Round-4 finding 1: with no snapshot, the resolve closes this process's own newest raise and
+    never another process's, rather than falling back to the unfenced resolve."""
     store = await MessageStore.open(tmp_path / "s.db")
     try:
         a = NotifierAlertSink([], store=store)
+        b = NotifierAlertSink([], store=store)
         _raise(a)
         await _drain(a)
+        if other_raised_last:
+            _raise(b)
+            await _drain(b)
 
         class _Broken(_Gated):
             def __getattr__(self, name: str) -> Any:
@@ -293,8 +300,13 @@ async def test_a_failed_snapshot_resolves_unfenced_and_says_so(
         with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.alert_sinks"):
             _clear(a)
             await _drain(a)
-        assert await _live(store) == [], "the behaviour before the fence, not a weaker one"
-        assert any("resolving unfenced" in r.getMessage() for r in caplog.records)
+        if other_raised_last:
+            [(_id, count)] = await _live(store)
+            assert count == 2, "another process's newer raise is not this clear's to close"
+        else:
+            assert await _live(store) == [], "this process's own raise is still closed"
+        failed = [r for r in caplog.records if "snapshot read failed" in r.getMessage()]
+        assert len(failed) == 1
     finally:
         await store.close()
 

@@ -195,15 +195,16 @@ class _ResolveFence:
     cannot both leave it open. If that process dies, or never clears, the instance stays open
     for an operator to resolve (an ``intake_paused`` one of another process is also expired by
     that monitor's sweep): a false open is the safe side, where the unfenced resolve gave a false
-    clear. The snapshot is taken when the read runs, which can be a little after the clear was
-    emitted; a raise from another process in that gap is closed, as before.
+    clear. The snapshot is taken when the read runs, after the clear was emitted: one loop turn
+    later at best, and on a server store as late as its bounded borrow wait. A raise from another
+    process in that gap is closed, as before the fence.
 
     With ``verdict`` set, a resolve that closes nothing re-reads the key, and if a live instance
     remains, :attr:`superseded` is set and the write is settled as not landed, with no retry, since
     a retry cannot help. The re-read is a second statement, so a raise landing between the two can
     mark a clear that had nothing to close as superseded; its caller then keeps what it would
-    have cleared, which is the safe side. If the snapshot read fails, the resolve runs unfenced,
-    as before."""
+    have cleared, which is the safe side. If the snapshot read fails, the resolve closes only this
+    writer's own newest raise. Only a store without the fence methods resolves unfenced."""
 
     def __init__(
         self,
@@ -220,6 +221,7 @@ class _ResolveFence:
         self._connection = connection
         self._writer_id = writer_id
         self._snapshot: asyncio.Future[Sequence[_Generation]] | None = None
+        self._snapshot_failed_logged = False
         self.superseded = False
 
     def begin(self) -> None:
@@ -241,17 +243,21 @@ class _ResolveFence:
     async def resolve(self, now: float) -> int:
         assert self._snapshot is not None  # begin ran
         self.superseded = False
+        seen: Sequence[_Generation] = ()
         try:
             seen = await self._snapshot
         except Exception as exc:
-            # Unfenced is the behaviour before the fence, not a weaker one; logged with the cause.
-            log.warning(
-                "alert-instance resolve fence: the snapshot read failed (%s); resolving unfenced",
-                type(exc).__name__,
-            )
-            return await self._store.resolve_alert_instances_for(
-                event_type=self._event_type, connection=self._connection, now=now
-            )
+            # With no snapshot, close only this writer's own newest raise: a false open is the safe
+            # side, where an unfenced resolve could close another process's newer raise. A retry
+            # re-awaits the same failed read, so this is logged once per clear.
+            if not self._snapshot_failed_logged:
+                self._snapshot_failed_logged = True
+                log.warning(
+                    "alert-instance resolve fence: the snapshot read failed (%s); closing only "
+                    "this process's own raise",
+                    type(exc).__name__,
+                    exc_info=True,
+                )
         closed = await self._store.resolve_alert_instances_fenced(
             event_type=self._event_type,
             connection=self._connection,

@@ -382,8 +382,9 @@ read, and is still the newest, keeps the instance open; that process's own clear
 So when two processes raise and clear one key at once, the one whose raise landed last clears it.
 If that process dies or never clears, the instance stays open for an operator (or, for another
 process's `intake_paused`, for the sweep above): a false open, where the unfenced resolve gave a
-false clear. The read runs a little after the emit, not at it, so a raise
-from another process in that gap is still closed, as before the fence.
+false clear. The read runs after the emit, not at it, and on a server store as late as its
+bounded borrow wait, so a raise from another process in that gap is still closed, as before the
+fence.
 
 No clock is compared: the `last_seen <= now` guard the PR for #3756 declined (decision
 d20261030T211551515-1de84e) would leave an alert open for good under cross-node clock skew. A
@@ -392,4 +393,5 @@ landed, and it is not retried. What the clear dropped from memory as it was emit
 key's suspend window and occurrence count for every inverse, and `connection_started`'s cooldown
 too, so a later raise of the still-open row stays muted and keeps its escalation tier. A fault in
 the re-read that tells superseded apart is treated as superseded, with no retry. A store without
-the fence methods, or a failed snapshot read, resolves unfenced, as before.
+the fence methods resolves unfenced, as before; a failed snapshot read closes only the resolver's
+own newest raise.
