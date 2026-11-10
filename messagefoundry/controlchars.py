@@ -85,6 +85,11 @@ import unicodedata
 #: Defined here, not there, so this module keeps importing nothing from the engine.
 CONTROL_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"})
 
+#: C0 controls, DEL and C1 controls, as a regular-expression character range for use inside
+#: ``[...]``: the class the API's ``PRINTABLE_TEXT_PATTERN`` excludes and the new-username rule
+#: refuses (BACKLOG #5521), written once. Wider than :func:`has_control_char`, which is C0 and DEL.
+C0_C1_CONTROL_RANGE = r"\x00-\x1f\x7f-\x9f"
+
 
 #: C0 controls (U+0000-U+001F) plus DEL (U+007F). NOT a general "is this printable" test: it is
 #: deliberately blind to C1 (U+0080-U+009F) and to Unicode separators, because every call site

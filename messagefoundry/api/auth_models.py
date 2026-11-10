@@ -23,6 +23,7 @@ from messagefoundry.api.validation import (
     RoleId,
 )
 from messagefoundry.auth.totp import MAX_DIGITS as TOTP_DIGITS
+from messagefoundry.auth.usernames import username_refusal
 
 # Upper bounds on free-text request fields (API-INPUT): reject absurd inputs before they reach the
 # store or argon2. Generous vs any legitimate value; the password cap also bounds argon2 work.
@@ -265,6 +266,19 @@ class ChannelScope(RequestModel):
     expected_source: Literal["ad", "manual"] | None = Field(default=None, exclude=True)
 
 
+def _valid_new_username(username: str) -> str:
+    """BACKLOG #5521: the rule ``AuthService.create_local_user`` applies, checked here as well so a
+    refused name never reaches the route."""
+    refusal = username_refusal(username)
+    if refusal is not None:
+        raise ValueError(refusal)
+    return username
+
+
+#: A new local account's username: the service's rule, mirrored (``auth/usernames.py``).
+NewUsername = Annotated[str, Field(max_length=_NAME_MAX), AfterValidator(_valid_new_username)]
+
+
 def _distinct_roles(roles: list[str]) -> list[str]:
     """A repeated role is one grant (BACKLOG #2733). The store writes it once, so this keeps the
     audit detail, the security notice and the reply from naming it twice. First-seen order."""
@@ -281,7 +295,9 @@ class UserCreateRequest(RequestModel):
     ``RequestModel`` refuses an unknown key, so a caller still sending ``password`` gets 422 rather
     than a credential it believes it chose."""
 
-    username: str = Field(max_length=_NAME_MAX)
+    #: Refused when blank, white space at either end, holding a control character, or one of the
+    #: audit trail's synthetic actor forms (BACKLOG #5521, ``auth/usernames.py``).
+    username: NewUsername
     display_name: str | None = Field(default=None, max_length=_NAME_MAX)
     #: REQUIRED (BACKLOG #2018, ASVS 6.3.7). It seeds both the profile address and ``notify_email``,
     #: where every security notice goes. An account born without one is told nothing about a change

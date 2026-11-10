@@ -162,6 +162,7 @@ from messagefoundry.auth.service import (
     FederatedBindingChanged,
     FederatedSubjectHeld,
     InvalidNotifyEmail,
+    InvalidUsername,
     LastAdministratorRefused,
     NotifyEmailAlreadySet,
     SelfTargetOp,
@@ -1457,9 +1458,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
         except UsernameTaken as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-        except InvalidNotifyEmail as exc:
-            # BACKLOG #2018: raised before any write, as on PATCH /users/{id}. The message names the
-            # rule and never echoes the value.
+        except (InvalidNotifyEmail, InvalidUsername) as exc:
+            # BACKLOG #2018, #5521: raised before any write, as on PATCH /users/{id}. The message
+            # names the rule and never echoes the value. The request model refuses the same
+            # username first; this is the service's own check, for every other caller.
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         except TemporaryPasswordUnavailable as exc:
             # ADR 0197 Amendment A: the credential is generated now, so the reset's 503 applies here

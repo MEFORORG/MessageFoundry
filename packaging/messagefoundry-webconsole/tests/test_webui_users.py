@@ -239,6 +239,20 @@ async def test_create_user_end_to_end(engine: Engine) -> None:
         )
 
 
+async def test_the_console_create_refuses_a_reserved_or_control_username(engine: Engine) -> None:
+    """BACKLOG #5521: the console builds the same request model, so it inherits the username rule.
+    A reserved actor name and a name holding a control character re-render the form with a 400,
+    and write nothing. The control is an ordinary name, created."""
+    service = await _service(engine)
+    async with _boss_client(engine, service) as c:
+        for name in ("system", "system:rotate-key", "<oidc>", "a\x07b"):
+            r = await _post_pairs(c, "/ui/users", [("username", name), ("email", "x@example.test")])
+            assert r.status_code == 400, name
+            assert await service.store.get_user_by_username(name) is None
+        ok = await _post_pairs(c, "/ui/users", [("username", "sysop"), ("email", "x@example.test")])
+        assert ok.status_code == 200 and "Account created" in ok.text
+
+
 async def test_create_user_duplicate_rerenders_without_password(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)

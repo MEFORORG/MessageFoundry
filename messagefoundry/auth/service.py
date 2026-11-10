@@ -149,6 +149,7 @@ from messagefoundry.auth.tokens import (
 from messagefoundry.auth.tokens import (
     credential_id_hash as _credential_id_hash,  # locals and parameters here use the bare name
 )
+from messagefoundry.auth.usernames import username_refusal
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.secretprovider import (
     SecretProvider,
@@ -2046,6 +2047,12 @@ class ListedUser:
 
     id: str
     user: VerifiedUser | None
+
+
+class InvalidUsername(ValueError):
+    """:meth:`AuthService.create_local_user` refused the name a new account was to take (BACKLOG
+    #5521), before anything was generated or written. ``POST /users`` answers it 400. The message
+    is :func:`~messagefoundry.auth.usernames.username_refusal`'s, which never echoes the value."""
 
 
 class DirectoryAccountNotFound(ValueError):
@@ -17275,8 +17282,16 @@ class AuthService:
         :class:`InvalidNotifyEmail`. ``None`` is still accepted here, for internal callers: both admin
         surfaces require an address before they reach this method (``UserCreateRequest.email``).
 
+        **``username`` IS CHECKED FIRST (BACKLOG #5521)**, by
+        :func:`~messagefoundry.auth.usernames.username_refusal`: a blank name, white space at either
+        end, a control character, or one of the audit trail's synthetic actor forms raises
+        :class:`InvalidUsername` before any credential is generated or anything is written.
+
         Raises :class:`UsernameTaken` when a concurrent create took ``username`` after the caller's
         own check (BACKLOG #1808)."""
+        refusal = username_refusal(username)
+        if refusal is not None:
+            raise InvalidUsername(refusal)
         if email is not None:
             email = _require_account_email(
                 email, blank="a new account needs a notification address, such as name@example.org"
