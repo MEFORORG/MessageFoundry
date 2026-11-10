@@ -62,6 +62,20 @@ async def _connected(path: Path | str) -> AsyncIterator[aiosqlite.Connection]:
         await _await_connection_worker_exit(db)
 
 
+def _fts5_loaded() -> bool:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE VIRTUAL TABLE probe USING fts5(a)")
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        conn.close()
+    return True
+
+
+_NEEDS_FTS5 = pytest.mark.skipif(not _fts5_loaded(), reason="this SQLite has no fts5")
+
+
 async def _fresh(path: Path) -> None:
     await (await MessageStore.open(path)).close()
 
@@ -149,6 +163,39 @@ async def test_a_counted_store_whose_salt_table_is_virtual_gets_the_new_key_reme
         assert await _counts_under_a_dek(db) is True
 
 
+@pytest.mark.parametrize(
+    "salt",
+    [
+        pytest.param("CREATE VIRTUAL TABLE store_salt USING fts5(salt)", marks=_NEEDS_FTS5),
+        "CREATE VIEW store_salt AS SELECT 's' AS salt",
+    ],
+)
+async def test_a_counted_store_whose_salt_is_a_readable_foreign_object_gets_the_new_key_remedy(
+    tmp_path: Path, salt: str
+) -> None:
+    # A loaded module or a view that yields a row is still not a salt this build minted, so the
+    # remedy must not hang on whether the module happens to load.
+    from messagefoundry.store.schema_verify import _counts_under_a_dek
+
+    path = tmp_path / "readable.db"
+    _sql(
+        path,
+        "CREATE TABLE cipher_meta (key_id TEXT, invocations INTEGER)",
+        "INSERT INTO cipher_meta VALUES ('k', 1)",
+        salt,
+    )
+    if salt.startswith("CREATE VIRTUAL"):
+        _sql(path, "INSERT INTO store_salt VALUES ('s')")
+    async with _connected(path) as db:
+        async with db.execute("SELECT count(*) FROM store_salt") as cur:
+            row = await cur.fetchone()
+        assert row is not None and row[0] == 1  # control: the foreign object reads as one salt
+        assert await _counts_under_a_dek(db) is True
+
+
+_VIRTUAL_TABLES = "SELECT name FROM sqlite_master WHERE sql LIKE 'CREATE VIRTUAL TABLE%'"
+
+
 async def test_the_expected_shape_holds_no_virtual_table() -> None:
     # The reads skip virtual tables, so one this build created would never be verified. Adding one
     # must fail here until the check learns to compare it.
@@ -156,9 +203,7 @@ async def test_the_expected_shape_holds_no_virtual_table() -> None:
         db.row_factory = aiosqlite.Row
         await db.executescript(_SCHEMA)
         await MessageStore._migrate(db)
-        async with db.execute(
-            "SELECT name FROM sqlite_master WHERE sql LIKE 'CREATE VIRTUAL TABLE%'"
-        ) as cur:
+        async with db.execute(_VIRTUAL_TABLES) as cur:
             virtual = [tuple(r) for r in await cur.fetchall()]
         async with db.execute("SELECT count(*) FROM sqlite_master WHERE type = 'table'") as cur:
             row = await cur.fetchone()
@@ -166,23 +211,20 @@ async def test_the_expected_shape_holds_no_virtual_table() -> None:
     assert virtual == []
 
 
+@_NEEDS_FTS5
+async def test_the_virtual_table_probe_finds_one() -> None:
+    # Negative control for the pin above: the same query does find a virtual table when one exists.
+    async with _connected(":memory:") as db:
+        await db.execute("CREATE VIRTUAL TABLE probe USING fts5(a)")
+        async with db.execute(_VIRTUAL_TABLES) as cur:
+            assert [tuple(r) for r in await cur.fetchall()] == [("probe",)]
+
+
 # --- BACKLOG #6720 ---------------------------------------------------------------------------------
-
-
-def _fts5_loaded() -> bool:
-    conn = sqlite3.connect(":memory:")
-    try:
-        conn.execute("CREATE VIRTUAL TABLE probe USING fts5(a)")
-    except sqlite3.OperationalError:
-        return False
-    finally:
-        conn.close()
-    return True
 
 
 _VIEW = "CREATE VIEW x AS SELECT a FROM other"
 _VIRTUAL = "CREATE VIRTUAL TABLE x USING fts5(a)"
-_NEEDS_FTS5 = pytest.mark.skipif(not _fts5_loaded(), reason="this SQLite has no fts5")
 
 _COLLISIONS = [
     pytest.param(
@@ -197,6 +239,7 @@ _COLLISIONS = [
     ),
     pytest.param(_VIEW, "ALTER TABLE x ADD COLUMN b TEXT", id="alter-a-table-that-is-a-view"),
     pytest.param(_VIEW, "UPDATE x SET a = 'b'", id="write-a-table-that-is-a-view"),
+    pytest.param(_VIEW, "DROP TABLE IF EXISTS x", id="drop-a-table-that-is-a-view"),
     pytest.param(
         _VIRTUAL,
         "CREATE INDEX IF NOT EXISTS ix_x ON x(a)",
@@ -262,6 +305,11 @@ def test_no_such_module_is_a_schema_step_error(tmp_path: Path) -> None:
             ("CREATE VIEW ix_queue_fifo_in_seq AS SELECT 1 AS a",),
             "there is already a table named ix_queue_fifo_in_seq",
             id="expected-index-held-by-a-view",
+        ),
+        pytest.param(
+            ("CREATE VIEW upload_quota AS SELECT 1 AS a",),
+            "use DROP VIEW to delete view upload_quota",
+            id="dropped-table-held-by-a-view",
         ),
         pytest.param(
             ("CREATE VIEW messages AS SELECT 1 AS id",),

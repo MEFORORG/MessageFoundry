@@ -105,6 +105,10 @@ _INDEXES_SQL = (
     " FROM sqlite_master AS m, pragma_index_list(m.name) AS il, pragma_index_xinfo(il.name) AS ix"
     f" WHERE {_ORDINARY_TABLE} AND ix.key = 1"
 )
+_SALT_TABLE_SQL = (
+    "SELECT EXISTS (SELECT 1 FROM sqlite_master AS m"
+    " WHERE " + _ORDINARY_TABLE + " AND lower(m.name) = 'store_salt')"
+)
 _TABLES_SQL = (
     "SELECT m.name FROM sqlite_master AS m"
     f" WHERE {_ORDINARY_TABLE} AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
@@ -362,6 +366,7 @@ _SHAPE_MESSAGES = (
     "Cannot add a column to a view",
     "virtual tables may not be altered",
     "because it is a view",
+    "use DROP VIEW to delete view",
     "no such module",
 )
 
@@ -371,9 +376,11 @@ def is_schema_step_error(exc: BaseException) -> bool:
 
     Two tests, both needed. The code must be SQLite's generic ``SQLITE_ERROR``: a busy or locked
     file, a read-only file, an I/O error, a full disk and a corrupt file each carry their own primary
-    code. And the message must name a missing or clashing table, column or index, because a syntax
-    error is ``SQLITE_ERROR`` too. None of the others is fixed by recreating the store, so each
-    keeps its own error rather than getting this remedy (BACKLOG #2101)."""
+    code. And the message must name a missing or clashing table, column or index, or a virtual
+    table's module, because a syntax error is ``SQLITE_ERROR`` too. This build creates no virtual
+    table, so a missing module is always an object some other tool left in the file (BACKLOG
+    #6719). None of the others is fixed by recreating the store, so each keeps its own error rather
+    than getting this remedy (BACKLOG #2101)."""
     code = getattr(exc, "sqlite_errorcode", None)
     return (
         isinstance(exc, sqlite3.OperationalError)
@@ -417,7 +424,9 @@ async def _counts_under_a_dek(db: aiosqlite.Connection) -> bool:
     row on its first keyed open, so a counted file without one never had its data key derived.
 
     The two tables are read separately. When the schema script itself failed (BACKLOG #2101), an
-    older file may have no ``store_salt`` table at all, and that too means no salt was ever minted."""
+    older file may have no ``store_salt`` table at all, and that too means no salt was ever minted.
+    So does a view or a virtual table under its name (BACKLOG #6719): this build creates neither,
+    so only an ordinary table can hold a salt this build minted."""
     try:
         async with db.execute("SELECT EXISTS (SELECT 1 FROM cipher_meta)") as cur:
             row = await cur.fetchone()
@@ -426,15 +435,15 @@ async def _counts_under_a_dek(db: aiosqlite.Connection) -> bool:
     if not (row and row[0]):
         return False
     try:
+        async with db.execute(_SALT_TABLE_SQL) as cur:
+            ordinary = await cur.fetchone()
+        if not (ordinary and ordinary[0]):
+            return True  # no ordinary salt table: this file never had a salt minted
         async with db.execute("SELECT EXISTS (SELECT 1 FROM store_salt)") as cur:
             salted = await cur.fetchone()
     except sqlite3.OperationalError as exc:
-        if "no such table" in str(exc) or "no such module" in str(exc):
-            # No salt table, or a virtual table under its name that this build never creates
-            # (BACKLOG #6719): either way this file never had a salt minted.
-            return True
-        # Anything else (a busy or unreadable file) answers nothing about the salt: say so, and
-        # fall back to the plain remedy, as an unreadable count does above.
+        # A busy or unreadable file answers nothing about the salt: say so, and fall back to the
+        # plain remedy, as an unreadable count does above.
         log.warning("could not read store_salt to pick the schema remedy: %s", exc)
         return False
     return not (salted and salted[0])
