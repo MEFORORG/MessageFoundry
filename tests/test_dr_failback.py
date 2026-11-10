@@ -9,9 +9,11 @@ engine guarantee). Driven through the real Engine callbacks the DR coordinator i
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -160,6 +162,80 @@ async def _seed(tmp_path: Path) -> tuple[MessageStore, str, StoreSettings]:
 
 async def _actions(store: MessageStore) -> list[str]:
     return [r["action"] for r in await store.list_audit(limit=50)]
+
+
+async def test_an_activation_reports_a_connector_its_reload_could_not_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A DR activation whose reload replaced an outbound connector and could not close the old one
+    applies the profile and reports ``outbound_close``, as ``reload_detail`` does. Red (engine PR
+    2815, Lander hold 6698688363 item 3): the activation discarded what the reload returned and
+    reported clean, with only a WARNING in the log."""
+    from messagefoundry.transports.file import FileDestination
+
+    store = await MessageStore.open(tmp_path / "fb.db")
+    engine = Engine(
+        store,
+        poll_interval=0.02,
+        config_dir=None,
+        store_settings=StoreSettings(path=str(tmp_path / "fb.db")),
+        dr_settings=DrSettings(enabled=True, activate=False),
+        egress_settings=EgressSettings(deny_by_default=False),
+        claim_mode="per_lane",
+    )
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    reg = Registry()
+    reg.add_inbound(
+        build_inbound_connection(
+            "in_crit", MLLP(port=19503), router="r", priority=Priority.CRITICAL
+        )
+    )
+    reg.add_outbound(
+        build_outbound_connection(
+            "out",
+            ConnectionSpec(
+                ConnectorType.FILE, {"directory": str(outdir), "filename": "{MSH-10}.hl7"}
+            ),
+            priority=Priority.CRITICAL,
+        )
+    )
+    reg.add_router("r", lambda m: ["h"])
+    reg.add_handler("h", lambda m: Send("out", m))
+    engine.add_registry(reg)
+    stale: FileDestination | None = None
+    real_close = FileDestination.aclose
+    try:
+        await engine.start()
+        rr = engine.registry_runner
+        assert rr is not None
+        assert await engine._dr_activate_profile() == {}
+        # A dead per-lane worker makes the next activation's reload rebuild the lane's connector
+        # and close the one it replaces, which this close refuses.
+        state: Any = rr
+        stale = state._destinations["out"]
+        worker = state._workers["out"]
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
+
+        async def close(self: FileDestination) -> None:
+            if self is stale:
+                raise OSError("synthetic close failure")
+            await real_close(self)
+
+        monkeypatch.setattr(FileDestination, "aclose", close)
+        failures = await engine._dr_activate_profile()
+
+        assert list(failures) == ["outbound_close"]
+        assert "'out'" in failures["outbound_close"]
+        assert "synthetic close failure" in failures["outbound_close"]
+        assert state._destinations["out"] is not stale
+        assert rr.inbound_running("in_crit")
+    finally:
+        await engine.stop()
+        if stale is not None:
+            await real_close(stale)
 
 
 async def test_release_failed_drain_stays_active_then_retry_succeeds(tmp_path: Path) -> None:

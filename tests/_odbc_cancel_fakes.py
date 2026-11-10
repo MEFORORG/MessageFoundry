@@ -101,7 +101,8 @@ class RawConn:
     ``block_autocommit`` makes the ``autocommit`` setter wait the same way: it goes through the
     driver, so a close beside it frees the handle under it. ``block_cursor_close`` makes the first
     cursor close wait too, a place for a cancellation to land during cleanup, and
-    ``block_conn_close`` does the same for the first connection close."""
+    ``block_conn_close`` does the same for the first connection close. ``block_cursor`` makes the
+    first ``cursor()`` call wait, a place for a cancellation to land while a cursor is made."""
 
     def __init__(
         self,
@@ -116,6 +117,7 @@ class RawConn:
         block_autocommit: bool = False,
         block_cursor_close: bool = False,
         block_conn_close: bool = False,
+        block_cursor: bool = False,
     ) -> None:
         self.log = log
         self.release = release
@@ -126,6 +128,7 @@ class RawConn:
         self.block_autocommit = block_autocommit
         self.block_cursor_close = block_cursor_close
         self.block_conn_close = block_conn_close
+        self.block_cursor = block_cursor
         self._prefix = f"{name}:" if name else ""
         self.cursors: list[RawCursor] = []
         self.closed = False
@@ -141,6 +144,13 @@ class RawConn:
         self.release.wait(WAIT)
 
     def cursor(self) -> RawCursor:
+        if self.block_cursor:
+            self.block_cursor = False  # the first cursor only
+            self.note("cursor:start")
+            self.hold()
+            if self.closed:
+                self.note(USE_AFTER_FREE)
+            self.note("cursor:end")
         cur = RawCursor(self)
         self.cursors.append(cur)
         return cur
@@ -306,6 +316,14 @@ async def cancel_once_started(started: threading.Event, coro: Any) -> asyncio.Ta
     assert await asyncio.to_thread(started.wait, WAIT), "the blocking call never started"
     task.cancel()
     return task
+
+
+async def cancelled_at_once(task: asyncio.Task[Any]) -> None:
+    """Require a cancelled ``task`` to end within a second: the cancellation must not wait for the
+    driver call it cancelled, which may have no time limit."""
+    done, _pending = await asyncio.wait({task}, timeout=1.0)
+    assert done, "the cancellation waited for the running driver call"
+    assert task.cancelled(), task
 
 
 async def wait_until(done: Callable[[], bool]) -> bool:

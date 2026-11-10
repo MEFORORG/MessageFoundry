@@ -628,6 +628,12 @@ def adopt_rig_session(client: EngineClient, url: str, cacert: str | None) -> Non
 #: answer, or it answered and refused the sign-in. A runner reports either as a setup failure.
 SIGN_IN_ERRORS: tuple[type[Exception], ...] = (ApiError, rigadmin.RigAdminError)
 
+#: The engine's default ``[auth].max_sessions_per_user``, which a rig-started engine runs unless the
+#: rig raised it in the node's env (a batch cell does, ``connscale/batchbox.py``); a caller that
+#: knows the node's env passes the value it set. The harness imports no engine settings, so
+#: ``tests/test_rig_admin.py`` pins this to the engine's default (vault BACKLOG #3241, item 5).
+RIG_SESSION_CAP = 5
+
 
 def rig_client(url: str, *, cacert: str | None, allow_insecure: bool = False) -> EngineClient:
     """An :class:`EngineClient` for ``url``, signed in as the rig Administrator.
@@ -654,7 +660,11 @@ class EnginePoller:
         origin: float,
         allow_insecure: bool = False,
         cacert: str | None = None,
+        session_cap: int = RIG_SESSION_CAP,
     ) -> None:
+        # `session_cap` is the engine's [auth].max_sessions_per_user, which :meth:`reload_client`
+        # keeps a session of headroom under (vault BACKLOG #3241, added item 5).
+        self._session_cap = session_cap
         # `token` is a bearer token for an engine started OUTSIDE this harness (the CLI's --token),
         # or `rigadmin.RIG_SESSION` for an engine this harness spawned: the poller then signs in as
         # the run's rig Administrator when it opens, which is after the engine starts. `None` sends
@@ -762,6 +772,30 @@ class EnginePoller:
 
     def _reload_client_sync(self) -> EngineClient | None:
         url = self._urls[0]
+        # Vault BACKLOG #3241, added item 5: a sign-in past [auth].max_sessions_per_user revokes the
+        # rig user's OLDEST session, which is the sampler's. So the rig user's live sessions are
+        # counted first, on the sampler's client (a plain read, which re-keys nothing), and at the
+        # cap the reload goes unmeasured rather than evicting the sampler. Another rig component
+        # signing in between this count and the sign-in below is not seen.
+        try:
+            # Counted, as every poller request is, so the load report leaves its cost out.
+            held = len(self._counted(0, self._clients[0].list_sessions))
+        except SIGN_IN_ERRORS as exc:
+            _log.warning(
+                "reload probe: could not count the rig user's sessions: %s (HTTP %s)",
+                type(exc).__name__,
+                getattr(exc, "status", None),
+            )
+            return None
+        # A cap of 0 or less is no cap at all to the engine, so it is none here either.
+        if 0 < self._session_cap <= held:
+            _log.warning(
+                "reload probe: the rig user holds %d of %d sessions, so another would evict the "
+                "sampler's; the reload goes unmeasured",
+                held,
+                self._session_cap,
+            )
+            return None
         cacert = self._cacert or self._cacert_for(url)
         client = EngineClient(url, allow_insecure=self._allow_insecure, cacert=cacert)
         try:

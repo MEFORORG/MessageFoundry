@@ -183,7 +183,7 @@ nothing prompts.
 | Route | Reaches | Refuses, before it removes anything |
 |---|---|---|
 | `-Name <dir>` | The `<repo>-<dir>` sibling of the checkout that copy of the script lives in | Uncommitted tracked changes (which `-Discard` parks instead), and the git repositories inside the tree listed in the next section. A detached HEAD no ref holds. An unlanded ledger number. A held claim, git or working-tree activity in six hours, uncommitted work written in six hours at any depth, and a nested worktree, whatever `-Force` says. |
-| `-Path <path>` | Any registered linked worktree that is not under `.claude/worktrees` | Everything `-Name` refuses, and the list in the next section. |
+| `-Path <path>` | Any registered linked worktree that is not under `.claude/worktrees` (one above the primary does not count; see below) | Everything `-Name` refuses, and the list in the next section. |
 | `-List` | Nothing. It is read-only. | It prints each worktree, its class, and which route reaches it. |
 
 ### `-Path` is the checked route, and a session may run it
@@ -240,7 +240,7 @@ is a copy for readers and can lag it.
   records it. That covers the primary, another repository's worktree, a plain directory, and a
   junction, `subst` or 8.3 spelling of a real worktree.
 - The tree you are standing in, and a tree that holds the copy of the script being run.
-- A tree under `.claude/worktrees`. The next section says why.
+- A tree under `.claude/worktrees`, other than a segment above the primary. The next section says why.
 - A tree that holds another registered worktree.
 - A tree git has locked.
 - A detached HEAD whose commit no ref holds.
@@ -315,7 +315,10 @@ population is worse than no route to it, so a session has none. (BACKLOG #1038, 
 batch 184.) Removing one of those trees stays the user's decision. The user's one standing route is
 the opt-in nightly step, `run-daily-prune.ps1 -RemoveFinishedClaudeWorktrees` (owner request
 2026-11-05), which refuses `-Apply` inside Claude Code; *Run it nightly* below says what it checks
-and what it cannot see.
+and what it cannot see. A `.claude/worktrees` segment
+that lies *above* the primary checkout does not count, so a clone made inside another checkout's
+harness folder still reaches its own trees (vault BACKLOG #2985, item 3); the worktree gate's own
+classifier still counts that segment, so its deny text offers no `-Path` line for them.
 
 One layout overlaps. `new.ps1` run from a linked worktree makes its sibling **beside that
 worktree**, and for a harness-made worktree that is also under `.claude/worktrees`. `-Path`

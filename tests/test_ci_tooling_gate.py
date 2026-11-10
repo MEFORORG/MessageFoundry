@@ -84,7 +84,7 @@ _CASES = [
     ([".gitattributes"], True, "rides along with .gitignore in the alwayscodepath arm"),
     (["messagefoundry/pipeline/engine.py"], False, "engine-only: the entire point of the split"),
     (["tests/test_api_auth.py"], False, "an unlisted engine test is not harness work"),
-    (["tests/test_security_static.py"], False, "stay-listed: runs on the engine legs, which run"),
+    (["tests/test_security_static.py"], False, "imports the engine, so runs on the engine legs"),
     (["scripts/worktree/new.ps1"], True, "the harness itself"),
     ([".github/workflows/ci.yml"], True, "the workflow files are a listed test's subject"),
     (["CLAUDE.md"], True, "root CLAUDE.md -- `\\.claude/` matches the DIRECTORY, not this file"),

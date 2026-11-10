@@ -41,6 +41,7 @@ __all__ = [
     "intake_pause_detail",
     "remote_debug_refused_detail",
     "sandbox_worker_refused_detail",
+    "shown_error_class",
     "store_restored_detail",
     "utc_or_unknown",
 ]
@@ -210,6 +211,14 @@ def sandbox_worker_refused_detail(*, content_only: bool) -> str:
         'dead-lettered as ERROR under internal_error = "continue", or the inbound stops under '
         '"stop". A WARNING line in the engine log names what differs.'
     )
+
+
+def shown_error_class(error_class: str | None) -> str:
+    """The exception class a ``connection_error`` alert shows in the log and off the box, or the
+    fixed token ``unnamed error`` for one that is not a plain identifier (BACKLOG #3210, #5021)."""
+    if type(error_class) is str and error_class.isascii() and error_class.isidentifier():
+        return error_class
+    return "unnamed error"
 
 
 #: The subject a ``store_restored`` alert is raised under (BACKLOG #2614). No connection can be
@@ -407,7 +416,8 @@ class AlertSink(Protocol):
         (``DeliveryError``) after the lane was healthy, edge-triggered so a retry storm fires at most
         one alert per lane per cooldown (#46, Corepoint "connection lost"). ``kind`` is the connection-
         event kind (``connection_lost``); ``detail`` is a ``safe_exc`` reason, and it can echo
-        transport text, so an implementation must not assume it is free of message content.
+        transport text, so an implementation must not assume it is free of message content, and must
+        not send it off the box (BACKLOG #5021).
         ``error_class`` is the failing exception's class name (BACKLOG #3210). A partner *rejection*
         (``NegativeAckError``) is NOT a connection error and never fires this."""
         ...
@@ -435,7 +445,10 @@ class AlertSink(Protocol):
         a lone engine, so each bound on each process is its own instance: a drained backlog cannot
         resolve a low-disk pause, and one node's clear cannot resolve another node's pause (BACKLOG
         #2272). An unpinned cluster node's id changes on every restart, so that node clears its own
-        instances when it stops. It is not
+        instances when it stops, and a subject no process raises again for
+        :data:`~messagefoundry.pipeline.intake_bound.STALE_SECONDS` is resolved by the sweep of
+        another engine process with an alert sink on the same store, where one runs (BACKLOG
+        #3269). It is not
         a connection-scoped event, so no rule's ``control_action`` fires on it (BACKLOG #1898).
         Its colon also keeps ``name`` outside the connection-name grammar, which guards only the
         default target, never a rule's ``control_target``. Carries counts and sizes only: no
@@ -459,8 +472,10 @@ class AlertSink(Protocol):
         ...
 
     def cert_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
-        """A served TLS certificate is expired or within the configured warn window. ``name`` labels
-        which cert (``"api"`` or the connection name); ``path`` is the PEM file; ``not_after`` is the
+        """A watched certificate is expired or within the configured warn window: a served or
+        presented TLS certificate, or a certificate setting such as the OIDC client certificate. ``name`` labels
+        which cert (``"api"``, a connection name, or a setting's dotted name such as
+        ``"auth.oidc_client_certificate"``); ``path`` is the PEM file; ``not_after`` is the
         ISO expiry; ``days_remaining`` is negative once expired. No key material is read or logged.
         Emitted by the :class:`~messagefoundry.pipeline.cert_expiry.CertExpiryRunner`."""
         ...
@@ -680,7 +695,28 @@ class AlertSink(Protocol):
         every inline reload's into the one ``config_reload:inline`` instance, and every queue
         listing's into the one ``approval:listing`` instance, until an operator resolves it.
         Nothing resolves it automatically. Carries the key and the action name only:
-        no username, no params, no PHI."""
+        no username, no params, no PHI.
+
+        **A failed write is not proof the row is missing.** A COMMIT can land with its reply lost,
+        so the reason says the row was not written OR its write's outcome is unknown (vault BACKLOG
+        #3193 item 4); a row the step-up return budget sheds is never written. Where the gate reads
+        back that its own write committed, it raises :meth:`audit_offbox_copy_missing` instead. A
+        request read back with a seal that fails still raises this one, and so does an outcome
+        read-back that does not show its own write committed; docs/SECURITY.md says which."""
+        ...
+
+    def audit_offbox_copy_missing(self, name: str, *, action: str) -> None:
+        """An audit row whose write the approval gate read back as committed has no off-box copy
+        (vault BACKLOG #3193 N1). The store tees a row off-box only after a COMMIT it saw succeed,
+        so when the write reported an error and its COMMIT landed anyway, the forwarded audit
+        stream lacks the row and nothing else reports the gap. Distinct from
+        :meth:`audit_write_failed`, whose row may be missing from the store too.
+
+        docs/SECURITY.md, in its approvals section, says which read-backs raise it. ``name`` is
+        ``approval:<approval id>`` and ``action`` the row's audit action, as for
+        :meth:`audit_write_failed`. Not connection-scoped, so no rule's ``control_action`` fires on
+        it, and repeated raises on one key fold into one instance until an operator resolves it.
+        Carries the key and the action name only: no username, no params, no PHI."""
         ...
 
     def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
@@ -736,19 +772,27 @@ class AlertSink(Protocol):
         the account enters that state, which leaves it unjudged too; or the directory has stayed
         unreachable for ``[auth].ad_reconcile_outage_passes`` passes running
         (``directory_unavailable``, BACKLOG #3709, the ``auth.ad_reconcile_skipped`` row whose
-        ``passes`` the page names), raised once per run. The type's name predates every case but the first. Read
-        ``reason`` before naming the cause.
+        ``passes`` the page names), raised once per run; or that many of one account's probes running
+        have failed to reach the directory, an outage pass's probes included
+        (``account_unreachable``, BACKLOG #3100, the ``auth.ad_reconcile_unreached`` row), raised
+        once as the account enters that state. The type's name predates every case but the first.
+        Read ``reason`` before naming the cause.
 
         ``name`` labels the source: ``"directory-reconciler"`` for the breaker,
         ``"directory-reconciler-referral"`` for a referral, ``"directory-reconciler-probe-fault"``
         for a probe fault, ``"directory-reconciler-misconfigured"`` for a configuration refusal,
-        ``"directory-reconciler-paging:<username>"`` for a paging refusal, and
-        ``"directory-reconciler-outage"`` for a lasting outage, so each is its own instance and
-        throttle. ``reason`` is one of those seven closed-set slugs. ``probed`` is, for
+        ``"directory-reconciler-paging:<username>"`` for a paging refusal,
+        ``"directory-reconciler-outage"`` for a lasting outage, and
+        ``"directory-reconciler-unreached:<username>"`` for an unreached account, or the bare
+        ``"directory-reconciler-unreached"`` for a rollup of those entering on one pass
+        (``AuthService._record_unreached_accounts`` decides when), so each
+        is its own instance and throttle. ``reason`` is one of those eight closed-set slugs.
+        ``probed`` is, for
         the breaker, how many principals the pass judged, its denominator, and a paging refusal
         carries that same count of candidates the pass took up, asked or not, which counts any
         id-less row: a paging refusal concerns one account, and its count is still the pass's. For
-        a referral, a configuration refusal, a probe fault and a lasting outage it is how many
+        a referral, a configuration refusal, a probe fault, a lasting outage and an unreached
+        account it is how many
         probes the pass sent to the directory, which leaves out an id-less row (BACKLOG #3170).
         ``detail`` is the operator-facing explanation the auth service latches, or for a paging
         refusal or a lasting outage a fixed sentence. No PHI. Emitted by the API-lifespan
@@ -884,7 +928,31 @@ class AlertSink(Protocol):
     def store_privilege_clean(self, name: str) -> None:
         """The INVERSE of :meth:`store_privilege_warning`: a start whose preflight OBSERVED a clean
         store principal. No page; when alert-state is wired (ADR 0044) it auto-resolves the open
-        warning for the same subject, so a fixed grant clears the dashboard."""
+        warning for the same subject, so a fixed grant clears the dashboard, fenced as the ADR 0044
+        BACKLOG #4916 amendment states, so a warning another process raised may stay open."""
+        ...
+
+    def vault_privilege_warning(
+        self, name: str, *, finding: str, refusing_count: int, detail: str
+    ) -> None:
+        """The Vault privilege preflight found a Vault token over-granted, or could not read it, at
+        start (BACKLOG #2903, ADR 0216). ``finding`` is ``"over_granted"`` or ``"unobservable"``.
+        ``refusing_count`` is how many of the over-grants are in the class that refuses a start
+        under ``enforce`` (the root policy, a grant on an administrative path); it is 0 for a token
+        whose over-grants are all in the warning class, and means nothing for ``"unobservable"``.
+        ``name`` is the subject, ``vault:<hop>`` (``vault:store`` or ``vault:secrets``). ``detail``
+        is the hop's judgment with control characters escaped: policy names, paths and capabilities
+        only, never a token, an accessor or a digest of either, and no message content. Fired
+        before any refusal, so a refused start still pages, and on a grant the opt-out accepts,
+        which quiets nothing. Emitted by
+        :func:`~messagefoundry.vault_preflight.run_vault_privilege_preflight`."""
+        ...
+
+    def vault_privilege_clean(self, name: str) -> None:
+        """The INVERSE of :meth:`vault_privilege_warning`: a start whose preflight read a Vault
+        token and found it clean. No page; when alert-state is wired (ADR 0044) it can auto-resolve
+        the open warning for the same subject; see ``docs/SECURITY.md``'s *A warning still open
+        after a clean start*."""
         ...
 
     def config_changed(
@@ -1062,8 +1130,8 @@ class AlertSink(Protocol):
 
 
 class LoggingAlertSink:
-    """Default :class:`AlertSink`: log each event at ``WARNING``. No PHI — only the connection name
-    and queue shape are recorded, never a message body."""
+    """Default :class:`AlertSink`: log each event at ``WARNING``. No message-body field, but not
+    PHI-free: an event's free-text detail or reason can go into the line (docs/PHI.md row 13)."""
 
     def connection_stopped(self, name: str, *, detail: str) -> None:
         # Not "outbound ... internal error": a start failure, an inbound router or transform halt and
@@ -1121,12 +1189,11 @@ class LoggingAlertSink:
     ) -> None:
         """This line is general-log text, so it names the caller's exception class and never reads
         ``detail``, which can echo transport text (BACKLOG #3210)."""
-        plain = error_class is not None and error_class.isascii() and error_class.isidentifier()
         log.warning(
             "ALERT connection_error: outbound %r %s (%s); the reason is not logged",
             name,
             kind,
-            error_class if plain else "unnamed error",
+            shown_error_class(error_class),
         )
 
     def log_write_failed(
@@ -1357,7 +1424,18 @@ class LoggingAlertSink:
 
     def audit_write_failed(self, name: str, *, action: str) -> None:
         log.warning(
-            "ALERT audit_write_failed: the %s audit row for %r was not written", action, name
+            "ALERT audit_write_failed: the %s audit row for %r was not written, or its write's "
+            "outcome is unknown",
+            action,
+            name,
+        )
+
+    def audit_offbox_copy_missing(self, name: str, *, action: str) -> None:
+        log.warning(
+            "ALERT audit_offbox_copy_missing: the %s audit row for %r is in the store, but its "
+            "off-box copy was not written",
+            action,
+            name,
         )
 
     def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
@@ -1384,8 +1462,9 @@ class LoggingAlertSink:
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         log.warning(
             # The count is the candidates the pass took up for the breaker and a paging refusal, or
-            # the probes the pass asked for a referral, a configuration refusal, a probe fault and a
-            # lasting outage (BACKLOG #3170, #3709); see AlertSink.ad_reconcile_aborted.
+            # the probes the pass asked for a referral, a configuration refusal, a probe fault, a
+            # lasting outage and an unreached account (BACKLOG #3170, #3709, #3100); see
+            # AlertSink.ad_reconcile_aborted.
             "ALERT ad_reconcile_aborted: %r left accounts unrevoked or unjudged, in a pass counting "
             "%d principal(s) "
             "(%s): %s",
@@ -1473,6 +1552,21 @@ class LoggingAlertSink:
     def store_privilege_clean(self, name: str) -> None:
         # The inverse (auto-resolve) event; no page, so DEBUG: the preflight already logged at INFO.
         log.debug("ALERT store_privilege_clean: %r store principal observed clean", name)
+
+    def vault_privilege_warning(
+        self, name: str, *, finding: str, refusing_count: int, detail: str
+    ) -> None:
+        # An unobservable read never judged the grant, so a "0 in the refusing class" would read clean.
+        counted = (
+            f"{refusing_count} grant(s) in the refusing class"
+            if finding == "over_granted"
+            else "the token's grants were not read"
+        )
+        log.warning("ALERT vault_privilege_warning: %r %s (%s): %s", name, finding, counted, detail)
+
+    def vault_privilege_clean(self, name: str) -> None:
+        # The inverse (auto-resolve) event; no page, so DEBUG: the preflight already logged at INFO.
+        log.debug("ALERT vault_privilege_clean: %r Vault token observed clean", name)
 
     def config_changed(
         self,

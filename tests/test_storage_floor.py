@@ -25,6 +25,7 @@ from messagefoundry.config.settings import RetentionSettings, StoreBackend
 from messagefoundry.pipeline import retention as retention_mod
 from messagefoundry.pipeline.retention import RetentionRunner, read_disk_floor
 from messagefoundry.store import MessageStore
+from tests._log_absence import assert_capture_sees
 
 SAMPLES_CONFIG = Path(__file__).resolve().parent.parent / "samples" / "config"
 MIB = 1 << 20
@@ -248,6 +249,7 @@ async def test_the_retention_pass_is_quiet_above_the_floor(
     with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
         result = await runner.run_once()
     assert result.below_disk_floor is False
+    assert_capture_sees(caplog, "messagefoundry.pipeline.retention")
     assert not [r for r in caplog.records if "min_free_disk_mb" in r.getMessage()]
 
 

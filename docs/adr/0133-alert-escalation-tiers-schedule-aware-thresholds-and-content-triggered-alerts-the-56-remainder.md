@@ -74,7 +74,9 @@
   [ADR 0001](0001-staged-pipeline-architecture.md) (the at-least-once / **routers-and-transforms-must-be-pure**
   invariant the content-trigger carve-out below claimed to reconcile; it did not, and D3 is retracted) · [ADR 0095](0095-connection-lifecycle-scheduler-and-credential-fault-stop.md)
   (the `Schedule` / `ActiveWindow` model #147 built, **reused** verbatim for schedule-aware rules) ·
-  [CLAUDE.md](../../CLAUDE.md) §2/§9 (PHI-free alerts, no new PHI tier) ·
+  [CLAUDE.md](../../CLAUDE.md) §2/§9 (PHI-free alerts, no new PHI tier; *note 2026-11-10,
+  BACKLOG #5021: alerts are not PHI-free in the shipped code, as the note under the invariants
+  below says*) ·
   [`pipeline/alert_sinks.py`](../../messagefoundry/pipeline/alert_sinks.py) ·
   [`config/settings.py`](../../messagefoundry/config/settings.py) ·
   [`store/store.py`](../../messagefoundry/store/store.py) (+ `sqlserver.py` / `postgres.py`).
@@ -103,7 +105,12 @@ Two invariants bound the design and **must not** be relaxed:
 - **Alerts are PHI-free (CLAUDE.md §9, ADR 0044).** Every emitted event carries "the connection name +
   queue shape only — no PHI". A content-triggered event is the risky one: it is *born from inspecting a
   message body*, so it must carry **only** the connection + a rule id + a boolean/label — **never the
-  matched field value**.
+  matched field value**. *(Note 2026-11-10, BACKLOG #5021: the quoted premise was false; some events
+  carry free-text detail, as the [PHI.md logging inventory](../PHI.md#logging-inventory-1611--1623)
+  rows for the `[alerts]` transports say. When this premise becomes true again for the alert
+  copies the off-box alert key allowlist routes, and which copies stay outside it, is in
+  [ADR 0173](0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)'s
+  note of 2026-11-10.)*
 - **Routers and transforms must be pure (ADR 0001).** A Handler that emits a content-triggered alert
   performs a **side effect**; under at-least-once a stage re-run **re-emits** it. This must be reconciled
   (below), not silently broken. **CORRECTED 2026-09-30:** it was not reconciled, and D3 is retracted

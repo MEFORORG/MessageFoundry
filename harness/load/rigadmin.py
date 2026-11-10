@@ -53,9 +53,9 @@ the image's interpreter.
 
 The session is one per process, as the TLS anchor is (:mod:`harness.load.tlsmat`). Sessions live in
 the store, so one sign-in covers every node that shares a store, however many nodes there are. That
-matters because the engine caps the sessions one user may hold (five by default) and ends the
-oldest past that: a session per node would end the first ones on a large fleet. A node on a
-different store refuses the session, and :func:`renew_session` signs in again there. A drive split
+matters because the engine caps the sessions one user may hold (``[auth].max_sessions_per_user``)
+and ends the oldest past that: a session per node would end the first ones on a large fleet. A node
+on a different store refuses the session, and :func:`renew_session` signs in again there. A drive split
 over several harness PROCESSES holds one session in each and makes one sign-in from each, so the
 rig that splits its drive that way sizes the cap and the sign-in rate limits on the engine it starts
 (``connscale/batchbox.py``, ``rig_sign_in_env``).
@@ -99,6 +99,7 @@ __all__ = [
     "RigAdminError",
     "RigReplyRefused",
     "RigSession",
+    "RigSignInRateLimited",
     "RigSignInRefused",
     "RigUnreachable",
     "provision",
@@ -188,6 +189,15 @@ class RigUnreachable(RigAdminError):
 
 class RigSignInRefused(RigAdminError):
     """The engine answered and refused the rig credential."""
+
+
+class RigSignInRateLimited(RigSignInRefused):
+    """The engine answered the rig's sign-in with HTTP 429, its sign-in rate limit, on every
+    attempt :func:`sign_in` made. It is usually transient: it clears once the engine's window
+    passes, unless the limit itself is set so no attempt fits (a negative count, for one).
+
+    A kind of :class:`RigSignInRefused`, so a caller that stops on a refusal still stops; one that
+    can wait longer may tell the transient limit from a refused credential by this type."""
 
 
 class RigReplyRefused(RigUnreachable):
@@ -316,9 +326,21 @@ def _check_key(key: str) -> None:
         raise refusal from None
 
 
-#: The clock and the wait :func:`_code_in_a_fresh_step` uses; tests replace them.
+#: The clock and the wait :func:`_code_in_a_fresh_step` and :func:`sign_in` use; tests replace them.
 _now = time.time
 _pause = time.sleep
+
+#: The waits :func:`sign_in` makes, when asked to wait out the rate limit, before each new attempt
+#: the engine answered with HTTP 429. A
+#: refused attempt does not count against the limit, so each wait lets the window drain. They sum to
+#: past the engine's shipped sign-in window (``[auth].login_rate_limit_window_seconds``; a test pins
+#: the sum past that default), so when only the rig's own burst filled the window, every hit made
+#: before the first refusal has aged out by the last attempt. An account with a key makes no such
+#: wait: each attempt already waits for a later TOTP step than the one before. Two attempts may be
+#: only seconds apart, at the turn of a step, but N attempts take N distinct steps, so the first and
+#: the last are more than N - 2 steps apart, and as many attempts span past the window the same way
+#: (a test pins that arithmetic).
+_RATE_LIMITED_WAITS_S = (2.0, 4.0, 8.0, 16.0, 32.0)
 
 
 class _SpentSteps:
@@ -745,44 +767,72 @@ def _call(
         raise RigUnreachable(f"the engine did not answer ({type(exc).__name__})") from None
 
 
-def sign_in(base_url: str, admin: RigAdmin | None = None, *, cacert: str | None = None) -> str:
+def sign_in(
+    base_url: str,
+    admin: RigAdmin | None = None,
+    *,
+    cacert: str | None = None,
+    wait_out_rate_limit: bool = False,
+) -> str:
     """Sign in as the rig Administrator and return the session's bearer token.
 
     An account with an authenticator key signs in with both factors in one request, the combined
     sign-in of ADR 0197, and first waits for a TOTP step to open (:func:`_code_in_a_fresh_step`).
 
-    Raises :class:`RigUnreachable` when the engine does not answer and :class:`RigSignInRefused`
-    when it answers anything but a usable session, or when the key is unusable, which is checked
+    An answer of HTTP 429, the sign-in rate limit, is transient, and raises
+    :class:`RigSignInRateLimited` so a caller can tell it from a refused credential. With
+    ``wait_out_rate_limit`` the attempt is first made again, once for each of
+    :data:`_RATE_LIMITED_WAITS_S`, after that wait, or for an account with a key after the wait for
+    a fresh step, which already spaces the attempts. Only a caller whose wait times nothing asks
+    for that: the command-line modes, a workflow's setup step. A poller or a drive process does
+    not, because a minute spent waiting inside a measured run would be read as engine time, or
+    would start one band's hold after its siblings'; it fails fast, as it did before.
+
+    Raises :class:`RigUnreachable` when the engine does not answer, :class:`RigSignInRateLimited`
+    when it answers HTTP 429 on the last attempt it makes, and :class:`RigSignInRefused` when it
+    answers anything else but a usable session, or when the key is unusable, which is checked
     before any wait.
     """
     admin = admin or rig_admin()
     base = _checked_base(base_url)
-    body = {"username": admin.username, "password": admin.password}
-    step: int | None = None
     if admin.totp_secret:
         try:
             _check_key(admin.totp_secret)
         except RigAdminError as exc:
             raise RigSignInRefused(str(exc)) from None
-        body["totp_code"], step = _code_in_a_fresh_step(admin.totp_secret)
-    status, raw = _call("POST", f"{base}/auth/login", cacert=cacert, body=body)
-    if step is not None:
-        # An HTTP answer came back, so the code reached the engine and its step is spent, whatever
-        # the answer. One with no usable answer raised above and records nothing; its step stays
-        # claimed, so this process never hands it out again.
-        _note_spent_step(step)
-    if status == 429:
-        # The sign-in rate limit, not the credential (BACKLOG #2795): the stale-Administrator advice
-        # below would send an operator after the wrong cause. Every attempt counts, successes too,
-        # so a fleet of rig processes signing in from one address can meet the per-address limit.
-        # A refused attempt does not count, which is why waiting out the window clears it.
-        raise RigSignInRefused(
-            "the engine rate-limited the rig Administrator's sign-in (HTTP 429): too many sign-in "
-            "attempts inside its window, which clears once the window passes. A rig of many "
-            "processes signing in from one address needs the engine's "
-            "MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP, and past the all-clients limit "
-            "MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL, sized to its sign-ins."
-        )
+    waits = iter(_RATE_LIMITED_WAITS_S if wait_out_rate_limit else ())
+    while True:
+        body = {"username": admin.username, "password": admin.password}
+        step: int | None = None
+        if admin.totp_secret:
+            body["totp_code"], step = _code_in_a_fresh_step(admin.totp_secret)
+        status, raw = _call("POST", f"{base}/auth/login", cacert=cacert, body=body)
+        if step is not None:
+            # An HTTP answer came back, so the code reached the engine and its step is spent,
+            # whatever the answer. One with no usable answer raised above and records nothing; its
+            # step stays claimed, so this process never hands it out again.
+            _note_spent_step(step)
+        if status != 429:
+            break
+        # The sign-in rate limit, not the credential (BACKLOG #2795). Every admitted attempt counts,
+        # successes too, so a fleet of rig processes signing in from one address can meet the
+        # per-address limit. A refused attempt does not count, so waiting lets the window drain.
+        wait = next(waits, None)
+        if wait is None:
+            # The stale-Administrator advice below would send an operator after the wrong cause.
+            tried = (
+                f" on all {len(_RATE_LIMITED_WAITS_S) + 1} attempts, spaced past its shipped window"
+                if wait_out_rate_limit
+                else ", which clears once its window passes"
+            )
+            raise RigSignInRateLimited(
+                f"the engine rate-limited the rig Administrator's sign-in (HTTP 429){tried}: too "
+                "many sign-in attempts inside its window. A rig of many processes signing in from "
+                "one address needs the engine's MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP, and past the "
+                "all-clients limit MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL, sized to its sign-ins."
+            )
+        if step is None:  # with a key, the next fresh step is the wait
+            _pause(wait)
     if status != 200:
         raise RigSignInRefused(
             f"the engine refused the rig Administrator's sign-in (HTTP {status}). If this store "
@@ -878,7 +928,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return 2
     base = _checked_base(args.engine)
     _require_sign_in(base, "/stats", cacert=args.cacert)
-    held = sign_in(base, cacert=args.cacert)
+    held = sign_in(base, cacert=args.cacert, wait_out_rate_limit=True)
     print(f"signed in as the rig Administrator; running {command[0]}", flush=True)
     # Resolved here, so a relative interpreter path works on Windows as it does on POSIX.
     command[0] = shutil.which(command[0]) or command[0]
@@ -930,7 +980,7 @@ def _cmd_get(args: argparse.Namespace) -> int:
     if any(ch.isspace() for ch in path):
         raise RigAdminError("the API path holds whitespace; quote it, and check the shell kept it")
     _require_sign_in(base, path, cacert=args.cacert)
-    held = sign_in(base, cacert=args.cacert)
+    held = sign_in(base, cacert=args.cacert, wait_out_rate_limit=True)
     deadline = time.monotonic() + args.timeout
     while True:
         status, raw = _call("GET", f"{base}{path}", cacert=args.cacert, bearer=held)

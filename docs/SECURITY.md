@@ -222,7 +222,21 @@ body, the early sign-in check above still answers before it. A route passes in o
   dependency guards by design, such as sign-in. Some web console routes of this kind still read a
   pending session inside the handler, such as `/ui/mfa`. `authorizes_in_body` marks a WebSocket
   that authorizes the caller inside its own body, and `/ws/stats` is the engine route that uses it.
-  On an HTTP route with no gate, that mark does not count, so the route is refused.
+  On an HTTP route with no gate, that mark does not count, so the route is refused. The mark is
+  not trusted on its own (vault BACKLOG #2955): `authorize_ws` records on the handshake whether it admitted the caller,
+  and the web console's `authorize_ui_ws` does so only on a browser handshake (one with an Origin),
+  the latest answer standing. `WebSocketAcceptGate` reads that record before it lets an accept
+  through. When the latest recorded answer is a refusal, it refuses accept on every socket, whatever its route declares. With no
+  recorded answer, a socket passes only where its route declares its authorization another way: a
+  gate dependency or a `public_route` mark. On a socket it refuses, it refuses a denial response
+  the body sends the same way, whatever its status, so none of its status, headers or body goes
+  out. The refusal is a close before accept, which the client gets as a bodyless HTTP
+  403. The web console's cookie gate records nothing for a handshake that sends no Origin, which
+  it leaves to the header path, so an earlier answer stands there. The accept gate writes an ERROR
+  line, `refused accept on WebSocket route`, for each refusal except a refusal status sent after a
+  gate's recorded refusal, at most once a minute for each route the handshake names.
+  Refusals on handshakes that name no route share one count and one line. That count is in
+  memory only; `GET /security/posture` does not report it.
 
 Any other route answers **403** `this route declares no authorization`, and a WebSocket is refused
 before it is accepted. Such a route is a defect in the code that registered it. The engine counts
@@ -294,13 +308,15 @@ host that file names. A bind host given only as `serve --host` is not in that fi
 check judges the file's host. The shipped service installer always passes `--host`, so on that path
 the check and `serve` can disagree on the bind host. With
 no file and no `--service-config`, it reads the environment instead. That needs
-`MEFOR_AI_ENVIRONMENT` to name the instance, and the line says so. At least these cases keep the
-skip. A `--service-config` naming a missing file is one, because `serve` refuses that file.
-Another is `--project-root` with no `--service-config`, no file under the root or the config
-directory, and a `messagefoundry.toml` in a working directory that is not the root. The line
-names that file. A third is no file and no `MEFOR_AI_ENVIRONMENT`. So a terminator set through
-`MEFOR_API_*` variables alone, for example on a site that names its environment only with
-`serve --env`, still reaches `serve` and not the check.
+`check --env` or `MEFOR_AI_ENVIRONMENT` to name the instance, and the line says which.
+`check --env` names the environment as `serve --env` does, above the file and the variable.
+A `--service-config` naming a missing file fails the check, as it stops `serve`.
+At least these cases keep the skip. One is `--project-root` with no `--service-config`, no file
+under the root or the config directory, and a `messagefoundry.toml` in a working directory that is
+not the root. The line names that file. Another is no file, no `check --env` and no
+`MEFOR_AI_ENVIRONMENT`. So a
+terminator set through `MEFOR_API_*` variables alone, on a site that names its environment only
+with `serve --env`, reaches the check only when `check` is given the same `--env`.
 
 **What else a proxy in front owes.** `serve` checks these after the refusals above, whether the hop
 is plaintext or TLS, and `--allow-insecure-bind` covers none of them.
@@ -823,9 +839,9 @@ again after a refusal that was not their error (BACKLOG #3194 declined that chan
 answers also differ either side of the floor, whatever the proof:
 
 - A pending directory session whose account the directory does not confirm. `verify_mfa` and
-  `finish_webauthn_assertion` run the floor before the directory lookup, so any code or assertion
-  gets the leg's ordinary failure inside the floor and the directory refusal past it (see *The
-  passkey leg asks the same question before it checks an assertion*, below).
+  `finish_webauthn_assertion` run the floor before the directory lookup, so any code, or any
+  assertion that verifies, gets the leg's ordinary failure inside the floor and the directory
+  refusal past it (see *The passkey leg asks the same question before it marks the factor*, below).
 - A passkey registration whose credential is already enrolled, on another account, is
   refused inside the floor as a failed verification, and past it as `this passkey is already
   enrolled`. `label already in use` differs the same way, but the console lets a pending session
@@ -855,7 +871,8 @@ the exchange, and a failed exchange is refused with its own reason rather than `
 **Why a sign-in callback is floored only sometimes.** An IdP that still holds a live single sign-on
 session answers the engine's redirect with no human step at all. A floor there would refuse that
 sign-in on every retry. So the sign-in is floored only when the verified `auth_time` is at or after
-the flow's start, which means the person signed in at the IdP inside this flow. An IdP clock that
+the flow's start rounded down to the whole second, which means the person signed in at the IdP
+inside this flow or in the second it started. An IdP clock that
 runs ahead can make an older sign-on look fresh. The refusal then clears once the skew has passed,
 and it never lets a flow through early. An IdP clock that runs behind can do the reverse, and then
 that sign-in is not floored. A sign-on made before the flow starts is the case the list under
@@ -990,6 +1007,28 @@ text, so an id that is not lower-case hex is recorded as `malformed` rather than
 write is soft: if the audit log refuses it, the answer still stands and the loss is logged at
 ERROR, so the row is the record of a miss only while the audit log accepts writes.
 
+**A session revoke that follows a committed change is retried, and a miss is audited (vault BACKLOG
+#3023).** At least a password change or reset, an MFA reset, a disable, a role, channel-scope or
+custom-role edit, a directory map save, a directory sign-in's role or scope resync and the
+`provision-admin` repair end the account's sessions after their own change has committed. A
+custom-role delete revokes before it deletes, so a refusal there leaves the role in place and
+writes no such row; the directory reconciler's demotion is not covered yet. A store
+refusal of that revoke, such as a pool shortage at the acquire limit, a statement timeout or a lost
+connection, is run again, up to three attempts. A re-run starts only while less than 15 seconds
+have passed since the first attempt began, give or take its half-second pause, and nothing bounds
+how long one attempt runs. At the default `acquire_timeout` a SQL Server pool wait uses up that
+budget on its own, so it is recorded at once rather than run into the request deadline. A refusal
+that reads as a defect is raised at once, unretried and unrecorded: at least a store whose tables,
+columns or grants are not what the statement needs, and SQLite's `ProgrammingError`. A SQL syntax
+error is not always one: SQLite's, and SQL Server's generic 42000, are run again and recorded like a
+fault, while PostgreSQL's, in SQLSTATE class 42, is raised at once. A revoke the service gives up on is logged at ERROR
+and writes one `auth.sessions_revoke_failed` row naming the account, the change, the attempts and
+the error class. A role edit or map save stops at that account, and its row counts the accounts it
+did not reach as `accounts_not_attempted`; the request still fails, the change stands, and the account's other sessions stay
+live until they lapse. The change's own audit row is not written then, so this row is its record.
+Its write is soft, as above: on a store that refuses it too, the ERROR line is the only trace. A
+cancellation, such as the request deadline, skips both the retry and the row (vault BACKLOG #3802).
+
 **Delegated identity & admin device posture (#193 sibling; ASVS 13.2.1 / 13.3.2 / 8.4.2 — the delegation
 boundary).** Three controls whose enforcement is largely the deploying organization's to provide.
 MessageFoundry states the boundary and adds one opt-in precondition check (#203):
@@ -1067,7 +1106,7 @@ backend hops that present a static credential or none (the *Delegated identity* 
 
 | Hop | Identity the engine presents | Least privilege it needs | Checked by the engine |
 |---|---|---|---|
-| Store, SQL Server | the `[store]` login: the service account under `auth = "integrated"`, else `[store].username` | `db_datareader` + `db_datawriter`, plus `db_ddladmin` only under `schema_management = "auto"`; `UPDATE` and `DELETE` denied on `audit_log`; no server role | **Yes**, at every start and by `check-privileges`; an over-grant refuses start under `enforce` |
+| Store, SQL Server | the `[store]` login: the service account under `auth = "integrated"`, else `[store].username` | `db_datareader` + `db_datawriter`, plus `db_ddladmin` only under `schema_management = "auto"`; under `key_provider = "host"`, the login that runs `provision-admin` needs more, at least what [DEPLOY-SERVER-DB.md §1.1](DEPLOY-SERVER-DB.md#11-integrated-gmsa-authentication--sql-server-worked-example-99) names; `UPDATE` and `DELETE` denied on `audit_log`; no server role | **Yes**, at every start and by `check-privileges`; an over-grant refuses start under `enforce` |
 | Store, PostgreSQL | `[store].username` | a `LOGIN` role with no attributes: `CONNECT`, `USAGE` on the store schema and row grants, only `INSERT` and `SELECT` on `audit_log`; it owns that schema only under `auto` | **Yes**, at every start and by `check-privileges`; an over-grant refuses start under `enforce` |
 | Store, SQLite | the service account | only that account may read and write the `.db` file and its `-wal`/`-shm` sidecars | No: reported **not applicable**; the filesystem ACL governs it |
 | Vault, store key provider | the token in `MEFOR_STORE_VAULT_TOKEN` | `read` on `transit/keys/<KEK>` and `update` on `transit/decrypt/<KEK>`; plus `read` on `auth/token/lookup-self` and `update` on `sys/capabilities-self` for the privilege probe `serve` and `check-privileges` run | **Yes**, at every start and by `check-privileges` (hop `vault.store`); the root policy or an administrative grant refuses start under `enforce`, anything else warns |
@@ -1076,7 +1115,7 @@ backend hops that present a static credential or none (the *Delegated identity* 
 | LDAP (AD) | `[auth].ad_bind_dn` | read and search on the user and group search bases; no write and no administrative group | **Partly**, by `check-privileges`: identity and administrative groups; delegated ACLs not read; never gates a start |
 | SMTP (alerts) | `[alerts].email_username`, or no AUTH account | send as `[alerts].email_from` only | No: printed, not probed |
 | IdP (OIDC) | `[auth].oidc_client_id` at `[auth].oidc_issuer` | a confidential client allowed the configured `oidc_scopes` only; no directory or admin API permission | No: printed, not probed |
-| Outbound connections | each connection's own credential (`Database`, `Rest`, `FHIR`, `Ftp`, `Email` and the rest) | what that feed's partner grants for that feed alone; for a `DatabaseLookup` or `DatabaseRef` login, `SELECT` on what it reads and nothing else | No: `check-privileges` does not read the connection graph; `messagefoundry check` lists their static credentials. The read-only statement test that `db_lookup` and `DatabaseRef` statements pass reads the statement's text, not the login's privilege, so it is not this check ([`CONNECTIONS.md`](CONNECTIONS.md) §*Give `db_lookup` a read-only login*) |
+| Outbound connections | each connection's own credential (`Database`, `Rest`, `FHIR`, `Ftp`, `Email` and the rest) | what that feed's partner grants for that feed alone; for a `DatabaseLookup` or `DatabaseRef` login, `SELECT` on what it reads and nothing else | **Partly**, for a `DatabaseLookup` or `DatabaseRef` login only: a role probe when its pool first opens reads its fixed server and database roles and warns on a database-wide write role; it never refuses, and it reads role membership only, not a permission granted at any scope (BACKLOG #2617, [`CONNECTIONS.md`](CONNECTIONS.md) §*The engine probes a lookup or reference login for write roles*). Every other outbound login: no. `check-privileges` does not read the connection graph, and `messagefoundry check` lists their static credentials. The read-only statement test that `db_lookup` and `DatabaseRef` statements pass reads the statement's text, not the login's privilege, so it is not this check ([`CONNECTIONS.md`](CONNECTIONS.md) §*Give `db_lookup` a read-only login*) |
 
 The Vault rows name at least the calls the code makes today. A policy that grants them and nothing
 more is the least grant for that consumer. The Transit cipher skips the separate audit-key read when
@@ -1184,7 +1223,8 @@ at that moment. The over-grants above fall in two classes:
   `GET /security/posture`.
 - **The warning class:** everything else the probe calls over-granted, at least one token serving
   both hops, an extra capability on a path the engine calls, and a policy name the probe cannot tell
-  apart from `root` by reading it. These log a warning and write the audit row; they never refuse.
+  apart from `root` by reading it. These log a warning, write the audit row and raise the alert
+  below; they never refuse.
 
 A probe that could not read the token because of a network failure, a timeout or a 403 also only
 warns. Any other failure leaves the token unjudged for a reason the ruling does not excuse: at
@@ -1196,8 +1236,41 @@ the opt-out does not lift it.
 Under `enforcement = warn` nothing refuses. The probe's limits stay: it asks about exact paths only,
 so a wildcard grant such as `secret/data/*` would read clean, and a token made with `-no-default-policy` reads
 as not observed at every start unless its policy grants the two paths the probe reads. Neither
-limit was measured against a live Vault. No alert is raised for a Vault finding yet; the log line
-and the audit row are the record.
+limit was measured against a live Vault.
+
+**Every Vault finding also raises an alert, and a clean read can resolve it** (vault BACKLOG #2903
+slice B). A hop that is over-granted, in either class, or that could not be read raises
+`vault_privilege_warning` under the subject `vault:store` or `vault:secrets`, before any refusal,
+so a refused start still pages, and an accepted opt-out quiets nothing. The payload is the finding,
+the count of refusing-class grants and the hop's judgment, which names policy names, paths and
+capabilities, never a token, an accessor or a digest of either. A later start that reads that
+hop's token clean raises `vault_privilege_clean`, which pages nobody and can resolve the open
+instance, as `store_privilege_clean` does for the store. The subject names the hop and nothing
+about the token, because a fix is usually a new token: so engine processes that share one store
+share each hop's alert, and a clean start by one can resolve a warning another raised on a
+different token.
+
+**A warning still open after a clean start.** A clean start can leave another process's warning
+open ([ADR 0044, the vault BACKLOG #4916 amendment](adr/0044-operator-alert-state.md#amendment-2026-11-09----an-auto-resolve-is-fenced-to-the-raises-it-speaks-for-backlog-4916)).
+Treat an open warning as live until you have found and fixed its cause. The cause may be, at
+least, the token, reachability, the probe paths, or the engine's own Vault client setup (a missing
+extra, address or token variable, or a refused TLS or cleartext address). Neither the log line nor
+the audit row names the process that raised or cleared it, and under the engine-shard supervisor
+every engine shard shares one log, so check each process's configuration and restart it after
+the fix: only a serve start's preflight raises this warning or resolves it automatically
+(`messagefoundry check-privileges` runs the same probe on demand but changes no alert). A start whose process has no `[alerts]`
+transport, such as a webhook or email, gets the logging sink, which resolves nothing. It also
+raises nothing durable, so that process's warning never appears in the alert list; an empty
+list does not prove every process is clean. A resolve can also fail to land, at least: it logs an
+ERROR such as `alert-instance resolve gave up` or `alert-instance resolve was cancelled before it
+landed`, or it can be dropped with no line at all. A resolve the fence kept open logs, at least,
+an INFO line containing `closed nothing: a live instance remains`, or a WARNING containing
+`closed nothing and the re-read failed` when the re-read fails. If the cause is fixed and the
+warning is still open, resolve it by hand from the alert list. Resolving it by hand needs, at
+least, an identity with no channel scope (by default an administrator) and `monitoring:diagnose`;
+a channel-scoped identity never sees this subject.
+
+The log line and the audit row of every start stay the record.
 
 ### Data-layer hops refuse cleartext on their defaults (ASVS 12.3.1 census)
 
@@ -1343,7 +1416,7 @@ apply. What each **adds** over plain `require()`:
 | `require_paced` | 17 | the **new-client-IP** refusal (403 + `X-Step-Up-Required: 1`, vault BACKLOG #2620), then per-actor anti-automation pacing on **non-GET** requests (`allow_admin_write`), 429 + a `Retry-After` naming the actor's wait |
 | `require_phi_read` | 8 | the ADR 0092 PHI-read hop refusal (`enforce_phi_read_hop`) **before** any identity work, then the **new-client-IP** refusal (403 + `X-Step-Up-Required: 1`, vault BACKLOG #2620), then the per-actor PHI-read budget, 429 + a `Retry-After` naming the actor's wait (the whole window while the global count is spent) |
 | `require_step_up` | 22 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
-| `require_step_up_action` | 18 | the same non-GET pacing (BACKLOG #1148), the **MFA gate**, then a **single-use, action-bound** step-up grant, minted on this plane only by `POST /me/reauth` (403 + `X-Step-Up-Action: <action>`; the password leg of `POST /ui/reauth` and the IdP leg mint it for a cookie session). Promoting a route here no longer drops the pacing floor. Since vault BACKLOG #2625 it also gates the injection and bulk-export set (see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)) |
+| `require_step_up_action` | 20 | the same non-GET pacing (BACKLOG #1148), the **MFA gate**, then a **single-use, action-bound** step-up grant, minted on this plane only by `POST /me/reauth` (403 + `X-Step-Up-Action: <action>`; the password leg of `POST /ui/reauth` and the IdP leg mint it for a cookie session). Promoting a route here no longer drops the pacing floor. Since vault BACKLOG #2625 it also gates the injection and bulk-export set (see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)) |
 | `require_reauth_only_action` | 4 | password step-up **without** the MFA gate — deadlock avoidance on the MFA-enrollment lanes, and on session terminate (ASVS 7.5.2), where the grant is action-bound so a login-seeded window does not unlock it. `require_reauth_only` still exists and still backs the `/ui` twin, but BACKLOG #1149 moved the last JSON route off it, so it no longer appears in this walk |
 | `require_service_cert` | 1 | cert-only authentication (a bearer token gets 401), and a **PHI fence** that raises at *app construction* if asked to gate `messages:view_summary` / `messages:view_raw` |
 
@@ -1402,7 +1475,7 @@ under `create_app()` (they sum to 102, not 98, because BOTH `/messages/export` r
 | `AI_ASSIST` | `ai:assist` | | 1 | `POST /ai/chat`; also *reported* (not enforced) as `assist_permitted` on the unauthenticated `GET /ai/policy` |
 | `SERVICE_CONFIGURE` | `service:configure` | | 1 | `POST /alerts/test-email` — a live outbound SMTP dial through the configured `[alerts]` mail transport (BACKLOG #118); service/settings administration, not the diagnostic ack/resolve tier |
 | `USERS_READ` | `users:read` | | 4 | `GET /roles`, `/roles/custom`, `/users`, `/users/{id}/permissions` |
-| `USERS_MANAGE` | `users:manage` | | 21 | every user/role/AD-map write, `DELETE /sessions` (BACKLOG #2614), **and** the four reads `GET /users/{id}/channel-scope`, `GET /users/{id}/federated-identity` (BACKLOG #2331), `/ad-group-map`, `/ad-group-scope-map`. Never assignable to a custom role |
+| `USERS_MANAGE` | `users:manage` | | 23 | every user/role/AD-map write, `DELETE /sessions` (BACKLOG #2614), the enrolment-code issue and revoke (ADR 0207), **and** the four reads `GET /users/{id}/channel-scope`, `GET /users/{id}/federated-identity` (BACKLOG #2331), `/ad-group-map`, `/ad-group-scope-map`. Never assignable to a custom role |
 | `AUDIT_READ` | `audit:read` | | 1 | `GET /audit` |
 | `AUDIT_EXPORT` | `audit:export` | | 1 | `GET /audit/export` — the filtered audit-report CSV (BACKLOG #170); distinct from `audit:read` |
 | `LOGS_VIEW` | `logs:view` | **PHI** | 1 | `GET /logs/tail` — the best-effort-redacted application-log tail (residual single-token PHI is possible), so it rides `require_phi_read` and writes a `logs_view` audit row |
@@ -1503,12 +1576,12 @@ Managed at `GET /roles/custom` (`users:read`) and `POST` / `PUT` / `DELETE /role
 
 ### Route → permission map (engine API)
 
-**Counting basis.** `create_app()` with no arguments builds **117 route objects** — 73 declared in
-[`api/app.py`](../messagefoundry/api/app.py) (72 HTTP + 1 WebSocket) and 44 declared in
+**Counting basis.** `create_app()` with no arguments builds **119 route objects** — 73 declared in
+[`api/app.py`](../messagefoundry/api/app.py) (72 HTTP + 1 WebSocket) and 46 declared in
 [`api/auth_routes.py`](../messagefoundry/api/auth_routes.py). No other module in `api/` declares routes
-and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 121 (`/openapi.json`,
-`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 245
-(117 + the 127 console routes + the `/ui/static` mount). Of the 117: **98 are permission-gated**, 19 are
+and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 123 (`/openapi.json`,
+`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 249
+(119 + the 129 console routes + the `/ui/static` mount). Of the 119: **100 are permission-gated**, 19 are
 not. Every one is listed below — none is collapsed away.
 
 #### Functions requiring no authorization
@@ -1570,6 +1643,8 @@ tuple: they act only on the caller's own account.
 | `PUT` | `/users/{user_id}/federated-identity` | `users:manage` | `require_step_up_action` (action `admin_federated_identity`). Binds the account to an IdP `sub` under the configured `[auth].oidc_issuer`, or rebinds it; either one revokes every live session of the account, in the same transaction as the write (vault BACKLOG #2609). **The only path that creates a federated binding** (ADR 0184, BACKLOG #1143): a federated login never binds, and an unbound one is refused. Directory (AD) accounts only, and only one that carries its immutable directory id (`users.directory_object_id`, the `objectGUID`): 400 `directory_object_id_missing` otherwise, audited as `auth.federated_bind_refused` (BACKLOG #1143 slice C). A local account is refused 400 too, audited with reason `not_a_directory_account` (BACKLOG #3174). 409 when another account holds the identity, audited with reason `federated_subject_held` (BACKLOG #3174), and 409 `federated_binding_changed` when the account no longer holds the body's required `expected_issuer`/`expected_subject`, the pair the caller saw (BACKLOG #2026), also audited as `auth.federated_bind_refused`, with reason `federated_binding_changed`, the expected pair (BACKLOG #2331), and the pair the row held as `held_issuer`/`held_subject` wherever the refusal read it (BACKLOG #3174). 404 for an unknown user, including one deleted while the bind ran (BACKLOG #2331). A rebind is still a clear then a separate set: if another bind lands between them the rebind is refused 409 without that code, and its clear has already removed the old binding, audited as `auth.federated_subject_unbound`. The refusal itself is audited as `auth.federated_bind_refused` with reason `account_bound_concurrently`; that row and the `federated_subject_held` one carry `previous_binding_removed`, which says whether this request's clear had removed a binding first (BACKLOG #3174). **A bound account is refused Windows SSO from then on**, whether or not `oidc_enabled` is on (vault BACKLOG #2609; [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) has the limits) |
 | `DELETE` | `/users/{user_id}/federated-identity` | `users:manage` | `require_step_up_action` (action `admin_federated_identity`). Removes the binding and revokes the account's sessions (BACKLOG #1474's service method); its next federated login is refused until it is bound again. The body's required `expected_issuer`/`expected_subject` is the pair the caller saw: a stored pair that differs is refused 409 `federated_binding_changed` with nothing changed, compared under the clear's row lock (BACKLOG #2026). That refusal writes an `auth.federated_unbind_refused` audit row naming the actor, with reason `federated_binding_changed` and the expected pair (BACKLOG #2331) |
 | `POST` | `/users/{user_id}/reset-mfa` | `users:manage` | `require_step_up_action` (action `admin_reset_mfa`); **refuses (400) when `user_id` is the caller's own** — use the self-service MFA settings instead. Targeting yourself here was a third route to zero factors that skipped the last-factor refusal both self-service paths make (BACKLOG #1022). Cross-user reset is untouched: it is the always-available recovery for a locked-out passkey user (ADR 0068 §2) |
+| `POST` | `/users/{user_id}/enrolment-code` | `users:manage` | `require_step_up_action` (action `admin_enrolment_code_issue`). Issues a directory account's single-use enrolment code, returned once and `no-store` ([Directory-account enrolment codes](#directory-account-enrolment-codes-adr-0207), ADR 0207). **Refuses (400) the caller's own account**, a local account, an account holding a factor and a disabled account; 404 for an unknown one |
+| `DELETE` | `/users/{user_id}/enrolment-code` | `users:manage` | `require_step_up_action` (action `admin_enrolment_code_revoke`). Clears an outstanding code; `revoked` says whether one was. Refuses (400) the caller's own account; 404 for an unknown one |
 | `GET` | `/users/{user_id}/channel-scope` | `users:manage` | `require` (a read on the `users:manage` tier, not `users:read`) |
 | `PUT` | `/users/{user_id}/channel-scope` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) |
 | `GET` | `/ad-group-map` | `users:manage` | `require` |
@@ -1743,7 +1818,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/logs/tail` | `logs:view` | `require_phi_read` | best-effort-redacted; writes a `logs_view` audit row |
 | `POST` | `/ai/chat` | `ai:assist` | `require` | **not** paced; bounded by the central AI policy |
 
-**PHI-egress route set.** Of the 117 route objects a default `create_app()` serves, **at least twenty-one**
+**PHI-egress route set.** Of the 119 route objects a default `create_app()` serves, **at least twenty-one**
 can put PHI on the wire: the thirteen message/search rows above marked PHI (`/messages`, `/messages/{id}`,
 `/messages/{id}/raw`, `/responses`, `/outbound`, `/attachments/{id}`, `/messages/search`, `/messages/export`,
 `/search/layered`, the three `/search/presets` rows, `/dead-letters`), plus
@@ -1773,14 +1848,14 @@ rather than shown a body its permission set does not authorize.
 
 #### The `/ui` console plane (`serve_ui=True`)
 
-When the console is served, the `/ui` plane adds **127 routes + one `/ui/static` mount** (federation off,
+When the console is served, the `/ui` plane adds **129 routes + one `/ui/static` mount** (federation off,
 the default — the three `/ui/oidc/*` routes, `GET`/`POST /ui/oidc/start` and `GET /ui/oidc/callback`,
 and the IdP step-up start `POST /ui/reauth/oidc` are registered only when `[auth].oidc_enabled`). They are
 functions too, and they gate on the **same 29-permission catalogue** through parallel wrappers —
 `require_ui`, `require_ui_step_up`, `require_ui_reauth_only`, `require_ui_step_up_action`,
 `require_ui_reauth_only_action` — but authenticate by the `SameSite=Strict` **session cookie**
 rather than a bearer token, and refuse cross-site state changes on `Sec-Fetch-Site`/`Origin`.
-**Route → permission map (`/ui` plane).** 116 of the 127 carry a gate. The 11 that do not are the
+**Route → permission map (`/ui` plane).** 118 of the 129 carry a gate. The 11 that do not are the
 sign-in, sign-out, re-auth and second-factor entry points and the CSP report sink, listed after the table. Where the console is served it is the
 *sole* operator UI, so ~20 of these have no JSON counterpart from which their authorization could be
 inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bulk`, the
@@ -1909,6 +1984,8 @@ the console routes with a rule of their own.
 | `POST` | `/ui/users/{user_id}/federated-identity/unlink` | `users:manage` | `require_ui_step_up_action` (action `admin_federated_identity`) |
 | `GET` | `/ui/users/{user_id}/federated-identity/unlink-confirm` | `users:manage` | `require_ui_step_up` |
 | `POST` | `/ui/users/{user_id}/reset-mfa` | `users:manage` | `require_ui_step_up_action` (action `admin_reset_mfa`) |
+| `POST` | `/ui/users/{user_id}/enrolment-code` | `users:manage` | `require_ui_step_up_action` (action `admin_enrolment_code_issue`); shows the code once (ADR 0207) |
+| `POST` | `/ui/users/{user_id}/enrolment-code/revoke` | `users:manage` | `require_ui_step_up_action` (action `admin_enrolment_code_revoke`) |
 | `POST` | `/ui/users/{user_id}/reset-password` | `users:manage` | `require_ui_step_up_action` (action `admin_reset_password`) |
 | `POST` | `/ui/users/{user_id}/revoke-sessions` | `users:manage` | `require_ui_step_up` |
 | `POST` | `/ui/users/{user_id}/roles` | `users:manage` | `require_ui_step_up` |
@@ -1990,7 +2067,18 @@ else would need its own authorization rule stated here.
    outside the browser issues nothing when the browser sends `Sec-Fetch-Site: none`. **A browser
    that sends no Fetch Metadata is judged only by the origin check, which accepts a top-level GET,
    so there a crafted link to the page itself still issues it and the re-auth mints the grant.**
-   The operator must still confirm on the page.
+   The operator must still confirm on the page. "Once" holds when two re-auths race one issue:
+   each leg takes the issue in one synchronous step, with no await between its read and its take,
+   right before the leg's re-proof awaits, so the second finds nothing and mints nothing. A
+   federated flow mints only while it still holds its issue; the ADR 0065 change cited below
+   says when it does not. A re-auth that fails, a refused IdP prompt included, gives it back
+   for the retry, which continues only while the issue has not lapsed (vault BACKLOG #3241,
+   added items 7 and 9; [ADR 0065](adr/0065-web-ops-dashboard.md) change of 2026-11-05). Auto-retry actions and action-bound unlock pages each have their own per-session
+   cap of issues, so one kind cannot evict the other (added item 8). `GET /ui/reauth` toward an
+   action-bound unlock page this session was not issued shows a link to the page, not a password
+   form, so a bookmarked or typed link costs one re-auth rather than two: following the link is a
+   same-origin navigation, whose refusal issues the page (added item 2). The link reaches only a
+   registered unlock page, which still asks for the re-auth and its confirm.
 2. **The `/ui` write path charges the per-actor admin-write floor in `require_ui` itself**, because
    the console calls the JSON handlers in-process and their pacing `Depends` never runs (see *The
    `/ui` write path is paced* under [Anti-automation](#admin-password-reset-wp-l3-12-asvs-646)).
@@ -2120,7 +2208,10 @@ the same permission set on the same method reds CI until it is listed here.
 > source counts as `ad` here (BACKLOG #2252):** it predates the source column, the sync withdraws
 > it like a directory scope, and the GET still reports it as null. The 409 detail names the
 > conflict, never the scope. Each 409 writes one `user.channel_scope_change_refused` audit row
-> naming the administrator, the account and the conflict, never the scope (BACKLOG #2271). A store
+> naming the administrator, the account and the conflict, never the scope (BACKLOG #2271); a
+> reader without `users:manage` reads its conflict fields withheld (the `GET /users` bullet under
+> *Every route of the default JSON API has a channel-scope class*, below, in
+> [The `/ui` console plane](#the-ui-console-plane-serve_uitrue)). A store
 > that refuses that row leaves an ERROR log line instead, and the 409 stands. The web console sends `expected_source` when the administrator ticks "Make this scope
 > manual", and shows a race as a refused save with the edits kept.
 >
@@ -2328,7 +2419,29 @@ the same permission set on the same method reds CI until it is listed here.
 > - `GET /users` sends each account's `channel_scope` and `channel_scope_source` only to a
 >   `users:manage` holder, the tier `GET /users/{user_id}/channel-scope` reads on. Everyone else
 >   gets null for both and `channel_scope_withheld: true`, so a null there means "not shown". The
->   console's user list reads that flag and drops both scope columns for such a reader.
+>   console's user list reads that flag and drops both scope columns for such a reader. On the
+>   same rule, `GET /audit`, its console page and `GET /audit/export` narrow, for such a reader,
+>   the detail of the four audit actions a census of the writers on 2026-11-09 found naming a
+>   channel list or who owns a scope: `user.channel_scope_changed` reads as the account's
+>   `user_id`, where the row has one, and `"channels": "withheld"`; `auth.ad_scope_resynced` reads
+>   as `"channels": "withheld"` alone, since its writer stores no `user_id` and the row names the
+>   account only as its actor;
+>   `auth.ad_session_revoked` reads `scope_from` and `scope_to` as `"withheld"` on a scope-delta
+>   row, the only row that carries them, and keeps `scope_changed`; and
+>   `user.channel_scope_change_refused` reads `owner`, `read_source`, `expected_source` and
+>   `reason` as `"withheld"` (vault BACKLOG #3748). Each rule is an
+>   allowlist, so a key a later writer adds to one of those four is withheld, but a NEW action
+>   whose detail names a scope is shown whole until a rule for it is added to `_NARROWED` in
+>   `messagefoundry/auth/audit_visibility.py`, which holds each action's kept and withheld keys.
+>   `tests/test_audit_scope_census.py` fails on some such writers, not all: its docstring lists at
+>   least the shapes it misses, among them a detail built outside the call and a key it does not
+>   know. `GET /logs/tail` gives such a reader no audit
+>   copies at all. **Left open:** this hides the stored lists and sources, not every inference.
+>   Rows left whole can still let such a reader piece a scope together: at least an `auth.channel_denied`
+>   row or a channel-attributed access row, each naming an actor and one channel, and the actors of
+>   `auth.ad_scope_resynced` rows, which say the directory owned that account's scope.
+>   `/me/security-events` is not narrowed either: it shows a holder its own `auth.*` rows whole,
+>   and, on the residuals its own bullet under *Single-route data rules* names, another account's.
 > - `POST /config/reload` refuses a scoped caller 403, a dry run included, because a reload loads
 >   the whole graph and a dry run's reply describes it. So a deployer needs the all-channels grant.
 >   The refusal writes one `auth.channel_denied` row naming no channel. The approval gate refuses
@@ -2446,16 +2559,18 @@ before the change is refused at release with **409** and an `approval.no_longer_
 the approver, whose `reason` says which (`approvals_disabled` or `operation_not_gated`). Nothing
 runs. The request stays pending until an approver rejects it or it expires. The refusal's wording
 tells the approver to reject it and, if the operation is still needed, to run it again, which now
-runs it without a second approver. `GET /approvals` marks such a request `gated: false`, read from
-the same settings test at listing time, and gives it a `release_blocked` reason, below, which the
-console's Approvals page keys on.
+runs it without a second approver. `GET /approvals` marks such a request `release_blocked:
+"not_gated"`, below, read from the same settings test at listing time, which the console's
+Approvals page keys on.
 
 **`GET /approvals` names at least some of the releases the gate refuses whoever approves them
 (vault BACKLOG #3192).** Each pending request carries `release_blocked`, which the release refuses
 on directly, so where it names a reason the two cannot disagree. It names at least a request with
 no requester id, an operation no longer registered, one dual control no longer gates, unreadable
 parameters, parameters naming no requester for an operation whose executor needs one (a purge or a
-reload, `params_no_requester`), and a requester who no longer holds the authority the operation needs, such as a held
+reload, `params_no_requester`), a held reload whose parameters carry no config digest, or one not
+of the form the engine writes, which its release could only refuse whatever the directory holds
+(`params_no_fingerprint`), and a requester who no longer holds the authority the operation needs, such as a held
 reload or purge whose requester has since been channel-scoped (`requester_not_authorized`, BACKLOG
 #3189). The requester's standing is read when the queue is listed, by the rule the release
 applies, so a change after the listing, or a standing the listing could not read, is met only at
@@ -2465,7 +2580,8 @@ the expiry, the dwell floor, the row's seal and the operation's own refusals are
 page keys on it, and offers a blocked request only Reject, or Withdraw on the requester's own row,
 with a note saying why. A release refused for unreadable parameters writes an
 `approval.params_unreadable` row against the approver, which carries no parameters, and one refused
-as `params_no_requester` writes an `approval.params_no_requester` row against the approver. A
+as `params_no_requester` or `params_no_fingerprint` writes an `approval.params_no_requester` or
+`approval.params_no_fingerprint` row against the approver. A
 release refused on the requester's standing writes `approval.stale_requester`, above. A refusal for
 a request with no requester id, or for an operation no longer registered, still writes no row.
 
@@ -2536,13 +2652,22 @@ row may have committed after all.
 
 **A reload's `config_reload_failed` row names why in `reason`.** At least these values are
 written: `trust_anchor`, `invalid_config`, `not_found`, `unreadable`, `digest_mismatch`,
-`no_approved_digest`, `digest_unavailable`, `store_unavailable` and `reload_fault`. **An operator
+`no_approved_digest` (reached only past the gate's own check, below), `digest_unavailable`,
+`store_unavailable` and `reload_fault`. **An operator
 reload's faults write a row too (BACKLOG #3157).** On the reload routes, inline, a dry run
 included, and released, any error the reload raises that none of the other reasons names is
 `reload_fault`, with the error's type name: at least a `FileNotFoundError` or a `PermissionError`
 raised by a runner start or swap. A `FileNotFoundError` there is never `not_found`. That reason is
 for the config directory itself: at least one that is missing, and one moved away between the
-reload's target check and its read of the directory. The row does not claim the old graph is still serving: at least a
+reload's target check and its read of the directory. An executor fault is named by its own type,
+at least when a lane's anchor check meets it. The row never
+carries the error's text. A connector build or build check that the executor refused at submit,
+before a worker took it, or cancelled or failed before it began, runs on the event loop instead,
+with a WARNING in the engine log, so that hop does not fail; a bad config is still refused. Work
+still queued behind a busy or hung pool waits for it and is not run on the loop. Other
+worker-thread hops have no such fallback, at least a lane's anchor check and a reload's reads of
+its config directory, so a pool that stays broken still fails the reload. The row does not claim
+the old graph is still serving: at least a
 fault raised after the swap committed leaves the new one live, and `GET /config/provenance` says
 which is. At least these write no such row: a DR activation's reload, and a row whose own write
 fails, which is logged. A cluster convergence reload records such a fault with reason
@@ -2586,7 +2711,9 @@ read as a completed action.
 
 **An inline, released or cluster convergence reload's `config_reload` row names that reload's own
 config (vault BACKLOG #2257, #3109).** It is built from the reload's own result: its directory,
-connection counts and the digest it took before the swap. The row is written after the swap, so a
+connection counts and the digest it took before the swap. A convergence reload's row can also
+carry `initiator_digest`: the unsigned digest read from the shared `cluster_config` row, never
+authenticated. The row is written after the swap, so a
 second reload can move the engine on first. The row then still names
 its own config, but is marked `superseded` and `baseline_unchecked`, so the next start passes over
 it and does not compare against it. Only a committed reload that moves the engine's loaded
@@ -2630,7 +2757,12 @@ the environment values it had. A reload applies the values it re-read only with 
 rolled-back swap puts the old ones back. A dry run checks the values and never applies them. The
 approve answers **422**, the request moves to `failed`, and a `config_reload_failed` row records
 reason `digest_mismatch` with `approved_fingerprint` and `current_fingerprint`. A hold whose
-params carry no digest is refused the same way, with reason `no_approved_digest`. A release that
+params carry no digest, or one not of the form the engine writes, is refused before its claim
+instead (vault BACKLOG #3192): the queue marks
+it `release_blocked: "params_no_fingerprint"`, the approve answers **409** and writes an
+`approval.params_no_fingerprint` row, nothing runs, and the request stays pending for a reject.
+A hold with no usable digest whose release skipped the gate's check is still refused by the
+executor, with reason `no_approved_digest` where it reaches the digest check. A release that
 cannot take the digest now is refused with reason `digest_unavailable`, and the engine logs the
 cause at WARNING. The requester asks again, and a second approver reviews the new bytes.
 
@@ -2767,7 +2899,8 @@ in the local audit log for a `dead_letter_replay` or `connection_purge` row writ
 **An audit or store outage that refuses writes answers a mapped status on at least these approval
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still
 answers **409**: that is at least `approval.too_early`, `approval.stale_requester`,
-`approval.no_longer_gated`, `approval.params_unreadable` and `approval.params_no_requester`. A claim, a rejection or a resolution that the store cannot write with
+`approval.no_longer_gated`, `approval.params_unreadable`, `approval.params_no_requester` and
+`approval.params_no_fingerprint`. A claim, a rejection or a resolution that the store cannot write with
 its audit row answers **503**. The request does not move, except where a COMMIT lands despite the
 error, as stated for the claim above.
 
@@ -2784,19 +2917,30 @@ than to one request.
   caller and their address;
 - the `approval.approver_provenance` row a release or a resolution writes after it has gone ahead.
   The log line carries the row's detail;
-- the request or repeat write, including one that reads back as held, as below. The log line names
-  the actor and the operation, or is a WARNING for a held one;
+- the request or repeat write, except one that reads back as held, as below. The log line names
+  the actor and the operation;
 - a claim, a rejection or a resolution that answers 503, and a claim whose approve was cancelled.
-  The log line carries the exception, not the row's detail.
+  The log line carries the exception, not the row's detail;
+- an outcome whose status write found the row moved, where the read-back does not find this
+  write's row at its status and decision time, as below. The log line carries the row's detail;
+  on an interrupted or failed outcome its `recorded` or `compensated` field reads `false` where
+  another caller moved the row, and `unknown` where the read-back cannot tell.
 
 For some failed writes the gate logs at ERROR and pages nothing. At least this one: a restart
 cannot move a leftover `executing` row to `interrupted`. The row stays `executing`, and the next
 start tries again.
 
 An outcome's combined write can fail while the status write that follows finds the row already
-moved. The combined write most likely committed, and only its reply was lost, so the gate writes
-no second row. It logs at ERROR and pages, because the store writes a row's off-box copy only
-after a commit it saw succeed (vault BACKLOG #3193).
+moved. The gate then writes no row alone, and reads the row back (vault BACKLOG #3193 N1). If it
+reads at the outcome's status with that write's decision time, the combined write committed and only its reply
+was lost, so its row is in the local audit log but not the off-box copy, which the store writes
+only after a commit it saw succeed. The gate logs at ERROR and pages `audit_offbox_copy_missing`,
+keyed `approval:<id>` with the row's action name. If the row reads otherwise, or cannot be read, it
+logs at ERROR and pages `audit_write_failed`.
+
+The `audit_write_failed` alert's reason says the row was not written or its write's outcome is
+unknown: a COMMIT can land despite the error, as stated for the claim above, and a row the step-up
+return audit budget sheds is never written.
 
 A call can be cancelled mid-write, for example by the request timeout. The gate then writes no
 ERROR line and no alert for at least two writes: a rejection, and a refusal's row. The gate
@@ -2823,8 +2967,9 @@ on a programming defect, rather than a store fault, is raised as it is.
 The request and its `approval.requested` row are one write, as above. When that write reports an
 error, the gate reads the request back by its id. If it is held and its seal holds, the COMMIT
 landed and only its reply was lost. The gate then answers the same **202** with that id, logs a
-WARNING, and still pages. Its row reaches the local audit log but not the off-box copy, which is
-written only after a commit the store saw succeed, and the page is what reports that gap. A cancel reaches the caller at once, while
+WARNING, and still pages, as `audit_offbox_copy_missing` (vault BACKLOG #3193 N1). Its row reaches
+the local audit log but not the off-box copy, which is written only after a commit the store saw
+succeed, and the page is what reports that gap. A cancel reaches the caller at once, while
 the write finishes on its own, and the shutdown drain waits for it.
 
 A retry can still file a second request. At least these cases leave the request held while the
@@ -2870,7 +3015,7 @@ that write never fails the call. If the move and its row cannot be written toget
 writes the status alone, so an audit outage never leaves the row at `executing`. It then writes the
 audit row alone. If that fails too, the loss is logged at ERROR and pages `audit_write_failed`.
 One case skips the row: the combined write fails, and the status write that follows finds the row
-already moved. The gate then writes no second row and pages nothing, as above.
+already moved. The gate then writes no row alone and pages, as above.
 
 Nothing retries an `interrupted` request. Re-running an operation that may already have run would be
 worse than a stuck row, so an operator has to check the operation's own effects. `GET /approvals`
@@ -3234,12 +3379,20 @@ drops an edit the operator is about to type, and a refusal of the console's own 
 The purge and upload-resend confirm pages hold their proof the same way, so the window alone no
 longer opens a page whose POST then asks for a re-auth. The JSON export spends its proof after its
 own criteria check, so a malformed export costs no proof (owner ruling 2026-10-13, #3241 R2). The
-bulk purge confirm page still drops its selection across a re-auth, as before.
+bulk purge confirm page keeps its selection across a re-auth (vault BACKLOG #3241): its refusal
+carries the `dest` and `scope` query to `/ui/reauth`, which returns to the page with it, unless the
+query is past the 512-character cap on `next` or not ASCII, when the page opens with no selection as
+before. The page still re-derives each destination's eligibility from live quiescence, and the
+operator still submits the confirm form.
 A refusal the engine handler raises before its store write gives the proof back (owner ruling
-2026-10-13, #3241 R1; ADR 0197 Amendment C), so the operator resubmits without a new password. A
-refusal from the store call on keeps the spend, because the store may have committed: the next
-submit asks again and re-opens the editor from the stored body, as an expired grant (300 s by
-default) does. The console resend checks
+2026-10-13, #3241 R1; ADR 0197 Amendment C), so the operator resubmits without a new password,
+except a 403, 404 or 409, which keeps the spend (owner ruling 2026-11-07, #3241 added item 1; ADR
+0197 Amendment D). An ingress guard refusal gives the proof back, and ADR 0197 Amendment D,
+*The order of the checks*, says which target checks run before the guard in each mode and so
+what such a refusal still tells the caller. A refusal from the store
+call on keeps the spend too, because the store may have committed. After any refusal that keeps
+the spend, the next submit asks again and re-opens the editor from the stored body, as an
+expired grant (300 s by default) does. The console resend checks
 its own input before it spends the proof too. On both, a double-click asks for no second proof.
 The console marks each request it spends a proof on. Only an identical request rides on that mark.
 For a resend that means the same key, target and source. For an edit-resend it means the same key,
@@ -3282,30 +3435,27 @@ nothing. It is audited as `auth.mfa_failed` with `reason=directory_unconfirmed` 
 outcome. `POST /auth/mfa-verify` answers **403** saying the directory could not confirm the account,
 and `/ui/mfa` and `/ui/reauth` say the same. A local account is never looked up.
 
-**The passkey leg asks the same question before it checks an assertion (BACKLOG #2239).** A passkey
+**The passkey leg asks the same question before it marks the factor (BACKLOG #2239).** A passkey
 opens no window, but it does mark the factor met. So without the check, an account disabled in the
 directory would clear the MFA gate with its passkey until the reconciliation pass revoked it.
 `finish_webauthn_assertion` uses the same lookup and refuses the same answers, through the one
 helper both legs call (`_directory_vouches_for_factor`, BACKLOG #3068). That includes a row with
 no directory object id, refused without a lookup as on the code leg, so such an account cannot
 clear the MFA gate by verifying a passkey either. It asks after the second-step lock and the
-`[auth].mfa_verify_min_elapsed_seconds` floor, and only once a ceremony is staged for the session,
-before it takes the challenge. A post with nothing staged for the session, which includes every
-post from an account that has never staged a ceremony because it holds no passkey, gets the plain
-failure audited `reason=expired` and causes no lookup, so such a caller does not learn what the
-directory said on this leg (BACKLOG #3068). The code leg does not gate this way: it asks the
-directory before it checks any code, so a session that has proved nothing can still read the
-directory refusal there, up to the route's rate limiter. **The passkey leg's gate does not stop
-a session that has staged a ceremony from reading the directory refusal.** The lookup still runs before the assertion is verified, so such a session can post a response that
-proves nothing and still cost one lookup and read the directory refusal, up to the per-actor
-limiter on `POST /ui/reauth/webauthn`. A ceremony staged before its passkey was deleted stays
-staged until it expires. After a confirmed lookup
-the leg reads the session, the account and its lock again. A refusal checks
-no assertion, leaves the challenge in flight, leaves the sign count alone, and charges nothing to
-the lockout. It is audited as `auth.webauthn_failed` with
-`reason=directory_unconfirmed` and the lookup's outcome. For that refusal
-`POST /ui/reauth/webauthn` answers **400** with the same words the other legs use. A session or
-account gone after the lookup answers **401**.
+`[auth].mfa_verify_min_elapsed_seconds` floor, and only once the assertion has verified against a
+ceremony staged for the session, before the sign count moves. So a caller that has proved nothing
+causes no lookup and does not learn what the directory said on this leg (BACKLOG #3068): a post with
+nothing staged, which includes every post from an account that holds no passkey, gets the plain
+failure audited `reason=expired`, and a response that does not verify against a staged ceremony
+gets the leg's ordinary failure. The code leg does not gate this way: it asks the directory before
+it checks any code, so a session that has proved nothing can still read the directory refusal
+there, up to the route's rate limiter. After a confirmed lookup the leg reads the session, the
+account and its lock again. A refusal puts the ceremony back in flight with its deadline unchanged,
+leaves the sign count alone, and charges nothing to the lockout, so the same assertion verifies once
+the directory confirms the account.
+It is audited as `auth.webauthn_failed` with `reason=directory_unconfirmed` and the lookup's
+outcome. For that refusal `POST /ui/reauth/webauthn` answers **400** with the same words the other
+legs use. A session or account gone after the lookup answers **401**.
 
 **The two enrolment legs ask the same question before a new factor marks the session (BACKLOG
 #3061).** Confirming a TOTP enrolment (`confirm_mfa_enrollment`) and finishing a passkey
@@ -3367,7 +3517,12 @@ change. When the re-read answers, the charge and its `auth.mfa_failed` row name 
 found it, so a rename during the check is charged under the new name; when the re-read raises, they
 name the account as the check began. The
 passkey leg re-reads whether or not its
-sign-count compare-and-set succeeded. What a miss means is stated once, under
+sign-count compare-and-set succeeded. It reads its passkey set again before that re-read, not after,
+so on both legs the session, account and lock re-read is the last read before the factor write and
+nothing else awaits between them (BACKLOG #3068). Every store, sealed or not, rewrites the account
+row's passkey digest on each passkey write, so a passkey deleted during that re-read moves it and
+the leg reads the set again and then the holder. A set still moving after three such passes is
+refused `reason=factor_unverified`. What a miss means is stated once, under
 [WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068).
 A session or account gone answers
 as gone on at least these surfaces: **401** on `POST /auth/mfa-verify` and
@@ -3401,13 +3556,25 @@ more. A lookup whose groups map to no role refuses every directory account that 
 refusal writes no roles; the next reconciliation pass, when it runs, or the next sign-in re-syncs
 them. It is audited as `directory_roles_demoted`: as the `outcome` beside
 `reason=directory_unconfirmed` on the code, passkey and enrolment legs, which otherwise behave as
-the refusals above, and as the `auth.reauth` row's `reason` on the IdP and re-bind legs. Channel
-scope is not compared on any of these legs. When the AD group-to-role map fails its seal, no role
-can be judged, so each of these legs refuses an account that holds a role with
-`directory_role_map_unsealed` instead, whether or not a role was lost, and an account with no role
-passes. That is not a demotion: nothing changed in the directory, a new sign-in reads the same
-map, and the fix is an administrator saving the map again. So it is never told to sign out. Every
-one of these legs calls one shared comparison rather than writing it out.
+the refusals above, and as the `auth.reauth` row's `reason` on the IdP and re-bind legs. Once the
+roles pass, each of these legs also refuses an account whose channel scope the groups would narrow,
+as `directory_scope_narrowed`, audited the same way (vault BACKLOG #3081 item 4). The question is
+the reconciliation pass's scope re-diff, which revokes for exactly that. An account whose groups
+grant Administrator is not asked, decided from the roles the groups grant, as sign-in and the
+reconciliation pass decide it, and neither is a stored scope that grants nothing. Its fix is a
+demotion's: a new sign-in writes the scope the groups grant now. When the AD group-to-role map
+fails its seal, no role can be judged, so each of these legs refuses an account that holds a role
+with `directory_role_map_unsealed` instead, whether or not a role was lost. An account with no
+role passes that role test, and can still be refused on its channel scope, as
+`directory_scope_narrowed` above or `directory_scope_map_unsealed` below. A
+`directory_role_map_unsealed` refusal is not a demotion: nothing changed in the directory, a new
+sign-in reads the same map, and the fix is an administrator saving the map again. So it is never
+told to sign out. The AD group-to-channel map is handled the same way: when it fails its seal, an
+account whose scope grants something is refused with `directory_scope_map_unsealed`, whether or not
+its scope would narrow, and is never told to sign out. A new sign-in reads the same failing map. It
+keeps a scope an administrator set, so that refusal stands. It withdraws a directory-set scope to
+NULL, which grants no channel, so the step-up then passes, with no channels. Every one of these legs
+calls one shared comparison rather than writing it out.
 
 **The caller is told which fix clears the refusal, and not its cause (BACKLOG #3082).** The precise
 cause stays on the audit row. A demotion is told to sign out and sign in again. A new sign-in clears
@@ -3479,10 +3646,9 @@ first deployment, a directory outage would stop every directory account from pro
 recovery code. A session that still owes its factor could not clear it with a code, and one that met
 it could not renew its window. The same outage blocks the password re-bind and the IdP step-up leg, so a
 directory operator would have no way to open a window until the directory returned. The passkey leg
-asks the directory too (BACKLOG #2239), so a directory session that still owes its factor could not
-clear it by verifying a passkey either. Both enrolment legs ask as well (BACKLOG #3061), so such a
-session could not clear its factor by enrolling TOTP or a passkey, and no directory account could
-enrol one, until the directory returned. Local accounts are not
+and both enrolment legs ask the directory as the paragraphs above state, so until the directory
+returned such a session could not clear its factor with a passkey or by enrolling TOTP or a passkey
+either, and no directory account could enrol one. Local accounts are not
 refused, so a local administrator keeps step-up through the outage. Each attempt costs one directory
 lookup: a service bind and a search, plus a group search. The route's rate limiter paces it while
 `[auth].login_rate_limit_enabled` is on; with it off, nothing does. A directory that accepts connections but never answers
@@ -3595,23 +3761,36 @@ second factor with a TOTP code or a recovery code. `DELETE /me/mfa` disables it,
 account `[security].require_mfa` covers that holds no passkey recorded as discoverable: TOTP is then
 its only way past the sign-in lock, so it keeps it (ADR 0197 Amendment A). Such an account's first
 factor must be TOTP or a discoverable passkey, too.
-An administrator clears a
-lost authenticator via `POST /users/{id}/reset-mfa` (which also revokes the user's sessions).
-A confirm turns TOTP on only while the row still holds the staged secret the confirm verified,
-and TOTP is still off (BACKLOG #2224, #3025): the enable is a compare-and-set on the stored
+An administrator clears a lost authenticator via `POST /users/{id}/reset-mfa` (which also revokes
+the user's sessions).
+A confirm turns TOTP on only while the row still holds the staged secret the confirm verified, and
+TOTP is still off (BACKLOG #2224, #3025): the enable is a compare-and-set on the stored
 `totp_secret` cell the code was checked against. If a reset clears the secret during the confirm,
-another confirm turns TOTP on first, or a second enrolment start re-stages a different secret
-inside the same window, the confirm turns nothing on and returns no recovery codes. The refused
-confirm asks the store to end the session it just rotated, and answers as a lost session: `401` on
-`POST /me/mfa/confirm`, and the sign-in page in the web console. It is audited
-`auth.mfa_enroll_refused`. The `reason` values it records include `account_gone`, `already_enabled`,
-`secret_cleared`, `secret_replaced` and `write_lost`. Each is read from the row after the refusal,
-so a `reason` points an operator at the likely cause rather than proving it. The row's
-`session_ended` is false when the store refused to end the rotated session. The token is still not
-handed back, and the row is written whatever the revoke raised, unless its own write fails,
-which is logged at ERROR (vault BACKLOG #3113). The compare is
-on the stored ciphertext, so at least a store-key rotation that re-encrypts the column inside the
-window refuses too. That refusal reads as `secret_replaced` although no second enrolment started.
+another confirm turns TOTP on first, or a second enrolment start re-stages a different secret inside
+the same window, the confirm turns nothing on and returns no recovery codes. The refused confirm
+asks the store to end the session it just rotated, and answers as a lost session: `401` on
+`POST /me/mfa/confirm`, and the sign-in page in the web console. It is audited `auth.mfa_enroll_refused`.
+The `reason` values it records include `account_gone`, `already_enabled`, `secret_cleared`,
+`secret_replaced` and `write_lost`. Each is read from the row after the refusal, so a `reason`
+points an operator at the likely cause rather than proving it. The row's `session_ended` is false
+when no revoke of the rotated session landed, as far as the confirm saw: a cancellation that lands
+after the store committed the revoke still reads false. The
+`auth.mfa_enroll_refused` row is written whatever the revoke raised, unless its own write fails,
+which is logged at ERROR (vault BACKLOG #3113). `AuthService.confirm_mfa_enrollment` tries a refused
+revoke once more (BACKLOG #3025). It retries a raise in `audit_write_errors()`
+(`messagefoundry/store/base.py`) that is not in `AUDIT_WRITE_DEFECTS`
+(`messagefoundry/audit_write.py`), and nothing else. The confirm stamps the session MFA-verified
+before it rotates it, so the rotated session is stamped MFA-verified from the moment it exists. It
+can stay live until its own timers end it in at least these cases: the revoke does not land, because
+the first attempt is refused and the retry does not land either, or because the first attempt meets
+a cancellation or a raise the helper does not answer False, so no second attempt runs; `enable_totp`
+itself raises, so no revoke runs; the `auth.session_rotated` audit write raises, after the rotation
+and before `enable_totp`; a cancellation lands during the session-cap run that follows the rotation,
+also before `enable_totp`; or the `auth.mfa_enrolled` audit write raises, after `enable_totp` turned
+TOTP on. While the session lives, it counts as a full session under `[auth].max_sessions_per_user`.
+Its token is not handed back in any case. The compare is on the stored ciphertext, so at least a
+store-key rotation that re-encrypts the column inside the window refuses too. That refusal reads as
+`secret_replaced` although no second enrolment started.
 `write_lost` means the row still held the verified secret with TOTP off, so the enable lost to
 some other concurrent write. After a `write_lost` or a store-key rotation the staged secret still
 stands. The user signs in again, because the refused confirm hands no token back and asks the
@@ -3658,6 +3837,70 @@ shared-secret factor — L3 *prefers*
 phishing-resistant factors: **WebAuthn passkeys are the built WP-14b sibling** (next section), and TOTP
 stays fully supported alongside them (a non-browser client — e.g. the test harness, or CLI/API
 automation — has no `navigator.credentials`, so TOTP remains its usable second factor).
+
+### Directory-account enrolment codes (ADR 0207)
+
+A directory account (`auth_provider = "ad"`) holds no engine password, so before
+[ADR 0207](adr/0207-a-single-use-enrolment-code-for-a-directory-account-s-first-engine-factor.md)
+whoever held its directory password could sign in by Windows SSO and bind the account's first
+engine factor, shutting the real holder out of it. Now **the step that binds a directory
+account's first factor also asks a single-use enrolment code issued for that account** (*Who
+issues it*, below), whenever
+the session is not stamped MFA-verified. That is every Kerberos session, and a federated session
+while `[auth].oidc_require_mfa_claim` is off. It holds with `[security].require_mfa` on or off,
+and with Kerberos on or off. A federated session the identity provider stamped needs no code, nor
+does a local account, nor an account that already holds a factor, which proves that factor.
+
+- **Where it is checked.** In `confirm_mfa_enrollment` (TOTP: `POST /me/mfa/confirm` with
+  `enrolment_code` in its body, and the console's confirm form) and in
+  `finish_webauthn_registration` (passkeys: `enrolment_code` in the body the console's passkey
+  page script sends to `/ui/account/webauthn/verify`). It is read after the directory lookup and
+  the factor check, and before the TOTP step is consumed or the passkey challenge popped, so a
+  refused code costs neither. Every code refused at that read, whether missing, malformed,
+  never issued, wrong, expired or spent, gets the same reply, and its
+  `auth.enrolment_code_refused` row says only `not_presented` or `code_refused`. A code that
+  passed the read and is revoked, expires or is spent by another ceremony before the spend is
+  the race ADR 0207 A3 names: on TOTP the confirm answers as a lost session
+  (`auth.mfa_enroll_refused`), and on a passkey the refusal comes after the challenge pop.
+- **Spent once, atomically.** On TOTP the spend is folded into the enable's own conditional
+  write, so a confirm whose enable matches no row spends nothing. On a passkey it is one
+  conditional write before the credential is written. Each write clears the code only while the
+  row still holds that code's digest, so two ceremonies cannot both spend one code; it also
+  needs the account to be an enabled directory account with no factor.
+- **The code.** 160 bits from `secrets`, shown grouped as base32 and normalised for case,
+  spaces and hyphens. Only its SHA-256 digest is stored, with its expiry and its issuer, in
+  three `users` columns inside the account's integrity seal while set. It lives **24 hours**,
+  fixed (not a setting), one per account; a new code replaces the old one, and disabling the
+  account clears it. It is never in a log, a URL or the audit trail, and every reply carrying it
+  is `no-store`.
+- **Who issues it.** An Administrator, from `POST /users/{id}/enrolment-code` or the console's
+  user page, behind its own single-use step-up action (`admin_enrolment_code_issue`) and
+  `users:manage`; `DELETE` on the same path revokes one (`admin_enrolment_code_revoke`). Both
+  refuse the caller's own account. The issue refuses a local account, a disabled one, an
+  account with a factor and an unknown one. An Administrator's **MFA reset** of an enabled
+  directory account issues one in the same reply. Where no Administrator can issue one, for
+  example every enabled Administrator is a directory account with no factor,
+  `messagefoundry issue-enrolment-code --username <name>` issues it from the host, on the gate
+  `admin-unlock` uses. On SQLite it refuses while another connection holds the store, a file
+  that is not a store, and a store its probe cannot check; on a server store it cannot check,
+  so run it with the engine stopped. Keeping a local Administrator avoids needing it.
+- **The handover is the control, and it is the operator's duty.** The code is worth what the
+  handover checks. Whoever hands it over must confirm who is asking by something the directory
+  password does not give: in person, a call-back to a number on file, or the site's own
+  identity check. **Never send the code through the account's own mail or chat**, which the same
+  password may open. The engine never sends it; the notice to the account's address names no
+  code, and the console's pending-MFA notice tells a directory user to ask through the site's
+  identity check, not by mail or chat.
+- **Under `require_mfa`, a directory operator's first session waits for a code.** That lockout
+  is deliberate: it is the onboarding step. When the issuing Administrator's code is spent, that
+  Administrator gets the `auth.enrolment_code_spent_notice` row, and a notice naming the account
+  only where that Administrator has a notification address and the site has a notifier
+  configured; a code from the host command names no issuer, so neither is written. Both are
+  written soft, so a store fault can lose them. On a passkey they are written at the spend,
+  before the credential is written, so a credential write refused after the spend leaves them
+  describing a code spent on an authenticator that was not added.
+- **Not built here.** The removal of the directory re-bind under owner ruling A5, and the gate
+  changes Amendment A, A1 ties to it, are their own build.
 
 ### WebAuthn passkeys (WP-14b, ADR 0068)
 
@@ -3725,15 +3968,19 @@ the enrol-first confinement does not reach the TOTP removal. Nor does the last-f
 such a TOTP as a factor beside the last passkey, and such a TOTP does not escalate the sign-in
 lock; a discoverable passkey under the configured relying party beside it still does
 (BACKLOG #3937).
-The census names an account holding one beside a working
-discoverable passkey in both lists, and says that a factor reset would remove that passkey: the
+The census names an account holding one beside a passkey that may still sign it in,
+whatever the requirement covers, and says that a factor reset would remove that passkey (BACKLOG
+#3948 finding 11). For a local account that is a passkey its combined passkey sign-in accepts; for
+a directory account, a passkey its second factor accepts, discoverable or not. The next list says
+which passkey each counts. A non-discoverable passkey a local account uses as its second factor
+after its password is not counted, so the census does not warn that a reset would remove it. The
 cure is the holder removing the authenticator app and enrolling it again. **Only a KNOWN refusal
 changes a decision.** A TOTP the engine cannot judge, because its cell does not open (a store-key
 fault, or a cipher service such as Transit that does not answer) or its value will not compute, is
 **unknown**: every gate then applies the plain enabled-TOTP rule, so it still counts as a way past
 and as a factor, its removal is refused as before, and the sign-in lock still escalates. The census
 names such an account as unknown, never as refused, and still says when a factor reset would remove
-its discoverable passkey; its lock notice names the passkey sign-in beside the code sign-in. The
+its passkey; its lock notice names the passkey sign-in beside the code sign-in. The
 lock escalation's own judgement of the TOTP, which under Transit is a decrypt, runs only for the
 wrong password that sets a lock past the first of its cycle count, so a wrong password below the
 threshold costs that path no cell open; the combined sign-in still opens the cell per attempt.
@@ -3756,9 +4003,13 @@ write races.
   account keeps its TOTP, removing any discoverable passkey needs a TOTP that is a way past, and
   a passkey-only account must enrol TOTP before it rotates and is named in `no_way_past`. That is
   the shipped default on a loopback bind. The census's reset warning
-  (`reset_would_remove_a_passkey`) counts a passkey under the configured `rp_id` too, and any
-  discoverable passkey when none is configured, since it asks whether a reset would remove one that
-  may sign the holder in. After a change from one configured origin to another
+  (`reset_would_remove_a_passkey`) counts a passkey under the configured `rp_id` too, and one
+  under any `rp_id` when none is configured, since it asks whether a reset would remove one that
+  may sign the holder in. It counts only a passkey stored under today's credential-id hash
+  scheme, the only key the sign-in finds one by; for a local account the passkey must also be
+  recorded as discoverable, and for a directory account it need not be, since its second factor
+  names the credential itself. At least these are not counted for either: a passkey under
+  another configured `rp_id`, and one the start-up rehash has not moved to today's scheme. After a change from one configured origin to another
   ([ADR 0068 section 7](adr/0068-browser-webauthn-passkeys-offloopback.md) makes such a passkey
   visibly unusable) a passkey under the old `rp_id` no longer counts at the gates, so the census
   names an account whose only way past it was.
@@ -3801,7 +4052,7 @@ normal for synced passkeys). Every compare-and-set miss writes that row once, as
 store answers and before any other read, and its detail names the store's answer as
 `sign_count_answer`: `mismatch` (the passkey held another count) or `gone` (no passkey row was
 left, whether its holder or an MFA reset deleted it, or it left outside the store's sealed write
-path, which the refusal below tells apart as `reason=factor_unverified`), decided under one locked
+path), decided under one locked
 write on
 every backend (BACKLOG #3068, #3774; [ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md),
 amendment of 2026-10-17). So at least these cannot suppress it: a holder ending their own session, a
@@ -3810,10 +4061,11 @@ passkey is then refused with, audited `auth.webauthn_failed`, include at least
 `reason=factor_removed`, `reason=factor_unverified` when the passkey set read after the write fails
 its seal, `reason=session_lost` when the session or the account went with it, and `reason=locked`;
 an MFA reset gives `reason=session_lost` once its revocation has landed, and
-`reason=factor_removed` before. A database driver error, a lost connection or a pool acquire timeout
-in the passkey set read after the write, on any sign-count answer, is refused with
-`reason=store_error` and leaves the factor unmarked (BACKLOG #3775); what still raises there is
-listed in [ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md), amendment of 2026-10-17.
+`reason=factor_removed` before. In the passkey set read after the write, on any sign-count answer,
+an exception the read's catch takes is refused with `reason=store_error` and leaves the factor
+unmarked (BACKLOG #3775). Which classes it takes, which it re-raises first, and that every other
+exception raises are in [ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md), amendment
+of 2026-10-17.
 Assertion failures are audited but deliberately do **not** feed the
 account lockout (signatures aren't guessable secrets). Unless a setting turns it off or loosens it (at least
 `[auth].login_rate_limit_enabled = false`; [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#authlogin_rate_limit_enabled--false-or-a-limit-looser-than-its-default--sign-in-attempts-go-less-paced)
@@ -3980,7 +4232,10 @@ alone:
 6. **A contextual-risk signal** — while `[auth].admin_new_ip_step_up` is on (the default), a sensitive admin action
    arriving from a **client IP the session has not verified from** emits an `auth.new_address_reverify_required`
    audit event + an out-of-band notice and **forces a fresh step-up**; a successful `POST /me/reauth`
-   (or `POST /auth/mfa-verify`) from that address re-anchors the session and clears the signal.
+   from that address re-anchors the session and clears the signal. At least these other legs
+   re-anchor too: the password leg of the console's `POST /ui/reauth`, the IdP step-up, next, and a
+   code at the MFA gate, under *A code at `POST /auth/mfa-verify` re-anchors too*, below, which
+   says on which sessions and what budget it draws.
    `POST /me/reauth` refuses an `oidc` session, so the gate's refusal names the IdP leg instead
    (BACKLOG #2158; [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753) has the rule). Such a session re-anchors only through the IdP step-up:
    a code at `POST /auth/mfa-verify` or `POST /ui/mfa` moves neither its anchor nor its window
@@ -4396,7 +4651,7 @@ slack.
 | PHI-read volume, per actor | `identity.user_id` | > 120 reads (`phi_read_rate_limit_per_actor`) per 60 s (`phi_read_rate_limit_window_seconds`); the global dimension `phi_read_rate_limit_global` defaults to `0` = **off** | **THROTTLE** 429 + a `Retry-After` naming the actor's wait (the whole window while `phi_read_rate_limit_global` is spent), charged at **admission** before any store work. WARNING-logged on the JSON API; the `/ui` `phi=True` arm is not (see *The console's refusal differs from the JSON floor's*) | on, 120 / 60 s | `[auth].phi_read_rate_limit_enabled` |
 | Admin-write rate, per actor | `identity.user_id` × request method | **non-GET only**; > 12 writes (`admin_write_rate_limit_per_actor`) per 15 s (`admin_write_rate_limit_window_seconds`), or a write less than 0.15 s after the actor's last admitted one (`admin_write_min_interval_seconds`, BACKLOG #2301), both provisional human-timing defaults; no global dimension (`glob=0`) | **THROTTLE** 429 + a `Retry-After` naming the actor's wait, the same on the JSON API and on `/ui`. Charged on the JSON API and on `/ui`, which re-applies it. WARNING-logged on the JSON API; the `/ui` refusal is not (see *The console's refusal differs from the JSON floor's*) | on, 12 writes / 15 s | `[auth].admin_write_rate_limit_enabled` |
 | Time from sign-in to the second factor | `session.created_at` vs the service's wall clock, while `session.mfa_verified_at` is unset | a TOTP or recovery code (`verify_mfa`), a passkey assertion, or an enrolment (`confirm_mfa_enrollment`, `finish_webauthn_registration`, BACKLOG #2389) that completes an MFA-pending session less than 1 s after the session was minted (`mfa_verify_min_elapsed_seconds`, BACKLOG #2301), a provisional human-timing default; a session whose factor is already satisfied, or that owes none, is not floored | **DENY** with the leg's ordinary failure, which says nothing about timing, though a caller that knows its proof is good, or resubmits it, can tell the floor fired (the answers per leg, and the tells, are under *Two second steps have a time floor too*); audited `auth.mfa_failed` or `auth.webauthn_failed` with `reason=too_early`, and `phase=enroll` on an enrolment; no lockout count, no code or challenge spent, though under the default `require_action_step_up` a TOTP enrolment confirm's route has already spent its password step-up | on, 1 s | `[auth].mfa_verify_min_elapsed_seconds` (`0` = off) |
-| Time from a federated start to its callback | at least the flow cache's monotonic clock when the flow was staged vs at the callback, and the verified ID token's `auth_time` (sign-in) and `amr` | a step-up callback less than 1 s after its `POST /ui/reauth/oidc` start (`oidc_callback_min_elapsed_seconds`, BACKLOG #2301), a provisional human-timing default; a sign-in callback likewise, **only** when the verified `auth_time` is at or after the flow's start, because an IdP holding a live single sign-on session answers with no human step; on either leg the floor does not apply when a verified `amr` value is in `oidc_callback_floor_exempt_amr` (empty by default; what an exempted pass records is under *What these floors do not do*) | **DENY** with the leg's ordinary failure: `federated sign-in failed`, audited `auth.login_failed` with `reason=too_early`, or the generic step-up refusal, audited `auth.reauth` with `reason=too_early`. The step-up is refused before its code is redeemed, unless `oidc_callback_floor_exempt_amr` is set (BACKLOG #2388): a callback whose verified `amr` names a listed value is then exempt, and the refusal waits for the code exchange | on, 1 s | `[auth].oidc_callback_min_elapsed_seconds` (`0` = off), `[auth].oidc_callback_floor_exempt_amr` |
+| Time from a federated start to its callback | at least the flow cache's monotonic clock when the flow was staged vs at the callback, and the verified ID token's `auth_time` (sign-in) and `amr` | a step-up callback less than 1 s after its `POST /ui/reauth/oidc` start (`oidc_callback_min_elapsed_seconds`, BACKLOG #2301), a provisional human-timing default; a sign-in callback likewise, **only** when the verified `auth_time` is at or after the flow's start rounded down to the whole second, because an IdP holding a live single sign-on session answers with no human step; on either leg the floor does not apply when a verified `amr` value is in `oidc_callback_floor_exempt_amr` (what an exempted pass records is under *What these floors do not do*) | **DENY** with the leg's ordinary failure: `federated sign-in failed`, audited `auth.login_failed` with `reason=too_early`, or the generic step-up refusal, audited `auth.reauth` with `reason=too_early`. The callback's age runs to the instant the flow cache consumes its flow, so at least the code exchange and the store reads after that consume do not count toward it; work the callback route does before the consume still does (BACKLOG #3221). The step-up is refused before its code is redeemed while `oidc_callback_floor_exempt_amr` is empty. On the sign-in leg, and on the step-up leg with the list set, the refusal waits for the code exchange, so a too-early callback whose exchange fails is refused and audited as that failure, not as `too_early`; on the step-up leg that row carries `callback_floor_deferred` (BACKLOG #3728) | on, 1 s; `oidc_callback_floor_exempt_amr` empty | `[auth].oidc_callback_min_elapsed_seconds` (`0` = off), `[auth].oidc_callback_floor_exempt_amr` |
 | Serve-hop security posture | `[security].enforcement` × (`api.is_loopback` **or** `exposure_protected`), via `phi_read_hop_disposition` | disposition is REFUSE — an instance under `enforcement = enforce` whose serve hop is neither loopback, nor on an operator `[api].tls_cert_file`, nor behind a declared TLS-terminating proxy (`exposure_protected`; the minted placeholder does not count). CORRECTED 2026-11-04 (BACKLOG #4636): this read "nor in-process TLS", which the minted placeholder also is. Setting `[security].enforcement = warn` turns the refusal into WARN-and-serve. **No data-class value switches it off**: BACKLOG #1279 deleted that axis | **DENY** 403 (PHI-free message) on every **JSON-API** PHI-read route (`require_phi_read`, plus the step-up bulk routes), **before** any identity work — and on the `/ui` PHI routes through `require_ui`'s `phi=True` arm, **after** identity work, so an unauthenticated visit still gets its login redirect instead of a 403 disclosing the posture (BACKLOG #1738). Two tests, and they pin different things: `test_ui_plane_states_the_phi_read_hop_gap` pins the DISCLOSURE both ways, by comparing this document against the console's call sites — it issues no request and cannot see ordering; the ORDER is pinned by the console suite's `test_the_refusal_lands_after_identity_so_a_visitor_still_gets_the_login_page` | ALLOW on loopback | `[security].enforcement`, `[api].tls_cert_file`, `tls_terminated_upstream` + `trusted_proxies` |
 | Bind / exposure posture — refusing arms | `settings.api.host` loopback-ness, `tls_terminated_upstream`, `trusted_proxies`, `settings.api.public_origin`; derived `instance_exposed` (an off-loopback bind, a declared terminator, **or** a set `trusted_proxies`, vault BACKLOG #2251) and `admin_exposed`, plus `ui_exposed` for the `/ui` arms only; `[security].enforcement` | at least: `/ui` exposed without the required origin/TLS declarations; a non-loopback bind with no `[api].tls_cert_file` and no declared terminator, where `enforce` clamps both `--allow-insecure-bind` and `[security].require_encryption_for_remote = false` shut; `admin_exposed` + `enforcing` + `require_mfa` explicitly opted out; a declared terminator with no `[api].tls_cert_file`, as [Plaintext proxy hop](#plaintext-proxy-hop) states; a non-loopback `[api].tls_cert_file` bind without the attestation, as [API revocation gate](#api-revocation-gate) states. CORRECTED 2026-11-04 (BACKLOG #4636): this cell read "neither in-process TLS nor a declared terminator", which counted the minted placeholder as in-process TLS and read as if a terminator could stand in for a certificate off loopback. `serve` has no arm for sign-in off: the settings loader and the settings model refuse `[auth].enabled`, and nothing reads that key (vault BACKLOG #2719, #2825) | **DENY at startup** — `serve` prints an error and exits **2**. The refuse/warn dial is `[security].enforcement` (default `enforce`), **not** `production`: the `/ui`-exposure, plaintext-hop and API revocation arms refuse **unconditionally** (BACKLOG #4636: this read "plaintext-hop-acknowledgement arms" and named no revocation arm), and the `require_mfa` arm refuses on enforcement `enforce` alone — no data-class term narrows it, so `dev` and `staging` are gated exactly as `prod` is — and warns otherwise. `[security].allow_single_factor_admin_when_exposed = true` downgrades that one arm to permitted-but-audited. **`admin_exposed` is `instance_exposed`, and reads no console flag** (BACKLOG #326): the ADR 0143 degrade arms rewrite `settings.api.serve_ui` in place earlier in the same startup, so deriving an exposure decision from it made this arm and the dual-control arm below miss a declared-proxy instance whose console had been degraded or disabled — while the ASVS 11.7.1 arm called that same boot exposed. The same attributes force the session cookie's `Secure` flag + HSTS, and permit WebAuthn `rp_id` derivation from the request URL **only** on a loopback bind with no proxy declared or trusted (`trusted_proxies` empty, BACKLOG #2116) | loopback, nothing declared | `[security].local_access_only`, `listen_address`, `serve_web_console`, `web_console_public_address`, `require_mfa`, `require_encryption_for_remote`, `[api].tls_cert_file`, `tls_terminated_upstream`, `plaintext_upstream_hop_acknowledged`, `trusted_proxies`, `[security].enforcement`, `[security].allow_single_factor_admin_when_exposed`, the `MEFOR_TLS_REVOCATION_ATTESTED` environment variable (API revocation arm) |
 | Bind / exposure posture — dual-control arm | `admin_exposed` (= `instance_exposed`: an off-loopback bind, a declared TLS terminator, **or** a set `trusted_proxies` (vault BACKLOG #2251) — never the console flag, BACKLOG #326) × `[approvals].enabled` and `[approvals].operations` | `admin_exposed` **and** either `[approvals].enabled` off, or on with an `[approvals].operations` list that leaves out a default operation or holds none, which `_approvals_loosenings` reads (vault BACKLOG #3474) — high-value actions complete on one caller's authority | **LOG** — a startup **WARNING only, on every instance including production**; `serve` does **not** refuse. The refuse arm is an explicit unresolved owner fork recorded in `__main__.py`, not a shipped control | approvals off | `[approvals].enabled`, `[approvals].operations` |
@@ -4454,9 +4709,9 @@ listen source. The refusal action differs materially per listener, so each has i
 | **MLLP** | peer socket address (`writer.get_extra_info('peername')`) | not in `source_ip_allowlist` | **DENY** — connection refused + WARNING log + a `peer_not_allowlisted` connection event; the refusal does **not** consume a `max_connections` slot |
 | **TCP** | peer socket address | not in `source_ip_allowlist` | **DENY** — as MLLP (refuse, log, `peer_not_allowlisted` event) |
 | **X12** | peer socket address | not in `source_ip_allowlist` | **DENY** — as MLLP (refuse, log, `peer_not_allowlisted` event); BACKLOG #1665 |
-| **HTTP** | peer socket address | not in `source_ip_allowlist` | **DENY** — a real `403 {"error":"forbidden"}` is written to the peer, then close; WARNING log + `peer_not_allowlisted` event. With `tls = true` on the standard asyncio loop the check runs before the handshake, so the socket is closed with no answer and no TLS byte (BACKLOG #2479) |
+| **HTTP** | peer socket address | not in `source_ip_allowlist` | **DENY** — a real `403 {"error":"forbidden"}` is written to the peer, then close; WARNING log + `peer_not_allowlisted` event. With `tls = true`, on every event loop, the check runs before the handshake, so the socket is closed with no answer and no TLS byte (BACKLOG #2479) |
 | **DICOM C-STORE SCP** | peer socket address at accept; `event.assoc.requestor.address` in the C-STORE backstop | not in `source_ip_allowlist` | **DENY** — the connection is closed at accept, before any TLS handshake or association; WARNING log naming the peer IP, at most one line per address per 60 s and at most 20 addresses per 60 s in all; **no connection event**. The backstop answers DIMSE status **`0x0124` (Not Authorized)** **before any durable commit** and logs each refusal with the calling AE; [DICOM.md](DICOM.md) section 3 says why a sender should not see it |
-| **MLLP / HTTP / DICOM** — peer client certificate | the TLS peer certificate presented at handshake | `tls = true` **and** `tls_ca_file` set → `ssl.CERT_REQUIRED` plus strict RFC 5280 verify flags; no client certificate, or one not issued by that CA | **DENY** — the TLS handshake fails. On HTTP where the event loop runs the handshake (uvloop), the connection **never reaches the accept path**, so there is no allow-list evaluation. On MLLP on every loop, and on HTTP on the standard asyncio loop or any subclass of `asyncio.BaseEventLoop`, the allow-list and both connection caps run BEFORE the handshake (BACKLOG #1606, #2479), and on HTTP so does the per-address handshake budget `max_handshakes_per_host`, which counts the socket until its handshake ends (vault BACKLOG #4888). MLLP has no handshake budget. Either way the only connection event is a throttled `tls_handshake_failed`, which [PHI.md section 7, row 7](PHI.md#7-logging--phi-redaction) describes (vault BACKLOG #2613, #3302). The DICOM SCP accepts the connection first, checks its allow-list, and only then runs the handshake, so a peer outside the list is refused before any handshake; a failed handshake writes **no** connection event there either. The SCP counts it and logs a throttled WARNING naming the peer instead, as [PHI.md section 7, row 7](PHI.md#7-logging--phi-redaction) states (vault BACKLOG #3784). `tls_ca_file` unset → server-only TLS and no peer-certificate decision. TCP and X12 have no inbound TLS at this release |
+| **MLLP / HTTP / DICOM** — peer client certificate | the TLS peer certificate presented at handshake | `tls = true` **and** `tls_ca_file` set → `ssl.CERT_REQUIRED` plus strict RFC 5280 verify flags; no client certificate, or one not issued by that CA | **DENY** — the TLS handshake fails. On MLLP and HTTP, on every loop, the allow-list and both connection caps run BEFORE the handshake (BACKLOG #1606, #2479), and on HTTP so does the per-address handshake budget `max_handshakes_per_host`, which counts the socket until its handshake ends (vault BACKLOG #4888). MLLP has no handshake budget. The failed handshake opens no session, so the only connection event is a throttled `tls_handshake_failed`, which [PHI.md section 7, row 7](PHI.md#7-logging--phi-redaction) describes (vault BACKLOG #2613, #3302). The DICOM SCP accepts the connection first, checks its allow-list, and only then runs the handshake, so a peer outside the list is refused before any handshake; a failed handshake writes **no** connection event there either. The SCP counts it and logs a throttled WARNING naming the peer instead, as [PHI.md section 7, row 7](PHI.md#7-logging--phi-redaction) states (vault BACKLOG #3784). `tls_ca_file` unset → server-only TLS and no peer-certificate decision. TCP and X12 have no inbound TLS at this release |
 | **MLLP** — expected sender (`tls_client_subjects`, BACKLOG #4907) | the verified client certificate's qualified `SAN:<type>:` / `CN:` names, read after the handshake | `tls_client_subjects` is set and none of the certificate's names is listed under the loaded `tls_ca_file` CA whose key signed the leaf; matched exactly and case-sensitively, through the matcher the HTTP row below uses, so a second CA in `tls_ca_file` issuing a listed name is refused. With `tls_client_subjects` set, the issuer map's start checks in the HTTP intake row below apply to `tls_ca_file`, so the start is refused when the CA certificates the map reads are not the ones the TLS library loaded, which that row matches by identity, while certificates that are not CAs are compared only by count. That row's rules for a loaded certificate that is not a CA apply too. Unset by default, and then a verified certificate from any loaded CA is admitted as any sender | **DENY** — each message the connection's first read completes is recorded as an `ERROR` row, then answered `AR` with MSA-3 `sender not permitted` on an HL7 v2 inbound that acknowledges, and the connection closes; on any other inbound it closes with nothing written. If a row cannot be written no `AR` is sent: an HL7 inbound that replies sends the handler-fault `AE`, and any other inbound closes with nothing written and no row. The row's reason, the reply and the WARNING log line (throttled per address) carry no certificate field. Each refusal is audited `intake.auth_subject_denied` with an `auth_subject_denied` connection event, and charged to the HTTP listener's failed-attempt budget at the `Http()` defaults, with no setting of its own; an address that has spent its own budget is closed unread before its certificate is compared, and the global budget closes only a sender whose certificate the compare has refused, never a listed one; each close is audited `intake.auth_rate_limited`. TLS renegotiation is refused on this listener. [CONNECTIONS.md](CONNECTIONS.md#expected-senders-tls_client_subjects) states the design |
 | **HTTP** — intake authentication (`intake_auth`, ADR 0154 D6) | the credential a peer presents: the `intake_api_key_header` header (default `x-api-key`) under `api_key`, `Authorization: Bearer` under `bearer`, or the verified client certificate's `CN:` / `SAN:` names under `mtls_subject` | `intake_auth` is not `none` and the key or token is missing or wrong, or the certificate's names are not in `intake_client_subjects` under the loaded `tls_ca_file` CA whose key signed it (vault BACKLOG #2287; the refusals include at least these, and the list is not complete: a listed name is refused when the loaded CA that signed the leaf is not the one the name is listed under, and a leaf signed by an intermediate the client sends is refused unless that intermediate is itself loaded in `tls_ca_file` and the name is listed under it; no certificate is admitted under a DN that `tls_ca_file` holds under two different keys, each on a CA or on a self-signed certificate that is not a CA, as during a key rollover, and the listener warns about that at start. **The issuer map's start checks.** They run only where an identity map is configured, at least here under `intake_auth = "mtls_subject"`, on an MLLP inbound with `tls_client_subjects`, and on the API with `[api].tls_client_ca_file` and `[api].tls_client_cert_identities` both set. A certificate block that cannot be parsed refuses the start. The CA certificates the map reads are compared, by identity, with the set the TLS library loaded, and any mismatch refuses the start. Every other certificate the map reads must load as no CA in a scratch context holding only those, or the start is refused. Those are compared with what the TLS library loaded only by count, which must lie between the distinct ones read and every copy read, or the start is refused. A certificate that is not a CA names as issuer only a leaf identical to it, and only when it signs itself. One that does not sign itself is named for no leaf and makes no DN ambiguous; the start warns when any certificate the map reads that is not a CA has a loaded CA's subject, ASCII case and white space folded, since OpenSSL may take it as the issuer of a client that CA issued and then refuse that client. When that certificate has no key identifier, or the CA's own, the warning says every client of that CA may be refused. It says the same when `cryptography` cannot read the CA's extensions, and adds that the map then cannot tell whether the CA itself is the cause, as a CA strict verification refuses would be, and, for a certificate with a key identifier, which clients carry an authority key identifier that rules it out, and says to check the CA too. When the CA's own version and extensions show a fault for which strict verification refuses it as a CA, the warning names the CA and each fault found as the cause instead, whatever key identifier the namesake has, in one warning per CA. The faults it reads include at least a version-1 CA, with or without extensions, and a version-3 CA with no basic constraints, basic constraints that are not critical, no key usage, no subject key identifier, a critical subject or authority key identifier, or, when it is not self-signed, no authority key identifier or one carrying no key identifier, which strict verification requires once the CA's issuer is loaded; whether it is self-signed is read by name, by a model of OpenSSL's name comparison: ASCII case and ASCII white space folded, a one-byte text type such as a T61String read as Latin-1, and the string type ignored only for text types. Each of those was measured against OpenSSL 3.5.7 for at least one pair of names, at least including a T61String holding UTF-8 bytes against a UTF8String of the same letters, which OpenSSL reads as two names (error 2). It is a model, not OpenSSL's own comparison, so it may still differ from OpenSSL in ways not measured. It reads names only, and OpenSSL's own self-signed read does not stop there: at least a root whose names match but whose authority key identifier names another serial number reads as self-signed here, with no fault named, while strict verification refuses a version-3 and a version-1 client through it (measured on OpenSSL 3.5.7, `test_a_root_whose_authority_key_identifier_names_another_serial_is_measured` in `tests/test_inbound_http_intake_issuer.py`). For a CA whose issuer name `cryptography` cannot read, only those two authority key identifier faults go unread; when no other fault is found, the warning, in whichever wording the namesake's key identifier gives, adds that the issuer name cannot be read, so the map cannot tell whether the CA is self-signed, that strict verification refuses every client through it if it is not, with its issuer loaded or not (without it no chain is found, and with it the CA needs an authority key identifier carrying a key identifier, which it lacks), and to check the CA too (measured on OpenSSL 3.5.7, for a version-3 and a version-1 client; the cases measured are listed once, in `test_what_a_ca_whose_issuer_cannot_be_read_does_to_its_clients_is_measured` in `tests/test_inbound_http_intake_issuer.py`). Where an engine defect, such as an installed `cryptography` that no longer exposes a name's string types, stops the names being compared, it says the engine cannot compare them instead. With no basic constraints it names only that fault, since OpenSSL then refuses the CA as invalid before its other checks. The list is not complete, and the warning says "at least". At least the API, HTTP and MLLP contexts that build the map verify strictly, and strict verification refuses every client whose chain runs through such a CA, with or without the namesake (each fault measured on OpenSSL 3.5.7, for a version-3 and a version-1 client, with the CA alone or, for one that is not self-signed, beside its issuer; the warning says it was measured there). So the warning says to re-issue the CA with the same subject and key as a version-3 CA with at least critical basic constraints `CA:TRUE`, key usage `keyCertSign`, and `cRLSign` too where the hop checks a CRL that CA signs, a subject key identifier equal to the key identifier its client certificates' authority key identifiers carry and, unless it is self-signed, an authority key identifier carrying its issuer's subject key identifier, neither critical, and that a client certificate whose authority key identifier names the CA's issuer and serial number, or another key identifier, must then be re-issued too; or to remove the CA if it is not needed; and, while the CA stays loaded, to remove the namesake or re-issue it under another subject. A CA strict verification refuses for a reason the check does not read, such as a missing issuer, gets the namesake wording instead. Where none of those faults is found, one with a key identifier other than the CA's is ruled out for a client whose authority key identifier names the CA's key, but not for a client with no authority key identifier, and strict verification accepts such a client when it is version 1, which has no extensions: on OpenSSL 3.5.7 a listener refused one in at least one listing order. Its warning names those clients. A warning changes no allow, deny or refusal). **The default is `intake_auth = "none"`, which checks no credential: a default HTTP inbound admits any peer the rows above admit.** Under `api_key` / `bearer`, `GET`/`HEAD` probes are inside the check unless `intake_auth_health = "allow"`. Under `mtls_subject` the certificate is checked at accept, before the method is known, so no probe is exempt. A peer with no certificate from `tls_ca_file` never reaches this row: it fails the handshake in the peer-client-certificate row above | **DENY** — `401` for a missing or wrong key or token (read before any body byte), `400` for a credential header sent more than once, even with identical copies, and with `_` read as `-` in the header name, since the engine would keep the last copy while a front end may read the first (BACKLOG #2051; refused before any comparison, charged to the failed-attempt budget and audited `intake.auth_failed`), `403` for a verified certificate whose subject is not listed under the loaded CA that signed it; nothing is committed. Audited `intake.auth_failed` / `intake.auth_subject_denied`, plus a connection event |
 | **HTTP** — intake failed-attempt budget (ADR 0154 D6) | the peer address, and the listener's failed-attempt count across all peers | the peer has spent `intake_auth_rate_limit` failed attempts in the window, or all peers together have spent `intake_auth_rate_limit_global` (defaults and the `0`/`None` off switch in [CONNECTIONS.md](CONNECTIONS.md)). A peer that authenticated inside the window is exempt from the global budget, so a flood cannot lock out a working partner. Counted in-process, so each engine shard keeps its own count | **THROTTLE** — `429` + `Retry-After: 60` before any credential is compared; audited `intake.auth_rate_limited`. A successful authentication never spends budget |
@@ -4684,6 +4939,14 @@ flowchart TB
 - A permitted request writes an `auth.permission_granted` row. Two cases differ. A route gated
   only by a PHI-view permission records the read in its own row. A route that names no permission
   writes no grant row.
+- A gate that adds checks of its own, at least `require_paced`, `require_phi_read` and the four
+  step-up gates, writes that row only once those checks pass (BACKLOG #1197). When a pacing limit,
+  the new-address question or a step-up refuses the request instead, it writes
+  `auth.gate_refused`, naming the same permission and a `reason` of `throttled` or `step_up`. It
+  writes that row only where it would have written the grant row, so a gate that writes no grant
+  row writes no refusal row either. A refused second factor writes `auth.mfa_denied`, as the base
+  gate's does. A refusal a route body makes after its gate has passed, such as a step-up proof the
+  route spends itself, still follows a grant row.
 - Routes that act on a Connection also check the identity's connection scope. That scope starts
   empty for every role except Administrator.
 - Sensitive routes add a step-up re-check on top of this flow. See
@@ -4723,9 +4986,13 @@ Both kinds of user share one identity model (`users.auth_provider` is `local` or
   caller names the ticket's principal. Only a DEBUG traceback carries the text. Each such row
   counts toward `signin_failure_burst`, which counts refused sign-ins per client address. So a
   key fault can raise that alert, sooner where many users reach the engine from one address.
-  If the step accepts the token but the principal cannot be read, the row is `auth.login_error`, reading
-  `Kerberos principal read failed` and the error's class, and the sign-in fails as a directory
-  outage. While browser SSO is available, a 400
+  If the step accepts the token but the principal cannot be read, the row is `auth.login_error`,
+  and the sign-in fails as a directory outage; the WARNING log line names the error's class and
+  status. At least the `auth.login_error` rows a directory error writes at a Kerberos and at a
+  federated sign-in hold the closed reason `directory_error` and fields such as the error's type
+  and an unanswered operation's integer result code, never the error's text, which can
+  carry what the caller or the directory chose (BACKLOG #3196, #3727). While
+  browser SSO is available, a 400
   for a token that is not base64 writes the `malformed_token` row `GET /ui/sso` writes. A 400 for
   a missing `Negotiate` header writes no row. A 429 from the sign-in window is throttle-logged,
   never audited.
@@ -4810,9 +5077,12 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   binds an account to a federated identity, Windows SSO refuses it. `POST /auth/negotiate` and
   `GET /ui/sso` answer as they do for any failed sign-in, and the `auth.login_failed` row carries
   `reason=federated_sign_in_required`. **Every bind also ends every live session of that
-  account**, in the bind's own transaction, so nothing minted before the bind outlives it,
-  with one limit on the SQL Server store that *Limits of the session sweep* below states. The
-  audit row, the route's answer and the holder's notice carry the count. A Windows SSO sign-in
+  account**. On a first bind the transaction of the bind's own write ends them all. On a rebind
+  the clear, in a transaction of its own before that write, ends every session live at the
+  clear, and the write's transaction ends any minted between the two. So nothing minted before
+  the bind outlives it, a session rotated while the bind runs included (*Limits of the session
+  sweep* below). The audit row, the route's answer and the holder's notice carry the count. A
+  Windows SSO sign-in
   already in flight cannot slip past either: its session insert requires an unbound row. The
   binding decides, not `oidc_enabled`: an account bound while federation is off, or under an
   issuer that is no longer configured, signs in by neither leg until an administrator unbinds
@@ -4823,19 +5093,91 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   has no Windows SSO fallback during an IdP outage. If every enabled Administrator is bound,
   no Administrator can sign in to unbind one. Since vault BACKLOG #2711, `provision-admin` at the
   host can make a local Administrator then, because a bound one does not block it.
-- **Limits of the session sweep.** On the SQL Server store, a session whose token is rotated
-  in the instant the sweep runs can be missed by it. The same holds on that store for an
-  unbind and for every other whole-account revoke, which run the same sweep: at least an
-  administrator's revoke of a user's sessions, a role change and a password reset. The
-  every-account revoke behind `DELETE /sessions` and `admin-revoke-sessions` (BACKLOG #2614) runs
-  its own table-wide statement of the same `UPDATE ... OUTPUT` shape, so treat it as having this
-  limit too. That is a reading by likeness to the per-account sweep, not one traced for the
-  table-wide statement, and the lock-order bullet below does not cover its every-account lock
-  footprint. **A missed session is refused the next time it is presented** (BACKLOG #2592),
-  within the limits the rest of this bullet states. Each of these raises the
-  account's session epoch in the same transaction, and a rotation keeps the epoch the session was
-  sealed under. So the gate refuses and ends the session, and the user's own session list hides
-  it and ends it the same way.
+- **Limits of the session sweep.** **A session whose token is rotated while a whole-account
+  sweep runs is swept too, on all three stores, except in at least the SQL Server cases this
+  paragraph names (BACKLOG #4974).** Until then the SQL Server store could miss any such session. That
+  store's re-key moves the session row to a new clustered key, so a sweep waiting on the row's
+  old key could find it gone and the new one outside its read, or deadlock with the re-key,
+  depending on the query plan. Its rotation now takes the
+  account's row under `UPDLOCK` before the session row, the order each whole-account sweep there
+  read for this takes them in. The unbind takes that row first through its own prior-pair
+  `UPDLOCK` read in `clear_user_federated_subject`, before its account write. A bind that passes
+  its own checks first runs `clear_user_federated_subject`'s transaction, which takes the row
+  through that same prior-pair read. On a pair mismatch (`changed=True`), whether the bind is a
+  first bind or a rebind, that transaction writes nothing and sweeps nothing, and the bind is
+  refused. Otherwise, on a rebind it sweeps, and on a first bind it
+  writes nothing. The row is released between that transaction and the bind's own write, which
+  then takes the row through the account write, and sweeps where that write lands. The TOTP
+  re-enrolment takes it through the account write too, and the whole-account revokes through the
+  epoch raise, at least an administrator's revoke of a user's sessions, a role change and a
+  password reset. So a rotation either commits before the sweep locks the account's row, and the
+  sweep reads the new key, or waits until the sweep commits and then finds the session ended.
+  Where the account's record fails its seal, at least an administrator's revoke of a user's sessions and the every-account revoke still end its
+  sessions, and for those two the order holds too, because the raise reads the row under that
+  lock before it checks the seal. That the order holds there was read from the code and not run.
+  The every-account revoke is run on such an account only as a store call, by the contracts in
+  `tests/test_b2614_revoke_all.py` and `tests/test_b5091_global_session_epoch.py`, which
+  `test_every_account_revoke_contracts` runs on both server legs. Both run it there only in the
+  form that spares the caller's session; neither runs the form with no kept session, which
+  `admin-revoke-sessions` calls. Of the two, only `tests/test_b2614_revoke_all.py` reads back a
+  session the revoke ended there: on such an account that form ends the session it was asked to
+  keep, and that is the session it reads back. `tests/test_b5091_global_session_epoch.py` reads
+  back no session the revoke ended on such an account: it finds that account's session refused
+  once raw writes have put back the session and the account's pre-revoke row. That the
+  administrator's revoke of a user's sessions still ends such an account's sessions was read
+  from the code and not run.
+  The per-account revoke's other form, which spares the caller's session, is reached through the
+  service on such an account only where the seal fails after identity resolution:
+  `DELETE /me/sessions` and the console's `POST /ui/account/sessions/revoke-others`, the only
+  two callers of `AuthService.revoke_other_sessions` that a search of the tree outside `tests/`
+  found for BACKLOG #4974, each resolve the caller in their gate, and then each route's handler
+  calls
+  `AuthService.revoke_other_sessions` with that identity, which it does not resolve again. The
+  API route's gate is `require_reauth_only_action` (`messagefoundry/api/auth_routes.py`),
+  which resolves through `identity_for_token` in `_session_caller` in
+  `messagefoundry/api/security.py`, and its handler `revoke_my_other_sessions` makes the
+  call (`messagefoundry/api/auth_routes.py`). The console route's gate is
+  `require_ui_reauth_only_action` (`messagefoundry_webconsole/routes/account.py`), which
+  resolves through `identity_for_token` in `require_ui` in `messagefoundry_webconsole/_auth.py`,
+  and its handler `ui_revoke_other_sessions` makes
+  the call (`messagefoundry_webconsole/routes/account.py`). That resolution refuses an
+  account whose record fails its seal. It is run on such an account only as a store call, where
+  it ends that session too, by the body in
+  `tests/_session_seal_contract.py`, which `test_session_seal_contract` runs on both server legs.
+  At least a bind, an unbind, a TOTP re-enrolment, an administrator's role change and a password
+  reset of such an account end no session; that was read from the code. The
+  every-account revoke behind `DELETE /sessions` and `admin-revoke-sessions` (BACKLOG #2614) takes
+  the row of each account its read of the account list returns before its table-wide sweep, so
+  the same holds for those accounts. Its sweep also reaches the sessions of an account created
+  after that read, but nothing orders a rotation of one of them against it, so on SQL Server a
+  rotation in that instant can still be missed; the global epoch below ends such a session at
+  its next presentation. A sweep that takes no account row is not ordered against a rotation
+  either, at least the session cap's trim. The trim raises no epoch, so a session a rotation
+  carries past it on SQL Server is not refused later: it stays live, over the cap, until
+  something else ends it, at least a logout, a whole-account sweep, its own expiry, or a later
+  trim that ranks it past the cap. The Postgres store's rotation takes no account row: its
+  sweep waits on the rotated row and then re-checks that row's newest version, which still
+  matches. The SQLite store runs one writer at a time. `test_rotation_racing_a_sweep_is_swept`,
+  in `tests/test_postgres_store.py` and `tests/test_sqlserver_store.py`, runs the shared body in
+  `tests/_federated_unbind_store_contract.py`. It pauses a rotation after its locked read and before
+  its re-key, then runs a bind, an unbind, a revoke of a user's sessions and the every-account
+  revoke against it, on both server legs; on the SQL Server leg it also starts a rotation while a
+  bind holds the account's row. Its bind (`_sweep_by_bind`) is only the store's
+  `set_user_federated_subject` on an unbound account, without the `expect_unbound` the service
+  passes: neither the service's clear-then-write path nor a rebind is raced as one operation.
+  The unbind case races the clear's transaction alone, and no test races a rotation in the gap
+  between the clear and the write. The TOTP re-enrolment's own sweep was read from the code and
+  is not replayed. A role change and a password reset each run that same per-account revoke,
+  `revoke_user_sessions`, in a transaction after their own write; that was read from `set_roles`
+  and `admin_reset_password` in `messagefoundry/auth/service.py`, and neither is replayed through
+  the service. That the old SQL Server order could miss the session, or deadlock with the
+  re-key, depending on the plan, was read from the code and was not run.
+  **A session a whole-account sweep missed is refused the next time it is presented** (BACKLOG
+  #2592), within the limits the rest of this bullet states. The bind, the unbind, the TOTP
+  re-enrolment and the per-account revoke each raise the account's session epoch in the same
+  transaction, and the every-account revoke raises it for each account its list read returned.
+  A rotation keeps the epoch the session was sealed under. So the gate refuses and ends the
+  session, and the user's own session list hides it and ends it the same way.
   **The every-account revoke also raises the store's global session epoch, on all three stores
   (BACKLOG #5091).** Every session is stamped with that epoch when it is minted and resolves
   only while it is current, so the revoke ends a session whatever its read of the account list
@@ -4916,29 +5258,32 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   re-alert throttle, or only to the log where no alert notifier is running.
   **That is a known false alarm, not intended behaviour:** nothing was altered, and neither the
   alert nor the audit row says which case it is, so an operator cannot tell it from tampering.
-  The count the bind, the unbind or the revoke reports leaves out each session it missed. The
-  bind's and the unbind's are read from the driver's row count, so where a session-wide
+  The count the every-account revoke reports leaves out each session it missed: on SQL Server, a
+  session of an account its list read did not return, rotated while it ran. The bind's and the
+  unbind's are read from the driver's row count, so where a session-wide
   `SET NOCOUNT ON` has leaked onto the connection they report -1 instead (BACKLOG #2283). And
-  until the session is presented or listed, the store still holds it as live. A follow-up row,
-  not yet filed, is to carry the fix for the missed session: a sweep that follows a rotated
-  session, so no rotated session is missed. That would not change the -1 count. The Postgres
-  store follows a rotated row and the SQLite store runs one writer at a time, so neither misses a
-  rotated session. The rotation miss was read from the code and has not
-  been reproduced against a server. A bind ends sessions only: an engine factor already enrolled
-  on the account stays.
+  until the session is presented or listed, the store still holds it as live. BACKLOG #4974,
+  which closed the rotation miss as the opening of this bullet states, did not change the -1
+  count. A bind ends sessions only: an engine factor already enrolled on the account stays.
 - **A bind and a user delete take one lock order on both server stores** (BACKLOG #2738). A
-  bind, an unbind and a whole-account revoke lock the account's row and then its sessions.
-  Deleting a user now takes the account's row first too, on SQL Server since BACKLOG #2733 and
+  bind, an unbind and a whole-account revoke lock the account's row and then its sessions, and
+  on SQL Server so does a session rotation (BACKLOG #4974). Deleting a user now takes the account's row first too, on SQL Server since BACKLOG #2733 and
   on Postgres since #2738, so the two cannot deadlock against one account. The order was read
   from the code. `test_bind_and_user_delete_take_one_lock_order` runs on both server legs: it
   pauses a bind while it holds the row, waits until the delete is queued behind it, then
   releases the bind and requires both to finish. Under the old Postgres order, by the same
   reading, the database would end one of them as a deadlock; that was not run. No bind,
   unbind, revoke or user delete retries a deadlock, so a deadlock between any of them and
-  another write still fails that request, and it has to be made again by hand. The SQLite store runs one writer at a time, so it has no lock order to get wrong.
-- **Limit: an account with no binding is unchanged.** It still signs in by Windows SSO, and its
-  first engine factor is enrolled on proof of the directory credential alone. The Kerberos row
-  of the [pathway table](#authentication-pathways--comparative-strength) describes that leg.
+  another write still fails that request, and it has to be made again by hand. Nor does a
+  rotation: one the server ends as a deadlock victim is a store refusal, which the service
+  answers by revoking the session under both hashes, best effort, and failing the ceremony
+  closed (BACKLOG #3023). The SQLite store runs one writer at a time, so it has no lock order to get wrong.
+- **An account with no binding still signs in by Windows SSO, and its first engine factor needs
+  an enrolment code** (ADR 0207). The directory credential alone no longer binds it: the binding
+  step also asks a single-use issued code, and so does a federated session on a
+  site that turned `oidc_require_mfa_claim` off. See [Directory-account enrolment
+  codes](#directory-account-enrolment-codes-adr-0207). The Kerberos row of the [pathway
+  table](#authentication-pathways--comparative-strength) describes that leg.
 - **The username is bound to an allow-listed UPN suffix** (`[auth].oidc_allowed_username_domains`,
   defaulting to `ad_domain`). Since ADR 0184 this is defence in depth: the bound (issuer, sub) pair
   selects the account, and the username claim selects none. Before ADR 0184 it was the control,
@@ -5011,7 +5356,9 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   - the account passes the role test in the paragraph that opens "A directory step-up or
     enrolment leg refuses a present account that lost a role in the directory" (BACKLOG #2154,
     #3082). Otherwise the leg refuses with the reason that paragraph names,
-    `reason=directory_roles_demoted` or `reason=directory_role_map_unsealed`.
+    `reason=directory_roles_demoted` or `reason=directory_role_map_unsealed`, or, for the channel
+    scope that paragraph also tests, `reason=directory_scope_narrowed` or
+    `reason=directory_scope_map_unsealed` (vault BACKLOG #3081 item 4).
 
   It then elevates through the same path as the password leg: `reauth_at` is stamped, the session
   is rotated (ASVS 7.2.4) and keeps its `mfa_verified_at`, and a single-use action grant is minted
@@ -5304,10 +5651,16 @@ who holds no audit key cannot silence the alert with a forged row. That method n
 residuals, at least a holder of the active audit key and a writer who lowers the watermark close
 to a genuine revocation of the same account. On a keyless audit chain no repeat is quiet.
 Any other revocation that ends nothing and changes no role, such as a scope, role, undetermined or
-unkeyed one, is quiet too. Two reconcilers that both read the old roles, or both read before either
-writes its row, both report. If the first reconciler's pass ended before it alerted, the second's
-quiet revocation means that account pages nobody. A quiet revocation whose own row is refused
-alerts instead, with no notice.
+unkeyed one, is quiet too. Two reconcilers that both read the audit chain before either writes its
+row both report. Two that both read the old roles do not, because the role write is a
+compare-and-set on the roles it read (vault BACKLOG #3085): only the first counts the change, and
+the second, ending no session, is quiet. A write that finds the roles moved to another set since
+the apply read them writes nothing. A sign-in that wrote between the pass's plan and its apply is
+still overwritten, as is a newer write of the same set the apply read. The second still reports when
+it ends a session the first had not yet ended; `AuthService._apply_reconcile_revocation` names that
+residual. If the first reconciler's pass ended before it alerted, the second's quiet revocation
+means that account pages nobody. A quiet revocation whose own row is refused alerts instead, with no
+notice.
 
 A pass that fails part-way keeps the audit rows for what it already revoked, but raises no alert for
 them. A refused audit write does not end the pass (BACKLOG #3018). That holds for the store errors
@@ -5395,8 +5748,22 @@ the right one*:
 When the hold's, the breaker's and the referral's alerts resolve themselves, and where they never do, is stated
 once, in [CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-alerts-resolve-themselves).
 
-Revocation is therefore bounded by *interval × strikes* (10 minutes at the recommended 300 s), not
-immediate, and one LDAP bind per signed-in directory user per pass is the cost —
+Revocation is therefore bounded by *interval × strikes* (10 minutes at the recommended 300 s) within
+one process's life, while each pass probes the account; it is not immediate.
+
+**What a restart loses** (vault BACKLOG #3689). The strike counts, the hold and the record of when
+each account was last probed are process memory, and a process runs its first pass one interval
+after it starts. So, at least: a process that restarts more often than *interval × strikes* never
+revokes, through the reconciler, an account that must strike, such as a disabled or absent one; one
+that restarts more often than one interval runs no pass and revokes nothing; and while
+`ad_session_recheck_max_users` is below the number of signed-in accounts, a fresh process starts
+its rotation again in user-id order, so an account the rotation does not reach before the next
+restart is never probed, and neither its disable nor its role or scope change reaches its sessions through the reconciler.
+What a restart does to the hold is in
+[ADR 0195](adr/0195-brake-the-ad-session-reconciler-on-an-undetermined-useraccountcontrol-wave.md),
+*What a restart does to the hold*.
+
+One LDAP bind per signed-in directory user per pass is the cost —
 `ad_session_recheck_max_users` (200) caps it, and it is zero when nobody is signed in. An off-loopback
 PHI deployment serving AD accounts gets `ad_session_recheck_seconds = 300` by default; setting it to `0` is a declared loosening, not a neutral choice.
 
@@ -5407,13 +5774,18 @@ revoked. A pass with any referral audits `auth.ad_reconcile_referred` and raises
 `ad_reconcile_aborted` alert with reason `directory_referral`, under its own source
 `directory-reconciler-referral`. So it is its own instance, apart from the breaker's, and
 acknowledging or suspending one does not silence the other. An `[alerts]` rule keyed on the event
-type alone matches the breaker, the referral, the probe fault, the configuration refusal and each
-paging refusal, and so does a source glob such as `directory-reconciler*`, which also matches the hold's
+type alone matches at least the breaker, the referral, the probe fault, the configuration refusal,
+each paging refusal, the lasting outage and each account the directory keeps failing to answer for
+(`directory-reconciler-unreached:<username>`, reason `account_unreachable`,
+audited as `auth.ad_reconcile_unreached`, vault BACKLOG #3100; on a rolled-up pass, those entering
+page once, under the bare `directory-reconciler-unreached` source; the `ad_reconcile_outage_passes`
+row of [CONFIGURATION.md](CONFIGURATION.md) states when),
+and so does a source glob such as `directory-reconciler*`, which also matches the hold's
 `ad_reconcile_held`. To mute only the referral, a rule names its source exactly. The alert's text
 names `ad_user_search_base`, `ad_group_search_base` and `ad_bind_dn`. A bind response that carries a
-referral, the service account's included, is a referral too (BACKLOG #3010). ldap3 cannot decode
-its hosts, so the ERROR line names none. A service-account bind answered with the referral code
-and no referral field is refused as a referral as well (BACKLOG #3017). When it resolves itself is
+referral, the service account's included, is a referral too (BACKLOG #3010). ldap3 cannot decode its
+hosts, so the ERROR line names none. A service-account bind answered with the referral code and no
+referral field is refused as a referral as well (BACKLOG #3017). When it resolves itself is
 stated once, in
 [CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-alerts-resolve-themselves).
 Referred accounts stay in the mass-revoke breaker's count, as unreachable ones do. Left out, a referring group base would
@@ -5609,8 +5981,16 @@ the console, through `POST /ui/reauth/webauthn`, because the JSON plane has no p
 JSON-only client cannot rotate it. Before this change such a client could rotate it and then do
 nothing else. Its next sign-in was pending, with no way to prove a passkey there. Under
 `[security].require_mfa` a covered passkey-only account rotates only once it holds a way past
-the sign-in lock: `_has_way_past` counts TOTP or a passkey recorded as discoverable under the
-configured `rp_id` (ADR 0197 Amendment A, wave 2; BACKLOG #3937). One whose passkeys are not discoverable must also enrol a factor that is
+the sign-in lock. The route's courtesy check, `must_enrol_before_rotating`, asks before the
+current password: `_has_way_past` counts TOTP or a passkey recorded as discoverable under the
+configured `rp_id` (ADR 0197 Amendment A, wave 2; BACKLOG #3937). The rotation itself asks in
+the same order before it hashes. It judges the TOTP first. Only where that TOTP is no way past and
+a passkey can count does this early check read the passkey set, through the verified read
+`_has_way_past` uses. It refuses an account with neither. The store's conditional write judges
+the TOTP again itself before its lock, counts that judgement under the lock only for the cell it
+judged (BACKLOG #3948), and reads the passkey set under its lock on every conditional rotation.
+Without the `[webauthn]` extra the write counts no passkey, as `_has_way_past` counts none.
+One whose passkeys are not discoverable must also enrol a factor that is a way past
 before it rotates, so after the passkey it goes to the enrolment page, and only then to the password
 page. Such an account exists only where its passkey came before the requirement covered it, or
 before wave 2: a store from before ADR 0197 Amendment A, a site that turned `require_mfa` on or
@@ -5755,17 +6135,67 @@ a lapse row is written, and put that lapse row on it; on `/ui/logout`, which nam
 
 **A refused sign-out audit write is logged, not raised (BACKLOG #3884),** so `/ui/logout` still
 clears the cookie. That row is then missing, with an ERROR log line; the line names the session
-when the sign-out ended one. A failed owner lookup on `/ui/logout`, which names no caller, writes
+when the sign-out ended one. A fault in the revoke itself still raises: that request answers 500,
+the cookie stays set and a live session stays live. A failed owner lookup on `/ui/logout`, which names no caller, writes
 the row with no actor, so it does not reach that user's security-events feed. On a session that
 passed its clock checks it also leaves the temporary credential unchecked, as above.
 
-**Open gap: `/ui/logout` audit rows for sign-outs that end no session are unbounded.** A request
-to `/ui/logout` whose session cookie ends no session can still write an `auth.logout` row, with
-`outcome` `nothing_to_revoke`. Nothing in the engine bounds how many such rows a caller who can
-reach the route can append, and nothing prunes `audit_log` (see
-[retention](CONFIGURATION.md#retention)). A bound in the engine is a follow-up, not yet filed.
-Until it exists, treat `/ui/logout` as an unbounded audit-write surface to any caller that can
-reach the console, on the engine's own host or beyond it.
+**`/ui/logout` audit rows for sign-outs that end no session are bounded (BACKLOG #4735).** A
+request to `/ui/logout` whose session cookie ends no session writes an `auth.logout` row with
+`outcome` `nothing_to_revoke`, and the route needs no credential, so the engine bounds those rows.
+Each source begins at most 3 such row writes in any 60 seconds, and all sources together at most
+120 begun. A source is the caller's address, folded as the sign-in limiter folds it, and every
+caller with no address shares one source. So ten distinct sources flooding the route write 30 rows a
+minute and leave the other 90 rows to everyone else, 30 more sources' worth. Forty sources at their
+share fill the 120 ceiling, and then no source writes its own row until earlier rows age out of the
+window.
+
+A sign-out past either limit is not written as its own row but counted. The count is written in an
+`auth.logout` row with no actor and no client, `outcome` `unrecorded` and `"count": N`, the
+sign-outs left unwritten since the last such row, and at most one such row is begun in any 60
+seconds. The slot is spent when the write starts, so count-row writes that stall can land together.
+A WARNING log line gives the same N once the row is written. Its own outcome keeps a reader
+that counts `nothing_to_revoke` rows from reading it as one sign-out. Only a sign-out that names no
+caller and ends nothing writes the count: the first one past a limit writes it at once, unless a
+count row was attempted in the 60 seconds before, since a count-row write that is refused or
+cancelled spends that window's one slot too. A sign-out through `POST /auth/logout` never writes
+it. The row's time is when its write began, not when the misses it counts arrived. When only the
+audit writes are refused, the ERROR line each refused row write logs is bounded the same way. When
+the whole store refuses, that bound does not apply: the revoke's own store write raises before any
+row is attempted, so each request that passes the route's origin check (`assert_same_origin`) and
+carries a non-empty session cookie answers 500, the cookie stays set and a live session stays
+live, and nothing bounds the errors those requests log.
+
+**What the count can miss.** A count stays in memory until a later sign-out that names no caller
+and ends nothing arrives after the 60 seconds, so the misses at the end of a flood are written only
+then, and a restart of either kind, graceful or not, loses a count not yet written. A count-row
+write that is refused or cancelled puts its count back for the next count row, but it has spent
+that window's one count row.
+
+At least these limits stay as well. Callers the engine sees under one folded address are one
+source: at least every caller behind one NAT or egress address, every caller behind a proxy whose
+forwarded address the engine does not trust, every loopback caller (so every caller of an engine
+on its default loopback bind), every caller with no address, and every caller whose forwarded
+address reads `unknown`, which shares the no-address source. Three misses from any of them then cost the rest their own rows for the window, and only
+the count records the others. The source is the whole address, so an IPv6 host that holds a /64 can
+be 40 sources by itself and fill the ceiling. The bound and the count are in-process, so each engine
+shard keeps its own. Nothing prunes `audit_log` (see [retention](CONFIGURATION.md#retention)), so the
+rows still grow, by at most 121 rows begun a minute for each engine process. Each bound is charged
+when a row's write starts, not when it lands, so the rows of writes that stall can land together,
+more than 121 in one minute.
+
+**The bound is on the audit row, not on the request.** Every request to `/ui/logout` that passes
+the route's origin check (`assert_same_origin`) and carries a non-empty session cookie still runs
+the sign-out's revoke, a store write transaction, whether or not it ends a session: on
+SQLite its `UPDATE` takes the store's write lock even when it matches no row, and that competes with
+message ingress commits. Nothing in the engine bounds those requests, so treat `/ui/logout` as an
+unbounded store-write surface to any caller that can reach the console, on the engine's own host or
+beyond it. The bound never refuses a sign-out, though one that writes a count row waits for that
+write too; a sign-out whose revoke raises answers 500, the cookie stays set and a live session
+stays live (above). The bound never stops the row of a sign-out that ended a session, or of one that names its
+caller, as `POST /auth/logout` does, though a refused audit write still loses such a row with an
+ERROR line (above). Concurrent `POST /auth/logout` calls on one token each write a row, all but one
+`nothing_to_revoke`, and that is kept on purpose, because each is an authenticated request.
 
 A session's `id` is its token hash, and that hash changes whenever the session completes MFA or a
 step-up. So an id shown on a sessions page can go stale. The console's revoke says "Nothing was
@@ -5814,7 +6244,9 @@ store before the restore):
 
 ### Security-event notifications (WP-L3-05, ASVS 6.3.5 / 6.3.7)
 
-Users are notified of security-relevant changes to their account through **two** channels:
+Users are notified of security-relevant changes to their account through **two** channels, the
+out-of-band email and the `GET /me/security-events` feed. The bullets below cover both, and what
+the email channel sends:
 
 - **Out-of-band email to the affected user** (gated by `[auth].notify_security_events`, default on; it
   reuses the `[alerts]` SMTP transport and is sent to each user's **own** address — not the operator
@@ -5830,15 +6262,7 @@ Users are notified of security-relevant changes to their account through **two**
   account disabled (vault BACKLOG #3121). The role notice says the roles were changed to match the
   directory's groups, not that the console played no part: those groups map to roles through the
   group-to-role map an administrator edits. Like the disable notice, it says the sessions already
-  open on the account were ended, which both of its senders do first. When the directory session
-  reconciler ends an account's sessions for a reason other than a read disabled bit, it sends
-  `directory_sessions_ended`, not `account_disabled` (vault BACKLOG #2140). At least
-  `directory_absent`, `directory_undetermined` and `directory_object_id_missing` send it. The
-  comment on `DIRECTORY_SESSIONS_ENDED` in `auth/notifications.py` says what each one means. For at
-  least `directory_object_id_missing` the engine never asks the directory (BACKLOG #2434). So the
-  notice names no directory check. It says only that the engine could not confirm from the
-  directory that the account may still sign in, which is true for each current reason. A new
-  reason must be checked against that wording (vault BACKLOG #3171).
+  open on the account were ended, which both of its senders do first.
   The rename notice, `username_changed`, names the old and the new name, and is sent only when
   the new name was written (BACKLOG #2017). An **unreplaced temporary password** near its deadline
   (ASVS 6.4.5, BACKLOG #2007) sends two reminders, beside the operator's `initial_credential_expiring`
@@ -5867,6 +6291,16 @@ Users are notified of security-relevant changes to their account through **two**
   SMTP configured, or for an account with no `notify_email`, the email is skipped and each skipped
   notice logs a WARNING naming the event and the username. Emission is **best-effort** — a
   notification failure is logged and never blocks a login or an admin action.
+- **Sessions the directory reconciler ended are notified too, by the same email channel**, though
+  that is not a credential change and not in the 6.3.7 list above (vault BACKLOG #3171). When the
+  directory session reconciler ends an account's sessions for a reason other than a read disabled
+  bit, it sends `directory_sessions_ended`, not `account_disabled` (vault BACKLOG #2140). At least
+  `directory_absent`, `directory_undetermined` and `directory_object_id_missing` send it. The
+  comment on `DIRECTORY_SESSIONS_ENDED` in `auth/notifications.py` says what each one means. For at
+  least `directory_object_id_missing` the engine never asks the directory (BACKLOG #2434). So the
+  notice names no directory check. It says only that the engine could not confirm from the
+  directory that the account may still sign in, which is true for each current reason. A new
+  reason must be checked against that wording (vault BACKLOG #3171).
 - **An account with no notification address sets one at sign-in** (BACKLOG #1139). While a notice
   channel is wired, `require()` and `require_ui` confine such a session to `POST /me/notify-email`
   (console: `/ui/account/notify-address`) plus the escapes of the password and factor gates, in the
@@ -5991,7 +6425,7 @@ list, which admits any certificate its CA ever signed.
 |---|---|---|---|
 | **Local** (argon2id) | **password** (argon2id) **plus an engine second factor** — RFC 6238 TOTP, single-use recovery codes, or a WebAuthn/FIDO2 passkey. That factor is an **access gate, not merely a step-up boundary**: an MFA-pending session is refused on *every* authorized route with `X-MFA-Required: 1`, and a browser session is **redirected** to `/ui/mfa` — *not* confined to it, as an earlier revision of this cell said, because the account and factor-enrolment routes are declared MFA-pending-exempt, so a user with no factor yet enrols at `/ui/account`. It binds any local account that has enrolled a factor, plus every account `[security].require_mfa_scope` covers — **`every_local_account` by default** (`[security].require_mfa` defaults **on**; both keys are rejected under `[auth]` and fail the start). Set the scope to `administrators` for the earlier, narrower posture, in which a non-admin, un-enrolled local session is **password-only end to end**. Caveat: a passkey is asserted at `user_verification=preferred`, so for a passkey-only account the second factor may be **device possession alone** | **per-account lockout** (5/15 min) on **two counters** (ADR 0197). The **sign-in** counter is fed by wrong passwords **and** by the step-up re-auth and password-change re-proofs, which it does not refuse; those are capped per session instead (BACKLOG #1138). The **second-step** counter is fed by wrong TOTP/recovery codes and by a **combined sign-in** (password and TOTP code in one request) that gets exactly one factor right. The sign-in lock refuses a password-only sign-in but **not** a combined one on an account with TOTP enrolled, nor a **combined passkey sign-in** (password and a discoverable-passkey assertion in one request, ADR 0197 Amendment A wave 2) on an account holding a discoverable passkey; the second-step lock refuses all of them, and the second step. The second-step lock doubles per cycle up to `lockout_max_minutes` on every local account, and the sign-in lock does so on a local account with a TOTP enrolled unless the engine KNOWS this release refuses that enrolment: a TOTP whose cell does not open, or whose value will not compute, still escalates. It does so too on a local account holding a discoverable passkey under the configured relying party (BACKLOG #3937). Every other lock keeps `lockout_minutes`. A local account whose enrolment is known to be refused, and that holds no such passkey, keeps it for serial failures only: a race listed under [WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068) escalates that account by the plain enabled-TOTP rule (BACKLOG #3422). While the credential in force is engine-generated, sign-in failures arm no lock, and under `require_mfa` the holder enrols TOTP or a discoverable passkey before replacing it (ADR 0197 Amendment A) + breach/context policy + the per-IP **and** global sign-in window | the only sign-in whose **first** factor feeds the engine lockout; the TOTP/recovery leg feeds it on **any** account that enrolled a code, directory accounts included. Its passkey is phishing-resistant, but not Local's alone: a directory account can enrol one too (BACKLOG #1144) |
 | **AD** (LDAP simple-bind over LDAPS) — **step-up re-authentication only; the sign-in was retired** | password, verified by a bind **as the user** against the DC. It no longer mints a session: `POST /auth/login` with `provider=ad` is refused and audited, and the bind survives only at `POST /me/reauth` and the console's `POST /ui/reauth`, where it re-proves a session **Kerberos** minted. An `oidc` session never reaches the bind: `reauth()` refuses it before any verify and it steps up at the IdP (the OIDC row). The one other session it can reach is a row written before `sessions.auth_mechanism` existed, which reads NULL and takes this leg for an AD account. So this row carries no MFA grant of its own — the session's MFA state was decided at its own sign-in. The delegated-directory relaxation it used to carry is **retired** (BACKLOG #1144): no pathway grants MFA satisfaction on a directory assertion the engine cannot read | the **directory's** lockout/complexity policy; engine-side, a **per-actor** step-up budget, **not** the sign-in limiter — the bind is post-session, so an unauthenticated flood cannot reach it — plus the **engine** per-account lockout, which a rejected re-bind feeds (BACKLOG #1138), and a per-session cap: the session whose re-binds reach `lockout_threshold` rejections is revoked, so it sends the DC at most that many counted ones. A re-bind the DC ends with an outage code, at least busy or unavailable, is charged to neither the lockout nor the cap; *Why the lock does not refuse a live session's re-proofs* below lists the codes, the other re-binds the engine does not count, and what bounds them (BACKLOG #3169). `[auth].login_rate_limit_enabled=false` removes the per-actor budget too, because that flag builds neither limiter; it is one of the settings that turn the budget off, and the same section links their list. The lockout feed and the per-session cap survive it, so the flag does not strip counted re-binds bare. The engine lock sets the engine's own row and is enforced at the Kerberos and OIDC sign-ins, not at the re-bind. It never writes a lock to the directory account, but each rejected re-bind still reaches the DC, so the domain's own lockout policy can lock the domain account too | password strength + lockout are the AD domain's responsibility. LDAPS is required: a plain `ldap://` bind is refused at every posture, with no escape (vault BACKLOG #3533; until then the removed `[auth].ad_allow_insecure_ldap` released it under `[security].enforcement = warn`), and `ad_tls_verify=false` is refused at startup, with no escape (vault BACKLOG #3230; until then the `MEFOR_ALLOW_INSECURE_TLS` dev escape released it) |
-| **Kerberos / SPNEGO** | domain ticket **plus an engine second factor**. No `amr`-equivalent evidence reaches the engine, so the ticket proves nothing about directory-side factor strength and the session is issued **MFA-pending** (BACKLOG #1144). It used to be issued **MFA-satisfied** under a delegated-directory relaxation, which cleared every engine MFA gate on zero engine-readable evidence; that grant is retired. While `[security].require_mfa` is on, an un-satisfied directory session reaches only the MFA-pending-exempt routes, and its holder enrols a TOTP or a passkey on the same routes a local account uses. Set `require_mfa = false` for the earlier single-factor posture | the **domain's** controls; engine-side, the sign-in window on the token-bearing leg (`[auth].login_rate_limit_enabled`, default on — **off leaves the ticket leg with no engine-side control at all**; the RFC 4559 challenge leg is deliberately unthrottled either way). An enrolled engine TOTP or recovery code still feeds the per-account lockout, and a locked account row refuses this sign-in (BACKLOG #1638) | experimental, off by default, **single-leg — no mutual authentication**, channel binding deliberately un-enforced. Both legs (`GET /ui/sso` and the JSON `POST /auth/negotiate`) mint with no step-up window, so a sensitive action forces a step-up unless a TOTP or recovery code proved at the MFA gate has already stamped one. That step-up is the **AD** row's directory re-bind, at `POST /me/reauth` or `POST /ui/reauth`. **Refuses an account that holds a federated binding** (vault BACKLOG #2609): that account signs in through the OIDC row, and [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) has the limits |
+| **Kerberos / SPNEGO** | domain ticket **plus an engine second factor**. No `amr`-equivalent evidence reaches the engine, so the ticket proves nothing about directory-side factor strength and the session is issued **MFA-pending** (BACKLOG #1144). It used to be issued **MFA-satisfied** under a delegated-directory relaxation, which cleared every engine MFA gate on zero engine-readable evidence; that grant is retired. While `[security].require_mfa` is on, an un-satisfied directory session reaches only the MFA-pending-exempt routes, and its holder enrols a TOTP or a passkey on the same routes a local account uses. **The account's first engine factor binds only with a single-use issued enrolment code** ([ADR 0207](adr/0207-a-single-use-enrolment-code-for-a-directory-account-s-first-engine-factor.md), [Directory-account enrolment codes](#directory-account-enrolment-codes-adr-0207)), with `require_mfa` on or off, so the directory password alone binds nothing. Set `require_mfa = false` for the earlier single-factor posture | the **domain's** controls; engine-side, the sign-in window on the token-bearing leg (`[auth].login_rate_limit_enabled`, default on — **off leaves the ticket leg with no engine-side control at all**; the RFC 4559 challenge leg is deliberately unthrottled either way). An enrolled engine TOTP or recovery code still feeds the per-account lockout, and a locked account row refuses this sign-in (BACKLOG #1638) | experimental, off by default, **single-leg — no mutual authentication**, channel binding deliberately un-enforced. Both legs (`GET /ui/sso` and the JSON `POST /auth/negotiate`) mint with no step-up window, so a sensitive action forces a step-up unless a TOTP or recovery code proved at the MFA gate has already stamped one. That step-up is the **AD** row's directory re-bind, at `POST /me/reauth` or `POST /ui/reauth`. **Refuses an account that holds a federated binding** (vault BACKLOG #2609): that account signs in through the OIDC row, and [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) has the limits |
 | **OIDC federation** (browser only, hybrid AD-backed) | IdP-asserted, gated on a **signature-verified** `amr`/`acr` claim (`[auth].oidc_require_mfa_claim` defaults **on**) — an assertion, not a proof | no engine credential to guess on the federated leg, so that leg feeds no per-account lockout, though a lock another leg set on the account row refuses this sign-in (BACKLOG #1638); both legs (`POST /ui/oidc/start`, `GET /ui/oidc/callback`) charge the sign-in window, and so does `GET /ui/oidc/start` when its interstitial is skipped (see the [Route → limiter map](#route--limiter-map)) (`[auth].login_rate_limit_enabled`, default on — **off leaves the federated leg with no engine-side control at all**, though the bounded pending-flow cache still caps concurrent start legs), plus the IdP's own lockout. The **step-up leg** checks no engine credential either, so a refused IdP step-up feeds no lockout and no per-session re-proof cap, and neither account lock refuses it. Its start, `POST /ui/reauth/oidc`, and the IdP's return to `GET /ui/oidc/callback` both draw the per-actor ceremony limiter, the return under a key of its own for the user the staged flow names (BACKLOG #3374) | hybrid-only: a federated principal with no on-prem AD object is refused. Roles come from LDAP, never from a token claim. When `[auth].oidc_username_strip_domain` is on (default), the claim's UPN suffix must match `oidc_allowed_username_domains` (or `[auth].ad_domain`); with stripping **off** the claim is used verbatim and no suffix check applies. Either way the claim selects no account: the bound (issuer, sub) pair does (ADR 0184). The session's absolute lifetime is capped at the verified `id_token.exp` and at `auth_time + [auth].oidc_max_age_seconds`; minted with no step-up window. **Its step-up goes back to the IdP and never to a password** (BACKLOG #296, ADR 0142 Amendment B). `POST /ui/reauth/oidc` sends the browser to the IdP with `max_age=0` and `prompt=login`, and `complete_oidc_step_up` checks the answer before it elevates the session. Among its checks, the verified (issuer, sub) pair must still be the account's, and the new `auth_time` must be no earlier than the moment the flow was staged, less `oidc_clock_skew_seconds`, and later than the IdP `auth_time` the session holds (BACKLOG #2143). The full list, in order, is under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142). It then stamps `reauth_at`, rotates the session, and mints the action-bound grant when the action the operator started from takes one and the session is not refused it (a pending session on an account with a factor, for a factor-binding or session-terminate action, a save that ends the caller's own sessions (BACKLOG #3401), or ending every session (BACKLOG #2614)). Console only: `POST /me/reauth` refuses an `oidc` session, and the JSON plane has no federated step-up |
 | **mTLS service identity** (non-interactive, ADR 0083) | a **verified** client certificate mapped through a deny-by-default, name-space-qualified allow-list (`CN:` / `SAN:<type>:`) | **not applicable** — no guessable secret and no lockout; admission requires a chain verifying to the pinned client CA plus a listed qualified name | no session, no MFA, no step-up — which is why it is **PHI-fenced**: `require_service_cert` raises at **app construction** if asked to gate a PHI-view permission. One route only (`GET /service/identity`); every success is audited `service_cert_auth` |
 | **HTTP intake authentication** (non-interactive, ingest plane, ADR 0154 D6) | per inbound `Http()` connection, `intake_auth` picks one of `none`, `api_key`, `bearer` or `mtls_subject`. **The default is `none`: no credential is checked, so any peer the network rules admit may submit.** `api_key` and `bearer` compare a shared secret (`intake_api_key`, `env()` only, with an `intake_api_key_next` rotation slot) in constant time; `mtls_subject` maps a client certificate already verified against `tls_ca_file` through the qualified `intake_client_subjects` allow-list, keyed by the loaded CA whose key signed the certificate | **per-peer and global failed-attempt budgets** (defaults `intake_auth_rate_limit` 10/min, `intake_auth_rate_limit_global` 60/min, then `429`; see Table B); a successful attempt never spends budget, and a peer that authenticated inside the window is exempt from the global one. **No per-account lockout** — there is no account | authorises *submitting* only: no session, no MFA, no step-up, no read. Under `api_key` / `bearer` a missing or wrong credential gets `401` before any body byte is read, or `400` if it sends the credential header twice (Table B). Under `mtls_subject` a peer with no certificate from `tls_ca_file` fails the TLS handshake and is never seen by the engine, and a verified certificate whose subject is not listed under the loaded CA that signed it gets `403`. The refusals the engine sees are audited `intake.auth_failed` / `intake.auth_subject_denied` / `intake.auth_rate_limited`. Off loopback, a listener with no effective peer control is refused at start under `[security].enforcement = enforce` (Table B) |
@@ -6202,17 +6636,17 @@ engine verified itself, a signed `amr` or `acr` value its claim gate accepted, o
 `auth_time`, and, while the claim gate is on, a configured `amr` or `acr`. A token missing either is
 refused, which grants nothing. The table covers at least these legs. Each cell was read against the
 code at engine commit `3345056505`, and the Where column names the code that does it, except the
-**WebAuthn passkey** cell. That cell was read against `AuthService.finish_webauthn_assertion` as
-BACKLOG #3068 left it, because its directory sentences describe code merged after `3345056505`
-(BACKLOG #2239). The enrolment sentences of the **Engine TOTP or recovery code** and **WebAuthn
-passkey** cells were read against `AuthService.confirm_mfa_enrollment` and
+**WebAuthn passkey** cell and the enrolment sentence of the **Engine TOTP or recovery code** cell,
+which describe code merged after `3345056505` (BACKLOG #2239, #3061). The passkey cell's directory
+sentence was read against `AuthService.finish_webauthn_assertion` as BACKLOG #3068 left it, and the
+enrolment sentences against `AuthService.confirm_mfa_enrollment` and
 `AuthService.finish_webauthn_registration` as BACKLOG #3061 left them.
 
 | Leg | What reaches the engine about strength or recency | What the engine assumes when that says nothing | Where |
 |---|---|---|---|
 | **Local password** | No outside provider. The engine checks the password itself, so it knows what it checked | Mints the session MFA-verified only when the sign-in owes no second factor, or when a combined sign-in proved a TOTP code or a passkey assertion in the same request. Otherwise the session is MFA-pending. At sign-in, the step-up window opens only in two cases. One is a sign-in that owes no factor and is not from a first-seen address. The other is a combined sign-in | `AuthService._login_local`: `mfa_verified=not mfa_required` and its `seed_reauth` expression |
 | **Engine TOTP or recovery code** | No outside provider. The engine checks the code itself | A good code marks the session's second factor and stamps the step-up window. Since BACKLOG #2142 it stamps no window on an `oidc` session, whose window opens only at the IdP. A directory account gets there only after the directory confirms the account (BACKLOG #2023). Confirming a TOTP enrolment also marks the factor, and for a directory account the engine asks the directory there too, before it checks the code (BACKLOG #3061) | `AuthService.verify_mfa`; `AuthService.confirm_mfa_enrollment` |
-| **WebAuthn passkey** | The authenticator's user-verification flag | Not relied on. The engine asks for `user_verification=preferred` and verifies without requiring the flag, so a passkey counts as one possession factor and never more. No sign-in accepts a passkey alone, so it is always the second factor. It marks the second factor and stamps no step-up window. For a directory account, the engine asks the directory before it verifies a passkey (BACKLOG #2239); [step-up](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753) states when and what it refuses. Registering a passkey also marks the factor, and for a directory account the engine asks the directory there too, before it takes the challenge (BACKLOG #3061); the step-up window also gates that route | `auth/webauthn.py` `verify_assertion`; `AuthService.finish_webauthn_assertion`; `AuthService.finish_webauthn_registration` |
+| **WebAuthn passkey** | The authenticator's user-verification flag | Not relied on. The engine asks for `user_verification=preferred` and verifies without requiring the flag, so a passkey counts as one possession factor and never more. No sign-in accepts a passkey alone, so it is always the second factor. It marks the second factor and stamps no step-up window. For a directory account, the engine asks the directory before it marks the factor (BACKLOG #2239); [step-up](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753) states when and what it refuses. Registering a passkey also marks the factor, and for a directory account the engine asks the directory there too, before it takes the challenge (BACKLOG #3061); the step-up window also gates that route | `auth/webauthn.py` `verify_assertion`; `AuthService.finish_webauthn_assertion`; `AuthService.finish_webauthn_registration` |
 | **Kerberos / SPNEGO** | A service ticket. It carries no factor-strength or sign-in-time value that `pyspnego` surfaces | One factor and no recent sign-in. The session is minted `mfa_verified=False`, with no step-up window. While `[security].require_mfa` is on (the default), such a directory session owes an engine factor whatever `require_mfa_scope` says | `AuthService._authenticate_kerberos`; `AuthService._complete_ad_login`, where `seed_reauth=False` is a constant; `AuthService._unverified_session_owes_factor` |
 | **AD bind, step-up only** | Whether the bind as the user succeeded. Nothing about the directory's own MFA | Not a sign-in since BACKLOG #1137. It re-proves the password behind a Kerberos session and stamps the step-up window. It grants no second factor: `reauth` stamps the window and never marks the factor. The directory's MFA is not delegated (BACKLOG #1144) | `AuthService.reauth` |
 | **OIDC sign-in, recency** | `auth_time` in the signed `id_token`. The engine asks for it by sending `max_age` on every authorization request | Refused, with no time assumed. A missing `auth_time` fails as `auth_time_missing`, and one older than `[auth].oidc_max_age_seconds` as `auth_time_stale`. An accepted session also ends at `auth_time + oidc_max_age_seconds` when that is sooner than its other caps | `_check_auth_time` in `auth/oidc/claims.py`; `AuthService._authenticate_oidc` |
@@ -6260,7 +6694,7 @@ for a token, so it is not a sign-in leg.
 
 ### The documented protection set (ASVS 6.1.1)
 
-Eleven controls defend the authentication surface against automated attack. Each is named with its
+Twelve controls defend the authentication surface against automated attack. Each is named with its
 threshold, the switch that disables it, and — the part that matters for "not disabled or bypassable" —
 **what is left when it is off**.
 
@@ -6270,13 +6704,14 @@ threshold, the switch that disables it, and — the part that matters for "not d
 | 2 | **Sign-in sliding window** (`allow_login_attempt`) | password-spraying across many usernames, which never trips a single account's lockout | > 10 attempts per client IP **or** > 60 across all clients, per 60 s (either dimension alone refuses — `global_full or key_full`) | `[auth].login_rate_limit_enabled = false` | lockout only — **and limiter 3 disappears with it** (see below). Nothing then bounds how many sign-ins wait in one account's queue (control 1), so a flood on one username also delays that account's own sign-ins (BACKLOG #1943) |
 | 3 | **Per-actor credential-ceremony budget** (`allow_reauth_attempt`) | a session holder guessing a password at the re-proof surface, **before** the per-session cap revokes the session | > 10 ceremonies per acting **user**, per 60 s, on each of the user's keys: an `oidc` session's IdP step-up return draws a key of its own (the *Credential ceremonies* row of [Business-logic limits](#business-logic-limits-asvs-213) says so). **No global dimension** (`glob=0`) | *the same* `[auth].login_rate_limit_enabled`, among others ([SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#authlogin_rate_limit_enabled--false-or-a-limit-looser-than-its-default--sign-in-attempts-go-less-paced) lists every value that turns it off) | the per-session cap — `POST /me/reauth` and `POST /me/password` still count each failure, and a session is revoked at `lockout_threshold` failures. An AD re-bind the engine does not count, such as one the DC ends busy, keeps no bound at all (BACKLOG #3169). Re-proofs run one at a time per account, so a burst on one session is checked one at a time against its cap, within one engine process |
 | 4 | **argon2 concurrency cap** | executor exhaustion under a login flood | an instance semaphore sized `max(2, min(8, cpu_count))`; every hash/verify runs off the event loop | none | n/a |
-| 5 | **Request-body cap + field limits** | oversized/ambiguous auth requests | 1 MiB (the `/uploads` routes alone admit up to `[store].max_upload_bytes`), a **required** `Content-Length` for any body (a chunked body is refused **411**), and CL+TE ambiguous framing refused **400** — all as ASGI middleware ahead of every route | none | n/a |
+| 5 | **Request-body cap + field limits** | oversized/ambiguous auth requests | ASGI middleware ahead of every route: any `Transfer-Encoding` (**411** for a coding list ending in a single `chunked` with no `Content-Length`, otherwise **400**), a `Content-Length` that is not one line of plain decimal digits (**400**), and a declared length over 1 MiB (**413**; the upload routes `/uploads` and `/ui/uploaded-logs/upload` alone admit up to `[store].max_upload_bytes`), each refused with the connection closed. Under `serve`, the pinned llhttp parser refuses some framing with its own **400**: most in the request head, so the middleware never runs; a malformed chunk in the body, unless the middleware's 411 has already closed the connection. [DEPLOYMENT.md](DEPLOYMENT.md#a-proxy-in-front-of-the-api-must-refuse-the-request-shapes-the-engine-refuses) lists the measured shapes | none | n/a |
 | 6 | **Pre-auth client-network gate** | reaching the auth surface at all from an unlisted network | membership in `[security].allowed_client_networks` | `[]` = no restriction (the default) | limiters 1–3 |
 | 7 | **Federated pending-flow bound** (`FlowCache.put`, **reject-when-full**) | flooding the OIDC start legs to exhaust engine memory or deny federated sign-in and step-up. The sign-in start is `POST /ui/oidc/start`, and `GET /ui/oidc/start` when its 3.7.3 interstitial is skipped, because that GET then runs the POST leg and stages a flow; with the interstitial shown, the default, the GET stages nothing — see the [Route → limiter map](#route--limiter-map). The step-up start is `POST /ui/reauth/oidc`, whose `begin_oidc_step_up` stages its flow in the **same** cache, so a flood on either start fills it for both | 16 pending flows per client IP, 512 engine-wide, 300 s TTL. It **rejects** rather than evicts — evict-oldest would turn a start-leg flood into a login DoS for legitimate users | **none** — and `oidc_flow_cache_max = 0` is not an opt-out either: `put` refuses at `len(entries) >= global_cap`, so `0` rejects **every** federated sign-in and IdP step-up (`FlowCacheFullError` on the first flow, an OIDC denial of service). No validator floors it; treat it as a security-relevant value | limiter 2 on the sign-in start, which charges `allow_login_attempt` first; limiter 3 on the step-up start, which charges `allow_reauth_attempt` first |
 | 8 | **WebAuthn pending-ceremony bound** (`ChallengeCache.put`), and the **pre-auth sign-in pool** (`PreAuthChallengePool.put`, ADR 0197 Amendment A wave 2) | flooding passkey registration/assertion ceremonies, and the usernameless passkey sign-in's challenges | 16 pending ceremonies per **user** (evicts that *same* user's oldest, so one principal can never deny another's), 4096 engine-wide (**refuses** with a cause-naming `ChallengeCacheFullError`), 120 s TTL. The pre-auth pool is its own: 4096 challenges, 120 s TTL, keyed by an opaque per-begin handle and never by client address, and a full pool **evicts its oldest** rather than refusing, so a flood can cost the owner a retry but never refuses the ceremony. Its begin leg (`POST /ui/login/passkey`) charges limiter 2 first; with limiter 2 off a fast enough flood can evict an owner's challenge before they finish | none | limiter 3 where the console charges it — `POST /ui/reauth/webauthn` (`ui_reauth_webauthn`, the assertion **finish** leg), plus `POST /ui/reauth` (`ui_reauth`) and `POST /ui/mfa` (`ui_mfa_submit`), whose code and password error re-renders re-stage fresh assertion options after the route has already charged `allow_reauth_attempt`. One `POST /ui/reauth` branch is the exception: its passkey-first refusal for a passkey-only session re-stages options **before** the limiter and charges nothing. The routes that *stage* a ceremony — the thing `ChallengeCache.put` actually bounds — charge no **auth-surface** limiter, but they are not unpaced: `POST /ui/account/webauthn/enroll` charges the per-actor **admin-write floor** (`allow_admin_write`, non-GET only, in `require_ui` — see 2.1.3 below). `GET /ui/reauth` and `GET /ui/mfa`, which re-stage fresh assertion options on **every** render, charge nothing at all, because that floor is non-GET only. There this bound plus cookie-holder-only reachability is all there is |
 | 9 | **JWKS min-refetch floor** (`JwksCache.get_key`) | unauthenticated `kid`-driven refetch amplification against the IdP on the OIDC callback leg — the sibling of control 7 on the *other* federated leg | one upstream fetch per **300 s**, globally (`[auth].oidc_jwks_min_refetch_seconds`), plus a `_MAX_JWKS_BYTES` **512 KiB** response-body cap and a 3600 s key TTL. Within the floor an unknown `kid` raises `JwksError` and that login fails (a still-cached key is served even past the soft TTL rather than fail while throttled) | `oidc_jwks_min_refetch_seconds = 0` — no validator floor, so this **is** a genuine opt-out, and it restores the amplification | limiter 2 and control 7 (the same legs charge `allow_login_attempt` and stage a bounded flow first) |
 | 10 | **Repeated-credential audit budget** (`allow_repeated_credential_audit`) | an unauthenticated caller growing `audit_log` by sending a repeated `Authorization` header or session cookie, which is refused before any credential is read (BACKLOG #2454) | > 10 `auth.repeated_credential` rows per client IP **or** > 60 across all clients, per 60 s. Its own budget: it never draws on, or exhausts, limiter 2. A flood from many addresses can spend the global 60, and other refusals in that window then get the line and no row | *the same* `[auth].login_rate_limit_enabled` | the refusal is unchanged: every repeat is still a `400` and a WARNING line. Only the row loses its bound, so with the switch off every refusal writes one |
 | 11 | **Step-up return audit budget** (`allow_step_up_return_audit`) | many accounts' live IdP step-up flows, or a page that sends many operators' browsers to `GET /ui/oidc/callback`, growing `audit_log` through the step-up return's refusals that consume nothing and so repeat while the flow lives: a `state` mismatch, on the completion or the abandon leg, and a non-navigation fetch (BACKLOG #3965) | > 10 such rows per **source** per 60 s, where the source is the staged **user**, or, for a flow that names no user, the callback's client **address**. Behind that, a **backstop** of 60 rows across all sources per 60 s: past it each **account** still writes one row a window, and a source with no account writes none. The first row it stops in a window, per audit action, pages `audit_write_failed` keyed `step_up_return:audit_budget:<action>`, with an ERROR line; a row the per-account floor writes pages nothing. Its own budget: it never draws on, or exhausts, limiter 2 or limiter 3, and it gates the **row only**. An over-budget refusal answers exactly as before (a `state` mismatch the step-up page with **403**, a non-navigation fetch a **303** to `/ui/login?e=oidc_failed`), consumes nothing, and writes a WARNING line instead of the row. So one source spending its budget costs no other source a row; a flood across many sources that spends the backstop still leaves each account one row that window, and pages once it stops one; and none of it refuses anyone's step-up return | *the same* `[auth].login_rate_limit_enabled`, among others: `login_rate_limit_global = 0` removes its backstop and with it the page, `login_rate_limit_per_ip = 0` its per-source figure, and a `login_rate_limit_window_seconds` of `0` or less the whole budget while the switch reads on. A **lower** `login_rate_limit_global` also writes fewer of these rows, and a negative one only each account's one row a window, paging once a window per action it stops. The startup loosening report names those values for the sign-in and ceremony limits only; [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#authlogin_rate_limit_enabled--false-or-a-limit-looser-than-its-default--sign-in-attempts-go-less-paced) says they loosen this budget too | nothing: the same switch removes limiter 3, whose per-user return key otherwise holds each user's step-up returns, these rows among them, to 10 a window with no ceiling across users. The refusals are unchanged, and with the switch off every one writes its row |
+| 12 | **Sign-out miss-row budget** (`_admit_logout_miss_row`) | an unauthenticated caller growing `audit_log` through `POST /ui/logout` with a cookie that ends no session, each request writing an `auth.logout` row with `outcome` `nothing_to_revoke` (BACKLOG #4735) | For each engine process, per 60 s: > 3 such row writes begun per source **or** > 120 begun across all sources, where the source is the client address and every caller with no address shares one; a miss past either is counted, and at most one `auth.logout` row with `outcome` `unrecorded` is begun to write the count, with a WARNING line once it is written. [Session inventory](#session-inventory--targeted-revocation-wp-10) states its limits | none: it is always on, and `[auth].login_rate_limit_enabled` does not turn it off | nothing to turn off. It gates the row only, so a sign-out is never refused, and each miss still runs one store write transaction that this budget does not bound |
 
 **Control 1 bounds the lock; it bounds the campaign only where the owner has a way past it
 (ADR 0197).** Each lock releases itself, and the next run to the threshold sets the next one. What
@@ -6600,7 +7035,7 @@ the recovery path. Controls 4–6 are covered in their own rows.
 | `POST /ui/account/mfa/verify` | per-actor ceremony budget | |
 | `POST /ui/account/webauthn/verify` | per-actor ceremony budget | the passkey registration finish (BACKLOG #3014); its 429 is a `JSONResponse` carrying `Retry-After: 30` (BACKLOG #3690 item 5), charged after the gate's admin-write floor, and not charged for a session the factor-binding rule refuses, which logs a WARNING instead (BACKLOG #3690 item 6) |
 | `POST /ui/account/password` | *(inherits)* | delegates to the JSON handler, which charges once; the 429 is re-raised intact — deliberately not double-charged |
-| **No limiter of any kind** | — | `POST /auth/logout`, `POST /me/mfa/enroll`, `DELETE /me/sessions[/{id}]`, `POST /ai/chat`. BACKLOG #287 paced three routes that were listed here. They are `DELETE /search/presets/{preset_id}`, `PATCH /logging/level` and `POST /alerts/test-email`, now on `require_paced`. **Two earlier routes left this row and the table did not follow them.** `PATCH /users/{user_id}` is the one already narrated: it lost the write pacing when it was promoted to an action-bound step-up gate, and BACKLOG #1148 made `require_step_up_action` charge the floor again. `DELETE /me/mfa` rides that same gate (`require_step_up_action(STEP_UP_ACTION_MFA_DISABLE)`), so #1148 paced it too and it was left listed here regardless. The `reauth_only` action gate (`require_reauth_only_action`) still charges none. `GET /ui/reauth` and `GET /ui/mfa` belong here because the admin-write floor is non-GET only, and so does `GET /ui/oidc/start` while its interstitial is shown. So do `POST /ui/logout` and `POST /ui/csp-report`, which carry no `require_ui` gate (the sign-out's unbounded `nothing_to_revoke` audit rows are an open gap under [Session inventory](#session-inventory--targeted-revocation-wp-10)), and the passkey-first refusal branch of `POST /ui/reauth` (control 8). The console's WebAuthn **staging** POSTs do **not** — see control 8. The list is at least these |
+| **No limiter of any kind** | — | `POST /auth/logout`, `POST /me/mfa/enroll`, `DELETE /me/sessions[/{id}]`, `POST /ai/chat`. BACKLOG #287 paced three routes that were listed here. They are `DELETE /search/presets/{preset_id}`, `PATCH /logging/level` and `POST /alerts/test-email`, now on `require_paced`. **Two earlier routes left this row and the table did not follow them.** `PATCH /users/{user_id}` is the one already narrated: it lost the write pacing when it was promoted to an action-bound step-up gate, and BACKLOG #1148 made `require_step_up_action` charge the floor again. `DELETE /me/mfa` rides that same gate (`require_step_up_action(STEP_UP_ACTION_MFA_DISABLE)`), so #1148 paced it too and it was left listed here regardless. The `reauth_only` action gate (`require_reauth_only_action`) still charges none. `GET /ui/reauth` and `GET /ui/mfa` belong here because the admin-write floor is non-GET only, and so does `GET /ui/oidc/start` while its interstitial is shown. So do `POST /ui/logout` and `POST /ui/csp-report`, which carry no `require_ui` gate (the sign-out's `nothing_to_revoke` audit rows are bounded, not the request, as [Session inventory](#session-inventory--targeted-revocation-wp-10) states), and the passkey-first refusal branch of `POST /ui/reauth` (control 8). The console's WebAuthn **staging** POSTs do **not** — see control 8. The list is at least these |
 
 The console calls the ceremony gate directly. It used to resolve it through a `getattr` shim that
 fell back to the **sign-in** budget on an engine without the method. The console pins one engine
@@ -6612,7 +7047,7 @@ Every enforced limit, with both dimensions stated even where one is hard-coded o
 **and** globally" is the requirement's own wording. **Enforcement scope is stated per row, because it
 is not uniform.** The four sliding-window limiters (sign-in, credential ceremony, PHI read, admin
 write) and the two pending-flow caches are **in-process, per API process** — N engine shards multiply
-*those* budgets by N. So are the two audit-row budgets of the 6.1.1 set (controls 10 and 11),
+*those* budgets by N. So are at least the three audit-row budgets of the 6.1.1 set (controls 10 to 12),
 which this table does not list. The account lockout and the concurrent-session cap are
 **store-backed** (`increment_login_failure` / `enforce_session_cap` against the one unified store), so they are **shared** by every API process and are **not** multiplied by N. For
 the lockout, shared is not by itself enough and the second half is what makes the first half true: the
@@ -6634,13 +7069,13 @@ additionally front the API with a proxy/WAF limiter and TLS.
 | PHI reads | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_global`, `phi_read_rate_limit_window_seconds` | on / 120 / **0 = off** / 60.0 s | 60 s | **yes** (120) | off by default | no | **in-process** — 8 JSON routes via `require_phi_read`, 4 bulk-PHI step-up GETs charged at admission, 11 `/ui` views via `require_ui(phi=True)`, 1 further `/ui` GET that inherits the charge by delegating into the handler body, and the `reveal` act on the monitoring JSON routes that carry one (at least `GET /events`, `GET /connections/{name}/events`, `GET /alerts/active`, `GET /connections` and `GET /connections/{name}/metadata`), charged at admission (BACKLOG #2443) | 429 + a `Retry-After` naming the actor's wait (the whole window while the global count is spent); logged on the JSON API, not by `require_ui` (see *The console's refusal differs from the JSON floor's*) |
 | Admin writes | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds`, `admin_write_min_interval_seconds` | on / 12 / 15 s / 0.15 s gap | 15 s | **yes** (12, and a 0.15 s minimum gap) | no (`glob=0`) | no | **in-process** — **non-GET only**, via `require_step_up`, `require_step_up_action` **and** `require_paced`; `/ui` re-applies it in `require_ui` | JSON API: 429 + a `Retry-After` naming the actor's wait, logged. `/ui`: the same 429 + `Retry-After`, no WARNING line (see *The console's refusal differs from the JSON floor's*) |
 | Concurrent sessions | `[auth].max_sessions_per_user` | 5 (`0` = unlimited) | — | **yes** | no | no | **store-backed** — every login and every completed second factor | the user's oldest live session is revoked; sessions past the idle or absolute limit do not count and are revoked; see the *Concurrent session count* signal row for sign-ins that still owe a second factor |
-| Request body | `[store].max_upload_bytes` (the `/uploads` routes only) | 1 MiB elsewhere | per request | no | no | no | **stateless** — every route, in ASGI middleware | **413** over the cap, **400** on ambiguous CL+TE framing or an invalid `Content-Length`, **411** on a chunked body |
+| Request body | `[store].max_upload_bytes` (the upload routes only; control 5 names them) | 1 MiB elsewhere | per request | no | no | no | **stateless** — every route, in ASGI middleware | **413** over the cap, **400** or **411** on framing; control 5 above gives the rule |
 | Uploaded files retained, per uploader | `[store].max_upload_files_per_user`, `max_upload_total_bytes_per_user`, `uploads_retention_days` | 100 files / 250 MiB / 30 days | cumulative (no window; the retention age is what releases budget) | **yes** — a **cumulative** count *and* byte total, so the single-file cap above is not the only upload bound | no | no | **store-backed** — scoped to the `uploads_dir` via an uncached sidecar scan, with the check-then-write held as an atomic `reserve_upload_quota` on the unified store, so shards sharing a dir share one budget (separate dirs get separate budgets by construction) | **409** before any write, audited `upload.reject_quota`; over-age blob+meta pairs are pruned and audited `upload.prune`. Defaults-**on** with a `ge=1` floor once `uploads_dir` is set — the control cannot ship disabled |
 | Remote-file retrieve | `max_file_bytes` (the `File(...)` and `Sftp`/`Ftp` inbound connections) | 16 MiB | per file | no | no | no | **stateless** — a per-file test carrying no budget, applied in the connector | the file is quarantined to `error_subdir` and WARNING-logged. A move that completes is also offered to the connection-event log as `file_oversize` (BACKLOG #1621), which keeps it only where connection events are captured (`docs/PHI.md` row 7); a failed move is logged only. It never becomes a received message, so there is no store disposition. **Charged twice on a remote source, and the second charge is the one that binds** (BACKLOG #1191): once against the size the partner server reported in its own directory listing, then again against the **bytes actually read**, streaming in 1 MiB chunks so a share that lists a small file and delivers an arbitrarily large body is cut off mid-transfer. That second charge is the only bound that can see this surface at all — the connector consumes the body *before* an ingress row exists |
 | Egress response body | *(module constants in `transports/bounded_read.py`: `DEFAULT_MAX_RESPONSE_BYTES`, `MAX_TOKEN_RESPONSE_BYTES` — no knobs)* | 16 MiB; 256 KiB on a token endpoint | per response | no | no | no | **stateless** — a per-response test carrying no budget, applied at every outbound HTTP read: REST, SOAP, FHIR write, the `fhir_lookup` live read, DICOMweb STOW-RS, the OAuth2 and SMART token endpoints, the AI broker and the alert webhook, plus each of their reachability probes | the read stops at the bound plus one byte and raises `ResponseTooLargeError`, a `DeliveryError`. Where that surfaces inside a delivery, as it does when a delivery mints its token, the message retries and then dead-letters like any other reply the engine could not read. At least a probe and the AI broker report it to their own caller instead, and nothing retries those. The alert webhook counts an over-cap body after a 2xx as delivered and logs a WARNING that carries no reply byte, because nothing reads that body (owner ruling 2026-10-12, vault BACKLOG #3040 item 1). **A REST, SOAP, FHIR or DICOMweb delivery that already holds a 2xx does not retry either** (vault BACKLOG #2180, owner ruling 2026-10-05): a retry would send again a request the partner answered 2xx, so an over-cap body there is either dropped or refused for good with the code `reply-too-large`. The table under REST in [`CONNECTIONS.md`](CONNECTIONS.md) says which destination and mode does which. The ruling names the principle, which is to judge the body by who reads it, and not the FHIR cases that refuse; refusing those is a reading of it made when this was built, which the owner may reverse, and the note under that table says which rows it covers. A 2xx body cut short of its declared length, or misframed, follows the same rule with the code `reply-truncated` or `reply-misframed` (BACKLOG #2989; ADR 0095 Amendment B.1 records who decided it). A `fhir_lookup` refusal is a `FhirLookupError` the Handler sees directly, and the two HTTP-error-body reads instead WARNING-log and classify on the status alone. 16 MiB is not a new number — it is `parsing/peek.DEFAULT_MAX_MESSAGE_BYTES`, the engine's existing one-message ceiling, so no honest clinical reply is refused. **Egress only:** this bounds a reply to a request the engine made, never a received message, so it cannot drop one (BACKLOG #1191) |
 | OIDC pending flows | `[auth].oidc_flow_cache_max` (global), `DEFAULT_PER_IP_CAP` (per-IP, no knob), `oidc_flow_ttl_seconds` | 512 / 16 / 300 s | 300 s TTL | no | **yes** (512) | **yes** (16) | **in-process** — `POST /ui/oidc/start`, and `GET /ui/oidc/start` when its interstitial is skipped, and the step-up start `POST /ui/reauth/oidc` (`begin_oidc_step_up`) — reject-when-full, never evict | 303 → `/ui/login?e=rate_limited` on the sign-in start; 429 re-rendering the step-up page, no `Retry-After`, on `POST /ui/reauth/oidc`; WARNING-logged, **never** audited |
 | WebAuthn pending ceremonies | `GLOBAL_PENDING_CAP`, `PER_USER_PENDING_CAP`, `CHALLENGE_TTL_SECONDS` (module constants, no knobs) | 4096 / 16 / 120 s | 120 s TTL | **yes** (16) | **yes** (4096) | no | **in-process** — every passkey registration + assertion ceremony | per-user: evicts that user's **own** oldest pending ceremony (silent); global: `ChallengeCacheFullError` naming the cause + the `admin_reset_mfa` recovery path |
-| **Ingest plane** | `max_messages_per_second`, `message_burst` (MLLP, raw-TCP, X12 and HTTP inbounds) | **off** (unset = no rate bound) | per message | no | no | no | **in-process** — one bucket per MLLP / raw-TCP / X12 **connection** and one per HTTP **listener**, so it neither coordinates across engine shards nor aggregates per peer | **Ships OFF, and the off default is ruled rather than accidental** — a rate on a clinical interface is only safe at a number taken from a real feed profile. **So a default install has NO message-RATE bound on the ingest plane**, and that is a deliberate posture, not a gap in the control. Both keys are parameters of the `MLLP()`, `Tcp()`, `X12()` and `Http()` factories, so **the code-first surface expresses them on all four**. `connections.toml` desugars through those same factories, so **the TOML surface expresses them on three of the four**: `X12` is absent from that loader's `_TRANSPORTS` map entirely, so **no** X12 setting is expressible in `connections.toml` and the pacing keys are not a special case of that. Closing it means adding the transport, which is a separate decision from this control; the gap is pinned with its own positive control at `tests/test_ingress_message_pacing.py::test_x12_has_no_toml_surface_at_all_which_is_a_separate_gap` (BACKLOG #1249 for MLLP, BACKLOG #1114 for the other three — until #1249 landed the pacer was built and no documented configuration could turn it on, and until #1114 landed the other three intakes had no rate control in **any** configuration, which is a different and worse thing than being off). *What it does when set:* the listener **pauses reading before its next read** so TCP back-pressures the sender; no message is dropped, refused, NAK'd, 429'd or reordered — the count-and-log invariant forbids accept-and-drop, so a discarding limiter was never available. **The HTTP bucket is listener-wide, not per-connection**, because that connector answers one request per connection; a `GET`/`HEAD` probe waits behind an outstanding debt but charges nothing. **Two SIBLING intake bounds on different units, added by BACKLOG #1114 — read them as separate controls, not as this row's keys reaching further.** (1) `max_associations_per_second` / `association_burst` bound the **DICOM C-STORE SCP**, and the unit is an **association**, not a message: `pynetdicom` owns the read loop, so by the time a C-STORE reaches the engine the object has already been read and decoded, and a pace after decode would delay a message the count-and-log invariant has already obliged us to account for. The pacer waits before reading the association request and never refuses one itself. A waiting connection does hold one of the SCP's slots for connections with no association yet, and a connection over those caps is closed ([DICOM.md](DICOM.md) section 3). The engine-wide intake pause is a separate control that does refuse a new association as busy while it holds (BACKLOG #290; the `[inbound].max_staged_depth` row of [CONFIGURATION.md](CONFIGURATION.md) says how). An established association is still **unbounded in the objects it may push** (`max_object_bytes` and `timeout_seconds` bound those instead). It **ships OFF**, for the reason in bold above, so it does not soften the sentence about a default install. (2) `poll_max_files` (the `File`, `Sftp` and `Ftp` sources) and `poll_max_rows` (the `DatabasePoll` source) cap how many items one **poll tick** takes, not how many it lists, and both **ship ON at 500**. That is the opposite default, deliberately, because a poll source has no sender to back-pressure. The excess is **deferred, not refused**: it stays in the drop directory or the table for a later tick. That holds on the Database source only under conditions, and a file source can still spend the cap on a file it leaves in place; [CONNECTIONS.md §*Per-tick poll ceilings*](CONNECTIONS.md#per-tick-poll-ceilings) states both, with what spends the cap on each source, why 500 and when to raise it. A negative or non-numeric value is **refused when the connection is built**, before it starts. **Still not covered even when set:** any **per-message** bound on the DICOM SCP, and any **per-peer MESSAGE-RATE** bound (MLLP, TCP and X12 peers are unauthenticated, so the only key would be source IP, which NAT collapses). **A per-peer CONNECTION bound does now ship on the MLLP, raw-TCP and X12 listeners** — `max_connections_per_host` (32). BACKLOG #1725 added it to MLLP, and vault BACKLOG #2606 to the other two. It is a different unit: it caps concurrent sockets from one address, refusing pre-ingress, and never bounds how fast an admitted peer may send. It keys on source IP, so the NAT objection still applies to it and is recorded at its constant; behind a source-NAT proxy set it to `None`/`0`. The HTTP listener takes the same key but **ships it off**. Behind a reverse proxy every partner arrives from one address, so a cap there would be the listener's whole capacity. It does ship `max_handshakes_per_host` (32) on. That is not a per-host connection cap: it counts only the sockets one address holds while their TLS handshake runs, and only with `tls = true` on the stdlib loop (vault BACKLOG #4888; [DEPLOYMENT.md](DEPLOYMENT.md#per-address-listener-caps-behind-the-vip)). The DICOM intake has no such key. It caps only connections with no association yet, per host and per listener, by constant, and it gives each one a deadline ([DICOM.md](DICOM.md) section 3). **Resource bounds that DO ship on** — at least `max_connections` (256), the MLLP, raw-TCP and X12 listeners' `max_connections_per_host` (32) and `max_frame_seconds` (60.0 s), the HTTP listener's `max_handshakes_per_host` (32, with `tls = true` on the stdlib loop only), `receive_timeout` (60.0 s), `max_frame_bytes` (16 MiB), per-connection `max_message_bytes`, `poll_max_files` and `poll_max_rows` (500, on the poll sources), `source_ip_allowlist`. On the MLLP, raw-TCP and X12 listeners `receive_timeout` resets on every byte received, so it bounds only silence; `max_frame_seconds` bounds the frame. Bytes outside a frame count toward that deadline too (vault BACKLOG #2847 brought MLLP into line). [CONNECTIONS.md](CONNECTIONS.md#resource-management--limits-asvs-1312--1313--1326) states when its clock starts and stops. |
+| **Ingest plane** | `max_messages_per_second`, `message_burst` (MLLP, raw-TCP, X12 and HTTP inbounds) | **off** (unset = no rate bound) | per message | no | no | no | **in-process** — one bucket per MLLP / raw-TCP / X12 **connection** and one per HTTP **listener**, so it neither coordinates across engine shards nor aggregates per peer | **Ships OFF, and the off default is ruled rather than accidental** — a rate on a clinical interface is only safe at a number taken from a real feed profile. **So a default install has NO message-RATE bound on the ingest plane**, and that is a deliberate posture, not a gap in the control. Both keys are parameters of the `MLLP()`, `Tcp()`, `X12()` and `Http()` factories, so **the code-first surface expresses them on all four**. `connections.toml` desugars through those same factories, so **the TOML surface expresses them on three of the four**: `X12` is absent from that loader's `_TRANSPORTS` map entirely, so **no** X12 setting is expressible in `connections.toml` and the pacing keys are not a special case of that. Closing it means adding the transport, which is a separate decision from this control; the gap is pinned with its own positive control at `tests/test_ingress_message_pacing.py::test_x12_has_no_toml_surface_at_all_which_is_a_separate_gap` (BACKLOG #1249 for MLLP, BACKLOG #1114 for the other three — until #1249 landed the pacer was built and no documented configuration could turn it on, and until #1114 landed the other three intakes had no rate control in **any** configuration, which is a different and worse thing than being off). *What it does when set:* the listener **pauses reading before its next read** so TCP back-pressures the sender; no message is dropped, refused, NAK'd, 429'd or reordered — the count-and-log invariant forbids accept-and-drop, so a discarding limiter was never available. **The HTTP bucket is listener-wide, not per-connection**, because that connector answers one request per connection; a `GET`/`HEAD` probe waits behind an outstanding debt but charges nothing. **Two SIBLING intake bounds on different units, added by BACKLOG #1114 — read them as separate controls, not as this row's keys reaching further.** (1) `max_associations_per_second` / `association_burst` bound the **DICOM C-STORE SCP**, and the unit is an **association**, not a message: `pynetdicom` owns the read loop, so by the time a C-STORE reaches the engine the object has already been read and decoded, and a pace after decode would delay a message the count-and-log invariant has already obliged us to account for. The pacer waits before reading the association request and never refuses one itself. A waiting connection does hold one of the SCP's slots for connections with no association yet, and a connection over those caps is closed ([DICOM.md](DICOM.md) section 3). The engine-wide intake pause is a separate control that does refuse a new association as busy while it holds (BACKLOG #290; the `[inbound].max_staged_depth` row of [CONFIGURATION.md](CONFIGURATION.md) says how). An established association is still **unbounded in the objects it may push** (`max_object_bytes` and `timeout_seconds` bound those instead). It **ships OFF**, for the reason in bold above, so it does not soften the sentence about a default install. (2) `poll_max_files` (the `File`, `Sftp` and `Ftp` sources) and `poll_max_rows` (the `DatabasePoll` source) cap how many items one **poll tick** takes, not how many it lists, and both **ship ON at 500**. That is the opposite default, deliberately, because a poll source has no sender to back-pressure. The excess is **deferred, not refused**: it stays in the drop directory or the table for a later tick. That holds on the Database source only under conditions, and a file source can still spend the cap on a file it leaves in place; [CONNECTIONS.md §*Per-tick poll ceilings*](CONNECTIONS.md#per-tick-poll-ceilings) states both, with what spends the cap on each source, why 500 and when to raise it. A negative or non-numeric value is **refused when the connection is built**, before it starts. **Still not covered even when set:** any **per-message** bound on the DICOM SCP, and any **per-peer MESSAGE-RATE** bound (MLLP, TCP and X12 peers are unauthenticated, so the only key would be source IP, which NAT collapses). **A per-peer CONNECTION bound does now ship on the MLLP, raw-TCP and X12 listeners** — `max_connections_per_host` (32). BACKLOG #1725 added it to MLLP, and vault BACKLOG #2606 to the other two. It is a different unit: it caps concurrent sockets from one address, refusing pre-ingress, and never bounds how fast an admitted peer may send. It keys on source IP, so the NAT objection still applies to it and is recorded at its constant; behind a source-NAT proxy set it to `None`/`0`. The HTTP listener takes the same key but **ships it off**. Behind a reverse proxy every partner arrives from one address, so a cap there would be the listener's whole capacity. It does ship `max_handshakes_per_host` (32) on. That is not a per-host connection cap: it counts only the sockets one address holds while their TLS handshake runs, and only with `tls = true` (vault BACKLOG #4888; [DEPLOYMENT.md](DEPLOYMENT.md#per-address-listener-caps-behind-the-vip)). The DICOM intake has no such key. It caps only connections with no association yet, per host and per listener, by constant, and it gives each one a deadline ([DICOM.md](DICOM.md) section 3). **Resource bounds that DO ship on** — at least `max_connections` (256), the MLLP, raw-TCP and X12 listeners' `max_connections_per_host` (32) and `max_frame_seconds` (60.0 s), the HTTP listener's `max_handshakes_per_host` (32, with `tls = true` only), `receive_timeout` (60.0 s), `max_frame_bytes` (16 MiB), per-connection `max_message_bytes`, `poll_max_files` and `poll_max_rows` (500, on the poll sources), `source_ip_allowlist`. On the MLLP, raw-TCP and X12 listeners `receive_timeout` resets on every byte received, so it bounds only silence; `max_frame_seconds` bounds the frame. Bytes outside a frame count toward that deadline too (vault BACKLOG #2847 brought MLLP into line). [CONNECTIONS.md](CONNECTIONS.md#resource-management--limits-asvs-1312--1313--1326) states when its clock starts and stops. |
 
 **What these limits defend, and what they do not.** The full inventory of resource-demanding
 functionality — including the surfaces that remain **unbounded** at this release — is
@@ -6715,10 +7150,10 @@ IP is a backlog follow-up).
 ## Audit
 
 Every authentication and authorization event is written to the durable `audit_log` with the acting
-user: `auth.login_success` / `auth.login_failed` / `auth.login_locked` / `auth.directory_login_locked` / `auth.logout` /
+user: `auth.login_success` / `auth.login_failed` / `auth.login_locked` / `auth.directory_login_locked` / `auth.logout` (an unauthenticated sign-out that ends nothing, past its bound, is counted in a row rather than written as its own; see [Session inventory](#session-inventory--targeted-revocation-wp-10)) /
 `auth.login_new_ip` / `auth.login_address_unevaluated` (the first-seen sign-in address, BACKLOG #288;
 on a directory sign-in the row's `mech` names the leg, `kerberos` or `oidc`) /
-`auth.permission_denied` / `auth.channel_denied` / `auth.self_target_refused` / `auth.session_revoke_missed`, the 6.3.5 events `auth.account_locked` /
+`auth.permission_denied` / `auth.channel_denied` / `auth.gate_refused` / `auth.self_target_refused` / `auth.session_revoke_missed`, the 6.3.5 events `auth.account_locked` /
 `auth.login_after_failures`, the re-proof rows `auth.reauth` / `auth.password_change_failed`, plus `user.created` / `user.roles_changed` /
 `user.channel_scope_changed` / `user.channel_scope_change_refused` / `user.deleted`, `ad_group_map.updated` / `ad_group_scope_map.updated`,
 and `auth.ad_scope_resynced`. Most reads narrowed to the caller's channel scope write no row
@@ -6727,6 +7162,17 @@ writes `alert_rules_withheld`. So do the console pages that read the rules throu
 (BACKLOG #3403). PHI access (viewing a raw message or displaying patient summaries) is recorded
 with the viewer. Read the trail via `GET /audit` (`audit:read`). **Credentials, tokens, and PHI bodies
 are never logged** (only ids/counts land in `detail`).
+
+**A directory account's enrolment code writes five actions** (ADR 0207): `auth.enrolment_code_issued`
+under the issuing Administrator (`cli:<osuser>` from the host command),
+`auth.enrolment_code_revoked` under the Administrator who revoked the code, who need not be
+its issuer, `auth.enrolment_code_used` and `auth.enrolment_code_refused` under the account whose
+session acted, and `auth.enrolment_code_spent_notice`. **That last one is the one audit row whose
+actor did not act**: it is written under the ISSUING Administrator's name, as the notice's
+recipient, so the issuer's own `GET /me/security-events` returns it. Its detail says so
+(`actor_role: recipient`) and names the account that spent the code and the client address the
+spend came from. An investigator filtering the log by actor must not read it as the issuer's act.
+None of the five carries the code or its digest.
 
 **Lock rows are read only with `users:manage` (owner ruling 2026-09-28, BACKLOG #1131).** The engine
 still writes every lock row (ADR 0197 AC-10), and an Administrator reads them all. A reader without
@@ -6753,7 +7199,11 @@ behind it, `"logout"` at a sign-out, and `"superseded"` at another sign-in on th
 which may be another account's (BACKLOG #2298, #3749; see [Admin password reset](#admin-password-reset-wp-l3-12-asvs-646)). The permission decides, not the role name; no custom role can grant
 `users:manage` (ADR 0045 D1). The store applies the filter in the query before `limit`, so a page
 never comes back short. The account holder's own `/me/security-events` feed is not filtered: it
-selects rows by the caller's own username, so it shows the holder their own lock and no one else's.
+selects rows by the caller's own username at or after the account's `created_at`, so it shows the
+holder their own rows. It can show another account's, at least where an account keeps its
+`created_at` while its name or holder changes, and on the store-side name-compare residuals
+`_security_events_where` in `messagefoundry/store/store.py` lists (the `GET /me/security-events` bullet under *Single-route data rules*, in
+[The `/ui` console plane](#the-ui-console-plane-serve_uitrue)).
 **The cost, accepted in the ruling: the Auditor can no longer review lockouts.** The list and its
 reasons are in `messagefoundry/auth/audit_visibility.py`.
 
@@ -6830,7 +7280,14 @@ open. The detector reads `config_loaded` rows and no `config_reload` row, so at 
 unseen. A reload whose swap lands after that read leaves the alert resolved while the loosened graph
 runs. A reload onto a loosened graph after a clean start raises nothing until a later start. A
 reload onto a clean graph resolves nothing either. `GET /security/posture` reads the live graph, so
-read that for the current posture.
+read that for the current posture. A cluster convergence reload's `config_reload` row, under
+`system:cluster-convergence`, carries a `loosenings` key read off the graph that reload loaded,
+as a start's row does, and the detector does not read it either (vault BACKLOG #3814). The key is
+`null`, which says unknown, at least when the list could not be read and when the reload ran
+before the start had put in place the settings it reads, as one inside the start's own
+convergence does. A convergence whose row is lost writes no list at all. An operator reload's row
+has no such key. So on a single node, no row names the loosenings an operator reload brings in
+until a later start's row lists them; on a cluster, the other nodes' convergence rows can.
 
 **`posture_loosened` may not name a given switch, the layer's own included.** Its sentence gives the
 count of every loosening, then their names, cut at 200 characters and ending in `...`. The
@@ -7227,10 +7684,14 @@ to the forwarded stream as to stdout (see [PHI.md §7](PHI.md#7-logging--phi-red
   as built on 2026-10-08.
 
 The **`audit_log`** rows *themselves* are **also** forwarded off-box (sec-offbox-log #361/#363): every
-committed audit row ships as metadata, with only best-effort PHI redaction
+audit row `serve` or `supervise` commits ships as metadata, with only best-effort PHI redaction
 ([PHI.md §7](PHI.md#7-logging--phi-redaction)), through the `messagefoundry.audit` logger to the same
 forwarder — so it inherits the TLS transport automatically — across all three store backends, so both the
-operational log and the tamper-evident audit trail survive a host/DB compromise.
+operational log and the tamper-evident audit trail survive a host/DB compromise. A row any other CLI
+subcommand commits, such as `admin-unlock`'s, is **not** forwarded: those processes install no
+forwarder, so the row reaches only their stderr, and a collector would see a gap in the anchor
+chain on a first deployment. [PHI.md §7](PHI.md#7-logging--phi-redaction) row 18 states it, and
+BACKLOG #3767 holds it.
 
 **Clock-sync gate (ASVS 16.2.2; ADR 0080).** Cross-host log/audit correlation assumes the engine host's
 clock tracks a reference. `[logging].require_time_sync` + `ntp_peer` arms an **opt-in**, fully-bounded SNTP
@@ -7358,7 +7819,7 @@ BACKLOG #190 bundled three integrity residuals; #190 closes with **one built** a
   The reason is that it would hide nothing: a 2026-07-20 DoH probe found **no** partner endpoint
   publishing an `ECHConfig`. The engine therefore ships only the opt-in, fail-closed **routing** half
   (per-connection `ech_egress` / `ech_sidecar`, refused when the sidecar is non-loopback or paired
-  with `proxy_url`), and the re-originator was retired from the tree on 2026-08-10 rather than carried
+  with `proxy_url` or `verify_tls = false`), and the re-originator was retired from the tree on 2026-08-10 rather than carried
   as a second language nothing builds, tests or pins. Evidence, the retrieval SHA and the re-score
   trigger: [ADR 0139](adr/0139-ech-egress-sidecar-sni-hiding-for-asvs-12-1-5-demand-gated.md);
   operator contract: [`samples/ech-sidecar/`](../samples/ech-sidecar/README.md). The residual is
@@ -7477,9 +7938,10 @@ system lets that process write the target's memory. On a first deployment, code 
 service account could be such a process. It would then run Python inside the engine, with
 everything the engine holds.
 
-Under `enforce`, `serve` and `supervise` refuse to start with the interface on, unless
-`[security].allow_remote_debugging` accepts it (vault BACKLOG #2700). Three further controls
-answer it, and they differ in strength:
+The first control is a start refusal under `enforce`, which `[security].allow_remote_debugging`
+lifts (vault BACKLOG #2700). Which commands make it, and when it fires, is stated once, in
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#remote_debug_enabled-and-remote_debug_unguarded-the-interpreter-accepts-a-script-from-another-process).
+Three further controls answer it, and they differ in strength:
 
 - **The engine's Python children start with the interface off.** `messagefoundry/childenv.py` is
   the one place that says which children and how.
@@ -7491,8 +7953,8 @@ answer it, and they differ in strength:
   console script, such as a developer's `messagefoundry serve`, leaves it on unless
   `PYTHON_DISABLE_REMOTE_DEBUG=1` is set. So the command line installs an audit hook as it
   starts, for every command (`messagefoundry/remotedebug.py`): the interface can be on in any
-  command, and `serve` or `supervise` runs with it on under `enforcement = warn` or with the
-  acceptance above set. The
+  command, and `serve` or `supervise` runs with it on wherever the start refusal does not stop
+  it. The
   interpreter raises an event before it runs an injected script, the hook raises on it, and the
   interpreter drops the script. A refusal is logged. Under `serve` the engine also writes a
   `remote_debug_refused` audit row and raises an alert of that name (vault BACKLOG #2742).

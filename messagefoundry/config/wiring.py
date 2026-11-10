@@ -217,9 +217,11 @@ __all__ = [
     "expiry_relaxed_hops",
     "hostname_unchecked_hops",
     "path_form_fhir_updates",
+    "UNRESOLVED_UPDATE_URL_FORM",
     "path_form_fhir_updates_without_if_match",
     "query_credential_hops",
     "revocation_attested_hops",
+    "odbc_hops",
     "unverified_generic_db_hops",
     "refused_generic_db_drivers",
     "POSSIBLY_GENERIC_DB_HOP",
@@ -883,8 +885,8 @@ def refuse_resolved_verify_off(
     # Read as the connector reads it: an explicit None is the default, on (vault BACKLOG #3230).
     if not bool_setting(settings, "verify_tls", default=True) and settings.get("tls_ca_file"):
         raise WiringError(
-            f"{where}: DICOMweb tls_ca_file would never be read: verify_tls resolved to a false or "
-            "empty value, which verifies nothing, and DICOMweb has no token hop."
+            f"{where}: DICOMweb tls_ca_file would never be read: verify_tls resolved to a false "
+            "value, which verifies nothing, and DICOMweb has no token hop."
         )
 
 
@@ -2211,8 +2213,9 @@ def _url_may_carry_a_credential(value: str) -> bool:
 
     Any of these withholds it: an ``@`` anywhere in it; a ``%40``, ``%3A``, ``%26``, ``%3B``,
     ``%3F``, ``%23`` or ``%25`` anywhere in it, any case (:data:`_WITHHELD_URL_ESCAPES`); a value
-    ``urlsplit`` refuses; a credential-looking query name by the warning detector
-    (:func:`~messagefoundry.secretscrub.credential_query_params`); a credential-looking name in any
+    ``urlsplit`` refuses; a credential-looking query name by the credential refusals' reading of
+    the warning detector (:func:`~messagefoundry.secretscrub.credential_query_params` with
+    ``refusal=True``, so ``?code=`` too); a credential-looking name in any
     ``name=value`` segment after a ``?``, ``&``, ``#`` or ``;``
     (:func:`~messagefoundry.secretscrub.has_credential_like_segment`), or a credential word anywhere
     in such a name (:func:`_has_credential_named_segment`); or a path segment that is a credential
@@ -2240,7 +2243,7 @@ def _url_may_carry_a_credential(value: str) -> bool:
         return True
     return (
         has_credential_like_segment(value)
-        or bool(credential_query_params(value))
+        or bool(credential_query_params(value, refusal=True))
         or _has_credential_named_segment(value)
         or _has_credential_path_segment(parts.path)
         # A hash route, ``#/token/SECRET/x``, is a path to the page that reads it.
@@ -3115,8 +3118,8 @@ def Http(
     (vault BACKLOG #2606): behind a reverse proxy every partner arrives from one address, so a cap
     would become the listener's whole capacity. Set one only where the listener sees real client
     addresses. ``max_handshakes_per_host`` (32) **ships on**: it caps only the sockets one address
-    holds a connection slot with while still in their TLS handshake, which happens where the engine
-    runs on a stdlib event loop with ``tls=True`` (vault BACKLOG #4888). See ``docs/DEPLOYMENT.md``
+    holds a connection slot with while still in their TLS handshake, which happens with
+    ``tls=True`` on every event loop (vault BACKLOG #4888, BACKLOG #2479). See ``docs/DEPLOYMENT.md``
     for the L4 load-balancer case.
 
     **Message-rate pacing (BACKLOG #1114).** ``max_messages_per_second`` bounds how fast this listener
@@ -3764,7 +3767,7 @@ def Rest(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared, and in every case with a credential or a static header off the allowlist; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
+    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared (never beside ech_egress, which refuses it whatever is attested), and in every case with a credential or a static header off the allowlist; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain signatures+hostname still verified, not validity windows; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
@@ -3841,6 +3844,30 @@ def Rest(
     )
 
 
+def _path_form_ruled_out(interaction: object, conditional: object, entry_lists_set: bool) -> bool:
+    """Whether a ``FHIR()`` connection's writes are known not to be updates, so the build refuses
+    the path form there. A value that is :data:`_UNRESOLVED` rules nothing out, but a resolved
+    ``conditional`` other than ``if-match`` decides it alone, whatever the interaction, and so does a
+    resolved ``transaction`` or ``batch`` interaction, whatever the conditional: the build refuses a
+    conditional beside a Bundle interaction, and a Bundle without one is not an update. So do Bundle
+    entry lists that are set (``entry_lists_set``): the build refuses them on any other interaction.
+
+    The rule is the build's own ``transports.fhir.takes_update``, imported lazily for the one-way
+    rule, so the factory, :func:`path_form_fhir_updates` and the build agree on which writes are
+    updates. The build refuses other combinations too, which neither caller models."""
+    from messagefoundry.transports.fhir import _BUNDLE_INTERACTIONS, takes_update
+
+    if entry_lists_set:
+        return True
+    if conditional is not _UNRESOLVED and conditional and str(conditional) != "if-match":
+        return True
+    if interaction is not _UNRESOLVED and str(interaction) in _BUNDLE_INTERACTIONS:
+        return True
+    if interaction is _UNRESOLVED or conditional is _UNRESOLVED:
+        return False
+    return not takes_update(interaction, conditional)
+
+
 def FHIR(
     *,
     url: str | EnvRef,  # the FHIR service BASE url, e.g. https://host/fhir (may be env())
@@ -3848,16 +3875,15 @@ def FHIR(
         "R4B", "R5", "STU3"
     ] = "R4B",  # "R4B" (default) | "R5" | "STU3" — explicit, no autodetect
     format: Literal["json"] = "json",  # "json" (MVP); "xml" is deferred (ADR 0022 Options #5)
-    interaction: Literal[
-        "create", "update", "transaction", "batch"
-    ] = "create",  # "create" (POST) | "update" (PUT in a transaction) | "transaction" | "batch"
+    interaction: Literal["create", "update", "transaction", "batch"]
+    | EnvRef = "create",  # "create" (POST) | "update" (PUT in a transaction) | "transaction" | "batch"
     conditional: Literal["if-none-exist", "conditional-update", "if-match"]
+    | EnvRef
     | None = None,  # None | "if-none-exist" | "conditional-update" | "if-match"
     conditional_query: str
     | None = None,  # search params for if-none-exist / conditional-update (e.g. "identifier=sys|val")
-    update_url_form: Literal[
-        "transaction", "path"
-    ] = "transaction",  # how an update/if-match is sent; "path" puts the id in the URL (a listed loosening)
+    update_url_form: Literal["transaction", "path"]
+    | EnvRef = "transaction",  # how an update/if-match is sent; "path" puts the id in the URL (a listed loosening)
     allowed_entry_methods: list[str]
     | None = None,  # transaction/batch only, and no default there: the entry verbs a Bundle may carry (#2804)
     allowed_entry_types: list[str]
@@ -3918,15 +3944,14 @@ def FHIR(
 
     ``tls_ca_file`` (BACKLOG #1180) pins this hop to one private CA. What it does, and what it does
     not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
-    if update_url_form == "path" and not (
-        conditional == "if-match" or (conditional is None and interaction == "update")
-    ):
-        # Refused here as well as in FhirDestination, so the loaded graph cannot hold a path-form
-        # connection that would never build, and path_form_fhir_updates names only real ones (#2550).
-        raise ValueError(
-            "FHIR update_url_form='path' applies only to interaction='update' or "
-            "conditional='if-match'"
-        )
+
+    def at_load(value: object) -> object:
+        # An env() is known only at build, where FhirDestination checks it: even a default may be
+        # overridden by a set key, so reading it here could refuse what the build accepts (vault
+        # BACKLOG #2571).
+        return _UNRESOLVED if isinstance(value, EnvRef) else value
+
+    form, kind, cond = at_load(update_url_form), at_load(interaction), at_load(conditional)
     _reject_envref_headers("FHIR", headers)
     _check_tls_ca_file("FHIR", tls_ca_file)
     _check_tls_ca_pin("FHIR", tls_ca_pin, tls_ca_file)
@@ -3940,7 +3965,11 @@ def FHIR(
     # vault BACKLOG #2804: checked here as well as in FhirDestination, so the loaded graph cannot
     # hold a transaction/batch connection with no entry allow-list. Lazy, as the smart-scope
     # advisory's import of the same module is.
-    from messagefoundry.transports.fhir import DEFERRED_ENTRY_LIST, entry_screen_settings
+    from messagefoundry.transports.fhir import (
+        _BUNDLE_INTERACTIONS,
+        DEFERRED_ENTRY_LIST,
+        entry_screen_settings,
+    )
 
     def load_time(value: object) -> object:
         # An env() standing for the whole list: its default is what an unset key resolves to, so
@@ -3950,9 +3979,47 @@ def FHIR(
             return DEFERRED_ENTRY_LIST if value.default is _UNSET else value.default
         return value
 
-    entry_screen_settings(
-        interaction, load_time(allowed_entry_methods), load_time(allowed_entry_types)
-    )
+    methods, types = load_time(allowed_entry_methods), load_time(allowed_entry_types)
+    lists_set = methods is not None or types is not None
+    has_cond = cond is not _UNRESOLVED and bool(cond)
+    # Refused here as well as in FhirDestination, so the loaded graph cannot hold a connection whose
+    # literal settings would never build (#2550, #2804). An env() is the build's, unless the literal
+    # settings beside it refuse every value it could take. Each check names a cause the build also
+    # refuses, though where several apply the build may name another one first.
+    if has_cond and kind is not _UNRESOLVED and str(kind) in _BUNDLE_INTERACTIONS:
+        raise ValueError(
+            f"FHIR conditional={cond!r} is incompatible with interaction={kind!r}; set per-entry "
+            "Bundle.entry.request fields instead"
+        )
+    if kind is _UNRESOLVED and lists_set and (has_cond or form == "path"):
+        # The entry lists apply only to a Bundle interaction, which takes neither a conditional nor
+        # the path form, so no value of the env() interaction builds.
+        raise ValueError(
+            "FHIR allowed_entry_methods and allowed_entry_types apply only to "
+            "interaction='transaction' or 'batch', which take neither a conditional nor "
+            "update_url_form='path'"
+        )
+    # Lists beside a known interaction are entry_screen_settings' below, which names that cause.
+    if form == "path" and _path_form_ruled_out(kind, cond, False):
+        raise ValueError(
+            "FHIR update_url_form='path' applies only to interaction='update' or "
+            "conditional='if-match'"
+        )
+    if kind is not _UNRESOLVED:
+        entry_screen_settings(str(kind), methods, types)
+    elif lists_set:
+        if allowed_entry_methods is None:
+            # A Bundle requires the methods and any other interaction refuses the types, so no value
+            # of the env() interaction builds with the types alone.
+            raise ValueError(
+                "FHIR allowed_entry_types applies only to interaction='transaction' or 'batch', "
+                "which also require allowed_entry_methods"
+            )
+        # The interaction is known only at build, which checks whether the lists apply to it. Their
+        # items are checked now, as on a Bundle interaction.
+        entry_screen_settings(
+            "transaction", DEFERRED_ENTRY_LIST if methods is None else methods, types
+        )
     return ConnectionSpec(
         ConnectorType.FHIR,
         {
@@ -6884,12 +6951,15 @@ def hostname_unchecked_hops(registry: Registry) -> list[tuple[str, str]]:
     return sorted(out)
 
 
-def query_credential_hops(registry: Registry) -> list[tuple[str, str]]:
+def query_credential_hops(
+    registry: Registry, *, env_values: Mapping[str, Any] | None = None
+) -> list[tuple[str, str]]:
     """Every outbound and ``FhirLookup`` whose ``url`` carries a credential-like query parameter, as
     ``(name, parameter names)`` (ASVS 14.2.1). Lookup names are prefixed ``fhir_lookup:``.
 
     The single reader, on the contract of :func:`expiry_relaxed_hops`, so ``messagefoundry check``,
-    ``security_loosenings()`` and ``GET /security/posture`` cannot disagree. Sorted by name. The
+    ``security_loosenings()`` and ``GET /security/posture`` cannot disagree on a literal ``url``;
+    on an ``env()`` one they read the values each has, as below. Sorted by name. The
     second element is the parameter NAMES only, comma-joined, from
     :func:`~messagefoundry.secretscrub.credential_query_params`; a value never leaves this function.
 
@@ -6899,38 +6969,94 @@ def query_credential_hops(registry: Registry) -> list[tuple[str, str]]:
     it nowhere else, so it is reported rather than refused, except where
     ``transports.egress.warn_url_query_credentials`` says a build refuses it.
 
-    It reads a literal ``url`` only. An ``env()`` URL is unresolved here and cannot be read; the
-    construction WARNING, ``transports.egress.warn_url_query_credentials``, reads the resolved one.
-    Pure."""
+    An ``env()`` URL is resolved with :func:`resolve_env_settings`, the build's own resolution and
+    the one ``transports.egress.warn_url_query_credentials_before_build`` applies, against
+    ``env_values`` (the live posture route passes the runner's). A key the values do not hold, or
+    no values at all, falls back to its literal ``default=`` (vault BACKLOG #3766 item 15); one with
+    neither is not read. A ``deployed=False`` outbound with an ``env()`` URL is skipped, as the
+    DATABASE and ECH readers skip one: its values are never resolved and it is never built (ADR
+    0111 AC-1). It touches nothing but the graph and the values, except that resolving runs an
+    ``env()`` URL's operator ``cast``, as the build does."""
     out: list[tuple[str, str]] = []
     for name, settings in (
-        *((oc.name, oc.spec.settings) for oc in registry.outbound.values()),
+        *(
+            (oc.name, oc.spec.settings)
+            for oc in registry.outbound.values()
+            if oc.deployed or not isinstance(oc.spec.settings.get("url"), EnvRef)
+        ),
         *((fhir_lookup_record_name(s.name), s.settings) for s in registry.fhir_lookups.values()),
     ):
-        url = settings.get("url")
+        url = _db_setting(settings, "url", None, env_values or {})
         if isinstance(url, str) and (names := credential_query_params(url)):
             out.append((name, ", ".join(names)))
     return sorted(out)
 
 
-def path_form_fhir_updates(registry: Registry) -> list[str]:
-    """Every outbound ``FHIR()`` connection that sets ``update_url_form="path"`` (vault BACKLOG #2550).
+#: The note :func:`path_form_fhir_updates` gives a connection whose ``update_url_form``,
+#: ``interaction``, ``conditional`` or a Bundle entry list is an ``env()`` reference it could not
+#: resolve.
+#: ``GET /security/posture`` keeps only names, so it marks such a name with this text rather than
+#: state the connection takes the path form.
+UNRESOLVED_UPDATE_URL_FORM = "possibly: an env() value this reading could not resolve"
+
+
+def path_form_fhir_updates(
+    registry: Registry, *, env_values: Mapping[str, Any] | None = None
+) -> list[tuple[str, str]]:
+    """Every outbound ``FHIR()`` connection that sets ``update_url_form="path"``, or may, as
+    ``(name, note)`` (vault BACKLOG #2550, #2571).
 
     The single reader of that set, on the contract of :func:`expiry_relaxed_hops`: ``messagefoundry
     check`` reads it, and so does ``GET /security/posture`` for the ``update_url_form`` entry of
     ``security_loosenings()`` (vault BACKLOG #2571). Any later surface must read it too, so they
-    cannot disagree. Sorted by name.
+    apply one rule. Sorted by name.
 
     The path form puts each message's resource id in the request URL, which owner ruling R3 (ASVS
     14.2.1) keeps out of it by default. It is an interoperability relaxation for a server with no
     ``transaction`` interaction, reported rather than refused, as ``tls_allow_expired`` is.
 
-    Pure: it reads the loaded graph and touches nothing else."""
-    return sorted(
-        oc.name
-        for oc in registry.outbound.values()
-        if oc.spec.type == ConnectorType.FHIR and oc.spec.settings.get("update_url_form") == "path"
-    )
+    The note is empty for a connection that takes the path form. An ``env()`` value of
+    ``update_url_form``, ``interaction``, ``conditional`` or a Bundle entry list is resolved against
+    ``env_values`` when the caller has them, as the build resolves it. The live posture route passes the runner's, and
+    ``check`` passes none, so the two can name different sets. A connection with a value this cannot
+    resolve is listed with :data:`UNRESOLVED_UPDATE_URL_FORM` rather than left off, so a value
+    nobody can read in the config counts as a possible loosening, never as none. At least these are
+    left off: a connection whose resolved values rule the path form out (another form, writes
+    that are not updates, or Bundle entry lists that are set, which the build refuses with the path
+    form), and a ``deployed=False`` connection whose ``update_url_form`` is an ``env()``, as
+    :func:`ech_cleartext_sidecar_hops` skips one: its values are never resolved and it is never
+    built (ADR 0111 AC-1). A not-deployed connection with a literal path form is read with no
+    values, so an ``env()`` beside it marks it possibly.
+
+    It reads the loaded graph and ``env_values`` and writes nothing, but resolving an ``env()``
+    runs that reference's ``cast``, as the build does."""
+    out: list[tuple[str, str]] = []
+    for oc in registry.outbound.values():
+        if oc.spec.type != ConnectorType.FHIR:
+            continue
+        settings = oc.spec.settings
+        if not oc.deployed and isinstance(settings.get("update_url_form"), EnvRef):
+            continue
+        # A not-deployed connection's values are never resolved (ADR 0111 AC-1), so none are read
+        # for it: a literal path form beside an env() interaction or conditional is named possibly.
+        values = env_values if oc.deployed else None
+        form = _db_setting(settings, "update_url_form", "transaction", values)
+        # FhirDestination's own read: an unset or empty value is the transaction form.
+        if form is not _UNRESOLVED and str(form or "transaction") != "path":
+            continue
+        kind = _db_setting(settings, "interaction", "create", values)
+        cond = _db_setting(settings, "conditional", None, values)
+        # A list this cannot resolve rules nothing out; one that resolves to None is unset.
+        lists = [
+            _db_setting(settings, key, None, values)
+            for key in ("allowed_entry_methods", "allowed_entry_types")
+        ]
+        lists_set = any(value is not None and value is not _UNRESOLVED for value in lists)
+        if _path_form_ruled_out(kind, cond, lists_set):
+            continue  # the build refuses the path form here, so no update is ever sent in it
+        unresolved = any(value is _UNRESOLVED for value in (form, kind, cond, *lists))
+        out.append((oc.name, UNRESOLVED_UPDATE_URL_FORM if unresolved else ""))
+    return sorted(out)
 
 
 def path_form_fhir_updates_without_if_match(registry: Registry) -> list[tuple[str, str]]:
@@ -6946,28 +7072,32 @@ def path_form_fhir_updates_without_if_match(registry: Registry) -> list[tuple[st
     dead-letter. ``docs/CONNECTIONS.md``, "Vendor compatibility and the path-form opt-in", records one
     vendor that documents the requirement, and is where the sourcing for it stops.
 
-    A connection is named when all three hold: it takes the path form, its ``conditional`` is not
-    ``if-match``, and its static ``headers`` carry no ``If-Match`` key in any letter case.
+    A connection is named when all three hold: it takes the path form, or may, its ``conditional`` is
+    not ``if-match``, and its static ``headers`` carry no ``If-Match`` key in any letter case.
 
     **The note says what this reader cannot see.** A Handler can stamp ``If-Match`` per message when
-    ``dynamic_headers`` is on, and no load-time reader can know whether it does. A ``headers`` table
-    written as one ``env()`` reference is unresolved here. Both cases are still named, with the reason
-    in the note, so the set is "declares none", never "sends none".
+    ``dynamic_headers`` is on, and no load-time reader can know whether it does. An
+    ``update_url_form``, a ``conditional`` or a ``headers`` table written as one ``env()`` reference
+    is unresolved here. Each case is still named, with the reason in the note, so the set is
+    "declares none", never "sends none".
 
     There is no vendor setting to read, so this cannot tell which server a connection points at. It is
     an inventory for review, not a verdict.
 
     Pure: it reads the loaded graph and touches nothing else."""
     out: list[tuple[str, str]] = []
-    for name in path_form_fhir_updates(registry):
+    for name, possible in path_form_fhir_updates(registry):
         settings = registry.outbound[name].spec.settings
-        if settings.get("conditional") == "if-match":
+        conditional = settings.get("conditional")
+        if conditional == "if-match":
             continue
+        unread = f"{possible}; " if possible else ""
+        if isinstance(conditional, EnvRef):
+            unread += "its conditional is an env() reference, which check does not resolve; "
         headers = settings.get("headers")
-        unread = ""
         # The whole table as one reference, the only shape `_reject_envref_headers` lets through.
         if isinstance(headers, EnvRef):
-            unread = "its headers are an env() reference, which check does not resolve; "
+            unread += "its headers are an env() reference, which check does not resolve; "
         elif isinstance(headers, Mapping) and any(
             str(key).lower() == "if-match" for key in headers
         ):
@@ -7152,6 +7282,56 @@ def _dark_env_dialect(conn: InboundConnection | OutboundConnection) -> bool:
     unresolved, so neither reader lists a connection that is not built because of a value it never
     reads. A not-deployed connection with a literal dialect resolves nothing and is read as before."""
     return not conn.deployed and isinstance(conn.spec.settings.get("dialect"), EnvRef)
+
+
+def odbc_hops(registry: Registry) -> list[tuple[str, str, str | None, str | None]]:
+    """Entries of the graph that open an ODBC connection, as ``(kind, record name, dialect,
+    driver)``, for ``messagefoundry verify``'s ``host.odbc`` and ``host.ciphers`` rows (BACKLOG
+    #3803 R3).
+
+    Kept beside the factories that write the settings it reads, so the verifier does not re-derive
+    them. The entries are each deployed ``DATABASE`` connection, on either dialect, each
+    database-backed reference set and each database lookup; the last two are always on the
+    ``sqlserver`` preset. ``dialect`` is that preset or ``generic``, in lower case, and ``driver``
+    the ``odbc_driver`` setting as written, the factories' ``ODBC Driver 18 for SQL Server`` when
+    unset; either is ``None`` when it is an ``env()`` reference, read with no values. Which driver
+    a name is, and so which TLS the hop takes, is the caller's to judge. A connection that is not
+    deployed is left out, since the engine never builds it (ADR 0111). A connection is named by its
+    record name, as the other readers here name it, so an inbound and an outbound of one name stay
+    apart. The connections come first, then the reference sets, then the lookups, each by name."""
+
+    # Imported lazily: messagefoundry.transports imports this module at its top level.
+    from messagefoundry.transports.db_endpoint import SQLSERVER_DEFAULT_DRIVER
+
+    def driver(settings: Mapping[str, Any]) -> str | None:
+        value = _db_setting(settings, "odbc_driver", SQLSERVER_DEFAULT_DRIVER, None)
+        return None if value is _UNRESOLVED else str(value)
+
+    connections = [
+        (
+            "DATABASE connection",
+            record_name(conn.name),
+            _db_dialect(conn.spec.settings, None),
+            driver(conn.spec.settings),
+        )
+        for record_name, table in (
+            (_outbound_record_name, registry.outbound),
+            (inbound_record_name, registry.inbound),
+        )
+        for conn in table.values()
+        if conn.spec.type is ConnectorType.DATABASE and conn.deployed
+    ]
+    connections.sort(key=lambda hop: hop[1])
+    references = [
+        ("DatabaseRef reference set", name, "sqlserver", driver(ref.source.settings))
+        for name, ref in sorted(registry.references.items())
+        if ref.source.kind == "database"
+    ]
+    lookups = [
+        ("DatabaseLookup", name, "sqlserver", driver(spec.settings))
+        for name, spec in sorted(registry.lookups.items())
+    ]
+    return [*connections, *references, *lookups]
 
 
 def unverified_generic_db_hops(
@@ -7517,8 +7697,13 @@ def overbroad_smart_scopes(registry: Registry) -> list[tuple[str, str]]:
         if conn_type is None:  # a FhirLookup: structurally GET-only, so read and search
             allowed, shape = frozenset("rs"), "GET-only lookup"
         elif conn_type is ConnectorType.FHIR:
-            allowed = scope_letters_for_shape(
-                str(settings.get("interaction") or ""), settings.get("conditional")
+            conditional = settings.get("conditional")
+            # An env() conditional is unresolved here, and hashing one with a list or dict default
+            # raises TypeError, so it is read as a shape that determines no letters (quiet).
+            allowed = (
+                None
+                if isinstance(conditional, EnvRef)
+                else scope_letters_for_shape(str(settings.get("interaction") or ""), conditional)
             )
             shape = f"interaction={settings.get('interaction')!r}"
             if settings.get("conditional"):
@@ -7631,7 +7816,8 @@ def oauth_request_advisories(registry: Registry) -> OAuthRequestAdvisories:
       graded.
 
     **It reads literal values only, and that limit is large.** An ``env()`` reference is unresolved in
-    the loaded graph, exactly as :func:`query_credential_hops` records for ``url``. Measured
+    the loaded graph; :func:`query_credential_hops` resolves its ``url``, and this reader does not.
+    Measured
     2026-10-04 over the tracked tree: all five worked examples of the two composers spell the endpoint
     ``url`` and the token URL as ``env()``, and none sets an audience. So on a configuration written
     the documented way, both audience rules have nothing to compare. No construction-time reader of

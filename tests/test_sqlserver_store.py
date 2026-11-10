@@ -13,6 +13,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 from uuid import uuid4
@@ -839,6 +840,22 @@ async def test_concurrent_admin_removals_leave_one(store) -> None:
     await assert_concurrent_removals_leave_one(store)
 
 
+async def test_role_write_if_held_contract(store) -> None:
+    """Vault BACKLOG #3085 on SQL Server: the reconciler's compare-and-set role write writes only
+    while the record holds the set the caller read."""
+    from tests._role_write_if_held_contract import assert_role_write_if_held_contract
+
+    await assert_role_write_if_held_contract(store)
+
+
+async def test_concurrent_role_writes_from_one_read_write_once(store) -> None:
+    """Vault BACKLOG #3085 on SQL Server: two writes from one read on two pooled connections, at
+    once. The ``UPDLOCK, ROWLOCK`` read serializes them; one writes."""
+    from tests._role_write_if_held_contract import assert_concurrent_role_writes_write_once
+
+    await assert_concurrent_role_writes_write_once(store)
+
+
 async def test_first_admin_grant_contract(store) -> None:
     """BACKLOG #3078 on SQL Server: the first-administrator grant refuses while another enabled
     administrator exists, and over credentials the caller did not write."""
@@ -855,6 +872,15 @@ async def test_first_admin_grant_counts_only_a_local_administrator_that_signs_in
     )
 
     await assert_grant_counts_only_a_local_administrator_that_signs_in(store)
+
+
+async def test_first_admin_grant_refuses_a_row_holding_a_passkey(store) -> None:
+    """BACKLOG #3078 F2 on SQL Server: the grant's refusal rolls its role write back."""
+    from tests._first_admin_grant_store_contract import (
+        assert_grant_refuses_a_row_holding_a_passkey,
+    )
+
+    await assert_grant_refuses_a_row_holding_a_passkey(store)
 
 
 async def test_concurrent_first_admin_grants_leave_one(store) -> None:
@@ -874,6 +900,14 @@ async def test_roles_permissions_contract(store) -> None:
     from tests.test_custom_roles import _assert_roles_contract
 
     await _assert_roles_contract(store)
+
+
+async def test_enrolment_code_store_contract(store) -> None:
+    """ADR 0207 on the real SQL Server backend: the enrolment code's conditional issue, revoke,
+    spend and TOTP fold, the disable's clear, and AC-10's race of two spends on one code."""
+    from tests._enrolment_code_store_contract import assert_enrolment_code_store_contract
+
+    await assert_enrolment_code_store_contract(store)
 
 
 async def test_webauthn_store_contract(store) -> None:
@@ -1161,6 +1195,14 @@ async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
         _assert_bind_and_user_delete_take_one_lock_order,
     )
 
+    await _assert_bind_and_user_delete_take_one_lock_order(store, **_lock_wait_probes(store))
+
+
+def _lock_wait_probes(store: Any) -> dict[str, Any]:
+    """The lock-order tests' probes on this backend: ``holder_of`` names a cursor's server
+    session, and ``is_blocking`` reads ``sys.dm_exec_requests`` for a request whose
+    ``blocking_session_id`` is that session."""
+
     async def _session_id(cur: Any) -> object:
         await cur.execute("SELECT @@SPID")
         rows = await cur.fetchall()
@@ -1172,9 +1214,131 @@ async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
         )
         return bool(row and row["n"])
 
-    await _assert_bind_and_user_delete_take_one_lock_order(
-        store, holder_of=_session_id, is_blocking=_is_blocking
+    return {"holder_of": _session_id, "is_blocking": _is_blocking}
+
+
+async def test_rotation_racing_a_sweep_is_swept(store) -> None:
+    """BACKLOG #4974 (#2738 step 2) on the real SQL Server backend: a session rotated while a bind,
+    an unbind, a revoke of the user's sessions or the every-account revoke runs is swept under its
+    new hash, and a rotation started while a bind holds the account row waits for it and re-keys
+    nothing.
+
+    ``rotate_session`` takes the account's ``users`` row before its session row, so the rotation
+    and the sweep take one lock order. The shared body is the one the Postgres suite runs, plus
+    the second order, which only this store's rotation has. Probes as the lock-order test above."""
+    from tests._federated_unbind_store_contract import (
+        _assert_rotation_racing_a_sweep_is_swept,
+        _assert_rotation_waits_for_a_bind,
     )
+
+    await _assert_rotation_racing_a_sweep_is_swept(store, **_lock_wait_probes(store))
+    await _assert_rotation_waits_for_a_bind(store, **_lock_wait_probes(store))
+
+
+async def test_the_user_keys_are_trusted_and_an_upgrade_removes_their_orphans(store) -> None:
+    """BACKLOG #2733 on the real SQL Server backend: the three ``users(id)`` keys are trusted, and a
+    store an earlier batch left with untrusted keys over orphaned rows is repaired by the next full
+    run. The plant is what that batch could leave: each key dropped and re-added ``WITH NOCHECK``,
+    and one row per table naming an account that does not exist, beside one that does."""
+    from messagefoundry.auth.service import _is_integrity_refusal
+
+    keys = {
+        "webauthn_credentials": "fk_webauthn_credentials_user",
+        "sessions": "fk_sessions_user",
+        "user_roles": "fk_user_roles_user",
+    }
+
+    async def _untrusted() -> dict[str, bool]:
+        rows = await store._fetchall(
+            "SELECT name, is_not_trusted FROM sys.foreign_keys WHERE name IN (?, ?, ?)",
+            tuple(keys.values()),
+        )
+        return {str(r["name"]): bool(r["is_not_trusted"]) for r in rows}
+
+    async def _rows(table: str) -> set[str]:
+        rows = await store._fetchall(f"SELECT user_id FROM {table}")  # table is a constant
+        return {str(r["user_id"]) for r in rows}
+
+    assert await _untrusted() == dict.fromkeys(keys.values(), False)
+    await store.upsert_role(role_id="viewer", display_name="Viewer", description=None, builtin=True)
+    await store.create_user(
+        user_id="kept",
+        username="kept",
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
+        audits=(),
+    )
+    async with store._pool.acquire() as conn:
+        cur = await conn.cursor()
+        for table, name in keys.items():
+            await cur.execute(f"ALTER TABLE {table} DROP CONSTRAINT {name}")
+        for user_id in ("kept", "ghost"):
+            await cur.execute(
+                "INSERT INTO user_roles (user_id, role_id, assigned_at) VALUES (?, 'viewer', 1.0)",
+                (user_id,),
+            )
+            await cur.execute(
+                "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at)"
+                " VALUES (?, ?, 1.0, 9e9, 1.0)",
+                (f"{user_id:x<64}", user_id),
+            )
+            await cur.execute(
+                "INSERT INTO webauthn_credentials (credential_id_hash, credential_id, user_id, rp_id,"
+                " public_key, sign_count, device_type, label, created_at)"
+                " VALUES (?, 'c', ?, 't', 'k', 0, 'single_device', 'l', 1.0)",
+                (f"h-{user_id}", user_id),
+            )
+        for table, name in keys.items():
+            await cur.execute(
+                f"ALTER TABLE {table} WITH NOCHECK ADD CONSTRAINT {name}"
+                " FOREIGN KEY (user_id) REFERENCES users(id)"
+            )
+        await cur.execute("DELETE FROM schema_meta")
+        await conn.commit()
+        await cur.close()
+    # Positive controls: the plant took, so the run below has something to repair.
+    assert await _untrusted() == dict.fromkeys(keys.values(), True)
+    # Awaited one by one: an await inside a generator expression makes an async generator,
+    # which all() cannot iterate.
+    for table in keys:
+        assert await _rows(table) == {"kept", "ghost"}, table
+
+    assert await store._ensure_schema() is True  # pre-marker DB: the full batch really ran
+    assert await _untrusted() == dict.fromkeys(keys.values(), False)
+    for table in keys:
+        assert await _rows(table) == {"kept"}, table
+    # Trusted keys refuse every later orphan, here a session and a role grant.
+    async with store._pool.acquire() as conn:
+        cur = await conn.cursor()
+        for sql in (
+            "INSERT INTO user_roles (user_id, role_id, assigned_at) VALUES ('ghost', 'viewer', 1.0)",
+            "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at)"
+            f" VALUES ('{'g' * 64}', 'ghost', 1.0, 9e9, 1.0)",
+        ):
+            with pytest.raises(Exception, match="FOREIGN KEY") as refused:  # noqa: PT011
+                await cur.execute(sql)
+            assert _is_integrity_refusal(refused.value), refused.value
+            await conn.rollback()
+        await cur.close()
+    # A second full run finds the keys trusted and leaves the kept rows alone.
+    async with store._pool.acquire() as conn:
+        cur = await conn.cursor()
+        await cur.execute("DELETE FROM schema_meta")
+        await conn.commit()
+        await cur.close()
+    assert await store._ensure_schema() is True
+    for table in keys:
+        assert await _rows(table) == {"kept"}, table
+
+
+async def test_a_session_for_a_missing_account_is_refused(store) -> None:
+    """BACKLOG #2733: SQL Server's sign-in wrote an orphaned session for an account that does not
+    exist, where SQLite and Postgres refused it on their key. The shared body is the one they run."""
+    from tests._webauthn_store_contract import assert_a_session_for_a_missing_account_is_refused
+
+    await assert_a_session_for_a_missing_account_is_refused(store)
 
 
 async def test_directory_binding_column_is_unconstrained_and_username_is_not(store) -> None:
@@ -5380,6 +5544,17 @@ async def test_summary_access_census_survives_and_coalesces_ss(store) -> None:
 # --- ALERT-19: alert_instance CRUD lifecycle + reason cipher-at-rest, on real SQL Server ------------
 
 
+async def test_alert_generation_bounds_the_resolve_ss(store) -> None:
+    """BACKLOG #3269, #4916: the generation-bounded resolves, the shared contract."""
+    from tests._alert_generation_contract import (
+        check_alert_generation_contract,
+        check_fenced_resolve_contract,
+    )
+
+    await check_alert_generation_contract(store)
+    await check_fenced_resolve_contract(store)
+
+
 async def test_alert_instance_lifecycle_ss(store) -> None:
     from messagefoundry.store.store import AlertSummary
 
@@ -7222,3 +7397,243 @@ async def test_webauthn_rehash_contract(store) -> None:
     from tests._webauthn_store_contract import _assert_webauthn_rehash_contract
 
     await _assert_webauthn_rehash_contract(store)
+
+
+async def test_microsoft_odbc_driver_reads_the_braced_password_escape() -> None:
+    """BACKLOG #2705 limb 1: Microsoft's ODBC Driver 18 reads the ``}}`` escape in a braced
+    password, so a password holding ``};``, ``}=``, a trailing ``}}``, ``{``, ``;`` and ``=`` logs
+    in as written and adds no keyword.
+
+    Measures ODBC Driver 18 for SQL Server on Linux (``msodbcsql18`` under unixODBC), on the hosted
+    ``sql server (store + connector)`` leg. The comment above ``_DRIVER_FAMILIES`` in
+    ``messagefoundry/transports/database.py`` holds what stays unmeasured, Windows
+    ``msodbcsql18.dll`` among it.
+
+    Every string braces the password with :func:`~messagefoundry.odbc_dsn.odbc_brace`. The generic
+    builder's (:func:`_build_odbc_dsn`, whose password goes through :func:`_odbc_password` for the
+    ``msodbc`` family) names the host alone, so it reaches the default port; it has
+    ``TrustServerCertificate=yes`` appended, which its ``odbc_params`` allowlist does not take and
+    the container's self-signed certificate needs. The SQL Server preset's (:func:`_build_dsn`)
+    sets that keyword here, and the store's (:func:`connection_string`) takes it from the leg's
+    settings; where the two strings match byte for byte one login covers both. They go through
+    aioodbc and pyodbc.
+
+    A driver that ended a braced value at its first ``}`` or its first ``};``, or did not turn
+    ``}}`` into ``}``, would send another password or a malformed string, and would not log in.
+    The control shows a refusal is what a wrong password gets here: the same escaped shape with
+    only its head changed is refused with SQLSTATE 28000. No assertion expression or message holds
+    the password, since pytest prints the parts of a failed assert, and only a refusal's SQLSTATE
+    is kept, never the driver's message."""
+    import secrets
+
+    import aioodbc
+    import pyodbc
+
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.odbc_dsn import odbc_brace
+    from messagefoundry.odbc_env import disable_driver_manager_pooling
+    from messagefoundry.store.sqlserver import connection_string
+    from messagefoundry.transports.database import _build_dsn, _build_odbc_dsn
+    from tests._live_scratch import scratch_name, sqlserver_admin
+
+    # BACKLOG #2049. Effective only if no earlier test has touched ODBC in this process; teardown's
+    # KILL ends any probe session pooling keeps alive either way.
+    disable_driver_manager_pooling()
+    base = load_settings(environ=os.environ).store
+    on_default_port = base.port == 1433
+    assert on_default_port, (
+        "this test sends the generic string, which names the host alone, to the default port"
+    )
+    login = scratch_name("mefor_brace")
+    tail = secrets.token_hex(8)
+
+    def shaped(head: str) -> str:
+        """A password of the measured shape. No quote character, so the CREATE LOGIN literal below
+        needs no escaping, as the other live tests here and tests/_live_scratch.py write it."""
+        return f"T}};{head}}}=s=t{{{tail}}}}}"
+
+    password = shaped(secrets.token_hex(8))
+    escaped = odbc_brace(password)
+    has_escape = "}};" in escaped and "}}=" in escaped and escaped.endswith("}}}}}")
+    assert has_escape, "the premise: the escaped password holds }}; and }}= and closes on }}}}}"
+
+    async def login_outcome(dsn: str) -> tuple[str | None, str]:
+        """``(login, "")`` with the login the server names, or ``(None, SQLSTATE)`` when the connect
+        is refused."""
+        try:
+            conn = await aioodbc.connect(dsn=dsn, autocommit=True, timeout=5)
+        except pyodbc.Error as exc:
+            return None, str(exc.args[0]) if exc.args else type(exc).__name__
+        try:
+            cur = await conn.cursor()
+            try:  # the cursor closes before its connection (tests/_live_scratch.py says why)
+                await cur.execute("SELECT SUSER_SNAME()")
+                row = await cur.fetchone()
+            finally:
+                await cur.close()
+        finally:
+            await conn.close()
+        return (None if row is None else str(row[0])), ""
+
+    generic = (
+        _build_odbc_dsn(
+            {
+                "odbc_driver": "ODBC Driver 18 for SQL Server",
+                "server": base.server or "localhost",
+                "database": "master",
+                "username": login,
+                "password": password,
+                "odbc_params": {"Encrypt": "yes"},
+            }
+        )
+        + "TrustServerCertificate=yes;"
+    )
+    preset = _build_dsn(
+        {
+            "server": base.server or "localhost",
+            "port": base.port,
+            "database": "master",
+            "username": login,
+            "password": password,
+            "trust_server_certificate": True,
+        }
+    )
+    store = connection_string(
+        base.model_copy(update={"database": "master", "username": login, "password": password})
+    )
+    strings = {"generic": generic, "preset": preset, "store": store}
+    for label, dsn in strings.items():
+        sent_escaped = _odbc_value(dsn, "PWD") == escaped
+        assert sent_escaped, f"the {label} string did not send the password braced with the escape"
+    distinct = {dsn: label for label, dsn in reversed(strings.items())}  # first label wins
+    async with sqlserver_admin(base.model_copy(update={"database": "master"})) as admin:
+        try:
+            await admin.run(f"CREATE LOGIN [{login}] WITH PASSWORD='{password}', CHECK_POLICY=OFF")
+            for dsn, label in distinct.items():
+                who, state = await login_outcome(dsn)
+                assert who == login, f"the {label} string did not log in (SQLSTATE {state!r})"
+            wrong = odbc_brace(shaped(secrets.token_hex(8)))
+            who, state = await login_outcome(_odbc_with(generic, "PWD", wrong))
+            assert who is None and state == "28000", (
+                f"another password of the same shape was not refused as a login (SQLSTATE {state!r})"
+            )
+        finally:
+            await admin.teardown(logins=[login])
+
+
+async def _empty_every_census_table(store) -> None:
+    """Every table the census lists, emptied but for ``schema_meta``, and the epoch back at its
+    seed, so the census reads a store nothing has used. The fixture leaves at least store_salt,
+    nodes and leader_lease as earlier tests wrote them. Deleted in passes, because a foreign key
+    refuses a parent before its children are gone."""
+    import pyodbc
+
+    pending = [n for n in await store.table_occupancy() if n != "schema_meta"]
+    pending.remove("global_session_epoch")
+    async with store._pool.acquire() as conn:
+        cur = await conn.cursor()
+        for _ in range(len(pending) + 1):
+            refused: list[str] = []
+            for name in pending:
+                try:
+                    await cur.execute("DELETE FROM [" + name.replace("]", "]]") + "]")
+                    await conn.commit()
+                except pyodbc.IntegrityError:
+                    await conn.rollback()
+                    refused.append(name)
+            pending = refused
+            if not pending:
+                break
+        assert not pending, pending
+        await cur.execute("DELETE FROM global_session_epoch WHERE id <> 1")
+        await cur.execute("UPDATE global_session_epoch SET epoch = 0 WHERE id = 1")
+        await conn.commit()
+
+
+async def test_table_occupancy_reads_the_store_schema_and_counts_a_connection_event(
+    store,
+) -> None:
+    # PR 2804 hold (A): the mint's server probe reads every table in the store's schema from the
+    # catalog, so a connection event alone holds data. The negative arm reads a store nothing has
+    # used as absent first, so the positive one is not true of every store.
+    from messagefoundry.store import sqlserver
+    from messagefoundry.store.custody_host import store_holds_data
+
+    await _empty_every_census_table(store)
+    before = await store.table_occupancy()
+    # The control on the census itself, from this build's DDL rather than from the census: every
+    # table the schema batch creates is listed, so emptying "every census table" emptied them all.
+    created = re.compile(r"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)", re.I)
+    assert {t for statement in sqlserver._SCHEMA for t in created.findall(statement)} <= set(before)
+    assert before["connection_event"] is False
+    assert not await store_holds_data(store)
+    await store.record_connection_event(
+        connection="IB_TEST_ADT", transport="mllp", direction="inbound", kind="established"
+    )
+    after = await store.table_occupancy()
+    assert after["connection_event"] is True
+    assert await store_holds_data(store)
+
+
+async def test_a_keyed_fresh_store_holds_data_until_its_chain_is_gone(store) -> None:
+    # PR 2804 hold (A): a keyed open, the shape a mint makes, starts the chain and so holds data. A
+    # mint that failed after the keyed open's own commits but before its genesis record leaves only
+    # the salt, counter and markers, which do not count, so the mint can be run again.
+    #
+    # Each open passes the audit MAC key open_store derives from a local cipher, whose audit MAC
+    # function is None. Without the key the handle has no active audit key, so _load_audit_chain
+    # writes no genesis row; the negative arm pins that.
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import audit_key_id
+    from messagefoundry.store.custody_host import KEYED_OPEN_TABLES, store_holds_data
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from messagefoundry.store.store import AUDIT_KEY_EPOCH_ACTION, parse_audit_genesis
+
+    settings = load_settings(environ=os.environ).store
+
+    async def open_keyed(*, with_audit_key: bool = True) -> str | None:
+        """Open and close a keyed handle. The key id its genesis row should name, or None when no
+        audit key was passed and so no genesis row is written."""
+        cipher = make_cipher(generate_key(), write_v2=True)
+        mac_key = cipher.audit_mac_key()
+        assert mac_key is not None and cipher.audit_mac_fn() is None
+        opened = await SqlServerStore.open(
+            settings, cipher=cipher, audit_mac_key=mac_key if with_audit_key else None
+        )
+        await opened.close()
+        return audit_key_id(mac_key) if with_audit_key else None
+
+    async def assert_chain_started_under(key_id: str | None) -> None:
+        assert key_id is not None
+        genesis = await store._audit_genesis_row()
+        assert genesis is not None
+        assert genesis["action"] == AUDIT_KEY_EPOCH_ACTION
+        assert parse_audit_genesis(genesis["detail"]) == key_id
+
+    async def empty_audit_log() -> None:
+        async with store._pool.acquire() as conn:
+            cur = await conn.cursor()
+            await cur.execute("DELETE FROM audit_log")
+            await conn.commit()
+
+    await _empty_every_census_table(store)
+    try:
+        # The mint's create on a fresh store: markers sealed and the chain started in one open.
+        await assert_chain_started_under(await open_keyed())
+        occupancy = await store.table_occupancy()
+        assert all(occupancy[table] for table in KEYED_OPEN_TABLES)
+        assert await store_holds_data(store)
+        # A mint that failed before its genesis record: the keyed tables alone.
+        await empty_audit_log()
+        assert not await store_holds_data(store)
+        # Negative control: a keyed open with no audit key starts no chain over them.
+        await open_keyed(with_audit_key=False)
+        assert not (await store.table_occupancy())["audit_log"]
+        assert not await store_holds_data(store)
+        # The re-run's own create: a new key opens over the salt, counter and markers the failed
+        # one left, and starts its chain.
+        await assert_chain_started_under(await open_keyed())
+        assert await store_holds_data(store)
+    finally:
+        # Leave no chain under a key nobody holds for a later module on this database.
+        await empty_audit_log()

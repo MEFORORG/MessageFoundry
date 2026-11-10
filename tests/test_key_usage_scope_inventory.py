@@ -79,6 +79,10 @@ _KEY_MATERIAL = frozenset(
         # Vault BACKLOG #2596: an HMAC key HKDF-derived from the audit-chain key, binding a held
         # reload to the environment value file outside the config directory.
         "Reload hold value-file binding",
+        # Vault BACKLOG #2609, ADR 0207: a single-use CSPRNG code that authorizes binding a
+        # directory account's first engine factor. Scoped here rather than beside the recovery codes
+        # because the row states a usage scope, and the scope is what keeps the code to that one step.
+        "Directory-account enrolment code",
     }
 )
 

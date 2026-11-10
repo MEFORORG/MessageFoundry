@@ -517,6 +517,17 @@ def test_auto_resolve_inverses_are_described_accurately() -> None:
         "_record_state no longer resolves an inverse through resolve_alert_instances_for; row 8's "
         "description is stale"
     )
+    fence_resolve = named_func(tree, "resolve")
+    assert "resolve_alert_instances_fenced" in {
+        n.func.attr
+        for n in _ast.walk(fence_resolve)
+        if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Attribute)
+    }, "the resolve fence no longer writes through resolve_alert_instances_fenced (BACKLOG #4916)"
+    assert "resolve_alert_instances_fenced" in row
+    # BACKLOG #3269: the staleness sweep resolves an open or acknowledged intake_paused row, so the
+    # retention sentence must name it rather than promise no condition ever leaves unasked.
+    assert "is never aged out from under an operator" not in row
+    assert "staleness sweep (BACKLOG #3269)" in row
     for inverse in sorted(_AUTO_RESOLVE):
         assert f"`{inverse}`" in section, (
             f"the auto-resolve inverse {inverse!r} is named nowhere in §7"

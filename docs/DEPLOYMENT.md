@@ -151,30 +151,36 @@ client request first, so its parser decides for the whole chain. The engine's ow
 only the hop it can see, and it cannot see what your proxy accepted from the client.
 
 The engine API parses requests with llhttp, through `httptools`, which `serve` pins (BACKLOG
-#1125). That parser refuses at least the shapes below with a `400`, and the engine closes the
-connection. For most shapes llhttp refuses the request head before any engine code runs, so the
-`400` is the only response.
+#1125). Sent in one write, each shape below gets a `400` and a closed connection. For most of
+them llhttp refuses the request head before any engine code runs, so the `400` is the only
+response. llhttp passes an empty `Transfer-Encoding` that comes before any `Content-Length`, and
+the engine refuses it itself.
 
 The two chunk shapes in the last row fail in the body instead. The engine starts handling a request
-once its head is read, and it answers any chunked body with `411` from the head alone. When the bad
-body arrives in the same read as the head, the engine writes only the `400`, and nothing after it.
-When the head arrives first and the bad body later, the engine can send its `411` and then the
-`400`: two responses to one request. Rule 1 below keeps a proxy clear of this, because a proxy that
-sends one `Content-Length` never forwards a chunked body.
+once its head is read, and its body limit answers a chunked request with no `Content-Length`
+with `411` from the head alone, then closes the connection. When the bad body arrives in the same read as
+the head, the engine writes only the `400`, and nothing after it. When the head arrives first
+and the bad body later, the body limit sends its `411` and closes, so the bad body is never parsed
+and no `400` follows. A client still sending its body when the engine closes after a body-limit
+refusal gets a connection reset, not the refusal.
 
 llhttp refuses more than this table lists, so treat it
 as the shapes that were measured, not as the whole set. `tests/test_api_request_framing_wire.py` sends each one on a real
-socket, and its `_REFUSED` table holds the exact bytes.
+socket, and its `_REFUSED` and `_APP_REFUSED` tables hold the exact bytes.
 
 | A request that carries | What your proxy must do |
 |---|---|
 | Both `Content-Length` and `Transfer-Encoding` | Refuse it. Do not forward it with either header removed. |
-| `Transfer-Encoding` twice, or as a list whose last coding is not `chunked`, or `identity`, or a list ending in an empty element | Refuse it. |
+| `Transfer-Encoding: chunked` on two lines, or `Transfer-Encoding` as a list whose last coding is not `chunked`, or `identity`, or a list ending in an empty element | Refuse it. |
 | `Content-Length` twice, even with equal values, or as a list such as `2, 2`, or holding anything but digits, such as `+2` or `0_2` | Refuse it. |
 | Whitespace between a field name and its colon, such as `Content-Length : 2` | Refuse it. |
 | A header line folded onto the next line (obs-fold) | Refuse it. Do not unfold it and forward the result. |
 | Head lines ended by a bare LF, or a bare CR inside a header line | Refuse it. |
 | A chunk size that is not hex digits, or chunk lines ended by a bare LF | Refuse it. |
+
+Refuse a request carrying `Transfer-Encoding` on more than one line too. llhttp frames
+`Transfer-Encoding: gzip` followed by `Transfer-Encoding: chunked` as chunked, so a proxy that reads
+only the first line would disagree with it about where the request ends.
 
 "Refuse" means answer the client with an error yourself, `400` or `501`, and close that client
 connection. A proxy that rewrites an ambiguous request into a clean one is the danger: the engine
@@ -183,12 +189,13 @@ then reads a request the client did not send.
 Your proxy must also meet at least these four rules.
 
 1. **Send each request body to the engine with one `Content-Length`.** Buffer the body first. The
-   engine answers a chunked request body with `411`. nginx buffers by default
+   engine refuses any request carrying `Transfer-Encoding`. nginx buffers by default
    (`proxy_request_buffering on`).
 2. **Do not reuse a connection to the engine after an error.** After an engine `400`, or a response
-   the proxy could not read to its framed end, drop that connection. The engine closes it too. One
-   request per connection to the engine is the simplest safe setting. nginx works that way unless
-   you configure keep-alive to the upstream.
+   the proxy could not read to its framed end, drop that connection. The engine closes it after
+   its parser's `400` and after every body-limit refusal. One request per connection to the
+   engine is the simplest safe setting. nginx works that way unless you configure keep-alive to
+   the upstream.
 3. **Re-check requests that arrive over HTTP/2 or HTTP/3.** If the proxy speaks HTTP/1.1 to the
    engine, it must refuse such a request when it carries `Transfer-Encoding`, or a `content-length`
    that does not match the body it received. It must also refuse a CR, LF or NUL in any field name
@@ -202,8 +209,8 @@ Your proxy must also meet at least these four rules.
 **Check your proxy, because nothing in the engine can.** Replay each shape in `_REFUSED` through the
 proxy with a second request appended, in one write, as that test does. The client must get exactly one response,
 an error, and the appended request must never be answered. Two responses mean the proxy and the
-engine framed the bytes differently. For the two chunk shapes, a `411` then a `400` instead means
-the proxy forwarded a chunked body, which breaks rule 1. Passing this check covers only the shapes in that table. A copy of a reference terminator config (see
+engine framed the bytes differently. For the two chunk shapes, a `411` instead means the proxy
+forwarded a chunked body, which breaks rule 1. Passing this check covers only the shapes in that table. A copy of a reference terminator config (see
 [REMOTE-CONSOLE.md](REMOTE-CONSOLE.md#option-b--tls-terminated-upstream-reverse-proxy--load-balancer))
 needs the same check.
 
@@ -411,7 +418,7 @@ the management API, and it does not inherit the API's auth: harden it deliberate
   `tls_ca_file` and `intake_client_subjects`, keyed by the CA that issues each partner's
   certificate), DoS caps (`max_connections`, `receive_timeout`,
   `max_body_bytes`, `max_header_bytes`, and the per-address handshake budget
-  `max_handshakes_per_host`, which applies only with `tls = true` on the stdlib loop; see
+  `max_handshakes_per_host`, which applies only with `tls = true`; see
   [Per-address listener caps behind the VIP](#per-address-listener-caps-behind-the-vip)), the off-loopback exposed-gate (`check_http_tls_exposure`), and
   the peer-control gate (`check_http_intake_auth`).
 - **Not built:** an HTTP Basic credential check. Use one of the three `intake_auth` modes, or front the
@@ -491,11 +498,8 @@ socket leaves the count when its handshake ends, so the cap does not bound how m
 address holds once their handshakes are done. It does bound how many can start at once: `Http()`
 answers every request with `Connection: close`, so each request opens a new connection and runs
 its own handshake, and one address could have at most 32 requests in their handshakes together.
-It applies only on a `tls = true` listener where the engine upgrades the socket itself, which is
-the stdlib event loop. uvloop does not run on Windows, so the Windows service always takes this
-path. On uvloop the loop runs the handshake before the engine sees the socket, so no engine cap
-counts a socket in its handshake, this one included. The loop's 10 s handshake bound is the only
-bound there.
+It applies only on a `tls = true` listener, on every event loop: the engine admits each socket
+before its handshake, on uvloop as on the stdlib loop (BACKLOG #2479).
 
 Without it, one address that opens sockets and never finishes a handshake could hold every
 `max_connections` slot (256) for up to the 10 s handshake bound each. Any peer that reaches the
@@ -537,13 +541,11 @@ are the ones *Without a balancer* above describes. If `at_capacity` events with 
 `max_handshakes_per_host` name the balancer's address under ordinary load, raise
 `max_handshakes_per_host`, or set it to `None` or `0` to turn it off.
 
-**`source_ip_allowlist` is a further mitigation, not a replacement.** On the stdlib loop it refuses
-an unlisted peer before any TLS byte; on uvloop it runs after the loop's handshake. A listed peer
-with no client certificate passes it. On the stdlib loop each socket it holds in a handshake takes
-a slot, so this budget, `max_connections` and `max_connections_per_host` where it is set all bound
-how many it holds, each for up to the 10 s handshake bound. On uvloop such a socket takes no slot,
-so no engine cap counts it, this budget included, and only the loop's 10 s handshake bound limits
-each one. Behind a balancer that collapses addresses, the allowlist sees the balancer's address, so
+**`source_ip_allowlist` is a further mitigation, not a replacement.** It refuses an unlisted peer
+before any TLS byte, on every event loop. A listed peer with no client certificate passes it. Each
+socket it holds in a handshake takes a slot, so this budget, `max_connections` and
+`max_connections_per_host` where it is set all bound how many it holds, each for up to the 10 s
+handshake bound. Behind a balancer that collapses addresses, the allowlist sees the balancer's address, so
 it cannot tell clients apart either.
 
 Two other shapes were weighed and not built:
@@ -863,11 +865,15 @@ loud warning):
 - Cleartext SMTP submission on a **Direct** (S/MIME) destination. *(Clamped, read directly
   rather than through the authority. CORRECTED 2026-10-13: this read *Not clamped*.)*
 - The non-connection cells that have nowhere to carry a per-hop declaration: the `[logging]` syslog/SIEM
-  forwarder and the API PHI-read serve hop, plus the webhook alert sink.
-  *(All clamped — the webhook sink since #329. A webhook URL can carry a path secret, and the
-  credential rule does not reach it yet. LDAPS was on this list until vault BACKLOG #3230 made
+  forwarder and the API PHI-read serve hop.
+  *(Both clamped. LDAPS was on this list until vault BACKLOG #3230 made
   `ad_tls_verify = false` a refusal with no escape. The AI-broker endpoint was on it until vault
-  BACKLOG #3533 did the same for its `http` endpoint, since every call sends `[ai].api_key`.)*
+  BACKLOG #3533 did the same for its `http` endpoint, since every call sends `[ai].api_key`. The
+  webhook alert sink was on it until vault BACKLOG #3533 item 5 did the same for an `http`
+  `[alerts].webhook_url`, which can carry the hop's credential as a path token. The escape has no
+  effect on the webhook: an `http` URL refuses the start in every posture when `serve` builds the
+  alert notifier, and no setting turns off the `https` webhook's certificate chain or hostname
+  check.)*
 
 **Two limits worth stating plainly.** *(a)* Since [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
 this variable has been **unhooked from the cleartext-hop authority** — that decision no longer reads it,
@@ -882,7 +888,7 @@ the opposite claim, "secure by other means", and ALLOWs the hop. It is reported 
 **clamped** (ADR 0092 decision 2 / ADR 0148): it cannot relax a hop while `[security].enforcement =
 enforce`. That holds for the weakened-TLS / cleartext-escape cells that route through
 `weakened_tls_escape_permitted` — at least the store-TLS, MLLP and anonymous FTPS cells and, since #329,
-the SFTP host key of a key-only login and the webhook sink. That clamp once also required the
+the SFTP host key of a key-only login. That clamp once also required the
 instance to be PHI; by design every instance is now treated as carrying patient data (BACKLOG
 #1279), so that conjunct is gone. Either way, on the shipped posture those cells are inert;
 no bullet above is marked *not clamped* now. CORRECTED 2026-10-13: the Direct bullet was, and that was wrong.
@@ -925,9 +931,17 @@ does not resolve to a listed `host:port` makes the config **fail at load / reloa
 | `[egress].allowed_syslog` | the off-box log forwarder's collector (`[logging].forward_host`). Checked at start, not at config load; see [CONFIGURATION.md](CONFIGURATION.md#egress) |
 
 **The alert sinks are *not* on this table and are not covered by `[egress]`.** The webhook and SMTP
-*alert* sinks carry no PHI bodies and keep their **own** host allow-lists —
+*alert* sinks carry no message-body field, though some alerts carry free-text detail (the
+[PHI.md logging inventory](PHI.md#logging-inventory-1611--1623) rows for the `[alerts]` webhook
+and SMTP transports, rows 10 and 11), and keep their **own** host allow-lists —
 `[alerts].webhook_allowed_hosts` and `[alerts].smtp_allowed_hosts`. Populate those separately; an
-`[egress].allowed_http` entry does nothing for a webhook alert.
+`[egress].allowed_http` entry does nothing for a webhook alert. *(Note 2026-11-10, BACKLOG #5021:
+this exemption was stated beside "carry no PHI bodies", read as the alert sinks carrying no PHI.
+That reading is false in the shipped code, and the exemption is to be re-checked against the
+off-box alert key allowlist once it is built. That re-check is a Manager decision, not part of
+the owner ruling of 2026-11-09 on the allowlist; [ADR
+0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)'s
+note of 2026-11-10 records both and which part each holds.)*
 
 **What `[egress]` does and does not bound — read this before you book it as the exfiltration control.**
 The check validates **declared connector settings** at config load / reload / start. It bounds the
@@ -1134,7 +1148,7 @@ bind-guard ladder above:
     reason. A relay with no login stays ungated (the table below).
   - **The https webhook.** The POST carries the webhook's path token. Its one lever is
     `[alerts].webhook_tls_revocation_attested = true` with its reason: it dials through one
-    opener built at import, so no CRL reaches it, as on the Vault hops.
+    shared opener, so no CRL reaches it, as on the Vault hops.
   - **A build with no instance posture is judged as enforcing**, as on the Vault hops and the
     AI-broker endpoint, and unlike at least the LDAPS bind, the OIDC legs and the FTPS hops,
     which do not refuse there.
@@ -1160,7 +1174,7 @@ on the shipped posture.
 |---|---|
 | **SQL Server store hop** | `[store].encrypt` defaults **true** and `[store].trust_server_certificate` defaults **false** — and SQL Server is a documented production store. The PostgreSQL store hop *is* gated; its SQL Server twin is not |
 | **`dialect='sqlserver'` DATABASE destination** | `Encrypt=yes` / `TrustServerCertificate=false` defaults |
-| **`[alerts]` SMTP sink** and the **per-user security-event notifier**, **with no `email_username`** | `email_tls_verify` defaults **true** ([#323](BACKLOG.md)) — one verifying context, two call sites. With no login the hop sends no credential, and an alert body carries no PHI, so it takes no revocation guard by the owner ruling of 2026-10-27, recorded in ADR 0173. With a login it is gated (above). Its verify-off / cleartext deviations are gated by `[security].allow_unverified_alert_smtp_tls` at the serve gate instead, for a hop with no login. Beside `email_username` either deviation is refused at settings load, with no escape (vault BACKLOG #3533) |
+| **`[alerts]` SMTP sink** and the **per-user security-event notifier**, **with no `email_username`** | `email_tls_verify` defaults **true** ([#323](BACKLOG.md)) — one verifying context, two call sites. With no login the hop sends no credential, so it takes no revocation guard by the owner ruling of 2026-10-27, recorded in ADR 0173. That decline does not rest on what the body holds, and an alert body is not PHI-free in the shipped code: the [PHI.md logging inventory](PHI.md#logging-inventory-1611--1623) rows 11 and 12 say what crosses, and [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)'s note of 2026-11-10 records the owner ruling that the decline stands. With a login it is gated (above). Its verify-off / cleartext deviations are gated by `[security].allow_unverified_alert_smtp_tls` at the serve gate instead, for a hop with no login. Beside `email_username` either deviation is refused at settings load, with no escape (vault BACKLOG #3533) |
 
 For every hop in that table, revocation is exactly what the ASVS row above calls *delegated* — **your
 PKI's or your egress proxy's job, written into your runbook**. The engine will not make you say so, and

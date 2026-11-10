@@ -30,6 +30,22 @@ A WARNING marks the start of each pause and an INFO its end. Slice 3 adds the Al
 house pattern of ``queue_buildup``: ``intake_paused`` when a pause starts, and again at most every
 :data:`REALERT_SECONDS` while it holds, so a notifier's re-alert, escalation and suspend logic see a
 condition that persists. ``intake_resumed``, its auto-resolving inverse, fires once when it ends.
+
+**A subject nobody reminds about expires (BACKLOG #3269).** Each process names itself in its
+subjects, so a subject whose process never comes back under that name has nobody left to clear it.
+At least these do that: an unpinned cluster node that crashed while paused, a lone engine that
+became several engine shards, an engine shard dropped from a shrinking engine shard count, and a
+renamed or retired ``[cluster].node_id``. Every
+monitor with a sink therefore sweeps the store's open ``intake_paused`` instances for subjects that
+are not its own. One whose occurrence count has not moved for :data:`STALE_SECONDS` of this
+monitor's own clock is resolved, bounded by the count it saw; a failed sweep read stretches that by
+the gap and up to :data:`GAP_GRACE_SECONDS`, as :meth:`IntakeBoundMonitor.sweep_once` says. A live paused process raises a
+reminder every :data:`REALERT_SECONDS`, which moves the count, so its alert stays open while those
+writes land. A paused process cut off from the store cannot remind, so another process's sweep
+expires its alert while it is still paused; its first reminder that lands again opens a new
+instance. No monitor expires its own subjects, so a lone process sweeps only the subjects other
+labels left behind, and a pause of its own whose clear did not land stays open for an operator. No
+clock is compared across processes.
 """
 
 from __future__ import annotations
@@ -54,8 +70,11 @@ from messagefoundry.transports.base import IntakeGate
 __all__ = [
     "DEPTH_REASON",
     "DISK_REASON",
+    "GAP_GRACE_SECONDS",
     "INTAKE_SUBJECT_MAX_LENGTH",
     "PAUSE_EFFECT",
+    "STALE_SECONDS",
+    "SWEEP_SECONDS",
     "IntakeBoundMonitor",
     "depth_resume_at",
     "disk_resume_at",
@@ -93,6 +112,25 @@ PAUSE_EFFECT = (
     "database inbounds skip their tick (docs/CONFIGURATION.md). Nothing already received is dropped "
     "or NAKed."
 )
+
+#: The alert type the sweep expires (the event ``AlertSink.intake_paused`` records).
+_PAUSED_EVENT = "intake_paused"
+
+#: How long an open ``intake_paused`` subject that is not this process's may go with no new raise
+#: before the sweep resolves it (BACKLOG #3269). A live paused process raises one every
+#: :data:`REALERT_SECONDS`, and each raise is tried once, so four intervals leave a live alert open
+#: through two failed reminders in a row, with a full interval left for drift and sweep spacing.
+STALE_SECONDS = 4 * REALERT_SECONDS
+
+#: How often a monitor sweeps for expired subjects. Coarse on purpose: the read is store-wide.
+SWEEP_SECONDS = 60.0
+
+#: What a failed sweep read leaves a watch, at least, once reads succeed again: its counted
+#: staleness is held to :data:`STALE_SECONDS` minus this. A live process whose reminder the outage
+#: ate raises its next within one reminder interval, and a sweep sees it within one sweep spacing;
+#: twice the probe timeout covers a slow read on each side. Without it, staleness counted before the
+#: outage could expire a live alert before that next reminder lands.
+GAP_GRACE_SECONDS = REALERT_SECONDS + SWEEP_SECONDS + 2 * PROBE_TIMEOUT_SECONDS
 
 #: The reminder clock, a module name so a test can move it without moving the event loop's.
 _monotonic = time.monotonic
@@ -201,6 +239,7 @@ class IntakeBoundMonitor:
         # The alert subject per reason, fixed for this monitor's life so a raise and its clear always
         # name the same instance.
         self._subjects = {r: intake_alert_subject(r, node) for r in (DEPTH_REASON, DISK_REASON)}
+        self._own_subjects = frozenset(self._subjects.values())
         self._resolve_on_stop = resolve_on_stop
         # None = no notifier configured. Then nothing is raised: the monitor's own WARNING and INFO
         # lines are the log record, and a LoggingAlertSink would only repeat them.
@@ -233,8 +272,19 @@ class IntakeBoundMonitor:
         # One WARNING per failing streak per probe, not one per interval.
         self._depth_failing = False
         self._disk_failing = False
+        self._check_failing = False
         # Whether check_once has run, so the loop does not repeat Engine.start's first measurement.
         self._measured = False
+        # BACKLOG #3269, the expiry sweep: per instance id, the count it last saw and the monotonic
+        # time it first saw that count.
+        self._watched: dict[int, tuple[int, float]] = {}
+        # The monotonic time of the last sweep whose read succeeded, and whether a read has failed
+        # since: the next good read moves every watch's start forward by the whole gap.
+        self._last_read: float | None = None
+        self._read_gap = False
+        self._sweep_task: asyncio.Task[None] | None = None
+        # The sweep steps ("read", "resolve") in a failing streak: one WARNING per step per streak.
+        self._sweep_failing: set[str] = set()
 
     @property
     def depth_bound_on(self) -> bool:
@@ -245,14 +295,25 @@ class IntakeBoundMonitor:
         return self._floor_path is not None
 
     @property
+    def _sweep_on(self) -> bool:
+        """Whether the expiry sweep runs (BACKLOG #3269): wherever a sink is wired, bounds on or
+        off, since a stale subject can outlive the config that raised it."""
+        return self._alert_sink is not None
+
+    @property
     def enabled(self) -> bool:
-        """True when either bound applies. When False, :meth:`start` spawns no task."""
+        """True when either bound applies. When False, :meth:`start` spawns no measuring task; the
+        expiry sweep runs on its own task whenever a sink is wired."""
         return self.depth_bound_on or self.disk_floor_on
 
     def start(self) -> None:
+        """Spawn the measuring loop when either bound applies, and the expiry sweep, in a task of
+        its own, when a sink is wired. A slow sweep therefore never delays a measurement."""
+        self._stop.clear()
+        if self._sweep_on and self._sweep_task is None:
+            self._sweep_task = asyncio.create_task(self._sweep_loop(), name="intake-alert-sweep")
         if self._task is not None or not self.enabled:
             return
-        self._stop.clear()
         self._task = asyncio.create_task(self._run(), name="intake-bound-monitor")
         log.info(
             "intake bounds on: [inbound].max_staged_depth=%d (resume at %d), "
@@ -271,14 +332,34 @@ class IntakeBoundMonitor:
         No ``intake_resumed`` is raised, because the condition has not cleared, only stopped being
         watched; the next start reports under the same subject. The exception is ``resolve_on_stop``,
         a process whose next start uses a different subject: it clears its open pauses here, since
-        nothing else ever will. A process that dies without stopping still leaves them open, for an
-        operator to resolve in the alert list."""
+        nothing else ever will. A process that dies without stopping still leaves them open, and so
+        does one that stops: another process's sweep resolves them once nobody has raised them for
+        :data:`STALE_SECONDS`, longer after a failed sweep read (:meth:`sweep_once`; BACKLOG
+        #3269). A process stopped for longer than that therefore
+        finds its pause resolved, and a pause that still holds at its next start opens a new
+        instance."""
         self._stop.set()
-        task, self._task = self._task, None
-        if task is not None:
+        tasks = (self._task, self._sweep_task)
+        self._task = self._sweep_task = None
+        me = asyncio.current_task()
+        # A count, not a flag: a caller that already took a cancel before calling stop() must not
+        # make the tasks' own expected cancels read as a new one.
+        baseline = me.cancelling() if me is not None else 0
+        cancelled = False
+        for task in tasks:
+            if task is None:
+                continue
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            try:
                 await task
+            except asyncio.CancelledError:
+                # The task's own cancel is expected; a cancel of the caller is passed on once the
+                # gate below has opened.
+                cancelled = cancelled or (me is not None and me.cancelling() > baseline)
+            except Exception:
+                cancelled = cancelled or (me is not None and me.cancelling() > baseline)
+                # A task that died must not stop the stop: the gate below still opens.
+                log.warning("intake monitor task %s had failed", task.get_name(), exc_info=True)
         held = set(self._gate.reasons)
         for reason in (DEPTH_REASON, DISK_REASON):
             self._gate.release(reason)
@@ -286,6 +367,8 @@ class IntakeBoundMonitor:
             for reason in (DEPTH_REASON, DISK_REASON):
                 if reason in held or self._reported.get(reason):
                     self._report_clear_on_stop(reason)
+        if cancelled:
+            raise asyncio.CancelledError
 
     def _report_clear_on_stop(self, reason: str) -> None:
         sink = self._alert_sink
@@ -317,10 +400,120 @@ class IntakeBoundMonitor:
         skip_first = self._measured
         while not self._stop.is_set():
             if not skip_first:
-                await self.check_once()
+                try:
+                    await self.check_once()
+                except Exception:
+                    # A defect in one check must not end measuring, and with it the gate's
+                    # release, for the life of the process. Once per failing streak, as the
+                    # class's other failure paths log, with the traceback.
+                    if not self._check_failing:
+                        self._check_failing = True
+                        log.exception("intake bound check raised; it runs again each interval")
+                else:
+                    self._check_failing = False
             skip_first = False
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), self._check_seconds)
+
+    async def _sweep_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await self.sweep_once()
+            except Exception:
+                # Broad on purpose: sweep_once guards its store calls, so this is a defect, and it
+                # must not end expiry for the life of the process. Logged every time it happens.
+                log.exception("intake pause alert sweep raised; it runs again next interval")
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._stop.wait(), SWEEP_SECONDS)
+
+    async def sweep_once(self) -> int:
+        """Resolve each open ``intake_paused`` subject of another process that has taken no raise
+        for :data:`STALE_SECONDS` (BACKLOG #3269). Returns how many it resolved.
+
+        Staleness is judged on this monitor's own monotonic clock, from the first sweep that saw
+        the instance at its current count, so no other process's clock enters it. The resolve is
+        bounded by that count (``resolve_alert_generation``): a reminder that lands between the read
+        and the write moves the count past it, and the row stays open. A subject this process owns
+        is skipped, since its own measurement raises and clears it. A failed read counts none of
+        the time from the last good read to the next one, and keeps every watch: what a watch had
+        counted stays counted, held to at most :data:`STALE_SECONDS` minus
+        :data:`GAP_GRACE_SECONDS` at that next good read, so a live process whose reminder the
+        outage ate has the grace to land its next one. Graces do not stack: a second failure
+        inside one holds the watch to the same bound again. So a dead subject still expires once
+        a run of good reads spans the grace, and stays open while reads fail more often than
+        that. A failed
+        resolve keeps that instance watched and the pass goes on to the rest. Each step's failure
+        is logged once per failing streak.
+
+        The resolve goes straight to the store, not through a sink: the subject is another
+        process's, so this process's sink holds no state for it."""
+        try:
+            generations = await asyncio.wait_for(
+                self._store.open_alert_generations(event_type=_PAUSED_EVENT), PROBE_TIMEOUT_SECONDS
+            )
+        except Exception:
+            # Broad on purpose, as in _check_depth: an advisory read must not kill the sweep task.
+            self._read_gap = True
+            self._sweep_failed("read")
+            return 0
+        self._sweep_failing.discard("read")
+        now = _monotonic()
+        # The time since the last good read, when a read failed in between: none of it counts.
+        gap = now - self._last_read if self._read_gap and self._last_read is not None else None
+        self._last_read, self._read_gap = now, False
+        watched: dict[int, tuple[int, float]] = {}
+        expired = 0
+        failed = False
+        for gen in generations:
+            if gen.connection in self._own_subjects:
+                continue
+            prev = self._watched.get(gen.id)
+            if prev is None or prev[0] != gen.count:
+                since = now
+            elif gap is None:
+                since = prev[1]
+            else:
+                # Held, not stacked: a second failure inside an earlier grace cannot push the
+                # watch's start past where one grace would put it.
+                since = max(prev[1] + gap, now + GAP_GRACE_SECONDS - STALE_SECONDS)
+            if now - since < STALE_SECONDS:
+                watched[gen.id] = (gen.count, since)
+                continue
+            try:
+                # No wait_for: cancelling a write on SQLite's one writer connection would leave a
+                # transaction to unwind. The store's own busy and command timeouts bound it.
+                resolved = await self._store.resolve_alert_generation(
+                    alert_id=gen.id, through_count=gen.count
+                )
+            except Exception:
+                # Broad, as above. Kept watched, so the next sweep tries this instance again.
+                watched[gen.id] = (gen.count, since)
+                failed = True
+                self._sweep_failed("resolve")
+                continue
+            if resolved:
+                expired += resolved
+                # The subject names the operator's own node or engine shard, never message content.
+                log.info(
+                    "intake pause alert %s expired: no process has raised it for at least %ds",
+                    gen.connection,
+                    int(now - since),
+                )
+        self._watched = watched
+        if not failed:
+            self._sweep_failing.discard("resolve")
+        return expired
+
+    def _sweep_failed(self, step: str) -> None:
+        """One WARNING per failing streak. Called from inside the ``except`` so the cause is logged."""
+        if step not in self._sweep_failing:
+            self._sweep_failing.add(step)
+            log.warning(
+                "intake pause alert sweep: the %s failed; stale subjects stay open until a sweep "
+                "succeeds",
+                step,
+                exc_info=True,
+            )
 
     async def check_once(self) -> None:
         """One measurement of each enabled bound. A probe that fails, or hangs past

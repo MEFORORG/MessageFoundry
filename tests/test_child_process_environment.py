@@ -1120,7 +1120,7 @@ _MUST_CHOOSE = frozenset(
         # the start-up names, with PATH and PSModulePath pinned; openssl takes the start-up names
         # plus the OPENSSL_* names OpenSSL reads (OPENSSL_CONF), and no PYTHON* name (#3803).
         # Both openssl runs, the suite list and the OPENSSLDIR read, start in _openssl_lines.
-        ("verify/cipher_policy.py", "_windows_enabled_suites", "subprocess.run"),
+        ("verify/cipher_policy.py", "_powershell", "subprocess.run"),
         ("verify/cipher_policy.py", "_openssl_lines", "subprocess.run"),
         # The dependency auditor's pip and pip-audit, with non_engine_environment: no MEFOR_*
         # secret.
