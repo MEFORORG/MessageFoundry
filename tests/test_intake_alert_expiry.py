@@ -196,9 +196,11 @@ async def test_a_failed_read_changes_nothing_and_warns_once_per_streak(
             monkeypatch.setattr(store, "open_alert_generations", real)
             assert await _is_open(store, stale), "a failed read resolves nothing"
             assert await monitor.sweep_once() == 0, (
-                "a failed read forgot the watch: the outage time does not count toward staleness"
+                "the outage time, and the grace after it, do not count toward staleness"
             )
             clock[0] += STALE_SECONDS
+            assert await monitor.sweep_once() == 0, "the grace after the gap is not counted yet"
+            clock[0] += intake_bound._GAP_GRACE_SECONDS
             assert await monitor.sweep_once() == 1
             monkeypatch.setattr(store, "open_alert_generations", broken)
             assert await monitor.sweep_once() == 0
@@ -494,7 +496,8 @@ async def test_one_failed_read_costs_a_watch_only_that_gap(
 ) -> None:
     """Lander hold on engine PR 2863, item 4: a failed read cleared every watch, so one transient
     failure threw away all the staleness already counted. It now keeps the watch and discounts
-    only the gap from the last good read to the next one."""
+    the gap from the last good read to the next one, plus a grace in which a live process's next
+    reminder lands, so the kept staleness cannot expire a live alert once the store returns."""
     clock = [1000.0]
     monkeypatch.setattr(intake_bound, "_monotonic", lambda: clock[0])
     store = await MessageStore.open(tmp_path / "s.db")
@@ -517,6 +520,8 @@ async def test_one_failed_read_costs_a_watch_only_that_gap(
         clock[0] += 5
         assert await monitor.sweep_once() == 0, "the 10s gap around the failure is not counted"
         assert await _is_open(store, stale)
+        clock[0] += intake_bound._GAP_GRACE_SECONDS
+        assert await monitor.sweep_once() == 0, "nor is the grace that follows the gap"
         clock[0] += 10
         assert await monitor.sweep_once() == 1, (
             "the S-10 counted before the failure still counts: the watch was not cleared"

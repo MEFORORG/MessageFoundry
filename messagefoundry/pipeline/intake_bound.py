@@ -123,6 +123,12 @@ STALE_SECONDS = 4 * REALERT_SECONDS
 #: How often a monitor sweeps for expired subjects. Coarse on purpose: the read is store-wide.
 SWEEP_SECONDS = 60.0
 
+#: What the first good sweep read after a failed one leaves uncounted, on top of the gap itself:
+#: a live process's reminder the outage ate is followed by its next within one reminder interval,
+#: and a sweep sees it within one sweep spacing. Without it, staleness counted before the outage
+#: could expire a live alert after the store returns, before that next reminder lands.
+_GAP_GRACE_SECONDS = REALERT_SECONDS + SWEEP_SECONDS
+
 #: The reminder clock, a module name so a test can move it without moving the event loop's.
 _monotonic = time.monotonic
 
@@ -426,9 +432,11 @@ class IntakeBoundMonitor:
         and the write moves the count past it, and the row stays open. A subject this process owns
         is skipped, since its own measurement raises and clears it. A failed read keeps every
         watch, and the next good read moves each one's start forward by the whole time since the
-        last good read, so an outage that also stopped a live process's reminders cannot expire its
-        alert when the store returns: staleness counts only time between two good reads in a row,
-        and a single failed read costs a watch that one gap, not what it had already counted. A failed
+        last good read plus :data:`_GAP_GRACE_SECONDS`, one reminder interval and one sweep
+        spacing: a live process whose reminder the outage ate raises its next one inside that
+        grace, which moves the count and resets the watch. So staleness counts only time between
+        two good reads in a row, outside the grace after a gap, and a single failed read costs a
+        watch that gap and the grace, not what it had already counted. A failed
         resolve keeps that instance watched and the pass goes on to the rest. Each step's failure
         is logged once per failing streak.
 
@@ -445,7 +453,11 @@ class IntakeBoundMonitor:
             return 0
         self._sweep_failing.discard("read")
         now = _monotonic()
-        gap = now - self._last_read if self._read_gap and self._last_read is not None else 0.0
+        gap = (
+            now - self._last_read + _GAP_GRACE_SECONDS
+            if self._read_gap and self._last_read is not None
+            else 0.0
+        )
         self._last_read, self._read_gap = now, False
         watched: dict[int, tuple[int, float]] = {}
         expired = 0
