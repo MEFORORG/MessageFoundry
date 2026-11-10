@@ -153,6 +153,37 @@ def test_users_page_lists_an_integrity_failed_account_by_id_alone() -> None:
     assert len({row.count("<td") for row in rows if "<td" in row}) == 1
 
 
+async def test_the_console_update_does_not_render_a_record_that_fails_its_seal(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5520: PATCH's handler answers 423 when the account's record fails its seal. The
+    console's update route raises it as is rather than re-rendering the detail page, which reads the
+    row unchecked and would show what the engine refused to. The seal failure is stood in for at
+    the service's checked reader; the control is the same post with the reader intact."""
+    from _ui_clients import SAME_ORIGIN, cookie_login, mint_bound_proof, provision, ui_client
+
+    from messagefoundry.auth.service import USER_SEAL_REFUSED, UserSealRefused
+
+    service = await _service(engine)
+    await provision(service, "root", [Role.ADMINISTRATOR.value])
+    victim = await provision(service, "victim", [Role.VIEWER.value])
+    form = {"display_name": "Shown-Name", "email": ""}
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "root")
+        await mint_bound_proof(c, f"/ui/users/{victim}")
+        ok = await c.post(f"/ui/users/{victim}/update", data=form, headers=SAME_ORIGIN)
+        assert ok.status_code == 303  # control
+
+        async def refused(user_id: str) -> None:
+            raise UserSealRefused(USER_SEAL_REFUSED)
+
+        monkeypatch.setattr(service, "checked_user", refused)
+        await mint_bound_proof(c, f"/ui/users/{victim}")
+        r = await c.post(f"/ui/users/{victim}/update", data=form, headers=SAME_ORIGIN)
+    assert r.status_code == 423
+    assert "Shown-Name" not in r.text
+
+
 async def test_users_page_shows_scopes_only_to_a_users_manage_holder(engine: Engine) -> None:
     """The route half of the rule above: a users:read-only reader, here a custom role, sees no
     account's channels on /ui/users, while an administrator sees them (BACKLOG #3189)."""

@@ -2029,7 +2029,7 @@ class UsernameTaken(RuntimeError):
 
 
 #: The text :class:`UserSealRefused` carries. Fixed, so it names no field of the record it refuses.
-USER_SEAL_REFUSED: Final = "the user record fails its integrity check, so it is not shown"
+USER_SEAL_REFUSED: Final = "the user record fails its integrity check, so it was refused"
 
 
 class UserSealRefused(RuntimeError):
@@ -12156,7 +12156,9 @@ class AuthService:
         """Resolve a user id directly to its :class:`Identity` (roles + custom-role overlay), or
         ``None`` when no such user exists — WITHOUT a bearer session.
 
-        Used by the effective-permission inspector (BACKLOG #177): an admin resolves the FLATTENED
+        Used by the approval gate. The effective-permission inspector (BACKLOG #177) reads its
+        account through :meth:`checked_user` and builds with :meth:`identity_for_checked_user`
+        instead (BACKLOG #5520). Either way, an admin resolves the FLATTENED
         effective permission set (built-in-role ∪ custom-role ∪ extras) for an arbitrary user via the
         same :meth:`Identity.build` path :meth:`identity_for_token` uses for the caller. Unlike the
         token / username auth paths, a *disabled* user still resolves here — the point is to inspect a

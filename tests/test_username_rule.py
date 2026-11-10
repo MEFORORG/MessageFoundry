@@ -23,7 +23,6 @@ from starlette.requests import Request
 
 from messagefoundry.api import create_app
 from messagefoundry.api.auth_models import UserCreateRequest
-from messagefoundry.api.validation import PRINTABLE_TEXT_PATTERN
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import InvalidUsername
 from messagefoundry.auth.usernames import username_refusal
@@ -56,6 +55,15 @@ REFUSED = [
     "<kerberos>",
     "<reconciler>",
     "<>",
+    "cli:Administrator",
+    "CLI:root",
+    # Format, separator and surrogate characters, and a fullwidth spelling of a reserved name.
+    "sys​tem",
+    "﻿system",
+    "‮system",
+    "a b",
+    "a\ud800b",
+    "ｓｙｓｔｅｍ",
 ]
 
 #: The controls: names beside each refused form that the rule must leave alone.
@@ -71,6 +79,9 @@ ACCEPTED = [
     "bob>",
     "directory",
     "Jos\xe9",
+    "cli",
+    "client",
+    "sysadmin",
 ]
 
 
@@ -82,12 +93,6 @@ def test_the_rule_refuses(name: str) -> None:
 @pytest.mark.parametrize("name", ACCEPTED)
 def test_the_rule_accepts(name: str) -> None:
     assert username_refusal(name) is None
-
-
-def test_the_printable_pattern_is_unchanged_by_the_shared_range() -> None:
-    """The API's printable pattern is now built from the shared control range, and still reads as
-    the literal it was before, so no field that takes it changed what it accepts."""
-    assert PRINTABLE_TEXT_PATTERN == r"^[^\x00-\x1f\x7f-\x9f]+$"
 
 
 @pytest.mark.parametrize("name", REFUSED)

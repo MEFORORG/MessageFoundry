@@ -51,7 +51,6 @@ from pydantic import Field, StringConstraints
 
 # The redundant alias is an explicit re-export, which strict mypy requires for a bare import.
 from messagefoundry.connection_names import CONNECTION_NAME_PATTERN as CONNECTION_NAME_PATTERN
-from messagefoundry.controlchars import C0_C1_CONTROL_RANGE
 
 # --- Engine-minted resource ids ------------------------------------------------------------------
 #
@@ -202,7 +201,7 @@ ALERT_SUSPEND_MINUTES_MAX = 43200
 # path is already a 4xx. A copy here would be a second definition of a rule that has one.
 
 #: Printable text: no C0 control, no DEL, no C1 control. One or more characters.
-PRINTABLE_TEXT_PATTERN = f"^[^{C0_C1_CONTROL_RANGE}]+$"
+PRINTABLE_TEXT_PATTERN = r"^[^\x00-\x1f\x7f-\x9f]+$"
 
 #: A member of one of the engine's own closed vocabularies -- ``MessageStatus``, ``OutboxStatus``,
 #: the connection-event kinds. Every member of all three is letters and underscores only. The

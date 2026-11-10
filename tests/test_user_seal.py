@@ -393,8 +393,12 @@ _ROUTE_READS: dict[str, frozenset[str]] = {
     # this request just wrote, for its reply.
     "create_user": frozenset({"get_user_by_username", "get_user"}),
     "create_directory_user": frozenset({"get_user"}),
-    # The write routes the row left alone: each acts by id, and its reply carries no field of the
-    # row. The store's own write refuses a row that fails its seal.
+    # The write routes the row left alone, each acting by id; the store's own write refuses a row
+    # that fails its seal. Their replies carry no field of the row, but ``set_user_roles`` decides
+    # its AD refusal on the unchecked ``auth_provider`` and names the unchecked ``username`` in its
+    # administrator-granted alert. Left for a later item, not covered by this row.
+    # The scan sees only ``<x>.store.<reader>`` chains in this one file: an alias, a ``getattr`` or
+    # a read in another module is not seen.
     "delete_user": frozenset({"get_user"}),
     "admin_revoke_user_sessions": frozenset({"get_user"}),
     "set_user_roles": frozenset({"get_user", "get_user_role_ids"}),

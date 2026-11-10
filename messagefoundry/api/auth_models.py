@@ -182,7 +182,8 @@ class IntegrityFailedUser(BaseModel):
     such a row is unchecked, so none is sent: not the name, the provider, the disabled flag or the
     roles, which a row altered outside the store could have set to anything. The row stays in the
     list, as a custom role that fails its seal stays in ``GET /roles/custom``, so an administrator
-    can see that it is there and delete it. The single-account reads answer 423 for it instead.
+    can see that it is there and delete it with ``DELETE /users/{id}``. The single-account reads
+    answer 423 for it instead.
 
     A shape of its own rather than optional fields on :class:`UserSummary`, which every other
     account read returns and whose readers rely on its name, provider and roles being set.
