@@ -652,36 +652,65 @@ def _late_validate(monkeypatch: pytest.MonkeyPatch, outcome: str) -> None:
 
 @pytest.mark.parametrize(
     ("outcome", "expect"),
-    # The reason form fails too, even on a reason the timeout text itself contains.
-    [("pass", "ERROR\n"), ("raise", "ERROR\n"), ("pass", "ERROR timed out")],
+    # The reason form fails too, on a reason the timeout text does not contain.
+    [("pass", "ERROR\n"), ("raise", "ERROR\n"), ("pass", "ERROR PV1"), ("raise", "ERROR PV1")],
 )
 def test_expect_error_does_not_pass_on_a_strict_validation_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str, expect: str
 ) -> None:
     # BACKLOG #5107: a timeout is the validator's clock, not the message, so a fixture that expects
-    # ERROR must not pass on one whose validate, late, found nothing wrong or raised.
+    # ERROR must not pass on one whose validate, late, found nothing wrong or raised, unless its
+    # reason names the timeout text (the test below).
     _slow_clock(monkeypatch)
     _late_validate(monkeypatch, outcome)
     cfg = _strict_config(tmp_path)
     msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), expect)
     dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
+    if expect.startswith("ERROR "):
+        assert "reason does not match" in dr.detail, dr.detail
+        assert "PV1" not in dr.detail, dr.detail
+    else:
+        assert "expected ERROR, got a strict-validation timeout" in dr.detail, dr.detail
+
+
+@pytest.mark.parametrize("outcome", ["pass", "raise"])
+def test_expect_error_reason_naming_the_timeout_text_passes_on_a_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    # BACKLOG #5107: the listener records a begun validate that runs past the timeout as a final
+    # AR (docs/HL7-VALIDATION.md), so a fixture may pin that DoS backstop: a valid but slow body,
+    # or one whose late validate raised, passes `ERROR <reason>` when the timeout text has it.
+    _slow_clock(monkeypatch)
+    _late_validate(monkeypatch, outcome)
+    cfg = _strict_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "ERROR strict-validation timed out\n")
+    dr = _run_dryrun(cfg, msgs)
+    assert dr.ok and "expectation-checked" in dr.detail, dr.detail
+    # The control: the same run under a bare ERROR fails, so the reason is what passed it.
+    Path(f"{msgs / 'IB_X' / 'a.hl7'}.expect").write_text("ERROR\n", encoding="utf-8")
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
     assert "expected ERROR, got a strict-validation timeout" in dr.detail, dr.detail
 
 
-def test_expect_error_reason_is_not_matched_against_the_timeout_text_on_an_empty_verdict(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(("reason", "passes"), [("timed out", True), ("PV1", False)])
+def test_expect_error_reason_beside_an_empty_late_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason: str, passes: bool
 ) -> None:
-    # A late refusal whose text is empty is still the verdict, so the reason is matched against
-    # it, not against the timeout text that stands in the run's error.
+    # A late refusal whose text is empty is still a verdict, and the run's error is still the
+    # timeout text: a reason in either passes, a reason in neither fails.
     from messagefoundry.parsing.validate import ValidationResult
     from messagefoundry.pipeline import dryrun
 
     _slow_clock(monkeypatch)
     monkeypatch.setattr(dryrun, "validate", lambda *a, **k: ValidationResult(False, "2.5.1", [""]))
     cfg = _strict_config(tmp_path)
-    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "ERROR timed out")
-    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
-    assert "reason does not match" in dr.detail, dr.detail
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), f"ERROR {reason}")
+    if passes:
+        dr = _run_dryrun(cfg, msgs)
+        assert dr.ok and "expectation-checked" in dr.detail, dr.detail
+    else:
+        dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
+        assert "reason does not match" in dr.detail, dr.detail
 
 
 # The reason form is matched against the validator's verdict, not the timeout text in the error.
@@ -727,7 +756,7 @@ def test_expect_error_reason_passes_when_the_error_contains_it(tmp_path: Path) -
 
 def test_expect_sidecar_with_a_utf8_bom_is_read(tmp_path: Path) -> None:
     cfg = _strict_config(tmp_path)
-    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "﻿ERROR PV1")
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "\ufeffERROR PV1")
     dr = _run_dryrun(cfg, msgs)
     assert dr.ok and "expectation-checked" in dr.detail, dr.detail
 

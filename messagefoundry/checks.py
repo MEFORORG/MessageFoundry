@@ -1772,9 +1772,10 @@ def _check_validate(config_dir: str | Path, *, allow_empty: bool = False) -> Che
 # but delivered nothing), ``NOT_DEPLOYED`` (a handler ran and every Send it produced addressed a
 # present-but-not-deployed destination — #233, BACKLOG #1690), or ``ERROR`` (parse/validate/
 # router-handler failure). ``PROCESSED``/``ROUTED`` are live-only post-delivery states, so they alias
-# to ``RECEIVED`` for authoring ergonomics. A strict-validation timeout satisfies ``ERROR`` only when
-# the validate, though late, returned a content refusal; a late pass or a late raise does not.
-# ``ERROR <reason>`` also requires the run's error to contain the reason (``_expected_disposition``).
+# to ``RECEIVED`` for authoring ergonomics. A strict-validation timeout satisfies a bare ``ERROR`` only
+# when the validate, though late, returned a content refusal; a late pass or a late raise does not.
+# ``ERROR <reason>`` requires the run's error (past the timeout, the timeout text) or the validator's
+# content refusal to contain the reason. docs/ADOPTER-CI.md section 3 states the rule for adopters.
 _DRYRUN_DISPOSITIONS = frozenset({"RECEIVED", "UNROUTED", "FILTERED", "NOT_DEPLOYED", "ERROR"})
 _DISPOSITION_ALIASES = {
     "PROCESSED": "RECEIVED",
@@ -1796,8 +1797,9 @@ def _expected_disposition(fixture_path: str | Path, *, cap: int) -> _Expectation
     """Read an optional ``<fixture>.expect`` sidecar declaring the expected dry-run disposition.
 
     The sidecar holds one disposition name, case-insensitive, or ``ERROR <reason>``: ``ERROR``, one
-    space, then the rest of the line, matched case-sensitively as a substring of the run's error
-    (BACKLOG #5107). Surrounding whitespace is ignored. Returns the normalized name (one of
+    space, then the rest of the line, matched case-sensitively as a substring of the run's error or
+    of the strict validator's content refusal (BACKLOG #5107; ``docs/ADOPTER-CI.md`` section 3 has
+    the whole rule, the timeout case included). Surrounding whitespace is ignored. Returns the normalized name (one of
     :data:`_DRYRUN_DISPOSITIONS`) with the reason, or ``None`` when no sidecar exists — then the
     fixture keeps the default "must not ERROR" semantics. Raises ``ValueError`` for an unreadable,
     over-cap or unrecognized declaration (a fixture-authoring mistake); the error names only the
@@ -1988,29 +1990,32 @@ def _check_dryrun(
                     errors.append(
                         f"{label} @ {ic_name}: expected {expected.disposition}, got {got}"
                     )
-                elif result.strict_timed_out and result.strict_refusal is None:
-                    # A timeout is the validator's wall clock, not the message, so on its own it
-                    # never proves a fixture that expects ERROR (BACKLOG #5107). A content refusal
-                    # the validate returned after the timeout does: the verdict is the message's,
-                    # only its arrival was slow. The detail names the refusal kind only: the
-                    # timeout text carries no message content.
-                    errors.append(
-                        f"{label} @ {ic_name}: expected {expected.disposition}, got a "
-                        "strict-validation timeout, which does not show the content is invalid"
-                    )
                 elif expected.reason is not None:
-                    # Matched against the raw text, never safe_error's: redaction must not decide
-                    # whether the gate fails. A strict refusal is matched as the validator's own
-                    # verdict, not the timeout text that stands in ``error`` for listener parity.
-                    # ``is None``, not ``or``: an empty verdict is still the validator's verdict.
-                    said = result.error if result.strict_refusal is None else result.strict_refusal
-                    if expected.reason not in (said or ""):
+                    # Matched against the raw texts, never safe_error's: redaction must not decide
+                    # whether the gate fails. The run's error is one candidate: past the timeout it
+                    # is the timeout text, so a fixture pinning the DoS backstop (a valid but slow
+                    # body, which the listener answers with a final AR) passes on a reason that
+                    # text contains (BACKLOG #5107). A content refusal the validate returned, on
+                    # time or late, is the other; ``is not None``: an empty verdict still counts.
+                    said = [t for t in (result.error, result.strict_refusal) if t is not None]
+                    if not any(expected.reason in text for text in said):
                         # Neither text is printed: the error and the reason can both quote the
                         # message, and this detail lands in a CI log.
                         errors.append(
                             f"{label} @ {ic_name}: expected ERROR with the .expect reason, got "
                             "an ERROR whose reason does not match it"
                         )
+                elif result.strict_timed_out and result.strict_refusal is None:
+                    # A bare ERROR: a timeout is the validator's wall clock, not the message, so on
+                    # its own it never proves the fixture (BACKLOG #5107); only ERROR <reason>
+                    # naming the timeout text pins the backstop, above. A content refusal the
+                    # validate returned after the timeout does prove it: the verdict is the
+                    # message's, only its arrival was slow. The detail names the refusal kind
+                    # only: the timeout text carries no message content.
+                    errors.append(
+                        f"{label} @ {ic_name}: expected {expected.disposition}, got a "
+                        "strict-validation timeout, which does not show the content is invalid"
+                    )
             elif result.error or result.disposition is MessageStatus.ERROR:
                 shown = safe_error(result.error) or result.disposition.value
                 errors.append(f"{label} @ {ic_name}: {shown}")

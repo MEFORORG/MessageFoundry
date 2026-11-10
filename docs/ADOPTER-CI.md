@@ -294,13 +294,22 @@ dry-run **only** against that feed; a fixture not under such a subdir is cross-p
 `NOT_DEPLOYED` or `ERROR` (`PROCESSED`, `ROUTED`, `DELIVERED` and `DELIVERS` alias `RECEIVED`). The
 fixture then passes only when its dry run lands in that disposition, instead of only when it does
 not error. To pin *why* a fixture errors, write `ERROR <reason>`: `ERROR`, one space, then the
-rest of the line. The run must then be `ERROR` and its error text must contain the reason, matched
-case-sensitively against the first 200 characters of a strict-validation refusal, as the listener
-keeps it. When that refusal came back only after the strict-validation timeout, the run's error is
-the timeout text and the reason is matched against the refusal instead. On a mismatch the gate says the reason did not match and prints neither text,
-since both can quote the message. A plain `ERROR` accepts any error. A strict-validation timeout
-satisfies neither form unless the validator, though late, returned a content refusal: a timeout
-measures the runner, not the message.
+rest of the line. The run must then be `ERROR`, and its error text, or the strict validator's
+content refusal, must contain the reason, matched case-sensitively. A strict-validation refusal is
+the validator's errors joined and cut at 200 characters, the text the MLLP listener's `AR` NAK
+carries. It is not what the listener stores: the stored error is `strict-validation failed: `
+followed by a scrubbed, uncut copy of those errors. So a reason that quotes text from past the
+200-character cut can never match a strict-validation refusal. On a mismatch the gate says the reason did not match and
+prints neither text, since both can quote the message.
+
+A strict-validation timeout needs a reason to pass. Past `validation.strict_timeout_s` the run's
+error is the timeout text, `strict-validation timed out after <N>s`, which the live listener
+records as a final `AR` ([`HL7-VALIDATION.md`](HL7-VALIDATION.md)). A fixture that pins that DoS
+backstop, a valid but slow body, writes a reason that text contains, such as `ERROR
+strict-validation timed out`. A plain `ERROR` accepts any other error, but never a timeout alone,
+because a timeout measures the runner, not the message. It does accept a timed-out run whose
+validator, though late, still returned a content refusal, and the reason form is then matched
+against that refusal as well as the timeout text.
 
 ---
 
