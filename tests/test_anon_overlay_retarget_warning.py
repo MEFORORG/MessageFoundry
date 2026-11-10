@@ -425,7 +425,7 @@ def test_no_pool_value_has_a_shape_the_residue_scan_looks_for(anon: ModuleType) 
         for entry in pool
     ]
     assert len(values) > 50  # the pools were read, not an empty walk
-    assert [value for value in values if anon.leak._structural_reasons(value, seps)] == []
+    assert [value for value in values if anon.leak._structural_reasons(value, seps, "|")] == []
 
 
 @_BOTH

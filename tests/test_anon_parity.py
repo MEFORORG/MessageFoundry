@@ -109,10 +109,13 @@ def test_vendored_hl7data_matches_generator_source() -> None:
 
 
 def test_leak_token_table_matches_publish_guard() -> None:
+    # The tee reads its tables from its own guard instance at each scan (BACKLOG #5541), so this
+    # pins that the guard it loads holds the same tables as the guard loaded here. It held a
+    # site-code binding too, which nothing read: the site code is checked field-anchored through
+    # surrogates.message_has_site_code, and that binding was removed.
     sf = _load_scan_forbidden()
-    assert tee_leak.ESTATE_TOKENS == sf.ESTATE_TOKENS  # type: ignore[attr-defined]
-    assert tee_leak.SITE_CODE_RE.pattern == sf.SITE_CODE_RE.pattern  # type: ignore[attr-defined]
-    assert [(p.pattern, r) for p, r in tee_leak.FORBIDDEN] == [
+    assert tee_leak.estate_tokens() == sf.ESTATE_TOKENS  # type: ignore[attr-defined]
+    assert [(p.pattern, r) for p, r in tee_leak.forbidden_names()] == [
         (p.pattern, r)
         for p, r in sf.FORBIDDEN  # type: ignore[attr-defined]
     ]
@@ -152,7 +155,7 @@ def test_leak_tables_are_sourced_from_the_guard_when_present() -> None:
         pytest.skip(
             "no token source configured (fork CI / fresh clone) — tables legitimately empty"
         )
-    assert tee_leak.FORBIDDEN and tee_leak.ESTATE_TOKENS
+    assert tee_leak.forbidden_names() and tee_leak.estate_tokens()
 
 
 # Synthetic-PHI-shape inputs (never a real value) whose UNMAPPED fields carry SSN/phone/MRN shapes,

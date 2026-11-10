@@ -144,12 +144,15 @@ REDACTED = "[REDACTED]"
 
 @dataclass(frozen=True)
 class Seps:
-    """The component/repetition/subcomponent separators of the message being anonymized, read from
-    its own MSH-1/MSH-2 (never hardcoded). The field separator is the adapter's concern."""
+    """The component/repetition/subcomponent separators and the escape character of the message
+    being anonymized, read from its own MSH-1/MSH-2 (never hardcoded). The field separator is the
+    adapter's concern. The surrogates never read ``escape``; the leak-check decodes an escaped value
+    with it before its detectors look (BACKLOG #5532)."""
 
     component: str = "^"
     repetition: str = "~"
     subcomponent: str = "&"
+    escape: str = "\\"
 
 
 def _fake_digits(rng: random.Random, length: int) -> str:
@@ -485,16 +488,18 @@ def normalized_message(raw: str, mapped_paths: tuple[str, ...] = ()) -> str:
 
 
 def read_message_seps(text: str) -> tuple[Seps, str] | None:
-    """The ``(component/repetition/subcomponent, field)`` separators of an HL7 message, read from its
-    own MSH-1/MSH-2 (never hardcoded). Returns ``None`` when there is no MSH carrying the **full four**
-    encoding characters — a degenerate/absent MSH-2 — so BOTH adapters fail closed identically (the
-    engine's ``Message`` itself raises when MSH-2 has fewer than four chars). Shared (parity)."""
+    """The ``(component/repetition/escape/subcomponent, field)`` separators of an HL7 message, read
+    from its own MSH-1/MSH-2 (never hardcoded). Returns ``None`` when there is no MSH carrying the
+    **full four** encoding characters — a degenerate/absent MSH-2 — so BOTH adapters fail closed
+    identically (the engine's ``Message`` itself raises when MSH-2 has fewer than four chars).
+    Shared (parity)."""
     for seg in text.replace("\r\n", "\r").replace("\n", "\r").split("\r"):
         if seg[:3].upper() == "MSH" and len(seg) >= 5:
             field = seg[3]
             enc = seg[4:].split(field, 1)[0]
             if len(enc) >= 4:
-                return Seps(component=enc[0], repetition=enc[1], subcomponent=enc[3]), field
+                seps = Seps(component=enc[0], repetition=enc[1], escape=enc[2], subcomponent=enc[3])
+                return seps, field
     return None
 
 

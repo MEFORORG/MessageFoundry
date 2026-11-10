@@ -26,7 +26,9 @@ already-pseudonymized field is never re-flagged:
   §5). A name, an undashed number or a date in an unmapped field
   is NOT detected; the coverage report is the only record of it (BACKLOG #1710). The dashed SSN
   and punctuated phone detectors also scan what a retarget of a default field left past its
-  first component (:func:`retarget_residue_hits`, BACKLOG #3493).
+  first component (:func:`retarget_residue_hits`, BACKLOG #3493). Every detector, and the token
+  scan, reads a value decoded from its HL7 escape sequences as well as as written, so a shape or
+  token written ``\\X2D\\`` for a dash is found too (BACKLOG #5532).
 
 The token-floor signal (``token_floor_failure``) is recorded in every report
 (``token_floor_reason``/``token_tables_live``) and folded into the fail-closed decision when
@@ -43,7 +45,7 @@ import importlib.util
 import re
 from bisect import bisect_left, bisect_right
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -545,24 +547,135 @@ def _split_shape_hits(line: str, field_sep: str, addresses: Sequence[str | None]
     return hits
 
 
-def _has_mrn_typed_identifier(value: str, seps: Seps) -> bool:
+#: What an HL7 escape sequence that names a delimiter decodes to, by the letter between the two
+#: escape characters: ``F`` the field separator, ``S`` component, ``T`` subcomponent, ``R``
+#: repetition and ``E`` the escape character itself.
+_DELIMITER_ESCAPES = ("F", "S", "T", "R", "E")
+#: A ``\Xhh...\`` body: an ``X`` and then hex digits in pairs.
+_HEX_ESCAPE: re.Pattern[str] = re.compile(r"X((?:[0-9A-Fa-f]{2})+)")
+#: The first letters of the escape sequences that change how text looks, not what it says:
+#: highlighting on and off (``H``, ``N``) and the character-set and local escapes (``C``, ``M``,
+#: ``Z``). They decode to nothing.
+_FORMAT_ESCAPES = frozenset("HNCMZ")
+
+
+def _decode_escape(body: str, seps: Seps, field_sep: str) -> str | None:
+    """What one escape sequence decodes to, given the text between its two escape characters.
+    ``None`` when ``body`` is no escape sequence HL7 defines, so the caller keeps it as written.
+
+    A hex escape decodes each pair to the character with that code, so an ASCII shape written in
+    hex reads as itself. A formatting command (``.br``, ``.sp`` and the like) decodes to one space,
+    so two runs of digits on either side of a line break never join into one number."""
+    if body in _DELIMITER_ESCAPES:
+        return (field_sep, seps.component, seps.subcomponent, seps.repetition, seps.escape)[
+            _DELIMITER_ESCAPES.index(body)
+        ]
+    if (hexed := _HEX_ESCAPE.fullmatch(body)) is not None:
+        return bytes.fromhex(hexed.group(1)).decode("latin-1")
+    if body.startswith("."):
+        return " "
+    if body and body[0] in _FORMAT_ESCAPES:
+        return ""
+    return None
+
+
+def _unescape(value: str, seps: Seps, field_sep: str) -> str:
+    """``value`` with every HL7 escape sequence decoded, by the message's own escape character and
+    separators (BACKLOG #5532). The tee cannot import the engine's parser, so this is the one
+    decoder both copies share. An escape character with no closing one, or a body HL7 does not
+    define, is kept as written. Never raises."""
+    escape = seps.escape
+    if not escape or escape not in value:
+        return value
+    out: list[str] = []
+    at = 0
+    while (start := value.find(escape, at)) != -1:
+        end = value.find(escape, start + 1)
+        if end == -1:
+            break
+        decoded = _decode_escape(value[start + 1 : end], seps, field_sep)
+        if decoded is None:
+            out.append(value[at : start + 1])
+            at = start + 1
+            continue
+        out.append(value[at:start])
+        out.append(decoded)
+        at = end + 1
+    out.append(value[at:])
+    return "".join(out)
+
+
+def _escaped_leaves(value: str, seps: Seps, field_sep: str) -> Iterator[str]:
+    """Each subcomponent of ``value`` that holds the escape character, decoded. A leaf is decoded
+    on its own, after the split, so an escaped separator inside it never makes a new component.
+    A leaf with no escape character is left out: the raw scan of the whole value already read it."""
+    if not seps.escape or seps.escape not in value:
+        return
+    for rep in value.split(seps.repetition):
+        for comp in rep.split(seps.component):
+            for leaf in comp.split(seps.subcomponent):
+                if seps.escape in leaf:
+                    yield _unescape(leaf, seps, field_sep)
+
+
+def unescaped_message(text: str) -> str:
+    """``text`` with the escape sequences in every field decoded, for the token scan (BACKLOG
+    #5532). The encoding characters of a header line are left as written, since they hold the
+    escape character itself. ``text`` is returned as it is when it has no parseable MSH or no field
+    holds an escape sequence that decodes."""
+    parsed = read_message_seps(text)
+    if parsed is None:
+        return text
+    seps, field_sep = parsed
+    changed = False
+    lines: list[str] = []
+    for line in text.replace("\r\n", "\r").replace("\n", "\r").split("\r"):
+        fields = line.split(field_sep)
+        kept = 2 if fields[0].upper() in HEADER_SEGMENTS else 1
+        decoded = [_unescape(field, seps, field_sep) for field in fields[kept:]]
+        changed = changed or decoded != fields[kept:]
+        lines.append(field_sep.join(fields[:kept] + decoded))
+    return "\r".join(lines) if changed else text
+
+
+def _merged_token_hits(scan: Callable[[str], list[str]], text: str) -> list[str]:
+    """``scan`` run over ``text`` as written, then over :func:`unescaped_message`, so a token
+    written with an HL7 escape sequence is found too (BACKLOG #5532). A reason the second pass
+    finds again is not repeated."""
+    hits = scan(text)
+    decoded = unescaped_message(text)
+    if decoded != text:
+        hits.extend(hit for hit in dict.fromkeys(scan(decoded)) if hit not in hits)
+    return hits
+
+
+def _has_mrn_typed_identifier(value: str, seps: Seps, field_sep: str) -> bool:
     """True if any repetition of ``value`` is a CX with a non-empty id (component 1) and a whole
     ``MR``/``MRN`` id-type component — an unmapped medical-record number by HL7 structure, far more
-    precise than a bare digit-run heuristic."""
+    precise than a bare digit-run heuristic. Each component is compared as written and decoded,
+    so an id type written with an escape sequence, such as ``M\\X52\\``, counts (BACKLOG #5532)."""
     for rep in value.split(seps.repetition):
         comps = rep.split(seps.component)
-        if comps[0] and any(comp.upper() in _MRN_TYPES for comp in comps):
+        if comps[0] and any(
+            comp.upper() in _MRN_TYPES or _unescape(comp, seps, field_sep).upper() in _MRN_TYPES
+            for comp in comps
+        ):
             return True
     return False
 
 
-def _structural_reasons(value: str, seps: Seps) -> list[str]:
-    """PHI-safe shape labels for one unmapped field value — the SHAPE only, never the value."""
+def _structural_reasons(value: str, seps: Seps, field_sep: str) -> list[str]:
+    """PHI-safe shape labels for one unmapped field value — the SHAPE only, never the value.
+
+    Each shape is looked for in the value as written and in each of its leaves decoded
+    (:func:`_escaped_leaves`), so a shape written with HL7 escape sequences, such as
+    ``123\\X2D\\45\\X2D\\6789``, is found too (BACKLOG #5532)."""
     reasons: list[str] = []
+    forms = [value, *_escaped_leaves(value, seps, field_sep)]
     for pattern, reason in _SPLITTABLE_SHAPES:
-        if reason not in reasons and pattern.search(value):
+        if reason not in reasons and any(pattern.search(form) for form in forms):
             reasons.append(reason)
-    if _has_mrn_typed_identifier(value, seps):
+    if _has_mrn_typed_identifier(value, seps, field_sep):
         reasons.append("unmapped MRN-typed identifier")
     return reasons
 
@@ -585,13 +698,15 @@ def structural_phi_hits(
     parsed = read_message_seps(text)
     if parsed is None:
         return []
-    seps, _field_sep = parsed
+    seps, field_sep = parsed
     hits: list[str] = []
     walked, split_hits = _walk(text, mapped_paths, version, split=True)
     for address, value in walked:
         if address == _MALFORMED_LINE:
             hits.append(MALFORMED_LINE_HIT)
-        hits.extend(f"{reason} in {address}" for reason in _structural_reasons(value, seps))
+        hits.extend(
+            f"{reason} in {address}" for reason in _structural_reasons(value, seps, field_sep)
+        )
     return hits + split_hits
 
 
@@ -621,7 +736,7 @@ def retarget_residue_hits(
     parsed = read_message_seps(text)
     if not retargeted or parsed is None:
         return []
-    seps = parsed[0]
+    seps, field_sep = parsed
     rewritten = {r.path for r in rules if r.kind != SurrogateKind.KEEP}
     hits: list[str] = []
     walk = unmapped_field_values(text, rewritten - retargeted, version=version, named_by=rewritten)
@@ -634,7 +749,7 @@ def retarget_residue_hits(
         )
         hits.extend(
             f"{reason.removeprefix('unmapped ')} {RETARGET_RESIDUE} in {address}"
-            for reason in _structural_reasons(rest, seps)
+            for reason in _structural_reasons(rest, seps, field_sep)
         )
     return hits
 
@@ -726,7 +841,10 @@ def leak_report(
     have rewritten MSH-12. Left out, the version is read from ``text`` (BACKLOG #3004).
     """
     scanner = _scanner()
-    token_hits = [str(h) for h in scanner.scan_text(text, include_estate=True)]
+    # Over the text as written and decoded, so an escaped token is found too (BACKLOG #5532).
+    token_hits = _merged_token_hits(
+        lambda body: [str(h) for h in scanner.scan_text(body, include_estate=True)], text
+    )
     # The rules scope this check too: a field the DATE kind filled is not a site code (#2330).
     if message_has_site_code(text, rules or ()):
         token_hits.append("site-code pattern")

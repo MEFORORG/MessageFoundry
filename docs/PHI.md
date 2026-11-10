@@ -2432,6 +2432,20 @@ a bare ten-digit phone number, an account number and a free-text note. A Z-segme
 case, since no default rule names one. A name in a standard field no rule maps, such as `NK1-26`,
 the next of kin's mother's maiden name, passes the same way. The detectors stay narrow on purpose: a broad digit search flags almost every HL7 body.
 
+**An escaped value is read decoded too (BACKLOG #5532).** HL7 lets a sender write any character
+as an escape sequence, so `123\X2D\45\X2D\6789` is a dashed SSN and `M\X52\` is the id type
+`MR`. The shape detectors read each unmapped value as written and then each of its subcomponents
+decoded, and the token scan reads the whole message as written and then decoded. The escape
+character is the one the message's own `MSH-2` declares. `\F\`, `\S\`, `\T\`, `\R\` and `\E\`
+decode to that message's own delimiters. A hex escape `\Xhh\` decodes each pair to the character
+with that code. A formatting command such as `\.br\` decodes to a space, so two runs of digits
+never join. `\H\`, `\N\` and the character-set escapes decode to nothing. A sequence HL7 does
+not define is kept as written. At least these still pass:
+
+- A subcomponent is decoded on its own, so a shape whose parts sit in different components or
+  subcomponents is not joined.
+- The site-code check does not decode, so a site code written with an escape sequence passes it.
+
 **A shape cut across fields by the message's own field separator is refused, but not in every
 form.** Under a field separator of `-`, the line `ZZZ-1-123-45-6789` holds the number as three
 fields, and none of them holds the shape. The check also reads each line as written, so both
@@ -2445,8 +2459,6 @@ these still get through, on both anonymizers:
   typed `ST`, `OBX-1-ST-8480^S^LN--123-45-6789` leaves as `...--[REDACTED]-45-6789`, and
   `OBX-1-ST-123-45-6789` as `OBX-1-ST-123-45-[REDACTED]`. `NTE-3` and `OBX-5` typed `TX` leave
   such a rest too.
-- A shape whose separators the sender escaped, as HL7 asks: `123\F\45\F\6789`. No detector
-  decodes an escape.
 - A shape cut by a digit field separator, such as `4`, when a separator sits right before or after
   it. The detectors read that digit as part of a longer number.
 - A shape in the header line, which the check skips whole.
