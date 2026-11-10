@@ -26,6 +26,12 @@ All notable changes to MessageFoundry are documented here. The format follows
   each text field before it serialises the record, and the handler filters still run over the
   whole line after. Of the residuals 0.5.2 named for the tee, the C0 one is closed; the other two
   remain, and the `emit_audit_tee` docstring names them. (`BACKLOG #3045`)
+- **The `supervise` process's own TLS log forwarder now picks up a replaced CRL without a
+  restart.** An engine process applied a replaced `[logging].forward_tls_crl_file` to its running
+  forwarder, but the supervisor builds no engine, so nothing in it did. On a first deployment a
+  collector certificate revoked after the start would have stayed trusted by the supervisor's
+  forwarder until a restart. `supervise` now runs the same CRL reload while its engine shards run,
+  capped by `[cert_monitor].crl_max_reloads`, and logs a refused reload. (`BACKLOG #3314`)
 
 ## [0.5.2] — 2026-10-20 — Early Access
 

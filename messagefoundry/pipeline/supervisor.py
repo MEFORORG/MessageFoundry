@@ -525,6 +525,7 @@ async def supervise(
     extra_serve_args: Sequence[str] = (),
     install_signal_handlers: bool = True,
     registry_guard: Callable[[Registry], None] | None = None,
+    crl_max_reloads: int | None = None,
 ) -> int:
     """Discover shards from ``config`` and run a :class:`Supervisor` until interrupted.
 
@@ -532,6 +533,14 @@ async def supervise(
     Runs while any engine shard is alive. Returns 0 on a clean shutdown, 1 when every engine shard
     tripped the crash-loop breaker, and 2 on a config/discovery error, which includes a graph
     ``registry_guard`` refuses (:func:`discover_shard_specs`).
+
+    While the engine shards run, a :class:`~messagefoundry.pipeline.crl_reload.CrlReloadRunner`
+    applies a replaced CRL file to this process's own TLS contexts, as an engine process's runner
+    does to its own (BACKLOG #3314). The one that matters is the supervisor's off-box log
+    forwarder: without the runner, a collector certificate revoked after the start stayed trusted
+    by that forwarder until a restart. ``crl_max_reloads`` is ``[cert_monitor].crl_max_reloads``,
+    and ``None`` takes the runner's default. There is no alert store here, so the runner's default
+    sink logs a refused reload.
     """
     from messagefoundry.config.wiring import WiringError
 
@@ -565,6 +574,23 @@ async def supervise(
         ", ".join(f"{s.shard}->:{s.port}" for s in specs),
     )
     supervisor = Supervisor(specs)
+    from messagefoundry.pipeline.crl_reload import MAX_RELOADS, CrlReloadRunner
+
+    crl_reload = CrlReloadRunner(
+        max_reloads=MAX_RELOADS if crl_max_reloads is None else crl_max_reloads,
+        node="supervisor",
+    )
+    crl_reload.start()
+    try:
+        return await _run_supervisor(supervisor, specs, install_signal_handlers)
+    finally:
+        await crl_reload.stop()
+
+
+async def _run_supervisor(
+    supervisor: Supervisor, specs: Sequence[ShardSpec], install_signal_handlers: bool
+) -> int:
+    """Run ``supervisor`` until it returns or a shutdown signal arrives; :func:`supervise`'s code."""
     runner = asyncio.create_task(supervisor.run(), name="supervisor")
 
     if install_signal_handlers:
