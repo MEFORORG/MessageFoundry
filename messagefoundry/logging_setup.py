@@ -524,10 +524,11 @@ def redacted_log_field(
     The placeholders the passes write are kept as they are, not escaped, so a search for
     ``<redacted>`` or ``[redacted]`` finds a value they wrote unless the bound cuts it off; a search
     for redactions also needs :data:`UNREADABLE_LOG_VALUE`, which a limit under 19 cuts, and the
-    ``unloggable-`` spelling. The reading sees only the context it is given, so a caller passes the
-    line text around the field as ``before`` and ``after``: with the empty defaults, at least an XML
-    element's value, a URL password after ``user:`` and a JSON ``name`` value that the shipped
-    filters redact in the raw line log as escaped text instead (review round-de8e127b).
+    ``unloggable-`` spelling. ``before`` and ``after`` hold only constant text the caller writes,
+    such as the line's fixed head; any text that came from a request or from another field goes in
+    ``checks``, as :func:`messagefoundry.auth.service._new_ip_path_field` does. The reading sees
+    only the context it is given, so empty context can leave readable what the shipped filters would
+    redact in the full line.
 
     The reading is the one every later shipped handler leaves, not a fixed number of handler
     passes, so the field hides what the last sink of a logger with any number of handlers would

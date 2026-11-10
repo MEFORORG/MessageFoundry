@@ -46,18 +46,18 @@ allowlist rather than by the predicate; its bullet below gives the encoding. The
     document from ``json.dumps`` without ``indent`` still parses after it (vault BACKLOG #3012):
     that output holds no character of the alphabet outside a string. A document with a CR or LF
     between tokens, an indented one for example, does not, because ``\\n`` is not JSON there.
-  * QUOTE -- one ``key=value`` field of a log line,
-    :func:`messagefoundry.logging_setup.redacted_log_field`, passing the line text around the field
-    as ``before`` and ``after``. ESCAPE keeps a value on one line but leaves its spaces, quotes and
-    ``=`` alone, so a value logged before another field can still write a field of its own. QUOTE
-    writes everything but a safe alphabet as ``_uXXXX_`` and wraps the result in quotes, so the
-    value holds no space, quote, ``:`` or ``=`` with which to end its field or write another, nor
-    any separator a handler filter's match needs to reach past its quotes (BACKLOG #3770). A filter
-    may still rewrite a run of kept characters inside the field, a date for example.
-    :func:`quote_log_text` is a separate JSON-quoted form for text printed to a terminal, such as a
-    check line, which no handler filter reads; a credential scrub can close it early, so it is not
-    for any text a handler filter reads, a last field or a whole message included. QUOTE changes the
-    value's spelling, so it does not replace ESCAPE on a whole line.
+  * QUOTE -- one ``key=value`` field of a log line, through
+    :func:`messagefoundry.logging_setup.redacted_log_field`, whose docstring says what context to
+    pass. ESCAPE keeps a value on one line but leaves its spaces, quotes and ``=`` alone, so a value
+    logged before another field can still write a field of its own. QUOTE writes everything but a
+    safe alphabet as ``_uXXXX_`` and wraps the result in quotes, so the value holds no space, quote,
+    ``:`` or ``=`` with which to end its field or write another, nor any separator a handler
+    filter's match needs to reach past its quotes (BACKLOG #3770). A filter may still rewrite a run
+    of kept characters inside the field, a date for example. :func:`quote_log_text` is a separate
+    JSON-quoted form for text printed to a terminal, such as a check line, which no handler filter
+    reads; a credential scrub can close it early, so it is not for any text a handler filter reads,
+    a last field or a whole message included. QUOTE changes the value's spelling, so it does not
+    replace ESCAPE on a whole line.
 
 WHY ESCAPE LIVES HERE, WHICH IS THE ONE FACT WORTH STATING ONCE (BACKLOG #1591). It was defined in
 ``logging_setup`` until ``logging_guard`` needed it, and ``logging_setup`` imports
@@ -344,8 +344,8 @@ def quote_log_text(text: str) -> str:
     NOT FOR ANY TEXT A CONFIGURED HANDLER'S FILTERS READ, WHEREVER IT SITS IN THE LINE. At least the
     credential scrub and the redaction filters can close the token early or erase its closing quote,
     and the text after it then reads as fields of its own (BACKLOG #3770). For a logged field, use
-    :func:`messagefoundry.logging_setup.redacted_log_field`, passing the line text around the field
-    as ``before`` and ``after``."""
+    :func:`messagefoundry.logging_setup.redacted_log_field`, whose docstring says what context to
+    pass."""
     # Imported here, not at the top: the remote-debug guard imports this module before its hook
     # goes in, and json, with re and enum under it, would lengthen that window.
     import json
@@ -406,8 +406,7 @@ def log_field_token(text: str, limit: int, *, literals: tuple[str, ...] = ()) ->
     claim of itself that something was redacted, though never of another field. The handler filters
     still read the token, and one may rewrite a run inside it, a date for example, as
     ``[redacted]``, which holds no space or quote. They anchor on less than they would in raw text,
-    so a caller does not call this directly: it calls ``logging_setup.redacted_log_field``, which
-    redacts first.
+    so a caller does not call this directly: it calls ``logging_setup.redacted_log_field`` instead.
 
     The escaped text is at most ``limit`` characters, counted after the escape, so the field is at
     most ``limit`` plus its two quotes whatever ``text`` holds. That is the token's bound; a handler
