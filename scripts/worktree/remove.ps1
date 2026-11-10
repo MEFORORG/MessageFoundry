@@ -558,8 +558,7 @@ if ($byPath) {
             throw "CLAUDE_CONFIG_DIR is the relative path '$env:CLAUDE_CONFIG_DIR', so its session registry cannot be placed. Occupancy unknown. Nothing was removed."
         }
         # A root holding a backtick, [, ], * or ? refuses. The registry reads every path literally
-        # (session-registry.ps1, vault BACKLOG #2985); this refusal keeps a registry read that goes
-        # back to a pattern read from misreading this root.
+        # (session-registry.ps1, vault BACKLOG #2985).
         if ($env:CLAUDE_CONFIG_DIR -match '[\[\]*?`]') {
             throw "CLAUDE_CONFIG_DIR '$env:CLAUDE_CONFIG_DIR' holds a wildcard character or a backtick, which this route refuses rather than read. Occupancy unknown. Nothing was removed."
         }

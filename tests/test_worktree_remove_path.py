@@ -788,8 +788,8 @@ def test_a_session_on_the_callers_config_root_outside_userprofile_occupies_the_t
     assert "Target is occupied" in _out(proc), _out(proc)
     assert wt.exists() and rig.is_registered(wt)
 
-    # A lone backtick refuses too: any backtick is refused (the doubled-backtick test below says
-    # why), so a root such as o`brien is not read. The refusal fires before any read.
+    # A lone backtick refuses too: any backtick is refused, so a root such as o`brien is not read.
+    # The refusal fires before any read.
     proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": str(rig.root / "o`brien")})
     assert proc.returncode != 0, _out(proc)
     assert "wildcard character" in _out(proc), _out(proc)
@@ -881,18 +881,16 @@ def test_a_hidden_record_is_read_and_occupies_the_target(rig: Rig, attrs: tuple[
 
 
 def test_the_record_count_guard_still_refuses_a_registry_read_that_skips_a_record(rig: Rig) -> None:
-    """remove.ps1 keeps its record-count guard behind the registry. No registry input reaches it any
-    more, so a copy of the scripts whose registry lists records without -Force stands in for a
-    registry that regresses: the hidden record it skips is counted by the second listing."""
+    """remove.ps1 keeps its record-count guard behind the registry. A copy of the scripts whose
+    registry lists records without -Force stands in for a registry that regresses: the hidden record
+    it skips is counted by the second listing."""
     wt = rig.add(rig.scratch("count-guard"))
     copy = rig.root / "copy"
     copy_real_scripts(copy)
     registry = copy / "scripts" / "coord" / "session-registry.ps1"
     text = registry.read_text(encoding="utf-8")
-    assert text.count("-Filter *.json -File -Force") == 1
-    registry.write_text(
-        text.replace("-Filter *.json -File -Force", "-Filter *.json -File"), "utf-8"
-    )
+    assert text.count("-Filter *.json -Force") == 1
+    registry.write_text(text.replace("-Filter *.json -Force", "-Filter *.json"), "utf-8")
     script = copy / "scripts" / "worktree" / "remove.ps1"
     hidden = rig.registry(wt) / ".claude" / "sessions" / "2.json"
     subprocess.run(["attrib", "+h", str(hidden)], check=True, capture_output=True)
@@ -905,6 +903,26 @@ def test_the_record_count_guard_still_refuses_a_registry_read_that_skips_a_recor
     # Control: without the hidden record the two reads agree, and the copy removes the tree.
     hidden.unlink()
     proc = rig.run("-Path", str(wt), script=script, repo_root=rig.primary)
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+def test_a_directory_named_as_a_record_makes_the_registry_unreadable(rig: Rig) -> None:
+    """Vault BACKLOG #2985. A directory where a record belongs cannot be read, and could stand where
+    a session's record should be, so it reads as an unreadable record and the fence cannot clear.
+    Red at fa4663ab74, whose registry listed records with -File and skipped it: the tree went."""
+    wt = rig.add(rig.scratch("dir-record"))
+    stray = rig.registry() / ".claude" / "sessions" / "4242.json"
+    stray.mkdir()
+
+    proc = rig.run("-Path", str(wt))
+    assert proc.returncode != 0, _out(proc)
+    assert "could not clear" in _out(proc) and "a directory, not a file" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    # Control: without the directory, the target is cleared.
+    stray.rmdir()
+    proc = rig.run("-Path", str(wt))
     assert proc.returncode == 0, _out(proc)
     assert not wt.exists()
 

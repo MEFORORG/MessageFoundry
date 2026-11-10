@@ -168,14 +168,17 @@ function Get-SessionRecords {
     $out = @()
     foreach ($root in (Get-ClaudeConfigRoots -ConfigRoot $ConfigRoot)) {
         # -Force lists hidden and system records too: a record skipped here is a session no caller sees.
-        # -File counts what remove.ps1's and remove-scratch.ps1's second listings count: a directory is
-        # never a record.
-        foreach ($f in @(Get-ChildItem -LiteralPath (Join-Path $root "sessions") -Filter *.json -File -Force -EA SilentlyContinue)) {
+        # A directory named *.json is listed too, and reads as unreadable below, so a caller about to
+        # destroy something refuses on it rather than skip it.
+        foreach ($f in @(Get-ChildItem -LiteralPath (Join-Path $root "sessions") -Filter *.json -Force -EA SilentlyContinue)) {
             # A single malformed record must never take down a caller -- one of these runs in a
             # SessionStart hook, where a throw replaces the chat's whole starting context.
             $rec = $null
             $err = ''
-            try { $rec = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { $err = $_.Exception.Message }
+            if ($f -is [System.IO.DirectoryInfo]) { $err = 'a directory, not a file, so it cannot be read as a record' }
+            else {
+                try { $rec = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { $err = $_.Exception.Message }
+            }
             if (-not $rec) {
                 if (-not $err) { $err = 'the file parsed to nothing (empty, or being written right now)' }
                 if ($IncludeUnreadable) {

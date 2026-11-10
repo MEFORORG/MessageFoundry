@@ -245,7 +245,8 @@ def _roots_and_records(home: str | None, cwd: Path | None = None) -> dict[str, A
         f". '{REGISTRY}'; "
         "$roots = @(Get-ClaudeConfigRoots | ForEach-Object { Split-Path $_ -Leaf }); "
         "$recs = @(Get-SessionRecords -IncludeUnreadable | "
-        "ForEach-Object { [string]$_.Record.sessionId }); "
+        "ForEach-Object { if ($_.Unreadable) { 'unreadable:' + (Split-Path $_.File -Leaf) } "
+        "else { [string]$_.Record.sessionId } }); "
         "[pscustomobject]@{ Roots = $roots; Records = $recs } | ConvertTo-Json -Compress"
     )
     proc = subprocess.run(
@@ -275,7 +276,7 @@ def test_every_root_and_record_under_the_profile_is_read_by_its_own_name(tmp_pat
     hidden = sessions / "2.json"
     hidden.write_text(json.dumps({"sessionId": "hidden"}), encoding="utf-8")
     subprocess.run(["attrib", "+h", "+s", str(hidden)], check=True, capture_output=True)
-    # A directory is never a record, hidden or not.
+    # A directory named as a record, hidden or not, is listed and reads as unreadable.
     for name in ("dir.json", "hidden-dir.json"):
         (sessions / name).mkdir()
     subprocess.run(["attrib", "+h", str(sessions / "hidden-dir.json")], check=True)
@@ -283,7 +284,14 @@ def test_every_root_and_record_under_the_profile_is_read_by_its_own_name(tmp_pat
     got = _roots_and_records(str(home))
     assert sorted(got["Roots"]) == [".claude", ".claude[1]"], got
     assert sorted(got["Records"]) == sorted(
-        ["plain", "bracketed-name", "hidden", "in-bracketed-root"]
+        [
+            "plain",
+            "bracketed-name",
+            "hidden",
+            "in-bracketed-root",
+            "unreadable:dir.json",
+            "unreadable:hidden-dir.json",
+        ]
     ), got
 
 
