@@ -149,8 +149,12 @@ class AutoKeyProvider:
 class HostKeyProvider:
     """``host`` — the store key derived from the key custody host blob (vault BACKLOG #3411). It
     converts a handoff as a store open does, since in the service it may be asked first (the upload
-    cipher is built before the store opens). ``posture`` is the caller's, and ``None`` counts as
-    enforcing for the account check.
+    cipher is built before the store opens). So every command that resolves the key outside a
+    store open converts and deletes a handoff too, when run as the account it was written for,
+    read-only ones such as restore-verify included;
+    :func:`~messagefoundry.store.custody_host.load_host_custody` lists the cases (vault BACKLOG
+    #8119 items 5 and 140). ``posture`` is the caller's, and ``None`` counts as enforcing for the
+    account check.
 
     A custody refusal from here reaches a caller of ``resolve_active_key``,
     ``resolve_decrypt_keys`` or ``build_store_cipher`` as a new ``KeyProviderError`` that keeps its

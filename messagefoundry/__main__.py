@@ -7333,9 +7333,10 @@ def _discard_minted_custody(
     could not be created, so a second run can mint again, but only where this run can prove the
     open wrote nothing under it: the store id pin refused before the open's first write
     (:class:`~messagefoundry.store.store.StoreIdPinRefusedBeforeWrite`; a pin refusal raised later,
-    once the salt bind may have run, does not count), a server create batch that failed before its
-    commit (:class:`~messagefoundry.store.store.StoreCreateBatchFailedBeforeKeyUse`, PR 2804 hold
-    17), or a SQLite store whose file was never made.
+    once the salt bind may have run, does not count), a server open that failed before its pin
+    check passed, its create batch's failure before the commit included
+    (:class:`~messagefoundry.store.store.StoreCreateBatchFailedBeforeKeyUse`, PR 2804 hold 17 and
+    vault BACKLOG #8119 item 2), or a SQLite store whose file was never made.
 
     Otherwise the file is kept, and the warning names it and says to keep it and the recovery key
     shown, deleting neither: the store may hold data sealed under it, and no check this run or an
@@ -9018,7 +9019,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # before any store is opened; `_build_provision_auth_service` says why.
     from messagefoundry.auth.policy import _common_passwords
     from messagefoundry.auth.trust_anchors import TrustAnchorError
-    from messagefoundry.config.settings import StoreBackend, hop_posture_from_ai
+    from messagefoundry.config.settings import SchemaManagement, StoreBackend, hop_posture_from_ai
     from messagefoundry.config.tls_policy import InsecureHopRefused
     from messagefoundry.store.base import StoreNotFoundError, build_store_cipher
     from messagefoundry.store.crypto import CipherError, StoreKeylessError
@@ -9114,6 +9115,17 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 "creates, so no key was minted. Point [store] at a new database or schema, or "
                 "grant this login the store's schema if they are a store it cannot reach, then "
                 "run the command again"
+            )
+        if settings.store.resolved_schema_management() is SchemaManagement.EXTERNAL:
+            # The create open runs no DDL under external schema management, so over a database
+            # with no store schema it would refuse only after the recovery key was shown and
+            # proved (vault BACKLOG #8119 item 1). Refused here instead, before the prompts.
+            raise HostCustodyRefused(
+                "the database holds no store schema, and [store].schema_management is 'external' "
+                "(the default on a server store), under which this command builds none, so no key "
+                f"was minted. Have a DDL-capable login run `{store_base.PROVISION_SCHEMA_COMMAND}` "
+                "against this database first (DEPLOY-SERVER-DB.md section 2), then run the "
+                "command again"
             )
         return "none"
 
@@ -9515,6 +9527,24 @@ def _provision_admin(args: argparse.Namespace) -> int:
         print(
             "The recovery key was entered back and opens the store key. Keep that copy off this "
             "host: this engine never shows it again.",
+            file=sys.stderr,
+        )
+        # Vault BACKLOG #8119 item 9: this shell's environment chose the custody directory, and
+        # the service reads its own, so the line names what the service must see. The variable is
+        # named as a literal: this text reaches stderr (keep_the_key_step says why).
+        import os
+
+        from messagefoundry.engine_secrets import SECRETS_DIRECTORY_VARIABLE
+
+        where = (
+            f"MEFOR_SECRETS_DIRECTORY set to {minted.path.parent}"
+            if os.environ.get(SECRETS_DIRECTORY_VARIABLE, "").strip()
+            else "MEFOR_SECRETS_DIRECTORY unset, so that it looks beside the SQLite store file"
+        )
+        print(
+            f"The store key was written to {minted.path}. The service finds it only with {where} "
+            "in its own environment too; one that names another custody directory does not find "
+            "it, and refuses to start.",
             file=sys.stderr,
         )
 

@@ -5722,13 +5722,15 @@ class StoreChainNeverStarted(StoreIdPinRefusedBeforeWrite):
 
 
 class StoreCreateBatchFailedBeforeKeyUse(Exception):
-    """A minting open's create batch failed before its commit (PR 2804 hold 17). The batch is one
-    transaction on each server backend, and nothing is sealed under the store key before it commits:
-    the first seal follows ``bind_store_salt``, after the batch and the pin check, which only reads.
-    So nothing was sealed under the key, and a minting command may remove the key
-    it minted, as for :class:`StoreIdPinRefusedBeforeWrite`. ``failure`` is the batch's own error,
+    """A minting server open failed before anything was sealed under the store key: its create
+    batch failed before its commit (PR 2804 hold 17), or the open failed before its store id pin
+    check passed, at least on the connection, the hop's TLS, the schema or the settings (vault
+    BACKLOG #8119 items 1 and 2). The batch is one transaction on each server backend, and the
+    first seal follows ``bind_store_salt``, after the batch and after the pin check, which only
+    reads. So nothing was sealed under the key, and a minting command may remove the key it
+    minted, as for :class:`StoreIdPinRefusedBeforeWrite`. ``failure`` is the open's own error,
     also the cause. Raised only on a minting open (:func:`minting_open`), so no other caller sees a
-    new class; a failure at or after the commit is never this."""
+    new class; a failure once the pin check has passed is never this."""
 
     def __init__(self, failure: Exception) -> None:
         # The failure itself is the one argument, so a copy or an unpickle rebuilds it whole.
@@ -5741,6 +5743,24 @@ class StoreCreateBatchFailedBeforeKeyUse(Exception):
 #: than a parameter of each backend's open, as the hop posture is held during connector
 #: construction; ``None`` for every open that is not under the ``host`` key provider.
 OPEN_STORE_PIN: ContextVar[StorePin | None] = ContextVar("mefor_open_store_pin", default=None)
+
+
+class PinCheck:
+    """Whether the open in progress has passed its store id pin check (:func:`check_open_store_pin`),
+    the last step before its first write. A mutable cell rather than a flag in a context variable,
+    so a pass recorded under a copied context still reaches the open that set it (vault BACKLOG
+    #8119 item 2)."""
+
+    __slots__ = ("passed",)
+
+    def __init__(self) -> None:
+        self.passed = False
+
+
+#: The cell ``store.base.open_store`` sets around a minting open's backend open; ``None`` otherwise.
+OPEN_STORE_PIN_CHECK: ContextVar[PinCheck | None] = ContextVar(
+    "mefor_open_store_pin_check", default=None
+)
 
 
 def minting_open() -> bool:
@@ -5871,6 +5891,8 @@ async def check_open_store_pin(host: AuditRangeHost) -> None:
         return
     refusal = await _store_pin_refusal(host, await host._audit_genesis_row(), pin, writable=True)
     if refusal is None:
+        if (check := OPEN_STORE_PIN_CHECK.get()) is not None:
+            check.passed = True  # the open may write from here on
         return
     refused = StoreChainNeverStarted if refusal.never_started else StoreIdPinRefusedBeforeWrite
     raise refused(f"refusing to open the store: {refusal.text}")

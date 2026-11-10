@@ -80,6 +80,7 @@ from messagefoundry.store.privilege import (
 from messagefoundry.store.row_seal import RowSealer
 from messagefoundry.store.store import (
     OPEN_STORE_PIN,
+    OPEN_STORE_PIN_CHECK,
     UPLOAD_RESERVATION_STALE_AFTER,
     AdMap,
     AdminGrant,
@@ -112,6 +113,7 @@ from messagefoundry.store.store import (
     OutboxItem,
     OwnedLanes,
     PasskeyCounts,
+    PinCheck,
     ReingressOriginMissing,
     ReingressOutcome,
     ReplyWaitState,
@@ -128,11 +130,14 @@ from messagefoundry.store.store import (
     SessionRecord,
     SignCountAnswer,
     Stage,
+    StoreCreateBatchFailedBeforeKeyUse,
+    StoreIdPinRefused,
     StorePin,
     StreamingAttachmentsUnsupported,
     TotpUsable,
     UserRecord,
     WebAuthnCredential,
+    minting_open,
     note_audit_chain_read,
 )
 
@@ -4492,6 +4497,11 @@ def _absent_sqlite_store(settings: StoreSettings) -> Path | None:
     return None
 
 
+#: Errors an open already types as raised before anything was written under the key, which the
+#: minting open's wrap passes as they are (vault BACKLOG #8119 item 2).
+_ALREADY_BEFORE_KEY_USE: Final = (StoreIdPinRefused, StoreCreateBatchFailedBeforeKeyUse)
+
+
 async def open_store(
     settings: StoreSettings,
     *,
@@ -4630,6 +4640,10 @@ async def open_store(
     # The pin rides a context variable to the genesis read every backend shares (vault BACKLOG
     # #3411); reset at once, so no later open in this context inherits it.
     pinned = OPEN_STORE_PIN.set(pin)
+    # A minting server open learns whether its pin check passed, so a failure before it is typed
+    # as one that sealed nothing under the minted key (vault BACKLOG #8119 items 1 and 2).
+    check = PinCheck() if minting_open() and settings.backend is not StoreBackend.SQLITE else None
+    checking = OPEN_STORE_PIN_CHECK.set(check)
     try:
         store = await _open_backend(
             settings,
@@ -4641,7 +4655,12 @@ async def open_store(
             create=create,
             read_only=read_only,
         )
+    except Exception as exc:
+        if check is None or check.passed or isinstance(exc, _ALREADY_BEFORE_KEY_USE):
+            raise
+        raise StoreCreateBatchFailedBeforeKeyUse(exc) from exc
     finally:
+        OPEN_STORE_PIN_CHECK.reset(checking)
         OPEN_STORE_PIN.reset(pinned)
     if keyless_chain_refusal is not None and audit_mac_key is None and audit_mac_fn is None:
         await _refuse_to_start_a_keyless_chain(
