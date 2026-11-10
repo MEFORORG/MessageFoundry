@@ -2648,9 +2648,10 @@ not hide a refusal: a later start failure that is not a store fault, a CA refuse
 changed included, replaces it in turn, with one alert. The class compared is only whether the line
 is a store fault (vault BACKLOG #5146). A later failure in the class the line already records keeps
 the line and alerts no more. So a refused CA after an unrelated line, such as a failed bind or
-build, keeps that line, and the refusal is named only in the server log and the
-`auth.trust_anchor` rows, while the lane is still held failed across a reload that leaves its
-config unchanged. On an inbound the rule holds for any start failure. On an outbound it holds for a
+build, keeps that line, and the lane's line does not name the refusal. It shows at least in the
+server log, the `auth.trust_anchor` rows and, on an operator start of that inbound, the 409's fixed
+detail `trust anchor refused; see the server log`, while the lane is still held failed across a
+reload that leaves its config unchanged. On an inbound the rule holds for any start failure. On an outbound it holds for a
 failure raised as a `TrustAnchorError`, as a refused or store-stopped CA check is; any other
 outbound start failure records its line and alerts each time. A refused-CA lane whose line a store
 fault replaced is no longer kept failed across a reload, so the next reload reads its CA again. An
