@@ -474,7 +474,7 @@ def redact_log_value(text: str, *, before: str = "", after: str = "") -> str | N
     or ``None`` when that line's context did not survive, the reading did not settle within
     :data:`_SHIPPED_READING_MAX_PASSES` passes, or ``text`` is longer than
     :data:`LOG_FIELD_READ_MAX`, which is not read (BACKLOG #3770). Its ``before`` and ``after``
-    follow the rule in :func:`redacted_log_field`.
+    carry the same restriction as :func:`redacted_log_field`'s.
 
     The field's own escape hides its text from every handler, so this value is meant to carry what
     the handlers would have hidden in that line. The filters are the ones
@@ -525,14 +525,12 @@ def redacted_log_field(
     The placeholders the passes write are kept as they are, not escaped, so a search for
     ``<redacted>`` or ``[redacted]`` finds a value they wrote unless the bound cuts it off; a search
     for redactions also needs :data:`UNREADABLE_LOG_VALUE`, which a limit under 19 cuts, and the
-    ``unloggable-`` spelling. ``before`` and ``after`` hold only string literals the caller writes;
-    anything interpolated, or taken from a request, a message, configuration or another field, goes
-    in ``checks``. Each check pair spells the whole text around the field, keys and separators
-    included, with every other field's value in its raw text, not in the quoted and escaped form the
-    logged line carries, which does not fire the check.
-    :func:`messagefoundry.auth.service._new_ip_path_field` is one example. The reading sees only the
-    context it is given, so empty context can leave readable what the shipped filters would redact
-    in the full line.
+    ``unloggable-`` spelling. Its hides-no-less-than-main tests cover only the call in
+    :func:`messagefoundry.auth.service._new_ip_path_field`, and no general rule for ``before``,
+    ``after`` and ``checks`` is stated: what a caller passes there decides what the field hides, and
+    empty or wrongly spelled context can leave readable what the shipped filters would redact in the
+    full line. A new caller adds its own hides-no-less-than-main test, as tests/test_admin_new_ip.py
+    does, before it ships.
 
     The reading is the one every later shipped handler leaves, not a fixed number of handler
     passes, so the field hides what the last sink of a logger with any number of handlers would
