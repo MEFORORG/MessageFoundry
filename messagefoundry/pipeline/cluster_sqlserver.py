@@ -477,7 +477,8 @@ class SqlServerCoordinator:
 
     async def _heartbeat_loop(self) -> None:
         while not self._stop.is_set():
-            # The log names main's step names, so the warning reads the same (BACKLOG #6472).
+            # Fixed labels: the names these steps logged before the refresh was split out, so the
+            # warning text does not change (BACKLOG #6472).
             for name, step in (
                 ("heartbeat_once", self.heartbeat_once),
                 ("_maintain_leadership", self._maintain_leadership),

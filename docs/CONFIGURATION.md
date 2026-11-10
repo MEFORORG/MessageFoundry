@@ -2954,9 +2954,9 @@ because no one setting sets every clamp (BACKLOG #5064). At a tie, raising the c
 lengthen the borrow: raise `[store].acquire_timeout` too. The message's `after Ns` is the limit
 that cut the borrow, so compare it with each term below to tell which applied; the claim and the
 paused owner read run in the same maintenance step, so the step name in the log does not tell them
-apart. `stop()`'s writes and the paused owner read each run inside an event-loop timeout
-(below); where that timeout ends the call first, it raises `TimeoutError` and no such message is
-logged. At least these set the clamps:
+apart. At least `stop()`'s writes and the paused owner read each run inside an event-loop
+timeout (below); where that timeout ends the call first, the timeout raises `TimeoutError` and no
+such message is logged. At least these set the clamps:
 
 - **The renew clamp**, for the claim and renew, the heartbeat, the config-version refresh and a
   stepdown's release write. It is `lease_renew_timeout_seconds` when set. Left unset, it is derived
