@@ -26,6 +26,7 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import WiringError
 from messagefoundry.transports.egress import check_egress_allowed
 from messagefoundry.transports.rest import RestDestination
+from tests._egress_policy import permitting
 
 _PARTNER = "https://partner.example.org/api"
 
@@ -89,6 +90,18 @@ def test_a_sidecar_port_urllib_cannot_read_is_refused_in_fixed_words() -> None:
     with pytest.raises(WiringError, match=r"not a number from 0 to 65535") as caught:
         check_egress_allowed(_ech("http://127.0.0.1:99999"), _egress("127.0.0.1:8123"))
     assert "99999" not in str(caught.value)
+    # Leading zeros pass the credential screen's port check, then break int() past 4300 digits.
+    long_port = "0" * 5000 + "8123"
+    with pytest.raises(WiringError, match=r"cannot be read as a number") as caught:
+        check_egress_allowed(_ech(f"http://127.0.0.1:{long_port}"), _egress("127.0.0.1:8123"))
+    assert long_port not in str(caught.value)
+
+
+def test_the_shared_test_policy_lists_no_sidecar_it_cannot_list() -> None:
+    port_zero = {"ech_egress": True, "ech_sidecar": "http://127.0.0.1:0"}
+    assert permitting(port_zero).allowed_ech_sidecar == []
+    ipv6 = {"ech_egress": True, "ech_sidecar": "http://[::1]"}
+    assert permitting(ipv6).allowed_ech_sidecar == ["[::1]:80"]
 
 
 def test_a_bracketed_ipv6_loopback_entry_matches() -> None:
@@ -115,7 +128,7 @@ def test_a_bracketed_ipv6_loopback_entry_matches() -> None:
         # Entries no sidecar could ever match, so an operator is not told the sidecar is listed:
         "10.0.0.5:8123",  # the resolver refuses a sidecar off this machine
         "user@127.0.0.1:8123",
-        "[127.0.0.1]:8123",  # urlsplit reads a bracketed IPv4 literal as no host
+        "[127.0.0.1]:8123",  # urlsplit refuses a bracketed IPv4 literal in a URL
     ],
 )
 def test_an_entry_that_is_not_host_and_port_is_refused_at_load(entry: str) -> None:
@@ -123,7 +136,12 @@ def test_an_entry_that_is_not_host_and_port_is_refused_at_load(entry: str) -> No
         EgressSettings(allowed_ech_sidecar=[entry])
     # The refusal names the entry by its position, never by its text: an operator who pasted a
     # sidecar URL with a credential in it would otherwise find it in the error.
-    assert "entry 1" in str(caught.value)
+    assert "entry 1 " in str(caught.value)
+
+
+def test_the_entry_position_skips_blank_entries() -> None:
+    with pytest.raises(ValidationError, match=r"entry 2 \(counting non-blank entries\)"):
+        EgressSettings(allowed_ech_sidecar=["127.0.0.1:8123", "", "bad"])
 
 
 def test_a_portless_entry_built_unvalidated_still_does_not_wildcard() -> None:

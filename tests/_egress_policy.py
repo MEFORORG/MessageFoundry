@@ -4,7 +4,7 @@
 
 ``build_destination`` runs the ``[egress]`` check itself (vault BACKLOG #2605), so a test that is
 about a connector's own behaviour must hand it a policy that lets that connector through. This one
-is the audited allow-any opt-out plus the three lists that stay deny-by-default under it: the
+is the audited allow-any opt-out plus at least these lists that stay deny-by-default under it: the
 forward-proxy host, the ECH sidecar's host and port (BACKLOG #5528) and the recipient domains, each
 taken from the connection's own settings. The recipient-domain list also gates an Email sender's
 domain (vault BACKLOG #2912), so the sender's domain is listed too. It permits exactly that connection and lists nothing else.
@@ -16,7 +16,7 @@ import urllib.parse
 from collections.abc import Mapping
 from typing import Any
 
-from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.settings import EgressSettings, pinned_host_port
 from messagefoundry.transports.egress import http_dial_port
 from messagefoundry.transports.email import envelope_address_problem, envelope_recipients
 from messagefoundry.transports.rest import ech_sidecar_url_from_settings
@@ -24,7 +24,7 @@ from messagefoundry.transports.rest import ech_sidecar_url_from_settings
 
 def _ech_sidecar_entries(settings: Mapping[str, Any]) -> list[str]:
     """The ``host:port`` entry that lists this connection's ECH sidecar, at the port urllib dials,
-    or none when ``ech_egress`` is off or the resolver refuses the sidecar (the gate refuses that)."""
+    or none when ``ech_egress`` is off or no entry could list the sidecar (the gate refuses that)."""
     try:
         sidecar = ech_sidecar_url_from_settings(settings)
         parts = urllib.parse.urlsplit(sidecar or "")
@@ -34,7 +34,9 @@ def _ech_sidecar_entries(settings: Mapping[str, Any]) -> list[str]:
     if sidecar is None or not parts.hostname:
         return []
     host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
-    return [f"{host}:{http_dial_port(parts.scheme, port)}"]
+    entry = f"{host}:{http_dial_port(parts.scheme, port)}"
+    # A sidecar no entry could list (port 0) gets none, and the gate refuses it.
+    return [entry] if pinned_host_port(entry) is not None else []
 
 
 def permitting(settings: Mapping[str, Any]) -> EgressSettings:

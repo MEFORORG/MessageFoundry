@@ -5240,7 +5240,7 @@ def pinned_host_port(entry: str) -> tuple[str, int] | None:
     port differently (BACKLOG #5528). It splits at the LAST ``:``, so ``[::1]:8123`` reads as a
     host and a port; ``transports.egress.host_port_allowed`` splits at the first. ``None`` for at
     least: no port; a port that is not 1 to 65535 in at most five ASCII digits; a host holding a
-    ``:`` outside brackets, or none inside them, which urlsplit reads as no host; and a host the
+    ``:`` outside brackets, or none inside them, which urlsplit refuses in a URL; and a host the
     sidecar resolver would refuse, because :func:`is_loopback_hop_host` does not read it as this
     machine. An IP literal is returned in :mod:`ipaddress`'s compressed form, so ``::1`` and
     ``0:0:0:0:0:0:0:1`` are one host; a name is returned lowercased."""
@@ -5365,7 +5365,7 @@ class EgressSettings(_Section):
     # connection is refused at config load while this list is empty, whatever
     # `[security].block_unlisted_outbound` says. An instance with no ECH connection never reads it.
     # The gate is `_check_ech_sidecar_egress` in messagefoundry/transports/egress.py, and it
-    # parses each entry with `pinned_host_port` below. Env (comma-separated):
+    # parses each entry with `pinned_host_port`, defined above this class. Env (comma-separated):
     # MEFOR_EGRESS_ALLOWED_ECH_SIDECAR.
     allowed_ech_sidecar: list[str] = []
     # Allowed SYSLOG collectors for the off-box log forwarder (``[logging].forward_host`` and
@@ -5502,16 +5502,18 @@ class EgressSettings(_Section):
     def _ech_sidecar_entries_pin_a_port(cls, value: list[str]) -> list[str]:
         """Refuse at load an entry :func:`pinned_host_port` cannot read, so one with no port is
         never taken for any port (BACKLOG #5528). Whitespace is stripped and a blank entry skipped.
-        The refusal names the entry by position, not by text: an operator who pasted the sidecar's
-        URL, credential and all, would otherwise find it in the error."""
+        The refusal names the entry by position among the non-blank ones, not by text: an operator
+        who pasted the sidecar's URL, credential and all, would otherwise find it in the error. The
+        env form drops blank items before this runs, so the position skips blanks in both forms."""
         cleaned: list[str] = []
-        for index, raw in enumerate(value, start=1):
+        for raw in value:
             item = raw.strip()
             if not item:
                 continue
             if pinned_host_port(item) is None:
                 raise ValueError(
-                    f"[egress].allowed_ech_sidecar entry {index} is not a loopback 'host:port'. "
+                    f"[egress].allowed_ech_sidecar entry {len(cleaned) + 1} (counting non-blank "
+                    "entries) is not a loopback 'host:port'. "
                     "Write the sidecar's loopback host and its port, such as '127.0.0.1:8123', "
                     "'localhost:8123' or '[::1]:8123'; an entry with no port is refused rather "
                     "than read as any port"

@@ -371,7 +371,7 @@ def _check_ech_sidecar_egress(
     if sidecar is None:
         return
     try:
-        # It also refuses a port urlsplit cannot read, so `.port` below cannot raise.
+        # It also refuses most ports urlsplit cannot read; `.port` below catches the rest.
         refuse_url_credentials(
             sidecar, f"{label} 'ech_sidecar'", use=_ECH_SIDECAR_CREDENTIAL_USE, error=WiringError
         )
@@ -391,7 +391,17 @@ def _check_ech_sidecar_egress(
         )
     # Uncached, as the resolver's own split is (vault BACKLOG #5287).
     parts = _UNCACHED_URLSPLIT(sidecar)
-    port = http_dial_port(parts.scheme, parts.port)
+    try:
+        url_port = parts.port
+        unreadable = False
+    except ValueError:
+        # A port of more than 4300 digits, leading zeros and all, passes the screen above and
+        # breaks int(). urlsplit's own text is not let out.
+        url_port, unreadable = None, True
+    if unreadable:
+        log.warning("egress denied: %s ECH sidecar port cannot be read", label)
+        raise WiringError(f"{label}: ech_sidecar names a port that cannot be read as a number")
+    port = http_dial_port(parts.scheme, url_port)
     hostname = parts.hostname or ""
     # Read back through the entries' own parse, so a host is compared in one spelling on both
     # sides: `0:0:0:0:0:0:0:1` matches a `[::1]` entry.
