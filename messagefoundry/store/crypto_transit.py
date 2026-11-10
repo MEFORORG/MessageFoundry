@@ -67,6 +67,7 @@ from messagefoundry.store.keyprovider_vault import (
     TRANSIT_KEY_TYPES_DATA,
     TRANSIT_MOUNT,
     _build_client,
+    checked_transit_key_name,
     is_vault_bad_request,
     require_transit_key_type,
     store_vault_hop,
@@ -297,7 +298,13 @@ def _key_names() -> tuple[str, str]:
         )
     # Optional dedicated audit-HMAC key; unset ⇒ reuse the data key. Either way the type is checked
     # at build — see the _ENV_AUDIT_KEY comment above for which types each use admits and why.
-    return key_name, os.environ.get(_ENV_AUDIT_KEY) or key_name
+    # Both names go into Transit request paths, so each is checked here, before any client is built
+    # (BACKLOG #6010).
+    key_name = checked_transit_key_name(key_name, selector=_ENV_TRANSIT_KEY)
+    audit_key = os.environ.get(_ENV_AUDIT_KEY)
+    return key_name, (
+        checked_transit_key_name(audit_key, selector=_ENV_AUDIT_KEY) if audit_key else key_name
+    )
 
 
 def build_transit_cipher(
