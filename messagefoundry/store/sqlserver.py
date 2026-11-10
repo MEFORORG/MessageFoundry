@@ -1034,6 +1034,14 @@ def _applock_timeout_ms(command_timeout: int) -> int:
     return int(command_timeout * 1000) if command_timeout else -1
 
 
+#: What a clamped borrow's :class:`StoreAcquireTimeout` advises when the clamp, not
+#: ``[store].acquire_timeout``, was the limit (:meth:`SqlServerStore._acquire_clamped`). stop()'s
+#: release borrows at its own shutdown bound, which no setting tunes, so the message names both.
+_CLAMPED_BORROW_RETUNE = (
+    "[cluster].lease_renew_timeout_seconds (the cluster clamp; stop()'s release has a fixed bound)"
+)
+
+
 def _clamped_statement_timeout(clamp_seconds: float, command_timeout: int) -> int:
     """The whole-second pyodbc statement timeout for a statement clamped below ``command_timeout``
     (ADR 0157 Inc 0: the cluster coordinator's maintenance loop and stepdown, BACKLOG #5064).
@@ -5560,16 +5568,21 @@ class SqlServerStore:
     def _acquire_clamped(self, clamp_seconds: float) -> AbstractAsyncContextManager[Any]:
         """:meth:`_acquire` with a SHORTER acquire limit: the smaller of ``[store].acquire_timeout``
         and ``clamp_seconds``. Only the cluster coordinator's clamped statements borrow this way
-        (:meth:`_fetchone_clamped` says why)."""
-        return self._borrow(min(self._settings.acquire_timeout, clamp_seconds))
+        (:meth:`_fetchone_clamped` says why). When the clamp is the shorter limit, a borrow that
+        times out names it rather than ``[store].acquire_timeout``, which would not help."""
+        if clamp_seconds < self._settings.acquire_timeout:
+            return self._borrow(clamp_seconds, retune=_CLAMPED_BORROW_RETUNE)
+        return self._borrow(self._settings.acquire_timeout)
 
     @asynccontextmanager
-    async def _borrow(self, timeout: float) -> AsyncIterator[Any]:
+    async def _borrow(
+        self, timeout: float, *, retune: str = "[store].acquire_timeout"
+    ) -> AsyncIterator[Any]:
         """The body of :meth:`_acquire`, :meth:`_acquire_after_commit` and :meth:`_acquire_clamped`,
         and the sole place this store borrows from its pool. ``timeout`` is the acquire limit, never
-        ``None``."""
+        ``None``; ``retune`` names the setting a timed-out borrow's message advises."""
         t0 = perf_counter()
-        conn = await acquire_pooled(self._pool, timeout=timeout, backend="sqlserver")
+        conn = await acquire_pooled(self._pool, timeout=timeout, backend="sqlserver", retune=retune)
         self._acquire_wait.record((perf_counter() - t0) * 1000.0)
         try:
             _install_call_gate(conn)  # BACKLOG #2049: one pyodbc call at a time on this connection
@@ -5889,7 +5902,7 @@ class SqlServerStore:
         :meth:`_execute_clamped` is its twin for a write.
 
         Two windows before the statement returns, each at most the clamp floored at 1 s. The wait
-        for a pooled connection is the smaller of ``max(1.0, clamp)`` and ``[store].acquire_timeout`` (:meth:`_fetch_rows` applies
+        for a pooled connection is the smaller of ``max(1.0, clamp)`` and ``[store].acquire_timeout`` (:meth:`_clamp_bounds` applies
         the floor, :meth:`_acquire_clamped` the minimum): a renew that waited out a saturated pool past the
         fence would otherwise still extend the lease after this node self-fenced. The statement's
         own timeout is :func:`_clamped_statement_timeout`, applied by :meth:`_statement_timeout`.

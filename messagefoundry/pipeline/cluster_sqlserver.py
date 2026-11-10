@@ -613,9 +613,11 @@ class SqlServerCoordinator:
                 self._no_claim_until = prior_pause
             elif arming:
                 # Armed a SECOND time from the instant the write returned, taking the later expiry, so
-                # the write's own duration, up to about three times the clamp with its rollback, is
-                # not spent out of the pause. DbCoordinator's step_down_leadership carries the full reasoning; keep the
-                # two in lockstep.
+                # the write's own duration is not spent out of the pause. Its borrow, statement and
+                # rollback take up to about three times the clamp, but its COMMIT is not known to be
+                # bounded at all (SqlServerStore._fetchone_clamped), so the write as a whole is
+                # still unbounded. DbCoordinator's step_down_leadership carries the full reasoning;
+                # keep the two in lockstep.
                 self._no_claim_until = max(self._no_claim_until, self._monotonic() + pause)
             if outcome.drained:  # a row release is a demotion edge too (#1508)
                 self._fire_on_demote()

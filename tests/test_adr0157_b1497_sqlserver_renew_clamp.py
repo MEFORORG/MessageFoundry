@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""ADR 0157 Inc 0 on SQL Server: the lease claim/renew runs under ``[cluster].lease_renew_timeout_seconds``.
+"""ADR 0157 Inc 0 on SQL Server: the lease claim/renew, and since BACKLOG #5064 the heartbeat,
+config-version refresh and stepdown release, run under ``[cluster].lease_renew_timeout_seconds``.
 
 Until BACKLOG #1497 the clamp bound only the Postgres coordinator. The SQL Server claim inherited
 ``[store].command_timeout`` (30 s by default) from the ODBC connection while it held the leadership
@@ -574,7 +575,7 @@ async def test_the_coordinator_claim_runs_under_its_renew_clamp_end_to_end() -> 
 
 
 async def test_the_paused_owner_read_is_not_clamped() -> None:
-    """Only the claim is in scope: the paused tick's owner read keeps its own BACKLOG #2540 bound."""
+    """The paused tick's owner read is out of the clamp's scope: it keeps its own BACKLOG #2540 bound."""
     calls: list[str] = []
 
     class _Store:

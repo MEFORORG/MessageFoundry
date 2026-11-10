@@ -288,6 +288,21 @@ async def test_sqlserver_store_acquire_is_bounded() -> None:
             pytest.fail("the body must never run on a wedged pool")
 
 
+async def test_sqlserver_clamped_borrow_names_the_setting_that_set_its_limit() -> None:
+    """BACKLOG #5064: a borrow cut at the cluster clamp names the clamp, since raising
+    ``[store].acquire_timeout`` would not lengthen it; one cut at ``[store].acquire_timeout``,
+    the shorter of the two, still names that setting."""
+    store = _sqlserver_store(_HangingPool(), timeout=0.2)
+    with pytest.raises(StoreAcquireTimeout, match=r"lease_renew_timeout_seconds") as clamped:
+        async with store._acquire_clamped(FAST):
+            pytest.fail("the body must never run on a wedged pool")
+    assert "[store].acquire_timeout" not in str(clamped.value)
+    store = _sqlserver_store(_HangingPool(), timeout=FAST)
+    with pytest.raises(StoreAcquireTimeout, match=r"retune with \[store\]\.acquire_timeout$"):
+        async with store._acquire_clamped(5.0):
+            pytest.fail("the body must never run on a wedged pool")
+
+
 async def test_postgres_store_acquire_is_bounded() -> None:
     store = _postgres_store(_HangingPool())
     with pytest.raises(StoreAcquireTimeout):

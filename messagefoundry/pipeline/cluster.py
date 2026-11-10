@@ -1869,8 +1869,9 @@ class DbCoordinator:
                 # ARMED A SECOND TIME, from the instant the write RETURNED, taking whichever expiry is
                 # LATER. The arm above is measured from before the write, so the write's own duration
                 # comes out of the pause. Since BACKLOG #2523 that duration is bounded, at the borrow
-                # wait plus twice the renew clamp; the SQL Server twin's has only
-                # `[store].command_timeout`, and a bound
+                # wait plus twice the renew clamp; the SQL Server twin's borrow and statement are
+                # bounded by the clamp too since BACKLOG #5064, but its COMMIT is not known to be
+                # bounded at all (SqlServerStore._fetchone_clamped), and a bound
                 # is still a cost taken out of the pause. The window that matters starts when the row
                 # becomes takeable, which is the
                 # commit, not the call: measuring from before it would hand a sibling (the pause - write
@@ -2132,7 +2133,7 @@ def build_coordinator(
             leader_fence_timeout_seconds=getattr(
                 cluster_settings, "leader_fence_timeout_seconds", 20.0
             ),
-            # ADR 0157 Inc 0, as for DbCoordinator below: the claim/renew statement's own timeout.
+            # ADR 0157 Inc 0, as for DbCoordinator below: the loop's and stepdown's statement clamp.
             lease_renew_timeout_seconds=_renew_timeout_or_default(cluster_settings),
             acquire_delay_seconds=getattr(cluster_settings, "acquire_delay_seconds", 0.0),
             promotable=getattr(cluster_settings, "promotable", True),
@@ -2149,7 +2150,8 @@ def build_coordinator(
             cluster_settings, "leader_fence_timeout_seconds", 20.0
         ),
         # ADR 0157 Inc 0. Threaded to both coordinators; SqlServerCoordinator applies it as the
-        # claim/renew statement's own ODBC timeout (SqlServerStore._fetchone_clamped).
+        # ODBC timeout and borrow bound of the heartbeat, the claim/renew, the config-version
+        # refresh and a stepdown's release (BACKLOG #5064; SqlServerStore._fetchone_clamped).
         #
         # ClusterSettings resolves the UNSET case (derive it from the detection margin) inside its own
         # validator, so a real settings object always hands over a concrete float and the derivation

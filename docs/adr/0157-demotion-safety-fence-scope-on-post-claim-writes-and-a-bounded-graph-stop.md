@@ -393,7 +393,9 @@ today** (30 vs 30), so ship it with a defaults change or rely on the clamp alone
 >    Postgres. First, the timeout counts whole seconds, so the clamp is rounded DOWN, never above the
 >    value `_renew_fits_the_margin` checked, and never below 1, and
 >    `ServiceSettings._sqlserver_renew_clamp_whole_seconds` refuses a clamp under 1 s on this
->    backend. Second, it binds the claim call only: its borrow waits at most the clamp too, but
+>    backend. Second, it binds each call on its own, never a shared deadline: the claim, and since
+>    BACKLOG #5064 the loop's other statements and the stepdown release. Each call's borrow waits at
+>    most the clamp too, but
 >    unlike Postgres the borrow and the statement do not share one deadline (a whole-second timeout
 >    cannot carry what a borrow leaves of a 1 s clamp), so a renew can land up to about twice the
 >    clamp after it is issued, while the margin check compares the clamp alone. The COMMIT after the
