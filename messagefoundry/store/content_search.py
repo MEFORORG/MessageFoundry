@@ -98,6 +98,15 @@ def _sent(value: str | None) -> str | None:
     return value if value and not value.isspace() else None
 
 
+def sends_a_needle(content: str | None, field_path: str | None, field_value: str | None) -> bool:
+    """Whether a request on a route where a needle is optional sent any needle term, by the same
+    rule :func:`make_spec` reads: a value of only whitespace is not sent. A route calls
+    :func:`make_spec` exactly when this is true, so a lone ``field_value`` is refused there rather
+    than dropped (BACKLOG #6700), and a blank one is not mistaken for a needle."""
+    has_path = bool(field_path and field_path.strip())
+    return has_path or _sent(content) is not None or _sent(field_value) is not None
+
+
 def _require_int(scan_limit: object) -> int:
     """``scan_limit`` itself, refused unless it is an ``int`` (a ``bool`` is refused too, BACKLOG #6700)."""
     if isinstance(scan_limit, bool) or not isinstance(scan_limit, int):

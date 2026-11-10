@@ -498,5 +498,25 @@ async def test_a_lone_field_value_is_refused_not_saved_unread(engine: Engine) ->
             headers=h,
         )
         assert ok.status_code == 200, ok.text
+        # A blank field_value is not a needle: a metadata-only preset still saves.
+        meta_only = await c.post(
+            "/search/presets",
+            json={"name": "m", "criteria": {"channel_id": "IB_A", "field_value": "   "}},
+            headers=h,
+        )
+        assert meta_only.status_code == 200, meta_only.text
+        # A stored lone field_value (saved before the refusal existed) is refused on the layered
+        # read rather than dropped by the compose.
+        pid = meta_only.json()["id"]
+        assert isinstance(engine.store, MessageStore)  # a SQLite engine: the raw write needs _db
+        await engine.store._db.execute(
+            "UPDATE search_presets SET criteria=? WHERE id=?",
+            (json.dumps({"field_value": "MRN999"}), pid),
+        )
+        await engine.store._db.commit()
+        r = await c.get("/search/layered", params={"presets": pid}, headers=h)
+        assert r.status_code == 400, r.text
+        assert "field_value needs an HL7 field path" in r.json()["detail"]
     rows = await engine.store.list_audit(action="preset.create")
-    assert [json.loads(r["detail"])["needle_shape"] for r in rows] == ["field_path"]
+    shapes = sorted(json.loads(r["detail"])["needle_shape"] or "" for r in rows)
+    assert shapes == ["", "field_path"]

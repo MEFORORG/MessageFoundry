@@ -528,6 +528,7 @@ from messagefoundry.store.content_search import (
     ContentSearchError,
     SearchSpec,
     make_spec,
+    sends_a_needle,
 )
 from messagefoundry.store.crypto import audit_body_digests
 from messagefoundry.store.metadata import user_metadata
@@ -3844,10 +3845,8 @@ def _compose_preset_layers(
                         400, f"layered presets conflict on {key!r}: {meta[key]!r} vs {value!r}"
                     )
                 meta[key] = value
-        has_needle = bool((crit.get("content") or "").strip()) or bool(
-            (crit.get("field_path") or "").strip()
-        )
-        if has_needle:
+        # A lone field_value counts, so make_spec refuses it rather than the compose dropping it.
+        if sends_a_needle(crit.get("content"), crit.get("field_path"), crit.get("field_value")):
             if needle is not None:
                 raise HTTPException(
                     400, "layered search allows at most one content predicate across presets"
@@ -9048,7 +9047,7 @@ def create_app(
         us = _require_upload_store(request)
         spec: SearchSpec | None = None
         # A lone field_value reaches make_spec too, so it is refused rather than dropped (#6700).
-        if content or field_path or field_value:
+        if sends_a_needle(content, field_path, field_value):
             try:
                 spec = make_spec(
                     content=content,
@@ -9388,7 +9387,7 @@ def create_app(
         crit = body.criteria
         needle_shape: str | None = None
         # A lone field_value reaches make_spec too, so it is refused rather than saved unread (#6700).
-        if crit.content or crit.field_path or crit.field_value:
+        if sends_a_needle(crit.content, crit.field_path, crit.field_value):
             try:
                 spec = make_spec(
                     content=crit.content,

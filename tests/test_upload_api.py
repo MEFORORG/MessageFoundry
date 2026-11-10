@@ -1963,3 +1963,9 @@ async def test_a_lone_field_value_on_an_upload_browse_is_refused(
         )
         assert ok.status_code == 200, ok.text
         assert ok.json()["matched"] == 1
+        # A blank field_value is not a needle, so the browse stays an unfiltered one.
+        blank = await c.post(
+            f"/uploads/{fid}/messages/search", json={"field_value": "   "}, headers=h
+        )
+        assert blank.status_code == 200, blank.text
+        assert blank.json()["matched"] == 2
