@@ -809,11 +809,11 @@ def test_a_session_on_the_callers_config_root_outside_userprofile_occupies_the_t
 
 
 def test_a_doubled_backtick_config_root_refuses_rather_than_read_its_sibling(rig: Rig) -> None:
-    """Vault BACKLOG #2985, item 6. The registry's reads take a root as a wildcard pattern, which reads
+    """Vault BACKLOG #2985, item 6. The registry's reads took a root as a wildcard pattern, which read
     a doubled backtick as one, so CLAUDE_CONFIG_DIR=<root>\\o``brien was read as its sibling
     <root>\\o`brien. Each holds one record, so the root and record counts of the two reads agreed,
     the session recorded in the target went unseen, and the tree went with exit 0. Red at 93139cf657,
-    which stopped refusing a backtick."""
+    which stopped refusing a backtick. The registry reads literally now, and the refusal stays."""
     wt = rig.add(rig.scratch("ticked-twice"))
     doubled = rig.root / "o``brien"
     (doubled / "sessions").mkdir(parents=True)
@@ -842,7 +842,7 @@ def test_a_doubled_backtick_config_root_refuses_rather_than_read_its_sibling(rig
 
 @pytest.mark.parametrize("char", ["[", "]", "*", "?"])
 def test_a_wildcard_character_in_the_config_root_refuses(rig: Rig, char: str) -> None:
-    """Vault BACKLOG #2985, item 6. The registry's reads take a root as a wildcard pattern, so a root
+    """Vault BACKLOG #2985, item 6. The registry's reads took a root as a wildcard pattern, so a root
     holding one of these could read another directory, or none. It refuses before anything is read,
     so the root need not exist (``*`` and ``?`` cannot be in a Windows file name at all)."""
     wt = rig.add(rig.scratch("wild"))
@@ -857,29 +857,79 @@ def test_a_wildcard_character_in_the_config_root_refuses(rig: Rig, char: str) ->
     assert not wt.exists()
 
 
-def test_a_record_the_registry_did_not_read_refuses_on_the_record_count(rig: Rig) -> None:
-    """Vault BACKLOG #2985. The registry lists records without -Force, so it skips a hidden one, and a
-    session recorded there in the target went unseen while the visible record kept the fence
-    available. The second listing counts every record, and a different record count now refuses.
-    Red before the guard: the tree went."""
+@pytest.mark.parametrize("attrs", [("+h",), ("+h", "+s")], ids=["hidden", "hidden-system"])
+def test_a_hidden_record_is_read_and_occupies_the_target(rig: Rig, attrs: tuple[str, ...]) -> None:
+    """Vault BACKLOG #2985. The registry listed records without -Force, so it skipped a hidden one,
+    and here only the record-count guard refused. The registry lists with -Force now, so the record
+    is read and placed in the target. The finished-tree removal has no such guard, and its own test
+    below removed the tree before the fix."""
     wt = rig.add(rig.scratch("hidden-record"))
     hidden = rig.registry(wt) / ".claude" / "sessions" / "2.json"
-    subprocess.run(["attrib", "+h", str(hidden)], check=True, capture_output=True)
+    subprocess.run(["attrib", *attrs, str(hidden)], check=True, capture_output=True)
 
     proc = rig.run("-Path", str(wt))
     assert proc.returncode != 0, _out(proc)
-    assert "session record(s) and a second listing found" in _out(proc), _out(proc)
-    assert wt.exists() and rig.is_registered(wt)
-
-    # Unhidden, both reads count the record, and it is placed in the target.
-    subprocess.run(["attrib", "-h", str(hidden)], check=True, capture_output=True)
-    proc = rig.run("-Path", str(wt))
-    assert proc.returncode != 0, _out(proc)
-    assert "Target is occupied" in _out(proc), _out(proc)
+    assert "Target is occupied" in _out(proc) and "in-2" in _out(proc), _out(proc)
     assert wt.exists() and rig.is_registered(wt)
 
     # Control: without that record, the target is cleared.
     rig.registry()
+    proc = rig.run("-Path", str(wt))
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+def test_a_record_whose_name_holds_wildcard_characters_is_read_by_its_own_name(rig: Rig) -> None:
+    """Vault BACKLOG #2985. The registry read each record with a positional Get-Content, which takes
+    the name as a pattern, so [1].json was read as 1.json. Both files counted as records and both
+    read as the session elsewhere, so the counts agreed and the tree went with exit 0 at 0a7ccdca1c.
+    Every read is literal now."""
+    wt = rig.add(rig.scratch("bracketed-record"))
+    sessions = rig.registry() / ".claude" / "sessions"
+    assert (sessions / "1.json").is_file()
+    (sessions / "[1].json").write_text(
+        json.dumps({"cwd": str(wt), "sessionId": "brkt"}), encoding="utf-8"
+    )
+
+    proc = rig.run("-Path", str(wt))
+    assert proc.returncode != 0, _out(proc)
+    assert "Target is occupied" in _out(proc) and "brkt" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    # Control: without that record, the target is cleared.
+    (sessions / "[1].json").unlink()
+    proc = rig.run("-Path", str(wt))
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+def test_a_config_root_whose_name_holds_a_backtick_is_read_by_its_own_name(rig: Rig) -> None:
+    """Vault BACKLOG #2985, with CLAUDE_CONFIG_DIR unset. The registry tested and listed each
+    USERPROFILE root as a pattern, so .claude``x was read as its sibling .claude`x. Both siblings
+    count as roots and each read one record, so the root and record counts agreed, the session in
+    the target went unseen, and the tree went with exit 0 at 0a7ccdca1c. Every read is literal now."""
+    wt = rig.add(rig.scratch("ticked-root"))
+    doubled = rig.home / ".claude``x" / "sessions"
+    doubled.mkdir(parents=True)
+    (doubled / "9.json").write_text(
+        json.dumps({"cwd": str(wt), "sessionId": "ticked-twice"}), encoding="utf-8"
+    )
+    single = rig.home / ".claude`x" / "sessions"
+    single.mkdir(parents=True)
+    (single / "9.json").write_text(
+        json.dumps(
+            {"cwd": str(rig.root / "elsewhere"), "pid": 1, "sessionId": "clear", "startedAt": 0}
+        ),
+        encoding="utf-8",
+    )
+
+    proc = rig.run("-Path", str(wt))
+    assert proc.returncode != 0, _out(proc)
+    assert "Target is occupied" in _out(proc) and "ticked-t" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    # Control: without that record, the target is cleared.
+    (doubled / "9.json").unlink()
     proc = rig.run("-Path", str(wt))
     assert proc.returncode == 0, _out(proc)
     assert not wt.exists()

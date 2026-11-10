@@ -47,10 +47,11 @@
         %USERPROFILE%\.claude* config root, and the caller's CLAUDE_CONFIG_DIR when it names another;
         a session on any other root is not seen. A CLAUDE_CONFIG_DIR holding a backtick, [, ], * or
         ? refuses, and so does a second listing of the registry that counts a different number of
-        roots than the registry's own read, or, when that read found records, of records. A record
-        whose process still runs counts unless that process started more than a minute after the record's startedAt. This fence sees only
-        the directory a session was launched in, never where it writes, so on its own it is blind
-        to a subagent's tree. The refusals in the next list are the signals that are not;
+        roots than the registry's own read, or, when that read is available, of records. A record
+        whose process still runs counts unless that process started more than a minute after the
+        record's startedAt. This fence sees only the directory a session was launched in, never
+        where it writes, so on its own it is blind to a subagent's tree. The refusals in the next
+        list are the signals that are not;
       * every refusal in the next list, which -Name shares.
 
     WHAT BOTH REMOVAL ROUTES REFUSE, WHATEVER -Force SAYS (-Name since vault BACKLOG #2988):
@@ -556,12 +557,10 @@ if ($byPath) {
         if (-not [System.IO.Path]::IsPathFullyQualified($env:CLAUDE_CONFIG_DIR)) {
             throw "CLAUDE_CONFIG_DIR is the relative path '$env:CLAUDE_CONFIG_DIR', so its session registry cannot be placed. Occupancy unknown. Nothing was removed."
         }
-        # The registry's own reads treat a root as a wildcard pattern, while the second listing reads it
-        # literally. A pattern read unescapes backtick escapes, so a doubled backtick reads as one, and
-        # a root holding a backtick can be read as a different directory. [, ], * and ? can do the same.
-        # So at least these refuse, and any backtick does, including a lone one that reads as itself.
+        # A root holding a backtick, [, ], * or ? refuses. The registry reads every path literally
+        # (session-registry.ps1, vault BACKLOG #2985); this refusal is a second fence beside it.
         if ($env:CLAUDE_CONFIG_DIR -match '[\[\]*?`]') {
-            throw "CLAUDE_CONFIG_DIR '$env:CLAUDE_CONFIG_DIR' holds a wildcard character or a backtick, and the session registry reads a root as a pattern, so this one is not read. Occupancy unknown. Nothing was removed."
+            throw "CLAUDE_CONFIG_DIR '$env:CLAUDE_CONFIG_DIR' holds a wildcard character or a backtick, which this route refuses rather than read. Occupancy unknown. Nothing was removed."
         }
         # TrimEndingDirectorySeparator keeps a drive root whole: `D:` alone would name D:'s cwd.
         $pin = [System.IO.Path]::TrimEndingDirectorySeparator([System.IO.Path]::GetFullPath($env:CLAUDE_CONFIG_DIR))
@@ -594,8 +593,8 @@ if ($byPath) {
     }
     # Never empty, so an exception with no message cannot read as a clean listing.
     catch { $listingError = "the second listing failed: $($_.Exception.Message)" }
-    # A record count that differs means the receipt read a different set of records, for example
-    # skipping a hidden file the second listing counts, so a receipt that is available cannot clear.
+    # A record count that differs means the receipt read a different set of records, so a receipt
+    # that is available cannot clear.
     # An unavailable receipt clears only as readable-empty below, which needs both counts at zero.
     $why = if ($listingError) { $listingError }
     elseif ($listedRoots -ne $occ.RootsExamined) {

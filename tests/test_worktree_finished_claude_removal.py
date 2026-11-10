@@ -1297,3 +1297,41 @@ def test_a_removed_tree_under_a_plain_parent_still_reads_removed(fx: Fx) -> None
     rows = remove(fx, [fx.tree("clean")], apply=True, prelude=_AFTER_REMOVAL)
     assert rows["clean"]["Outcome"] == "REMOVED", rows["clean"]
     assert not fx.tree("clean").exists()
+
+
+@pytest.mark.parametrize("case", ["hidden", "bracketed-name", "backtick-root"])
+def test_a_session_record_the_registry_read_as_a_pattern_or_skipped_occupies(
+    fx: Fx, sleeper: int, case: str
+) -> None:
+    """Vault BACKLOG #2985. The session registry skipped a hidden record, read [1].json as 1.json,
+    and read a root named .claude``x as its sibling .claude`x. This pass has no second listing to
+    catch either, so at 0a7ccdca1c each removed a tree a live session was recorded in. The registry
+    lists with -Force and reads every path literally now."""
+    tree = fx.tree("clean")
+    _session(fx, sleeper, tree, "live1111-0000")
+    occupant = fx.sessions / f"{sleeper}.json"
+    if case == "hidden":
+        subprocess.run(["attrib", "+h", str(occupant)], check=True, capture_output=True)
+    else:
+        # A record in a decoy the old read substituted for the occupant's own name.
+        dead = {"cwd": str(fx.root), "pid": never_live_pid(), "sessionId": "d", "startedAt": 0}
+        if case == "bracketed-name":
+            decoy, moved = fx.sessions / "1.json", fx.sessions / "[1].json"
+        else:
+            decoy = fx.home / ".claude`x" / "sessions" / "9.json"
+            moved = fx.home / ".claude``x" / "sessions" / "9.json"
+        for p in (decoy, moved):
+            p.parent.mkdir(parents=True, exist_ok=True)
+        decoy.write_text(json.dumps(dead), encoding="utf-8")
+        occupant = occupant.rename(moved)
+
+    rows = remove(fx, [tree], apply=True)
+    assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
+    assert "occupied: live1111 LIVE" in rows["clean"]["Reason"], rows["clean"]
+    assert tree.is_dir() and fx.is_registered(tree)
+
+    # Control: without that record, the same pass removes the tree. A hidden file deletes as is.
+    occupant.unlink()
+    rows = remove(fx, [tree], apply=True)
+    assert rows["clean"]["Outcome"] == "REMOVED", rows["clean"]
+    assert not tree.exists()
