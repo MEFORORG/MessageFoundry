@@ -4730,8 +4730,9 @@ class AiSettings(_Section):
     allowed_endpoints: list[str] = []
     # Attest that revocation of the AI endpoint's server certificate is covered outside the engine
     # (BACKLOG #2193 slice (e), on the ADR 0173 section 12 pattern). The broker verifies that
-    # certificate and checks no CRL and no OCSP, so an off-box endpoint is REFUSED under
-    # [security].enforcement = enforce unless this is set; no CRL lever is built for this hop. What
+    # certificate and checks no OCSP, and no CRL unless [tls].crl_file reaches the hop (BACKLOG
+    # #5527), so without that CRL an off-box endpoint is REFUSED under
+    # [security].enforcement = enforce unless this is set. What
     # the refusal keys on is stated once, on transports.ai_broker._refuse_an_unrevoked_ai_hop.
     # Setting it adds no check on the wire. The reason is MANDATORY; at least a flag without one, a
     # blank one, a reason without the flag, or a control character in the reason refuses at load.
@@ -10745,10 +10746,10 @@ def security_loosenings(
                 "ai.endpoint_revocation_attested",
                 "revocation of the [ai].endpoint server certificate is attested as covered outside "
                 f"the engine (reason: {ai.endpoint_revocation_attested_reason}) -- the AI broker "
-                "verifies that certificate but its own handshake checks no CRL and no OCSP, and the "
-                "attestation adds no check. Wherever the revocation refusal would apply to that hop "
-                "it is lifted, so a revoked certificate is caught only if what the reason names "
-                "really covers it. No CRL lever is built for this hop. It never lifts a cleartext "
+                "verifies that certificate but its own handshake checks no OCSP, and no CRL unless "
+                "[tls].crl_file is set; the attestation adds no check. Wherever the revocation "
+                "refusal would apply to that hop it is lifted, so a revoked certificate is caught "
+                "only if what the reason names really covers it. It never lifts a cleartext "
                 "refusal",
             )
         )

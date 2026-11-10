@@ -2941,9 +2941,10 @@ class TrustAnchorPolicy:
     connector's client-verify context resolves the same anchor at both ``build_check`` and live
     construction. Those are not its only receivers. It also reaches at least the
     ``FhirLookupExecutor`` (``transports/fhir.py``, built by ``pipeline/wiring_runner.py``, #1180),
-    the alerts SMTP sink (``pipeline/alert_sinks.py``) and its test send (``api/app.py``), and the
-    security notifier (``pipeline/security_notify.py``), each through
-    :func:`resolve_trust_anchor`."""
+    the alerts SMTP sink (``pipeline/alert_sinks.py``) and its test send (``api/app.py``), the
+    security notifier (``pipeline/security_notify.py``), and the engine AI broker
+    (``transports/ai_broker.py``, which the ``POST /ai/chat`` route in ``api/app.py`` hands it,
+    BACKLOG #5527), each through :func:`resolve_trust_anchor`."""
 
     internal_ca_file: str | None = None
     mode: TrustAnchorMode = "system"

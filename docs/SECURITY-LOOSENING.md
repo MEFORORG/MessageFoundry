@@ -1612,18 +1612,21 @@ count is above `0` (vault BACKLOG #2613).
 > above). It needs its `[ai].endpoint_revocation_attested_reason`.
 - **What the engine refuses without it:** the engine AI broker sends `[ai].api_key` and the code
   sent for assistance over https that verifies the endpoint's certificate, and its handshake
-  checks no CRL and no OCSP. So an `[ai].endpoint` whose host is not loopback is refused under
+  checks no OCSP, and no CRL unless `[tls].crl_file` is set (BACKLOG #5527). So without that CRL
+  an `[ai].endpoint` whose host is not loopback is refused under
   `[security].enforcement = enforce`, and wherever a broker is built without a known posture,
   which counts as enforcing. The broker is built for each `POST /ai/chat` request, so the refusal
   comes there, answered 503; `serve` starts, and `messagefoundry check` does not report it.
-- **What you lose:** that refusal. A revoked but unexpired endpoint certificate is then accepted
-  unless something outside the engine stops it, and the API key crosses to whoever holds it.
-  **Setting the flag adds no check on the wire.**
-- **What the attestation can truthfully rest on:** not on the engine. No CRL lever is built for
-  this hop, so `[tls].crl_file` does not reach it and the flag is the only way across under
-  `enforce`. A short-lived endpoint certificate is the main honest basis; put its lifetime in the
-  reason. A gateway on this machine that checks the upstream's revocation itself needs no
-  attestation at all: a loopback endpoint is not refused.
+- **What you lose:** that refusal. With no `[tls].crl_file`, a revoked but unexpired endpoint
+  certificate is then accepted unless something outside the engine stops it, and the API key
+  crosses to whoever holds it. **Setting the flag adds no check on the wire.**
+- **What the attestation can truthfully rest on:** not on the engine. Since BACKLOG #5527
+  `[tls].crl_file` reaches this hop and is the other way across under `enforce`, so prefer it where
+  you hold the CRL of the endpoint certificate's issuer. It is instance-wide: once set, an endpoint
+  whose issuer has no CRL in that file fails its handshake, and this flag does not change that.
+  For an endpoint under a public CA you hold no CRL for, a short-lived endpoint certificate is the
+  main honest basis; put its lifetime in the reason. A gateway on this machine that checks the
+  upstream's revocation itself needs no attestation at all: a loopback endpoint is not refused.
 - **What it cannot do:** it never lifts the broker's other refusals, at least an `http` endpoint,
   an endpoint missing from `[ai].allowed_endpoints`, and credentials in the URL. The process-wide
   `MEFOR_TLS_REVOCATION_ATTESTED` does **not** cross this hop under an enforcing or unknown

@@ -436,6 +436,13 @@ byte-identical SSL context.
 | `internal_ca_file` | path | — | PEM path to the org's internal CA. **Not a secret** — a path, like `tls_cert_file` / `forward_tls_ca_file`. Unset (default) = no internal anchor; every hop uses the OS trust store. |
 | `trust_anchor_mode` | enum | `system` | how `internal_ca_file` composes with the OS default roots on a non-loopback internal hop. `system` (default) = **OS trust store only**, `internal_ca_file` ignored (byte-identical). `augment` = OS roots **and** the internal CA (a mixed public + private estate). `pinned` = **only** the internal CA, not the public bundle (a fully-private estate; strictest). `pinned` **without** `internal_ca_file` is **refused at load** — with nothing to pin it would silently fall back to the full OS trust store, i.e. the operator excludes public roots and gets all of them. |
 
+**The engine AI broker reads this block too** (BACKLOG #5527). `POST /ai/chat` verifies an
+`[ai].endpoint` whose host is not loopback against `internal_ca_file` under `augment` or `pinned`,
+and checks it against `crl_file` in any mode, as the HTTP-family connections do. The broker is built
+for each request, so it reads both files on each assist call. A `crl_file` that reaches the endpoint
+is a way across its revocation refusal, beside `[ai].endpoint_revocation_attested`; an endpoint
+whose issuer has no CRL in that file then fails its handshake.
+
 ### `[inbound]` — inbound listener defaults
 | Key | Type | Default | Notes |
 |---|---|---|---|
@@ -1009,7 +1016,7 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 | `endpoint` | str | — | the customer-managed LLM URL. **Required** for `mode = managed_endpoint`; `http`/`https` only, and a cleartext `http` endpoint is **refused** (it would expose `api_key`) |
 | `api_key` | secret | — | the LLM credential — **env only** (`MEFOR_AI_API_KEY`), never the file. **Required** for `mode = managed_endpoint` |
 | `allowed_endpoints` | list | `[]` | fail-closed SSRF allow-list for `endpoint`'s host; each entry is `host` (any port) or `host:port`. **An empty list permits nothing** — deliberately independent of `[egress].allowed_http`, which an empty list leaves allow-any under the `[security].block_unlisted_outbound = false` opt-out ([`[egress]`](#egress) states the rule), so it can't gate this surface |
-| `endpoint_revocation_attested` | bool | `false` | attests that revocation of the `endpoint`'s server certificate is covered outside the engine (BACKLOG #2193, owner ruling 2026-10-27). The broker verifies that certificate and checks no CRL and no OCSP, so under `[security].enforcement = enforce` an `endpoint` whose host is not loopback is **refused** at `POST /ai/chat` (503) unless this is set; no CRL lever is built, so `[tls].crl_file` does not reach this hop. Adds no check on the wire. A **loosening**: `security_loosenings()` names it with the reason. What it can rest on: [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). Env: `MEFOR_AI_ENDPOINT_REVOCATION_ATTESTED` |
+| `endpoint_revocation_attested` | bool | `false` | attests that revocation of the `endpoint`'s server certificate is covered outside the engine (BACKLOG #2193, owner ruling 2026-10-27). The broker verifies that certificate against the [`[tls]`](#tls--outbound-client-trust-anchors) anchor and checks no OCSP. So under `[security].enforcement = enforce` an `endpoint` whose host is not loopback is **refused** at `POST /ai/chat` (503) unless `[tls].crl_file` reaches the hop or this is set (BACKLOG #5527). `[tls].crl_file` adds a check on the wire and this does not, but the CRL is instance-wide: once it is set, an endpoint whose issuer has no CRL in that file fails its handshake, attested or not. So an endpoint under a public CA you hold no CRL for is a case for this flag with `[tls].crl_file` unset. Adds no check on the wire. A **loosening**: `security_loosenings()` names it with the reason. What it can rest on: [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). Env: `MEFOR_AI_ENDPOINT_REVOCATION_ATTESTED` |
 | `endpoint_revocation_attested_reason` | str | — | **required** with `endpoint_revocation_attested = true`: what covers revocation of the endpoint's certificate, for example its short lifetime. Put no secret in it: it is printed in the serve-time warning and `GET /security/posture`. The load rules are the `[store].vault_revocation_attested_reason` row's. Env: `MEFOR_AI_ENDPOINT_REVOCATION_ATTESTED_REASON` |
 
 > Only `code_only` context is ever sent in the MVP (graph names + active editor code) — **never
