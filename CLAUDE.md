@@ -526,8 +526,9 @@ table instead. A Builder still gets one turn: it puts an owner question in its r
 hook, required context, seat or method rule, except a fix for a red `main` or a security control.
 Existing machinery is still repaired, and review effort is not touched. The freeze lapses on
 2026-12-02. The owner exempted the 2026-11-09 autonomy change from it, and only that change, which
-landed as tier T4 alone ([`docs/AUTONOMY-PLAN.md`](docs/AUTONOMY-PLAN.md) section 12). The drafting Manager reads R5 as not freezing R1-R9 themselves, so building what they
-require is carrying them out, not new machinery; that reading is recorded beside the signed text
+landed as tier T4 alone ([`docs/AUTONOMY-PLAN.md`](docs/AUTONOMY-PLAN.md) section 12). The
+drafting Manager reads R5 as not freezing R1-R9 themselves, so building what they require is
+carrying them out, not new machinery; that reading is recorded beside the signed text
 and is not part of the signature. The signature covers R1-R9 as they stand in vault
 `docs/LEDGER-INFLOW-RULINGS-DRAFT.md` at commit `22579b25071c`, anchored at the vault ref
 `refs/liaison/owner-ruling-20261104-r1-r9`; that commit is not on vault `main`, so fetch the ref.
@@ -618,9 +619,10 @@ Manager's watch reached the cloud session 29 seconds after its question.
   10 opens the no-review path only in its last wave, per seat, as calibration passes. Plan section
   5.2 retires the go *"once section 4 is built"*, and section 4 is only partly built, so this
   retirement runs ahead of the plan's order; SAIDS section 6.2 and its A.6 record the gap. Filed
-  ledger rows, and work an accepted ADR names as its direction, are class B too, and the Manager
-  picks and decomposes ledger work itself; every such act takes the adversarial review, and plan
-  section 12 lists what stays class C (tier T4, owner ruling 2026-11-09). Point the brief at the
+  ledger rows, and work an owner-accepted ADR names as its direction, are class B too, and the
+  Manager picks and decomposes ledger work itself; every such act takes the adversarial review,
+  plan section 12 lists what stays class C, and while the kill switch is on the picking waits for
+  the owner too (tier T4, owner ruling 2026-11-09). Point the brief at the
   relevant existing code; it measurably improves the result.
 - The rest of the Manager's dispatch rules bind only that seat. Korus `roles/MANAGER.md` carries
   them; read it at `origin/main`. Every brief ends with push, then report. A brief names who else is
