@@ -1261,6 +1261,26 @@ class DrIntakeState(NamedTuple):
     parked: frozenset[str]
 
 
+class FailedLine(NamedTuple):
+    """One lane's recorded start failure (ADR 0031), the value of ``RegistryRunner._failed``.
+
+    ``reason`` is the line the lane's status and its ``connection_stopped`` alert carry.
+    ``store_fault`` says whether that line records the store stopping the lane's CA check
+    (:class:`AnchorStoreUnavailable` on the failure's explicit cause chain, :func:`_is_store_fault`)
+    rather than any other failure, a refused CA included (vault BACKLOG #5146). It lives in the
+    value, so a pop or a replace of the line can never leave the class behind it. Read it with
+    :meth:`RegistryRunner.failed_on_store_fault`."""
+
+    reason: str
+    store_fault: bool
+
+
+def _is_store_fault(exc: BaseException) -> bool:
+    """Whether ``exc`` is the store stopping a CA check, read off its explicit cause chain, never
+    off its text (vault BACKLOG #3746, #5146)."""
+    return explicit_cause(exc, AnchorStoreUnavailable) is not None
+
+
 class _IngressFields(NamedTuple):
     """The peek reads an ingress commit records, taken once (see :func:`_read_ingress_fields`)."""
 
@@ -1898,7 +1918,8 @@ class RegistryRunner:
         # reported itself healthy, while an operator restarting that outbound afterwards re-set the entry
         # and made a status reader call the healthy inbound failed. Read it through the direction-scoped
         # accessors (inbound_failed / outbound_failed), never by reaching in with a bare name.
-        self._failed: dict[tuple[Direction, str], str] = {}
+        # Each value carries whether its line is a store fault (FailedLine, vault BACKLOG #5146).
+        self._failed: dict[tuple[Direction, str], FailedLine] = {}
         # Connections SKIPPED by the DR run-profile (#61, ADR 0048): (kind, name) → reason (e.g. "DR
         # profile threshold=critical: connection tier=normal is below threshold"). Distinct from _failed
         # (ADR 0031): a filtered connection did not FAIL to build/bind — it was deliberately not started
@@ -3162,22 +3183,46 @@ class RegistryRunner:
         """The failure reason if the INBOUND of this name failed to build/bind at start, else ``None``
         (ADR 0031). A failed connection is isolated, not fatal: the engine starts the rest of the graph
         and an operator recovers it (fix the cause, then reload or restart it)."""
-        return self._failed.get(("inbound", name))
+        line = self._failed.get(("inbound", name))
+        return None if line is None else line.reason
 
     def outbound_failed(self, name: str) -> str | None:
         """The failure reason if the OUTBOUND of this name failed to build at start, else ``None``
         (ADR 0031) - the outbound half of :meth:`inbound_failed`."""
-        return self._failed.get(("outbound", name))
+        line = self._failed.get(("outbound", name))
+        return None if line is None else line.reason
+
+    def failed_on_store_fault(self, kind: Direction, name: str) -> bool:
+        """Whether the ``kind`` lane ``name`` is recorded failed and its line records the store
+        stopping its CA check (:attr:`FailedLine.store_fault`, vault BACKLOG #5146). ``False`` for
+        a lane recorded failed for any other reason, a refused CA included, and for one not
+        recorded failed."""
+        line = self._failed.get((kind, name))
+        return line is not None and line.store_fault
+
+    def _repeats_failed_class(self, kind: Direction, name: str, exc: BaseException) -> bool:
+        """Whether the ``kind`` lane ``name`` already has a failed line of ``exc``'s class: both a
+        store fault, or both not (vault BACKLOG #5146). The once-only guards stay silent on a repeat,
+        so a scheduled retry or a rule's restart does not page again. A class that flips replaces
+        the line, with its alert: a CA refused once the store is back no longer reads as a store
+        outage, nor a store outage as a refused CA. The class is a flag, never the line's text,
+        which varies."""
+        line = self._failed.get((kind, name))
+        return line is not None and line.store_fault == _is_store_fault(exc)
 
     def degraded_inbound(self) -> dict[str, str]:
         """Snapshot of ``{inbound: reason}`` for INBOUND connections that failed to bind (ADR 0031).
         Empty when every inbound came up."""
-        return {name: reason for (kind, name), reason in self._failed.items() if kind == "inbound"}
+        return {
+            name: line.reason for (kind, name), line in self._failed.items() if kind == "inbound"
+        }
 
     def degraded_outbound(self) -> dict[str, str]:
         """Snapshot of ``{outbound: reason}`` for OUTBOUND connections that failed to build (ADR 0031).
         Empty when every outbound came up."""
-        return {name: reason for (kind, name), reason in self._failed.items() if kind == "outbound"}
+        return {
+            name: line.reason for (kind, name), line in self._failed.items() if kind == "outbound"
+        }
 
     def degraded_stages(self) -> dict[str, str]:
         """Snapshot of ``{stage: reason}`` for pooled pipeline stages with a claimer that died and has
@@ -3855,7 +3900,8 @@ class RegistryRunner:
         Once only, as :meth:`_record_window_open_failure` records: a scheduled poller retries at
         every in-window tick, and every alert could re-fire a ``restart_inbound`` control action,
         so a page per refusal would be an alert-restart loop. A start that binds clears the record,
-        so the next refusal pages again."""
+        so the next refusal pages again. So does a failure whose class differs from the recorded
+        line's, a store fault against anything else (:meth:`_repeats_failed_class`)."""
         try:
             await self._check_inbound_lane_anchor(name)
             await self._start_inbound_unsafe(name)
@@ -3865,7 +3911,7 @@ class RegistryRunner:
             if (
                 name in self.registry.inbound
                 and not self.inbound_running(name)  # a raise after the bind leaves it serving
-                and ("inbound", name) not in self._failed
+                and not self._repeats_failed_class("inbound", name, exc)
             ):
                 self._record_failed(name, exc, kind="inbound")
             raise
@@ -3905,7 +3951,7 @@ class RegistryRunner:
                     and not self.inbound_running(name)
                     and name in self.registry.inbound
                     and self._deployed(name, "inbound")
-                    and ("inbound", name) not in self._failed
+                    and not self._repeats_failed_class("inbound", name, exc)
                 ):
                     self._record_failed(name, exc, kind="inbound")
                 raise
@@ -4255,7 +4301,7 @@ class RegistryRunner:
                     exc_info=not refused,
                 )
                 line = _lane_anchor_line(direction, name, settings, exc, passive=True)
-                self._record_failed(name, line, kind=direction)
+                self._record_failed(name, line, kind=direction, store_fault=_is_store_fault(exc))
 
     def engine_parked_outbounds(self) -> frozenset[str]:
         """The outbounds the ENGINE holds down by design: those the DR run-profile parks, and those
@@ -4648,10 +4694,15 @@ class RegistryRunner:
             # first failed for another reason keeps that older reason in its status; the CA
             # refusal is in the server log and the auth.trust_anchor rows (vault BACKLOG #3224,
             # item 3, declined: recording it again is what the alert-storm test pins against).
-            # A store fault's line is a TrustAnchorError too, so it is held to the same rule.
-            if not (isinstance(exc, TrustAnchorError) and ("outbound", name) in self._failed):
+            # A store fault's line is a TrustAnchorError too, so it is held to the same rule,
+            # within its class: a refusal after a store fault's line, or a store fault after any
+            # other line, replaces the line and alerts once (vault BACKLOG #5146).
+            if not (
+                isinstance(exc, TrustAnchorError)
+                and self._repeats_failed_class("outbound", name, exc)
+            ):
                 self._record_failed(name, exc, kind="outbound")
-            return exc if explicit_cause(exc, AnchorStoreUnavailable) is not None else None
+            return exc if _is_store_fault(exc) else None
         self._destinations[name] = connector
         self._failed.pop(("outbound", name), None)
         self._dr_unbuilt.pop(name, None)
@@ -4977,8 +5028,9 @@ class RegistryRunner:
 
         :meth:`_checked_inbound_start` records a failed start before this runs (BACKLOG #3859), so
         this usually finds the record and only logs the retry. It still records anything that
-        method leaves unrecorded, including a raise after the bind."""
-        if ("inbound", name) in self._failed:
+        method leaves unrecorded, including a raise after the bind, and a failure whose class
+        differs from the recorded line's (:meth:`_repeats_failed_class`, vault BACKLOG #5146)."""
+        if self._repeats_failed_class("inbound", name, exc):
             log.debug(
                 "schedule: inbound connection %r still cannot start (%s); retrying next tick",
                 name,
@@ -5344,7 +5396,9 @@ class RegistryRunner:
         if source is not None:
             await source.stop()
 
-    def _record_failed(self, name: str, exc: BaseException, *, kind: Direction) -> None:
+    def _record_failed(
+        self, name: str, exc: BaseException, *, kind: Direction, store_fault: bool | None = None
+    ) -> None:
         """Isolate a connection that failed to build/bind (ADR 0031): record the reason, log it
         loudly, and alert — the engine keeps the rest of the graph running. Reuses the AlertSink
         ``connection_stopped`` signal: its meaning ("this connection is down until an operator
@@ -5352,10 +5406,21 @@ class RegistryRunner:
 
         ``kind`` is part of the KEY, not just the log line (see ``_failed``). The alert still carries the
         bare name: an alert row is addressed to the operator's connection, and the detail says which
-        direction failed to start."""
+        direction failed to start.
+
+        The line's class (:class:`FailedLine`) is read off ``exc``'s cause chain, unless
+        ``store_fault`` names it for a line raised with no cause (vault BACKLOG #5146)."""
         fixed = isinstance(exc, TrustAnchorError) and exc.fixed_text
         reason = safe_exc(exc, limit=_ANCHOR_LINE_LIMIT) if fixed else safe_exc(exc)
-        self._failed[(kind, name)] = reason  # stored before the alert fires, so a sink reads it
+        if store_fault is None:
+            store_fault = _is_store_fault(exc)
+        if store_fault:
+            # A store fault's line replaces a refusal's, so the refusal's mark goes with it: the
+            # lane no longer reads as held on a refused CA, and the next reload reads the CA
+            # again rather than keep a failure its line no longer states (vault BACKLOG #5146).
+            self._anchor_refused.pop((kind, name), None)
+        # Stored before the alert fires, so a sink reads it.
+        self._failed[(kind, name)] = FailedLine(reason, store_fault)
         self._log_and_alert_start_failure(
             f"{kind} connection {name!r}",
             name,
@@ -6170,7 +6235,9 @@ class RegistryRunner:
                     len(self._failed),
                     # Named WITH the direction — an operator reading this has to know which half
                     # of a dual-role name to go and fix.
-                    ", ".join(f"{k} {n} ({r})" for (k, n), r in sorted(self._failed.items())),
+                    ", ".join(
+                        f"{k} {n} ({line.reason})" for (k, n), line in sorted(self._failed.items())
+                    ),
                 )
             else:
                 log.info(
@@ -7690,12 +7757,16 @@ class RegistryRunner:
                         # passive start wrote stays, so the lane still reads failed, in words
                         # that no longer ask for the activation that has run.
                         self._dr_unbuilt[name] = False
-                        if ("outbound", name) in self._failed:
-                            self._failed[("outbound", name)] = (
-                                f"outbound connection '{name}' failed its check at the passive "
-                                "start, and the log halt held the activation's build of it. Repair "
-                                "the log and the cause, then reload or start the connection; the "
-                                "server log says why"
+                        passive_line = self._failed.get(("outbound", name))
+                        if passive_line is not None:
+                            # New words, the passive check's class (vault BACKLOG #5146).
+                            self._failed[("outbound", name)] = passive_line._replace(
+                                reason=(
+                                    f"outbound connection '{name}' failed its check at the passive "
+                                    "start, and the log halt held the activation's build of it. "
+                                    "Repair the log and the cause, then reload or start the "
+                                    "connection; the server log says why"
+                                )
                             )
                     self._dr_filters_out(name, oc.priority, kind="outbound")
                     continue
