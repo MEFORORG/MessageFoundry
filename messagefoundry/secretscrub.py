@@ -141,15 +141,16 @@ WHAT THE CAMELCASE START, THE SPLIT WALK AND THE COMPOUND KEY WORDS COST (BACKLO
 2026-11-10 the third paragraph's way: one whole ``scrub_credentials`` call against the module at
 ``82ddcd03bc``, minimum over interleaved rounds, on a shared box whose absolute figures sit above the
 table's. The table above is left as measured, because it is a different instrument. The plain line
-is level, 0.70 against 0.70 us. A credential line costs 12 percent more, 6.3 against 5.6 us, because
-every start position now also tries the camelCase start; it fails on the first character unless
-that is a capital opening a label word, which most are not. The 6 KB hyphen-and-dot run naming every
-family, the adversarial ceiling above, costs 4.9 against 4.0 ms. Two shapes built for this change
-cost more and are stated rather than hidden: a 6 KB run of alternating lower-case and capital letters
-naming every family, where each capital is a candidate start, 1.9 against 0.52 ms, and a 6 KB value
-of such letters ending on a quote, which forces the value walk to check before every unit, 0.65
-against 0.082 ms. Both grow linearly, as ``tests/test_secretscrub_camelcase_label.py`` times, and both
-sit under the ceiling.
+costs 0.80 against 0.60 us, because the admission gate's substring sweep grew from 15 words to 23.
+A credential line costs 18 percent more, 6.5 against 5.5 us, because every start position now also
+tries the camelCase start; it fails on the first character unless that is a capital opening a label
+word, which most are not. A 6 KB base64url run naming one word costs 0.099 against 0.068 ms. The 6 KB
+hyphen-and-dot run naming every family, the adversarial ceiling above, costs 5.6 against 4.0 ms. Two
+shapes built for this change cost more and are stated rather than hidden: a 6 KB run of alternating
+lower-case and capital letters naming every family, where each capital is a candidate start, 2.3
+against 0.51 ms, and a 6 KB value of such letters ending on a quote, which forces the value walk to
+check before every unit, 0.90 against 0.083 ms. Both grow linearly, as
+``tests/test_secretscrub_camelcase_label.py`` times, and both sit under the ceiling.
 """
 
 from __future__ import annotations
@@ -206,8 +207,10 @@ _KEY_MATERIAL_WORDS = (
 #: Key MATERIAL labels written as ONE compound word, the way Azure and cloud SDKs spell a key secret:
 #: ``AccountKey=`` in a storage connection string, ``SharedAccessKey=`` in a Service Bus or Event Hubs
 #: one, ``accessKey`` or ``secretKey`` in an SDK's configuration, and ``privateKey`` or
-#: ``encryptionKey``, the engine's own key settings as camelCase configuration spells them (BACKLOG
-#: #5545).
+#: ``encryptionKey``, the engine's own key settings as camelCase configuration spells them, and
+#: ``secondaryKey``, ``masterKey`` and ``subscriptionKey`` from Azure key listings (BACKLOG #5545).
+#: ``primaryKey`` is LEFT OUT on purpose, though Azure names a storage key that way: it is ordinary
+#: database vocabulary in a log line, so it would discriminate nothing, the reason bare ``key`` is out.
 #:
 #: A NAMED LIST, NOT A ``key`` RULE, because bare ``key`` is deliberately absent from every family here
 #: (the comment on :data:`_CREDENTIAL_WORDS` says why), and a camelCase ``Key`` tail would read
@@ -229,6 +232,9 @@ _COMPOUND_KEY_WORDS = (
     "authkey",
     "privatekey",
     "encryptionkey",
+    "secondarykey",
+    "masterkey",
+    "subscriptionkey",
 )
 
 #: Every word :data:`_KEY_MATERIAL` reads as a label.
@@ -333,8 +339,11 @@ _CAMEL_INITIALS = "".join(sorted({word[0].upper() for word in _CAMEL_WORDS}))
 # read, exactly as ``access_token_value=`` is not, since both patterns end the keyword with ``\b``.
 #
 # THE VALUE WALKS STOP AT IT TOO. The stop before a later quoted label checks in front of each
-# :data:`_RUN_UNIT`, which splits a run at exactly this boundary, so ``token=x;accessToken="v w"``
-# hides "v w" as ``token=x;access_token="v w"`` does.
+# :data:`_RUN_UNIT`, which splits a run at exactly this boundary, so in this module's pass
+# ``token=x;accessToken="v w"`` hides "v w" as ``token=x;access_token="v w"`` does. NOT ON THE
+# INSTALLED CHAIN after ``token=``, ``code=`` or ``state=``: ``logging_setup``'s query filter runs
+# first, and its own stop before a later label has neither this start nor the compound key words,
+# so it takes the later label and the quoted value prints, as it did before this change.
 #
 # AT LEAST THESE ARE NOT READ, and each is a residual: an all-capitals run before the keyword
 # (``SASToken=``, where the capital follows a capital), a keyword spelled with a fold character such
@@ -344,7 +353,10 @@ _CAMEL_INITIALS = "".join(sorted({word[0].upper() for word in _CAMEL_WORDS}))
 # still prints the braced tail " ww}", because :data:`_BRACED_HEAD` keeps its ``\b``. The support
 # bundle's own copy of these patterns, in ``support/redact.py``, has neither this start nor the split
 # walk; its second layer is this module, which reads a camelCase label the copy left alone, but not
-# one the copy's plain value already ran over.
+# one the copy's plain value already ran over. The copy has no :data:`_COMPOUND_KEY_WORDS` either, so
+# in the bundle ``token=a;AccountKey="v w"`` prints "v w". And ``redaction``'s
+# ``_CREDENTIAL_AHEAD``, which keeps a label glued to an encoded HL7 run out of the PHI pass, reads
+# neither, so ``x%7Cy%7Cz,AccountKey: v`` prints its value on the write-time chain.
 #
 # THE START IS A TRADE, as :data:`_LABEL_START`'s escape start was, and for the same reason: the passes
 # run one after another, and a label read now can end an earlier value where it used to run on, or
@@ -360,10 +372,18 @@ _CAMEL_INITIALS = "".join(sorted({word[0].upper() for word in _CAMEL_WORDS}))
 # lines), the bundle (2), the chain run twice (13) and a chain line the bundle reads back (13); in
 # ``^accessToken=secret: Jane DoexToken=`` the chain prints "Jane". The structured differential in
 # ``tests/test_log_redaction_secret_domain.py``, which holds no camelCase label, reads 0 printed.
+#: One lower-case letter or digit as the ENCLOSING pattern's case rule reads it: an ASCII one, case-
+#: sensitively, or a non-ASCII character the pattern's own ``[a-z]`` takes. Under ``(?i)`` that is
+#: the :data:`_GATE_FOLDS` letters, which ``(?i)[A-Za-z0-9]`` took; under ``_MEFOR_SECRET``, compiled
+#: without it, it is nothing, which is what that pattern's ``[A-Za-z0-9]`` took (found by code
+#: review). Spelled with the pattern's own class rather than a list, so it cannot drift from it.
+_LOWER_ONE = r"(?:(?-i:[a-z0-9])|(?-i:(?![\x00-\x7f]))[a-z])"
 _CAMEL_START = (
     r"(?-i:(?=["
     + _CAMEL_INITIALS
-    + r"])(?<=[a-z0-9]))(?=(?i:"
+    + r"]))(?<="
+    + _LOWER_ONE
+    + r")(?=(?i:"
     + _alternation(_CAMEL_WORDS)
     + r")\b)"
 )
@@ -648,16 +668,19 @@ _GUARDED_BRACED_NO_SPACE = r"\{(?:[^}'\"\s]|\}\})*+\}(?!\})"
 #: start. Each branch opens on a class the other refuses and takes its run possessively, so the walk
 #: stays deterministic, and a unit is never empty.
 #:
-#: CASE-SENSITIVE, SO IT NAMES THE FOUR FOLD LETTERS ITSELF. The run class it replaced was
-#: ``[A-Za-z0-9]++`` under the patterns' ``(?i)``, which also takes U+0130, U+0131, U+017F and U+212A,
-#: the :data:`_GATE_FOLDS` letters, and the separator class beside it refuses them for the same
-#: reason. Without them here a value walk stopped at such a letter, and ``password=`` with a value
-#: opening on U+0131 printed whole (found by code review). They sit in the lower-case class, so no
-#: unit splits before one, as no run did. ``tests/test_secretscrub_camelcase_label.py`` holds the set
-#: to :data:`_GATE_FOLDS`. :data:`_RUN_ON_INNER` keeps its whole ASCII run and does not take this
+#: CASE-SENSITIVE ON ASCII, AND IT TAKES A NON-ASCII LETTER EXACTLY WHERE THE ENCLOSING PATTERN'S
+#: ``[a-z]`` DOES. The run class it replaced was ``[A-Za-z0-9]++`` under each pattern's own flags,
+#: and the separator class beside it is its complement under the same flags. Under ``(?i)`` that run
+#: took U+0130, U+0131, U+017F and U+212A, the :data:`_GATE_FOLDS` letters; without them a value walk
+#: stopped at such a letter, and ``password=`` with a value opening on U+0131 printed whole. Under
+#: ``_MEFOR_SECRET``, which has no ``(?i)``, the run took none of them; a unit that took them there
+#: skipped the stop after one, and a ``MEFOR_`` value ran over ``password="..."``. Both found by code
+#: review. A fold letter sits in the lower-case branch, so no unit splits before one, as no run did.
+#: ``tests/test_secretscrub_camelcase_label.py`` holds both readings. :data:`_RUN_ON_INNER` keeps its whole ASCII run and does not take this
 #: unit: it must stop at every non-ASCII character, and splitting it stopped a later quoted value at
 #: a camelCase label inside it, which printed that value's head.
-_RUN_UNIT = r"(?-i:[A-Z]++[a-z0-9\u0130\u0131\u017f\u212a]*+|[a-z0-9\u0130\u0131\u017f\u212a]++)"
+_LOWER_RUN = r"(?:(?-i:[a-z0-9]++)|(?-i:(?![\x00-\x7f]))[a-z])"
+_RUN_UNIT = r"(?:(?-i:[A-Z]++)" + _LOWER_RUN + r"*+|" + _LOWER_RUN + r"++)"
 
 #: The first letters of every label keyword. A one-character gate in front of the keyword alternation:
 #: a case-folded alternation is tried branch by branch, and most runs start with none of these.
@@ -1617,7 +1640,7 @@ _DSN_HINT = (_DSN_MARKER,)
 #: is dropped, because any text holding it holds the shorter one too. Derived, so it cannot drift from
 #: the tuples above -- ``pass`` subsumes ``password``/``passwd``/``passphrase``, ``encryption_key``
 #: subsumes ``encryption_keys_retired``, ``api_key`` subsumes ``intake_api_key_next``, ``accesskey``
-#: subsumes ``sharedaccesskey``. One scan of 18 members instead of 25 (counted since BACKLOG #5545's
+#: subsumes ``sharedaccesskey``. One scan of 23 members instead of 30 (counted with BACKLOG #5545's
 #: compound key words), and it rejects the overwhelmingly common record: the one carrying no
 #: credential word at all. The member pass's own words (:data:`_MEMBER_EXTRA_HINT`) are in it too,
 #: so a word added there and nowhere else still admits the record (BACKLOG #5030).

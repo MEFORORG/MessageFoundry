@@ -99,6 +99,8 @@ _NOT_LABELS = (
     "compassHeading=12 bypassMode=on",
     "userName=jdoe sessionCount=4",
     "PasswordPolicy=strict TokenEndpoint=https://idp.example.invalid/t",
+    # A database primary key, which is why ``primarykey`` is not a compound key word.
+    "insert failed: primaryKey=patient_id",
 )
 
 
@@ -197,6 +199,7 @@ _COMPOUND_KEY_LINES = (
     f"cfg AUTHKEY={_VALUE}",
     f'jwk load failed {{"privateKey": "{_VALUE}"}}',
     f"smart: smartPrivateKey={_VALUE} encryptionKey=zq",
+    f"listKeys: secondaryKey={_VALUE} cosmos masterKey={_VALUE} apim subscriptionKey={_VALUE}",
 )
 
 
@@ -259,12 +262,14 @@ def test_every_compound_key_word_is_a_stop_label() -> None:
 # --- Found by code review: the split walk must keep what the whole-run walk kept ------------------
 
 
-def test_the_walk_unit_takes_every_gate_fold_letter() -> None:
-    """``(?i)[A-Za-z0-9]`` takes the four fold letters, so the case-sensitive unit names them. Held to
-    ``_GATE_FOLDS``, the module's measured set, so the two cannot drift."""
-    unit = re.compile(secretscrub._RUN_UNIT)
+def test_the_walk_unit_reads_a_fold_letter_as_its_pattern_does() -> None:
+    """``(?i)[A-Za-z0-9]`` takes the four fold letters and ``[A-Za-z0-9]`` takes none, so the unit
+    must do each under the same flags. Held to ``_GATE_FOLDS``, the module's measured set."""
+    folded = re.compile(secretscrub._RUN_UNIT, re.IGNORECASE)
+    plain = re.compile(secretscrub._RUN_UNIT)
     for char, _letter in secretscrub._GATE_FOLDS:
-        assert unit.fullmatch(f"ab{char}cd"), hex(ord(char))
+        assert folded.fullmatch(f"ab{char}cd"), hex(ord(char))
+        assert not plain.fullmatch(f"ab{char}cd"), hex(ord(char))
 
 
 #: Values opening on, or holding, a fold letter, each hidden on ``origin/main``. Built with ``chr``.
@@ -273,6 +278,10 @@ _FOLD_LINES = (
     (f'error: "api_key={chr(0x130)}st{_VALUE}"', _VALUE),
     (f'token=abc{chr(0x17F)}{_VALUE};password="v w"', _VALUE),
     (f"password='pw1 s{chr(0x131)}{_VALUE} pw3, private_key='p w q'", _VALUE),
+    # ``_MEFOR_SECRET`` has no ``(?i)``: a fold letter there ends the run, so the stop still sees the
+    # later quoted label (found by code review round two).
+    (f'MEFOR_STORE_PW=ab{chr(0x131)}password="{_VALUE} two" end', _VALUE),
+    (f"MEFOR_STORE_PW=ab{chr(0x17F)}secret='{_VALUE} w'", _VALUE),
 )
 
 

@@ -1649,10 +1649,10 @@ def test_the_dsn_scan_grows_linearly_in_line_length() -> None:
     )
 
     # THE GATE-REJECT PATH IS A SUBJECT IN ITS OWN RIGHT, and it is the one that runs on nearly every
-    # record: a line naming no credential word at all. It reaches `_ANY_HINT`'s 15 substring sweeps and
-    # then returns, so nothing below it is exercised -- which is exactly why it needs its own timed row
-    # rather than being inferred from the marked one. Without it a regression that made that sweep
-    # pathological would have no timed coverage anywhere in this file.
+    # record: a line naming no credential word at all. It reaches `_ANY_HINT`'s substring sweeps (23
+    # since BACKLOG #5545) and then returns, so nothing below it is exercised -- which is exactly why
+    # it needs its own timed row rather than being inferred from the marked one. Without it a
+    # regression that made that sweep pathological would have no timed coverage anywhere in this file.
     subjects: tuple[tuple[str, Callable[[str], object], bool], ...] = (
         (
             "support.redact._DSN_PASSWORD",
