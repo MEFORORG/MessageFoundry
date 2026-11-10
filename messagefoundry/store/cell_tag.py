@@ -36,7 +36,6 @@ import functools
 import inspect
 import json
 import logging
-import math
 import threading
 import time
 from collections.abc import Callable, Coroutine, Mapping
@@ -335,9 +334,6 @@ _reported_audit: _Memo = {}
 #: The memos are touched from the event loop and from worker threads (the content-search scan, the
 #: SQL Server fused handoff), so every read-modify-write holds this lock.
 _reported_lock = threading.Lock()
-#: The audit memo's mark for a cell whose row is being written: it reads as recent, and is replaced
-#: by the write time on success or removed on failure.
-_IN_FLIGHT: Final = math.inf
 
 
 def _memo_key(err: CellTagError) -> _Key:
@@ -399,22 +395,19 @@ async def report_cell_tag_failure(store: _AuditSink, err: CellTagError) -> None:
     audit failure is logged and swallowed: reporting must never change what the read did. A corrupt
     cell is not drift, so it writes no tag-failed row; its WARNING was logged at the read.
 
-    The cell is muted for the interval only once its row is WRITTEN (BACKLOG #6697). While a write
-    is in flight a concurrent report of the cell is skipped; a write that fails or is cancelled
-    releases the cell, so its next refusal writes the row again."""
+    The cell is muted for the interval only once its row is WRITTEN, so a write that fails or is
+    cancelled leaves the cell's next refusal to write it (BACKLOG #6697). Nothing marks a write in
+    flight: concurrent reports of one cell may each write a row, since a duplicate audit row is the
+    price of never losing one."""
     if err.audited or not err.drift:
         return
     key = _memo_key(err)
     with _reported_lock:
-        last = _reported_audit.get(key)
-        if last == _IN_FLIGHT:
-            return
-        if _is_recent(_reported_audit, key, time.monotonic()):
-            err.audited = True
-            return
-        _remember(_reported_audit, key, _IN_FLIGHT)
+        recent = _is_recent(_reported_audit, key, time.monotonic())
+    if recent:
+        err.audited = True
+        return
     action = _TAG_FAILED_ACTION[err.table]
-    written = False
     try:
         await store.record_audit(
             action,
@@ -422,26 +415,22 @@ async def report_cell_tag_failure(store: _AuditSink, err: CellTagError) -> None:
             channel_id=err.channel_id,
             detail=json.dumps({"cell": err.column, "row": err.row_ref}, sort_keys=True),
         )
-        written = True
     except Exception as exc:  # noqa: BLE001 -- the refusal stands whatever the audit write does
-        # Class and SQLSTATE only, as the store's other driver-failure lines: a driver's text and
-        # traceback are not this function's to vouch for.
+        # Class and an error code only (SQLSTATE, or SQLite's error name), as the store's other
+        # driver-failure lines: a driver's text and traceback are not this function's to vouch for.
         from messagefoundry.store.base import driver_sqlstate  # lazy: base imports this module
 
         _log.error(
-            "the %s audit row could not be written (%s, SQLSTATE %s); it is written only if the"
-            " cell is refused again",
+            "the %s audit row could not be written (%s, code %s); it is written only if the cell"
+            " is refused again",
             action,
             type(exc).__name__,
-            driver_sqlstate(exc),
+            driver_sqlstate(exc) or getattr(exc, "sqlite_errorname", None),
         )
-    finally:
-        with _reported_lock:
-            if written:
-                _remember(_reported_audit, key, time.monotonic())
-            elif _reported_audit.get(key) == _IN_FLIGHT:
-                del _reported_audit[key]
-    err.audited = written
+        return
+    err.audited = True
+    with _reported_lock:
+        _remember(_reported_audit, key, time.monotonic())
 
 
 def audits_cell_tag[S: _AuditSink, **P, R](
@@ -480,8 +469,9 @@ def dead_letters_on_cell_tag[S: CellTagSink, **P](
     ``routed_id`` must be keyword-only, so every call that reaches the handoff carries it in
     ``kwargs``; a handoff that takes it any other way is refused here, at decoration (BACKLOG
     #6698)."""
-    # FORWARDREF: a TYPE_CHECKING-only annotation must not raise NameError at decoration.
-    sig = inspect.signature(fn, annotation_format=annotationlib.Format.FORWARDREF)
+    # STRING: only the kind is read, so no annotation is evaluated (a TYPE_CHECKING-only one would
+    # raise NameError at decoration).
+    sig = inspect.signature(fn, annotation_format=annotationlib.Format.STRING)
     param = sig.parameters.get("routed_id")
     if param is None or param.kind is not inspect.Parameter.KEYWORD_ONLY:
         raise TypeError(f"{fn.__qualname__} must take routed_id as a keyword-only parameter")

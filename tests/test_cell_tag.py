@@ -228,11 +228,17 @@ async def test_a_failed_audit_write_does_not_mute_the_cells_next_report(
 
 
 @pytest.mark.usefixtures("fresh_audit_memo")
-async def test_a_report_in_flight_skips_a_concurrent_one_and_a_cancel_releases_the_cell() -> None:
-    """BACKLOG #6697: while one report of a cell is writing, a concurrent one writes no duplicate;
-    a write that is cancelled leaves the cell unmuted for its next refusal."""
+async def test_a_concurrent_report_is_not_lost_when_the_first_write_fails_or_is_cancelled() -> None:
+    """BACKLOG #6697: a report that runs while another write of the same cell is in flight writes
+    its own row, so the first write failing loses nothing; a cancelled write leaves the cell
+    unmuted for its next refusal."""
     rows: list[str] = []
     gate = asyncio.Event()
+
+    class _FailingSink:
+        async def record_audit(self, action: str, **_kwargs: object) -> None:
+            await gate.wait()
+            raise sqlite3.OperationalError("synthetic")
 
     class _Sink:
         async def record_audit(self, action: str, **_kwargs: object) -> None:
@@ -240,12 +246,16 @@ async def test_a_report_in_flight_skips_a_concurrent_one_and_a_cancel_releases_t
             rows.append(action)
 
     first = asyncio.create_task(
+        report_cell_tag_failure(_FailingSink(), CellTagError("messages", "raw", "au-flight", "A"))
+    )
+    await asyncio.sleep(0)
+    second = asyncio.create_task(
         report_cell_tag_failure(_Sink(), CellTagError("messages", "raw", "au-flight", "A"))
     )
     await asyncio.sleep(0)
-    await report_cell_tag_failure(_Sink(), CellTagError("messages", "raw", "au-flight", "A"))
     gate.set()
     await first
+    await second
     assert rows == [MESSAGE_TAG_FAILED_ACTION]
 
     gate.clear()
