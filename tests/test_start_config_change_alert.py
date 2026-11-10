@@ -1665,6 +1665,98 @@ async def test_the_convergence_row_writes_the_fingerprint_it_judged(
     assert row["baseline_unchecked"] is True, "the engine has moved on: it is no baseline"
 
 
+async def test_a_convergence_row_names_the_loosening_it_brings_in(
+    tmp_path: Path, cfg: Path, alerts: list[dict[str, Any]]
+) -> None:
+    """vault BACKLOG #3814: a convergence reload onto a graph with a loosening the start's graph
+    did not have writes a row naming it. Before, the convergence row had no ``loosenings`` key, so
+    no row named what the converged graph loosened."""
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        start = (await _start_rows(engine))[-1]
+        _add_a_cleartext_hop(cfg)  # the sibling's change, on the shared directory
+        await engine._converge_reload(3)
+        rows = await engine.store.list_audit(action="config_reload")
+    assert "cleartext_accepted" not in start["loosenings"], "control: the start had none"
+    assert len(rows) == 1 and rows[0]["actor"] == "system:cluster-convergence"
+    row = json.loads(rows[0]["detail"])
+    assert row["initiator"] == "cluster_convergence"
+    assert "cleartext_accepted" in row["loosenings"]
+
+
+async def test_a_convergence_row_whose_loosenings_cannot_be_read_records_none(
+    tmp_path: Path,
+    cfg: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    alerts: list[dict[str, Any]],
+) -> None:
+    """vault BACKLOG #3814: a list the reader faults on is ``None``, unknown, never ``[]``, which
+    would say none are active, and the row is still written."""
+    app = _app(tmp_path, cfg)
+
+    def _fault(*_a: Any, **_kw: Any) -> Any:
+        raise RuntimeError("synthetic posture read fault")
+
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        with monkeypatch.context() as patch, caplog.at_level(logging.ERROR):
+            patch.setattr(app_module, "_posture_loosenings", _fault)
+            await engine._converge_reload(3)
+        rows = await engine.store.list_audit(action="config_reload")
+    assert len(rows) == 1 and rows[0]["actor"] == "system:cluster-convergence"
+    row = json.loads(rows[0]["detail"])
+    assert "loosenings" in row and row["loosenings"] is None
+    assert any(
+        r.levelno == logging.ERROR and "config_reload records None" in r.getMessage()
+        for r in caplog.records
+    ), "the unknown list is logged, not silent"
+
+
+async def test_a_convergence_inside_the_start_records_its_loosenings_as_unknown(
+    tmp_path: Path, cfg: Path, monkeypatch: pytest.MonkeyPatch, alerts: list[dict[str, Any]]
+) -> None:
+    """vault BACKLOG #3814: a convergence reload that runs inside engine.start() comes before the
+    lifespan stashes the settings the loosenings reader needs, so a list read then could leave
+    the settings-scoped loosenings out. It is recorded as unknown, ``None``."""
+    real_start = Engine.start
+
+    async def _start_then_converge(self: Engine) -> None:
+        await real_start(self)
+        await self._converge_reload(1)
+
+    monkeypatch.setattr(Engine, "start", _start_then_converge)
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        rows = await engine.store.list_audit(action="config_reload")
+        await engine._converge_reload(2)  # control: once the start is done
+        after = await engine.store.list_audit(action="config_reload")
+    assert len(rows) == 1 and json.loads(rows[0]["detail"])["loosenings"] is None
+    assert len(after) == 2
+    assert isinstance(json.loads(after[0]["detail"])["loosenings"], list), "the newest row"
+
+
+async def test_an_applied_reload_carries_the_env_values_it_swapped_in(
+    tmp_path: Path, cfg: Path
+) -> None:
+    """vault BACKLOG #3814: the outcome carries the reload's own env() values, so its row reads
+    that graph's loosenings against them, not against whatever the runner holds at the write. A
+    dry run carries none."""
+    app = _app(tmp_path, cfg)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        outcome = await engine.reload_detail(None, dry_run=False, propagate=False)
+        rr = engine.registry_runner
+        assert rr is not None
+        live = dict(rr.env_values)
+        dry = await engine.reload_detail(None, dry_run=True, propagate=False)
+    assert outcome.env_values is not None and dict(outcome.env_values) == live
+    assert dry.env_values is None
+    assert "env_values" not in repr(outcome)
+
+
 # --- vault BACKLOG #3765, items 18 and 21, LF8 and LF11: one digest read, of the bytes that ran ---
 
 
