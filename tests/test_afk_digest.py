@@ -333,7 +333,8 @@ def test_the_digest_shows_reds_after_merge_and_lander_holds(sb: Sandbox) -> None
         rec("outcome", seat="lander", ref=recent[1]["id"], outcome="held"),
         rec("outcome", seat="lander", ref=recent[2]["id"], outcome="held"),
     ]
-    seed_vault(sb, recent + signals)
+    statuses = [rec("outcome", seat="lander", ref=d["id"], outcome="merged") for d in recent]
+    seed_vault(sb, recent + signals + statuses)
     cells = _calibration_row(digest(sb, "-Sample", "0"), "lander", "B")
     assert cells[8:11] == ["0.0%", "10.0% BREACH", "20.0% BREACH"]
 
@@ -346,12 +347,13 @@ def test_the_fourteen_day_reversal_rate_breaches_above_five_percent(sb: Sandbox)
         rec("outcome", seat="lander", ref=d["id"], outcome="reversed", note="reverted in PR 9")
         for d in (recent[0], stale[0], stale[1])
     ]
-    seed_vault(sb, recent + stale + reversed_)
+    statuses = [rec("outcome", seat="lander", ref=d["id"], outcome="merged") for d in recent]
+    seed_vault(sb, recent + stale + reversed_ + statuses)
     out = digest(sb, "-Sample", "0")
     cells = _calibration_row(out, "lander", "B")
     assert [cells[5], *cells[7:9]] == ["10", "1", "10.0% BREACH"]
-    # Ten decisions, none with a resolved status, and one reversal mark: below the floor.
-    assert cells[6] == "1/20 BELOW FLOOR"
+    # Ten decisions resolved by a later status: below the floor of twenty.
+    assert cells[6] == "10/20 BELOW FLOOR"
     assert f"reversal of `{recent[0]['id']}`" in out
 
 

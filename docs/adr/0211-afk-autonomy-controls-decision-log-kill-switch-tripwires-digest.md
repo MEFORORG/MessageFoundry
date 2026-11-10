@@ -616,9 +616,11 @@ blind sample optional. Three things change here.
 - **Calibration** (`Get-DecisionCalibration`) is the automated signals over the seat's Class B
   decisions in the trailing 14 days: the reversal rate, and the rates of decisions any `outcome`
   record marks `red-after-merge` or `held`, each a breach above 5 percent. Decisions answered
-  HALT, left PENDING or marked `dropped` are not in the denominator. Fewer than 20 decisions with a
-  resolved outcome in the window is not calibrated, so an empty history is not (Manager decision
-  2026-11-09, plan section 12). Owner ratings still count when given: any trailing window of up to 60
+  HALT, left PENDING or marked `dropped` are left out unless they carry a mark, and the rates
+  divide by the resolved decisions: those marked, or given a later status on
+  `DecisionResolvedOutcomes`. A decision's own log-time outcome never resolves it. Fewer than 20
+  resolved decisions in the window is not calibrated, so an empty history is not (Manager
+  decision 2026-11-09, plan section 12). Owner ratings still count when given: any trailing window of up to 60
   holding more than 3 disagreements is a breach, with the 60 fresh ratings to recover. Fewer than
   60 ratings no longer holds a class back, so AC-7's *"calibrated only at 60 rated samples"* and
   the gate section's *"Today it answers REVIEW (or HALT) for every seat"* are superseded.
@@ -627,8 +629,11 @@ blind sample optional. Three things change here.
   `-Touches`. No path is REVIEW, since an act that changes no file has no git undo. Every path must
   be on the fail-closed allowlist `_decisionlog.ps1` `DecisionFastPathAllow`, and none may be one
   `Get-DecisionClassCPath` names or cannot classify (a `~` segment included); anything else is
-  REVIEW. The gate answers NO-REVIEW only where origin is `MEFORORG/MessageFoundry`, and names on
-  stderr the conditions it did not check, so a NO-REVIEW still never shows the act is not a
+  REVIEW, and so is a symbolic link or a file marked skip-worktree or assume-unchanged. The
+  derived paths are the checkout's state at gate time, not the act's, so the session names every
+  path the act will change; `-Json` and the record carry the paths classified. The gate answers
+  NO-REVIEW only where origin is `MEFORORG/MessageFoundry`, and names on stderr the conditions it
+  did not check, so a NO-REVIEW still never shows the act is not a
   security control. The record schema gains `touches`, still version 1, filled empty for an older
   record.
 - **A seat is read through `docs/roles/seats.json`**: an alias shares its seat's calibration and

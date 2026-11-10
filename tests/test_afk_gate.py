@@ -89,14 +89,21 @@ def rec(kind: str = "decision", at: datetime | None = None, **fields: Any) -> di
 FLOOR = 20
 
 
-def calibrated(seat: str, count: int = FLOOR) -> list[dict[str, Any]]:
-    """``count`` Class B decisions by ``seat``, 3 days old, each with the resolved outcome
-    ``merged``: the resolved-outcome floor met, all on one day so the gate reads one more issue for
-    them, and outside the chain floor's 24 hours."""
+def merged(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A later ``merged`` status for each decision, the record that resolves it."""
     return [
-        rec(at=ago(days=3, minutes=i), seat=seat, item="calib", outcome="merged")
-        for i in range(count)
+        rec("outcome", at=ago(days=1), seat="lander", ref=d["id"], outcome="merged")
+        for d in decisions
     ]
+
+
+def calibrated(seat: str, count: int = FLOOR) -> list[dict[str, Any]]:
+    """``count`` Class B decisions by ``seat``, 3 days old, then a later ``merged`` outcome for
+    each: the resolved-outcome floor met, the decisions on one day so the gate reads one more issue
+    for them, and outside the chain floor's 24 hours. The decisions come first, so ``[:n]`` slices
+    them."""
+    decided = [rec(at=ago(days=3, minutes=i), seat=seat, item="calib") for i in range(count)]
+    return decided + merged(decided)
 
 
 def reversal(decision: dict[str, Any], at: datetime, by: str = "lander") -> dict[str, Any]:
@@ -236,6 +243,46 @@ def test_the_resolved_outcome_floor(sb: Sandbox, count: int, expected: int) -> N
     assert code == expected, why(doc)
 
 
+def test_a_decisions_own_log_time_outcome_does_not_resolve_it(sb: Sandbox) -> None:
+    """It is written before the act exists, so it says nothing about a result."""
+    seed_vault(sb, [rec(at=ago(days=3, minutes=i), outcome="merged") for i in range(FLOOR)])
+    code, doc = gate(sb)
+    assert code == REVIEW and "resolved outcomes 0/20 BELOW FLOOR" in why(doc), why(doc)
+
+
+@pytest.mark.parametrize("status", ["deferred", "rejected", "pending.", "in-progress"])
+def test_a_status_off_the_resolved_list_does_not_resolve(sb: Sandbox, status: str) -> None:
+    decided = [rec(at=ago(days=3, minutes=i), item=f"o{i}") for i in range(FLOOR)]
+    later = [
+        rec("outcome", at=ago(days=1), seat="lander", ref=d["id"], outcome=status) for d in decided
+    ]
+    seed_vault(sb, decided + later)
+    code, doc = gate(sb)
+    assert code == REVIEW and "BELOW FLOOR" in why(doc), why(doc)
+
+
+def test_the_rates_divide_by_the_resolved_decisions_only(sb: Sandbox) -> None:
+    """Unlogged decisions cannot dilute a rate: 2 holds in 20 resolved is 10 percent, however many
+    pending decisions sit beside them."""
+    acted = calibrated("manager")
+    idle = [rec(at=ago(days=4, minutes=i), item=f"u{i}") for i in range(100)]
+    seed_vault(sb, acted + idle + [_signal(d, "held") for d in acted[:2]])
+    code, doc = gate(sb)
+    assert code == REVIEW and "Lander holds 10.0% BREACH" in why(doc), why(doc)
+
+
+def test_a_dropped_status_does_not_cancel_a_mark(sb: Sandbox) -> None:
+    acted = calibrated("manager")
+    reversed_ = [_signal(d, "reversed") for d in acted[:3]]
+    dropped = [
+        rec("outcome", at=ago(minutes=5), seat="manager", ref=d["id"], outcome="dropped")
+        for d in acted[:3]
+    ]
+    seed_vault(sb, acted + reversed_ + dropped)
+    code, doc = gate(sb)
+    assert code == REVIEW and "reversal rate 15.0% BREACH" in why(doc), why(doc)
+
+
 def test_a_status_logged_later_resolves_a_decision(sb: Sandbox) -> None:
     decided = [rec(at=ago(days=3, minutes=i), item=f"o{i}") for i in range(FLOOR)]
     merged = [
@@ -276,10 +323,10 @@ def test_an_act_that_names_nothing_it_touches_reviews(sb: Sandbox) -> None:
     "path",
     [
         "messagefoundry/parsing/peek.py",
-        "messagefoundry/parsing/_builtin_hl7.py",
+        "messagefoundry/parsing/split.py",
         "samples/config/IB_DEMO_ORU_router.py",
         "messagefoundry_toolkit/generators/adt.py",
-        "docs/CONNECTIONS.md",
+        "docs/CODESETS.md",
         "tests/test_parsing.py",
     ],
 )
@@ -390,7 +437,7 @@ def test_an_alias_shares_its_seats_calibration(sb: Sandbox) -> None:
     """manager2 is manager in the roster, so manager's breach closes manager2's path too."""
     recent = [rec(at=ago(days=3, minutes=i), item=f"o{i}") for i in range(10)]
     held = [_signal(d, "held") for d in recent[:2]]
-    seed_vault(sb, recent + held)
+    seed_vault(sb, recent + merged(recent) + held)
     code, doc = gate(sb, seat="manager2")
     assert code == REVIEW and "Lander holds 20.0% BREACH" in why(doc), why(doc)
 
@@ -496,6 +543,18 @@ def test_an_alias_shares_its_seats_calibration(sb: Sandbox) -> None:
         "samples/../scripts/hooks/x.py",
         "README.md",
         "harness/app.py",
+        "messagefoundry/parsing/xml/harden.py",
+        "messagefoundry/parsing/xml/signature.py",
+        "messagefoundry/parsing/_bounded_inflate.py",
+        "messagefoundry/parsing/compression.py",
+        "messagefoundry/parsing/_builtin_hl7.py",
+        "messagefoundry/parsing/dicom/_inflate.py",
+        "samples/config/IB_IMMUNIZATION_BODYCRED_VXU.py",
+        "samples/ech-sidecar/README.md",
+        "samples/config/.claude/settings.json",
+        "samples/.github/workflows/x.yml",
+        "docs/CONNECTIONS.md",
+        "docs/USER-GUIDE.md",
     ],
 )
 def test_a_class_c_or_unclassifiable_path_reviews(sb: Sandbox, path: str) -> None:
@@ -542,7 +601,7 @@ def test_a_signal_above_five_percent_in_14_days_reviews(
         rec("outcome", at=ago(days=5 + i), seat="lander", ref=d["id"], outcome=outcome)
         for i, d in enumerate(recent[:2])
     ]
-    seed_vault(sb, recent + signals)
+    seed_vault(sb, recent + merged(recent) + signals)
     code, doc = gate(sb)
     assert code == REVIEW, why(doc)
     assert f"{label} 20.0% BREACH" in why(doc), why(doc)
@@ -575,7 +634,22 @@ def test_a_reversal_logged_with_a_hash_item_closes_the_item(sb: Sandbox) -> None
 
 
 @pytest.mark.parametrize(
-    "near", ["hold", "Lander-hold", "red", "red after merge", "reverted", "reopen", "override"]
+    "near",
+    [
+        "hold",
+        "Lander-hold",
+        "lander-held",
+        "on-hold",
+        "red",
+        "red after merge",
+        "reverted",
+        "reopen",
+        "override",
+        "rolled-back",
+        "rollback",
+        "undone",
+        "backed-out",
+    ],
 )
 def test_a_near_miss_signal_spelling_is_refused_at_write(sb: Sandbox, near: str) -> None:
     """It would be read as a status and the signal lost, so it is never written."""
@@ -587,9 +661,48 @@ def test_a_near_miss_signal_spelling_is_refused_at_write(sb: Sandbox, near: str)
     assert sb.spool() == []
 
 
+@pytest.mark.parametrize("word", ["held", "reversed", "rolled-back"])
+def test_a_decision_record_cannot_carry_a_signal_as_its_own_outcome(sb: Sandbox, word: str) -> None:
+    proc = sb.run(
+        DECISION,
+        *no_host_usage(sb, (*LOG_B, "-Class", "C", "-Outcome", word)),
+    )
+    assert proc.returncode == 2 and "on a decision record" in proc.stderr, proc.stderr
+    assert sb.spool() == []
+
+
+def test_a_skip_worktree_file_reviews(sb: Sandbox) -> None:
+    """Its edits are hidden from every git read the gate makes."""
+    seed_vault(sb, calibrated("manager"))
+    git(sb.repo, "update-index", "--skip-worktree", "docs/roles/seats.json")
+    code, doc = gate(sb)
+    assert code == REVIEW and "skip-worktree" in why(doc), why(doc)
+
+
+def test_a_symbolic_link_reviews(sb: Sandbox) -> None:
+    seed_vault(sb, calibrated("manager"))
+    link = sb.repo / "samples" / "l.py"
+    link.parent.mkdir(parents=True)
+    try:
+        link.symlink_to(sb.repo / "scripts" / "coord" / "decision.ps1")
+    except OSError:
+        pytest.skip("this account cannot create a symbolic link")
+    code, doc = gate_touching(sb, ("-Touches", "samples/l.py"))
+    assert code == REVIEW and "symbolic link" in why(doc), why(doc)
+
+
+def test_the_json_answer_carries_the_paths_it_classified(sb: Sandbox) -> None:
+    seed_vault(sb, calibrated("manager"))
+    (sb.repo / "samples").mkdir()
+    (sb.repo / "samples" / "a.py").write_text("x = 1\n", encoding="utf-8")
+    code, doc = gate(sb)
+    assert code == NO_REVIEW, why(doc)
+    assert sorted(doc["paths"]) == ["messagefoundry/parsing/peek.py", "samples/a.py"]
+
+
 def test_a_signal_is_read_whatever_its_case(sb: Sandbox) -> None:
     recent = [rec(at=ago(days=3, minutes=i), item=f"o{i}") for i in range(10)]
-    seed_vault(sb, recent + [_signal(d, " Held") for d in recent[:2]])
+    seed_vault(sb, recent + merged(recent) + [_signal(d, " Held") for d in recent[:2]])
     code, doc = gate(sb)
     assert code == REVIEW and "Lander holds 20.0% BREACH" in why(doc), why(doc)
 
@@ -612,14 +725,13 @@ def test_a_decision_that_cannot_carry_a_result_is_not_in_the_denominator(
 
 
 def test_a_hold_later_cleared_still_counts(sb: Sandbox) -> None:
-    """A signal counts once any outcome record carries it; unlike a reversal it is not undone by a
-    later outcome."""
+    """A signal counts once any outcome record carries it, and no later outcome undoes it."""
     recent = [rec(at=ago(days=3, minutes=i), item=f"o{i}") for i in range(10)]
     later = [
         rec("outcome", at=ago(hours=1), seat="lander", ref=d["id"], outcome="merged")
         for d in recent[:2]
     ]
-    seed_vault(sb, recent + [_signal(d, "held") for d in recent[:2]] + later)
+    seed_vault(sb, recent + merged(recent) + [_signal(d, "held") for d in recent[:2]] + later)
     code, doc = gate(sb)
     assert code == REVIEW and "Lander holds 20.0% BREACH" in why(doc), why(doc)
 

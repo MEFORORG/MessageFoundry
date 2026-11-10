@@ -603,8 +603,10 @@ function Get-DecisionOutcome($Record, [hashtable]$Outcomes) {
 # STICKY: once logged it counts, and no later outcome cancels it.
 $script:DecisionSignalOutcomes = @('red-after-merge', 'held')
 $script:DecisionReversalOutcomes = @('reversed', 'reopened', 'rebriefed', 're-briefed', 'overridden')
-# The status outcomes that are not yet a result.
-$script:DecisionUnresolvedOutcomes = @('', 'pending', 'asked')
+# The status outcomes that are a result, an allowlist: any other status, a typo included, is not
+# one. A status counts only from a later `outcome` record, never from the decision's own log-time
+# -Outcome, which is written before the act exists.
+$script:DecisionResolvedOutcomes = @('merged', 'landed', 'kept', 'done', 'closed', 'completed', 'fixed', 'shipped')
 # NO-REVIEW needs at least this many of the seat's decisions in the 14-day window to carry a
 # resolved outcome (Manager decision 2026-11-09, plan section 12).
 $script:DecisionResolvedFloor = 20
@@ -688,18 +690,22 @@ function Format-DecisionRate([int]$Count, [int]$Of) {
 function Get-DecisionCalibration {
     <#
       One seat and class's calibration (owner ruling 2026-11-09, tier T1, and the Manager's
-      decisions of that day; plan section 12). It reads the seat's decisions logged on -RecentDays
-      that can carry a result: not answered HALT, not left PENDING, and not dropped (status outcome
-      `dropped`). A decision answered REVIEW and acted on after its review counts.
+      decisions of that day; plan section 12), over the seat's decisions logged on -RecentDays.
 
-      Calibrated needs all of: at least $script:DecisionResolvedFloor of those decisions with a
-      resolved outcome (a mark, or a status other than pending or asked), so an empty or unlogged
-      history is NOT calibrated; the reversal rate, the rate of reds after merge and the rate of
-      Lander holds each at 5 percent or less; and no blind-sample breach. The blind sample is
-      optional: any trailing window of up to 60 ratings holding more than 3 disagreements is a
-      breach, and after the latest one, 60 ratings newer than it must pass (plan section 4.2). The
-      arithmetic is automatic; its inputs are `outcome` records a seat logs, and nothing writes one
-      for it. The digest's calibration table prints this, and the gate reads Calibrated.
+      A decision is RESOLVED when an `outcome` record carries a mark (a reversal word,
+      `red-after-merge` or `held`), or a later `outcome` record gives it a status on
+      $script:DecisionResolvedOutcomes. Its own log-time -Outcome never resolves it. A decision with
+      no mark that was answered HALT, left PENDING, or later marked `dropped` is left out; a marked
+      one never is, so no later outcome cancels a mark.
+
+      Calibrated needs all of: at least $script:DecisionResolvedFloor resolved decisions, so an
+      empty or unlogged history is NOT calibrated; the reversal rate, the rate of reds after merge
+      and the rate of Lander holds, each over the resolved decisions, at 5 percent or less; and no
+      blind-sample breach. The blind sample is optional: any trailing window of up to 60 ratings
+      holding more than 3 disagreements is a breach, and after the latest one, 60 ratings newer
+      than it must pass (plan section 4.2). The arithmetic is automatic; its inputs are `outcome`
+      records a seat logs, and nothing writes one for it. The digest's calibration table prints
+      this, and the gate reads Calibrated.
     #>
     param($Decisions, [hashtable]$Ratings, [hashtable]$Outcomes, [string[]]$RecentDays, [hashtable]$Signals = @{})
     # Verdicts oldest first.
@@ -717,25 +723,27 @@ function Get-DecisionCalibration {
     $blind = if ($lastBreach -ge 0 -and $since -lt 60) { "BREACH: review path, $since/60 fresh samples" }
     elseif ($n -lt 60) { $blindOk = $true; "optional, $n/60 samples" }
     else { $blindOk = $true; 'calibrated' }
+    function Test-Mark($d, [string]$Mark) { return ($Signals.ContainsKey([string]$d.id) -and ($Mark -eq '' -or $Signals[[string]$d.id].Contains($Mark))) }
+    function Get-Status($d) {
+        if ($Outcomes.ContainsKey([string]$d.id)) { return (Get-DecisionOutcomeWord $Outcomes[[string]$d.id].outcome) }
+        return ''
+    }
     $recent = @($Decisions | Where-Object {
-            [string]$_.gate -notin @('HALT', 'PENDING') -and (Get-DecisionOutcomeWord (Get-DecisionOutcome $_ $Outcomes)) -ne 'dropped' -and
-            $RecentDays -contains (Get-DecisionIdDay ([string]$_.id))
+            $RecentDays -contains (Get-DecisionIdDay ([string]$_.id)) -and (
+                (Test-Mark $_ '') -or ([string]$_.gate -notin @('HALT', 'PENDING') -and (Get-Status $_) -ne 'dropped'))
         })
-    function Test-Mark($d, [string]$Mark) { return ($Signals.ContainsKey([string]$d.id) -and $Signals[[string]$d.id].Contains($Mark)) }
-    $revd = @($recent | Where-Object { Test-Mark $_ 'reversed' }).Count
-    $red = @($recent | Where-Object { Test-Mark $_ 'red-after-merge' }).Count
-    $held = @($recent | Where-Object { Test-Mark $_ 'held' }).Count
-    $resolved = @($recent | Where-Object {
-            $Signals.ContainsKey([string]$_.id) -or $script:DecisionUnresolvedOutcomes -notcontains (Get-DecisionOutcomeWord (Get-DecisionOutcome $_ $Outcomes))
-        }).Count
-    $of = $recent.Count
+    $resolvedSet = @($recent | Where-Object { (Test-Mark $_ '') -or $script:DecisionResolvedOutcomes -contains (Get-Status $_) })
+    $revd = @($resolvedSet | Where-Object { Test-Mark $_ 'reversed' }).Count
+    $red = @($resolvedSet | Where-Object { Test-Mark $_ 'red-after-merge' }).Count
+    $held = @($resolvedSet | Where-Object { Test-Mark $_ 'held' }).Count
+    $of = $resolvedSet.Count
     $breach = $of -and (($revd / $of) -gt 0.05 -or ($red / $of) -gt 0.05 -or ($held / $of) -gt 0.05)
-    $floorOk = $resolved -ge $script:DecisionResolvedFloor
+    $floorOk = $of -ge $script:DecisionResolvedFloor
     return [pscustomobject]@{
-        Rated = $rated; Disagree = $dis; Blind = $blind; Recent = $of; Reversed = $revd
+        Rated = $rated; Disagree = $dis; Blind = $blind; Recent = $recent.Count; Reversed = $revd
         RateText = (Format-DecisionRate $revd $of); Red = $red; RedText = (Format-DecisionRate $red $of)
-        Held = $held; HeldText = (Format-DecisionRate $held $of); Resolved = $resolved
-        ResolvedText = "$resolved/$($script:DecisionResolvedFloor)$(if ($floorOk) { '' } else { ' BELOW FLOOR' })"
+        Held = $held; HeldText = (Format-DecisionRate $held $of); Resolved = $of
+        ResolvedText = "$of/$($script:DecisionResolvedFloor)$(if ($floorOk) { '' } else { ' BELOW FLOOR' })"
         Calibrated = ($blindOk -and -not $breach -and $floorOk)
     }
 }
@@ -743,18 +751,26 @@ function Get-DecisionCalibration {
 # THE FAST-PATH ALLOWLIST, the one place it lives (Manager decision 2026-11-09, plan section 12).
 # A path the T1 fast path may touch matches one of these, and Get-DecisionClassCPath names nothing
 # about it. Anything else goes to review. Product code outside the security modules, and its tests:
-# keep it conservative, since a path added here skips review.
+# keep it conservative, since a path added here skips review. The parser's hardening, XML, DICOM,
+# FHIR and decompression code is denied in Get-DecisionClassCPath, and so is every dot segment.
 $script:DecisionFastPathAllow = @(
     '^messagefoundry/parsing/.+',
     '^messagefoundry_toolkit/generators/.+',
     '^messagefoundry_toolkit/hl7(schema|structures)\.py$',
     '^samples/.+',
-    # Ordinary product pages, named one by one: a rule, assurance, security, deployment or
-    # exposure page is never here.
-    '^docs/(architecture-diagram|browser-support|codesets|connections|dicom|feature-map|hl7-message-ordering-reference|hl7-validation|load-testing|mental-model|message-ordering-design|steps-palette|system-requirements|throughput|tray|user-guide)\.md$',
+    # Ordinary product pages, named one by one: a page carrying security, TLS, deployment or
+    # exposure prose is never here.
+    '^docs/(codesets|hl7-message-ordering-reference|hl7-validation|message-ordering-design|steps-palette|throughput)\.md$',
     # Their tests, named one by one: a hardening, bounds, guard, transport or pipeline test is not.
     '^tests/test_(binary_carriage|builtin_hl7_parity|generate_cli|generated_adt|generators_(choice|core|types)|hl7_core_features|hl7_raw_separators|hl7schema|hl7structures|message|message_(copy|split|timestamps|type_of)|parse_tree|parsing|samples_typed_steps|x12_parsing|x12_validate)\.py$'
 )
+
+function Get-DecisionPathKey([string]$Path) {
+    # The folded, lower-case form both classifiers compare: '\' to '/', empty and '.' segments
+    # dropped, a trailing dot dropped as Windows drops it. One copy, so the two cannot drift.
+    $segs = @(([string]$Path).Trim() -replace '\\', '/' -split '/' | Where-Object { $_ -and $_ -ne '.' } | ForEach-Object { $_.TrimEnd('.') })
+    return [pscustomobject]@{ Segments = $segs; Key = ($segs -join '/').ToLowerInvariant() }
+}
 
 function Get-DecisionFastPathRefusal([string]$Path) {
     <#
@@ -764,7 +780,7 @@ function Get-DecisionFastPathRefusal([string]$Path) {
     #>
     $c = Get-DecisionClassCPath $Path
     if ($c) { return $c }
-    $l = ((@(([string]$Path).Trim() -replace '\\', '/' -split '/' | Where-Object { $_ -and $_ -ne '.' } | ForEach-Object { $_.TrimEnd('.') })) -join '/').ToLowerInvariant()
+    $l = (Get-DecisionPathKey $Path).Key
     foreach ($a in $script:DecisionFastPathAllow) { if ($l -match $a) { return '' } }
     return "'$Path' is not on the fast-path allowlist (_decisionlog.ps1 DecisionFastPathAllow)"
 }
@@ -793,10 +809,11 @@ function Get-DecisionClassCPath([string]$Path) {
     if ($p -match '[\s,;:$*?\[\]{}|<>"]') { return "'$Path' carries a glob, a list separator, whitespace, a colon or a dollar sign, so it cannot be classified; name each path on its own line" }
     if ($p -match '^/') { return "'$Path' is not a path relative to the repository, so it cannot be classified" }
     if ($p.Contains('~')) { return "'$Path' carries a '~', a home path or an 8.3 short name that may alias another path, so it cannot be classified" }
-    $segs = @($p -split '/' | Where-Object { $_ -and $_ -ne '.' } | ForEach-Object { $_.TrimEnd('.') })
+    $pk = Get-DecisionPathKey $p
+    $segs = @($pk.Segments)
     if ($segs -contains '' -or $segs -contains '..') { return "'$Path' climbs out with '..' or names a dot-only segment, so it cannot be classified" }
     if (-not $segs.Count) { return "'$Path' names the whole tree, so it cannot be classified" }
-    $l = ($segs -join '/').ToLowerInvariant()
+    $l = $pk.Key
     $leaf = $segs[-1].ToLowerInvariant()
     if ($leaf -in @('claude.md', 'claude.local.md', 'agents.md', 'agents.override.md')) { return "'$Path' is an agent instruction file, a rule file (Class C)" }
     if ($leaf -like '.env*') { return "'$Path' is an environment file, which holds secrets (Class C)" }
@@ -806,17 +823,21 @@ function Get-DecisionClassCPath([string]$Path) {
     if ($leaf -match '^(license|notice|cla|governance|commercial-license)(\..*)?$' -or $leaf -in @('.gitignore', '.gitattributes', '.worktreeinclude')) {
         return "'$Path' is a legal file or decides what git ignores or copies (Class C)"
     }
-    $words = 'redact|secret|credential|tls|auth|keywrap|pki|dpapi|crypt|cert|password|mfa|webauthn|token|security|policy|phi|guard|gate|smart'
+    $words = 'redact|secret|cred|tls|auth|keywrap|pki|dpapi|crypt|cert|password|mfa|webauthn|token|security|policy|phi|guard|gate|smart|harden|signature|wsdl|inflate|compress|bomb|xxe|ssrf|egress|limit|bound'
     if ($leaf -match "($words)") { return "'$Path' is named as security, PHI, credential or policy code (Class C on the fast path)" }
+    # A dot segment anywhere is agent, hook or tool configuration (a nested .claude/skills is read
+    # in its subtree), so none takes the fast path.
+    if (@($segs | Where-Object { $_.StartsWith('.') }).Count) { return "'$Path' has a dot segment, agent, hook or tool configuration (Class C on the fast path)" }
     $dirs = @(
         '.agents', '.claude', '.codex', '.github', '.mefor-hooks', '.semgrep', 'docker', 'docs/adr', 'docs/roles', 'environments', 'net-helper',
         'docs/security', 'messagefoundry/api', 'messagefoundry/auth', 'messagefoundry/config', 'messagefoundry/pipeline', 'messagefoundry/security',
         'messagefoundry/store', 'messagefoundry/support', 'messagefoundry/transports', 'messagefoundry_webconsole', 'scripts', 'tests/fixtures',
+        'messagefoundry/parsing/xml', 'messagefoundry/parsing/dicom', 'messagefoundry/parsing/fhir', 'samples/ech-sidecar',
         'messagefoundry_toolkit/anon', 'roles', 'scripts/asvs', 'scripts/ci', 'scripts/coord', 'scripts/dev', 'scripts/hooks',
         'scripts/quality', 'scripts/release', 'scripts/security', 'scripts/worktree', 'security', 'skills', 'tee/anon'
     )
     $files = @(
-        '.gitleaks.toml', '.pre-commit-config.yaml', 'docs/ai.md', 'docs/architecture.md', 'docs/autonomy-plan.md',
+        '.gitleaks.toml', '.pre-commit-config.yaml', 'messagefoundry/parsing/_builtin_hl7.py', 'docs/ai.md', 'docs/architecture.md', 'docs/autonomy-plan.md',
         'docs/code_quality_standards.md', 'docs/ledger-gate.md', 'docs/method.md', 'docs/phi.md', 'docs/review-standards.md',
         'docs/secure_ai_development_standards.md', 'docs/secure_development_standards.md', 'docs/security.md', 'docs/worktrees.md'
     )

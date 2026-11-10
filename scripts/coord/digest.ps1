@@ -38,16 +38,17 @@
     owner ruling of 2026-11-09 (tier T1; docs/AUTONOMY-PLAN.md section 12) it is automated signals,
     and the blind sample is optional:
       * the 14-day reversal rate -- decisions any `outcome` record marks `reversed`, `reopened`,
-        `rebriefed`, `re-briefed` or `overridden`, over the decisions logged in the 14 days ending
-        -Day that can carry a result (not answered HALT, not left PENDING, not dropped); above 5
+        `rebriefed`, `re-briefed` or `overridden`, over the resolved decisions logged in the 14 days
+        ending -Day (one answered HALT, left PENDING or dropped is left out unless marked); above 5
         percent is a breach. Every mark is sticky: no later outcome cancels it;
       * the 14-day rates of reds after merge and of Lander holds -- decisions any `outcome` record
         marks `red-after-merge` or `held`; above 5 percent is a breach;
       * the owner's disagreement on the ratings given -- any trailing window of up to 60 holding
         more than 3 disagreements is a breach, and the class then stays on the review path until 60
         ratings newer than the breach pass (plan section 4.2). Fewer than 60 ratings is no breach;
-      * the floor -- fewer than 20 of those 14-day decisions with a resolved outcome (a mark, or a
-        status other than pending or asked) is not calibrated, so an empty history is not.
+      * the floor -- fewer than 20 of those 14-day decisions resolved (a mark, or a later status on
+        _decisionlog.ps1 DecisionResolvedOutcomes; never the decision's own log-time outcome) is not
+        calibrated, so an empty history is not. The three rates divide by the resolved decisions.
     A rating older than the window is not read, so the trailing 60 is a trailing 60 within it.
 
     THE GATE'S STATE (plan 4.5 to 4.7): the reversal budget fleet-wide and per seat, the cost rung

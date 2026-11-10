@@ -47,7 +47,10 @@
     not refused by Get-DecisionClassCPath; the kill switch (afk-kill.ps1 -Status); the seat's
     calibration (_decisionlog.ps1 Get-DecisionCalibration, the digest's own arithmetic); any
     reversal on the item; the reversal budgets (plan 4.5); and the chain (plan 4.6, below). A
-    NO-REVIEW lists on stderr the conditions it did not check.
+    NO-REVIEW lists on stderr the conditions it did not check. The derived paths are the checkout's
+    state when the gate runs, not the act's: an act made afterwards, outside git, in an ignored file,
+    or in another checkout is not in them, so the session names in -Touches every path the act will
+    change. -Json and the -Log record carry the paths the gate classified.
     IT FAILS CLOSED. No exit code but 10 is NO-REVIEW, so a crash (1), a usage error (2) or anything
     else reads as no permission. A read that fails, a seat that cannot be named, an empty or
     unreadable set of touched paths, and a cost reading that is UNKNOWN all answer REVIEW. HALT
@@ -345,6 +348,13 @@ function Get-DecisionTouchedPaths([string]$Top) {
       unknown.
     #>
     $paths = [System.Collections.Generic.List[string]]::new()
+    # A file marked assume-unchanged or skip-worktree hides its edits from every read below.
+    $flags = & git -C $Top ls-files -v 2>$null
+    if ($LASTEXITCODE -ne 0) { return [pscustomobject]@{ Paths = @(); Error = 'git ls-files -v failed' } }
+    $hidden = @(@($flags) | Where-Object { [string]$_ -cmatch '^([a-z]|S) ' })
+    if ($hidden.Count) {
+        return [pscustomobject]@{ Paths = @(); Error = "$($hidden.Count) file(s) are marked assume-unchanged or skip-worktree, so git may hide their edits" }
+    }
     $reads = @(
         @('diff', '--name-only', '--no-renames', 'origin/main...HEAD'),
         @('diff', '--name-only', '--no-renames', 'HEAD'),
@@ -358,8 +368,8 @@ function Get-DecisionTouchedPaths([string]$Top) {
     return [pscustomobject]@{ Paths = @($paths | Select-Object -Unique); Error = '' }
 }
 
-function New-GateAnswer([string]$Result, $Why) {
-    return [pscustomobject]@{ Result = $Result; Reasons = @($Why) }
+function New-GateAnswer([string]$Result, $Why, $Paths = @()) {
+    return [pscustomobject]@{ Result = $Result; Reasons = @($Why); Paths = @($Paths) }
 }
 
 function Invoke-DecisionGate {
@@ -371,7 +381,7 @@ function Invoke-DecisionGate {
       count against itself.
     #>
     param([string]$Item, [string]$Seat, [string[]]$BuildsOn, [string]$UsageScript, [string]$ThresholdsFile, [switch]$Offline,
-        [string]$ExcludeId = '', [string[]]$Touches = @())
+        [string]$ExcludeId = '', [string[]]$Touches = @(), [string]$RegistrySeat = '')
     $why = [System.Collections.Generic.List[string]]::new()
     try {
         if (Test-DecisionLanderSeat $Seat) {
@@ -420,16 +430,27 @@ function Invoke-DecisionGate {
             return (New-GateAnswer 'REVIEW' $why)
         }
         $refused = @($paths | ForEach-Object { Get-DecisionFastPathRefusal $_ } | Where-Object { $_ })
-        # A directory in this checkout may hold any file, so it is not classified as one path.
         foreach ($t in $paths) {
-            if ([System.IO.Directory]::Exists((Join-Path $top $t))) { $refused += "'$t' is a directory in this checkout, so it cannot be classified; name the files" }
+            $full = Join-Path $top $t
+            # A directory in this checkout may hold any file, so it is not classified as one path.
+            if ([System.IO.Directory]::Exists($full)) { $refused += "'$t' is a directory in this checkout, so it cannot be classified; name the files" }
+            # A link is classified by its name while a write lands on its target.
+            elseif ([System.IO.File]::Exists($full) -and ([System.IO.File]::GetAttributes($full) -band [System.IO.FileAttributes]::ReparsePoint)) {
+                $refused += "'$t' is a symbolic link or reparse point, so its name does not say what it changes"
+            }
         }
         if ($refused.Count) {
             foreach ($c in $refused) { $why.Add("touches: $c, so the T1 fast path does not apply") }
-            return (New-GateAnswer 'REVIEW' $why)
+            return (New-GateAnswer 'REVIEW' $why $paths)
         }
         $touched = $paths.Count
         $canon = Get-DecisionSeatKey $Seat
+        # A -Seat the caller names must agree with the seat this session declared, where it declared
+        # one, or a session could borrow another seat's calibration and budget.
+        if ($canon -and $RegistrySeat -and (Get-DecisionSeatKey $RegistrySeat) -ne $canon) {
+            $why.Add("seat: -Seat '$Seat' is not the seat this session declared ('$RegistrySeat'), so whose calibration applies is unknown")
+            return (New-GateAnswer 'REVIEW' $why $paths)
+        }
         if (-not $canon) {
             $why.Add("seat: '$Seat' is not a live seat or alias in docs/roles/seats.json, or that roster could not be read, so it cannot be held to a seat's calibration and budget")
             return (New-GateAnswer 'REVIEW' $why)
@@ -451,7 +472,7 @@ function Invoke-DecisionGate {
         $res = Read-DecisionLogForGate -Repo $Repo -CoordRoot $coord -Days $days
         if (-not $res.Complete) {
             $why.Add("the decision log was not fully read, so no condition on it can be shown: $($res.Errors -join '; ')")
-            return (New-GateAnswer 'REVIEW' $why)
+            return (New-GateAnswer 'REVIEW' $why $paths)
         }
         $all = @($res.Records | Where-Object { [string]$_.id -ne $ExcludeId })
         $ratings = Get-DecisionLatest $all 'rating'
@@ -498,7 +519,7 @@ function Invoke-DecisionGate {
             $why.Add("chain: depth $($ch.Depth) on item $Item ($($ch.Walked) through -BuildsOn, $($ch.Floor) in the trailing 24 hours), and more than two goes to review")
             $closed = $true
         }
-        if ($closed) { return (New-GateAnswer 'REVIEW' $why) }
+        if ($closed) { return (New-GateAnswer 'REVIEW' $why $paths) }
         $why.Add("every condition the gate can see holds: $touched touched path(s), all on the fast-path allowlist; kill switch OFF; calibrated; no reversal on the item; budgets open; chain depth $($ch.Depth)")
         # NECESSARY, NOT SUFFICIENT: these are the plan R4 conditions the gate cannot see.
         foreach ($u in @(
@@ -506,10 +527,12 @@ function Invoke-DecisionGate {
                 'the act serves one item',
                 'the act changes no security control, whatever its path',
                 'the live state the act rests on was read this turn',
-                'the act is not class C under plan R3 for a reason no path shows')) {
+                'the act is not class C under plan R3 for a reason no path shows',
+                'every path the act will change is in the touched set, not only what git shows now',
+                "the seat is this session's own$(if (-not $RegistrySeat) { ', since no declared seat was found to compare' })")) {
             $why.Add("unchecked: $u; the session checks it before acting without review")
         }
-        return (New-GateAnswer 'NO-REVIEW' $why)
+        return (New-GateAnswer 'NO-REVIEW' $why $paths)
     } catch {
         $why.Add("the gate failed, so it fails closed: $($_.Exception.Message)")
         return (New-GateAnswer 'REVIEW' $why)
@@ -529,13 +552,14 @@ $Touches = @($Touches | ForEach-Object { $_ -split '\r?\n' } | ForEach-Object { 
 if ($Gate) {
     if (-not $Item) { [Console]::Error.WriteLine('decision.ps1: -Gate needs -Item, the item the act is on.'); exit 2 }
     if (-not $Session) { $Session = [string]$env:CLAUDE_CODE_SESSION_ID }
-    if (-not $Seat) { $Seat = Resolve-SeatFromRegistry $Session }
+    $declared = Resolve-SeatFromRegistry $Session
+    if (-not $Seat) { $Seat = $declared }
     $g = Invoke-DecisionGate -Item $Item -Seat $Seat -BuildsOn $BuildsOn -UsageScript $UsageScript -ThresholdsFile $ThresholdsFile `
-        -Touches $Touches
+        -Touches $Touches -RegistrySeat $declared
     if ($Json) {
         Write-Output (ConvertTo-Json -Depth 4 -InputObject ([ordered]@{
                     result = $g.Result; exit = $GateCodes[$g.Result]; item = $Item; seat = $Seat; buildsOn = @($BuildsOn)
-                    touches = @($Touches); reasons = @($g.Reasons)
+                    touches = @($Touches); paths = @($g.Paths); reasons = @($g.Reasons)
                 }))
     } else {
         foreach ($r in $g.Reasons) { [Console]::Error.WriteLine("decision.ps1: gate: $r") }
@@ -577,7 +601,8 @@ if ($List) {
 
 # -Log. Refuse a record missing what its kind needs, before anything is written.
 if (-not $Session) { $Session = [string]$env:CLAUDE_CODE_SESSION_ID }
-if (-not $Seat) { $Seat = Resolve-SeatFromRegistry $Session -Offline:$NoPost }
+$declaredSeat = Resolve-SeatFromRegistry $Session -Offline:$NoPost
+if (-not $Seat) { $Seat = $declaredSeat }
 $missing = switch ($Kind) {
     'decision' { @(@{ Item = $Item; Class = $Class; Recommendation = $Recommendation; Seat = $Seat }.GetEnumerator() | Where-Object { -not $_.Value } | ForEach-Object Key) }
     'tripwire' { @(if (-not $Note) { 'Note' }) }
@@ -593,8 +618,12 @@ if ($Ref -and -not (Get-DecisionIdDay $Ref)) {
     exit 2
 }
 $normOutcome = $Outcome.Trim().ToLowerInvariant()
-if ($Kind -eq 'outcome' -and -not (Test-DecisionMarkOutcome $normOutcome) -and
-    $normOutcome -match '^(lander[-_ ]?)?hold(s|ing)?$|^held.|^red($|[-_ ])|^revers|^revert|^reopen|^re-?brief|^overrid|^overrule') {
+$nearMiss = 'hold|held|revers|revert|reopen|re-?brief|overrid|overrul|roll(ed)?[-_ ]?back|undo|undone|back(ed)?[-_ ]?out|(^|[-_ ])reds?($|[-_ ])'
+if ($Kind -eq 'decision' -and $normOutcome -and ((Test-DecisionMarkOutcome $normOutcome) -or $normOutcome -match $nearMiss)) {
+    [Console]::Error.WriteLine("decision.ps1: -Outcome '$Outcome' on a decision record reads like a calibration signal, which a decision's own outcome never is: log it later with -Kind outcome -Ref <id>. Nothing was written.")
+    exit 2
+}
+if ($Kind -eq 'outcome' -and -not (Test-DecisionMarkOutcome $normOutcome) -and $normOutcome -match $nearMiss) {
     [Console]::Error.WriteLine("decision.ps1: -Outcome '$Outcome' reads like a calibration signal but is not one: use reversed, reopened, rebriefed, overridden, red-after-merge or held. A near miss would be read as a status and the signal lost. Nothing was written.")
     exit 2
 }
@@ -668,8 +697,10 @@ if ($gated) {
     try {
         Write-DecisionSpool -CoordRoot $coord -Record ([pscustomobject]$record)
         $gateAnswer = Invoke-DecisionGate -Item $Item -Seat $Seat -BuildsOn $BuildsOn -UsageScript $UsageScript `
-            -ThresholdsFile $ThresholdsFile -Offline:$NoPost -ExcludeId $record.id -Touches $Touches
+            -ThresholdsFile $ThresholdsFile -Offline:$NoPost -ExcludeId $record.id -Touches $Touches -RegistrySeat $declaredSeat
         $record.gate = $gateAnswer.Result
+        # The record keeps the paths the gate classified, which hold the derived ones too.
+        if (@($gateAnswer.Paths).Count) { $record.touches = @($gateAnswer.Paths) }
         # The gate has answered, so a failure to write the answer down must not hide it: the record
         # keeps PENDING, which counts toward the chain floor, and -Log still reports the answer.
         try { Update-DecisionSpool -CoordRoot $coord -Record ([pscustomobject]$record) }
