@@ -45,6 +45,7 @@ from messagefoundry.pipeline._sandbox_codec import (
 from messagefoundry.pipeline.dryrun import route_only, transform_one
 from messagefoundry.pipeline.sandbox import (
     _EOF,
+    _OVERSIZE,
     KillCause,
     SandboxError,
     SandboxMode,
@@ -2170,7 +2171,6 @@ def test_an_oserror_while_encoding_is_wrapped_and_keeps_the_worker(
         expected = _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
         proc = session._proc
         assert proc is not None
-        real_encode = codec.encode_request
 
         def _fails(**kwargs: Any) -> bytes:
             raise OSError("the encoder failed")
@@ -2182,7 +2182,7 @@ def test_an_oserror_while_encoding_is_wrapped_and_keeps_the_worker(
         assert session._proc is proc
         assert proc.poll() is None
         assert session.last_kill_cause is None
-        monkeypatch.setattr(codec, "encode_request", real_encode)
+        monkeypatch.undo()
         assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == expected
         assert session._proc is proc
     finally:
@@ -2213,22 +2213,23 @@ def test_an_over_cap_length_header_from_a_live_worker_is_an_invalid_frame(
 
 
 @pytest.mark.parametrize("when", ["before", "after"])
-def test_a_queued_over_cap_header_kills_as_an_invalid_frame(
+def test_a_queued_over_cap_header_kills_as_an_unsolicited_write(
     graph: tuple[Registry, str], when: str
 ) -> None:
     """Between dispatches the same header is a stray write from a worker that may be alive, so it
-    kills the worker as an invalid frame, where a queued EOF only reaps a dead one with no cause."""
+    kills the worker as an unsolicited write, where a queued EOF only reaps a dead one with no
+    cause."""
     registry, config_dir = graph
     session = _session(config_dir)
     try:
         _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
         proc = session._proc
         assert proc is not None
-        session._responses.put(sandbox_mod._OVERSIZE)
+        session._responses.put(_OVERSIZE)
         assert session._drop_unsolicited(proc, when, "transform") is True
         assert session._proc is None
         assert proc.poll() is not None
-        assert session.last_kill_cause is KillCause.INVALID_FRAME
+        assert session.last_kill_cause is sandbox_mod._UNSOLICITED[when]
     finally:
         session.close()
 
@@ -2236,8 +2237,8 @@ def test_a_queued_over_cap_header_kills_as_an_invalid_frame(
 def test_the_reader_tells_an_over_cap_header_from_a_closed_pipe() -> None:
     """The parent's reader returns the over-cap sentinel; the child's ``_read_frame_bytes`` keeps
     reading it as a dead peer."""
-    header = (sandbox_mod._MAX_FRAME + 1).to_bytes(4, "big")
-    assert sandbox_mod._read_frame_or_oversize(io.BytesIO(header)) is sandbox_mod._OVERSIZE
+    header = sandbox_mod._LEN.pack(sandbox_mod._MAX_FRAME + 1)
+    assert sandbox_mod._read_frame_or_oversize(io.BytesIO(header)) is _OVERSIZE
     assert sandbox_mod._read_frame_bytes(io.BytesIO(header)) is None
     assert sandbox_mod._read_frame_or_oversize(io.BytesIO(b"")) is None
 
