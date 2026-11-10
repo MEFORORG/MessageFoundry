@@ -231,6 +231,17 @@ def test_a_system_exit_overriding_its_code_is_not_asked_for_it() -> None:
     assert text == "Router or Handler code raised SystemExit with code 4 (sys.exit() at run time)"
 
 
+def test_a_non_exit_faking_the_system_exit_class_names_no_code() -> None:
+    class Liar(ValueError):
+        @property  # type: ignore[misc]
+        def __class__(self) -> type:
+            return SystemExit
+
+    exc: Any = Liar("PID-5 was DOE^JANE")
+    text = str(UserCodeCalledSysExit.from_exit(exc))
+    assert text == "Router or Handler code raised SystemExit (sys.exit() at run time)"
+
+
 def test_an_exit_code_faking_its_class_names_no_code() -> None:
     # Built here, not in a parametrize list: collection itself would read its __class__.
     text = str(UserCodeCalledSysExit.from_exit(SystemExit(_FakeInt())))

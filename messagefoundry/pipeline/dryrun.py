@@ -670,9 +670,9 @@ class UserCodeCalledSysExit(Exception):
     thread, and a ``SystemExit`` there is a script habit in one piece of logic, not a request to stop
     the engine. Left alone, asyncio re-raises it out of the event loop and every connection stops.
     (``config/wiring.py`` refuses an ``env()`` cast's ``SystemExit`` the same way, BACKLOG #5105.)
-    Only ``SystemExit`` is converted: a ``KeyboardInterrupt`` or ``CancelledError`` that Router or
-    Handler code raises itself still escapes, and would still stop every connection, since in a
-    worker thread it is no Ctrl+C. Converting it too is not done here.
+    Only ``SystemExit`` is converted, so a ``KeyboardInterrupt`` or ``CancelledError`` that Router
+    or Handler code raises itself still escapes. A ``KeyboardInterrupt`` would still stop every
+    connection, since in a worker thread it is no Ctrl+C. Converting it too is not done here.
 
     Redacted by construction: the text names an integer exit code and nothing else, since
     ``sys.exit("...")`` carries the author's text, which could quote a field. Named without a leading
@@ -682,7 +682,10 @@ class UserCodeCalledSysExit(Exception):
     def from_exit(cls, exc: SystemExit) -> UserCodeCalledSysExit:
         # The base slot, not ``exc.code``: a SystemExit subclass can make ``code`` a property,
         # which is user code that could exit again inside the arm converting this exit.
-        code: object = _SYSTEM_EXIT_CODE.__get__(exc, SystemExit)
+        # A caller's isinstance() can be fooled by a faked ``__class__``; such an object has no
+        # slot to read, so it names no code rather than raise inside the converting arm.
+        is_exit = issubclass(type(exc), SystemExit)
+        code: object = _SYSTEM_EXIT_CODE.__get__(exc, SystemExit) if is_exit else None
         named = ""
         # type() first, since isinstance() alone may read a user-defined ``__class__``; the
         # isinstance() after it only narrows for mypy. bool cannot be subclassed, so ``is`` will do.
