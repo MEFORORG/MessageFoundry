@@ -106,6 +106,7 @@ class _Allowed:
 
 _APP = "messagefoundry/api/app.py::create_app"
 _HTTP = "::HTTPException"
+_OUTAGE = "::_UploadUnavailable"
 _NOTHING_WITHHELD = "the detail is str(exc), so nothing is withheld"
 _UPLOAD_MISS = (
     "the caught error names a file id or the cipher's own type-only text; below it sits the "
@@ -356,6 +357,17 @@ _ALLOWED: tuple[_Allowed, ...] = (
         _SAFE + _UPLOAD_MISS,
     ),
     _Allowed(f"{_APP}.delete_uploaded_file::UploadUnreadableError" + _HTTP, _SAFE + _UPLOAD_MISS),
+    # BACKLOG #3734: _UploadUnavailable builds a 503 with fixed text and a Retry-After header.
+    _Allowed(f"{_APP}.upload_file::UploadUnavailableError" + _OUTAGE, _SAFE + _UPLOAD_MISS),
+    _Allowed(
+        f"{_APP}.browse_uploaded_file::UploadUnavailableError" + _OUTAGE, _SAFE + _UPLOAD_MISS
+    ),
+    _Allowed(
+        f"{_APP}.resend_uploaded_message::UploadUnavailableError" + _OUTAGE, _SAFE + _UPLOAD_MISS
+    ),
+    _Allowed(
+        f"{_APP}.delete_uploaded_file::UploadUnavailableError" + _OUTAGE, _SAFE + _UPLOAD_MISS
+    ),
 )
 
 

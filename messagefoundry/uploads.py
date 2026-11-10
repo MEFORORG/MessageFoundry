@@ -977,7 +977,7 @@ class UploadStore:
                 yield fid, entry
 
     def _scan_metas_sync(
-        self, held: list[_UnsealableUpload] | None = None
+        self, held: list[_UnsealableUpload] | None = None, *, outage_raises: bool = False
     ) -> list[UploadedFileMeta]:
         """Walk the uploads root and decrypt every well-formed ``.meta`` sidecar (UNSORTED). A
         bad/foreign/undecryptable sidecar is skipped **with its cause named** (never a body in the
@@ -1033,6 +1033,9 @@ class UploadStore:
             try:
                 out.append(self._decrypt_meta(entry.read_text(encoding="utf-8"), fid))
             except CipherError as exc:
+                if outage_raises and isinstance(exc, CipherUnavailableError):
+                    # A count with a sidecar it could not read is not a count (BACKLOG #3734).
+                    raise UploadUnavailableError(str(exc)) from exc
                 # The cipher declined the value: a wrong/rotated-away key, a blob relocated into
                 # another cell, or the refusal of an unmarked (legacy, planted or downgraded)
                 # sidecar. Named on its own so these can be told apart from a damaged file.
@@ -1989,9 +1992,13 @@ class UploadStore:
         An upload ``rotate-key`` cannot seal counts too, at its body's size on disk (BACKLOG #2322).
         Its owner is unverified, so this errs toward refusing; :class:`_UnsealableUpload` says why.
         Both kinds come from one walk of the directory (BACKLOG #3184). The never-sealable ones are
-        also counted apart, for the refusal to name (BACKLOG #3183)."""
+        also counted apart, for the refusal to name (BACKLOG #3183).
+
+        A sidecar the key service gave no verdict on raises :class:`UploadUnavailableError` rather
+        than being left out, so an outage cannot lower the count a quota is checked against
+        (BACKLOG #3734)."""
         held: list[_UnsealableUpload] = []
-        metas = self._scan_metas_sync(held)
+        metas = self._scan_metas_sync(held, outage_raises=True)
         sizes = [m.size for m in metas if m.uploader_id == uploader_id]
         mine = [h.size for h in held if h.uploader_id == uploader_id]
         held_files, held_bytes = len(mine), sum(mine)

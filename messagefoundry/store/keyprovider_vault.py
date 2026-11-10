@@ -303,7 +303,8 @@ def is_vault_unavailable(exc: BaseException) -> bool:
     ``RateLimitExceeded``, ``InternalServerError``, ``BadGateway`` and ``VaultDown`` (a sealed or
     standby node answers 503). False for everything else, at least a 400 (a value whose tag Transit
     refused), a 403, a 404, any other status hvac raises as ``UnexpectedError`` (a 504 among them),
-    any other TLS failure (a certificate the hop refuses), and a refusal of the hop or of its reply.
+    any other TLS failure (a certificate the hop refuses) wherever it sits in the chain, a proxy
+    error (a 407 among them), and a refusal of the hop or of its reply.
     A connection error that carries such a refusal anywhere in its chain is a refusal too: the
     strict reply adapter wraps a reply head it would not read in one. A refusal keeps the 423 it
     had before this split, which is the safe side of a wrong guess."""
@@ -333,20 +334,25 @@ def is_vault_unavailable(exc: BaseException) -> bool:
         return True  # bounded_read documents it as a connection cut mid-body, transient
     if not isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
         return False
+    if isinstance(exc, requests.exceptions.ProxyError):
+        return False  # a proxy that refuses the engine (a 407 among them) refuses it again
     try:
         chain = list(exception_chain(exc))
     except ExceptionChainTooLong:
         return False
-    if isinstance(exc, requests.exceptions.SSLError) and not any(
-        is_ssl_error(link, name) for link in chain for name in _TLS_SESSION_DROPS
-    ):
-        return False  # a certificate or protocol the hop refuses is refused again on the next try
+
+    def dropped(link: BaseException) -> bool:
+        return any(is_ssl_error(link, name) for name in _TLS_SESSION_DROPS)
 
     def refuses(link: BaseException) -> bool:
         if isinstance(link, TruncatedResponseError):
             return False  # a cut-off reply is the one EgressReplyError that is not a refusal
+        if is_ssl_error(link, "SSLError") and not dropped(link):
+            return True  # a certificate or protocol the hop refuses, wherever requests wrapped it
         return isinstance(link, (EgressReplyError, InsecureHopRefused))
 
+    if isinstance(exc, requests.exceptions.SSLError) and not any(dropped(link) for link in chain):
+        return False  # a TLS failure that names no dropped session is read as a refusal
     return not any(refuses(link) for link in chain)
 
 

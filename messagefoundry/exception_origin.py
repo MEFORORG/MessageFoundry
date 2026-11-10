@@ -41,6 +41,7 @@ from typing import Any, Final
 __all__ = [
     "ExceptionChainTooLong",
     "exception_chain",
+    "is_ssl_error",
     "raise_statement_file",
     "raised_by_the_engine",
     "raised_only_by_the_engine",

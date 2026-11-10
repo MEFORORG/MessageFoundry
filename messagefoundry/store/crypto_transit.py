@@ -109,8 +109,16 @@ _VERSION_PROBE_INPUT = base64.b64encode(b"messagefoundry audit key version probe
 def _transit_failure(exc: Exception) -> type[CipherError]:
     """The error an ``encrypt`` or ``decrypt`` raises for ``exc``: :class:`CipherUnavailableError`
     where Transit gave no verdict on the value, else plain :class:`CipherError` (BACKLOG #3734).
-    The audit HMAC keeps plain :class:`CipherError`; this split is for the data key alone."""
-    return CipherUnavailableError if is_vault_unavailable(exc) else CipherError
+    The audit HMAC keeps plain :class:`CipherError`; this split is for the data key alone.
+
+    Runs inside the caller's ``except``, so a classifier fault must not replace the type-only
+    error: anything it raises reads as a refusal, the side the split keeps when it cannot tell."""
+    try:
+        unavailable = is_vault_unavailable(exc)
+    except Exception as fault:  # noqa: BLE001 -- see the docstring; the caller raises CipherError
+        log.warning("Transit failure classifier raised %s; read as a refusal", type(fault).__name__)
+        unavailable = False
+    return CipherUnavailableError if unavailable else CipherError
 
 
 class TransitCipher(_UnmarkedPolicy):

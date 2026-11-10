@@ -102,6 +102,11 @@ _REFUSALS: list[Exception] = [
     InvalidPath("no such key"),
     requests.exceptions.SSLError("certificate verify failed"),
     _tls_error(ssl.SSLCertVerificationError(1, "certificate verify failed")),
+    # A TLS failure mid-body, which the strict adapter wraps in a plain ConnectionError.
+    requests.exceptions.ConnectionError(ssl.SSLError(1, "bad record mac")),
+    requests.exceptions.ConnectionError(ssl.SSLCertVerificationError(1, "verify failed")),
+    # A proxy that refuses the engine refuses it again.
+    requests.exceptions.ProxyError("Unable to connect to proxy", OSError("407 Proxy Auth")),
     # A dropped session or a cut-off reply beside a refusal is still a refusal.
     _tls_error(ssl.SSLEOFError(8, "EOF"), VaultHopRefused("store: the Vault hop is refused")),
     requests.exceptions.ConnectionError(
@@ -220,7 +225,38 @@ def test_the_audit_hmac_keeps_plain_cipher_error_on_an_outage() -> None:
     assert not isinstance(info.value, CipherUnavailableError)
 
 
+def test_a_classifier_fault_keeps_plain_cipher_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The split runs inside the cipher's except, so a fault in it reads as a refusal."""
+    import messagefoundry.store.crypto_transit as crypto_transit  # noqa: PLC0415
+
+    def broken(exc: BaseException) -> bool:
+        raise LookupError("classifier fault")
+
+    monkeypatch.setattr(crypto_transit, "is_vault_unavailable", broken)
+    cipher, transit = _cipher()
+    transit.fail = requests.exceptions.ConnectionError("connection refused")
+    with pytest.raises(CipherError) as info:
+        cipher.encrypt("PID|1", aad=b"cell")
+    assert type(info.value) is CipherError
+
+
 # --- the upload store -------------------------------------------------------------------------
+
+
+async def test_an_outage_in_the_quota_scan_refuses_the_save(tmp_path: Path) -> None:
+    """A sidecar the scan could not read is not left out of the count: the save answers 503 rather
+    than admit a file past the quota."""
+    cipher, transit = _cipher()
+    store = UploadStore(tmp_path, cipher, max_bytes=1 << 20, max_files_per_user=1)
+    await store.save(data=BATCH.encode(), filename="a.hl7", uploader="op", uploader_id="u-1")
+
+    def down(**_kw: Any) -> dict[str, Any]:
+        raise requests.exceptions.ConnectionError("connection refused")
+
+    transit.decrypt_data = down  # type: ignore[method-assign]
+    with pytest.raises(UploadUnavailableError):
+        await store.save(data=BATCH.encode(), filename="b.hl7", uploader="op", uploader_id="u-1")
+    assert len([p for p in tmp_path.iterdir() if p.name.endswith(".meta")]) == 1
 
 
 async def test_the_upload_store_raises_unavailable_for_an_outage(tmp_path: Path) -> None:
