@@ -183,7 +183,9 @@ def user_metadata(metadata_json: str | None) -> str | None:
     Returns ``None`` for absent/empty/unparseable metadata or an empty user bag, so the wire field is
     ``null`` rather than ``"{}"`` when nothing was attached. A cell too deep to decode or re-encode
     raises :class:`MetadataTooDeepError` instead: ``None`` would send a ``dynamic_headers`` delivery
-    out without its headers, where the error faults it and it retries, as on main."""
+    out without its headers. The delivery worker takes the error on its internal-error arm: under
+    the default ``InternalErrorPolicy.CONTINUE`` it dead-letters the row, and under ``STOP`` it
+    re-pends the row and halts the lane for an operator. It does not retry on the backoff."""
     user = _load_object(metadata_json, too_deep_raises=True).get("user")
     if not isinstance(user, dict) or not user:
         return None
