@@ -25,14 +25,14 @@ fixture-driven suite, and this rig needs neither its fixture nor its clean-slate
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
-import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+from tests._process_rig import ProcessRig
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("MEFOR_TEST_SQLSERVER"),
@@ -87,52 +87,25 @@ async def _audit_row_count(store: Any) -> int:
         return int(row[0])
 
 
-def _spawn(tag: str, ready: Path, go: Path) -> subprocess.Popen[str]:
-    return subprocess.Popen(
-        [sys.executable, str(_WORKER), tag, str(_APPENDS_PER_SHARD), str(ready), str(go)],
-        cwd=str(_REPO_ROOT),
-        env=dict(os.environ),  # the MEFOR_STORE_* connection env this leg already runs under
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-
-def _await_ready(procs: list[subprocess.Popen[str]], ready_files: list[Path]) -> None:
-    """Block until every worker has its store open. A worker that dies first is reported with its
-    own stderr rather than as an opaque barrier timeout."""
-    deadline = time.monotonic() + _BARRIER_TIMEOUT_SECONDS
-    while not all(f.exists() for f in ready_files):
-        for proc in procs:
-            if proc.poll() is not None:
-                _, err = proc.communicate()
-                raise AssertionError(f"a shard worker exited early (rc={proc.returncode}): {err}")
-        if time.monotonic() > deadline:
-            raise AssertionError("shard workers never reached the barrier")
-        time.sleep(0.01)
-
-
 async def test_two_processes_appending_audit_rows_cannot_fork_the_chain(
     clean_audit_store: Any, tmp_path: Path
 ) -> None:
     store = clean_audit_store
-    ready_files = [tmp_path / "ready-a", tmp_path / "ready-b"]
-    go = tmp_path / "go"
-
-    procs = [_spawn("a", ready_files[0], go), _spawn("b", ready_files[1], go)]
-    try:
-        _await_ready(procs, ready_files)
+    # The rig is tests/_process_rig.py, shared with the repeat-request race (vault BACKLOG #3193
+    # N5). Each worker inherits the MEFOR_STORE_* connection env this leg already runs under.
+    with ProcessRig(tmp_path, "applock") as rig:
+        rig.start(
+            [
+                [sys.executable, str(_WORKER), tag, str(_APPENDS_PER_SHARD), str(rig.go)]
+                for tag in ("a", "b")
+            ],
+            ready_timeout=_BARRIER_TIMEOUT_SECONDS,
+        )
         # Both stores are open and idle, so the table is empty AT THE MOMENT the appends start:
         # a fresh chain from prev="" is what verify_audit_chain walks.
         await _truncate_audit(store)
-        go.write_text("go", encoding="utf-8")
-        for proc in procs:
-            out, err = proc.communicate(timeout=_RUN_TIMEOUT_SECONDS)
-            assert proc.returncode == 0, f"shard worker failed (rc={proc.returncode}): {err}{out}"
-    finally:
-        for proc in procs:
-            if proc.poll() is None:
-                proc.kill()
+        rig.release("go")
+        rig.finish(timeout=_RUN_TIMEOUT_SECONDS)
 
     # Positive control: both shards really did append, so a green verify below is not green-on-empty.
     assert await _audit_row_count(store) == 2 * _APPENDS_PER_SHARD

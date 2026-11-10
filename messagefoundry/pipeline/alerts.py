@@ -459,8 +459,10 @@ class AlertSink(Protocol):
         ...
 
     def cert_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
-        """A served TLS certificate is expired or within the configured warn window. ``name`` labels
-        which cert (``"api"`` or the connection name); ``path`` is the PEM file; ``not_after`` is the
+        """A watched certificate is expired or within the configured warn window: a served or
+        presented TLS certificate, or a certificate setting such as the OIDC client certificate. ``name`` labels
+        which cert (``"api"``, a connection name, or a setting's dotted name such as
+        ``"auth.oidc_client_certificate"``); ``path`` is the PEM file; ``not_after`` is the
         ISO expiry; ``days_remaining`` is negative once expired. No key material is read or logged.
         Emitted by the :class:`~messagefoundry.pipeline.cert_expiry.CertExpiryRunner`."""
         ...
@@ -680,7 +682,28 @@ class AlertSink(Protocol):
         every inline reload's into the one ``config_reload:inline`` instance, and every queue
         listing's into the one ``approval:listing`` instance, until an operator resolves it.
         Nothing resolves it automatically. Carries the key and the action name only:
-        no username, no params, no PHI."""
+        no username, no params, no PHI.
+
+        **A failed write is not proof the row is missing.** A COMMIT can land with its reply lost,
+        so the reason says the row was not written OR its write's outcome is unknown (vault BACKLOG
+        #3193 item 4); a row the step-up return budget sheds is never written. Where the gate reads
+        back that its own write committed, it raises :meth:`audit_offbox_copy_missing` instead. A
+        request read back with a seal that fails still raises this one, and so does an outcome
+        read-back that does not show its own write committed; docs/SECURITY.md says which."""
+        ...
+
+    def audit_offbox_copy_missing(self, name: str, *, action: str) -> None:
+        """An audit row whose write the approval gate read back as committed has no off-box copy
+        (vault BACKLOG #3193 N1). The store tees a row off-box only after a COMMIT it saw succeed,
+        so when the write reported an error and its COMMIT landed anyway, the forwarded audit
+        stream lacks the row and nothing else reports the gap. Distinct from
+        :meth:`audit_write_failed`, whose row may be missing from the store too.
+
+        docs/SECURITY.md, in its approvals section, says which read-backs raise it. ``name`` is
+        ``approval:<approval id>`` and ``action`` the row's audit action, as for
+        :meth:`audit_write_failed`. Not connection-scoped, so no rule's ``control_action`` fires on
+        it, and repeated raises on one key fold into one instance until an operator resolves it.
+        Carries the key and the action name only: no username, no params, no PHI."""
         ...
 
     def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
@@ -736,19 +759,27 @@ class AlertSink(Protocol):
         the account enters that state, which leaves it unjudged too; or the directory has stayed
         unreachable for ``[auth].ad_reconcile_outage_passes`` passes running
         (``directory_unavailable``, BACKLOG #3709, the ``auth.ad_reconcile_skipped`` row whose
-        ``passes`` the page names), raised once per run. The type's name predates every case but the first. Read
-        ``reason`` before naming the cause.
+        ``passes`` the page names), raised once per run; or that many of one account's probes running
+        have failed to reach the directory, an outage pass's probes included
+        (``account_unreachable``, BACKLOG #3100, the ``auth.ad_reconcile_unreached`` row), raised
+        once as the account enters that state. The type's name predates every case but the first.
+        Read ``reason`` before naming the cause.
 
         ``name`` labels the source: ``"directory-reconciler"`` for the breaker,
         ``"directory-reconciler-referral"`` for a referral, ``"directory-reconciler-probe-fault"``
         for a probe fault, ``"directory-reconciler-misconfigured"`` for a configuration refusal,
-        ``"directory-reconciler-paging:<username>"`` for a paging refusal, and
-        ``"directory-reconciler-outage"`` for a lasting outage, so each is its own instance and
-        throttle. ``reason`` is one of those seven closed-set slugs. ``probed`` is, for
+        ``"directory-reconciler-paging:<username>"`` for a paging refusal,
+        ``"directory-reconciler-outage"`` for a lasting outage, and
+        ``"directory-reconciler-unreached:<username>"`` for an unreached account, or the bare
+        ``"directory-reconciler-unreached"`` for a rollup of those entering on one pass
+        (``AuthService._record_unreached_accounts`` decides when), so each
+        is its own instance and throttle. ``reason`` is one of those eight closed-set slugs.
+        ``probed`` is, for
         the breaker, how many principals the pass judged, its denominator, and a paging refusal
         carries that same count of candidates the pass took up, asked or not, which counts any
         id-less row: a paging refusal concerns one account, and its count is still the pass's. For
-        a referral, a configuration refusal, a probe fault and a lasting outage it is how many
+        a referral, a configuration refusal, a probe fault, a lasting outage and an unreached
+        account it is how many
         probes the pass sent to the directory, which leaves out an id-less row (BACKLOG #3170).
         ``detail`` is the operator-facing explanation the auth service latches, or for a paging
         refusal or a lasting outage a fixed sentence. No PHI. Emitted by the API-lifespan
@@ -885,6 +916,28 @@ class AlertSink(Protocol):
         """The INVERSE of :meth:`store_privilege_warning`: a start whose preflight OBSERVED a clean
         store principal. No page; when alert-state is wired (ADR 0044) it auto-resolves the open
         warning for the same subject, so a fixed grant clears the dashboard."""
+        ...
+
+    def vault_privilege_warning(
+        self, name: str, *, finding: str, refusing_count: int, detail: str
+    ) -> None:
+        """The Vault privilege preflight found a Vault token over-granted, or could not read it, at
+        start (BACKLOG #2903, ADR 0216). ``finding`` is ``"over_granted"`` or ``"unobservable"``.
+        ``refusing_count`` is how many of the over-grants are in the class that refuses a start
+        under ``enforce`` (the root policy, a grant on an administrative path); it is 0 for a token
+        whose over-grants are all in the warning class, and means nothing for ``"unobservable"``.
+        ``name`` is the subject, ``vault:<hop>`` (``vault:store`` or ``vault:secrets``). ``detail``
+        is the hop's judgment with control characters escaped: policy names, paths and capabilities
+        only, never a token, an accessor or a digest of either, and no message content. Fired
+        before any refusal, so a refused start still pages, and on a grant the opt-out accepts,
+        which quiets nothing. Emitted by
+        :func:`~messagefoundry.vault_preflight.run_vault_privilege_preflight`."""
+        ...
+
+    def vault_privilege_clean(self, name: str) -> None:
+        """The INVERSE of :meth:`vault_privilege_warning`: a start whose preflight read a Vault
+        token and found it clean. No page; when alert-state is wired (ADR 0044) it auto-resolves
+        the open warning for the same subject, so a fixed token clears the dashboard."""
         ...
 
     def config_changed(
@@ -1357,7 +1410,18 @@ class LoggingAlertSink:
 
     def audit_write_failed(self, name: str, *, action: str) -> None:
         log.warning(
-            "ALERT audit_write_failed: the %s audit row for %r was not written", action, name
+            "ALERT audit_write_failed: the %s audit row for %r was not written, or its write's "
+            "outcome is unknown",
+            action,
+            name,
+        )
+
+    def audit_offbox_copy_missing(self, name: str, *, action: str) -> None:
+        log.warning(
+            "ALERT audit_offbox_copy_missing: the %s audit row for %r is in the store, but its "
+            "off-box copy was not written",
+            action,
+            name,
         )
 
     def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
@@ -1384,8 +1448,9 @@ class LoggingAlertSink:
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         log.warning(
             # The count is the candidates the pass took up for the breaker and a paging refusal, or
-            # the probes the pass asked for a referral, a configuration refusal, a probe fault and a
-            # lasting outage (BACKLOG #3170, #3709); see AlertSink.ad_reconcile_aborted.
+            # the probes the pass asked for a referral, a configuration refusal, a probe fault, a
+            # lasting outage and an unreached account (BACKLOG #3170, #3709, #3100); see
+            # AlertSink.ad_reconcile_aborted.
             "ALERT ad_reconcile_aborted: %r left accounts unrevoked or unjudged, in a pass counting "
             "%d principal(s) "
             "(%s): %s",
@@ -1473,6 +1538,21 @@ class LoggingAlertSink:
     def store_privilege_clean(self, name: str) -> None:
         # The inverse (auto-resolve) event; no page, so DEBUG: the preflight already logged at INFO.
         log.debug("ALERT store_privilege_clean: %r store principal observed clean", name)
+
+    def vault_privilege_warning(
+        self, name: str, *, finding: str, refusing_count: int, detail: str
+    ) -> None:
+        # An unobservable read never judged the grant, so a "0 in the refusing class" would read clean.
+        counted = (
+            f"{refusing_count} grant(s) in the refusing class"
+            if finding == "over_granted"
+            else "the token's grants were not read"
+        )
+        log.warning("ALERT vault_privilege_warning: %r %s (%s): %s", name, finding, counted, detail)
+
+    def vault_privilege_clean(self, name: str) -> None:
+        # The inverse (auto-resolve) event; no page, so DEBUG: the preflight already logged at INFO.
+        log.debug("ALERT vault_privilege_clean: %r Vault token observed clean", name)
 
     def config_changed(
         self,

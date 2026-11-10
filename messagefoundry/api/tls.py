@@ -10,12 +10,10 @@ isolation. The ``tls_min_version`` floor (NIST SP 800-52r2: 1.2+) is enforced vi
 
 from __future__ import annotations
 
-import errno
 import json
 import logging
 import os
 import ssl
-import sys
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -36,6 +34,8 @@ from messagefoundry.config.tls_policy import (
     harden_verify_flags,
     narrow_to_approved_suites,
 )
+from messagefoundry.file_lock import lock_exclusive as _try_lock
+from messagefoundry.file_lock import unlock as _unlock
 from messagefoundry.keywrap import load_checked_cert_chain
 from messagefoundry.redaction import log_timestamp
 from messagefoundry.restricted_file import replace_generated, unlink_generated
@@ -507,48 +507,6 @@ def _discard_unusable_pair(cert_path: Path, key_path: Path, reason: str) -> None
     # discards as a half-pair, so no ordering leaves anything a later start cannot recover.
     unlink_generated(cert_path)
     unlink_generated(key_path)
-
-
-def _try_lock(fd: int) -> bool:
-    """Take an exclusive OS lock on ``fd`` without blocking. ``False`` when another handle holds it.
-
-    An OS lock rather than an ``O_EXCL`` lock FILE, because the kernel releases it when its holder
-    dies. A lock file left by a SIGKILL or a power loss would block every later start, which is the
-    same unrecoverable shape the half-pair discard exists to prevent. Both forms conflict between
-    separate opens of the file, within one process as well as across processes.
-    """
-    if sys.platform == "win32":
-        import msvcrt
-
-        os.lseek(fd, 0, os.SEEK_SET)
-        try:
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-        except OSError as exc:
-            # Measured on Windows: a held range refuses with EACCES. EDEADLOCK is the CRT's other
-            # documented contention code. Anything else is a real fault and propagates.
-            if exc.errno in (errno.EACCES, errno.EDEADLOCK):
-                return False
-            raise
-        return True
-    import fcntl
-
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        return False
-    return True
-
-
-def _unlock(fd: int) -> None:
-    if sys.platform == "win32":
-        import msvcrt
-
-        os.lseek(fd, 0, os.SEEK_SET)
-        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-    else:
-        import fcntl
-
-        fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 @contextmanager

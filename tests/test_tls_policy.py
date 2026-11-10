@@ -1787,8 +1787,8 @@ def test_no_crl_configured_leaves_every_anchor_byte_identical() -> None:
 
 
 def test_a_crl_alone_makes_the_anchor_narrow(_crl_material: dict[str, str]) -> None:
-    # LOAD-BEARING for the HTTP family. Those five call sites reuse a module-level opener built at
-    # IMPORT time, before any config exists, whenever the anchor does not narrow. A CRL-only anchor that
+    # LOAD-BEARING for the HTTP family. Those five call sites reuse a shared opener built with no
+    # anchor whenever the anchor does not narrow. A CRL-only anchor that
     # answered False here would leave the hop on that unrevoked shared opener while its guard was told
     # revocation was checked -- the exact per-hop scoping failure this item warns about.
     anchor = resolve_trust_anchor(
@@ -1868,8 +1868,11 @@ def test_requests_verify_refuses_a_crl_it_cannot_express(_crl_material: dict[str
         load_system_roots=False,
         crl_file=_crl_material["fresh_only"],
     )
-    with pytest.raises(ValueError, match="crl_file"):
+    with pytest.raises(ValueError, match="crl_file") as exc:
         requests_verify_from_anchor(anchor, cell="probe")
+    # Vault BACKLOG #2977 item 9: a proxy does not unset the CRL, which is what this refusal keys
+    # on, so the text no longer offers one.
+    assert "revocation-checking proxy" not in str(exc.value)
     # Without a CRL the two expressible shapes are unchanged.
     assert requests_verify_from_anchor(SYSTEM_TRUST_ANCHOR, cell="probe") is None
     assert (

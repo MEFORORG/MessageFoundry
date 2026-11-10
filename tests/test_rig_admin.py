@@ -401,20 +401,110 @@ def test_an_answer_that_is_not_a_usable_session_is_a_refusal_and_never_carries_t
     assert admin.password not in str(refused.value)
 
 
+#: The engine's answer to a sign-in past its rate limit.
+_LIMITED = (429, {"detail": "too many attempts; please retry later"})
+
+
+def _record_pauses(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Replace the rig's wait with one that only records how long it was asked to wait."""
+    waited: list[float] = []
+    monkeypatch.setattr(rigadmin, "_pause", waited.append)
+    return waited
+
+
 def test_a_rate_limited_sign_in_names_the_limit_not_a_stale_administrator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """HTTP 429 is the sign-in rate limit, so the stale-store advice would send the operator after
-    the wrong cause (BACKLOG #2795)."""
-    _answers(monkeypatch, (429, {"detail": "too many attempts; please retry later"}))
+    the wrong cause (BACKLOG #2795). A caller that does not ask to wait is told at once, as a
+    transient refusal it can tell apart, so a measured run never spends a minute waiting."""
+    calls = _answers(monkeypatch, _LIMITED)
+    waited = _record_pauses(monkeypatch)
     admin = RigAdmin("rig-operator", "cd" * 24)
-    with pytest.raises(rigadmin.RigSignInRefused) as refused:
+    with pytest.raises(rigadmin.RigSignInRateLimited) as refused:
         rigadmin.sign_in("https://127.0.0.1:1", admin)
+    assert isinstance(refused.value, rigadmin.RigSignInRefused), "a caller that stops still stops"
+    assert waited == []
+    assert len(calls) == 1
     message = str(refused.value)
     assert "HTTP 429" in message
     assert "MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP" in message
     assert rigadmin.ADMIN_NAME_ENV not in message, "the stale-Administrator advice is not the cause"
     assert admin.password not in message
+
+
+def test_a_rate_limited_sign_in_is_tried_again_and_takes_the_session_once_admitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 429 is transient (BACKLOG #2795 pass F finding 2): a refused attempt does not count, so
+    the rig waits and signs in again rather than ending the run on the first one."""
+    calls = _answers(monkeypatch, _LIMITED, _LIMITED, (200, {"token": "session-3"}))
+    waited = _record_pauses(monkeypatch)
+    admin = RigAdmin("rig-operator", "ab" * 24)
+    signed_in = rigadmin.sign_in("https://127.0.0.1:1", admin, wait_out_rate_limit=True)
+    assert signed_in == "session-3"
+    assert waited == list(rigadmin._RATE_LIMITED_WAITS_S[:2])
+    assert len(calls) == 3
+
+
+def test_a_sign_in_that_waits_gives_up_after_its_last_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _answers(monkeypatch, *[_LIMITED] * (len(rigadmin._RATE_LIMITED_WAITS_S) + 1))
+    waited = _record_pauses(monkeypatch)
+    admin = RigAdmin("rig-operator", "cd" * 24)
+    with pytest.raises(rigadmin.RigSignInRateLimited, match="HTTP 429.* attempts"):
+        rigadmin.sign_in("https://127.0.0.1:1", admin, wait_out_rate_limit=True)
+    assert waited == list(rigadmin._RATE_LIMITED_WAITS_S)
+    assert len(calls) == len(rigadmin._RATE_LIMITED_WAITS_S) + 1
+
+
+def test_the_session_a_poller_holds_fails_fast_on_the_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pollers and drive processes sign in through session_token and renew_session, inside a
+    measured run, so a 429 there is raised at once rather than waited out."""
+    monkeypatch.setenv(rigadmin.ADMIN_PASS_ENV, "ef" * 24)
+    calls = _answers(monkeypatch, _LIMITED, _LIMITED)
+    waited = _record_pauses(monkeypatch)
+    with pytest.raises(rigadmin.RigSignInRateLimited):
+        rigadmin.session_token("https://127.0.0.1:1")
+    with pytest.raises(rigadmin.RigSignInRateLimited):
+        rigadmin.renew_session("https://127.0.0.1:1", None)
+    assert waited == []
+    assert len(calls) == 2
+
+
+def test_a_rate_limited_sign_in_with_a_key_sends_a_fresh_code_each_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The engine takes each step's code once, and a 429 is an answer, so its step is spent: the
+    next attempt must carry the code of a later step, never the refused one again. The wait for
+    that step spaces the attempts, so no backoff wait is added to it."""
+    calls = _answers(monkeypatch, _LIMITED, (200, {"token": "session-4"}))
+    waited = _record_pauses(monkeypatch)
+    steps = iter([("111111", 40), ("222222", 41)])
+    monkeypatch.setattr(rigadmin, "_code_in_a_fresh_step", lambda key: next(steps))
+    admin = RigAdmin("rig-operator", "ab" * 24, totp.generate_secret())
+    signed_in = rigadmin.sign_in("https://127.0.0.1:1", admin, wait_out_rate_limit=True)
+    assert signed_in == "session-4"
+    assert [c["body"]["totp_code"] for c in calls] == ["111111", "222222"]
+    assert rigadmin._spent.last == 41
+    assert waited == []
+
+
+def test_the_rate_limit_waits_outlast_the_engines_shipped_sign_in_window() -> None:
+    """When only the rig's own burst filled the window, the last attempt comes after every earlier
+    hit has aged out of it. Pinned to the engine's default, so a longer shipped window fails here."""
+    from messagefoundry.config.settings import AuthSettings
+
+    window = AuthSettings.model_fields["login_rate_limit_window_seconds"].get_default(
+        call_default_factory=True
+    )
+    assert sum(rigadmin._RATE_LIMITED_WAITS_S) > window
+    # With a key, each attempt takes a later step than the one before, so the first and the last
+    # are at least this far apart.
+    assert (len(rigadmin._RATE_LIMITED_WAITS_S) - 1) * totp.DEFAULT_PERIOD > window
 
 
 def test_an_engine_that_does_not_answer_is_unreachable_and_not_a_refusal() -> None:
@@ -1099,6 +1189,57 @@ def test_a_token_poller_gets_no_reload_client() -> None:
     assert asyncio.run(poller.reload_client()) is None
     # CONTROL: a rig poller does hold the session that lets it re-prove.
     assert EnginePoller("https://127.0.0.1:1", RIG_SESSION, origin=0.0).holds_rig_session
+
+
+def test_the_rig_session_cap_is_the_engine_default() -> None:
+    """``RIG_SESSION_CAP`` is a copy of the engine's default, because the harness may not import the
+    engine's settings. RED when the engine default moves and the copy does not."""
+    from messagefoundry.config.settings import AuthSettings
+
+    assert AuthSettings().max_sessions_per_user == enginepoll.RIG_SESSION_CAP
+
+
+class _SessionsClient:
+    """The sampler's client as :meth:`EnginePoller._reload_client_sync` reads it: a session list."""
+
+    def __init__(self, held: int) -> None:
+        self.held = held
+
+    def list_sessions(self) -> list[object]:
+        return [object()] * self.held
+
+
+@pytest.mark.parametrize(("held", "cap"), [(5, 5), (6, 5), (9, 9)])
+def test_a_reload_probe_at_the_session_cap_signs_nothing_in(
+    monkeypatch: pytest.MonkeyPatch, held: int, cap: int
+) -> None:
+    """Vault BACKLOG #3241, added item 5. A sign-in past ``[auth].max_sessions_per_user`` ends the
+    rig user's oldest session, the sampler's. So at the cap the reload probe signs nothing in and
+    reports the reload unmeasured. RED when: it signs in at the cap."""
+    monkeypatch.setattr(
+        rigadmin, "sign_in", lambda *a, **k: pytest.fail("signed in at the session cap")
+    )
+    poller = EnginePoller("https://127.0.0.1:1", RIG_SESSION, origin=0.0, session_cap=cap)
+    poller._clients = [_SessionsClient(held)]  # type: ignore[list-item]
+    assert asyncio.run(poller.reload_client()) is None
+
+
+@pytest.mark.parametrize(("held", "cap"), [(4, 5), (7, 0)], ids=["headroom", "uncapped"])
+def test_a_reload_probe_under_the_session_cap_signs_in(held: int, cap: int) -> None:
+    """The control for the test above: one session of headroom, or a cap of 0, which the engine
+    reads as no cap, and the probe signs in."""
+    calls: list[str] = []
+
+    def _sign_in(url: str, *_a: object, **_k: object) -> str:
+        calls.append(url)
+        raise rigadmin.RigAdminError("synthetic: stop after the sign-in was attempted")
+
+    poller = EnginePoller("https://127.0.0.1:1", RIG_SESSION, origin=0.0, session_cap=cap)
+    poller._clients = [_SessionsClient(held)]  # type: ignore[list-item]
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(rigadmin, "sign_in", _sign_in)
+        assert asyncio.run(poller.reload_client()) is None
+    assert calls == ["https://127.0.0.1:1"]
 
 
 def test_an_unreachable_engine_reads_as_an_api_error_and_a_refusal_does_not(

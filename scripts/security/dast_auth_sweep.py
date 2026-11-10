@@ -97,6 +97,7 @@ from scripts.security.dast_target import (  # noqa: E402
     ADMIN_USERNAME,
     PREFLIGHT_PATH,
     VIEWER_USERNAME,
+    DastReproofRefused,
     DastTarget,
     DastTargetUnusable,
     dast_target,
@@ -159,9 +160,22 @@ def load_policy(path: Path) -> dict[str, Any]:
         raise PolicyError(f"the policy at {path} is not valid JSON: {exc}") from exc
     if not isinstance(parsed, dict):
         raise PolicyError(f"the policy at {path} must be a JSON object")
-    for key in ("floors", "canary_floors", "unreachable_allowlist", "anonymous_allowlist"):
+    for key in (
+        "floors",
+        "canary_floors",
+        "unreachable_allowlist",
+        "anonymous_allowlist",
+        "public_websocket_allowlist",
+    ):
         if key not in parsed:
             raise PolicyError(f"the policy at {path} is missing the required {key!r} section")
+    for key in ("unreachable_allowlist", "anonymous_allowlist", "public_websocket_allowlist"):
+        # Every reader iterates these, some outside evaluate()'s PolicyError handler, so a null or
+        # a string must stop the run here, as could-not-measure, and not crash it later as exit 1.
+        if not isinstance(parsed[key], list):
+            raise PolicyError(
+                f"the policy at {path} has {key!r} as {type(parsed[key]).__name__}, not a list"
+            )
     return parsed
 
 
@@ -244,6 +258,11 @@ async def _probe(client: httpx.AsyncClient, method: str, url: str, token: str | 
     return response.status_code
 
 
+#: ``POST /me/reauth`` answers to a re-proof that would refuse every later re-proof too: the session
+#: died, or the per-actor limiter tripped. Either still ends the sweep (see :func:`_reach_probe`).
+_RUN_WIDE_REPROOF_REFUSALS: Final = frozenset({401, 429})
+
+
 async def _reach_probe(
     client: httpx.AsyncClient,
     row: route_gates.RouteRow,
@@ -252,6 +271,7 @@ async def _reach_probe(
     *,
     target: DastTarget,
     reproved: list[str],
+    reproof_refused: list[str],
 ) -> tuple[int, str]:
     """One privileged probe that passes an action-bound step-up wall: ``(status, live token)``.
 
@@ -261,14 +281,29 @@ async def _reach_probe(
     re-proves for the named action ONCE, as the IDE and the harness do, and sends the probe again.
     A second refusal is scored like any other, so a wall that a re-proof cannot pass still reds.
 
+    A re-proof the engine refuses no longer ends the sweep (vault BACKLOG #3241, added item 3). The
+    row goes into ``reproof_refused``, keeps its first 403, and is scored as unreached like any
+    other refused row, so the run still fails, and every other row is still measured. The token is
+    unchanged: a refused re-proof re-keys nothing. A refusal that is not the one action's still
+    ends the sweep, as every refusal did before: a 401 (the session died) or a 429 (the per-actor
+    limiter tripped) would refuse every later re-proof too, and the rows after it would be probed
+    with a dead token or spend the limiter again, so they would read as measured when they were not.
+
     The re-proof re-keys the session, so the caller must carry the returned token forward. Only
-    the method and path template go into ``reproved``, never the action: it is a header value.
+    the method and path template go into ``reproved`` and ``reproof_refused``, never the action: it
+    is a header value.
     """
     response = await client.request(row.method, url, headers={"Authorization": f"Bearer {token}"})
     action = response.headers.get(STEP_UP_ACTION_HEADER)
     if response.status_code != 403 or not action:
         return response.status_code, token
-    token = await target.reprove(token, action)
+    try:
+        token = await target.reprove(token, action)
+    except DastReproofRefused as refused:
+        if refused.status in _RUN_WIDE_REPROOF_REFUSALS:
+            raise
+        reproof_refused.append(f"{row.method} {row.path}")
+        return response.status_code, token
     reproved.append(f"{row.method} {row.path}")
     response = await client.request(row.method, url, headers={"Authorization": f"Bearer {token}"})
     return response.status_code, token
@@ -285,12 +320,14 @@ async def _write_pass(
     max_rebuilds: int,
     rebuilt: list[str],
     reproved: list[str] | None = None,
+    reproof_refused: list[str] | None = None,
 ) -> tuple[list[tuple[route_gates.RouteRow, int]], str]:
     """Probe ``rows`` with ``username``'s session, keeping that session alive across side effects.
     Returns the results and the session's token as the pass left it.
 
     With ``reproved`` given, each probe passes an action-bound step-up wall through
-    :func:`_reach_probe`, which records the row there. The privileged reach pass passes it; the
+    :func:`_reach_probe`, which records the row there, or in ``reproof_refused`` when the engine
+    refuses the re-proof. The privileged reach pass passes it; the
     BFLA pass does not, because a low-privilege caller must be refused before any step-up is asked.
 
     THE PROBLEM THIS SOLVES, measured rather than imagined: ``POST /auth/logout`` answers a valid
@@ -310,14 +347,23 @@ async def _write_pass(
     probed is one whose reach numbers cannot be credited, and grinding through a login per row would
     report a number built on an unstable target rather than refusing to report one.
     """
+    if (reproved is None) != (reproof_refused is None):
+        # Either both lists or neither: one without the other would drop refused re-proofs.
+        raise ValueError("reproved and reproof_refused are passed together")
     results: list[tuple[route_gates.RouteRow, int]] = []
     for row in rows:
         url = route_gates.concrete_path(row.path, placeholder)
-        if reproved is None:
+        if reproved is None or reproof_refused is None:
             status = await _probe(client, row.method, url, token)
         else:
             status, token = await _reach_probe(
-                client, row, url, token, target=target, reproved=reproved
+                client,
+                row,
+                url,
+                token,
+                target=target,
+                reproved=reproved,
+                reproof_refused=reproof_refused,
             )
         results.append((row, status))
 
@@ -366,6 +412,7 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
         write_outcomes = {"refused": 0, "stopped-at-validation": 0, "executed": 0}
         rebuilt: list[str] = []
         reproved: list[str] = []
+        reproof_refused: list[str] = []
         max_rebuilds = int(policy.get("max_write_session_rebuilds", 0))
         # The administrator's session as the reach passes leave it: a re-proof re-keys it.
         admin_token = target.admin_token
@@ -399,7 +446,13 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
             for row in get_rows:
                 url = route_gates.concrete_path(row.path, placeholder)
                 status, admin_token = await _reach_probe(
-                    client, row, url, admin_token, target=target, reproved=reproved
+                    client,
+                    row,
+                    url,
+                    admin_token,
+                    target=target,
+                    reproved=reproved,
+                    reproof_refused=reproof_refused,
                 )
                 if is_reached(status):
                     reached += 1
@@ -465,6 +518,7 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
                 max_rebuilds=max_rebuilds,
                 rebuilt=rebuilt,
                 reproved=reproved,
+                reproof_refused=reproof_refused,
             )
             for row, status in write_reach_results:
                 write_outcomes[write_probe_outcome(status)] += 1
@@ -521,6 +575,10 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
             # template only; the action the gate named is a header value and stays out.
             "step_up_reproofs": len(reproved),
             "step_up_reproof_rows": list(reproved),
+            # Rows whose re-proof the engine refused (vault BACKLOG #3241, added item 3). Each is
+            # also scored as unreached above, so the run fails; the sweep no longer stops there.
+            "step_up_reproof_refusals": len(reproof_refused),
+            "step_up_reproof_refused_rows": list(reproof_refused),
             "findings": findings,
             "canary": canary,
         }
@@ -530,22 +588,26 @@ def _row_record(row: route_gates.RouteRow) -> dict[str, Any]:
     """A route row as the receipt carries it. ``kind`` and ``declaration`` tell a route public by
     design from one the engine refuses to every caller, which the method and path alone cannot
     (vault BACKLOG #2846, and #2955 for WebSocket rows). ``gates`` is what the walk found the
-    operation runs; for a WebSocket that authorizes in its body it is the only evidence it does."""
+    operation runs; for a WebSocket that authorizes in its body it is the only evidence it does.
+    ``permissions`` is what those gates demand, as wire strings."""
     return {
         "method": row.method,
         "path": row.path,
         "kind": row.kind,
         "declaration": row.declaration,
         "gates": list(row.gates),
+        "permissions": list(row.permissions),
     }
 
 
 #: What a WebSocket row may be and pass (vault BACKLOG #2955). Gated outright passes. Marked
-#: ``public_route`` passes with its reason. Marked ``authorizes_in_body``, or outside the engine's
-#: refusal, passes only with a reason AND a gate the walk found: the engine accepts any declaration
-#: on a socket, and outside the refusal nothing reads it, so the reason alone would vouch for a
-#: socket that authorizes nobody. The walk finds a gate by its call, not by what the endpoint does
-#: with the answer, so a pass here is evidence of a gate call, not proof it is enforced.
+#: ``public_route`` passes with its reason, and only if the policy allow-lists it. Marked
+#: ``authorizes_in_body``, or outside the engine's refusal, passes only with a reason AND a gate the
+#: walk found that demands a permission: the refusal accepts either declaration on a socket, and
+#: outside the refusal nothing reads one, so the reason alone would vouch for a socket that
+#: authorizes nobody. The walk finds a gate by its call, not by what the endpoint does with the
+#: answer. At run time the engine's ``WebSocketAcceptGate`` applies its own rule, stated in
+#: docs/SECURITY.md; this check is the sweep's own reading, not a substitute for that control.
 _WS_PASSES: Final = frozenset({route_gates.KIND_GATED})
 _WS_NEEDS_REASON: Final = frozenset(
     {route_gates.KIND_PUBLIC, route_gates.KIND_IN_BODY, route_gates.KIND_OUTSIDE}
@@ -562,13 +624,19 @@ def _rows_not_declared(
     needs_gate: frozenset[str] = frozenset(),
 ) -> list[str]:
     """Each row whose kind is not in ``passes``, and not in ``needs_reason`` with a declaration
-    (and, for a kind in ``needs_gate``, at least one gate).
+    (and, for a kind in ``needs_gate``, at least one gate and at least one permission).
 
     A row with no kind is listed too, so an older receipt cannot pass by omission."""
     found: list[str] = []
     for row in rows:
         kind = row.get("kind") or "no kind"
         if kind in passes:
+            # Engine PR 2390 note 5: a gate dependency that demands no Permission vouches for
+            # nothing either, as tests/test_route_gates.py holds for every shipped socket.
+            if needs_gate and not row.get("permissions"):
+                found.append(
+                    f"{str(row['method']).upper()} {row['path']} ({kind}, no permission found)"
+                )
             continue
         if kind not in needs_reason:
             state = kind
@@ -576,6 +644,10 @@ def _rows_not_declared(
             state = f"{kind}, no reason"
         elif kind in needs_gate and not row.get("gates"):
             state = f"{kind}, no gate found"
+        elif kind in needs_gate and not row.get("permissions"):
+            # Engine PR 2390 note 5: tests/test_route_gates.py rejects a shipped socket whose gate
+            # demands no Permission, so the sweep does too. A receipt with no field reads as none.
+            state = f"{kind}, no permission found"
         else:
             continue
         found.append(f"{str(row['method']).upper()} {row['path']} ({state})")
@@ -606,6 +678,31 @@ def websocket_rows_not_declared(receipt: dict[str, Any]) -> list[str]:
     )
 
 
+def _allowlist_drift(
+    policy: dict[str, Any],
+    key: str,
+    rows: list[dict[str, Any]],
+    what: str,
+    added_label: str,
+    why: str,
+) -> str | None:
+    """The error line when ``rows``' ``(METHOD, path)`` set differs from the policy's ``key``
+    allow-list, else ``None``. Raises :class:`PolicyError` on a malformed entry, or an allow-list
+    that is not a list, so a bad policy reads as could-not-measure rather than as a finding."""
+    entries = policy.get(key, [])
+    if not isinstance(entries, list):
+        raise PolicyError(f"the policy's {key!r} must be a list, got {type(entries).__name__}")
+    expected = {_key(e) for e in entries}
+    actual = {(str(r["method"]).upper(), str(r["path"])) for r in rows}
+    if actual == expected:
+        return None
+    return (
+        f"{what} no longer matches the documented allow-list. "
+        f"{added_label}: {sorted(actual - expected) or 'none'}; "
+        f"documented but absent: {sorted(expected - actual) or 'none'}. {why}"
+    )
+
+
 def evaluate(receipt: dict[str, Any], policy: dict[str, Any]) -> tuple[int, list[str]]:
     """``(exit code, error lines)`` for a receipt. Pure — the tests drive it with no target running.
 
@@ -629,6 +726,9 @@ def evaluate(receipt: dict[str, Any], policy: dict[str, Any]) -> tuple[int, list
         # pass that did not run at all, not only on one that ran short.
         "min_write_rows_reached": int(receipt.get("write_reached", 0)),
         "min_write_bfla_probes": int(receipt.get("write_bfla_probes", 0)),
+        # Engine PR 2390 note 4 (vault BACKLOG #2955): the WebSocket kind check passes on an empty
+        # list, so a walk that stopped yielding socket rows would read as clean. Rows, not probes.
+        "min_websocket_rows": len(receipt.get("websocket_rows", [])),
     }
 
     if observed["min_gated_http_rows"] == 0:
@@ -648,28 +748,45 @@ def evaluate(receipt: dict[str, Any], policy: dict[str, Any]) -> tuple[int, list
                 "Too little was measured for a clean result to mean anything."
             )
 
-    # A newly ungated route must red the run rather than quietly joining the background.
+    # A newly ungated route must red the run rather than quietly joining the background. Engine PR
+    # 2390 note 3 (vault BACKLOG #2955): a public socket is the one the engine accepts with no gate
+    # (api/security.py WebSocketAcceptGate), so that set is pinned the same way.
     try:
-        expected_anonymous = {_key(e) for e in policy.get("anonymous_allowlist", [])}
+        drift = [
+            _allowlist_drift(
+                policy,
+                "anonymous_allowlist",
+                receipt.get("ungated_routes", []),
+                "the ungated (anonymous) route set",
+                "Newly anonymous",
+                "A route with no require*() gate is reachable by anyone.",
+            ),
+            _allowlist_drift(
+                policy,
+                "public_websocket_allowlist",
+                [
+                    r
+                    for r in receipt.get("websocket_rows", [])
+                    if r.get("kind") == route_gates.KIND_PUBLIC
+                ],
+                "the public WebSocket route set",
+                "Newly public",
+                "A public socket is accepted with no gate.",
+            ),
+        ]
     except PolicyError as exc:
         return 2, [str(exc)]
-    actual_anonymous = {
-        (str(r["method"]).upper(), str(r["path"])) for r in receipt.get("ungated_routes", [])
-    }
-    if actual_anonymous != expected_anonymous:
-        added = sorted(actual_anonymous - expected_anonymous)
-        removed = sorted(expected_anonymous - actual_anonymous)
-        errors.append(
-            "the ungated (anonymous) route set no longer matches the documented allow-list. "
-            f"Newly anonymous: {added or 'none'}; documented but absent: {removed or 'none'}. "
-            "A route with no require*() gate is reachable by anyone."
-        )
+    anonymous_drift, public_ws_drift = drift
+    if anonymous_drift:
+        errors.append(anonymous_drift)
     undeclared = ungated_not_declared_public(receipt)
     if undeclared:
         errors.append(
             f"ungated route(s) not declared public with a reason: {undeclared}. The allow-list "
             "cannot tell such a route from one public by design."
         )
+    if public_ws_drift:
+        errors.append(public_ws_drift)
     undeclared_ws = websocket_rows_not_declared(receipt)
     if undeclared_ws:
         errors.append(
@@ -687,6 +804,17 @@ def evaluate(receipt: dict[str, Any], policy: dict[str, Any]) -> tuple[int, list
             f"{rebuilds} write probe(s) destroyed the scan session, over the cap of {max_rebuilds}: "
             f"{receipt.get('write_session_rebuild_rows', [])}. Reach measured against a session that "
             "kept dying cannot be credited."
+        )
+
+    # Vault BACKLOG #3241, added item 3: a refused re-proof no longer ends the sweep, so it is
+    # checked here, whether or not its row is also allowlisted. The scan password re-proved nothing
+    # for that row, so the step-up wall in front of it was measured, not the route behind it: a
+    # could-not-measure, exit 2, as the refusal was when it ended the sweep.
+    refused_reproofs = receipt.get("step_up_reproof_refused_rows") or []
+    if refused_reproofs:
+        fatal.append(
+            f"the engine refused the action-bound re-proof for {len(refused_reproofs)} row(s): "
+            f"{refused_reproofs}. Each was measured at its step-up wall, not behind it."
         )
 
     max_unexplained = int(policy.get("max_unexplained_unreached", 0))
@@ -782,6 +910,7 @@ def receipt_lines(receipt: dict[str, Any], policy: dict[str, Any], verdict: str)
             ("min_bfla_probes", receipt.get("bfla_probes", 0)),
             ("min_write_rows_reached", receipt.get("write_reached", 0)),
             ("min_write_bfla_probes", receipt.get("write_bfla_probes", 0)),
+            ("min_websocket_rows", len(ws)),
         )
     )
     outcomes = receipt.get("write_probe_outcomes", {})
@@ -806,7 +935,8 @@ def receipt_lines(receipt: dict[str, Any], policy: dict[str, Any], verdict: str)
         f"declared public with a reason -- "
         f"{len(ungated_rows) - len(not_public)}/{len(ungated_rows)} ungated routes"
         + (f"; NOT: {not_public}" if not_public else ""),
-        f"WebSocket rows gated, declared public with a reason, or declared with a gate found -- "
+        "WebSocket rows gated with a permission, declared public with a reason, or declared with a "
+        f"reason and a gate found that demands a permission -- "
         f"{len(ws) - len(ws_undeclared)}/{len(ws)}"
         + (f"; NOT: {ws_undeclared}" if ws_undeclared else ""),
         f"negative probes -- {receipt.get('negative_probes')} requests "
@@ -835,7 +965,9 @@ def receipt_lines(receipt: dict[str, Any], policy: dict[str, Any], verdict: str)
         f"re-minted -- {receipt.get('write_session_rebuild_rows') or 'none'}",
         f"step-up re-proofs -- {receipt.get('step_up_reproofs', 0)} row(s) refused the "
         "administrator with an action-bound step-up, were re-proved for that action and probed "
-        f"again -- {receipt.get('step_up_reproof_rows') or 'none'}",
+        f"again -- {receipt.get('step_up_reproof_rows') or 'none'}; "
+        f"{receipt.get('step_up_reproof_refusals', 0)} re-proof(s) refused -- "
+        f"{receipt.get('step_up_reproof_refused_rows') or 'none'}",
         f"floors -- {floor_text} unexplained<="
         f"{policy.get('max_unexplained_unreached', 0)} "
         f"{'ok' if int(receipt.get('unreached_unexplained', 0)) <= int(policy.get('max_unexplained_unreached', 0)) else 'FAIL'}"
@@ -934,6 +1066,7 @@ def main(argv: list[str] | None = None) -> int:
             ("min_bfla_probes", receipt["bfla_probes"]),
             ("min_write_rows_reached", receipt["write_reached"]),
             ("min_write_bfla_probes", receipt["write_bfla_probes"]),
+            ("min_websocket_rows", len(receipt["websocket_rows"])),
         )
     }
     receipt["floors"]["max_unexplained_unreached"] = {

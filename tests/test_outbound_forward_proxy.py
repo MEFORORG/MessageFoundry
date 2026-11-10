@@ -5,7 +5,7 @@
 Covers, without touching the network (everything is decided at connector construction):
 
 * **#112** — an explicit proxy address builds a PER-CONNECTION opener carrying a ``ProxyHandler`` (never
-  the shared ``_NO_REDIRECT_OPENER``); ``proxy="default"`` uses the OS default web proxy
+  the shared ``_shared_no_redirect_opener()``); ``proxy="default"`` uses the OS default web proxy
   (``getproxies()``); no proxy is byte-identical (the shared opener, no ``Proxy-Authorization``).
 * **#127** — Basic proxy auth is a pre-emptive ``Proxy-Authorization`` header (tunnelled for https by
   urllib); a cleartext-http proxy hop carrying the credential is refused REGARDLESS of destination scheme
@@ -42,10 +42,10 @@ from messagefoundry.transports.egress import check_egress_allowed
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.http_auth import HttpAuthError, OAuth2ClientCredentialsProvider
 from messagefoundry.transports.rest import (
-    _NO_REDIRECT_OPENER,
     ProxyConfig,
     _proxy_bypasses,
     _ProxyDigestRecipe,
+    _shared_no_redirect_opener,
     proxy_config_from_settings,
 )
 from messagefoundry.transports.smart import SmartBackendTokenProvider
@@ -133,11 +133,11 @@ def test_explicit_proxy_builds_per_connection_opener(ctype: ConnectorType) -> No
     shared verifying opener is NOT reused (and never mutated)."""
     dest = _build(ctype, HTTPS_DEST, proxy=PROXY)
     opener = dest._opener  # type: ignore[attr-defined]
-    assert opener is not _NO_REDIRECT_OPENER
+    assert opener is not _shared_no_redirect_opener()
     ph = _proxy_handler(opener)
     assert ph is not None and ph.proxies == {"http": PROXY, "https": PROXY}
     # The shared opener's own default ProxyHandler was left untouched.
-    shared_ph = _proxy_handler(_NO_REDIRECT_OPENER)
+    shared_ph = _proxy_handler(_shared_no_redirect_opener())
     assert shared_ph is None or shared_ph.proxies == {}
 
 
@@ -147,7 +147,7 @@ def test_use_default_web_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     dest = _build(ConnectorType.REST, HTTPS_DEST, proxy="default")
     assert dest._proxy is not None and dest._proxy.use_default is True  # type: ignore[attr-defined]
     opener = dest._opener  # type: ignore[attr-defined]
-    assert opener is not _NO_REDIRECT_OPENER
+    assert opener is not _shared_no_redirect_opener()
     ph = _proxy_handler(opener)
     assert ph is not None and ph.proxies == {"http": "http://sys:3128"}
 
@@ -156,7 +156,7 @@ def test_use_default_web_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_no_proxy_is_byte_identical(ctype: ConnectorType) -> None:
     """AC-3: no proxy → the shared verifying opener is reused and no Proxy-Authorization is added."""
     dest = _build(ctype, HTTPS_DEST)
-    assert dest._opener is _NO_REDIRECT_OPENER  # type: ignore[attr-defined]
+    assert dest._opener is _shared_no_redirect_opener()  # type: ignore[attr-defined]
     assert dest._proxy is None  # type: ignore[attr-defined]
     assert "Proxy-Authorization" not in dest._headers  # type: ignore[attr-defined]
 
@@ -558,7 +558,7 @@ def test_intranet_bypass() -> None:
         proxy_password="pw",
         proxy_no_proxy=["intranet.local"],
     )
-    assert dest._opener is _NO_REDIRECT_OPENER  # type: ignore[attr-defined]
+    assert dest._opener is _shared_no_redirect_opener()  # type: ignore[attr-defined]
     assert "Proxy-Authorization" not in dest._headers  # type: ignore[attr-defined]
     # A non-matching host on the SAME connection config still gets the proxy.
     dest2 = _build(
@@ -569,7 +569,7 @@ def test_intranet_bypass() -> None:
         proxy_password="pw",
         proxy_no_proxy=["intranet.local"],
     )
-    assert dest2._opener is not _NO_REDIRECT_OPENER  # type: ignore[attr-defined]
+    assert dest2._opener is not _shared_no_redirect_opener()  # type: ignore[attr-defined]
     assert "Proxy-Authorization" in dest2._headers  # type: ignore[attr-defined]
 
 
@@ -588,7 +588,7 @@ def test_intranet_bypass_ipv6() -> None:
         proxy_password="pw",
         proxy_no_proxy=["2001:db8::1"],
     )
-    assert dest._opener is _NO_REDIRECT_OPENER  # type: ignore[attr-defined]
+    assert dest._opener is _shared_no_redirect_opener()  # type: ignore[attr-defined]
     assert "Proxy-Authorization" not in dest._headers  # type: ignore[attr-defined]
     # A DIFFERENT IPv6 host is NOT bypassed → still proxied. The positive case above is what the
     # truncation bug broke; assert the negative to pin correctness both ways.
@@ -600,7 +600,7 @@ def test_intranet_bypass_ipv6() -> None:
         proxy_password="pw",
         proxy_no_proxy=["2001:db8::1"],
     )
-    assert dest2._opener is not _NO_REDIRECT_OPENER  # type: ignore[attr-defined]
+    assert dest2._opener is not _shared_no_redirect_opener()  # type: ignore[attr-defined]
     assert "Proxy-Authorization" in dest2._headers  # type: ignore[attr-defined]
 
 
@@ -867,6 +867,6 @@ def test_fhir_lookup_executor_proxied() -> None:
             egress=permitting({"proxy_url": PROXY}),
         )
     opener = ex._opener["epic"]
-    assert opener is not _NO_REDIRECT_OPENER
+    assert opener is not _shared_no_redirect_opener()
     ph = _proxy_handler(opener)
     assert ph is not None and ph.proxies == {"http": PROXY, "https": PROXY}

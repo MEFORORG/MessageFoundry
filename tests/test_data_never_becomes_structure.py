@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import logging
 import random
 import textwrap
 import threading
@@ -866,20 +867,28 @@ async def test_a_stop_before_the_first_message_hands_nothing_over_and_still_prun
     # nothing. So a marker goes through that same logger, at the same level, on each side of the
     # poll, and both must be captured.
     markers = ("BACKLOG #2967 capture marker, before", "BACKLOG #2967 capture marker, after")
+    # Every RemoteFileSource logs through the one module logger, so its name alone would also take a
+    # line another source logged meanwhile, from its own poller task, and fail this test for it. A
+    # record logged on another task is not this poll's. One with no task is kept, since this poll's
+    # worker threads log with none (vault BACKLOG #3766 item 9).
+    poll_task = asyncio.current_task()
+    assert poll_task is not None
+    our_tasks = (None, poll_task.get_name())
+
+    def ours(r: logging.LogRecord) -> bool:
+        return r.name == connector_log.name and r.taskName in our_tasks
+
     connector_log.warning(markers[0])
     await src._poll_once()
     connector_log.warning(markers[1])
     assert len(caplog.records) >= 2, "the capture missed a marker: it cannot see the connector"
-    seen = {r.getMessage() for r in caplog.records if r.name == connector_log.name}
+    # The markers are logged on this task, so they pass through the same filter as the failures.
+    seen = {r.getMessage() for r in caplog.records if ours(r)}
     assert set(markers) <= seen, "the capture missed a marker sent through the connector's logger"
     # _poll_once catches a failed hand-off, logs it and goes on, so a _hand_off that raised once the
     # stop was set would leave the assertions below green. The connector logs no failure this poll.
     # The message prints each logged line in full, where pytest's diff would truncate it.
-    failures = [
-        r.getMessage()
-        for r in caplog.records
-        if r.name == connector_log.name and r.getMessage() not in markers
-    ]
+    failures = [r.getMessage() for r in caplog.records if ours(r) and r.getMessage() not in markers]
     assert failures == [], "the connector logged a WARNING this poll:\n" + "\n".join(failures)
     # a.hl7 was handed over and recorded; b.hl7 met the stop before its first message.
     assert [b.decode("utf-8").split("|")[9] for b in handler.bodies] == ["CTRL1"]

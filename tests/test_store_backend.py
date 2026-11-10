@@ -94,6 +94,7 @@ def test_messagestore_satisfies_store_protocol() -> None:
         "list_roles",
         "get_user_role_ids",
         "set_user_roles",
+        "set_user_roles_if_held",
         "roles_for_ad_groups",
         "list_ad_group_role_map",
         "set_ad_group_role_map",
