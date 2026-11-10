@@ -1187,8 +1187,8 @@ def test_a_word_after_the_lock_that_pip_audit_would_quote_is_refused_unquoted(
 def test_a_dry_run_fix_help_or_version_word_is_refused_after_the_lock(
     word: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Each option ``_FAIL_OPEN_LONG`` names, whose comment says why, is refused by position, in
-    full, abbreviated, or inside a cluster of short flags, and pip-audit never starts."""
+    """Each word listed here, put third after the lock, is refused with exit 2 and a refusal that
+    names word 3 after the lock, and pip-audit never starts."""
     src = tmp_path / "x.lock"
     src.write_text(LOCK, encoding="utf-8")
     ran, run = _recorder(0)
