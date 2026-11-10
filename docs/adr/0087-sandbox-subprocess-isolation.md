@@ -242,7 +242,7 @@ target, no `pickle` import left to mis-suppress:
   queued before it encodes and writes that frame, so the check proves nothing about a frame arriving
   after it; AC-10's amendment says what such a frame meets, and the grandchild residual says how one
   can carry the right id. A **dead peer** is deliberately not the same event as a stray frame: EOF is a
-  parent-private sentinel with no wire form, so a worker cannot manufacture one and it proves nothing
+  parent-private sentinel with no wire form, so it proves nothing
   about trust. It reaps the worker without failing a call that already holds a correlation-proven
   answer — treating it as a forgery would fail closed on a signal that carries no information.
   **What this is not.** It does not confine one Handler from another *inside* a worker: code running a
@@ -360,7 +360,7 @@ target, no `pickle` import left to mis-suppress:
   staged *between* dispatches — THE SYSTEM SHALL NOT consume it as a later dispatch's answer; it SHALL
   drop that worker and fail the call closed, and the later dispatch SHALL resolve identically to
   `mode=off`. Request ids SHALL be unpredictable and never reused. A **dead peer** (EOF) is NOT a
-  frame — it has no wire form, so a worker cannot manufacture one — and SHALL drop the worker without
+  frame — it has no wire form — and SHALL drop the worker without
   failing a call that already has a correlation-proven answer.
   > **Amended 2026-11-09 (vault BACKLOG #3135 step 4, owner ruling 2026-11-09).** A frame found
   > waiting **before** a request still drops that worker and is still never consumed as an answer,
@@ -376,8 +376,7 @@ target, no `pickle` import left to mis-suppress:
   >   that second check runs.
   > - **A call refused at encode reads nothing after its check.** A request the engine cannot
   >   encode, or one over the frame cap, fails only its message and keeps its worker. A frame that
-  >   arrives after that call's check before its request is not read by that call, and rolls to the
-  >   next call's check before its request.
+  >   arrives after that call's check before its request is not read by that call.
   > - **A frame that arrives later meets at least these outcomes.** On a worker still kept, the
   >   next call's check before its request finds it, and that message is retried. One that arrives
   >   after that check, and ahead of that call's answer, is read in its place. It is rejected as an
@@ -442,7 +441,7 @@ target, no `pickle` import left to mis-suppress:
   > BACKLOG #3135 (ledger ruling R2).
   >
   > - On Linux, a forged answer from a same-UID process that opened the worker's `/proc/<pid>/fd/0`
-  >   or `/proc/<pid>/fd/1`, since the engine reads answers from the worker's stdout.
+  >   and `/proc/<pid>/fd/1`, since the engine reads answers from the worker's stdout.
   > - On Windows, a forged answer from a same-user process that duplicated the worker's pipe handles.
   > - A forged lookup at `mode=isolated`, read after a call's check before its request and ahead of
   >   its answer.
@@ -676,7 +675,7 @@ it is the constraint any proposal to make `subprocess` a *default* has to clear 
   detected, and a worker exiting mid-dispatch does not close that dispatch's answer slot to it while
   it still holds fd 1. *Corrected 2026-11-10:* this bullet said *"nothing it writes can be taken as
   an answer, and its mere presence kills the worker"*, and called the result harmless. On Linux,
-  `/proc/<pid>/fd/0` and `/proc/<pid>/fd/1` are additionally openable by any same-UID process,
+  `/proc/<pid>/fd/0` and `/proc/<pid>/fd/1` are additionally openable by a same-UID process,
   so such a process can forge an answer the same way, with no grandchild. Yama's `ptrace_scope`
   governs attaching rather than this open, and `hidepid` hides only other users' processes, so
   neither is a bound on it. Whether a same-account process on Windows can do the same, by
