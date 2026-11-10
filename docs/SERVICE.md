@@ -630,13 +630,17 @@ environment.
   secret. The path is `-SecretsDir`, else the one the service already names, else
   `<DataDir>-secrets`, beside the data directory and not in it, so a backup of the data directory
   does not copy the plain files. The installer refuses a path that is a volume root, a junction, a
-  file or a folder holding a folder, or that is, holds or sits inside at least the data, log,
-  store, config, value-file and settings-file folders, NSSM's folder, the engine install, the
-  checkout, the Windows folder and Program Files. The directory starts empty: as an administrator, add one file
-  per setting, named as its variable, and restart the service. Each run removes every grant there
-  but SYSTEM's, Administrators' and the service account's, whose own grant it keeps, and warns
-  about any it could not remove. It refuses an existing directory it would adopt for the first time
-  while that holds files. A folder above the directory that the installer
+  file or a folder holding a folder, that sits below a junction, or that is, holds or sits inside
+  at least the data, log, store, config, value-file and settings-file folders, NSSM's folder, the
+  engine install, the checkout, the Windows folder and Program Files. It refuses a path another
+  service already names as its `MEFOR_SECRETS_DIRECTORY`, so a second service on the same
+  `-DataDir` needs its own `-SecretsDir`. The installer makes the directory with its owner and
+  access list in one step. The directory starts empty: as an administrator, add one file
+  per setting, named as its variable, and restart the service. Each run makes Administrators the
+  owner and removes every grant there but SYSTEM's, Administrators' and the service account's,
+  whose own grant it keeps, and refuses when any is left. It refuses an existing directory it would
+  adopt for the first time while that holds files, before and after restricting it. A refusal
+  after the service is registered sets the service to Disabled. A folder above the directory that the installer
   creates is administrator-only; one that already existed is yours to restrict, since the engine
   does not read it. `uninstall-service.ps1` leaves the directory and its files, names them, and
   with `-RemoveAccountAces` removes the account's entry there too. Which settings it supplies, the

@@ -835,72 +835,194 @@ function Get-BroadAclResidue {
     return ($found | Select-Object -Unique)
 }
 
+function Get-ReparsePointAncestor {
+    <#
+      The nearest folder above $Path, below its volume root, that is a junction, a link or a mounted
+      volume, or "" when there is none. A folder above that cannot be read is named too: it cannot
+      be shown not to be one. A folder that does not exist yet is skipped; the caller creates it.
+
+      A JUNCTION ABOVE THE SECRETS DIRECTORY MOVES IT. Get-LockPathProblem reads only the path itself,
+      so 'C:\ProgramData\MF\secrets' under a junctioned 'C:\ProgramData\MF' would be made and locked
+      wherever the junction points, and whoever controls the junction controls where the service's
+      secrets live.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $dir = Split-Path -Parent $Path
+    while ($dir -and (Split-Path -Parent $dir)) {
+        $item = $null
+        $absent = $false
+        try { $item = Get-Item -LiteralPath $dir -Force -ErrorAction Stop }
+        catch [System.Management.Automation.ItemNotFoundException] { $absent = $true }
+        catch { $absent = $false }
+        if (-not $item -and -not $absent) { return "'$dir' above it could not be read" }
+        if ($item -and ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            return "'$dir' above it is a junction, a link or a mounted volume"
+        }
+        $dir = Split-Path -Parent $dir
+    }
+    return ""
+}
+
+function Get-OtherServiceNamingPath {
+    <#
+      The names of the services, other than $ServiceName, whose NSSM environment names $Path as
+      $Name, case and a trailing backslash aside. Empty when none does.
+
+      A SECOND SERVICE ON THE SAME -DataDir GETS THE SAME DEFAULT secrets directory, and
+      Set-SecretsDirAcl removes every account's entry but its own service's. So adopting the
+      directory would strip the first service's read, and sharing it would let each service read
+      the other's secrets. The installer refuses instead.
+    #>
+    param([Parameter(Mandatory)][string]$ServiceName, [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Path,
+        [string]$ServicesKey = "HKLM:\SYSTEM\CurrentControlSet\Services")
+    $want = $Path.TrimEnd('\')
+    $found = @()
+    foreach ($svc in @(Get-ChildItem -LiteralPath $ServicesKey -ErrorAction SilentlyContinue)) {
+        if ($svc.PSChildName -eq $ServiceName) { continue }
+        $params = Get-Item -LiteralPath (Join-Path $svc.PSPath "Parameters") -ErrorAction SilentlyContinue
+        if (-not $params) { continue }
+        $entry = @($params.GetValue('AppEnvironmentExtra', $null) |
+            Where-Object { $_ -and (Test-EnvironmentEntryNames -Entry $_ -Name $Name) }) | Select-Object -Last 1
+        if ($entry -and ($entry.Substring($Name.Length + 1).TrimEnd('\') -eq $want)) { $found += $svc.PSChildName }
+    }
+    return $found
+}
+
+function New-RestrictedDirectory {
+    <#
+      Create the folder $Path in one step with its final protection: owner $OwnerSid, inheritance
+      off, and SYSTEM and Administrators full control inherited by the files in it. Its parent must
+      already exist. Throws when the folder it finds afterwards is not the one it asked for.
+
+      ONE STEP, NOT NEW-ITEM THEN ICACLS (vault BACKLOG #2595 slice C). A folder New-Item makes under
+      ProgramData inherits Users' right to create files in it, and its owner is whatever the host's
+      default-owner policy says, until the access list is replaced. A local user can drop a file in
+      during that window, and the file keeps the user's own access list. Made with its security
+      descriptor, the folder is never open.
+
+      CreateDirectory succeeds on a folder that is already there, so someone who made the path first
+      would hand this call their folder. The owner and the protection are read back to catch that.
+      $OwnerSid is a parameter so the unelevated tests can make a folder they own.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [string]$OwnerSid = "S-1-5-32-544")
+    $sec = New-Object System.Security.AccessControl.DirectorySecurity
+    $sec.SetOwner([Security.Principal.SecurityIdentifier]$OwnerSid)
+    $sec.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @("S-1-5-18", "S-1-5-32-544")) {
+        $sec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            [Security.Principal.SecurityIdentifier]$sid,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            [System.Security.AccessControl.InheritanceFlags]::ObjectInherit,
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow)))
+    }
+    # .NET Framework (Windows PowerShell 5.1) has the overload; .NET (PowerShell 7) moved it to an
+    # extension method.
+    $overload = [System.IO.Directory].GetMethod('CreateDirectory',
+        [type[]]@([string], [System.Security.AccessControl.DirectorySecurity]))
+    if ($overload) { [void][System.IO.Directory]::CreateDirectory($Path, $sec) }
+    else { [System.IO.FileSystemAclExtensions]::Create((New-Object System.IO.DirectoryInfo($Path)), $sec) }
+    $acl = Get-Acl -LiteralPath $Path
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($owner -ne $OwnerSid -or -not $acl.AreAccessRulesProtected) {
+        throw ("'$Path' was there before this install made it (its owner is $owner), so it is not " +
+            "the restricted folder the install asked for. Check who made it, and re-run the installer.")
+    }
+}
+
 function Set-SecretsDirAcl {
     <#
-      Restrict the secrets directory (vault BACKLOG #2595 slice C, ADR 0214): inheritance off, SYSTEM
-      and Administrators full control, the service account read, each inherited by the files in it,
-      and Administrators as the owner: an individual owner keeps WRITE_DAC whatever the list says
-      (Set-AdminOnlyAcl says when New-Item leaves one). The engine refuses the directory, and every
-      setting in it, when a known broad group can read or change it, so a directory left open fails
-      the service's start rather than leaking. Read access only: the engine never writes the files.
+      Restrict the secrets directory (vault BACKLOG #2595 slice C, ADR 0214): Administrators as the
+      owner, inheritance off, SYSTEM and Administrators full control, the service account read, each
+      inherited by the files in it. Read access only: the engine never writes the files.
+
+      THE OWNER GOES FIRST. An individual owner keeps WRITE_DAC whatever the list says
+      (Set-AdminOnlyAcl says when New-Item leaves one), so someone who made the folder could put an
+      entry back between the list being replaced and the owner being changed.
 
       THE ACCOUNT'S GRANT IS ADDED, NEVER REPLACED. An existing directory may give a dedicated engine
       account more than read, for the Vault Agent sink route docs/CONFIGURATION.md describes, and a
       rerun must not take that away. Inheritance comes off, so a grant the directory inherited goes.
       Every entry for another account is removed: none is offered one, and anyone may have made the
-      folder first under ProgramData. The read-back names what could not be removed.
+      folder first under ProgramData.
 
-      Each step after the first runs whatever the one before it did, and says what failed, so one
-      failure does not leave a broad entry standing. Best-effort, like Set-SecureDataDirAcl: it
-      warns and never aborts.
+      THROWS WHEN THE RESULT IS NOT RESTRICTED. Each step runs whatever the one before it did, so one
+      failure does not leave a broad entry standing; then the owner and the list are read back, and
+      anything left over is a refusal, not a warning. The engine refuses only the known broad groups
+      at start, so an entry for some other account would go unnoticed there and could read every
+      secret in the directory.
     #>
     param([Parameter(Mandatory)][string]$Path, [string]$Account)
-    $remedy = "Restrict it as docs/CONFIGURATION.md 'The secrets directory' shows."
+    $remedy = "Restrict it as docs/CONFIGURATION.md 'The secrets directory' shows, and re-run the installer."
     # Read again here, not only when -SecretsDir was judged: icacls follows a junction to its
-    # target, and the path may have become one since.
+    # target, and the path, or a folder above it, may have become one since.
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
     if (-not $item -or -not $item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
-        Write-Warning ("The secrets directory '$Path' is no longer a plain folder, so its access list " +
-            "was not changed. Check what is at that path, and re-run the installer.")
-        return
+        throw ("The secrets directory '$Path' is no longer a plain folder, so its access list was not " +
+            "changed. Check what is at that path, and re-run the installer.")
     }
+    $above = Get-ReparsePointAncestor -Path $Path
+    if ($above) {
+        throw ("The secrets directory '$Path' was not restricted: $above. Check what is at that path, " +
+            "and re-run the installer.")
+    }
+    $problems = @()
+    & icacls $Path /setowner "*S-1-5-32-544" | Out-Null
+    if ($LASTEXITCODE -ne 0) { $problems += "Administrators could not be made its owner (icacls exit $LASTEXITCODE)" }
     & icacls $Path /inheritance:r /grant:r "*S-1-5-18:(OI)F" "*S-1-5-32-544:(OI)F" | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning ("Could not turn inheritance off on the secrets directory '$Path' and grant " +
-            "SYSTEM and Administrators (icacls exit $LASTEXITCODE). $remedy")
+        $problems += "inheritance could not be turned off with SYSTEM and Administrators granted (icacls exit $LASTEXITCODE)"
     }
     if ($Account) {
         & icacls $Path /grant "${Account}:(OI)RX" | Out-Null
         if ($LASTEXITCODE -ne 0) {
-            Write-Warning ("Could not grant '$Account' read on the secrets directory '$Path' (icacls " +
-                "exit $LASTEXITCODE). The service cannot read the directory, and refuses to start " +
-                "while MEFOR_SECRETS_DIRECTORY names it. $remedy")
+            $problems += ("'$Account' could not be granted read (icacls exit $LASTEXITCODE), so the " +
+                "service could not read the directory")
         }
     }
     # The same well-known broad set Set-SecureDataDirAcl removes, for the reasons it gives.
     $broad = Get-WellKnownBroadSids
     & icacls $Path /remove:g @broad | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning ("Could not remove the broad groups from the secrets directory '$Path' (icacls " +
-            "exit $LASTEXITCODE). The engine refuses a secrets directory a broad group can read or " +
-            "change. $remedy")
-    }
     # No other account is offered a grant here (docs/CONFIGURATION.md), and a folder made under
-    # ProgramData may have been made by any local user first. So every other entry is removed, and
-    # what is left is read back.
+    # ProgramData may have been made by any local user first. So every other entry is removed.
     foreach ($holder in @(Get-BroadAclResidue -Path $Path -Account $Account)) {
         $spelled = if ($holder -match '^S-1-') { "*$holder" } else { $holder }
         & icacls $Path /remove:g $spelled | Out-Null
     }
-    $residue = Get-BroadAclResidue -Path $Path -Account $Account
-    if ($residue) {
-        Write-Warning ("The secrets directory '$Path' still grants access to: $($residue -join ', '). " +
-            "Each can read the service's secrets. Remove them by hand. $remedy")
+    # The read-back is the verdict. Get-BroadAclResidue returns nothing when it cannot read the
+    # list, so the list is read here first, and an unread one is a problem.
+    try {
+        $acl = Get-Acl -LiteralPath $Path
+        $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+        if ($owner -ne "S-1-5-32-544" -and $owner -ne "S-1-5-18") { $problems += "its owner is still $owner" }
+        if (-not $acl.AreAccessRulesProtected) { $problems += "it still inherits entries from the folder above" }
+        $residue = @(Get-BroadAclResidue -Path $Path -Account $Account)
+        if ($residue) { $problems += "it still grants access to: $($residue -join ', ')" }
+    } catch {
+        $problems += "its access list could not be read back ($($_.Exception.Message))"
     }
-    & icacls $Path /setowner "*S-1-5-32-544" | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning ("Could not make Administrators the owner of the secrets directory '$Path' " +
-            "(icacls exit $LASTEXITCODE). Run 'icacls ""$Path"" /setowner ""*S-1-5-32-544""' elevated.")
+    if ($problems) {
+        throw ("The secrets directory '$Path' is not restricted: $($problems -join '; '). Anyone it " +
+            "still lets in could read the service's secrets. $remedy")
+    }
+}
+
+function Assert-SecretsDirEmpty {
+    <#
+      Refuse a secrets directory that holds anything (vault BACKLOG #2595 slice C). Called after the
+      directory is restricted, on one the service does not already name: until the restriction, a
+      local user may have put a file in it, and a file keeps its own access list, which the
+      directory's does not replace. The engine reads every file in the directory as a setting, so a
+      planted file would be read as a secret the operator never set.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $held = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)
+    if ($held.Count -gt 0) {
+        throw ("The secrets directory '$Path' holds $($held.Count) item(s) the installer did not put " +
+            "there, such as '$($held[0].Name)', and the service does not name it yet. Something may " +
+            "have been written there before it was restricted. Empty it, check who wrote them, and " +
+            "re-run the installer; move each file in after the install.")
     }
 }
 
@@ -2114,14 +2236,22 @@ $SecretsNotWithin = @($SecretsHolds) + @($env:SystemRoot, $env:ProgramFiles, ${e
 # A volume root in that list, such as the folder of a settings file at D:\, would refuse the whole
 # volume; the root's own rule is the volume-root refusal above.
 $SecretsNotWithin = @($SecretsNotWithin | Where-Object { $_ -and (Split-Path -Parent $_) })
-$secretsProblem =if (Test-Path -LiteralPath $SecretsDir -PathType Leaf) { "it is a file" }
+$secretsProblem = if (Test-Path -LiteralPath $SecretsDir -PathType Leaf) { "it is a file" }
     else { Get-LockPathProblem -Path $SecretsDir -Holds $SecretsHolds -NotWithin $SecretsNotWithin -OnlyFolders @() -AllowMissing }
-# A directory that already exists and that the service does not already name is adopted, and its
-# files were made by someone this installer cannot vouch for: anyone may create a folder under
-# ProgramData, where the default sits. So it must be empty. A rerun's own directory is the
-# operator's, files included.
-if (-not $secretsProblem -and (Test-Path -LiteralPath $SecretsDir) -and
-        ($RegisteredSecretsDir -ne $SecretsDir) -and
+if (-not $secretsProblem) { $secretsProblem = Get-ReparsePointAncestor -Path $SecretsDir }
+if (-not $secretsProblem) {
+    $SecretsDirSharers = @(Get-OtherServiceNamingPath -ServiceName $ServiceName -Name "MEFOR_SECRETS_DIRECTORY" -Path $SecretsDir)
+    if ($SecretsDirSharers) {
+        $secretsProblem = ("the service(s) $($SecretsDirSharers -join ', ') already name it, and this " +
+            "install would remove their read there. Pass -SecretsDir with a folder for this service")
+    }
+}
+# Does the service already name this directory? Then it is a rerun's own directory, and its files
+# are the operator's. Any other directory that already exists is adopted, and its files were made
+# by someone this installer cannot vouch for: anyone may create a folder under ProgramData, where
+# the default sits. So it must be empty, here and again once it is restricted.
+$SecretsDirNamed = [bool]$RegisteredSecretsDir -and ($RegisteredSecretsDir.TrimEnd('\') -eq $SecretsDir.TrimEnd('\'))
+if (-not $secretsProblem -and (Test-Path -LiteralPath $SecretsDir) -and -not $SecretsDirNamed -and
         @(Get-ChildItem -LiteralPath $SecretsDir -Force -ErrorAction Stop).Count -gt 0) {
     $secretsProblem = ("it already exists and holds files, and the service does not name it. Empty " +
         "it, or create a new one, and move each file in after the install")
@@ -2198,12 +2328,18 @@ New-Item -ItemType Directory -Force -Path $LogDir  | Out-Null
 # Before the service is registered, so a -SecretsDir that cannot be made stops the install before
 # anything acts on the service. Any folder above it that this makes is administrator-only, so a
 # broad group cannot move it aside; one that already existed is the operator's (docs/SERVICE.md).
-# A directory this run makes is locked to SYSTEM and Administrators at once, so an install that
-# fails before the account's grant below never leaves it readable by Users. The account's read is
-# added once it resolves.
-$SecretsDirCreated = -not (Test-Path -LiteralPath $SecretsDir)
-New-AdminOnlyFolder -Path $SecretsDir
-if ($SecretsDirCreated) { Set-SecretsDirAcl -Path $SecretsDir }
+# A directory this run makes is created restricted, owner included, in one step
+# (New-RestrictedDirectory says why one step). One that exists and the service does not name is
+# restricted now, owner first, and must then still be empty. The account's read is added once it
+# resolves. A directory the service already names is the operator's, and is left to that step.
+New-AdminOnlyFolder -Path (Split-Path -Parent $SecretsDir)
+if (-not (Test-Path -LiteralPath $SecretsDir)) { New-RestrictedDirectory -Path $SecretsDir }
+elseif (-not $SecretsDirNamed) { Set-SecretsDirAcl -Path $SecretsDir }
+if (-not $SecretsDirNamed) {
+    $above = Get-ReparsePointAncestor -Path $SecretsDir
+    if ($above) { throw "-SecretsDir '$SecretsDir' cannot be the secrets directory: $above." }
+    Assert-SecretsDirEmpty -Path $SecretsDir
+}
 # NB the data-dir + config-dir ACL lockdown is applied LATER, AFTER the service is registered and its
 # ObjectName (run-as account) is set - see "ACLs" below. The default run-as is now a per-service VIRTUAL
 # account (NT SERVICE\<ServiceName>, #224), whose SID does NOT resolve for icacls until the service
@@ -2561,7 +2697,12 @@ Set-DataDirOwner -Path $DataDir
 # secret but the store key, which stays in its DPAPI key file. Created before the service was
 # registered; restricted here, once the account resolves. An administrator adds one file per
 # setting. The service is told where it is through its environment, which holds only the path.
-Set-SecretsDirAcl -Path $SecretsDir -Account $ServiceAccount
+# A directory left unrestricted is a refusal, and the service is registered by now, so it is
+# disabled first, as the other refusals after registration are.
+try { Set-SecretsDirAcl -Path $SecretsDir -Account $ServiceAccount }
+catch {
+    throw "$($_.Exception.Message) $(Disable-RefusedService -ServiceName $ServiceName -Consequence 'it cannot start with a secrets directory others can read')"
+}
 try {
     $replacedSecretsDir = Set-ServiceEnvironmentValue -ServiceName $ServiceName -Name "MEFOR_SECRETS_DIRECTORY" -Value $SecretsDir
     if ($replacedSecretsDir) {
