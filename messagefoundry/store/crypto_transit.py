@@ -289,18 +289,17 @@ class TransitCipher(_UnmarkedPolicy):
 def _key_names() -> tuple[str, str]:
     """The Transit data key and audit key from the environment, read in one place for the cipher
     and for :func:`transit_cipher_required_capabilities`. Raises :class:`KeyProviderError` when the
-    data-key name is not set."""
+    data-key name is not set, and when either name is not a Transit key name (BACKLOG #6010): both
+    go into Transit request paths, so each is checked here, before any client is built."""
     key_name = os.environ.get(_ENV_TRANSIT_KEY)
     if not key_name:
         raise KeyProviderError(
             f"[store].cipher_provider={PROVIDER_NAME!r} is selected but {_ENV_TRANSIT_KEY} is not set — "
             f"supply the Transit data-key name via the environment."
         )
+    key_name = checked_transit_key_name(key_name, selector=_ENV_TRANSIT_KEY)
     # Optional dedicated audit-HMAC key; unset ⇒ reuse the data key. Either way the type is checked
     # at build — see the _ENV_AUDIT_KEY comment above for which types each use admits and why.
-    # Both names go into Transit request paths, so each is checked here, before any client is built
-    # (BACKLOG #6010).
-    key_name = checked_transit_key_name(key_name, selector=_ENV_TRANSIT_KEY)
     audit_key = os.environ.get(_ENV_AUDIT_KEY)
     return key_name, (
         checked_transit_key_name(audit_key, selector=_ENV_AUDIT_KEY) if audit_key else key_name
