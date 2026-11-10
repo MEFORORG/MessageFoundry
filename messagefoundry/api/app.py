@@ -4780,8 +4780,8 @@ def create_app(
     def _refuse_body(request: Request, status: int, detail: str, what: str) -> JSONResponse:
         _log.warning("rejected %s on %s from %s", what, request.url.path, client_ip(request))
         # `Connection: close` makes the server drop the connection after every refusal, so bytes
-        # it framed one way and a proxy another, or a refused body the client never sent, are
-        # never read as a next request (RFC 9112 §6.1, §6.3).
+        # it framed one way and a proxy another (RFC 9112 §6.1, §6.3), or a refused body the
+        # client never sent, are never read as a next request.
         return JSONResponse({"detail": detail}, status_code=status, headers={"Connection": "close"})
 
     def _body_refusal(request: Request) -> JSONResponse | None:

@@ -507,7 +507,7 @@ async def _split(port: int, head: bytes, body: bytes) -> tuple[list[int], bytes,
         while chunk := await asyncio.wait_for(reader.read(65536), 3.0):
             raw += chunk
         closed = True
-    except ConnectionResetError:
+    except (ConnectionResetError, ConnectionAbortedError):  # Windows reports either
         closed = True
     except TimeoutError:
         pass

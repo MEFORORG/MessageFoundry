@@ -161,8 +161,8 @@ once its head is read, and its body limit answers a chunked request with no `Con
 with `411` from the head alone, then closes the connection. When the bad body arrives in the same read as
 the head, the engine writes only the `400`, and nothing after it. When the head arrives first
 and the bad body later, the body limit sends its `411` and closes, so the bad body is never parsed
-and no `400` follows. A client still sending its body when the engine closes gets a connection
-reset, not the `411`.
+and no `400` follows. A client still sending its body when the engine closes after a body-limit
+refusal gets a connection reset, not the refusal.
 
 llhttp refuses more than this table lists, so treat it
 as the shapes that were measured, not as the whole set. `tests/test_api_request_framing_wire.py` sends each one on a real
@@ -193,9 +193,9 @@ Your proxy must also meet at least these four rules.
    (`proxy_request_buffering on`).
 2. **Do not reuse a connection to the engine after an error.** After an engine `400`, or a response
    the proxy could not read to its framed end, drop that connection. The engine closes it after
-   its parser's `400` and after every body-limit refusal (`400`, `411`, `413`). One request per
-   connection to the engine is the simplest safe setting. nginx works that way unless you
-   configure keep-alive to the upstream.
+   its parser's `400` and after every body-limit refusal. One request per connection to the
+   engine is the simplest safe setting. nginx works that way unless you configure keep-alive to
+   the upstream.
 3. **Re-check requests that arrive over HTTP/2 or HTTP/3.** If the proxy speaks HTTP/1.1 to the
    engine, it must refuse such a request when it carries `Transfer-Encoding`, or a `content-length`
    that does not match the body it received. It must also refuse a CR, LF or NUL in any field name
