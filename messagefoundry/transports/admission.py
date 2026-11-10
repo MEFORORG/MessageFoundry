@@ -24,9 +24,8 @@ Everything here runs before ingress, so no message is read, persisted or acknowl
 ACK-on-receipt and count-and-log invariants are untouched: a refused connection has delivered
 nothing, and the sender retries.
 
-**TLS is not in the helper.** The MLLP listener on every loop, and the HTTP listener on the stdlib
-loop, start TLS on a socket themselves after admission (BACKLOG #1606, #2479), so that step stays
-in their accept handlers.
+**TLS is not in the helper.** The MLLP and HTTP listeners start TLS on a socket themselves after
+admission, on every loop (BACKLOG #1606, #2479), so that step stays in their accept handlers.
 """
 
 from __future__ import annotations

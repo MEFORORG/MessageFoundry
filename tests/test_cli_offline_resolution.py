@@ -3,17 +3,30 @@
 """ADR 0050 §3 / AC-6 — the offline subcommands (validate/graph/dryrun/check) carry the same
 project-root / active-env / service-config flags serve does, resolve the same bundle root, and check
 suppresses its messagefoundry.toml upward-walk when --service-config / --project-root is supplied —
-WITHOUT adopting serve's required-active-env / explicit-posture refusal.
+WITHOUT adopting serve's required-active-env / explicit-posture refusal. ADR 0050 Amendment A makes
+one exception: `check --env`'s settings checks read the name as `serve --env` does
+(tests/test_checks_gate_parity.py covers it).
 """
 
 from __future__ import annotations
 
+import os
 import textwrap
 from pathlib import Path
 
 import pytest
 
 from messagefoundry.__main__ import main
+
+
+@pytest.fixture(autouse=True)
+def _no_mefor_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remove every MEFOR_* variable: an exported MEFOR_ENVIRONMENTS_DIR moves the value dir these
+    tests look in, and other settings variables reach check's settings legs."""
+    for name in list(os.environ):
+        if name.upper().startswith("MEFOR_"):
+            monkeypatch.delenv(name)
+
 
 _NO_ENV_GRAPH = """
     from messagefoundry import inbound, outbound, MLLP, router, handler, Send
@@ -217,6 +230,66 @@ def test_offline_ac3_custom_env_dir_missing_file_still_fails_loud(
     assert rc == 2
     err = capsys.readouterr().err
     assert "envs" in err and "prod.toml" in err
+
+
+# --- AC-3 offline: MEFOR_ENVIRONMENTS_DIR beats the file's dir, as in serve (vault BACKLOG #2355) ---
+
+
+@pytest.mark.parametrize("command", ["check", "validate"])
+@pytest.mark.parametrize("present", ["envs", "environments"])
+def test_offline_ac3_reads_the_env_dir_variable_as_serve_does(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    present: str,
+) -> None:
+    # serve's load_settings puts MEFOR_ENVIRONMENTS_DIR above the file's [environments].dir, and its
+    # AC-3 check looks for <root>/<that dir>/<env>.toml. The offline pre-check read the file alone,
+    # so it failed loud on a file serve finds, and passed a layout serve refuses.
+    from messagefoundry.config.settings import load_settings
+
+    cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
+    svc = tmp_path / "messagefoundry.toml"
+    svc.write_text('[environments]\ndir = "environments"\n', encoding="utf-8")
+    (tmp_path / present).mkdir()
+    (tmp_path / present / "prod.toml").write_text('peer_host = "10.0.0.9"\n', encoding="utf-8")
+    argv = [command, "--project-root", str(tmp_path), "--service-config", str(svc)]
+    argv += ["--config", str(cfg), "--env", "prod"]
+    if command == "check":
+        argv.append("--no-lint")
+
+    # The variable set, then unset as the control: whichever dir serve's reader names decides.
+    for variable in ("envs", None):
+        if variable is None:
+            monkeypatch.delenv("MEFOR_ENVIRONMENTS_DIR")
+        else:
+            monkeypatch.setenv("MEFOR_ENVIRONMENTS_DIR", variable)
+        expected = load_settings(config_path=svc).environments.dir
+        assert expected == (variable or "environments")
+        rc = main(argv)
+        err = capsys.readouterr().err
+        if present == expected:
+            assert rc != 2 and "no value file" not in err, err
+        else:
+            assert rc == 2 and str(tmp_path / expected / "prod.toml") in err, err
+
+
+def test_offline_ac3_takes_a_blank_env_dir_as_serve_does(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # serve's loader takes [environments].dir = "" as given, so it reads <root>/<env>.toml. The
+    # offline check put "environments" in its place and failed loud on a layout serve starts.
+    from messagefoundry.config.settings import load_settings
+
+    cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
+    svc = tmp_path / "messagefoundry.toml"
+    svc.write_text('[environments]\ndir = ""\n', encoding="utf-8")
+    (tmp_path / "prod.toml").write_text('peer_host = "10.0.0.9"\n', encoding="utf-8")
+    assert load_settings(config_path=svc).environments.dir == ""  # serve's reader
+    argv = ["--project-root", str(tmp_path), "--service-config", str(svc), "--config", str(cfg)]
+    rc = main(["validate", *argv, "--env", "prod", "--json"])
+    assert rc == 0, capsys.readouterr().err
 
 
 def test_graph_and_dryrun_honor_relative_config_under_root(

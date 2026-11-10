@@ -411,7 +411,7 @@ the management API, and it does not inherit the API's auth: harden it deliberate
   `tls_ca_file` and `intake_client_subjects`, keyed by the CA that issues each partner's
   certificate), DoS caps (`max_connections`, `receive_timeout`,
   `max_body_bytes`, `max_header_bytes`, and the per-address handshake budget
-  `max_handshakes_per_host`, which applies only with `tls = true` on the stdlib loop; see
+  `max_handshakes_per_host`, which applies only with `tls = true`; see
   [Per-address listener caps behind the VIP](#per-address-listener-caps-behind-the-vip)), the off-loopback exposed-gate (`check_http_tls_exposure`), and
   the peer-control gate (`check_http_intake_auth`).
 - **Not built:** an HTTP Basic credential check. Use one of the three `intake_auth` modes, or front the
@@ -491,11 +491,8 @@ socket leaves the count when its handshake ends, so the cap does not bound how m
 address holds once their handshakes are done. It does bound how many can start at once: `Http()`
 answers every request with `Connection: close`, so each request opens a new connection and runs
 its own handshake, and one address could have at most 32 requests in their handshakes together.
-It applies only on a `tls = true` listener where the engine upgrades the socket itself, which is
-the stdlib event loop. uvloop does not run on Windows, so the Windows service always takes this
-path. On uvloop the loop runs the handshake before the engine sees the socket, so no engine cap
-counts a socket in its handshake, this one included. The loop's 10 s handshake bound is the only
-bound there.
+It applies only on a `tls = true` listener, on every event loop: the engine admits each socket
+before its handshake, on uvloop as on the stdlib loop (BACKLOG #2479).
 
 Without it, one address that opens sockets and never finishes a handshake could hold every
 `max_connections` slot (256) for up to the 10 s handshake bound each. Any peer that reaches the
@@ -537,13 +534,11 @@ are the ones *Without a balancer* above describes. If `at_capacity` events with 
 `max_handshakes_per_host` name the balancer's address under ordinary load, raise
 `max_handshakes_per_host`, or set it to `None` or `0` to turn it off.
 
-**`source_ip_allowlist` is a further mitigation, not a replacement.** On the stdlib loop it refuses
-an unlisted peer before any TLS byte; on uvloop it runs after the loop's handshake. A listed peer
-with no client certificate passes it. On the stdlib loop each socket it holds in a handshake takes
-a slot, so this budget, `max_connections` and `max_connections_per_host` where it is set all bound
-how many it holds, each for up to the 10 s handshake bound. On uvloop such a socket takes no slot,
-so no engine cap counts it, this budget included, and only the loop's 10 s handshake bound limits
-each one. Behind a balancer that collapses addresses, the allowlist sees the balancer's address, so
+**`source_ip_allowlist` is a further mitigation, not a replacement.** It refuses an unlisted peer
+before any TLS byte, on every event loop. A listed peer with no client certificate passes it. Each
+socket it holds in a handshake takes a slot, so this budget, `max_connections` and
+`max_connections_per_host` where it is set all bound how many it holds, each for up to the 10 s
+handshake bound. Behind a balancer that collapses addresses, the allowlist sees the balancer's address, so
 it cannot tell clients apart either.
 
 Two other shapes were weighed and not built:
@@ -863,11 +858,15 @@ loud warning):
 - Cleartext SMTP submission on a **Direct** (S/MIME) destination. *(Clamped, read directly
   rather than through the authority. CORRECTED 2026-10-13: this read *Not clamped*.)*
 - The non-connection cells that have nowhere to carry a per-hop declaration: the `[logging]` syslog/SIEM
-  forwarder and the API PHI-read serve hop, plus the webhook alert sink.
-  *(All clamped — the webhook sink since #329. A webhook URL can carry a path secret, and the
-  credential rule does not reach it yet. LDAPS was on this list until vault BACKLOG #3230 made
+  forwarder and the API PHI-read serve hop.
+  *(Both clamped. LDAPS was on this list until vault BACKLOG #3230 made
   `ad_tls_verify = false` a refusal with no escape. The AI-broker endpoint was on it until vault
-  BACKLOG #3533 did the same for its `http` endpoint, since every call sends `[ai].api_key`.)*
+  BACKLOG #3533 did the same for its `http` endpoint, since every call sends `[ai].api_key`. The
+  webhook alert sink was on it until vault BACKLOG #3533 item 5 did the same for an `http`
+  `[alerts].webhook_url`, which can carry the hop's credential as a path token. The escape has no
+  effect on the webhook: an `http` URL refuses the start in every posture when `serve` builds the
+  alert notifier, and no setting turns off the `https` webhook's certificate chain or hostname
+  check.)*
 
 **Two limits worth stating plainly.** *(a)* Since [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
 this variable has been **unhooked from the cleartext-hop authority** — that decision no longer reads it,
@@ -882,7 +881,7 @@ the opposite claim, "secure by other means", and ALLOWs the hop. It is reported 
 **clamped** (ADR 0092 decision 2 / ADR 0148): it cannot relax a hop while `[security].enforcement =
 enforce`. That holds for the weakened-TLS / cleartext-escape cells that route through
 `weakened_tls_escape_permitted` — at least the store-TLS, MLLP and anonymous FTPS cells and, since #329,
-the SFTP host key of a key-only login and the webhook sink. That clamp once also required the
+the SFTP host key of a key-only login. That clamp once also required the
 instance to be PHI; by design every instance is now treated as carrying patient data (BACKLOG
 #1279), so that conjunct is gone. Either way, on the shipped posture those cells are inert;
 no bullet above is marked *not clamped* now. CORRECTED 2026-10-13: the Direct bullet was, and that was wrong.

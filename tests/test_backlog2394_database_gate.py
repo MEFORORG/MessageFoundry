@@ -17,6 +17,7 @@ borrows through ``acquire_pooled``. Synthetic data only; no driver, no database.
 from __future__ import annotations
 
 import asyncio
+import gc
 import sys
 import threading
 import types
@@ -38,12 +39,14 @@ from messagefoundry.transports.database import (
     DatabaseSource,
 )
 from tests._odbc_cancel_fakes import (
+    DEL_CLOSE,
     USE_AFTER_FREE,
     WAIT,
     AioConn,
     Pool,
     RawConn,
     cancel_once_started,
+    cancelled_at_once,
     never,
     wait_for_entry,
     wait_until,
@@ -70,11 +73,15 @@ class _ClosingPool(Pool):
         self.closed = True
 
     async def release(self, conn: AioConn) -> None:
-        self.returned = True
+        # ``returned`` is what ``wait_closed`` waits for, so it is set only once the close below has
+        # ended, as aioodbc wakes a waiter only after it. Set first, it let a ``wait_closed`` end
+        # while that close was still queued on the executor, and an arm reading ``conn.close``
+        # right after the pool closed failed intermittently (GitHub Actions job 126638079516).
         if self.closed and not conn.closed:
             await conn.close()  # a gated call, through aioodbc's _execute
-            return
-        await super().release(conn)
+        else:
+            await super().release(conn)
+        self.returned = True
 
     async def wait_closed(self) -> None:
         self.waits += 1
@@ -215,20 +222,51 @@ async def test_a_cancelled_source_mark_frees_nothing_until_its_statement_returns
     assert rig.log.index("autocommit:end") < rig.log.index("execute:start"), rig.log
 
 
-async def test_an_ungated_connection_gets_no_rollback_beside_its_statement(
+async def test_a_send_cancelled_while_its_cursor_is_made_waits_for_that_call(
     monkeypatch: pytest.MonkeyPatch, rig: _Rig
 ) -> None:
-    """A connection the gate could not wrap. Its cursor close still runs beside the statement,
-    the hazard an ungated connection keeps, but no rollback is added to it."""
+    """Red before #2394's last slice: the connection went back to its pool at once, while
+    ``cursor()`` still ran on it, and the cursor that call made was left for the collector. Now the
+    connection goes back only once that call has returned, the gate closes the cursor it made, and
+    the rollback a cancellation takes runs after it."""
+    _aioodbc_serving(monkeypatch, rig, blocks=never, block_cursor=True)
+    task = await cancel_once_started(rig.started, _destination().send('{"a": 1}'))
+    await cancelled_at_once(task)
+    assert "cursor:end" not in rig.log, "the arm is vacuous: the cursor had already been made"
+    assert rig.pools[0].free == [], "the connection went back while its cursor() call ran"
+
+    rig.release.set()
+    assert await wait_until(lambda: rig.pools[0].free == [rig.conn]), "it never went back"
+    assert "execute:start" not in rig.log, rig.log
+    assert USE_AFTER_FREE not in rig.log, rig.log
+    end = rig.log.index("cursor:end")
+    assert end < rig.log.index("cursor.close") < rig.log.index("rollback"), rig.log
+
+
+async def test_a_cancelled_borrow_on_an_ungated_connection_closes_nothing_beside_it(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """A connection the gate could not wrap has no running call to hand a close to. Red before
+    #2394's last slice: its cursor close ran beside the statement, on another thread, and the
+    connection went back to be lent again. Now the cancellation drops its handle and closes
+    nothing: the pool gets it back closed, and no cursor close, rollback or connection close runs
+    on it while, or after, its statement runs."""
     _aioodbc_serving(monkeypatch, rig, gateable=False, blocks=lambda sql: sql == _INSERT)
     task = await cancel_once_started(rig.started, _destination().send('{"a": 1}'))
     done, _pending = await asyncio.wait({task}, timeout=1.0)
     assert done, "the cancellation waited for the running statement"
+    assert task.cancelled(), task
     assert call_gate(rig.conn) is None, "the arm is vacuous: the connection was gated"
+    assert "execute:end" not in rig.log, "the arm is vacuous: the statement had already returned"
+    assert rig.conn.closed and rig.pools[0].returned and rig.pools[0].free == [], rig.log
 
     rig.release.set()
-    assert await wait_until(lambda: rig.pools[0].free == [rig.conn]), "it never went back"
-    assert "rollback" not in rig.log, rig.log
+    await wait_for_entry(rig.log, "execute:end")
+    del task, done
+    gc.collect()
+    await asyncio.sleep(0.1)  # time for a close queued beside the statement to run, were one queued
+    touched = {"cursor.close", "rollback", "conn.close", DEL_CLOSE, USE_AFTER_FREE} & set(rig.log)
+    assert not touched, rig.log
 
 
 async def test_a_cancelled_reference_sync_frees_nothing_until_its_statement_returns(

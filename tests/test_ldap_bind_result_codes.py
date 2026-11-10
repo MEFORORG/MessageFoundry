@@ -53,6 +53,7 @@ from messagefoundry.auth.ldap import (
     LdapUnansweredError,
 )
 from messagefoundry.auth.service import DirectoryRefusal
+from tests.test_ad_user_account_control import _settings as _estate_settings
 from tests.test_ad_user_account_control import _signed_in_estate
 from tests.test_ldap_referrals import _BIND_RESPONSE, _tlv
 from tests.test_ldap_search_result_codes import (
@@ -78,10 +79,30 @@ _UNJUDGED_CODES = [p.values[0] for p in _UNJUDGED]
 _PASSWORD = "synthetic-user-pw-3169"
 
 
+#: The service account's DN under each settings helper these tests build on. Its bind is never the
+#: one under test, so the doubles below let it through as installed (BACKLOG #3017 L5).
+_SERVICE_DNS = frozenset({_ad_settings().ad_bind_dn, _estate_settings().ad_bind_dn})
+
+
+def _is_service(conn: Any) -> bool:
+    return getattr(conn, "_bind_dn", None) in _SERVICE_DNS
+
+
+def _past_the_service_bind(bind: Callable[[Any], bool]) -> Callable[[Any], bool]:
+    """``bind`` for every connection but the service account's, which keeps the bind installed."""
+    installed = ldap3.Connection.bind
+
+    def replaced(self: Any) -> bool:
+        return bool(installed(self)) if _is_service(self) else bind(self)
+
+    return replaced
+
+
 def _bind_ends_with(monkeypatch: pytest.MonkeyPatch, code: int) -> list[str | None]:
-    """Over the ldap3 double already installed, end every explicit bind with ``code``, as ldap3's
-    synchronous strategy leaves it: ``bind()`` returns ``False`` and ``result`` holds the code.
-    Returns the DN of each bind, so a test can tell the real bind from the decoy."""
+    """Over the ldap3 double already installed, end every bind but the service account's with
+    ``code``, as ldap3's synchronous strategy leaves it: ``bind()`` returns ``False`` and
+    ``result`` holds the code. Returns the DN of each bind, so a test can tell the real bind from
+    the decoy."""
     binds: list[str | None] = []
 
     def bind(self: Any) -> bool:
@@ -89,7 +110,7 @@ def _bind_ends_with(monkeypatch: pytest.MonkeyPatch, code: int) -> list[str | No
         self.result = {"result": code, "description": "x", "message": "", "type": "bindResponse"}
         return False
 
-    monkeypatch.setattr(ldap3.Connection, "bind", bind)
+    monkeypatch.setattr(ldap3.Connection, "bind", _past_the_service_bind(bind))
     return binds
 
 
@@ -202,15 +223,16 @@ def test_real_ldap3_leaves_the_bind_code_where_the_refusal_reads_it(code: int) -
 
 def _unbind_fails_after_a_bind(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str | None]]:
     """Over the bind already installed, make ``unbind`` raise an ldap3 error on each connection
-    that ran an explicit bind, as a send failing on the release would, before ldap3 closes the
-    socket. The service connection is built with ``auto_bind``, which these doubles never route
-    through ``bind()``, so its unbind runs as installed. Returns each failed unbind and each socket
-    close, in order, as ``(event, DN)``."""
+    that ran a bind other than the service account's, as a send failing on the release would,
+    before ldap3 closes the socket. The service connection's unbind runs as installed. Returns each
+    failed unbind and each socket close, in order, as ``(event, DN)``."""
     bind, unbind_before = ldap3.Connection.bind, ldap3.Connection.unbind
     events: list[tuple[str, str | None]] = []
 
     def binding(self: Any) -> bool:
         bound = bool(bind(self))
+        if _is_service(self):
+            return bound
         dn = getattr(self, "_bind_dn", None)
         self.mf_bind_ran = True
         self.strategy = SimpleNamespace(close=lambda: events.append(("closed", dn)))
@@ -243,7 +265,7 @@ async def _rebind_after(
         if isinstance(end, int):
             _bind_ends_with(monkeypatch, end)
         else:
-            monkeypatch.setattr(ldap3.Connection, "bind", end)
+            monkeypatch.setattr(ldap3.Connection, "bind", _past_the_service_bind(end))
         released = _unbind_fails_after_a_bind(monkeypatch) if unbind_fails else []
         identity = await service.identity_for_token(tokens["alice"])
         assert identity is not None

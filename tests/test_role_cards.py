@@ -13,9 +13,10 @@ each measured 2026-09-06 and each guarded below:
      joined this table on 2026-09-10, when the owner retired the Console (BACKLOG #1529). The
      SPECIAL seat joined on 2026-09-16, taking the table to six. On 2026-09-19 the owner retired
      the REGULATOR and added the WATCHDOG, which holds the table at six and is NOT its successor:
-     it measures whether reds are cleared and never says whose one is. The `elsewhere` bucket
-     emptied on 2026-09-16 by owner instruction, so the tests below guard its MECHANISM rather
-     than an occupant.
+     it measures whether reds are cleared and never says whose one is. On 2026-11-05 the owner
+     said the STEWARD had been retired months earlier, which takes the table to five. The
+     `elsewhere` bucket emptied on 2026-09-16 by owner instruction, so the tests below guard its
+     MECHANISM rather than an occupant.
   2. PUSH AUTHORITY. korus's cards say pushing needs the owner. Section 5 carries the opposite as an
      anchored ruling, `refs/liaison/owner-ruling-20260829-push`.
   3. PLAYBOOK PATHS. korus's cards cite `roles/COMMON.md`. No such path exists in this checkout.
@@ -50,9 +51,10 @@ SETTINGS = _REPO / ".claude" / "settings.json"
 MARKER_RELPATH = ".claude/seat.local.txt"
 ROLE_COPY_RELPATH = ".claude/ROLE.local.md"
 
-#: Section 5's table governs. SIX seats: SPECIAL joined 2026-09-16, and on 2026-09-19 the owner
-#: retired the REGULATOR and added the WATCHDOG, which is not its successor.
-EXPECTED_SEATS = frozenset({"manager", "builder", "watchdog", "steward", "lander", "special"})
+#: Section 5's table governs. FIVE seats: SPECIAL joined 2026-09-16, on 2026-09-19 the owner
+#: retired the REGULATOR and added the WATCHDOG, which is not its successor, and on 2026-11-05 the
+#: owner said the STEWARD had been retired months earlier.
+EXPECTED_SEATS = frozenset({"manager", "builder", "watchdog", "lander", "special"})
 
 #: Seats live in korus and absent here. They must resolve to a card-less explanation, never to
 #: silence. EMPTY SINCE 2026-09-16 by owner instruction, and empty is the correct state -- so any
@@ -1412,6 +1414,306 @@ class TheRegulatorRetirementDeniesTheWatchdogSucceededIt(unittest.TestCase):
             "the check cannot tell a bare retirement from one that denies the succession, so it "
             "guards nothing",
         )
+
+
+class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
+    """Owner statement 2026-11-05: the Steward seat had been retired months earlier.
+
+    The seat named the account with headroom, so a reader told only that it is gone can take the
+    usage limits to have gone with it. They did not: the usage watch hook and the Workflow gate
+    still bind. The notice has to say so, and it must not invent a date or a successor the tree
+    does not record.
+    """
+
+    #: Every spelling the alias map carried before the retirement.
+    SPELLINGS = frozenset({"steward", "steward1", "steward-1", "stewart"})
+
+    def test_every_steward_spelling_resolves_to_a_retirement(self):
+        missing = sorted(self.SPELLINGS - set(seats()["retired"]))
+        self.assertEqual(
+            [],
+            missing,
+            f"these Steward spellings resolve to nothing instead of a retirement: {missing}",
+        )
+
+    def test_no_steward_spelling_is_live_or_an_alias(self):
+        reachable = sorted(self.SPELLINGS & (set(seats()["live"]) | set(seats()["aliases"])))
+        self.assertEqual([], reachable, f"the Steward is still reachable as: {reachable}")
+
+    def test_the_notice_says_the_usage_controls_still_bind(self):
+        why = seats()["retired"]["steward"].lower()
+        self.assertIn("watch.py", why, "the notice never names the usage watch hook that stayed")
+        self.assertIn("workflow", why, "the notice never says the Workflow gate still binds")
+        self.assertIn(
+            "did not go with it", why, "the notice no longer says the usage controls stayed"
+        )
+        self.assertIn("still bind", why, "the notice no longer says the usage controls bind")
+
+    #: What every spelling's notice must carry, matched lowercased over collapsed whitespace. It
+    #: follows korus PR 265 (`160a0865de`): the usage states and their stop moved to korus
+    #: `roles/COMMON.md`, *The three usage states*, and which seat may now say a HOLD is lifted is
+    #: an open owner question there.
+    CAVEAT = (
+        "still bind",
+        "hold new work",
+        "workflow",
+        "roles/common.md",
+        "the three usage states",
+        "lifted",
+        "open owner question",
+        "every seat but the lander",
+        "never on hook silence",
+    )
+
+    @staticmethod
+    def _flat(text: str) -> str:
+        return " ".join(text.lower().split())
+
+    @classmethod
+    def _missing_caveat(cls, notice: str) -> list[str]:
+        flat = cls._flat(notice)
+        return [part for part in cls.CAVEAT if part not in flat]
+
+    @classmethod
+    def _steward_spellings(cls, retired: dict[str, str]) -> set[str]:
+        """SPELLINGS, plus any later entry that points at the canonical one, in any case or wrap.
+
+        AT LEAST these: an entry that names the seat some other way still escapes.
+        """
+        return set(cls.SPELLINGS) | {k for k, v in retired.items() if "'steward'" in cls._flat(v)}
+
+    def test_every_steward_spelling_carries_the_usage_caveat(self):
+        """A session that declares `stewart` reads only that entry, never the canonical one."""
+        retired = seats()["retired"]
+        spellings = sorted(self._steward_spellings(retired))
+        gaps = {s: self._missing_caveat(retired.get(s, "")) for s in spellings}
+        self.assertEqual(
+            {},
+            {s: m for s, m in gaps.items() if m},
+            "these Steward spellings resolve to a notice that never says the usage controls "
+            "still bind, so a reader can take the HOLD NEW WORK stop to have retired with the seat",
+        )
+
+    def test_the_caveat_scan_fires_on_a_bare_pointer(self):
+        """Positive control: the wording the spellings carried before this check existed."""
+        bare = "Retired, a spelling of 'steward'. See the 'steward' entry."
+        self.assertEqual(list(self.CAVEAT), self._missing_caveat(bare))
+        planted = {"steward2": "Retired. See the  'Steward'\n entry.", "regulator": "Retired."}
+        self.assertEqual({"steward2", *self.SPELLINGS}, self._steward_spellings(planted))
+
+    #: The one date the notice may carry: the day the owner said the seat was gone. Any other date
+    #: in it, ISO or a month name, is a retirement date the tree does not record. AT LEAST these two
+    #: forms: a date in some other spelling still passes.
+    STATEMENT_DATE = "2026-11-05"
+    _MONTH = re.compile(
+        r"\b(?:january|february|march|april|may|june|july|august|september|october|november"
+        r"|december)\b",
+        re.I,
+    )
+
+    @classmethod
+    def _invented_dates(cls, notice: str) -> list[str]:
+        iso = [d for d in re.findall(r"\b20\d\d-\d\d?-\d\d?\b", notice) if d != cls.STATEMENT_DATE]
+        return iso + cls._MONTH.findall(notice)
+
+    #: The row the agreement must no longer carry, matched as a table row.
+    _ROW = re.compile(r"^\|\s*\*\*Steward\*\*\s*\|", re.M)
+
+    def test_no_card_sends_a_session_to_the_steward(self):
+        """A card outranks the agreement in a session's context, so the cards must agree too."""
+        offenders = [
+            p.name
+            for p in card_paths()
+            if re.search(r"STEWARD\.md|steward hold|steward's hold", read(p), re.I)
+        ]
+        self.assertEqual([], offenders, f"these cards still point at the Steward: {offenders}")
+
+    def test_the_notice_invents_no_date_or_successor(self):
+        why = seats()["retired"]["steward"].lower()
+        self.assertIn("not recorded", why, "the notice no longer says the date is unrecorded")
+        self.assertEqual([], self._invented_dates(why), "the notice states a retirement date")
+        self.assertIn("no successor", why, "the notice no longer denies a recorded successor")
+
+    def test_the_scans_would_fire_on_the_wording_they_forbid(self):
+        """Positive controls. Without them each scan above passes against any wording."""
+        self.assertEqual(
+            ["2026-08-01"], self._invented_dates("retired on 2026-08-01 by owner decision.")
+        )
+        self.assertEqual(["August"], self._invented_dates("retired in August 2026."))
+        self.assertEqual([], self._invented_dates("the owner's statement of 2026-11-05"))
+        removed = "| **Steward** | cron, zero model calls | Reading usage. | Warn a session. |"
+        self.assertIsNotNone(self._ROW.search(removed), "the row pattern misses the removed row")
+
+    def test_the_agreement_retires_the_steward_rather_than_going_quiet(self):
+        text = read(AGREEMENT)
+        # The Manager row repeats the caveat below; drop it, so this pins the notice's own copy.
+        flat = " ".join(self._MANAGER_ROW.sub("", text).split())
+        self.assertIsNone(self._ROW.search(text), "CLAUDE.md keeps a Steward row")
+        self.assertIn(
+            "The STEWARD is retired too",
+            flat,
+            "CLAUDE.md no longer states the retirement, so a document routing work to a Steward "
+            "has nothing contradicting it",
+        )
+        self.assertIn(
+            "where nothing prints them, for example in a cloud session or on an unwired root, "
+            "they bind all the same",
+            flat,
+            "CLAUDE.md no longer says the usage controls bind where watch.py prints nothing",
+        )
+
+    _MANAGER_ROW = re.compile(r"^\|\s*\*\*Manager\*\*\s*\|.*$", re.M)
+    _HOOK = re.compile(r"watch\.py|thresholds\.json")
+    #: A clause ends at a period or semicolon followed by a space, so `~/.claude/` does not end it.
+    _CLAUSE_END = re.compile(r"[.;]\s")
+    _ROW_CAVEAT = "for example in a cloud session or on an unwired root, they bind all the same"
+
+    @staticmethod
+    def _usage_text(text: str) -> str:
+        """The usage-limits text of the Manager row or card: from 'Usage limits' to ASVS work."""
+        start = text.find("Usage limits")
+        end = text.find("ASVS record work", start) if start != -1 else -1
+        # A missing end marker reads as no usage text, not as the rest of the file.
+        return text[start:end] if end != -1 else ""
+
+    @classmethod
+    def _hook_as_source(cls, text: str, *, row: bool) -> list[str]:
+        """What a Manager's usage text gets wrong about where the states come from.
+
+        Korus COMMON.md, *The three usage states*, holds the states, levels and triggers and wins
+        where the hook disagrees. AT LEAST these wrongs are caught: a clause saying the hook or its
+        settings file holds the states, levels, triggers or numbers; a clause naming the hook
+        beside a level or trigger, unless the hook is only what a tool reads FROM; the binding HOLD
+        defined by what the hook prints; COMMON or the section left unnamed; and, in the row, the
+        cloud caveat dropped.
+        """
+        usage = " ".join(text.split())
+        if not usage:
+            return ["no 'Usage limits' text"]
+        wrongs = []
+        for clause in cls._CLAUSE_END.split(usage):
+            if not cls._HOOK.search(clause):
+                continue
+            # Lowercase only, so the state name HOLD does not read as the verb.
+            holds = re.search(r"\b(?:hold|holds|held|holding)\b", clause)
+            if holds and re.search(r"\b(?:state|level|trigger|number)s?\b", clause, re.I):
+                wrongs.append(f"says the hook holds the states or levels: {clause!r}")
+            # Exempt only a named script reading from the file, not "take the levels from it".
+            read_from = re.search(
+                r"`[\w./-]+\.ps1`(?:(?![.;]\s).)*?\b(?:grades|reads|takes)\b"
+                r"(?:(?![.;]\s).)*?\bfrom `[^`]*(?:watch\.py|thresholds\.json)`",
+                clause,
+            )
+            if re.search(r"\b(?:level|trigger)", clause, re.I) and not (read_from and not holds):
+                wrongs.append(f"names the hook beside a level or trigger: {clause!r}")
+            # The opening clause says what binds, whatever its verb.
+            if clause.startswith("Usage limits") and "HOLD NEW WORK" in clause:
+                wrongs.append(f"defines the binding HOLD by the hook: {clause!r}")
+        if "COMMON.md" not in usage or "*The three usage states*" not in usage:
+            wrongs.append("does not name COMMON.md, *The three usage states*")
+        if row and cls._ROW_CAVEAT not in usage:
+            wrongs.append("drops the cloud and unwired-root caveat")
+        return wrongs
+
+    def test_the_manager_reads_the_states_from_common_not_from_the_hook(self):
+        """A Manager reads its own row and card first, so both must name COMMON as the source."""
+        row = self._MANAGER_ROW.search(read(AGREEMENT))
+        self.assertIsNotNone(row, "CLAUDE.md has no Manager row to check")
+        assert row is not None
+        texts = {
+            "CLAUDE.md Manager row": (row.group(0), True),
+            "manager.card.md": (read(CARD_DIR / "manager.card.md"), False),
+        }
+        for where, (text, is_row) in texts.items():
+            with self.subTest(where=where):
+                wrongs = self._hook_as_source(self._usage_text(text), row=is_row)
+                self.assertEqual([], wrongs, f"{where} points the Manager at the hook")
+
+    def test_the_hook_as_source_scan_fires_on_the_wording_it_forbids(self):
+        """Positive controls: the wording before this check, rewordings of it, and the fix."""
+        good_row = (
+            "Usage limits still bind, at least the weekly HOLD NEW WORK state, and the gate; korus "
+            "`roles/COMMON.md`, *The three usage states*, holds the states, levels and triggers. "
+            "The hook `watch.py` is a copy that prints the current state only on a config root "
+            "that wires it; where nothing prints them, " + self._ROW_CAVEAT + "."
+        )
+        self.assertEqual([], self._hook_as_source(good_row, row=True))
+        self.assertEqual(
+            [],
+            self._hook_as_source(
+                "Usage limits bind (`COMMON.md`, *The three usage states*).", row=False
+            ),
+        )
+        old_row = (
+            "Usage limits still bind, at least the weekly HOLD NEW WORK state that the hook "
+            "`watch.py` prints, and the gate; `watch.py` and the `thresholds.json` beside it, in "
+            "`~/.claude/mefor-usage/`, hold the levels and triggers, and korus `roles/COMMON.md` "
+            "states the gate."
+        )
+        # Each check fires on its own, so a dead check cannot hide behind another firing twice.
+        self.assertEqual(
+            [
+                "defines the binding HOLD by the hook",
+                "says the hook holds the states or levels",
+                "names the hook beside a level or trigger",
+                "does not name COMMON.md, *The three usage states*",
+                "drops the cloud and unwired-root caveat",
+            ],
+            [w.split(":")[0] for w in self._hook_as_source(old_row, row=True)],
+        )
+        mutations = {
+            "the hook as the authority": good_row.replace(
+                "a copy that prints", "the authority for the levels and triggers; it prints"
+            ),
+            "passive voice": good_row + " The levels and triggers are held in `thresholds.json`.",
+            "the caveat dropped": good_row.replace(self._ROW_CAVEAT, "they apply"),
+            "the HOLD defined by the hook, another verb": good_row.replace(
+                "Usage limits still bind, at least the weekly HOLD NEW WORK state,",
+                "Usage limits still apply, at least the weekly HOLD NEW WORK state `watch.py` "
+                "prints,",
+            ),
+        }
+        for name, mutated in mutations.items():
+            with self.subTest(mutation=name):
+                self.assertNotEqual([], self._hook_as_source(mutated, row=True))
+        self.assertEqual("", self._usage_text("Usage limits bind (`watch.py`). No end marker."))
+        old_card = "Usage limits still bind (`watch.py`, CLAUDE.md section 5)."
+        self.assertNotEqual([], self._hook_as_source(old_card, row=False))
+        self.assertNotEqual(
+            [],
+            self._hook_as_source(
+                "Usage limits bind (`watch.py`, *The three usage states*).", row=False
+            ),
+        )
+        self.assertEqual(["no 'Usage limits' text"], self._hook_as_source("", row=False))
+
+    #: The row's warning that one tool reads its HOLD number from the hook's settings file. It says
+    #: what decision.ps1 reads, not that the file holds the levels, so the scan must accept it.
+    _READS_FROM = (
+        "`decision.ps1` grades the class B HOLD level from `~/.claude/mefor-usage/thresholds.json` "
+        "wherever that file sets one (`scripts/coord/_decisionlog.ps1`, `Get-DecisionRungLevels`), "
+        "so it can grade against a number other than COMMON's."
+    )
+
+    def test_the_scan_accepts_what_a_tool_reads_and_refuses_what_a_file_holds(self):
+        """Control: the reads-from sentence passes; the same fact in the holds form fires."""
+        good_row = (
+            "Usage limits still bind; korus `roles/COMMON.md`, *The three usage states*, holds the "
+            "states, levels and triggers. Where nothing prints them, " + self._ROW_CAVEAT + ". "
+        )
+        self.assertEqual([], self._hook_as_source(good_row + self._READS_FROM, row=True))
+        holds = {
+            "holds the levels": "`~/.claude/mefor-usage/thresholds.json` holds the class B HOLD "
+            "levels, so `decision.ps1` can grade against a number other than COMMON's.",
+            "reads from, but holds the numbers": self._READS_FROM.replace(
+                "wherever that file sets one", "which holds the numbers"
+            ),
+            "holds the states": "`watch.py` holds the states.",
+            "take the levels from the hook": "Take the HOLD levels and triggers from `watch.py`.",
+        }
+        for name, sentence in holds.items():
+            with self.subTest(form=name):
+                self.assertNotEqual([], self._hook_as_source(good_row + sentence, row=True))
 
 
 if __name__ == "__main__":

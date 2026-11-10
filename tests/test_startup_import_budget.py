@@ -68,6 +68,9 @@ _CLI_ENGINE = frozenset(
         "messagefoundry.config.tls_policy",
         "messagefoundry.console_streams",
         "messagefoundry.controlchars",
+        # Eager on purpose (BACKLOG #2279 item 9): `log_spool` takes its directory lock through
+        # it. A stdlib-only leaf.
+        "messagefoundry.file_lock",
         "messagefoundry.keywrap",
         "messagefoundry.last_resort",
         "messagefoundry.log_spool",

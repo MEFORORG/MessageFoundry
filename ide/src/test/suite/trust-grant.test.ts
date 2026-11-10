@@ -27,6 +27,7 @@ function recordingSteps(ran: StepName[], fail?: { step: StepName; async: boolean
     repaintStatusBar: step("repaintStatusBar"),
     refreshEngineTrust: step("refreshEngineTrust"),
     suggestSourceControl: step("suggestSourceControl"),
+    rerunLiveDebug: step("rerunLiveDebug"),
   };
 }
 
@@ -39,6 +40,7 @@ suite("trustGrant — runTrustGrantSteps", () => {
       "repaintStatusBar",
       "refreshEngineTrust",
       "suggestSourceControl",
+      "rerunLiveDebug",
     ]);
   });
 
@@ -49,7 +51,7 @@ suite("trustGrant — runTrustGrantSteps", () => {
       errors.push(`${step}: ${(err as Error).message}`),
     );
     assert.deepStrictEqual(errors, ["refreshViews: refreshViews broke"]);
-    assert.strictEqual(ran.length, 4, JSON.stringify(ran));
+    assert.strictEqual(ran.length, 5, JSON.stringify(ran));
   });
 
   test("a step whose promise rejects is reported, not left as an unhandled rejection", async () => {
@@ -58,7 +60,7 @@ suite("trustGrant — runTrustGrantSteps", () => {
     runTrustGrantSteps(recordingSteps(ran, { step: "refreshEngineTrust", async: true }), (step, err) =>
       errors.push(`${step}: ${(err as Error).message}`),
     );
-    assert.strictEqual(ran.length, 4, JSON.stringify(ran));
+    assert.strictEqual(ran.length, 5, JSON.stringify(ran));
     await new Promise((resolve) => setImmediate(resolve));
     assert.deepStrictEqual(errors, ["refreshEngineTrust: refreshEngineTrust broke"]);
   });
@@ -92,8 +94,11 @@ suite("trustGrant — extension.ts wiring", () => {
       ["repaintStatusBar", "engineStatusBar.repaint()"],
       ["refreshEngineTrust", "refreshEngineTrustThenRecheck()"],
       ["suggestSourceControl", "maybeSuggestSourceControl(context)"],
+      ["rerunLiveDebug", "liveDebug.onTrustGranted()"],
     ]) {
       assert.ok(handler.includes(`${step}: () => ${callee}`), `${step} is not wired to ${callee}`);
     }
+    // The live-debug step must reach the controller the extension registered, not a second one.
+    assert.match(src, /const liveDebug = registerLiveDebug\(context\);/);
   });
 });

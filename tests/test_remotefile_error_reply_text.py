@@ -43,6 +43,7 @@ from messagefoundry.transports.remotefile import (
     _RemoteError,
 )
 from tests._ast_sites import callee_name, parse_source
+from tests._log_absence import assert_capture_sees
 from tests._refusal_log_capture import record_texts
 from tests.test_file_write_error_names import MRN, TEMPLATE, _traceback
 from tests.test_remotefile_publish_refuses import _ftp_client, _ScriptedFtp
@@ -544,6 +545,7 @@ def test_a_failed_confirming_listing_logs_no_reply(
     warned = [r for r in caplog.records if "confirm a refused RNTO" in r.getMessage()]
     assert len(warned) == 1
     assert "reply 550" in warned[0].getMessage()
+    assert_capture_sees(caplog, "messagefoundry.transports.remotefile")
     assert not [r for r in caplog.records if any(MRN in t for t in record_texts(r))]
     assert str(caught.value) == "FTP rejected the operation: reply 553 (file name not allowed)"
     assert MRN not in _traceback(caught.value)

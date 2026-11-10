@@ -39,12 +39,10 @@ from typing import Any, Generic, Protocol, TypeVar
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import (
     _ALERT_CONTROL_EVENT_TYPES,
-    INSECURE_TLS_ESCAPE_ENV,
     AlertRule,
     AlertSeverity,
     AlertsSettings,
     EscalationTier,
-    weakened_tls_escape_permitted,
 )
 from messagefoundry.config.tls_policy import (
     HopPosture,
@@ -602,15 +600,10 @@ class WebhookTransport:
         revocation_attested: bool = False,
         revocation_attested_reason: str | None = None,
     ) -> None:
-        # Refuse a plaintext http:// webhook target unless the explicit dev escape is set: the alert
-        # POST otherwise crosses the network in cleartext (ASVS 12.2.1 — no insecure fallback). https
-        # is the only scheme accepted by default; http(s) remain the only schemes at all (see _post).
-        # Same refuse-unless-MEFOR_ALLOW_INSECURE_TLS pattern as SQL Server / MLLP. #329: read
-        # the escape through the ADR-0092 clamp (weakened_tls_escape_permitted) so on an enforcing-PHI
-        # instance the blunt env var can never re-permit a cleartext alert POST. The webhook sink is
-        # built out of the connector-construction gate (notifier_from_settings, in the app lifespan), so
-        # the posture is threaded explicitly; None (a direct/test construction) fails closed since
-        # vault BACKLOG #2354. It used to fall back to the unclamped escape.
+        # https is the only scheme (ASVS 12.2.1). A plaintext http:// target is refused with no
+        # escape, in every posture (vault BACKLOG #3533 item 5): every POST carries the path token
+        # the webhook service issues, the hop's credential, as every AI broker call carries its key.
+        # Until then MEFOR_ALLOW_INSECURE_TLS released it at [security].enforcement = warn.
         #
         # No refusal here prints the URL (BACKLOG #1793). A Slack or Teams hook carries its secret in
         # the PATH, and a userinfo URL carries a password, and redact() keeps both. The userinfo screen
@@ -626,27 +619,18 @@ class WebhookTransport:
             url, "[alerts].webhook_url", use="the path token the webhook service issues"
         )
         scheme = urllib.parse.urlsplit(url).scheme.lower()
-        if scheme not in ("http", "https"):
-            raise ValueError(f"[alerts].webhook_url must be http or https, got scheme {scheme!r}")
-        if scheme == "http" and not weakened_tls_escape_permitted(posture):
-            raise ValueError(
-                "[alerts].webhook_url uses plaintext http; refused unless "
-                f"{INSECURE_TLS_ESCAPE_ENV} is set on an instance at [security].enforcement = warn "
-                "(dev/trusted-network only; the escape has no effect while enforcing, the default, "
-                "or with no posture) — use https"
-            )
-        # BACKLOG #5088: the allowlist _post applies, here at the build, so a host it would refuse
-        # at every POST refuses the start instead. Before the permitted-cleartext WARNING, so a
-        # refused URL never logs that its hop was permitted, and before the revocation guard, which
-        # reads no allowlist, so that guard never judges a host the egress policy forbids.
-        _refuse_off_allowlist_webhook(url, allowed_hosts)
+        # Before the allowlist, so an http URL is never sent to fix an entry it cannot use.
         if scheme == "http":
-            log.warning(
-                "webhook target uses plaintext http; permitted only because %s is set on an instance "
-                "at [security].enforcement = warn (cleartext, MITM-able — trusted-network/dev use "
-                "only)",
-                INSECURE_TLS_ESCAPE_ENV,
+            raise ValueError(
+                "[alerts].webhook_url over cleartext http would send the webhook's path token in "
+                "clear; refused, with no escape, in every posture — use https"
             )
+        if scheme != "https":
+            raise ValueError(f"[alerts].webhook_url must be https, got scheme {scheme!r}")
+        # BACKLOG #5088: the allowlist _post applies, here at the build, so a host it would refuse
+        # at every POST refuses the start instead. Before the revocation guard, which reads no
+        # allowlist, so that guard never judges a host the egress policy forbids.
+        _refuse_off_allowlist_webhook(url, allowed_hosts)
         # ASVS 4.2.5: bound the webhook URL. Construction-only is sufficient here and not a shortcut:
         # the URL is operator config and the sole header is a fixed ``Content-Type``, so nothing is
         # added between here and the wire.
@@ -677,21 +661,19 @@ class WebhookTransport:
 
     def _post(self, event: dict[str, Any]) -> None:
         # Guard the scheme before opening: urllib would otherwise honour file:/ftp:/custom schemes
-        # (bandit B310). The URL is operator-configured, but an http(s)-only check is cheap
+        # (bandit B310). The URL is operator-configured, but an https-only check is cheap
         # defense-in-depth so a typo'd or hostile config can't turn an alert POST into a local-file
-        # read. With the scheme provably http/https here, the Request nosec is justified.
+        # read. With the scheme provably https here, the Request nosec is justified.
         split = urllib.parse.urlsplit(self.url)
-        if split.scheme.lower() not in ("http", "https"):
-            raise ValueError(
-                f"[alerts].webhook_url must be http or https, got scheme {split.scheme!r}"
-            )
+        if split.scheme.lower() != "https":
+            raise ValueError(f"[alerts].webhook_url must be https, got scheme {split.scheme!r}")
         _refuse_off_allowlist_webhook(self.url, self.allowed_hosts)
         # Never serialize INTERNAL routing keys (``_``-prefixed: e.g. the #146 ``_recipients`` override)
         # onto the wire — the fan-out loop pops them before send, but strip defensively so a webhook
         # payload can never carry recipient addresses / internal metadata even if a key slips through.
         payload = {k: v for k, v in event.items() if not k.startswith("_")}
         data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme guarded to http(s) above
+        req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme guarded to https above
             self.url,
             data=data,
             headers={"Content-Type": "application/json"},
@@ -1538,7 +1520,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # ADR 0079 mechanism 2: the mass-revoke breaker tripped and the pass applied nothing, or one
         # or more probes were referred (BACKLOG #2538), refused for the configuration (BACKLOG
         # #3010) or faulted (BACKLOG #3100) and left unjudged, or the directory stayed unreachable
-        # for a run of passes (BACKLOG #3709); `reason` tells which. The
+        # for a run of passes (BACKLOG #3709), or one account's probe kept failing to reach it
+        # (BACKLOG #3100); at least those, and `reason` tells which. The
         # fixed source label keys the throttle, so a standing misconfiguration that trips every pass
         # pages once per cooldown rather than once per pass. `detail` is the latched operator explanation,
         # and it is what the instance's reason column shows (detail wins over reason there).
@@ -2443,7 +2426,7 @@ def notifier_from_settings(
     SMTP hop when ``[alerts].email_tls_ca_file`` names none of its own (#323 layer 3). It only chooses
     WHICH roots verify the relay — it never turns verification off.
 
-    ``posture`` keys the webhook's cleartext refusal (#329) and both transports' revocation guards
+    ``posture`` keys both transports' revocation guards
     (BACKLOG #2193): an off-box https webhook, and an SMTP login to an off-box relay, are refused on
     an enforcing posture unless their ``[alerts]`` attestation pair is set or, for SMTP only, a
     ``[tls].crl_file`` reaches the hop. For those guards ``None`` with none stamped counts as
@@ -2466,9 +2449,7 @@ def notifier_from_settings(
                 alerts.webhook_url,
                 timeout=alerts.webhook_timeout,
                 allowed_hosts=tuple(alerts.webhook_allowed_hosts),
-                # #329: thread the derived instance posture so the cleartext-http refusal is clamped on
-                # an enforcing-PHI instance (the escape can no longer re-permit a plaintext alert POST).
-                # The same posture keys the https hop's revocation guard (BACKLOG #2193).
+                # The derived instance posture keys the https hop's revocation guard (BACKLOG #2193).
                 posture=posture,
                 revocation_attested=alerts.webhook_tls_revocation_attested,
                 revocation_attested_reason=alerts.webhook_tls_revocation_attested_reason,

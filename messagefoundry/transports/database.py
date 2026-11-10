@@ -51,6 +51,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import errno
 import json
 import logging
 import os
@@ -60,14 +61,16 @@ import weakref
 from collections.abc import Callable, Coroutine, Generator, Iterator, Mapping
 from datetime import date, datetime
 from decimal import Decimal
-from functools import partial
-from typing import Any, NamedTuple, TypeGuard
+from functools import cache, partial
+from itertools import islice
+from typing import Any, NamedTuple, TypeGuard, cast
 
 from messagefoundry.auth.anchor_path import (
+    LINK,
     SHARE_CAUSE,
     WinProbe,
     _win_probe,
-    subst_target,
+    query_drive_target,
     windows_chain,
 )
 from messagefoundry.auth.trust_anchors import (
@@ -709,6 +712,23 @@ def _odbc_literal(value: object, *, what: str, connection: str | None) -> str:
     return text
 
 
+def odbc_param_text(name: str, value: object, *, connection: str | None) -> str:
+    """The text the generic build sends for the ``odbc_params`` keyword ``name`` (in the form
+    :func:`odbc_keyword_name` gives), or a ValueError naming the keyword and never the value: for
+    ``None``, a boolean, and anything :func:`_odbc_literal` refuses. The one judgement the build and
+    the lane check (``auth.trust_anchors.database_ca_anchor_spec``) both run, so the lane check
+    refuses what the build refuses, in the build's words (vault BACKLOG #5197)."""
+    what = f"odbc_params value for '{name}'"
+    if isinstance(value, bool):
+        # str() would send True or False, which no driver is known to spell its own way
+        # (psqlODBC reads SSLmode=True as disable). BACKLOG #2705.
+        raise ValueError(
+            f"{hop_name_prefix(connection)}DATABASE {what} must not be a boolean; write the "
+            "driver's own spelling as a string"
+        )
+    return _odbc_literal(value, what=what, connection=connection)
+
+
 # The ``sslmode`` values psqlODBC reads: libpq's six modes, exactly, in lower case (BACKLOG #2705).
 # psqlODBC's source reads an ``SSLmode`` value by its first byte, and only a lower case one names a
 # mode, so ``Require``, ``VERIFY-FULL``, ``REQUIRED``, ``on`` or ``1`` would mean disable to it,
@@ -866,7 +886,12 @@ _DRIVE_UNKNOWN = 0
 class _LeavesHost(Exception):
     """Raised through :func:`~messagefoundry.auth.anchor_path.windows_chain` by a reader that met
     another host: a network drive, a link to a share, or a share Windows could not reach. Not an
-    ``OSError``, which the walk would catch and report as a cause."""
+    ``OSError``, which the walk would catch and report as a cause. ``kind`` names the check that
+    found it and never the path, for the WARNING :func:`_not_cleared` logs."""
+
+    def __init__(self, kind: str) -> None:
+        super().__init__(kind)
+        self.kind = kind
 
 
 class _PathEnds(Exception):
@@ -878,37 +903,21 @@ def _windows_drive_type(root: str) -> int:
     """``GetDriveTypeW``'s answer for a volume root. Raises ``OSError`` off Windows."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise OSError("the drive type is read only on Windows")
-    import ctypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.GetDriveTypeW.argtypes = [ctypes.c_wchar_p]
-    kernel32.GetDriveTypeW.restype = ctypes.c_uint
-    return int(kernel32.GetDriveTypeW(root))
+    return int(_get_drive_type()(root))
 
 
-def _windows_drive_target(drive: str) -> str | None:
-    """The folder a ``subst`` drive stands for, whole, or ``None`` for a real volume or no device
-    at all, as ``anchor_path.windows_host_readers`` reads it (``anchor_path.subst_target``). Any
-    other failure of the query raises ``OSError``, so the walk does not clear the path: a subst
-    drive it could not read would hide the links behind it."""
+@cache
+def _get_drive_type() -> Callable[[str], int]:
+    """``GetDriveTypeW`` from a private ``kernel32`` handle, typed once: a walk asks it for each
+    volume it meets, and an ``sslcapath`` folder can walk many entries. Windows only."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
-        raise OSError("the drive target is read only on Windows")
+        raise OSError("GetDriveTypeW exists only on Windows")
     import ctypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.QueryDosDeviceW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint]
-    kernel32.QueryDosDeviceW.restype = ctypes.c_uint
-    buf = ctypes.create_unicode_buffer(1024)
-    if not kernel32.QueryDosDeviceW(drive, buf, len(buf)):
-        error = ctypes.get_last_error()
-        if error == _ERROR_FILE_NOT_FOUND:  # no such device: the drive type then says no volume
-            return None
-        raise OSError(f"the drive {drive} could not be read (winerror {error})")
-    return subst_target(buf.value)
-
-
-#: ``QueryDosDeviceW``'s answer for a drive letter with no device behind it.
-_ERROR_FILE_NOT_FOUND = 2
+    query = ctypes.WinDLL("kernel32", use_last_error=True).GetDriveTypeW
+    query.argtypes = [ctypes.c_wchar_p]
+    query.restype = ctypes.c_uint
+    return cast("Callable[[str], int]", query)
 
 
 def _windows_path_verdict(
@@ -918,11 +927,14 @@ def _windows_path_verdict(
     drive_type: Callable[[str], int],
     drive_target: Callable[[str], str | None],
     cwd: str | Callable[[], str],
+    unread: dict[str, str] | None = None,
 ) -> bool | None:
     """The best-effort verdict on whether a Windows ``path`` leads off this host, from a walk of it
     with :func:`~messagefoundry.auth.anchor_path.windows_chain`. ``True``: the walk found the path
     leads to another host. ``None``: the walk could not finish; a path-free class of its cause is
     logged at WARNING and the whole cause, which can name the path, at DEBUG (:func:`_not_cleared`).
+    ``True`` is logged the same way, naming the check that found the other host, so a refusal that
+    points the operator at the server log finds a reason there (engine PR 2815, hold F1).
     ``False``: the walk found nothing that leads off the host, which is not proof the path is
     local. ``probe``, ``drive_type``, ``drive_target`` and ``cwd`` are the walk's inputs, passed in
     so a test can stand in for the file system. ``docs/CONNECTIONS.md``, Generic ODBC, states the
@@ -930,56 +942,78 @@ def _windows_path_verdict(
 
     A walk that reaches a share (``anchor_path.SHARE_CAUSE``), such as through a ``subst`` drive
     onto one, is ``True`` (vault BACKLOG #5197 item 11). A link whose target is rooted with no drive
-    is ``None``, as ``windows_chain`` answers it (item 9)."""
+    is ``None``, as ``windows_chain`` answers it (item 9).
+
+    When the walk stops because the system could not read a name, ``unread``, if given, maps
+    ``path`` to the walk's path-free cause, so a caller can say the file could not be read rather
+    than that it names another host. Nothing past that name was walked, so that is no proof the
+    path is local."""
 
     def volume_cause(root: str) -> str | None:
         kind = drive_type(root)
         if kind == _DRIVE_REMOTE:
-            raise _LeavesHost
+            raise _LeavesHost("the path is on a network drive")
         if kind == _DRIVE_NO_ROOT_DIR:
             raise _PathEnds  # no volume at that letter here: left to the driver, as a missing file is
         if kind == _DRIVE_UNKNOWN:
             return "the type of this volume could not be read"
         return None
 
+    stopped_unread = False
+
     def probing(part: str) -> tuple[str, str | None]:
+        nonlocal stopped_unread
         try:
             kind, target = probe(part)
         except (FileNotFoundError, NotADirectoryError) as exc:
             if getattr(exc, "winerror", None) in _WINDOWS_UNREACHABLE:
-                raise _LeavesHost from None
+                raise _LeavesHost("the path is on a share Windows could not reach") from None
             raise _PathEnds from None
+        except OSError as exc:
+            # windows_chain ends the walk here with a cause the verdict below reads as None. Only
+            # a failure the system reported counts as unread, not _win_probe's own refusal of a
+            # reparse point it does not follow, which carries no errno.
+            if exc.errno is not None:
+                stopped_unread = True
+            raise
         if target is not None:
             text = target.strip()
             if is_remote_spelling(text) and not _LOCAL_DEVICE_TARGET.match(text):
-                raise _LeavesHost
+                raise _LeavesHost("a link on the path leads to a share or a device path")
         return kind, target
 
     try:
         _chain, cause = windows_chain(
             path, cwd, probing, volume_cause=volume_cause, drive_target=drive_target
         )
-    except _LeavesHost:
+    except _LeavesHost as leaves:
+        _not_cleared(leaves.kind, path)
         return True
     except _PathEnds:
         return False
     except OSError as exc:  # a reader the walk does not guard: cwd, or the drive type
         _not_cleared(
-            f"a drive or the working directory could not be read: {type(exc).__name__}", exc
+            f"the working directory or a volume's type could not be read: {type(exc).__name__}",
+            exc,
         )
         return None
     if cause is not None and cause.kind == SHARE_CAUSE:
-        return True  # the walk reached a share, as through a subst drive onto \??\UNC\host\share
+        # The walk reached a share, as through a subst drive onto \??\UNC\host\share.
+        _not_cleared(cause.kind, path)  # the cause's text is its kind, so DEBUG gets the path
+        return True
     if cause is not None:
+        if unread is not None and stopped_unread:
+            unread[path] = cause.kind
         _not_cleared(cause.kind, cause)
         return None
     return False
 
 
 def _not_cleared(kind: str, detail: object) -> None:
-    """Log why the walk did not clear a file keyword path: ``kind``, which names no path, at
-    WARNING, so the operator who meets the refusal sees a reason, and ``detail``, which can name
-    the path, at DEBUG only (``docs/PHI.md``; vault BACKLOG #5197 item 22)."""
+    """Log why the walk did not clear a file keyword path, or what it found leads off the host:
+    ``kind``, which names no path, at WARNING, so the operator who meets the refusal sees a reason,
+    and ``detail``, which can name the path, at DEBUG only (``docs/PHI.md``; vault BACKLOG #5197
+    item 22)."""
     logger.warning(
         "DATABASE file keyword path not cleared: %s (the path, if any, is logged at DEBUG)", kind
     )
@@ -996,16 +1030,22 @@ _LOCAL_DEVICE_TARGET = re.compile(r"[\\/]{2}[?.][\\/](?:[A-Za-z]:|[Vv]olume\{)")
 def _path_verdict(text: str) -> bool | None:
     """:func:`_windows_path_verdict` for ``text`` on Windows, and ``None`` for an ``OSError`` or
     ``ValueError`` it raises. ``False`` on POSIX, where nothing past the spelling is checked
-    (``docs/CONNECTIONS.md``, Generic ODBC)."""
-    if sys.platform != "win32":
+    (``docs/CONNECTIONS.md``, Generic ODBC). :data:`_WALKS_BEYOND_SPELLING` is the one gate."""
+    return _noted_path_verdict(text, None)
+
+
+def _noted_path_verdict(text: str, unread: dict[str, str] | None) -> bool | None:
+    """:func:`_path_verdict`, passing ``unread`` to the walk (:func:`_windows_path_verdict`)."""
+    if not _WALKS_BEYOND_SPELLING:
         return False
     try:
         return _windows_path_verdict(
             text,
             probe=_win_probe,
             drive_type=_windows_drive_type,
-            drive_target=_windows_drive_target,
+            drive_target=query_drive_target,
             cwd=os.getcwd,
+            unread=unread,
         )
     except (OSError, ValueError) as exc:
         _not_cleared(f"the check could not run: {type(exc).__name__}", type(exc).__name__)
@@ -1025,12 +1065,17 @@ def _sent_text(value: object) -> str:
     return "" if value is None else str(value)
 
 
-def file_keyword_verdicts(value: object) -> FileVerdicts:
+def file_keyword_verdicts(value: object, unread: dict[str, str] | None = None) -> FileVerdicts:
     """:data:`FileVerdicts` for ``value``, empty when no text is sent (:func:`_sent_text`). A
-    spelling the spelling check refuses is ``True`` and is not walked."""
+    spelling the spelling check refuses is ``True`` and is not walked. Given ``unread``, each walk
+    records in it a name it could not read (:func:`_windows_path_verdict`)."""
     raw = _sent_text(value)
+
+    def verdict(p: str) -> bool | None:
+        return _path_verdict(p) if unread is None else _noted_path_verdict(p, unread)
+
     return {
-        p: True if is_remote_spelling(p) else _path_verdict(p)
+        p: True if is_remote_spelling(p) else verdict(p)
         for p in dict.fromkeys((raw, raw.strip()))
         if p
     }
@@ -1074,14 +1119,13 @@ def driver_file_spellings(value: object, verdicts: FileVerdicts | None = None) -
 def _refuse_remote_path(
     value: object, verdicts: FileVerdicts, *, name: str, connection: str | None
 ) -> None:
-    """Raise ``ValueError`` when :func:`names_another_host` is ``True`` for ``value`` and its
-    ``verdicts`` (BACKLOG #2705); otherwise return. The message names the keyword, not the value.
-    ``docs/CONNECTIONS.md``, Generic ODBC, states the check's limits."""
-    if names_another_host(value, verdicts):
+    """Raise ``ValueError`` when ``value`` breaks a rule :func:`driver_file_rule` names for the
+    file keyword ``name`` and its ``verdicts`` (BACKLOG #2705); otherwise return. The message names
+    the keyword, not the value. ``docs/CONNECTIONS.md``, Generic ODBC, states the check's limits."""
+    rule = driver_file_rule(name, value, verdicts)
+    if rule is not None:
         raise ValueError(
-            f"{hop_name_prefix(connection)}DATABASE odbc_params value for '{name}' must be a plain "
-            "local path on this host: not a share, a network drive, a link to one, or a path it "
-            "cannot read"
+            f"{hop_name_prefix(connection)}DATABASE odbc_params value for '{name}' {rule}"
         )
 
 
@@ -1089,16 +1133,150 @@ def _refuse_remote_paths(
     named: Mapping[str, Any], *, connection: str | None
 ) -> dict[str, FileVerdicts]:
     """Compute the verdicts of each file keyword in ``named``, in sorted keyword order, and raise
-    ``ValueError`` (:func:`_refuse_remote_path`) at the first that :func:`names_another_host`
-    refuses, in every ``sslmode``. Otherwise return the verdicts for the checks that read the
-    files: one entry per file keyword ``named`` holds, set or not. ``docs/CONNECTIONS.md``, Generic
-    ODBC, states the check's limits."""
+    ``ValueError`` (:func:`_refuse_remote_path`) at the first that breaks a rule, in every
+    ``sslmode``. Otherwise return the verdicts for the checks that read the files: one entry per
+    file keyword ``named`` holds, set or not. ``docs/CONNECTIONS.md``, Generic ODBC, states the
+    check's limits."""
     verdicts: dict[str, FileVerdicts] = {}
     for name in sorted(_ODBC_PATH_KEYS & named.keys()):
         value = named[name]
         verdicts[name] = file_keyword_verdicts(value)
         _refuse_remote_path(value, verdicts[name], name=name, connection=connection)
     return verdicts
+
+
+#: What a refused driver file value must be, after the setting's name, for the build and the lane
+#: check alike (:func:`driver_file_rule`). Neither names a path.
+#: Kept short: a stored failure keeps about the first 200 characters, and the build's prefix and
+#: the connection name come first.
+REMOTE_PATH_RULE = (
+    "must be a plain local path on this host: not a share, a network drive, a link to one, or a "
+    "path it cannot read"
+)
+#: The entry rule covers a folder that cannot be listed or is past the entry cap too, so it points
+#: at the WARNING, which names the cause's kind.
+CAPATH_ENTRY_RULE = (
+    "must name a folder it can list, whose entries are plain local paths on this host; the "
+    "server log says which check failed"
+)
+
+
+def driver_file_rule(keyword: str, value: object, verdicts: FileVerdicts) -> str | None:
+    """The rule a driver file keyword's ``value`` breaks, given its ``verdicts``, or ``None``:
+    :data:`REMOTE_PATH_RULE` when :func:`names_another_host` refuses it, and
+    :data:`CAPATH_ENTRY_RULE` when an entry of an ``sslcapath`` folder must be refused
+    (:func:`_capath_entries_leave_host`). The one judgement the build and the lane check
+    (``auth.trust_anchors.database_ca_anchor_spec``) both run, so the two refuse alike (vault
+    BACKLOG #5197)."""
+    if names_another_host(value, verdicts):
+        return REMOTE_PATH_RULE
+    if keyword == "sslcapath" and _capath_entries_leave_host(value, verdicts):
+        return CAPATH_ENTRY_RULE
+    return None
+
+
+#: Whether the remote-path check reads anything beyond the spelling: on Windows only, the one gate
+#: for :func:`_path_verdict` and for listing an ``sslcapath`` folder.
+_WALKS_BEYOND_SPELLING = sys.platform == "win32"
+#: How many entries of an ``sslcapath`` folder :func:`_capath_entries_leave_host` judges. A folder
+#: holding more is refused rather than judged in part, which bounds the time a build or a lane
+#: check spends listing it. A serving engine builds a connector, and runs the lane check, in a
+#: worker thread (``pipeline.wiring_runner``; engine PR 2815, hold F2), and builds on the event loop
+#: only a connector the executor never began, where the bound also bounds the loop's stall. A
+#: CA folder holds a few hundred at most (one file and one link per CA), and each entry that is not
+#: a link costs one ``lstat`` (:func:`_capath_entry_clear`).
+_MAX_CAPATH_ENTRIES = 4096
+
+
+def _capath_entries_leave_host(value: object, verdicts: FileVerdicts) -> bool:
+    """Whether an entry of the ``sslcapath`` folder that ``value`` names must be refused (vault
+    BACKLOG #5197, closing step 4). The driver's TLS library opens a ``<hash>.0`` entry there by
+    name at a handshake, so a link there onto a share leads the CA lookup off the host, as the
+    folder itself would. ``verdicts`` are the folder's own (:func:`file_keyword_verdicts`). A value
+    they refuse answers ``True`` here too, so the answer never clears a folder that its own walk
+    did not.
+
+    Each spelling :func:`driver_file_spellings` gives that is a folder is listed, and every entry
+    in it, not only the hash-named ones, is judged by :func:`_capath_entry_clear`. There one
+    ``lstat`` clears a plain file or folder whose name the walk does not end on. Any other entry
+    takes :func:`_path_verdict`. ``True`` or ``None`` for any one refuses, as for the trimmed
+    spelling of a file keyword. So does a folder that cannot be listed, whether at open or partway
+    through, or one holding more than :data:`_MAX_CAPATH_ENTRIES`. A spelling that names no folder,
+    or a file, is left to the driver, as a missing file is. Entries are not walked into: the driver
+    reads none below the folder. ``False`` where only the spelling is checked
+    (:data:`_WALKS_BEYOND_SPELLING`), with nothing listed. Like the rest of the check, it judges
+    where an entry leads, not who can write it, and an entry added after the check is not judged
+    (``docs/CONNECTIONS.md``, Generic ODBC)."""
+    if names_another_host(value, verdicts):
+        return True  # driver_file_spellings answers no spelling for it, which would read as clear
+    if not _WALKS_BEYOND_SPELLING:
+        return False
+    return any(not _capath_folder_clear(p) for p in driver_file_spellings(value, verdicts))
+
+
+def _capath_folder_clear(folder: str) -> bool:
+    """Whether no entry of ``folder`` leads off the host or is a path the walk cannot clear, for
+    :func:`_capath_entries_leave_host`. A reason it is not is logged as the walk logs one
+    (:func:`_not_cleared`)."""
+    try:
+        # Not found and not a folder are tolerated at the open only. Raised while the folder is
+        # listed, they leave part of it unjudged, so they refuse below as any listing error does.
+        try:
+            listing = os.scandir(folder)
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            winerror = getattr(exc, "winerror", None)
+            if winerror in _WINDOWS_UNREACHABLE:
+                # A share Windows could not reach, which CPython raises as not found, read as the
+                # walk's own probe reads it (_windows_path_verdict): the folder leads off the host.
+                _not_cleared("an sslcapath folder is on a share Windows could not reach", exc)
+                return False
+            if isinstance(exc, FileNotFoundError) and winerror not in _CAPATH_MISSING_WINERRORS:
+                # CPython raises other Windows codes as not found too, at least 161
+                # ERROR_BAD_PATHNAME and 206 ERROR_FILENAME_EXCED_RANGE, where a folder may be
+                # there. Nothing in it was judged, so it is refused as an unlistable folder is.
+                _not_cleared(f"an sslcapath folder could not be listed: {_why(exc)}", exc)
+                return False
+            # No folder at this spelling: left to the driver, as a missing file is. The reason
+            # only, since the exception's text names the path.
+            logger.debug(
+                "sslcapath gave no folder listing at open, so it is left to the driver: %s",
+                _why(exc),
+            )
+            return True
+        with listing:
+            names = [entry.name for entry in islice(listing, _MAX_CAPATH_ENTRIES + 1)]
+    except (OSError, ValueError) as exc:
+        _not_cleared(f"an sslcapath folder could not be listed: {_why(exc)}", exc)
+        return False
+    if len(names) > _MAX_CAPATH_ENTRIES:
+        _not_cleared(f"an sslcapath folder holds more than {_MAX_CAPATH_ENTRIES} entries", folder)
+        return False
+    return all(_capath_entry_clear(os.path.join(folder, name), name) for name in names)
+
+
+def _why(exc: Exception) -> str:
+    """A reason ``exc`` gives that names no path: its ``strerror``, or failing that its type."""
+    return exc.strerror if isinstance(exc, OSError) and exc.strerror else type(exc).__name__
+
+
+def _capath_entry_clear(path: str, name: str) -> bool:
+    """Whether the ``sslcapath`` entry ``name``, at ``path`` in a folder whose own walk cleared it,
+    is clear. An entry the probe reads as a plain file or folder is: the walk of its full path
+    would pass the folder's own chain, then end at this probe with no cause. Anything else takes
+    that full walk (:func:`_path_verdict`): a link, an entry the probe cannot read, and a name the
+    walk ends on (a stream, or a trailing space or dot). So one ``lstat`` judges a plain entry,
+    not a walk from the volume root, and no entry the walk would refuse is cleared."""
+    if ":" not in name and not name.endswith((" ", ".")):
+        try:
+            kind, _target = _win_probe(path)
+        except OSError as exc:
+            # The full walk below probes again and reports its own cause; this one stays at DEBUG,
+            # where the path may be logged, so a failure the second probe does not meet is seen.
+            logger.debug("sslcapath entry probe failed, so the entry takes the full walk: %s", exc)
+        else:
+            if kind != LINK:
+                return True
+    return _path_verdict(path) is False
 
 
 def _refuse_weak_driver_key(
@@ -1150,8 +1328,9 @@ def _refuse_weak_driver_cert(
     not read here. That is the rule
     :func:`~messagefoundry.keywrap.refuse_weak_cert_chain_key` follows. It runs when the
     connection is built, not at each connect. docs/CONNECTIONS.md, under the generic dialect, says
-    what it does not cover."""
-    if not str(named.get("sslkey") or "").strip():
+    what it does not cover. ``sslkey`` counts as set by the text the build sends
+    (:func:`_sent_text`), so ``0`` is a key file, not an unset key (vault BACKLOG #5197)."""
+    if not _sent_text(named.get("sslkey")).strip():
         _refuse_weak_driver_wrap(
             named, "sslcert", "certificate file", connection, verdicts=verdicts
         )
@@ -1170,7 +1349,8 @@ def _refuse_weak_driver_wrap(
     passphrase, through :func:`~messagefoundry.keywrap.refuse_weak_key_wrap`. A file the check
     cannot read is refused as :class:`~messagefoundry.keywrap.KeyWrapRefused`, as
     :func:`~messagefoundry.keywrap.refuse_weak_key_file` refuses it. ``leave_irregular`` is
-    :func:`_read_driver_file`'s."""
+    :func:`_read_driver_file`'s. A passphrase counts as given by the text the build sends
+    (:func:`_sent_text`): the driver unlocks with ``sslpassword=0`` (vault BACKLOG #5197)."""
     for setting, data in _driver_file_spellings(
         named,
         keyword,
@@ -1185,14 +1365,15 @@ def _refuse_weak_driver_wrap(
             data,
             setting=setting,
             unlock_setting="odbc_params sslpassword",
-            passphrase_given=bool(named.get("sslpassword")),
+            passphrase_given=bool(_sent_text(named.get("sslpassword"))),
         )
 
 
 #: How much of an ``sslca``, ``sslcert`` or ``sslkey`` file :func:`_read_driver_file` reads: 1 MiB,
 #: the cap :mod:`messagefoundry.keywrap` puts on a key file (vault BACKLOG #3090, step 8). A CA
 #: bundle is tens or hundreds of KiB, and a client certificate with its key a few KiB. The read
-#: runs on the event loop when the connection is built, so the cap bounds that stall too.
+#: runs when the connection is built, in a worker thread on a serving engine, or on its event
+#: loop when the executor never began the build, so the cap bounds that stall too.
 _MAX_DRIVER_CA_FILE_BYTES = 1 << 20
 #: ``ERROR_INVALID_NAME``: Windows' answer for a path it cannot spell, such as one with a leading
 #: space before the drive letter.
@@ -1200,6 +1381,44 @@ _WINDOWS_INVALID_NAME = 123
 #: ``ERROR_BAD_NETPATH`` and ``ERROR_BAD_NET_NAME``: a share Windows could not reach, which
 #: CPython raises as ``FileNotFoundError`` though a file may be there.
 _WINDOWS_UNREACHABLE = frozenset({53, 67})
+#: The not-found answers at an ``sslcapath`` folder's open that mean no folder is there
+#: (:func:`_capath_folder_clear`): 2 ``ERROR_FILE_NOT_FOUND`` and 3 ``ERROR_PATH_NOT_FOUND``, and
+#: ``None``, a ``FileNotFoundError`` with no ``winerror``, as ENOENT is off Windows.
+_CAPATH_MISSING_WINERRORS = frozenset({None, 2, 3})
+#: The ``stat`` failures of libpq's root certificate that leave it to libpq, by ``errno`` off
+#: Windows: no file is there, or libpq, running as the same identity, cannot ``stat`` it either and
+#: so loads nothing. ENOENT and ENOTDIR: no such file. ENAMETOOLONG: a name the filesystem cannot
+#: hold. ELOOP: a link loop no ``stat`` resolves. EACCES and EPERM: both raise ``PermissionError``,
+#: which :func:`_libpq_cannot_stat_either` leaves off Windows, since libpq, as the same identity,
+#: is denied too; a denial on a Kerberos network mount can still clear once a ticket renews.
+#: Every other failure, at least EIO, ETIMEDOUT, ESTALE, EHOSTDOWN and ENOTCONN on a network
+#: mount, takes the read's handling, which refuses it: libpq stats again at every connect, and may
+#: then load a file the build never checked.
+_LIBPQ_STAT_LEFT_ERRNOS = frozenset(
+    {errno.ENOENT, errno.ENOTDIR, errno.ENAMETOOLONG, errno.ELOOP, errno.EACCES, errno.EPERM}
+)
+#: The same set on Windows, by ``winerror``, since CPython maps every Win32 code it has no errno
+#: for to EINVAL and maps the unreachable-share codes 53 and 67 to ENOENT. With CPython's errno for
+#: each (measured on Windows 11): 2 ``ERROR_FILE_NOT_FOUND``, 3 ``ERROR_PATH_NOT_FOUND``, 15
+#: ``ERROR_INVALID_DRIVE`` and 161 ``ERROR_BAD_PATHNAME`` (ENOENT); 267 ``ERROR_DIRECTORY``
+#: (ENOTDIR, a path through a file); 123 ``ERROR_INVALID_NAME`` (EINVAL); 206
+#: ``ERROR_FILENAME_EXCED_RANGE`` (ENOENT, the ENAMETOOLONG case); 1921
+#: ``ERROR_CANT_RESOLVE_FILENAME`` (EINVAL, the ELOOP case); and 5 ``ERROR_ACCESS_DENIED``
+#: (EACCES), the only Windows ``PermissionError`` left. A network fault Windows reports as one of
+#: these codes is left too, and may clear before a later connect. Every other code takes the read's
+#: handling, which refuses at least 53 and 67 (:data:`_WINDOWS_UNREACHABLE`), 59
+#: ``ERROR_UNEXP_NET_ERR``, 64 ``ERROR_NETNAME_DELETED``, 121 ``ERROR_SEM_TIMEOUT`` and 1231
+#: ``ERROR_NETWORK_UNREACHABLE``, all EINVAL but 53 and 67, and the ``PermissionError`` faults
+#: 21 ``ERROR_NOT_READY``, 23 ``ERROR_CRC``, 31 ``ERROR_GEN_FAILURE``, 32
+#: ``ERROR_SHARING_VIOLATION``, 33 ``ERROR_LOCK_VIOLATION`` and 65 ``ERROR_NETWORK_ACCESS_DENIED``,
+#: on a directory too. This set judges the file's own ``stat``. Before it, the
+#: :func:`names_another_host` walk has refused at least a code other than a missing name met on a
+#: folder in the path, 5, 123 and 1921 among them, so on a folder those are refused, not left.
+_LIBPQ_STAT_LEFT_WINERRORS = frozenset({2, 3, 5, 15, _WINDOWS_INVALID_NAME, 161, 206, 267, 1921})
+
+
+#: What a CA file's read checks it for, as its refusals word it.
+_CA_CHECKED_FOR = "it for an encryption header or a private key"
 
 
 def _refuse_encrypted_driver_ca(
@@ -1235,21 +1454,193 @@ def _refuse_encrypted_driver_ca(
         "sslca",
         connection,
         "CA file",
-        "it for an encryption header or a private key",
+        _CA_CHECKED_FOR,
         leave_unreachable=generic_odbc_tls_off({"dialect": "generic", "odbc_params": named}),
         verdicts=verdicts,
     ):
-        if has_encryption_header_bytes(data):
+        _refuse_ca_content(setting, data, refusing="refusing to hand it over")
+
+
+def _refuse_ca_content(setting: str, data: bytes, *, refusing: str) -> None:
+    """Raise ``ValueError`` when the CA file ``data`` holds an encryption header or a private-key
+    label. The message names ``setting`` and ends with ``refusing``, never the file's content."""
+    if has_encryption_header_bytes(data):
+        raise ValueError(
+            f"{setting}: the CA file {ENCRYPTION_HEADER_SCOPE}. The driver loads it with its "
+            f"own TLS library, which can wait for a password on an encrypted block; {refusing} "
+            "(BACKLOG #3090)"
+        )
+    if has_private_key_label_bytes(data):
+        raise ValueError(
+            f"{setting}: the CA file {PRIVATE_KEY_SCOPE}. A CA file is public trust material, "
+            f"so a private key does not belong in it; {refusing} (BACKLOG #3745)"
+        )
+
+
+#: libpq's root certificate file name under its home directory (``ROOT_CERT_FILE`` in libpq).
+_LIBPQ_ROOT_CERT = "root.crt"
+
+
+def _libpq_root_cert() -> tuple[str, str] | None:
+    """The ``(setting, path)`` of the root certificate libpq reads from the engine's environment
+    when no ``sslrootcert`` is given, which the generic dialect never gives (BACKLOG #3090, step
+    3): ``PGSSLROOTCERT`` when it is set and not empty, else ``root.crt`` in
+    :func:`_libpq_home`. ``None`` for ``system``, libpq 16's name for the platform's own store,
+    which is no file, and when no home directory can be named, where libpq reads no default
+    either. A libpq older than 16 reads ``system`` as a file in its working directory, and that
+    file is not read here."""
+    named = os.environ.get("PGSSLROOTCERT")
+    if named:
+        # Not "DATABASE PGSSLROOTCERT": the log redaction scrubs two adjacent ALL-CAPS tokens.
+        return None if named == "system" else ("libpq root certificate PGSSLROOTCERT", named)
+    home = _libpq_home()
+    if home is None:
+        return None
+    return "libpq's default root certificate", os.path.join(home, _LIBPQ_ROOT_CERT)
+
+
+def _libpq_home() -> str | None:
+    """The directory libpq reads its default files from, found as libpq 15 and later find it:
+    ``postgresql`` in the roaming application-data folder the shell names on Windows, and
+    ``.postgresql`` in ``HOME``, or in the effective user's password-file home when ``HOME`` is
+    unset or empty, elsewhere. libpq 14 and older read the password-file home only. ``None`` when
+    neither can be named, as libpq then reads no default file.
+
+    An empty folder or password-file home still names one: libpq joins it as ``'%s/%s'``, so it
+    reads ``/.postgresql/root.crt``, or ``/postgresql/root.crt`` on Windows (``pqGetHomeDirectory``
+    and ``initialize_SSL`` in libpq 17). Raises ``OSError`` when the Windows shell call cannot be
+    made (:func:`_windows_roaming_appdata`)."""
+    if sys.platform == "win32":
+        appdata = _windows_roaming_appdata()
+        return None if appdata is None else os.path.join(appdata or os.sep, "postgresql")
+    home = os.environ.get("HOME")
+    if not home:
+        import pwd
+
+        try:
+            home = pwd.getpwuid(os.geteuid()).pw_dir
+        except KeyError:
+            return None
+    return os.path.join(home or os.sep, ".postgresql")
+
+
+#: ``CSIDL_APPDATA``: the roaming application-data folder libpq asks the Windows shell for.
+_CSIDL_APPDATA = 0x1A
+
+
+def _windows_roaming_appdata() -> str | None:
+    """``SHGetFolderPathW``'s ``CSIDL_APPDATA`` folder, the call libpq makes, rather than the
+    ``APPDATA`` variable, which a service's environment may not carry. ``None`` when the call
+    reports a failure, as libpq then reads no default file, and possibly empty when it succeeds.
+    Raises ``OSError`` off Windows, and when ``shell32`` or its export cannot be loaded: then the
+    engine cannot say which folder libpq reads, so its caller refuses rather than read nothing."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the application-data folder is read only on Windows")
+    import ctypes
+
+    try:
+        get_folder = ctypes.WinDLL("shell32").SHGetFolderPathW
+    except (OSError, AttributeError) as exc:
+        raise OSError("SHGetFolderPathW could not be loaded from shell32") from exc
+    get_folder.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_wchar_p,
+    ]
+    get_folder.restype = ctypes.c_long
+    buf = ctypes.create_unicode_buffer(260)  # MAX_PATH, the size the call is documented to take
+    if get_folder(None, _CSIDL_APPDATA, None, 0, buf) != 0:
+        return None
+    return buf.value
+
+
+def _refuse_encrypted_libpq_root_cert(
+    named: Mapping[str, Any], *, family: str, connection: str | None = None
+) -> None:
+    """Refuse a psqlODBC connection whose libpq would load a root certificate with an encryption
+    header or a private key (BACKLOG #3090, step 3), as :func:`_refuse_encrypted_driver_ca`
+    refuses an ``sslca``.
+
+    psqlODBC hands libpq no ``sslrootcert``, since the generic dialect refuses that keyword and
+    ``pqopt``, so libpq takes the file :func:`_libpq_root_cert` names. libpq 17's
+    ``initialize_SSL`` loads that file at every TLS attempt whose ``stat`` of it succeeds, whatever
+    the mode, and only a ``verify`` mode fails the connect when the ``stat`` fails. So the check
+    runs for the psqlODBC family whenever ``sslmode`` asks libpq for TLS, erring wide on ``allow``
+    and ``prefer``, which may not go to TLS. It reads nothing when ``sslmode`` is ``disable`` or
+    unset: psqlODBC sends ``disable`` to libpq when no mode is given (``DEFAULT_SSLMODE`` in its
+    ``dlg_specific.h``), and a DSN-less connection reads no registered DSN's mode.
+
+    A path that names another host (:func:`names_another_host`) is refused unread, with
+    ``PGSSLROOTCERT`` as the way out. On Windows that check's walk reads each name of the path
+    before the file is judged. It refuses at least a folder the system could not read or resolve,
+    saying the file could not be read, and a chain of links it will not follow further or a path
+    through a file, saying it must be a plain local path, not a share, a network drive, a link to
+    one, or a path the check cannot read (``docs/CONNECTIONS.md``, Generic ODBC). A ``stat``
+    failure that says no file is there, or that libpq could not ``stat`` it either, is left to
+    libpq (:func:`_libpq_cannot_stat_either`): at least a missing name other than a share Windows
+    could not reach, and off Windows a permission denial. Every other ``stat`` failure is judged
+    as a failed read is, with no second look for a directory, so it is refused unless it says no
+    file is there, since libpq stats again at every connect and may load the file once the fault
+    clears.
+    Past the ``stat``, the path takes :func:`_read_driver_file`'s read,
+    as an ``sslca`` does: a directory is left to libpq, and a file that cannot be opened or read,
+    or one past :data:`_MAX_DRIVER_CA_FILE_BYTES`, is refused, as libpq would fail the connect on
+    a file it cannot load.
+
+    **It reads the environment of the process that builds the connection**, so ``messagefoundry
+    check`` and a dry run judge their own machine's file, not the service's. **It runs when the
+    connection is built, not at each connect**, as the ``sslca`` check does, and the file is no
+    lane anchor: no ACL, change or audit check covers it. Nor is a ``sslrootcert`` read that a
+    libpq service file, or a DSN registered with the driver manager, names."""
+    if (
+        family != "psqlodbc"
+        or "sslmode" not in named
+        or generic_odbc_tls_off({"dialect": "generic", "odbc_params": named})
+    ):
+        return
+    try:
+        found = _libpq_root_cert()
+    except OSError as exc:
+        raise ValueError(
+            f"{hop_name_prefix(connection)}DATABASE libpq's default root certificate: set "
+            "PGSSLROOTCERT to a local path; the folder libpq reads it from could not be named, so "
+            f"it was not read to check {_CA_CHECKED_FOR}"
+        ) from exc
+    if found is None:
+        return
+    source, path = found
+    setting = f"{hop_name_prefix(connection)}DATABASE {source}"
+    what = "root certificate file"
+    unread: dict[str, str] = {}
+    verdicts = file_keyword_verdicts(path, unread)
+    if names_another_host(path, verdicts):
+        cause = unread.get(path.strip())
+        if cause is not None and True not in verdicts.values():
+            # The walk stopped at a name the system could not read, before anything showed the
+            # path leads off the host, so this refusal names the walk's cause, which the general
+            # one below does not.
             raise ValueError(
-                f"{setting}: the CA file {ENCRYPTION_HEADER_SCOPE}. The driver loads it with its "
-                "own TLS library, which can wait for a password on an encrypted block; refusing "
-                "to hand it over (BACKLOG #3090)"
+                f"{setting}: the {what} could not be read to check {_CA_CHECKED_FOR}: {cause}; "
+                "check the path and the folders above it, or set PGSSLROOTCERT to a readable "
+                "local path"
             )
-        if has_private_key_label_bytes(data):
-            raise ValueError(
-                f"{setting}: the CA file {PRIVATE_KEY_SCOPE}. A CA file is public trust material, "
-                "so a private key does not belong in it; refusing to hand it over (BACKLOG #3745)"
-            )
+        # Worded as _refuse_remote_path words it: the walk may have stopped on a local path it
+        # could not finish, so the remedy cannot be only to name a local path. The copy it names
+        # is a trust anchor no ACL check covers, so the remedy says who may write its folder.
+        raise ValueError(
+            f"{setting}: the {what} must be a plain local path on this host: not a share, a "
+            "network drive, a link to one, or a path it cannot read; check the path and the "
+            "folders above it, or point PGSSLROOTCERT at a readable copy in a local folder only "
+            f"administrators and the service account can write. It was not read to check "
+            f"{_CA_CHECKED_FOR}"
+        )
+    data = _read_driver_file(path, setting, what, _CA_CHECKED_FOR, leave_unstatable=True)
+    if data is not None:
+        _refuse_ca_content(
+            setting, data, refusing="refusing to build a connection libpq loads it on"
+        )
 
 
 def _driver_file_spellings(
@@ -1314,6 +1705,7 @@ def _read_driver_file(
     error: type[ValueError] = ValueError,
     leave_irregular: bool = True,
     leave_unreachable: bool = False,
+    leave_unstatable: bool = False,
 ) -> bytes | None:
     """The bytes of one spelling of a file a driver loads, for the engine to check first, or
     ``None`` when the file is left to the driver. ``what`` and ``checked_for`` word a refusal, and
@@ -1329,9 +1721,30 @@ def _read_driver_file(
     (:func:`_names_no_file`), unless ``leave_unreachable`` says the driver will not read the file
     either: then :class:`_UnreachedShare` is raised.
 
+    With ``leave_unstatable``, for a driver that loads a file only once its ``stat`` succeeds, as
+    libpq loads its root certificate, a ``stat`` failure that says no file is there, or that the
+    driver could not ``stat`` it either (:func:`_libpq_cannot_stat_either`), is left to the driver
+    too: at least a missing name other than a share Windows could not reach, and off Windows a
+    permission denial. On Windows the caller's :func:`names_another_host` walk has already refused
+    at least a folder in the path the system could not read, as
+    :func:`_refuse_encrypted_libpq_root_cert` says. Every other ``stat`` failure is judged as a
+    failed read is, with no second look for a directory, so it is refused unless it says no file is
+    there, since the driver stats again at each connect and may then load the file. That costs a
+    second ``stat`` of a path that passes, which :func:`read_if_regular` makes again.
+
     The file is read by :func:`~messagefoundry.auth.trust_anchors.read_if_regular`, which says
     how a device or pipe is judged without being read, or waited on."""
+    stat_failed = False
     try:
+        if leave_unstatable:
+            try:
+                os.stat(path)
+            except OSError as exc:
+                if not _libpq_cannot_stat_either(exc):
+                    stat_failed = True
+                    raise  # judged below as a failed read, with no second look for a directory
+                logger.debug("%s: the driver loads no file it cannot stat, so it is left", setting)
+                return None
         data = read_if_regular(path, _MAX_DRIVER_CA_FILE_BYTES + 1)
     except ValueError:
         # A path os.stat cannot take, such as one holding a NUL: the driver cannot load it either.
@@ -1341,11 +1754,15 @@ def _read_driver_file(
         # read_if_regular returns None for a directory it stats. One swapped in after that stat
         # can fail the open instead, as PermissionError on Windows, so the path is looked at
         # again after that failure alone: on a share Windows could not reach, a second look would
-        # wait out the same network timeout again, on the event loop. A path through a file names
+        # wait out the same network timeout again. A path through a file names
         # no file either. POSIX reports it as NotADirectoryError, which keywrap refused, so sslkey
-        # still does; Windows reports it as a missing name, left to the driver.
+        # still does; Windows reports it as a missing name, left to the driver. A failed stat is
+        # not looked at again: it says nothing of a directory swapped in, and the second look
+        # would wait out the same device or network fault on the event loop.
         if isinstance(exc, NotADirectoryError) or (
-            isinstance(exc, (PermissionError, IsADirectoryError)) and os.path.isdir(path)
+            not stat_failed
+            and isinstance(exc, (PermissionError, IsADirectoryError))
+            and os.path.isdir(path)
         ):
             _irregular(setting, what, checked_for, error, leave_irregular)
             return None
@@ -1387,6 +1804,18 @@ def _names_no_file(exc: OSError) -> bool:
     if isinstance(exc, FileNotFoundError):
         return winerror not in _WINDOWS_UNREACHABLE
     return winerror == _WINDOWS_INVALID_NAME
+
+
+def _libpq_cannot_stat_either(exc: OSError) -> bool:
+    """Whether a failed ``stat`` of libpq's root certificate is left to libpq at once:
+    :data:`_LIBPQ_STAT_LEFT_WINERRORS` by ``winerror`` where Windows set one, so a Windows
+    ``PermissionError`` is left only as ``ERROR_ACCESS_DENIED``; else any ``PermissionError``, or
+    :data:`_LIBPQ_STAT_LEFT_ERRNOS` by ``errno``. Any other failure takes
+    :func:`_read_driver_file`'s handling of a failed read."""
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        return winerror in _LIBPQ_STAT_LEFT_WINERRORS
+    return isinstance(exc, PermissionError) or exc.errno in _LIBPQ_STAT_LEFT_ERRNOS
 
 
 def _irregular(
@@ -1513,18 +1942,8 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
                 "(keywords are case-insensitive); give it once"
             )
         # Before anything reads the value: the remote-path screen reads its str() too.
-        _refuse_none(value, what=f"odbc_params value for '{name}'", connection=connection)
-        if isinstance(value, bool):
-            # str() would send True or False, which no driver is known to spell its own way
-            # (psqlODBC reads SSLmode=True as disable). BACKLOG #2705.
-            raise ValueError(
-                f"{where}DATABASE odbc_params value for '{name}' must not be a boolean; write the "
-                "driver's own spelling as a string"
-            )
+        literal = odbc_param_text(name, value, connection=connection)
         named[name] = value
-        literal = _odbc_literal(
-            value, what=f"odbc_params value for '{name}'", connection=connection
-        )
         if name == "sslmode":
             _refuse_unread_sslmode(literal, family=family, connection=connection)
         parts.append(f"{k}={literal}")
@@ -1534,6 +1953,7 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     _refuse_weak_driver_key(named, connection=connection, verdicts=verdicts)
     _refuse_weak_driver_cert(named, connection=connection, verdicts=verdicts)
     _refuse_encrypted_driver_ca(named, connection=connection, verdicts=verdicts)
+    _refuse_encrypted_libpq_root_cert(named, family=family, connection=connection)
     _warn_generic_tls_unenforced(params, family=family, connection=connection)
     return ";".join(parts) + ";"
 
@@ -2159,7 +2579,42 @@ def _log_sqlstate(exc: BaseException) -> str | None:
     return _sqlstate(exc)
 
 
-def _safe_db_error(exc: BaseException) -> str:
+#: Driver packages whose errors :func:`_raised_by_a_driver` counts though the package has no DB-API
+#: ``apilevel``: asyncpg, the PostgreSQL store's driver, whose handler-failure arm meets it.
+_NON_DBAPI_DRIVERS = frozenset({"asyncpg"})
+
+
+def _raised_by_a_driver(exc: BaseException) -> bool:
+    """Whether ``exc``'s class, or a class it inherits, is a database driver's: from a module, or
+    a package above it, that declares the DB-API 2.0 ``apilevel`` (pyodbc, sqlite3, psycopg and
+    ``mysql.connector``, at least), or from a package named in :data:`_NON_DBAPI_DRIVERS`. A
+    builtin exception a driver raises does not count, though its cause chain is withheld under a
+    driver error that holds it (:func:`_redacted_copy`)."""
+    for kind in type(exc).__mro__:
+        parts = kind.__module__.split(".")
+        if parts[0] in _NON_DBAPI_DRIVERS:
+            return True
+        for depth in range(1, len(parts) + 1):
+            module = sys.modules.get(".".join(parts[:depth]))
+            if getattr(module, "apilevel", None) == "2.0":
+                return True
+    return False
+
+
+#: SQLite's own name for a result code, as ``sqlite3`` sets ``sqlite_errorname``: a fixed word
+#: such as ``SQLITE_CONSTRAINT_UNIQUE``, never a value.
+_SQLITE_ERRORNAME_RE = re.compile(r"SQLITE_[A-Z_]{1,40}")
+
+
+def _withheld(exc: BaseException) -> str:
+    """A driver error with no SQLSTATE: its type, and SQLite's result-code name when it has one,
+    since SQLite has no SQLSTATE and that name is its only PHI-free diagnostic."""
+    name = getattr(exc, "sqlite_errorname", None)
+    code = f" {name}" if isinstance(name, str) and _SQLITE_ERRORNAME_RE.fullmatch(name) else ""
+    return f"{type(exc).__name__} [driver message withheld{code}]"
+
+
+def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
     """A PHI-free rendering of a failure for a LOG line, the log-side twin of
     :func:`_classify_db_error` (BACKLOG #1661).
 
@@ -2168,21 +2623,30 @@ def _safe_db_error(exc: BaseException) -> str:
     Server 2627 text, it keeps ``Cannot insert duplicate key ... The duplicate key value is (4242``
     because ``redact`` sees no HL7 delimiters and no name run, and the 200-character bound cuts the
     identifier in the middle rather than removing it. asyncpg's errors, from a PostgreSQL store,
-    count too: their ``str()`` appends a ``DETAIL`` that quotes the key. Anything else with no
-    SQLSTATE (:func:`_log_sqlstate`) keeps the ``safe_exc`` rendering, which is the more useful text
-    for a bug or an unreachable host. That is a bound, not a guarantee: an error from another driver
-    that quotes a value and carries no SQLSTATE in either place is printed as ``safe_exc`` prints it.
+    count too: their ``str()`` appends a ``DETAIL`` that quotes the key. A driver error with no
+    SQLSTATE (:func:`_raised_by_a_driver`), such as asyncpg's client-side ``DataError``, which quotes
+    the argument it could not encode, renders as its type alone (engine PR 2658, finding 4). Anything
+    else with no SQLSTATE keeps the ``safe_exc`` rendering, which is the more useful text for a bug or
+    an unreachable host, unless ``withhold`` says it is held by a driver error, as a link of its
+    chain (:func:`_redacted_copy`). That is a bound, not a guarantee: an error a driver raises as a
+    builtin type, or wraps in another library's, is printed as ``safe_exc`` prints it.
 
-    A Unicode error, or an exception holding one, always takes ``safe_exc``, so this never prints a
-    codec error's text; ``tests/test_unicode_error_log_paths.py`` counts it among the safe renderers
-    for that reason.
+    Under ``withhold``, only a driver's own error may name a SQLSTATE: any other link renders as
+    its type alone, since ``args[0]`` of five letters or digits may be a value.
+
+    A Unicode error, or a non-driver exception holding one, takes ``safe_exc`` or, under
+    ``withhold``, its type alone, so this never prints a codec error's text;
+    ``tests/test_unicode_error_log_paths.py`` counts it among the safe renderers for that reason.
 
     It never raises. Its callers are error arms and helpers documented never to raise, and an
     exception whose ``__str__`` raises renders as its type and a fixed note instead."""
     try:
+        driver = _raised_by_a_driver(exc)
+        if withhold and not driver:
+            return _withheld(exc)
         state = _log_sqlstate(exc)
         if state is None:
-            return safe_exc(exc)
+            return _withheld(exc) if driver else safe_exc(exc)
         code = _driver_code(str(exc))
     except Exception as failure:  # noqa: BLE001 - see docstring
         return (
@@ -2222,17 +2686,25 @@ def _safe_db_exc_info(exc: BaseException) -> RedactedDbError:
         )
 
 
-def _redacted_copy(exc: BaseException, made: dict[int, RedactedDbError]) -> RedactedDbError:
-    """``exc`` and its chain as :class:`RedactedDbError` copies. ``made`` closes a cycle."""
+def _redacted_copy(
+    exc: BaseException, made: dict[int, RedactedDbError], *, under: bool = False
+) -> RedactedDbError:
+    """``exc`` and its chain as :class:`RedactedDbError` copies. ``made`` closes a cycle.
+
+    Every link under a driver error (:func:`_raised_by_a_driver`) is withheld as one, since a
+    driver raises its own error from the builtin one its codec raised, as asyncpg's client-side
+    ``DataError`` does, and that builtin's message can quote the value too. ``under`` carries that
+    down the chain. A link reached first from outside a driver error keeps that rendering."""
     found = made.get(id(exc))
     if found is not None:
         return found
-    copy = RedactedDbError(_safe_db_error(exc)).with_traceback(exc.__traceback__)
+    copy = RedactedDbError(_safe_db_error(exc, withhold=under)).with_traceback(exc.__traceback__)
     made[id(exc)] = copy
+    below = under or _raised_by_a_driver(exc)
     if exc.__cause__ is not None:
-        copy.__cause__ = _redacted_copy(exc.__cause__, made)
+        copy.__cause__ = _redacted_copy(exc.__cause__, made, under=below)
     if exc.__context__ is not None:
-        copy.__context__ = _redacted_copy(exc.__context__, made)
+        copy.__context__ = _redacted_copy(exc.__context__, made, under=below)
     copy.__suppress_context__ = exc.__suppress_context__  # set last: a cause assignment sets it
     return copy
 
@@ -2699,7 +3171,7 @@ class _AutocommitPool:
         logger.warning(
             "DATABASE: an abandoned borrow's autocommit set did not pass (%s); the connection goes "
             "back unconfirmed and is set again on its next borrow",
-            "not kept" if failure is None else safe_exc(failure),
+            "not kept" if failure is None else _safe_db_error(failure),
         )
         _detach(_return_held(self._pool, conn))
 
@@ -2822,17 +3294,25 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
     waiting for it at a bound (:func:`_close_pool_bounded`). Nothing in the engine bounds that time,
     because this connector sets no statement timeout (ADR 0159, amendment of 2026-10-30).
 
-    **What this does not cover, at least.** A cancellation during ``conn.cursor()`` reaches this
-    function with no cursor, so the connection goes back while that call may still be running. The
-    gate holds the next borrower's calls behind it, and the cursor it makes is left for the
-    collector. A cancellation that lands after a call was handed to the connection's executor but
-    before that call entered the gate finds no call running, so the close is not handed to it: the
-    two race for the gate, the close may run first, and the connection can go back while that call
-    is still to run. A connection with no gate (a test double) closes its cursor beside a running
-    call, as before. A cursor with no raw pyodbc cursor (a test double, or an aioodbc that renamed
-    ``_impl``, which :func:`~messagefoundry.odbc_call_gate.raw_cursor` logs once) is closed through
-    its own ``close()`` as a task, and a teardown cancel of that task keeps the connection out of
-    the pool (:func:`_return_when_settled`).
+    **The cancel paths the gate itself closes (BACKLOG #2394).** A cancellation during
+    ``conn.cursor()`` reaches this function with no cursor. On a gated connection the rollback
+    alone is handed to that call, so the connection goes back only once it has returned, and the
+    gate closes the cursor it made as it returns. A cancellation that lands after a call was handed
+    to the connection's executor but before that call entered the gate leaves a call that never
+    runs (:class:`~messagefoundry.odbc_call_gate.CallGate`), so no close races it. A connection
+    with no gate (one :func:`~messagefoundry.odbc_call_gate.install_call_gate` could not wrap,
+    which it logs at ERROR, or a test double) has nothing to hand a close to, so a cancellation
+    drops its handle and closes nothing: the pool gets it back closed, and pyodbc frees the cursor
+    and then the connection once nothing uses them, since its cursor holds the connection.
+
+    **What this does not cover, at least.** A cursor with no raw pyodbc cursor (a test double, or
+    an aioodbc that renamed ``_impl``, which :func:`~messagefoundry.odbc_call_gate.raw_cursor` logs
+    once) is closed through its own ``close()`` as a task, and a teardown cancel of that task keeps
+    the connection out of the pool (:func:`_return_when_settled`). An ungated connection's
+    unclosed handles are freed where their last reference drops, which can be the event loop, for
+    one through the cancelled call's own result: that free rolls back and disconnects there, the
+    trade for not freeing them under the call. Its session ends only then. A cancellation that lands after a ``cursor()`` call returned on its
+    thread, but before the loop delivered the result, leaves that cursor for the collector.
 
     **``discard`` closes the connection instead of returning it open (BACKLOG #5010).** A caller
     whose own rollback failed passes it, since the transaction may still be open on a live session
@@ -2841,18 +3321,27 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
     handle, and the pool gets the connection back closed (:func:`_release`). Where the executor is
     shut down, no job runs, and the handle is left for pyodbc to close when it is collected."""
     cancelled = _unwinding_a_cancel()
+    gate = call_gate(conn)
+    hand_to_gate = cancelled and gate is not None
+    if cancelled and gate is None and getattr(conn, "_conn", None) is not None:
+        # No gate to hand a close to, so any close here would run beside a call that may still be
+        # running. Drop the handle and close nothing (BACKLOG #2394), with ``discard`` or without.
+        drop_handle(conn)
+        logger.debug("DATABASE: a cancelled borrow on an ungated connection discarded it unclosed")
+        await _release(pool, conn)
+        return
     dropped = drop_handle(conn) if discard else None  # first: no await may come before it
-    if cur is None and dropped is None:
+    if cur is None and dropped is None and not hand_to_gate:
         await _release(pool, conn)
         return
     raw_cur = None if cur is None else raw_cursor(cur)
-    gate = call_gate(conn)
     work: asyncio.Future[Any]
     if raw_cur is not None or cur is None:
         if dropped is not None:
             close = partial(_close_and_discard, raw_cur, dropped)
-        elif cancelled and gate is not None:
+        elif hand_to_gate:
             # Only inside a gate: on an ungated connection a rollback would run beside the statement.
+            # With no cursor the job is the rollback alone, handed to a cursor() call still running.
             close = partial(_close_after_a_cancel, conn, raw_cur)
         else:
             close = partial(_close_raw_cursor, raw_cur)
@@ -2872,14 +3361,18 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
         # The loop holds a task only weakly; keep this one alive until its done-callback has run.
         _DETACHED_SETTLES.add(work)
         work.add_done_callback(_DETACHED_SETTLES.discard)
+    if cur is not None:
+        what = "a cursor close"
+    else:
+        what = "a connection close" if dropped is not None else "a rollback after a cancel"
     if cancelled:
         # The close may be waiting for a cancelled statement; the cancellation must not.
-        _return_when_settled(pool, conn, work, "a cursor close")
+        _return_when_settled(pool, conn, work, what)
         return
     try:
         await asyncio.shield(work)
     except BaseException:
-        _return_when_settled(pool, conn, work, "a cursor close")
+        _return_when_settled(pool, conn, work, what)
         raise
     await _release(pool, conn)
 
@@ -2921,8 +3414,13 @@ def _close_after_a_cancel(conn: Any, raw_cur: Any) -> None:
     retry would write it again. It is dropped and closed here, still inside the gate,
     and the return that follows hands the pool a closed connection, which :func:`_release` wakes
     the pool for. The close need not end the server's session; :func:`_close_dropped` says what
-    that leaves."""
-    _close_raw_cursor(raw_cur)
+    that leaves.
+
+    ``raw_cur`` is ``None`` when the cancellation landed before the borrow had a cursor, during
+    ``conn.cursor()`` included: the job is then the rollback alone, and a cursor that call made is
+    closed by the gate as the call returns (BACKLOG #2394)."""
+    if raw_cur is not None:
+        _close_raw_cursor(raw_cur)
     raw = getattr(conn, "_conn", None)
     if raw is None:
         return
@@ -3093,7 +3591,7 @@ async def _probe_db(
         raise (
             _classify_db_error(state, str(exc))
             if state
-            else DeliveryError(f"DATABASE connect failed: {safe_exc(exc)}")
+            else DeliveryError(f"DATABASE connect failed: {_safe_db_error(exc)}")
         ) from exc
     cur: Any = None
     try:
@@ -3104,7 +3602,7 @@ async def _probe_db(
         raise (
             _classify_db_error(state, str(exc))
             if state
-            else DeliveryError(f"DATABASE probe failed: {safe_exc(exc)}")
+            else DeliveryError(f"DATABASE probe failed: {_safe_db_error(exc)}")
         ) from exc
     finally:
         await _close_and_release(pool, conn, cur)
