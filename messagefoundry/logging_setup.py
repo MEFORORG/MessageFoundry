@@ -475,10 +475,12 @@ def redacted_log_field(
     exception type when a reading or the bound raises, since a log argument must never raise. A
     ``checks`` pair is read only to compare with, never logged, so its text never reaches the
     field. The placeholders the passes write are kept as they are, not escaped, so a search for
-    ``<redacted>`` or ``[redacted]`` finds a value they wrote; a search for redactions also
-    needs :data:`UNREADABLE_LOG_VALUE`, which a limit under 19 cuts.
+    ``<redacted>`` or ``[redacted]`` finds a value they wrote unless the bound cuts it off; a
+    search for redactions also needs :data:`UNREADABLE_LOG_VALUE`, which a limit under 19 cuts,
+    and the ``unloggable-`` spelling.
 
-    The field is :data:`UNREADABLE_LOG_VALUE` when the reading of ``before`` + ``text`` +
+    Apart from a bound under 16, which gives ``unloggable-ValueError``, the field is
+    :data:`UNREADABLE_LOG_VALUE` at least when the reading of ``before`` + ``text`` +
     ``after`` does not keep ``before`` and ``after`` whole at its ends, or when, for a
     ``(head, tail)`` of ``checks``, the reading of ``head`` + ``text`` + ``tail`` does not read as
     ``head``, the value, and the tail either as it was or as written alone. This rule is stated

@@ -1814,10 +1814,11 @@ def test_a_seen_text_that_turns_a_pass_off_blanks_a_path_that_pass_rewrote(seen:
 def test_a_raw_run_beside_another_rewritten_shape_blanks_a_switch_off_path(
     path: str, seen: str
 ) -> None:
-    """RED when: the case ``redacted_log_field`` lists, a path that turns
-    a pass off for its whole line with a seen text holding a raw encoded run beside a tab, a date
-    or a name, stops logging the placeholder (BACKLOG #3770). It fails closed; a change that makes
-    it readable must also change that docstring, and still pass the hides-no-less tests."""
+    """RED when: a path that turns a pass off for its whole line, with a seen text holding a raw
+    encoded run beside a tab, a date or a name, stops logging the placeholder (BACKLOG #3770).
+    ``redacted_log_field`` lists the tab form as an example; the date and name forms are measured
+    here only. It fails closed; a change that makes the tab form readable must also change that
+    docstring, and still pass the hides-no-less tests."""
     assert _new_ip_path_field(path, _bounded_address_text(seen)) == _UNREADABLE_FIELD
     assert _new_ip_path_field(path) != _UNREADABLE_FIELD
 
