@@ -1299,19 +1299,25 @@ def test_a_removed_tree_under_a_plain_parent_still_reads_removed(fx: Fx) -> None
     assert not fx.tree("clean").exists()
 
 
-@pytest.mark.parametrize("case", ["hidden", "bracketed-name", "backtick-root"])
+@pytest.mark.parametrize("case", ["hidden", "bracketed-name", "backtick-root", "bracketed-root"])
 def test_a_session_record_the_registry_read_as_a_pattern_or_skipped_occupies(
     fx: Fx, sleeper: int, case: str
 ) -> None:
     """Vault BACKLOG #2985. The session registry skipped a hidden record, read [1].json as 1.json,
-    and read a root named .claude``x as its sibling .claude`x. This pass has no second listing to
-    catch either, so at 0a7ccdca1c each removed a tree a live session was recorded in. The registry
-    lists with -Force and reads every path literally now."""
+    read a root named .claude``x as its sibling .claude`x, and dropped a root named .claude[1],
+    whose sessions directory it tested as the pattern .claude1\\sessions. This pass has no second
+    listing to catch any of them, so at 0a7ccdca1c each removed a tree a live session was recorded
+    in. The registry lists with -Force and reads every path literally now."""
     tree = fx.tree("clean")
     _session(fx, sleeper, tree, "live1111-0000")
     occupant = fx.sessions / f"{sleeper}.json"
     if case == "hidden":
         subprocess.run(["attrib", "+h", str(occupant)], check=True, capture_output=True)
+    elif case == "bracketed-root":
+        # No .claude1 beside it, so the pattern test finds nothing and the root is dropped.
+        moved = fx.home / ".claude[1]" / "sessions" / "9.json"
+        moved.parent.mkdir(parents=True)
+        occupant = occupant.rename(moved)
     else:
         # A record in a decoy the old read substituted for the occupant's own name.
         dead = {"cwd": str(fx.root), "pid": never_live_pid(), "sessionId": "d", "startedAt": 0}

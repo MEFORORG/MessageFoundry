@@ -91,6 +91,9 @@ function Get-ClaudeConfigRoots {
     [CmdletBinding()]
     param([string[]]$ConfigRoot)
     if ($ConfigRoot) { return @($ConfigRoot | Where-Object { Test-Path -LiteralPath $_ }) }
+    # No profile names no root. -LiteralPath refuses a null path with a throw, where -Path listed
+    # the current directory instead.
+    if (-not $env:USERPROFILE) { return @() }
     return @(
         Get-ChildItem -LiteralPath $env:USERPROFILE -Directory -Filter ".claude*" -Force -EA SilentlyContinue |
             Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "sessions") } |

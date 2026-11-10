@@ -861,8 +861,9 @@ def test_a_wildcard_character_in_the_config_root_refuses(rig: Rig, char: str) ->
 def test_a_hidden_record_is_read_and_occupies_the_target(rig: Rig, attrs: tuple[str, ...]) -> None:
     """Vault BACKLOG #2985. The registry listed records without -Force, so it skipped a hidden one,
     and here only the record-count guard refused. The registry lists with -Force now, so the record
-    is read and placed in the target. The finished-tree removal has no such guard, and its own test
-    below removed the tree before the fix."""
+    is read and placed in the target. prune-merged.ps1 and the finished-tree removal have no such
+    guard, and their tests in tests/test_worktree_prune_merged.py and
+    tests/test_worktree_finished_claude_removal.py removed the tree before the fix."""
     wt = rig.add(rig.scratch("hidden-record"))
     hidden = rig.registry(wt) / ".claude" / "sessions" / "2.json"
     subprocess.run(["attrib", *attrs, str(hidden)], check=True, capture_output=True)
