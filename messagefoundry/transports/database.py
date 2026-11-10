@@ -789,9 +789,9 @@ class _DriverFamily(NamedTuple):
 # rely on. A test on the hosted ``sql server (store + connector)`` leg measures Microsoft's for ODBC
 # Driver 18 on Linux (``msodbcsql18`` under unixODBC):
 # tests/test_sqlserver_store.py::test_microsoft_odbc_driver_reads_the_braced_password_escape.
-# That leg installs whichever ``msodbcsql18`` build apt resolves; selfhosted-win2025-sql.yml, run on
-# demand, runs the same test on Windows. Unmeasured: at least other Driver 18 builds, Windows
-# ``msodbcsql18.dll``, macOS, and every other major the family accepts.
+# That leg installs whichever ``msodbcsql18`` build apt resolves. Unmeasured: at least other Driver
+# 18 builds, Windows ``msodbcsql18.dll``, macOS, every other major the family accepts, and every
+# driver the SQL Server preset accepts outside this family.
 _DRIVER_FAMILIES: dict[str, _DriverFamily] = {
     "psqlodbc": _DriverFamily(
         "sslmode",

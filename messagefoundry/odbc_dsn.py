@@ -34,7 +34,7 @@ def odbc_brace(value: str) -> str:
     The ODBC escape: inside braces a driver that follows it reads ``;``, ``{`` and ``=`` as text,
     and ``}}`` as one ``}``, so an attacker-influenced value cannot end the value early and add a
     keyword. The comment above ``_DRIVER_FAMILIES`` in ``messagefoundry/transports/database.py``
-    says which drivers were measured to read it (BACKLOG #2705)."""
+    says which drivers were measured to read it in a password (BACKLOG #2705)."""
     return "{" + value.replace("}", "}}") + "}"
 
 

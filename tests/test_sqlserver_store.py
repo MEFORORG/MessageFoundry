@@ -7404,14 +7404,15 @@ async def test_microsoft_odbc_driver_reads_the_braced_password_escape() -> None:
     ``TrustServerCertificate=yes`` appended, which its ``odbc_params`` allowlist does not take and
     the container's self-signed certificate needs. The SQL Server preset's (:func:`_build_dsn`)
     sets that keyword here, and the store's (:func:`connection_string`) takes it from the leg's
-    settings; where the two strings match byte for byte one login covers both. They go through aioodbc and pyodbc.
+    settings; where the two strings match byte for byte one login covers both. They go through
+    aioodbc and pyodbc.
 
     A driver that ended a braced value at its first ``}`` or its first ``};``, or did not turn
-    ``}}`` into ``}``, would send another password, and the login would be refused. The control
-    shows a refusal is what a wrong password gets here: the same escaped shape with only its head
-    changed is refused with SQLSTATE 28000. No
-    assertion expression or message holds the password, since pytest prints the parts of a
-    failed assert, and only a refusal's SQLSTATE is kept, never the driver's message."""
+    ``}}`` into ``}``, would send another password or a malformed string, and would not log in.
+    The control shows a refusal is what a wrong password gets here: the same escaped shape with
+    only its head changed is refused with SQLSTATE 28000. No assertion expression or message holds
+    the password, since pytest prints the parts of a failed assert, and only a refusal's SQLSTATE
+    is kept, never the driver's message."""
     import secrets
 
     import aioodbc
