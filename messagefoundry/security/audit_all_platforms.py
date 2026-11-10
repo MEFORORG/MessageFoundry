@@ -537,12 +537,6 @@ def _skip_private_refusal(private: Collection[str], pip_audit_args: Sequence[str
     )
 
 
-def _starts_pass_environment(arg: str) -> bool:
-    """Whether ``arg``, up to any ``=``, starts with ``--pas``: the flag, its ``=`` form, an
-    abbreviation of it, or a misspelling past those letters."""
-    return arg.partition("=")[0].startswith("--pas")
-
-
 def _pass_environment_refusal(names: Sequence[str], pip_audit_args: Sequence[str]) -> str | None:
     """Why a ``--pass-environment`` request is refused, or ``None``.
 
@@ -551,7 +545,7 @@ def _pass_environment_refusal(names: Sequence[str], pip_audit_args: Sequence[str
     error prints it, and ``--pass-environment=NAME=value`` typed by mistake would carry the value
     into a CI log. A pip-audit option that started with ``--pas`` would be refused too. The text
     echoes none of it."""
-    if any(_starts_pass_environment(arg) for arg in pip_audit_args):
+    if any(arg.partition("=")[0].startswith("--pas") for arg in pip_audit_args):
         return "--pass-environment goes before the lock, not after it"
     refusals = (pass_environment_refusal(name) for name in names)
     first = next((refusal for refusal in refusals if refusal), None)

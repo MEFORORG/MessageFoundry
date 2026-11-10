@@ -91,9 +91,10 @@ _BOOTSTRAP: Final = str(Path(__file__).resolve().parent / "_child_bootstrap.py")
 #: starts, where it imports from, or how the same code behaves (encoding, hash seed, warnings), so
 #: a child started without one the parent has would run the same Handler differently from
 #: ``[sandbox].mode = "off"``. Named one by one, not by the ``PYTHON`` prefix: an operator's own
-#: variable can start with those letters. The ones that hand control to a console or a debugger
-#: (``PYTHONSTARTUP``, ``PYTHONINSPECT``, ``PYTHONBREAKPOINT``) are left out on purpose. A variable
-#: a later interpreter adds is not here until somebody adds it.
+#: variable can start with those letters. ``PYTHONSTARTUP``, ``PYTHONINSPECT`` and
+#: ``PYTHONBREAKPOINT`` are left out on purpose; :data:`_INTERPRETER_CONTROL_NAMES` says which of
+#: them may still be named, and why. A variable a later interpreter adds is not here until somebody
+#: adds it.
 _INTERPRETER_NAMES: Final = frozenset(
     {
         "PYTHONHOME",
@@ -279,9 +280,9 @@ def pass_environment_refusal(name: str) -> str | None:
     """Why ``name`` may not be named as an extra variable for a child, or ``None``: the rule for the
     dependency auditor's ``--pass-environment`` and for the ``[sandbox]`` and ``[dr]``
     ``pass_environment`` settings. Refused: an entry that is not a variable name, a name of the
-    engine's namespace (:func:`outside_engine_namespace`), and an interpreter variable that hands
-    control to a console (:data:`_INTERPRETER_CONTROL_NAMES`). The text never echoes an entry that is not a name, since ``NAME=value`` typed by
-    mistake would carry the value (vault BACKLOG #2600)."""
+    engine's namespace (:func:`outside_engine_namespace`), and a name in
+    :data:`_INTERPRETER_CONTROL_NAMES`. The text never echoes an entry that is not a name, since
+    ``NAME=value`` typed by mistake would carry the value (vault BACKLOG #2600)."""
     if not (name.isascii() and name.isidentifier()):
         return "an entry is not an environment variable name; list names only, never NAME=value"
     if not outside_engine_namespace(name):

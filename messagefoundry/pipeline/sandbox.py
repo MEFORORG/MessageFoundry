@@ -742,6 +742,24 @@ class SandboxSession:
             raise SandboxWorkerRefused(
                 self._refused[1], first=False, content_only=self._refused[2], graph=engine_graph
             )
+        # NAMED, not inherited: an allowlist, so the engine's secrets are not in the child's
+        # environment (vault BACKLOG #2587). No engine variable crosses. The config-source escape
+        # and the enforcement dial that unlocks it (vault BACKLOG #2599) used to, because the child
+        # ran ``load_config`` on the directory itself. Since vault BACKLOG #2596 the parent makes
+        # that decision when it reads the snapshot, the boot frame carries the bytes it vetted, and
+        # the child runs no trust check of its own, so nothing in it reads either. The operator's
+        # ``[sandbox].pass_environment`` names cross.
+        # At most one glibc malloc arena besides the main one, where the worker's memory cap is
+        # RLIMIT_DATA. An arena keeps its peak writable size counted in VmData after its threads
+        # exit, so with one per thread, the threads a Handler starts would spend [sandbox].mem_mb
+        # for the worker's whole life (vault BACKLOG #3133 part 2). Ignored by other allocators. An
+        # operator's own value, named in pass_environment, wins. Passed to the builder rather than
+        # set on its result, which the spawn guard trusts only unwritten (vault BACKLOG #2724).
+        arena = (
+            {"MALLOC_ARENA_MAX": "2"}
+            if self.policy.mem_mb is not None and sys.platform.startswith("linux")
+            else {}
+        )
         # The boot frame and the environment are built BEFORE the child exists, so a snapshot that
         # cannot be read (a session given none reads its directory here), a frame that cannot be
         # encoded, or a pass_environment name the builder refuses leaves no live child, job handle
@@ -753,24 +771,6 @@ class SandboxSession:
                 mem_mb=self.policy.mem_mb,
                 code_sets=self._code_sets,
                 broker=self.policy.mode is SandboxMode.ISOLATED,
-            )
-            # NAMED, not inherited: an allowlist, so the engine's secrets are not in the child's
-            # environment (vault BACKLOG #2587). No engine variable crosses. The config-source escape
-            # and the enforcement dial that unlocks it (vault BACKLOG #2599) used to, because the child
-            # ran ``load_config`` on the directory itself. Since vault BACKLOG #2596 the parent makes
-            # that decision when it reads the snapshot, the boot frame carries the bytes it vetted, and
-            # the child runs no trust check of its own, so nothing in it reads either. The operator's
-            # ``[sandbox].pass_environment`` names cross.
-            # At most one glibc malloc arena besides the main one, where the worker's memory cap is
-            # RLIMIT_DATA. An arena keeps its peak writable size counted in VmData after its threads
-            # exit, so with one per thread, the threads a Handler starts would spend [sandbox].mem_mb
-            # for the worker's whole life (vault BACKLOG #3133 part 2). Ignored by other allocators. An
-            # operator's own value, named in pass_environment, wins. Passed to the builder rather than
-            # set on its result, which the spawn guard trusts only unwritten (vault BACKLOG #2724).
-            arena = (
-                {"MALLOC_ARENA_MAX": "2"}
-                if self.policy.mem_mb is not None and sys.platform.startswith("linux")
-                else {}
             )
             env = worker_environment(extra_names=self.policy.pass_environment, defaults=arena)
         except (OSError, ValueError, SandboxError) as exc:  # WiringError is a ValueError
