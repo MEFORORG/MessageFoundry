@@ -188,13 +188,11 @@ expects:
 - a size and a segment count inside the caps `enforce_size_limits` applies;
 - escape sequences that cannot expand past the budget `enforce_expansion_budget` applies.
 
-The separators come from the message's own `MSH` segment. They are never assumed. A body that fails
+The separators come from the message's own `MSH` segment. A body that fails
 gets an `ERROR` row and, on a replying inbound, a negative acknowledgment.
 
 **Tier 2 is opt-in per inbound.** It checks the message structure against the HL7 version.
-HL7-VALIDATION.md lists what that covers. It does not check field content.
-
-**The parser gives every field one structure, and it never refuses a field for breaking it.**
+HL7-VALIDATION.md lists what that covers.
 
 - The separators are the message's own, read from `MSH-1` and `MSH-2` by `_extract_separators` in
   [`parsing/_builtin_hl7.py`](../messagefoundry/parsing/_builtin_hl7.py). A missing encoding
@@ -204,10 +202,8 @@ HL7-VALIDATION.md lists what that covers. It does not check field content.
 - When your code reads a value, `unescape` decodes it. `\F\`, `\S\`, `\R\`, `\T\` and `\E\` become
   the message's own delimiters, and `\Xhh\` is read as hex. A sequence it cannot map is dropped from
   the value, not refused.
-- Inside a field, ingress does not check that an escape sequence is known.
 
-**The engine defines no rule for what a field's value means.** Checking it is the job of your Router
-or Handler. Two tools exist for that:
+Two tools exist for checking a field's value in your Router or Handler:
 
 - the consistency primitives in
   [`parsing/consistency.py`](../messagefoundry/parsing/consistency.py), described under Tier 3 in
@@ -261,7 +257,7 @@ model you supply adds its own.
 | `content_type` | Structure | Symbol |
 |---|---|---|
 | `json` | Any JSON text Python's `json.loads` accepts. A repeated key is not refused: the last value wins. `NaN` and `Infinity` are accepted. No depth or size limit applies beyond the ingress size limit; a body nested too deeply raises a `JSONDecodeError`. | `RawMessage.json` in `parsing/message.py` |
-| `fhir` | A JSON object, never a scalar or an array. `FhirPeek` refuses an XML body and a key repeated anywhere in the body. `FhirResource` then needs a known `resourceType` and checks the resource against its model. | `FhirPeek.parse` and `FhirResource.parse` in `parsing/fhir/` |
+| `fhir` | A JSON object, never a scalar or an array. `FhirPeek` refuses an XML body and a key repeated anywhere in the body. `FhirResource` needs a known `resourceType` and checks the resource against its model. | `FhirPeek.parse` and `FhirResource.parse` in `parsing/fhir/` |
 | `xml` | Well-formed XML with no `DOCTYPE`. `RawMessage.xml()` also refuses entity declarations and external references. The hardened parser resolves no entity, loads no DTD and fetches nothing over the network. A schema you pass to `validate_against` is loaded from local sources only. | `RawMessage.xml`; `hardened_parser` and `parse_bytes` in `parsing/xml/harden.py`; `validate_against` in `parsing/xml/schema.py` |
 | `x12` | A body that opens with `ISA`, with a full 106-character `ISA` header. The element separator must sit at every position the header fixes, and the delimiters must all differ. | `find_isa_start` and `discover_delimiters` in `parsing/x12/delimiters.py` |
 | `dicom` | A DICOM Part 10 object: the preamble, `DICM`, then a dataset `pydicom` can read. A deflated object is held to an inflate limit. | `DicomPeek.parse` and `DicomDataset.parse` in `parsing/dicom/` |
@@ -284,7 +280,7 @@ need and the engine does not enforce is written in your Handler, as
 
 | Payload | Rules the engine checks over two or more items | Where |
 |---|---|---|
-| HL7 v2 | At ingress, both listeners refuse a body that holds the document handle marker where a delimiter is a base64 character or the delimiters cannot be read. Strict validation refuses an encoding character that repeats. On a streaming inbound that detaches a document, the detach refuses a body that raises `UnreadableDelimitersError`, `Base64DelimiterError`, `EscapedDocumentError`, `NonVerbatimDocumentError` or `InboundDocRefError`. The opt-in primitives `same_across` and `dates_in_order` compare fields and return the violations; they refuse nothing. HL7-VALIDATION.md, Tier 3, describes them. `extract_obx_document` reads an embedded document only when `OBX-2` is `ED` and `OBX-5.4` is `Base64`. | `doc_ref_marker_refusal` in `pipeline/ingress_guards.py`; `validate` in `parsing/validate.py`; `iter_obx_documents` and `parsing/consistency.py`; `parsing/binary.py` |
+| HL7 v2 | At ingress, both listeners refuse a body that holds the document handle marker where a delimiter is a base64 character or the delimiters cannot be read. On a streaming inbound, the detach refuses what `_DETACH_REFUSALS` lists. | `doc_ref_marker_refusal` in `pipeline/ingress_guards.py`; `_DETACH_REFUSALS` in `pipeline/wiring_runner.py` |
 | `json` | None. | |
 | `text` | None. | |
 | `binary` | None. | |
