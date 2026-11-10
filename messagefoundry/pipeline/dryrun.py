@@ -954,12 +954,6 @@ def _dry_run_raw(
     )
 
 
-# The (MSH-9, MSH-12) pairs this process has warmed strict validation for. hl7apy's structure
-# follows from them, and everything the warm-up fills is cached per process or per structure, so
-# warming a pair again would buy only a second parse (BACKLOG #5107).
-_warmed: set[tuple[str | None, str | None]] = set()
-
-
 class _StrictRefusal(NamedTuple):
     """A strict-validation refusal: the listener's text, and whether it is the timeout."""
 
@@ -967,7 +961,7 @@ class _StrictRefusal(NamedTuple):
     timed_out: bool
 
 
-def _strict_validation_error(text: str, ic: InboundConnection, peek: Peek) -> _StrictRefusal | None:
+def _strict_validation_error(text: str, ic: InboundConnection) -> _StrictRefusal | None:
     """Strict-validate ``text`` under the listener's timeout; the refusal, or ``None`` if valid.
 
     The listener bounds the validate with ``asyncio.wait_for`` over ``asyncio.to_thread`` and refuses
@@ -990,17 +984,15 @@ def _strict_validation_error(text: str, ic: InboundConnection, peek: Peek) -> _S
     fired; the preview validates one message at a time and does not model that. Nor does it model
     the listener's late-result recovery: a validate that began before the deadline and finished
     after it, but before the listener handled the timeout, is used there as if it had not timed out,
-    while a dry run reports any validate past the timeout as timed out. Below the timeout the
-    verdict matches; the wall clock, the concurrency and that boundary case do not.
-
-    The clock starts after :func:`~messagefoundry.parsing.validate.warm_validation`, run the first
-    time each MSH-9 and MSH-12 pair is validated, so a verdict never counts the process's cold ``hl7apy`` import, its choice-group probe or the structure's
-    reference load (BACKLOG #5107). The listener's clock still counts them on its first validate;
-    it is not changed here."""
+    while a dry run reports any validate past the timeout as timed out. And the preview's clock
+    starts after :func:`~messagefoundry.parsing.validate.warm_validation`, so it never counts the
+    process's cold ``hl7apy`` import, its choice-group probe, the version's library or the
+    structure's reference load (BACKLOG #5107), where the listener's clock counts them on the first
+    validate of each after a start. Below the timeout the verdict matches; the wall clock, the
+    concurrency, that boundary case and a listener's first validate do not."""
     timeout = strict_validate_timeout(ic)
-    if timeout is not None and (key := (peek.message_type, peek.version)) not in _warmed:
+    if timeout is not None:
         warm_validation(text)
-        _warmed.add(key)
     started = time.monotonic()
     fault: Exception | None = None
     try:
@@ -1112,7 +1104,7 @@ def dry_run(
     # threshold, so the preview never times a whole-body validate the engine does not run.
     if (
         strict_validation_due(ic, text)
-        and (refused := _strict_validation_error(text, ic, peek)) is not None
+        and (refused := _strict_validation_error(text, ic)) is not None
     ):
         return DryRunResult(
             inbound=ic.name,

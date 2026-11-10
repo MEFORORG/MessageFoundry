@@ -1960,7 +1960,7 @@ def _check_dryrun(
                     # kind only: the timeout text carries no message content.
                     errors.append(
                         f"{label} @ {ic_name}: expected {expected}, got a strict-validation "
-                        "timeout, which does not show the message is refused"
+                        "timeout, which does not show the content is invalid"
                     )
             elif result.error or result.disposition is MessageStatus.ERROR:
                 shown = safe_error(result.error) or result.disposition.value
