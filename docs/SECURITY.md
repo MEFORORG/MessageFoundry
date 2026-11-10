@@ -1250,31 +1250,29 @@ about the token, because a fix is usually a new token: so engine processes that 
 share each hop's alert, and a clean start by one can resolve a warning another raised on a
 different token.
 
-**When a clean start resolves the warning.** This is the one statement of these conditions, and
-other pages link here. A clean start resolves the open warning only when, at least, its process
-has an `[alerts]` notifier (the logging sink a process without one gets resolves nothing), it
-probes that hop and reads it clean, and the warning's newest raise is one the fenced auto-resolve
-speaks for ([ADR 0044, the vault BACKLOG #4916
-amendment](adr/0044-operator-alert-state.md#amendment-2026-11-09----an-auto-resolve-is-fenced-to-the-raises-it-speaks-for-backlog-4916)).
-The fence reads the open alert once and every retry reuses that snapshot; it reads afresh only
-after the snapshot read itself failed. The read starts when the resolve's task first runs, before
-it queues on the alert's lock, but it can execute later: a loop turn later at best, and on a server
-store as late as its bounded borrow wait. So a raise from another process that lands after the
-snapshot read executed keeps the warning open, and one that lands before it, even after the clean
-start emitted its resolve, is closed. A
-resolve can also fail every retry, and then logs an ERROR starting `alert-instance resolve gave up`.
+**When a clean start resolves the warning.** Other pages link here for this. A clean start can
+leave another process's warning open. At least these do that: the start's process has no
+`[alerts]` notifier (the logging sink it then gets resolves nothing); it does not probe that hop,
+or does not read it clean; the warning's newest raise is one the fenced auto-resolve does not
+speak for ([ADR 0044, the vault BACKLOG #4916 amendment](adr/0044-operator-alert-state.md#amendment-2026-11-09----an-auto-resolve-is-fenced-to-the-raises-it-speaks-for-backlog-4916), which states how the fence
+behaves); and the resolve fails every attempt or is cancelled before it lands.
 
-**A warning still open after a clean start may be a live finding:** another engine process on the
-same store still running on an over-granted or unread token. Before you resolve it by hand, rule
-out at least the two local causes: an ERROR `alert-instance resolve gave up` line in the clean
-start's log, and a clean start with no `[alerts]` notifier. Then find the process. Cluster nodes on
-separate hosts each write their own log, where a start's finding is a WARNING starting
-`vault privilege preflight: <hop> <state>`, so read each node's own log. Engine shards share one log, and neither that line nor the audit row's detail
-names the process that wrote it, so for them check the Vault token each engine process is
-configured with. Fix an over-granted token. For an unread one, fix whatever kept its grants from
-being read, which may be reachability or the probe paths rather than the token. Then restart that
-process, since the check runs only at start. The log line and the audit row of every start stay
-the record.
+**Treat a warning still open after a clean start as a live finding until you have checked it:**
+another engine process on the same store may still be running on an over-granted or unread token.
+To check, at least:
+
+- Read the clean start's own log. `alert-instance resolve for ... closed nothing` (INFO or
+  WARNING) means the fence kept it open; an ERROR starting `alert-instance resolve gave up` or
+  `alert-instance resolve was cancelled before it landed` means the resolve did not land.
+- Check that the clean start's process has an `[alerts]` notifier.
+- Read each node's own log, where cluster nodes run on separate hosts: a start's finding is a
+  WARNING starting `vault privilege preflight: <hop> <state>`. Engine shards share one log, and
+  neither that line nor the audit row's detail names the process that wrote it.
+- The check runs only at start, so a token fixed since a process started is judged only at that
+  process's next start. Restart it after you fix the token, or, for an unread one, whatever kept
+  its grants from being read, which may be reachability or the probe paths rather than the token.
+
+The log line and the audit row of every start stay the record.
 
 ### Data-layer hops refuse cleartext on their defaults (ASVS 12.3.1 census)
 

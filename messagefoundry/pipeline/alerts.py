@@ -918,10 +918,8 @@ class AlertSink(Protocol):
     def store_privilege_clean(self, name: str) -> None:
         """The INVERSE of :meth:`store_privilege_warning`: a start whose preflight OBSERVED a clean
         store principal. No page; when alert-state is wired (ADR 0044) it auto-resolves the open
-        warning for the same subject, so a fixed grant clears the dashboard. The resolve is fenced
-        (ADR 0044, the vault BACKLOG #4916 amendment): a warning another process raised that lands
-        after the fence's snapshot read stays open, and may be a live finding. ``docs/SECURITY.md``
-        (*When a clean start resolves the warning*) says when that read runs."""
+        warning for the same subject, so a fixed grant clears the dashboard, fenced as the ADR 0044
+        BACKLOG #4916 amendment states, so a warning another process raised may stay open."""
         ...
 
     def vault_privilege_warning(
@@ -943,8 +941,8 @@ class AlertSink(Protocol):
     def vault_privilege_clean(self, name: str) -> None:
         """The INVERSE of :meth:`vault_privilege_warning`: a start whose preflight read a Vault
         token and found it clean. No page; when alert-state is wired (ADR 0044) it auto-resolves
-        the open warning for the same subject, so a fixed token clears the dashboard, under the
-        conditions ``docs/SECURITY.md`` states once (*When a clean start resolves the warning*)."""
+        the open warning for the same subject, so a fixed token clears the dashboard; when it does
+        not is ``docs/SECURITY.md``'s *When a clean start resolves the warning*."""
         ...
 
     def config_changed(

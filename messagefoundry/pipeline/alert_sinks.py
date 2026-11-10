@@ -186,28 +186,11 @@ class _ResolveFence:
     newer raise. A ``last_seen <= now`` guard was refuted (decision d20261030T211551515-1de84e):
     under cross-node clock skew it leaves an alert open for good. The fence compares no clock.
 
-    Each raise stamps the instance with its writer's random id (``raised_by``). :meth:`begin` runs
-    at the write task's first step, before the task queues on the key's lock, and reads the key's
-    live ``(id, count)`` (the snapshot). The resolve then closes the instance only if its newest
-    raise is this writer's own, which covers #2272 defect 8's raise emitted before this clear, or
-    if it has taken no raise past the snapshot. A raise from another process that landed after the
-    snapshot read, and is still the newest, keeps the instance open. That raise's own process
-    clears it later through its own id, so two processes that raise and clear the same key at once
-    cannot both leave it open. If that process dies, or never clears, the instance stays open
-    for an operator to resolve (an ``intake_paused`` one of another process is also expired by
-    that monitor's sweep): a false open is the safe side, where the unfenced resolve gave a false
-    clear. The snapshot is taken when the read runs, after the clear was emitted: one loop turn
-    later at best, and on a server store as late as its bounded borrow wait. A raise from another
-    process in that gap is closed, as before the fence.
-
-    With ``verdict`` set, a resolve that closes nothing re-reads the key, and if a live instance
-    remains, :attr:`superseded` is set and the write is settled as not landed, with no retry, since
-    a retry cannot help. The re-read is a second statement, so a raise landing between the two can
-    mark a clear that had nothing to close as superseded; its caller then keeps what it would
-    have cleared, which is the safe side. If the snapshot read fails, that attempt fails as a
-    store error would, and a new read starts for the next attempt, which runs under the key's
-    lock; a resolve whose every read fails gives up as any failed resolve does. Only a store
-    without the fence methods resolves unfenced."""
+    Each raise stamps the instance with its writer's random id (``raised_by``), and the resolve
+    closes only what that id and a snapshot of the key allow. ``docs/adr/0044-operator-alert-state.md``,
+    the BACKLOG #4916 amendment, is the one statement of how it behaves: what the snapshot is, when
+    its read starts and runs, what a retry reuses, the verdict re-read, and how a resolve fails.
+    Only a store without the fence methods resolves unfenced."""
 
     def __init__(
         self,

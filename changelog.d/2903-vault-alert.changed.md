@@ -2,6 +2,6 @@
   start.** The Vault privilege preflight already logged and audited each finding. It now also fires
   the alert through the configured notifier, keyed on `vault:store` or `vault:secrets`, before any
   refusal, so a refused start still pages. An alert rule can match the new event type, and a later
-  start that reads that hop's token clean can resolve the open alert, under the conditions
-  `docs/SECURITY.md` names beside the `vault_privilege_clean` event. ADR 0216 Amendment A says what
+  start that reads that hop's token clean can resolve the open alert; `docs/SECURITY.md`, *When a
+  clean start resolves the warning*, says when it does not. ADR 0216 Amendment A says what
   the payload holds. (`BACKLOG #2903`)
