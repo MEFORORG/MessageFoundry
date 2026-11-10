@@ -211,6 +211,30 @@ def test_an_external_provider_that_returns_no_key_fails_closed(
 
 
 @pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(ImportError("DLL load failed"), id="broken-c-extension"),
+        pytest.param(ImportError("cannot import name 'Client' from 'sdk'"), id="missing-symbol"),
+    ],
+)
+def test_an_external_provider_whose_backend_import_breaks_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, error: ImportError
+) -> None:
+    # Vault BACKLOG #6709: an SDK that is installed but broken raises a plain ImportError, not
+    # ModuleNotFoundError. It must leave as the KeyProviderError every caller words a refusal
+    # around, chained to the original, never as a raw ImportError.
+    def _import(_name: str) -> ModuleType:
+        raise error
+
+    monkeypatch.setattr("messagefoundry.store.keyprovider.importlib.import_module", _import)
+    with pytest.raises(KeyProviderError, match="could not load its backend") as caught:
+        resolve_key_provider(StoreSettings(key_provider="vault"))
+    assert caught.value.__cause__ is error
+    with pytest.raises(KeyProviderError):
+        resolve_active_key(StoreSettings(key_provider="vault"))
+
+
+@pytest.mark.parametrize(
     "settings",
     [
         pytest.param(

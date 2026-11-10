@@ -299,6 +299,14 @@ def _load_external_provider(
             f"[store].key_provider={name!r} could not load its backend ({exc.name!r} is missing) — "
             f"install the optional {extra!r} extra."
         ) from exc
+    except ImportError as exc:
+        # Present but broken: a C extension that fails to load, or a name its SDK no longer has.
+        # A raw ImportError would escape every caller that words a KeyProviderError refusal, so it
+        # fails closed the same way, chained for the traceback (vault BACKLOG #6709).
+        raise KeyProviderError(
+            f"[store].key_provider={name!r} could not load its backend (an import failed: "
+            f"{type(exc).__name__}) — reinstall the optional {extra!r} extra."
+        ) from exc
     # The provider module owns its own construction; annotate the local so mypy keeps the contract.
     provider: KeyProvider = module.build_provider(settings, posture=posture)
     return provider
