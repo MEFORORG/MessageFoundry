@@ -13,6 +13,7 @@ const STAMPED = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z) (INFO|WARNING|ER
 /** Every write that reached the channel, and the options it was created with. */
 let writes: string[] = [];
 let created: { name: string; options: unknown }[] = [];
+let shown: (boolean | undefined)[] = [];
 
 const vscodeStub = {
   window: {
@@ -22,7 +23,7 @@ const vscodeStub = {
       created.push({ name, options });
       return {
         appendLine: (text: string): void => void writes.push(text),
-        show: (): void => {},
+        show: (preserveFocus?: boolean): void => void shown.push(preserveFocus),
         dispose: (): void => {},
       };
     },
@@ -81,6 +82,7 @@ channelSuite("engineLog: what reaches the MessageFoundry Engine channel", () => 
     el.disposeEngineLog();
     writes = [];
     created = [];
+    shown = [];
   });
 
   teardown(() => el.disposeEngineLog());
@@ -129,16 +131,22 @@ channelSuite("engineLog: what reaches the MessageFoundry Engine channel", () => 
   test("the other controls a reader may split or reorder on are escaped, and tab is kept", () => {
     const forged = "2026-01-02T03:04:05.678Z INFO x";
     el.engineLog().info(
-      `a\u0085${forged}\u2029b\u000bc\u000cd\u001ce\u001ef\u0000g\u001bh\u007fi\u202ej\u2066k\tl`,
+      `a\u0085${forged}\u2029b\u000bc\u000cd\u001ce\u001ef\u0000g\u001bh\u007fi\u202ej\u2066k\u061cm\tl`,
     );
     const written = writes.flatMap((w) => w.split(/\r\n|[\n\v\f\r\x1c-\x1e\x85\u2028\u2029]/));
     assert.strictEqual(written.length, 1, JSON.stringify(written));
     assert.ok(
       written[0].endsWith(
-        `INFO a\\u0085${forged}\\u2029b\\u000bc\\u000cd\\u001ce\\u001ef\\u0000g\\u001bh\\u007fi\\u202ej\\u2066k\tl`,
+        `INFO a\\u0085${forged}\\u2029b\\u000bc\\u000cd\\u001ce\\u001ef\\u0000g\\u001bh\\u007fi\\u202ej\\u2066k\\u061cm\tl`,
       ),
       written[0],
     );
+  });
+
+  test("Show the Engine Log reveals the channel without taking focus", () => {
+    el.showEngineLog();
+    assert.deepStrictEqual(shown, [true]);
+    assert.deepStrictEqual(created, [{ name: "MessageFoundry Engine", options: "log" }]);
   });
 
   test("the probe, state and action lines are stamped, and a refused route is a visible ERROR", () => {

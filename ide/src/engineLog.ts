@@ -42,28 +42,43 @@ const out = (): vscode.OutputChannel =>
 
 /** One record is one line. A message can carry text this extension did not write, such as an
  *  error's message, so a line break in it is written as an escape. Left raw, it would start a line
- *  that carries a real stamp and level word, and reads as a record of its own (CWE-117). The other
- *  C0 and C1 controls but tab, DEL, and the bidi controls are escaped too: a reader of the editor's
- *  copy may split lines on VT, FF or FS to RS (Python's `splitlines` does), and a bidi override can
- *  reorder the rest of the line as shown. */
-const ESCAPED = /[\u0000-\u0008\u000a-\u001f\u007f-\u009f\u200e\u200f\u2028-\u202e\u2066-\u2069]/g;
-const ESCAPES = new Map<string, string>();
-for (const [first, last] of [
+ *  that carries a real stamp and level word, and reads as a record of its own (CWE-117).
+ *
+ *  Tab is kept. CR and LF are written as `\r` and `\n`. Every other C0 and C1 control, DEL, U+2028,
+ *  U+2029 and the Unicode bidi controls (U+061C, U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069)
+ *  are written as `\uXXXX`: a reader of the editor's copy may split lines on VT, FF or FS to RS
+ *  (Python's `splitlines` does), and a bidi control can reorder the rest of the line as shown. A
+ *  backslash is not escaped, so a literal `\n` in a message, such as in a Windows path, reads the
+ *  same as an escaped line break. The regex and the map are both built from ESCAPED_RANGES, so every
+ *  character the regex matches has an entry. */
+const ESCAPED_RANGES: readonly (readonly [number, number])[] = [
   [0x00, 0x08],
   [0x0a, 0x1f],
   [0x7f, 0x9f],
+  [0x061c, 0x061c],
   [0x200e, 0x200f],
   [0x2028, 0x202e],
   [0x2066, 0x2069],
-]) {
+];
+const hex4 = (code: number): string => code.toString(16).padStart(4, "0");
+const ESCAPED = new RegExp(
+  `[${ESCAPED_RANGES.map(([first, last]) => `\\u${hex4(first)}-\\u${hex4(last)}`).join("")}]`,
+  "g",
+);
+const ESCAPES = new Map<string, string>([
+  ["\r", "\\r"],
+  ["\n", "\\n"],
+]);
+for (const [first, last] of ESCAPED_RANGES) {
   for (let code = first; code <= last; code++) {
-    ESCAPES.set(String.fromCharCode(code), `\\u${code.toString(16).padStart(4, "0")}`);
+    const c = String.fromCharCode(code);
+    if (!ESCAPES.has(c)) {
+      ESCAPES.set(c, `\\u${hex4(code)}`);
+    }
   }
 }
-ESCAPES.set("\r", "\\r");
-ESCAPES.set("\n", "\\n");
 function oneLine(message: string): string {
-  return message.replace(ESCAPED, (c) => ESCAPES.get(c) ?? c);
+  return message.replace(ESCAPED, (c) => ESCAPES.get(c) as string);
 }
 
 const write = (level: string, message: string): void =>

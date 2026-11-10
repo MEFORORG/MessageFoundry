@@ -134,11 +134,12 @@ if (NODE_SIDE) {
     // The interception ends here, synchronously, before any other suite's hooks run. THE LOADER is
     // restored; what it already loaded is not — `out/cli.js`, `out/engineTrust.js` and
     // `out/engineLog.js` stay bound to the stub in the require cache for the rest of this process.
-    // engine-log.test.ts loads its own fresh `out/engineLog.js` and restores whatever cache entry it
-    // found, so its own copy never replaces this one. Nothing else under `test:unit` imports them
-    // (the two suites that do are in package.json's
-    // --ignore list), but a future one would get the stub rather than a failure, so teardown below
-    // leaves the stub's state coherent rather than pointing at a deleted directory.
+    // One other suite under `test:unit` loads `out/engineLog.js`: engine-log.test.ts takes a fresh
+    // copy of its own and restores whatever cache entry it found, so its copy never replaces this
+    // one. Apart from that, nothing under `test:unit` imports these modules (the two suites that do
+    // are in package.json's --ignore list), but a future one would get the stub rather than a
+    // failure, so teardown below leaves the stub's state coherent rather than pointing at a deleted
+    // directory.
     loader._load = realLoad;
   }
   realExecFile = childProcess.execFile;
