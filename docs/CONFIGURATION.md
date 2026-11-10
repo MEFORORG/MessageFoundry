@@ -1356,8 +1356,9 @@ chain, and every live socket. `mode="off"` (**the default**) runs them in-proces
 with zero overhead**. `mode="subprocess"` runs each inbound's Router/Handler in a **persistent
 per-inbound worker child** (never a per-message fork), enforcing a forbidden-import guard
 (socket/store/crypto) and the resource caps below. An isolation denial (forbidden op, cap overrun,
-worker crash, an invalid or forged answer) routes the message to `ERROR`/dead-letter **post-ACK** (no
-NAK, never dropped). At least two cases differ (vault BACKLOG #3135). A request the engine cannot
+worker crash, an invalid answer or one forged without the request's id) routes the message to
+`ERROR`/dead-letter **post-ACK** (no NAK, never dropped); a forged answer that carries the id is taken
+as the result (see the grandchild paragraph below). At least two cases differ (vault BACKLOG #3135). A request the engine cannot
 encode, or one over the frame cap, dead-letters only that message and keeps the worker, since no byte
 of it was written; a worker answer the codec rejects still kills the worker. A stray frame found
 waiting **before** a request kills the worker and retries the message once on a fresh one (owner
@@ -1518,12 +1519,11 @@ share a single worker, so this does **not** confine one Handler from another —
 admin code and the engine, exactly as `mode=off` shares an address space. A grandchild the Handler
 spawns inherits the response pipe and can stage a frame while the worker is alive; killing the worker
 now reaps its whole process tree (a Windows kill-on-close job object / a POSIX process group), so such
-a grandchild no longer outlives the kill (BACKLOG #342). That reap is best-effort process hygiene: what
-bounds a stray frame is still the codec plus the request-answer binding, not the process teardown. A
-live grandchild can at least force a respawn and dead-letter a message, or cost one a retry on a fresh
-worker, and since it inherits the request pipe too it can forge a request's answer; ADR 0087's
-grandchild residual and AC-10's 2026-11-09 amendment in
-[ADR 0087](adr/0087-sandbox-subprocess-isolation.md) say how, and when.
+a grandchild no longer outlives the kill (BACKLOG #342). That reap is best-effort process hygiene, and
+neither it nor the request-answer binding stops a live grandchild from forging an answer:
+it can at least do that, and deny the feed. The grandchild residual in
+[ADR 0087](adr/0087-sandbox-subprocess-isolation.md) says what it can do, and AC-10's 2026-11-09
+amendment there says when.
 The child's **stderr is captured by the engine, not inherited** (ADR 0176): a Handler that prints is
 relayed into the engine's log attributed to the inbound, the child pid and the worker generation, with
 **the content itself only at `DEBUG`**. At `INFO` and above you get a rate-limited `WARNING` naming the
