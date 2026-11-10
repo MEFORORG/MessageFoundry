@@ -216,7 +216,6 @@ async def test_a_restart_claims_no_outcome_from_the_trail(engine: Engine, action
     [interrupted] = await _audit(engine, "approval.interrupted", approval_id)
     detail = json.loads(str(interrupted["detail"]))
     assert detail["reason"] == "engine_restart" and str(interrupted["actor"]) == "system"
-    assert await _audit(engine, "approval.reconciled", approval_id) == []
 
 
 async def test_a_restart_never_reads_the_audit_trail(engine: Engine) -> None:

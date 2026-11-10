@@ -352,6 +352,21 @@ def _stranded_fields(row: ApprovalRow, reason: str, **extra: Any) -> dict[str, A
     }
 
 
+def _refuse_requester(row: ApprovalRow, user_id: str, *, noun: str, verb: str, done: str) -> None:
+    """Refuse the original requester of ``row`` an act on their own release, keyed on the user id
+    (BACKLOG #1540): 403 when ``user_id`` is theirs, and 409 when the row records no requester id.
+    That fails closed, for the reason approve() gives: with no id there is no way to tell the
+    requester apart from anyone else, and the stored name is not a usable key."""
+    if not row.requester_user_id:
+        raise ApprovalError(
+            409,
+            f"this request has no recorded requester id, so it cannot be checked for "
+            f"self-{noun} and cannot be {done} here",
+        )
+    if row.requester_user_id == user_id:
+        raise ApprovalError(403, f"you cannot {verb} your own request")
+
+
 def _interrupt_verdict(
     liveness: OwnerLiveness,
 ) -> InterruptVerdict:
@@ -2470,17 +2485,7 @@ class ApprovalGate:
                 f"request is {current}; only an interrupted request can be resolved"
             ),
         )
-        requester_user_id = row.requester_user_id
-        if not requester_user_id:
-            # Fail closed, for the reason approve() gives: with no id there is no way to tell the
-            # requester apart from anyone else, and the stored name is not a usable key.
-            raise ApprovalError(
-                409,
-                "this request has no recorded requester id, so it cannot be checked for "
-                "self-resolution and cannot be resolved here",
-            )
-        if requester_user_id == resolver_user_id:
-            raise ApprovalError(403, "you cannot resolve your own request")
+        _refuse_requester(row, resolver_user_id, noun="resolution", verb="resolve", done="resolved")
         # BACKLOG #2125 (docstring above): read before the write, as approve reads before its claim.
         changed = await self._approver_changes(resolver_user_id, row.requested_at)
         operation = row.operation
@@ -2647,16 +2652,9 @@ class ApprovalGate:
                 f"request is {current}; only an executing release can be interrupted here"
             ),
         )
-        if not row.requester_user_id:
-            # Fail closed, as resolve_interrupted does: with no id the requester cannot be told
-            # apart from anyone else.
-            raise ApprovalError(
-                409,
-                "this request has no recorded requester id, so it cannot be checked for "
-                "self-interruption and cannot be interrupted here",
-            )
-        if row.requester_user_id == actor_user_id:
-            raise ApprovalError(403, "you cannot interrupt your own request")
+        _refuse_requester(
+            row, actor_user_id, noun="interruption", verb="interrupt", done="interrupted"
+        )
         liveness = await self._owner_liveness(row, {})
         verdict = _interrupt_verdict(liveness)
         if verdict == "refused":
