@@ -9885,6 +9885,10 @@ class StreamingAttachmentsUnsupported(NotImplementedError):
 class MessageStore:
     """Async SQLite-backed durable queue. Open with :meth:`open`."""
 
+    #: Set once this handle's open has opened the AES-GCM invocation bound; only then does its close
+    #: settle and close it (BACKLOG #3191).
+    _bound_opened: bool = False
+
     # This backend implements the staged ingress pipeline (enqueue_ingress/handoff). The engine
     # refuses to start the staged runner on a backend that doesn't (see Engine.start).
     supports_ingest_stage = True
@@ -10237,6 +10241,7 @@ class MessageStore:
                     raise
                 # A store closed earlier on this cipher left its bound closed (BACKLOG #3191).
                 reopen_invocation_bound(cipher)
+                store._bound_opened = True
                 # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the
                 # first block BEFORE anything on this handle encrypts — the at-rest migration below
                 # included, since on a store that is having a key enabled for the first time it is
@@ -11856,8 +11861,15 @@ class MessageStore:
         # Best-effort: a failing settlement must never turn a clean shutdown into an error.
         try:
             # A read-only handle reserved nothing and cannot write the settlement (BACKLOG #1780).
-            if not self._cipher_foreign and not self._read_only:
-                await settle_at_close(self._cipher, self.add_cipher_invocations)
+            # Nor did an open that failed before it opened the bound, and settling then would close
+            # the bound of a handle still serving on the same cipher. Under the writer lock, so
+            # writers queued ahead of the close finish, and are counted, first (BACKLOG #3191).
+            if not self._cipher_foreign and not self._read_only and self._bound_opened:
+                await settle_at_close(
+                    self._cipher,
+                    self._add_cipher_invocations_locked,
+                    hold=lambda: _writer_guard(self._db, self._lock),
+                )
         except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
             log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
         # Close every pooled read connection (tracked in _read_conns regardless of pool checkout

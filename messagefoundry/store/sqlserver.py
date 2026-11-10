@@ -3231,6 +3231,10 @@ def _probed_grant(value: Any) -> bool | None:
 class SqlServerStore:
     """SQL Server-backed durable queue (the :class:`Store` protocol). Open with :meth:`open`."""
 
+    #: Set once this handle's open has opened the AES-GCM invocation bound; only then does its close
+    #: settle and close it (BACKLOG #3191).
+    _bound_opened: bool = False
+
     # The staged ingress pipeline (enqueue_ingress + the ingress->routed->outbound handoffs) is
     # implemented on the unified ``queue`` table: atomic DELETE...OUTPUT claim-handoffs, an
     # sp_getapplock-serialized queue-aware finalizer, and RCSI for non-blocking claim/finalize
@@ -4028,6 +4032,7 @@ class SqlServerStore:
                 await bind_store_salt(store._cipher, store._ensure_store_salt)
                 # A store closed earlier on this cipher left its bound closed (BACKLOG #3191).
                 reopen_invocation_bound(store._cipher)
+                store._bound_opened = True
                 # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the
                 # first block BEFORE anything on this handle encrypts — the at-rest migration below
                 # included, since on a store that is having a key enabled for the first time it is
@@ -5405,7 +5410,10 @@ class SqlServerStore:
         # settlement closes the bound, so the cipher refuses any encrypt after it (BACKLOG #3191).
         # Best-effort: a failing settlement must never turn a clean shutdown into an error.
         try:
-            if not self._read_only:  # #1780: a read-only handle reserved nothing to settle
+            # #1780: a read-only handle reserved nothing to settle. Nor did an open that failed
+            # before it opened the bound, and settling then would close the bound of a handle
+            # still serving on the same cipher (BACKLOG #3191).
+            if not self._read_only and self._bound_opened:
                 await settle_at_close(self._cipher, self.add_cipher_invocations)
         except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
             log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)

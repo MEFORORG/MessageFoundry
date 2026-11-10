@@ -492,7 +492,8 @@ from messagefoundry.pipeline.security_signals import (
     install_security_signals,
 )
 from messagefoundry.pipeline.teardown import INNER_SHARE as _INNER_SHARE
-from messagefoundry.pipeline.teardown import ROW_CANCEL_WAIT_SECONDS, ROW_UNWIND_MARGIN_SECONDS
+from messagefoundry.pipeline.teardown import ROW_CANCEL_WAIT_SECONDS as _TEARDOWN_ROW_WAIT
+from messagefoundry.pipeline.teardown import ROW_UNWIND_MARGIN_SECONDS as _TEARDOWN_ROW_MARGIN
 from messagefoundry.pipeline.teardown import TeardownStep as _TeardownStep
 from messagefoundry.pipeline.teardown import run_teardown as _run_teardown
 from messagefoundry.pipeline.wiring_runner import (
@@ -2245,10 +2246,10 @@ async def _reload_and_record(
 #: engine.stop() cancels as one of its runner stops. Under the managed lifespan engine.stop() can cut
 #: that step first, and its store's close then waits out what is left of this wait, so the row lands
 #: before the store closes (BACKLOG #3191). The value lives in pipeline/teardown.py for that reason.
-_ROW_CANCEL_WAIT_SECONDS: Final = ROW_CANCEL_WAIT_SECONDS
+_ROW_CANCEL_WAIT_SECONDS: Final = _TEARDOWN_ROW_WAIT
 #: The part of a drain's remaining grace a row wait leaves for the reload's task to unwind, so the
 #: drain sees the task end rather than timing out beside it.
-_ROW_UNWIND_MARGIN_SECONDS: Final = ROW_UNWIND_MARGIN_SECONDS
+_ROW_UNWIND_MARGIN_SECONDS: Final = _TEARDOWN_ROW_MARGIN
 
 #: Row writes still running after the cancel bound. The event loop keeps only a weak reference to a
 #: task, so this set keeps each alive until it ends and its outcome is logged.

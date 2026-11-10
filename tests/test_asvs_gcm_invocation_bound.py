@@ -46,7 +46,12 @@ from messagefoundry.store.crypto import (
     generate_key,
     make_cipher,
 )
-from messagefoundry.store.gcm_bound import GCM_RESERVE_BLOCK, bounded_cipher, checkpoint_invocations
+from messagefoundry.store.gcm_bound import (
+    GCM_RESERVE_BLOCK,
+    bounded_cipher,
+    checkpoint_invocations,
+    settle_at_close,
+)
 
 #: A synthetic placeholder body. enqueue_ingress stores the raw str verbatim (no parsing),
 #: so no real-shaped HL7 - and no temptation toward real PHI - is needed in this suite.
@@ -593,7 +598,7 @@ async def test_an_encrypt_racing_the_close_is_refused_and_the_total_is_the_exact
     key_id = cipher.invocation_key_id
     for i in range(3):
         await store.enqueue_ingress(channel_id="c", raw=_MSG.format(i=i))
-    real_add = store.add_cipher_invocations
+    real_add = store._add_cipher_invocations_locked
     raced: list[BaseException | None] = []
 
     async def _add(add_key: str, count: int) -> int:
@@ -606,7 +611,7 @@ async def test_an_encrypt_racing_the_close_is_refused_and_the_total_is_the_exact
                 raced.append(exc)
         return await real_add(add_key, count)
 
-    store.add_cipher_invocations = _add  # type: ignore[method-assign, assignment]
+    store._add_cipher_invocations_locked = _add  # type: ignore[method-assign, assignment]
     await store.close()
     assert len(raced) == 1 and isinstance(raced[0], CipherError), raced
     spent = cipher._invocations
@@ -616,6 +621,77 @@ async def test_an_encrypt_racing_the_close_is_refused_and_the_total_is_the_exact
         assert await plain.cipher_invocations(key_id) == spent
     finally:
         await plain.close()
+
+
+async def _persisted(db: Path, key_id: str) -> int:
+    """The key's persisted total, read by a keyless handle that reserves nothing."""
+    plain = await MessageStore.open(db)
+    try:
+        return await plain.cipher_invocations(key_id)
+    finally:
+        await plain.close()
+
+
+async def test_two_overlapping_settlements_refund_the_reserve_once(tmp_path: Path) -> None:
+    """Two closes on one cipher, as two concurrent engine.stop() calls would run, must not both
+    refund the unspent reserve: that would under-count by up to a block."""
+    db = tmp_path / "twice.db"
+    store, cipher = await _keyed_store(db)
+    await store.enqueue_ingress(channel_id="c", raw=_MSG.format(i=0))
+    add = store.add_cipher_invocations
+    await asyncio.gather(settle_at_close(cipher, add), settle_at_close(cipher, add))
+    spent = cipher._invocations
+    assert spent > 0, "the control: the handle did encrypt"
+    try:
+        # Read before the store's own close, whose settlement would square a double refund again.
+        assert await store.cipher_invocations(cipher.invocation_key_id) == spent
+    finally:
+        await store.close()
+    assert await _persisted(db, cipher.invocation_key_id) == spent
+
+
+async def test_a_writer_queued_ahead_of_the_close_lands_and_is_counted(tmp_path: Path) -> None:
+    """The SQLite close settles under the writer lock, so a write already queued for it runs
+    first, encrypts, commits and is in the settled total, rather than meeting a closed bound."""
+    db = tmp_path / "queued.db"
+    store, cipher = await _keyed_store(db)
+    await store._lock.acquire()
+    try:
+        write = asyncio.ensure_future(store.enqueue_ingress(channel_id="c", raw=_MSG.format(i=1)))
+        await asyncio.sleep(0.05)
+        close = asyncio.ensure_future(store.close())
+        await asyncio.sleep(0.05)
+        assert not write.done() and not close.done(), "the control: both wait on the lock"
+    finally:
+        store._lock.release()
+    await asyncio.wait_for(write, 10)
+    await asyncio.wait_for(close, 10)
+    assert await _persisted(db, cipher.invocation_key_id) == cipher._invocations
+
+
+async def test_a_failed_open_leaves_a_live_handle_s_bound_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An open that fails before it opens the bound must not close it on its way out: another
+    handle on the same cipher is still serving."""
+    from messagefoundry.store import store as store_module
+
+    live, cipher = await _keyed_store(tmp_path / "live.db")
+    try:
+
+        async def _refuse(_host: object) -> None:
+            raise RuntimeError("PROBE: the pin check refused")
+
+        monkeypatch.setattr(store_module, "check_open_store_pin", _refuse)
+        with pytest.raises(RuntimeError, match="PROBE"):
+            await MessageStore.open(
+                tmp_path / "second.db", cipher=cipher, audit_mac_key=cipher.audit_mac_key()
+            )
+        monkeypatch.undo()
+        assert not cipher.invocation_bound_closed
+        await live.enqueue_ingress(channel_id="c", raw=_MSG.format(i=2))
+    finally:
+        await live.close()
 
 
 async def test_a_reopened_store_on_the_same_cipher_encrypts_again(tmp_path: Path) -> None:
@@ -642,21 +718,23 @@ async def test_a_runner_pass_after_the_close_does_nothing_and_its_stop_ends_it(
     runner.start()
     task = runner._task
     assert task is not None
-    await asyncio.sleep(0)
-    await store.close()
-    checkpoints: list[bool] = []
+    try:
+        await asyncio.sleep(0)
+        await store.close()
+        checkpoints: list[bool] = []
 
-    async def _checkpoint(*, settle: bool = False) -> int | None:
-        checkpoints.append(settle)
-        return None
+        async def _checkpoint(*, settle: bool = False) -> int | None:
+            checkpoints.append(settle)
+            return None
 
-    store.checkpoint_cipher_invocations = _checkpoint  # type: ignore[method-assign]
-    sink = runner._alert_sink
-    sink.calls.clear()  # type: ignore[attr-defined]  # the pass before the close may have alerted
-    assert await runner.run_once() == cipher.cumulative_invocations()
-    assert checkpoints == []
-    assert sink.calls == []  # type: ignore[attr-defined]
-    await runner.stop()
+        store.checkpoint_cipher_invocations = _checkpoint  # type: ignore[method-assign]
+        sink = runner._alert_sink
+        sink.calls.clear()  # type: ignore[attr-defined]  # the pass before the close may have alerted
+        assert await runner.run_once() == cipher.cumulative_invocations()
+        assert checkpoints == []
+        assert sink.calls == []  # type: ignore[attr-defined]
+    finally:
+        await runner.stop()
     assert task.done() and runner._task is None
     assert cipher._refill_hook is None
 

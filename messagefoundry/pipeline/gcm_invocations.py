@@ -9,7 +9,8 @@ Two jobs, one small background task modelled on
    lock, so it cannot itself write to the DB. It spends from a pre-reserved block instead; this runner
    tops the block up asynchronously, one DB round trip per ~2**15 encrypts. While it keeps up, the
    reservation is durable *before* the encrypts happen. The settlement is the store's own close, which
-   closes the bound as it settles, so no encrypt follows it (``store/gcm_bound.py``, BACKLOG #3191).
+   closes the bound as it settles, so the cipher refuses any encrypt after it (``store/gcm_bound.py``,
+   BACKLOG #3191).
 
    The refill is **demand-driven**: the cipher fires a hook the moment its reserve crosses the half-block
    watermark and this runner wakes on it, so the interval below is a FLOOR (it still drives the alert
@@ -49,6 +50,13 @@ from messagefoundry.store.gcm_bound import bounded_cipher
 __all__ = ["GcmInvocationRunner"]
 
 log = logging.getLogger(__name__)
+
+
+def _retrieve(task: asyncio.Task[None]) -> None:
+    """Log what a runner loop ended with when the stop that awaited it was cancelled."""
+    if not task.cancelled() and (error := task.exception()) is not None:
+        log.warning("the AES-GCM invocation runner ended with an error", exc_info=error)
+
 
 #: Idle cadence — the FLOOR, not the refill mechanism (the cipher's refill hook wakes this loop the
 #: moment the reserve crosses its watermark). It bounds how long an idle engine can sit on a key that
@@ -136,7 +144,13 @@ class GcmInvocationRunner:
         task.cancel()
         # asyncio.wait, not ``await task``: the loop's own cancellation is expected, a cancel of
         # this caller is not, and only wait tells the two apart.
-        await asyncio.wait({task})
+        try:
+            await asyncio.wait({task})
+        except asyncio.CancelledError:
+            # Read the loop's outcome once it ends, so an error it ended with is not reported as
+            # never retrieved.
+            task.add_done_callback(_retrieve)
+            raise
         if not task.cancelled() and (error := task.exception()) is not None:
             raise error
 

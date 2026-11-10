@@ -3926,8 +3926,8 @@ class Engine:
         the next start, and a step that raises no longer skips the store's close. A graph that did
         not stop keeps its intake gate, raises no graph-stopped clear and keeps its cluster lease
         (:meth:`_graph_left_running`). The store's close settles the AES-GCM invocation bound and
-        closes it, so nothing encrypts after it, and the invocation runner stops after that close
-        (:meth:`_close_store_at_stop`).
+        closes it, so the store's cipher refuses any encrypt after it, and the invocation runner
+        stops after that close (:meth:`_close_store_at_stop`).
 
         Without a budget every step runs to completion, in order, with its fixed waits, and the
         first failure is raised once its step ends. That much is as before. At least these differ:
@@ -4160,19 +4160,30 @@ class Engine:
             await drain(_within(bound, _ALERT_STATE_DRAIN_SECONDS))
 
     async def _close_store_at_stop(self, _bound: float) -> None:
+        closed = False
         try:
             await self._await_convergence_row()
             # The close settles the AES-GCM invocation bound and closes it in one step, so the cipher
             # refuses any encrypt after the figure it writes, a graph left running among them
             # (ASVS 11.3.4, BACKLOG #3191).
             await self.store.close()
+            closed = True
         finally:
             # Only now: until the close took its settlement the runner kept the reserve ahead of
             # every encrypt, and a pass that starts after it finds the bound closed and does
-            # nothing. Stopped here, a failure of its stop cannot keep the store open.
+            # nothing. Stopped here, a failure of its stop cannot keep the store open. When the
+            # close itself failed, that failure is the one raised, and the runner's is logged.
             runner, self._gcm_invocation_runner = self._gcm_invocation_runner, None
             if runner is not None:
-                await runner.stop()
+                try:
+                    await runner.stop()
+                except Exception as exc:
+                    if closed:
+                        raise
+                    log.warning(
+                        "engine stop: the AES-GCM invocation runner's stop failed: %s",
+                        safe_exc(exc),
+                    )
 
     async def _await_convergence_row(self) -> None:
         """Wait out what is left of the audit-row wait of a convergence reload the runners' step
@@ -4193,6 +4204,6 @@ class Engine:
             await asyncio.wait({pending}, timeout=left)
         if not pending.done():
             log.error(
-                "engine stop: a convergence reload was still unwinding when the store closed; its "
-                "audit row may be lost"
+                "engine stop: the config-convergence runner was still stopping when the store "
+                "closed; if a reload it cancelled was writing its audit row, that row may be lost"
             )
