@@ -532,12 +532,12 @@ def test_check_json_shape(capsys: pytest.CaptureFixture[str]) -> None:
 # --- executable acceptance criteria: <fixture>.expect (Secure Development Standards §5 / R2) -------
 
 
-def _delivering_config(tmp_path: Path) -> Path:
+def _delivering_config(tmp_path: Path, inbound_kwargs: str = "") -> Path:
     cfg = tmp_path / "config"
     cfg.mkdir()
     (cfg / "c.py").write_text(
         "from messagefoundry import inbound, outbound, router, handler, File, Send\n"
-        "inbound('IB_X', File(directory='in'), router='r')\n"
+        f"inbound('IB_X', File(directory='in'), router='r'{inbound_kwargs})\n"
         "outbound('OB_X', File(directory='out'))\n"
         "@router('r')\n"
         "def r(m): return ['h']\n"
@@ -614,6 +614,51 @@ def test_expect_error_passes_for_malformed_message(tmp_path: Path) -> None:
     msgs = _feed_fixture(tmp_path, b"NOT-AN-HL7-MESSAGE\r", "ERROR")
     dr = _run_dryrun(cfg, msgs)
     assert dr.ok and dr.required, dr.detail
+
+
+def _strict_config(tmp_path: Path) -> Path:
+    return _delivering_config(tmp_path, ", strict=True, hl7_version='2.5.1', strict_timeout_s=30.0")
+
+
+def _slow_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every read of the dry-run's monotonic clock advances it 31 s, so each strict validate
+    measures past the config's 30 s timeout without the test sleeping."""
+    import itertools
+    import time
+    from types import SimpleNamespace
+
+    from messagefoundry.pipeline import dryrun
+
+    ticks = itertools.count()
+    # The module's own `time` name only, so the patched clock reaches nothing outside dryrun.
+    monkeypatch.setattr(
+        dryrun, "time", SimpleNamespace(time=time.time, monotonic=lambda: next(ticks) * 31.0)
+    )
+
+
+def test_expect_error_does_not_pass_on_a_strict_validation_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #5107: a timeout is the validator's clock, not the message, so a fixture that expects
+    # ERROR must not pass on one. ADT_A01 has no PV1, so un-timed it would be refused as content.
+    _slow_clock(monkeypatch)
+    cfg = _strict_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "ERROR\n")
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
+    assert "expected ERROR, got a strict-validation timeout" in dr.detail, dr.detail
+
+
+def test_expect_error_passes_on_a_strict_validation_content_refusal(tmp_path: Path) -> None:
+    # The control for the test above: the same fixture and config, validated inside the timeout,
+    # is refused for its content, and that ERROR still satisfies the bare ERROR form.
+    cfg = _strict_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "ERROR")
+    dr = _run_dryrun(cfg, msgs)
+    assert dr.ok and "expectation-checked" in dr.detail, dr.detail
+    # And the refusal is the content one: with no .expect the same fixture fails on hl7apy's text.
+    Path(f"{msgs / 'IB_X' / 'a.hl7'}.expect").unlink()
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
+    assert "timed out" not in dr.detail and "PV1" in dr.detail, dr.detail
 
 
 def test_expect_unrouted_is_case_insensitive(tmp_path: Path) -> None:
