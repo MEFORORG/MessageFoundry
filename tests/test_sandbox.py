@@ -2360,3 +2360,183 @@ def test_a_request_over_the_frame_cap_keeps_the_worker(
         assert session.last_kill_cause is None
     finally:
         session.close()
+
+
+# --- vault BACKLOG #3135, repair round 3 -------------------------------------
+
+# A Handler that starts a grandchild NOT holding the response pipe, then has its worker exit on its
+# own after it answers. The grandchild stays in the worker's process group.
+_SELF_EXIT_GRAPH = """
+from messagefoundry import inbound, outbound, router, handler, MLLP, Send
+
+inbound("IB_X", MLLP(port=19353), router="r")
+outbound("OB_X", MLLP(host="127.0.0.1", port=19354))
+
+
+@router("r")
+def r(msg):
+    return "h_spawn_then_exit"
+
+
+@handler("h_spawn_then_exit")
+def h_spawn_then_exit(msg):
+    import os
+    import subprocess
+    import sys
+    import threading
+
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    with open(__PIDFILE__, "w", encoding="utf-8") as fh:
+        fh.write(str(child.pid))
+    threading.Timer(0.3, os._exit, (0,)).start()
+    return Send("OB_X", "SPAWNED")
+
+
+@handler("h_plain")
+def h_plain(msg):
+    return Send("OB_X", "PLAIN")
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the POSIX process-group reap")
+@pytest.mark.parametrize("after", ["dispatch", "close"])
+def test_a_worker_that_died_on_its_own_still_has_its_group_reaped(
+    tmp_path: Path, after: str
+) -> None:
+    """A worker that exits on its own leaves a grandchild in its process group. The next dispatch's
+    respawn, or ``close``, must still reach that group, so the liveness check must not reap the
+    worker first (vault BACKLOG #3135, the WNOWAIT fix).
+
+    FALSIFICATION, not run on the Windows host this was written on: make :func:`_has_exited` return
+    ``proc.poll() is not None`` on POSIX again. The poll reaps the zombie, ``kill_process_group``
+    can no longer read its group and falls back to a single kill of a dead pid, and the grandchild
+    is still sleeping when the assert below reads it."""
+    pidfile = tmp_path / "grandchild.pid"
+    source = _SELF_EXIT_GRAPH.replace("__PIDFILE__", repr(str(pidfile)))
+    (tmp_path / "graph.py").write_text(source, encoding="utf-8")
+    registry = load_config(tmp_path)
+    session = _session(str(tmp_path), inbound="IB_X")
+    grandchild_pid: int | None = None
+    try:
+        assert _deliveries(
+            registry, "h_spawn_then_exit", sandbox=session, run_context=RunContext()
+        ) == [("OB_X", "SPAWNED")]
+        grandchild_pid = int(pidfile.read_text())
+        proc = session._proc
+        assert proc is not None
+        # The worker exits on its own; it is a zombie now, which nothing has reaped.
+        assert _wait_until_not_running(proc.pid, timeout=10.0) is not True
+        assert _pid_running(grandchild_pid) is True  # the control: the grandchild outlived it
+        if after == "dispatch":
+            assert _deliveries(registry, "h_plain", sandbox=session, run_context=RunContext()) == [
+                ("OB_X", "PLAIN")
+            ]
+        else:
+            session.close()
+        assert _wait_until_not_running(grandchild_pid, timeout=5.0) is not True, (
+            "the grandchild of a worker that died on its own survived the reap of its group"
+        )
+    finally:
+        if grandchild_pid is not None:
+            _best_effort_kill_pid(grandchild_pid)
+        session.close()
+
+
+def test_a_memory_cap_exit_is_never_recorded_as_a_closed_pipe(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker that answered with the memory cap exits, and on a loaded host its EOF can land
+    before the exit does. That EOF is still the memory cap, not a closed pipe.
+
+    FALSIFICATION: give the memory-cap EOF the grace again, and with the slow exit below the kill is
+    recorded as ``stdout_closed``."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    real_await = session._await_answer
+
+    def _answer_then_eof(*args: Any) -> Any:
+        answer = real_await(*args)
+        session._responses.put(_EOF)  # its exit EOF, queued before the check reads the queue
+        return answer
+
+    try:
+        monkeypatch.setattr(session, "_await_answer", _answer_then_eof)
+        monkeypatch.setattr(sandbox_mod, "_has_exited", lambda proc: False)  # a slow exit
+        with pytest.raises(SandboxError, match="ran out of memory"):
+            _deliveries(registry, "h_oom", sandbox=session, run_context=RunContext())
+        assert session.kill_counts == {KillCause.MEMORY_CAP: 1}
+        assert session._proc is None
+    finally:
+        monkeypatch.undo()
+        session.close()
+
+
+def test_the_eof_grace_is_one_budget_per_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every EOF a dispatch meets draws on one grace, so the wait under the session lock is
+    bounded by the grace, not by the grace times the EOFs."""
+    monkeypatch.setattr(sandbox_mod, "_has_exited", lambda proc: False)  # never exits
+    session = _session(".")
+    proc: Any = object()
+    started = time.monotonic()
+    assert session._eof_cause(proc, KillCause.CRASH) is KillCause.STDOUT_CLOSED
+    assert session._eof_cause(proc, KillCause.CRASH) is KillCause.STDOUT_CLOSED
+    assert session._eof_cause(proc, KillCause.CRASH) is KillCause.STDOUT_CLOSED
+    # Three graces would be 1.5 s. The margin is for a slow host, and stays under two graces.
+    assert time.monotonic() - started < 2 * sandbox_mod._EOF_EXIT_GRACE_SECONDS
+    assert session._eof_grace_left == 0.0
+
+
+def test_a_fresh_worker_that_keeps_exiting_records_a_cause_and_says_so(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker that exits right after its boot, three times in a row, is a crash loop: each one is
+    recorded, and the error says the worker kept exiting.
+
+    FALSIFICATION: reap a fresh worker's queued EOF with no cause again, and ``kill_counts`` stays
+    empty."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    real_spawn = session._spawn
+
+    def _spawn_then_die(phase: str = "spawn") -> None:
+        real_spawn(phase)
+        proc = session._proc
+        assert proc is not None
+        proc.kill()
+        deadline = time.monotonic() + 10.0
+        while not sandbox_mod._has_exited(proc) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        session._responses.put(_EOF)
+
+    try:
+        monkeypatch.setattr(session, "_spawn", _spawn_then_die)
+        with pytest.raises(SandboxError, match="kept exiting, or closing its pipe") as caught:
+            _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        assert "3 workers in a row" in str(caught.value)
+        assert session.kill_counts == {KillCause.EXITED_AFTER_BOOT: 3}
+    finally:
+        session.close()
+
+
+def test_a_second_spawn_over_a_live_worker_is_refused(graph: tuple[Registry, str]) -> None:
+    """A spawn replaces only a worker that is gone, so a second one cannot kill a live worker
+    without a cause."""
+    _, config_dir = graph
+    session = _session(config_dir)
+    try:
+        session._spawn("transform")
+        proc = session._proc
+        assert proc is not None
+        with pytest.raises(SandboxError, match="still running"):
+            session._spawn("transform")
+        assert session._proc is proc
+        assert proc.poll() is None
+        assert session._generation == 1
+        assert not session.kill_counts
+    finally:
+        session.close()
