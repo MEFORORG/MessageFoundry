@@ -78,6 +78,7 @@ from messagefoundry.api.approvals import (
     ApprovalError,
     ApprovalGate,
     IdentityResolver,
+    held_fingerprint,
     named_requester,
 )
 from messagefoundry.api.auth_routes import add_auth_routes
@@ -1828,14 +1829,15 @@ def _build_approval_gate(
                 "name who ran it; it was not run",
             )
         # Vault BACKLOG #2596, step 3: the release loads only the bytes the approval named. A hold
-        # whose params carry no digest (none is filed that way now) binds to None, which matches
-        # nothing, so it is refused as a mismatch once its directory resolves. On a store that holds
-        # a key the params are sealed with the rest of the request, so a writer to pending_approvals
-        # who changes the digest leaves a request the gate refuses (vault BACKLOG #2592).
-        approved = p.get("fingerprint")
-        approval = ApprovedConfig(
-            approved if isinstance(approved, str) else None, p.get("value_file")
-        )
+        # with no usable digest (held_fingerprint) binds to None, which matches nothing. The gate
+        # refuses such a hold before its claim (requires_fingerprint below, release_blocked
+        # 'params_no_fingerprint', vault BACKLOG #3192), so None reaches this only if that flag is
+        # dropped. It is then refused, with reason no_approved_digest where the release reaches
+        # the digest check.
+        # On a store that holds a key the params are sealed with the rest of the request, so a
+        # writer to pending_approvals who changes the digest leaves a request the gate refuses
+        # (vault BACKLOG #2592).
+        approval = ApprovedConfig(held_fingerprint(p), p.get("value_file"))
         # reload_detail for parity with the inline route (BACKLOG #1111): a released reload that
         # swapped the graph and then failed a follow-on step must report the same degraded outcome
         # the inline path reports, or dual control would be the quieter of the two.
@@ -1910,6 +1912,7 @@ def _build_approval_gate(
         permission=Permission.CONFIG_DEPLOY,
         in_scope=lambda identity, _p: _cross_channel_in_scope(identity),
         requires_requester=True,
+        requires_fingerprint=True,
     )
     return gate
 
@@ -2665,9 +2668,11 @@ async def _audit_refused_reload(
     filter sees both, and ``invalid_config`` otherwise. A trust-anchor check the store stopped, by
     refusing its audit read or write, writes reason ``store_unavailable`` and answers 503 (BACKLOG
     #3091); it is neither a refused anchor nor a bad graph. A released reload whose config is not the
-    one its approval named writes ``config_reload_failed`` with reason ``digest_mismatch``, or
-    ``no_approved_digest`` when the hold took none, with both digests, and answers 422 (vault
-    BACKLOG #2596); only the executor meets it. One whose digest could not be taken now writes
+    one its approval named writes ``config_reload_failed`` with ``approved_fingerprint`` and
+    ``current_fingerprint`` and reason ``digest_mismatch``, or ``no_approved_digest`` when the hold
+    carries no usable digest (:func:`held_fingerprint`), whose ``approved_fingerprint`` is then
+    null, and answers 422 (vault BACKLOG #2596); only the
+    executor meets it. One whose digest could not be taken now writes
     reason ``digest_unavailable`` and answers 422; the engine logged why at WARNING. A gated
     request whose digest cannot be taken is refused the same way, with no hold filed. A release
     refused before its digest check (:class:`ConfigRefusedBeforeApprovalCheck`) keeps its reason
@@ -2724,7 +2729,7 @@ async def _audit_refused_reload(
         action, detail["reason"] = "config_reload_failed", "not_found"
         status, answer = 404, "config directory not found"
     elif isinstance(exc, ConfigDigestMismatch):
-        # A hold that took no digest is told apart, so nobody goes looking for an edit that
+        # A hold with no usable digest is told apart, so nobody goes looking for an edit that
         # never happened.
         unbound = exc.approved is None
         warn(
@@ -4968,8 +4973,10 @@ def create_app(
         # the broker's revocation refusal. An off-box endpoint with no [ai].endpoint_revocation_attested
         # pair is refused under enforce, and a None posture counts as enforcing there. The cleartext-
         # http refusal takes no posture: it refuses in every one (vault BACKLOG #3533 item 5).
+        # Off the event loop: the constructor builds rest.py's shared opener on first use, a TLS
+        # context that reads the system trust store, under a lock a worker thread may hold.
         try:
-            broker = ai_broker_from_settings(ai, posture=_phi_read_posture)
+            broker = await asyncio.to_thread(ai_broker_from_settings, ai, posture=_phi_read_posture)
         except AiBrokerError as exc:
             _log.warning("engine AI broker misconfigured: %s", exc)
             raise HTTPException(503, "engine-brokered AI assistance is not available") from exc
