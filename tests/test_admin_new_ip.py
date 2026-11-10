@@ -53,7 +53,7 @@ from messagefoundry.auth.service import (
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.controlchars import log_field_token
-from messagefoundry.logging_setup import _install_phi_filters
+from messagefoundry.logging_setup import _install_phi_filters, redact_log_value
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_admin, create_local_user_chosen
@@ -301,7 +301,9 @@ def _logged_fields(line: str) -> list[tuple[str, str]]:
 #: Paths that tried to write a field of their own (BACKLOG #3770). The second is the one the review
 #: measured: the credential scrub filters read the backslash before a JSON-escaped quote as part of
 #: the token's value, so ``quote_log_text`` closed early on a configured sink. The rest end on a
-#: label a credential scrub reads as the start of a quoted value, or open a quoted value.
+#: label a credential scrub reads as the start of a quoted value, open a quoted value, or start a
+#: PHI or credential pattern that runs to the end of the line (an HL7 segment, an XML element, an
+#: ODBC brace, a ``MEFOR_`` name). One is a plain path, which must log unchanged.
 _FORGING_PATHS = (
     '/users seen_ip=10.6.6.6 held_back=99 "x\\',
     '/users token=a" seen_ip=10.6.6.6 z="',
@@ -309,6 +311,14 @@ _FORGING_PATHS = (
     "/x password:",
     "/x password='a seen_ip=10.6.6.6 '",
     "/x code=a&state=b seen_ip=10.6.6.6",
+    "/x code=SECRETVALUE",
+    "/PID|x",
+    "/a|b|c",
+    "/x<given>abc",
+    "/x;pwd={abc",
+    "/x/password={a",
+    "/MEFOR_X=abc",
+    "/plain/path-with.dots_and~tilde",
     "/u" + "\U0001f600" * 300,
     "/u" + "x" * 5000,
 )
@@ -360,8 +370,13 @@ async def test_a_path_cannot_forge_a_field_of_the_new_address_warnings() -> None
         assert over[1][1] == f"10.9.9.{i}"
         for _, value in (*repeat, *over):
             assert len(value) <= _NEW_IP_LOG_FIELD_MAX
-        if len(path) < 100 and "=" not in path and ":" not in path:
-            assert unquote(over[0][1], errors="surrogatepass") == path
+        # A field within its bound reads back as the path after the redaction the filters would
+        # have applied, so the escape neither mangles a path nor lets PHI or a credential through.
+        if "%~crc32:" not in over[0][1]:
+            assert unquote(over[0][1], errors="surrogatepass") == redact_log_value(path)
+    assert "SECRETVALUE" not in stream.getvalue()
+    plain = _FORGING_PATHS.index("/plain/path-with.dots_and~tilde")
+    assert _logged_fields(lines[2 * plain + 1])[0][1] == _FORGING_PATHS[plain]
 
 
 async def test_alternating_new_addresses_audit_once_each() -> None:

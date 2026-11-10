@@ -160,6 +160,7 @@ from messagefoundry.controlchars import log_field_token, scrub_log_argument
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.keyed_lock import KeyedLock as _KeyedLock
 from messagefoundry.keyed_lock import hold_keyed_lock as _hold_keyed_lock
+from messagefoundry.logging_setup import redact_log_value
 from messagefoundry.store.base import (
     AdminStore,
     audit_write_errors,
@@ -508,7 +509,9 @@ _NEW_IP_DEDUP_MAX = 4096
 _NEW_IP_PER_SESSION_MAX = 8
 
 # BACKLOG #3772: the longest client-address text the new-address signal keeps as it is, in its dedupe
-# keys, the seen_ip, known_ip and client of its audit row, its notice and its past-cap log line. Every
+# keys, the seen_ip, known_ip and client of its audit row, its notice, and the text its past-cap log
+# line escapes (``_NEW_IP_LOG_FIELD_MAX`` below; so ``%`` and ``:`` in an address log as ``%25`` and
+# ``%3A`` there). Every
 # IPv4 or IPv6 address without a zone id fits, the longest being 45 characters; only text that does
 # not parse, or an IPv6 address with a long zone id, is longer. That text is caller-supplied on a
 # proxied hop, and without a bound each session could hold nine copies of it. Longer text keeps a
@@ -13953,7 +13956,7 @@ class AuthService:
             _log.warning(
                 "a request from a new client address must re-verify; the address was already "
                 "flagged since the session's last re-verification (audit suppressed): path=%s",
-                log_field_token(path, _NEW_IP_LOG_FIELD_MAX),
+                log_field_token(redact_log_value(path), _NEW_IP_LOG_FIELD_MAX),
             )
             return True
         # What the row, the notice and the past-cap log line carry. Text within _NEW_IP_TEXT_MAX,
@@ -13969,8 +13972,8 @@ class AuthService:
                 "a request from a new client address must re-verify; the address is past the "
                 "per-session cap of %d (audit suppressed): path=%s seen_ip=%s",
                 _NEW_IP_PER_SESSION_MAX,
-                log_field_token(path, _NEW_IP_LOG_FIELD_MAX),
-                log_field_token(seen_text, _NEW_IP_LOG_FIELD_MAX),
+                log_field_token(redact_log_value(path), _NEW_IP_LOG_FIELD_MAX),
+                log_field_token(redact_log_value(seen_text), _NEW_IP_LOG_FIELD_MAX),
             )
             return True
         known_text = _bounded_address_text(session.client)

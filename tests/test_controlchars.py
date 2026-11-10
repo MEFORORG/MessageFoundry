@@ -447,7 +447,7 @@ def test_escape_lone_surrogates_escapes_only_surrogates() -> None:
 
 @pytest.mark.parametrize(
     "text",
-    ["/a b", 'x"y', "x'y", "a\\b", "50%", "tab\there", "line\nbreak", "é‮", "\ud800", ""],
+    ["/a b", 'x"y', "x'y", "a\\b", "50%", "tab\there", "line\nbreak", "\u00e9\u202e", "\ud800", ""],
 )
 def test_log_field_token_is_quote_free_ascii_and_reverses(text: str) -> None:
     """RED when: the token holds a space, a quote or a backslash, which the credential scrub
@@ -456,16 +456,16 @@ def test_log_field_token_is_quote_free_ascii_and_reverses(text: str) -> None:
     body = token[1:-1]
     assert token == f'"{body}"'
     assert body.isascii() and body.isprintable()
-    assert not set(body) & set(" \"'\\")
+    assert re.fullmatch(r"(?:[A-Za-z0-9._~/-]|%[0-9A-F]{2})*", body)
     assert unquote(body, errors="surrogatepass") == text
 
 
-@pytest.mark.parametrize("text", ["/x token=", "/x password:"])
-def test_log_field_token_escapes_a_final_label_mark(text: str) -> None:
-    """RED when: a token ends ``=`` or ``:``, so its closing quote reads to a credential scrub as
-    the start of a quoted value that runs on into the next field."""
+@pytest.mark.parametrize("text", ["/x token=", "/x password:", "/PID|x", "/x<g>", "/x;pwd={a"])
+def test_log_field_token_escapes_every_mark_a_filter_anchors_on(text: str) -> None:
+    """RED when: a token keeps ``=``, ``:``, ``|``, ``<``, ``{`` or ``;``, so a handler filter
+    pattern can start inside the field and run past its closing quote."""
     body = log_field_token(text, 256)[1:-1]
-    assert body[-1] not in "=:"
+    assert not set(body) & set("=:|<{;")
     assert unquote(body) == text
 
 
@@ -478,6 +478,9 @@ def test_log_field_token_is_bounded_after_its_escape(text: str) -> None:
     head, _, checksum = body.partition("%~crc32:")
     assert re.fullmatch(r"[0-9a-f]{8}", checksum)
     assert re.fullmatch(r"(?:[^%]|%[0-9A-F]{2})*", head)
+    # Whole characters only, so the head decodes strictly.
+    unquote(head, errors="strict")
+    assert len(log_field_token("a" * 255 + "=", 256)) - 2 <= 256
 
 
 def test_log_field_token_keeps_two_long_texts_with_one_head_apart() -> None:

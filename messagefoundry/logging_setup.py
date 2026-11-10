@@ -97,6 +97,7 @@ __all__ = [
     "JsonFormatter",
     "CredentialQueryScrubFilter",
     "CredentialScrubFilter",
+    "redact_log_value",
     "SyslogForward",
     "ForwarderStatus",
     "FORWARD_LOSS_COUNTERS",
@@ -392,6 +393,18 @@ def _scrub_credential_query(text: str) -> str:
     able to carry two spellings of "a credential was here", and a hand-copied literal is how it
     would."""
     return _CREDENTIAL_QUERY_RE.sub(lambda m: f"{m.group(1)}={CREDENTIAL_PLACEHOLDER}", text)
+
+
+def redact_log_value(text: str) -> str:
+    """``text`` through the three text passes :func:`_install_phi_filters` applies, in its order:
+    PHI redaction, the credential query scrub, the credential scrub (BACKLOG #3770).
+
+    For a value a caller escapes before logging, with
+    :func:`~messagefoundry.controlchars.log_field_token`. The escape hides every character the
+    handler filters anchor on, so they cannot read a value inside the token; this runs the same
+    passes on the value first, so nothing they would have hidden prints. The filters still run on
+    the whole line afterwards, as on every record."""
+    return scrub_credentials(_scrub_credential_query(redact_untrusted(text)))
 
 
 class CredentialQueryScrubFilter(logging.Filter):

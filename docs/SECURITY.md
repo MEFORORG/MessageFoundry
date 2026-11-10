@@ -5489,7 +5489,8 @@ on that session, for example) ends it as a revocation would.
   as the bulk export's does, but the quarter is counted from when the stream starts sending, not
   from the gate's own move. The row count, the first page's read and the `audit.export` row run
   between the two, so on a large trail the first move can come more than a quarter window after
-  the gate's. The first page never moves it, where the bulk export's first row does.
+  the gate's. The first page moves it only if sending the CSV header stalled for a quarter window,
+  where the bulk export's first row always does.
 
 **At least these paths do not see a change on the next request.** The table is not a complete list.
 On a first deployment, each would let a caller keep acting on a withdrawn grant for the time shown.
