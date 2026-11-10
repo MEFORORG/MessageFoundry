@@ -47,14 +47,6 @@ All notable changes to MessageFoundry are documented here. The format follows
   pass is stuck cuts the supervisor's wait on that pass; the process can still wait at exit for
   the stuck read's worker thread to return. (`BACKLOG #3314`)
 
-### Security
-- **BREAKING: `zip_decompress` reads only STORED and DEFLATED entries.** An archive with a BZIP2,
-  LZMA or Zstandard entry, or any other method, directory entries included, now raises
-  `CompressionError` before any member is read, with or without `max_output_bytes`. Stdlib
-  `zipfile` does not bound one read's output for those methods, so a tiny archive could expand far
-  past the ceiling before it was checked; ADR 0123's 2026-11-10 amendment records the measurement.
-  `zip_compress` writes only DEFLATED, so its archives are unaffected. (`BACKLOG #5535`)
-
 ## [0.5.2] — 2026-10-20 — Early Access
 
 This engine pairs with web console 0.5.0, which is published after it under its own
