@@ -218,7 +218,7 @@ async def test_a_key_rotation_reseals_every_account_under_the_active_key(tmp_pat
     try:
         await AuthService(store, AuthSettings()).initialize()  # the built-in roles
         await _user(store, "u")
-        await store.set_user_roles("u", [Role.VIEWER.value])
+        await store.set_user_roles("u", [Role.VIEWER.value], audits=())
         await store.set_totp_secret("u", secret="JBSWY3DPEHPK3PXP")
     finally:
         await store.close()
@@ -266,7 +266,7 @@ async def test_the_last_administrator_guard_counts_only_sealed_administrators(
     await AuthService(store, AuthSettings()).initialize()
     for name in ("a", "b"):
         await _user(store, name)
-        await store.set_user_roles(name, [Role.ADMINISTRATOR.value])
+        await store.set_user_roles(name, [Role.ADMINISTRATOR.value], audits=())
 
     async def removable(target: str) -> bool:
         return await store.remove_unless_last_admin(
@@ -274,12 +274,13 @@ async def test_the_last_administrator_guard_counts_only_sealed_administrators(
             AdminRemoval.SET_ROLES,
             admin_role_id=Role.ADMINISTRATOR.value,
             role_ids=[Role.VIEWER.value],
+            audits=(),
         )
 
     await _raw_for(path)("UPDATE users SET display_name=? WHERE id=?", ("bent", "b"))
     assert not await removable("a")  # b is refused, so a is the last usable administrator
     await _user(store, "c")
-    await store.set_user_roles("c", [Role.ADMINISTRATOR.value])
+    await store.set_user_roles("c", [Role.ADMINISTRATOR.value], audits=())
     assert await removable("a")  # control: c is a sealed administrator
 
 
@@ -323,7 +324,7 @@ async def test_a_session_resolves_with_one_role_read(keyed: tuple[MessageStore, 
     service = AuthService(store, AuthSettings())
     await service.initialize()
     await _user(store, "u")
-    await store.set_user_roles("u", [Role.VIEWER.value])
+    await store.set_user_roles("u", [Role.VIEWER.value], audits=())
     token = mint_token()
     await store.create_session(
         token_hash=hash_token(token), user_id="u", expires_at=time.time() + 3600

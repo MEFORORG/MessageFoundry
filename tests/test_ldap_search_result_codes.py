@@ -500,7 +500,7 @@ async def test_a_group_search_the_directory_did_not_finish_never_narrows_a_signe
         await store.set_ad_group_role_map([(canonical, Role.OPERATOR.value)])
         user = await store.get_user_by_username("jdoe")
         assert user is not None
-        await store.set_user_roles(user.id, [Role.OPERATOR.value])
+        await store.set_user_roles(user.id, [Role.OPERATOR.value], audits=())
         assert (await service._probe_principal(user)).outcome is ProbeOutcome.PRESENT
         assert (await _pass(service)).revocations == ()
 

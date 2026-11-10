@@ -50,7 +50,7 @@ from messagefoundry.auth.service import (
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
-from messagefoundry.store.store import MessageStore, WebAuthnCredential
+from messagefoundry.store.store import MessageStore, WebAuthnCredential, no_audit_row
 from tests._admin_account import ADMIN_USERNAME, create_admin, login_admin
 
 
@@ -2442,7 +2442,7 @@ async def test_a_session_revoked_after_rotation_still_delivers_the_codes(
             expected_secret_cell: str | None,
             now: float | None = None,
         ) -> bool:
-            await store.revoke_user_sessions(user_id)
+            await store.revoke_user_sessions(user_id, audit=no_audit_row)
             return await real_enable(
                 user_id,
                 recovery_code_hashes=recovery_code_hashes,

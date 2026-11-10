@@ -149,7 +149,7 @@ async def assert_grant_counts_only_a_local_administrator_that_signs_in(store: An
         password_generated=False,
         audits=(),
     )
-    await store.set_user_roles("dir", [ADMIN], assigned_by="test")
+    await store.set_user_roles("dir", [ADMIN], assigned_by="test", audits=())
     # A directory account holding a hash still needs the directory: the provider is what decides.
     await store.create_user(
         user_id="dir-hashed",
@@ -160,7 +160,7 @@ async def assert_grant_counts_only_a_local_administrator_that_signs_in(store: An
         password_generated=False,
         audits=(),
     )
-    await store.set_user_roles("dir-hashed", [ADMIN], assigned_by="test")
+    await store.set_user_roles("dir-hashed", [ADMIN], assigned_by="test", audits=())
     await store.create_user(
         user_id="hashless",
         username="name-hashless",
@@ -170,7 +170,7 @@ async def assert_grant_counts_only_a_local_administrator_that_signs_in(store: An
         password_generated=False,
         audits=(),
     )
-    await store.set_user_roles("hashless", [ADMIN], assigned_by="test")
+    await store.set_user_roles("hashless", [ADMIN], assigned_by="test", audits=())
     # Vault BACKLOG #3849 C1: an admin-issued temporary credential past its deadline signs nobody
     # in, so it does not refuse the grant. Stamped at 1.0, far past the shipped 72-hour expiry.
     await _temporary_credential_admin(store, "lapsed", issued_at=1.0)
@@ -206,7 +206,7 @@ async def _temporary_credential_admin(store: Any, user_id: str, *, issued_at: fl
         password_generated=True,
         audits=(),
     )
-    await store.set_user_roles(user_id, [ADMIN], assigned_by="test")
+    await store.set_user_roles(user_id, [ADMIN], assigned_by="test", audits=())
 
 
 async def assert_concurrent_grants_leave_one(store: Any) -> None:

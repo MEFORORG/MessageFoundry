@@ -164,7 +164,7 @@ def _unguarded_grant(store: MessageStore) -> Callable[..., Awaitable[AdminGrant]
     async def unguarded(
         user_id: str, *, admin_role_id: str, assigned_by: str | None = None, **_: Any
     ) -> AdminGrant:
-        await store.set_user_roles(user_id, [admin_role_id], assigned_by=assigned_by)
+        await store.set_user_roles(user_id, [admin_role_id], assigned_by=assigned_by, audits=())
         return AdminGrant.GRANTED
 
     return unguarded
@@ -258,7 +258,9 @@ async def test_two_runs_with_different_usernames_make_one_administrator(
                 password_generated=False,
                 audits=(),
             )
-            await stores[0].set_user_roles("dir-a", [Role.ADMINISTRATOR.value], assigned_by="test")
+            await stores[0].set_user_roles(
+                "dir-a", [Role.ADMINISTRATOR.value], assigned_by="test", audits=()
+            )
             directory = {"dir-a"}
         both_read = _hold_both_after_the_read(services, monkeypatch)
         outcomes = await asyncio.gather(
@@ -400,7 +402,7 @@ def _out_of_contract_grant(
         user_id: str, *, admin_role_id: str, assigned_by: str | None = None, **_: Any
     ) -> object:
         if writes_role:
-            await store.set_user_roles(user_id, [admin_role_id], assigned_by=assigned_by)
+            await store.set_user_roles(user_id, [admin_role_id], assigned_by=assigned_by, audits=())
         return object()
 
     return grant
@@ -436,10 +438,10 @@ async def test_an_unknown_grant_outcome_that_wrote_the_role_advises_the_totp_res
     revokes: list[int] = []
     original_revoke = store.revoke_user_sessions
 
-    async def counted_revoke(user_id: str) -> RevokeResult:
+    async def counted_revoke(user_id: str, **kwargs: Any) -> RevokeResult:
         # How many ERROR lines had landed when this revoke ran.
         revokes.append(len(_error_lines(caplog)))
-        return await original_revoke(user_id)
+        return await original_revoke(user_id, **kwargs)
 
     monkeypatch.setattr(store, "revoke_user_sessions", counted_revoke)
     with (
@@ -511,9 +513,9 @@ async def test_an_unknown_grant_outcome_revokes_even_when_the_re_read_raises(
     revokes: list[str] = []
     original_revoke = store.revoke_user_sessions
 
-    async def counted_revoke(user_id: str) -> RevokeResult:
+    async def counted_revoke(user_id: str, **kwargs: Any) -> RevokeResult:
         revokes.append(user_id)
-        return await original_revoke(user_id)
+        return await original_revoke(user_id, **kwargs)
 
     monkeypatch.setattr(store, "revoke_user_sessions", counted_revoke)
     with (
@@ -603,7 +605,9 @@ async def test_an_unknown_grant_outcome_names_an_administrator_that_appeared_mea
                 password_generated=False,
                 audits=(),
             )
-            await store.set_user_roles("dir-a", [Role.ADMINISTRATOR.value], assigned_by="test")
+            await store.set_user_roles(
+                "dir-a", [Role.ADMINISTRATOR.value], assigned_by="test", audits=()
+            )
         return await roleless(*a, **k)
 
     monkeypatch.setattr(store, "grant_first_admin_unless_admin_exists", another_appears_then_answer)

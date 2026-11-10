@@ -36,6 +36,7 @@ from messagefoundry.store.store import (
     UserRow,
     WebAuthnCredential,
     new_user_record,
+    no_audit_row,
     user_seal_ok,
 )
 from tests._session_seal_contract import RawSql
@@ -105,7 +106,7 @@ class _Harness:
             password_generated=False,
             audits=(),
         )
-        await self.store.set_user_roles(user_id, list(roles), assigned_by="contract")
+        await self.store.set_user_roles(user_id, list(roles), assigned_by="contract", audits=())
         await self.store.set_user_channel_scope(user_id, '["IB_A"]', source="manual")
         return user_id
 
@@ -159,7 +160,7 @@ async def assert_user_seal_contract(store: Any, raw: RawSql) -> None:
     # Control: the same grant through the store takes effect.
     granted = await h.account("granted")
     await store.set_user_roles(
-        granted, [Role.VIEWER.value, Role.ADMINISTRATOR.value], assigned_by="contract"
+        granted, [Role.VIEWER.value, Role.ADMINISTRATOR.value], assigned_by="contract", audits=()
     )
     promoted = await h.service.identity_for_token(await h.token(granted))
     assert promoted is not None and Role.ADMINISTRATOR in promoted.roles
@@ -301,7 +302,7 @@ async def assert_user_seal_contract(store: Any, raw: RawSql) -> None:
     before = await _record(store, bent)
     for write in (
         lambda: store.set_user_disabled(bent, disabled=False),
-        lambda: store.set_user_roles(bent, [Role.VIEWER.value]),
+        lambda: store.set_user_roles(bent, [Role.VIEWER.value], audits=()),
         lambda: store.set_user_channel_scope(bent, '["IB_A"]', source="manual"),
         lambda: store.record_login_success(bent),
         lambda: store.set_password(
@@ -326,7 +327,7 @@ async def assert_user_seal_contract(store: Any, raw: RawSql) -> None:
     # --- ending every session raises the sealed epoch through the helper ----------------------
     epoch = await h.account("epoch")
     first = await h.token(epoch)
-    await store.revoke_user_sessions(epoch)
+    await store.revoke_user_sessions(epoch, audit=no_audit_row)
     after_revoke = await _record(store, epoch)
     assert after_revoke.row.session_epoch == 1 and user_seal_ok(sealer, after_revoke)
     assert await h.service.identity_for_token(first) is None
@@ -351,7 +352,9 @@ async def assert_user_seal_contract(store: Any, raw: RawSql) -> None:
     late = await h.account("late")
     before_late = await _record(store, late)
     try:
-        await store.set_user_roles(late, [Role.VIEWER.value, gone], assigned_by="contract")
+        await store.set_user_roles(
+            late, [Role.VIEWER.value, gone], assigned_by="contract", audits=()
+        )
     except UnknownRoleError as exc:
         assert exc.role_ids == (gone,)
     else:
@@ -360,7 +363,7 @@ async def assert_user_seal_contract(store: Any, raw: RawSql) -> None:
     assert await h.service._load_user(late) is not None
     # Control: the same write naming a role that exists grants it, sealed.
     live = await _custom_role(h, "contract-live")
-    await store.set_user_roles(late, [Role.VIEWER.value, live], assigned_by="contract")
+    await store.set_user_roles(late, [Role.VIEWER.value, live], assigned_by="contract", audits=())
     granted_late = await h.service._load_user(late)
     assert granted_late is not None
     assert granted_late.role_ids == tuple(sorted((Role.VIEWER.value, live)))
@@ -397,7 +400,9 @@ async def assert_role_delete_race_refused(
         nonlocal fired
         if not fired:
             fired = True
-            await store.set_user_roles(granted, [Role.VIEWER.value, role], assigned_by="contract")
+            await store.set_user_roles(
+                granted, [Role.VIEWER.value, role], assigned_by="contract", audits=()
+            )
         return await real_write(*args, **kwargs)
 
     store._write_user = grant_mid_delete
@@ -445,7 +450,7 @@ async def assert_user_record_round_trips(store: Any) -> None:
         audits=(),
     )
     await store.set_user_roles(
-        "seal-fixed", [Role.VIEWER.value], assigned_by="contract", now=now + 1
+        "seal-fixed", [Role.VIEWER.value], assigned_by="contract", now=now + 1, audits=()
     )
     expected = UserAuthzRecord.of(
         new_user_record(

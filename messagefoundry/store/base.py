@@ -2743,13 +2743,18 @@ class AuthStore(Protocol):
         *,
         assigned_by: str | None = None,
         now: float | None = None,
+        audits: Sequence[AuditAppend],
     ) -> None:
         """Replace the account's roles with ``role_ids``. Raises ``UnknownRoleError``, writing
         nothing, when an id the account does not already hold has no ``roles`` row as the write
         reads it; a role deleted after that read fails the ``user_roles`` foreign key instead, with
         the driver's integrity error. A held id with no row is dropped (BACKLOG #2592,
         ``store.existing_roles_only``). :meth:`remove_unless_last_admin` with ``SET_ROLES`` does
-        the same."""
+        the same.
+
+        ``audits`` commit in the SAME transaction as the role write, as ``create_user``'s do, so a
+        failed append rolls the roles back (BACKLOG #2221). They are appended whenever the call
+        commits, so the caller passes rows only for a change it has decided to record."""
         ...
 
     async def remove_unless_last_admin(
@@ -2761,9 +2766,14 @@ class AuthStore(Protocol):
         role_ids: Sequence[str] = (),
         assigned_by: str | None = None,
         now: float | None = None,
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """Apply ``change`` to ``user_id`` unless it would leave no enabled administrator (vault
         BACKLOG #2779).
+
+        **``audits`` are appended only when the change is applied, in its transaction (BACKLOG
+        #2221).** A refusal writes nothing and appends nothing, and an append that fails rolls the
+        change back, so a disable, delete or role change never commits without its row.
 
         One transaction re-reads the enabled accounts holding ``admin_role_id`` and refuses, writing
         nothing and returning ``False``, when ``user_id`` is one of them, no other is, and the
@@ -3167,7 +3177,12 @@ class AuthStore(Protocol):
         ...
 
     async def revoke_user_sessions(
-        self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
+        self,
+        user_id: str,
+        *,
+        except_token_hash: str | None = None,
+        now: float | None = None,
+        audit: OperatorAudit[RevokeResult],
     ) -> RevokeResult:
         """Revoke the account's unrevoked sessions, but ``except_token_hash`` when it is given,
         raising the account's session epoch in the same transaction (BACKLOG #2592). Returns how
@@ -3177,7 +3192,12 @@ class AuthStore(Protocol):
         current global epoch, read in that transaction (store.py's ``KeptSessionRestamp``). A
         session of the account it declines to re-stamp it ends in the same transaction and counts,
         and reports ``ended_kept`` (follow-up to BACKLOG #4975). ``kept`` is False with no
-        ``except_token_hash``."""
+        ``except_token_hash``.
+
+        ``audit`` builds the revocation's row from that result, and the row is appended before the
+        one commit, so the sessions end with their record or not at all (BACKLOG #3018 step 4). It
+        is a function, not a row, because the row can carry the count. It returns ``None`` where
+        the caller records the revocation itself (``store.no_audit_row``)."""
         ...
 
     async def count_user_sessions(

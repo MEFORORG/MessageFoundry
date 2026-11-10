@@ -27,7 +27,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Literal, get_args
+from typing import Any, Literal, cast, get_args
 
 import aiosqlite
 import pytest
@@ -67,10 +67,10 @@ from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
     MessageStore,
-    RevokeResult,
     UserRecord,
     VerifiedUser,
     audit_row_hash,
+    no_audit_row,
 )
 from tests._admin_account import create_local_user_chosen
 from tests.test_ad_user_account_control import _InverseSink
@@ -1005,7 +1005,7 @@ async def test_the_breaker_alert_clears_on_a_clean_pass() -> None:
         for name in names:
             user = await store.get_user_by_username(name)
             assert user is not None
-            await store.revoke_user_sessions(user.id)
+            await store.revoke_user_sessions(user.id, audit=no_audit_row)
         await service.reconcile_directory_sessions()
         assert service.directory_reconcile_alert is not None
 
@@ -1182,7 +1182,9 @@ async def test_a_referral_is_not_cleared_by_a_sample_that_missed_an_account_it_s
         assert service._reconcile_referred == everyone, "only the probed account was marked"
         row = await store.get_user_by_username(first)
         assert row is not None
-        await store.revoke_user_sessions(row.id)  # it signs out, and leaves the candidate set
+        await store.revoke_user_sessions(
+            row.id, audit=no_audit_row
+        )  # it signs out, and leaves the candidate set
 
         missed = await service.reconcile_directory_sessions()
         assert _probed() == second and missed.referred == ()
@@ -1226,7 +1228,7 @@ async def test_a_referral_whose_accounts_all_left_is_not_cleared_by_the_accounts
         for name in ("jdoe", "asmith"):
             row = await store.get_user_by_username(name)
             assert row is not None
-            await store.revoke_user_sessions(row.id)  # both sign out
+            await store.revoke_user_sessions(row.id, audit=no_audit_row)  # both sign out
         await _signed_in_ad_user(service, store, "bwong")
         del ldap.present["bwong"]  # one strike, so still signed in
 
@@ -2365,7 +2367,9 @@ async def test_an_unanswered_account_that_signs_out_takes_its_part_with_it(
         await _sampled_pass(service, ids, {"alice", "cdoe"})
         assert service._reconcile_unanswered == {ids["cdoe"]}
 
-        await store.revoke_user_sessions(ids["cdoe"])  # signs out, still unanswered
+        await store.revoke_user_sessions(
+            ids["cdoe"], audit=no_audit_row
+        )  # signs out, still unanswered
         del ids["cdoe"]
         after = await _sampled_pass(service, ids, {"alice", "bwong"})
         assert service._reconcile_unanswered == set()
@@ -2448,7 +2452,7 @@ async def test_a_forfeited_breaker_logs_a_trip_of_id_less_rows_once_not_per_pass
         for name in names:
             user = await store.get_user_by_username(name)
             assert user is not None
-            await store.revoke_user_sessions(user.id)
+            await store.revoke_user_sessions(user.id, audit=no_audit_row)
         assert (await service.reconcile_directory_sessions()).probed == 0
         assert service._reconcile_breaker_standing == "forfeit"
 
@@ -2609,7 +2613,7 @@ async def test_a_pass_that_asks_nothing_leaves_the_outage_run_alone() -> None:
         for name in ("alice", "bob"):  # everyone signs out
             row = await store.get_user_by_username(name)
             assert row is not None
-            await store.revoke_user_sessions(row.id)
+            await store.revoke_user_sessions(row.id, audit=no_audit_row)
             assert await store.list_sessions(row.id) == []
         empty = await _pass(service, sink)
         assert empty.asked == 0 and not empty.outage_page and not empty.outage_clear
@@ -2920,7 +2924,7 @@ async def test_an_unkeyed_binding_is_reported_once_per_process_across_sign_ins()
             )
 
         await service.reconcile_directory_sessions()
-        await store.revoke_user_sessions(legacy.id)
+        await store.revoke_user_sessions(legacy.id, audit=no_audit_row)
         await service.reconcile_directory_sessions()  # no session: not a candidate at all
         assert await _signed_in_ad_user(service, store, "legacy") is not None
         await service.reconcile_directory_sessions()
@@ -5230,6 +5234,25 @@ def _refuse_first(
     return refused
 
 
+def _refuse_every_append(
+    monkeypatch: pytest.MonkeyPatch, store: MessageStore, action: str
+) -> list[str]:
+    """Make the store refuse every ``action`` row, in a write's transaction and through
+    ``record_audit`` alike, since both append through ``_append_audit_row``. Returns the actor of
+    each refused append, in order."""
+    real = store._append_audit_row
+    refused: list[str] = []
+
+    async def failing(name: str, **kwargs: Any) -> Any:
+        if name == action:
+            refused.append(kwargs["actor"])
+            raise sqlite3.OperationalError("synthetic: disk I/O error")
+        return await real(name, **kwargs)
+
+    monkeypatch.setattr(store, "_append_audit_row", failing)
+    return refused
+
+
 def _logged_at_error(caplog: pytest.LogCaptureFixture, *needles: str) -> bool:
     return any(
         r.levelno == logging.ERROR and all(n in r.getMessage() for n in needles)
@@ -5249,11 +5272,13 @@ async def _actors(store: MessageStore, action: str) -> list[str]:
 async def test_a_refused_revocation_audit_row_still_ends_the_sessions_and_tells_everyone(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, refusal: Exception
 ) -> None:
-    """BACKLOG #3018 steps 1, 3, 5 and 6. The store refuses the FIRST account's
-    ``auth.ad_session_revoked`` row. Its sessions still end, its user is still told, the pass goes
-    on to the second account, and the returned plan still carries both, so the lifespan task still
-    raises both alerts. The refusal is logged at ERROR naming the action and the account. Before
-    #3018 the refusal raised out of the pass, after the sessions were already gone."""
+    """BACKLOG #3018 steps 1, 3, 4, 5 and 6. The store refuses the FIRST account's
+    ``auth.ad_session_revoked`` row in the revoke's own transaction, so that revoke rolls back with
+    it. Its sessions still end, without the row, and the row is then written on its own. Its user is
+    still told, the pass goes on to the second account, and the returned plan still carries both, so
+    the lifespan task still raises both alerts. The refusal is logged at ERROR naming the action
+    and the account, and nothing pages, since no row was lost. Before #3018 the refusal raised out
+    of the pass, after the sessions were already gone."""
     store = await MessageStore.open(":memory:")
     try:
         ldap = _FakeLdap({"jdoe": _principal("jdoe"), "asmith": _principal("asmith")})
@@ -5264,7 +5289,9 @@ async def test_a_refused_revocation_audit_row_still_ends_the_sessions_and_tells_
         await service.initialize()
         tokens = [await _signed_in_ad_user(service, store, n) for n in ("jdoe", "asmith")]
         notifier.sent.clear()
-        refused = _refuse_first(monkeypatch, store, "auth.ad_session_revoked", refusal)
+        refused = _refuse_first(
+            monkeypatch, store, "auth.ad_session_revoked", refusal, via="_append_audit_row"
+        )
         ldap.present.clear()  # both accounts leave the directory
         with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
             plan = await service.reconcile_directory_sessions()
@@ -5274,17 +5301,74 @@ async def test_a_refused_revocation_audit_row_still_ends_the_sessions_and_tells_
         for token in tokens:
             assert token is not None and await service.identity_for_token(token) is None
         rows = await _actors(store, "auth.ad_session_revoked")
-        assert rows == sorted({"asmith", "jdoe"} - set(refused)), "the pass stopped at the refusal"
+        assert rows == ["asmith", "jdoe"], "the row was not written on its own after the refusal"
         assert sorted(e.username for e in notifier.sent) == ["asmith", "jdoe"], (
             "the refused account's user was not told"
         )
         assert _logged_at_error(caplog, "auth.ad_session_revoked", refused[0]), (
             "the refused write was not logged at ERROR naming the action and the account"
         )
+        assert plan.audit_refused == (), "a row written on the second try was reported lost"
         sink = _Sink()
         _alert_reconcile_plan(plan, service, sink)
         revoked = sorted(e[1] for e in sink.events if e[0] == "ad_session_revoked")
         assert revoked == ["asmith", "jdoe"]
+        assert not [e for e in sink.events if e[0] == "audit_write_failed"]
+    finally:
+        await store.close()
+
+
+async def test_a_revocation_row_refused_twice_still_ends_the_sessions_and_pages(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #3018 steps 2 and 4. The store refuses every ``auth.ad_session_revoked`` row, in the
+    revoke's transaction and on its own. The sessions still end, so a refused record never keeps
+    an account signed in; each user is still told and each revocation still alerts. The rows are
+    lost, and the plan says so, so the lifespan task pages ``audit_write_failed`` once for the
+    action. The control: a pass whose rows land pages no ``audit_write_failed``."""
+    store = await MessageStore.open(":memory:")
+    try:
+        ldap = _FakeLdap({"jdoe": _principal("jdoe"), "asmith": _principal("asmith")})
+        settings = _ad_settings(ad_session_recheck_strikes=1)
+        service = AuthService(store, settings, ldap=ldap)  # type: ignore[arg-type]
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        await service.initialize()
+        tokens = [await _signed_in_ad_user(service, store, n) for n in ("jdoe", "asmith")]
+        notifier.sent.clear()
+        refused = _refuse_every_append(monkeypatch, store, "auth.ad_session_revoked")
+        ldap.present.clear()
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+            plan = await service.reconcile_directory_sessions()
+        assert sorted(refused) == ["asmith", "asmith", "jdoe", "jdoe"], (
+            "each row was not tried twice"
+        )
+        for token in tokens:
+            assert token is not None and await service.identity_for_token(token) is None
+        assert await _actors(store, "auth.ad_session_revoked") == []
+        assert sorted(e.username for e in notifier.sent) == ["asmith", "jdoe"]
+        assert plan.audit_refused == ("auth.ad_session_revoked",) * 2
+        sink = _Sink()
+        _alert_reconcile_plan(plan, service, sink)
+        assert sorted(e[1] for e in sink.events if e[0] == "ad_session_revoked") == [
+            "asmith",
+            "jdoe",
+        ]
+        assert [e for e in sink.events if e[0] == "audit_write_failed"] == [
+            (
+                "audit_write_failed",
+                "directory-reconciler:auth.ad_session_revoked",
+                {"action": "auth.ad_session_revoked"},
+            )
+        ]
+        # Control: with the store taking rows again, a pass pages none.
+        monkeypatch.undo()
+        ldap.present["jdoe"] = _principal("jdoe")
+        await _signed_in_ad_user(service, store, "jdoe")
+        ldap.present.clear()
+        control = await service.reconcile_directory_sessions()
+        assert [r.username for r in control.revocations] == ["jdoe"]
+        assert control.audit_refused == ()
     finally:
         await store.close()
 
@@ -5294,19 +5378,29 @@ async def test_a_defect_in_a_revocation_audit_write_is_still_raised(
     monkeypatch: pytest.MonkeyPatch, defect: type[Exception]
 ) -> None:
     """BACKLOG #3018. The soft write passes a store refusal and nothing else: a defect in the code
-    still ends the pass, as it does for the pass's own rows (BACKLOG #2137)."""
+    still ends the pass, as it does for the pass's own rows (BACKLOG #2137). The defect is in the
+    revoke's own append, so the revoke rolls back with it; the sessions are still ended, without
+    the row, before the defect is raised (BACKLOG #3018 step 4)."""
     store = await MessageStore.open(":memory:")
     try:
         ldap = _FakeLdap({"jdoe": _principal("jdoe")})
         settings = _ad_settings(ad_session_recheck_strikes=1)
         service = AuthService(store, settings, ldap=ldap)  # type: ignore[arg-type]
         await service.initialize()
-        await _signed_in_ad_user(service, store, "jdoe")
-        refused = _refuse_first(monkeypatch, store, "auth.ad_session_revoked", defect("synthetic"))
+        token = await _signed_in_ad_user(service, store, "jdoe")
+        refused = _refuse_first(
+            monkeypatch,
+            store,
+            "auth.ad_session_revoked",
+            defect("synthetic"),
+            via="_append_audit_row",
+        )
         ldap.present.clear()
         with pytest.raises(defect):
             await service.reconcile_directory_sessions()
         assert refused == ["jdoe"]
+        assert token is not None and await service.identity_for_token(token) is None
+        assert await _actors(store, "auth.ad_session_revoked") == []
     finally:
         await store.close()
 
@@ -5535,19 +5629,24 @@ async def _absent_pass_with_sessions_gone_first(
         await service.initialize()
         token = await _signed_in_ad_user(service, store, "jdoe")
         notifier.sent.clear()
-        real_revoke = store.revoke_user_sessions
+        real_elsewhere = service._already_revoked_elsewhere
 
-        async def sessions_gone_first(user_id: str) -> RevokeResult:
-            ended = await real_revoke(user_id)  # the other reconciler, or the user's sign-out
+        # Just before this pass reads its evidence, which since BACKLOG #3018 step 4 is read
+        # before its own revoke: that revoke commits this pass's row, which the read would find.
+        async def sessions_gone_first(
+            revocation: reconcile.SessionRevocation, *, watermark: Any
+        ) -> bool:
+            # The other reconciler, or the user's sign-out.
+            ended = await store.revoke_user_sessions(revocation.user_id, audit=no_audit_row)
             if other_reconciler_row:
                 await service._audit(
                     "auth.ad_session_revoked",
                     actor="jdoe",
                     detail=json.dumps({"reason": "directory_absent", "sessions": ended.count}),
                 )
-            return await real_revoke(user_id)
+            return await real_elsewhere(revocation, watermark=watermark)
 
-        monkeypatch.setattr(store, "revoke_user_sessions", sessions_gone_first)
+        monkeypatch.setattr(service, "_already_revoked_elsewhere", sessions_gone_first)
         absent_row = json.dumps({"reason": "directory_absent", "sessions": 1})
         if planted == "before_pass":
             await store.record_audit(
@@ -5669,7 +5768,9 @@ async def test_a_foreign_revocation_row_does_not_silence_the_alert(
 async def _signed_out(store: MessageStore, username: str) -> UserRecord:
     user = await store.get_user_by_username(username)
     assert user is not None
-    await store.revoke_user_sessions(user.id)  # the user signed out before the apply
+    await store.revoke_user_sessions(
+        user.id, audit=no_audit_row
+    )  # the user signed out before the apply
     return user
 
 
@@ -5948,14 +6049,7 @@ async def test_a_quiet_revocation_whose_row_is_refused_reports_instead(
             )
             == "quiet"
         )
-        real = store.record_audit
-
-        async def refusing(name: str, **kwargs: Any) -> None:
-            if name == "auth.ad_session_revoked":
-                raise sqlite3.OperationalError("synthetic: disk I/O error")
-            await real(name, **kwargs)
-
-        monkeypatch.setattr(store, "record_audit", refusing)
+        _refuse_every_append(monkeypatch, store, "auth.ad_session_revoked")
         assert (
             await service._apply_reconcile_revocation(
                 revocation, watermark=await service._audit_watermark()
@@ -5984,14 +6078,7 @@ async def test_a_verified_repeat_whose_row_is_refused_alerts_without_a_notice(
         )
         assert await service._apply_reconcile_revocation(revocation, watermark=mark) == "reported"
         assert await service._apply_reconcile_revocation(revocation, watermark=mark) == "quiet"
-        real = store.record_audit
-
-        async def refusing(name: str, **kwargs: Any) -> None:
-            if name == "auth.ad_session_revoked":
-                raise sqlite3.OperationalError("synthetic: disk I/O error")
-            await real(name, **kwargs)
-
-        monkeypatch.setattr(store, "record_audit", refusing)
+        _refuse_every_append(monkeypatch, store, "auth.ad_session_revoked")
         assert await service._apply_reconcile_revocation(revocation, watermark=mark) == "reported"
         assert [e.event_type for e in notifier.sent] == [ACCOUNT_DISABLED]
     finally:
@@ -6029,6 +6116,91 @@ async def test_a_role_revocation_another_reconciler_applied_first_is_quiet() -> 
         await store.close()
 
 
+def test_refused_rows_page_once_per_action_and_a_raising_page_costs_no_other_alert() -> None:
+    """BACKLOG #3018 step 2, at the lifespan task. Two lost rows of one action page once, keyed by
+    the action; a sink whose ``audit_write_failed`` raises still gets the revocation's alert."""
+    plan = reconcile.ReconcilePlan(
+        revocations=(reconcile.SessionRevocation("u1", "jdoe", reason="directory_absent"),),
+        audit_refused=("auth.ad_session_revoked", "auth.ad_reconcile_held")
+        + ("auth.ad_session_revoked",),
+    )
+    auth = cast(AuthService, None)  # read only on an aborted pass
+    sink = _Sink()
+    _alert_reconcile_plan(plan, auth, sink)
+    assert [e for e in sink.events if e[0] == "audit_write_failed"] == [
+        (
+            "audit_write_failed",
+            "directory-reconciler:auth.ad_session_revoked",
+            {"action": "auth.ad_session_revoked"},
+        ),
+        (
+            "audit_write_failed",
+            "directory-reconciler:auth.ad_reconcile_held",
+            {"action": "auth.ad_reconcile_held"},
+        ),
+    ]
+
+    class _Raising(_Sink):
+        def audit_write_failed(self, name: str, *, action: str) -> None:
+            raise RuntimeError("synthetic: the sink broke its contract")
+
+    raising = _Raising()
+    _alert_reconcile_plan(plan, auth, raising)
+    assert [e[0] for e in raising.events] == ["ad_session_revoked"]
+
+
+@pytest.mark.parametrize("refused", [0, 1, 2], ids=["lands", "refused-once", "refused-twice"])
+async def test_a_role_revocation_commits_its_roles_row_with_the_role_write(
+    monkeypatch: pytest.MonkeyPatch, refused: int
+) -> None:
+    """BACKLOG #3018 step 4. The role write is its own transaction, ahead of the revoke's, and
+    carries an ``auth.ad_roles_resynced`` row. Landed, it leaves exactly one. A refused append rolls
+    the roles back with it, so they are written again without it, since the directory stays
+    authoritative, and the row is then written on its own. Refused there too, the row is lost and
+    the pass records the action, so the lifespan task pages ``audit_write_failed``."""
+    store, _, service, _ = await _scoped_service(_GRP_A)
+    try:
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        before = sorted(await store.get_user_role_ids(user.id))
+        target = () if before else (Role.OPERATOR.value,)
+        actors: list[str] = []
+        if refused:
+            real = store._append_audit_row
+
+            async def failing(name: str, **kwargs: Any) -> Any:
+                if name == "auth.ad_roles_resynced" and len(actors) < refused:
+                    actors.append(kwargs["actor"])
+                    raise sqlite3.OperationalError("synthetic: disk I/O error")
+                return await real(name, **kwargs)
+
+            monkeypatch.setattr(store, "_append_audit_row", failing)
+        service._reconcile_refused_rows = []
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="roles_changed", role_ids=target
+        )
+        assert (
+            await service._apply_reconcile_revocation(
+                revocation, watermark=await service._audit_watermark()
+            )
+            == "reported"
+        )
+        assert actors == ["jdoe"] * refused
+        assert sorted(await store.get_user_role_ids(user.id)) == sorted(target)
+        rows = [
+            json.loads(r["detail"]) for r in await store.list_audit(action="auth.ad_roles_resynced")
+        ]
+        if refused == 2:
+            assert rows == []
+            assert service._reconcile_refused_rows == ["auth.ad_roles_resynced"]
+        else:
+            assert rows == [{"from": before, "to": sorted(target), "via": "ad-reconcile"}]
+            assert service._reconcile_refused_rows == []
+        assert len(_revoked_rows(await store.list_audit())) == 1
+    finally:
+        await store.close()
+
+
 async def test_a_role_change_that_ends_no_session_still_reports() -> None:
     """The control on the quiet case: a revocation that ends no session but does change the roles
     still alerts and still tells the user, because something did happen to the account."""
@@ -6038,7 +6210,7 @@ async def test_a_role_change_that_ends_no_session_still_reports() -> None:
         service._security_notifier = notifier
         user = await store.get_user_by_username("jdoe")
         assert user is not None
-        await store.revoke_user_sessions(user.id)  # no session left to end
+        await store.revoke_user_sessions(user.id, audit=no_audit_row)  # no session left to end
         target = () if await store.get_user_role_ids(user.id) else (Role.OPERATOR.value,)
         revocation = reconcile.SessionRevocation(
             user.id, user.username, reason="roles_changed", role_ids=target

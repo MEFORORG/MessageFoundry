@@ -26,7 +26,7 @@ import pytest
 
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
-from messagefoundry.store.store import GLOBAL_SESSION_EPOCH_SQL
+from messagefoundry.store.store import GLOBAL_SESSION_EPOCH_SQL, no_audit_row
 
 _HASH = "a" * 64
 _OTHER = "b" * 64
@@ -62,9 +62,9 @@ _CALLS: dict[str, Callable[[Any], Awaitable[Any]]] = {
     "supersede_session_lineage": lambda s: s.supersede_session(
         _HASH, now=_NOW, lineage_since=_NOW - 360
     ),
-    "revoke_user_sessions": lambda s: s.revoke_user_sessions("u", now=_NOW),
+    "revoke_user_sessions": lambda s: s.revoke_user_sessions("u", now=_NOW, audit=no_audit_row),
     "revoke_user_sessions_except": lambda s: s.revoke_user_sessions(
-        "u", except_token_hash=_HASH, now=_NOW
+        "u", except_token_hash=_HASH, now=_NOW, audit=no_audit_row
     ),
     # BACKLOG #3393: the revoke's clause, counted. Postgres renumbers it rather than sharing it.
     "count_user_sessions": lambda s: s.count_user_sessions("u"),
@@ -263,7 +263,9 @@ async def test_sqlserver_revoke_user_sessions_counts_its_output_rowset(revoked: 
         seen.append(("raise the epoch", (user_id,)))
 
     store._bump_session_epoch = bump
-    result = await store.revoke_user_sessions("u", except_token_hash=_HASH, now=_NOW)
+    result = await store.revoke_user_sessions(
+        "u", except_token_hash=_HASH, now=_NOW, audit=no_audit_row
+    )
     assert result.count == revoked
     # The account's epoch is raised first (BACKLOG #2592); the sweep is the statement that counts.
     assert seen[0][0] == "raise the epoch"

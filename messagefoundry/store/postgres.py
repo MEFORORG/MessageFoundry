@@ -10168,10 +10168,15 @@ class PostgresStore:
         role_ids: Sequence[str] = (),
         assigned_by: str | None = None,
         now: float | None = None,
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """The last-administrator guard and its write in one transaction (vault BACKLOG #2779); see
         ``AuthStore``. The advisory lock comes first, so at the default READ COMMITTED the read after
-        it sees whatever an earlier holder committed before releasing it."""
+        it sees whatever an earlier holder committed before releasing it. ``audits`` are appended
+        only when the change is applied, last, so the audit advisory lock is taken after the
+        guard's lock and the account's row. The writers here that take the audit lock early, at
+        least the connection flag, the approval repeat and the transit attestation withdraw, take
+        neither after it (BACKLOG #2221)."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             if change.takes_role(admin_role_id, role_ids):
@@ -10204,6 +10209,8 @@ class PostgresStore:
                 )
             else:
                 assert_never(change)
+            appended = await self._append_audits(conn, audits, now=now)
+        tee_audits(audits, appended, ts=now)
         return True
 
     async def grant_first_admin_unless_admin_exists(
@@ -10428,12 +10435,17 @@ class PostgresStore:
         *,
         assigned_by: str | None = None,
         now: float | None = None,
+        audits: Sequence[AuditAppend],
     ) -> None:
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             await self._write_user(
                 conn, user_id, lambda r: r.with_roles(role_ids, assigned_by=assigned_by, now=now)
             )
+            # BACKLOG #2221. In the role write's transaction; the append takes the audit advisory
+            # lock while the write holds the account's row lock, as `_execute_with_audits` does.
+            appended = await self._append_audits(conn, audits, now=now)
+        tee_audits(audits, appended, ts=now)
 
     async def set_user_channel_scope(
         self,
@@ -10883,7 +10895,12 @@ class PostgresStore:
             )
 
     async def revoke_user_sessions(
-        self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
+        self,
+        user_id: str,
+        *,
+        except_token_hash: str | None = None,
+        now: float | None = None,
+        audit: OperatorAudit[RevokeResult],
     ) -> RevokeResult:
         """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count
         and whether the kept session was re-stamped (:class:`RevokeResult`, BACKLOG #4975).
@@ -10895,9 +10912,11 @@ class PostgresStore:
         too, read here without a lock clause as every reader of it is, and without refusing a
         missing row (store.py's ``global_epoch_unmoved``), and ended where it is declined
         (:meth:`_keep_or_end_session`, follow-up to BACKLOG #4975). The borrow is
-        :meth:`_after_commit_txn`'s, for the reason it gives."""
+        :meth:`_after_commit_txn`'s, for the reason it gives. ``audit``'s row is appended last,
+        in this transaction, so the audit advisory lock follows the account and session rows
+        (BACKLOG #3018 step 4)."""
         now = time.time() if now is None else now
-        async with self._after_commit_txn() as conn:
+        async with AuditedWrite(now) as written, self._after_commit_txn() as conn:
             raised = await self._bump_session_epoch(conn, user_id)
             status = await conn.execute(
                 _PG_REVOKE_USER_SESSIONS_SQL + " AND ($3::text IS NULL OR token_hash != $3)",
@@ -10906,15 +10925,18 @@ class PostgresStore:
                 except_token_hash,
             )
             if except_token_hash is None:
-                return RevokeResult(_rowcount(status))
-            unmoved = global_epoch_unmoved(await self._global_session_epoch_value(conn))
-            return await self._keep_or_end_session(
-                conn,
-                _rowcount(status),
-                except_token_hash,
-                KeptSessionRestamp(user_id, raised, unmoved),
-                now,
-            )
+                result = RevokeResult(_rowcount(status))
+            else:
+                unmoved = global_epoch_unmoved(await self._global_session_epoch_value(conn))
+                result = await self._keep_or_end_session(
+                    conn,
+                    _rowcount(status),
+                    except_token_hash,
+                    KeptSessionRestamp(user_id, raised, unmoved),
+                    now,
+                )
+            await self._append_operator_audit(conn, written, audit, result)
+        return result
 
     async def _keep_or_end_session(
         self, conn: Any, revoked: int, token_hash: str, restamp: KeptSessionRestamp, now: float

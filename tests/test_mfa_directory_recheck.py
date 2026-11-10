@@ -461,7 +461,7 @@ async def test_the_role_test_judges_the_roles_read_after_the_lookup(
 
     async def lookup_then_resync(user: Any) -> reconcile.Probe | str:
         answer = await original(user)
-        await store.set_user_roles(e.user_id, ["viewer"], assigned_by="ad-sync")
+        await store.set_user_roles(e.user_id, ["viewer"], assigned_by="ad-sync", audits=())
         return answer
 
     monkeypatch.setattr(e.service, "_directory_presence", lookup_then_resync)

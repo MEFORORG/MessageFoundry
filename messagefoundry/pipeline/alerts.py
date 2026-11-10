@@ -668,7 +668,9 @@ class AlertSink(Protocol):
         an ungated reload, and then refuses the reload with 503 (vault BACKLOG #2254). The IdP
         step-up return's audit budget uses ``step_up_return:audit_budget:<action>`` when its
         all-callers backstop stops a row, at most once a window per action (BACKLOG #3965); that
-        row was shed by the budget, not refused by the store. ``action`` is
+        row was shed by the budget, not refused by the store. The directory reconciler uses
+        ``directory-reconciler:<action>`` for a row a completed pass could not write, once per
+        action per pass (BACKLOG #3018 step 2). ``action`` is
         the audit action of the lost row, such as ``approval.approved``. The row's detail is NOT
         carried. The ERROR log line written beside this alert carries the row's detail on some paths
         and only the exception on others; docs/SECURITY.md says which. It is raised whether the gate

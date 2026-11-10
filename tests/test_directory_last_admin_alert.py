@@ -139,7 +139,9 @@ class _Rig:
             password_generated=False,
             audits=(),
         )
-        await self.store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by="admin")
+        await self.store.set_user_roles(
+            user_id, [Role.ADMINISTRATOR.value], assigned_by="admin", audits=()
+        )
         if disabled:
             await self.store.set_user_disabled(user_id, disabled=True)
 
@@ -420,6 +422,7 @@ async def test_the_grant_is_judged_on_the_roles_read_at_apply_time_not_the_plans
             revocation.user_id,
             [Role.ADMINISTRATOR.value, Role.OPERATOR.value],
             assigned_by="ad-sync",
+            audits=(),
         )
         return await real(revocation, watermark=watermark)
 
