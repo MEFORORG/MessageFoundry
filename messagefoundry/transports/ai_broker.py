@@ -61,6 +61,7 @@ from messagefoundry.config.tls_policy import (
     HopDisposition,
     HopPosture,
     RevocationHopGuard,
+    TrustAnchor,
     TrustAnchorPolicy,
     hop_url_host,
     is_loopback_hop_host,
@@ -108,15 +109,26 @@ _AI_HOP_CELL = "[ai] engine AI broker (verified TLS, no revocation check)"
 
 #: The ways across that refusal under an enforcing posture, besides an endpoint on this machine.
 #: ``[tls].crl_file`` reaches this hop since BACKLOG #5527, the later CRL lever ADR 0173 section 12
-#: foresaw when the owner ruling of 2026-10-27 built the attestation pair alone. The text offers no
-#: connection's attestation: the endpoint is not a connection, so naming one would be a remedy the
-#: operator cannot perform.
-_AI_REVOCATION_LEVER = (
-    "Set [tls].crl_file to a CRL file that covers the issuer of the AI endpoint's certificate, "
-    "or set [ai].endpoint_revocation_attested = true with an "
-    "[ai].endpoint_revocation_attested_reason that says what covers revocation of that "
-    "certificate, or use an endpoint on this machine."
+#: foresaw when the owner ruling of 2026-10-27 built the attestation pair alone. It is offered only
+#: to a broker that was handed a ``[tls]`` policy: on a build with none, such as a direct
+#: ``create_app``, setting it would change nothing. No connection's attestation is offered either:
+#: the endpoint is not a connection. Naming either would be a remedy the operator cannot perform.
+_AI_CRL_LEVER = (
+    "Set [tls].crl_file to a CRL file that covers the issuer of the AI endpoint's certificate, or "
 )
+_AI_ATTESTATION_LEVER = (
+    "set [ai].endpoint_revocation_attested = true with an "
+    "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
+    "endpoint's certificate, or use an endpoint on this machine."
+)
+
+
+def _revocation_lever(*, crl_reachable: bool) -> str:
+    """The refusal's remedy text: :data:`_AI_CRL_LEVER` only where a CRL can reach the hop."""
+    if crl_reachable:
+        return _AI_CRL_LEVER + _AI_ATTESTATION_LEVER
+    return _AI_ATTESTATION_LEVER[0].upper() + _AI_ATTESTATION_LEVER[1:]
+
 
 #: Each crossing line already logged, keyed by its kind and the endpoint host, so each is written
 #: once per process for each hop, as the Vault hop's are. The broker is built for every request, so
@@ -170,22 +182,37 @@ def _endpoint_opener(
     The anchor is resolved by ``rest.http_family_trust_anchor``, as for every HTTP-family hop, here
     with no ``tls_ca_file`` of its own: ``[tls].internal_ca_file`` under ``augment`` or ``pinned``,
     and ``[tls].crl_file`` in any mode, each only for a host that is not loopback. So this is where
-    a CRL reaches this hop. An anchor that narrows gets an opener of this broker's own. One that
+    a CRL reaches this hop. An anchor that narrows gets an anchored opener of its own. One that
     narrows nothing gets rest.py's shared opener, which is never mutated: callers compare an
     opener to it by identity to learn that.
 
-    The broker is built for every request, so an opener of its own reads the CA and CRL files on
-    every assist call, as the LDAPS bind does: each call checks the files as they are then, and
-    the context is released with the request.
+    **The anchored opener is held across requests**, though the broker is built for each one: one
+    slot, keyed on the resolved anchor, so a changed ``[tls]`` policy builds a new one and drops the
+    old. Held, its context is a live hop as every connection's is, so ``loaded_crls`` records the
+    CRL it holds, the expiry monitor judges that copy, and ``crl_reload`` brings it current when
+    the file is replaced. Built per request, it would read and judge the CA and CRL files on every
+    assist call, and record a held copy for each throwaway context.
 
     Raises ``ValueError`` or ``OSError`` for a file that cannot be loaded or a CRL that
-    ``harden_crl_check`` refuses."""
+    ``harden_crl_check`` refuses; a build that raises caches nothing."""
     anchor = http_family_trust_anchor(
         {}, url=endpoint, trust_anchor_policy=policy, cell="[ai].endpoint"
     )
-    if anchor.narrows:
-        return _no_redirect_opener(trust_anchor=anchor)
-    return _shared_no_redirect_opener()
+    if not anchor.narrows:
+        return _shared_no_redirect_opener()
+    global _anchored_opener
+    with _anchored_opener_lock:
+        held = _anchored_opener
+        if held is not None and held[0] == anchor:
+            return held[1]
+        opener = _no_redirect_opener(trust_anchor=anchor)
+        _anchored_opener = (anchor, opener)
+        return opener
+
+
+#: The one anchored opener :func:`_endpoint_opener` holds, with the anchor it was built for.
+_anchored_opener: tuple[TrustAnchor, urllib.request.OpenerDirector] | None = None
+_anchored_opener_lock = threading.Lock()
 
 
 def _refuse_an_unrevoked_ai_hop(
@@ -195,13 +222,16 @@ def _refuse_an_unrevoked_ai_hop(
     posture: HopPosture | None,
     revocation_attested: bool,
     revocation_reason: str | None,
+    crl_reachable: bool = False,
 ) -> None:
     """Refuse a verifying AI endpoint hop that checks no revocation and carries no attestation
     (BACKLOG #2193 slice (e), owner ruling 2026-10-27, on the ADR 0173 section 12 pattern).
 
     Every call sends ``[ai].api_key`` and the code sent for assistance over https that verifies
-    the endpoint's certificate. Stdlib ssl checks no CRL and no OCSP, so a revoked but unexpired
-    certificate would be accepted with no refusal and no record.
+    the endpoint's certificate. Stdlib ssl checks no OCSP, and no CRL unless one is loaded on the
+    context, so without one a revoked but unexpired certificate would be accepted with no refusal
+    and no record. ``crl_reachable`` says whether a ``[tls]`` policy reached the broker, and so
+    whether the refusal and the warning may offer ``[tls].crl_file``.
 
     The decision is ``tls_policy.revocation_hop_disposition``, the authority every revocation
     guard uses, asked through ``RevocationHopGuard.capture(...).disposition()``, with these inputs:
@@ -318,13 +348,16 @@ def _refuse_an_unrevoked_ai_hop(
         if _first_crossing("warn", host):
             logger.warning(
                 "insecure transport hop permitted -- %s: %s; under [security].enforcement = "
-                "enforce this hop is refused unless [ai].endpoint_revocation_attested is true "
+                "enforce this hop is refused unless %s[ai].endpoint_revocation_attested is true "
                 "with its reason",
                 _AI_HOP_CELL,
                 detail,
+                "a [tls].crl_file covering its issuer is set or " if crl_reachable else "",
             )
         return
-    raise AiBrokerError(f"{_AI_HOP_CELL}: {detail}. {_AI_REVOCATION_LEVER}")
+    raise AiBrokerError(
+        f"{_AI_HOP_CELL}: {detail}. {_revocation_lever(crl_reachable=crl_reachable)}"
+    )
 
 
 class AiBroker:
@@ -414,6 +447,7 @@ class AiBroker:
             posture=posture,
             revocation_attested=revocation_attested,
             revocation_reason=revocation_attested_reason,
+            crl_reachable=trust_anchor_policy is not None,
         )
         self.endpoint = endpoint
         self.api_key = api_key

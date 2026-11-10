@@ -1641,7 +1641,9 @@ count is above `0` (vault BACKLOG #2613).
   whatever `[ai].mode` is.
 - **At load:** the flag without a reason, a blank reason, a reason without the flag, or a reason
   holding a control character or a lone surrogate is refused when the settings load.
-- **Reversible:** yes. Delete both lines and restart. An off-box endpoint then refuses again.
+- **Reversible:** yes. Delete both lines and restart. An off-box endpoint then refuses again,
+  unless a `[tls].crl_file` reaches it (BACKLOG #5527): that hop crosses on its CRL, with or
+  without this pair.
 
 ### `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1` **with `MEFOR_SECURITY_ENFORCEMENT=warn`** — config Python loads from a place others can write
 > **An environment variable, not a setting, and refused under `[security].enforcement = enforce`**

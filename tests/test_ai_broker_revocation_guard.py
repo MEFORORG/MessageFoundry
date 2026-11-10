@@ -69,10 +69,12 @@ _LOGGER = "messagefoundry.transports.ai_broker"
 
 @pytest.fixture(autouse=True)
 def _fresh_crossings(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Each test starts with no crossing logged and no process-wide attestation set."""
+    """Each test starts with no crossing logged, no anchored opener held and no process-wide
+    attestation set."""
     # raising=False only so this file fails on its assertions, not in setup, where the set is
     # absent; the once-per-process tests below go red if it is renamed.
     monkeypatch.setattr(ai_broker_mod, "_LOGGED_CROSSINGS", set(), raising=False)
+    monkeypatch.setattr(ai_broker_mod, "_anchored_opener", None, raising=False)
     monkeypatch.delenv(TLS_REVOCATION_ATTESTED_ENV, raising=False)
     yield
 
@@ -133,10 +135,9 @@ def test_an_off_box_endpoint_with_no_attestation_is_refused(posture: HopPosture 
     message = str(info.value)
     assert "no revocation check" in message
     assert _PAIR in message and "endpoint_revocation_attested_reason" in message
-    # It offers only levers that reach this hop: [tls].crl_file since BACKLOG #5527, never a
-    # connection's pair.
-    assert "Set [tls].crl_file" in message
-    assert "No CRL can reach this hop" not in message
+    # It offers only levers that reach this hop. With no [tls] policy handed in, no CRL can
+    # reach it, so [tls].crl_file is not offered (BACKLOG #5527); nor is a connection's pair.
+    assert "[tls].crl_file" not in message
     assert "tls_revocation_attested=true" not in message
     assert _KEY not in message
 
@@ -621,6 +622,35 @@ def test_a_loopback_endpoint_takes_neither_the_internal_ca_nor_the_crl(pki: _Pki
         policy=policy,
     )
     assert broker._opener is _shared_no_redirect_opener()
+
+
+def test_a_broker_handed_a_tls_policy_offers_the_crl_lever(ai_log: list[str]) -> None:
+    """Where a ``[tls]`` policy reaches the broker, ``[tls].crl_file`` is a way across, so the
+    refusal and the warn line both offer it beside the pair. The control is the first test in this
+    file, which hands no policy and is offered no CRL."""
+    with pytest.raises(AiBrokerError) as info:
+        _broker(posture=_ENFORCING, policy=TrustAnchorPolicy())
+    message = str(info.value)
+    assert "Set [tls].crl_file" in message
+    assert _PAIR in message
+    _broker(posture=_WARN, policy=TrustAnchorPolicy())
+    assert len(ai_log) == 1
+    assert "[tls].crl_file" in ai_log[0]
+    assert _PAIR in ai_log[0]
+
+
+def test_the_anchored_opener_is_held_across_requests(pki: _Pki) -> None:
+    """The broker is built per request, but its anchored opener is built once for an anchor, so
+    ``crl_reload`` can bring its CRL current and the expiry monitor sees one live copy. A changed
+    policy builds a new one."""
+    crl = TrustAnchorPolicy(crl_file=pki.crl_file)
+    first = _broker(posture=_ENFORCING, policy=crl)
+    second = _broker(posture=_ENFORCING, policy=crl)
+    assert second._opener is first._opener
+    pinned = TrustAnchorPolicy(internal_ca_file=pki.ca_file, mode="pinned", crl_file=pki.crl_file)
+    third = _broker(posture=_ENFORCING, policy=pinned)
+    assert third._opener is not first._opener
+    assert _broker(posture=_ENFORCING, policy=pinned)._opener is third._opener
 
 
 def test_a_tls_file_that_cannot_be_loaded_is_the_brokers_own_error(tmp_path: Path) -> None:

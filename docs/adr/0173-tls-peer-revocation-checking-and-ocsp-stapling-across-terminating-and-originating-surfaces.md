@@ -1100,7 +1100,8 @@ reached them.
 **Note 2026-10-28: the LDAPS AD bind is guarded (BACKLOG #2193 slice (b), owner ruling 2026-10-27).** The LDAPS row of the table above says how. The counts paragraph below names LDAPS as one of its seven hops; it no longer needs a guard. Two facts the row does not carry. A Kerberos sign-in adds no hop: the SPNEGO acceptor reads a ticket the browser sent and builds no TLS context, and the directory lookups a Kerberos or OIDC sign-in makes are binds over this one guarded context, since every bind in `auth/ldap.py` is an ldap3 SIMPLE bind. And `messagefoundry check` has no leg for this guard, where it reports the OIDC legs' through its required `oidc-revocation` leg (BACKLOG #2131). At least `serve`, `provision-admin` and `messagefoundry check-privileges` reach it. This note does not re-check the paragraph's other counts.
 
 **The counts.** At least seven hops need a guard: the FHIR lookup, the AI broker (guarded by
-attestation since 2026-10-30, see the note of that date below), the DICOM SCU,
+attestation since 2026-10-30, see the note of that date below, and crossing on `[tls].crl_file`
+too since 2026-11-10, BACKLOG #5527), the DICOM SCU,
 FTPS, LDAPS (guarded since 2026-10-28, see the note above), the alert and security-notice SMTP hop,
 and the alert webhook. BACKLOG #2193 tracks
 all seven, one checklist line per hop. No row in this table needs an owner answer now. DIRECT,
@@ -1129,8 +1130,9 @@ The counts paragraph above names the alert SMTP hop and the alert webhook among 
 
 - `POST /ai/chat` in `api/app.py` hands `ai_broker_from_settings` the `[tls]` policy the app stashes, as the alerts test send does. A direct `create_app` holds none, and that is the empty policy.
 - `_endpoint_opener` in `transports/ai_broker.py` resolves the anchor through rest.py's `http_family_trust_anchor`, which each HTTP-family hop uses, with no connection CA. An anchor that narrows gets an opener of the broker's own, through rest.py's `_no_redirect_opener`. One that narrows nothing gets the shared opener, which is never mutated. A loopback endpoint takes neither file, the exemption `resolve_trust_anchor` gives every hop.
-- The guard is unchanged. It already read `crl_checked` off the context of the opener the broker dials, so a CRL that reaches that context crosses an enforcing posture with no attestation and logs no attested crossing line. Its refusal text now offers `[tls].crl_file` beside the attestation pair.
-- The broker is built per request, so an opener of its own reads the CA and CRL files on each assist call. A CRL replaced on disk reaches the next call.
+- The guard is unchanged. It already read `crl_checked` off the context of the opener the broker dials, so a CRL that reaches that context crosses an enforcing posture with no attestation and logs no attested crossing line. Its refusal text now offers `[tls].crl_file` beside the attestation pair, on the terms the next bullet but one states.
+- The broker is built per request, but its anchored opener is held: one slot keyed on the resolved anchor. So its context is a live hop like a connection's: `loaded_crls` records the CRL it holds, the expiry monitor judges that copy, and `crl_reload` brings it current when the file is replaced. A changed `[tls]` policy builds a new one.
+- The refusal offers `[tls].crl_file` only to a broker handed a `[tls]` policy, and the warn line names it on the same terms; a direct `create_app` hands none, so setting it there would change nothing.
 - The CRL is instance-wide. `VERIFY_CRL_CHECK_LEAF` refuses a peer whose issuer has no CRL in the file, so an AI endpoint under a public CA the file does not cover fails its handshake once `[tls].crl_file` is set. The attestation pair does not change that: it lifts the refusal, not the CRL on the context. That is the trade every hop `[tls].crl_file` reaches makes, and there is no per-hop opt-out. Such a site puts the endpoint issuer's CRL in the file, or leaves `[tls].crl_file` unset and attests.
 - `security_loosenings()` still names a set attestation pair, and its text now says no CRL is checked unless `[tls].crl_file` is set. `tests/test_ai_broker_revocation_guard.py` pins each point above.
 
