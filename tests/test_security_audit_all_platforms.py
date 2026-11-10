@@ -1134,7 +1134,7 @@ _SECRET = "marker-not-a-key"
         ([f"--out=KEYRING_A={_SECRET}"], 1, "holds '='"),
         # A flag in the = form: argparse's "ignored explicit argument" error quotes the value.
         ([f"--strict={_SECRET}"], 1, "holds '='"),
-        ([f"--help={_SECRET}"], 1, "dry run, fix"),
+        ([f"--help={_SECRET}"], 1, "is not passed on"),
         ([f"-S={_SECRET}"], 1, "holds '='"),
         # A fixed-form value holding "=": its "invalid choice" error quotes the value.
         ([f"--format=json={_SECRET}"], 1, "holds '='"),
@@ -1195,7 +1195,7 @@ def test_a_dry_run_fix_help_or_version_word_is_refused_after_the_lock(
     assert main([str(src), "--desc", "on", word], run=run) == 2
     assert not ran
     err = capsys.readouterr().err
-    assert "word 3 after the lock is, or may be read as, pip-audit's dry run" in err
+    assert "word 3 after the lock is not passed on" in err
 
 
 def test_pip_audits_own_options_still_pass_through_after_the_lock(tmp_path: Path) -> None:
