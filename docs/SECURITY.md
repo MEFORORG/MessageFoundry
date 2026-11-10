@@ -1256,15 +1256,19 @@ Treat an open warning as live until you have found and fixed its cause. The caus
 least, the token, reachability, the probe paths, or the engine's own Vault client setup (a missing
 extra, address or token variable, or a refused TLS or cleartext address). Neither the log line nor
 the audit row names the process that raised or cleared it, and under the engine-shard supervisor
-every shard shares one log, so check each process's configuration and restart it after the fix:
-only a serve start's preflight raises or resolves this warning (`messagefoundry check-privileges`
-runs the same probe on demand but changes no alert). A start whose process has no `[alerts]`
+every engine shard shares one log, so check each process's configuration and restart it after
+the fix: only a serve start's preflight raises this warning or resolves it automatically
+(`messagefoundry check-privileges` runs the same probe on demand but changes no alert). A start whose process has no `[alerts]`
 transport, such as a webhook or email, gets the logging sink, which resolves nothing. It also
-raises nothing durable, so a process with no transport never appears in the alert list; an empty
+raises nothing durable, so that process's warning never appears in the alert list; an empty
 list does not prove every process is clean. A resolve can also fail to land, at least: it logs an
 ERROR such as `alert-instance resolve gave up` or `alert-instance resolve was cancelled before it
-landed`, or it can be dropped with no line at all. If the cause is fixed and the warning is still
-open, resolve it by hand from the alert list.
+landed`, or it can be dropped with no line at all. A resolve the fence kept open logs, at least,
+an INFO line containing `closed nothing: a live instance remains`, or a WARNING containing
+`closed nothing and the re-read failed` when the re-read fails. If the cause is fixed and the
+warning is still open, resolve it by hand from the alert list. Resolving it by hand needs an
+identity with no channel scope and `monitoring:diagnose`; a channel-scoped identity never sees
+this subject.
 
 The log line and the audit row of every start stay the record.
 
