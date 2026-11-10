@@ -660,14 +660,13 @@ class ResealResult:
     #: it is a skip.
     not_regular: int = 0
     #: True when the uploads root could not be listed, as when it is missing or is not a directory
-    #: (BACKLOG #4940). Also True when a non-empty listing is followed by a root that is no
-    #: directory, at the check right after the listing or at the pass's first pair-lock check. An
-    #: unmounted volume and a directory never created both look like this, and the pass cannot tell
-    #: them apart: read as zero uploads, an unmounted volume's uploads would stay under the prior key
-    #: while the run reported success. ``rotate-key`` refuses such a root before it writes anything,
-    #: so this is a backstop for one that goes away in those windows. It is not a skip:
-    #: ``rotate-key`` aborts on it before its audit roll. What that leaves uncaught is in
-    #: docs/PHI.md, at the ``rotate-key`` passage.
+    #: (BACKLOG #4940). An unmounted volume and a directory never created cannot be listed alike,
+    #: and the pass cannot tell them apart: read as zero uploads, an unmounted volume's uploads
+    #: would stay under the prior key while the run reported success. ``rotate-key`` refuses such a
+    #: root before it writes anything, so this is a backstop. Also True when a non-empty listing is
+    #: followed by a root that is no directory, at the check right after the listing or at the
+    #: pass's first pair-lock check. It is not a skip: ``rotate-key`` aborts on it before its audit
+    #: roll.
     root_missing: bool = False
 
     @property
@@ -3296,10 +3295,12 @@ _NOT_A_FILE = _not_a_file_errnos(sys.platform)
 
 
 def _root_gone(exc: OSError, root: Path) -> bool:
-    """Whether ``exc`` is a ``FileNotFoundError`` from a missing uploads root ``root``, and not
-    from something missing under a root still there. ``os.path.isdir`` follows links, so a root
-    that is a link to a missing target is gone too."""
-    return isinstance(exc, FileNotFoundError) and not os.path.isdir(root)
+    """Whether ``exc`` is a ``FileNotFoundError`` or ``NotADirectoryError`` while the uploads root
+    ``root`` is no directory, as when it is missing or was replaced by a file, and not one from
+    under a root still there. ``os.path.isdir`` follows links, so a root that is a link to a
+    missing target is gone too. The CLI's ``_uploads_root_refusal`` and the re-seal's check after
+    its listing read a root that is no directory the same way."""
+    return isinstance(exc, FileNotFoundError | NotADirectoryError) and not os.path.isdir(root)
 
 
 def _lock_name(path: Path) -> str:
@@ -3309,7 +3310,7 @@ def _lock_name(path: Path) -> str:
 
 def _pair_lock_failure(exc: OSError, root: Path) -> _PairLockFailure:
     """Why :func:`_pair_lock` could not take the lock in the uploads root ``root``. ``busy``:
-    another holder kept it past the wait. ``gone``: the root is missing (:func:`_root_gone`).
+    another holder kept it past the wait. ``gone``: the root is no directory (:func:`_root_gone`).
     ``timeout``: the OS timed out (``ETIMEDOUT``), as a network file system can. ``refused``:
     the file system refused this account (``atomic_edit._REFUSED``), such as a lock file another
     account owns; a ``_PairLockBusy`` with a cause is one too, as is what ``_NOT_A_FILE`` names,
@@ -3317,8 +3318,10 @@ def _pair_lock_failure(exc: OSError, root: Path) -> _PairLockFailure:
     ``EIO`` or ``ESTALE`` from a network file system."""
     if isinstance(exc, _PairLockBusy):
         return "refused" if exc.__cause__ is not None else "busy"
+    if _root_gone(exc, root):
+        return "gone"
     if isinstance(exc, FileNotFoundError):
-        return "gone" if _root_gone(exc, root) else "refused"
+        return "refused"
     if isinstance(exc, TimeoutError):
         return "timeout"
     if exc.errno in _REFUSED or exc.errno in _NOT_A_FILE:

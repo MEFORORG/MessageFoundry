@@ -470,6 +470,35 @@ def test_a_root_gone_at_the_first_lock_check_is_root_missing(
     assert (result.skipped, result.body_lost, reads) == (0, 0, [])
 
 
+def test_a_root_replaced_by_a_file_at_the_first_lock_check_is_root_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A root replaced by a regular file at the first lock check fails the lock's open with
+    ``ENOTDIR`` on POSIX. That reads "gone", as a missing root does, so the pass reports the
+    missing root (BACKLOG #4940), not every half skipped. The errno is raised by hand so the case
+    runs on Windows too, which reports the same event as ``ENOENT``."""
+    root = tmp_path / "uploads"
+    old, new = generate_key(), generate_key()
+    _seed(root, old)
+    _seed(root, old)
+
+    def _replaced(path: Path, **_: Any) -> Any:
+        lock = lock_path_for(path)
+        shutil.rmtree(lock.parent)
+        lock.parent.write_bytes(b"")
+        raise NotADirectoryError(errno.ENOTDIR, "Not a directory", str(lock))
+
+    monkeypatch.setattr(uploads_mod, "edit_lock", _replaced)
+    reads = _record_decrypts(monkeypatch)
+    result = asyncio.run(_store(root, new, old).reseal_to_active())
+    assert root.is_file()
+    assert result.root_missing and result.incomplete
+    assert (result.skipped, result.body_lost, reads) == (0, 0, [])
+    not_a_dir = NotADirectoryError(errno.ENOTDIR, "Not a directory")
+    assert uploads_mod._pair_lock_failure(not_a_dir, root) == "gone"
+    assert uploads_mod._pair_lock_failure(not_a_dir, tmp_path) == "failed"
+
+
 def test_a_root_gone_right_after_the_listing_is_root_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
