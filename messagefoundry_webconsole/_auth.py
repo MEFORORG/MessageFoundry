@@ -30,6 +30,7 @@ from messagefoundry.api.security import (
     get_auth,
     mark_route_gate,
     record_repeated_credential,
+    record_ws_gate,
 )
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.service import AuthService
@@ -2100,7 +2101,12 @@ async def authorize_ui_ws(
     """
     origin = websocket.headers.get("origin")
     if not origin:
-        return None, None  # native client (no Origin) — the header path handles it
+        # Native client (no Origin): not this gate's handshake, so it records nothing and leaves
+        # the header path's answer standing.
+        return None, None
+    # Vault BACKLOG #2955: the handshake is this gate's to judge from here. Not admitted until the
+    # end below, so a refusal clears an earlier answer.
+    record_ws_gate(websocket, admitted=False)
     if not _origin_matches(websocket.app.state, origin, websocket.headers.get("host")):
         return None, None  # cross-origin browser handshake (CSWSH) — reject
     if session_cookie_copies(websocket) > 1:
@@ -2161,6 +2167,8 @@ async def authorize_ui_ws(
                 identity, permission, websocket.url.path, client=client_ip(websocket)
             )
             return None, None
+    # Vault BACKLOG #2955: the engine refuses to accept an in-body socket no gate admitted.
+    record_ws_gate(websocket, admitted=True)
     return identity, token
 
 

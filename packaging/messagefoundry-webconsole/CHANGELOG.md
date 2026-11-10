@@ -76,6 +76,11 @@ this line.**
 
 ### Security
 
+- **The cookie WebSocket gate records its answer for the engine's accept gate.** `authorize_ui_ws`
+  records on the handshake whether it admitted the caller, which the engine's accept gate reads,
+  the latest recorded answer standing. A handshake with no Origin is not this gate's to judge, so it
+  records nothing there. Needs the engine seam that carries `api.security.record_ws_gate`. See
+  [`docs/SECURITY.md`](../../docs/SECURITY.md). (vault BACKLOG #2955)
 - **One issued continuation mints one grant, even when two re-auths race it.** `POST /ui/reauth`
   and the federated start `POST /ui/reauth/oidc` now take the issue before the password check or
   the flow is staged, so a second tab re-authenticating toward the same confirm page meanwhile

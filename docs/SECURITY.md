@@ -222,7 +222,21 @@ body, the early sign-in check above still answers before it. A route passes in o
   dependency guards by design, such as sign-in. Some web console routes of this kind still read a
   pending session inside the handler, such as `/ui/mfa`. `authorizes_in_body` marks a WebSocket
   that authorizes the caller inside its own body, and `/ws/stats` is the engine route that uses it.
-  On an HTTP route with no gate, that mark does not count, so the route is refused.
+  On an HTTP route with no gate, that mark does not count, so the route is refused. The mark is
+  not trusted on its own (vault BACKLOG #2955): `authorize_ws` records on the handshake whether it admitted the caller,
+  and the web console's `authorize_ui_ws` does so only on a browser handshake (one with an Origin),
+  the latest answer standing. `WebSocketAcceptGate` reads that record before it lets an accept
+  through. When the latest recorded answer is a refusal, it refuses accept on every socket, whatever its route declares. With no
+  recorded answer, a socket passes only where its route declares its authorization another way: a
+  gate dependency or a `public_route` mark. On a socket it refuses, it refuses a denial response
+  the body sends the same way, whatever its status, so none of its status, headers or body goes
+  out. The refusal is a close before accept, which the client gets as a bodyless HTTP
+  403. The web console's cookie gate records nothing for a handshake that sends no Origin, which
+  it leaves to the header path, so an earlier answer stands there. The accept gate writes an ERROR
+  line, `refused accept on WebSocket route`, for each refusal except a refusal status sent after a
+  gate's recorded refusal, at most once a minute for each route the handshake names.
+  Refusals on handshakes that name no route share one count and one line. That count is in
+  memory only; `GET /security/posture` does not report it.
 
 Any other route answers **403** `this route declares no authorization`, and a WebSocket is refused
 before it is accepted. Such a route is a defect in the code that registered it. The engine counts

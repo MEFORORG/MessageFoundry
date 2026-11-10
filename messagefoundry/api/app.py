@@ -242,6 +242,7 @@ from messagefoundry.api.security import (
     ConfigWriteNotRecorded,
     ExportStopped,
     StandingRefusal,
+    WebSocketAcceptGate,
     alert_sink_for,
     answers_before_body,
     authorize_ws,
@@ -4855,6 +4856,9 @@ def create_app(
     # through _security_headers, and the outermost floor (registered below) is what covers them.
     app.add_middleware(_security_headers)
     app.add_middleware(_limit_request_body)
+    # Vault BACKLOG #2955: an in-body WebSocket is accepted only once a gate admitted its caller.
+    # Inside the header floor, so its refusal close gets the floor's 403 like a gate's own refusal.
+    app.add_middleware(WebSocketAcceptGate)
 
     @app.get("/health", response_model=Health)
     @public_route("liveness must answer a tokenless probe; the version needs a session")
@@ -10714,7 +10718,9 @@ def create_app(
             identity = await authorize_ws(websocket, Permission.MONITORING_READ)
             token = ws_token(websocket)
         # The three refusals below happen BEFORE accept, so each is the handshake's HTTP answer
-        # (BACKLOG #1120; see header_floor.refuse_websocket).
+        # (BACKLOG #1120; see header_floor.refuse_websocket). The first runs with no gate admitted,
+        # so WebSocketAcceptGate refuses its denial response and the client gets a bodyless 403
+        # (vault BACKLOG #2955); the two 503s run after a gate admitted the caller.
         if identity is None:
             await refuse_websocket(
                 websocket,
