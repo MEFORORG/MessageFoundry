@@ -708,8 +708,8 @@ async def test_an_ungated_reload_with_no_snapshot_refuses_a_value_file_on_a_lost
         assert cast(Any, engine)._env_values == approved_values
         runner = engine.registry_runner
 
-        # serve's provider vets the file's access list first. That vet is not under test here,
-        # so it passes, and the refusal is the read's own.
+        # serve's provider vets the file's access list first. Stubbed, so the refusal pinned is
+        # the read's own whatever the vet decides of a lost share.
         monkeypatch.setattr(
             "messagefoundry.config.wiring.assert_trusted_start_paths", lambda *_a, **_k: None
         )
