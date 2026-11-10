@@ -1256,9 +1256,12 @@ has an `[alerts]` notifier (the logging sink a process without one gets resolves
 probes that hop and reads it clean, and the warning's newest raise is one the fenced auto-resolve
 speaks for ([ADR 0044, the vault BACKLOG #4916
 amendment](adr/0044-operator-alert-state.md#amendment-2026-11-09----an-auto-resolve-is-fenced-to-the-raises-it-speaks-for-backlog-4916)).
-The fence reads the open alert once, in a snapshot taken before the resolve queues, and every
-retry reuses that snapshot; it reads afresh only after the snapshot read itself failed. So a raise
-from another process that lands after the snapshot the resolve used keeps the warning open. A
+The fence reads the open alert once and every retry reuses that snapshot; it reads afresh only
+after the snapshot read itself failed. The read starts when the resolve's task first runs, before
+it queues on the alert's lock, but it can execute later: a loop turn later at best, and on a server
+store as late as its bounded borrow wait. So a raise from another process that lands after the
+snapshot read executed keeps the warning open, and one that lands before it, even after the clean
+start emitted its resolve, is closed. A
 resolve can also fail every retry, and then logs an ERROR starting `alert-instance resolve gave up`.
 
 **A warning still open after a clean start may be a live finding:** another engine process on the

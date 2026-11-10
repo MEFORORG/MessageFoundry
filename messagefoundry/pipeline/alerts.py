@@ -919,9 +919,9 @@ class AlertSink(Protocol):
         """The INVERSE of :meth:`store_privilege_warning`: a start whose preflight OBSERVED a clean
         store principal. No page; when alert-state is wired (ADR 0044) it auto-resolves the open
         warning for the same subject, so a fixed grant clears the dashboard. The resolve is fenced
-        (ADR 0044, the vault BACKLOG #4916 amendment) to the snapshot it reads once, which every
-        retry reuses: a warning another process raised that lands after that snapshot stays open,
-        and may be a live finding."""
+        (ADR 0044, the vault BACKLOG #4916 amendment): a warning another process raised that lands
+        after the fence's snapshot read stays open, and may be a live finding. ``docs/SECURITY.md``
+        (*When a clean start resolves the warning*) says when that read runs."""
         ...
 
     def vault_privilege_warning(
