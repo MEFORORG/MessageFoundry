@@ -142,8 +142,8 @@ WHAT THE CAMELCASE START, THE SPLIT WALK AND THE COMPOUND KEY WORDS COST (BACKLO
 ``82ddcd03bc``, minimum over interleaved rounds, on a shared box whose absolute figures sit above the
 table's. The table above is left as measured, because it is a different instrument. The plain line
 is level, 0.70 against 0.70 us. A credential line costs 12 percent more, 6.3 against 5.6 us, because
-every start position now also tries the camelCase start; it fails on the first character that is not
-a capital, which is most of them. The 6 KB hyphen-and-dot run naming every family, the adversarial
+every start position now also tries the camelCase start; it fails on the first character unless that
+is a capital opening a label word, which most are not. The 6 KB hyphen-and-dot run naming every family, the adversarial
 ceiling above, costs 4.9 against 4.0 ms. Two shapes built for this change cost more and are stated
 rather than hidden: a 6 KB run of alternating lower-case and capital letters naming every family,
 where each capital is a candidate start, 1.9 against 0.52 ms, and a 6 KB value of such letters ending
@@ -296,6 +296,8 @@ _LABEL_START = r"(?:\b|(?<=%[0-9A-Fa-f]{2}))"
 
 #: The label words a camelCase start may open on (BACKLOG #5545): every family's.
 _CAMEL_WORDS = _CREDENTIAL_WORDS + _TOKEN_WORDS + _KEY_LABEL_WORDS
+#: Their first letters, as capitals: a one-character gate in front of the camelCase start.
+_CAMEL_INITIALS = "".join(sorted({word[0].upper() for word in _CAMEL_WORDS}))
 
 # A second place a label may start: at a camelCase boundary, a capital right after a lower-case
 # letter or a digit, where the label word runs from that capital to the end of the word (BACKLOG
@@ -343,7 +345,13 @@ _CAMEL_WORDS = _CREDENTIAL_WORDS + _TOKEN_WORDS + _KEY_LABEL_WORDS
 # unquoted, unclosed, or a quote the guard refuses. That is a sample, not a census. The structured
 # differential in ``tests/test_log_redaction_secret_domain.py``, which holds no camelCase label,
 # reads 0 printed.
-_CAMEL_START = r"(?-i:(?=[A-Z])(?<=[a-z0-9]))(?=(?i:" + _alternation(_CAMEL_WORDS) + r")\b)"
+_CAMEL_START = (
+    r"(?-i:(?=["
+    + _CAMEL_INITIALS
+    + r"])(?<=[a-z0-9]))(?=(?i:"
+    + _alternation(_CAMEL_WORDS)
+    + r")\b)"
+)
 #: Where the three LABEL patterns may start: :data:`_LABEL_START` or :data:`_CAMEL_START`.
 #: ``_AUTH_SCHEME`` keeps :data:`_LABEL_START` alone, since a scheme word glued on by a capital, as
 #: in ``isBearer token``, is no ``Authorization`` header.
@@ -628,9 +636,7 @@ _RUN_UNIT = r"(?-i:[A-Z]++[a-z0-9]*+|[a-z0-9]++)"
 
 #: The first letters of every label keyword. A one-character gate in front of the keyword alternation:
 #: a case-folded alternation is tried branch by branch, and most runs start with none of these.
-_KEYWORD_INITIALS = "".join(
-    sorted({word[0] for word in _CREDENTIAL_WORDS + _KEY_LABEL_WORDS + _TOKEN_WORDS})
-)
+_KEYWORD_INITIALS = _CAMEL_INITIALS.lower()
 #: A label up to where its value starts: the keyword, an optional quote, the ":" or "=", and an auth
 #: scheme word after a token label. A token label takes the quote only before ":"; ``_BEARER`` says
 #: why.

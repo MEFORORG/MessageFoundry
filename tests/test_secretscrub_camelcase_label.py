@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from functools import partial
 
 import pytest
@@ -148,8 +149,7 @@ def _swallow_lines() -> list[str]:
     ]
 
 
-def _printing(lines: list[str], apply: object) -> list[str]:
-    assert callable(apply)
+def _printing(lines: list[str], apply: Callable[[str], str]) -> list[str]:
     return [line for line in lines if any(value in apply(line) for value in _SWALLOW_VALUES)]
 
 
