@@ -486,10 +486,11 @@ def test_the_guard_is_handed_the_opener_of_each_opener_shape(
 ) -> None:
     seen = _record_guard_openers(cell, monkeypatch)
     dest = _build(cell, crl=pki["crl"] if with_crl else None, extra=_shape_settings(shape, pki))
+    opener = dest._opener  # type: ignore[attr-defined]
     assert len(seen) == 1
-    assert seen[0] is dest._opener  # type: ignore[attr-defined]
+    assert seen[0] is opener
     # CONTROL: the shape built its own opener, so the identity above is not the shared one.
-    assert dest._opener is not rest._NO_REDIRECT_OPENER  # type: ignore[attr-defined]
+    assert opener is not rest._shared_no_redirect_opener()
 
 
 @pytest.mark.parametrize("cell", _EXPIRY_CELLS)
