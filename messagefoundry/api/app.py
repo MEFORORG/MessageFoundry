@@ -1287,14 +1287,12 @@ def _requester_identity_resolver(app: FastAPI) -> IdentityResolver:
 async def _reconcile_approvals_after_restart(gate: ApprovalGate) -> None:
     """Run :meth:`ApprovalGate.reconcile_after_restart` and never fail the start on it.
 
-    A failure here is logged, and the next start tries again. Refusing to start would cost more
-    than that."""
+    A failure here is logged, and the start goes on. Refusing to start would cost more than that."""
     try:
         await gate.reconcile_after_restart()
     except Exception:
         _log.exception(
-            "approval gate: the startup reconcile of 'executing' releases failed; the next start "
-            "tries again"
+            "approval gate: the startup reconcile of 'executing' releases failed; the start goes on"
         )
 
 

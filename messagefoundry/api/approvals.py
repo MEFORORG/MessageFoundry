@@ -2005,7 +2005,7 @@ class ApprovalGate:
         except Exception:  # noqa: BLE001 - the caller's outcome stands either way
             log.exception(
                 "approval %s: writing the '%s' status alone failed too; the row may still read "
-                "'executing' until this engine restarts and reconciles it",
+                "'executing'",
                 approval_id,
                 status,
             )
@@ -2036,13 +2036,11 @@ class ApprovalGate:
         except Exception:  # noqa: BLE001 - the caller's cancellation is re-raised either way
             # "Most likely": a COMMIT can land with its reply lost, and then the row and its
             # approval.release_attempted row are both in the store, with nothing run. That row
-            # reads 'executing', and reconcile_after_restart moves it at the next start (vault
-            # BACKLOG #3193).
+            # reads 'executing' (vault BACKLOG #3193).
             log.exception(
                 "approval %s: the approve was cancelled and its claim failed, so most likely its "
                 "approval.release_attempted row was not written and nothing ran. If the COMMIT "
-                "landed anyway, the request reads 'executing' until this engine restarts and "
-                "reconciles it",
+                "landed anyway, the request reads 'executing'",
                 approval_id,
             )
             # The claim carries its audit row, so a failed claim lost that row too; page it, as
