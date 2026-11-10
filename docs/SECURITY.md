@@ -1264,8 +1264,7 @@ raises nothing durable, so that process's warning never appears in the alert lis
 list does not prove every process is clean. A resolve can also fail to land, at least: it logs an
 ERROR such as `alert-instance resolve gave up` or `alert-instance resolve was cancelled before it
 landed`, or it can be dropped with no line at all. A resolve the fence kept open logs, at least,
-an INFO line containing `closed nothing: a live instance remains` (at INFO, so it reaches the log
-only when `[logging].level` allows INFO), or a WARNING containing
+an INFO line containing `closed nothing: a live instance remains`, or a WARNING containing
 `closed nothing and the re-read failed` when the re-read fails. If the cause is fixed and the
 warning is still open, resolve it by hand from the alert list. Resolving it by hand needs, at
 least, an identity with no channel scope (by default an administrator) and `monitoring:diagnose`;
