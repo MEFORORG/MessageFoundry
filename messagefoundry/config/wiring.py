@@ -6613,21 +6613,26 @@ def read_lax_flag(value: object, where: str, key: str) -> bool:
     false spelling such as ``"off"`` or ``b"false"`` is ``False`` (vault BACKLOG #5286).
 
     A value that lax ``bool`` refuses is a :class:`WiringError` naming ``where`` and ``key``, never
-    the value: pydantic's own error quotes its input."""
+    the value: pydantic's own error quotes its input, so it is raised after the handler ends,
+    with neither a cause nor a context."""
     try:
         return _LAX_BOOL.validate_python(value)
     except ValidationError:
-        raise WiringError(f"{where}: {key} must be a boolean") from None
+        pass
+    raise WiringError(f"{where}: {key} must be a boolean")
 
 
 def _declares(flag: object) -> bool:
     """Whether a connection's typed declaration flag is set, read as :func:`read_lax_flag` reads
     it, so a report lists only what the build and the settings mirror honour (vault BACKLOG #5286).
-    A value lax ``bool`` refuses is listed: the build refuses it, and a report fails toward
-    listing (vault BACKLOG #2232)."""
+    ``None`` is not set, as :func:`attested_secure_hop_records` reads it. Any other value lax
+    ``bool`` refuses is listed: the build refuses it, and a report fails toward listing (vault
+    BACKLOG #2232)."""
+    if flag is None:
+        return False
     try:
-        return read_lax_flag(flag, "", "")
-    except WiringError:
+        return _LAX_BOOL.validate_python(flag)
+    except ValidationError:
         return True
 
 

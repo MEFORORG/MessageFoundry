@@ -10293,9 +10293,9 @@ class RegistryRunner:
             # every member has hydrated, so a fault that sends the whole batch to an arm below takes
             # that member with it rather than leaving it in two dispositions. A refusal that is not
             # permanent, or one that must stop the lane, is the whole batch's, as in the frame split.
-            # Any other fault, such as a stored CR (ADR 0105), takes the whole batch to the
-            # internal-error arm, which names the member by its outbox id (vault BACKLOG #5100); a
-            # frame check's internal error does the same.
+            # Any other fault but a DeliveryError or a _StoreReadFault, such as a stored CR (ADR
+            # 0105), takes the whole batch to the internal-error arm, which names the member by its
+            # outbox id (vault BACKLOG #5100); a frame check's internal error does the same.
             hydrated_items: list[OutboxItem] = []
             hydrated: list[str] = []
             unhydratable: list[_RefusedMember] = []
@@ -10448,7 +10448,7 @@ class RegistryRunner:
     ) -> tuple[list[OutboxItem], list[Message | str], list[_RefusedMember]]:
         """Split the batch into the members ``connector``'s frame can carry, with their hydrated
         payloads, and the ``(id, error, refusal)`` of each member it refuses permanently (ADR 0205
-        rule 1). Pure: it writes and logs nothing, so a store fault cannot strike between a refusal
+        rule 1). It writes nothing to the store and logs nothing, so a store fault cannot strike between a refusal
         and the send, and the caller dead-letters and logs the refused members once the rest are
         resolved. A refusal that is not permanent, or one that must stop the lane, is re-raised for
         the whole batch, as a send would raise it. The MLLP and TCP checks name no content: a
@@ -12548,9 +12548,9 @@ def _mirror_declarations(
     settings: dict[str, Any],
     *,
     connection: str,
-    cleartext_accepted: bool,
+    cleartext_accepted: object,
     cleartext_reason: str | None,
-    tls_revocation_attested: bool,
+    tls_revocation_attested: object,
     tls_revocation_attested_reason: str | None,
 ) -> None:
     """Replace the declaration keys the settings-driven seams read with the typed declarations.

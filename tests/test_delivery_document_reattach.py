@@ -723,9 +723,10 @@ async def test_an_engine_value_error_in_a_batch_reattach_still_stops_a_stop_lane
     assert (await store.stats()).get(OutboxStatus.DEAD.value, 0) == 0
 
 
+@pytest.mark.parametrize("corrupt_head", [False, True], ids=["corrupt-second", "corrupt-head"])
 @pytest.mark.parametrize("policy", [InternalErrorPolicy.STOP, InternalErrorPolicy.CONTINUE])
 async def test_a_batch_member_with_a_stored_cr_takes_the_whole_batch_to_the_policy(
-    store: MessageStore, policy: InternalErrorPolicy
+    store: MessageStore, policy: InternalErrorPolicy, corrupt_head: bool
 ) -> None:
     # The batch twin of the stored-CR case (vault BACKLOG #2809): not the member's own refusal, so
     # the whole batch takes the internal-error policy, sibling included. STOP stops the lane and
@@ -734,12 +735,14 @@ async def test_a_batch_member_with_a_stored_cr_takes_the_whole_batch_to_the_poli
     ref_a, ref_bad = await _store_doc(store, a), await _store_doc_with_a_cr(store)
     sk_a = _hl7_with_value(make_doc_ref(ref_a, "application/pdf"))
     sk_bad = _hl7_with_value(make_doc_ref(ref_bad, "application/pdf"))
-    # The clean member is the head, so naming the head instead of the corrupt member would fail.
+    # Both orders: with the clean member as the head, naming the head instead of the corrupt
+    # member fails.
+    t_a, t_bad = (101.0, 100.0) if corrupt_head else (100.0, 101.0)
     mid_a = await store.enqueue_message(
-        channel_id="c1", raw=sk_a, deliveries=[(DEST, sk_a)], now=100.0
+        channel_id="c1", raw=sk_a, deliveries=[(DEST, sk_a)], now=t_a
     )
     mid_bad = await store.enqueue_message(
-        channel_id="c1", raw=sk_bad, deliveries=[(DEST, sk_bad)], now=101.0
+        channel_id="c1", raw=sk_bad, deliveries=[(DEST, sk_bad)], now=t_bad
     )
     col = _Collector()
     runner, sink = _batch_runner(store, col)

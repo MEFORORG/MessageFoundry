@@ -442,7 +442,8 @@ def test_a_flag_lax_bool_refuses_is_refused_without_its_value(flag: str) -> None
     with pytest.raises(WiringError, match=f"'OB_CASE': {flag} must be a boolean") as info:
         _build_outbound(**{flag: "SYNTHMAYBE"}, **_ATTEST)
     assert "SYNTHMAYBE" not in str(info.value)
-    assert info.value.__cause__ is None and info.value.__suppress_context__
+    # No chained pydantic error at all: a suppressed context is still reachable by a chain walk.
+    assert info.value.__cause__ is None and info.value.__context__ is None
 
 
 @_EACH_FLAG
@@ -458,7 +459,7 @@ def test_control_a_set_flag_with_its_reason_still_mirrors(flag: str, value: obje
 
 
 @pytest.mark.parametrize(
-    ("value", "listed"), [("off", False), (b"no", False), ("SYNTHMAYBE", True)]
+    ("value", "listed"), [("off", False), (b"no", False), (None, False), ("SYNTHMAYBE", True)]
 )
 def test_the_declared_hop_reports_read_a_flag_as_the_build_does(value: Any, listed: bool) -> None:
     """The ``check`` and posture readers list a declaration only when the build honours it, so a
