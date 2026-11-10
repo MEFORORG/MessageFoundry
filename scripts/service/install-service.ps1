@@ -891,7 +891,7 @@ function Get-OtherServiceNamingPath {
         # The engine refuses a relative value, so only an absolute one names a directory.
         if (-not $named -or ($named -notmatch '^([A-Za-z]:[\\/]|[\\/]{2}[^\\/])')) { continue }
         # The same directory, or one inside the other: the lockdown of either reaches the other.
-        # A value .NET cannot read as a path names no directory the engine could use either.
+        # A value .NET cannot read as a path is skipped.
         $theirs = ConvertTo-NormalPath $named
         if (-not $theirs) { continue }
         $theirs = $theirs.TrimEnd('\') + '\'
@@ -954,7 +954,7 @@ function Set-SecretsDirAcl {
     <#
       Restrict the secrets directory (vault BACKLOG #2595 slice C, ADR 0214): Administrators as the
       owner, inheritance off, SYSTEM and Administrators full control, the service account read, each
-      inherited by the files in it. Read access only: the engine never writes the files.
+      inherited by the files in it.
 
       THE OWNER GOES FIRST. An individual owner keeps WRITE_DAC whatever the list says
       (Set-AdminOnlyAcl says when New-Item leaves one), so someone who made the folder could put an
