@@ -15,7 +15,12 @@ cases known to differ (a header not in capitals among them). A ``BHS`` or ``FHS`
 the same field on both sides, and both refuse a short later header line (BACKLOG #2998).
 
 Never string-slices in the forbidden sense: it splits only on the message's *actual* field separator
-(read from MSH) and replaces whole fields — surrogate values never contain a field separator.
+(read from MSH) and replaces whole fields. A surrogate value CAN hold the field separator under a
+custom MSH-1: the date fill writes ``+``, the free-text redaction writes ``[`` and ``]``, and the
+name, address and provider pools hold letters, digits and spaces. Joined back, such a value would
+add fields and renumber every later field for any reader of the output. So a surrogate that holds
+the field separator, CR or LF is refused, as the engine adapter's ``Message.set`` refuses it
+(BACKLOG #5540).
 """
 
 from __future__ import annotations
@@ -87,11 +92,32 @@ def anonymize_message(
             if _skip_obx5(rule, fields, seps):
                 continue
             if index < len(fields):
-                fields[index] = surrogate_field_recorded(
-                    rule.path, _kind_for(rule, fields), fields[index], keyer, seps, blanked
+                fields[index] = _whole_field(
+                    rule.path,
+                    surrogate_field_recorded(
+                        rule.path, _kind_for(rule, fields), fields[index], keyer, seps, blanked
+                    ),
+                    field_sep,
                 )
     encoded = "\r".join(field_sep.join(fields) for fields in segments)
     return scrub_message_site_codes(encoded, keyer, rules)
+
+
+#: Segment separators. With the field separator, what the engine's whole-field ``Message.set``
+#: refuses, so the tee refuses the same values the engine adapter does.
+_REFUSED_IN_FIELD = ("\r", "\n")
+
+
+def _whole_field(path: str, value: str, field_sep: str) -> str:
+    """``value``, unless it holds the field separator or a segment separator. Joined back, either
+    would split it into more fields or lines than the rule wrote, so it is refused, body-free, as
+    the engine adapter refuses it (BACKLOG #5540). The error names the rule, never the value."""
+    if field_sep in value or any(char in value for char in _REFUSED_IN_FIELD):
+        raise AnonError(
+            f"the surrogate for {path} would hold the field separator or a segment separator, "
+            "which would split it into more fields than the rule wrote — refusing to emit"
+        )
+    return value
 
 
 def _skip_obx5(rule: FieldRule, fields: list[str], seps: Seps) -> bool:
