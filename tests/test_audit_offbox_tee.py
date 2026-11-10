@@ -504,44 +504,65 @@ def _tee_lines(cases: list[dict[str, str | None]], capsys) -> list[str]:
     return lines
 
 
-#: Where a C0 control goes: ``{c}`` before, after, and between a label and its value or between
-#: the parts of a name. With ``{c}`` as a space each is redacted, which the sweep checks first.
+#: Where a C0 control goes: ``{c}`` before, after, between a label and its value or between the
+#: parts of a name, after an HL7-shaped run, and inside a token. The third member is what stands
+#: in the control's place for the control case, a space or nothing; with it, each is redacted,
+#: which the sweep checks first.
 _C0_SWEEP_TEMPLATES = (
-    ("{c}DOE JANE", "DOE"),
-    ("DOE JANE{c}", "DOE"),
-    ("DOE{c}JANE", "DOE"),
-    ("SMITH,{c}JOHN", "SMITH"),
-    ("{c}password=hunter2", "hunter2"),
-    ("password=hunter2{c}", "hunter2"),
-    ("{c}05/05/1980", "1980"),
-    ("05/05/1980{c}", "1980"),
-    ("{c}Bearer abcdefgh", "abcdefgh"),
-    ("Bearer{c}abcdefgh", "abcdefgh"),
-    ("{c}MRN 12345678", "12345678"),
-    ("MRN{c}12345678", "12345678"),
-    ("MRN 12345678{c}", "12345678"),
+    ("{c}DOE JANE", "DOE", " "),
+    ("DOE JANE{c}", "DOE", " "),
+    ("DOE{c}JANE", "DOE", " "),
+    ("SMITH,{c}JOHN", "SMITH", " "),
+    ("a|b|c{c}DOE JANE", "JANE", " "),
+    ("{c}password=hunter2", "hunter2", " "),
+    ("password=hunter2{c}", "hunter2", " "),
+    ("pass{c}word=hunter2", "hunter2", ""),
+    ("{c}05/05/1980", "1980", " "),
+    ("05/05/1980{c}", "1980", " "),
+    ("05{c}/05/1980", "1980", ""),
+    ("{c}Bearer abcdefgh", "abcdefgh", " "),
+    ("Bearer{c}abcdefgh", "abcdefgh", " "),
+    ("{c}MRN 12345678", "12345678", " "),
+    ("MRN{c}12345678", "12345678", " "),
+    ("MRN 12345678{c}", "12345678", " "),
+    ("MRN 1234{c}5678", "5678", ""),
 )
 
 
-@pytest.mark.parametrize("field", ["actor", "channel_id", "client", "detail"])
+@pytest.mark.parametrize("field", ["actor", "channel_id", "client", "detail", "detail-as-json"])
 def test_every_c0_control_beside_or_inside_the_text_of_each_field_is_redacted(
     field: str, capsys
 ) -> None:
     """The sweep the review of engine PR 2040 used, all 32 C0 code points, widened to put the
     control inside the text as well as on either side, in every free-text field of the record
-    (BACKLOG #3045). A space in the control's place is the control case: it must be redacted,
-    so a leak measures the control and not the pattern. A leak names the code point and value."""
+    (BACKLOG #3045). ``detail-as-json`` is ``detail`` as its writers hand it over, already
+    through ``json.dumps``, so the control arrives as an escape. The control case comes first,
+    with a space or nothing in the control's place: it must be redacted, so a leak measures the
+    control and not the pattern. A leak names the code point and the value.
+
+    A tab, LF or CR is whitespace, and the field scrub reads it as itself, so for those three
+    the bar is the handler chain's own verdict on the same text in a plain log line: where
+    whitespace there hides a name from a pattern, that is the pattern's residual, not this
+    one's (``MRN`` then a newline, or a tab inside a date)."""
+    from messagefoundry.logging_setup import _scrub_text_passes
+
     keys = [
-        (code, template.format(c=chr(code)), needle)
-        for code in [0x20, *range(0x20)]  # 0x20, a space, first: the control case
-        for template, needle in _C0_SWEEP_TEMPLATES
+        (code, template.format(c=chr(code) if code >= 0 else control), needle)
+        for code in [-1, *range(0x20)]  # -1: the control case
+        for template, needle, control in _C0_SWEEP_TEMPLATES
     ]
-    cases: list[dict[str, str | None]] = [{field: value} for _code, value, _needle in keys]
+    if field == "detail-as-json":
+        cases: list[dict[str, str | None]] = [
+            {"detail": json.dumps({"error": value})} for _code, value, _needle in keys
+        ]
+    else:
+        cases = [{field: value} for _code, value, _needle in keys]
     lines = _tee_lines(cases, capsys)
     leaks = [
         (hex(code), ascii(value), needle)
         for (code, value, needle), line in zip(keys, lines, strict=True)
         if needle in line
+        and (code not in (0x09, 0x0A, 0x0D) or needle not in _scrub_text_passes(value))
     ]
     assert not leaks, leaks
 

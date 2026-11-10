@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import functools
 import json
 import logging
 import logging.handlers
@@ -57,7 +58,11 @@ from messagefoundry.config.tls_policy import (
 # controlchars, which imports only the standard library and is therefore reachable from
 # ``logging_guard`` too. That
 # module's docstring carries the reasoning; this is now an ordinary import of a leaf.
-from messagefoundry.controlchars import escape_lone_surrogates, scrub_control_chars
+from messagefoundry.controlchars import (
+    JSON_ESCAPED_CONTROLS,
+    escape_lone_surrogates,
+    scrub_control_chars,
+)
 from messagefoundry.keywrap import load_checked_cert_chain
 from messagefoundry.log_spool import LogSpool, SpoolEntry, SpoolUnavailable
 from messagefoundry.logging_guard import (
@@ -67,6 +72,7 @@ from messagefoundry.logging_guard import (
     set_active_guard,
 )
 from messagefoundry.redaction import (
+    _REDACTED,
     ExcInfo,
     prepare_log_record,
     redact_untrusted,
@@ -446,30 +452,75 @@ def scrub_log_field(text: str) -> str:
     PHI redaction, the credential query scrub, then the credential scrub.
 
     For a caller that serialises several values into one log message, so each value is scrubbed
-    while it is still raw (BACKLOG #3045). The audit tee needs it: ``json.dumps`` escapes a C0
-    control as ``\\u0001`` or ``\\t``, each escape ends in a word character, and the handler chain
-    then sees no word boundary or whitespace beside it. The handler chain still runs over the whole
-    message after this, so a caller loses nothing by also calling this. The control-character scrub
-    is left to the handler, which runs it last on every sink.
+    before ``json.dumps`` escapes it (BACKLOG #3045). The audit tee is that caller, and its
+    ``emit_audit_tee`` says why it needs this. The handler chain still runs over the whole message
+    after this. The control-character scrub is left to the handler, which runs it last on every
+    sink.
 
-    **A C0 control inside the value is read as a space too.** Raw, a control such as U+0001 is not
-    whitespace, so a pattern that needs a space between a label and its value, or between the
-    parts of a name, misses ``MRN\\x0112345678`` or ``SMITH,\\x01JOHN``. So a value holding one is
-    scrubbed again with each C0 control as a space, and when that second pass redacts more, its
-    result is returned, with the controls as spaces. A value it redacts no more keeps its controls.
+    **A C0 control in the value is also read two other ways.** A raw control such as U+0001 is
+    not whitespace, so a pattern that needs a space between a label and its value, or between
+    the parts of a name, misses ``MRN\x0112345678`` or ``SMITH,\x01JOHN``, and one inside a token
+    splits it, as in ``05\x01/05/1980``. A writer that ``json.dumps`` its own value first, as
+    the audit ``detail`` writers do, hands over the same control as the text ``\u0001`` or
+    ``\t``, which no pattern reads as a control at all. So a value holding a C0 control, raw or
+    as such an escape, is scrubbed again twice: once with each control as a space, and once with
+    each removed. A tab, LF or CR, raw or escaped, is read as itself, so line structure holds.
+    Whichever of the three results keeps the fewest letters and digits outside redaction
+    markers, not counting a control's escape, is returned, the plain one on a tie. A reading that wins loses the controls, or their escapes,
+    from the value; a value no reading redacts more keeps them.
 
     ``tests/test_audit_offbox_tee.py`` holds the three passes to the handler chain's, at least on
     the inputs it names, and the chain's filter count to four."""
     scrubbed = _scrub_text_passes(text)
-    if not _C0_CONTROL.search(scrubbed):
+    if not _C0_READING.search(text):
         return scrubbed
-    spaced = _C0_CONTROL.sub(" ", scrubbed)
-    rescrubbed = _scrub_text_passes(spaced)
-    return scrubbed if rescrubbed == spaced else rescrubbed
+    best, best_left = scrubbed, _visible(scrubbed)
+    for control in (" ", ""):
+        result = _scrub_text_passes(_read_controls(text, control))
+        left = _visible(result)
+        if left < best_left:
+            best, best_left = result, left
+    return best
 
 
-#: The 32 C0 controls, U+0000 to U+001F, the characters ``json.dumps`` escapes in a string.
-_C0_CONTROL = re.compile("[\x00-\x1f]")
+#: A C0 control (:data:`~messagefoundry.controlchars.JSON_ESCAPED_CONTROLS`) raw, or as the JSON
+#: escape ``json.dumps`` writes for it. An escaped backslash comes first, so the ``\t`` in
+#: ``\\temp`` is not read as a tab.
+_C0_READING = re.compile(
+    r"\\\\|\\u00[01][0-9a-fA-F]|\\[bfnrt]|[" + re.escape(JSON_ESCAPED_CONTROLS) + "]"
+)
+_JSON_SHORT_ESCAPES = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+
+
+def _read_c0(match: re.Match[str], *, control: str) -> str:
+    """One :data:`_C0_READING` match as the scrub's second pass reads it: a tab, LF or CR as
+    itself, any other C0 control as ``control``, and an escaped backslash unchanged."""
+    found = match.group()
+    if found == "\\\\":
+        return found
+    if len(found) == 6:
+        char = chr(int(found[2:], 16))
+    elif len(found) == 2:
+        char = _JSON_SHORT_ESCAPES[found[1]]
+    else:
+        char = found
+    return char if char in "\t\n\r" else control
+
+
+#: The markers the three text passes write in place of what they hide.
+_REDACTION_MARKERS = re.compile(re.escape(_REDACTED) + "|" + re.escape(CREDENTIAL_PLACEHOLDER))
+
+
+def _read_controls(text: str, control: str) -> str:
+    """``text`` with each :data:`_C0_READING` match read by :func:`_read_c0`."""
+    return _C0_READING.sub(functools.partial(_read_c0, control=control), text)
+
+
+def _visible(text: str) -> int:
+    """How many letters and digits ``text`` keeps outside the redaction markers, not counting a
+    control's escape, so a result that kept ``\\u0001`` as text does not look less redacted."""
+    unmarked = _REDACTION_MARKERS.sub("", _read_controls(text, ""))
+    return sum(ch.isalnum() for ch in unmarked)
 
 
 def _scrub_text_passes(text: str) -> str:

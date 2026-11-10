@@ -92,14 +92,17 @@ audit_logger.setLevel(logging.INFO)
 _TEE_FAILURE_LOGGED = False
 
 
-def _scrubbed(value: str | None) -> str | None:
-    """``value`` through :func:`~messagefoundry.logging_setup.scrub_log_field`, or, if the scrub
-    raises, a fixed marker in its place, as ``RedactionFilter`` writes for a record: the copy and
-    its anchors still ship, and the raw value never does."""
+def _scrubbed(value: str | None, finish: Callable[[str], str] | None = None) -> str | None:
+    """``value`` through :func:`~messagefoundry.logging_setup.scrub_log_field`, then through
+    ``finish`` if given. The field scrub goes first so it reads the raw value: a pass that ran
+    before it could redact the text beside a C0 control and leave the rest. If either raises, a
+    fixed marker takes its place, as ``RedactionFilter`` writes for a record: the copy and its
+    anchors still ship, and the raw value never does."""
     if not value:
         return value
     try:
-        return scrub_log_field(value)
+        scrubbed = scrub_log_field(value)
+        return finish(scrubbed) if finish is not None else scrubbed
     except Exception as exc:  # noqa: BLE001 -- fail closed on the field, not the whole copy
         return f"[field dropped: {type(exc).__name__} while scrubbing it]"
 
@@ -200,7 +203,8 @@ def emit_audit_tee(
     bearer token, an MRN or a ``password=`` value beside a C0 control. Each text field therefore
     goes through :func:`~messagefoundry.logging_setup.scrub_log_field` first, the same text passes
     the handlers run, and the handlers still run over the whole line afterwards. That function
-    says how it reads a C0 control inside a value. ``ts`` and the anchor fields are
+    says how it reads a C0 control inside a value, and a ``detail`` its writer already ran
+    through ``json.dumps``, where the control arrives as an escape. ``ts`` and the anchor fields are
     engine-generated numbers and digests, and are not scrubbed on their own. A field the scrub
     raises on ships as a fixed marker, so the copy and its anchors still go.
 
@@ -208,9 +212,10 @@ def emit_audit_tee(
     alter it silently. The second can break it.
 
     * The redaction and credential filters rewrite spans of this document as text, and a span can
-      take a closing quote with it. A typed name of ``password=`` does that on every sink, with no
-      escaped character involved. (``a|b|c`` did too until BACKLOG #3045: the field scrub now
-      redacts it before the document exists.) When two fields carry attacker-influenced text,
+      take a closing quote with it. A typed name of ``password=``, or one shaped like an HL7
+      segment such as ``PID|1``, does that on every sink, with no escaped character involved: the
+      line's segment pattern runs to the end of the line. (``a|b|c`` did too until BACKLOG #3045:
+      the field scrub now redacts it before the document exists.) When two fields carry attacker-influenced text,
       the document can instead still parse, with the fields between them missing. Those can be
       at least ``channel_id``, ``client``, ``detail`` and the row anchors. A field that survives,
       such as ``actor``, can then carry another field's text.
@@ -244,7 +249,7 @@ def emit_audit_tee(
             "seq": seq,
             "row_hash": row_hash,
             # PHI chokepoint: redact HL7-shaped content + bound length before it ships off-box.
-            "detail": _scrubbed(safe_text(detail) if detail else None),
+            "detail": _scrubbed(detail, safe_text) if detail else None,
         }
         ensure_logger_sink(audit_logger)
         # Not ensure_ascii, and no escaping here: see "The record survives the scrub" above.

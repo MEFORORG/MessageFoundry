@@ -85,6 +85,11 @@ import unicodedata
 #: Defined here, not there, so this module keeps importing nothing from the engine.
 CONTROL_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"})
 
+#: The characters ``json.dumps`` must escape inside a string besides the quote and backslash: the
+#: 32 C0 controls, U+0000 to U+001F, so :func:`_is_control_char` less DEL. The audit tee's field
+#: scrub reads them (``logging_setup.scrub_log_field``, BACKLOG #3045).
+JSON_ESCAPED_CONTROLS = "".join(chr(code) for code in range(0x20))
+
 
 #: C0 controls (U+0000-U+001F) plus DEL (U+007F). NOT a general "is this printable" test: it is
 #: deliberately blind to C1 (U+0080-U+009F) and to Unicode separators, because every call site

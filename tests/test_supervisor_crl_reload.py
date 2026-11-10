@@ -105,6 +105,7 @@ def _run_supervise(
     monkeypatch.setattr(supervisor_module, "preflight_shard_config", no_refusal)
     monkeypatch.setattr(supervisor_module, "Supervisor", lambda specs: fleet)
     monkeypatch.setattr(_StopRecordingRunner, "stops", 0)
+    monkeypatch.setattr(_StopRecordingRunner, "max_reloads", -1)  # no runner built reads -1
     monkeypatch.setattr(crl_reload, "CrlReloadRunner", _StopRecordingRunner)
     return asyncio.run(
         supervise(
