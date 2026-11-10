@@ -621,7 +621,8 @@ Manager's watch reached the cloud session 29 seconds after its question.
   retirement runs ahead of the plan's order; SAIDS section 6.2 and its A.6 record the gap. Ledger
   rows and the direction of an owner-accepted ADR are class B under tier T4, with review,
   fail-closed, and Managers pick and decompose that work; [`docs/AUTONOMY-PLAN.md`](docs/AUTONOMY-PLAN.md)
-  section 12 holds the limits. While the kill switch is on, T4 is off. Point the brief at the
+  section 12 holds the limits, and they bind the Lander at every head of a `T4 act` PR too. While
+  the kill switch is on, T4 is off. Point the brief at the
   relevant existing code; it measurably improves the result.
 - The rest of the Manager's dispatch rules bind only that seat. Korus `roles/MANAGER.md` carries
   them; read it at `origin/main`. Every brief ends with push, then report. A brief names who else is
