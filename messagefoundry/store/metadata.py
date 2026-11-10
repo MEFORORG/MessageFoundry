@@ -16,10 +16,15 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any
+
+from messagefoundry.redaction import json_loads_or_refusal
+
+log = logging.getLogger(__name__)
 
 
 def _reference_json_default(value: Any) -> Any:
@@ -58,8 +63,19 @@ def encode_reference_value(value: Any) -> str:
 
     An unencodable type still raises ``TypeError``: the sync's caller keeps the last-good snapshot
     rather than committing a set with a value silently replaced by a placeholder (ADR 0006's graceful
-    degradation), which is the same never-accept-and-drop rule the rest of the store follows."""
-    return json.dumps(value, default=_reference_json_default)
+    degradation), which is the same never-accept-and-drop rule the rest of the store follows.
+
+    A non-finite float (a TOML ``nan``, a DATABASE double column) raises the same ``TypeError``
+    (BACKLOG #6711): ``json.dumps``' default would write the bare ``NaN`` token, which is not JSON."""
+    try:
+        return json.dumps(value, default=_reference_json_default, allow_nan=False)
+    except ValueError:
+        # Content-free: a reference value may be PHI for a patient-keyed set. json raises ValueError
+        # for at least a non-finite float, a circular value and an int too long to print.
+        raise TypeError(
+            "reference snapshot cannot serialize this value to JSON (ValueError: at least a "
+            "non-finite float, a circular value or an oversized int)"
+        ) from None
 
 
 def encode_response_headers(headers: Mapping[str, str] | None) -> str | None:
@@ -78,21 +94,41 @@ def encode_response_headers(headers: Mapping[str, str] | None) -> str | None:
     return json.dumps(clean)
 
 
+def _load_object(text: str | None) -> dict[str, Any]:
+    """The JSON object ``text`` holds, or ``{}`` for ``None``, empty, malformed or non-object text.
+
+    It decodes a ``str`` through :func:`~messagefoundry.redaction.json_loads_or_refusal`, so json's
+    depth-limit ``RecursionError`` on deeply nested input reads as malformed like any other decode
+    failure (BACKLOG #6712). A refusal is logged with json's content-free hint, never the text."""
+    if not text:
+        return {}
+    value, refusal = json_loads_or_refusal(text)
+    if refusal is not None:
+        log.warning("stored metadata JSON is unreadable (%s); read as empty", refusal)
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _dumps_or_none(value: Any) -> str | None:
+    """``json.dumps(value)``, or ``None`` when json's encoder hits its depth limit.
+
+    The encoder's limit sits below the decoder's, so an object :func:`_load_object` read can still
+    be too deep to write back (BACKLOG #6712). Logged, content-free."""
+    try:
+        return json.dumps(value)
+    except RecursionError:
+        log.warning("stored metadata JSON is too deeply nested to re-encode; read as empty")
+        return None
+
+
 def decode_response_headers(headers_json: str | None) -> dict[str, str]:
     """Parse the decrypted ``resp_headers`` JSON back to a ``{name: value}`` map (BACKLOG #154).
 
     ``None``/empty/unparseable/non-object → ``{}`` (the byte-identical default), so a purged row (
     retention nulls the column) or a legacy row reads as "no captured headers". Only ``str``→``str``
-    entries survive. Pure: the caller decrypts before calling."""
-    if not headers_json:
-        return {}
-    try:
-        loaded = json.loads(headers_json)
-    except (TypeError, ValueError):
-        return {}
-    if not isinstance(loaded, dict):
-        return {}
-    return {str(k): str(v) for k, v in loaded.items() if isinstance(v, (str, int, float, bool))}
+    entries survive, as :func:`encode_response_headers` writes nothing else. Pure: the caller decrypts
+    before calling."""
+    return {k: v for k, v in _load_object(headers_json).items() if isinstance(v, str)}
 
 
 def merge_user_metadata(existing_json: str | None, meta_ops: Sequence[tuple[str, str]]) -> str:
@@ -103,19 +139,15 @@ def merge_user_metadata(existing_json: str | None, meta_ops: Sequence[tuple[str,
     one message the same key is last-writer-wins. ``existing_json`` may be ``None``/empty (no metadata
     yet) or a non-object (defensively treated as empty). Caller passes decrypted JSON in and encrypts the
     result out — this function does neither."""
-    parsed: dict[str, Any] = {}
-    if existing_json:
-        try:
-            loaded = json.loads(existing_json)
-        except (TypeError, ValueError):
-            loaded = None
-        if isinstance(loaded, dict):
-            parsed = loaded
-    user: dict[str, Any] = dict(parsed.get("user") or {})
+    parsed = _load_object(existing_json)
+    existing_user = parsed.get("user")
+    user: dict[str, Any] = dict(existing_user) if isinstance(existing_user, dict) else {}
     for key, value in meta_ops:
         user[key] = value
     parsed["user"] = user
-    return json.dumps(parsed)
+    encoded = _dumps_or_none(parsed)
+    # Too deep to write back: the same outcome as unreadable existing metadata, the ops alone.
+    return encoded if encoded is not None else json.dumps({"user": dict(meta_ops)})
 
 
 def user_metadata(metadata_json: str | None) -> str | None:
@@ -131,15 +163,7 @@ def user_metadata(metadata_json: str | None) -> str | None:
 
     Returns ``None`` for absent/empty/unparseable metadata or an empty user bag, so the wire field is
     ``null`` rather than ``"{}"`` when nothing was attached."""
-    if not metadata_json:
-        return None
-    try:
-        loaded = json.loads(metadata_json)
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(loaded, dict):
-        return None
-    user = loaded.get("user")
+    user = _load_object(metadata_json).get("user")
     if not isinstance(user, dict) or not user:
         return None
-    return json.dumps(user)
+    return _dumps_or_none(user)
