@@ -121,10 +121,17 @@ After a revoke's first Outage it makes no more seal checks through Transit, so a
 seal is not checked and records no refusal; the audit rows it writes after the commit still go
 through Transit for the audit chain's MAC on `vault_transit`. `SealPager.forged` pages a Forged row
 with no interval, and `SealPager.unverifiable` pages an Unverifiable one every time too, its
-five-minute window choosing only the page's subject. So a sealed session row that keeps failing is
-reported on each revoke that meets it. Every one of these pages is still an `integrity_drift`
-alert, which the notifier sink throttles per subject for `[alerts].realert_seconds` (300 seconds by
-default), so an operator is notified at most once per subject in that window. That is a filed residual (vault #8202). What each refusal does
+five-minute window choosing only the page's subject. So a row a revoke checks that keeps failing
+Forged or Unverifiable is audited, and paged to the alert sink, on each revoke whose seal checks
+reach it. That is mainly the user row the account-epoch raise reads, and at least also the kept
+session's re-stamp. A row the revoke meets after its first Outage is not checked, so it is not
+reported, and an Outage is paged without an audit row. That engine-side lack of an interval is a
+filed residual (vault #8202). Every one of these pages is an `integrity_drift` alert. A
+configured notifier sink throttles it per subject for `[alerts].realert_seconds` (300 seconds by
+default), and a matching alert rule's `cooldown_seconds` replaces that interval. The throttle is
+held in memory by each sink instance, so each process or node that pages throttles on its own.
+With no notifier, the pages go to the logging sink, which has no throttle. So an operator can be
+notified more than once per subject in that window, in at least those three cases. What each refusal does
 is in the changelog entries for vault BACKLOG #2592, #2593 and #3510 (in `changelog.d/` until the
 next release, then [CHANGELOG.md](../CHANGELOG.md)). The seal format is
 in [`store/row_seal.py`](../messagefoundry/store/row_seal.py).
