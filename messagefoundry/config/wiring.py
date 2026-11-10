@@ -6636,11 +6636,12 @@ def read_lax_flag(value: object, where: str, key: str) -> bool:
 
 
 def _declares(flag: object) -> bool:
-    """Whether a connection's typed declaration flag is set, read as :func:`read_lax_flag` reads
-    it, so a report lists only what the build and the settings mirror honour (vault BACKLOG #5286).
-    ``None`` is not set, as :func:`attested_secure_hop_records` reads it. Any other value lax
-    ``bool`` refuses is listed: the build refuses it, and a report fails toward listing (vault
-    BACKLOG #2232)."""
+    """Whether a connection's typed declaration flag is set, for a report. A report lists a flag
+    lax ``bool`` reads as true, as :func:`read_lax_flag` reads it and the build and the settings
+    mirror honour it, and does not list one it reads as false, so a falsy string such as ``"no"``
+    is not listed (vault BACKLOG #5286). ``None`` is not listed, as
+    :func:`attested_secure_hop_records` reads it. Every other value lax ``bool`` refuses is listed
+    although the build refuses it, because a report fails toward listing (vault BACKLOG #2232)."""
     if flag is None:
         return False
     try:
