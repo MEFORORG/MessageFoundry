@@ -562,9 +562,10 @@ for group in logical_lines("requirements.txt"):
                 (
                     f"{line} names a constraints file, which this check does not follow",
                     "remove the line only once its limits apply elsewhere, as the engine's"
-                    " docs/ADOPTER-CI.md, Job 3, says: for any other file, pass -c FILE to every"
-                    " command that writes requirements.lock and keep it in the README's, and for"
-                    " any file, make every install of requirements.txt apply the lock, with"
+                    " docs/ADOPTER-CI.md, Job 3, says: for a file other than requirements.lock,"
+                    " pass -c FILE to every command that writes requirements.lock and keep it in"
+                    " the README's, and for any file, make every install of requirements.txt"
+                    " apply the lock, with"
                     " PIP_CONSTRAINT=requirements.lock for that command only or pip install"
                     " --require-hashes -r requirements.lock in its place, using a lock that covers"
                     " that install's platform",
@@ -726,8 +727,8 @@ hardening steps (recommended for any PHI-handling adopter):
 1. **Pin the index** so the resolver cannot be confused onto a hostile source:
    ```bash
    pip install --index-url https://your-internal-index/simple -r requirements.txt
-   # or set it in the environment / pip.conf, plus a constraints pin:
-   export PIP_CONSTRAINT=requirements.lock
+   # or set it in the environment / pip.conf, plus a constraints pin for this command only:
+   PIP_CONSTRAINT=requirements.lock pip install -r requirements.txt
    ```
 2. **Hash-pin your transitive closure** so every byte is verified at install — generate a lock over
    *your* resolved deps and install with `--require-hashes`:

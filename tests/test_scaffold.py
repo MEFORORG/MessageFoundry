@@ -808,8 +808,9 @@ _INCLUDE = (
 _CONSTRAINT = (
     "names a constraints file, which this check does not follow;"
     " remove the line only once its limits apply elsewhere, as the engine's docs/ADOPTER-CI.md,"
-    " Job 3, says: for any other file, pass -c FILE to every command that writes requirements.lock"
-    " and keep it in the README's, and for any file, make every install of requirements.txt apply"
+    " Job 3, says: for a file other than requirements.lock, pass -c FILE to every command that"
+    " writes requirements.lock and keep it in the README's, and for any file, make every install"
+    " of requirements.txt apply"
     " the lock, with PIP_CONSTRAINT=requirements.lock for that command only or pip install"
     " --require-hashes -r requirements.lock in its place, using a lock that covers that install's"
     " platform"
@@ -817,8 +818,8 @@ _CONSTRAINT = (
 
 #: (the line after ``foo==1.0``, the ::error:: it raises, whether the pins audit's grep also sees it).
 #: pip's own parser reads each as an include or a constraint, abbreviated or attached as pip allows.
-#: Not every spelling: pip can read a line as one only through a ${VAR} nested in another's
-#: value, and this step does not read that line as one.
+#: Not every spelling: pip can also read a line as one when a ${VAR} nested in another variable's
+#: value expands to the option, and this step, which expands each ${VAR} once, does not.
 _INCLUDE_CASES = [
     ("--requirem extra.txt", f"--requirem extra.txt {_INCLUDE}", False),
     ("-\\\nr extra.txt", f"-r extra.txt {_INCLUDE}", False),
@@ -829,8 +830,9 @@ _INCLUDE_CASES = [
     ("--constraint=extra.txt", f"--constraint=extra.txt {_CONSTRAINT}", False),
     ("-rextra.txt", f"-rextra.txt {_INCLUDE}", True),
     ("-cextra.txt", f"-cextra.txt {_CONSTRAINT}", False),
-    # Lander hold 12 on PR 2840: removing it leaves `pip install -r requirements.txt` unconstrained
-    # unless every install applies the lock, so it stays refused, and its remedy says so.
+    # Lander hold 11 on PR 2840: refusing it fails closed, and while it is there the old lock
+    # constrains its own regeneration. Hold 12: an install that does not apply the lock resolves
+    # live once it is gone, so the remedy says to remove it only once every install applies the lock.
     ("-c requirements.lock", f"-c requirements.lock {_CONSTRAINT}", False),
     # pip follows the include when a line names both.
     ("-c other.txt -r extra.txt", f"-c other.txt -r extra.txt {_INCLUDE}", False),

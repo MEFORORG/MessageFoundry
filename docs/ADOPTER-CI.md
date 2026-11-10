@@ -240,9 +240,9 @@ that package's build code may run in CI:
       those installs resolve live, with none of its limits, unless each passes `-c <file>` itself
       or applies the lock. To apply the lock, set `PIP_CONSTRAINT=requirements.lock` for that
       command only, or install with `pip install --require-hashes -r requirements.lock` in its
-      place. Do not export `PIP_CONSTRAINT` for the whole shell or job, as the README's hardening
-      example does: a hashed constraints file turns on hash checking for everything pip installs
-      under it, so an install the lock does not cover, such as `requirements-dev.txt`, is refused.
+      place. Do not export `PIP_CONSTRAINT` for the whole shell or job: a hashed constraints file
+      turns on hash checking for everything pip installs under it, so an install the lock does not
+      cover, such as `requirements-dev.txt`, is refused.
       The scaffolded `check` job and the README's "Use it" apply the lock in neither way; the
       README recommends both as hardening for any PHI-handling adopter. The lock must also cover
       the platform of each install it is applied to. The `check` job runs on `ubuntu-latest`, the
