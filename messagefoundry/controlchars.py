@@ -24,8 +24,9 @@ predicate, which the escape widens. (This paragraph replaced a "shares the predi
 action" thesis that its own module had already outgrown: a reader taking that literally puts the next neutraliser elsewhere,
 which is how the escape table came to live in ``logging_setup``.)
 
-THE TWO NEUTRALISERS ARE DIFFERENT AND ONE MUST NEVER BE "SIMPLIFIED" INTO THE OTHER. Beside the
-refusals, that makes three actions built on one predicate, and QUOTE adds a fourth on top of ESCAPE:
+THE NEUTRALISERS ARE DIFFERENT AND ONE MUST NEVER BE "SIMPLIFIED" INTO ANOTHER. Beside the
+refusals, that makes three actions built on one predicate. QUOTE, a fourth, is built on JSON string
+quoting and then ESCAPE, not on the predicate:
 
   * REJECT -- six sites. A control character in a value that reaches a URL path, a header, a
     filename or a config field is refused outright.
@@ -324,11 +325,12 @@ def quote_log_text(text: str) -> str:
 
     JSON string quoting escapes every quote, backslash and C0 control, so a value cannot end its
     token and write a separator, a second field or a mark after it. ``ensure_ascii`` also writes
-    every non-ASCII character as ``\\uXXXX``, so a lookalike quote such as U+02BA or U+FF02, or a
-    right-to-left letter, cannot fake that end for a human reader. :func:`scrub_log_argument` then
-    covers DEL, the one ASCII control JSON leaves raw (vault BACKLOG #3139); its line-break
-    ``replace`` never fires on JSON output, and is there because CodeQL's ``py/log-injection``
-    accepts it as the neutraliser (see :func:`scrub_log_argument`). For a caller-supplied
+    every character outside printable ASCII as ``\\uXXXX``, DEL included, so a lookalike quote
+    such as U+02BA or U+FF02, or a right-to-left letter, cannot fake that end for a human reader.
+    The output is therefore printable ASCII, and :func:`scrub_log_argument` changes nothing in it.
+    It stays as a guard should the ``json.dumps`` call ever drop ``ensure_ascii``, and because
+    CodeQL's ``py/log-injection`` accepts its line-break ``replace`` as the neutraliser and does
+    not see ``json.dumps`` (see :func:`scrub_log_argument`). For a caller-supplied
     value logged beside other ``key=value`` fields, such as a request path (BACKLOG #3770)."""
     # Imported here, not at the top: the remote-debug guard imports this module before its hook
     # goes in, and json, with re and enum under it, would lengthen that window.
