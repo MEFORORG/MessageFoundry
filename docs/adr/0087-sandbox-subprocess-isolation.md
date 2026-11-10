@@ -387,19 +387,23 @@ target, no `pickle` import left to mis-suppress:
   >   the expected sequence moves on, so the worker's own next lookup or request can then fail. So in
   >   that window the later dispatch does not resolve as `mode=off` does, a case the SHALL above does
   >   not except. A forged answer that carries the request's id can do worse. **The condition for
-  >   every forged-answer case in this bullet:** the worker's own answer is not yet queued when
-  >   `_reject_unsolicited(..., "after")` runs, right after the forged answer is read. If it is
-  >   queued by then, that check kills the worker and the call fails with the unsolicited-frame
-  >   error, whatever the forged answer said. Under that condition, the outcome depends on the
-  >   answer's kind; the wire grammar has `ok` and the fail kinds `denied`, `error` and `memory`. A
-  >   forged `ok` answer is consumed as the result, the worker is kept and the call does not fail,
-  >   so none of the SHALL's three clauses holds for it. A forged `denied` or `error` answer is
-  >   taken as the answer too: the message dead-letters with the writer's error text, and the worker
-  >   is kept. A forged `memory` answer kills the worker and records a `MEMORY_CAP` kill cause for a
-  >   memory cap that was never hit, and the message dead-letters as having run out of memory. The
-  >   owner accepted two of these cases as recorded deviations, each only in the scope its record
-  >   gives; *Owner acceptances* below cites both records and names deviations that neither covers.
-  >   Only a writer that knows the
+  >   every forged-answer case in this bullet:** no other frame is queued when
+  >   `_reject_unsolicited(..., "after")` runs, right after the forged answer is read. If any frame
+  >   is queued by then, the worker's own answer, a lookup it writes at `mode=isolated` or a second
+  >   forged frame among them, that check kills the worker and the call fails with the
+  >   unsolicited-frame error, whatever the forged answer said. If only an EOF is queued then, the
+  >   worker is reaped or killed for that EOF, and the forged answer still stands. Under that
+  >   condition, the outcome depends on the answer's kind; the fail kinds include at least `denied`,
+  >   `error` and `memory` (`_answer` in `_sandbox_codec.py`). A forged `ok` answer is consumed as
+  >   the result and the call does not fail, and the worker is kept unless an EOF was queued, so
+  >   none of the SHALL's three clauses holds for it. A forged `denied` or `error` answer is taken
+  >   as the answer too: the call fails with the writer's error text, which dead-letters the
+  >   message, or under `internal_error=STOP` holds the inbound, and the worker is kept unless an
+  >   EOF was queued. A forged `memory` answer kills the worker, records a `MEMORY_CAP` kill cause
+  >   for a memory cap that was never hit, and fails the call as having run out of memory. The
+  >   owner accepted two cases in this amendment as recorded deviations, each only in the scope its
+  >   record gives; *Owner acceptances* below cites both records, and lists, as the Manager's
+  >   reading, deviations that neither covers. Only a writer that knows the
   >   request's id can carry it: at least a grandchild or same-UID process that read the request (the
   >   grandchild residual below), and code running in the worker (the residual on one Handler not
   >   confined from another). One that arrives after that call's answer meets that call's own check
@@ -421,7 +425,7 @@ target, no `pickle` import left to mis-suppress:
   > of the over-cap bullet, and the pointer to the owner acceptances.
   >
   > **Owner acceptances 2026-11-10.** The owner accepted two cases as recorded deviations from the
-  > SHALL above, each until a fix narrows or closes it. The fixes are tracked as steps on
+  > SHALL above, each until a fix narrows or closes it. The fixes are tracked as steps on vault
   > BACKLOG #3135 (ledger ruling R2).
   >
   > - **Record d20261110T144543956-d8f55a:** a stray frame that arrives after a call's check before
@@ -433,15 +437,16 @@ target, no `pickle` import left to mis-suppress:
   >   bold, *The condition for every forged-answer case in this bullet*, in this amendment's bullet
   >   *A frame that arrives later meets at least these outcomes*.
   >
-  > *The Manager's 2026-11-10 reading of the code, not the owner's words:* at least these
-  > deviations are named in neither record. Each is not accepted by either owner record, and each
-  > is tracked as a step on BACKLOG #3135.
+  > *The Manager's 2026-11-10 reading of the code and the two records, not the owner's words:* at
+  > least these deviations are not accepted by either owner record, and each is tracked as a step
+  > on vault BACKLOG #3135.
   >
   > - A forged answer from a same-UID process that opened the worker's `/proc/<pid>/fd/0`.
   > - A forged answer from code running in the worker.
   > - The `mode=isolated` lookup in that window.
-  > - A forged `memory` answer, which records a `MEMORY_CAP` kill cause that never happened.
-  > - A partial read of fd 0 plus a forged `ok` answer, which desyncs the next message.
+  > - A forged `memory` answer, which kills a healthy worker and records a `MEMORY_CAP` kill cause
+  >   for a memory cap that was never hit.
+  > - The desync of the next message after a partial read of fd 0 and a forged `ok` answer.
   >
   > *Also the Manager's 2026-11-10 reading:* closing the fd-0 path alone does not stop a surviving
   > grandchild on Linux from reaching a later worker through `/proc`, as the grandchild residual
