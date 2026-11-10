@@ -660,13 +660,13 @@ class ResealResult:
     #: it is a skip.
     not_regular: int = 0
     #: True when the uploads root could not be listed, as when it is missing or is not a directory
-    #: (BACKLOG #4940). An unmounted volume and a directory never created cannot be listed alike,
-    #: and the pass cannot tell them apart: read as zero uploads, an unmounted volume's uploads
-    #: would stay under the prior key while the run reported success. ``rotate-key`` refuses such a
-    #: root before it writes anything, so this is a backstop. Also True when a non-empty listing is
-    #: followed by a root that is no directory, at the check right after the listing or at the
-    #: pass's first pair-lock check. It is not a skip: ``rotate-key`` aborts on it before its audit
-    #: roll.
+    #: (BACKLOG #4940). ``rotate-key`` refuses such a root before it writes anything, so this is a
+    #: backstop. A root it can list is not missing, so an empty mount point over a volume that is
+    #: not mounted reads as no uploads; docs/PHI.md's ``rotate-key`` passage, under "It refuses only
+    #: a path it cannot list", names that and the rest it leaves uncaught. Also True when a
+    #: non-empty listing is followed by a root that is no directory, at the check right after the
+    #: listing or at the pass's first pair-lock check. It is not a skip: ``rotate-key`` aborts on it
+    #: before its audit roll.
     root_missing: bool = False
 
     @property
@@ -3298,8 +3298,7 @@ def _root_gone(exc: OSError, root: Path) -> bool:
     """Whether ``exc`` is a ``FileNotFoundError`` or ``NotADirectoryError`` while the uploads root
     ``root`` is no directory, as when it is missing or was replaced by a file, and not one from
     under a root still there. ``os.path.isdir`` follows links, so a root that is a link to a
-    missing target is gone too. The CLI's ``_uploads_root_refusal`` and the re-seal's check after
-    its listing read a root that is no directory the same way."""
+    missing target is gone too."""
     return isinstance(exc, FileNotFoundError | NotADirectoryError) and not os.path.isdir(root)
 
 
@@ -3310,7 +3309,8 @@ def _lock_name(path: Path) -> str:
 
 def _pair_lock_failure(exc: OSError, root: Path) -> _PairLockFailure:
     """Why :func:`_pair_lock` could not take the lock in the uploads root ``root``. ``busy``:
-    another holder kept it past the wait. ``gone``: the root is no directory (:func:`_root_gone`).
+    another holder kept it past the wait. ``gone``: a ``FileNotFoundError`` or
+    ``NotADirectoryError`` while the root is no directory (:func:`_root_gone`).
     ``timeout``: the OS timed out (``ETIMEDOUT``), as a network file system can. ``refused``:
     the file system refused this account (``atomic_edit._REFUSED``), such as a lock file another
     account owns; a ``_PairLockBusy`` with a cause is one too, as is what ``_NOT_A_FILE`` names,
