@@ -68,6 +68,11 @@ from messagefoundry.pipeline.cluster import (
     stop_tasks_within,
 )
 from messagefoundry.redaction import safe_exc
+from messagefoundry.store.base import (
+    CLUSTER_FENCE_RETUNE,
+    CLUSTER_RENEW_RETUNE,
+    CLUSTER_STOP_RETUNE,
+)
 
 log = logging.getLogger(__name__)
 
@@ -256,6 +261,7 @@ class SqlServerCoordinator:
                     "UPDATE nodes SET status=?, last_seen=?, is_leader=0 WHERE node_id=?",
                     ("left", time.time(), self.node_id),
                     timeout_clamp=self._stop_write_timeout,
+                    retune=CLUSTER_STOP_RETUNE,
                 )
         except Exception as exc:  # pool may already be closing on shutdown — log, don't raise
             log.warning("cluster: failed to mark node %s left: %s", self.node_id, safe_exc(exc))
@@ -306,6 +312,7 @@ class SqlServerCoordinator:
             " OUTPUT inserted.config_version AS config_version;",
             (time.time(),),
             timeout_clamp=self._renew_timeout,
+            retune=CLUSTER_RENEW_RETUNE,
         )
         assert row is not None, "cluster_config upsert returned no row"
         self._config_version = int(row["config_version"])
@@ -430,6 +437,7 @@ class SqlServerCoordinator:
             "UPDATE nodes SET last_seen=?, status=?, is_leader=? WHERE node_id=?",
             (time.time(), "active", 1 if self._is_leader else 0, self.node_id),
             timeout_clamp=self._renew_timeout,
+            retune=CLUSTER_RENEW_RETUNE,
         )
 
     async def _heartbeat_loop(self) -> None:
@@ -518,11 +526,19 @@ class SqlServerCoordinator:
             # executor thread for [store].command_timeout (BACKLOG #5064). Half the budget, as on
             # Postgres, because the clamped borrow and statement each take up to the clamp; the
             # loop's bound stays as the backstop for the rollback and the 1 s floor.
+            # The advice a timed-out borrow gives names whichever term set the clamp: raising the
+            # renew setting cannot lengthen a clamp half the budget set, and the reverse.
+            budget_term = self._paused_read_budget / 2.0
             async with asyncio.timeout(self._paused_read_budget):
                 current = await self._store._fetchone_clamped(
                     "SELECT owner FROM leader_lease WHERE lease_key = ?",
                     (self._lease_key,),
-                    timeout_clamp=min(self._renew_timeout, self._paused_read_budget / 2.0),
+                    timeout_clamp=min(self._renew_timeout, budget_term),
+                    retune=(
+                        CLUSTER_FENCE_RETUNE
+                        if budget_term < self._renew_timeout
+                        else CLUSTER_RENEW_RETUNE
+                    ),
                 )
             if current is not None and current["owner"] != self.node_id:
                 self._no_claim_until = 0.0
@@ -553,6 +569,7 @@ class SqlServerCoordinator:
                 self._lease_ttl,  # INSERT lease_expires_at
             ),
             timeout_clamp=self._renew_timeout,
+            retune=CLUSTER_RENEW_RETUNE,
         )
         if row is None or row["owner"] != self.node_id:
             # The DB saw another owner's live lease; see DbCoordinator._claim_or_renew_lease (#1508).
@@ -675,6 +692,7 @@ class SqlServerCoordinator:
             # and to the driver alike (BACKLOG #5064), since the loop's bound alone cannot stop a
             # write the server already took.
             clamp = self._renew_timeout if timeout is None else timeout
+            retune = CLUSTER_RENEW_RETUNE if timeout is None else CLUSTER_STOP_RETUNE
             async with asyncio.timeout(timeout):
                 # The expiry is the DB clock's now, read by the same _DB_NOW expression the MERGE's
                 # take-over predicate reads, so each sibling waits its own acquire_delay (BACKLOG
@@ -687,6 +705,7 @@ class SqlServerCoordinator:
                     " WHERE lease_key = ? AND owner = ?",
                     (self._lease_key, self.node_id),
                     timeout_clamp=clamp,
+                    retune=retune,
                 )
         except Exception as exc:
             log.warning(

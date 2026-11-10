@@ -2654,13 +2654,12 @@ refused; see the server log`. Where the CA check wrote one, it shows in the `aut
 rows too; a CA setting refused before any audit row is written has none. The lane is still held
 failed across a reload that leaves its config unchanged. On an inbound the rule holds for any start
 failure. On an outbound it holds for a failure raised as a `TrustAnchorError`, as a refused or
-store-stopped CA check is; any other outbound start failure records its line and alerts each time. A refused-CA lane whose line a store
-fault replaced is no longer kept failed across a reload, so the next reload reads its CA again. An
-outbound checks its CA at a
-start only when it has no connector. An operator start of
-such a lane that was paused would leave it paused with its rows pending, because a resumed lane
-with no connector charges each row it claims an attempt, and a finite `max_attempts` would
-dead-letter it with nothing known against the CA.
+store-stopped CA check is; any other outbound start failure records its line and alerts each time. A
+refused-CA lane whose line a store fault replaced is no longer kept failed across a reload, so the
+next reload reads its CA again. An outbound checks its CA at a start only when it has no connector.
+An operator start of such a lane that was paused would leave it paused with its rows pending,
+because a resumed lane with no connector charges each row it claims an attempt, and a finite
+`max_attempts` would dead-letter it with nothing known against the CA.
 
 **That hold covers the operator control route only, and it ends at the lane's next start**, which
 at least an operator, a schedule or a rule can make. While a lane is held it sits in the paused

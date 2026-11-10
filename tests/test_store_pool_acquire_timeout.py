@@ -39,8 +39,12 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.settings import StoreSettings
+from messagefoundry.redaction import _DEFAULT_LIMIT as _SAFE_EXC_DEFAULT_LIMIT
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store.base import (
+    CLUSTER_FENCE_RETUNE,
+    CLUSTER_RENEW_RETUNE,
+    CLUSTER_STOP_RETUNE,
     DEFAULT_STORE_ACQUIRE_TIMEOUT,
     StoreAcquireTimeout,
     acquire_pooled,
@@ -408,27 +412,31 @@ async def test_sqlserver_store_acquire_is_bounded() -> None:
 
 
 async def test_sqlserver_clamped_borrow_names_the_setting_that_set_its_limit() -> None:
-    """BACKLOG #5064: a borrow cut at the cluster clamp names the clamp, since raising
-    ``[store].acquire_timeout`` would not lengthen it; one cut at ``[store].acquire_timeout``,
-    the shorter of the two, still names that setting."""
-    store = _sqlserver_store(_HangingPool(), timeout=0.2)
-    with pytest.raises(StoreAcquireTimeout, match=r"lease_renew_timeout_seconds") as clamped:
-        async with store._acquire_clamped(FAST):
-            pytest.fail("the body must never run on a wedged pool")
-    assert "[store].acquire_timeout" not in str(clamped.value)
-    # The stepdown pause read can be cut by the fence timeout instead, and a logged error passes
-    # through safe_exc, whose default limit must keep both names (BACKLOG #5064).
-    assert safe_exc(clamped.value).endswith(
-        "[cluster].lease_renew_timeout_seconds or leader_fence_timeout_seconds"
-    ), safe_exc(clamped.value)
+    """BACKLOG #5064: a borrow cut at the cluster clamp names the setting its caller says set the
+    clamp, since raising ``[store].acquire_timeout`` would not lengthen it; one cut at
+    ``[store].acquire_timeout``, the shorter of the two, still names that setting."""
+    for retune in (CLUSTER_RENEW_RETUNE, CLUSTER_FENCE_RETUNE, CLUSTER_STOP_RETUNE):
+        store = _sqlserver_store(_HangingPool(), timeout=0.2)
+        with pytest.raises(StoreAcquireTimeout) as clamped:
+            async with store._acquire_clamped(FAST, retune):
+                pytest.fail("the body must never run on a wedged pool")
+        message = str(clamped.value)
+        assert message.endswith(f"retune with {retune}"), message
+        assert "[store].acquire_timeout" not in message
+        # A logged error passes through safe_exc, whose default limit must keep the whole advice.
+        # The worst case renders the limit in the most characters ``:g`` uses for a value of at
+        # least the 1 s floor, such as 1.23457e+08, so pad the measured message to it.
+        worst = len(message) - len(f"{FAST:g}") + len(f"{1.23456789e8:g}")
+        assert worst <= _SAFE_EXC_DEFAULT_LIMIT, (worst, message)
+        assert safe_exc(clamped.value).endswith(retune), safe_exc(clamped.value)
     # A tie names the clamp too: raising [store].acquire_timeout alone would not lengthen it.
     store = _sqlserver_store(_HangingPool(), timeout=FAST)
-    with pytest.raises(StoreAcquireTimeout, match=r"lease_renew_timeout_seconds"):
-        async with store._acquire_clamped(FAST):
+    with pytest.raises(StoreAcquireTimeout, match=r"retune with \[cluster\]\.lease_renew_timeout"):
+        async with store._acquire_clamped(FAST, CLUSTER_RENEW_RETUNE):
             pytest.fail("the body must never run on a wedged pool")
     store = _sqlserver_store(_HangingPool(), timeout=FAST)
     with pytest.raises(StoreAcquireTimeout, match=r"retune with \[store\]\.acquire_timeout$"):
-        async with store._acquire_clamped(5.0):
+        async with store._acquire_clamped(5.0, CLUSTER_RENEW_RETUNE):
             pytest.fail("the body must never run on a wedged pool")
 
 
