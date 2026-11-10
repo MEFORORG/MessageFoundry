@@ -280,9 +280,9 @@ class _Notices:
 async def _signed_in(
     store: MessageStore, role: str = "operator"
 ) -> tuple[Any, str, list[tuple[str, str]], list[str]]:
-    """A directory service whose jdoe signed in once holding ``role``, then had the group map moved
-    to viewer, or to operator when ``role`` is viewer. Returns the service, that first token, and
-    the lists the administrator-grant and sign-in audit pages land in."""
+    """A directory service whose jdoe signed in once holding ``role``. Returns the service, that
+    first token, and the lists the administrator-grant and sign-in audit pages land in; each test
+    then moves the group map itself."""
     service = await _service(store, _AD_SETTINGS, ldap=_FakeLdap())
     grants: list[tuple[str, str]] = []
     audit_pages: list[str] = []
@@ -393,7 +393,8 @@ async def test_a_sign_in_writes_its_role_row_before_a_revoke_that_raises(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BACKLOG #2221. A role row refused in the write's transaction is written on its own before
-    the post-commit revoke runs, so a revoke that then raises cannot cost the row."""
+    the post-commit revoke runs, so a revoke that then raises cannot cost the row; the user is
+    still told of the committed change before the sign-in fails."""
     service, _first, _grants, _audit_pages = await _signed_in(store)
     await service.set_ad_group_map([("cn=mf-ops,dc=x", "viewer")], actor="admin")
     _refuse(monkeypatch, store, "auth.ad_roles_resynced")
@@ -402,8 +403,12 @@ async def test_a_sign_in_writes_its_role_row_before_a_revoke_that_raises(
         raise sqlite3.OperationalError("synthetic: the revoke was refused")
 
     monkeypatch.setattr(service, "_revoke_after_commit", revoke_fails)
+    service._security_notifier.sent.clear()
     with pytest.raises(sqlite3.OperationalError, match="revoke"):
         await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)
+    assert [e.username for e in service._security_notifier.sent] == ["jdoe"], (
+        "a committed role change was not told to its user when the revoke raised"
+    )
     assert (await _details(store, "auth.ad_roles_resynced"))[0] == {
         "from": ["operator"],
         "to": ["viewer"],

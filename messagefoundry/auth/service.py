@@ -266,12 +266,12 @@ def _row_write_errors() -> tuple[type[Exception], ...]:
 
 
 def _is_held_write_error(exc: BaseException) -> bool:
-    """Whether an error a write raised with its audit row in its transaction is held, and raised
-    once the write's own steps have run, rather than sorted as a store refusal (BACKLOG #2221,
-    #3018 step 4): a defect (:data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`), or an error
-    :func:`~messagefoundry.store.base.audit_write_errors` does not name. This is the one statement
-    of the rule."""
-    return isinstance(exc, AUDIT_WRITE_DEFECTS) or not isinstance(exc, audit_write_errors())
+    """Whether an error :func:`_row_write_errors` caught from a write with its audit row, or from
+    that row on its own, is held, and raised once the write's own steps have run, rather than
+    sorted as a store refusal (BACKLOG #2221, #3018 step 4): a defect
+    (:data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`). An error that set does not name is
+    not caught, and raises at once. This is the one statement of the rule."""
+    return isinstance(exc, AUDIT_WRITE_DEFECTS)
 
 
 def _hold(held: Exception | None, more: Exception | None) -> Exception | None:
@@ -281,7 +281,7 @@ def _hold(held: Exception | None, more: Exception | None) -> Exception | None:
     if held is None:
         return more
     if more is not None and more is not held:
-        held.add_note(f"also held and logged after it: {type(more).__name__}: {more}")
+        held.add_note(f"also held and logged after it: {type(more).__name__}")
     return held
 
 
@@ -7788,22 +7788,22 @@ class AuthService:
                 await self._revoke_after_commit(
                     user.id, change="ad_roles_resynced", actor=user.username, client=client
                 )
-                # A directory-pushed privilege change is the same privilege change to the same
-                # user as a local one, so notify the affected user out-of-band too (ASVS 6.3.7),
-                # matching set_roles(). Best-effort; the change is also visible in the audited
-                # /me/security-events feed. ``source`` words it for the directory, as the
-                # reconciler's notice is (vault BACKLOG #3121): the holder did not make this
-                # change, so "if this was you" cannot apply.
-                await self._notify_security(
-                    ROLES_CHANGED,
-                    username=user.username,
-                    email=user.notify_email,
-                    client=client,
-                    detail={"roles": role_ids, "source": "directory"},
-                )
             except Exception as exc:
-                # Raised below, after the grant's page; any error held before it is named on it.
+                # Raised below, after the notice and the grant's page, since the roles committed.
                 held = _hold(exc, held)
+            # A directory-pushed privilege change is the same privilege change to the same user as
+            # a local one, so notify the affected user out-of-band too (ASVS 6.3.7), matching
+            # set_roles(). Best-effort; the change is also visible in the audited
+            # /me/security-events feed. ``source`` words it for the directory, as the reconciler's
+            # notice is (vault BACKLOG #3121): the holder did not make this change, so "if this
+            # was you" cannot apply.
+            await self._notify_security(
+                ROLES_CHANGED,
+                username=user.username,
+                email=user.notify_email,
+                client=client,
+                detail={"roles": role_ids, "source": "directory"},
+            )
         if held is not None:
             # The route raises the grant's page from the outcome this raise takes away.
             self._report_directory_admin_grant(
@@ -10723,8 +10723,7 @@ class AuthService:
             if lost.__cause__ is None:
                 lost.__cause__ = first
             _log.error(
-                "%s: the %s row for %s was refused on its own too (%s); the row is lost, and "
-                "audit_write_failed pages",
+                "%s: the %s row for %s was refused on its own too (%s); the row is lost",
                 where,
                 action,
                 scrub_log_argument(actor),
@@ -11034,14 +11033,15 @@ class AuthService:
 
         The sign-in rule (vault BACKLOG #2610): only a role this write ADDED pages, so an account
         that already held Administrator raises nothing. ``before`` is the account's roles as read
-        through its seal just before the write, never the plan's, which can be a pass old. Only an
-        applied revocation reaches here, and only a pass that did not abort applies one. The alert
-        pops the account's ``no_enabled_administrator`` cooldown in the sink, which is intended:
-        a later loss of the role pages again.
+        through its seal just before the write, never the plan's, which can be a pass old. On the
+        reconciler, only an applied revocation reaches here, and only a pass that did not abort
+        applies one. The alert pops the account's ``no_enabled_administrator`` cooldown in the
+        sink, which is intended: a later loss of the role pages again.
 
-        Never raises, a defect in the callable included: it runs between the role write and the
-        session revocation, and a raise would skip the revocation (see
-        :meth:`_report_directory_admin_loss`)."""
+        Never raises, a defect in the callable included: on the reconciler it runs between the role
+        write and the session revocation, and a raise would skip the revocation (see
+        :meth:`_report_directory_admin_loss`); on the sign-in it runs just before the held error
+        is raised, which a raise here would replace."""
         admin = Role.ADMINISTRATOR.value
         if admin in set(before) or admin not in set(after):
             return
