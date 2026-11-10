@@ -25,8 +25,11 @@ from messagefoundry.store import MessageStore, cell_tag
 from messagefoundry.store.cell_tag import (
     MESSAGE_TAG_CELLS,
     MESSAGE_TAG_FAILED_ACTION,
+    PRESET_TAG_FAILED_ACTION,
     CellTagError,
     CorruptCellError,
+    dead_letter_on_cell_tag,
+    dead_letters_on_cell_tag,
     message_cell_aad,
     open_message_cell,
     preset_criteria_aad,
@@ -183,6 +186,96 @@ async def test_a_corrupt_cell_writes_no_tag_failed_audit_and_drift_does() -> Non
     assert rows == []
     await report_cell_tag_failure(_Sink(), CellTagError("messages", "raw", "au-drift", "A"))
     assert rows == [MESSAGE_TAG_FAILED_ACTION]
+
+
+async def test_a_failed_audit_write_does_not_mute_the_cells_next_report(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #6697: a transient audit-write failure leaves the cell unmuted, so its next refusal
+    writes the row; once written, the interval mutes it. The failure logs no driver text or
+    traceback."""
+    rows: list[str] = []
+    fail = [True]
+
+    class _Sink:
+        async def record_audit(self, action: str, **_kwargs: object) -> None:
+            if fail[0]:
+                fail[0] = False
+                raise sqlite3.OperationalError("synthetic-driver-text")
+            rows.append(action)
+
+    first = CellTagError("messages", "raw", "au-retry", "A")
+    with caplog.at_level("ERROR", logger=cell_tag.__name__):
+        await report_cell_tag_failure(_Sink(), first)
+    assert rows == [] and not first.audited
+    [line] = [r for r in caplog.records if r.name == cell_tag.__name__]
+    assert line.exc_info is None and "synthetic-driver-text" not in line.getMessage()
+    assert "OperationalError" in line.getMessage()
+
+    await report_cell_tag_failure(_Sink(), first)  # a nested boundary retries the same error
+    assert rows == [MESSAGE_TAG_FAILED_ACTION] and first.audited
+    await report_cell_tag_failure(_Sink(), CellTagError("messages", "raw", "au-retry", "A"))
+    assert rows == [MESSAGE_TAG_FAILED_ACTION]  # written, so muted for the interval
+
+
+async def test_each_table_is_audited_under_its_own_action() -> None:
+    """BACKLOG #6697: a preset failure is audited as a preset's, and no other table can be named, so
+    no failure falls through to another table's action."""
+    rows: list[str] = []
+
+    class _Sink:
+        async def record_audit(self, action: str, **_kwargs: object) -> None:
+            rows.append(action)
+
+    await report_cell_tag_failure(_Sink(), CellTagError("search_presets", "criteria", "au-p", None))
+    assert rows == [PRESET_TAG_FAILED_ACTION]
+    with pytest.raises(ValueError):
+        CellTagError("queue", "payload", "au-q", None)
+
+
+class _DeadLetterSink:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.dead: list[str] = []
+        self.audits: list[str] = []
+
+    async def record_audit(self, action: str, **_kwargs: object) -> None:
+        self.audits.append(action)
+
+    async def dead_letter_now(self, outbox_id: str, error: str, now: float | None = None) -> None:
+        if self.fail:
+            raise sqlite3.OperationalError("synthetic")
+        self.dead.append(outbox_id)
+
+
+async def test_a_failed_dead_letter_still_writes_the_audit_row() -> None:
+    """BACKLOG #6698: the dead-letter's error propagates, so the row is re-run and dead-lettered
+    then, and the audit row is written regardless."""
+    sink = _DeadLetterSink(fail=True)
+    with pytest.raises(sqlite3.OperationalError):
+        await dead_letter_on_cell_tag(sink, "dl-1", CellTagError("messages", "raw", "dl-fail", "A"))
+    assert sink.audits == [MESSAGE_TAG_FAILED_ACTION]
+    ok = _DeadLetterSink()  # control: the ordinary path dead-letters and audits
+    await dead_letter_on_cell_tag(ok, "dl-2", CellTagError("messages", "raw", "dl-ok", "A"))
+    assert ok.dead == ["dl-2"] and ok.audits == [MESSAGE_TAG_FAILED_ACTION]
+
+
+async def test_the_handoff_wrapper_requires_a_keyword_only_routed_id() -> None:
+    """BACKLOG #6698: a handoff that could take ``routed_id`` positionally is refused at decoration,
+    so the wrapper never meets a call whose ``kwargs`` lack it."""
+
+    async def positional(self: _DeadLetterSink, routed_id: str) -> bool:
+        return True
+
+    with pytest.raises(TypeError, match="keyword-only"):
+        dead_letters_on_cell_tag(positional)
+
+    async def keyword(self: _DeadLetterSink, *, routed_id: str) -> bool:
+        raise CellTagError("messages", "raw", "kw-1", "A")
+
+    sink = _DeadLetterSink()
+    assert await dead_letters_on_cell_tag(keyword)(sink, routed_id="r-1") is False
+    assert sink.dead == ["r-1"] and sink.audits == [MESSAGE_TAG_FAILED_ACTION]
 
 
 class _NoKeyringView:

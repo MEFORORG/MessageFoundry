@@ -33,6 +33,7 @@ drift.
 from __future__ import annotations
 
 import functools
+import inspect
 import json
 import logging
 import threading
@@ -90,6 +91,12 @@ PRESET_TAG_COLUMNS: Final = ("id", "owner_user_id")
 MESSAGE_TAG_FAILED_ACTION: Final = "integrity.message_tag_failed"
 #: The audit action written when a preset's criteria do not open under its row's tag.
 PRESET_TAG_FAILED_ACTION: Final = "integrity.preset_tag_failed"
+#: Each tagged table's tag-failed audit action. A :class:`CellTagError` names one of these tables, so
+#: no failure is audited under another table's action (BACKLOG #6697).
+_TAG_FAILED_ACTION: Final[Mapping[str, str]] = {
+    "messages": MESSAGE_TAG_FAILED_ACTION,
+    "search_presets": PRESET_TAG_FAILED_ACTION,
+}
 
 # Each table's ``seal_bytes`` kind: its own, so no tag can equal another table's or a row seal's.
 _MESSAGE_KIND: Final = "message-cell"
@@ -183,6 +190,8 @@ class CellTagError(CipherError):
     drift: ClassVar[bool] = True
 
     def __init__(self, table: str, column: str, row_id: str, channel_id: str | None) -> None:
+        if table not in _TAG_FAILED_ACTION:
+            raise ValueError(f"{table} is not a table this module tags")
         self.table = table
         self.column = column
         self.row_ref = str(row_id)[:_ROW_REF_LEN]
@@ -312,25 +321,38 @@ def withhold_message_cells(
 _REPORT_INTERVAL_S: Final = 3600.0
 #: The most cells remembered; the oldest is forgotten first.
 _REPORTED_MAX: Final = 4096
-_reported: dict[tuple[str, str, str, bool], float] = {}
-_reported_audit: dict[tuple[str, str, str, bool], float] = {}
+type _Key = tuple[str, str, str, bool]
+type _Memo = dict[_Key, float]
+_reported: _Memo = {}
+_reported_audit: _Memo = {}
 #: The memos are touched from the event loop and from worker threads (the content-search scan, the
 #: SQL Server fused handoff), so every read-modify-write holds this lock.
 _reported_lock = threading.Lock()
 
 
-def _first_in_interval(memo: dict[tuple[str, str, str, bool], float], err: CellTagError) -> bool:
+def _memo_key(err: CellTagError) -> _Key:
+    return (err.table, err.column, err.row_ref, err.drift)  # a corrupt read never mutes drift
+
+
+def _is_recent(memo: _Memo, key: _Key, now: float) -> bool:
+    last = memo.get(key)
+    return last is not None and now - last < _REPORT_INTERVAL_S
+
+
+def _remember(memo: _Memo, key: _Key, now: float) -> None:
+    memo.pop(key, None)
+    memo[key] = now
+    while len(memo) > _REPORTED_MAX:
+        memo.pop(next(iter(memo)))
+
+
+def _first_in_interval(memo: _Memo, err: CellTagError) -> bool:
     """Whether ``err``'s cell has not been reported in ``memo`` within the interval; records it."""
-    key = (err.table, err.column, err.row_ref, err.drift)  # a corrupt read never mutes drift
-    now = time.monotonic()
+    key, now = _memo_key(err), time.monotonic()
     with _reported_lock:
-        last = memo.get(key)
-        if last is not None and now - last < _REPORT_INTERVAL_S:
+        if _is_recent(memo, key, now):
             return False
-        memo.pop(key, None)
-        memo[key] = now
-        while len(memo) > _REPORTED_MAX:
-            memo.pop(next(iter(memo)))
+        _remember(memo, key, now)
     return True
 
 
@@ -365,13 +387,20 @@ class _AuditSink(Protocol):
 async def report_cell_tag_failure(store: _AuditSink, err: CellTagError) -> None:
     """Write the audit row for ``err``, once. The alert was raised when the read was refused. An
     audit failure is logged and swallowed: reporting must never change what the read did. A corrupt
-    cell is not drift, so it writes no tag-failed row; its WARNING was logged at the read."""
+    cell is not drift, so it writes no tag-failed row; its WARNING was logged at the read.
+
+    The cell is muted for the interval only once its row is WRITTEN, so a failed write leaves the
+    next refusal of the cell to write it (BACKLOG #6697). Two concurrent reports of one cell may then
+    both write: a duplicate audit row is the price of never losing one."""
     if err.audited or not err.drift:
         return
-    err.audited = True
-    if not _first_in_interval(_reported_audit, err):
+    key = _memo_key(err)
+    with _reported_lock:
+        recent = _is_recent(_reported_audit, key, time.monotonic())
+    if recent:
+        err.audited = True
         return
-    action = MESSAGE_TAG_FAILED_ACTION if err.table == "messages" else PRESET_TAG_FAILED_ACTION
+    action = _TAG_FAILED_ACTION[err.table]
     try:
         await store.record_audit(
             action,
@@ -379,8 +408,22 @@ async def report_cell_tag_failure(store: _AuditSink, err: CellTagError) -> None:
             channel_id=err.channel_id,
             detail=json.dumps({"cell": err.column, "row": err.row_ref}, sort_keys=True),
         )
-    except Exception:  # noqa: BLE001 -- the refusal stands whatever the audit write does
-        _log.exception("the %s audit row could not be written", action)
+    except Exception as exc:  # noqa: BLE001 -- the refusal stands whatever the audit write does
+        # Class and SQLSTATE only, as the store's other driver-failure lines: a driver's text and
+        # traceback are not this function's to vouch for.
+        from messagefoundry.store.base import driver_sqlstate  # lazy: base imports this module
+
+        _log.error(
+            "the %s audit row could not be written (%s, SQLSTATE %s); the cell's next refusal"
+            " writes it",
+            action,
+            type(exc).__name__,
+            driver_sqlstate(exc),
+        )
+        return
+    err.audited = True
+    with _reported_lock:
+        _remember(_reported_audit, key, time.monotonic())
 
 
 def audits_cell_tag[S: _AuditSink, **P, R](
@@ -414,7 +457,14 @@ def dead_letters_on_cell_tag[S: CellTagSink, **P](
     handoff raises :class:`CellTagError`, its transaction has rolled back: the row is dead-lettered so
     the lane moves on and the message is ``ERROR`` (count-and-log), the failure is audited (the alert
     was raised at the read), and the handoff reports ``False``. Without this the runner would read the
-    raise as an infrastructure fault and re-pend the row until the inbound stopped."""
+    raise as an infrastructure fault and re-pend the row until the inbound stopped.
+
+    ``routed_id`` must be keyword-only, so every call that reaches the handoff carries it in
+    ``kwargs``; a handoff that takes it any other way is refused here, at decoration (BACKLOG
+    #6698)."""
+    param = inspect.signature(fn).parameters.get("routed_id")
+    if param is None or param.kind is not inspect.Parameter.KEYWORD_ONLY:
+        raise TypeError(f"{fn.__qualname__} must take routed_id as a keyword-only parameter")
 
     async def wrapper(self: S, /, *args: P.args, **kwargs: P.kwargs) -> bool:
         try:
@@ -430,9 +480,15 @@ def dead_letters_on_cell_tag[S: CellTagSink, **P](
 async def dead_letter_on_cell_tag(store: CellTagSink, row_id: str, err: CellTagError) -> None:
     """Dead-letter the in-flight queue row ``row_id`` whose message failed its cell tag, so the lane
     moves on and the message is ``ERROR`` (count-and-log), then audit the failure. The one policy for
-    a stage that met a tag failure, on the async handoffs and the runner's fused path alike."""
-    await store.dead_letter_now(row_id, str(err))
-    await report_cell_tag_failure(store, err)
+    a stage that met a tag failure, on the async handoffs and the runner's fused path alike.
+
+    The audit is written even when the dead-letter raises, whose error then propagates: the row
+    stays in flight, meets the tag failure again on its re-run and is dead-lettered then, and the
+    audit row is not lost meanwhile (BACKLOG #6698)."""
+    try:
+        await store.dead_letter_now(row_id, str(err))
+    finally:
+        await report_cell_tag_failure(store, err)
 
 
 async def report_cell_tag_failures(store: _AuditSink, failures: list[CellTagError]) -> None:
