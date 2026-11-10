@@ -731,22 +731,24 @@ def _to_ber(der: bytes, form: str) -> bytes:
     return shapes[form]
 
 
-#: Forms the check reads far enough to judge on the wrap.
+#: Forms whose AlgorithmIdentifier is DER, so the check judges them on the wrap, whatever BER
+#: the bytes around it use.
 _JUDGED_BER_FORMS = [
     "indefinite-outer",
     "constructed-octets",
     "definite-constructed-octets",
     "both",
-]
-#: Forms the check does not walk. Each is refused as unreadable, the approved wrap with the weak.
-_UNWALKED_BER_FORMS = [
     "long-outer-length",
     "long-octets-length",
     "high-tag-outer",
     "padded-high-tag-outer",
+    "high-tag-octets",
+]
+#: Forms whose AlgorithmIdentifier is itself BER, which the check does not walk. Each is refused as
+#: unreadable, the approved wrap with the weak.
+_UNWALKED_BER_FORMS = [
     "high-tag-algorithm",
     "padded-high-tag-algorithm",
-    "high-tag-octets",
     "indefinite-algorithm",
     "indefinite-algorithm-and-outer",
 ]
@@ -770,13 +772,15 @@ def test_a_weak_ber_wrap_is_judged_under_any_label_and_as_raw_der(
 def test_a_ber_wrap_the_check_cannot_walk_is_refused_not_passed(
     material: Material, form: str
 ) -> None:
-    # The default is inverted for bytes the DER reader cannot walk: a SEQUENCE that opens with an
-    # AlgorithmIdentifier is refused, whatever its wrap, rather than passed as an unencrypted key.
+    # A BER key that names a password-based scheme, in a form whose scheme this check cannot read,
+    # is refused whatever its wrap rather than passed as an unencrypted key. The text says the
+    # encoding is unread; it does not call the wrap weak or tell the operator to re-wrap.
     for wrap in ("best-available-2048", "approved"):
         ber = _to_ber(_der_of(material.wraps[wrap]), form)
         for shaped in (ber, pem(ber, "PRIVATE KEY"), pem(ber)):
             refusal = _check(shaped)
-            assert refusal is not None and "cannot read" in refusal
+            assert refusal is not None and "BER encoding this engine cannot read" in refusal
+            assert "Supply it DER-encoded" in refusal and "Re-wrap" not in refusal
 
 
 @pytest.mark.parametrize(
@@ -822,16 +826,63 @@ def test_an_unencrypted_ber_key_still_passes_and_loads(
     assert _api(cert, key, None) is not None
 
 
+def _not_keys(material: Material) -> dict[str, bytes]:
+    """DER objects that hold no private key, each a SEQUENCE whose first element is a SEQUENCE."""
+    csr = (
+        x509.CertificateSigningRequestBuilder()
+        .subject_name(x509.load_pem_x509_certificate(material.cert_pem).subject)
+        .sign(material.key, hashes.SHA256())
+    )
+    return {
+        "certificate": _der_of(material.cert_pem),
+        "csr": csr.public_bytes(serialization.Encoding.DER),
+        "public-key": material.key.public_key().public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    "form", ["indefinite-outer", "long-outer-length", "high-tag-outer", "padded-high-tag-outer"]
+)
+def test_a_ber_certificate_csr_or_public_key_is_left_to_the_loader(
+    tmp_path: Path, material: Material, form: str
+) -> None:
+    # None of these names a password-based scheme, so the BER reader leaves them to the loader as
+    # the DER reader always did. A database driver's sslcert is checked this way, as raw bytes.
+    for name, der in _not_keys(material).items():
+        ber = _to_ber(der, form)
+        assert _check(ber, given=False) is None, name
+        assert _check(ber) is None, name
+        path = _write(tmp_path, f"{name}.der", ber)
+        keywrap.refuse_weak_key_file(
+            path, setting="sslcert", unlock_setting=None, passphrase_given=False
+        )
+    # The positive control: a weak wrap in the same BER form is still refused.
+    weak = _to_ber(_der_of(material.wraps["best-available-2048"]), form)
+    refusal = _check(weak, given=False)
+    assert refusal is not None and "2048 iterations" in refusal
+
+
 #: A BER PKCS#7 ContentInfo: SEQUENCE { OID data, [0] { OCTET STRING } }, all indefinite.
 _BER_CONTENT_INFO = (
     b"\x30\x80\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x07\x01\xa0\x80\x04\x00\x00\x00\x00\x00"
 )
 
 
+#: id-ecPublicKey: a key-algorithm OID outside the password-based arcs.
+_EC_PUBLIC_KEY = "1.2.840.10045.2.1"
+
+
 def test_bytes_that_are_not_a_key_are_still_left_to_the_loader() -> None:
-    # Truncated bytes, an empty BER SEQUENCE and a SEQUENCE that opens with an OID are not the
-    # EncryptedPrivateKeyInfo shape, so the inverted default does not refuse them.
+    # Truncated bytes, an empty BER SEQUENCE, a SEQUENCE that opens with an OID, a SEQUENCE whose
+    # inner SEQUENCE names a scheme outside the password-based arcs, and text that starts with "0"
+    # (0x30, the SEQUENCE tag) are not the EncryptedPrivateKeyInfo shape, so none is refused.
     for junk in (
+        b"000",
+        b"0000000000 is not a key\n",
+        _to_ber(seq(seq(oid(_EC_PUBLIC_KEY)), octets(b"\x00")), "indefinite-algorithm-and-outer"),
+        b"\x30\x80\x30\x80" + oid(PBES2)[:-1],  # a password-based scheme's OID, cut short
         b"\x30\x80",
         b"\x30\x80\x30",
         b"\x30\x80\x02\x01\x00\x00\x00",

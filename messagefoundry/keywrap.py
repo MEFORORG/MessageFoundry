@@ -20,9 +20,9 @@ What is refused, by default and with no setting to turn it off:
   by RFC 8018's default, so it is refused like an explicit SHA-1 one.
 * **PBES2 with scrypt** below Appendix C's floor: ``r >= 8``, and ``N`` at least 2^17, 2^16 or 2^15
   for ``p`` of 1, 2, or 3 and up. Those are the table's three rows, encoded as written.
-* Any other derivation this module does not recognise, an encrypted key it cannot parse (a BER
-  form it does not walk among them, where the bytes open as an EncryptedPrivateKeyInfo does), and
-  a key file it cannot read or that is too large to check.
+* Any other derivation this module does not recognise, an encrypted key it cannot parse (among
+  them a BER encoding of one that names a password-based scheme, where the scheme's own
+  AlgorithmIdentifier is not DER), and a key file it cannot read or that is too large to check.
 * An encrypted key where the loader has NO passphrase to give, before any library can try it.
 
 ``cryptography``'s ``BestAvailableEncryption`` and the ``openssl`` CLI's own default both write
@@ -143,8 +143,10 @@ _PBES2: Final = "1.2.840.113549.1.5.13"
 _PBKDF2: Final = "1.2.840.113549.1.5.12"
 _SCRYPT: Final = "1.3.6.1.4.1.11591.4.11"
 _HMAC_SHA1: Final = "1.2.840.113549.2.7"
-_PBES1: Final = frozenset(f"1.2.840.113549.1.5.{n}" for n in (1, 3, 4, 6, 10, 11))
-_PKCS12_PBE: Final = frozenset(f"1.2.840.113549.1.12.1.{n}" for n in range(1, 7))
+_PKCS5_ARC: Final = "1.2.840.113549.1.5."
+_PKCS12_PBE_ARC: Final = "1.2.840.113549.1.12.1."
+_PBES1: Final = frozenset(f"{_PKCS5_ARC}{n}" for n in (1, 3, 4, 6, 10, 11))
+_PKCS12_PBE: Final = frozenset(f"{_PKCS12_PBE_ARC}{n}" for n in range(1, 7))
 
 _ENCRYPTED_LABEL: Final = b"ENCRYPTED PRIVATE KEY"
 
@@ -261,17 +263,19 @@ def _encrypted_pkcs8_algorithm(der: bytes) -> _Tlv | None:
 
     The shape is ``SEQUENCE { AlgorithmIdentifier, OCTET STRING }``. An unencrypted PKCS#8 or a
     traditional key opens with an INTEGER instead, so it returns ``None``. A constructed OCTET
-    STRING with a definite length is BER, but this reader walks it and OpenSSL decrypts it, so it
-    counts (BACKLOG #5543).
+    STRING is BER, which DER forbids, so it raises :class:`_Malformed` and is left to
+    :func:`_ber_encrypted_pkcs8_algorithm`, which reads what the AlgorithmIdentifier names first.
     Bytes after the outer SEQUENCE are ignored HERE, on purpose: a lenient loader may ignore them
     too, so a weak wrap with a byte appended must still be seen and refused."""
     outer = _read_tlv(der, 0, len(der))
     if outer.tag != 0x30:
         raise _Malformed
     parts = _children(der, outer)
-    if len(parts) != 2 or parts[0].tag != 0x30 or parts[1].tag not in (0x04, 0x24):
+    if len(parts) != 2 or parts[0].tag != 0x30:
         return None
-    return parts[0]
+    if parts[1].tag == 0x24:
+        raise _Malformed  # BER: left to _ber_encrypted_pkcs8_algorithm
+    return parts[0] if parts[1].tag == 0x04 else None
 
 
 #: What :func:`_ber_header` gives for a tag number it cannot fold to one byte. No element of a key
@@ -279,11 +283,12 @@ def _encrypted_pkcs8_algorithm(der: bytes) -> _Tlv | None:
 _HIGH_TAG: Final = -1
 
 
-def _ber_header(buf: bytes, pos: int) -> tuple[int, int, bool] | None:
-    """``(tag, contents start, indefinite)`` for the BER header at ``pos``, or ``None`` when the
-    bytes end before the header does. The length is skipped, not read, whatever its width. A tag in
-    the high-tag-number form is folded to its one-byte form, however many 0x80 bytes pad its number,
-    as OpenSSL reads it; a number of 31 or more gives :data:`_HIGH_TAG`."""
+def _ber_header(buf: bytes, pos: int) -> tuple[int, int, int | None] | None:
+    """``(tag, contents start, length)`` for the BER header at ``pos``, the length ``None`` when it
+    is indefinite, or ``None`` when the bytes end before the header does. A long length is read
+    whatever its width, leading zeros and all. A tag in the high-tag-number form is folded to its
+    one-byte form, however many 0x80 bytes pad its number, as OpenSSL reads it; a number of 31 or
+    more gives :data:`_HIGH_TAG`."""
     end = len(buf)
     if pos >= end:
         return None
@@ -305,42 +310,58 @@ def _ber_header(buf: bytes, pos: int) -> tuple[int, int, bool] | None:
     first = buf[pos]
     pos += 1
     if first == 0x80:
-        return tag, pos, True
-    if first & 0x80:
-        pos += first & 0x7F
-    return (tag, pos, False) if pos <= end else None
+        return tag, pos, None
+    if not first & 0x80:
+        return tag, pos, first
+    count = first & 0x7F  # at most 127 bytes, so the int below stays small to build
+    if pos + count > end:
+        return None
+    return tag, pos + count, int.from_bytes(buf[pos : pos + count], "big")
+
+
+#: The OID arcs of the password-based schemes an EncryptedPrivateKeyInfo names: PKCS#5 (PBES1,
+#: PBES2 and their kin) and the PKCS#12 PBE schemes. A certificate, a CSR, a public key and an
+#: unencrypted key never open with an AlgorithmIdentifier under either.
+_PBE_ARCS: Final = (_PKCS5_ARC, _PKCS12_PBE_ARC)
 
 
 def _ber_encrypted_pkcs8_algorithm(der: bytes) -> _Tlv | None:
     """For bytes the DER reader could not walk: the AlgorithmIdentifier of an EncryptedPrivateKeyInfo
-    in a BER form this reads, or ``None`` when ``der`` is not that shape (BACKLOG #5543).
+    in a BER form, or ``None`` when ``der`` is not that shape (BACKLOG #5543).
 
     OpenSSL's decoder takes BER, so it decrypts an EncryptedPrivateKeyInfo in forms DER forbids, at
-    least: an indefinite length, a long length padded with leading zeros, and a tag in the
-    high-tag-number form, padded or not. Under a plain ``PRIVATE KEY`` label or as raw DER such a
-    key would pass as unencrypted. So the default is inverted here. A SEQUENCE whose first element
-    is a SEQUENCE, the only shape an AlgorithmIdentifier takes, is read as encrypted: when the
-    AlgorithmIdentifier is one-byte-tagged DER and the ciphertext after it is a constructed OCTET
-    STRING, or a primitive one inside an indefinite outer length, it is returned to be judged on its
-    wrap; in any other form this raises :class:`_Malformed`, and the caller refuses it as
-    unreadable. Every unencrypted key form opens with an INTEGER, and a file that is not a key
-    rarely opens with a SEQUENCE in a SEQUENCE, so those return ``None`` and are left to the
-    loader; a certificate in BER form is the one known exception, and it is refused.
-    :func:`_read_tlv` and :func:`_children` stay DER readers, because :mod:`messagefoundry.pki`
-    shares them."""
+    least: an indefinite length, a constructed OCTET STRING, a long length padded with leading
+    zeros, and a tag in the high-tag-number form, padded or not. Under a plain ``PRIVATE KEY``
+    label or as raw DER such a key would pass as unencrypted. So the shape is read leniently, as
+    far as the scheme OID: a SEQUENCE whose first element is a SEQUENCE whose first element is an
+    OID under :data:`_PBE_ARCS`. Anything else returns ``None`` and is left to the loader, as
+    before this reader existed: a BER certificate, CSR or public key opens with another OID or with
+    no OID at all there, and an unencrypted key opens with an INTEGER.
+
+    In that shape, the AlgorithmIdentifier is returned to be judged on its wrap when it is DER
+    :func:`_read_tlv` can walk, whatever BER the bytes around it use; the wrap is decided by the
+    AlgorithmIdentifier alone. Otherwise this raises :class:`_Malformed`, and the caller refuses it
+    as unreadable. :func:`_read_tlv` and :func:`_children` stay DER readers, because
+    :mod:`messagefoundry.pki` shares them."""
     outer = _ber_header(der, 0)
     if outer is None or outer[0] != 0x30:
-        return None  # not a SEQUENCE: not a key, and the loader reports it
-    _, start, indefinite = outer
-    inner = _ber_header(der, start)
+        return None
+    inner = _ber_header(der, outer[1])
     if inner is None or inner[0] != 0x30:
-        return None  # truncated, or not an AlgorithmIdentifier: an unencrypted key or not a key
-    if der[start] == 0x30:
-        first = _read_tlv(der, start, len(der))
-        second = der[first.end] if first.end < len(der) else None
-        if second == 0x24 or (indefinite and second == 0x04):
-            return first
-    raise _Malformed
+        return None
+    named = _ber_header(der, inner[1])
+    if named is None:
+        return None
+    tag, start, length = named
+    if tag != 0x06 or length is None or start + length > len(der):
+        return None
+    try:
+        scheme = _oid(der, _Tlv(0x06, start, start + length))
+    except _Malformed:
+        return None
+    if not scheme.startswith(_PBE_ARCS):
+        return None
+    return _read_tlv(der, outer[1], len(der))  # raises when the AlgorithmIdentifier is not DER
 
 
 def _pbes2_problem(buf: bytes, params: _Tlv | None) -> str | None:
@@ -455,6 +476,15 @@ def _wrap_problem(der: bytes, algorithm: str, params: _Tlv | None) -> str | None
 
 _UNREADABLE: Final = "is an encrypted private key this engine cannot read to check its wrap"
 
+#: The refusal for a BER EncryptedPrivateKeyInfo whose wrap this module cannot read. Its remedy is
+#: :data:`_REENCODE`, not a re-wrap: the wrap may be approved, and only its encoding is unread.
+_UNREADABLE_BER: Final = (
+    "is an encrypted private key in a BER encoding this engine cannot read to check its wrap"
+)
+_REENCODE: Final = (
+    "Supply it DER-encoded, as the openssl CLI and the cryptography library write a key"
+)
+
 
 def _der_problem(der: bytes, *, known_encrypted: bool) -> tuple[bool, str | None]:
     """``(encrypted, problem)`` for one DER key.
@@ -462,16 +492,16 @@ def _der_problem(der: bytes, *, known_encrypted: bool) -> tuple[bool, str | None
     ``known_encrypted`` is true for the body of an ``ENCRYPTED PRIVATE KEY`` PEM block, which must
     parse as an EncryptedPrivateKeyInfo. Bare DER need not: if its outer shape is not one, it is an
     unencrypted key or not a key at all, and the loader reports the second itself. Bytes the DER
-    reader cannot walk get :func:`_ber_encrypted_pkcs8_algorithm`'s inverted default: a SEQUENCE
-    that opens with an AlgorithmIdentifier is judged on its wrap where that function can read it,
-    and refused as unreadable where it cannot."""
+    reader cannot walk go to :func:`_ber_encrypted_pkcs8_algorithm`: one that names a
+    password-based scheme is judged on its wrap where that function can read it, and refused as
+    unreadable BER where it cannot; any other is treated as the DER reader would treat a non-key."""
     try:
         found = _encrypted_pkcs8_algorithm(der)
     except _Malformed:
         try:
             found = _ber_encrypted_pkcs8_algorithm(der)
         except _Malformed:
-            return True, _UNREADABLE
+            return True, _UNREADABLE_BER
     if found is None:
         return (True, _UNREADABLE) if known_encrypted else (False, None)
     # The shape said encrypted; an algorithm or parameters that do not parse are refused, failing
@@ -1090,7 +1120,12 @@ def key_wrap_refusal(
         )
     encrypted, problem = _inspect(material)
     if problem is not None:
-        fix = _DECRYPT if unlock_setting is None else _REWRAP
+        # _inspect hands _der_problem's constant through unchanged, so this match holds; the BER
+        # refusal test pins it.
+        if problem == _UNREADABLE_BER:
+            fix = _REENCODE
+        else:
+            fix = _DECRYPT if unlock_setting is None else _REWRAP
         return f"{setting}: the private key {problem}. It is refused. {fix}"
     if encrypted and not passphrase_given:
         fix = _DECRYPT if unlock_setting is None else f"Set {unlock_setting}"
