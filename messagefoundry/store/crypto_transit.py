@@ -57,6 +57,7 @@ from messagefoundry.store.crypto import (
     AUDIT_TRANSIT_HASH_ALGO,
     MARKER_PREFIX,
     AuditKeyVersionRefusedError,
+    AuditKeyVersionUnverifiedError,
     AuditMacFn,
     CipherError,
     _UnmarkedPolicy,
@@ -101,9 +102,9 @@ _ENV_AUDIT_KEY = "MEFOR_STORE_TRANSIT_AUDIT_KEY"
 #: Texts Transit's ``hmac`` endpoint answers a refused key VERSION with, lower-cased (BACKLOG #6707).
 #: Read on 2026-11-10 from Vault ``builtin/logical/transit/path_hmac.go`` and
 #: ``sdk/helper/keysutil/policy.go`` (``HMACKey``, ``safeGetKeyEntry``) at commit cbc874e2358f, and
-#: from OpenBao, which says the same, at 80e208bf4f83 and 79e101fe2e59. The alarm never REQUIRES one
-#: of these: unknown Vault wording still reads as a refused version. A reply naming one of these is
-#: read as a refused version even beside a reason in :data:`_NOT_VERSION_TEXTS`.
+#: from OpenBao, which says the same, at 80e208bf4f83 and 79e101fe2e59. They choose only the label of
+#: the error, never whether the row is a break: a reply naming one is labelled a refused version even
+#: beside a reason in :data:`_NOT_VERSION_TEXTS`, and unknown Vault wording is labelled one too.
 _VERSION_REFUSAL_TEXTS = (
     "key version does not exist",
     "no such key version",
@@ -112,17 +113,20 @@ _VERSION_REFUSAL_TEXTS = (
 )
 #: Whole Vault error texts, lower-cased, that say a pinned ``hmac`` 400 is NOT about the version
 #: (BACKLOG #6707), from the same Vault source. Matched whole, never as a substring. Kept short on
-#: purpose: :meth:`TransitCipher.audit_hmac` always sends base64 it encoded and a fixed algorithm, so
-#: no request-level 400 is reachable from it, and an unlisted text keeps the alarm.
+#: purpose: :meth:`TransitCipher.audit_hmac` sends base64 it encoded and a fixed algorithm, so at
+#: least the input-encoding and algorithm 400s are not reachable from it.
 _NOT_VERSION_TEXTS = frozenset({"missing input for hmac", "encryption key not found"})
 
 
 def _not_a_version_refusal(exc: Exception) -> bool:
     """Whether a pinned ``hmac`` 400 is affirmatively NOT Transit refusing the version (BACKLOG
-    #6707), so it must not read as one. Only two things say so: no Vault JSON ``errors`` list at
-    all (a proxy or WAF page, or text that is not JSON), or a list every entry of which is a whole
-    text in :data:`_NOT_VERSION_TEXTS` and none of which names a refused version. Anything else,
-    unknown Vault wording included, stays a refused version, as before this check existed.
+    #6707). It changes only the label: such a 400 raises
+    :class:`~messagefoundry.store.crypto.AuditKeyVersionUnverifiedError`, which every handler treats
+    as its parent, so the walk, the alert and the open run as for a refused version. Only two
+    things say so: no Vault JSON ``errors`` list at all (a proxy or WAF page, or text that is not
+    JSON), or a list every entry of which is a whole text in :data:`_NOT_VERSION_TEXTS` and none of
+    which names a refused version. Anything else, unknown Vault wording included, is labelled a
+    refused version.
 
     hvac fills ``exc.errors`` only when the reply's Content-Type is exactly ``application/json``,
     so a proxy that adds a charset leaves the same JSON in ``exc.text``; that is read the same way."""
@@ -268,7 +272,9 @@ class TransitCipher(_UnmarkedPolicy):
         ``key_version`` pins the Transit key version; ``None`` means Transit's latest. A check of a
         stored MAC passes the version that MAC names (BACKLOG #2337), so a key rotation does not make
         an older row read as forged. A pinned call Transit refuses for its version alone raises
-        :class:`AuditKeyVersionRefusedError` (see :meth:`_refuses_only_version`)."""
+        :class:`AuditKeyVersionRefusedError` (see :meth:`_refuses_only_version`), or its subclass
+        :class:`AuditKeyVersionUnverifiedError` when the 400 is affirmatively not a version refusal
+        (:func:`_not_a_version_refusal`, BACKLOG #6707)."""
         inp = base64.b64encode(data).decode("ascii")
         kwargs: dict[str, Any] = {
             "name": self._audit_key,
@@ -282,6 +288,8 @@ class TransitCipher(_UnmarkedPolicy):
             mac = response["data"]["hmac"]  # "vault:v1:…" — no key, no plaintext
         except Exception as exc:
             if key_version is not None and self._refuses_only_version(exc, key_version):
+                if _not_a_version_refusal(exc):  # the same flow, labelled apart (BACKLOG #6707)
+                    raise AuditKeyVersionUnverifiedError(key_version, self._audit_key) from exc
                 raise AuditKeyVersionRefusedError(key_version) from exc
             raise CipherError(
                 f"Transit audit HMAC failed (key={self._audit_key!r}): {vault_failure_text(exc)}"
@@ -299,23 +307,11 @@ class TransitCipher(_UnmarkedPolicy):
         raises another class, so none of those reads as a refused version. A 400 can also mean the
         key itself is missing, so a probe under the latest version, over FIXED input, must succeed
         too. Fixed input keeps a row's own content from deciding the answer. The probe must also
-        name a different version, or the refusal was not about the version. Once a rotation moves
-        the latest version the probe always differs, so a 400 that is affirmatively not Transit's
-        version check (:func:`_not_a_version_refusal`, BACKLOG #6707) is not read as one either.
+        name a different version, or the refusal was not about the version.
 
         This infers the cause from the reply; it does not read the key's version range. So a node
         whose copy of the key lags a rotation can refuse a real, newer version and still pass."""
         if not is_vault_bad_request(exc):
-            return False
-        if _not_a_version_refusal(exc):
-            # Vault's own text stays out of the log, as it stays out of the error.
-            log.warning(
-                "An audit HMAC pinned to key version %d got HTTP 400 that is not Transit refusing "
-                "the version (no Vault error list, or a reason that is not the version), so it is "
-                "not read as one (key=%r)",
-                key_version,
-                self._audit_key,
-            )
             return False
         try:
             probe: Any = self._client.secrets.transit.generate_hmac(

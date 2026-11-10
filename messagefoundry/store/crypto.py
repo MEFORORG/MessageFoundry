@@ -643,6 +643,29 @@ class AuditKeyVersionRefusedError(CipherError):
         )
 
 
+class AuditKeyVersionUnverifiedError(AuditKeyVersionRefusedError):
+    """Transit answered an audit MAC pinned to one key version with HTTP 400 that is not a version
+    refusal, and still answers under the latest (BACKLOG #6707).
+
+    A subclass, so every handler of its parent treats the row exactly as it treats a refused
+    version: a break reported at that row, the walk going on, the tamper alert raised. Only the
+    label differs, because the reply did not say the version was refused: it carried no Vault error
+    list (a proxy's own page, say) or named a reason that is not the version. Its text names the
+    version and the key only, never the reply."""
+
+    def __init__(self, version: int, key: str) -> None:
+        super().__init__(version)
+        # Both in ``args``, so a copy or pickle rebuilds the same exception.
+        self.args = (version, key)
+        self.key = key
+
+    def __str__(self) -> str:
+        return (
+            f"Transit could not verify audit key version {self.version} (key={self.key!r}): it "
+            "answered HTTP 400 that is not a version refusal"
+        )
+
+
 class StoreKeylessError(RuntimeError):
     """A store eager-read seam met an **encrypted** value (an ``mfenc:`` marker) but **no store key is
     configured** — a keyless (mis)configured open of a store that carries key-encrypted rows at rest.
