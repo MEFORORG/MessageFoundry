@@ -7031,6 +7031,41 @@ def test_refused_rows_page_once_per_action_and_a_raising_page_costs_no_other_ale
     assert [e[0] for e in raising.events] == ["ad_session_revoked"]
 
 
+async def test_a_defect_in_the_roles_row_still_ends_the_sessions_before_it_is_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3018 step 4. A defect in the role write's own append rolls that write back; the
+    roles are then written without the row, since the directory stays authoritative. The defect is
+    raised only after the revoke, so the new roles never ride a stale session."""
+    store, _, service, _ = await _scoped_service(_GRP_A)
+    try:
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        before = sorted(await store.get_user_role_ids(user.id))
+        target = () if before else (Role.OPERATOR.value,)
+        real = store._append_audit_row
+
+        async def failing(name: str, **kwargs: Any) -> Any:
+            if name == "auth.ad_roles_resynced":
+                raise NotImplementedError("synthetic defect")
+            return await real(name, **kwargs)
+
+        monkeypatch.setattr(store, "_append_audit_row", failing)
+        service._reconcile_refused_rows = []
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="roles_changed", role_ids=target
+        )
+        with pytest.raises(NotImplementedError):
+            await service._apply_reconcile_revocation(
+                revocation, watermark=await service._audit_watermark()
+            )
+        assert sorted(await store.get_user_role_ids(user.id)) == sorted(target)
+        assert len(_revoked_rows(await store.list_audit())) == 1, "the revoke did not run"
+        assert await store.list_audit(action="auth.ad_roles_resynced") == []
+    finally:
+        await store.close()
+
+
 @pytest.mark.parametrize("refused", [0, 1, 2], ids=["lands", "refused-once", "refused-twice"])
 async def test_a_role_revocation_commits_its_roles_row_with_the_role_write(
     monkeypatch: pytest.MonkeyPatch, refused: int

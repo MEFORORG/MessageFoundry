@@ -5666,11 +5666,14 @@ notice.
 A pass that fails part-way keeps the audit rows for what it already revoked, but raises no alert for
 them. A refused audit write does not end the pass (BACKLOG #3018). That holds for the store errors
 the reconciler treats as a refusal. Any other error still ends the pass. The reconciler logs
-a refused row at ERROR, naming the action and the account. For at least the
-`auth.ad_session_revoked` row, that line is the only record of the row, and nothing writes it
-later. Any notice that account was due still goes. Its alert still goes too, unless something later in the
-same pass raises and ends it. Then that account has neither its row nor its alert. A later refused
-audit write does not end the pass. The `auth.ad_username_refreshed` row is different: it commits in
+a refused row at ERROR, naming the action and the account. The `auth.ad_session_revoked` row
+commits in the revoke's own transaction, and a role revocation's `auth.ad_roles_resynced` row in
+the role write's (BACKLOG #3018 step 4). If either is refused there, the write is applied again
+without its row and the row is written on its own. A row refused that second time is lost, and a
+pass that completes pages `audit_write_failed` keyed `directory-reconciler:<action>`, once per
+action. A pass that raises part-way raises no such page, and its refused rows have only their
+ERROR lines. Any notice that account was due still goes. Its alert still goes too, unless something
+later in the same pass raises and ends it. A later refused audit write does not end the pass. The `auth.ad_username_refreshed` row is different: it commits in
 the rename's own transaction (BACKLOG #3018 step 7), so a refused one rolls the rename back. The
 account's row keeps its old name, and there is no `auth.ad_username_refreshed` row and no
 username_changed notice on that pass. The engine would apply it on a pass or sign-in that reaches

@@ -199,9 +199,10 @@ class _FakeLdap:
 async def test_a_directory_sign_in_commits_ad_roles_resynced_with_the_role_write(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The login sync's row commits with its role write. Refused, the directory's roles still land
-    and the stale sessions still end, since the directory is authoritative, and the sign-in fails
-    on the refusal, as it did when the row was written after the revoke. Landed, it leaves one."""
+    """The login sync's row commits with its role write. Refused there, the directory's roles still
+    land and the stale sessions still end, since the directory is authoritative, and the row is
+    written on its own, so the sign-in goes on. Refused on its own too, the sign-in fails, as it
+    did when the row was written after the revoke. Landed, it leaves one."""
     settings = AuthSettings(
         ad_enabled=True,
         ad_server="ldaps://x",
@@ -215,20 +216,43 @@ async def test_a_directory_sign_in_commits_ad_roles_resynced_with_the_role_write
     assert first is not None
     # The account's first sign-in wrote its first roles, with their row.
     assert await _details(store, "auth.ad_roles_resynced") == [{"from": [], "to": ["operator"]}]
+    # Refused in the role write's transaction only: the row is then written on its own.
     await service.set_ad_group_map([("cn=mf-ops,dc=x", "viewer")], actor="admin")
     refused = _refuse(monkeypatch, store, "auth.ad_roles_resynced")
-    with pytest.raises(sqlite3.OperationalError):
-        await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)
+    second = (await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)).token
+    assert second is not None
     assert refused == ["auth.ad_roles_resynced"]
     user = await store.get_user_by_username("jdoe")
     assert user is not None and await store.get_user_role_ids(user.id) == ["viewer"]
     assert await service.identity_for_token(first) is None, "a refused row kept a stale session"
-    assert await _details(store, "auth.ad_roles_resynced") == [{"from": [], "to": ["operator"]}]
-
-    monkeypatch.undo()
-    await service.set_ad_group_map([("cn=mf-ops,dc=x", "operator")], actor="admin")
-    assert (await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)).token
     assert await _details(store, "auth.ad_roles_resynced") == [
-        {"from": ["viewer"], "to": ["operator"]},
+        {"from": ["operator"], "to": ["viewer"]},
         {"from": [], "to": ["operator"]},
     ]
+    monkeypatch.undo()
+
+    # Refused on its own too: the roles and the revoke still land, and the sign-in fails.
+    await service.set_ad_group_map([("cn=mf-ops,dc=x", "operator")], actor="admin")
+    real = store._append_audit_row
+
+    async def refusing(name: str, **kwargs: Any) -> Any:
+        if name == "auth.ad_roles_resynced":
+            raise sqlite3.OperationalError("synthetic: disk I/O error")
+        return await real(name, **kwargs)
+
+    monkeypatch.setattr(store, "_append_audit_row", refusing)
+    with pytest.raises(sqlite3.OperationalError):
+        await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)
+    assert await store.get_user_role_ids(user.id) == ["operator"]
+    assert await service.identity_for_token(second) is None, "a refused row kept a stale session"
+    assert len(await _details(store, "auth.ad_roles_resynced")) == 2
+    monkeypatch.undo()
+
+    # Landed: one more row, written with the roles.
+    await service.set_ad_group_map([("cn=mf-ops,dc=x", "viewer")], actor="admin")
+    assert (await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)).token
+    assert (await _details(store, "auth.ad_roles_resynced"))[0] == {
+        "from": ["operator"],
+        "to": ["viewer"],
+    }
+    assert len(await _details(store, "auth.ad_roles_resynced")) == 3
