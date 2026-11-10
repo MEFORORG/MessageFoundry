@@ -87,6 +87,7 @@ __all__ = [
     "configure_stderr_logging",
     "ensure_logger_sink",
     "install_filtered_last_resort",
+    "scrub_log_text",
     "set_runtime_level",
     "current_log_level",
     "LogLevelRefused",
@@ -233,9 +234,10 @@ class RedactionFilter(logging.Filter):
     The "never put PHI in an exception message" convention binds only the engine's own authors, Router
     and Handler authors included, in text they write themselves, and never a remote peer, a library or the runtime (docs/PHI.md
     section 7, *Who the exception-message convention binds*).
-    A message escaped before it reaches this filter is another residual: the audit tee's
-    ``json.dumps`` escapes the C0 controls first, and a name or date beside one can pass. See
-    :func:`~messagefoundry.store.audit_tee.emit_audit_tee`.
+    A message escaped before it reaches this filter is another residual: a name or date beside an
+    escape can pass. The audit tee's ``json.dumps`` escapes the C0 controls, so since BACKLOG #3045
+    the tee scrubs each field that holds one before it encodes it; see
+    :func:`~messagefoundry.store.audit_tee.emit_audit_tee` for what that leaves.
 
     **EVERY FIELD IS BOUNDED BEFORE IT IS SCANNED (BACKLOG #1576).** This filter had no ceiling at all,
     and it is the worst place in the engine not to have one: a ``logging.Filter`` is synchronous by the
@@ -927,6 +929,18 @@ def _install_phi_filters(handler: logging.Handler) -> None:
     handler.addFilter(CredentialQueryScrubFilter())  # OIDC code/state in a URL (ADR 0142 AC-10)
     handler.addFilter(CredentialScrubFilter())  # credential labels + values (BACKLOG #1478)
     handler.addFilter(ControlCharScrubFilter())  # log-injection defense (16.4.1)
+
+
+def scrub_log_text(text: str) -> str:
+    """``text`` through the three text passes :func:`_install_phi_filters` installs, in its order:
+    PHI redaction (bounded), the credential query scrub, then the credential scrub. The control
+    scrub, which runs last on a handler, is left out, so a control character stays as it is.
+
+    For a caller that must filter a value before it is encoded, as the audit tee does with each
+    field before ``json.dumps`` escapes a C0 control in it (BACKLOG #3045). A handler still runs
+    the whole chain over the encoded line afterwards, so this adds a pass and replaces none.
+    ``tests/test_audit_offbox_tee.py`` holds it equal to the filters themselves."""
+    return scrub_credentials(_scrub_credential_query(redact_untrusted(text)))
 
 
 def _build_syslog_handler(

@@ -17,6 +17,17 @@ All notable changes to MessageFoundry are documented here. The format follows
 - On Windows, a generic DATABASE file keyword is now also refused when a best-effort check finds
   its path leads to another host, or cannot finish reading the path; see the Generic ODBC section of
   [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #2705`)
+- **A C0 control in an off-box audit record field no longer hides the text beside it.**
+  `json.dumps` escapes the 32 C0 controls before the log filters run, and each escape ends in a
+  word character, so on a first deployment a name, a date, a bearer token, an MRN or a
+  `password=` value beside one, as in a typed sign-in name, would have reached the tee line
+  unredacted. Now each text field that holds a C0 control is scrubbed by the same filters
+  before it is encoded, reading each control as written, as a space and as nothing; in
+  `detail`, a JSON escape that spells a control counts as one where the detail parses as JSON.
+  A field with no C0 control is not touched. Where a reading finds more than the plain filters,
+  the whole field ships as `[redacted]`, so that record loses its `actor` or `detail`. The
+  `emit_audit_tee` docstring says what this does not cover, at least a pattern that misses the
+  same text with a space in the control's place. (`BACKLOG #3045`)
 
 ## [0.5.2] — 2026-10-20 — Early Access
 
