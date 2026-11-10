@@ -5233,33 +5233,35 @@ def _bare_domain_entries(
 
 
 def pinned_host_port(entry: str) -> tuple[str, int] | None:
-    """``entry`` read as ``host:port``, with the host lowercased and an IPv6 literal's brackets
-    removed, or ``None`` when it is not one: no port, a port that is not 1 to 65535 in ASCII
-    digits, an empty host, or a host holding a ``:`` outside brackets.
+    """``entry`` read as a loopback ``host:port``, or ``None`` when it is not one.
 
     The one parse ``[egress].allowed_ech_sidecar`` is validated with at load and matched with at
-    the gate (BACKLOG #5528), so the two cannot read an entry differently. Unlike the
-    ``host[:port]`` lists, which ``transports.egress.host_port_allowed`` splits at the first ``:``,
-    it splits at the last one, so ``[::1]:8123`` reads as a host and a port."""
+    the gate, which reads the sidecar it dials back through it, so the two cannot read a host or a
+    port differently (BACKLOG #5528). It splits at the LAST ``:``, so ``[::1]:8123`` reads as a
+    host and a port; ``transports.egress.host_port_allowed`` splits at the first. ``None`` for at
+    least: no port; a port that is not 1 to 65535 in at most five ASCII digits; a host holding a
+    ``:`` outside brackets, or none inside them, which urlsplit reads as no host; and a host the
+    sidecar resolver would refuse, because :func:`is_loopback_hop_host` does not read it as this
+    machine. An IP literal is returned in :mod:`ipaddress`'s compressed form, so ``::1`` and
+    ``0:0:0:0:0:0:0:1`` are one host; a name is returned lowercased."""
     host, _, port = entry.strip().rpartition(":")
     host = host.strip()
     if host.startswith("[") and host.endswith("]"):
         host = host[1:-1]
+        if ":" not in host:
+            return None
     elif ":" in host:
         return None
-    if not host or not (port.isascii() and port.isdigit()):
+    # The length cap first: int() refuses a string of more than 4300 digits with its own error.
+    if not (port.isascii() and port.isdigit()) or len(port) > 5:
         return None
     number = int(port)
-    if not 1 <= number <= 65535:
+    if not host or not 1 <= number <= 65535 or not is_loopback_hop_host(host):
         return None
-    return host.lower(), number
-
-
-def http_dial_port(scheme: str, port: int | None) -> int:
-    """The port urllib dials for an ``http`` or ``https`` URL: ``port`` when the URL names one,
-    else the scheme's default. The ``[egress].allowed_ech_sidecar`` gate compares this with
-    :func:`pinned_host_port` (BACKLOG #5528)."""
-    return _DEFAULT_PORTS[scheme.lower()] if port is None else port
+    try:
+        return ipaddress.ip_address(host).compressed, number
+    except ValueError:
+        return host.lower(), number
 
 
 class EgressSettings(_Section):
@@ -5351,7 +5353,8 @@ class EgressSettings(_Section):
     allowed_proxy: list[str] = []
     # The ECH-SIDECAR address allowlist (BACKLOG #5528, ADR 0139). Each entry is "host:port", and
     # the port is REQUIRED: an entry with none is refused at load rather than read as any port, as
-    # every other list here reads it. NOT a destination list: it gates the loopback sidecar an
+    # the `host[:port]` lists such as `allowed_http` read it. The host must be one the sidecar
+    # resolver reads as this machine, or the entry could never match. NOT a destination list: it gates the loopback sidecar an
     # `ech_egress` REST connection sends every request to, body and credential headers included,
     # and the token-endpoint POST too on a SMART or OAuth2 connection. Loopback alone does not bound
     # that hop: without this list a connection could name any port on this host, and whatever
@@ -5508,9 +5511,10 @@ class EgressSettings(_Section):
                 continue
             if pinned_host_port(item) is None:
                 raise ValueError(
-                    f"[egress].allowed_ech_sidecar entry {index} is not 'host:port'. Write the "
-                    "sidecar's loopback host and its port, such as '127.0.0.1:8123' or "
-                    "'[::1]:8123'; an entry with no port is refused rather than read as any port"
+                    f"[egress].allowed_ech_sidecar entry {index} is not a loopback 'host:port'. "
+                    "Write the sidecar's loopback host and its port, such as '127.0.0.1:8123', "
+                    "'localhost:8123' or '[::1]:8123'; an entry with no port is refused rather "
+                    "than read as any port"
                 )
             cleaned.append(item)
         return cleaned

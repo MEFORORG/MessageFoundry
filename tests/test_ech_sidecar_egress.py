@@ -25,6 +25,7 @@ from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import WiringError
 from messagefoundry.transports.egress import check_egress_allowed
+from messagefoundry.transports.rest import RestDestination
 
 _PARTNER = "https://partner.example.org/api"
 
@@ -92,6 +93,9 @@ def test_a_sidecar_port_urllib_cannot_read_is_refused_in_fixed_words() -> None:
 
 def test_a_bracketed_ipv6_loopback_entry_matches() -> None:
     check_egress_allowed(_ech("http://[::1]:8123"), _egress("[::1]:8123"))
+    # One address, two spellings: compared as an address on both sides.
+    check_egress_allowed(_ech("http://[0:0:0:0:0:0:0:1]:8123"), _egress("[::1]:8123"))
+    check_egress_allowed(_ech("http://[::1]:8123"), _egress("[0:0:0:0:0:0:0:1]:8123"))
     with pytest.raises(WiringError, match=r"allowed_ech_sidecar"):
         check_egress_allowed(_ech("http://[::1]:8124"), _egress("[::1]:8123"))
 
@@ -107,6 +111,11 @@ def test_a_bracketed_ipv6_loopback_entry_matches() -> None:
         ":8123",
         "::1:8123",  # an unbracketed IPv6 literal cannot be split unambiguously
         "http://127.0.0.1:8123",
+        "127.0.0.1:" + "1" * 5000,  # past int()'s digit limit: refused, not a stray ValueError
+        # Entries no sidecar could ever match, so an operator is not told the sidecar is listed:
+        "10.0.0.5:8123",  # the resolver refuses a sidecar off this machine
+        "user@127.0.0.1:8123",
+        "[127.0.0.1]:8123",  # urlsplit reads a bracketed IPv4 literal as no host
     ],
 )
 def test_an_entry_that_is_not_host_and_port_is_refused_at_load(entry: str) -> None:
@@ -164,6 +173,10 @@ def test_a_sidecar_url_with_a_credential_is_refused_and_not_echoed(
     assert "s3cr3t" not in str(caught.value)
     assert "s3cr3t" not in caplog.text
     assert caught.value.__context__ is None or "s3cr3t" not in str(caught.value.__context__)
+    # The remedy is the sidecar's own configuration: a credential on the connection would ride
+    # every request through the sidecar to the partner.
+    assert "sidecar's own configuration" in str(caught.value)
+    assert "egress denied" in caplog.text
 
 
 def test_an_unlisted_refusal_names_the_host_and_never_the_url(
@@ -185,3 +198,14 @@ def test_a_listed_sidecar_does_not_satisfy_the_destination_gate() -> None:
     )
     with pytest.raises(WiringError, match=r"allowed_http"):
         check_egress_allowed(_ech("http://127.0.0.1:8123"), egress)
+
+
+@pytest.mark.parametrize(
+    ("sidecar", "match"), [("http://sidecar.example.org:8123", "loopback"), ("", "is empty")]
+)
+def test_the_connector_still_refuses_a_bad_sidecar_on_its_own(sidecar: str, match: str) -> None:
+    """A control. build_destination now runs the gate before the builder, so the tests that build
+    through it are refused by the gate first. This pins the connector's own refusal, built
+    directly, so it cannot go away unseen behind the gate."""
+    with pytest.raises(ValueError, match=match):
+        RestDestination(_ech(sidecar))

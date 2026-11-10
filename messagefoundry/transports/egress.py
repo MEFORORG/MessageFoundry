@@ -25,7 +25,6 @@ from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import (
     BLOCK_UNLISTED_OUTBOUND_IN_FORCE,
     EgressSettings,
-    http_dial_port,
     pinned_host_port,
 )
 from messagefoundry.config.wiring import WiringError, resolve_env_settings
@@ -313,6 +312,24 @@ def _check_forward_proxy_egress(
         )
 
 
+#: What a refused ``ech_sidecar`` URL credential is told to do instead. Not the connection's
+#: ``basic_user`` or ``bearer_token``: those ride every request through the sidecar to the partner.
+_ECH_SIDECAR_CREDENTIAL_USE = (
+    "the sidecar's own configuration (the engine sends the sidecar no credential, and "
+    "basic_user/basic_password or bearer_token on this connection would reach the partner)"
+)
+
+#: The port urllib dials for an ``http`` or ``https`` URL that names none.
+_HTTP_DEFAULT_PORTS: Mapping[str, int] = {"http": 80, "https": 443}
+
+
+def http_dial_port(scheme: str, port: int | None) -> int:
+    """The port urllib dials for an ``http`` or ``https`` URL: ``port`` when the URL names one,
+    else the scheme's default. The ``[egress].allowed_ech_sidecar`` gate judges the sidecar at it
+    (BACKLOG #5528)."""
+    return _HTTP_DEFAULT_PORTS[scheme.lower()] if port is None else port
+
+
 def _check_ech_sidecar_egress(
     label: str, settings: Mapping[str, Any], allowed_ech_sidecar: list[str]
 ) -> None:
@@ -336,10 +353,10 @@ def _check_ech_sidecar_egress(
     connector dials from, so a value the build refuses is refused here first, in that resolver's
     words, which name no credential. A URL credential is refused next, because urllib would dial
     ``user:pw@host`` as the host, not the host this gate reads. The port is the URL's, or 80 for
-    ``http`` and 443 for ``https`` where it names none, as urllib dials. Each entry is read by
-    :func:`~messagefoundry.config.settings.pinned_host_port`, the parse the list is validated with
-    at load, and an entry it cannot read never matches, so no entry stands for any port. An unset
-    ``ech_egress`` is a no-op."""
+    ``http`` and 443 for ``https`` where it names none, as urllib dials. That host and port, and
+    each entry, are read by :func:`~messagefoundry.config.settings.pinned_host_port`, the parse the
+    list is validated with at load, so an IP literal compares in one spelling and an entry it
+    cannot read never matches: no entry stands for any port. An unset ``ech_egress`` is a no-op."""
     refusal: str | None = None
     try:
         sidecar = ech_sidecar_url_from_settings(settings)
@@ -353,8 +370,15 @@ def _check_ech_sidecar_egress(
         raise WiringError(f"{label}: {refusal}")
     if sidecar is None:
         return
-    # It also refuses a port urlsplit cannot read, so `.port` below cannot raise.
-    refuse_url_credentials(sidecar, f"{label} 'ech_sidecar'", error=WiringError)
+    try:
+        # It also refuses a port urlsplit cannot read, so `.port` below cannot raise.
+        refuse_url_credentials(
+            sidecar, f"{label} 'ech_sidecar'", use=_ECH_SIDECAR_CREDENTIAL_USE, error=WiringError
+        )
+    except WiringError:
+        # The egress-denied WARNING the other refusals write; it names the connection only.
+        log.warning("egress denied: %s ECH sidecar URL refused before the allowlist", label)
+        raise
     if not allowed_ech_sidecar:
         log.warning(
             "egress denied: %s ECH sidecar set with an empty [egress].allowed_ech_sidecar", label
@@ -368,8 +392,11 @@ def _check_ech_sidecar_egress(
     # Uncached, as the resolver's own split is (vault BACKLOG #5287).
     parts = _UNCACHED_URLSPLIT(sidecar)
     port = http_dial_port(parts.scheme, parts.port)
-    dialled = (parts.hostname or "", port)
-    if not any(pinned_host_port(entry) == dialled for entry in allowed_ech_sidecar):
+    hostname = parts.hostname or ""
+    # Read back through the entries' own parse, so a host is compared in one spelling on both
+    # sides: `0:0:0:0:0:0:0:1` matches a `[::1]` entry.
+    dialled = pinned_host_port(f"[{hostname}]:{port}" if ":" in hostname else f"{hostname}:{port}")
+    if dialled is None or not any(pinned_host_port(e) == dialled for e in allowed_ech_sidecar):
         host = url_host_label(sidecar)
         log.warning(
             "egress denied: %s ECH sidecar host %r port %s not in [egress].allowed_ech_sidecar",

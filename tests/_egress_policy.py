@@ -16,7 +16,8 @@ import urllib.parse
 from collections.abc import Mapping
 from typing import Any
 
-from messagefoundry.config.settings import EgressSettings, http_dial_port
+from messagefoundry.config.settings import EgressSettings
+from messagefoundry.transports.egress import http_dial_port
 from messagefoundry.transports.email import envelope_address_problem, envelope_recipients
 from messagefoundry.transports.rest import ech_sidecar_url_from_settings
 

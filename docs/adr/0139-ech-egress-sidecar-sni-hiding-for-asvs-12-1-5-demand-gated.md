@@ -81,8 +81,8 @@ any listener on this host whose port the connection's author named.
 - **Deny-by-default on its own terms.** An empty list refuses an `ech_egress` connection even under
   `[security].block_unlisted_outbound = false`. An instance with no ECH connection never reads it.
 - **No entry stands for any port.** The port is required, and an entry with none is refused at load.
-  The other `[egress]` lists read a host-only entry as any port; on this list that would re-open the
-  hole the list closes.
+  The `host[:port]` lists, such as `allowed_http`, read a host-only entry as any port; on this list
+  that would re-open the hole the list closes.
 - **The gate judges the dialled address.** It reads the sidecar through
   `ech_sidecar_url_from_settings`, the resolver the connector dials from, refuses a user or a
   password in the URL, and compares the host and the port urllib dials (80 or 443 where the URL

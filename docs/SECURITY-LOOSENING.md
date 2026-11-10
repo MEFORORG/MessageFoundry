@@ -1976,13 +1976,11 @@ count is above `0` (vault BACKLOG #2613).
   build, `http` or `https`, and no declaration lifts that refusal: neither `cleartext_accepted` nor
   `tls_hop_attested`. So this hop never leaves the host, which is why no cleartext-hop gate refuses
   it.
-- **What else you keep, whatever the scheme:** the sidecar's host and port must be listed in
-  `[egress].allowed_ech_sidecar` as `host:port` (BACKLOG #5528). That list is not a loosening: it is
-  deny-by-default even under `block_unlisted_outbound = false`, an entry with no port is refused at
-  load, and an `ech_egress` connection is refused at config load while the list is empty. Loopback
-  alone would not bound the hop, because any port on this host is loopback, so without the list a
-  deploying site's connection could send this traffic to whatever listened on a port the author named.
-  [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress) has the key.
+- **What else you keep, whatever the scheme:** the sidecar's `host:port` must be on
+  `[egress].allowed_ech_sidecar` (BACKLOG #5528), a deny-by-default list rather than a loosening;
+  [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress) states its rules. Loopback alone would not
+  bound the hop: without the list a deploying site's connection could send this traffic to whatever
+  listened on a port its author named.
 - **Why it is listed when a loopback `http://` `url` is not:** an ECH connection's `url` is
   normally `https://`, so its config reads as TLS while the first leg under it is cleartext. A plain
   `http://127.0.0.1` `url` shows what it is. The list names every `http://` sidecar, whatever the
