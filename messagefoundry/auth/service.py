@@ -537,10 +537,12 @@ _NEW_IP_OVER_CAP_HEAD = (
 
 def _new_ip_path_field(path: str, seen_text: str | None = None) -> str:
     """The path field of a new-address WARNING (BACKLOG #3770). On both lines it holds the path
-    as the shipped handler filters read it in the pre-#3770 repeat line, escaped and bounded, or
-    a placeholder; never seen-address text. With ``seen_text``, the past-cap line's, that
-    reading is compared with the pre-#3770 past-cap line; when the field is the placeholder is
-    stated in ``logging_setup.redacted_log_field``."""
+    as the shipped handler filters read it in the pre-#3770 repeat line, with a tab written as a
+    space and the line then read once more, escaped and bounded; or a placeholder; never
+    seen-address text. With
+    ``seen_text``, the past-cap line's, that reading is compared with the pre-#3770 past-cap
+    line, and the field is the placeholder by the rule ``logging_setup.redacted_log_field``
+    states."""
     checks = (
         ()
         if seen_text is None

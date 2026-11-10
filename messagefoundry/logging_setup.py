@@ -472,28 +472,27 @@ def redacted_log_field(
     :func:`redact_log_value` reads it in the line ``before`` + ``text`` + ``after``, escaped and
     bounded by :func:`~messagefoundry.controlchars.log_field_token`; or
     :data:`UNREADABLE_LOG_VALUE`, escaped and bounded by ``limit``; or ``unloggable-`` and an
-    exception type when a reading raises, since a log argument must never raise. A ``checks``
-    pair is read only to compare with, never logged, so its text never reaches the field. The
-    placeholders the passes write are kept as they are, not escaped, so a search for
+    exception type when a reading or the bound raises, since a log argument must never raise. A
+    ``checks`` pair is read only to compare with, never logged, so its text never reaches the
+    field. The placeholders the passes write are kept as they are, not escaped, so a search for
     ``<redacted>`` or ``[redacted]`` finds a value they wrote; a search for redactions also
     needs :data:`UNREADABLE_LOG_VALUE`, which a limit under 19 cuts.
 
-    It is :data:`UNREADABLE_LOG_VALUE` in at least these measured cases, stated here once for
-    callers to link to; ``tests/test_admin_new_ip.py`` pins each. All but the first are read
-    through the new-address WARNING, whose check pair puts ``seen_ip=`` and the seen address
-    after the path:
+    The field is :data:`UNREADABLE_LOG_VALUE` when the reading of ``before`` + ``text`` +
+    ``after`` does not keep ``before`` and ``after`` whole at its ends, or when, for a
+    ``(head, tail)`` of ``checks``, the reading of ``head`` + ``text`` + ``tail`` does not read as
+    ``head``, the value, and the tail either as it was or as written alone. This rule is stated
+    here once for callers to link to.
 
-    - a pass rewrote ``before`` or ``after``, as ``/x/password:`` with ``after`` set to
-      ``" seen_ip=0.0.0.0"``;
-    - a path ending in a credential label, ``/x/password:`` or
-      ``/api/auth/bearer``;
-    - a path that opens a quoted credential value which the seen address closes, as
-      ``/x password='hunter2 more words`` with ``x'``;
-    - a path a pass rewrote, ``/api/x a%7Cb%7Cc``, with a seen address holding a credential shape
-      or a no-break space, ``code=SECRETVALUE`` or ``10.0.0.1`` and a no-break space;
-    - a path holding a no-break space or a credential shape, ``/x code=SECRETVALUE`` for one,
-      with a seen address holding an encoded HL7 run beside a tab, a date or a name, as
-      ``a%7Cb%7Cc`` and a tab, ``a%7Cb%7Cc 1980-01-01`` or ``a%7Cb%7Cc DOE JANE``."""
+    For example (measured, each pinned in ``tests/test_admin_new_ip.py`` through the new-address
+    path field, whose check puts ``seen_ip=`` and the seen address after the path):
+
+    - a percent-encoded HL7 run, as ``/api/x a%7Cb%7Cc``, with a seen address that turns a pass
+      off for the whole line, as ``code=SECRETVALUE`` or ``10.0.0.1`` and a no-break space;
+    - a path ending in a credential label followed by ``:`` or ``=``, as ``/x/password:`` or
+      ``/x/password=``, or in the Bearer word, as ``/api/auth/bearer``;
+    - a path holding a no-break space or a credential shape, as ``/x code=SECRETVALUE``, with a
+      seen address holding an encoded HL7 run and a tab, as ``a%7Cb%7Cc``, a tab and ``x``."""
     try:
         value = redact_log_value(text, before=before, after=after)
         if value is None or not all(_reads_as(value, head, text, tail) for head, tail in checks):

@@ -1743,6 +1743,7 @@ def test_a_rewritten_context_logs_a_placeholder() -> None:
     for limit in range(16, 24):
         assert len(redacted_log_field("/x/password:", limit, after=after)) <= limit + 2
     assert _new_ip_path_field("/x/password:", "10.0.0.1") == _UNREADABLE_FIELD
+    assert _new_ip_path_field("/x/password=", "10.0.0.1") == _UNREADABLE_FIELD
     assert _new_ip_path_field("/x/password:") == '"/x/password_u003A_"'
     assert _new_ip_path_field("/plain/path", "10.0.0.1") == '"/plain/path"'
     assert _new_ip_path_field("/api/auth/bearer") == '"/api/auth/bearer"'
