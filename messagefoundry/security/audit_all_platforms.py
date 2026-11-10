@@ -89,9 +89,9 @@ a ``--skip-private`` that names the engine or another published
 MessageFoundry package, a package the lock does not pin, or every pin, or that comes after the lock
 as a word of its own (the ``=`` form or an abbreviation there reaches pip-audit, which fails on it
 as an unknown option); and a ``--pass-environment`` entry the paragraph above says it refuses, or
-any word after the lock that argparse would read as that flag before it, the ``=`` form and an
-abbreviation down to ``--p`` included, since pip-audit's usage error would print a ``NAME=value``
-typed there. It does not judge
+any word after the lock that is that flag or an abbreviation of it down to ``--p``, in any case
+and in the ``=`` form, or that starts with ``--pas``, since pip-audit's usage error would print a
+``NAME=value`` typed there. Its own usage error withholds what follows the ``=`` in each word. It does not judge
 whether a non-empty lock is complete; released-line-audit carries its own floor for that.
 
 It reads lines as pip does: a requirement or option is any line that does not continue the one
@@ -135,6 +135,7 @@ import tempfile
 import urllib.parse
 from collections.abc import Callable, Collection, Sequence
 from pathlib import Path
+from typing import NoReturn
 
 from messagefoundry.childenv import (
     auditor_environment,
@@ -539,12 +540,26 @@ def _skip_private_refusal(private: Collection[str], pip_audit_args: Sequence[str
 
 
 def _names_pass_environment(arg: str) -> bool:
-    """Whether ``arg``, up to any ``=``, is a word argparse would read as ``--pass-environment``
-    before the lock, down to its shortest abbreviation ``--p``, or a longer word starting with
-    ``--pas``. pip-audit has ``--path`` and ``--progress-spinner``, so ``--p`` and ``--pa`` reach its
-    ambiguous-option error, which prints the word whole."""
-    head = arg.partition("=")[0]
+    """Whether ``arg``, up to any ``=`` and in any case, is ``--pass-environment`` or an
+    abbreviation of it down to ``--p``, or starts with ``--pas``. pip-audit's own ``--path`` and
+    ``--progress-spinner`` are not matched."""
+    head = arg.partition("=")[0].lower()
     return (len(head) > 2 and "--pass-environment".startswith(head)) or head.startswith("--pas")
+
+
+class _ValueWithholdingParser(argparse.ArgumentParser):
+    """A parser whose usage error withholds what follows the ``=`` wherever it quotes a whole word it
+    was given: a misspelled ``--pass-enviroment=NAME=value`` would otherwise reach the CI log through argparse's
+    own "unrecognized arguments" line (vault BACKLOG #2600)."""
+
+    def __init__(self, words: Sequence[str], *, description: str | None) -> None:
+        super().__init__(description=description)
+        self._words = [word for word in words if "=" in word]
+
+    def error(self, message: str) -> NoReturn:
+        for word in self._words:
+            message = message.replace(word, f"{word.partition('=')[0]}=<withheld>")
+        super().error(message)
 
 
 def _pass_environment_refusal(names: Sequence[str], pip_audit_args: Sequence[str]) -> str | None:
@@ -577,7 +592,10 @@ def _run(cmd: list[str], *, pass_environment: Sequence[str] = ()) -> int:
 
 
 def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
+    words = list(sys.argv[1:] if argv is None else argv)
+    parser = _ValueWithholdingParser(
+        words, description=__doc__.splitlines()[0] if __doc__ else None
+    )
     parser.add_argument(
         "--skip-private",
         action="append",
@@ -600,7 +618,7 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | No
         nargs=argparse.REMAINDER,
         help="passed through to pip-audit, e.g. --ignore-vuln <ID>",
     )
-    args = parser.parse_args(argv)
+    args = parser.parse_args(words)
 
     try:
         raw = args.lock.read_bytes()

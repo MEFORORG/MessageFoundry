@@ -268,12 +268,13 @@ def outside_engine_namespace(name: str) -> bool:
     )
 
 
-#: The interpreter variables :data:`_INTERPRETER_NAMES` leaves out because they hand control to a
-#: console. :func:`pass_environment_refusal` refuses them: a child started with ``PYTHONINSPECT``
-#: set waits at a prompt instead of exiting. ``PYTHONBREAKPOINT`` is left out too but may be
-#: named: ``PYTHONBREAKPOINT=0`` turns ``breakpoint()`` into a no-op, and unset it calls
-#: ``pdb.set_trace`` anyway, so refusing it would only block the protective value.
-_INTERPRETER_CONTROL_NAMES: Final = frozenset({"PYTHONSTARTUP", "PYTHONINSPECT"})
+#: The interpreter variables :data:`_INTERPRETER_NAMES` leaves out that
+#: :func:`pass_environment_refusal` refuses: a child started with ``PYTHONINSPECT`` set waits at a
+#: prompt instead of exiting. The other two may be named. ``PYTHONSTARTUP`` is read only by an
+#: interactive interpreter, which none of these children is. ``PYTHONBREAKPOINT=0`` turns
+#: ``breakpoint()`` into a no-op, and unset it calls ``pdb.set_trace`` anyway, so refusing it would
+#: only block the protective value.
+_INTERPRETER_CONTROL_NAMES: Final = frozenset({"PYTHONINSPECT"})
 
 
 def pass_environment_refusal(name: str) -> str | None:
@@ -431,7 +432,7 @@ def worker_environment(
     writes to it (vault BACKLOG #2724). A default in the engine's own namespace is refused, as
     ``[sandbox].pass_environment`` refuses one: a builder call is all the spawn guard checks.
     """
-    extras = _outside_engine_keys(extra_names)
+    extras = _passable_keys(extra_names)
     env = _without_working_directory_entries(
         {n: v for n, v in _source(environ).items() if _allowed_for_a_worker(n, extras)}
     )
@@ -445,7 +446,7 @@ def worker_environment(
     return env
 
 
-def _outside_engine_keys(extra_names: Collection[str]) -> frozenset[str]:
+def _passable_keys(extra_names: Collection[str]) -> frozenset[str]:
     """:func:`_extra_keys`, refusing with :class:`ValueError` a name
     :func:`pass_environment_refusal` refuses, so a builder called with a policy no settings load
     checked applies the same rule. It checks the keys it returns, so a one-shot iterable cannot
@@ -511,7 +512,7 @@ def hook_environment(
     :func:`pass_environment_refusal` refuses, one in the engine's own namespace among them, raises
     :class:`ValueError`. Settings load refuses one first, so this is the last check, not the
     first."""
-    names = _platform_names() | _outside_engine_keys(extra_names)
+    names = _platform_names() | _passable_keys(extra_names)
     if sys.platform == "win32":
         names |= _WINDOWS_SHELL_NAMES
     return {n: v for n, v in _source(environ).items() if _key(n) in names}
@@ -536,13 +537,13 @@ def auditor_environment(
     Built through :func:`worker_environment`, so the two cannot drift apart. That builder's
     "never a secret" rule is for code the engine does not trust; ``pip`` is a tool the auditor
     names, and a ``PIP_INDEX_URL`` that carries an index credential is meant for it."""
-    extras = _outside_engine_keys(extra_names)
+    extras = _passable_keys(extra_names)
     source = _source(environ)
-    # A name that is not an identifier is no pip option, and the builder would refuse it.
+    # A PIP_ name the builder would refuse, one that is not a variable name, is no pip option.
     pip_names = {
         name
         for name in source
-        if _key(name).startswith(_PIP_PREFIX) and name.isascii() and name.isidentifier()
+        if _key(name).startswith(_PIP_PREFIX) and pass_environment_refusal(name) is None
     }
     return worker_environment(source, extra_names=_AUDITOR_NAMES | pip_names | extras)
 

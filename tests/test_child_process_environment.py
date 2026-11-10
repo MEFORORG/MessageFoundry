@@ -268,14 +268,15 @@ def test_a_policy_naming_an_engine_variable_fails_the_spawn_as_a_sandbox_error(
     assert started == []
 
 
-@pytest.mark.parametrize("name", ["PYTHONINSPECT", "PYTHONSTARTUP", "KEYRING_A=marker-not-a-key"])
+@pytest.mark.parametrize("name", ["PYTHONINSPECT", "KEYRING_A=marker-not-a-key"])
 def test_the_worker_and_hook_builders_refuse_what_settings_load_refuses(name: str) -> None:
     """A policy built in code reaches the builder unchecked, so the builder applies the whole
     ``pass_environment`` rule, not only its engine-namespace half, and never echoes a value."""
     for builder in (childenv.worker_environment, childenv.hook_environment):
         with pytest.raises(ValueError, match="extra_names") as refused:
             builder({}, extra_names=(name,))
-        assert _MARKER not in str(refused.value)
+        # Upper-cased on both sides: Windows folds the entry before the refusal sees it.
+        assert _MARKER.upper() not in str(refused.value).upper()
 
 
 # --- the DR hook, through the real spawn --------------------------------------------------------

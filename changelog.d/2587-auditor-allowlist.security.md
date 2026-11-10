@@ -5,7 +5,7 @@
   `NETRC` and XDG folder variables pip and pip-audit read to reach an index. A variable a keyring
   backend or a cloud credential helper needs is named with `--pass-environment <name>`, given before
   the lock. The deny-list builder `non_engine_environment` is removed. (`BACKLOG #2587`)
-- **`[sandbox].pass_environment` and `[dr].pass_environment` refuse `PYTHONSTARTUP` and
-  `PYTHONINSPECT` at load**, as the auditor's `--pass-environment` does: a child started with
-  `PYTHONINSPECT` set waits at a prompt instead of exiting. `PYTHONBREAKPOINT` may still be named,
+- **`[sandbox].pass_environment` and `[dr].pass_environment` refuse `PYTHONINSPECT` at load**, as
+  the auditor's `--pass-environment` does: a child started with it set waits at a prompt instead of
+  exiting. `PYTHONBREAKPOINT` may still be named,
   so `PYTHONBREAKPOINT=0` reaches the child. (`BACKLOG #2587`)

@@ -1119,6 +1119,7 @@ def test_a_pass_environment_after_the_lock_is_refused_by_name(
         ["--pas=KEYRING_A=marker-not-a-key"],
         ["--pa=KEYRING_A=marker-not-a-key"],
         ["--p=KEYRING_A=marker-not-a-key"],
+        ["--PASS-ENVIRONMENT=KEYRING_A=marker-not-a-key"],
         ["--pass-environment-x=marker-not-a-key"],
         ["--pass-env", "KEYRING_A=marker-not-a-key"],
     ],
@@ -1137,6 +1138,34 @@ def test_a_pass_environment_value_after_the_lock_never_reaches_pip_audit_or_the_
     assert not ran
     out, err = capsys.readouterr()
     assert "goes before the lock" in err
+    assert "marker-not-a-key" not in out + err
+
+
+def test_pip_audits_own_p_options_still_pass_through_after_the_lock(tmp_path: Path) -> None:
+    """The control for the refusal above: ``--progress-spinner`` and ``--path`` start with ``--p``
+    but are pip-audit's own, so they reach it."""
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    ran, run = _recorder(0)
+    assert main([str(src), "--progress-spinner=off", "--path", "x"], run=run) == 0
+    assert ran[-1][-3:] == ["--progress-spinner=off", "--path", "x"]
+
+
+@pytest.mark.parametrize("flag", ["--pass-enviroment", "--Pass-Environment"])
+def test_a_misspelled_pass_environment_before_the_lock_keeps_its_value_out_of_the_log(
+    flag: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """argparse's own usage error names an unrecognized word; the parser withholds what follows
+    its ``=``, so a typo does not put a value in the CI log (vault BACKLOG #2600)."""
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    ran, run = _recorder(0)
+    with pytest.raises(SystemExit) as stopped:
+        main([f"{flag}=KEYRING_A=marker-not-a-key", str(src)], run=run)
+    assert stopped.value.code == 2
+    assert not ran
+    out, err = capsys.readouterr()
+    assert f"{flag}=<withheld>" in err
     assert "marker-not-a-key" not in out + err
 
 
