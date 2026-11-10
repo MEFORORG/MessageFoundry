@@ -7743,7 +7743,7 @@ BACKLOG #190 bundled three integrity residuals; #190 closes with **one built** a
   The reason is that it would hide nothing: a 2026-07-20 DoH probe found **no** partner endpoint
   publishing an `ECHConfig`. The engine therefore ships only the opt-in, fail-closed **routing** half
   (per-connection `ech_egress` / `ech_sidecar`, refused when the sidecar is non-loopback or paired
-  with `proxy_url`), and the re-originator was retired from the tree on 2026-08-10 rather than carried
+  with `proxy_url` or `verify_tls = false`), and the re-originator was retired from the tree on 2026-08-10 rather than carried
   as a second language nothing builds, tests or pins. Evidence, the retrieval SHA and the re-score
   trigger: [ADR 0139](adr/0139-ech-egress-sidecar-sni-hiding-for-asvs-12-1-5-demand-gated.md);
   operator contract: [`samples/ech-sidecar/`](../samples/ech-sidecar/README.md). The residual is
