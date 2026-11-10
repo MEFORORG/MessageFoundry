@@ -510,6 +510,10 @@ async def test_an_interrupted_release_offers_the_resolve_and_not_approve(engine:
         r = await checker.get("/ui/approvals")
         assert r.status_code == 200
         assert "Interrupted releases" in r.text
+        # decided_at is the claim time on a row a restart or an operator interrupt moved, so the
+        # column does not claim it is only the cut-off time (BACKLOG #1562).
+        assert "<th>Cut off or claimed</th>" in r.text
+        assert "<th>Cut off</th>" not in r.text
         assert approval_id in r.text
         assert f'formaction="{_resolve(approval_id)}"' in r.text
         assert f'formaction="{_resolve(approval_id, "effects_not_applied")}"' in r.text

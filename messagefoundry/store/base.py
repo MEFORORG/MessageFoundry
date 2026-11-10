@@ -79,6 +79,7 @@ from messagefoundry.store.privilege import (
 )
 from messagefoundry.store.row_seal import RowSealer
 from messagefoundry.store.store import (
+    ANY_CLAIM_OWNER,
     OPEN_STORE_PIN,
     UPLOAD_RESERVATION_STALE_AFTER,
     AdMap,
@@ -93,6 +94,7 @@ from messagefoundry.store.store import (
     CapturedResponse,
     ChannelScopeSource,
     ClaimedHeads,
+    ClaimOwnerGuard,
     ClaimProcStatus,
     ConnectionEvent,
     ConnectionEventWrite,
@@ -2133,7 +2135,7 @@ class AuditStore(Protocol):
         ...
 
     async def list_interrupted_approvals(self, *, limit: int = 100) -> Sequence[Row]:
-        """Released requests whose operation was cut off mid-run (status ``interrupted``), OLDEST
+        """Released requests at status ``interrupted``, OLDEST
         first (BACKLOG #1562). Kept apart from :meth:`list_pending_approvals` so "pending" keeps its
         one meaning: awaiting a second approver. An interrupted row is awaiting an operator's record
         of what happened, so no expiry applies to it; it stays listed until it is resolved.
@@ -2142,8 +2144,7 @@ class AuditStore(Protocol):
         hide the rows that have waited longest, and nothing would ever bring them back. Oldest first,
         a row past the cap appears as the ones before it are resolved.
 
-        Projects the same columns as the pending queue, so ``approver`` and ``decided_at`` say who
-        released it and when it was cut off."""
+        Projects the same columns as the pending queue."""
         ...
 
     async def decide_pending_approval(
@@ -2156,6 +2157,7 @@ class AuditStore(Protocol):
         from_status: str = "pending",
         audit: AuditAppend | None = None,
         claim_owner: str | None = None,
+        from_claim_owner: ClaimOwnerGuard = ANY_CLAIM_OWNER,
     ) -> bool:
         """Move a request from ``from_status`` to ``status`` in one guarded UPDATE. ``True`` iff
         this call moved it, which is what guards a double decision.
@@ -2172,6 +2174,11 @@ class AuditStore(Protocol):
         operation, so that process can recognise its own claims after a restart
         (``ApprovalGate.reconcile_after_restart``). Engine shards and cluster nodes share one store,
         and the owner is what keeps one process from settling a sibling's live release.
+
+        ``from_claim_owner``, when not :data:`~messagefoundry.store.store.ANY_CLAIM_OWNER`, also
+        guards the move on the row's ``claim_owner`` reading exactly that value, ``None`` meaning
+        no owner, checked on the row read in the write (BACKLOG #1562). An operator's settle of a
+        stranded release passes the owner it judged, so the move lands only on the row it judged.
 
         **The move checks the row's seal first (BACKLOG #2592).** It reads the row, and raises
         :class:`~messagefoundry.store.row_seal.RowSealError`, writing nothing, when the seal does
@@ -2210,12 +2217,19 @@ class AuditStore(Protocol):
         ...
 
     async def list_executing_approvals(
-        self, *, claim_owner: str | None = None, limit: int = 1000
+        self,
+        *,
+        claim_owner: str | None = None,
+        not_claimed_by: str | None = None,
+        limit: int = 1000,
     ) -> Sequence[Row]:
         """Released requests still claimed as ``executing``, OLDEST claim first (BACKLOG #1562).
 
         ``claim_owner``, when given, keeps only the rows that owner claimed and the rows with no
         owner, filtered in SQL so other owners' rows cannot push them past ``limit``.
+        ``not_claimed_by`` is its complement for a sibling scan: only rows some OTHER owner
+        claimed, never an unowned row, so the caller's own rows cannot push a sibling's past
+        ``limit`` either. Passing both raises :class:`ValueError`.
 
         Projects every column, as :meth:`list_pending_approvals` does; ``decided_at`` is when it
         was claimed. Read at startup by ``ApprovalGate.reconcile_after_restart``,

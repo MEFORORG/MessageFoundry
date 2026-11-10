@@ -134,7 +134,7 @@ Four more facts:
 ## Enforcement model
 
 Authentication is **required** for the running service. The engine `serve` command always attaches an
-auth layer, and no setting turns it off (vault BACKLOG #2719). Of the **117** engine route objects, **98 demand a
+auth layer, and no setting turns it off (vault BACKLOG #2719). Of the **121** engine route objects, **102 demand a
 specific permission** and 19 do not — 3 are deliberately unauthenticated (`GET /auth/providers`, an
 unbounded capability advertisement that carries no account state and charges **no** limiter;
 `POST /auth/login` and `POST /auth/negotiate`, bounded by the per-IP **and** global login sliding
@@ -1412,10 +1412,10 @@ apply. What each **adds** over plain `require()`:
 
 | Gate wrapper | Routes | What it adds over `require()` |
 |---|---|---|
-| `require` | 41 | nothing — the ladder itself |
+| `require` | 42 | nothing — the ladder itself |
 | `require_paced` | 17 | the **new-client-IP** refusal (403 + `X-Step-Up-Required: 1`, vault BACKLOG #2620), then per-actor anti-automation pacing on **non-GET** requests (`allow_admin_write`), 429 + a `Retry-After` naming the actor's wait |
 | `require_phi_read` | 8 | the ADR 0092 PHI-read hop refusal (`enforce_phi_read_hop`) **before** any identity work, then the **new-client-IP** refusal (403 + `X-Step-Up-Required: 1`, vault BACKLOG #2620), then the per-actor PHI-read budget, 429 + a `Retry-After` naming the actor's wait (the whole window while the global count is spent) |
-| `require_step_up` | 22 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
+| `require_step_up` | 23 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
 | `require_step_up_action` | 20 | the same non-GET pacing (BACKLOG #1148), the **MFA gate**, then a **single-use, action-bound** step-up grant, minted on this plane only by `POST /me/reauth` (403 + `X-Step-Up-Action: <action>`; the password leg of `POST /ui/reauth` and the IdP leg mint it for a cookie session). Promoting a route here no longer drops the pacing floor. Since vault BACKLOG #2625 it also gates the injection and bulk-export set (see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)) |
 | `require_reauth_only_action` | 4 | password step-up **without** the MFA gate — deadlock avoidance on the MFA-enrollment lanes, and on session terminate (ASVS 7.5.2), where the grant is action-bound so a login-seeded window does not unlock it. `require_reauth_only` still exists and still backs the `/ui` twin, but BACKLOG #1149 moved the last JSON route off it, so it no longer appears in this walk |
 | `require_service_cert` | 1 | cert-only authentication (a bearer token gets 401), and a **PHI fence** that raises at *app construction* if asked to gate `messages:view_summary` / `messages:view_raw` |
@@ -1450,7 +1450,7 @@ The two gates audit differently. Under the default audit setting, `authorize_ws`
 
 The catalogue is `Permission` in [`auth/permissions.py`](../messagefoundry/auth/permissions.py); the
 enum value **is** the wire/storage string. "Routes" counts engine route objects gated on that permission
-under `create_app()` (they sum to 102, not 98, because BOTH `/messages/export` routes,
+under `create_app()` (they sum to 106, not 102, because BOTH `/messages/export` routes,
 `/messages/{id}/outbound` and `POST /uploads/{id}/resend` require two).
 
 | Constant | Permission | PHI | Routes | Gates |
@@ -1483,7 +1483,7 @@ under `create_app()` (they sum to 102, not 98, because BOTH `/messages/export` r
 | `FILES_BROWSE` | `files:browse` | **PHI** | 4 | `GET /uploads` (metadata), `GET /uploads/{id}/messages` (bulk decrypt+split), `POST /uploads/{id}/resend` (with `messages:edit` since vault BACKLOG #2625; a browse-only role reads and cannot inject) |
 | `FILES_DELETE` | `files:delete` | | 1 | `DELETE /uploads/{id}` — destructive, audited cleanup |
 | `FILES_ACCESS_ANY` | `files:access_any` | **PHI** | 0 | no route — an **object-level** override (ASVS 8.2.2), enforced in the uploaded-files handler bodies rather than at a gate (the console calls those handlers directly over the seam, so a gate would not cover it). Uploaded files are **owner-only**: without this, `files:browse`/`files:delete` reach only what the caller uploaded; with it, every uploader's. It is not a capability of its own — the holder still needs `files:browse` / `files:delete` for the route. Never assignable to a custom role |
-| `APPROVALS_APPROVE` | `approvals:approve` | | 4 | `GET /approvals`, `POST /approvals/{id}/approve`, `/reject`, `/resolve` (dual control, ASVS 2.3.5). The console's Approvals page, `/ui/approvals`, reaches all four (BACKLOG #1982, #2460). Never assignable to a custom role |
+| `APPROVALS_APPROVE` | `approvals:approve` | | 6 | `GET /approvals`, `POST /approvals/{id}/approve`, `/reject`, `/resolve` (dual control, ASVS 2.3.5). The console's Approvals page, `/ui/approvals`, reaches all four (BACKLOG #1982, #2460). Also `GET /approvals/executing` and `POST /approvals/{id}/interrupt`, which no console page reaches (BACKLOG #1562). Never assignable to a custom role |
 
 `config:validate` and `code:edit` have **no API endpoint yet**; they are defined so
 the Deployment/Coding roles are complete and those endpoints can be gated the moment they land, without
@@ -1576,12 +1576,12 @@ Managed at `GET /roles/custom` (`users:read`) and `POST` / `PUT` / `DELETE /role
 
 ### Route → permission map (engine API)
 
-**Counting basis.** `create_app()` with no arguments builds **119 route objects** — 73 declared in
-[`api/app.py`](../messagefoundry/api/app.py) (72 HTTP + 1 WebSocket) and 46 declared in
+**Counting basis.** `create_app()` with no arguments builds **121 route objects** — 75 declared in
+[`api/app.py`](../messagefoundry/api/app.py) (74 HTTP + 1 WebSocket) and 46 declared in
 [`api/auth_routes.py`](../messagefoundry/api/auth_routes.py). No other module in `api/` declares routes
-and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 123 (`/openapi.json`,
-`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 249
-(119 + the 129 console routes + the `/ui/static` mount). Of the 119: **100 are permission-gated**, 19 are
+and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 125 (`/openapi.json`,
+`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 251
+(121 + the 129 console routes + the `/ui/static` mount). Of the 121: **102 are permission-gated**, 19 are
 not. Every one is listed below — none is collapsed away.
 
 #### Functions requiring no authorization
@@ -1709,6 +1709,8 @@ tuple: they act only on the caller's own account.
 | `POST` | `/approvals/{approval_id}/approve` | `approvals:approve` | `require_step_up` — a fresh step-up, as the resolve asks (owner ruling 2026-10-13, #3241 R4); the requester can never approve their own request; data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `POST` | `/approvals/{approval_id}/reject` | `approvals:approve` | `require_paced` |
 | `POST` | `/approvals/{approval_id}/resolve` | `approvals:approve` | `require_step_up` — records an `interrupted` release as `effects_applied` or `effects_not_applied`; never re-runs it, and the requester can never resolve their own request (BACKLOG #1562) |
+| `GET` | `/approvals/executing` | `approvals:approve` | `require` — releases still claimed as `executing`, up to the store read's cap, with their claim owner and what an interrupt would judge of that owner now; params are not listed (BACKLOG #1562) |
+| `POST` | `/approvals/{approval_id}/interrupt` | `approvals:approve` | `require_step_up` — moves a stranded `executing` release to `interrupted`, refused while its owner may be live; an owner with no heartbeat to read needs `attest_owner_stopped`; never runs the operation (BACKLOG #1562) |
 | `POST` | `/cluster/stepdown` | `cluster:control` | `require_step_up` |
 | `POST` | `/dr/activate` | `dr:operate` | `require_step_up` |
 | `POST` | `/dr/release` | `dr:operate` | `require_step_up` |
@@ -1818,7 +1820,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/logs/tail` | `logs:view` | `require_phi_read` | best-effort-redacted; writes a `logs_view` audit row |
 | `POST` | `/ai/chat` | `ai:assist` | `require` | **not** paced; bounded by the central AI policy |
 
-**PHI-egress route set.** Of the 119 route objects a default `create_app()` serves, **at least twenty-one**
+**PHI-egress route set.** Of the 121 route objects a default `create_app()` serves, **at least twenty-one**
 can put PHI on the wire: the thirteen message/search rows above marked PHI (`/messages`, `/messages/{id}`,
 `/messages/{id}/raw`, `/responses`, `/outbound`, `/attachments/{id}`, `/messages/search`, `/messages/export`,
 `/search/layered`, the three `/search/presets` rows, `/dead-letters`), plus
@@ -2941,8 +2943,7 @@ than to one request.
   another caller moved the row, and `unknown` where the read-back cannot tell.
 
 For some failed writes the gate logs at ERROR and pages nothing. At least this one: a restart
-cannot move a leftover `executing` row to `interrupted`. The row stays `executing`, and the next
-start tries again.
+cannot move a leftover `executing` row to `interrupted`.
 
 An outcome's combined write can fail while the status write that follows finds the row already
 moved. The gate then writes no row alone, and reads the row back (vault BACKLOG #3193 N1). If it
@@ -3020,7 +3021,7 @@ the row to one of three outcomes. Each move carries its own audit row, after the
 |---|---|---|
 | `approved` | The operation ran and returned | `approval.approved` |
 | `failed` | The operation raised, or the release was cancelled before it started. It did not complete | `approval.failed` |
-| `interrupted` | The release was cancelled while the operation ran, for example by the request timeout. Or the engine process that claimed it restarted before it recorded an outcome. It may have done none, some or all of its work | `approval.interrupted` (against `system`, with `reason` `engine_restart`, when a restart finds it) |
+| `interrupted` | The release was cancelled while the operation ran, for example by the request timeout. Or the engine process that claimed it restarted before it recorded an outcome. Or an operator interrupted a release stranded in `executing`. It may have done none, some or all of its work | `approval.interrupted` (against `system`, with `reason` `engine_restart`, when a restart finds it; against the operator, with `reason` `operator_interrupt`, when an operator interrupts it) |
 | `resolved_applied` | An operator checked an `interrupted` release and recorded that its effects were applied | `approval.resolved` (against the resolver) |
 | `resolved_not_applied` | An operator checked an `interrupted` release and recorded that its effects were not applied | `approval.resolved` (against the resolver) |
 
@@ -3034,7 +3035,7 @@ already moved. The gate then writes no row alone and pages, as above.
 Nothing retries an `interrupted` request. Re-running an operation that may already have run would be
 worse than a stuck row, so an operator has to check the operation's own effects. `GET /approvals`
 lists `interrupted` rows after the pending ones, each with its `status`, the approver who released it,
-and when it was cut off. Once the operator has checked, `POST /approvals/{id}/resolve` with
+and its `decided_at`. Once the operator has checked, `POST /approvals/{id}/resolve` with
 `{"outcome": "effects_applied"}` or `{"outcome": "effects_not_applied"}` records the finding and moves
 the row to the matching `resolved_*` status (owner ruling 2026-09-26). The resolve:
 
@@ -3048,14 +3049,15 @@ the row to the matching `resolved_*` status (owner ruling 2026-09-26). The resol
   the operation afresh, through dual control;
 - answers **409** for a row that is not `interrupted`, including one another operator resolved first;
 - writes `approval.resolved` against the resolver in the same write as the move, naming the
-  requester, the releasing approver, the outcome, the new status and the cut-off time. If that write
-  fails, the resolve answers **503** and the row stays `interrupted`. A resolver who loses a race
+  requester, the releasing approver, the outcome, the new status and the row's earlier `decided_at`
+  as `interrupted_at`. If that write raises anything but a seal refusal, the resolve answers **503**
+  and pages `audit_write_failed`. A resolver who loses a race
   moves nothing and writes no row. The row keeps the releasing approver;
 - flags a resolver whose account changed after the request, and still resolves (BACKLOG #2125). It
   runs the approver check below on the resolver, against the request time. Once the row has moved,
   it writes `approval.approver_provenance` with `act` `resolve` and raises the same alert, keyed
   `approval:<id>:resolve`. A resolve that answers 409 or 503 is not flagged, even where its COMMIT
-  landed despite the error. The check compares against the request time, not the cut-off time,
+  landed despite the error. The check compares against the request time, not `decided_at`,
   so a row left `interrupted` for a long time also flags a routine password change or TOTP
   enrolment made while it waited. This is a seat decision under owner delegation
   2026-10-08, not an owner ruling.
@@ -3068,15 +3070,17 @@ row at `executing`. A process can die mid-operation. A release's outcome write c
 the operation ran but the move from `executing` to `approved` fails even when written alone, the
 error is logged and the release still succeeds, because an error would invite a new request that
 runs it twice. The gate still tries to write the `approval.approved` audit row. And a claim can
-commit after its reply was lost, so nothing ran. The status cannot tell these apart; the audit
-trail sometimes can, so read it before resolving.
+commit after its reply was lost, so nothing ran. The status cannot tell these apart, so the
+restart claims no outcome for any of them.
 
 The claim records which engine process owns the release, in the row's `claim_owner` column. At its
 next start, before the API serves an approval, that process moves each `executing` row it owns to
-`interrupted`, with an `approval.interrupted` row in the same write. That row is written against
-`system` and carries `reason` `engine_restart`, the claim owner and the claim time. Nothing
-re-runs. The operator checks the effects and resolves the row as above. A move that fails is logged
-and the row stays `executing` for the next start to try again.
+`interrupted`, with an `approval.interrupted` row; so does the catch-up an embedded engine shard
+runs once its name is known. Each row is in the same write as its move, written against `system`,
+and carries `reason` `engine_restart`, the claim owner and the claim time. The move keeps the row's `decided_at` as the
+claim time, so an `interrupted` row a restart settled shows when it was claimed, not when the
+engine restarted. Nothing re-runs. The operator checks the effects of an `interrupted` row and
+resolves it as above. A move that fails is logged.
 
 Engine shards and cluster nodes share one store, so a process touches only its own rows: a
 sibling's `executing` row may be a live release. The owner is:
@@ -3088,10 +3092,46 @@ sibling's `executing` row may be a live release. The owner is:
 | A `[cluster]` node | `node:<node_id>` | Only when `[cluster].node_id` is pinned |
 
 A row owned by another process is left alone and logged at WARNING at each start, with its owner and
-claim time. If that owner never returns, as with an unpinned cluster node, the row stays
-`executing`. Nothing settles it on a timer, because no check here can tell a dead owner from a slow
-one. `GET /approvals` does not list `executing` rows, so that WARNING is the place to find one. A
-row claimed before the column existed has no owner, and the first process to start treats it as its
+claim time. The start reads other owners' rows apart from its own, so its own rows never fill that
+read and hide a sibling's. If that owner never returns, as with an unpinned cluster node, the row
+stays `executing`. Nothing settles it on a timer, because no check here can tell a dead owner from
+a slow one. An operator settles it instead, through two routes (owner-delegated decision of
+2026-10-29, `d20261029T205247402-81159c`):
+
+- `GET /approvals/executing` lists `executing` rows, up to the store read's cap and leaving out
+  any that fail their seal, with its claim owner, its claim time,
+  whether this process owns it, and what an interrupt would judge of its owner now. It needs
+  `approvals:approve`. `GET /approvals` does not list `executing` rows.
+- `POST /approvals/{id}/interrupt` moves one to `interrupted`, so it takes the resolve above. It
+  needs `approvals:approve` and a fresh step-up, and it refuses the original requester, **403**, as
+  the resolve does, comparing user ids; a row with no recorded requester id is refused, **409**. It
+  never runs the operation and never records an outcome. It judges the owner in three tiers:
+
+| Owner | The interrupt |
+|---|---|
+| This process is running the release, or still writing its outcome | refused, **409** |
+| `node:<id>`, and that node's heartbeat is fresh | refused, **409** |
+| `node:<id>`, and the heartbeats cannot be read | refused, **503**; try again |
+| `node:<id>`, on an engine that is not a cluster node and reads no heartbeats | refused, **409**; interrupt from a cluster node |
+| `node:<id>`, and the heartbeat has lapsed or the node is gone | moves the row |
+| `shard:<id>`, `engine`, no owner, or any other name | moves the row only with `{"attest_owner_stopped": true}`, a JSON `true` and nothing a parser could coerce to one (any other value is **422**), the operator's word that no process under that name is running; otherwise **409** |
+
+A cluster node whose `[cluster].node_id` is not pinned comes back under a new id, so its old claims
+read as a lapsed heartbeat here and can be interrupted without an attestation. The heartbeat is the
+`fresh` reading `/cluster/nodes` shows. A fresh heartbeat on this process's own node id refuses too,
+even for a row this process is not running.
+
+The move is guarded on `executing` and on the claim owner it judged, so a row that moved or changed
+owner since answers **409** and moves nothing. Its `approval.interrupted` row is in the same write,
+against the operator, with `reason` `operator_interrupt`, the claim owner, the tier as `liveness`,
+and `owner_stopped_attested`. If that write raises anything but a seal refusal, the call answers
+**503** and pages `audit_write_failed`. The move keeps `decided_at` as the claim time.
+An attestation is the operator's word, and nothing checks it. A row interrupted while its owner was
+in fact still running it is recorded when that owner writes its outcome: the outcome write finds
+the row moved and logs it, and the outcome row is written alone. If that outcome write raised
+instead, no outcome row is written alone, and it pages `audit_write_failed`, as the list above says.
+
+A row claimed before the column existed has no owner, and the first process to start treats it as its
 own. Two plain `serve` processes over one store would share the `engine` owner; that layout is
 unsupported anyway. For the same reason, build one app per engine: a second app over the same
 engine runs the reconcile again and would take the first one's live releases for leftovers.
@@ -3742,6 +3782,8 @@ The complete set, as enumerated in the [route map](#route--permission-map-engine
   hook and unbinds every inbound. Each asks for the same fresh proof as the planned failover above.
 - **Dual control** -- `POST /approvals/{id}/resolve` (BACKLOG #1562). Approve and reject are not
   step-up gated; this one is, because it closes an approval record on the resolver's word alone.
+  So is `POST /approvals/{id}/interrupt`, the step before a resolve for a release stranded in
+  `executing`, which can rest on the operator's word that its owner is stopped (BACKLOG #1562).
 - **Bulk-PHI reads** — `GET /messages/search`, `GET /messages/export`, `GET /search/layered`,
   `GET /uploads/{file_id}/messages`, and the body-carrying twins `POST /messages/search`,
   `POST /messages/export` and `POST /uploads/{file_id}/messages/search` (BACKLOG #1184). The two
