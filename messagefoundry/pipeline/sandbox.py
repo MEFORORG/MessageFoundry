@@ -1502,7 +1502,9 @@ class SandboxSession:
             assert proc.stdin is not None
             # Encoded and size-checked outside the write's try: a payload or run-context outside the
             # closed grammar, or a frame over the cap, is refused with no byte written, so the worker
-            # is still in step and is kept (vault BACKLOG #3135). Only this message fails.
+            # is still in step and is kept (vault BACKLOG #3135). Only this message fails. An OSError
+            # raised while encoding is wrapped the same way: it, too, comes before any byte is
+            # written, and an unwrapped one would escape this method's SandboxError contract.
             try:
                 request = codec.encode_request(
                     request_id=request_id,
@@ -1514,7 +1516,7 @@ class SandboxSession:
                 )
                 if len(request) > _MAX_FRAME:
                     raise SandboxError(f"sandbox frame too large: {len(request)} bytes")
-            except SandboxError as exc:
+            except (OSError, SandboxError) as exc:
                 raise SandboxError(f"failed to marshal sandbox {phase} {name!r}: {exc}") from exc
             try:
                 _write_frame(proc.stdin, request)

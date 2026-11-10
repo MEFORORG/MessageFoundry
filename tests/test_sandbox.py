@@ -2145,6 +2145,39 @@ def test_a_request_the_codec_refuses_keeps_the_worker(
         session.close()
 
 
+def test_an_oserror_while_encoding_is_wrapped_and_keeps_the_worker(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An OSError raised by the encoder comes before any byte is written, so it is wrapped as a
+    marshal SandboxError like a codec refusal, and the worker is kept.
+
+    FALSIFICATION: narrow the encode ``except`` to ``SandboxError`` alone and the OSError escapes
+    ``dispatch`` unwrapped, so ``pytest.raises(SandboxError)`` fails."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        expected = _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        proc = session._proc
+        assert proc is not None
+        real_encode = codec.encode_request
+
+        def _fails(**kwargs: Any) -> bytes:
+            raise OSError("the encoder failed")
+
+        monkeypatch.setattr(codec, "encode_request", _fails)
+        with pytest.raises(SandboxError, match="failed to marshal") as caught:
+            _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        assert isinstance(caught.value.__cause__, OSError)
+        assert session._proc is proc
+        assert proc.poll() is None
+        assert session.last_kill_cause is None
+        monkeypatch.setattr(codec, "encode_request", real_encode)
+        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == expected
+        assert session._proc is proc
+    finally:
+        session.close()
+
+
 def test_a_request_write_that_fails_still_kills_the_worker(
     graph: tuple[Registry, str],
     monkeypatch: pytest.MonkeyPatch,
