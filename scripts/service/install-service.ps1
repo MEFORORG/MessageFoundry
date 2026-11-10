@@ -865,6 +865,16 @@ function Get-ReparsePointAncestor {
     return ""
 }
 
+function ConvertTo-EngineStripped {
+    <#
+      $Value with the characters Python's str.strip() removes taken off both ends, as the engine
+      does before it reads MEFOR_SECRETS_DIRECTORY. String.Trim() is not that: it keeps U+001C to
+      U+001F, which str.strip() removes.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+    return $Value -replace '^[\s\x1c-\x1f]+|[\s\x1c-\x1f]+$', ''
+}
+
 function Get-OtherServiceNamingPath {
     <#
       The names of the services, other than $ServiceName, whose NSSM environment names as $Name the
@@ -891,7 +901,7 @@ function Get-OtherServiceNamingPath {
         $named = Get-EnvironmentListValue -List $params.GetValue('AppEnvironmentExtra', $null) -Name $Name
         # Trimmed because the engine strips the value before reading it, so a leading space still
         # names a directory. The engine refuses a relative value, so only an absolute one names one.
-        if ($named) { $named = $named.Trim() }
+        if ($named) { $named = ConvertTo-EngineStripped $named }
         if (-not $named -or ($named -notmatch '^([A-Za-z]:[\\/]|[\\/]{2}[^\\/])')) { continue }
         # The same directory, or one inside the other: the lockdown of either reaches the other.
         # A value .NET cannot read here, such as a path over 260 characters on Windows PowerShell
@@ -2246,7 +2256,7 @@ else { $DbPath = Resolve-AbsolutePath $DbPath }
 # what a data-directory backup copies.
 $RegisteredSecretsDir = Get-RegisteredEnvironmentValue -ServiceName $ServiceName -Name "MEFOR_SECRETS_DIRECTORY"
 # Trimmed because the engine strips it, so a value the engine reads as absolute is not refused as relative.
-if ($RegisteredSecretsDir) { $RegisteredSecretsDir = $RegisteredSecretsDir.Trim() }
+if ($RegisteredSecretsDir) { $RegisteredSecretsDir = ConvertTo-EngineStripped $RegisteredSecretsDir }
 # Every secrets-directory path is compared in one spelling, '..' segments and forward slashes
 # resolved: Get-LockPathProblem's rules and the named and sharer checks compare paths as written.
 if ($RegisteredSecretsDir -and ($RegisteredSecretsDir -match '^([A-Za-z]:[\\/]|[\\/]{2}[^\\/])')) {
@@ -2326,7 +2336,8 @@ if (-not $secretsProblem) {
         $secretsProblem = ("the service(s) $($SecretsDirSharers -join ', ') name it, a folder inside " +
             "it, a folder around it, or a path this installer cannot compare with it, as their secrets " +
             "directory, and the lockdown here could reach theirs. Pass -SecretsDir with a folder for " +
-            "this service")
+            "this service. A path this installer cannot compare is refused whatever -SecretsDir names, " +
+            "so correct that service's MEFOR_SECRETS_DIRECTORY instead")
     }
 }
 # Does the service already name this directory? Then it is a rerun's own directory, and its files

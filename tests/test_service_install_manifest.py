@@ -3015,57 +3015,9 @@ def test_a_junction_above_the_secrets_directory_is_named(tmp_path: Path) -> None
     assert got["plain"] == "", f"CONTROL FAILED: a plain path was named: {got}"
 
 
-@_windows_only
-def test_a_secrets_directory_another_service_names_is_found(tmp_path: Path) -> None:
-    """Get-OtherServiceNamingPath, against a services key built under HKCU: a second service whose
-    NSSM environment names the same directory (another case, a trailing backslash), the same one
-    through '..' and forward slashes, a folder inside it, or a folder around it is returned; the
-    installing service itself, a sibling whose name only starts the same, and a service naming
-    another directory are not."""
-    assert _SCRIPT is not None
-    root = f"HKCU:\\Software\\MeforTest-{uuid.uuid4().hex[:8]}"
-    body = rf"""
-  $root = {_psq(root)}
-  try {{
-    foreach ($s in @(@('First', 'mefor_secrets_directory=C:\PD\MF-SECRETS\'),
-                     @('Mine', 'MEFOR_SECRETS_DIRECTORY=C:\PD\MF-secrets'),
-                     @('Dots', 'MEFOR_SECRETS_DIRECTORY=C:/PD/x/../MF-secrets'),
-                     @('Inside', 'MEFOR_SECRETS_DIRECTORY=C:\PD\MF-secrets\sub'),
-                     @('Around', 'MEFOR_SECRETS_DIRECTORY=C:\PD'),
-                     @('Sibling', 'MEFOR_SECRETS_DIRECTORY=C:\PD\MF-secrets-two'),
-                     @('Other', 'MEFOR_SECRETS_DIRECTORY=C:\PD\elsewhere'))) {{
-      $k = New-Item -Path (Join-Path $root "$($s[0])\Parameters") -Force
-      Set-ItemProperty -LiteralPath $k.PSPath -Name AppEnvironmentExtra -Type MultiString `
-        -Value @('MEFOR_X=1', $s[1])
-    }}
-    New-Item -Path (Join-Path $root 'NoParams') -Force | Out-Null
-    $hits = @(Get-OtherServiceNamingPath -ServiceName 'Mine' -Name 'MEFOR_SECRETS_DIRECTORY' `
-      -Path 'C:\PD\MF-secrets' -ServicesKey $root)
-    [pscustomobject]@{{ hits = $hits }} | ConvertTo-Json -Compress
-  }} finally {{ Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }}
-"""
-    got = json.loads(
-        _ok(
-            _extract(
-                _SCRIPT,
-                [
-                    "Get-OtherServiceNamingPath",
-                    "ConvertTo-NormalPath",
-                    "Get-EnvironmentListValue",
-                    "Test-EnvironmentEntryNames",
-                ],
-                body,
-            ),
-            tmp_path,
-        )
-        .strip()
-        .splitlines()[-1]
-    )
-    assert sorted(got["hits"]) == ["Around", "Dots", "First", "Inside"], got
-
-
 _SHARER_FUNCTIONS = [
     "Get-OtherServiceNamingPath",
+    "ConvertTo-EngineStripped",
     "ConvertTo-NormalPath",
     "Get-EnvironmentListValue",
     "Test-EnvironmentEntryNames",
@@ -3076,21 +3028,28 @@ def _sharer_hits(
     tmp_path: Path, services: list[tuple[str, str]], host: str = "pwsh", extra: str = ""
 ) -> dict[str, Any]:
     """Get-OtherServiceNamingPath for 'Mine' at C:\\PD\\MF-secrets, against a services key built
-    under HKCU holding ``services`` as (name, MEFOR_SECRETS_DIRECTORY value) pairs. ``extra`` is
-    PowerShell whose value is returned as ``extra``."""
+    under HKCU holding ``services`` as (name, MEFOR_SECRETS_DIRECTORY value) pairs, plus a service
+    with no Parameters key. ``extra`` is PowerShell whose value is returned as ``extra``."""
     assert _SCRIPT is not None
     root = f"HKCU:\\Software\\MeforTest-{uuid.uuid4().hex[:8]}"
-    rows = ",\n".join(
-        f"@({_psq(name)}, {_psq('MEFOR_SECRETS_DIRECTORY=' + value)})" for name, value in services
+    # One row per line, each with a unary comma, so a single row stays one pair rather than
+    # flattening into its two strings.
+    rows = "\n".join(
+        f"      ,@({_psq(name)}, {_psq('MEFOR_SECRETS_DIRECTORY=' + value)})"
+        for name, value in services
     )
     body = rf"""
   $root = {_psq(root)}
   try {{
-    foreach ($s in @({rows})) {{
+    $services = @(
+{rows}
+    )
+    foreach ($s in $services) {{
       $k = New-Item -Path (Join-Path $root "$($s[0])\Parameters") -Force
       Set-ItemProperty -LiteralPath $k.PSPath -Name AppEnvironmentExtra -Type MultiString `
         -Value @('MEFOR_X=1', $s[1])
     }}
+    New-Item -Path (Join-Path $root 'NoParams') -Force | Out-Null
     $hits = @(Get-OtherServiceNamingPath -ServiceName 'Mine' -Name 'MEFOR_SECRETS_DIRECTORY' `
       -Path 'C:\PD\MF-secrets' -ServicesKey $root)
     [pscustomobject]@{{ hits = $hits; extra = $({extra or "$null"}) }} | ConvertTo-Json -Compress
@@ -3102,14 +3061,36 @@ def _sharer_hits(
 
 
 @_windows_only
+def test_a_secrets_directory_another_service_names_is_found(tmp_path: Path) -> None:
+    """Get-OtherServiceNamingPath, against a services key built under HKCU: a second service whose
+    NSSM environment names the same directory (another case, a trailing backslash), the same one
+    through '..' and forward slashes, a folder inside it, or a folder around it is returned; the
+    installing service itself, a sibling whose name only starts the same, and a service naming
+    another directory are not."""
+    got = _sharer_hits(
+        tmp_path,
+        [
+            ("First", "C:\\PD\\MF-SECRETS\\"),
+            ("Mine", "C:\\PD\\MF-secrets"),
+            ("Dots", "C:/PD/x/../MF-secrets"),
+            ("Inside", "C:\\PD\\MF-secrets\\sub"),
+            ("Around", "C:\\PD"),
+            ("Sibling", "C:\\PD\\MF-secrets-two"),
+            ("Other", "C:\\PD\\elsewhere"),
+        ],
+    )
+    assert sorted(got["hits"]) == ["Around", "Dots", "First", "Inside"], got
+
+
+@_windows_only
 def test_a_secrets_directory_value_that_cannot_be_compared_counts_as_a_sharer(
     tmp_path: Path,
 ) -> None:
     """An absolute value ConvertTo-NormalPath cannot read is returned, not skipped: on Windows
     PowerShell 5.1 a path over 260 characters, which the engine may still read. It names no folder
-    that overlaps C:\\PD\\MF-secrets as written, so only the fail-closed rule reports it. The
-    precondition: the host really cannot read it. The control: a readable value naming another
-    directory is still not returned."""
+    that overlaps C:\\PD\\MF-secrets as written, so only the fail-closed rule reports it. A host
+    that can read it measures nothing here, so it skips. The control: a readable value naming
+    another directory is still not returned."""
     long_value = "C:\\PD\\other\\" + "a" * 300
     got = _sharer_hits(
         tmp_path,
@@ -3117,19 +3098,28 @@ def test_a_secrets_directory_value_that_cannot_be_compared_counts_as_a_sharer(
         host="powershell",
         extra=f"$null -eq (ConvertTo-NormalPath {_psq(long_value)})",
     )
-    assert got["extra"] is True, f"PRECONDITION FAILED: this host reads the long path: {got}"
+    if got["extra"] is not True:
+        pytest.skip(f"SKIP (nothing measured): this host reads the long path: {got}")
     assert sorted(got["hits"]) == ["Long"], got
 
 
 @_windows_only
 def test_a_secrets_directory_value_with_a_leading_space_is_a_sharer(tmp_path: Path) -> None:
-    """The engine strips MEFOR_SECRETS_DIRECTORY before reading it, so a value with a leading space
-    names the same directory and is returned. The control: a leading-space value naming another
-    directory is not."""
+    """The engine strips MEFOR_SECRETS_DIRECTORY with str.strip() before reading it, so a value
+    with a leading space, or a leading U+001C that String.Trim() would keep, names the same
+    directory and is returned. A run with one service checks a single row is not flattened. The
+    control: a leading-space value naming another directory is not returned."""
     got = _sharer_hits(
-        tmp_path, [("Spaced", " C:\\PD\\MF-secrets"), ("Other", " C:\\PD\\elsewhere")]
+        tmp_path,
+        [
+            ("Spaced", " C:\\PD\\MF-secrets"),
+            ("Sep", "\x1cC:\\PD\\MF-secrets"),
+            ("Other", " C:\\PD\\elsewhere"),
+        ],
     )
-    assert sorted(got["hits"]) == ["Spaced"], got
+    assert sorted(got["hits"]) == ["Sep", "Spaced"], got
+    single = _sharer_hits(tmp_path, [("Only", " C:\\PD\\MF-secrets")])
+    assert single["hits"] == ["Only"], single
 
 
 @_windows_only
