@@ -537,9 +537,10 @@ _NEW_IP_OVER_CAP_HEAD = (
 
 def _new_ip_path_field(path: str, seen_text: str | None = None) -> str:
     """The path field of a new-address WARNING (BACKLOG #3770). On both lines it holds the path
-    as the shipped handler filters read it in the pre-#3770 repeat line and, when that leaves a
-    tab, read once more with each tab as a space; escaped and bounded; or a placeholder; never
-    seen-address text. With ``seen_text``, the past-cap line's, that reading is compared with the
+    as the shipped handler filters read it in the pre-#3770 repeat line, read through further
+    handlers until a pass changes nothing, and, when that leaves a tab, read again with each tab as
+    a space; escaped and bounded; or a placeholder; never seen-address text. So the field does not
+    depend on how many handlers the logger carries; ``logging_setup._settled_reading`` says how. With ``seen_text``, the past-cap line's, that reading is compared with the
     pre-#3770 past-cap line, and the field is the placeholder by the rule
     ``logging_setup.redacted_log_field`` states."""
     checks = (
@@ -14014,7 +14015,9 @@ class AuthService:
         # BACKLOG #3770: the path logs as an escaped, bounded field holding only its own redacted
         # text, and the address only as a canonical address or a keyed digest. The tests read
         # both lines through two shipped handlers and check that no field closes, merges with or
-        # erases another for the vectors they name. The path still comes last, a second guard.
+        # erases another for the vectors they name, and that the second handler changes nothing,
+        # which leaves the line the same for every later handler. The path still comes last, a
+        # second guard.
         # Only when the line will be written: this branch is the one a replayed token loops on.
         if flag == "repeat":
             if _log.isEnabledFor(logging.WARNING):

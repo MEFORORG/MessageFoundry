@@ -410,10 +410,11 @@ def _seen_leaks(seen: str, path: str, field: str) -> list[str]:
     return leaks
 
 
-def _two_shipped_handlers() -> tuple[list[io.StringIO], list[logging.Handler]]:
-    """Two handlers, each with the shipped filter chain, so the second reads what the first
-    rewrote: the filters rewrite the record in place."""
-    streams = [io.StringIO(), io.StringIO()]
+def _shipped_handlers(count: int = 2) -> tuple[list[io.StringIO], list[logging.Handler]]:
+    """``count`` handlers, two unless named, each with the shipped filter chain, so each reads what
+    the one before it rewrote: the filters rewrite the record in place. ``configure_logging`` with a
+    log file and a forwarder installs three."""
+    streams = [io.StringIO() for _ in range(count)]
     handlers: list[logging.Handler] = []
     for stream in streams:
         handler = logging.StreamHandler(stream)
@@ -437,7 +438,7 @@ async def test_a_path_cannot_forge_a_field_of_the_new_address_warnings() -> None
     path; or a field is longer than its bound after its escape; or a redaction placeholder is
     escaped out of its searchable spelling (BACKLOG #3770). The lines are read through two handlers,
     each carrying the shipped filter chain (``_install_phi_filters``), not from the record."""
-    streams, handlers = _two_shipped_handlers()
+    streams, handlers = _shipped_handlers()
     logger = logging.getLogger("messagefoundry.auth.service")
     level = logger.level
     for handler in handlers:
@@ -1472,9 +1473,9 @@ _QUOTE_CLOSING_SEEN = (
 )
 
 
-def _sink_lines(fmt: str, *args: object) -> list[str]:
-    """What each of two shipped handlers writes for one WARNING."""
-    streams, handlers = _two_shipped_handlers()
+def _sink_lines(fmt: str, *args: object, count: int = 2) -> list[str]:
+    """What each of ``count`` shipped handlers, two unless named, writes for one WARNING."""
+    streams, handlers = _shipped_handlers(count)
     logger = logging.getLogger("tests.control_hl7")
     logger.propagate = False
     for handler in handlers:
@@ -1492,9 +1493,10 @@ def _sink_lines(fmt: str, *args: object) -> list[str]:
     return written
 
 
-def _last_sink_line(fmt: str, *args: object) -> str:
-    """What the last of two shipped handlers writes for one WARNING, without its line break."""
-    return _sink_lines(fmt, *args)[-1].rstrip("\n")
+def _last_sink_line(fmt: str, *args: object, count: int = 2) -> str:
+    """What the last of ``count`` shipped handlers, two unless named, writes for one WARNING,
+    without its line break."""
+    return _sink_lines(fmt, *args, count=count)[-1].rstrip("\n")
 
 
 def _seen_tail(seen_text: str) -> str:
@@ -1502,12 +1504,13 @@ def _seen_tail(seen_text: str) -> str:
     return " seen_ip=" + scrub_log_argument(seen_text)
 
 
-def _hides_no_less_than_main(path: str, seen: str = "10.0.0.1") -> list[str]:
-    """The words of ``path`` that a sink of this branch's matching line prints in its path field,
-    escapes decoded, more often than main's last handler printed them in its path span, on one of
-    main's two WARNING lines. Main's lines are its own two formats, with the seen address as main
-    logged it. Main's path span is its line after its head and, on the past-cap line, before
-    ``seen_ip=`` and the seen text, as main logged it or as two handlers write it alone. Where
+def _hides_no_less_than_main(path: str, seen: str = "10.0.0.1", count: int = 2) -> list[str]:
+    """With ``count`` shipped handlers, two unless named: the words of ``path`` that a sink of this
+    branch's matching line prints in its path field, escapes decoded, more often than main's last
+    handler printed them in its path span, on one of main's two WARNING lines. Main's lines are its
+    own two formats, with the seen address as main logged it. Main's path span is its line after
+    its head and, on the past-cap line, before ``seen_ip=`` and the seen text, as main logged it or
+    as the same handlers write it alone. Where
     neither tail is found whole, the span runs to the end of the line and the larger of the two
     tails' counts of the word is taken off, uncapped. The subtraction is strict: it guesses no
     boundary, so a word only main's tail printed is not credited to main, but a path word main
@@ -1519,10 +1522,15 @@ def _hides_no_less_than_main(path: str, seen: str = "10.0.0.1") -> list[str]:
     over = _new_ip_path_field(path, seen_text)
     main_tail = _seen_tail(seen_text)
     pairs = (
-        (_sink_lines(_REPEAT_HEAD + "%s", path), _sink_lines(_REPEAT_HEAD + "%s", repeat)),
         (
-            _sink_lines(_OVER_HEAD + "path=%s%s", path, main_tail),
-            _sink_lines(_OVER_HEAD + "seen_ip=%s path=%s", _address_log_field(seen), over),
+            _sink_lines(_REPEAT_HEAD + "%s", path, count=count),
+            _sink_lines(_REPEAT_HEAD + "%s", repeat, count=count),
+        ),
+        (
+            _sink_lines(_OVER_HEAD + "path=%s%s", path, main_tail, count=count),
+            _sink_lines(
+                _OVER_HEAD + "seen_ip=%s path=%s", _address_log_field(seen), over, count=count
+            ),
         ),
     )
     # The control: every sink wrote the WARNING. Its opening words, since main's own line can lose
@@ -1530,13 +1538,16 @@ def _hides_no_less_than_main(path: str, seen: str = "10.0.0.1") -> list[str]:
     opening = "a request from a new client address must re-verify; the address "
     assert all(line.startswith(opening) for pair in pairs for side in pair for line in side)
     words = set(re.findall(r"[A-Za-z0-9]{3,}", path))
-    tails = (main_tail, _last_sink_line("%s", main_tail))
+    tails = (main_tail, _last_sink_line("%s", main_tail, count=count))
     shown = []
     for (main, ours), head, after in zip(
         pairs, (_REPEAT_HEAD, _OVER_HEAD + "path="), (("",), tails), strict=True
     ):
         span, taken_off = _main_span(main[-1], head, opening, after)
-        fields = [_unescaped(_path_value(line)) for line in ours]
+        # The unreadable placeholder is a constant that carries no path text, so its own words,
+        # such as ``redacted``, are not words the field printed of the path.
+        values = (_path_value(line) for line in ours)
+        fields = ["" if value == _UNREADABLE else _unescaped(value) for value in values]
         for word in sorted(words):
             in_main_span = max(0, span.count(word) - taken_off(word))
             if any(field.count(word) > in_main_span for field in fields):
@@ -1612,14 +1623,128 @@ def test_a_control_character_does_not_unhide_an_encoded_hl7_name(path: str) -> N
     assert not _hides_no_less_than_main(path)
 
 
-@pytest.mark.parametrize("path", _MAIN_HID_PATHS)
-def test_the_path_field_hides_no_less_than_main(path: str) -> None:
+#: Paths whose words main's third shipped handler hid and its second printed, so a reading taken
+#: at two handlers printed them (review round-f0aa430e and its fuzz). With a log file and a
+#: forwarder, ``configure_logging`` installs three handlers on one shared record.
+_THIRD_HANDLER_HID = (
+    "/MEFOR_X=session:';\"DOE",
+    "/MEFOR_X=%7C\":'[redacted]token=",
+    "/MEFOR_X=WORDAcode=SECRETVALUE';\"MEFOR_X",
+    '/MEFOR_X=/token="1980-01-01"DOE:',
+    "/MEFOR_X=password=password='token=\"session:'name",
+    '/MEFOR_X=x\'"token="\xa0',
+)
+
+
+@pytest.mark.parametrize("count", (2, 3))
+@pytest.mark.parametrize("path", (*_MAIN_HID_PATHS, *_THIRD_HANDLER_HID))
+def test_the_path_field_hides_no_less_than_main(path: str, count: int) -> None:
     """RED when: a word of the path that main's last shipped handler hid on main's repeat or
-    past-cap line prints on a sink of this branch's matching line (BACKLOG #3770). Main logged the
-    raw path in ``path=%s`` and ``path=%s seen_ip=%s``; this branch logs an escaped field the
-    handlers cannot read into, so the field must already carry what they would have hidden."""
+    past-cap line prints on a sink of this branch's matching line (BACKLOG #3770), with two
+    handlers or with three, as ``configure_logging`` installs with a log file and a forwarder.
+    Main logged the raw path in ``path=%s`` and ``path=%s seen_ip=%s``; this branch logs an
+    escaped field the handlers cannot read into, so the field must already carry what they would
+    have hidden."""
     for seen in _BASELINE_SEEN:
-        assert not _hides_no_less_than_main(path, seen), (ascii(path), seen)
+        assert not _hides_no_less_than_main(path, seen, count), (ascii(path), seen, count)
+
+
+def test_a_third_handler_does_not_unhide_the_path() -> None:
+    """RED when: the path field carries a word that main's third shipped handler hid, so a
+    forwarder behind a log file would write it on a first deployment (BACKLOG #3770). The
+    reviewer's vector: main's forwarder wrote ``path=/MEFOR_X=<redacted> seen_ip=10.0.0.1``."""
+    path, seen = _THIRD_HANDLER_HID[0], "10.0.0.1"
+    seen_text = _bounded_address_text(seen)
+    main = _sink_lines(_OVER_HEAD + "path=%s%s", path, _seen_tail(seen_text), count=3)
+    # The control: main's second sink printed the name and its third hid it.
+    assert "DOE" in main[1] and "DOE" not in main[2], [ascii(line) for line in main]
+    ours = _sink_lines(_REPEAT_HEAD + "%s", _new_ip_path_field(path), count=3)
+    ours += _sink_lines(
+        _OVER_HEAD + "seen_ip=%s path=%s",
+        _address_log_field(seen),
+        _new_ip_path_field(path, seen_text),
+        count=3,
+    )
+    for line in ours:
+        assert "DOE" not in _unescaped(line), ascii(line)
+
+
+#: What the three-handler corpus builds paths from, after ``/MEFOR_X=``: credential labels, quotes
+#: that open and close a value, names, encoded separators and the shapes that turn a pass off.
+_QUOTE_PIECES = (
+    "\xa0",
+    "code=SECRETVALUE",
+    "password='",
+    'token="',
+    "password=",
+    "SECRET",
+    "hunter2",
+    " ",
+    " seen_ip=",
+    "x'",
+    "'",
+    '"',
+    "DOE",
+    "JANE",
+    "a%7Cb%7Cc",
+    "%5E",
+    "/",
+    "Bearer ",
+    "1980-01-01",
+    "\t",
+    "more",
+    ":",
+    "=",
+    "session:",
+    "MEFOR_X=",
+    ";",
+    "|",
+    "name",
+    "token",
+)
+
+
+def test_the_path_field_hides_no_less_than_main_with_three_handlers_over_quote_vectors() -> None:
+    """RED when: over a seeded corpus of quote-closing paths, a word that main's last of three
+    shipped handlers hid prints on a sink of this branch's matching line (BACKLOG #3770)."""
+    rng = random.Random(3)
+    third_hid = 0
+    for _ in range(300):
+        path = _corpus_path(rng, _QUOTE_PIECES, prefix="/MEFOR_X=", most=7)
+        assert not _hides_no_less_than_main(path, "10.0.0.1", count=3), ascii(path)
+        main = _sink_lines(_REPEAT_HEAD + "%s", path, count=3)
+        third_hid += main[1] != main[2]
+    # The control: the corpus holds paths that main's third handler wrote differently from its
+    # second, so a reading taken at two handlers is tested here.
+    assert third_hid >= 10, third_hid
+
+
+def test_a_reading_still_changing_at_the_cap_logs_the_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: a line that the shipped handlers are still rewriting when the reading stops is
+    logged from that last pass rather than as the placeholder, or the cap stops being read
+    (BACKLOG #3770). The reviewer's path changes on main's third handler pass."""
+    import messagefoundry.logging_setup as logging_setup
+
+    path = _THIRD_HANDLER_HID[0]
+    # The control: with the shipped cap the path reads, and its name is hidden.
+    assert _new_ip_path_field(path) == '"/MEFOR_u005F_X_u003D_<redacted>"'
+    monkeypatch.setattr(logging_setup, "_SHIPPED_READING_MAX_PASSES", 3)
+    assert _new_ip_path_field(path) == _UNREADABLE_FIELD
+    assert _new_ip_path_field(path, "10.0.0.1") == _UNREADABLE_FIELD
+
+
+@pytest.mark.parametrize("label", ("token", "password", "secret", "id_token", "access_token"))
+def test_a_credential_matrix_parameter_blanks_every_past_cap_line(label: str) -> None:
+    """RED when: a path holding a credential matrix parameter stops logging the placeholder on the
+    past-cap line, a case ``redacted_log_field`` lists, or its repeat line stops hiding the value
+    (BACKLOG #3770)."""
+    path = f"/x;{label}=abc"
+    repeat = _new_ip_path_field(path)
+    assert "abc" not in repeat and repeat.endswith('_u003D_<redacted>"'), repeat
+    for seen in _BASELINE_SEEN:
+        assert _new_ip_path_field(path, _bounded_address_text(seen)) == _UNREADABLE_FIELD, seen
 
 
 #: What the seeded corpora build paths from: labels, separators, encoded separators, controls,
@@ -1671,9 +1796,16 @@ _CORPUS_PIECES = (
 )
 
 
-def _corpus_path(rng: random.Random) -> str:
-    """One path of a seeded corpus: one to nine of ``_CORPUS_PIECES`` after a slash."""
-    return "/" + "".join(rng.choice(_CORPUS_PIECES) for _ in range(rng.randrange(1, 10)))
+def _corpus_path(
+    rng: random.Random,
+    pieces: tuple[str, ...] = _CORPUS_PIECES,
+    *,
+    prefix: str = "/",
+    most: int = 9,
+) -> str:
+    """One path of a seeded corpus: one to ``most`` of ``pieces`` after ``prefix``, by default
+    one to nine of ``_CORPUS_PIECES`` after a slash."""
+    return prefix + "".join(rng.choice(pieces) for _ in range(rng.randrange(1, most + 1)))
 
 
 def test_the_path_field_hides_no_less_than_main_over_a_seeded_corpus() -> None:
@@ -1877,7 +2009,7 @@ def test_the_past_cap_line_blanks_a_path_only_where_main_wrote_neither_tail_form
 def test_a_cut_checksum_is_never_read_as_a_date() -> None:
     """RED when: the cut mark ends where a word boundary falls before the checksum, so a checksum
     of eight decimal digits starting 19 or 20 logs as ``[redacted]`` (BACKLOG #3770)."""
-    streams, handlers = _two_shipped_handlers()
+    streams, handlers = _shipped_handlers()
     logger = logging.getLogger("tests.cut_checksum")
     logger.propagate = False
     for handler in handlers:

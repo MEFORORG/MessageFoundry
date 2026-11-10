@@ -410,24 +410,41 @@ def _shipped_filters() -> tuple[logging.Filter, ...]:
     return tuple(f for f in handler.filters if isinstance(f, logging.Filter))
 
 
-def _through_shipped_handlers(text: str, handlers: int) -> str:
-    """What the last of ``handlers`` shipped handlers writes for a record whose message is ``text``.
-    Each handler runs the whole chain over the one shared record, as on a configured logger."""
-    filters = _shipped_filters()
+#: The most handler passes :func:`_settled_reading` runs before it gives up on a line that is still
+#: changing (BACKLOG #3770). The measured lines settle within a few passes; one that does not is
+#: read as unreadable rather than as any one pass's output.
+_SHIPPED_READING_MAX_PASSES = 8
+
+
+def _settled_reading(text: str, filters: tuple[logging.Filter, ...]) -> str | None:
+    """What a shipped handler writes for a record whose message is ``text`` once further handlers
+    change it no more, or ``None`` when it is still changing after
+    :data:`_SHIPPED_READING_MAX_PASSES` passes (BACKLOG #3770). Each handler runs the whole chain
+    over the one shared record, as on a configured logger, so the Nth sink writes what N passes
+    leave; a reading taken at a fixed count would hide less than a logger with more handlers, and
+    :func:`configure_logging` installs up to three. The settled line is what every later pass
+    leaves, so it does not depend on the handler count."""
     record = logging.LogRecord(__name__, logging.WARNING, __file__, 0, "%s", (text,), None)
-    for _ in range(handlers):
+    previous: str | None = None
+    for _ in range(_SHIPPED_READING_MAX_PASSES):
         for log_filter in filters:
             log_filter.filter(record)
-    return record.getMessage()
+        out = record.getMessage()
+        if out == previous:
+            return out
+        previous = out
+    return None
 
 
-def _shipped_reading(line: str) -> str:
-    """``line`` as the second of two shipped handlers writes it, then, when that holds a tab, once
-    more with each tab written as a space: a tab, which the control-character escape keeps, makes
-    the PHI pass read the text as not printable and skip it (BACKLOG #3770)."""
-    out = _through_shipped_handlers(line, 2)
-    if "\t" in out:
-        out = _through_shipped_handlers(out.replace("\t", " "), 1)
+def _shipped_reading(line: str) -> str | None:
+    """``line`` as :func:`_settled_reading` reads it, then, when that holds a tab, read again with
+    each tab written as a space: a tab, which the control-character escape keeps, makes the PHI pass
+    read the text as not printable and skip it (BACKLOG #3770). ``None`` when either reading did
+    not settle."""
+    filters = _shipped_filters()
+    out = _settled_reading(line, filters)
+    if out is not None and "\t" in out:
+        out = _settled_reading(out.replace("\t", " "), filters)
     return out
 
 
@@ -446,17 +463,22 @@ def redact_log_value(text: str, *, before: str = "", after: str = "") -> str | N
     control logs as its escape spelling and a tab as a space, so the value no longer tells either
     from that text."""
     out = _shipped_reading(before + text + after)
-    if len(out) < len(before) + len(after) or not (out.startswith(before) and out.endswith(after)):
+    if out is None or len(out) < len(before) + len(after):
+        return None
+    if not (out.startswith(before) and out.endswith(after)):
         return None
     return out[len(before) : len(out) - len(after)]
 
 
 #: What :func:`redacted_log_field` logs when its value cannot be read apart from its context,
 #: escaped and bounded like any value, so it logs as ``"unreadable-redacted"`` at every limit of
-#: 19 or more. Spelled apart from the two placeholders, so it does not read as a credential or PHI
-#: redaction. The escape keeping a character does not stop a filter reading it, so what keeps
-#: this spelling whole is only that two shipped handlers leave it unchanged, which
-#: ``tests/test_admin_new_ip.py`` checks; a respelling needs that check again.
+#: 19 or more; a limit of 16 to 18 gives a cut form, its first 0 to 2 characters and a checksum,
+#: and a limit under 16 gives ``"unloggable-ValueError"``. Spelled apart from the two
+#: placeholders, so it does not read as a credential or PHI redaction. The escape keeping a
+#: character does not stop a filter reading it, so what keeps this spelling whole is only that the
+#: shipped handlers leave it unchanged, which ``tests/test_admin_new_ip.py`` checks through two of
+#: them: a second handler that changes nothing leaves the line the same for every later one. A
+#: respelling needs that check again.
 UNREADABLE_LOG_VALUE = "unreadable-redacted"
 
 
@@ -479,12 +501,19 @@ def redacted_log_field(
     search for redactions also needs :data:`UNREADABLE_LOG_VALUE`, which a limit under 19 cuts,
     and the ``unloggable-`` spelling.
 
-    Apart from a bound under 16, which gives ``unloggable-ValueError``, the field is
+    The reading is the one every later shipped handler leaves, not a fixed number of handler
+    passes, so the field hides what the last sink of a logger with any number of handlers would
+    have hidden; :func:`_settled_reading` gives up after a fixed number of passes, and a line still
+    changing then reads as unreadable.
+
+    Apart from a bound under 16, which gives ``unloggable-ValueError``, and a bound of 16 to 18,
+    which gives the cut form :data:`UNREADABLE_LOG_VALUE` states where that value is due, the field
+    is
     :data:`UNREADABLE_LOG_VALUE` at least when the reading of ``before`` + ``text`` +
     ``after`` does not keep ``before`` and ``after`` whole at its ends, or when, for a
     ``(head, tail)`` of ``checks``, the reading of ``head`` + ``text`` + ``tail`` does not read as
-    ``head``, the value, and the tail either as it was or as written alone. This rule is stated
-    here once for callers to link to.
+    ``head``, the value, and the tail either as it was or as written alone; or when a reading
+    does not settle. This rule is stated here once for callers to link to.
 
     For example (measured, each pinned in ``tests/test_admin_new_ip.py`` through the new-address
     path field, whose check puts ``seen_ip=`` and the seen address after the path):
@@ -494,7 +523,11 @@ def redacted_log_field(
     - a path ending in a credential label followed by ``:`` or ``=``, as ``/x/password:`` or
       ``/x/password=``, or in the Bearer word, as ``/api/auth/bearer``;
     - a path holding a no-break space or a credential shape, as ``/x code=SECRETVALUE``, with a
-      seen address holding an encoded HL7 run and a tab, as ``a%7Cb%7Cc``, a tab and ``x``."""
+      seen address holding an encoded HL7 run and a tab, as ``a%7Cb%7Cc``, a tab and ``x``;
+    - a path holding a credential matrix parameter, as ``/x;password=abc``, ``;token=``,
+      ``;secret=``, ``;id_token=`` or ``;access_token=``, with any seen address: the repeat line
+      logs the label and the placeholder, and every past-cap line logs
+      :data:`UNREADABLE_LOG_VALUE`."""
     try:
         value = redact_log_value(text, before=before, after=after)
         if value is None or not all(_reads_as(value, head, text, tail) for head, tail in checks):
@@ -516,9 +549,15 @@ def redacted_log_field(
 def _reads_as(value: str, head: str, text: str, tail: str) -> bool:
     """Whether the line ``head`` + ``text`` + ``tail`` reads with ``value`` unchanged where ``text``
     stood, then ``tail`` as it was or as the passes write it alone (BACKLOG #3770). The tail is read
-    alone only when the line is not exactly ``head``, ``value`` and ``tail``."""
+    alone only when the line is not exactly ``head``, ``value`` and ``tail``. A reading that did not
+    settle matches nothing."""
     line = _shipped_reading(head + text + tail)
-    return line == head + value + tail or line == head + value + _shipped_reading(tail)
+    if line is None:
+        return False
+    if line == head + value + tail:
+        return True
+    alone = _shipped_reading(tail)
+    return alone is not None and line == head + value + alone
 
 
 #: The exception types :func:`redacted_log_field` has reported, so each is reported once.
