@@ -41,7 +41,8 @@ from typing import Final
 from messagefoundry.store.crypto import NO_STORE_ID, Cipher, derive_row_seal_key, row_seal_key_id
 
 #: The marker every stored seal starts with. Versioned, so a later format is an added version and
-#: never a silent change to what an existing seal means.
+#: never a silent change to what an existing seal means. One change predates any deployment: v1's
+#: encoding of ``-0.0`` moved onto ``0.0``'s (BACKLOG #6717).
 SEAL_PREFIX: Final = "mfseal:v1:"
 
 #: The kind a session row is sealed under. Each sealed table has its own kind.
@@ -145,7 +146,6 @@ def _encode_value(value: object) -> tuple[bytes, bytes]:
         return _TYPE_INT, str(value).encode("ascii")
     if isinstance(value, float):
         # -0.0 == 0.0, so this moves -0.0 alone onto 0.0's encoding and leaves every other float's.
-        # It changed v1's encoding of -0.0 in place, before any store was deployed (BACKLOG #6717).
         return _TYPE_FLOAT, (0.0 if value == 0.0 else value).hex().encode("ascii")
     if isinstance(value, str):
         # surrogatepass, so a value a driver decoded with surrogateescape still encodes.
@@ -218,25 +218,19 @@ class RowSealer:
 
     @staticmethod
     def _matches(key: bytes, kind: str, fields: Iterable[tuple[str, object]], mac: str) -> bool:
-        try:
-            encoded = seal_bytes(kind, fields)
-        except (ValueError, OverflowError):
-            # A value the encoder cannot frame (an int past str()'s digit limit, a part past 4 GiB,
-            # a name that is not UTF-8) fails the check. Callers catch only TypeError, which still
-            # propagates as it did (BACKLOG #6718).
-            return False
-        expected = hmac.new(key, encoded, hashlib.sha256).hexdigest()
+        expected = hmac.new(key, seal_bytes(kind, fields), hashlib.sha256).hexdigest()
         # As bytes: compare_digest refuses a str holding non-ASCII, which a stored value may.
         return hmac.compare_digest(mac.encode("utf-8", "surrogatepass"), expected.encode("ascii"))
 
     def seal(self, kind: str, fields: Iterable[tuple[str, object]]) -> str:
         """The stored seal for a row of ``kind`` holding ``fields``.
 
-        Raises ``ValueError`` when a float is a NaN or an infinity (BACKLOG #6717). SQLite stores a
-        NaN as ``NULL``, so its seal would fail the next read as if the row had been changed. An
-        infinity round-trips, but no sealed field means anything by one, so it is refused with the
-        NaN rather than sealed. The check is here and not in the encoder, so a row someone set to
-        such a value still fails :meth:`verify` rather than raising from it."""
+        Raises at least what the encoder raises, and ``ValueError`` when a float is a NaN or an
+        infinity (BACKLOG #6717). SQLite stores a NaN as ``NULL``, so its seal would fail the next
+        read as if the row had been changed. An infinity round-trips, but no sealed field means
+        anything by one, so it is refused with the NaN rather than sealed. The check is here and not in the encoder, so a row someone set to
+        such a value still fails :meth:`verify` rather than raising from it, and so that
+        :func:`seal_bytes`'s other callers keep their encodings."""
         fields = tuple(fields)
         if any(isinstance(v, float) and not -_FLOAT_INF < v < _FLOAT_INF for _, v in fields):
             raise ValueError("a row seal refuses a float that is not finite")

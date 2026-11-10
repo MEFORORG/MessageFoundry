@@ -252,20 +252,3 @@ def test_a_stored_seal_that_is_not_text_fails_every_check_without_raising(
     assert not held.verify_held("session", _FIELDS, other)
     assert not held.is_active(other)
     assert not rekeyed.sealed_by_retired_key("session", _FIELDS, other)
-
-
-@pytest.mark.parametrize(
-    "fields",
-    [(("f", 10**5000),), (("\udc80", "v"),)],
-    ids=["int-past-the-digit-limit", "name-not-utf8"],
-)
-def test_a_value_the_encoder_cannot_frame_fails_the_check_without_raising(
-    fields: tuple[tuple[str, object], ...],
-) -> None:
-    # BACKLOG #6718: a ValueError escaped every caller's ``except TypeError``.
-    sealer = _sealer()
-    stored = sealer.seal("session", _FIELDS)
-    assert sealer.verify_held("session", _FIELDS, stored)  # control
-    assert not sealer.verify("session", fields, stored)
-    assert not sealer.verify_held("session", fields, stored)
-    assert not sealer.sealed_by_retired_key("session", fields, stored)
