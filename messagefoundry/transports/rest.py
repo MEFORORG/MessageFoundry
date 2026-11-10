@@ -1438,6 +1438,10 @@ def refuse_verify_off(
     docs/CONNECTIONS.md, :func:`_shipped_strict_disposition` and the ``verify_tls`` parameter
     comments in ``config/wiring.py`` still restate parts of it; change them with it.
 
+    A REST destination that sets ``ech_egress`` never reaches this gate with ``verify_tls=false``:
+    ``RestDestination.__init__`` refuses that pair first, in every posture and whatever the
+    connection attests (vault BACKLOG #2977).
+
     Disabling certificate verification makes the ``https`` hop MITM-able, so it is an insecure hop:
     an enforcing hop REFUSES, an on-box loopback / per-hop-attested hop is allowed, and the CLAMPED
     global escape (``MEFOR_ALLOW_INSECURE_TLS``, honoured only at ``[security].enforcement = warn``
@@ -2775,6 +2779,17 @@ class RestDestination(DestinationConnector):
                 "ech_egress and proxy_url are mutually exclusive — the ECH sidecar IS this connection's "
                 "egress path (ADR 0139)"
             )
+        # Vault BACKLOG #2977 item 8: the sidecar, not the engine, makes the TLS connection to the
+        # destination, so verify_tls=false turns off no verification the engine does. It used to skip
+        # the revocation guard below, which runs only on the verify-ON branch. Refused here, above
+        # refuse_verify_off, so that gate logs no attested crossing and no DISABLED warning for a
+        # connection that never builds. No attestation crosses it, as with proxy_url above.
+        verify = bool_setting(s, "verify_tls", default=True)
+        if self._ech_sidecar is not None and not verify:
+            raise ValueError(
+                "ech_egress and verify_tls=false are mutually exclusive — the ECH sidecar, not the "
+                "engine, makes this connection's TLS connection to the destination (ADR 0139)"
+            )
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy. None (default, or when
         # ECH is active) → no ProxyHandler and no Proxy-Authorization threaded below → byte-identical.
         self._proxy: ProxyConfig | None = (
@@ -2860,7 +2875,6 @@ class RestDestination(DestinationConnector):
                 credentials=(),
                 connection=config.name,
             )
-        verify = bool_setting(s, "verify_tls", default=True)
         if verify:
             # #129 (ADR 0094): granular expiry-only relaxation — verify the chain's signatures + hostname
             # but tolerate an expired server cert, and at least the other chain certificates' and a CRL's
