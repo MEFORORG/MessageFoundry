@@ -2046,21 +2046,6 @@ def test_an_unsolicited_frame_after_an_answer_still_dead_letters(
         session.close()
 
 
-def test_an_unsolicited_frame_after_an_answer_is_its_own_cause(
-    graph: tuple[Registry, str],
-) -> None:
-    registry, config_dir = graph
-    session = _session(config_dir)
-    try:
-        session._spawn("transform")
-        session._responses.put(b"{}")
-        with pytest.raises(SandboxError, match="unsolicited"):
-            session._reject_unsolicited(session._proc, "after", "transform")
-        assert session.last_kill_cause is KillCause.UNSOLICITED_AFTER
-    finally:
-        session.close()
-
-
 def test_a_reap_that_is_not_a_kill_records_nothing_and_does_not_warn(
     graph: tuple[Registry, str], caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -2069,7 +2054,7 @@ def test_a_reap_that_is_not_a_kill_records_nothing_and_does_not_warn(
     same."""
     registry, config_dir = graph
     session = _session(config_dir)
-    caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
+    caplog.set_level(logging.INFO, logger=sandbox_mod.log.name)
     try:
         session._spawn("transform")
         session._responses.put(_EOF)

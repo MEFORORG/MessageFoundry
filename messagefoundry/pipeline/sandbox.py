@@ -1024,6 +1024,11 @@ class SandboxSession:
         :meth:`_reap` instead."""
         if proc is None:
             return
+        self._record_kill(cause, phase)
+        self._reap(proc)
+
+    def _record_kill(self, cause: KillCause, phase: str) -> None:
+        """Record a kill's cause and write its line, as :meth:`_kill` describes."""
         self.last_kill_cause = cause
         self.kill_counts[cause] += 1
         if cause not in _RUNNER_ALERTED:
@@ -1034,7 +1039,6 @@ class SandboxSession:
                 phase,
                 cause.value,
             )
-        self._reap(proc)
 
     def _reap(self, proc: subprocess.Popen[bytes] | None) -> None:
         """Reap ``proc``'s whole tree, recording and logging nothing (see :class:`KillCause`)."""
@@ -1492,10 +1496,13 @@ class SandboxSession:
             # per-spawn nonce plus a sequence) let the code running dispatch N compute N+1's and
             # pre-stage its answer.
             request_id = secrets.token_hex(16)
-            # Encoded and size-checked BEFORE a worker is resolved and outside the write's try: a
-            # payload or run-context outside the closed grammar, or a frame over the cap, is refused
-            # with no byte written, so the worker is still in step and is kept, and no worker is
-            # started for a message that cannot be sent (vault BACKLOG #3135). Only this message fails.
+            # Resolved FIRST, so a session with a cached graph refusal refuses at once rather than
+            # encode each message (a reference view can be large) only to refuse it.
+            proc = self._live_worker(phase)
+            assert proc.stdin is not None
+            # Encoded and size-checked outside the write's try: a payload or run-context outside the
+            # closed grammar, or a frame over the cap, is refused with no byte written, so the worker
+            # is still in step and is kept (vault BACKLOG #3135). Only this message fails.
             try:
                 request = codec.encode_request(
                     request_id=request_id,
@@ -1509,8 +1516,6 @@ class SandboxSession:
                     raise SandboxError(f"sandbox frame too large: {len(request)} bytes")
             except SandboxError as exc:
                 raise SandboxError(f"failed to marshal sandbox {phase} {name!r}: {exc}") from exc
-            proc = self._live_worker(phase)
-            assert proc.stdin is not None
             try:
                 _write_frame(proc.stdin, request)
             except (OSError, SandboxError) as exc:
@@ -1519,21 +1524,25 @@ class SandboxSession:
                 self._kill(proc, KillCause.REQUEST_WRITE, phase)
                 raise SandboxError(f"failed to send sandbox {phase} {name!r}: {exc}") from exc
             resp = self._await_answer(proc, request_id, phase, name)
-            if not resp.ok and resp.kind == codec.FAIL_MEMORY:
-                # The worker exits after this reply. Kill it now, before the unsolicited check,
-                # which would otherwise take the exit's EOF and reap it with no cause recorded; the
-                # next dispatch starts a fresh worker with a fresh queue (vault BACKLOG #3133, #3135).
-                self._kill(proc, KillCause.MEMORY_CAP, phase)
-                # The worker's text names the cap it set, or says it set none.
-                raise SandboxError(
-                    f"sandbox {phase} {name!r} ran out of memory, and its worker was "
-                    f"recycled: {resp.error}"
-                )
             # One request, one frame: a second FRAME already queued means the worker is writing frames
             # nobody asked for, so this answer is not trustworthy either. (A queued EOF is only a dead
             # peer — it reaps the worker and leaves this proven answer standing.)
             self._reject_unsolicited(proc, "after", phase)
             if not resp.ok:
+                if resp.kind == codec.FAIL_MEMORY:
+                    # The worker exits after this reply. Reap it now, so the next dispatch starts a
+                    # fresh one rather than writing to a worker on its way out (vault BACKLOG #3133).
+                    # Its exit EOF may already have reaped it in the check above, and the cause is
+                    # then recorded without a second reap of a dead pid (vault BACKLOG #3135).
+                    if proc is self._proc:
+                        self._kill(proc, KillCause.MEMORY_CAP, phase)
+                    else:
+                        self._record_kill(KillCause.MEMORY_CAP, phase)
+                    # The worker's text names the cap it set, or says it set none.
+                    raise SandboxError(
+                        f"sandbox {phase} {name!r} ran out of memory, and its worker was "
+                        f"recycled: {resp.error}"
+                    )
                 verdict = "denied" if resp.kind == "denied" else "failed"
                 raise SandboxError(f"sandbox {verdict} {phase} {name!r}: {resp.error}")
             return resp.result
