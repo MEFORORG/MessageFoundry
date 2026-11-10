@@ -186,7 +186,37 @@ def _thresholds(sb: Sandbox) -> Path:
     return sb.state_path.parent / "thresholds.json"
 
 
-PLAIN = ("-Touches", "messagefoundry/parsing/consistency.py")
+PLAIN = ("-Touches", "messagefoundry_toolkit/generators/adt.py")
+SID = "sess-test-0001"
+_BOXES: dict[str, str] = {}
+
+
+def _box(sb: Sandbox) -> str:
+    """This sandbox worktree's host-keyed seat box, as decision.ps1 resolves it."""
+    key = str(sb.repo)
+    if key not in _BOXES:
+        script = (
+            ". ./scripts/coord/mail-key.ps1; . ./scripts/coord/coord-root.ps1; "
+            "ConvertTo-BoxKey -Path (Resolve-Path -LiteralPath (git rev-parse --show-toplevel)).Path"
+        )
+        out = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+            cwd=key,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=True,
+        ).stdout.split()
+        assert len(out) == 1, out
+        _BOXES[key] = out[0]
+    return _BOXES[key]
+
+
+def declare(sb: Sandbox, seat: str, sid: str = SID) -> None:
+    """Write the seat record ``sid`` declared, where seat.ps1 writes it in the sandbox."""
+    box = sb.coord / "seats" / _box(sb)
+    box.mkdir(parents=True, exist_ok=True)
+    (box / f"{sid}.json").write_text(json.dumps({"seat": seat}), encoding="utf-8")
 
 
 def gate(
@@ -201,9 +231,12 @@ def gate_touching(
     *args: str,
     item: str = "4242",
     seat: str | None = "manager",
+    declared: str = "yes",  # "no" leaves the seat record to the test; a str so **extra types
     **extra: str,
 ) -> tuple[int, dict[str, Any]]:
     seat_args = ("-Seat", seat) if seat is not None else ()
+    if seat is not None and declared == "yes":
+        declare(sb, seat)
     proc = sb.run(
         DECISION,
         *no_host_usage(sb, ("-Gate", "-Item", item, *seat_args, "-Json", *touches, *args)),
@@ -228,6 +261,73 @@ def test_a_calibrated_seat_with_nothing_against_it_may_act_without_review(sb: Sa
     assert (code, doc["result"]) == (NO_REVIEW, "NO-REVIEW"), why(doc)
 
 
+def test_a_seat_other_than_the_declared_one_reviews(sb: Sandbox) -> None:
+    seed_vault(sb, calibrated("manager"))
+    declare(sb, "builder")
+    code, doc = gate_touching(sb, PLAIN, declared="no")
+    assert code == REVIEW and "is not the seat this session declared" in why(doc), why(doc)
+
+
+def test_the_declared_seat_is_this_sessions_own_whatever_session_names(sb: Sandbox) -> None:
+    """Another session's record is not this one's, so -Session cannot borrow it."""
+    seed_vault(sb, calibrated("manager"))
+    declare(sb, "manager", sid="other-sess")
+    code, doc = gate_touching(sb, PLAIN, "-Session", "other-sess", declared="no")
+    assert code == REVIEW and "no seat record names this session" in why(doc), why(doc)
+
+
+def test_no_session_id_reviews(sb: Sandbox) -> None:
+    seed_vault(sb, calibrated("manager"))
+    declare(sb, "manager")
+    code, doc = gate_touching(sb, PLAIN, "-Session", SID, declared="no", CLAUDE_CODE_SESSION_ID="")
+    assert code == REVIEW and "CLAUDE_CODE_SESSION_ID is not set" in why(doc), why(doc)
+
+
+def test_a_declared_builder_naming_the_lander_is_not_exempt(sb: Sandbox) -> None:
+    declare(sb, "builder")
+    write_fake_usage(_usage_path(sb), usage(99.0, state="CRITICAL"))
+    code, doc = gate_touching(sb, PLAIN, seat="lander", declared="no")
+    assert code == HALT, why(doc)
+
+
+def test_the_special_seat_has_no_fast_path(sb: Sandbox) -> None:
+    seed_vault(sb, calibrated("special"))
+    code, doc = gate(sb, seat="special")
+    assert code == REVIEW and "the Special seat" in why(doc), why(doc)
+
+
+def test_log_refuses_a_record_under_another_seats_label(sb: Sandbox) -> None:
+    declare(sb, "builder")
+    ref = rec()["id"]
+    proc = sb.run(
+        DECISION, "-Log", "-Kind", "outcome", "-Seat", "manager", "-Ref", ref, "-Outcome", "merged"
+    )
+    assert proc.returncode == 2 and "is not the seat this session declared" in proc.stderr
+    assert sb.spool() == []
+
+
+def test_a_path_under_a_linked_directory_reviews(sb: Sandbox, tmp_path: Path) -> None:
+    seed_vault(sb, calibrated("manager"))
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    (target / "a.hl7").write_text("MSH|\n", encoding="utf-8")
+    link = sb.repo / "samples" / "messages"
+    link.parent.mkdir(parents=True)
+    if sys.platform == "win32":
+        made = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        if made.returncode != 0:
+            pytest.skip("no junction could be made")
+    else:
+        link.symlink_to(target, target_is_directory=True)
+    code, doc = gate_touching(sb, ("-Touches", "samples/messages/a.hl7"))
+    assert code == REVIEW and "symbolic link" in why(doc), why(doc)
+
+
 def test_an_empty_history_is_not_calibrated(sb: Sandbox) -> None:
     """Manager decision 2026-11-09: no signal against a seat is not evidence for it, so the fast
     path stays closed until 20 resolved outcomes are logged."""
@@ -250,7 +350,9 @@ def test_a_decisions_own_log_time_outcome_does_not_resolve_it(sb: Sandbox) -> No
     assert code == REVIEW and "resolved outcomes 0/20 BELOW FLOOR" in why(doc), why(doc)
 
 
-@pytest.mark.parametrize("status", ["deferred", "rejected", "pending.", "in-progress"])
+@pytest.mark.parametrize(
+    "status", ["deferred", "rejected", "pending.", "in-progress", "done", "kept"]
+)
 def test_a_status_off_the_resolved_list_does_not_resolve(sb: Sandbox, status: str) -> None:
     decided = [rec(at=ago(days=3, minutes=i), item=f"o{i}") for i in range(FLOOR)]
     later = [
@@ -296,6 +398,7 @@ def test_a_status_logged_later_resolves_a_decision(sb: Sandbox) -> None:
 
 def test_no_review_names_the_conditions_it_did_not_check(sb: Sandbox) -> None:
     seed_vault(sb, calibrated("manager"))
+    declare(sb, "manager")
     proc = sb.run(DECISION, *no_host_usage(sb, ("-Gate", "-Item", "1", "-Seat", "manager", *PLAIN)))
     assert proc.returncode == NO_REVIEW and proc.stdout.strip() == "NO-REVIEW", proc.stderr
     for unchecked in ("a single revert or PR close undoes the act", "the act serves one item"):
@@ -303,6 +406,7 @@ def test_no_review_names_the_conditions_it_did_not_check(sb: Sandbox) -> None:
 
 
 def test_the_plain_answer_is_one_word_with_the_reasons_on_stderr(sb: Sandbox) -> None:
+    declare(sb, "manager")
     proc = sb.run(DECISION, *no_host_usage(sb, ("-Gate", "-Item", "1", "-Seat", "manager")))
     assert proc.returncode == REVIEW
     assert proc.stdout.strip() == "REVIEW"
@@ -322,11 +426,10 @@ def test_an_act_that_names_nothing_it_touches_reviews(sb: Sandbox) -> None:
 @pytest.mark.parametrize(
     "path",
     [
-        "messagefoundry/parsing/consistency.py",
         "samples/messages/adt_a01.hl7",
         "messagefoundry_toolkit/generators/adt.py",
-        "docs/STEPS-PALETTE.md",
-        "tests/test_message.py",
+        "docs/MESSAGE-ORDERING-DESIGN.md",
+        "tests/test_generated_adt.py",
     ],
 )
 def test_a_path_on_the_allowlist_may_take_the_fast_path(sb: Sandbox, path: str) -> None:
@@ -572,6 +675,11 @@ def test_an_alias_shares_its_seats_calibration(sb: Sandbox) -> None:
         "messagefoundry/parsing/x12/delimiters.py",
         "tests/test_parsing.py",
         "tests/test_parse_tree.py",
+        "messagefoundry/parsing/consistency.py",
+        "tests/test_message.py",
+        "tests/test_generators_core.py",
+        "messagefoundry_toolkit/generators/_core.py",
+        "docs/STEPS-PALETTE.md",
     ],
 )
 def test_a_class_c_or_unclassifiable_path_reviews(sb: Sandbox, path: str) -> None:
@@ -715,23 +823,31 @@ def test_the_json_answer_carries_the_paths_it_classified(sb: Sandbox) -> None:
     code, doc = gate(sb)
     assert code == NO_REVIEW, why(doc)
     assert sorted(doc["paths"]) == [
-        "messagefoundry/parsing/consistency.py",
+        "messagefoundry_toolkit/generators/adt.py",
         "samples/messages/a.hl7",
     ]
 
 
 def test_a_deleted_test_reviews(sb: Sandbox) -> None:
     (sb.repo / "tests").mkdir()
-    (sb.repo / "tests" / "test_message.py").write_text("x = 1\n", encoding="utf-8")
+    (sb.repo / "tests" / "test_generated_adt.py").write_text("x = 1\n", encoding="utf-8")
     resync(sb)
     seed_vault(sb, calibrated("manager"))
-    (sb.repo / "tests" / "test_message.py").unlink()
+    (sb.repo / "tests" / "test_generated_adt.py").unlink()
     code, doc = gate(sb)
     assert code == REVIEW and "is a deleted test" in why(doc), why(doc)
 
 
 @pytest.mark.parametrize(
-    "ignored", [".claude/settings.local.json", ".env", "samples/messages/.env.local"]
+    "ignored",
+    [
+        ".claude/settings.local.json",
+        ".env",
+        "samples/messages/.env.local",
+        "docker/secrets.env",
+        "AGENTS.md",
+        "scripts/x.local.txt",
+    ],
 )
 def test_an_ignored_agent_or_environment_file_reviews(sb: Sandbox, ignored: str) -> None:
     (sb.repo / ".gitignore").write_text(f"{ignored}\n", encoding="utf-8")
@@ -741,7 +857,7 @@ def test_an_ignored_agent_or_environment_file_reviews(sb: Sandbox, ignored: str)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("x\n", encoding="utf-8")
     code, doc = gate(sb)
-    assert code == REVIEW and "git-ignored agent or environment path" in why(doc), why(doc)
+    assert code == REVIEW and "git-ignored" in why(doc), why(doc)
 
 
 def test_the_hook_written_seat_files_do_not_close_the_path(sb: Sandbox) -> None:
@@ -1667,7 +1783,10 @@ def test_a_reversal_is_sticky_whatever_is_logged_after_it(sb: Sandbox) -> None:
     assert code == REVIEW and "two reversals of manager's decisions" in why(doc), why(doc)
 
 
-@pytest.mark.parametrize("word", ["reopened", "rebriefed", "re-briefed", "Overridden"])
+@pytest.mark.parametrize(
+    "word",
+    ["reopened", "rebriefed", "re-briefed", "Overridden", "closed", "abandoned", "withdrawn"],
+)
 def test_every_reversal_word_is_a_reversal(sb: Sandbox, word: str) -> None:
     theirs = rec(at=ago(days=6), seat="builder", item="4242")
     undone = rec("outcome", at=ago(days=5), seat="lander", ref=theirs["id"], outcome=word)
@@ -1797,6 +1916,7 @@ LOG_B = ("-Log", "-Item", "4242", "-Seat", "manager", "-Recommendation", "go")
 def _log(
     sb: Sandbox, *args: str, klass: str = "B", touches: tuple[str, ...] = PLAIN
 ) -> subprocess.CompletedProcess[str]:
+    declare(sb, "manager")
     return sb.run(DECISION, *no_host_usage(sb, (*LOG_B, "-Class", klass, *touches, *args)))
 
 

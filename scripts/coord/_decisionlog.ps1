@@ -602,11 +602,13 @@ function Get-DecisionOutcome($Record, [hashtable]$Outcomes) {
 # a reversal, which plan 4.2 defines as a revert, a reopen, a re-brief or an override. Every one is
 # STICKY: once logged it counts, and no later outcome cancels it.
 $script:DecisionSignalOutcomes = @('red-after-merge', 'held')
-$script:DecisionReversalOutcomes = @('reversed', 'reopened', 'rebriefed', 're-briefed', 'overridden')
+# A PR close is the T1 undo, so closed, abandoned and withdrawn are reversals too (Manager
+# decision 2026-11-09, plan section 12).
+$script:DecisionReversalOutcomes = @('reversed', 'reopened', 'rebriefed', 're-briefed', 'overridden', 'closed', 'abandoned', 'withdrawn')
 # The status outcomes that are a result, an allowlist: any other status, a typo included, is not
 # one. A status counts only from a later `outcome` record, never from the decision's own log-time
 # -Outcome, which is written before the act exists.
-# A close is the T1 undo, so 'closed' is not a clean result, and a vague 'done' or 'kept' is not one.
+# A close is a reversal (above), and a vague 'done' or 'kept' is not a result.
 $script:DecisionResolvedOutcomes = @('merged', 'landed', 'shipped')
 # NO-REVIEW needs at least this many of the seat's decisions in the 14-day window to carry a
 # resolved outcome (Manager decision 2026-11-09, plan section 12).
@@ -753,24 +755,22 @@ function Get-DecisionCalibration {
 # A path the T1 fast path may touch matches one of these, and Get-DecisionClassCPath names nothing
 # about it. Anything else goes to review. Product code outside the security modules, and its tests:
 # keep it conservative, since a path added here skips review. Every entry names files one by one,
-# so a file added later defaults to REVIEW until someone decides it belongs here. The parser's
-# message model (XXE hardening in message.py), validators, XML, DICOM, FHIR and decompression code
-# are not named, and Get-DecisionClassCPath denies them and every dot segment as well.
+# so a file added later defaults to REVIEW until someone decides it belongs here. No file under
+# messagefoundry/parsing/ is eligible (Manager decision 2026-11-09): every module there holds a
+# bound, a PHI-safe message, a ReDoS-pinned pattern or a hardening, or is pinned as one.
 $script:DecisionFastPathAllow = @(
-    # Not peek (input bounds), summary (PHI summary fields), split (ReDoS-pinned patterns),
-    # validate, tree, binary, groups, sniff or the X12 framing: each holds or is pinned as a control
-    # (Manager decision 2026-11-09). A parsing file joins only when a test pins nothing in it.
-    '^messagefoundry/parsing/consistency\.py$',
-    '^messagefoundry_toolkit/generators/(readme\.md|_core\.py|_hl7data\.py|(adt|all_types|bar|dft|documents|mdm|mfn|oml|orl|orm|oru|ras|rde|siu|vxu)\.py)$',
+    # Not _core.py, which holds write_corpus's out-of-root refusal.
+    '^messagefoundry_toolkit/generators/(readme\.md|_hl7data\.py|(adt|all_types|bar|dft|documents|mdm|mfn|oml|orl|orm|oru|ras|rde|siu|vxu)\.py)$',
     '^messagefoundry_toolkit/hl7(schema|structures)\.py$',
     # Synthetic sample messages only: sample config carries connection, TLS and credential settings.
     '^samples/messages/[a-z0-9_.-]+\.hl7$',
     # Ordinary product pages, named one by one: a page carrying security, PHI, TLS, deployment or
     # exposure prose is never here.
-    '^docs/(hl7-message-ordering-reference|message-ordering-design|steps-palette)\.md$',
-    # Their tests, named one by one: a hardening, bounds, guard, transport or pipeline test is not.
-    # A test that pins a bound, a ReDoS pattern, PHI handling or entity hardening is not here.
-    '^tests/test_(builtin_hl7_parity|generate_cli|generated_adt|generators_(choice|core|types)|hl7schema|message|message_type_of)\.py$'
+    '^docs/(hl7-message-ordering-reference|message-ordering-design)\.md$',
+    # Their tests, named one by one.
+    # Only tests a grep for guard, injection, refusal, PHI, bound, ReDoS and hardening words finds
+    # nothing in: not test_generators_core (an out-of-root refusal) or test_message (HL7 injection).
+    '^tests/test_(generate_cli|generated_adt|generators_(choice|types)|hl7schema)\.py$'
 )
 
 function Get-DecisionPathKey([string]$Path) {
