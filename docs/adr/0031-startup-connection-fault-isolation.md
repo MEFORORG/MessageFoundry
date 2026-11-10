@@ -67,9 +67,9 @@ ADT, X12, eligibility, and FHIR feeds with it.
 ### §1 Per-connection isolation at startup
 
 `start()` builds each Connection independently. The outbound build + the inbound bind are each wrapped
-so a failure of one is caught, **recorded** (`self._failed[name] = reason` as decided; amended
-2026-11-09, vault BACKLOG #5146: the key is `(kind, name)` and the value a `FailedLine` holding the
-reason and whether it is a store fault), **logged** at ERROR with
+so a failure of one is caught, **recorded** (`self._failed[name] = reason` as decided; the key has
+been `(kind, name)` since section 5, and amended 2026-11-09, vault BACKLOG #5146, the value is a
+`FailedLine` holding the reason and whether it is a store fault), **logged** at ERROR with
 the cause, and **alerted** (`AlertSink.connection_stopped(name, detail="failed to start: …")`) — then
 startup **continues**. The outer `except` that unwinds + re-raises is retained as a backstop for
 genuinely fatal, *graph-wide* startup errors (the store, the lookup executor) — those are not a single
@@ -120,9 +120,11 @@ running production engine gets the config validated before anything is quiesced)
 
 ### §5 Surfacing
 
-`RegistryRunner` exposes exactly four accessors over the failure map, and every one of them names a
+`RegistryRunner` exposed exactly four accessors over the failure map, and every one of them names a
 direction: `inbound_failed(name) -> str | None`, `outbound_failed(name) -> str | None`,
-`degraded_inbound() -> dict[str, str]`, and `degraded_outbound() -> dict[str, str]`.
+`degraded_inbound() -> dict[str, str]`, and `degraded_outbound() -> dict[str, str]`. Amended
+2026-11-09 (vault BACKLOG #5146): a fifth, `failed_on_store_fault(kind, name) -> bool`, reads the
+line's class, and it names a direction too.
 
 **The map is keyed by `(Direction, name)`, not by name, and there is deliberately no direction-blind
 accessor.** A name may legitimately be both an inbound and an outbound (`Registry._add` enforces uniqueness

@@ -1905,7 +1905,7 @@ class RegistryRunner:
         # success, so a retry storm emits one transition pair, not one per delivery. A partner reject
         # (NegativeAckError) is not a transport failure and never flips it.
         self._lane_healthy: dict[str, bool] = {}
-        # Connections that FAILED to build/bind at start ((kind, name) → reason). A failed connection is
+        # Connections that FAILED to build/bind at start ((kind, name) → FailedLine). A failed connection is
         # isolated, never fatal — the rest of the graph still comes up (a failed connection must not
         # crash the engine, ADR 0031). A failed OUTBOUND still gets its delivery worker, but with no
         # connector in _destinations, so rows routed to it are retried + alerted (never silently
@@ -1918,7 +1918,7 @@ class RegistryRunner:
         # reported itself healthy, while an operator restarting that outbound afterwards re-set the entry
         # and made a status reader call the healthy inbound failed. Read it through the direction-scoped
         # accessors (inbound_failed / outbound_failed), never by reaching in with a bare name.
-        # Each value carries whether its line is a store fault (FailedLine, vault BACKLOG #5146).
+        # A FailedLine carries the reason and whether it is a store fault (vault BACKLOG #5146).
         self._failed: dict[tuple[Direction, str], FailedLine] = {}
         # Connections SKIPPED by the DR run-profile (#61, ADR 0048): (kind, name) → reason (e.g. "DR
         # profile threshold=critical: connection tier=normal is below threshold"). Distinct from _failed
@@ -3204,12 +3204,10 @@ class RegistryRunner:
         """Whether the ``kind`` lane ``name`` already has a failed line of ``exc``'s class: both a
         store fault, or both not (vault BACKLOG #5146). The once-only guards stay silent on a
         repeat, so a scheduled retry or a rule's restart does not page again. The inbound guards ask
-        this of any failure; the outbound build's guard asks it only of a :class:`TrustAnchorError`,
-        so any other outbound failure records and alerts every time. A class that flips replaces
-        the line, with its alert: a store-fault line gives way to a CA refused at a later start, and
-        any other line, a refusal's included, to a store fault. docs/SECURITY.md, under *The same
-        store fault would not read as a refused anchor*, states the rule for operators. The class is
-        a flag, never the line's text, which varies."""
+        this of any failure; the outbound build's guard asks it only of a :class:`TrustAnchorError`.
+        What replaces what is stated once, in docs/SECURITY.md, in the paragraph *The same store
+        fault would not read as a refused anchor*. The class is a flag, never the line's text, which
+        varies."""
         line = self._failed.get((kind, name))
         return line is not None and line.store_fault == _is_store_fault(exc)
 
@@ -3934,7 +3932,8 @@ class RegistryRunner:
         a store fault or not, holds (:meth:`_repeats_failed_class`). Its stop half
         already ran, so without the record a restart queued behind an operator's resolving start
         could leave the inbound down with no record and no open alert. Either way the error still
-        reaches the caller; an operator's restart records nothing, as before."""
+        reaches the caller. This method records nothing for an operator's restart, as before; the
+        start's own :meth:`_checked_inbound_start` still records a failure, on either path."""
         # One lock span so stop+start is atomic w.r.t. a concurrent reload (review M-10). Refused
         # whole on a passive standby, so an engine restart cannot drop an operator's start either.
         async with self._reload_lock:
