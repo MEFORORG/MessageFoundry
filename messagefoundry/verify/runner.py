@@ -110,6 +110,18 @@ def _microsoft_driver(driver: str) -> bool:
     return _preset_driver(driver) or generic_driver_family(driver) == "msodbc"
 
 
+#: The two dialects the build accepts; another is refused at build (``transports.database``).
+_DIALECTS = ("sqlserver", "generic")
+
+
+def _builds_on(dialect: str, driver: str) -> bool:
+    """Whether the build accepts ``driver``, an ``odbc_driver`` as written, on ``dialect``: the
+    preset's own driver test, or the generic dialect's allowlist."""
+    if dialect == "sqlserver":
+        return _preset_driver(driver)
+    return generic_driver_family(driver) is not None
+
+
 #: The file name, in lower case, of a Driver 18 library the SQL Server preset accepts as a path:
 #: ``libmsodbcsql-18.3.so.3.1``, ``libmsodbcsql.18.dylib`` or ``msodbcsql18.dll``. Read only after
 #: :func:`_preset_driver` accepts the whole path, so it tells the version and nothing else.
@@ -140,7 +152,8 @@ class _Graph:
                 # would otherwise add its own to the one instance and keep them all alive.
                 self._outcome = exc.with_traceback(None)
         if isinstance(self._outcome, BaseException):
-            raise self._outcome
+            # Cleared again here, since each raise adds the raiser's frames to the one instance.
+            raise self._outcome.with_traceback(None)
         return self._outcome
 
 
@@ -162,8 +175,9 @@ def _odbc_hops(
     either way is enough. For ``host.ciphers`` a hop is an entry on a Microsoft SQL Server driver,
     whose TLS the host policy decides, which every preset entry the engine builds is; for
     ``host.odbc`` it is an entry naming Driver 18, which pyodbc must list, so an entry on another
-    driver needs nothing of that row. A preset entry whose driver the preset refuses is no hop of
-    either row, since the build refuses it and the engine never dials it.
+    driver needs nothing of that row. An entry the build refuses, on a dialect other than the two,
+    or on a driver no dialect it can take accepts, is no hop of either row, since the engine never
+    dials it.
 
     Anything not read leaves the answer unknown rather than "no hop", because a hop could sit in it:
     a graph that does not load, settings that did not load, or a shell with no
@@ -171,8 +185,8 @@ def _odbc_hops(
     need not carry the service's own environment, so without it even a file that says sqlite does
     not show the service's store (BACKLOG #3803 R1). An entry whose driver the row needs and is an
     ``env()`` reference is unknown too, and so for ``host.ciphers`` is one off the preset on another
-    vendor's driver, which may bring its own TLS, and for ``host.odbc`` a preset entry naming the
-    Driver 18 library by its path, since pyodbc lists registered names and not paths."""
+    vendor's driver, which may bring its own TLS, and for ``host.odbc`` an entry naming the Driver
+    18 library by its path, since pyodbc lists registered names and not paths."""
     if settings is not None and settings.store.backend is StoreBackend.SQLSERVER:
         return OdbcHops(found=("the [store] backend is sqlserver",))
     from messagefoundry.config.settings import settings_file_path
@@ -194,19 +208,26 @@ def _odbc_hops(
     undecided: list[str] = []
     for kind, name, dialect, driver in odbc_hops(reg):
         label = f"{kind} {name}"
+        if dialect is not None and dialect not in _DIALECTS:
+            continue  # the build refuses another dialect, so nothing dials the entry
+        # An env() dialect may take either arm, so its driver is refused only where both refuse it.
+        arms = _DIALECTS if dialect is None else (dialect,)
+        if driver is not None and not any(_builds_on(arm, driver) for arm in arms):
+            continue  # the build refuses this driver on every arm the entry can take
         preset = dialect == "sqlserver"
-        if preset and driver is not None and not _preset_driver(driver):
-            continue  # the build refuses this driver on the preset, so nothing dials the entry
         if driver_18:
             if driver is None:
                 undecided.append(f"{label} names its odbc_driver by an env() reference")
-            elif preset and _DRIVER_18_LIBRARY.fullmatch(re.split(r"[\\/]", driver.lower())[-1]):
+            # Only the preset takes a path, so an env() dialect naming one is on the preset.
+            elif dialect != "generic" and _DRIVER_18_LIBRARY.fullmatch(
+                re.split(r"[\\/]", driver.lower())[-1]
+            ):
                 undecided.append(
                     f"{label} names the Driver 18 library by its path, which pyodbc's driver list "
                     "does not show"
                 )
-            # The generic dialect trims the name it sends; a preset name passed the build's test above,
-            # which refuses a padded one, so trimming it changes nothing.
+            # The generic dialect trims the name it sends; a preset name passed the build's test
+            # above, which refuses a padded one, so trimming it changes nothing.
             elif driver.strip().lower() == SQLSERVER_DEFAULT_DRIVER.lower():
                 found.append(label)
         # The preset builds only on a Microsoft driver, so any preset entry the engine builds takes

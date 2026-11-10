@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The host cipher policy the ODBC Driver 18 hops take: DEPLOY-SERVER-DB.md section 5.4, run.
+"""The host cipher policy the Microsoft ODBC driver hops take: DEPLOY-SERVER-DB.md section 5.4, run.
 
 The native driver terminates TLS, so the host's TLS policy decides the suites and versions on every
 ODBC hop (ADR 0180). Section 5.4 asks the operator to set that policy and gives manual commands to
@@ -243,15 +243,12 @@ def _powershell_pins() -> dict[str, str]:
     }
 
 
-def _powershell(
-    command: str, *, timeout: float = _PROBE_TIMEOUT_S
-) -> subprocess.CompletedProcess[str]:
+def _powershell(command: str) -> subprocess.CompletedProcess[str]:
     """Windows PowerShell, by its pinned path, run on ``command`` as the probe runs it.
 
     One start, so the tests that run other text through the real PowerShell take it too, and
     cannot drift from the probe's arguments or environment (BACKLOG #3803 S5). ``command`` is a
-    fixed text of this module's or a test's, never host data. ``timeout`` is the probe's own unless
-    a test, which has no probe error mapping around it, gives a cold runner longer."""
+    fixed text of this module's or a test's, never host data."""
     return subprocess.run(  # nosec B603 - pinned tool, argv list (no shell), fixed arguments
         [
             _system_exe(*_POWERSHELL_HOME, "powershell.exe"),
@@ -267,7 +264,7 @@ def _powershell(
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=timeout,
+        timeout=_PROBE_TIMEOUT_S,
         check=False,
         creationflags=_NO_WINDOW,
     )

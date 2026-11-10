@@ -221,6 +221,7 @@ __all__ = [
     "path_form_fhir_updates_without_if_match",
     "query_credential_hops",
     "revocation_attested_hops",
+    "odbc_hops",
     "unverified_generic_db_hops",
     "refused_generic_db_drivers",
     "POSSIBLY_GENERIC_DB_HOP",
@@ -7299,8 +7300,11 @@ def odbc_hops(registry: Registry) -> list[tuple[str, str, str | None, str | None
     record name, as the other readers here name it, so an inbound and an outbound of one name stay
     apart. The connections come first, then the reference sets, then the lookups, each by name."""
 
+    # Imported lazily: messagefoundry.transports imports this module at its top level.
+    from messagefoundry.transports.db_endpoint import SQLSERVER_DEFAULT_DRIVER
+
     def driver(settings: Mapping[str, Any]) -> str | None:
-        value = _db_setting(settings, "odbc_driver", "ODBC Driver 18 for SQL Server", None)
+        value = _db_setting(settings, "odbc_driver", SQLSERVER_DEFAULT_DRIVER, None)
         return None if value is _UNRESOLVED else str(value)
 
     connections = [

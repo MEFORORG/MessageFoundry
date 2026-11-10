@@ -199,9 +199,8 @@ def check_sqlserver_odbc_driver(odbc_hops: Callable[[], OdbcHops]) -> CheckResul
             reading.id,
             reading.title,
             Status.SKIP,
-            f"{_no_hop_detail(hops, 'hop naming ODBC Driver 18', 'naming it')}, so none needs "
-            "it; it reads "
-            f"{reading.status.value}: {reading.detail}",
+            f"{_no_hop_detail(hops, 'hop naming ODBC Driver 18', 'naming it')}, so none needs it; "
+            f"it reads {reading.status.value}: {reading.detail}",
             evidence=reading.evidence,
         )
     return _as_the_hops_make_it(
@@ -239,9 +238,8 @@ def check_host_cipher_policy(odbc_hops: Callable[[], OdbcHops]) -> CheckResult:
             rid,
             title,
             Status.SKIP,
-            f"{_no_hop_detail(hops, 'ODBC hop', 'on a Microsoft SQL Server driver')}, so the host "
-            "policy does "
-            "not reach one",
+            f"{_no_hop_detail(hops, 'ODBC hop', 'on a Microsoft SQL Server driver')}, "
+            "so the host policy does not reach one",
         )
     try:
         reading = cipher_policy.read_host_cipher_policy()

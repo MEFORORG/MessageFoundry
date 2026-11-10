@@ -243,10 +243,12 @@ def _run_powershell(
     """``text`` through the probe's own PowerShell start, so these tests cannot drift from its
     arguments or environment (BACKLOG #3803 S5). ``pins``, when given, replace the probe's fixed
     ``PATH`` and ``PSModulePath``: ``{}`` is the start-up names alone, as unpinned."""
-    if pins is None:
-        return cipher_policy._powershell(text, timeout=_TEST_TIMEOUT_S)
-    with mock.patch.object(cipher_policy, "_powershell_pins", lambda: dict(pins)):
-        return cipher_policy._powershell(text, timeout=_TEST_TIMEOUT_S)
+    # The start reads _PROBE_TIMEOUT_S when it runs, so the longer bound reaches it alone.
+    with mock.patch.object(cipher_policy, "_PROBE_TIMEOUT_S", _TEST_TIMEOUT_S):
+        if pins is None:
+            return cipher_policy._powershell(text)
+        with mock.patch.object(cipher_policy, "_powershell_pins", lambda: dict(pins)):
+            return cipher_policy._powershell(text)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="runs the real Windows PowerShell")
@@ -1829,6 +1831,16 @@ def test_the_wiring_reader_names_each_odbc_entry_and_its_driver() -> None:
         (None, "/opt/microsoft/msodbcsql17/lib64/libmsodbcsql-17.10.so.6.1", "found", "none"),
         # The preset sends the name as written and refuses a padded one at build, so it is no hop.
         (None, " ODBC Driver 18 for SQL Server ", "none", "none"),
+        # An env() dialect naming the Driver 18 library by path can only be on the preset, which
+        # alone takes a path (code review round 4, finding 2).
+        ("env", "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.3.so.3.1", "found", "unknown"),
+        # A dialect the build refuses is no hop (round 4, finding 5).
+        ("mssql", None, "none", "none"),
+        # A driver every arm the entry can take refuses is no hop (round 4, finding 6).
+        ("env", "FreeTDS", "none", "none"),
+        ("generic", "FreeTDS", "none", "none"),
+        # An env() dialect on another vendor's allowed driver may be generic, with its own TLS.
+        ("env", "PostgreSQL Unicode", "unknown", "none"),
     ],
 )
 def test_each_row_counts_the_hops_its_driver_question_reaches(
@@ -1845,7 +1857,10 @@ def test_each_row_counts_the_hops_its_driver_question_reaches(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_BACKEND", "sqlite")
     odbc_driver = env("db_driver") if driver == "env" else driver
-    _registry_with(monkeypatch, outbound={"OB_X": _database("OB_X", dialect, driver=odbc_driver)})
+    odbc_dialect = env("db_dialect") if dialect == "env" else dialect
+    _registry_with(
+        monkeypatch, outbound={"OB_X": _database("OB_X", odbc_dialect, driver=odbc_driver)}
+    )
 
     def outcome(hops: checks.OdbcHops) -> str:
         return "found" if hops.found else "unknown" if hops.unknown else "none"
