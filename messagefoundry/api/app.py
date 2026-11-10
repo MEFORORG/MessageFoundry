@@ -4973,8 +4973,10 @@ def create_app(
         # the broker's revocation refusal. An off-box endpoint with no [ai].endpoint_revocation_attested
         # pair is refused under enforce, and a None posture counts as enforcing there. The cleartext-
         # http refusal takes no posture: it refuses in every one (vault BACKLOG #3533 item 5).
+        # Off the event loop: the constructor builds rest.py's shared opener on first use, a TLS
+        # context that reads the system trust store, under a lock a worker thread may hold.
         try:
-            broker = ai_broker_from_settings(ai, posture=_phi_read_posture)
+            broker = await asyncio.to_thread(ai_broker_from_settings, ai, posture=_phi_read_posture)
         except AiBrokerError as exc:
             _log.warning("engine AI broker misconfigured: %s", exc)
             raise HTTPException(503, "engine-brokered AI assistance is not available") from exc
