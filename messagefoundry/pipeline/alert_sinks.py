@@ -1488,7 +1488,23 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 "type": "audit_write_failed",
                 "connection": name,
                 "action": action,
-                "reason": f"the {action} audit row was not written",
+                # Not "was not written" alone: a COMMIT can land with its reply lost (vault
+                # BACKLOG #3193 item 4). A budget-shed row (step_up_return:...) is never written.
+                "reason": f"the {action} audit row was not written, or its write's outcome is "
+                "unknown",
+            }
+        )
+
+    def audit_offbox_copy_missing(self, name: str, *, action: str) -> None:
+        # vault BACKLOG #3193 N1: the gate read the row's write back as committed, and only its
+        # off-box copy is missing (AlertSink.audit_offbox_copy_missing says why). Keyed
+        # `approval:<id>`, as audit_write_failed is, and its own instance. No PHI.
+        self._emit(
+            {
+                "type": "audit_offbox_copy_missing",
+                "connection": name,
+                "action": action,
+                "reason": f"the {action} audit row's off-box copy was not written",
             }
         )
 
