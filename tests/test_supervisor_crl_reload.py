@@ -208,7 +208,9 @@ class _SignalledFleet:
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
+        deadline = loop.time() + _DEADLINE_SECONDS
         while not _BlockedPassRunner.entered.is_set():
+            assert loop.time() < deadline, "control: the reload pass never started"
             await asyncio.sleep(0.01)
 
         def send_sigterm() -> None:
@@ -249,4 +251,6 @@ def test_a_shutdown_signal_cuts_the_wait_on_a_blocked_crl_pass(
     assert returned_at - fleet.signalled_at[0] < 1.0, (
         "SIGTERM during the CRL reload's stop did not cut the wait on its blocked pass"
     )
-    assert fleet.handlers == {}, "the stop's signal handlers must be removed once it ends"
+    # Left installed, as _run_supervisor's were, so a late signal is a no-op and never the default
+    # action that would kill the process mid-flush.
+    assert signal.SIGTERM in fleet.handlers, "a late SIGTERM must still reach a harmless handler"

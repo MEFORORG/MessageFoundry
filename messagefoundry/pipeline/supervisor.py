@@ -19,7 +19,8 @@ trip the crash-loop breaker for THAT shard: it is not relaunched again, the ERRO
 its exit history, and it stays listed in :attr:`Supervisor.crash_looped`. The other shards keep
 running, so one shard's start-up failure is not a fleet outage (a crash in one supervised task stays
 isolated). Only when every shard has tripped does ``supervise`` return non-zero. The supervisor has
-no store and so no AlertSink; the ERROR log is its alert. A child that ran for ``stable_uptime``
+no store and so no alert store; the ERROR log is its alert, and its CRL reload's only sink logs
+(:func:`_supervisor_crl_alert_sink`). A child that ran for ``stable_uptime``
 resets both. Without this a start-up failure neither config load reproduces (a
 store that cannot be reached, a port in use, a ``serve`` gate refusing) would relaunch in a tight
 loop, each pass a full interpreter start and config load.
@@ -551,8 +552,8 @@ async def supervise(
     supervisor's own log (:func:`_supervisor_crl_alert_sink`).
 
     Stopping the runner waits for a pass in flight, for at most its stop timeout. A shutdown
-    signal in that window cuts the wait (:func:`_stop_crl_reload`), so a CRL read hung on a share
-    cannot hold SIGINT/SIGTERM.
+    signal in that window cuts the wait (:func:`_stop_crl_reload`). The process can still wait at
+    exit for the abandoned pass's worker thread.
     """
     from messagefoundry.config.wiring import WiringError
 
@@ -602,9 +603,8 @@ async def supervise(
 
 #: Appended to the supervisor's refused-reload line, whose shared detail speaks of "the engine".
 SUPERVISOR_CRL_REFUSED_NOTE = (
-    "This line comes from the supervise process, which raises no [alerts] alert: there, "
-    "restarting the engine means restarting the supervise process, and the crl_reload ERROR line "
-    "is in the supervise process's own log."
+    "This line comes from the supervise process, which raises no [alerts] alert. Here, "
+    '"the engine" above means the supervise process, and "the engine log" its own log.'
 )
 
 
@@ -645,31 +645,31 @@ async def _stop_crl_reload(crl_reload: CrlReloadRunner, install_signal_handlers:
 
     The handlers :func:`_run_supervisor` installed point at its finished task, so without this a
     signal sent while a pass hangs would do nothing until the stop timeout ran out. Here they
-    cancel the stop instead, which abandons the pass, and are removed once it ends, so a later
-    signal takes its default action. The abandoned pass's worker thread cannot be cancelled: the
-    process can still wait at exit for that thread to return, as the runner's :meth:`stop` says."""
+    cancel the stop instead, which abandons the pass. They stay installed after the stop ends, as
+    :func:`_run_supervisor`'s did, so a late signal stays harmless until the loop closes. Where
+    the loop takes no signal handler, as on Windows, a Ctrl-C cancels the main task, which cuts
+    the wait the same way. A cut skips the runner's stop-time resolve of the alerts it still has
+    open. The abandoned pass's worker thread cannot be cancelled: the process can still wait at
+    exit for that thread to return, as the runner's :meth:`stop` says."""
     stop = asyncio.ensure_future(crl_reload.stop())
-    loop = asyncio.get_running_loop()
-    retargeted: list[signal.Signals] = []
     if install_signal_handlers:
+        loop = asyncio.get_running_loop()
         for sig in _shutdown_signals():
-            try:
+            try:  # noqa: SIM105
                 loop.add_signal_handler(sig, stop.cancel)
-            except (NotImplementedError, ValueError):
-                continue  # unsupported on Windows event loops, as in _run_supervisor
-            retargeted.append(sig)
+            except (NotImplementedError, ValueError, RuntimeError):
+                # Unsupported on Windows event loops, as in _run_supervisor, and off the main
+                # thread. The main task's cancellation still cuts the wait there.
+                pass
     try:
         await asyncio.wait({stop})
     except asyncio.CancelledError:
         stop.cancel()
         raise
-    finally:
-        for sig in retargeted:
-            loop.remove_signal_handler(sig)
     if stop.cancelled():
         logger.warning(
-            "supervise: a shutdown signal cut the wait for the CRL reload to stop; its pass in "
-            "flight is abandoned"
+            "supervise: a shutdown signal cut the wait for the CRL reload to stop; any pass in "
+            "flight is abandoned, and a refused-reload alert it left open is not resolved"
         )
         return
     stop.result()

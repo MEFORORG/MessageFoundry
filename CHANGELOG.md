@@ -28,7 +28,8 @@ All notable changes to MessageFoundry are documented here. The format follows
   forwarder's next handshake; a connection it already holds is not cut, and keeps sending until it
   fails and the forwarder reconnects. The supervisor raises no `[alerts]` alert for a refused
   reload: it is a WARNING line in the supervisor's own log. A shutdown signal sent while a reload
-  pass is stuck no longer waits for the pass. (`BACKLOG #3314`)
+  pass is stuck cuts the supervisor's wait on that pass; the process can still wait at exit for
+  the stuck read's worker thread to return. (`BACKLOG #3314`)
 
 ## [0.5.2] — 2026-10-20 — Early Access
 

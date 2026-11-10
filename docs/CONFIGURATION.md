@@ -2350,8 +2350,10 @@ it is not enforced on the hops that hold the old copy. Match the alert in a `[[a
 with `event_type = "crl_reload_refused"`. It does not depend on `warn_days`. With no `[alerts]`
 transport it is a WARNING in the log, beside the reload's ERROR. The `supervise` process reloads
 its own forwarder's CRL too, and never raises this alert, whatever `[alerts]` says: a refusal there
-is only a WARNING line in the supervise process's own log, whose subject ends `@supervisor`, and
-which says that its "restart the engine" means restarting the supervise process (BACKLOG #3314).
+is only a WARNING line in the supervise process's own log, whose subject ends `@supervisor`. That
+line says its "engine" means the supervise process; the reload's ERROR line beside it, which gives
+the reason, still says "Restart the engine", and there that also means the supervise process
+(BACKLOG #3314).
 
 | Event field | What it holds |
 |---|---|
