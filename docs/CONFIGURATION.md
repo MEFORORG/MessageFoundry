@@ -1869,9 +1869,25 @@ limit. This clears a pause that an earlier run of the same process left open whe
 That relies on the process keeping its name across a restart. An engine shard does. A cluster node
 does only when `[cluster].node_id` is pinned; otherwise its id is new on every start. An unpinned
 node therefore clears its own open pause alerts when it stops, since its next start reports under a
-new name. The stop waits up to 5 seconds for that write before it closes the store. An unpinned node
-that crashes while paused, or whose clear does not land in time, leaves its alert open; resolve it
-in the alert list, or pin `[cluster].node_id`.
+new name. The stop waits up to 5 seconds for that write before it closes the store.
+
+A subject whose process never comes back under its name can expire instead (BACKLOG #3269). At
+least these leave one: an unpinned node that crashed while paused or whose clear did not land, a
+lone engine that became several engine shards, an engine shard dropped from the count, and a
+renamed or retired `[cluster].node_id`.
+Every engine process with an alert sink checks the open `intake_paused` alerts of the OTHER
+processes once a minute, and resolves one whose occurrence count has not moved for 20 minutes, four
+reminder intervals, of its own clock. A paused process that is alive raises a reminder every 5
+minutes, so its alert stays open while those writes reach the store. **The expiry reads only
+whether a reminder landed, by design: a process that is still paused but whose reminders stop
+reaching the store has its alert resolved while its intake stays paused.** At least a process cut
+off from the store, one whose reminder writes keep failing, and one whose intake check keeps
+raising do that. Its first reminder that lands again opens a new alert. So an alert expires only while some other engine process with an
+alert sink runs on the same store; no process expires its own. A process stopped for longer than 20
+minutes while another runs finds its pause resolved, and a pause that still holds when it starts
+opens a new alert. An operator's acknowledgement on the old alert goes with it, as it does on any
+other auto-resolve. An alert that nothing expires, such as a lone engine's whose own clear did not
+land, stays open: resolve it in the alert list.
 
 **`config_changed` says a start's config differs from the store's baseline: the bytes it loaded, or
 the directory just after the load** (vault BACKLOG #2597, #3765). At each start the engine compares

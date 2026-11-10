@@ -435,7 +435,10 @@ class AlertSink(Protocol):
         a lone engine, so each bound on each process is its own instance: a drained backlog cannot
         resolve a low-disk pause, and one node's clear cannot resolve another node's pause (BACKLOG
         #2272). An unpinned cluster node's id changes on every restart, so that node clears its own
-        instances when it stops. It is not
+        instances when it stops, and a subject no process raises again for
+        :data:`~messagefoundry.pipeline.intake_bound.STALE_SECONDS` is resolved by the sweep of
+        another engine process with an alert sink on the same store, where one runs (BACKLOG
+        #3269). It is not
         a connection-scoped event, so no rule's ``control_action`` fires on it (BACKLOG #1898).
         Its colon also keeps ``name`` outside the connection-name grammar, which guards only the
         default target, never a rule's ``control_target``. Carries counts and sizes only: no
