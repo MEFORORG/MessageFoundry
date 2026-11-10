@@ -4997,26 +4997,12 @@ def pool_over_provisioned_warning(pool_max_size: int, n_inbound: int) -> str | N
 DEFAULT_STORE_ACQUIRE_TIMEOUT = 30.0
 
 
-#: What a SQL Server cluster coordinator's clamped borrow advises when its clamp, not
-#: ``[store].acquire_timeout``, was the limit (BACKLOG #5064). Each call site passes the one that
-#: sets its clamp: the renew setting for the heartbeat, the lease claim, the config-version refresh
-#: and a stepdown's release; for the stepdown pause's owner read, the fence setting when half its
-#: budget (``messagefoundry.pipeline.cluster.paused_read_budget_seconds``) is the smaller term and
-#: the renew setting when it is not (``SqlServerCoordinator._claim_or_renew_lease`` picks); and the
-#: stop text for ``stop()``'s two writes, whose bound is the fixed
-#: ``messagefoundry.pipeline.cluster.STOP_WRITE_TIMEOUT_SECONDS``. Each fits inside ``safe_exc``'s
-#: default limit in a logged error (``tests/test_store_pool_acquire_timeout.py`` checks the worst
-#: case).
-CLUSTER_RENEW_RETUNE: Final = "[cluster].lease_renew_timeout_seconds"
-CLUSTER_FENCE_RETUNE: Final = "[cluster].leader_fence_timeout_seconds"
-CLUSTER_STOP_RETUNE: Final = "no setting (stop()'s shutdown bound is fixed)"
-
-
 class StoreAcquireTimeout(RuntimeError):
     """A store pooled-connection borrow exceeded its limit: at least ``[store].acquire_timeout``,
     a shorter cluster clamp, or the longer post-commit limit. The message names the setting
-    its caller passed, ``[store].acquire_timeout`` unless the caller says otherwise; a clamped
-    borrow names what set its clamp (:data:`CLUSTER_RENEW_RETUNE` and its siblings say which).
+    its caller passed, ``[store].acquire_timeout`` unless the caller says otherwise. A SQL Server
+    cluster coordinator's clamped borrow names the setting that set its clamp, as the coordinator
+    passes it (``messagefoundry.pipeline.cluster_sqlserver``, BACKLOG #5064).
 
     An ordinary ``Exception`` on purpose, so it lands in the store callers' existing ``except
     Exception`` handling and is treated as a transient stage failure (retry / dead-letter) — never a

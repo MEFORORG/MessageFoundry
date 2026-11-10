@@ -5839,22 +5839,22 @@ class SqlServerStore:
         return await self._fetch_rows(sql, params)
 
     def _clamp_bounds(
-        self, timeout_clamp: float | None, retune: str | None
+        self, clamp: tuple[float, str] | None
     ) -> tuple[AbstractAsyncContextManager[Any], int | None, float | None]:
-        """``(borrow, statement timeout, rollback bound)`` for one statement. ``timeout_clamp`` is
-        ``None`` for every caller outside the SQL Server cluster coordinator, and ``None`` keeps the :meth:`_acquire` borrow and ``[store].command_timeout``. One value sets
-        the borrow, the statement and the rollback bounds, so none can be set without the others; a
+        """``(borrow, statement timeout, rollback bound)`` for one statement. ``clamp`` is
+        ``None`` for every caller outside the SQL Server cluster coordinator, and ``None`` keeps the :meth:`_acquire` borrow and ``[store].command_timeout``. Otherwise it is
+        ``(timeout_clamp, retune)``: one value sets the borrow, the statement and the rollback
+        bounds, so none can be set without the others, and the advice a clamped borrow that times
+        out gives (:meth:`_acquire_clamped`) travels with it, so neither can be passed alone. A
         shorter ``[store].command_timeout`` still ends the statement first, and bounds neither of
-        the other two. ``retune`` is what a clamped borrow that times out advises
-        (:meth:`_acquire_clamped`); a clamp without one is a caller bug."""
-        if timeout_clamp is None:
+        the other two."""
+        if clamp is None:
             return self._acquire(), None, None
+        timeout_clamp, retune = clamp
         # The borrow is floored at 1 s like the statement, so a sub-second clamp runs as 1 s on
         # both, as the coordinator's warning says, and a 0 clamp never refuses every borrow. The
         # rollback after a failure gets the same floored clamp (BACKLOG #5066).
         floored_clamp = max(1.0, timeout_clamp)
-        if retune is None:
-            raise TypeError("a clamped statement must name the setting that sets its clamp")
         return (
             self._acquire_clamped(floored_clamp, retune),
             _clamped_statement_timeout(timeout_clamp, self._settings.command_timeout),
@@ -5862,18 +5862,14 @@ class SqlServerStore:
         )
 
     async def _fetch_rows(
-        self,
-        sql: str,
-        params: tuple[Any, ...],
-        timeout_clamp: float | None = None,
-        retune: str | None = None,
+        self, sql: str, params: tuple[Any, ...], clamp: tuple[float, str] | None = None
     ) -> list[dict[str, Any]]:
         """The body of :meth:`_fetchall` and :meth:`_fetchone_clamped`; :meth:`_clamp_bounds`
-        says what ``timeout_clamp`` sets. A failure of the pool release alone, after the commit,
+        says what ``clamp`` sets. A failure of the pool release alone, after the commit,
         keeps the result, as :meth:`_write_rows` does: the lease claim and the config-version
         refresh are MERGEs that come through here, so a claim that committed must not read as a
         failed renew (BACKLOG #5064)."""
-        borrow, statement_timeout, floored_clamp = self._clamp_bounds(timeout_clamp, retune)
+        borrow, statement_timeout, floored_clamp = self._clamp_bounds(clamp)
         result: list[dict[str, Any]] | None = None
         try:
             async with borrow as conn:
@@ -5920,9 +5916,9 @@ class SqlServerStore:
     ) -> dict[str, Any] | None:
         """:meth:`_fetchone` bounded by ``timeout_clamp`` (ADR 0157 Inc 0). The cluster lease
         claim/renew and the config-version refresh are at least its callers (BACKLOG #5064);
-        :meth:`_execute_clamped` is its twin for a write. ``retune`` names the one setting that
-        sets ``timeout_clamp``, for a borrow that times out at it (:meth:`_acquire_clamped`); the
-        ``CLUSTER_*_RETUNE`` constants in ``messagefoundry.store.base`` are the choices.
+        :meth:`_execute_clamped` is its twin for a write. ``retune`` is what a borrow that times
+        out at the clamp advises (:meth:`_acquire_clamped`); the caller names the setting that
+        sets ``timeout_clamp``, and ``messagefoundry.pipeline.cluster_sqlserver`` holds the choices.
 
         Two windows before the statement returns, each at most the clamp floored at 1 s. The wait
         for a pooled connection is the smaller of ``max(1.0, clamp)`` and ``[store].acquire_timeout`` (:meth:`_clamp_bounds` applies
@@ -5950,7 +5946,7 @@ class SqlServerStore:
         session keeps its open transaction, and the ``HOLDLOCK`` locks on ``leader_lease``, until
         its close lands or the server ends it, and the timed-out rollback keeps its executor thread
         until the driver returns."""
-        rows = await self._fetch_rows(sql, params, timeout_clamp, retune)
+        rows = await self._fetch_rows(sql, params, (timeout_clamp, retune))
         return rows[0] if rows else None
 
     async def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:
@@ -5969,23 +5965,19 @@ class SqlServerStore:
         heartbeat runs in series with the renew and a stepdown's release under
         ``_leadership_lock``, so ``[store].command_timeout`` there would delay the renew (BACKLOG
         #6472); ``stop()`` passes its own bound instead of the renew clamp."""
-        return await self._write_rows(sql, params, timeout_clamp, retune)
+        return await self._write_rows(sql, params, (timeout_clamp, retune))
 
     async def _write_rows(
-        self,
-        sql: str,
-        params: tuple[Any, ...],
-        timeout_clamp: float | None = None,
-        retune: str | None = None,
+        self, sql: str, params: tuple[Any, ...], clamp: tuple[float, str] | None = None
     ) -> int:
         """The body of :meth:`_execute` and :meth:`_execute_clamped`; :meth:`_clamp_bounds` says
-        what ``timeout_clamp`` sets.
+        what ``clamp`` sets.
 
         A failure of the pool release alone, after the write committed, is logged and the row count
         returned, as ``cluster._call_within`` does on Postgres: reporting that write as failed would
         tell the cluster stepdown its release is unconfirmed when it landed (BACKLOG #5064). Before
         #5064, :meth:`_execute` lost the count the same way."""
-        borrow, statement_timeout, floored_clamp = self._clamp_bounds(timeout_clamp, retune)
+        borrow, statement_timeout, floored_clamp = self._clamp_bounds(clamp)
         committed: int | None = None
         try:
             async with borrow as conn:

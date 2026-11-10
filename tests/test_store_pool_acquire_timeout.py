@@ -39,12 +39,14 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.settings import StoreSettings
-from messagefoundry.redaction import _DEFAULT_LIMIT as _SAFE_EXC_DEFAULT_LIMIT
-from messagefoundry.redaction import safe_exc
-from messagefoundry.store.base import (
+from messagefoundry.pipeline.cluster_sqlserver import (
     CLUSTER_FENCE_RETUNE,
     CLUSTER_RENEW_RETUNE,
     CLUSTER_STOP_RETUNE,
+)
+from messagefoundry.redaction import _DEFAULT_LIMIT as _SAFE_EXC_DEFAULT_LIMIT
+from messagefoundry.redaction import safe_exc
+from messagefoundry.store.base import (
     DEFAULT_STORE_ACQUIRE_TIMEOUT,
     StoreAcquireTimeout,
     acquire_pooled,
@@ -424,9 +426,9 @@ async def test_sqlserver_clamped_borrow_names_the_setting_that_set_its_limit() -
         assert message.endswith(f"retune with {retune}"), message
         assert "[store].acquire_timeout" not in message
         # A logged error passes through safe_exc, whose default limit must keep the whole advice.
-        # The worst case renders the limit in the most characters ``:g`` uses for a value of at
-        # least the 1 s floor, such as 1.23457e+08, so pad the measured message to it.
-        worst = len(message) - len(f"{FAST:g}") + len(f"{1.23456789e8:g}")
+        # The worst case renders the limit in the most characters ``:g`` uses for a finite value
+        # of at least the 1 s floor, 12 for a three-digit exponent, so pad the message to it.
+        worst = len(message) - len(f"{FAST:g}") + len(f"{1.23456789e100:g}")
         assert worst <= _SAFE_EXC_DEFAULT_LIMIT, (worst, message)
         assert safe_exc(clamped.value).endswith(retune), safe_exc(clamped.value)
     # A tie names the clamp too: raising [store].acquire_timeout alone would not lengthen it.

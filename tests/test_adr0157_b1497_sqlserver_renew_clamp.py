@@ -38,11 +38,11 @@ from messagefoundry.config.settings import (
     load_settings,
 )
 from messagefoundry.pipeline.cluster import build_coordinator
-from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
-from messagefoundry.store.base import (
+from messagefoundry.pipeline.cluster_sqlserver import (
     CLUSTER_FENCE_RETUNE,
     CLUSTER_RENEW_RETUNE,
     CLUSTER_STOP_RETUNE,
+    SqlServerCoordinator,
 )
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
 from messagefoundry.store.sqlserver import _clamped_statement_timeout
@@ -669,7 +669,8 @@ async def test_each_renew_clamped_statement_names_the_renew_setting_alone() -> N
     """BACKLOG #5064: the heartbeat, the lease claim, the config-version refresh and a stepdown's
     release are clamped at ``[cluster].lease_renew_timeout_seconds`` alone, so a borrow that times
     out names that setting, never the fence, which on the default derived clamp would shrink it.
-    ``stop()``'s two writes run at a fixed bound and say so."""
+    The lease release under ``stop()``'s fixed bound names no setting; its ``left`` write passes the
+    same constant, and both run inside an event-loop timeout that fires first."""
     seen: list[tuple[str, str]] = []
 
     class _Store:
