@@ -1,6 +1,6 @@
 # 0087 — Router/Handler subprocess isolation
 
-- **Status:** Accepted; **Amended (2026-08-04)** — the transform-result parity rule changed shape. The child now materialises a container return with `_partition`'s **own** rule instead of reproducing its exact input container, so a tuple/set/generator **delivers** in both modes (BACKLOG #341). AC-11 and the "Result parity" bullet below are rewritten accordingly; the isolation boundary and the codec grammar are untouched. **Amended (2026-09-05)** — a 74 GiB extrapolation added under the per-worker footprint on 2026-09-04 is **retracted in place**; the measured per-child figures stand, and the surviving constraint is restated as the ADR 0052 AC-2 conflict it always was. No decision, boundary or acceptance criterion of this ADR changes. **Corrected (2026-10-01)** — the "DEK-in-worker" residual said there is no key in the worker to strip. That was false wherever the key arrives by environment variable, because the worker inherited the engine's environment. The correction sits beside that bullet; the worker now gets an allowlisted environment (vault BACKLOG #2587), which is not an isolation boundary by itself. **Amended (2026-10-07).** The owner ruled to drop the worker's POSIX `RLIMIT_CPU` backstop, so CPU time is bounded only per call, by the wall cap, and `[sandbox].cpu_seconds` is gone (vault BACKLOG #3133 part 1). The Decision bullet that named the backstop is edited, the reasons are under "POSIX CPU limit dropped" below, and what the limit used to bound is a new residual. `RLIMIT_AS` is unchanged. **Amended (2026-10-11).** The owner ruled that `[sandbox].mem_mb` stays and changes meaning (vault BACKLOG #3133 part 2). On Linux it is now headroom above the loaded graph, enforced with `RLIMIT_DATA`, so address space a thread only reserves does not count. A call that runs out of memory is reported as the memory cap, and its worker is recycled. The reasons are under "Memory cap is headroom above the loaded graph" below; the Decision bullet that named `RLIMIT_AS` is edited. **Amended (2026-11-09).** The owner ruled that a frame found waiting before a request no longer fails that call: the worker is still dropped, and the message is retried once on a fresh worker (vault BACKLOG #3135 step 4). A length header over the frame cap is now read by the engine as a frame rather than a dead peer; AC-10's amendment says what that changes. AC-10 and the residual on a compromised worker denying its own feed carry the amendment beside them, and every kill now records a cause, as ADR 0187 *Amendment B* says. **Corrected (2026-11-10).** At least two statements were false of the code: the grandchild residual, which said nothing a grandchild writes can be taken as an answer, and the Decision bullet *"A frame answers a request, or the worker dies"*. Each correction sits beside its text, and the residual says what a grandchild can do. AC-10's 2026-11-09 amendment gains dated additions, among them that the code does not meet its SHALL in at least two cases. **Owner acceptances (2026-11-10).** The owner accepted two cases as recorded deviations, each only in its record's scope; AC-10's 2026-11-09 amendment, *Owner acceptances*, holds them and names deviations neither covers.  <!-- opt-in subprocess isolation built (#197, 2026-07-10) -->
+- **Status:** Accepted; **Amended (2026-08-04)** — the transform-result parity rule changed shape. The child now materialises a container return with `_partition`'s **own** rule instead of reproducing its exact input container, so a tuple/set/generator **delivers** in both modes (BACKLOG #341). AC-11 and the "Result parity" bullet below are rewritten accordingly; the isolation boundary and the codec grammar are untouched. **Amended (2026-09-05)** — a 74 GiB extrapolation added under the per-worker footprint on 2026-09-04 is **retracted in place**; the measured per-child figures stand, and the surviving constraint is restated as the ADR 0052 AC-2 conflict it always was. No decision, boundary or acceptance criterion of this ADR changes. **Corrected (2026-10-01)** — the "DEK-in-worker" residual said there is no key in the worker to strip. That was false wherever the key arrives by environment variable, because the worker inherited the engine's environment. The correction sits beside that bullet; the worker now gets an allowlisted environment (vault BACKLOG #2587), which is not an isolation boundary by itself. **Amended (2026-10-07).** The owner ruled to drop the worker's POSIX `RLIMIT_CPU` backstop, so CPU time is bounded only per call, by the wall cap, and `[sandbox].cpu_seconds` is gone (vault BACKLOG #3133 part 1). The Decision bullet that named the backstop is edited, the reasons are under "POSIX CPU limit dropped" below, and what the limit used to bound is a new residual. `RLIMIT_AS` is unchanged. **Amended (2026-10-11).** The owner ruled that `[sandbox].mem_mb` stays and changes meaning (vault BACKLOG #3133 part 2). On Linux it is now headroom above the loaded graph, enforced with `RLIMIT_DATA`, so address space a thread only reserves does not count. A call that runs out of memory is reported as the memory cap, and its worker is recycled. The reasons are under "Memory cap is headroom above the loaded graph" below; the Decision bullet that named `RLIMIT_AS` is edited. **Amended (2026-11-09).** The owner ruled that a frame found waiting before a request no longer fails that call: the worker is still dropped, and the message is retried once on a fresh worker (vault BACKLOG #3135 step 4). A length header over the frame cap is now read by the engine as a frame rather than a dead peer; AC-10's amendment says what that changes. AC-10 and the residual on a compromised worker denying its own feed carry the amendment beside them, and every kill now records a cause, as ADR 0187 *Amendment B* says. **Corrected (2026-11-10).** At least two statements were false of the code: the grandchild residual, which said nothing a grandchild writes can be taken as an answer, and the Decision bullet *"A frame answers a request, or the worker dies"*. Each correction sits beside its text, and the residual says what a grandchild can do. AC-10's 2026-11-09 amendment gains dated additions, among them that the code does not meet its SHALL in at least two cases. **Owner acceptances (2026-11-10).** The owner accepted two cases as recorded deviations, each only in its record's scope; AC-10's 2026-11-09 amendment, *Owner acceptances*, holds them.  <!-- opt-in subprocess isolation built (#197, 2026-07-10) -->
 - **Date:** 2026-07-10
 - **Related:** [ADR 0009](0009-run-scoped-context-providers.md) (RunContext providers) · [ADR 0010](0010-handler-callable-db-lookup.md) / [ADR 0043](0043-fhir-read-lookup.md) (`db_lookup`/`fhir_lookup`) · [ADR 0072](0072-traced-dryrun-mode.md) (tracer seam it composes with) · [ADR 0036](0036-windows-config-source-trust.md) / [ADR 0041](0041-load-path-attestation-and-change-attribution.md) (config-source trust) · CLAUDE.md §2 (reliability/purity, count-and-log) · CLAUDE.md §4 (layering) · BACKLOG #197 · ASVS 15.2.5 / `docs/security/ASVS-L3-REMEDIATION-PLAN.md` WP-L3-17
 
@@ -380,33 +380,17 @@ target, no `pickle` import left to mis-suppress:
   > - **A frame that arrives later meets at least these outcomes.** On a worker still kept, the
   >   next call's check before its request finds it, and that message is retried. One that arrives
   >   after that check, and ahead of that call's answer, is read in its place. It is rejected as an
-  >   invalid frame, and the message dead-letters, unless it is a well-formed answer to that very
-  >   request, which is taken as the answer, or, at `mode=isolated`, a well-formed lookup for that
-  >   request carrying the next sequence number. That lookup is brokered like the worker's own: the
-  >   writer chooses what the broker runs, the parent writes a reply the worker did not ask for, and
-  >   the expected sequence moves on, so the worker's own next lookup or request can then fail. So in
-  >   that window the later dispatch does not resolve as `mode=off` does, a case the SHALL above does
-  >   not except. A forged answer that carries the request's id can do worse. **The condition for
-  >   every forged-answer case in this bullet:** no other frame is queued when
-  >   `_reject_unsolicited(..., "after")` runs, right after the forged answer is read. If any frame
-  >   is queued by then, the worker's own answer, a lookup it writes at `mode=isolated` or a second
-  >   forged frame among them, that check kills the worker and the call fails with the
-  >   unsolicited-frame error, whatever the forged answer said. If only an EOF is queued then, the
-  >   worker is reaped or killed, as `MEMORY_CAP` after a forged `memory` answer, and the forged
-  >   answer still stands. The writer can meet the condition whenever it chooses: a writer that
-  >   took the whole request from fd 0 leaves the worker nothing to answer, and code in the worker
-  >   can withhold its own answer. Under that condition, the outcome depends on the answer's kind;
-  >   the fail kinds are `denied`, `error` and `memory`, and `_answer` in `_sandbox_codec.py`
-  >   rejects any other kind. A forged `ok` answer is consumed as the result and the call does not
-  >   fail, so the call is never failed closed, and with no EOF queued the worker is kept and none
-  >   of the SHALL's three clauses holds. A forged `denied` or `error` answer is taken as the answer
-  >   too: the call fails with the writer's error text, and the message takes the path any failed
-  >   call takes, and the worker is kept unless an EOF was queued. A forged `memory` answer kills
-  >   the worker, records a `MEMORY_CAP` kill cause for a memory cap that was never hit, and fails
-  >   the call as having run out of memory, with the writer's text. The
+  >   invalid frame, and the call fails as an internal error, which the `[delivery] internal_error`
+  >   policy then handles, unless it is a well-formed answer to that very request, which is taken as
+  >   the answer, or, at `mode=isolated`, a well-formed lookup for that request carrying the next
+  >   sequence number, which is brokered like the worker's own. So in that window the later dispatch
+  >   does not resolve as `mode=off` does, a case the SHALL above does not except. **The condition
+  >   for every forged-answer case in this bullet:** no other frame is queued when
+  >   `_reject_unsolicited(..., "after")` runs, right after the forged answer is read. What the
+  >   forged answer then does is in `dispatch` in `messagefoundry/pipeline/sandbox.py`, and an answer's
+  >   fail kinds are at least `denied`, `error` and `memory` (`_answer` in `_sandbox_codec.py`). The
   >   owner accepted two cases in this amendment as recorded deviations, each only in the scope its
-  >   record gives; *Owner acceptances* below cites both records, and lists, as the Manager's
-  >   reading, deviations that neither covers. Only a writer that knows the
+  >   record gives; *Owner acceptances* below cites both records. Only a writer that knows the
   >   request's id can carry it: at least a grandchild or same-UID process that read the request (the
   >   grandchild residual below), and code running in the worker (the residual on one Handler not
   >   confined from another). One that arrives after that call's answer meets that call's own check
@@ -428,7 +412,7 @@ target, no `pickle` import left to mis-suppress:
   > of the over-cap bullet, and the pointer to the owner acceptances.
   >
   > **Owner acceptances 2026-11-10.** The owner accepted two cases as recorded deviations from the
-  > SHALL above, each until a fix narrows or closes it. The fixes are tracked as steps on vault
+  > SHALL above, each until a fix narrows or closes it. The fixes are to be added as steps on vault
   > BACKLOG #3135 (ledger ruling R2).
   >
   > - **Record d20261110T144543956-d8f55a:** a stray frame that arrives after a call's check before
@@ -441,18 +425,18 @@ target, no `pickle` import left to mis-suppress:
   >   this amendment's bullet *A frame that arrives later meets at least these outcomes*.
   >
   > *The Manager's 2026-11-10 reading of the code and the two records, not the owner's words:* at
-  > least these deviations are not accepted by either owner record, and each is tracked as a step
-  > on vault BACKLOG #3135.
+  > least these are not accepted by either owner record, and each is to be added as a step on vault
+  > BACKLOG #3135 (ledger ruling R2).
   >
-  > - A forged answer from a same-UID process that opened the worker's `/proc/<pid>/fd/0`.
-  > - A forged answer from code running in the worker.
-  > - The `mode=isolated` lookup in that window.
-  > - A forged `denied` or `error` answer, which fails the call with the writer's text and keeps
-  >   the worker.
-  > - A forged `memory` answer, which kills a healthy worker and records a `MEMORY_CAP` kill cause
-  >   for a memory cap that was never hit.
-  > - The desync of the next message after a partial read of fd 0 and a forged answer that keeps
-  >   the worker.
+  > - On Linux, a forged answer from a same-UID process that opened the worker's `/proc/<pid>/fd/0`.
+  > - A forged lookup at `mode=isolated`, read after a call's check before its request and ahead of
+  >   its answer.
+  > - A forged `denied` or `error` answer.
+  > - A forged `memory` answer.
+  > - The desync of the next message after a partial read of fd 0 and a forged answer.
+  >
+  > A forged answer from code running in the worker is not in this list: it falls under the residual
+  > *One Handler is not confined from another inside a worker*.
   >
   > Closing the fd-0 path alone does not close the `/proc` route; see the grandchild residual.
   → `tests/test_sandbox.py::test_a_desynced_or_forged_response_is_rejected`,
@@ -676,7 +660,7 @@ it is the constraint any proposal to make `subprocess` a *default* has to clear 
   neither is a bound on it. Whether a same-account process on Windows can do the same, by
   duplicating the worker's pipe handles, is unmeasured. Either way a compromised worker can deny its
   own feed: a kill-and-respawn dead-letters messages on that inbound. (Since 2026-11-09 a frame staged before a request costs that message a retry on a
-  fresh worker, and in the cases AC-10's amendment points to, its dead-letter too.)
+  fresh worker, and in the cases AC-10's amendment points to, a failed call too.)
 - **One Handler is not confined from another inside a worker.** All of an inbound's Routers/Handlers
   share one child and one `Registry`, so admin code can rebind a sibling in-process. This seam does
   not change that — `mode=off` shares an address space too — and any claim that the pipe protects
