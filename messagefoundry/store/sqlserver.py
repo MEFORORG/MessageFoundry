@@ -1040,9 +1040,7 @@ def _applock_timeout_ms(command_timeout: int) -> int:
 #: docs/CONFIGURATION.md [cluster] paragraph it points to says which does, and stop()'s writes run
 #: at a fixed bound that none does. It stays short enough that ``safe_exc``'s default limit keeps
 #: the whole rendered message, at any timeout (BACKLOG #5064).
-CLAMPED_BORROW_ADVICE = (
-    "the setting that sets its [cluster] clamp, if any (docs/CONFIGURATION.md [cluster])"
-)
+CLAMPED_BORROW_ADVICE = "its [cluster] clamp's setting, if any (docs/CONFIGURATION.md [cluster])"
 
 
 def _clamped_statement_timeout(clamp_seconds: float, command_timeout: int) -> int:

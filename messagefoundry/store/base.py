@@ -4999,10 +4999,11 @@ DEFAULT_STORE_ACQUIRE_TIMEOUT = 30.0
 
 class StoreAcquireTimeout(RuntimeError):
     """A store pooled-connection borrow exceeded its limit: at least ``[store].acquire_timeout``,
-    a shorter cluster clamp, or the longer post-commit limit. The message names the setting
-    its caller passed, ``[store].acquire_timeout`` unless the caller says otherwise. A SQL Server
-    cluster coordinator's clamped borrow whose clamp is no longer than ``[store].acquire_timeout``
-    advises one fixed text that points to the docs/CONFIGURATION.md [cluster] paragraph instead
+    a shorter cluster clamp, or the longer post-commit limit. The message ends with the advice its
+    caller passed, ``[store].acquire_timeout`` unless the caller says otherwise. A SQL Server
+    cluster coordinator's clamped borrow whose clamp, floored at 1 s, is no longer than
+    ``[store].acquire_timeout`` advises one fixed text that points to the docs/CONFIGURATION.md
+    [cluster] paragraph instead
     (``SqlServerStore._acquire_clamped``, BACKLOG #5064).
 
     An ordinary ``Exception`` on purpose, so it lands in the store callers' existing ``except

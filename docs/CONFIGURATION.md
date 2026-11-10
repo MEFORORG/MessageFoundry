@@ -2949,9 +2949,12 @@ nodes automatically:
 statements wait for a pooled connection for at most their clamp floored at 1 s, or
 `[store].acquire_timeout` if that is shorter. When the clamp is the shorter limit, or ties with
 `[store].acquire_timeout`, a borrow that times out raises `StoreAcquireTimeout`, whose message ends
-`retune with the setting that sets its [cluster] clamp, if any (docs/CONFIGURATION.md [cluster])`,
+`retune with its [cluster] clamp's setting, if any (docs/CONFIGURATION.md [cluster])`,
 because no one setting sets every clamp (BACKLOG #5064). At a tie, raising the clamp alone does not
-lengthen the borrow: raise `[store].acquire_timeout` too. At least these set the clamps:
+lengthen the borrow: raise `[store].acquire_timeout` too. The message's `after Ns` is the limit
+that cut the borrow, so compare it with each term below to tell which applied; the claim and the
+paused owner read run in the same maintenance step, so the step name in the log does not tell them
+apart. At least these set the clamps:
 
 - **The renew clamp**, for the claim and renew, the heartbeat, the config-version refresh and a
   stepdown's release write. It is `lease_renew_timeout_seconds` when set. Left unset, it is derived
@@ -2959,8 +2962,9 @@ lengthen the borrow: raise `[store].acquire_timeout` too. At least these set the
   `lease_renew_timeout_seconds` row above says. Raising the fence timeout narrows the margin that
   derivation reads, so it shortens a derived clamp, unless the derivation's cap or floor holds it.
 - **The paused tick's owner read**, which runs while a stepdown pause holds. Its clamp is the
-  smaller of two terms: the renew clamp, and half the paused-read budget, which is a fixed share of
-  `leader_fence_timeout_seconds` (`pipeline.cluster.paused_read_budget_seconds`). Raising the fence
+  smaller of two terms: the renew clamp, and half the paused-read budget, which is three quarters of
+  `leader_fence_timeout_seconds` ([CLUSTERING.md](CLUSTERING.md), *A slow store during the pause
+  does not block a retried stepdown*). Raising the fence
   timeout lengthens the budget term but can shorten a derived renew term, so it can shorten this
   clamp rather than lengthen it. An explicit `lease_renew_timeout_seconds` takes the fence timeout
   out of the renew term, but it is still checked against the margin, and the row above says why
