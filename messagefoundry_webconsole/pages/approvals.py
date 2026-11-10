@@ -9,7 +9,7 @@ each ``pending`` one, through the same engine handlers as ``POST /approvals/{id}
 authorized) stay the engine's to make.
 
 **An ``interrupted`` row offers the resolve, never approve or reject** (BACKLOG #2460). Its release
-was cut off while the operation ran, so the engine answers approve and reject with 409. The resolve
+never recorded an outcome, so the engine answers approve and reject with 409. The resolve
 records whether its effects were applied, through the same handler as
 ``POST /approvals/{id}/resolve``, and its route asks for the same fresh step-up.
 
@@ -89,7 +89,7 @@ _RESOLVE_LABELS: dict[ResolveOutcome, str] = {
 }
 
 _INTERRUPTED_NOTE = (
-    "These releases were cut off while the operation ran, so it may have done none, some or all of "
+    "These releases never recorded an outcome, so the operation may have done none, some or all of "
     "its work. Nothing re-runs them. Check the operation's own effects, then record what you found. "
     "Recording is final, and it may ask you to prove it is you again first; if it does, you come "
     "back here and choose again. The requester cannot record their own."
