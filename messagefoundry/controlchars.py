@@ -406,7 +406,8 @@ def log_field_token(text: str, limit: int, *, literals: tuple[str, ...] = ()) ->
     claim of itself that something was redacted, though never of another field. The handler filters
     still read the token, and one may rewrite a run inside it, a date for example, as
     ``[redacted]``, which holds no space or quote. They anchor on less than they would in raw text,
-    so a caller does not call this directly: it calls ``logging_setup.redacted_log_field`` instead.
+    so a caller does not call this directly: it calls ``logging_setup.redacted_log_field`` instead,
+    whose docstring gives the context rule.
 
     The escaped text is at most ``limit`` characters, counted after the escape, so the field is at
     most ``limit`` plus its two quotes whatever ``text`` holds. That is the token's bound; a handler
