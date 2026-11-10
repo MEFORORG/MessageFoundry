@@ -272,9 +272,10 @@ fix cannot quietly regress.
 
 The short-MSH-2 body is still accepted by `Peek.parse` and `Message.parse`, by design: ADR 0054
 refuses at parse only a header too short for MSH-1 plus one encoding character, so the refusal sits
-in the readers. Below the streaming threshold the listener answers such a body `AA`. Over it, a body
-with an OBX reaches the ingress document detach, where `iter_obx_documents` refuses it as
-`UnreadableDelimitersError` and the listener answers `AR` with an `ERROR` row (BACKLOG #5099).
+in the readers. Such a body can still be ACKed `AA`, at least below the streaming threshold when no
+other ingress check refuses it. Over the threshold, a body with an OBX reaches the ingress document
+detach, where `iter_obx_documents` refuses it as `UnreadableDelimitersError` with an `ERROR` row and
+a refusal from the listener, `AR` over MLLP (BACKLOG #5099).
 `strip_documents` returns such a body unchanged, so the retention document-strip pass skips the row
 rather than aborting. The FHS- or BHS-led body is refused by `Peek.parse`, so the listener refuses
 it before any detach; that `Message.parse` accepts it is BACKLOG #2874, not changed here.

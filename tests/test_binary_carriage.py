@@ -156,6 +156,15 @@ def test_extract_refuses_unreadable_delimiters_as_binary_carriage_error(
     assert not isinstance(wrong.value, BinaryCarriageError)
 
 
+def test_extract_names_a_handler_written_msh_1_as_the_cause() -> None:
+    """BACKLOG #2873: a Handler that writes a two-character MSH-1 gets the MSH-1 cause named."""
+    msg = Message.parse(OBX_HL7)
+    embed_obx_document(msg, b"data", data_subtype="PDF")
+    msg.set("MSH-1", "##")
+    with pytest.raises(BinaryCarriageError, match="^its first MSH's MSH-1 is not one character,"):
+        extract_obx_document(msg)
+
+
 def test_extract_rejects_wrong_encoding() -> None:
     msg = Message.parse(OBX_HL7)
     embed_obx_document(msg, b"data", data_subtype="PDF")

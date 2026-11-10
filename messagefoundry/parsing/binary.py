@@ -318,7 +318,8 @@ def extract_obx_document(message: Message, *, occurrence: int = 1) -> bytes:
     if occurrence >= 1 and not _delimiters_readable(message):
         # Every read below would raise the bare ValueError, whose text quotes MSH-1 and MSH-2.
         raise BinaryCarriageError(
-            f"{_unreadable_delimiters_cause(message)}, so no OBX can be read; refusing the extract"
+            f"{_unreadable_delimiters_cause(message)}, so no OBX field can be read; refusing the "
+            "extract"
         )
     obx2 = message.field("OBX-2", occurrence=occurrence)
     if (obx2 or "").upper() != "ED":

@@ -672,8 +672,9 @@ def test_the_batch_header_reproducer_is_refused_by_name_through_the_raw_helpers(
 def test_extract_obx_document_lets_a_valueerror_subclass_from_the_delimiter_read_escape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only the bare ``ValueError`` ``Message._encoding_chars`` raises is blamed on the header; a
-    subclass is some other fault and must escape, not be refused as the sender's."""
+    """A ``ValueError`` subclass out of the delimiter read is not refused as the sender's header: it
+    escapes ``extract_obx_document`` as itself. This pins that the guard does not over-catch; it
+    does not tell the guard apart from no guard, since ``Message.field`` lets the subclass out too."""
 
     class Other(ValueError):
         pass
