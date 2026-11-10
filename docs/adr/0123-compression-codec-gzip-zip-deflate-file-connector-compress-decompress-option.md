@@ -141,9 +141,10 @@ the **codec and the byte ceiling only** — never any decompressed content.
 > compressed chunk to their decompressor with no output bound. So one bounded read can expand a
 > member in full before the byte ceiling is checked, and the trial pass is no protection, because it
 > reads the same way. Measured on CPython 3.14: a 350-byte BZIP2 archive peaked at over 600 MB
-> under a 1 MiB ceiling, which would exhaust a worker's memory on first deployment. A member with
-> any method other than STORED or DEFLATED now refuses the whole archive with `CompressionError`
-> before any member is read, naming the member by position, with or without a ceiling. A streamed
+> under a 1 MiB ceiling, which would exhaust a worker's memory on first deployment. An entry with
+> any method other than STORED or DEFLATED, a directory entry included, now refuses the whole
+> archive with `CompressionError` before any member is read, naming the entry by position, with or
+> without a ceiling. A streamed
 > bounded reader for the other three methods was the alternative. It was not built: it would
 > re-implement `zipfile`'s member reading, and `zip_compress` writes only DEFLATED.
 

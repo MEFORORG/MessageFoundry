@@ -23,12 +23,6 @@ All notable changes to MessageFoundry are documented here. The format follows
   external provider. (`BACKLOG #2595`)
 
 ### Changed
-- **BREAKING: `zip_decompress` reads only STORED and DEFLATED members.** An archive with a BZIP2,
-  LZMA or Zstandard member, or any other method, now raises `CompressionError` before any member is
-  read, with or without `max_output_bytes`. Stdlib `zipfile` expands those three methods a whole
-  compressed chunk at a time, so a 350-byte BZIP2 archive reached over 600 MB of memory before a
-  1 MiB ceiling was checked. `zip_compress` writes only DEFLATED, so its archives are unaffected.
-  See ADR 0123's 2026-11-10 amendment. (`BACKLOG #5535`)
 - **A `[dr]` takeover or release hook now gets an allowlisted environment.** It used to get the
   engine's whole environment less the engine's own `MEFOR_*` names, so a secret kept under any
   other name reached it. Now a variable reaches a hook only if it is one a shell needs to start or
@@ -52,6 +46,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   reload: it is a WARNING line in the supervisor's own log. A shutdown signal sent while a reload
   pass is stuck cuts the supervisor's wait on that pass; the process can still wait at exit for
   the stuck read's worker thread to return. (`BACKLOG #3314`)
+
+### Security
+- **BREAKING: `zip_decompress` reads only STORED and DEFLATED entries.** An archive with a BZIP2,
+  LZMA or Zstandard entry, or any other method, directory entries included, now raises
+  `CompressionError` before any member is read, with or without `max_output_bytes`. Stdlib
+  `zipfile` does not bound one read's output for those methods, so a tiny archive could expand far
+  past the ceiling before it was checked; ADR 0123's 2026-11-10 amendment records the measurement.
+  `zip_compress` writes only DEFLATED, so its archives are unaffected. (`BACKLOG #5535`)
 
 ## [0.5.2] — 2026-10-20 — Early Access
 
