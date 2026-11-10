@@ -8132,7 +8132,7 @@ class SqlServerStore:
         reason: str | None = None,
         escalation_tier: int = 0,
         now: float | None = None,
-    ) -> None:
+    ) -> AlertGeneration:
         # Pure observer (ADR 0044 D2): no queue row, no finalizer. De-dup grain = ADR 0014's
         # (event_type, connection) key. UPDATE-then-conditional-INSERT in one serializable transaction
         # (matching the SQLite path): the filtered unique index keeps it to one LIVE instance per key. The
@@ -8149,11 +8149,14 @@ class SqlServerStore:
             if reason
             else None
         )
+        # OUTPUT on both statements: the generation this write left (BACKLOG #4916), and a
+        # zero-match UPDATE read from its empty rowset, which SET NOCOUNT ON cannot hide.
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "UPDATE alert_instance SET last_seen=?, [count]=[count]+1, severity=?, reason=?,"
                     " escalation_tier=CASE WHEN escalation_tier < ? THEN ? ELSE escalation_tier END"
+                    " OUTPUT inserted.id, inserted.[count]"
                     " WHERE event_type=? AND connection=? AND status<>'resolved'",
                     (
                         now,
@@ -8165,17 +8168,22 @@ class SqlServerStore:
                         connection,
                     ),
                 )
-                if cur.rowcount == 0:
+                row = await cur.fetchone()
+                if row is None:
                     await cur.execute(
                         "INSERT INTO alert_instance"
                         " (event_type, connection, severity, status, first_seen, last_seen,"
-                        " [count], reason, escalation_tier) VALUES (?,?,?,'open',?,?,1,?,?)",
+                        " [count], reason, escalation_tier)"
+                        " OUTPUT inserted.id, inserted.[count] VALUES (?,?,?,'open',?,?,1,?,?)",
                         (event_type, connection, severity, now, now, reason_enc, escalation_tier),
                     )
+                    row = await cur.fetchone()
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
+        assert row is not None  # an OUTPUT clause on the write that landed returns its row
+        return AlertGeneration(int(row[0]), connection, int(row[1]))
 
     async def list_active_alert_instances(
         self,

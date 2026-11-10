@@ -15,8 +15,11 @@ from typing import Any
 
 async def check_alert_generation_contract(store: Any) -> None:
     kind = "intake_paused"
-    await store.upsert_alert_instance(
+    first = await store.upsert_alert_instance(
         event_type=kind, connection="intake:a@node:1", severity="warning", now=10.0
+    )
+    assert (first.connection, first.count) == ("intake:a@node:1", 1), (
+        "BACKLOG #4916: an upsert returns the generation it left"
     )
     await store.upsert_alert_instance(
         event_type=kind, connection="intake:b@node:2", severity="warning", now=10.0
@@ -32,10 +35,12 @@ async def check_alert_generation_contract(store: Any) -> None:
     [seen] = await store.open_alert_generations(event_type=kind, connection="intake:a@node:1")
     assert seen == every[0]
 
+    assert seen.id == first.id
     # A raise that lands after the read keeps the row open: no clock is compared.
-    await store.upsert_alert_instance(
+    folded = await store.upsert_alert_instance(
         event_type=kind, connection="intake:a@node:1", severity="warning", now=1.0
     )
+    assert (folded.id, folded.count) == (seen.id, seen.count + 1)
     assert await store.resolve_alert_generation(alert_id=seen.id, through_count=seen.count) == 0
     [moved] = await store.open_alert_generations(event_type=kind, connection="intake:a@node:1")
     assert (moved.id, moved.count) == (seen.id, seen.count + 1)

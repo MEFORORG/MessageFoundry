@@ -16333,7 +16333,7 @@ class MessageStore:
         reason: str | None = None,
         escalation_tier: int = 0,
         now: float | None = None,
-    ) -> None:
+    ) -> AlertGeneration:
         # Pure observer (ADR 0044 D2): a single short upsert under the write lock — NO queue row, NO
         # finalizer call (alert_instance is invisible to _maybe_finalize_message's `FROM queue` scan), so
         # it can never pin a message disposition. De-dup grain = ADR 0014's (event_type, connection)
@@ -16368,7 +16368,17 @@ class MessageStore:
                     " VALUES (?,?,?,'open',?,?,1,?,?)",
                     (event_type, connection, severity, now, now, reason_enc, escalation_tier),
                 )
+            # BACKLOG #4916: the generation this write left, read on the writer connection before
+            # the commit, so it is this write's and no later one's.
+            cur = await self._db.execute(
+                "SELECT id, count FROM alert_instance"
+                " WHERE event_type=? AND connection=? AND status!='resolved'",
+                (event_type, connection),
+            )
+            row = await cur.fetchone()
             await self._commit()
+        assert row is not None  # the write above left exactly one live row for the key
+        return AlertGeneration(int(row[0]), connection, int(row[1]))
 
     async def list_active_alert_instances(
         self,

@@ -364,3 +364,19 @@ no clock is compared across processes. It closes an acknowledged instance too, a
 does; retention then treats it as any other resolved row. Other process-labelled subjects
 (`crl_reload_refused`, `posture_loosened`, `log_forward_failed`, `remote_debug_refused`) are not
 swept by it.
+
+## Amendment (2026-11-09) -- an auto-resolve is fenced to the raises it saw (BACKLOG #4916)
+
+D2's auto-resolve closed every live instance of its key when it landed. It waits behind the key's
+FIFO lock (#2272 defect 8) and its retries (BACKLOG #3756), so another engine shard or node on the
+same store could raise the key in that window, and the late resolve closed the newer raise. The
+notifier now reads the key's live `(id, count)` when the resolve's task first runs, which is in
+emit order and before it queues, and closes each instance only through that count, plus one for
+each of its own raises that landed past it (the raises emitted before the clear, which defect 8
+still requires it to close). An upsert returns the generation it left, on all three backends, for
+that count. A raise from another process that lands later moves the count past the bound, and the
+instance stays open. No clock is compared: the `last_seen <= now` guard the PR for #3756 declined
+(decision d20261030T211551515-1de84e) would leave an alert open for good under cross-node clock
+skew. A resolve that closes nothing still landed, since nothing it observed is open or the instance
+it observed has taken a newer raise. A store without the generation methods, or a failed snapshot
+read, resolves unfenced, as before.

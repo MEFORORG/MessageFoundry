@@ -1449,7 +1449,7 @@ class QueueStore(StoreLifecycle, Protocol):
         reason: str | None = None,
         escalation_tier: int = 0,
         now: float | None = None,
-    ) -> None:
+    ) -> AlertGeneration:
         """Record/fold one operator-alert occurrence into a resolvable ``alert_instance`` (ADR 0044),
         de-duped on ADR 0014's ``(event_type, connection)`` throttle key: if a live (``open`` or
         ``acknowledged``) instance for the key exists, bump ``last_seen`` + ``count`` (refresh
@@ -1461,7 +1461,10 @@ class QueueStore(StoreLifecycle, Protocol):
         transaction, touching no ``queue`` row and calling no finalizer, so it can never pin a message's
         disposition. ``reason`` is ``safe_text``-scrubbed (#120) and encrypted at rest on every backend;
         no message body is ever passed here. The caller (the ``_emit`` chokepoint) wraps it fail-soft, so
-        a store error here can never wedge a delivery worker."""
+        a store error here can never wedge a delivery worker.
+
+        Returns the live instance's :class:`AlertGeneration` as this write left it (BACKLOG #4916),
+        which the notifier uses to bound a later resolve to the raises it has seen."""
         ...
 
     async def list_active_alert_instances(

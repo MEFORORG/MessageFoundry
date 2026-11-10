@@ -6613,7 +6613,7 @@ class PostgresStore:
         reason: str | None = None,
         escalation_tier: int = 0,
         now: float | None = None,
-    ) -> None:
+    ) -> AlertGeneration:
         # Pure observer (ADR 0044 D2): no queue row, no finalizer. De-dup grain = ADR 0014's
         # (event_type, connection) key. ON CONFLICT on the partial unique index folds a re-fire into the
         # live instance (bump last_seen + count, refresh severity/reason); an acknowledged instance stays
@@ -6631,7 +6631,8 @@ class PostgresStore:
             if reason
             else None
         )
-        await self._pool.execute(
+        # RETURNING: the generation this one statement left (BACKLOG #4916).
+        row = await self._pool.fetchrow(
             "INSERT INTO alert_instance"
             " (event_type, connection, severity, status, first_seen, last_seen, count, reason,"
             " escalation_tier)"
@@ -6639,7 +6640,8 @@ class PostgresStore:
             " ON CONFLICT (event_type, connection) WHERE status <> 'resolved' DO UPDATE SET"
             " last_seen=EXCLUDED.last_seen, count=alert_instance.count+1,"
             " severity=EXCLUDED.severity, reason=EXCLUDED.reason,"
-            " escalation_tier=GREATEST(alert_instance.escalation_tier, EXCLUDED.escalation_tier)",
+            " escalation_tier=GREATEST(alert_instance.escalation_tier, EXCLUDED.escalation_tier)"
+            " RETURNING id, count",
             event_type,
             connection,
             severity,
@@ -6647,6 +6649,8 @@ class PostgresStore:
             reason_enc,
             escalation_tier,
         )
+        assert row is not None  # an upsert always returns its row
+        return AlertGeneration(int(row["id"]), connection, int(row["count"]))
 
     async def list_active_alert_instances(
         self,
