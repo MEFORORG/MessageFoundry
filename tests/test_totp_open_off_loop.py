@@ -170,14 +170,53 @@ async def test_a_combined_sign_in_does_not_stall_the_loop_on_a_blocking_decrypt(
         await store.close()
 
 
+@pytest.mark.parametrize("on_loop", [False, True], ids=["off-loop", "control-on-loop"])
+async def test_the_lockable_account_census_does_not_stall_the_loop_on_a_blocking_decrypt(
+    monkeypatch: pytest.MonkeyPatch, on_loop: bool
+) -> None:
+    """The lockable-account census reads every enrolled account's TOTP cell through the store's
+    ``get_totp_secret``, at startup and in ``verify``. Each open runs in a worker thread, so a
+    decrypt that blocks for :data:`_BLOCK` leaves the loop serving the heartbeat (BACKLOG #3929).
+
+    The control makes the store's hand-off run the blocking stub inline, and shows the instrument
+    sees the stall, so the off-loop arm can fail."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _identity, _password, _steps, _codes = await _totp_admin(
+            store, monkeypatch, before_confirm=lambda: None
+        )
+        loop_thread = threading.current_thread()
+        blocking_open, threads = _blocking_cipher(store, monkeypatch)
+        if on_loop:
+            real_to_thread = asyncio.to_thread
+
+            async def inline_for_the_cipher(fn: Callable[..., Any], /, *a: Any, **kw: Any) -> Any:
+                if fn is blocking_open:
+                    return fn(*a, **kw)
+                return await real_to_thread(fn, *a, **kw)
+
+            monkeypatch.setattr(asyncio, "to_thread", inline_for_the_cipher)
+        census, stall = await _longest_stall(service.lockable_account_census())
+        assert census.clean, census
+        assert len(threads) == 1, f"the census opened {len(threads)} cells, not the admin's one"
+        if on_loop:
+            assert stall >= _BLOCK * 0.9, f"the control saw no stall ({stall:.3f}s)"
+            assert threads == [loop_thread]
+            return
+        assert stall < _TOLERATED_STALL, f"the loop stalled {stall:.3f}s on a blocking decrypt"
+        assert threads[0] is not loop_thread, "the census opened a TOTP cell on the event loop"
+    finally:
+        await store.close()
+
+
 async def test_the_service_paths_that_open_the_totp_cell_open_it_off_the_loop(
     monkeypatch: pytest.MonkeyPatch, store: MessageStore
 ) -> None:
     """At least these service paths open the TOTP cell in a worker thread: the enrolment's confirm,
     the combined sign-in, the two-step verify (its code check and its before-and-after enrolment
     reads), a replayed code's failed spend (its after-read), a way-past gate (``_totp_state``), and
-    the status read where a re-enrolment is possible. The lockable-account census is not among them:
-    it reads through the store's ``get_totp_secret``, whose decrypt is the store's own."""
+    the status read where a re-enrolment is possible. The lockable-account census reads through the
+    store's ``get_totp_secret``, which has its own test above."""
     real_open = store.open_totp_secret
     seen: dict[str, list[threading.Thread]] = {}
     path = ["setup"]
@@ -325,3 +364,64 @@ async def test_a_disable_during_the_after_check_comparison_stops_the_factor_writ
         assert any((r["detail"] or "").find("factor_removed") >= 0 for r in rows), rows
     finally:
         await store.close()
+
+
+async def test_the_gates_and_the_store_judge_a_totp_cell_with_one_helper(
+    monkeypatch: pytest.MonkeyPatch, store: MessageStore
+) -> None:
+    """BACKLOG #3948 finding 17: the service's way-past gates (``_totp_state``) and the store's
+    judgement for its conditional writes (``judge_totp``) both judge a cell through the store's
+    ``judge_totp_cell``, so the two cannot drift apart. A spy on that one helper sees both calls.
+    RED when either side restates the judgement beside it."""
+    from messagefoundry.auth.service import _opened_totp_state
+    from messagefoundry.store import store as store_module
+
+    service, identity, _password, _steps, _codes = await _totp_admin(
+        store, monkeypatch, before_confirm=lambda: None
+    )
+    real_judge = store_module.judge_totp_cell
+    calls: list[str] = []
+
+    async def spy(*args: Any, **kwargs: Any) -> Any:
+        calls.append(str(args[2]))
+        return await real_judge(*args, **kwargs)
+
+    monkeypatch.setattr(store_module, "judge_totp_cell", spy)
+    monkeypatch.setattr(service_module, "judge_totp_cell", spy)
+    assert not await service.must_enrol_before_rotating(identity)
+    assert calls == [identity.user_id], calls
+    judgement = await store_module.judge_totp(
+        store.open_totp_secret, _opened_totp_state, await store.get_user(identity.user_id)
+    )
+    assert isinstance(judgement, store_module.TotpJudgement) and judgement.state == "usable"
+    assert calls == [identity.user_id, identity.user_id], calls
+
+
+async def test_a_password_change_currently_opens_the_totp_cell_twice(
+    monkeypatch: pytest.MonkeyPatch, store: MessageStore
+) -> None:
+    """BACKLOG #3948: this characterises the OPEN remainder of the row, not a desired contract.
+    A password change by a covered account with TOTP on opens the TOTP cell twice, once in the
+    early refusal before the argon2 hash and once in the store's conditional write after it. Under
+    a Transit cipher each open is one round trip. RED when either site stops opening the cell, or
+    a third open is added; fixing the row to open it once is meant to turn this RED."""
+    service, identity, _password, _steps, _codes = await _totp_admin(
+        store, monkeypatch, before_confirm=lambda: None
+    )
+    real_open = store.open_totp_secret
+    real_argon2 = service._argon2
+    events: list[str] = []
+
+    def counting(user_id: str, cell: str | None) -> str | None:
+        events.append(f"open:{user_id}")
+        return real_open(user_id, cell)
+
+    async def marking(fn: Callable[..., Any], *args: Any) -> Any:
+        events.append("hash")
+        return await real_argon2(fn, *args)
+
+    monkeypatch.setattr(store, "open_totp_secret", counting)
+    monkeypatch.setattr(service, "_argon2", marking)
+    assert await service.change_password(identity, "a fresh synthetic passphrase 7341") == []
+    opened = f"open:{identity.user_id}"
+    assert events == [opened, "hash", opened], events

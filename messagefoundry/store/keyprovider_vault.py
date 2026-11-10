@@ -189,7 +189,7 @@ def _build_client(
     # named in MEFOR_STORE_VAULT_ADDR, which is the one the client dials.
     #
     # allow_redirects=False (BACKLOG #1042, ASVS 15.3.2/1.3.6): every other shipped HTTP egress
-    # refuses redirects (transports/rest.py's _NO_REDIRECT_OPENER, auth/oidc_http.py's local twin),
+    # refuses redirects (transports/rest.py's shared no-redirect opener, auth/oidc_http.py's local twin),
     # and this client was the exception -- hvac's default is True. `token` rides as an
     # `X-Vault-Token` header on EVERY Transit call, so a 3xx from an on-path attacker (absent TLS
     # integrity) or a spoofed Vault would otherwise relocate the request, and requests re-sends the

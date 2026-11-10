@@ -102,7 +102,6 @@ from messagefoundry.transports.bounded_read import (
 # Reuse REST's hardened HTTP plumbing — same transports/ package, same no-redirect + TLS posture
 # (NOT a wrapper around RestDestination; ADR 0022 §2, exactly as soap.py does).
 from messagefoundry.transports.rest import (
-    _NO_REDIRECT_OPENER,
     _RETRYABLE_4XX,
     AUTH_CHALLENGE_REFUSED,
     MAX_OUTBOUND_HEADER_VALUE_LEN,
@@ -111,8 +110,10 @@ from messagefoundry.transports.rest import (
     ProxyConfig,
     _expiry_relaxed_opener,
     _insecure_opener,
+    _is_shared_no_redirect_opener,
     _no_redirect_opener,
     _redact_url,
+    _shared_no_redirect_opener,
     assert_probe_hop,
     auth_challenge_refused,
     capture_response_headers,
@@ -267,6 +268,17 @@ def _allow_list(
                 "(value withheld)"
             )
     return frozenset(value)
+
+
+def takes_update(interaction: object, conditional: object) -> bool:
+    """Whether a connection's writes are updates by id, so ``update_url_form="path"`` applies.
+
+    Conditional first, as :class:`FhirDestination` dispatches: ``if-match`` is an update whatever the
+    interaction says. Pure. The ``FHIR()`` factory and ``path_form_fhir_updates`` call it too, so the
+    three apply one rule for which writes are updates (vault BACKLOG #2571). It is not every rule
+    the build applies: a conditional beside ``transaction`` or ``batch`` is refused separately."""
+    cond = str(conditional) if conditional else None
+    return cond == "if-match" or (cond is None and str(interaction) == "update")
 
 
 def entry_screen_settings(interaction: str, methods: object, types: object) -> _EntryScreen | None:
@@ -1021,20 +1033,20 @@ class FhirDestination(DestinationConnector):
         self.format: str = str(s.get("format", "json"))
         if self.format != "json":
             # JSON-only MVP; FHIR-XML is deferred to a hardened-lxml path (ADR 0022 Options #5).
+            # The received value is left out, as for interaction below (#1183).
             raise ValueError(
-                f"FHIR destination format={self.format!r} is not supported (JSON only; ADR 0022)"
+                f"FHIR destination format must be one of {('json',)} (JSON only; ADR 0022)"
             )
         self.interaction: str = str(s.get("interaction", "create"))
         if self.interaction not in _INTERACTIONS:
-            raise ValueError(
-                f"FHIR destination interaction must be one of {_INTERACTIONS}, got {self.interaction!r}"
-            )
+            # The received value is left out: an env() value reaches this check at build, and a
+            # wrongly bound key can hold a credential (#1183, as resolve_env_settings does).
+            raise ValueError(f"FHIR destination interaction must be one of {_INTERACTIONS}")
         conditional = s.get("conditional")
         self.conditional: str | None = str(conditional) if conditional else None
         if self.conditional is not None and self.conditional not in _CONDITIONALS:
             raise ValueError(
-                f"FHIR destination conditional must be one of {_CONDITIONALS} or unset, "
-                f"got {self.conditional!r}"
+                f"FHIR destination conditional must be one of {_CONDITIONALS} or unset"
             )
         # Screened HERE rather than on the send path: it reaches an unencoded URL interpolation AND
         # the If-None-Exist HEADER value, and the header sink has none of the URL limb's incidental
@@ -1066,17 +1078,11 @@ class FhirDestination(DestinationConnector):
         self._entry_screen = entry_screen_settings(
             self.interaction, s.get("allowed_entry_methods"), s.get("allowed_entry_types")
         )
-        # Whether this connection's writes are updates by id. Conditional first, as _resolve_request
-        # dispatches: if-match is an update whatever the interaction says.
-        self._is_update = self.conditional == "if-match" or (
-            self.conditional is None and self.interaction == "update"
-        )
+        # Whether this connection's writes are updates by id, as _resolve_request dispatches.
+        self._is_update = takes_update(self.interaction, self.conditional)
         self.update_url_form: str = str(s.get("update_url_form") or "transaction")
         if self.update_url_form not in _UPDATE_URL_FORMS:
-            raise ValueError(
-                f"FHIR destination update_url_form must be one of {_UPDATE_URL_FORMS}, "
-                f"got {self.update_url_form!r}"
-            )
+            raise ValueError(f"FHIR destination update_url_form must be one of {_UPDATE_URL_FORMS}")
         self._path_form = self.update_url_form == "path"
         if self._path_form and not self._is_update:
             # Nothing else carries an id in the URL, so the setting would do nothing. Refused
@@ -1215,7 +1221,7 @@ class FhirDestination(DestinationConnector):
                 # A narrowed trust anchor needs its own opener for the same reason.
                 self._opener = _no_redirect_opener(*proxy_handlers, trust_anchor=anchor)
             else:
-                self._opener = _NO_REDIRECT_OPENER
+                self._opener = _shared_no_redirect_opener()
         else:
             # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
             guard = refuse_verify_off(
@@ -1248,7 +1254,7 @@ class FhirDestination(DestinationConnector):
                     "a connection cannot use BOTH a bearer-token provider and HTTP Digest auth "
                     "(mutually exclusive — configure exactly one)"
                 )
-            if self._opener is _NO_REDIRECT_OPENER:
+            if _is_shared_no_redirect_opener(self._opener):
                 # _no_redirect_opener, not a bare build_opener: the bare form lets urllib fill in an
                 # HTTPSHandler whose context the engine never names, so the forward-secrecy assertion
                 # cannot reach this hop (ASVS 12.1.2).
@@ -1261,13 +1267,15 @@ class FhirDestination(DestinationConnector):
             #
             # Last in __init__, below every statement that builds or replaces `self._opener`, and no
             # opener with tls_allow_expired: see refuse_unrevoked_verified_hop.
+            allow_expired = bool(s.get("tls_allow_expired", False))
             refuse_unrevoked_verified_hop(
                 scheme,
                 self.base_url,
                 connector="FHIR destination",
                 revocation_attested=config.tls_revocation_attested,
                 revocation_attested_reason=config.tls_revocation_attested_reason,
-                opener=None if bool(s.get("tls_allow_expired", False)) else self._opener,
+                opener=None if allow_expired else self._opener,
+                expiry_relaxed=allow_expired,
                 connection=config.name,
             )
 
@@ -1995,7 +2003,7 @@ class FhirLookupExecutor:
                 self._opener[cname] = (
                     _no_redirect_opener(*proxy_handlers, trust_anchor=lookup_anchor)
                     if proxy_handlers or lookup_anchor.narrows
-                    else _NO_REDIRECT_OPENER
+                    else _shared_no_redirect_opener()
                 )
                 # BACKLOG #2193 (ADR 0173): the read hop verifies the FHIR server's certificate, but
                 # stdlib ssl checks no OCSP or CRL, so a revoked certificate would still be accepted on

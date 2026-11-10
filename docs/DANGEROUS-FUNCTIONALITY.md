@@ -257,10 +257,46 @@ handles. The launcher was also started through `ShellExecuteExW`, the Windows sh
 opening a file. With neither variable set, each start ran the stand-in, with no stderr. With
 `PYTHONFAULTHANDLER=1`, and again with `PYTHONDEVMODE=1`, each exited 1 without running it.
 `pythonw -m` that inherited its parent's handles, as from a terminal that hands its own on, had a
-stderr and ran under each variable. Not measured, at least: the installed `messagefoundry-tray`
-launcher itself, a real click in Explorer or the Start menu, a `.lnk` shortcut, a start typed
-into an interactive console window, and other `PYTHON*` variables. `docs/TRAY.md` gives the
-operator's remedy.
+stderr and ran under each variable.
+
+The installed launcher was measured on 2026-11-05, on Windows 11 build 26300 with Python 3.14.7,
+by hand. No test or script in the tree repeats it. The launcher was the `messagefoundry-tray.exe`
+that pip wrote for `[project.gui-scripts]` into the `Scripts` folder of a venv inside a git
+worktree, holding an editable install, so a "checkout" in the terms above. It is a GUI-subsystem
+program. Each start was a Python `subprocess` call with `close_fds` set and no standard handles
+passed, with every other `PYTHON*` variable removed, and with its own `LOCALAPPDATA`, `APPDATA`,
+`TEMP` and `TMP`. `pythonw -m messagefoundry.tray`, run with the same venv's `pythonw.exe` the same
+way, was measured beside it.
+
+The measuring process held the tray's single-instance mutex, so that a start which got as far as
+the tray's mutex check would stop there rather than add an icon. By the code, not by this run, the
+chain is: pip's GUI launcher, then the venv's `pythonw.exe` redirector, then the base interpreter,
+which runs the tray code; `pythonw -m` starts at the redirector. The instruments were each start's
+exit code, a listing of processes from the venv taken after it exited, and the contents of its own
+`tray.log`. Which code path ended each process is not recorded. After the launcher's neither-set
+start exited, the listing still showed a `MessageFoundryTray.exe` from the venv, and its
+`tray.log` was empty; read again after that process had gone, it held the start line.
+
+| Start, no standard handles | `PYTHONFAULTHANDLER=1` | `PYTHONDEVMODE=1` | Neither set |
+|---|---|---|---|
+| `messagefoundry-tray.exe` | exit 1, no `tray.log` | exit 1, no `tray.log` | exit 0, start line in `tray.log` |
+| `pythonw -m messagefoundry.tray` | exit 1, no `tray.log` | exit 1, no `tray.log` | exit 0, start line in `tray.log` |
+
+Where a start line was written, so was the line saying another tray instance was running. A
+`MessageFoundryTray.exe` copy and four runtime DLLs appeared in the venv's `Scripts` folder,
+which every start shared, between a listing taken before the first start and one after the last.
+
+So under either variable no start reached `tray.log`. A `tray.log` cannot show that no code ran at
+all, since the tray opens it only after its imports and its branded relaunch. The readings that
+show the exit coming before any code are the 2026-10-16 ones above, taken with the throwaway
+ScriptMaker stand-in launcher, not with the installed launcher. As a contrast, in the 2026-11-05
+run the installed launcher, started by a process that handed it a pipe as its stderr, exited 0 and
+wrote its start line under each variable. That is not a terminal start, and in that run
+`pythonw -m` was not started with a pipe. Not measured, at least: a real click
+in Explorer or the Start menu, a `.lnk` shortcut, the installed launcher through `ShellExecuteExW`,
+a start typed into an interactive console window, a tray left to run on to its icon, a
+non-editable install, the installed launcher's import path, and other `PYTHON*` variables.
+`docs/TRAY.md` gives the operator's remedy.
 
 Shipping a hand start that carries `-E` was rejected. The project cannot add `-E` to the
 `messagefoundry-tray` launcher: pip writes the interpreter line from the interpreter's path alone,
@@ -271,9 +307,9 @@ command, which also turns remote debugging off, uses the bootstrap script in a c
 install it runs from.
 
 The `messagefoundry-tray` command is a launcher the installer writes. It was not run to measure its
-import path, because that starts a real tray; the stand-in measurement above covers only the
-exit. Its console twin from the same install,
-`messagefoundry.exe`, has the same form: a small program with the entry-point script archived
+import path, which the not-measured list above names. In a reading taken on 2026-10-02 with
+Python 3.14.6, not in the 2026-11-05 run, its console twin from one install, `messagefoundry.exe`,
+had the same form: a small program with the entry-point script archived
 inside it. Run from a working directory holding a decoy `messagefoundry` package,
 `messagefoundry.exe --version` loaded the real package, while `python -m messagefoundry --version`
 loaded the decoy. Measured 2026-10-02 on Windows, Python 3.14.6. Either way that start keeps remote
@@ -635,8 +671,10 @@ these:
 A hit inside a codec package under `parsing/`, such as `parsing/xml/`, counts for the whole package.
 Every parse site the scan finds sits in exactly one of the first two tables below. The first holds
 the modules where any code reads input from outside the engine, whichever call the scan matched.
-The second holds the ones that read only what the engine wrote itself or an operator supplied. The
-third table lists hand-written parsers the patterns cannot see, found by reading the code.
+The second holds the ones that read only what the engine wrote itself, what an operator supplied,
+or, for the dependency audit, a requirements lock from the repository being checked. On a pull
+request run that lock comes from whoever opened the pull request. The third table lists
+hand-written parsers the patterns cannot see, found by reading the code.
 
 **One rule decides a hand-over.** Some modules only hand outside input to other code. Such a module
 is in the first table when it hands the input to a parser. A parser here is a format library, a
@@ -716,6 +754,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 | It reads rows or files the engine wrote itself: its store, the key custody host blob and the recovery wrap kept in its store (no command reads a wrap from an archive yet), audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches | `store/metadata.py`, `store/crypto.py`, `store/custody.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py`, `pipeline/security_signals.py` |
 | It reads the responses the engine's own HTTP server writes | `api/protocol_headers.py`, `api/protocol_floor_selftest.py` |
 | It reads what an operator supplies: service settings, the code sets in the config directory and edits to them, private key files, command-line JSON, the install's package metadata, a restore token file, the trust anchor files it chooses to trust, a systemd credential and a recovery key a person types | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `cli_common.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py`, `store/custody.py` |
+| It reads a hashed requirements lock from the repository being checked, never a received message: the engine's own locks in `security.yml`, a released line's lock at the tag a release names, an adopter's `requirements.lock` in the `audit-pin` job `messagefoundry-toolkit init` generates, or a lock a person names when running it by hand. On a pull request run the lock comes from whoever opened the pull request, and so do the workflow and the script that read it. It decodes the file as pip does, so a coding declaration in the lock picks the codec, which can be any text codec this Python knows; a declaration naming a codec that is not a text codec, such as `zlib`, `hex` or `rot13`, is refused. It splits each requirement line into its pin, marker, options and comment, to write a copy with the markers removed for `pip-audit`. It is a command run in CI or by hand; the engine never calls it. | `security/audit_all_platforms.py` |
 | It is an inbound whose own code reads nothing. The timer emits a body an operator configured. The loopback and pass-through inbounds take bodies the engine hands over: a partner's captured reply, or a Handler's output. Those bodies are outside input, and the parsers in the first table read them. | `transports/timer.py`, `transports/loopback.py`, `transports/passthrough.py` |
 | It parses no input. It builds messages or reads `hl7apy`'s own schema tables. | `messagefoundry_toolkit/generators/_core.py`, `messagefoundry_toolkit/generators/siu.py`, `messagefoundry_toolkit/hl7schema.py`, `messagefoundry_toolkit/hl7structures.py` |
 | It reads a URL an operator configures, never a received body: an outbound's or a `FhirLookup`'s `url` setting, the value its `env()` reference resolves to, and, for the settings views, any URL-named setting such as `proxy_url` and an `env()` default. It splits the query string with `urllib.parse` to name the parameters that look like credentials. At least the ASVS 14.2.1 warning and loosening entry, the `verify_tls = false` credential refusal (vault BACKLOG #3230) and the off-box cleartext credential refusal (vault BACKLOG #3533) use those names. For the settings views it also splits the whole URL by hand, with one regular expression, at every `?`, `&`, `#` and `;`, and percent-decodes each segment's name; a URL it finds a credential name in is withheld whole. It runs at least when a `Rest`, `Soap`, `FHIR`, `DICOMweb` or `FhirLookup` connection is built, in `messagefoundry check`, on `GET /security/posture` on a running engine and on each settings view (`GET /metadata`, `graph --json`). The warning, the reports and the views put no bound on the URL's length, because the operator wrote it. Some refusals read it only after `enforce_outbound_length_limits` has refused one over `MAX_OUTBOUND_URL_LEN`, and some before, at least a `FhirLookup`'s off-box cleartext refusal. It returns parameter names, never values, and returns nothing rather than raising on a URL it cannot parse. | `secretscrub.py` |
@@ -1194,6 +1233,7 @@ key, the account's second factor is a key the caller chose rather than one the e
 | An engine's replies to what the harness sends | The engine under test | `drivers/dimse.py`, `drivers/http.py`, `load/sender.py` |
 | What an engine delivers to a harness sink | The engine under test, and anything else that connects on loopback | `scenarios/http.py`, `sinks/dimse.py`, `sinks/email.py` |
 | Files a run or its operator wrote | A path on the command line, or a folder the run's processes share | `__main__.py`, `acceptance/runner.py`, `load/connscale/batchbox.py`, `load/coord.py`, `load/corpus.py`, `reconcile/compare.py` |
+| The self-test probe servers' answers, read before the HTTP sink binds its port | One throwaway server per `SELF_TEST_CASES` entry, each started by `_probe` in the same process on the `LOOPBACK` address in `sinks/__init__.py`. They start every time an HTTP sink starts. The self-test sends each one fixed request on its own connection and reads the answer. Every HTTP sink runs its own self-test before it binds. With several HTTP sinks live in one process, a later sink's probes can run while earlier sinks still listen. A local process with no foothold beyond its own loopback connection can make the self-test fail, but not pass. At least these footholds let a process make it pass: reaching the harness process, writing a file the harness imports, and reading, injecting into, resetting or redirecting loopback connections. A process running as the same user usually has one. On a default Windows box it can reach the harness process. It can write the files the harness imports wherever that user owns the install or the working directory. Another user may have one too, at least as Administrator or root. At least two other reads in `sinks/_http.py` take input any local peer chooses, and the six patterns find neither. One is what reaches the sink's own port, the other what reaches a probe's port. Both are parsed mostly through the standard library's `http.server`. Neither read stops when its server closes. At least on CPython 3.14.7, the handler threads are daemon threads, and `server_close` does not join them. So a connection accepted while a server was open can still be parsed after that server closes, after `HttpSink.stop` too. Each read on it times out on its own, so a peer that sends a little at a time can keep it going long after the close. | `sinks/_http.py` |
 | Nothing | These only build or write the format | `acceptance/report.py`, `load/connscale/report.py`, `load/report.py`, `scenarios/_dimse_dataset.py` |
 
 `acceptance/runner.py` reads the JUnit file its own `pytest` child wrote, with the standard
