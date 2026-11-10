@@ -92,11 +92,13 @@ __all__ = [
     "postgres_excess",
     "preflight_outcome",
     "probe_failure",
+    "probed_grant",
     "refusal_reason",
     "run_store_privilege_preflight",
     "sqlite_not_applicable",
     "sqlserver_excess",
     "store_privilege_alert_subject",
+    "view_definition_grant",
 ]
 
 
@@ -195,26 +197,43 @@ def audit_write_grant(privilege: str, table: str) -> str:
     return f"{label} on table {table}"
 
 
+def view_definition_grant(schema: str) -> str:
+    """The one wording for ``VIEW DEFINITION`` held on ``schema`` (BACKLOG #6714), lower-cased for
+    the log redaction as :func:`audit_write_grant` says."""
+    return f"view definition on schema {schema}"
+
+
 def audit_write_alias(table: str, privilege: str) -> str:
     """The probe column that reads ``privilege`` on ``table``. Both come from the closed tuples above,
     never from input, so the alias is a fixed identifier."""
     return f"aw_{table}_{privilege.lower().replace(' ', '_')}"
 
 
+def probed_grant(value: object) -> bool | None:
+    """Read one privilege-probe answer THREE ways: ``True`` held, ``False`` not held, ``None`` **not
+    read**. Only an int or a bool that is 0 or 1 reads; anything else, a NULL, the text ``"1"``, a
+    ``2``, ``1.0`` or bytes, is not read (BACKLOG #6015), as ``classify_login_roles`` reads the
+    partner login. Folding an unexpected value to "not held" would read as clean, so a driver that
+    changed its answer type could turn the probe into a false clean."""
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    return None
+
+
 def classify_audit_writes(
     row: Mapping[str, object], privileges: Sequence[str]
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Read the probe's audit-table columns THREE ways, as ``_probed_grant`` reads a role: ``(held,
-    unread)``, each in :func:`audit_write_grant` wording. A NULL is a table the login cannot resolve,
-    so it is NOT READ and never folds into "not held". ``== 1`` accepts a driver's ``True`` or ``1``."""
+    """Read the probe's audit-table columns THREE ways, by :func:`probed_grant`: ``(held, unread)``,
+    each in :func:`audit_write_grant` wording. A NULL is a table the login cannot resolve, so it is
+    NOT READ and never folds into "not held"."""
     held: list[str] = []
     unread: list[str] = []
     for table in AUDIT_APPEND_ONLY_TABLES:
         for privilege in privileges:
-            value = row[audit_write_alias(table, privilege)]
-            if value is None:
+            grant = probed_grant(row[audit_write_alias(table, privilege)])
+            if grant is None:
                 unread.append(audit_write_grant(privilege, table))
-            elif value == 1:
+            elif grant:
                 held.append(audit_write_grant(privilege, table))
     return tuple(held), tuple(unread)
 
@@ -254,6 +273,7 @@ def sqlserver_excess(
     create_table: bool = False,
     alter_schema: str | None = None,
     audit_writes: Sequence[str] = (),
+    view_definition: Sequence[str] = (),
 ) -> tuple[str, ...]:
     """What an observed SQL Server principal holds BEYOND the documented least-privilege grant.
 
@@ -261,8 +281,16 @@ def sqlserver_excess(
     the runtime login holds row CRUD only, so ``db_ddladmin`` is reported as excess, and so are the
     same rights granted directly rather than by role: ``create_table`` (``CREATE TABLE`` on the
     database) and ``alter_schema`` (the name of the default schema, when the login holds ``ALTER`` on
-    it). Both are suppressed when ``db_ddladmin`` or ``db_owner`` is already named, since that role
-    carries them. ``False`` keeps the auto-mode grant, where the login runs its own schema DDL.
+    it). Both are suppressed when ``db_ddladmin``, ``db_owner``, ``sysadmin``, database ``CONTROL``
+    or ``CONTROL SERVER`` is already named, since each carries them; another server role does not
+    suppress them, because it carries neither right (BACKLOG #6714). ``False`` keeps the auto-mode
+    grant, where the login runs its own schema DDL.
+
+    ``view_definition`` names the schemas the login holds ``VIEW DEFINITION`` on (BACKLOG #6714).
+    Only ``provision-admin`` needs that grant, to read the catalog before a mint
+    (``docs/DEPLOY-SERVER-DB.md`` §1.1), so the runtime login holding it is excess. Counted under
+    ``external`` only, like the direct schema-DDL rights, and suppressed when ``db_owner``,
+    ``sysadmin``, database ``CONTROL`` or ``CONTROL SERVER`` is named, since each carries it.
 
     ``audit_writes`` names the row-changing rights the login holds on the append-only audit tables
     (:func:`audit_write_grant` wording, owner ruling R16). ``db_datawriter`` grants them on every table,
@@ -292,12 +320,6 @@ def sqlserver_excess(
         out.append("control server")
     if control_database and "db_owner" not in database_roles:
         out.append(f"CONTROL on database {database}")
-    ddl_role_named = bool({"db_ddladmin", "db_owner"} & set(database_roles)) or bool(server_roles)
-    if external and not ddl_role_named and not control_database:
-        if create_table:
-            out.append(f"create table on database {database}")
-        if alter_schema:
-            out.append(f"ALTER on schema {alter_schema}")
     owner_named = (
         "db_owner" in database_roles
         or "sysadmin" in server_roles
@@ -305,10 +327,16 @@ def sqlserver_excess(
         or control_server
     )
     if external and not owner_named:
-        # ALTER on every table rides db_ddladmin, named above. ALTER on the default schema is not
-        # folded in: the audit tables may resolve to dbo instead, so it may not be the same grant.
+        # db_ddladmin, named above, carries CREATE TABLE, ALTER on every schema and ALTER on every
+        # table. ALTER on the default schema is not folded into the table right: the audit tables
+        # may resolve to dbo instead, so it may not be the same grant.
         ddladmin = "db_ddladmin" in database_roles
+        if create_table and not ddladmin:
+            out.append(f"create table on database {database}")
+        if alter_schema and not ddladmin:
+            out.append(f"ALTER on schema {alter_schema}")
         out.extend(w for w in audit_writes if not (ddladmin and w.startswith("ALTER ")))
+        out.extend(view_definition_grant(s) for s in dict.fromkeys(view_definition))
     return tuple(out)
 
 
@@ -546,7 +574,13 @@ def store_privilege_alert_subject(report: StorePrivilegeReport) -> str:
 
     Keyed by principal, not fixed, because several processes share one store (HA nodes, engine
     shards) and may log in as different principals: a clean start by one must not resolve the open
-    warning another still earns. A re-alert from the same principal folds into the same instance."""
+    warning another still earns. A re-alert from the same principal folds into the same instance.
+
+    The bare ``store`` names no principal, so no start can show the warning there is its own. A
+    clean OBSERVED start clears it as well as its own subject (BACKLOG #6715), or nothing would.
+    So on a shared store, one process's clean start also clears a bare warning another process
+    opened and may still earn. That process opens it again only at its next start, and the log
+    line and audit row of the start that opened it are kept."""
     if not report.principal:
         return STORE_PRIVILEGE_ALERT_SUBJECT
     return f"{STORE_PRIVILEGE_ALERT_SUBJECT}:{report.principal}@{report.database}"
@@ -647,10 +681,16 @@ async def run_store_privilege_preflight(
         if alert_sink is not None and report.status is StorePrivilegeStatus.OBSERVED:
             # The inverse: a clean OBSERVED read resolves an open warning from an earlier start, so a
             # fixed grant clears GET /alerts/active without a hand resolve. SQLite has nothing to clear.
-            try:
-                alert_sink.store_privilege_clean(store_privilege_alert_subject(report))
-            except Exception:  # noqa: BLE001 — best-effort, like the warning
-                log.exception("store privilege preflight: the alert sink raised")
+            # The bare subject is cleared too (BACKLOG #6715): an earlier start whose probe named no
+            # principal opened its warning there, and nothing else ever resolves it.
+            subjects = dict.fromkeys(
+                (store_privilege_alert_subject(report), STORE_PRIVILEGE_ALERT_SUBJECT)
+            )
+            for subject in subjects:
+                try:
+                    alert_sink.store_privilege_clean(subject)
+                except Exception:  # noqa: BLE001 — best-effort, like the warning
+                    log.exception("store privilege preflight: the alert sink raised")
     else:
         log.warning(
             "%s — [store].require_least_privilege=%s, enforcing=%s%s",

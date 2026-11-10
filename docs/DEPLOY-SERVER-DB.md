@@ -227,8 +227,10 @@ Vault and LDAP*.
 > the login that runs `provision-admin`, for example
 > `GRANT VIEW DEFINITION ON SCHEMA::[dbo] TO [CORP\some-operator];` when that schema is `dbo`.
 > Under `auth = "integrated"` that login is the Windows account that runs the command, which is
-> not the gMSA unless the command runs as it. The startup probe (§1.3) does not report it as excess,
-> so where that login is the runtime login (`auth = "sql"`), revoke the grant once the mint is done.
+> not the gMSA unless the command runs as it. Where that login is the runtime login (`auth = "sql"`),
+> revoke the grant once the mint is done. Under `schema_management = "external"` the startup probe
+> (§1.3) reports the grant as excess on the runtime login's default schema or on `dbo`; under `auto`
+> it does not report it.
 >
 > **`[store].schema_management = "auto"` puts the DDL back on the runtime login.** The engine then
 > builds and upgrades its own schema at open, and the gMSA also needs `db_ddladmin` as a standing
@@ -357,7 +359,7 @@ The grants in §1.1 and §1.2 used to be prescriptions the engine could not chec
 
 | Backend | What the probe reads | On SQLite |
 |---|---|---|
-| SQL Server | fixed **server**-role and **database**-role membership by name (`IS_SRVROLEMEMBER` / `IS_ROLEMEMBER` — authoritative and independent of catalog visibility), plus `CONTROL SERVER` / database `CONTROL`, plus any user-defined database role the catalog exposes. Under `schema_management = "external"` (the default) `db_ddladmin` counts as excess, and so does `UPDATE` (on the table or any one column), `DELETE`, `ALTER`, `CONTROL` or `TAKE OWNERSHIP` on `audit_log`; under `auto` `db_ddladmin` is prescribed and the audit-table rights are not counted | n/a |
+| SQL Server | fixed **server**-role and **database**-role membership by name (`IS_SRVROLEMEMBER` / `IS_ROLEMEMBER` — authoritative and independent of catalog visibility), plus `CONTROL SERVER` / database `CONTROL`, plus any user-defined database role the catalog exposes. Under `schema_management = "external"` (the default) `db_ddladmin` counts as excess, and so do `VIEW DEFINITION` on the login's default schema or on `dbo`, and `UPDATE` (on the table or any one column), `DELETE`, `ALTER`, `CONTROL` or `TAKE OWNERSHIP` on `audit_log`; under `auto` `db_ddladmin` is prescribed, and neither the audit-table rights nor `VIEW DEFINITION` is counted | n/a |
 | PostgreSQL | every role the principal may assume and the **attributes** each carries (`SUPERUSER`, `CREATEROLE`, `CREATEDB`, `REPLICATION`, `BYPASSRLS`), plus database ownership and `CREATE` on the database. Under `external` it also counts `CREATE` on the store's schema, ownership of objects in it, and `UPDATE` (on the table or any one column), `DELETE`, `TRUNCATE` or `TRIGGER` on `audit_log` held by any role it may assume, as excess; under `auto` the first two are prescribed and the audit-table rights are not counted | n/a |
 | SQLite | — | reported **not applicable**: a local file has no server principal; access is the filesystem ACL on the `.db` and its `-wal`/`-shm` sidecars |
 

@@ -167,7 +167,9 @@ from messagefoundry.store.privilege import (
     StorePrivilegeReport,
     audit_write_alias,
     classify_audit_writes,
+    probed_grant,
     sqlserver_excess,
+    view_definition_grant,
 )
 from messagefoundry.store.queue_tag import (
     LIVE_INLINE_ROW,
@@ -3205,16 +3207,32 @@ def _audit_write_probe(table: str, privilege: str) -> str:
     The one-part name resolves as the store's own unqualified statements do, and ``HAS_PERMS_BY_NAME``
     answers NULL for a table this login cannot see, which the probe reads as NOT READ. ``UPDATE`` is
     read column by column: a column-level GRANT outranks a table-level DENY, so the table-level answer
-    alone would miss it. ``OBJECT_ID`` is NULL for a table the login cannot see, so no column row is
-    found and the MAX is NULL too. ``table`` and ``privilege`` come from closed tuples in
-    ``store.privilege``, never from input."""
+    alone would miss it. The per-column answers fold through :func:`_any_grant`, never ``MAX``.
+    ``table`` and ``privilege`` come from closed tuples in ``store.privilege``, never from input."""
     alias = audit_write_alias(table, privilege)
     if privilege == "UPDATE":
-        return (
-            f"(SELECT MAX(HAS_PERMS_BY_NAME('{table}', 'OBJECT', 'UPDATE', c.name, 'COLUMN'))"
-            f" FROM sys.columns c WHERE c.object_id = OBJECT_ID('{table}')) AS {alias}"
+        per_column = (
+            f"SELECT HAS_PERMS_BY_NAME('{table}', 'OBJECT', 'UPDATE', c.name, 'COLUMN') AS p"
+            f" FROM sys.columns c WHERE c.object_id = OBJECT_ID('{table}')"
         )
+        return f"{_any_grant(per_column)} AS {alias}"
     return f"HAS_PERMS_BY_NAME('{table}', 'OBJECT', '{privilege}') AS {alias}"
+
+
+def _any_grant(answers: str) -> str:
+    """A scalar subquery folding the 1 / 0 / NULL answers in column ``p`` of ``answers`` three ways
+    (BACKLOG #6015): 1 when any answer is 1, 0 when every answer is 0, and NULL, NOT READ, when an
+    answer is NULL and none is 1, or when there is no answer at all.
+
+    ``MAX`` skips NULLs, so a NULL column beside a 0 column folded to 0 and read as not held: a
+    false clean from a column that was never read. A 1 still wins over a NULL, since a partial read
+    can only understate a held grant. ``OBJECT_ID`` is NULL for a table the login cannot see, so no
+    column row is found and the fold is NULL. Standard SQL only, so a test can run it on SQLite."""
+    return (
+        "(SELECT CASE WHEN SUM(CASE WHEN a.p = 1 THEN 1 ELSE 0 END) > 0 THEN 1"
+        " WHEN COUNT(*) > 0 AND COUNT(a.p) = COUNT(*) THEN 0 END"
+        f" FROM ({answers}) AS a)"
+    )
 
 
 def _probed_grant(value: Any) -> bool | None:
@@ -3227,11 +3245,9 @@ def _probed_grant(value: Any) -> bool | None:
     that NULL through ``== 1`` yields ``False``, which reads as *"not a member"* and therefore as
     clean, so a probe that read NOTHING would render as a clean bill of health — the exact false-clean
     :meth:`SqlServerStore.probe_principal_privileges` names catalog enumeration to avoid, arriving by
-    the other door. ``True``/``False`` from a driver that returns booleans still compares equal to
-    ``1``/``0``, so this keeps working on such a driver."""
-    if value is None:
-        return None
-    return bool(value == 1)
+    the other door. ``True``/``False`` from a driver that returns booleans still read as ``1``/``0``;
+    any other value is not read either, by :func:`~messagefoundry.store.privilege.probed_grant`."""
+    return probed_grant(value)
 
 
 class SqlServerStore:
@@ -4682,7 +4698,12 @@ class SqlServerStore:
             # counted only under external, where the runtime login must hold none.
             " HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE TABLE') AS create_table,"
             " SCHEMA_NAME() AS default_schema,"
-            " HAS_PERMS_BY_NAME(SCHEMA_NAME(), 'SCHEMA', 'ALTER') AS alter_schema, "
+            " HAS_PERMS_BY_NAME(SCHEMA_NAME(), 'SCHEMA', 'ALTER') AS alter_schema,"
+            # #6714: VIEW DEFINITION on the two schemas a store's tables resolve through. Only
+            # provision-admin needs it, so under external the runtime login holding it is excess.
+            " HAS_PERMS_BY_NAME(QUOTENAME(SCHEMA_NAME()), N'SCHEMA', N'VIEW DEFINITION')"
+            " AS view_def_default,"
+            " HAS_PERMS_BY_NAME(N'[dbo]', N'SCHEMA', N'VIEW DEFINITION') AS view_def_dbo, "
             + ", ".join(server_cols + db_cols + audit_cols),
             SQLSERVER_FIXED_SERVER_ROLES + SQLSERVER_FIXED_DATABASE_ROLES,
         )
@@ -4725,6 +4746,17 @@ class SqlServerStore:
                 unread.append(f"create table on database {database}")
             if alter_schema is None:
                 unread.append("ALTER on the default schema")
+        # One column per distinct schema: when the default schema is dbo the two name one schema.
+        view_def_columns = {str(row["default_schema"] or ""): "view_def_default"}
+        view_def_columns.setdefault("dbo", "view_def_dbo")
+        view_definition: list[str] = []
+        for schema, column in view_def_columns.items():
+            grant = _probed_grant(row[column])
+            if grant is None:
+                if external:  # counted under external only, like the direct DDL rights
+                    unread.append(view_definition_grant(schema))
+            elif grant:
+                view_definition.append(schema)
         audit_writes, audit_unread = classify_audit_writes(row, SQLSERVER_AUDIT_WRITE_PRIVILEGES)
         server_roles = tuple(held_server)
         database_roles = tuple(held_database)
@@ -4732,8 +4764,9 @@ class SqlServerStore:
             probed = len(SQLSERVER_FIXED_SERVER_ROLES) + len(SQLSERVER_FIXED_DATABASE_ROLES) + 2
             held_labels = [f"server role {r}" for r in server_roles]
             held_labels += [f"database role {r}" for r in database_roles]
-            if external:  # owner ruling R16: a held audit-table right is a finding there
+            if external:  # owner ruling R16 and #6714: each is a finding there
                 held_labels += list(audit_writes)
+                held_labels += [view_definition_grant(s) for s in view_definition]
             # The catalog enumeration below is skipped deliberately: it is additive only, and widening
             # a report already saying the read was incomplete buys nothing an operator can act on.
             return StorePrivilegeReport(
@@ -4783,6 +4816,7 @@ class SqlServerStore:
             create_table=bool(create_table),
             alter_schema=(str(row["default_schema"] or "") if alter_schema else None),
             audit_writes=audit_writes,
+            view_definition=view_definition,
         )
         if external and audit_unread:
             # Owner ruling R16 counts these under external only, so only external needs them READ. A
