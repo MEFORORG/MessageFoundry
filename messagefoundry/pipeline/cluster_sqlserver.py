@@ -137,12 +137,15 @@ class SqlServerCoordinator:
         self._on_demote: Callable[[], None] | None = None
         self._fence_timeout = leader_fence_timeout_seconds
         # ADR 0157 Inc 0: the clamp on every statement in the maintenance loop (the heartbeat, the
-        # claim/renew and the config-version refresh) and on the stepdown's release write, in
-        # lockstep with DbCoordinator._call_tick (BACKLOG #5064, #6472): each runs in series with
-        # the renew or under _leadership_lock, so [store].command_timeout there would delay the
-        # renew past the fence. SqlServerStore._fetchone_clamped says how it is applied, and why
-        # each costs up to about twice the clamp and the COMMIT is outside it; the paused tick's
-        # owner read keeps its own budget (_paused_read_budget).
+        # claim/renew and the config-version refresh, which the engine's start-up seed also calls)
+        # and on the stepdown's release write, as DbCoordinator._call_tick bounds them (BACKLOG
+        # #5064, #6472): each runs in series with the renew or under _leadership_lock, so
+        # [store].command_timeout there would delay the renew. SqlServerStore._fetchone_clamped
+        # says how it is applied, why one costs up to about twice the clamp, three times when its
+        # rollback runs, and why the COMMIT is outside it. The clamp bounds each statement, not
+        # the tick: nothing checks that the heartbeat interval plus the loop's statements fit
+        # inside the fence, on either backend. The paused tick's owner read keeps its own budget
+        # (_paused_read_budget), and stop()'s release its own bound.
         self._renew_timeout = lease_renew_timeout_seconds
         if lease_renew_timeout_seconds < 1.0:
             # ServiceSettings refuses this at config load; a coordinator built another way is told.
@@ -287,7 +290,8 @@ class SqlServerCoordinator:
 
     async def config_version(self) -> int:
         """Read (seeding to 0 if absent) and cache the cluster-wide config-reload version. Under
-        the renew clamp, as the maintenance loop runs it (BACKLOG #6472)."""
+        the renew clamp, because the maintenance loop runs it (BACKLOG #6472); the engine's
+        start-up seed calls it too and gets the same bound, as on Postgres."""
         row = await self._store._fetchone_clamped(
             "SET NOCOUNT ON;"
             " MERGE cluster_config WITH (HOLDLOCK) AS t USING (SELECT 1 AS id) AS s ON t.id = s.id"
@@ -609,8 +613,8 @@ class SqlServerCoordinator:
                 self._no_claim_until = prior_pause
             elif arming:
                 # Armed a SECOND time from the instant the write returned, taking the later expiry, so
-                # the write's own duration, up to about twice the clamp, is not spent out of the
-                # pause. DbCoordinator's step_down_leadership carries the full reasoning; keep the
+                # the write's own duration, up to about three times the clamp with its rollback, is
+                # not spent out of the pause. DbCoordinator's step_down_leadership carries the full reasoning; keep the
                 # two in lockstep.
                 self._no_claim_until = max(self._no_claim_until, self._monotonic() + pause)
             if outcome.drained:  # a row release is a demotion edge too (#1508)
@@ -652,10 +656,11 @@ class SqlServerCoordinator:
         # DbCoordinator._release_leadership carries the full reasoning; keep the two in lockstep.
         self._lease_release_owed = True
         try:
-            # The driver-side bound is the renew clamp on both paths, as the claim gets (BACKLOG
-            # #5064); stop() also passes `timeout`, a whole-call bound on the event loop that
-            # cannot stop a write the server already took. None leaves the clamp alone, the
-            # stepdown's case.
+            # A stepdown (timeout None) gets the renew clamp, as the claim does; stop() gets its
+            # own bound, as DbCoordinator._release_leadership gives it, applied on the event loop
+            # and to the driver alike (BACKLOG #5064), since the loop's bound alone cannot stop a
+            # write the server already took.
+            clamp = self._renew_timeout if timeout is None else timeout
             async with asyncio.timeout(timeout):
                 # The expiry is the DB clock's now, read by the same _DB_NOW expression the MERGE's
                 # take-over predicate reads, so each sibling waits its own acquire_delay (BACKLOG
@@ -667,7 +672,7 @@ class SqlServerCoordinator:
                     f" (SELECT MIN(v) FROM (VALUES (lease_expires_at), ({_DB_NOW})) AS x(v))"
                     " WHERE lease_key = ? AND owner = ?",
                     (self._lease_key, self.node_id),
-                    timeout_clamp=self._renew_timeout,
+                    timeout_clamp=clamp,
                 )
         except Exception as exc:
             log.warning(

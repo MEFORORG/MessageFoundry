@@ -381,7 +381,7 @@ async def test_a_hung_rollback_on_a_failed_claim_frees_the_leadership_lock_in_th
 
 
 def test_an_unbounded_rollback_outside_a_task_still_runs() -> None:
-    """``within=None``, which every caller but a clamped read passes, enters no timeout at all.
+    """``within=None``, which every caller but a clamped statement passes, enters no timeout at all.
     ``asyncio.timeout(None)`` still needs a current task, so wrapping the rollback in it raised
     RuntimeError outside one, and the broad except then discarded the connection without trying the
     rollback. Driven by hand, so no task is current."""
@@ -601,21 +601,24 @@ async def test_a_renew_on_a_busy_pool_and_a_stalled_server_resolves_within_twice
     """The kept bound (Manager decision d20261030T213636115-0af931), pinned by timing rather than
     by the warning's arithmetic: the borrow and the statement each get the clamp, with no shared
     deadline, so a renew that waits on a busy pool and then meets a stalled server still resolves
-    inside twice the clamp, and the node takes nothing. The lower bound shows both windows were
-    spent, so this is the composite and not one window alone. The COMMIT is outside both windows,
-    by a reading of pyodbc, not a measurement (BACKLOG #6621); this fake's commit is immediate."""
-    clamp = 1.0
+    inside twice the clamp, and the node takes nothing. The borrow takes 0.9 of the clamp, near
+    the most it may, and the statement the whole of it, so the expected 1.9 x clamp is close to the
+    bound; the 0.5 s over it is timer slack on a loaded runner, not part of the bound. The lower
+    bound shows both windows were spent, so this is the composite and not one window alone. The
+    COMMIT is outside both windows, by a reading of pyodbc, not a measurement (BACKLOG #6621); this
+    fake's commit is immediate."""
+    clamp = 2.0
     conn = _Conn()
     conn.stalls = True
     store = _store(conn)
-    store._pool = _SlowPool(conn, delay=0.6 * clamp)
+    store._pool = _SlowPool(conn, delay=0.9 * clamp)
     coord = SqlServerCoordinator(store, "A", lease_renew_timeout_seconds=clamp)
     started = time.monotonic()
     with pytest.raises(RuntimeError, match="HYT00"):
         await coord._maintain_leadership()
     elapsed = time.monotonic() - started
-    assert 1.5 * clamp <= elapsed < 2 * clamp, elapsed
-    assert conn.statement_timeouts == [1]
+    assert 1.75 * clamp <= elapsed < 2 * clamp + 0.5, elapsed
+    assert conn.statement_timeouts == [2]
     assert coord.is_leader() is False
     assert not coord._leadership_lock.locked()
 
@@ -655,16 +658,19 @@ async def test_the_config_version_refresh_runs_under_the_renew_clamp() -> None:
     assert conn.raw.timeout == 30
 
 
-@pytest.mark.parametrize("stop_bound", [None, 10.0])
-async def test_the_lease_release_runs_under_the_renew_clamp(stop_bound: float | None) -> None:
-    """The stepdown's release holds _leadership_lock, and stop() passes its own whole-call bound on
-    top; the driver-side bound is the clamp on both paths (BACKLOG #5064, #6472)."""
+@pytest.mark.parametrize(("stop_bound", "expected"), [(None, 3), (10.0, 10)])
+async def test_the_lease_release_is_bounded_at_the_driver(
+    stop_bound: float | None, expected: int
+) -> None:
+    """The stepdown's release holds _leadership_lock, so it gets the renew clamp; stop() passes its
+    own bound, which reaches the driver too, as DbCoordinator gives stop() its own bound (BACKLOG
+    #5064, #6472)."""
     conn = _Conn()
     coord = SqlServerCoordinator(_store(conn), "A", lease_renew_timeout_seconds=3.25)
     coord._is_leader = True
     was_leader, _, wrote, _ = await coord._release_leadership(force_write=True, timeout=stop_bound)
     assert (was_leader, wrote) == (True, True)
-    assert conn.statement_timeouts == [3]
+    assert conn.statement_timeouts == [expected]
     assert conn.raw.timeout == 30
 
 

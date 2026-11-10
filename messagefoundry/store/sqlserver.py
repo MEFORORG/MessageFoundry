@@ -5829,8 +5829,7 @@ class SqlServerStore:
         self, timeout_clamp: float | None
     ) -> tuple[AbstractAsyncContextManager[Any], int | None, float | None]:
         """``(borrow, statement timeout, rollback bound)`` for one statement. ``timeout_clamp`` is
-        ``None`` for every caller but the cluster coordinator's maintenance loop and stepdown, and
-        ``None`` keeps the :meth:`_acquire` borrow and ``[store].command_timeout``. One value sets
+        ``None`` for every caller outside the SQL Server cluster coordinator, and ``None`` keeps the :meth:`_acquire` borrow and ``[store].command_timeout``. One value sets
         the borrow, the statement and the rollback bounds, so none can be set without the others; a
         shorter ``[store].command_timeout`` still ends the statement first, and bounds neither of
         the other two."""
@@ -5884,8 +5883,8 @@ class SqlServerStore:
         self, sql: str, params: tuple[Any, ...], *, timeout_clamp: float
     ) -> dict[str, Any] | None:
         """:meth:`_fetchone` bounded by ``timeout_clamp`` (ADR 0157 Inc 0). The cluster lease
-        claim/renew and the maintenance loop's config-version refresh are its callers (BACKLOG
-        #5064); :meth:`_execute_clamped` is its twin for a write.
+        claim/renew and the config-version refresh are at least its callers (BACKLOG #5064);
+        :meth:`_execute_clamped` is its twin for a write.
 
         Two windows before the statement returns, each at most the clamp floored at 1 s. The wait
         for a pooled connection is the smaller of ``max(1.0, clamp)`` and ``[store].acquire_timeout`` (:meth:`_fetch_rows` applies
@@ -5919,7 +5918,8 @@ class SqlServerStore:
     async def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:
         """Run a single write statement (or T-SQL batch) in its own committed transaction, and return
         the driver's row count (``-1`` when it reports none). Most callers ignore it; the cluster
-        stepdown reads it to say truthfully whether its owner-scoped release matched a row."""
+        stepdown reads it, through :meth:`_execute_clamped`, to say truthfully whether its
+        owner-scoped release matched a row."""
         return await self._write_rows(sql, params)
 
     async def _execute_clamped(
@@ -5927,9 +5927,10 @@ class SqlServerStore:
     ) -> int:
         """:meth:`_execute` bounded by ``timeout_clamp`` exactly as :meth:`_fetchone_clamped` bounds
         a read, whose docstring says what that leaves unbounded, the COMMIT included (BACKLOG
-        #5064). The cluster heartbeat and the lease release are its callers: both run in series
-        with the renew or under ``_leadership_lock``, so ``[store].command_timeout`` there would
-        delay the renew past the fence (BACKLOG #6472)."""
+        #5064). The cluster heartbeat and the lease release are at least its callers. The
+        heartbeat runs in series with the renew and a stepdown's release under
+        ``_leadership_lock``, so ``[store].command_timeout`` there would delay the renew (BACKLOG
+        #6472); ``stop()`` passes its own bound instead of the renew clamp."""
         return await self._write_rows(sql, params, timeout_clamp)
 
     async def _write_rows(
