@@ -392,15 +392,18 @@ target, no `pickle` import left to mis-suppress:
   >   is queued by then, the worker's own answer, a lookup it writes at `mode=isolated` or a second
   >   forged frame among them, that check kills the worker and the call fails with the
   >   unsolicited-frame error, whatever the forged answer said. If only an EOF is queued then, the
-  >   worker is reaped or killed for that EOF, and the forged answer still stands. Under that
-  >   condition, the outcome depends on the answer's kind; the fail kinds include at least `denied`,
-  >   `error` and `memory` (`_answer` in `_sandbox_codec.py`). A forged `ok` answer is consumed as
-  >   the result and the call does not fail, and the worker is kept unless an EOF was queued, so
-  >   none of the SHALL's three clauses holds for it. A forged `denied` or `error` answer is taken
-  >   as the answer too: the call fails with the writer's error text, which dead-letters the
-  >   message, or under `internal_error=STOP` holds the inbound, and the worker is kept unless an
-  >   EOF was queued. A forged `memory` answer kills the worker, records a `MEMORY_CAP` kill cause
-  >   for a memory cap that was never hit, and fails the call as having run out of memory. The
+  >   worker is reaped or killed, as `MEMORY_CAP` after a forged `memory` answer, and the forged
+  >   answer still stands. The writer can meet the condition whenever it chooses: a writer that
+  >   took the whole request from fd 0 leaves the worker nothing to answer, and code in the worker
+  >   can withhold its own answer. Under that condition, the outcome depends on the answer's kind;
+  >   the fail kinds are `denied`, `error` and `memory`, and `_answer` in `_sandbox_codec.py`
+  >   rejects any other kind. A forged `ok` answer is consumed as the result and the call does not
+  >   fail, so the call is never failed closed, and with no EOF queued the worker is kept and none
+  >   of the SHALL's three clauses holds. A forged `denied` or `error` answer is taken as the answer
+  >   too: the call fails with the writer's error text, and the message takes the path any failed
+  >   call takes, and the worker is kept unless an EOF was queued. A forged `memory` answer kills
+  >   the worker, records a `MEMORY_CAP` kill cause for a memory cap that was never hit, and fails
+  >   the call as having run out of memory, with the writer's text. The
   >   owner accepted two cases in this amendment as recorded deviations, each only in the scope its
   >   record gives; *Owner acceptances* below cites both records, and lists, as the Manager's
   >   reading, deviations that neither covers. Only a writer that knows the
@@ -433,9 +436,9 @@ target, no `pickle` import left to mis-suppress:
   > - **Record d20261110T165507353-b70f7b:** a grandchild that inherits the worker's request pipe
   >   (fd 0) can read a later request's id and forge an answer that the engine accepts as that
   >   message's result. This falls under this ADR's no-confinement residual, until a fix closes
-  >   the fd-0 path. The condition under which the engine accepts such an answer is the one in
-  >   bold, *The condition for every forged-answer case in this bullet*, in this amendment's bullet
-  >   *A frame that arrives later meets at least these outcomes*.
+  >   the fd-0 path. *Not the record's words:* the condition under which the engine accepts such an
+  >   answer is the one in bold, *The condition for every forged-answer case in this bullet*, in
+  >   this amendment's bullet *A frame that arrives later meets at least these outcomes*.
   >
   > *The Manager's 2026-11-10 reading of the code and the two records, not the owner's words:* at
   > least these deviations are not accepted by either owner record, and each is tracked as a step
@@ -444,13 +447,14 @@ target, no `pickle` import left to mis-suppress:
   > - A forged answer from a same-UID process that opened the worker's `/proc/<pid>/fd/0`.
   > - A forged answer from code running in the worker.
   > - The `mode=isolated` lookup in that window.
+  > - A forged `denied` or `error` answer, which fails the call with the writer's text and keeps
+  >   the worker.
   > - A forged `memory` answer, which kills a healthy worker and records a `MEMORY_CAP` kill cause
   >   for a memory cap that was never hit.
-  > - The desync of the next message after a partial read of fd 0 and a forged `ok` answer.
+  > - The desync of the next message after a partial read of fd 0 and a forged answer that keeps
+  >   the worker.
   >
-  > *Also the Manager's 2026-11-10 reading:* closing the fd-0 path alone does not stop a surviving
-  > grandchild on Linux from reaching a later worker through `/proc`, as the grandchild residual
-  > says.
+  > Closing the fd-0 path alone does not close the `/proc` route; see the grandchild residual.
   → `tests/test_sandbox.py::test_a_desynced_or_forged_response_is_rejected`,
   `tests/test_sandbox.py::test_a_frame_staged_between_dispatches_can_never_answer_the_next_one`,
   `tests/test_sandbox.py::test_a_dead_peer_is_not_treated_as_a_forged_frame`,
