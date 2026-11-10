@@ -421,11 +421,11 @@ target, no `pickle` import left to mis-suppress:
   > BACKLOG #3135 (ledger ruling R2).
   >
   > - **Record d20261110T144543956-d8f55a:** a stray frame that arrives after a call's check before
-  >   its request and ahead of its answer fails that message's call, which the
-  >   `[delivery] internal_error` policy then handles. Record
+  >   its request and ahead of its answer, in the record's words, *"dead-letters that message"*. Record
   >   d20261110T193056983-46d125: asked whether acceptance d20261110T144543956-d8f55a covers every
   >   `[delivery] internal_error` policy, the owner answered *"Yes, any policy"*, so the case is
-  >   accepted under `internal_error=stop` too.
+  >   accepted under every such policy, where the call fails and that policy handles it,
+  >   `internal_error=stop` included.
   > - **Record d20261110T165507353-b70f7b:** a grandchild that inherits the worker's request pipe
   >   (fd 0) can read a later request's id and forge an answer that the engine accepts as that
   >   message's result. This falls under this ADR's no-confinement residual, until a fix closes
