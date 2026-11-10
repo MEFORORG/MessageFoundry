@@ -2514,7 +2514,7 @@ def _checked_pass_environment(names: tuple[str, ...], key: str, receiver: str) -
     ``[dr]``'s, read by the DR hooks. Each child gets an allowlist
     (:mod:`messagefoundry.childenv`), and this keeps the engine's own names off both lists: no
     ``MEFOR_*`` variable at all, no secret a library reads on the engine's behalf, and no
-    interpreter variable that starts a console or a debugger
+    interpreter variable that starts a console
     (:func:`messagefoundry.childenv.pass_environment_refusal`, reused so the rules cannot drift).
     Refusing the whole namespace, not a list of secret names, cannot go stale when a secret is
     added. The text never echoes an entry that is not a name, since ``NAME=value`` typed by

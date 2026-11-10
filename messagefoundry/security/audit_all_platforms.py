@@ -53,7 +53,7 @@ private: like ``--ignore-vuln``, it is the adopter's recorded decision.
 one more environment variable than their allowlist holds, such as one a keyring backend or a cloud
 credential helper reads to reach a private index (vault BACKLOG #2587). It refuses at least an
 entry that is not a variable name, an engine variable, and an interpreter variable that starts a
-console or a debugger (``childenv.pass_environment_refusal``). A caller that passes its own ``run``
+console (``childenv.pass_environment_refusal``). A caller that passes its own ``run``
 to :func:`main` gets the names checked but not forwarded: they reach only the default runner.
 
 WHY STRIPPING IS SOUND HERE. Every pin in a uv export is a version that uv resolved for some
@@ -76,7 +76,8 @@ would stay in place; and a ``--skip-private`` that names the engine or another p
 MessageFoundry package, a package the lock does not pin, or every pin, or that comes after the lock
 as a word of its own (the ``=`` form or an abbreviation there reaches pip-audit, which fails on it
 as an unknown option); and a ``--pass-environment`` entry the paragraph above says it refuses, or
-one that comes after the lock as a word of its own. It does not judge
+any word after the lock that starts with ``--pas``, the ``=`` form and an abbreviation included,
+since pip-audit's usage error would print a ``NAME=value`` typed there. It does not judge
 whether a non-empty lock is complete; released-line-audit carries its own floor for that.
 
 It reads lines as pip does: a requirement or option is any line that does not continue the one
@@ -274,9 +275,21 @@ def _skip_private_refusal(private: Collection[str], pip_audit_args: Sequence[str
     )
 
 
+def _starts_pass_environment(arg: str) -> bool:
+    """Whether ``arg``, up to any ``=``, starts with ``--pas``: the flag, its ``=`` form, an
+    abbreviation of it, or a misspelling past those letters."""
+    return arg.partition("=")[0].startswith("--pas")
+
+
 def _pass_environment_refusal(names: Sequence[str], pip_audit_args: Sequence[str]) -> str | None:
-    """Why a ``--pass-environment`` request is refused, or ``None``."""
-    if "--pass-environment" in pip_audit_args:
+    """Why a ``--pass-environment`` request is refused, or ``None``.
+
+    After the lock, any word that starts as the flag does is refused, the ``=`` form and an
+    abbreviation included, not only the exact word: argparse hands it to pip-audit, whose usage
+    error prints it, and ``--pass-environment=NAME=value`` typed by mistake would carry the value
+    into a CI log. A pip-audit option that started with ``--pas`` would be refused too. The text
+    echoes none of it."""
+    if any(_starts_pass_environment(arg) for arg in pip_audit_args):
         return "--pass-environment goes before the lock, not after it"
     refusals = (pass_environment_refusal(name) for name in names)
     first = next((refusal for refusal in refusals if refusal), None)

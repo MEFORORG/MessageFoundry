@@ -112,6 +112,9 @@ def test_a_worker_whose_graph_differs_from_the_engines_is_refused(
     assert "IB_PARITY" in text
     assert "allowlist" in text
     assert "[sandbox].pass_environment" in text
+    # Settings load refuses an engine variable in that setting, so the remedy says not to name one
+    # there rather than send the operator after a name load refuses.
+    assert "refuses an engine variable there, any MEFOR_* name among them" in text
     # A worker runs the snapshot it is sent (vault BACKLOG #2596), so a reload is no remedy for a
     # graph that differs by name, and the refusal does not send the operator after one.
     assert "reload" not in text

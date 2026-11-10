@@ -265,6 +265,8 @@ def test_the_detail_names_the_cause_and_the_remedy_first() -> None:
     assert "changed on disk" not in edited + names
     assert "reload" not in names.lower()
     assert "add it to [sandbox].pass_environment and restart" in kept_names
+    # Settings load refuses a MEFOR_* name in that setting, so the remedy says so, within the bound.
+    assert "A MEFOR_* name is refused there" in kept_names
 
 
 def test_the_logging_sink_warns(caplog: pytest.LogCaptureFixture) -> None:

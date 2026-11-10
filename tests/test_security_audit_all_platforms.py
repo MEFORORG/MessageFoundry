@@ -388,7 +388,7 @@ def test_a_pass_environment_naming_a_console_variable_is_refused(
     ran, run = _recorder(0)
     assert main(["--pass-environment", "PYTHONINSPECT", str(src)], run=run) == 2
     assert not ran
-    assert "console or a debugger" in capsys.readouterr().err
+    assert "to a console" in capsys.readouterr().err
 
 
 def test_a_pass_environment_after_the_lock_is_refused_by_name(
@@ -400,6 +400,33 @@ def test_a_pass_environment_after_the_lock_is_refused_by_name(
     assert main([str(src), "--pass-environment", "KEYRING_A"], run=run) == 2
     assert not ran
     assert "goes before the lock" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "after",
+    [
+        ["--pass-environment=KEYRING_A=marker-not-a-key"],
+        ["--pass-env=KEYRING_A=marker-not-a-key"],
+        ["--pas=KEYRING_A=marker-not-a-key"],
+        ["--pass-environment-x=marker-not-a-key"],
+        ["--pass-env", "KEYRING_A=marker-not-a-key"],
+    ],
+)
+def test_a_pass_environment_value_after_the_lock_never_reaches_pip_audit_or_the_log(
+    after: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """After the lock, argparse hands every word to pip-audit, whose usage error prints an unknown
+    option whole, so ``--pass-environment=NAME=value`` would carry the value into a CI log. The
+    ``=`` form and an abbreviation are refused as the exact word is: pip-audit never starts, and
+    nothing this module prints holds the value."""
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    ran, run = _recorder(0)
+    assert main([str(src), *after], run=run) == 2
+    assert not ran
+    out, err = capsys.readouterr()
+    assert "goes before the lock" in err
+    assert "marker-not-a-key" not in out + err
 
 
 def test_a_relative_pythonpath_entry_does_not_reach_pip_or_pip_audit(

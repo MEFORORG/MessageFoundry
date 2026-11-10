@@ -203,7 +203,8 @@ def sandbox_worker_refused_detail(*, content_only: bool) -> str:
     else:
         cause = (
             "Config most likely reads a variable the worker lacks: add it to "
-            "[sandbox].pass_environment and restart."
+            "[sandbox].pass_environment and restart. A MEFOR_* name is refused there: read "
+            "the value under another name."
         )
     return (
         f"{cause} Until then every message on this inbound fails at routing or transform: "

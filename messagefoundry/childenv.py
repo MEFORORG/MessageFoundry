@@ -267,26 +267,26 @@ def outside_engine_namespace(name: str) -> bool:
 
 
 #: The interpreter variables :data:`_INTERPRETER_NAMES` leaves out because they hand control to a
-#: console or a debugger. :func:`pass_environment_refusal` refuses them: a child started with
-#: ``PYTHONINSPECT`` set waits at a prompt instead of exiting.
-_INTERPRETER_CONTROL_NAMES: Final = frozenset(
-    {"PYTHONSTARTUP", "PYTHONINSPECT", "PYTHONBREAKPOINT"}
-)
+#: console. :func:`pass_environment_refusal` refuses them: a child started with ``PYTHONINSPECT``
+#: set waits at a prompt instead of exiting. ``PYTHONBREAKPOINT`` is left out too but may be
+#: named: ``PYTHONBREAKPOINT=0`` turns ``breakpoint()`` into a no-op, and unset it calls
+#: ``pdb.set_trace`` anyway, so refusing it would only block the protective value.
+_INTERPRETER_CONTROL_NAMES: Final = frozenset({"PYTHONSTARTUP", "PYTHONINSPECT"})
 
 
 def pass_environment_refusal(name: str) -> str | None:
     """Why ``name`` may not be named as an extra variable for a child, or ``None``: the rule for the
     dependency auditor's ``--pass-environment`` and for the ``[sandbox]`` and ``[dr]``
-    ``pass_environment`` settings. Refused: an entry that is not a variable name, a name of the engine's namespace
-    (:func:`outside_engine_namespace`), and an interpreter variable that hands control to a console
-    or a debugger. The text never echoes an entry that is not a name, since ``NAME=value`` typed by
+    ``pass_environment`` settings. Refused: an entry that is not a variable name, a name of the
+    engine's namespace (:func:`outside_engine_namespace`), and an interpreter variable that hands
+    control to a console (:data:`_INTERPRETER_CONTROL_NAMES`). The text never echoes an entry that is not a name, since ``NAME=value`` typed by
     mistake would carry the value (vault BACKLOG #2600)."""
     if not (name.isascii() and name.isidentifier()):
         return "an entry is not an environment variable name; list names only, never NAME=value"
     if not outside_engine_namespace(name):
         return f"{name} is one of the engine's own variables"
     if name.upper() in _INTERPRETER_CONTROL_NAMES:
-        return f"{name} hands the interpreter to a console or a debugger"
+        return f"{name} hands the interpreter to a console"
     return None
 
 

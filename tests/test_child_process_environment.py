@@ -248,6 +248,26 @@ def test_the_sandbox_hands_its_worker_no_engine_variable(
     assert captured["argv"] == childenv.python_child_argv(sandbox_mod.WORKER_MODULE)
 
 
+def test_a_policy_naming_an_engine_variable_fails_the_spawn_as_a_sandbox_error(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A :class:`SandboxPolicy` built in code is not checked by settings load, so the worker's
+    builder is the check, and its :class:`ValueError` is a failed spawn like any other: a
+    :class:`~messagefoundry.pipeline.sandbox.SandboxError`, raised before any child starts."""
+    _registry, config_dir = graph
+    started: list[object] = []
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: started.append(a))
+    policy = sandbox_mod.SandboxPolicy(
+        mode=sandbox_mod.SandboxMode.SUBPROCESS,
+        wall_seconds=15.0,
+        pass_environment=("MEFOR_STORE_KEY",),
+    )
+
+    with pytest.raises(sandbox_mod.SandboxError, match="engine's own variable"):
+        _session(config_dir, inbound="IB_ENV", policy=policy)._spawn()
+    assert started == []
+
+
 # --- the DR hook, through the real spawn --------------------------------------------------------
 
 
@@ -619,11 +639,28 @@ def test_a_console_variable_in_pass_environment_is_refused_at_load(
     ordinary name, which loads."""
     path = tmp_path / "messagefoundry.toml"
     path.write_text(f'[{section}]\npass_environment = ["PYTHONINSPECT"]\n', encoding="utf-8")
-    with pytest.raises(ValidationError, match="console or a debugger"):
+    with pytest.raises(ValidationError, match="to a console"):
         settings.load_settings(config_path=path, environ={})
     path.write_text(f'[{section}]\npass_environment = ["{_PASSED}"]\n', encoding="utf-8")
     loaded = settings.load_settings(config_path=path, environ={})
     assert getattr(loaded, section).pass_environment == (_PASSED,)
+
+
+@pytest.mark.parametrize("section", ["sandbox", "dr"])
+def test_pythonbreakpoint_may_be_passed_so_its_protective_zero_reaches_the_child(
+    section: str, tmp_path: Path
+) -> None:
+    """``PYTHONBREAKPOINT=0`` makes ``breakpoint()`` a no-op, and unset it calls ``pdb.set_trace``
+    anyway, so refusing the name would only block the protective value. Both settings and the
+    auditor's ``--pass-environment`` take it, and the value crosses."""
+    path = tmp_path / "messagefoundry.toml"
+    path.write_text(f'[{section}]\npass_environment = ["PYTHONBREAKPOINT"]\n', encoding="utf-8")
+    loaded = settings.load_settings(config_path=path, environ={})
+    assert getattr(loaded, section).pass_environment == ("PYTHONBREAKPOINT",)
+    assert childenv.pass_environment_refusal("PYTHONBREAKPOINT") is None
+    parent = {"PYTHONBREAKPOINT": "0"}
+    assert childenv.worker_environment(parent, extra_names=("PYTHONBREAKPOINT",)) == parent
+    assert childenv.auditor_environment(parent, extra_names=("PYTHONBREAKPOINT",)) == parent
 
 
 def test_dr_pass_environment_is_refused_at_load(tmp_path: Path) -> None:
