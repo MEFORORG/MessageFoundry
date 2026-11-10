@@ -1580,32 +1580,28 @@ async def test_audit_export_continues_when_the_lock_rows_become_readable(
     assert len(data) == 7 and stops == []
 
 
-@pytest.mark.parametrize("stalled", [False, True])
-async def test_audit_export_moves_the_idle_clock_only_once_a_quarter_window_has_passed(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch, stalled: bool
+async def test_audit_export_moves_the_idle_clock_once_a_quarter_window_since_the_last_move(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """RED when: the per-page re-check never moves the idle clock, so a long download ends its
-    own session, or moves it on every page (BACKLOG #3469 finding 3). Each page's clock read is
-    pushed a whole idle window on when ``stalled``; otherwise the test runs well inside a quarter
-    of the window, so no page touches. Only the export's own ``time`` is replaced, so the event
-    loop's clock is untouched."""
+    own session, moves it on every page, or measures from the export's start rather than from the
+    last move (BACKLOG #3469 finding 3). The export's own clock advances 0.15 of the idle window
+    per page, so the third page is the first past a quarter window, and the fourth, 0.15 after
+    that move, is not. Only the export's own ``time`` is replaced, so the event loop's clock is
+    untouched."""
     from messagefoundry.api import auth_routes
 
-    clock = [time.monotonic()]
-
-    def monotonic() -> float:
-        if not stalled:
-            return time.monotonic()
-        clock[0] += 86_400.0
-        return clock[0]
-
-    monkeypatch.setattr(auth_routes, "time", SimpleNamespace(monotonic=monotonic, time=time.time))
+    clock = [0.0]
+    monkeypatch.setattr(
+        auth_routes, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time)
+    )
     activity: list[bool] = []
     real_recheck = auth_routes.recheck_standing
 
-    async def recording(*args: Any, **kwargs: Any) -> Any:
+    async def recording(service: AuthService, *args: Any, **kwargs: Any) -> Any:
         activity.append(bool(kwargs.get("activity")))
-        return await real_recheck(*args, **kwargs)
+        clock[0] += 0.15 * service.session_idle_seconds
+        return await real_recheck(service, *args, **kwargs)
 
     monkeypatch.setattr(auth_routes, "recheck_standing", recording)
 
@@ -1614,8 +1610,7 @@ async def test_audit_export_moves_the_idle_clock_only_once_a_quarter_window_has_
 
     data, stops = await _export_with_mid_stream_act(engine, monkeypatch, Role.AUDITOR, nothing)
     assert len(data) == 7 and stops == []
-    assert len(activity) == 4  # seven rows at a page of two
-    assert activity == [stalled] * 4
+    assert activity == [False, False, True, False]  # seven rows at a page of two
 
 
 async def test_audit_export_denied_to_unauthorized_role(engine: Engine) -> None:

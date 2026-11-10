@@ -25,7 +25,7 @@ action" thesis that its own module had already outgrown: a reader taking that li
 which is how the escape table came to live in ``logging_setup``.)
 
 THE TWO NEUTRALISERS ARE DIFFERENT AND ONE MUST NEVER BE "SIMPLIFIED" INTO THE OTHER. Beside the
-refusals, that makes three actions built on one predicate:
+refusals, that makes three actions built on one predicate, and QUOTE adds a fourth on top of ESCAPE:
 
   * REJECT -- six sites. A control character in a value that reaches a URL path, a header, a
     filename or a config field is refused outright.
@@ -45,6 +45,11 @@ refusals, that makes three actions built on one predicate:
     document from ``json.dumps`` without ``indent`` still parses after it (vault BACKLOG #3012):
     that output holds no character of the alphabet outside a string. A document with a CR or LF
     between tokens, an indented one for example, does not, because ``\\n`` is not JSON there.
+  * QUOTE -- one ``key=value`` field of a log line, :func:`quote_log_text`. ESCAPE keeps a value
+    on one line but leaves its spaces, quotes and ``=`` alone, so a value logged before another
+    field can still write a field of its own. QUOTE wraps the value in one JSON string and then
+    ESCAPES it, so the value cannot end its token (BACKLOG #3770). It changes the value's
+    spelling, so it does not replace ESCAPE on a whole line.
 
 WHY ESCAPE LIVES HERE, WHICH IS THE ONE FACT WORTH STATING ONCE (BACKLOG #1591). It was defined in
 ``logging_setup`` until ``logging_guard`` needed it, and ``logging_setup`` imports
@@ -73,7 +78,6 @@ THE POINT IS THE COPYING PRACTICE, not the seven known lines. If you need this t
 
 from __future__ import annotations
 
-import json
 import unicodedata
 
 #: The Unicode general categories a reader of TEXT may act on rather than show: the C0 and C1
@@ -326,4 +330,8 @@ def quote_log_text(text: str) -> str:
     ``replace`` never fires on JSON output, and is there because CodeQL's ``py/log-injection``
     accepts it as the neutraliser (see :func:`scrub_log_argument`). For a caller-supplied
     value logged beside other ``key=value`` fields, such as a request path (BACKLOG #3770)."""
+    # Imported here, not at the top: the remote-debug guard imports this module before its hook
+    # goes in, and json, with re and enum under it, would lengthen that window.
+    import json
+
     return scrub_log_argument(json.dumps(text))

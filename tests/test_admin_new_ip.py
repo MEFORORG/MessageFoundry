@@ -42,6 +42,7 @@ from messagefoundry.auth.service import (
     _NEW_IP_LOG_PATH_PREFIX,
     _NEW_IP_PER_SESSION_MAX,
     _NEW_IP_TEXT_MAX,
+    _NEW_IP_TEXT_PREFIX,
     STEP_UP_ACTION_ADMIN_USER_UPDATE,
     STEP_UP_ACTION_SESSION_TERMINATE,
     AuthService,
@@ -292,6 +293,15 @@ def _logged_fields(line: str) -> dict[str, str]:
         fields[key] = value
         rest = rest[end:].removeprefix(" ")
     return fields
+
+
+def test_a_bounded_form_is_always_longer_than_its_bound() -> None:
+    """RED when: a bound and its prefix are edited so the replacement fits under the bound, so a
+    short text spelled like ``<prefix>...sha256:<hex>`` could read as the bounded form of a longer
+    one (BACKLOG #3772, #3770)."""
+    marker = len("...sha256:") + 64
+    assert _NEW_IP_TEXT_PREFIX + marker > _NEW_IP_TEXT_MAX
+    assert _NEW_IP_LOG_PATH_PREFIX + marker > _NEW_IP_LOG_PATH_MAX
 
 
 async def test_a_path_cannot_forge_a_field_of_the_new_address_warnings(
