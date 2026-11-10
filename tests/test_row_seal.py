@@ -181,8 +181,7 @@ def _through_sqlite_real(value: float) -> object:
 def test_a_negative_zero_seal_survives_a_sqlite_real_round_trip() -> None:
     # BACKLOG #6717. SQLite's REAL column reads -0.0 back as 0.0, so a seal over -0.0's own
     # encoding failed the next read as if the row had been changed.
-    back = _through_sqlite_real(-0.0)
-    assert back == 0.0 and str(back) == "0.0"  # the premise: the sign is lost
+    back = _through_sqlite_real(-0.0)  # 0.0 on SQLite 3.50; the check holds either way
     sealer = _sealer()
     stored = sealer.seal("session", (("revoked_at", -0.0),))
     assert sealer.verify("session", (("revoked_at", back),), stored)
@@ -207,7 +206,7 @@ def test_negative_zero_encodes_as_zero_does() -> None:
 def test_a_seal_refuses_a_float_that_is_not_finite(value: float) -> None:
     # BACKLOG #6717. SQLite stores a NaN as NULL, so a seal over one could never verify again.
     sealer = _sealer()
-    with pytest.raises(TypeError):
+    with pytest.raises(ValueError):
         sealer.seal("session", (("expires_at", value),))
     assert sealer.seal("session", (("expires_at", 1.5),))  # control: a finite value seals
 
@@ -217,6 +216,7 @@ def test_a_row_changed_to_a_float_that_is_not_finite_fails_without_raising(value
     sealer = _sealer()
     stored = sealer.seal("session", (("expires_at", 1.5),))
     assert sealer.verify("session", (("expires_at", 1.5),), stored)  # control
+    assert sealer.verify_held("session", (("expires_at", 1.5),), stored)  # control
     assert not sealer.verify("session", (("expires_at", value),), stored)
     assert not sealer.verify_held("session", (("expires_at", value),), stored)
 
@@ -243,10 +243,29 @@ def test_a_stored_seal_that_is_not_text_fails_every_check_without_raising(
     rekeyed = RowSealer.for_cipher(make_cipher(new, [old]))
     assert rekeyed is not None
     held = _sealer(old)
-    assert held.verify("session", _FIELDS, stored)  # control: the text form verifies
+    assert held.verify("session", _FIELDS, stored)  # controls: the text form verifies
+    assert held.verify_held("session", _FIELDS, stored)
+    assert held.is_active(stored)
     assert rekeyed.sealed_by_retired_key("session", _FIELDS, stored)  # control
     other = as_type(stored)
     assert not held.verify("session", _FIELDS, other)
     assert not held.verify_held("session", _FIELDS, other)
     assert not held.is_active(other)
     assert not rekeyed.sealed_by_retired_key("session", _FIELDS, other)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [(("f", 10**5000),), (("\udc80", "v"),)],
+    ids=["int-past-the-digit-limit", "name-not-utf8"],
+)
+def test_a_value_the_encoder_cannot_frame_fails_the_check_without_raising(
+    fields: tuple[tuple[str, object], ...],
+) -> None:
+    # BACKLOG #6718: a ValueError escaped every caller's ``except TypeError``.
+    sealer = _sealer()
+    stored = sealer.seal("session", _FIELDS)
+    assert sealer.verify_held("session", _FIELDS, stored)  # control
+    assert not sealer.verify("session", fields, stored)
+    assert not sealer.verify_held("session", fields, stored)
+    assert not sealer.sealed_by_retired_key("session", fields, stored)

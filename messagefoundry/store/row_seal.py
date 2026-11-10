@@ -145,6 +145,7 @@ def _encode_value(value: object) -> tuple[bytes, bytes]:
         return _TYPE_INT, str(value).encode("ascii")
     if isinstance(value, float):
         # -0.0 == 0.0, so this moves -0.0 alone onto 0.0's encoding and leaves every other float's.
+        # It changed v1's encoding of -0.0 in place, before any store was deployed (BACKLOG #6717).
         return _TYPE_FLOAT, (0.0 if value == 0.0 else value).hex().encode("ascii")
     if isinstance(value, str):
         # surrogatepass, so a value a driver decoded with surrogateescape still encodes.
@@ -217,20 +218,28 @@ class RowSealer:
 
     @staticmethod
     def _matches(key: bytes, kind: str, fields: Iterable[tuple[str, object]], mac: str) -> bool:
-        expected = hmac.new(key, seal_bytes(kind, fields), hashlib.sha256).hexdigest()
+        try:
+            encoded = seal_bytes(kind, fields)
+        except (ValueError, OverflowError):
+            # A value the encoder cannot frame (an int past str()'s digit limit, a part past 4 GiB,
+            # a name that is not UTF-8) fails the check. Callers catch only TypeError, which still
+            # propagates as it did (BACKLOG #6718).
+            return False
+        expected = hmac.new(key, encoded, hashlib.sha256).hexdigest()
         # As bytes: compare_digest refuses a str holding non-ASCII, which a stored value may.
         return hmac.compare_digest(mac.encode("utf-8", "surrogatepass"), expected.encode("ascii"))
 
     def seal(self, kind: str, fields: Iterable[tuple[str, object]]) -> str:
         """The stored seal for a row of ``kind`` holding ``fields``.
 
-        Raises ``TypeError``, as for a value of a type the encoder cannot read, when a float is a
-        NaN or an infinity (BACKLOG #6717): SQLite stores a NaN as ``NULL``, so its seal would fail
-        the next read as if the row had been changed. The check is here and not in the encoder, so
-        a row someone set to such a value still fails :meth:`verify` rather than raising from it."""
+        Raises ``ValueError`` when a float is a NaN or an infinity (BACKLOG #6717). SQLite stores a
+        NaN as ``NULL``, so its seal would fail the next read as if the row had been changed. An
+        infinity round-trips, but no sealed field means anything by one, so it is refused with the
+        NaN rather than sealed. The check is here and not in the encoder, so a row someone set to
+        such a value still fails :meth:`verify` rather than raising from it."""
         fields = tuple(fields)
         if any(isinstance(v, float) and not -_FLOAT_INF < v < _FLOAT_INF for _, v in fields):
-            raise TypeError("a row seal cannot encode a float that is not finite")
+            raise ValueError("a row seal refuses a float that is not finite")
         mac = hmac.new(self._key, seal_bytes(kind, fields), hashlib.sha256).hexdigest()
         return f"{SEAL_PREFIX}{self.key_id}:{mac}"
 
