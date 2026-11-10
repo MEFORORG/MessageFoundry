@@ -471,3 +471,68 @@ async def test_the_passkey_assertion_answers_a_refused_success_audit_row(
         )
     finally:
         await store.close()
+
+
+# --- decision d20261110T004916856-814db8, Q1: a step-up lost at the rotation writes softly --------
+
+
+@pytest.mark.parametrize("site", ["rotate_session", "lapse_check"])
+async def test_a_reauth_lost_at_the_rotation_writes_its_row_softly(
+    monkeypatch: pytest.MonkeyPatch, site: str
+) -> None:
+    """A Transit Outage at the re-key, or at the lapse check, answers session_lost from
+    ``_elevated_hash`` with the window closed; the ``auth.reauth`` row, refused by the same
+    Outage's audit MAC, is then written softly rather than turning the answer into an error."""
+    store, service = await _service()
+    try:
+        identity, token, password = await login_admin(service)
+        if site == "rotate_session":
+            monkeypatch.setattr(store, "rotate_session", _raising(TransitSealUnavailableError()))
+        else:
+            monkeypatch.setattr(
+                service, "_rotation_lapsed", _raising(TransitSealUnavailableError())
+            )
+        _refuse_audit(monkeypatch, store, "auth.reauth")
+        lost = await service.reauth(identity, password, token=token)
+        assert lost.session_lost and lost.token is None
+        assert await store.list_audit(action="auth.reauth") == []
+    finally:
+        await store.close()
+
+
+async def test_a_federated_step_up_lost_at_the_rotation_writes_its_row_softly(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.test_auth_oidc_service import _service as _oidc_service
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _oidc_service(store, rsa_key)
+        token = await _oidc_session(service, monkeypatch, rsa_key)
+        flow_id, _url = await _begin(service, token, purpose=None)
+        monkeypatch.setattr(store, "rotate_session", _raising(TransitSealUnavailableError()))
+        _refuse_audit(monkeypatch, store, "auth.reauth")
+        out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id, auth_time=time.time())
+        assert out.elevation.session_lost and out.elevation.token is None
+        assert await store.list_audit(action="auth.reauth") == []
+    finally:
+        await store.close()
+
+
+async def test_a_reproof_budget_exhaustion_row_stays_hard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The flag is the rotation's, not ``Elevation.session_lost``: a failed re-proof that spends
+    the session's budget also answers session_lost, and its ``auth.reauth`` row stays hard."""
+    store, service = await _service()
+    try:
+        identity, token, _password = await login_admin(service)
+        threshold = service.policy.lockout_threshold
+        for _ in range(threshold - 1):
+            out = await service.reauth(identity, "synthetic-wrong-password", token=token)
+            assert not out.ok and not out.session_lost
+        _refuse_audit(monkeypatch, store, "auth.reauth")
+        with pytest.raises(CipherError):
+            await service.reauth(identity, "synthetic-wrong-password", token=token)
+    finally:
+        await store.close()

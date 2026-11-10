@@ -225,6 +225,15 @@ session would otherwise refuse that row's audit MAC and turn the answer into a 5
 `auth.reauth` row is written as before. When the factor-binding check never ran, the row's
 `grant_refused` is null.
 
+**A step-up lost at the rotation writes its row softly too, decided 2026-11-10 (decision
+d20261110T004916856-814db8, Q1).** The window closes before the re-key, so a Transit Outage at the
+lapse check or the re-key is answered `session_lost` by `_elevated_hash`, not by the window, and
+item 3's soft write did not cover it. `_StampWindow.rotation_lost` is set when that lapse check or
+re-key answers `session_lost`, and `reauth` and the federated re-auth callback write their
+`auth.reauth` row softly on `lost` or `rotation_lost`. The flag is the rotation's own and is not
+`Elevation.session_lost`: a failed re-proof that spends the session's budget sets that too, and
+its row stays hard. `auth.login_after_failures` stays hard (decision d20261110T004922661-14430e).
+
 ## Context
 
 Engine `main` seals identity and authorization rows (sessions, users with their role grants, custom

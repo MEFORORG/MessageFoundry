@@ -3197,11 +3197,15 @@ class _StampWindow:
     wrote to, which arms the window; ``closed`` is set once the rotation begins, which owns its
     own refusals; ``lost`` says the window caught a refusal and answered for the ceremony.
     ``audit_refused`` is the ``CipherError`` the window's own success audit row raised
-    (:meth:`AuthService._window_audit`), the one ``CipherError`` it answers for."""
+    (:meth:`AuthService._window_audit`), the one ``CipherError`` it answers for.
+    ``rotation_lost`` says :meth:`AuthService._elevated_hash`'s lapse check or re-key answered
+    ``session_lost`` (decision d20261110T004916856-814db8 on ADR 0217, Q1). It is not
+    ``Elevation.session_lost``, which a failed re-proof also sets, and whose row stays hard."""
 
     stamped: str | None = None
     closed: bool = False
     lost: bool = False
+    rotation_lost: bool = False
     audit_refused: BaseException | None = None
 
 
@@ -6881,7 +6885,10 @@ class AuthService:
             **self._step_up_address_fields(flow, client),
         }
         await self._write_reauth_row(
-            lost=window.lost, actor=user.username, detail=_json(detail), client=client
+            lost=window.lost or window.rotation_lost,
+            actor=user.username,
+            detail=_json(detail),
+            client=client,
         )
         return OidcStepUp(elevation=elevation, return_to=return_to)
 
@@ -6892,7 +6899,9 @@ class AuthService:
         answered ``session_lost`` (decision d20261109T200352805-599b24 on ADR 0217, item 3): then
         softly, through the audit set, since the Transit Outage that ended the session on a
         ``vault_transit`` store also refuses this row's audit-chain MAC, and the answer is the
-        fail-closed control while the row only records it."""
+        fail-closed control while the row only records it. ``lost`` is also set when the session
+        was lost at the rotation itself, the lapse check or the re-key (decision
+        d20261110T004916856-814db8, Q1), never for a failed re-proof, whose row stays hard."""
 
         async def row() -> None:
             await self._audit("auth.reauth", actor=actor, detail=detail, client=client)
@@ -10585,6 +10594,8 @@ class AuthService:
         failure: dict[str, object] = {"reason": "session_gone"}
         try:
             if await self._rotation_lapsed(token_hash, ceremony=ceremony, client=client):
+                if window is not None:
+                    window.rotation_lost = True
                 return Elevation(session_lost=True)
             if window is not None:
                 # The rotation owns its refusals from here (:meth:`_stamp_to_rotation`). The lapse
@@ -10603,6 +10614,10 @@ class AuthService:
             revoked = await self._revoke_unrotated(token_hash, None, exc)
             failure = {"reason": _rotation_failure_reason(exc), "revokes_landed": revoked}
         if rotated is None:
+            if window is not None:
+                # Decision d20261110T004916856-814db8 on ADR 0217, Q1: the session was lost at the
+                # rotation, so the ceremony's own row is written softly, as for a lost window.
+                window.rotation_lost = True
             await self._audit_rotation_failed(
                 ceremony=ceremony, actor=actor, client=client, failure=failure
             )
@@ -12631,6 +12646,8 @@ class AuthService:
                 if not grant_checked:
                     # Decision d20261109T200352805-599b24, item 3: the check never ran.
                     grant_refused = None
+            # Decision d20261110T004916856-814db8, Q1: lost at the rotation is written softly too.
+            lost = lost or window.rotation_lost
             if elevation.ok:
                 # vault BACKLOG #2145: a step-up on an account that owes no factor is how a
                 # first-seen address passes its challenge, so it becomes known.
