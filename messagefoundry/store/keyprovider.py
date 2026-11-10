@@ -303,8 +303,9 @@ def _load_external_provider(
         # Present but broken: a C extension that fails to load, or a name its SDK or the provider
         # module itself no longer has. resolve_active_key and resolve_decrypt_keys already refuse
         # any provider error as a KeyProviderError with a fixed text, so this changes nothing
-        # there; it keeps this seam's own contract, KeyProviderError and never a raw ImportError,
-        # for any caller of resolve_key_provider (vault BACKLOG #6709).
+        # there; it keeps this seam's own contract, KeyProviderError, for a provider module whose
+        # import fails. An ImportError raised later, inside build_provider, is the provider's to
+        # wrap, as keyprovider_vault wraps its lazy hvac import (vault BACKLOG #6709).
         raise KeyProviderError(
             f"[store].key_provider={name!r} could not load its provider module or backend (an "
             f"import failed: {type(exc).__name__}, chained below) — reinstall MessageFoundry "

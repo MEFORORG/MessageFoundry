@@ -607,9 +607,15 @@ def test_windows_an_owner_no_token_may_assign_is_refused_on_every_leg(tmp_path: 
     # Vault BACKLOG #6674 item 2: the Administrators owner reaches ERROR_INVALID_OWNER only off-admin,
     # and the hosted legs run elevated. One service's SID is an owner neither an elevated nor a
     # filtered token may assign without the restore privilege enabled, so this reaches the 1307
-    # branch on every leg.
+    # branch on every leg. The CI leg runs under Git Bash, whose runtime is believed to enable that
+    # privilege on an elevated token, so it is turned off for the create.
+    from tests.test_worktree_remove_in_use import _privileges_disabled
+
     path = tmp_path / "handoff.key"
-    with pytest.raises(RestrictedFileError, match="may not make") as caught:
+    with (
+        _privileges_disabled(("SeRestorePrivilege",)),
+        pytest.raises(RestrictedFileError, match="may not make") as caught,
+    ):
         write_restricted_file(path, b"k", owner=f"*{_SERVICE}")
     assert isinstance(caught.value, restricted_file.OwnerRefused)
     assert not path.exists()
@@ -641,12 +647,18 @@ def test_windows_an_owner_is_screened_as_a_read_grant_is(
 
 @windows_only
 def test_windows_an_owner_named_by_a_group_name_is_refused(tmp_path: Path) -> None:
-    # Vault BACKLOG #6674 item 3, as documented: a name must resolve to one account, so a group
-    # such as Administrators is named as an owner by its SID.
+    # Vault BACKLOG #6674 item 3, as documented: an alias such as Administrators is refused by
+    # name, with owner advice, and is named as an owner by its SID.
+    import getpass
+
     path = tmp_path / "store.key"
-    with pytest.raises(RestrictedFileError, match="names a group"):
+    with pytest.raises(RestrictedFileError, match="name an owner .* by its SID"):
         write_restricted_file(path, b"k", owner="BUILTIN\\Administrators")
     assert not path.exists()
+    # The control: an owner named by this process's own account name resolves and is accepted.
+    mine = tmp_path / "mine.key"
+    write_restricted_file(mine, b"k", owner=f"{os.environ['USERDOMAIN']}\\{getpass.getuser()}")
+    assert mine.read_bytes() == b"k"
 
 
 @windows_only

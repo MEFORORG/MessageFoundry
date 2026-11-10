@@ -1337,7 +1337,8 @@ def write_restricted_file(
     it, and read back through the creating handle before a byte is written. It is a SID, with or
     without a leading ``*``, or a name: a name Windows reports as a group, an alias or a domain is
     refused, as for a read grant, so a group such as Administrators is named by its SID. A name it
-    reports as a well-known account passes that gate, and a SID is taken as given. Then an
+    reports as a well-known group (SID_NAME_USE 5, as SYSTEM, a service's virtual account and
+    Everyone all report) passes that gate, and a SID is taken as given. Then an
     application package, and at least the broad groups :func:`_is_broad_group` knows, are refused
     as an owner, as they are as a read grant; other groups are not screened here. A token that may
     not make that account an owner, or a file that reads back owned by anyone else, raises
@@ -1717,8 +1718,8 @@ def _resolve_sid(principal: str, *, as_owner: bool = False) -> str:
                 f"{principal!r} names a group or a domain, not one account, so a key file cannot "
                 "be granted to it. Name the one account the engine runs as"
                 if not as_owner
-                else f"{principal!r} names a group or a domain, not one account; an owner is "
-                "named by one account's name or by a SID"
+                else f"{principal!r} is not a user or well-known account by name; name an owner "
+                "that is a group, a computer or any other kind by its SID"
             )
     if rendered is None:
         raise refusal

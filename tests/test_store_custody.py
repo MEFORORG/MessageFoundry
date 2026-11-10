@@ -1077,9 +1077,16 @@ def test_windows_a_create_refused_its_owner_is_a_custody_refusal_on_every_leg(
     # Vault BACKLOG #6674 item 2: the test above skips on the elevated hosted legs, so this one asks
     # for an owner no token there may assign either (one service's SID, without the restore
     # privilege enabled). Windows refuses it at the create on every leg, and custody translates it.
+    # The restore privilege is turned off for the call: the CI leg's Git Bash runtime is believed
+    # to enable it on an elevated token.
+    from tests.test_worktree_remove_in_use import _privileges_disabled
+
     _handoff_owned_by(monkeypatch, _SERVICE)
     path = tmp_path / "handoff.key"
-    with pytest.raises(CustodyError, match="may not make") as excinfo:
+    with (
+        _privileges_disabled(("SeRestorePrivilege",)),
+        pytest.raises(CustodyError, match="may not make") as excinfo,
+    ):
         custody.write_handoff_file(path, _blob(), service_account=f"*{_SERVICE}")
     assert isinstance(excinfo.value.__cause__, restricted_file.OwnerRefused)
     assert dpapi_scopes == [True]  # it got as far as protecting the blob, then the create refused

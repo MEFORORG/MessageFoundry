@@ -338,7 +338,10 @@ def test_a_whitespace_bearing_env_key_fails_closed_and_is_not_stripped(
     settings = StoreSettings(
         key_provider=provider, encryption_key=value, encryption_key_file="C:/x/k.dpapi"
     )
-    assert provider_reads_a_configured_key(settings)
+    # Without the key file, so the gate answers on the environment key alone under auto too.
+    assert provider_reads_a_configured_key(
+        StoreSettings(key_provider=provider, encryption_key=value)
+    )
     assert resolve_active_key(settings) == value
     with pytest.raises(ValueError, match="MEFOR_STORE_ENCRYPTION_KEY.*must be valid base64"):
         make_cipher(resolve_active_key(settings))
