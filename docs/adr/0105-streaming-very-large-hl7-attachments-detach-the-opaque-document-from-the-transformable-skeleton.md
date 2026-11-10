@@ -276,7 +276,7 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   (decided again 2026-11-09, vault BACKLOG #5100: a corrupt store is not a fault one member can be
   trusted to own). Each member's stored error, the log line and a `stop` alert name the member whose
   re-attach failed by its outbox id, never its content. A member's re-attach refusal that is not
-  permanent, or that must stop the connection, is the whole batch's, as the frame split treats one,
+  permanent, or that must stop the connection, is the whole batch's, as the frame check treats one,
   and the members refused alone are logged in the order they were claimed.
   A held attachment whose read fails stays the retryable `DeliveryError` above; on a batched
   outbound the whole batch re-pends, and its stored error names the member whose re-attach was

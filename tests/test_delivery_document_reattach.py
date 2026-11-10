@@ -537,7 +537,7 @@ async def test_batch_hydrates_every_member(store: MessageStore) -> None:
 
 class _FramingCollector(_Collector):
     """A collector that frames (defines ``check_frame``), so the batch takes the framing branch,
-    where re-attach refusals join the frame split's. It refuses nothing, and counts its checks."""
+    where re-attach refusals join the frame check's. It refuses nothing, and counts its checks."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -577,7 +577,7 @@ async def test_a_batch_member_whose_reattach_breaks_is_dead_lettered_alone(
     assert len(col.deliveries) == 1
     assert [Message.parse(m).field("OBX-5.5") for m in split_batch(col.deliveries[0])] == [a]
     if isinstance(col, _FramingCollector):
-        assert col.checked == 1  # only the survivor reached the frame split
+        assert col.checked == 1  # only the survivor reached the frame check
     stats = await store.stats()
     assert stats.get(OutboxStatus.DEAD.value, 0) == 1
     assert stats.get(OutboxStatus.DONE.value, 0) == 1
@@ -847,7 +847,8 @@ async def test_a_retryable_fault_in_the_middle_members_reattach_names_that_membe
     named = f"; batch member {ids[1]}"
     rows = await _rows(store, mids)
     assert [status for status, _ in rows] == [OutboxStatus.PENDING.value] * 3
-    assert all(err.startswith(f"batch member {ids[1]}: ") for _, err in rows)
+    lead = f"store read during batch member {ids[1]}: " if logs else f"batch member {ids[1]}: "
+    assert all(err.startswith(lead) for _, err in rows)
     assert blamed == ([ids[1]] if blames else [])
     if logs:
         # The store-fault line's own text, not the retry-cap line, which also says "before sending".
@@ -865,7 +866,8 @@ async def test_a_long_error_still_names_the_member(
 
     async def _hydrate(payload: str, message_id: str) -> str:
         if "FAULT" in payload:
-            raise DeliveryError("document re-attach failed: " + "x" * 400)
+            # Many short tokens, so safe_exc keeps about 200 characters and the store cuts again.
+            raise DeliveryError("document re-attach failed: " + "xx " * 150)
         return await real(payload, message_id)
 
     monkeypatch.setattr(runner, "_hydrate_payload", _hydrate)
@@ -874,7 +876,8 @@ async def test_a_long_error_still_names_the_member(
 
     rows = await _rows(store, mids)
     assert all(err.startswith(f"batch member {ids[1]}: DeliveryError") for _, err in rows)
-    assert all(len(err) < 300 for _, err in rows)  # the cut ran, and the id survived it
+    # Positive control: the store's cut ran, so a suffix would have been the part it dropped.
+    assert all(err.endswith(" chars)") for _, err in rows)
 
 
 async def test_a_non_hl7_head_names_the_head(store: MessageStore) -> None:
@@ -1012,7 +1015,7 @@ async def test_a_batch_reattach_refusal_that_is_not_the_members_own_keeps_every_
     refusal: Callable[[], NegativeAckError],
     stops: bool,
 ) -> None:
-    # Vault BACKLOG #5100: the hydration catch re-raises as the frame split does. A refusal that
+    # Vault BACKLOG #5100: the hydration catch re-raises as the frame check does. A refusal that
     # must stop the lane (a credential fault) stops it, and one that is not permanent re-pends the
     # batch; either way every member is kept rather than one dead-lettered as its own refusal.
     for t in (100.0, 101.0):

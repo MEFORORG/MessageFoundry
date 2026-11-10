@@ -295,12 +295,13 @@ def _batch_member(outbox_id: str | None) -> str:
     return f"; batch member {outbox_id}" if outbox_id is not None else ""
 
 
-def _member_error(error: str, outbox_id: str | None) -> str:
+def _member_error(error: str, outbox_id: str | None, *, lead: str = "") -> str:
     """``error`` as a batch's stored ``last_error``, the member a fault came from named FIRST. The
     store bounds a ``last_error`` at 200 characters and keeps the head, so a suffix after a long
-    error would be the part it cut (vault BACKLOG #5100). ``error`` alone when the fault is the
+    error would be the part it cut (vault BACKLOG #5100). ``lead`` qualifies the name where the
+    member is only where the fault struck, not its cause. ``error`` alone when the fault is the
     whole batch's."""
-    return f"batch member {outbox_id}: {error}" if outbox_id is not None else error
+    return f"{lead}batch member {outbox_id}: {error}" if outbox_id is not None else error
 
 
 type _RefusedMember = tuple[str, str, NegativeAckError]
@@ -10409,7 +10410,7 @@ class RegistryRunner:
             # internal-error arm below. The member named is the one whose read was running when
             # the store faulted, which says where, not that the member caused it.
             failed = await self._mark_batch_failed_and_arm(
-                name, ids, _member_error(str(exc), current), retry
+                name, ids, _member_error(str(exc), current, lead="store read during "), retry
             )
             retry_until = failed.retry_at
             self._note_store_read_fault(name, exc, len(ids), failed, member=_batch_member(current))
@@ -10425,7 +10426,8 @@ class RegistryRunner:
             # The member whose re-attach raised it; otherwise the send raised it, which only
             # happens with a member kept, and the envelope's head stands for it, as it did before
             # members were named.
-            self._note_lane_unhealthy(name, current if current is not None else ids[0], exc)
+            blamed = current if current is not None else (ids[0] if ids else head.id)
+            self._note_lane_unhealthy(name, blamed, exc)
         except Exception as exc:
             # A framing error (unparseable/non-HL7 head) or an internal/code error — NOT the partner's
             # fault. The per-connection policy decides: STOP halts the lane and alerts, and
