@@ -20,7 +20,10 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.static_credentials import _http_static
 from messagefoundry.config.wiring import Soap
 from messagefoundry.transports import build_destination
-from messagefoundry.transports.http_auth import with_oauth2_client_credentials
+from messagefoundry.transports.http_auth import (
+    is_authorization_header_name,
+    with_oauth2_client_credentials,
+)
 from messagefoundry.transports.soap import SoapDestination
 
 URL = "https://api.example.com/svc"
@@ -41,7 +44,8 @@ def _dest(**over: object) -> SoapDestination:
 
 
 def _auth_keys(d: SoapDestination) -> list[str]:
-    return [k for k in d._headers if k.lower() == "authorization"]
+    # The same spelling rule the purge uses, so a surviving "Authorization\t" key is counted.
+    return [k for k in d._headers if is_authorization_header_name(k)]
 
 
 # --- HTTP Basic: both halves or neither -----------------------------------------------------
@@ -132,9 +136,10 @@ def test_control_a_whole_username_token_pair_stamps_the_token() -> None:
 def test_a_static_authorization_header_of_any_casing_is_purged(
     casing: str, cred: dict[str, str]
 ) -> None:
-    """Hardening, not a reproduced override: urllib capitalises header names and the last write wins,
-    so the configured credential already reached the wire. But ``_headers`` held two casings, and the
-    length gate measured both. Now it holds exactly one, the configured credential."""
+    """For a name in plain letters this is hardening: urllib capitalises header names and the last
+    write wins, so the configured credential already reached the wire, though ``_headers`` held two
+    keys. A name with a tab or a space at an end is not merged by urllib, so before this change the
+    static value crossed as a second header beside the configured one. Now exactly one is held."""
     d = _dest(headers={casing: "Basic STATIC"}, **cred)
     keys = _auth_keys(d)
     assert keys == ["Authorization"]

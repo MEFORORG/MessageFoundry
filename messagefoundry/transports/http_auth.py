@@ -381,19 +381,32 @@ def refuse_http_digest_conflicts(s: Mapping[str, Any]) -> bool:
     Refuses an unrecognised ``http_auth`` (:func:`http_digest_selected`), and with Digest selected,
     a static ``bearer_token``, ``basic_user``, ``basic_password`` or ``Authorization`` entry in
     ``headers``: urllib lets a request header override the Digest handler's own, so where such a
-    credential is sent it replaces the Digest response on the wire. Names settings, never a value."""
+    credential is sent it replaces the Digest response on the wire. Also refuses, here rather than
+    late, a SMART or OAuth2 bearer provider beside Digest and a missing Digest user or password.
+    Names settings, never a value."""
     if not http_digest_selected(s):
         return False
+    # Read strictly: a non-bool flag raises HttpAuthError naming the connection (#2232).
+    _, (_, _, conn), _ = hop_declarations_from_settings(s, HttpAuthError)
+    prefix = hop_name_prefix(conn)
     static = [name for name in ("bearer_token", "basic_user", "basic_password") if s.get(name)]
     extra = s.get("headers")
     if isinstance(extra, Mapping) and any(is_authorization_header_name(str(k)) for k in extra):
         static.append("an Authorization entry in headers")
     if static:
-        # Read strictly: a non-bool flag raises HttpAuthError naming the connection (#2232).
-        _, (_, _, conn), _ = hop_declarations_from_settings(s, HttpAuthError)
         raise HttpAuthError(
-            f"{hop_name_prefix(conn)}HTTP Digest cannot be configured beside a static credential "
+            f"{prefix}HTTP Digest cannot be configured beside a static credential "
             f"({', '.join(static)}); configure exactly one"
+        )
+    if smart_auth_configured(s) or oauth2_auth_configured(s):
+        raise HttpAuthError(
+            f"{prefix}a connection cannot use BOTH a bearer-token provider and HTTP Digest auth "
+            "(mutually exclusive — configure exactly one)"
+        )
+    if not str(s.get("http_auth_user") or "") or not str(s.get("http_auth_password") or ""):
+        raise HttpAuthError(
+            f"{prefix}HTTP Digest auth requires 'http_auth_user' and 'http_auth_password' "
+            "(password via env())"
         )
     return True
 
@@ -402,8 +415,9 @@ def digest_handler_from_settings(
     s: Mapping[str, Any], *, url: str
 ) -> urllib.request.HTTPDigestAuthHandler | None:
     """An :class:`urllib.request.HTTPDigestAuthHandler` pre-loaded with the connection's credentials
-    (BACKLOG #65, RFC 7616), or ``None`` when HTTP Digest auth is off (``http_auth`` != ``"digest"``) —
-    byte-identical. The connector folds the returned handler into its per-connection opener; urllib then
+    (BACKLOG #65, RFC 7616), or ``None`` when HTTP Digest auth is off (``http_auth`` unset or
+    blank) — byte-identical. Any other value than ``digest`` raises, as do the conflicts
+    :func:`refuse_http_digest_conflicts` names. The connector folds the returned handler into its per-connection opener; urllib then
     answers the endpoint's ``401`` Digest challenge and retries within one ``opener.open()``.
 
     Refuses to run over cleartext ``http`` to an off-box host (the digest response is a credential),
@@ -433,12 +447,9 @@ def digest_handler_from_settings(
             f"{hop_name_prefix(accept_conn)}HTTP Digest over cleartext http would expose the digest "
             f"credential; refused ({CREDENTIAL_HOP_WAYS_ACROSS})"
         ) from exc
+    # Both are non-empty: refuse_http_digest_conflicts refused a missing one above.
     user = str(s.get("http_auth_user") or "")
     password = str(s.get("http_auth_password") or "")
-    if not user or not password:
-        raise HttpAuthError(
-            "HTTP Digest auth requires 'http_auth_user' and 'http_auth_password' (password via env())"
-        )
     pwmgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
     # A default-realm entry keyed on the endpoint URL: urllib matches by URL prefix, so the same
     # credential answers whatever realm the server names in its 401 challenge.

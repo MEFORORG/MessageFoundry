@@ -172,8 +172,10 @@ def _digest(settings: Mapping[str, Any]) -> bool:
 
     try:
         return http_digest_selected(settings)
-    except HttpAuthError:
-        # An unrecognised mode refuses the connector (#5529), so no Digest credential crosses.
+    except HttpAuthError as exc:
+        # An unrecognised mode refuses the connector (#5529), so no Digest credential crosses. The
+        # message names the connection and never the value; the connector's build reports it loudly.
+        logging.getLogger(__name__).debug("static-credential census: %s", exc)
         return False
 
 

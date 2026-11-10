@@ -31,6 +31,7 @@ from messagefoundry.transports.http_auth import (
     http_digest_selected,
     is_authorization_header_name,
     with_http_digest,
+    with_oauth2_client_credentials,
 )
 from messagefoundry.transports.rest import HttpAuthError, RestDestination
 from tests._egress_policy import permitting
@@ -199,6 +200,20 @@ def test_an_unrecognised_mode_refuses_before_the_verify_off_gate_logs(
     with pytest.raises(HttpAuthError, match="http_auth"):
         _build(ConnectorType.REST, settings)
     assert "DISABLED" not in caplog.text
+    # Round 2: a bearer provider beside Digest, and a Digest pair with no password, refuse as early.
+    provider = with_oauth2_client_credentials(
+        with_http_digest(Rest(url=url, verify_tls=False), user="u", password=_PW),
+        token_url="https://127.0.0.1:8443/token",
+        client_id="cid",
+        client_secret="cs-synthetic",  # noqa: S106 -- a synthetic test credential
+    ).settings
+    no_password = {**Rest(url=url, verify_tls=False).settings, "http_auth": "digest"}
+    no_password["http_auth_user"] = "u"
+    for conflicted, words in ((provider, "bearer-token provider"), (no_password, "requires")):
+        caplog.clear()
+        with pytest.raises(HttpAuthError, match=words):
+            _build(ConnectorType.REST, conflicted)
+        assert "DISABLED" not in caplog.text
     # CONTROL: the same loopback verify-off hop with no http_auth builds and logs the warning, so the
     # absence above is the refusal's placement and not a log this capture cannot see.
     caplog.clear()

@@ -397,10 +397,12 @@ _SCRUB_MIN_LEN = 8
 
 
 def _drop_authorization(headers: dict[str, str]) -> None:
-    """Remove every casing of ``Authorization`` from a static header table, so the credential the
-    connection configures owns the one header (BACKLOG #5526). urllib capitalises names and the last
-    write wins, so the configured value already crossed; the table still held two keys, and the
-    length gate measured both."""
+    """Remove every spelling of ``Authorization`` from a static header table, so the credential the
+    connection configures owns the one header (BACKLOG #5526). For a name in plain letters urllib
+    capitalises it and the last write wins, so the configured value already crossed, though the
+    table held two keys. A name with a tab, a NUL or a DEL at an end is not merged, so the static
+    value crossed too, as a second header a peer may read as ``Authorization``. The REST, FHIR and
+    DICOMweb header builders do not purge."""
     from messagefoundry.transports.http_auth import is_authorization_header_name
 
     for key in [k for k in headers if is_authorization_header_name(k)]:
