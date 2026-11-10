@@ -1356,9 +1356,10 @@ chain, and every live socket. `mode="off"` (**the default**) runs them in-proces
 with zero overhead**. `mode="subprocess"` runs each inbound's Router/Handler in a **persistent
 per-inbound worker child** (never a per-message fork), enforcing a forbidden-import guard
 (socket/store/crypto) and the resource caps below. An isolation denial (forbidden op, cap overrun,
-worker crash, an invalid answer or one forged without the request's id) routes the message to
-`ERROR`/dead-letter **post-ACK** (no NAK, never dropped). At least two cases differ (vault BACKLOG #3135). A request the engine cannot
-encode, or one over the frame cap, dead-letters only that message and keeps the worker, since no byte
+worker crash, an invalid answer or one forged without the request's id) fails that message's call as
+an internal error **post-ACK** (no NAK, never dropped), which the `[delivery] internal_error` policy
+then handles. At least two cases differ (vault BACKLOG #3135). A request the engine cannot
+encode, or one over the frame cap, fails only that message's call and keeps the worker, since no byte
 of it was written; a worker answer the codec rejects still kills the worker. A stray frame found
 waiting **before** a request kills the worker and retries the message once on a fresh one (owner
 ruling 2026-11-09); [ADR 0187](adr/0187-bound-the-subprocess-sandbox-worker-count-a-shared-pool-or-router-phase-only-isolation.md)
