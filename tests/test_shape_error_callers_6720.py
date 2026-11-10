@@ -1,17 +1,20 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #6720: the two callers of ``base.is_store_shape_error`` that the widened
+"""BACKLOG #6720: two callers of ``base.is_store_shape_error`` that the widened
 ``schema_verify._SHAPE_MESSAGES`` reaches.
 
 An expected name held by an object of another kind (a view, an index, a table) now reads as a store
-shape error. Two callers outside the schema step act on that:
+shape error. At least three callers outside the schema step act on that; this file pins these two
+(the ``verify-audit-chain`` walk in ``__main__`` is the third, and is not covered here):
 
 * ``auth.service._is_revoke_defect``: the post-commit session revoke raises such an error at once,
   unretried, and records no ``auth.sessions_revoke_failed`` row, as it does for any other defect.
 * ``store.note_audit_chain_read``: the open no longer tags such an error as row evidence about the
   audit chain, so it is reported as a store this build cannot read.
 
-Each case uses a real SQLite error, so the code and the text are SQLite's own. The control is a
+Each case is a real SQLite error from every collision ``test_schema_verify_6719_6720`` measures, so
+the code and the text are SQLite's own and a collision added there is pinned here too. The control
+is a
 syntax error: the same ``SQLITE_ERROR`` code, but not a shape message, which keeps the old handling.
 """
 
@@ -28,6 +31,7 @@ from messagefoundry.auth.service import SESSIONS_REVOKE_FAILED_ACTION, AuthServi
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.base import is_store_shape_error
 from messagefoundry.store.store import AUDIT_CHAIN_READ_NOTE, MessageStore, note_audit_chain_read
+from tests.test_schema_verify_6719_6720 import _COLLISIONS
 
 _PASSWORD = "Str0ng-Synthetic-Pass!!"
 
@@ -44,29 +48,6 @@ def _sqlite_error(*statements: str) -> sqlite3.OperationalError:
         conn.close()
     return info.value
 
-
-#: Names held by an object of another kind: each message is one #6720 added.
-_SHAPE = [
-    pytest.param(
-        (
-            "CREATE TABLE other (a TEXT)",
-            "CREATE VIEW x AS SELECT a FROM other",
-            "CREATE INDEX ix ON x(a)",
-        ),
-        "views may not be indexed",
-        id="index-on-a-view",
-    ),
-    pytest.param(
-        ("CREATE TABLE other (a TEXT)", "CREATE INDEX x ON other(a)", "CREATE TABLE x (a TEXT)"),
-        "there is already an index named",
-        id="table-vs-index",
-    ),
-    pytest.param(
-        ("CREATE TABLE other (a TEXT)", "CREATE VIEW x AS SELECT a FROM other", "DROP TABLE x"),
-        "use DROP VIEW to delete view",
-        id="drop-a-view-as-a-table",
-    ),
-]
 
 #: Same ``SQLITE_ERROR`` code, not a shape message: the old handling applies.
 _SYNTAX = ("SELEC 1",)
@@ -126,12 +107,11 @@ async def _revoke_raising(exc: Exception) -> tuple[int, list[Any]]:
         await store.close()
 
 
-@pytest.mark.parametrize(("statements", "text"), _SHAPE)
+@pytest.mark.parametrize(("existing", "step"), _COLLISIONS)
 async def test_a_name_held_by_another_kind_of_object_is_a_revoke_defect(
-    statements: tuple[str, ...], text: str
+    existing: str, step: str
 ) -> None:
-    exc = _sqlite_error(*statements)
-    assert text in str(exc)  # the message this case is about
+    exc = _sqlite_error("CREATE TABLE other (a TEXT)", existing, step)
     assert service_module._is_revoke_defect(exc)
     calls, rows = await _revoke_raising(exc)
     assert calls == 1, "a shape error was retried"
@@ -149,12 +129,11 @@ async def test_a_sqlite_error_that_is_not_a_shape_is_still_retried_and_recorded(
 # --- store.note_audit_chain_read -------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(("statements", "text"), _SHAPE)
+@pytest.mark.parametrize(("existing", "step"), _COLLISIONS)
 def test_a_name_held_by_another_kind_of_object_is_not_tagged_as_row_evidence(
-    statements: tuple[str, ...], text: str
+    existing: str, step: str
 ) -> None:
-    exc = _sqlite_error(*statements)
-    assert text in str(exc)
+    exc = _sqlite_error("CREATE TABLE other (a TEXT)", existing, step)
     note_audit_chain_read(exc)
     assert AUDIT_CHAIN_READ_NOTE not in getattr(exc, "__notes__", ())
 
