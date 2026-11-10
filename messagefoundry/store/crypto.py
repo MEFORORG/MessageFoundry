@@ -655,8 +655,8 @@ class AuditKeyVersionUnverifiedError(AuditKeyVersionRefusedError):
 
     def __str__(self) -> str:
         return (
-            "Transit answered HTTP 400 without a reason that names the version; audit key version "
-            f"{self.version} could not be confirmed"
+            f"the Transit audit MAC pinned to key version {self.version} got HTTP 400 without a "
+            "reason that names the version, so the version could not be confirmed"
         )
 
 

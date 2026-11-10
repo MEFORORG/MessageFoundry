@@ -592,8 +592,8 @@ def test_a_pinned_400_without_a_version_reason_is_labelled_unverified(
     refused = _pinned_refusal("vault:v2:AAAA", errors, text=text)
     assert isinstance(refused, AuditKeyVersionUnverifiedError)
     assert str(refused) == (
-        "Transit answered HTTP 400 without a reason that names the version; audit key version 3 "
-        "could not be confirmed"
+        "the Transit audit MAC pinned to key version 3 got HTTP 400 without a reason that names "
+        "the version, so the version could not be confirmed"
     )
     assert _KEY_NAME not in str(refused)  # the walk puts this text in the tamper alert
 
@@ -647,7 +647,7 @@ async def test_a_planted_version_behind_a_proxy_is_a_chain_break_on_the_startup_
     finally:
         await store.close()
     assert not ok and f"seq={seq}," in str(msg), msg
-    assert f"audit key version {_UNHELD_VERSION} could not be confirmed" in str(msg), msg
+    assert f"pinned to key version {_UNHELD_VERSION} got HTTP 400" in str(msg), msg
     assert [name for name, _ in sink.events] == ["audit-chain"], sink.events
     assert not any("could not run" in line for line in lines), lines
 
