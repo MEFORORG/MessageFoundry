@@ -184,7 +184,7 @@ at ingress. The third runs in a Router or Handler. The HL7 conventions for engin
 expects:
 
 - a body that opens with an `MSH` segment, after any leading whitespace;
-- a header long enough to read its field separator;
+- a first line of at least 5 characters, long enough to read its encoding characters;
 - a size and a segment count inside the caps `enforce_size_limits` applies;
 - escape sequences that cannot expand past the budget `enforce_expansion_budget` applies.
 
@@ -192,13 +192,6 @@ A body that fails gets an `ERROR` row and, on a replying inbound, a negative ack
 
 **Tier 2 is opt-in per inbound.** It checks the message structure against the HL7 version.
 HL7-VALIDATION.md lists what that covers.
-
-- The separators are the message's own, read from `MSH-1` and `MSH-2` by `_extract_separators` in
-  [`parsing/_builtin_hl7.py`](../messagefoundry/parsing/_builtin_hl7.py). A missing encoding
-  character takes its default: `^`, `~`, `\` and `&`.
-- `unescape` decodes a value. `\F\`, `\S\`, `\R\`, `\T\` and `\E\` become
-  the message's own delimiters, and `\Xhh\` is read as hex. A sequence it cannot map is dropped from
-  the value, not refused.
 
 Tools for checking a field's value in your Router or Handler:
 
