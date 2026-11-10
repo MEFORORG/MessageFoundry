@@ -458,8 +458,8 @@ def test_a_first_lock_check_that_fails_stops_the_reseal_before_any_decrypt(
 def test_a_root_gone_at_the_first_lock_check_is_root_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The root went after the listing, before the first lock check: the pass reports the missing
-    root (BACKLOG #4940) and reads no file, rather than calling every body lost."""
+    """The root went at the first lock check: the pass reports the missing root (BACKLOG #4940)
+    and decrypts no file, rather than calling every body lost."""
     root = tmp_path / "uploads"
     old, new = generate_key(), generate_key()
     _seed(root, old)
@@ -469,6 +469,28 @@ def test_a_root_gone_at_the_first_lock_check_is_root_missing(
     assert not root.exists()
     assert result.root_missing and result.incomplete
     assert (result.skipped, result.body_lost, reads) == (0, 0, [])
+
+
+def test_a_root_gone_right_after_the_listing_is_root_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The root went after the listing and before the first half was read, so no lock check runs:
+    the pass still reports the missing root (BACKLOG #4940), not every upload skipped or lost."""
+    root = tmp_path / "uploads"
+    old, new = generate_key(), generate_key()
+    _seed(root, old)
+    _seed(root, old)
+    real = UploadStore._walk_sidecars
+
+    def _walk(self: UploadStore) -> Any:
+        listed = list(real(self))
+        shutil.rmtree(root)
+        return iter(listed)
+
+    monkeypatch.setattr(UploadStore, "_walk_sidecars", _walk)
+    result = asyncio.run(_store(root, new, old).reseal_to_active())
+    assert result.root_missing and result.incomplete
+    assert (result.skipped, result.body_lost) == (0, 0)
 
 
 def _root_gone_answers(monkeypatch: pytest.MonkeyPatch, *answers: bool) -> list[bool]:
@@ -618,11 +640,21 @@ def test_a_link_planted_at_the_lock_path_is_refused_and_never_followed(
     assert (root / LOCK_FILE_NAME).is_symlink()
 
 
-def test_a_reparse_point_at_the_lock_path_is_refused(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize(
+    ("tag", "refused"),
+    [(0xA0000003, True), (0x9000001A, False)],
+    ids=["junction", "cloud-files-placeholder"],
+)
+def test_a_reparse_point_at_the_lock_path_is_refused_only_when_it_names_another_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tag: int,
+    refused: bool,
 ) -> None:
-    """On Windows a junction or other reparse point is no symlink to ``S_ISLNK``; its attribute
-    refuses it the same way. Faked by ``lstat``, so it runs on every platform."""
+    """On Windows a junction is no symlink to ``S_ISLNK``; its reparse attribute and name-surrogate
+    tag refuse it the same way. A placeholder whose tag names no other path is a lock file like any
+    other. Faked by ``lstat``, so it runs on every platform."""
     root = tmp_path / "uploads"
     key = generate_key()
     fids = [_seed(root, key), _seed(root, key)]
@@ -631,14 +663,22 @@ def test_a_reparse_point_at_the_lock_path_is_refused(
     def _lstat(self: Path) -> Any:
         if self.name == LOCK_FILE_NAME:
             return SimpleNamespace(
-                st_mode=stat.S_IFREG | 0o600, st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT
+                st_mode=stat.S_IFREG | 0o600,
+                st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+                st_reparse_tag=tag,
             )
         return real(self)
 
     monkeypatch.setattr(Path, "lstat", _lstat)
     opened = _count_lock_opens(monkeypatch)
-    _assert_a_planted_link_refusal(root, key, caplog, opened, fids)
-    assert not (root / LOCK_FILE_NAME).exists()
+    if refused:
+        _assert_a_planted_link_refusal(root, key, caplog, opened, fids)
+        assert not (root / LOCK_FILE_NAME).exists()
+        return
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        assert _store(root, key)._discard_cancelled_sync(fids[0]) is True
+    assert len(opened) == 1, opened  # the lock was opened and taken, not refused
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], caplog.text
 
 
 def test_a_rotate_key_with_nothing_to_write_creates_no_lock_file(

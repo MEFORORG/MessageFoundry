@@ -2165,6 +2165,9 @@ class UploadStore:
                 exc.strerror or type(exc).__name__,
             )
             return ResealResult(root_missing=True)
+        if pairs and not os.path.isdir(self._root):
+            # The root went after the listing: the BACKLOG #4940 outcome, not N lost bodies.
+            return ResealResult(root_missing=True)
         gate = _ResealLockCheck(self._root / LOCK_FILE_NAME)
         resealed = skipped = sealed_plaintext = unsealable = body_lost = not_regular = 0
         for fid, _sidecar in pairs:
@@ -2182,12 +2185,14 @@ class UploadStore:
             # keyed store refuses a plaintext value (BACKLOG #1169). Sealing the sidecar first would
             # let an interrupted pass list an upload whose body is still refused.
             body = self._reseal_half(cipher, fid, blob_path, "body", gate=gate)
+            if gate.root_gone():
+                # The root went before the lock check, which runs before the pass's first write, so
+                # nothing was written: the BACKLOG #4940 outcome, as above.
+                return ResealResult(root_missing=True)
             meta = self._reseal_half(
                 cipher, fid, meta_path, "meta", over=(body, blob_path), gate=gate
             )
-            if gate.failure == "gone":
-                # The root went after the listing: the BACKLOG #4940 outcome, not N lost bodies.
-                # Nothing was written before the check, which runs before the pass's first write.
+            if gate.root_gone():
                 return ResealResult(root_missing=True)
             resealed += (body in _WRITTEN) + (meta in _WRITTEN)
             # Once per pair, whichever half failed. A skipped pair counts in sealed_plaintext too
@@ -3342,6 +3347,10 @@ class _ResealLockCheck:
         self._checked = False
         self.failure: _PairLockFailure | None = None
 
+    def root_gone(self) -> bool:
+        """Whether the check ran and found the uploads root gone."""
+        return self.failure == "gone"
+
     def check(self) -> _PairLockFailure | None:
         """Take and release the lock the first time, and return why that failed, or None."""
         if not self._checked:
@@ -3475,9 +3484,15 @@ def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
         yield
 
 
+#: The reparse-tag bit of a Windows reparse point that names another path, such as a symbolic
+#: link or a junction (``IO_REPARSE_TAG_NAME_SURROGATE``), as ``pipeline/dr_backup.py`` tests it. A
+#: cloud-files, dedup or tiering placeholder lacks it and names no other path.
+_NAME_SURROGATE_TAG = 0x20000000
+
+
 def _refuse_a_planted_link(lock: Path) -> None:
     """Refuse the pair lock file ``lock`` before ``edit_lock`` opens it when it is a link, or on
-    Windows any reparse point, such as a junction: raises :class:`_PairLockBusy` chained from an
+    Windows a reparse point that names another path, such as a junction: raises :class:`_PairLockBusy` chained from an
     ``ELOOP``, the shape ``edit_lock`` gives a link its ``O_NOFOLLOW`` open refuses, so
     :func:`_pair_lock_failure` reads it as a refusal. Windows has no ``O_NOFOLLOW``, so there
     ``edit_lock`` follows a planted link and creates or locks its target. A link planted after this
@@ -3486,10 +3501,12 @@ def _refuse_a_planted_link(lock: Path) -> None:
     try:
         info = lock.lstat()
     except OSError:
+        # Not logged here: edit_lock opens this same path next, and its own error is classified
+        # and logged by _pair_lock, as it was before this check existed.
         return
-    if (
-        S_ISLNK(info.st_mode)
-        or getattr(info, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT
+    reparse = getattr(info, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT
+    if S_ISLNK(info.st_mode) or (
+        reparse and getattr(info, "st_reparse_tag", 0) & _NAME_SURROGATE_TAG
     ):
         loop = OSError(errno.ELOOP, os.strerror(errno.ELOOP), str(lock))
         raise _PairLockBusy(
