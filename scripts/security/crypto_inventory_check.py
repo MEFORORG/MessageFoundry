@@ -1853,6 +1853,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.check_hostname = False",
             "tls_context:.minimum_version = TLSv1_2",
             "tls_context:.verify_mode = CERT_NONE",
+            # BACKLOG #5530: the FTPS data channel is wrapped with the connection's own verifying
+            # context, passing the control channel's session so a reuse-requiring server accepts it.
+            "tls_context:.wrap_socket()",
             "tls_context:via messagefoundry.config.tls_policy",
             "tls_context:via messagefoundry.keywrap",
         }

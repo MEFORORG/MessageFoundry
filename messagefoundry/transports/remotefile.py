@@ -1065,9 +1065,43 @@ def _ftp_connect_refusal(step: str, exc: ftplib.error_perm, *, tls: bool) -> _Re
     return _RemoteError(f"FTP login refused: {detail}", permanent=True, credential_fault=True)
 
 
+class _SessionReusingFtpTls(ftplib.FTP_TLS):
+    """``ftplib.FTP_TLS`` whose ``PROT P`` data connections resume the control channel's TLS session.
+
+    The stdlib wraps each data socket with a fresh handshake. A server that requires the data channel
+    to reuse the control session, at least vsftpd at its default ``require_ssl_reuse=YES`` and
+    FileZilla Server with its session-resumption requirement on, would refuse every transfer (BACKLOG
+    #5530). Reuse also binds the data connection to the session that carried the login.
+
+    Under TLS 1.3 the control session can be absent, or not yet resumable, until the server's ticket
+    has been read. It is passed as it is: ``session=None``, or a ticket the server will not resume,
+    falls back to a full handshake, so reuse is best-effort there. The protocol is never forced down
+    to TLS 1.2 to make it work.
+
+    A failed data handshake does not leak the socket. ``ssl.SSLSocket._create`` (CPython 3.14)
+    detaches the raw socket before the handshake and closes the descriptor if the handshake raises,
+    so nothing here closes it a second time. ``_FtpClient._connect`` resolves this name at call
+    time, which is the seam the tests patch."""
+
+    #: Set by ``FTP_TLS.__init__`` and by ``prot_p``/``prot_c``; typeshed does not declare it.
+    _prot_p: bool
+
+    def ntransfercmd(
+        self, cmd: str, rest: int | str | None = None
+    ) -> tuple[socket.socket, int | None]:
+        # Read before the data connection opens, so nothing between it and the wrap can raise and
+        # strand the raw socket. A control channel that is not TLS yields None, a full handshake.
+        session = self.sock.session if isinstance(self.sock, ssl.SSLSocket) else None
+        conn, size = ftplib.FTP.ntransfercmd(self, cmd, rest)
+        if self._prot_p:
+            conn = self.context.wrap_socket(conn, server_hostname=self.host, session=session)
+        return conn, size
+
+
 class _FtpClient(_RemoteClient):
     """FTP / FTPS client over the stdlib ``ftplib``. ``tls`` selects ``FTP_TLS`` (explicit TLS, with
-    ``PROT P`` so the data channel is encrypted too) over plain ``FTP``. For FTPS a verifying
+    ``PROT P`` so the data channel is encrypted too, resuming the control channel's TLS session; see
+    :class:`_SessionReusingFtpTls`) over plain ``FTP``. For FTPS a verifying
     :class:`ssl.SSLContext` is built at construction (fail-fast) so the server certificate and hostname
     are validated — ftplib's default no-verify stdlib context is never used."""
 
@@ -1109,23 +1143,25 @@ class _FtpClient(_RemoteClient):
         is closed on every failure."""
         # B321: plain FTP only when explicitly selected, and only anonymously: credentials over it
         # are refused outright (see _validate_common). FTPS/SFTP are the encrypted defaults.
+        ftps: ftplib.FTP_TLS | None = None
         if self._tls:
-            ftp: ftplib.FTP = ftplib.FTP_TLS(context=self._context, timeout=self._timeout)
+            ftps = _SessionReusingFtpTls(context=self._context, timeout=self._timeout)
+            ftp: ftplib.FTP = ftps
         else:
             ftp = ftplib.FTP(timeout=self._timeout)  # nosec B321
         step = _FTP_GREETING
         try:
             ftp.connect(self._host, self._port)
-            if isinstance(ftp, ftplib.FTP_TLS):
+            if ftps is not None:
                 # Explicit here rather than left to login(), so a refusal is known to answer AUTH TLS
                 # and not the credential. login() skips its own AUTH once the socket is TLS.
                 step = _FTP_AUTH_TLS
-                ftp.auth()
+                ftps.auth()
             step = _FTP_LOGIN
             ftp.login(user=str(self._user or ""), passwd=str(self._password or ""))
-            if isinstance(ftp, ftplib.FTP_TLS):
+            if ftps is not None:
                 step = _FTP_PROT_P
-                ftp.prot_p()  # encrypt the data channel, not just the control channel
+                ftps.prot_p()  # encrypt the data channel, not just the control channel
             return ftp
         except ftplib.error_perm as exc:
             fault = _ftp_connect_refusal(step, exc, tls=self._tls)
