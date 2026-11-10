@@ -1036,7 +1036,7 @@ def _applock_timeout_ms(command_timeout: int) -> int:
 
 def _clamped_statement_timeout(clamp_seconds: float, command_timeout: int) -> int:
     """The whole-second pyodbc statement timeout for a statement clamped below ``command_timeout``
-    (ADR 0157 Inc 0: the cluster lease claim/renew).
+    (ADR 0157 Inc 0: the cluster coordinator's maintenance loop and stepdown, BACKLOG #5064).
 
     pyodbc's ``Connection.timeout`` is an integer, so the clamp rounds DOWN, never up: a bound that
     rounded up could land past the detection margin the clamp was checked against. It never drops
@@ -5559,7 +5559,7 @@ class SqlServerStore:
 
     def _acquire_clamped(self, clamp_seconds: float) -> AbstractAsyncContextManager[Any]:
         """:meth:`_acquire` with a SHORTER acquire limit: the smaller of ``[store].acquire_timeout``
-        and ``clamp_seconds``. Only the cluster lease claim/renew borrows this way
+        and ``clamp_seconds``. Only the cluster coordinator's clamped statements borrow this way
         (:meth:`_fetchone_clamped` says why)."""
         return self._borrow(min(self._settings.acquire_timeout, clamp_seconds))
 
@@ -5656,9 +5656,9 @@ class SqlServerStore:
         duplicate key and 2628 the truncated value.
 
         ``within`` bounds the rollback, in seconds; ``None``, which every caller but
-        :meth:`_fetch_rows` on a clamped read passes, leaves it unbounded and enters no timeout at
-        all. A rollback that runs past the bound is treated as one that failed: the connection is
-        discarded. Where the call gate already marks the rollback as running, the close is handed
+        :meth:`_fetch_rows` and :meth:`_write_rows` on a clamped statement passes, leaves it
+        unbounded and enters no timeout at all. A rollback that runs past the bound is treated as
+        one that failed: the connection is discarded. Where the call gate already marks the rollback as running, the close is handed
         to it and lands as it returns (BACKLOG #2049). A rollback the bound cancelled before it
         entered the gate never runs (BACKLOG #2394), so the separate close that follows takes the
         gate's lock with no rollback left to race it, and the close ends the transaction.
@@ -5825,26 +5825,33 @@ class SqlServerStore:
     async def _fetchall(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         return await self._fetch_rows(sql, params)
 
+    def _clamp_bounds(
+        self, timeout_clamp: float | None
+    ) -> tuple[AbstractAsyncContextManager[Any], int | None, float | None]:
+        """``(borrow, statement timeout, rollback bound)`` for one statement. ``timeout_clamp`` is
+        ``None`` for every caller but the cluster coordinator's maintenance loop and stepdown, and
+        ``None`` keeps the :meth:`_acquire` borrow and ``[store].command_timeout``. One value sets
+        the borrow, the statement and the rollback bounds, so none can be set without the others; a
+        shorter ``[store].command_timeout`` still ends the statement first, and bounds neither of
+        the other two."""
+        if timeout_clamp is None:
+            return self._acquire(), None, None
+        # The borrow is floored at 1 s like the statement, so a sub-second clamp runs as 1 s on
+        # both, as the coordinator's warning says, and a 0 clamp never refuses every borrow. The
+        # rollback after a failure gets the same floored clamp (BACKLOG #5066).
+        floored_clamp = max(1.0, timeout_clamp)
+        return (
+            self._acquire_clamped(floored_clamp),
+            _clamped_statement_timeout(timeout_clamp, self._settings.command_timeout),
+            floored_clamp,
+        )
+
     async def _fetch_rows(
         self, sql: str, params: tuple[Any, ...], timeout_clamp: float | None = None
     ) -> list[dict[str, Any]]:
-        """The body of :meth:`_fetchall` and :meth:`_fetchone_clamped`. ``timeout_clamp`` is
-        ``None`` for every caller but the cluster lease claim/renew, and ``None`` keeps the
-        :meth:`_acquire` borrow and ``[store].command_timeout``. One value sets the borrow, the
-        statement and the rollback bounds, so none can be set without the others; a shorter
-        ``[store].command_timeout`` still ends the statement first, and bounds neither of the
-        other two."""
-        if timeout_clamp is None:
-            borrow, statement_timeout, floored_clamp = self._acquire(), None, None
-        else:
-            # The borrow is floored at 1 s like the statement, so a sub-second clamp runs as 1 s on
-            # both, as the coordinator's warning says, and a 0 clamp never refuses every borrow. The
-            # rollback after a failure gets the same floored clamp (BACKLOG #5066).
-            floored_clamp = max(1.0, timeout_clamp)
-            borrow = self._acquire_clamped(floored_clamp)
-            statement_timeout = _clamped_statement_timeout(
-                timeout_clamp, self._settings.command_timeout
-            )
+        """The body of :meth:`_fetchall` and :meth:`_fetchone_clamped`; :meth:`_clamp_bounds`
+        says what ``timeout_clamp`` sets."""
+        borrow, statement_timeout, floored_clamp = self._clamp_bounds(timeout_clamp)
         async with borrow as conn:
             try:
                 async with (
@@ -5877,7 +5884,8 @@ class SqlServerStore:
         self, sql: str, params: tuple[Any, ...], *, timeout_clamp: float
     ) -> dict[str, Any] | None:
         """:meth:`_fetchone` bounded by ``timeout_clamp`` (ADR 0157 Inc 0). The cluster lease
-        claim/renew is its only caller.
+        claim/renew and the maintenance loop's config-version refresh are its callers (BACKLOG
+        #5064); :meth:`_execute_clamped` is its twin for a write.
 
         Two windows before the statement returns, each at most the clamp floored at 1 s. The wait
         for a pooled connection is the smaller of ``max(1.0, clamp)`` and ``[store].acquire_timeout`` (:meth:`_fetch_rows` applies
@@ -5892,7 +5900,9 @@ class SqlServerStore:
         clamp after it is issued, while ``ClusterSettings._renew_fits_the_margin`` compares the
         clamp alone with the margin. The COMMIT after the statement is a call on the connection, not a
         statement, so neither the clamp nor ``[store].command_timeout`` is known to bound it, by a
-        reading of pyodbc's documentation, not a measurement.
+        reading of pyodbc's documentation, not a measurement. Whether msodbcsql bounds
+        ``SQLEndTran`` needs a live SQL Server, and BACKLOG #6621 measures it; until then the COMMIT
+        is outside both windows (BACKLOG #5064 keeps that as a stated reason, not a bound).
 
         **The ROLLBACK after a failure has its own bound (BACKLOG #5066):** the clamp floored at
         1 s, applied on the event loop by :meth:`_rollback_or_discard`. One that fails or runs past
@@ -5910,9 +5920,30 @@ class SqlServerStore:
         """Run a single write statement (or T-SQL batch) in its own committed transaction, and return
         the driver's row count (``-1`` when it reports none). Most callers ignore it; the cluster
         stepdown reads it to say truthfully whether its owner-scoped release matched a row."""
-        async with self._acquire() as conn:
+        return await self._write_rows(sql, params)
+
+    async def _execute_clamped(
+        self, sql: str, params: tuple[Any, ...], *, timeout_clamp: float
+    ) -> int:
+        """:meth:`_execute` bounded by ``timeout_clamp`` exactly as :meth:`_fetchone_clamped` bounds
+        a read, whose docstring says what that leaves unbounded, the COMMIT included (BACKLOG
+        #5064). The cluster heartbeat and the lease release are its callers: both run in series
+        with the renew or under ``_leadership_lock``, so ``[store].command_timeout`` there would
+        delay the renew past the fence (BACKLOG #6472)."""
+        return await self._write_rows(sql, params, timeout_clamp)
+
+    async def _write_rows(
+        self, sql: str, params: tuple[Any, ...], timeout_clamp: float | None = None
+    ) -> int:
+        """The body of :meth:`_execute` and :meth:`_execute_clamped`; :meth:`_clamp_bounds` says
+        what ``timeout_clamp`` sets."""
+        borrow, statement_timeout, floored_clamp = self._clamp_bounds(timeout_clamp)
+        async with borrow as conn:
             try:
-                async with self._cursor(conn) as cur:
+                async with (
+                    self._statement_timeout(conn, statement_timeout),
+                    self._cursor(conn) as cur,
+                ):
                     await cur.execute(sql, params)
                     # getattr: some test cursors model no row count, and -1 is the DB-API 'unknown'.
                     count = getattr(cur, "rowcount", -1)
@@ -5922,7 +5953,7 @@ class SqlServerStore:
                 # A rollback that fails would otherwise recycle a connection still holding the
                 # write's X locks; _rollback_or_discard discards it instead. After the cursor block,
                 # so a detached close cannot race the cursor's own close.
-                await self._rollback_or_discard(conn)
+                await self._rollback_or_discard(conn, within=floored_clamp)
                 raise
         return rows
 

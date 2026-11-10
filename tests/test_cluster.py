@@ -1505,6 +1505,9 @@ async def test_sqlserver_step_down_mirrors_the_postgres_seam() -> None:
             self.executed.append(sql)
             return 1  # the owner-scoped release matched this node's row
 
+        async def _execute_clamped(self, sql: str, params: object, **k: object) -> int:
+            return await self._execute(sql, params)  # the release's entry point (BACKLOG #5064)
+
         async def _fetchone(self, sql: str, *a: object, **k: object) -> object:
             # Since BACKLOG #1986 a paused node READS the lease owner, to lift the pause once a
             # successor holds the row. It must still never send the claim.

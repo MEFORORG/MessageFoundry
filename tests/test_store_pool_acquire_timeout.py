@@ -759,13 +759,15 @@ def test_sqlserver_longer_post_commit_borrow_has_exactly_its_two_writes() -> Non
         " it too follows a committed write nothing retries, then update this pin"
     )
     assert _sqlserver_functions_referencing("after_commit") == ["rotate_session"]
-    # BACKLOG #1497 added a SHORTER borrow for the cluster lease claim alone; pinned the same way.
+    # BACKLOG #1497 added a SHORTER borrow for the cluster lease claim; pinned the same way.
     assert _sqlserver_functions_referencing("_borrow") == [
         "_acquire",
         "_acquire_after_commit",
         "_acquire_clamped",
     ]
-    assert _sqlserver_functions_referencing("_acquire_clamped") == ["_fetch_rows"]
+    # BACKLOG #5064 moved it behind _clamp_bounds, shared by the clamped read and the clamped write.
+    assert _sqlserver_functions_referencing("_acquire_clamped") == ["_clamp_bounds"]
+    assert _sqlserver_functions_referencing("_clamp_bounds") == ["_fetch_rows", "_write_rows"]
 
 
 # --- the setting -------------------------------------------------------------

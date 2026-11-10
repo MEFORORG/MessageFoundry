@@ -93,7 +93,7 @@ class _Cursor:
     def __init__(self, conn: _Conn) -> None:
         self._conn = conn
         self.timeout = conn._conn.timeout if conn._conn is not None else None  # copied at creation
-        self.description = [("owner",), ("leader_epoch",)]
+        self.description = [(name,) for name in conn.columns]
 
     async def execute(self, sql: str, params: Any = None) -> None:
         self._conn.statement_timeouts.append(self.timeout)
@@ -101,9 +101,15 @@ class _Cursor:
             raise self._conn.fail
         if self._conn.hang is not None:
             await self._conn.hang.wait()
+        if self._conn.stalls:
+            # A statement the server never answers, ended where pyodbc ends it: at the timeout the
+            # cursor copied when it was created, raised as an ordinary driver error.
+            assert self.timeout, "a stalled statement with no timeout would never return"
+            await asyncio.sleep(self.timeout)
+            raise RuntimeError("HYT00 query timeout expired")
 
     async def fetchall(self) -> list[tuple[object, ...]]:
-        return [("A", 7)]
+        return [self._conn.row]
 
     async def close(self) -> None:
         pass
@@ -119,6 +125,9 @@ class _Conn:
         self.rolled_back = 0
         self.rollback_fail: Exception | None = None
         self.rollback_hangs = False
+        self.stalls = False  # each statement runs until its own timeout ends it
+        self.columns: tuple[str, ...] = ("owner", "leader_epoch")
+        self.row: tuple[object, ...] = ("A", 7)
 
     @property
     def closed(self) -> bool:
@@ -149,6 +158,18 @@ class _Pool:
 
     async def release(self, conn: _Conn) -> None:
         self.released.append(conn)
+
+
+class _SlowPool(_Pool):
+    """A busy pool: every borrow waits ``delay`` seconds before a connection is handed over."""
+
+    def __init__(self, conn: _Conn, delay: float) -> None:
+        super().__init__(conn)
+        self.delay = delay
+
+    async def acquire(self) -> _Conn:
+        await asyncio.sleep(self.delay)
+        return self.conn
 
 
 class _HangingPool:
@@ -569,6 +590,91 @@ async def test_the_paused_owner_read_is_not_clamped() -> None:
     coord._no_claim_until = 10.0
     assert await coord._claim_or_renew_lease() is False
     assert calls == ["plain"]
+
+
+# --- the two-times bound, and the loop's other statements (BACKLOG #5064, #6472) -----------
+
+
+async def test_a_renew_on_a_busy_pool_and_a_stalled_server_resolves_within_twice_the_clamp() -> (
+    None
+):
+    """The kept bound (Manager decision d20261030T213636115-0af931), pinned by timing rather than
+    by the warning's arithmetic: the borrow and the statement each get the clamp, with no shared
+    deadline, so a renew that waits on a busy pool and then meets a stalled server still resolves
+    inside twice the clamp, and the node takes nothing. The lower bound shows both windows were
+    spent, so this is the composite and not one window alone. The COMMIT is outside both windows,
+    by a reading of pyodbc, not a measurement (BACKLOG #6621); this fake's commit is immediate."""
+    clamp = 1.0
+    conn = _Conn()
+    conn.stalls = True
+    store = _store(conn)
+    store._pool = _SlowPool(conn, delay=0.6 * clamp)
+    coord = SqlServerCoordinator(store, "A", lease_renew_timeout_seconds=clamp)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="HYT00"):
+        await coord._maintain_leadership()
+    elapsed = time.monotonic() - started
+    assert 1.5 * clamp <= elapsed < 2 * clamp, elapsed
+    assert conn.statement_timeouts == [1]
+    assert coord.is_leader() is False
+    assert not coord._leadership_lock.locked()
+
+
+async def test_the_heartbeat_runs_under_the_renew_clamp() -> None:
+    """It runs before the renew in the same tick, so its bound delays the renew (BACKLOG #6472).
+    Before #5064 it ran at [store].command_timeout: this assertion read [30]."""
+    conn = _Conn()
+    coord = SqlServerCoordinator(_store(conn), "A", lease_renew_timeout_seconds=3.25)
+    await coord.heartbeat_once()
+    assert conn.statement_timeouts == [3]
+    assert conn.raw.timeout == 30
+
+
+async def test_a_stalled_heartbeat_ends_at_the_clamp_not_at_command_timeout() -> None:
+    """A heartbeat the server never answers ends at the clamp, so the tick reaches its renew. At
+    command_timeout (30 s) the fake would run 30 s and the bound below would fail."""
+    conn = _Conn()
+    conn.stalls = True
+    coord = SqlServerCoordinator(_store(conn), "A", lease_renew_timeout_seconds=1.0)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="HYT00"):
+        await coord.heartbeat_once()
+    assert time.monotonic() - started < 2.0
+    assert conn.statement_timeouts == [1]
+    assert conn.rolled_back == 1
+
+
+async def test_the_config_version_refresh_runs_under_the_renew_clamp() -> None:
+    """The loop's third statement (BACKLOG #6472)."""
+    conn = _Conn()
+    conn.columns = ("config_version",)
+    conn.row = (4,)
+    coord = SqlServerCoordinator(_store(conn), "A", lease_renew_timeout_seconds=3.25)
+    assert await coord.config_version() == 4
+    assert conn.statement_timeouts == [3]
+    assert conn.raw.timeout == 30
+
+
+@pytest.mark.parametrize("stop_bound", [None, 10.0])
+async def test_the_lease_release_runs_under_the_renew_clamp(stop_bound: float | None) -> None:
+    """The stepdown's release holds _leadership_lock, and stop() passes its own whole-call bound on
+    top; the driver-side bound is the clamp on both paths (BACKLOG #5064, #6472)."""
+    conn = _Conn()
+    coord = SqlServerCoordinator(_store(conn), "A", lease_renew_timeout_seconds=3.25)
+    coord._is_leader = True
+    was_leader, _, wrote, _ = await coord._release_leadership(force_write=True, timeout=stop_bound)
+    assert (was_leader, wrote) == (True, True)
+    assert conn.statement_timeouts == [3]
+    assert conn.raw.timeout == 30
+
+
+async def test_the_unclamped_write_is_unchanged() -> None:
+    """Control: every other write keeps [store].command_timeout and never touches the timeout."""
+    conn = _Conn()
+    store = _store(conn)
+    await store._execute("UPDATE nodes SET status = ?", ("left",))
+    assert conn.statement_timeouts == [30]
+    assert conn.raw.assigned == [30]
 
 
 class _SqlServerSettings:
