@@ -2652,7 +2652,9 @@ read as a completed action.
 
 **An inline, released or cluster convergence reload's `config_reload` row names that reload's own
 config (vault BACKLOG #2257, #3109).** It is built from the reload's own result: its directory,
-connection counts and the digest it took before the swap. The row is written after the swap, so a
+connection counts and the digest it took before the swap. A convergence reload's row can also
+carry `initiator_digest`: what another node stored as unsigned text in the shared `cluster_config`
+row, shape-checked and never authenticated. The row is written after the swap, so a
 second reload can move the engine on first. The row then still names
 its own config, but is marked `superseded` and `baseline_unchecked`, so the next start passes over
 it and does not compare against it. Only a committed reload that moves the engine's loaded
