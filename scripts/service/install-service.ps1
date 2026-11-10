@@ -2334,7 +2334,8 @@ New-Item -ItemType Directory -Force -Path $LogDir  | Out-Null
 # (New-RestrictedDirectory says why one step). One that exists and the service does not name is
 # restricted now, owner first, and must then still be empty. The account's read is added once it
 # resolves. A directory the service already names is the operator's, and is left to that step.
-New-AdminOnlyFolder -Path (Split-Path -Parent $SecretsDir)
+$SecretsParent = Split-Path -Parent $SecretsDir
+if (-not (Test-Path -LiteralPath $SecretsParent)) { New-AdminOnlyFolder -Path $SecretsParent }
 if (-not (Test-Path -LiteralPath $SecretsDir)) { New-RestrictedDirectory -Path $SecretsDir }
 elseif (-not $SecretsDirNamed) { Set-SecretsDirAcl -Path $SecretsDir }
 if (-not $SecretsDirNamed) {
