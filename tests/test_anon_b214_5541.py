@@ -57,7 +57,7 @@ def test_a_reload_of_the_guard_reaches_the_scan(reloaded_guard: ModuleType) -> N
     assert "estate token (zqsynthestate)" in report.hits
 
 
-def test_no_guard_reports_structural_only_and_refuses_only_on_the_opt_in(
+def test_no_guard_reports_no_token_check_and_refuses_only_on_the_opt_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(tee_leak, "_GUARD", None)
@@ -68,7 +68,7 @@ def test_no_guard_reports_structural_only_and_refuses_only_on_the_opt_in(
     reason = report.token_floor_reason or ""
     assert "no publish guard reachable" in reason
     # The reason says what ran. It once said "refusing", and by default nothing refuses.
-    assert "refusing" not in reason and "structural-only" in reason
+    assert "refusing" not in reason and "no partner or vendor token was checked" in reason
     assert tee_leak.denylist_is_live(report) is False
     # The documented default: a guardless run is reported, not refused.
     assert tee_anon.anonymize_checked(clean, salt=_SALT)

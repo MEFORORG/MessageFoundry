@@ -150,16 +150,17 @@ class FieldRule:
 # with PID-5) and keyed on the same value, so an A40 merge's old-to-new linkage is preserved across
 # the surrogate mapping.
 #
-# BACKLOG #5533 mapped the identifier, name, location and contact fields that were still unmapped
+# BACKLOG #5533 mapped fourteen identifier, name, location and contact fields that were unmapped
 # inside segments this map already scrubs: PID-2/21/23, NK1-13/30/31/32/33/37, GT1-2 and
 # PV1-6/11/42/43. The coded fields of those segments stay unmapped ON PURPOSE, because a table code
 # names no one and tests route on it: PID-8 sex, PID-10 race, PID-15 language, PID-16 marital
 # status, PID-17 religion, PID-22 ethnic group, PID-24/25 multiple birth, PID-26 citizenship,
 # PID-27 veteran status, PID-28 nationality, PID-30 death indicator, NK1-3 relationship, NK1-14/15
 # marital status and sex, and PV1-2/4/10 patient class, admission type and hospital service. Any
-# other field of these segments that is neither listed here nor mapped below, such as NK1-12
-# employee number, NK1-26 mother's maiden name or GT1-19 guarantor employee id, has no rule yet:
-# only the coverage report names it, and require_full_coverage refuses it.
+# other field of these segments that is neither listed here nor mapped below has no rule yet.
+# At least these do: NK1-12, NK1-26 and NK1-38, GT1-4, GT1-19, GT1-42, GT1-45, GT1-46 and GT1-56,
+# PV1-5, PV1-50 and PV1-52, and MRG-2, MRG-5 and MRG-6. Only the coverage report names such a
+# field, and require_full_coverage refuses it.
 DEFAULT_RULES: tuple[FieldRule, ...] = (
     # PID — patient identity
     FieldRule("PID-2", SurrogateKind.MRN),  # patient id (external), a CX like PID-3
@@ -192,7 +193,9 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("NK1-5", SurrogateKind.PHONE),
     FieldRule("NK1-6", SurrogateKind.PHONE),
     FieldRule("NK1-7", SurrogateKind.PHONE),
-    FieldRule("NK1-13", SurrogateKind.NAME),  # organization name, an XON, as IN1-11
+    # NK1-13 is an XON. The name kind would write a person's name into it, and XON.3 is numeric,
+    # so the output would fail strict validation; the blunt redact keeps it valid.
+    FieldRule("NK1-13", SurrogateKind.FREETEXT),  # organization name
     FieldRule("NK1-16", SurrogateKind.DOB),  # contact's date of birth
     FieldRule("NK1-30", SurrogateKind.NAME),  # contact person's name
     FieldRule("NK1-31", SurrogateKind.PHONE),  # contact person's telephone

@@ -23,8 +23,9 @@ they are held byte-for-byte identical with the toolkit copy so the two agree on 
 dashed SSN and punctuated phone detectors also refuse such a shape that the message's own field
 separator cut across fields, when at least one of them is unmapped (BACKLOG #3465), and scan what
 a retarget of a default field left past its first component (:func:`retarget_residue_hits`,
-BACKLOG #3493). Every detector, and the token scan, reads a value decoded from its HL7 escape
-sequences as well as as written (BACKLOG #5532).
+BACKLOG #3493). The shape detectors that read one field, and the token scan, read a value
+decoded from its HL7 escape sequences as well as as written (BACKLOG #5532); docs/PHI.md section
+9 names the checks that do not decode.
 """
 
 from __future__ import annotations
@@ -622,8 +623,9 @@ def _merged_token_hits(scan: Callable[[str], list[str]], text: str) -> list[str]
 def _has_mrn_typed_identifier(value: str, seps: Seps, field_sep: str) -> bool:
     """True if any repetition of ``value`` is a CX with a non-empty id (component 1) and a whole
     ``MR``/``MRN`` id-type component — an unmapped medical-record number by HL7 structure, far more
-    precise than a bare digit-run heuristic. Each component is compared as written and decoded,
-    so an id type written with an escape sequence, such as ``M\\X52\\``, counts (BACKLOG #5532)."""
+    precise than a bare digit-run heuristic. Each component is compared decoded, which for one
+    with no escape character is the component as written, so an id type written with an escape
+    sequence, such as ``M\\X52\\``, counts (BACKLOG #5532)."""
     for rep in value.split(seps.repetition):
         comps = rep.split(seps.component)
         # A component with no escape character comes back from unescape as it was.
@@ -857,8 +859,8 @@ def leak_report(
         # ran and nothing more: a caller refuses on it only with require_live_denylist (BACKLOG
         # #5541), which the tee's own run does not set.
         token_floor_reason = (  # nosec B105
-            "no publish guard reachable: the token tables are empty, so the check ran "
-            "structural-only"
+            "no publish guard reachable: the token tables are empty, so no partner or vendor "
+            "token was checked"
         )
     return LeakReport(
         hits=token_hits + structural,

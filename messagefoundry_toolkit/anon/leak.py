@@ -6,8 +6,8 @@ A de-identified dataset is only safe to commit/share once it is **proven** free 
 customer/partner/site tokens — and that token set must be the SINGLE source of truth, not a third
 copy that drifts (the very drift that already bit ``tests/test_load_config.py``). So the toolkit-side
 leak-check delegates to ``scripts/security/scan_forbidden.py`` — the owner-managed guard — via
-its importable :func:`scan_text`. The standalone ``tee/anon/leak.py`` vendors the same token data
-(held identical by the parity test), since the tee cannot reach ``scripts/``.
+its importable :func:`scan_text`. The standalone ``tee/anon/leak.py`` loads the same guard by
+path and reads its tables at each scan, so it holds no copy of them.
 
 The token denylist alone is a **backstop that only catches known *strings***: a real MRN in a field
 the rule map never mapped is not a denylisted token, so it would sail through clean. Two structural
@@ -26,9 +26,10 @@ already-pseudonymized field is never re-flagged:
   §5). A name, an undashed number or a date in an unmapped field
   is NOT detected; the coverage report is the only record of it (BACKLOG #1710). The dashed SSN
   and punctuated phone detectors also scan what a retarget of a default field left past its
-  first component (:func:`retarget_residue_hits`, BACKLOG #3493). Every detector, and the token
-  scan, reads a value decoded from its HL7 escape sequences as well as as written, so a shape or
-  token written ``\\X2D\\`` for a dash is found too (BACKLOG #5532).
+  first component (:func:`retarget_residue_hits`, BACKLOG #3493). The shape detectors that read
+  one field, and the token scan, read a value decoded from its HL7 escape sequences as well as as
+  written, so a shape or token written ``\\X2D\\`` for a dash is found too (BACKLOG #5532).
+  docs/PHI.md section 9 names the checks that do not decode.
 
 The token-floor signal (``token_floor_failure``) is recorded in every report
 (``token_floor_reason``/``token_tables_live``) and folded into the fail-closed decision when
@@ -580,8 +581,9 @@ def _merged_token_hits(scan: Callable[[str], list[str]], text: str) -> list[str]
 def _has_mrn_typed_identifier(value: str, seps: Seps, field_sep: str) -> bool:
     """True if any repetition of ``value`` is a CX with a non-empty id (component 1) and a whole
     ``MR``/``MRN`` id-type component — an unmapped medical-record number by HL7 structure, far more
-    precise than a bare digit-run heuristic. Each component is compared as written and decoded,
-    so an id type written with an escape sequence, such as ``M\\X52\\``, counts (BACKLOG #5532)."""
+    precise than a bare digit-run heuristic. Each component is compared decoded, which for one
+    with no escape character is the component as written, so an id type written with an escape
+    sequence, such as ``M\\X52\\``, counts (BACKLOG #5532)."""
     for rep in value.split(seps.repetition):
         comps = rep.split(seps.component)
         # A component with no escape character comes back from unescape as it was.

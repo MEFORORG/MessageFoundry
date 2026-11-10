@@ -114,7 +114,8 @@
   > ADR 0201 slice 6 moves it."*
 - **AMENDED 2026-11-10 (BACKLOG #5533): fourteen more default rules, inside segments the map
   already scrubbed.** The default map adds `PID-2` and `PID-21` as `MRN`, `PID-23` (birth place) as
-  `FREETEXT`, `NK1-13` and `NK1-30` as `NAME`, `NK1-31` as `PHONE`, `NK1-32` as `ADDRESS`, `NK1-33`
+  `FREETEXT`, `NK1-13` (an organization name, whose numeric XON.3 a person name would break) as
+  `FREETEXT`, `NK1-30` as `NAME`, `NK1-31` as `PHONE`, `NK1-32` as `ADDRESS`, `NK1-33`
   and `GT1-2` as `ID`, `NK1-37` as `SSN`, and the prior, temporary, pending and prior temporary
   locations `PV1-6`, `PV1-11`, `PV1-42` and `PV1-43` as `FREETEXT`, like `PV1-3`. **This adds to
   the §3 field list and changes none of its ratified choices:** the coded fields of those segments

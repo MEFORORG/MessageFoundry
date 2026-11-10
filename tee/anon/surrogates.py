@@ -546,21 +546,36 @@ def read_message_seps(text: str) -> tuple[Seps, str] | None:
     return None
 
 
-#: A ``\Xhh...\`` body: an ``X`` and then hex digits in pairs.
-_HEX_ESCAPE: re.Pattern[str] = re.compile(r"X((?:[0-9A-Fa-f]{2})+)")
-#: The first letters of the escape sequences that change how text looks, not what it says:
-#: highlighting on and off (``H``, ``N``) and the character-set and local escapes (``C``, ``M``,
-#: ``Z``). They decode to nothing.
-_FORMAT_ESCAPES = frozenset("HNCMZ")
+#: The dotted formatting commands that decode to nothing, as the engine's parser reads them:
+#: ``.fi`` and ``.nf`` (fill and no-fill). Every other dotted command it knows writes a line break
+#: or spaces, which this decoder writes as one space, so two runs of digits never join.
+_EMPTY_FORMAT_COMMANDS = frozenset({".fi", ".nf"})
+#: The dotted formatting commands that write a break or spaces: ``.br``, ``.sp``, ``.ce``, ``.in``,
+#: ``.ti`` and ``.sk``. Any other dotted body is unmappable.
+_SPACING_FORMAT_COMMANDS = frozenset({".br", ".sp", ".ce", ".in", ".ti", ".sk"})
 
 
-def _decode_escape(body: str, seps: Seps, field_sep: str) -> str | None:
-    """What one escape sequence decodes to, given the text between its two escape characters.
-    ``None`` when ``body`` is no escape sequence HL7 defines, so the caller keeps it as written.
+def _decode_hex(digits: str) -> str:
+    """A ``\\Xhh...\\`` body after its ``X``, decoded one pair at a time to the character with
+    that code, as the engine's parser decodes it. A last single digit is read alone, and the
+    decode stops at the first pair that is not hex, keeping what it already decoded."""
+    out: list[str] = []
+    for at in range(0, len(digits), 2):
+        try:
+            out.append(chr(int(digits[at : at + 2], 16)))
+        except ValueError:
+            break
+    return "".join(out)
 
-    A hex escape decodes each pair to the character with that code, so an ASCII shape written in
-    hex reads as itself. A formatting command (``.br``, ``.sp`` and the like) decodes to one space,
-    so two runs of digits on either side of a line break never join into one number."""
+
+def _decode_escape(body: str, seps: Seps, field_sep: str) -> str:
+    """What one escape sequence decodes to, given the text between its two escape characters. It
+    follows ``messagefoundry/parsing/_builtin_hl7.unescape``, the engine's own reading, so a value
+    reads here as an HL7 receiver reads it (BACKLOG #5532): a delimiter escape becomes the
+    message's own delimiter, ``\\H\\`` and ``\\N\\`` become ``_``, a hex escape becomes its
+    characters, and a sequence the receiver cannot map, an empty one included, decodes to nothing.
+    One deliberate difference: a dotted formatting command that writes a break or spaces decodes
+    to one space, not the break or the run of spaces. Either keeps two runs of digits apart."""
     # A delimiter escape names its delimiter by letter: F field, S component, T subcomponent,
     # R repetition and E the escape character itself.
     delimiter = {
@@ -569,23 +584,26 @@ def _decode_escape(body: str, seps: Seps, field_sep: str) -> str | None:
         "T": seps.subcomponent,
         "R": seps.repetition,
         "E": seps.escape,
+        "H": "_",
+        "N": "_",
     }.get(body)
     if delimiter is not None:
         return delimiter
-    if (hexed := _HEX_ESCAPE.fullmatch(body)) is not None:
-        return bytes.fromhex(hexed.group(1)).decode("latin-1")
-    if body.startswith("."):
+    if body.startswith("X"):
+        return _decode_hex(body[1:])
+    # A spacing command may carry a repeat count, as ``\.sp2\`` does.
+    if body[:3] in _SPACING_FORMAT_COMMANDS and (len(body) == 3 or body[3:].isdigit()):
         return " "
-    if body and body[0] in _FORMAT_ESCAPES:
-        return ""
-    return None
+    # The empty fill commands, the character-set switches and every unmappable sequence.
+    return ""
 
 
 def unescape(value: str, seps: Seps, field_sep: str) -> str:
     """``value`` with every HL7 escape sequence decoded, by the message's own escape character and
-    separators (BACKLOG #5532). The tee cannot import the engine's parser, so the leak-check of
-    both copies decodes here, in this byte-identical file. The anonymizer never calls it. An escape character with no closing one, or a body HL7 does not
-    define, is kept as written. Never raises."""
+    separators (BACKLOG #5532), as :func:`_decode_escape` reads each one. The tee cannot import the
+    engine's parser, so the leak-check of both copies decodes here, in this byte-identical file.
+    The anonymizer never calls it. An escape character that no second one closes is kept, with
+    the text after it, as the engine's parser keeps it. Never raises."""
     escape = seps.escape
     if not escape or escape not in value:
         return value
@@ -595,13 +613,8 @@ def unescape(value: str, seps: Seps, field_sep: str) -> str:
         end = value.find(escape, start + 1)
         if end == -1:
             break
-        decoded = _decode_escape(value[start + 1 : end], seps, field_sep)
-        if decoded is None:
-            out.append(value[at : start + 1])
-            at = start + 1
-            continue
         out.append(value[at:start])
-        out.append(decoded)
+        out.append(_decode_escape(value[start + 1 : end], seps, field_sep))
         at = end + 1
     out.append(value[at:])
     return "".join(out)

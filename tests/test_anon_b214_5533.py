@@ -33,7 +33,7 @@ _NEW_DEFAULTS = {
     "PID-2": SurrogateKind.MRN,
     "PID-21": SurrogateKind.MRN,
     "PID-23": SurrogateKind.FREETEXT,
-    "NK1-13": SurrogateKind.NAME,
+    "NK1-13": SurrogateKind.FREETEXT,
     "NK1-30": SurrogateKind.NAME,
     "NK1-31": SurrogateKind.PHONE,
     "NK1-32": SurrogateKind.ADDRESS,

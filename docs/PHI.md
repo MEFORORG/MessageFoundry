@@ -2391,13 +2391,14 @@ Properties of the anonymizer:
   alphabet. The rates and the stated bound are in the docstring of `_estimated_entropy_bits` in
   [`keying.py`](../messagefoundry_toolkit/anon/keying.py) (vault BACKLOG #3359).
 - **Width/shape-preserving surrogates** — a surrogate keeps the original's width/shape so the
-  scrubbed dataset stays structurally realistic. An identifier surrogate (`mrn`, `id`, `ssn`)
-  fabricates every letter and digit of the id, as ASCII, and keeps only the CX components that
-  name who issued it: CX.3 to CX.6, CX.9 and CX.10. It blanks CX.2, the check digit, the CX.7 and
+  scrubbed dataset stays structurally realistic. An identifier surrogate (`mrn`, `id`) fabricates
+  every letter and digit of the id, as ASCII; `ssn` writes fabricated digits. Each keeps only the
+  CX components that name who issued it: CX.3 to CX.6, CX.9 and CX.10. It blanks CX.2, the check digit, the CX.7 and
   CX.8 dates, and anything past CX.10. `PID-20`, a driver's licence, takes the `dln` kind: the
   number is fabricated, the issuing state kept and the expiry blanked (BACKLOG #5534). A kept
   component is not leak-scanned, because a rule maps the field, so text a sender puts in one
-  passes.
+  passes. The kept positions are CX positions whatever the field's type, so an overlay that points
+  an EI field such as `OBR-3` at `id` blanks EI.2, the namespace id.
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
   loose string search. With no site prefix loaded it matches nothing, and
   `python -m tee anonymize-captures` prints a warning saying so (vault BACKLOG #3516).
@@ -2442,15 +2443,21 @@ the next of kin's mother's maiden name, passes the same way. The detectors stay 
 as an escape sequence, so `123\X2D\45\X2D\6789` is a dashed SSN and `M\X52\` is the id type
 `MR`. The shape detectors read each unmapped value as written and then each of its subcomponents
 decoded, and the token scan reads the whole message as written and then decoded. The escape
-character is the one the message's own `MSH-2` declares. `\F\`, `\S\`, `\T\`, `\R\` and `\E\`
-decode to that message's own delimiters. A hex escape `\Xhh\` decodes each pair to the character
-with that code. A formatting command such as `\.br\` decodes to a space, so two runs of digits
-never join. `\H\`, `\N\` and the character-set escapes decode to nothing. A sequence HL7 does
-not define is kept as written. At least these still pass:
+character is the one the message's own `MSH-2` declares. Each sequence decodes as the engine's
+own parser reads it: `\F\`, `\S\`, `\T\`, `\R\` and `\E\` become that message's own
+delimiters, `\H\` and `\N\` become `_`, and a hex escape `\Xhh\` becomes the character with
+each pair's code. A sequence the parser cannot map, an empty one included, decodes to nothing, so
+`123\Q\-45-6789` reads as the SSN a receiver would see. One difference: a formatting command
+that writes a line break or spaces, such as `\.br\`, decodes to one space, so two runs of digits
+never join. An escape character that no second one closes is kept as written. At least these
+still pass:
 
 - A subcomponent is decoded on its own, so a shape whose parts sit in different components or
   subcomponents is not joined.
 - The site-code check does not decode, so a site code written with an escape sequence passes it.
+- The check for a shape cut across fields by the field separator does not decode.
+- A hex escape decodes one byte to one character. A non-ASCII character a UTF-8 sender wrote as
+  several hex pairs reads as several characters, so a token holding it is not found in that form.
 
 **A shape cut across fields by the message's own field separator is refused, but not in every
 form.** Under a field separator of `-`, the line `ZZZ-1-123-45-6789` holds the number as three

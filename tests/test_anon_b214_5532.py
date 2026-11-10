@@ -58,18 +58,24 @@ def test_the_escape_character_is_read_from_msh_2(surrogates: ModuleType) -> None
         ("555\\X2D\\555\\X2D\\1212", "phone"),
         ("(555) 555\\X2D\\1212", "phone"),
         ("\\X3132332D34352D36373839\\", "SSN"),
-        ("123\\H\\-45-6789", "SSN"),
+        ("123\\Q\\-45-6789", "SSN"),
+        ("123\\\\-45-6789", "SSN"),
+        ("123\\.fi\\-45-6789", "SSN"),
         ("M1^^^H^\\X4D52\\", "MRN"),
         ("M1^^^H^M\\X52\\", "MRN"),
+        ("M1^^^H^M\\Q\\R", "MRN"),
     ],
     ids=[
         "ssn-hex",
         "phone-hex",
         "phone-paren-hex",
         "ssn-one-escape",
-        "highlight",
+        "unmappable-dropped",
+        "empty-dropped",
+        "fill-command-dropped",
         "mr-hex",
         "mr-one-letter-escaped",
+        "mr-unmappable-dropped",
     ],
 )
 def test_an_escaped_shape_in_an_unmapped_field_is_a_hit(
@@ -108,8 +114,12 @@ def test_the_escape_character_is_the_one_msh_2_declares(leak: ModuleType) -> Non
         "SMITH\\T\\JONES^ANN",  # an escaped subcomponent separator in a name
         "555\\.br\\555-1212",  # a line break between two runs of digits never joins them
         "A\\F\\B\\S\\C\\R\\D\\E\\",  # every delimiter escape, no shape in it
-        "123\\X2\\45",  # a hex escape with an odd digit count is kept as written
+        "123\\X2\\45",  # an odd hex digit reads alone, as the engine reads it
         "123\\Q\\45\\X2D",  # an unknown escape, and an escape with no closing character
+        "123\\H\\-45-6789",  # highlighting reads as an underscore, as the engine reads it
+        # An unknown escape is consumed whole, so the X2D after it is text, not a hex dash. HL7
+        # reads this as 123X2DX2D followed by an unclosed run, with no shape in it.
+        "123\\Q\\X2D\\45\\X2D\\6789",
         "\\",  # a lone escape character
     ],
 )
