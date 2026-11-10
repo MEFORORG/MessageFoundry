@@ -1037,8 +1037,14 @@ def _applock_timeout_ms(command_timeout: int) -> int:
 #: What a clamped borrow's :class:`StoreAcquireTimeout` advises when the clamp, not
 #: ``[store].acquire_timeout``, was the limit (:meth:`SqlServerStore._acquire_clamped`). stop()'s
 #: writes borrow at their own shutdown bound, but inside an event-loop timeout of the same length,
-#: which fires first, so they never raise this.
-_CLAMPED_BORROW_RETUNE = "[cluster].lease_renew_timeout_seconds"
+#: which fires first, so they never raise this. Most clamped borrows are cut at the renew clamp. The
+#: stepdown pause read is cut at the smaller of that clamp and half its paused-read budget, a share
+#: of the fence timeout (``SqlServerCoordinator._claim_or_renew_lease``), so the advice names both
+#: settings and when the second binds (BACKLOG #5064).
+_CLAMPED_BORROW_RETUNE = (
+    "[cluster].lease_renew_timeout_seconds, or, for the stepdown pause read when half its"
+    " paused-read budget is the smaller, [cluster].leader_fence_timeout_seconds"
+)
 
 
 def _clamped_statement_timeout(clamp_seconds: float, command_timeout: int) -> int:
