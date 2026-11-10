@@ -50,9 +50,10 @@ def test_builtins_satisfy_the_runtime_checkable_protocol() -> None:
 
 
 def test_known_providers_is_the_built_set() -> None:
-    # auto/env/dpapi (built-in) + vault, the one external provider that is built. Vault BACKLOG #2595
-    # slice D removed the four names ADR 0019 declared and nobody built.
-    assert KNOWN_PROVIDERS == ("auto", "env", "dpapi", "vault")
+    # auto/env/dpapi (built-in), the key custody host blob (vault BACKLOG #3411), and vault, the one
+    # external provider that is built. Vault BACKLOG #2595 slice D removed the four names ADR 0019
+    # declared and nobody built.
+    assert KNOWN_PROVIDERS == ("auto", "env", "dpapi", "host", "vault")
 
 
 def test_default_key_provider_is_auto_and_not_a_secret() -> None:

@@ -1,0 +1,576 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""The de-identification **rule model** — which HL7 field gets which *kind* of surrogate (ADR 0030 §2).
+
+A de-id rule has two halves and the project identity dictates which is which:
+
+* **WHICH** field is scrubbed and **WHAT KIND** of surrogate it gets is **data** — the declarative
+  :data:`DEFAULT_RULES` map of ``FieldRule(path, kind)``, optionally overlaid by an ``anon.toml`` —
+  the same sanctioned config category as ``connections.toml`` (ADR 0007). A deployment customising
+  *which* PHI fields to scrub edits data, not code.
+* **HOW** a surrogate is produced is **code** — the pure functions in
+  :mod:`messagefoundry_toolkit.anon.surrogates`, keyed by :class:`SurrogateKind`.
+
+The data layer is deliberately incapable of expressing a *transform*: a rule may only map a
+whole-**field** path to an existing :class:`SurrogateKind` (or ``keep``/``drop``). There is no
+expression language, no conditionals, no field arithmetic — the moment a rule needs to *do*
+something new, that is a code change in ``surrogates.py``. :func:`load_rules` **enforces** this at
+load time (it rejects any overlay key that is not a ``path -> kind``/``keep``/``drop``, or the
+``retarget_acknowledged`` list, which only lets a retarget load and maps nothing), so the
+config can never drift into declarative *logic* authoring (CLAUDE.md §12). This shapes test data;
+it is tooling-side only and never enters a Router/Handler or ``pipeline/``.
+
+Pure stdlib — byte-identical with ``tee/anon/rules.py`` (parity test); no ``messagefoundry`` import.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import tomllib
+from dataclasses import dataclass
+from enum import StrEnum
+from pathlib import Path
+
+#: A whole-FIELD HL7 address: a 3-char segment id then ``-`` then a 1-based field number
+#: (``PID-5``, ``MRG-1``). Component paths (``PID-5.1``) are rejected — surrogates compose a whole
+#: field's value (ADR 0030 §3), so rules address whole fields only. The number is ASCII digits with
+#: no leading zero: ``PID-0`` is the segment id itself, which the tee would overwrite, and ``PID-05``
+#: or a non-ASCII digit names a field the two adapters and the leak-check would read differently.
+#: The number has at most three digits: with no bound, a path of thousands of digits loaded as a
+#: rule (BACKLOG #3493). The cost is a field past 999, which no rule or keep can name, so
+#: ``require_full_coverage`` refuses a message that carries a value there. No HL7-defined
+#: segment comes near that many fields.
+_FIELD_PATH_RE = re.compile(r"[A-Z][A-Z0-9]{2}-[1-9][0-9]{0,2}")
+
+
+class SurrogateKind(StrEnum):
+    """The kind of surrogate a field gets. ``KEEP``/``DROP`` are overlay actions, not surrogates."""
+
+    NAME = "name"  # XPN person name (PID-5/6/9, NK1-2, GT1-3, IN1-16, MRG-4/7)
+    ADDRESS = "address"  # XAD address (PID-11, NK1-4, GT1-5, IN1-19)
+    MRN = "mrn"  # CX medical-record / patient identifier (PID-3, MRG-1/3)
+    SSN = "ssn"  # social-security / national id (PID-19, GT1-12, IN2-2)
+    PHONE = "phone"  # XTN phone/contact (PID-13/14, NK1-5/6/7, GT1-6/7)
+    DOB = "dob"  # DT/TS date of birth (PID-7)
+    DATE = "date"  # DTM/TS event date: keep the year, fill the rest (EVN-2, PV1-44, OBR-7, ...)
+    ID = "id"  # a generic identifier (PID-4/18/20, IN1-36/49, PV1-19)
+    PROVIDER = "provider"  # XCN clinician (PV1-7/8/9/17, PD1-4, ORC-12, OBR-16/32, OBX-16)
+    FREETEXT = "freetext"  # narrative that may embed identifiers — blunt full-redact (OBX-5, NTE-3)
+    KEEP = "keep"  # leave the field intact (overlay: cancel a default scrub)
+    DROP = "drop"  # blank the field entirely (overlay)
+
+
+class RuleError(ValueError):
+    """A rule the data layer refuses: a malformed ``anon.toml`` overlay, one that tries to express
+    something the data layer deliberately cannot (ADR 0030 §2 — selection only, never logic), or
+    a :class:`FieldRule` built in code with an unknown kind or a path that is not a whole field."""
+
+
+#: The most characters of rule or overlay text a :class:`RuleError` quotes for ONE thing it names:
+#: a path, a value that is not a kind, or the whole sorted list of unknown keys. No message quotes
+#: more than two, and the words around them are fixed, so every schema refusal is bounded however
+#: long the overlay is (BACKLOG #3000). A real path or kind is far shorter than this.
+_QUOTE_LIMIT = 80
+
+
+def _quoted(value: object) -> str:
+    """``repr(value)`` for a :class:`RuleError`, cut to :data:`_QUOTE_LIMIT` characters.
+
+    A cut is marked with the number of characters left out, so a reader can tell a long key from
+    a short one that happens to end there. The bound is on the WHOLE repr, so a list of many
+    short keys and a value that is not a string are cut the way one long string is."""
+    text = repr(value)
+    if len(text) <= _QUOTE_LIMIT:
+        return text
+    return f"{text[:_QUOTE_LIMIT]}... ({len(text) - _QUOTE_LIMIT} more characters not shown)"
+
+
+def _coerce_kind(path: str, raw: object) -> SurrogateKind:
+    if not isinstance(raw, str):
+        raise RuleError(
+            f"rule for {_quoted(path)} must name a surrogate kind as a string, got {_quoted(raw)}"
+        )
+    try:
+        return SurrogateKind(raw)
+    except ValueError:
+        allowed = ", ".join(k.value for k in SurrogateKind)
+        raise RuleError(
+            f"rule for {_quoted(path)} names unknown surrogate kind {_quoted(raw)}; "
+            f"allowed: {allowed}. "
+            "A new kind is a code change in surrogates.py, never an overlay value."
+        ) from None
+
+
+def _check_field_path(path: object) -> None:
+    """Refuse a path that is not a whole-field address. ``fullmatch``, so a trailing newline, a
+    lower-case segment id and a component path all fail here, for a rule built in code and for an
+    overlay key alike."""
+    if not isinstance(path, str) or _FIELD_PATH_RE.fullmatch(path) is None:
+        raise RuleError(
+            f"rule path {_quoted(path)} is not a whole-field HL7 address like 'PID-5', a "
+            "segment id and a field number from 1 to 999 (component paths and free text are "
+            "rejected — selection is field-level only)"
+        )
+
+
+@dataclass(frozen=True)
+class FieldRule:
+    """One rule: scrub the whole field at ``path`` with surrogate ``kind``.
+
+    ``kind`` is normalized to THIS package's :class:`SurrogateKind` on construction, so a plain
+    ``"drop"`` string, or the other package's member, becomes the member here. An unknown kind
+    raises :class:`RuleError` at construction, not at the first message. So does a ``path`` that is
+    not a whole-field address: ``pid-29`` would match no segment and scrub nothing, and ``PID-29.1``
+    would fail inside the tee on the first message (BACKLOG #2330). A rule built by the other
+    package still carries that package's member, which is why the adapters and the leak-check
+    compare a kind by value rather than by identity.
+    """
+
+    path: str
+    kind: SurrogateKind
+
+    def __post_init__(self) -> None:
+        _check_field_path(self.path)
+        object.__setattr__(self, "kind", _coerce_kind(self.path, self.kind))
+
+
+# The recommended default scrub map (ADR 0030 §3). Anything NOT listed is left intact — so the
+# routing/coded fields (MSH-7/9/10/12, NK1-3 relationship, IN1-2/3/4 plan codes, DG1/AL1, the PR1
+# codes, OBR-4 service) survive untouched and correlation + parity-diff (#14) still work.
+#
+# The DATE and location rules map these Safe Harbor date and location fields, and that is NOT Safe
+# Harbor de-identification: MSH-7 keeps the full message time, the order and accession numbers
+# (ORC-2/3, OBR-2/3) are left unmapped (BACKLOG #2248). The date fields BACKLOG #2330 listed are
+# mapped: an event date takes DATE, and a date of birth takes DOB like PID-7. A date field outside
+# that list still has no rule, and only the coverage report names it.
+#
+# MRG fields are scrubbed with the SAME kinds as their PID counterparts (MRG-1 with PID-3, MRG-4
+# with PID-5) and keyed on the same value, so an A40 merge's old-to-new linkage is preserved across
+# the surrogate mapping.
+DEFAULT_RULES: tuple[FieldRule, ...] = (
+    # PID — patient identity
+    FieldRule("PID-3", SurrogateKind.MRN),
+    FieldRule("PID-4", SurrogateKind.ID),
+    FieldRule("PID-5", SurrogateKind.NAME),
+    FieldRule("PID-6", SurrogateKind.NAME),
+    FieldRule("PID-7", SurrogateKind.DOB),
+    FieldRule("PID-9", SurrogateKind.NAME),
+    FieldRule("PID-11", SurrogateKind.ADDRESS),
+    # PID-12 and PV1-3 take the blunt FREETEXT redact until a shape-keeping location kind exists:
+    # a CWE county can name the county, and a PL location carries free text in PL.9.
+    FieldRule("PID-12", SurrogateKind.FREETEXT),
+    FieldRule("PID-13", SurrogateKind.PHONE),
+    FieldRule("PID-14", SurrogateKind.PHONE),
+    FieldRule("PID-18", SurrogateKind.ID),
+    FieldRule("PID-19", SurrogateKind.SSN),
+    FieldRule("PID-20", SurrogateKind.ID),
+    FieldRule("PID-29", SurrogateKind.DATE),  # death date/time
+    # MRG — merge (A40); keep linkage to the PID kinds above
+    FieldRule("MRG-1", SurrogateKind.MRN),
+    FieldRule("MRG-3", SurrogateKind.MRN),
+    FieldRule("MRG-4", SurrogateKind.NAME),
+    FieldRule("MRG-7", SurrogateKind.NAME),
+    # NK1 — next of kin / contacts (NK1-3 relationship code is KEPT by omission)
+    FieldRule("NK1-2", SurrogateKind.NAME),
+    FieldRule("NK1-4", SurrogateKind.ADDRESS),
+    FieldRule("NK1-5", SurrogateKind.PHONE),
+    FieldRule("NK1-6", SurrogateKind.PHONE),
+    FieldRule("NK1-7", SurrogateKind.PHONE),
+    FieldRule("NK1-16", SurrogateKind.DOB),  # contact's date of birth
+    # GT1 — guarantor
+    FieldRule("GT1-3", SurrogateKind.NAME),
+    FieldRule("GT1-5", SurrogateKind.ADDRESS),
+    FieldRule("GT1-6", SurrogateKind.PHONE),
+    FieldRule("GT1-7", SurrogateKind.PHONE),
+    FieldRule("GT1-8", SurrogateKind.DOB),  # guarantor's date of birth
+    FieldRule("GT1-12", SurrogateKind.SSN),
+    FieldRule("GT1-16", SurrogateKind.NAME),  # guarantor's employer, an XPN
+    FieldRule("GT1-17", SurrogateKind.ADDRESS),  # guarantor's employer address
+    FieldRule("GT1-18", SurrogateKind.PHONE),  # guarantor's employer phone
+    # IN1/IN2 — insurance (plan/company codes IN1-2/3/4 are KEPT by omission). The company's
+    # address, contact and phone, and the insured's employer, are mapped (BACKLOG #2645).
+    FieldRule("IN1-5", SurrogateKind.ADDRESS),  # insurance company address
+    FieldRule("IN1-6", SurrogateKind.NAME),  # insurance company contact person
+    FieldRule("IN1-7", SurrogateKind.PHONE),  # insurance company phone
+    FieldRule("IN1-11", SurrogateKind.NAME),  # insured's group employer name
+    FieldRule("IN1-16", SurrogateKind.NAME),
+    FieldRule("IN1-18", SurrogateKind.DOB),  # insured's date of birth
+    FieldRule("IN1-19", SurrogateKind.ADDRESS),
+    FieldRule("IN1-36", SurrogateKind.ID),
+    FieldRule("IN1-44", SurrogateKind.ADDRESS),  # insured's employer address
+    FieldRule("IN1-49", SurrogateKind.ID),
+    FieldRule("IN2-2", SurrogateKind.SSN),
+    FieldRule("IN2-3", SurrogateKind.FREETEXT),
+    # EVN — event dates (the recorded and the occurred time)
+    FieldRule("EVN-2", SurrogateKind.DATE),
+    FieldRule("EVN-6", SurrogateKind.DATE),
+    # PV1/PD1 — visit + providers
+    FieldRule("PV1-3", SurrogateKind.FREETEXT),  # assigned location, see PID-12
+    FieldRule("PV1-7", SurrogateKind.PROVIDER),
+    FieldRule("PV1-8", SurrogateKind.PROVIDER),
+    FieldRule("PV1-9", SurrogateKind.PROVIDER),
+    FieldRule("PV1-17", SurrogateKind.PROVIDER),
+    FieldRule("PV1-19", SurrogateKind.ID),
+    FieldRule("PV1-44", SurrogateKind.DATE),  # admit date/time
+    FieldRule("PV1-45", SurrogateKind.DATE),  # discharge date/time
+    FieldRule("PD1-4", SurrogateKind.PROVIDER),
+    # ORC/OBR/OBX — orders, results, observations
+    FieldRule("ORC-9", SurrogateKind.DATE),  # transaction date/time
+    FieldRule("ORC-12", SurrogateKind.PROVIDER),
+    FieldRule("OBR-7", SurrogateKind.DATE),  # observation date/time
+    FieldRule("OBR-16", SurrogateKind.PROVIDER),
+    FieldRule("OBR-32", SurrogateKind.PROVIDER),
+    FieldRule("OBR-35", SurrogateKind.PROVIDER),  # transcriptionist
+    FieldRule("OBX-5", SurrogateKind.FREETEXT),
+    FieldRule("OBX-14", SurrogateKind.DATE),  # observation date/time
+    FieldRule("OBX-16", SurrogateKind.PROVIDER),
+    # NTE — notes / comments
+    FieldRule("NTE-3", SurrogateKind.FREETEXT),
+    # Event dates in the scheduling, pharmacy, procedure and financial segments (BACKLOG #2330)
+    FieldRule("AIS-4", SurrogateKind.DATE),  # appointment start date/time
+    FieldRule("RXA-3", SurrogateKind.DATE),  # administration start date/time
+    FieldRule("RXA-4", SurrogateKind.DATE),  # administration end date/time
+    FieldRule("PR1-5", SurrogateKind.DATE),  # procedure date/time
+    FieldRule("FT1-4", SurrogateKind.DATE),  # transaction date
+)
+
+
+class AnonError(ValueError):
+    """The anonymizer cannot safely de-identify a message (no parseable MSH / encoding chars, or a
+    malformed structure) — a **fail-closed** refusal (ADR 0030 §3: *withhold + error, never emit
+    un-anonymized*). Carries no message body, so it is safe to raise/log. Subclasses ``ValueError``
+    so existing fail-closed call-site catches treat it as a drop-and-count."""
+
+
+_LOG = logging.getLogger(__name__)
+
+#: The ``[hl7]`` key that lets an overlay retarget a default field to a kind that can leave part of
+#: it as captured. Without it such a retarget is refused (BACKLOG #3000).
+RETARGET_ACKNOWLEDGED = "retarget_acknowledged"
+
+
+#: The most retargets an unlisted-retarget refusal names one by one. The rest are counted, so the
+#: refusal stays one bounded line however many default fields an overlay retargets.
+_RETARGETS_NAMED = 3
+
+#: The ``[hl7]`` keys an overlay can write by mistake under ``[hl7.fields]``: in TOML, a key after
+#: that header belongs to it. Each is named with a hint, matched in any case, rather than refused
+#: as a field rule whose kind is not a string.
+_HL7_LIST_KEYS = frozenset({"keep", "drop", RETARGET_ACKNOWLEDGED})
+
+
+def _shown(overlay: Path) -> str:
+    """The overlay's file path for a refusal or a warning, with each character that does not print
+    written as its escape, so a NUL or a newline in a path a caller built reaches the console as
+    ``\\x00`` or ``\\n`` and never as itself (BACKLOG #3493). It is the escape ``_printable`` in
+    ``messagefoundry/config/settings.py`` writes, copied because this module imports only stdlib."""
+    return "".join(ch if ch.isprintable() else repr(ch)[1:-1] for ch in str(overlay))
+
+
+#: The header segments. Fields 1 and 2 of each hold delimiters: the field separator and the
+#: encoding characters. So field N of a header line sits at split index N-1, one lower than in
+#: any other segment. The leak-check, the tee adapter and the refusal below read this set. The
+#: engine adapter does NOT: it gets the same numbering from the parser's own list of header ids,
+#: so a change here alone moves the check and the tee away from the engine (BACKLOG #2998).
+HEADER_SEGMENTS: frozenset[str] = frozenset({"MSH", "FHS", "BHS"})
+
+#: The lowest field number a rule may rewrite: 1 in any segment, because field 0 is the segment
+#: id, and 3 in a header segment, because fields 1 and 2 hold delimiters. With MSH-1 or MSH-2
+#: rewritten the output has no readable header, and the leak-check has no separators to walk it
+#: with. With BHS-1 or FHS-1 rewritten the engine wrote the line with its separators missing.
+_FIRST_REWRITABLE_FIELD = 1
+_FIRST_REWRITABLE_HEADER_FIELD = 3
+
+
+def _unwritable_fields(rules: tuple[FieldRule, ...]) -> tuple[str, ...]:
+    """The fields ``rules`` would rewrite and no rule can: a segment id, or field 1 or 2 of a
+    header segment (:data:`HEADER_SEGMENTS`). Sorted, and empty when the rule set is fine.
+
+    The field number is read with ``int()``, the way the adapters read it, so ``MSH-02`` and a
+    path with a stray space or newline are named like ``MSH-2``. A path whose number ``int()``
+    cannot read is not a whole-field address, and it is not this check's to name.
+    ``FieldRule`` refuses every path that is not a whole-field address when the rule is built,
+    field 0 and ``MSH-02`` included (BACKLOG #2330). So for those spellings this check is a
+    second line, and for fields 1 and 2 of ``MSH``, ``BHS`` and ``FHS`` it is the only one. A
+    ``KEEP`` rewrites nothing, so it is allowed (BACKLOG #2265).
+    """
+    named: set[str] = set()
+    for rule in rules:
+        if rule.kind == SurrogateKind.KEEP:
+            continue
+        segment, _, number = rule.path.partition("-")
+        try:
+            field = int(number)
+        except ValueError:
+            continue
+        is_header = segment.upper() in HEADER_SEGMENTS
+        if field < (_FIRST_REWRITABLE_HEADER_FIELD if is_header else _FIRST_REWRITABLE_FIELD):
+            named.add(f"{segment}-{field}")
+    return tuple(sorted(named))
+
+
+def _refuse_unwritable_rules(rules: tuple[FieldRule, ...]) -> None:
+    """Refuse a rule set that would rewrite a segment id, or field 1 or 2 of ``MSH``, ``BHS`` or
+    ``FHS`` (a body-free :class:`AnonError`).
+
+    Both adapters call this for every message, so a rule set built in code meets the refusal
+    too. :func:`load_rules` runs the same check once, on the overlay (BACKLOG #2997)."""
+    named = _unwritable_fields(rules)
+    if named:
+        raise AnonError(
+            f"a rule names {', '.join(named)}, which no rule can rewrite: field 0 is the "
+            "segment id, and fields 1 and 2 of a header segment (MSH/BHS/FHS) hold delimiters. "
+            "Repair or remove a line that carries data there. Refusing to emit"
+        )
+
+
+def _validate_path(path: str) -> str:
+    _check_field_path(path)
+    return path
+
+
+def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
+    """The effective rule set: :data:`DEFAULT_RULES` optionally overlaid by an ``anon.toml``.
+
+    The overlay may ONLY map fields to existing kinds — its schema is enforced so the data layer
+    can never express a transform (ADR 0030 §2). Accepted shape::
+
+        [hl7.fields]      # add or retarget a field -> kind
+        "ZPD-2" = "mrn"
+        "PID-5" = "name"
+
+        [hl7]
+        keep = ["PID-13"]  # cancel a default scrub, or record a field as reviewed and left intact
+        drop = ["PID-40"]  # blank the field entirely
+        retarget_acknowledged = ["PID-5"]  # load a retarget of a default field, see below
+
+    Any other table/key, a component path, or an unknown kind raises :class:`RuleError`. So does
+    an overlay that cannot be read or parsed: that error names the file and, for bad TOML, a line
+    and column. TOML that runs out after a final newline names the last line. A path the system refuses to open is
+    reported as the path's fault. It quotes nothing from the file, and it chains no other exception.
+
+    An overlay whose final rule set would rewrite field 1 or 2 of ``MSH``, ``BHS`` or ``FHS`` is
+    refused here too, once, with the field named (BACKLOG #2997, #2998). A ``keep`` on any of
+    them still loads.
+
+    A ``keep`` comes back as a :attr:`SurrogateKind.KEEP` rule. The anonymizer rewrites nothing for
+    it; the leak-check counts the field as DECIDED for ``require_full_coverage`` and still scans
+    it for PHI shapes (BACKLOG #1710).
+
+    A keep on a :data:`DEFAULT_RULES` path turns that default scrub off. Each one is logged at
+    WARNING, by field address and kind only; :func:`kept_defaults` lists them (BACKLOG #2268).
+
+    An overlay that points a :data:`DEFAULT_RULES` path at a DIFFERENT kind is REFUSED, unless the
+    path is also listed under ``[hl7].retarget_acknowledged``. :func:`retargeted_defaults` names
+    the retargets this covers. A different kind can leave part of the field as captured: ``id``,
+    ``mrn`` and ``ssn`` rewrite the first component only, so on ``PID-5`` they leave the given
+    name. A retarget to the same kind changes nothing, and ``drop`` and ``freetext`` write a
+    constant, so none of those needs the list. A path on the list that is not such a retarget is
+    refused too, so a misspelt entry cannot sit there doing nothing. Each acknowledged retarget is
+    logged at WARNING, by field address, default kind and new kind (BACKLOG #3000).
+
+    Every warning is logged on every call. The anonymizer never loads an overlay itself, so a
+    caller loads it once and passes the rules to each message.
+
+    A schema refusal quotes at most :data:`_QUOTE_LIMIT` characters of any one overlay key or
+    value, and of the whole list of unknown keys.
+    """
+    if overlay is None:
+        return DEFAULT_RULES
+
+    # Each arm keeps one content-free fact. A TOMLDecodeError holds the whole file on ``.doc`` and
+    # a UnicodeDecodeError holds its bytes on ``.object``, so neither may reach the refusal's chain.
+    # The read and the parse are two steps, so an error about the PATH is never reported as one
+    # about the file's content (BACKLOG #3003).
+    shown = _shown(overlay)
+    refusal: str | None = None
+    try:
+        text = overlay.read_text(encoding="utf-8")
+    except UnicodeDecodeError:  # a ValueError, not an OSError, so it goes before the plain arm
+        refusal = "the file is not UTF-8 text"
+    except OSError as exc:
+        refusal = exc.strerror or type(exc).__name__
+    except ValueError:  # the path was refused before any byte was read: at least an embedded NUL
+        refusal = "the path is not one the system can open"
+    if refusal is None:
+        try:
+            data = tomllib.loads(text)
+        except tomllib.TOMLDecodeError as exc:  # a ValueError, so it goes before the plain arm
+            refusal = _toml_refusal(exc)
+        except RecursionError:  # tomllib recurses on nested arrays and tables
+            refusal = "the file nests too deeply to parse"
+        except ValueError:  # at least int()'s digit limit, which tomllib lets through as it is
+            refusal = "the file holds a value the TOML parser refused"
+    if refusal is not None:
+        # Raised AFTER the handler, so neither __cause__ nor __context__ is set. ``from None``
+        # would not do: it leaves __context__ populated (BACKLOG #2310).
+        raise RuleError(f"cannot read anon overlay {shown}: {refusal}")
+
+    unknown_top = set(data) - {"hl7"}
+    if unknown_top:
+        raise RuleError(
+            f"anon overlay has unexpected top-level key(s) {_quoted(sorted(unknown_top))}; "
+            f"only an [hl7] section (fields/keep/drop/{RETARGET_ACKNOWLEDGED}) is allowed"
+        )
+    hl7 = data.get("hl7", {})
+    if not isinstance(hl7, dict):
+        raise RuleError("anon overlay [hl7] must be a table")
+    unknown_hl7 = set(hl7) - {"fields", "keep", "drop", RETARGET_ACKNOWLEDGED}
+    if unknown_hl7:
+        raise RuleError(
+            f"anon overlay [hl7] has unexpected key(s) {_quoted(sorted(unknown_hl7))}; "
+            f"only 'fields', 'keep', 'drop', '{RETARGET_ACKNOWLEDGED}' are allowed"
+        )
+
+    fields = hl7.get("fields", {})
+    if not isinstance(fields, dict):
+        raise RuleError("anon overlay [hl7.fields] must be a table of path = kind")
+    misplaced = sorted(key for key in fields if key.lower() in _HL7_LIST_KEYS)
+    if misplaced:
+        raise RuleError(
+            f"anon overlay [hl7.fields] holds {_quoted(misplaced)}, which belongs under [hl7]. "
+            "In TOML a key written after the [hl7.fields] header is part of that table. Put it "
+            "under an [hl7] header, written in lower case, and merge it into a list of that name "
+            "already there"
+        )
+    effective: dict[str, SurrogateKind] = {r.path: r.kind for r in DEFAULT_RULES}
+    for path, raw_kind in fields.items():
+        effective[_validate_path(path)] = _coerce_kind(path, raw_kind)
+    for path in _as_path_list(hl7, "keep"):
+        effective[_validate_path(path)] = SurrogateKind.KEEP
+    for path in _as_path_list(hl7, "drop"):
+        effective[_validate_path(path)] = SurrogateKind.DROP
+    acknowledged = {_validate_path(path) for path in _as_path_list(hl7, RETARGET_ACKNOWLEDGED)}
+
+    # A KEEP rule is returned, not dropped: it is the record that someone decided the field.
+    rules = tuple(FieldRule(path, kind) for path, kind in effective.items())
+    # Checked on the final rule set, so a later keep on the same path lifts the refusal. Left to
+    # the adapters alone, this rule would fail every message and the tee would report a count.
+    # Field 0 never gets this far: the path check above refuses it. Only field 1 or 2 of a header
+    # segment can.
+    unwritable = _unwritable_fields(rules)
+    if unwritable:
+        raise RuleError(
+            f"anon overlay {shown} sets a rule on {', '.join(unwritable)}, which no rule can "
+            "rewrite: fields 1 and 2 of a header segment (MSH/BHS/FHS) hold delimiters. Remove "
+            "the rule"
+        )
+    retargeted = retargeted_defaults(rules)
+    # Checked first: a misspelt entry is the likeliest reason the retarget it meant is unlisted.
+    stray = sorted(acknowledged - {default.path for default, _ in retargeted})
+    if stray:
+        raise RuleError(
+            f"anon overlay {shown} lists {_quoted(stray)} under [hl7].{RETARGET_ACKNOWLEDGED}, "
+            "but sets no rule that points that default field at a kind the list is for: a kind "
+            "other than the default's own, drop or freetext. Remove the entry, or correct it"
+        )
+    unlisted = [(default, now) for default, now in retargeted if default.path not in acknowledged]
+    if unlisted:
+        named = [_retarget_phrase(default, now) for default, now in unlisted[:_RETARGETS_NAMED]]
+        if len(unlisted) > _RETARGETS_NAMED:
+            named.append(f"and {len(unlisted) - _RETARGETS_NAMED} more default field(s)")
+        raise RuleError(
+            f"anon overlay {shown} retargets {', '.join(named)}: a different kind can leave "
+            "part of the field as captured. Point each back at its default kind, or at drop or "
+            f"freetext, or list it under [hl7].{RETARGET_ACKNOWLEDGED} to load it anyway"
+        )
+    # Field addresses and kinds only, never a value.
+    for cancelled in kept_defaults(rules):
+        _LOG.warning(
+            "anon overlay %s keeps %s, which turns off its default %s scrub: the field is left "
+            "as captured",
+            shown,
+            cancelled.path,
+            cancelled.kind.value,
+        )
+    for default, now in retargeted:
+        _LOG.warning(
+            "anon overlay %s retargets %s, as [hl7].%s allows: a different kind can leave part "
+            "of the field as captured",
+            shown,
+            _retarget_phrase(default, now),
+            RETARGET_ACKNOWLEDGED,
+        )
+    return rules
+
+
+def _retarget_phrase(default: FieldRule, now: FieldRule) -> str:
+    """One retarget, as the refusal and the warning both name it: addresses and kinds only."""
+    return f"{default.path} from its default {default.kind.value} scrub to {now.kind.value}"
+
+
+def _toml_refusal(exc: tomllib.TOMLDecodeError) -> str:
+    """Where the TOML went wrong, as a line and column. Nothing from the file is quoted.
+
+    When the parser runs off the end of text that ends in a newline, it reports column 1 of the
+    line AFTER the last one, which no editor shows. That one case names the last line instead
+    (BACKLOG #3003). With no final newline the parser's own line and column exist, so they stand:
+    it reports the end position for at least a repeated key there too, not only for cut-off text.
+    """
+    if exc.pos >= len(exc.doc) and exc.doc.endswith("\n"):
+        return f"invalid TOML at the end of the file, line {exc.lineno - 1}"
+    return f"invalid TOML at line {exc.lineno}, column {exc.colno}"
+
+
+def kept_defaults(rules: tuple[FieldRule, ...]) -> tuple[FieldRule, ...]:
+    """The :data:`DEFAULT_RULES` entries that ``rules`` keeps, so their scrub no longer runs.
+
+    A keep does two jobs. It records a field as reviewed for ``require_full_coverage``, and it
+    cancels any default scrub on that path. So a keep on ``PID-5`` turns the name scrub off,
+    whatever it was added for. :func:`load_rules` logs each one, and a caller with a console of
+    its own can repeat them there. Each entry is the default rule, so it names the lost kind.
+
+    A keep with a rewrite on the same path, which only a rule set built in code can hold, is not
+    listed: the anonymizer runs the rewrite, so the field is not left as captured, and
+    :func:`retargeted_defaults` names a change of kind there (BACKLOG #3609).
+    """
+    kept = {r.path for r in rules if r.kind == SurrogateKind.KEEP} - {
+        r.path for r in rules if r.kind != SurrogateKind.KEEP
+    }
+    return tuple(r for r in DEFAULT_RULES if r.path in kept)
+
+
+#: The kinds that write a constant in place of the whole field, so nothing of the value is left
+#: whatever the default was: ``drop`` writes nothing and ``freetext`` a fixed marker. On OBX-5,
+#: where ``freetext`` can keep a value, it is the default's own kind (BACKLOG #3493).
+_CONSTANT_KINDS: tuple[SurrogateKind, ...] = (SurrogateKind.DROP, SurrogateKind.FREETEXT)
+
+
+def retargeted_defaults(rules: tuple[FieldRule, ...]) -> tuple[tuple[FieldRule, FieldRule], ...]:
+    """The :data:`DEFAULT_RULES` entries that ``rules`` scrubs with a DIFFERENT kind, each as
+    ``(default rule, last rule on that path)``, in :data:`DEFAULT_RULES` order.
+
+    The kinds do not rewrite the same parts of a field, so a retarget can leave part of a real
+    value behind, and the leak-check scans what is left only for a dashed SSN or a punctuated
+    phone (``leak.retarget_residue_hits``). ``id``, ``mrn`` and
+    ``ssn`` rewrite the first component only: on ``PID-5`` that leaves the given name, on
+    ``PID-11`` the city and postal code, on ``PV1-7`` the clinician's name. ``date`` keeps the
+    year, so on ``PID-7`` it keeps the birth year. No ordering of the kinds says which retarget is
+    safe, because what ``date`` leaves depends on the value. So every change of kind is listed,
+    with three exceptions: ``drop`` and ``freetext``, which write a constant in place of the whole
+    field, and a ``keep``, which :func:`kept_defaults` lists. A rule that names the default's own
+    kind changed nothing and is not listed. :func:`load_rules` refuses each entry the overlay does
+    not list under ``[hl7].retarget_acknowledged`` and logs the rest, and a caller with a console
+    of its own can repeat them there.
+    """
+    # Every rule on a path runs, in order, so a set built in code may hold several. The default
+    # scrub is replaced only when none of them is the default's kind or writes a constant.
+    on_path: dict[str, list[FieldRule]] = {}
+    for rule in rules:
+        if rule.kind != SurrogateKind.KEEP:
+            on_path.setdefault(rule.path, []).append(rule)
+    listed: list[tuple[FieldRule, FieldRule]] = []
+    for default in DEFAULT_RULES:
+        rewrites = on_path.get(default.path, [])
+        kinds = [rule.kind for rule in rewrites]  # a list: kinds compare by value, see FieldRule
+        if rewrites and all(kind not in kinds for kind in (default.kind, *_CONSTANT_KINDS)):
+            listed.append((default, rewrites[-1]))
+    return tuple(listed)
+
+
+def _as_path_list(hl7: dict[str, object], key: str) -> list[str]:
+    value = hl7.get(key, [])
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise RuleError(f"anon overlay [hl7].{key} must be a list of field paths")
+    return [str(v) for v in value]

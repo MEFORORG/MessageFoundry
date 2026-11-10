@@ -147,29 +147,31 @@ def test_ldaps_verifying_secure_path_unaffected(monkeypatch: pytest.MonkeyPatch)
 # --- Cell (3): webhook alert sink cleartext http (OUT-OF-GATE, explicit posture) ----------------
 
 
-def test_webhook_cleartext_clamped_prod_phi_even_with_escape(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "posture", [PROD_PHI, STAGING_PHI, None], ids=["enforcing", "warn", "no-posture"]
+)
+def test_webhook_cleartext_is_refused_in_every_posture_even_with_escape(
+    posture: HopPosture | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Vault BACKLOG #3533 item 5: every POST carries the webhook's path token, so http is refused
+    # with no escape. Until then the escape released it at warn (#329); now no posture does.
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
-    with pytest.raises(ValueError, match="plaintext http"):
-        WebhookTransport("http://hooks.example/x", posture=PROD_PHI)
-    # Non-enforcing PHI crosses with the escape; no posture fails closed (vault BACKLOG #2354).
-    WebhookTransport("http://hooks.example/x", posture=STAGING_PHI)
-    with pytest.raises(ValueError, match="plaintext http"):
-        WebhookTransport("http://hooks.example/x", posture=None)
+    with pytest.raises(ValueError, match="cleartext http") as info:
+        WebhookTransport("http://hooks.example/x", posture=posture)
+    assert "with no escape" in str(info.value)
+    assert INSECURE_TLS_ESCAPE_ENV not in str(info.value)
 
 
-def test_webhook_notifier_threads_posture(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Seam: notifier_from_settings must thread posture into the WebhookTransport it builds.
+@pytest.mark.parametrize("posture", [PROD_PHI, STAGING_PHI], ids=["enforcing", "warn"])
+def test_webhook_notifier_refuses_cleartext_in_every_posture(
+    posture: HopPosture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The settings route meets the same refusal; the warn posture used to build here.
     monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
-    with pytest.raises(ValueError, match="plaintext http"):
+    with pytest.raises(ValueError, match="cleartext http"):
         notifier_from_settings(
-            AlertsSettings(webhook_url="http://hooks.example/x"), posture=PROD_PHI
+            AlertsSettings(webhook_url="http://hooks.example/x"), posture=posture
         )
-    # Non-enforcing posture builds the notifier (crosses with the escape).
-    notifier_from_settings(
-        AlertsSettings(webhook_url="http://hooks.example/x"), posture=STAGING_PHI
-    )
 
 
 def test_webhook_https_secure_path_unaffected(monkeypatch: pytest.MonkeyPatch) -> None:

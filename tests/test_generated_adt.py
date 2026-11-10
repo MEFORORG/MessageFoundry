@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Tests for the ADT message generator (``messagefoundry/generators/adt.py``).
+"""Tests for the ADT message generator (``messagefoundry_toolkit/generators/adt.py``).
 
 Messages are generated **deterministically at test time** — the corpus itself is not committed
-(it's regenerable via ``python -m messagefoundry.generators.adt``). The default suite checks a fast
+(it's regenerable via ``python -m messagefoundry_toolkit.generators.adt``). The default suite checks a fast
 representative slice (one message per trigger) plus the generator's units; set
 ``MEFOR_FULL_CORPUS=1`` to generate and re-validate all 2,850 messages.
 """
@@ -15,16 +15,16 @@ from datetime import datetime
 
 import pytest
 
-from messagefoundry.generators import _core, adt
-from messagefoundry.generators import _hl7data as d
-from messagefoundry.generators._core import seg
-from messagefoundry.generators.adt import (
+from messagefoundry.parsing import Peek
+from messagefoundry_toolkit.generators import _core, adt
+from messagefoundry_toolkit.generators import _hl7data as d
+from messagefoundry_toolkit.generators._core import seg
+from messagefoundry_toolkit.generators.adt import (
     ALL_TRIGGERS,
     gate,
     generate_message,
 )
-from messagefoundry.hl7structures import TRIGGER_TO_STRUCTURE
-from messagefoundry.parsing import Peek
+from messagefoundry_toolkit.hl7structures import TRIGGER_TO_STRUCTURE
 
 PER_TRIGGER = 50  # messages per trigger the CLI emits (and the full-corpus check regenerates)
 

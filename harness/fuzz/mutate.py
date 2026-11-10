@@ -28,13 +28,13 @@ from dataclasses import dataclass
 from functools import cache
 
 from harness.scenarios._core import control_id_of
-from messagefoundry.generators import (
-    _core,
-    all_types,  # noqa: F401  (registers the built-in message types)
-)
 from messagefoundry.mllpcodec import CR, EB, SB, MLLPDecoder, MLLPFrameError, frame
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import PEEK_READ_FAULTS
+from messagefoundry_toolkit.generators import (
+    _core,
+    all_types,  # noqa: F401  (registers the built-in message types)
+)
 
 NONE = "none"
 BYTE = "byte"

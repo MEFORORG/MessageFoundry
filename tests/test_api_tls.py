@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import errno
+import inspect
 import ipaddress
 import json
 import logging
@@ -31,6 +32,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from fastapi import HTTPException
 from pydantic import ValidationError
 from starlette.requests import Request
+from uvicorn.main import run as _uvicorn_run
 
 from messagefoundry.__main__ import main
 from messagefoundry.api import create_app
@@ -515,10 +517,10 @@ def _serve_capturing(
     return handed, captured
 
 
-def test_serve_hands_the_settings_crls_to_the_expiry_monitor(
+def test_serve_hands_the_settings_monitored_files_to_the_expiry_monitor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #299: ``settings_crls`` is the only route an outbound CRL takes to
+    """BACKLOG #299: ``settings_monitored_files`` is the only route an outbound CRL takes to
     ``Engine._monitored_certs``. Without it a stale ``[tls].crl_file`` raised no alert."""
     ca_key = ec.generate_private_key(ec.SECP256R1())
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "crl-ca")])
@@ -538,7 +540,7 @@ def test_serve_hands_the_settings_crls_to_the_expiry_monitor(
     # that one to the monitor too, after [tls].crl_file.
     import os
 
-    assert list(handed["settings_crls"]) == [
+    assert list(handed["settings_monitored_files"]) == [
         MonitoredCert("tls.crl_file", str(crl_path), kind="crl"),
         MonitoredCert(
             "logging.forward_tls_crl_file",
@@ -546,6 +548,21 @@ def test_serve_hands_the_settings_crls_to_the_expiry_monitor(
             kind="crl",
         ),
     ]
+
+
+def test_serve_hands_the_monitored_files_helper_output_to_the_expiry_monitor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3714 item 5: serve passes exactly what ``monitored_files_from_settings`` returns,
+    the helper ``cert inventory`` also calls. The CRL test above runs on SQLite, where the helper
+    and ``crls_from_settings`` agree, so only a sentinel tells a call to the helper apart."""
+    sentinel = [MonitoredCert("sentinel.row", str(tmp_path / "absent.pem"))]
+    monkeypatch.setattr(
+        "messagefoundry.pipeline.cert_expiry.monitored_files_from_settings",
+        lambda _settings: sentinel,
+    )
+    handed, _captured = _serve_capturing(tmp_path, monkeypatch, _SYNTHETIC_LOOPBACK_TOML)
+    assert list(handed["settings_monitored_files"]) == sentinel
 
 
 def test_the_generated_api_certificate_is_watched_by_the_expiry_monitor(
@@ -1303,6 +1320,14 @@ def test_serve_forwarded_allow_ips_empty_when_no_proxy(
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
     # Trust nothing by default (override uvicorn's loopback default), so XFF can't spoof the source IP.
     assert captured["forwarded_allow_ips"] == []
+    # Vault BACKLOG #3764 item 6: the premise of tests/test_api_listener_ipv6_only.py. serve names
+    # no loop, so uvicorn.run's own "auto" default runs it on uvloop wherever that imports, and it
+    # binds by host and port, so the loop's create_server makes the socket that file reads.
+    # uvicorn.run is stubbed here, so the default is read off the unpatched function.
+    premise = "the premise of tests/test_api_listener_ipv6_only.py no longer holds"
+    assert "loop" not in captured, premise
+    assert inspect.signature(_uvicorn_run).parameters["loop"].default == "auto", premise
+    assert "fd" not in captured and "uds" not in captured, premise
     # WP-L3-07 (ASVS 13.4.6): the `Server: uvicorn` banner is suppressed.
     assert captured["server_header"] is False
     # BACKLOG #3256: the connection drain before the lifespan teardown is bounded.
@@ -2758,9 +2783,11 @@ def _signed(
     by: _CaPair | None,
     *,
     key_usage: bool = False,
+    key_ids: bool = True,
 ) -> x509.Certificate:
     """A cert for ``subject`` signed by ``by`` (self-signed CA when ``None``). Key identifiers are
-    set so OpenSSL picks the issuer by key, not only by name, as real CAs do.
+    set so OpenSSL picks the issuer by key, not only by name, as real CAs do, unless ``key_ids`` is
+    false.
 
     ``key_usage`` adds a ``keyUsage`` extension, which a verifier under ``VERIFY_X509_STRICT``
     requires on a CA, as the inbound HTTP listener is (``tests/test_inbound_http_intake_issuer.py``).
@@ -2775,11 +2802,13 @@ def _signed(
         .not_valid_before(_NOW - datetime.timedelta(minutes=5))
         .not_valid_after(_NOW + datetime.timedelta(days=1))
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
-        .add_extension(
+    )
+    if key_ids:
+        builder = builder.add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False
+        ).add_extension(
             x509.AuthorityKeyIdentifier.from_issuer_public_key(signer.public_key()), critical=False
         )
-    )
     if key_usage:
         builder = builder.add_extension(
             x509.KeyUsage(
@@ -2798,13 +2827,27 @@ def _signed(
     return builder.sign(signer, hashes.SHA256())
 
 
-def _new_ca(dn: x509.Name, by: _CaPair | None = None, *, key_usage: bool = False) -> _CaPair:
+def _new_ca(
+    dn: x509.Name, by: _CaPair | None = None, *, key_usage: bool = False, key_ids: bool = True
+) -> _CaPair:
     key = ec.generate_private_key(ec.SECP256R1())
-    return _signed(dn, key, by, key_usage=key_usage), key
+    return _signed(dn, key, by, key_usage=key_usage, key_ids=key_ids), key
 
 
 def _pem(cert: x509.Certificate) -> bytes:
     return cert.public_bytes(serialization.Encoding.PEM)
+
+
+def _relabelled(pem: bytes, label: str) -> bytes:
+    """A ``CERTIFICATE`` PEM block's markers rewritten under ``label``, body unchanged."""
+    return pem.replace(
+        b"-----BEGIN CERTIFICATE-----", f"-----BEGIN {label}-----".encode("ascii")
+    ).replace(b"-----END CERTIFICATE-----", f"-----END {label}-----".encode("ascii"))
+
+
+def _labelled(cert: x509.Certificate, label: str) -> bytes:
+    """``cert`` as one PEM block under ``label`` in place of ``CERTIFICATE``."""
+    return _relabelled(_pem(cert), label)
 
 
 def _upn(value: bytes) -> x509.OtherName:
@@ -3006,16 +3049,18 @@ def test_a_ca_reissued_under_the_same_key_is_one_issuer(tmp_path: Path) -> None:
     assert view[VERIFIED_ISSUER_KEY] == "CN=Acme CA"
 
 
+@pytest.mark.parametrize("label", ["CERTIFICATE", "X509 CERTIFICATE"])
 def test_serve_context_carries_the_issuer_index_and_warns_about_dead_keys(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, label: str
 ) -> None:
     # The shim reads the index off the real API context. If the builder stopped attaching it, every
     # mapped certificate would be denied while every shim test (which attaches it by hand) stayed
-    # green; and a key naming no loaded CA would deny with nothing in the log.
+    # green; and a key naming no loaded CA would deny with nothing in the log. The context loads a
+    # CA under the legacy X509 CERTIFICATE label too, so the index must hold it (BACKLOG #4948).
     cert, key = _self_signed(tmp_path)
     ca = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
     ca_file = tmp_path / "client-ca.pem"
-    ca_file.write_bytes(_pem(ca[0]))
+    ca_file.write_bytes(_labelled(ca[0], label))
     uid = "0123456789abcdef0123456789abcdef"
     api = ApiSettings(
         tls_cert_file=str(cert),
@@ -3041,6 +3086,31 @@ def test_serve_context_carries_the_issuer_index_and_warns_about_dead_keys(
         enforcing=False,
     )
     assert getattr(plain, ISSUER_INDEX_ATTR, None) is None
+
+
+def test_serve_context_refuses_a_client_ca_file_the_issuer_index_cannot_match(
+    tmp_path: Path,
+) -> None:
+    # OpenSSL silently stops loading the file at an empty block, so the CA after it is never
+    # trusted. An index naming it would admit a client that sends it as its intermediate, so the
+    # build refuses, naming the setting (BACKLOG #4948).
+    cert, key = _self_signed(tmp_path)
+    root = _new_ca(_dn((NameOID.COMMON_NAME, "Root CA")))
+    inter = _new_ca(_dn((NameOID.COMMON_NAME, "Inter CA")), root)
+    ca_file = tmp_path / "client-ca.pem"
+    ca_file.write_bytes(
+        _pem(root[0]) + b"-----BEGIN FOO-----\n-----END FOO-----\n" + _pem(inter[0])
+    )
+    api = ApiSettings(
+        tls_cert_file=str(cert),
+        tls_key_file=str(key),
+        tls_client_ca_file=str(ca_file),
+        tls_client_cert_identities={"CN=Inter CA": {"CN:svc.internal": "0" * 32}},
+    )
+    with pytest.raises(
+        ValueError, match=r"\[api\]\.tls_client_ca_file: .*does not load 1 CA certificate"
+    ):
+        build_api_ssl_context(api, enforcing=False)
 
 
 def test_a_resumed_session_still_maps_under_its_issuer(tmp_path: Path) -> None:
@@ -3148,7 +3218,8 @@ def test_the_issuer_lookup_never_breaks_the_handshake() -> None:
             return {"subject": ((("commonName", "svc.internal"),),)}
 
     broken = _Broken()
-    setattr(broken.context, ISSUER_INDEX_ATTR, IssuerIndex(""))
+    ca = _pem(_new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")))[0]).decode("ascii")
+    setattr(broken.context, ISSUER_INDEX_ATTR, IssuerIndex(ca))
     view = peercert_from_ssl_object(broken)
     assert view is not None and view[VERIFIED_ISSUER_KEY] == ""
 

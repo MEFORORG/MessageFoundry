@@ -10,11 +10,14 @@ a pinned ``requirements.txt`` and ``requirements-dev.txt``, a CI ``check`` workf
 README — everything an analyst needs to author + validate + deploy config without touching engine source.
 
 The templates are plain strings (they ship in the wheel as part of this module — no package-data
-config). ``scaffold()`` writes them and never overwrites an existing file.
+config), except ``requirements-audit.lock``, the CI job's hash-pinned pip-audit closure: a file
+beside this module, which the toolkit wheel carries with the rest of the package. ``scaffold()``
+writes them and never overwrites an existing file.
 """
 
 from __future__ import annotations
 
+from importlib.resources import files
 from pathlib import Path
 
 from messagefoundry import __version__
@@ -164,6 +167,13 @@ _VSCODE_SETTINGS = """\
 # check` (validate + dryrun + advisory lint) on every PR. `pip install -r requirements.txt` resolves the
 # engine from your configured index — public PyPI (the published releases carry SLSA + PEP 740
 # attestations), the engine's GitHub Release wheel, or a private index.
+#
+# Where the workflow's comments or _CHECK_STALE's messages name a `-c` or `-e` flag, a backtick
+# sits right before the flag, as in `-c FILE`. A flag that _SCRIPT_TEXT_FLAG_RE in
+# tests/test_threat_model_doc_drift.py matches in a string literal is read as one that hands an
+# interpreter its script text, which makes this module a shell-execution site there. That backtick
+# keeps the flag from matching. Backticks around a longer command do not, so a flag inside one, such
+# as the `-c` in `uv pip compile -c FILE`, still matches.
 _CI_WORKFLOW = """\
 name: check
 on:
@@ -314,30 +324,18 @@ jobs:
           python-version: "3.14"
       # Only the engine's own pin goes into the interpreter that runs the auditor, pip and pip-audit,
       # so no other locked package's code runs inside them. The auditor checks the rest of the lock
-      # with a dry run that installs nothing. This reads the lock as pip does: by its byte-order
-      # mark, and joining a line that ends in a backslash to the next unless it is a comment.
+      # with a dry run that installs nothing. This step and the stale-lock check read a file as pip
+      # does: decoded by its byte-order mark, a PEP 263 coding comment on its first two lines, UTF-8
+      # or the locale, and joining a line that ends in a backslash to the next unless it is a comment.
       # pip's --require-hashes then refuses the pin if it carries no hash.
       - name: Install the engine alone, from its locked hashes, for its auditor
         id: engine
         if: ${{ hashFiles('requirements.lock') != '' }}
         run: |
           python -I - <<'PY'
-          import codecs, os, re, sys
-          from pathlib import Path
-
-          raw = Path("requirements.lock").read_bytes()
-          boms = [(codecs.BOM_UTF32_LE, "utf-32"), (codecs.BOM_UTF32_BE, "utf-32")]
-          boms += [(codecs.BOM_UTF16_LE, "utf-16"), (codecs.BOM_UTF16_BE, "utf-16")]
-          encoding = next((name for bom, name in boms if raw.startswith(bom)), "utf-8-sig")
-          pins, group = [], []
-          for line in raw.decode(encoding).splitlines():
-              group.append(line)
-              if line.endswith(chr(92)) and not line.lstrip().startswith("#"):
-                  continue
-              name = re.match("[A-Za-z0-9][A-Za-z0-9._-]*", group[0].lstrip())
-              if name and re.sub("[-_.]+", "-", name[0]).lower() == "messagefoundry":
-                  pins.append(group)
-              group = []
+@@READ_AS_PIP@@
+          lock = logical_lines("requirements.lock")
+          pins = [group for group in lock if named(group, "messagefoundry")]
           if len(pins) != 1:
               print(f"::error::requirements.lock must pin messagefoundry once; it pins it {len(pins)} times")
               sys.exit(1)
@@ -349,31 +347,278 @@ jobs:
         if: ${{ hashFiles('requirements.lock') == '' }}
         run: |
           echo "::warning::No requirements.lock — the transitive dependency closure resolves LIVE and UNHASHED at install time."
-          echo "::warning::Pin your index (pip --index-url / PIP_CONSTRAINT) against dependency-confusion, and ship a hash-pinned requirements.lock (uv pip compile --universal --generate-hashes) installed with --require-hashes. See the README."
-      # One exact version. Its own dependencies still resolve live and unhashed, into the
-      # interpreter the auditor runs in.
-      - name: Install pip-audit
+          echo "::warning::Pin your index (pip --index-url / PIP_CONSTRAINT) against dependency-confusion, and ship a hash-pinned requirements.lock (uv pip compile --python-platform windows --python-version 3.14 --generate-hashes) installed with --require-hashes. See the README."
+      # With a lock, each audit below reads requirements.txt as written or the lock, and nothing
+      # resolves requirements.txt. So a lock not regenerated after requirements.txt changed would
+      # audit the closure the old file named, while CI and your deployment install the new one. Each
+      # requirement in requirements.txt whose marker holds on this Windows runner must be in the
+      # lock, under a marker that holds here too, at a version its specifier allows, compared as pip
+      # compares versions. The packaging copy pip carries parses each requirement, after this
+      # step's version of pip's line handling, whose ${VAR} expansion is not pip's (split_line
+      # below says how), and pip's own parser reads a line of options with no requirement. A
+      # marker false here, an extra, a URL or path with no name, and an editable line (`-e` or
+      # `--editable`, abbreviated or attached as pip allows) are only noted: the lock records no
+      # extras, an unnamed URL has no name to look up, and an editable installs a source tree or
+      # checkout that no lock pin holds. A requirement it cannot parse fails, and so does a line of
+      # options with no requirement that pip cannot read. An include or constraint line (`-r`,
+      # `--requirement`, `-c` or `--constraint`, abbreviated or attached as pip allows, with no
+      # editable on the line) fails too: this step follows no file a line names, and no new lock
+      # clears such a line.
+      - name: Check requirements.lock is not stale against requirements.txt
+        if: ${{ !cancelled() && hashFiles('requirements.lock') != '' }}
+        run: |
+          python -I - <<'PY'
+@@READ_AS_PIP@@
+@@CHECK_STALE@@
+          PY
+      # pip-audit and every package it needs come from requirements-audit.lock, which
+      # `messagefoundry-toolkit init` wrote, each pin with its hashes, so nothing resolves live here.
+      - name: Install pip-audit from its locked hashes
+        id: auditor
         if: ${{ !cancelled() }}
-        run: python -m pip install pip-audit==2.10.1
+        run: python -m pip install --require-hashes -r requirements-audit.lock
+      # Pinned with hashes, the auditor no longer moves, so it is audited like the rest. Its markers
+      # are evaluated as this Windows runner evaluates them, which is right for this file: it is
+      # installed nowhere else. This audit and each one below need the auditor this install brings,
+      # so they wait on it: after a failed install they would only fail again, for a reason that is
+      # not an advisory.
+      - name: Audit pip-audit's own locked pins
+        if: ${{ !cancelled() && steps.auditor.outcome == 'success' }}
+        run: pip-audit -r requirements-audit.lock --desc --disable-pip --strict
       - name: Audit requirements.txt as Windows resolves it
-        if: ${{ !cancelled() && hashFiles('requirements.lock') == '' }}
+        if: ${{ !cancelled() && steps.auditor.outcome == 'success' && hashFiles('requirements.lock') == '' }}
         run: pip-audit -r requirements.txt --desc
       # Each pin as written, with no resolve and no install, so each must be pinned with ==. This
       # form of pip-audit skips an included file without a word, so an include is refused.
       - name: Audit the pins of requirements.txt as written
-        if: ${{ !cancelled() && hashFiles('requirements.lock') != '' }}
+        if: ${{ !cancelled() && steps.auditor.outcome == 'success' && hashFiles('requirements.lock') != '' }}
         run: |
           if grep -Eq '^[[:space:]]*(-r|--requirement)' requirements.txt; then
             echo "::error::requirements.txt includes another file, which this audit would skip; list its pins in requirements.txt"
             exit 1
           fi
           pip-audit -r requirements.txt --desc --disable-pip --no-deps
-      # Needs the auditor the install step brings, so it waits on that step alone: after a failed
-      # install it would only fail again, for a reason that is not an advisory.
+      # Needs the engine's auditor too, so it also waits on the engine install.
       - name: Audit every pin of requirements.lock, whatever its marker
-        if: ${{ !cancelled() && steps.engine.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.engine.outcome == 'success' && steps.auditor.outcome == 'success' }}
         run: python -P -m messagefoundry.security.audit_all_platforms requirements.lock
 """
+
+#: The reader the two steps that read the lock share, written once here and into each step's script
+#: below. They run before the engine, and so its auditor, is installed, which is why they cannot
+#: import ``messagefoundry.security.audit_all_platforms``; it decodes a file the same way. Each
+#: requirement is parsed by the copy of ``packaging`` that the runner's pip carries, the parser pip
+#: reads it with. A raw string, so each regular expression reaches the generated script as written.
+_READ_AS_PIP = r"""
+import codecs, locale, os, re, sys
+from pathlib import Path
+
+from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
+from pip._vendor.packaging.utils import canonicalize_name
+
+
+COMMENT_RE = re.compile(r"(^|\s+)#.*$")  # pip 26's own, for a comment line and a comment strip
+
+
+def comment(line):
+    return COMMENT_RE.match(line) is not None
+
+
+def continued(line):
+    # pip 26's join_lines joins a line that ends in a backslash to the next, unless it is a comment.
+    return line.endswith("\\") and not comment(line)
+
+
+def logical_lines(path):
+    # Each logical line of a requirements file, as its physical lines, read as pip 26 reads it. The
+    # last group is a file's last lines when that file ends on a continued line.
+    raw = Path(path).read_bytes()
+    boms = [(codecs.BOM_UTF32_LE, "utf-32"), (codecs.BOM_UTF32_BE, "utf-32")]
+    boms += [(codecs.BOM_UTF16_LE, "utf-16"), (codecs.BOM_UTF16_BE, "utf-16")]
+    boms += [(codecs.BOM_UTF8, "utf-8-sig")]
+    codec = next((name for bom, name in boms if raw.startswith(bom)), None)
+    for line in [] if codec else raw.split(b"\n")[:2]:
+        cookie = re.search(rb"coding[:=]\s*([-\w.]+)", line) if line[:1] == b"#" else None
+        codec = codec or (cookie[1].decode("ascii") if cookie else None)
+    try:
+        text = raw.decode(codec or "utf-8")
+    except UnicodeDecodeError:
+        if codec:
+            raise
+        text = raw.decode(locale.getencoding())
+    groups, group = [], []
+    for line in text.splitlines():
+        group.append(line)
+        if continued(line):
+            continue
+        groups.append(group)
+        group = []
+    return groups + [group] * bool(group)
+
+
+def split_line(group):
+    # A logical line's requirement text and its options, after this script's version of pip 26's
+    # line handling: join_lines (a continued line loses its backslashes and joins with nothing, a
+    # file's last line included, and a comment joins after a space), the comment strip, ${VAR}
+    # expansion and break_args_options (options start at the first word beginning with "-"). Then
+    # the line before expansion, for a message that echoes it, so a value kept out of the file,
+    # such as a token in a URL, stays out of the log. pip leaves an unset or empty variable as
+    # written. The expansion is not pip's: this expands each ${VAR} once, in one pass, while pip
+    # replaces them in turn, so pip can also expand a ${VAR} that a value brings in, whole or in
+    # part, when the line names that variable later.
+    joined = "".join(
+        ln.strip("\\") if continued(ln) else f" {ln}" if comment(ln) else ln for ln in group
+    )
+    code = COMMENT_RE.sub("", joined).strip()
+    words = re.sub(r"\$\{([A-Z0-9_]+)\}", lambda m: os.environ.get(m[1]) or m[0], code).split(" ")
+    first = next((n for n, word in enumerate(words) if word.startswith("-")), len(words))
+    return " ".join(words[:first]).strip(), words[first:], code
+
+
+def requirement(text):
+    # A logical line's requirement text, parsed by the packaging copy pip carries. None for a line
+    # with no requirement; its text when packaging cannot read it.
+    try:
+        return Requirement(text) if text else None
+    except InvalidRequirement:
+        return text
+
+
+def parsed(group):
+    return requirement(split_line(group)[0])
+
+
+def named(group, name):
+    found = parsed(group)
+    return isinstance(found, Requirement) and canonicalize_name(found.name) == name
+"""
+
+#: The stale-lock check's own code, after the shared reader. A raw string for the same reason. A line
+#: of options and no requirement is read by the runner's pip's own requirements-line parser. A `-c`
+#: flag its messages name has a backtick right before it, and the note above ``_CI_WORKFLOW`` says
+#: why.
+_CHECK_STALE = r"""
+import optparse, shlex
+
+from pip._internal.exceptions import PipError
+from pip._internal.req.req_file import OptionParsingError, build_parser
+from pip._vendor.packaging.version import InvalidVersion, Version
+
+# A Windows runner's piped stdout is the ANSI code page, which cannot print every name or path.
+sys.stdout.reconfigure(errors="backslashreplace")
+
+
+def version(text):
+    try:
+        return Version(text)
+    except InvalidVersion:
+        return text
+
+
+def unnamed(text):
+    # A URL or a path, which pip installs with no name to look up; anything else is a typo.
+    scheme = text.split(":", 1)[0].lower() if ":" in text else ""
+    return "/" in text or "\\" in text or text.startswith(".") or scheme.isalpha() or "+" in scheme
+
+
+def option_kind(options):
+    # What pip does with a line of options and no requirement, read by pip's own requirements-line
+    # parser as its parse_line reads it: "editable", "include" or "constraint", in the order pip 26
+    # gives them (an editable is the line's requirement, so pip follows no file named beside it, and
+    # an include wins over a constraint), or "" for any other options. None when pip cannot read the
+    # options: shlex's ValueError, optparse's error, or a PipError such as CommandError from an
+    # option's check.
+    parser = build_parser()
+    parser.set_usage(optparse.SUPPRESS_USAGE)
+    try:
+        opts = parser.parse_args(shlex.split(" ".join(options)), parser.get_default_values())[0]
+    except (OptionParsingError, PipError, ValueError):
+        return None
+    if opts.editables:
+        return "editable"
+    if opts.requirements:
+        return "include"
+    return "constraint" if opts.constraints else ""
+
+
+locked = {}
+for group in logical_lines("requirements.lock"):
+    req = parsed(group)
+    # A pin whose marker is false here is one this runner's install skips, so it covers nothing.
+    if isinstance(req, Requirement) and (req.marker is None or req.marker.evaluate()):
+        exact = [s.version for s in req.specifier if s.operator in ("==", "===")]
+        locked.setdefault(canonicalize_name(req.name), set()).update(exact)
+REGENERATE = (
+    "regenerate requirements.lock from requirements.txt, keeping any `-c FILE` in the lock command"
+)
+# Each error with its remedy, in file order.
+errors = []
+for group in logical_lines("requirements.txt"):
+    text, options, line = split_line(group)
+    req = requirement(text)
+    if req is None:
+        kind = option_kind(options)
+        if kind is None:
+            errors.append((f"{line} is not a line pip can read", REGENERATE))
+        elif kind == "editable":
+            print(f"::notice::{line} is editable, so it is not checked against requirements.lock")
+        elif kind == "include":
+            # No new lock clears these two, so each names a remedy of its own, not REGENERATE.
+            errors.append(
+                (
+                    f"{line} includes another requirements file, which this check does not follow",
+                    "move that file's lines into requirements.txt",
+                )
+            )
+        elif kind == "constraint":
+            errors.append(
+                (
+                    f"{line} names a constraints file, which this check does not follow",
+                    "remove the line only once its limits apply elsewhere, as the engine's"
+                    " docs/ADOPTER-CI.md, Job 3, says: for a file other than requirements.lock,"
+                    " pass `-c FILE` to every command that writes requirements.lock and keep it in"
+                    " the README's, and for any file, make every install of requirements.txt"
+                    " apply the lock (Job 3 says what the VS Code extension's setup needs), with"
+                    " PIP_CONSTRAINT=requirements.lock for that command only or pip install"
+                    " --require-hashes -r requirements.lock in its place, using a lock that covers"
+                    " that install's platform",
+                )
+            )
+        continue
+    if isinstance(req, str):
+        if unnamed(req):
+            print(f"::notice::{line} names no package, so it is not checked against requirements.lock")
+        else:
+            errors.append((f"{line} is not a requirement this check can read", REGENERATE))
+        continue
+    name = canonicalize_name(req.name)
+    if req.marker is not None and not req.marker.evaluate():
+        print(f"::notice::{name}'s marker is false on this runner, so it is not checked")
+        continue
+    if req.extras:
+        print(f"::notice::{name}'s extras are not checked: requirements.lock records none")
+    if name not in locked:
+        errors.append((f"{name} is in requirements.txt but not in requirements.lock", REGENERATE))
+        continue
+    versions = [version(v) for v in locked[name]]
+    allowed = [v for v in versions if isinstance(v, Version) and req.specifier.contains(v, prereleases=True)]
+    if req.specifier and not allowed:
+        have = ", ".join(sorted(locked[name])) or "unpinned"
+        errors.append((f"requirements.txt asks for {name}{req.specifier}, requirements.lock pins {have}", REGENERATE))
+for problem, remedy in errors:
+    print(f"::error::{problem}; {remedy}")
+sys.exit(1 if errors else 0)
+"""
+
+
+def _heredoc(code: str) -> str:
+    """``code`` indented as the body of a ``run: |`` step's heredoc, then a blank line."""
+    return "".join(f"          {ln}\n" if ln else "\n" for ln in f"{code.strip()}\n\n".splitlines())
+
+
+_CI_WORKFLOW = _CI_WORKFLOW.replace("@@READ_AS_PIP@@\n", _heredoc(_READ_AS_PIP)).replace(
+    "@@CHECK_STALE@@\n", _heredoc(_CHECK_STALE)
+)
 
 _GITIGNORE = """\
 # MessageFoundry config repo — never commit local stores, secrets, captures, or build cruft.
@@ -427,6 +672,8 @@ edit it here; you author config against its public surface (ADR 0017).
 - `requirements-dev.txt` — pins the authoring toolkit (`messagefoundry-toolkit`) at the same version.
   Install it on an authoring machine only; a deploying host installs `requirements.txt` alone, so it
   carries no development tooling.
+- `requirements-audit.lock` — `pip-audit` and its dependencies, each pinned with its hashes, for the
+  `audit-pin` CI job. Its header says how to regenerate it.
 - `.github/workflows/check.yml` — CI: install the pinned engine + run `messagefoundry check` on every PR.
 
 ## Use it
@@ -476,7 +723,8 @@ whose environment marker does not match the runner, so a Linux runner never audi
 Windows-only dependencies. With a `requirements.lock` it audits `requirements.txt` as written, with
 no resolve, so pin each requirement there with `==`, and runs the engine's own auditor
 (`python -P -m messagefoundry.security.audit_all_platforms requirements.lock`), which audits every pin
-in the lock whatever its marker. The engine's `docs/ADOPTER-CI.md`, "Job 3", says what each step
+in the lock whatever its marker. It also fails on a stale lock, and installs `pip-audit` itself
+from `requirements-audit.lock`. The engine's `docs/ADOPTER-CI.md`, "Job 3", says what each step
 requires and refuses. The job
 takes wheels only (`PIP_ONLY_BINARY`), so a dependency with no wheel for Windows fails it rather
 than having its build code run in CI.
@@ -492,22 +740,23 @@ hardening steps (recommended for any PHI-handling adopter):
 1. **Pin the index** so the resolver cannot be confused onto a hostile source:
    ```bash
    pip install --index-url https://your-internal-index/simple -r requirements.txt
-   # or set it in the environment / pip.conf, plus a constraints pin:
-   export PIP_CONSTRAINT=requirements.lock
+   # or set it in the environment / pip.conf, plus a constraints pin for this command only:
+   PIP_CONSTRAINT=requirements.lock pip install -r requirements.txt
    ```
 2. **Hash-pin your transitive closure** so every byte is verified at install — generate a lock over
    *your* resolved deps and install with `--require-hashes`:
    ```bash
-   # generate (pick one):
-   uv pip compile --universal --generate-hashes requirements.txt -o requirements.lock
+   # generate (pick one), for the platform you deploy on:
+   uv pip compile --python-platform windows --python-version 3.14 --generate-hashes requirements.txt -o requirements.lock
    pip-compile --generate-hashes --no-emit-index-url --no-emit-trusted-host --no-emit-find-links --no-emit-options -o requirements.lock requirements.txt
    # install — fails if ANY requirement is unhashed:
    pip install --require-hashes -r requirements.lock
    ```
    When you commit a `requirements.lock`, the `audit-pin` CI job dry-run installs it under
    `--require-hashes` on Windows, then audits every pin; without one it **warns** that the
-   closure resolves live and unhashed. `uv pip compile --universal` writes every platform's pins;
-   `pip-compile` locks only the platform it runs on, so run it on Windows.
+   closure resolves live and unhashed. `pip-compile` locks only the platform it runs on, so run it
+   on Windows. Regenerate the lock whenever `requirements.txt` changes; the job fails on a stale one.
+   For a universal lock (`uv pip compile --universal`), read "Job 3" first.
 
 ## Environments & posture
 The active environment is **required** and **free-form** — name instances `dev`/`staging`/`test`/`prod`/`poc`/…
@@ -535,6 +784,11 @@ Generated by `messagefoundry-toolkit init`.
 """
 
 
+#: Copied into the config repo as is. tests/test_scaffold.py holds it to the engine's own
+#: ci/locks/ci-scanners.lock.
+_AUDIT_TOOL_LOCK = files("messagefoundry_toolkit") / "requirements-audit.lock"
+
+
 def _templates(version: str) -> dict[str, str]:
     """The relative-path -> file-content map for a fresh config repo, pinning ``version``."""
     return {
@@ -543,6 +797,8 @@ def _templates(version: str) -> dict[str, str]:
         # The toolkit is lockstep with the engine (ADR 0201 section 1), so it pins the same version.
         # A file of its own, so a deploy that installs requirements.txt carries no toolkit (section 6).
         "requirements-dev.txt": f"messagefoundry-toolkit=={version}\n",
+        # The CI audit job's own tool, pip-audit, and what it needs, each pin with its hashes.
+        "requirements-audit.lock": _AUDIT_TOOL_LOCK.read_text(encoding="utf-8"),
         ".gitignore": _GITIGNORE,
         ".gitattributes": _GITATTRIBUTES,
         ".vscode/settings.json": _VSCODE_SETTINGS,

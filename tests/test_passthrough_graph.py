@@ -15,8 +15,11 @@ import pytest
 
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.wiring import load_config
-from messagefoundry.generators import _core, all_types  # noqa: F401  (registers message types)
 from messagefoundry.pipeline.dryrun import dry_run
+from messagefoundry_toolkit.generators import (  # noqa: F401  (registers message types)
+    _core,
+    all_types,
+)
 
 _CONFIG = "harness/config/passthrough"
 

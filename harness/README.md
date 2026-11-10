@@ -13,10 +13,12 @@ python -m harness --list-profiles      # list headless load profiles
 python -m harness --load smoke         # run a load profile (exit 0 SLOs met / 1 violation / 2 setup)
 ```
 
-It reuses the engine's own MLLP framing + ACK builder (`messagefoundry.mllpcodec`), message
-generators (`messagefoundry/generators`), and API client (`messagefoundry.apiclient`), so it
-frames, acknowledges, and reads engine state exactly as the real components do. New message types
-light up automatically as they're added to `messagefoundry/generators/all_types.py`.
+It reuses the engine's own MLLP framing + ACK builder (`messagefoundry.mllpcodec`), the
+toolkit's message generators (`messagefoundry_toolkit/generators`, from the `messagefoundry-toolkit`
+distribution the harness pins beside the engine, ADR 0201), and the engine's API client
+(`messagefoundry.apiclient`), so it frames, acknowledges, and reads engine state exactly as the real
+components do. New message types light up automatically as they're added to
+`messagefoundry_toolkit/generators/all_types.py`.
 
 It frames by the engine's one-frame rule too (ADR 0205): whether a payload holds a frame byte is
 judged in one place, `FrameCodec.find_frame_byte` in `messagefoundry.framing`. At least the MLLP ACK writers (the Receive tab and the MLLP, load and

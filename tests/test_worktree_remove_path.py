@@ -25,7 +25,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -40,8 +39,15 @@ pytestmark = pytest.mark.skipif(
 )
 
 # Every GIT_* variable goes: run from inside a git hook, GIT_DIR or GIT_WORK_TREE would point these
-# children at the REAL repository instead of the throwaway one.
-_ENV = {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
+# children at the REAL repository instead of the throwaway one. CLAUDE_CONFIG_DIR goes too: the
+# occupancy fence reads the config root it names, which would be this machine's real registry. So
+# does MEFOR_COORD_ROOT, which would point the claim and allocation reads at the real shared root.
+_ENV = {
+    k: v
+    for k, v in os.environ.items()
+    if not k.upper().startswith("GIT_")
+    and k.upper() not in {"CLAUDE_CONFIG_DIR", "MEFOR_COORD_ROOT"}
+}
 
 # What the fixture repository ignores. `__pycache__` is written WITHOUT a trailing slash so it also
 # matches a FILE of that name, which is one of the two cases the exception must not swallow.
@@ -69,10 +75,12 @@ def _git(cwd: Path, *args: str) -> str:
     return proc.stdout
 
 
-#: remove.ps1 and the three scripts it dot-sources. A test that runs a COPY of the script needs all
-#: four: without coord-root.ps1 it refuses. One list, shared with tests/test_worktree_gate_removal_route.py.
+#: remove.ps1 and the four scripts it dot-sources. A test that runs a COPY of the script needs all
+#: five: without coord-root.ps1 it refuses, and without worktree-gates.ps1 it cannot load its readers.
+#: One list, shared with tests/test_worktree_gate_removal_route.py.
 REAL_SCRIPTS = (
     "scripts/worktree/remove.ps1",
+    "scripts/worktree/worktree-gates.ps1",
     "scripts/coord/occupancy.ps1",
     "scripts/coord/session-registry.ps1",
     "scripts/coord/coord-root.ps1",
@@ -224,6 +232,22 @@ def _out(proc: subprocess.CompletedProcess[str]) -> str:
     return proc.stdout + proc.stderr
 
 
+def start_live_process(cwd: Path) -> subprocess.Popen[bytes]:
+    """A real running process for a session record to name, started from ``cwd``.
+
+    pwsh, which this module already requires, and NOT sys.executable: in a Windows virtual
+    environment that is a launcher stub that starts the real interpreter as a child, so killing it
+    would leave the child sleeping. This used to reach the base interpreter through
+    ``sys._base_executable``, a private attribute (vault BACKLOG #2985, item 18). The caller kills it.
+    """
+    return subprocess.Popen(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"],
+        cwd=str(cwd),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def build_rig(root: Path) -> Rig:
     """A primary with one seed commit, an origin/main at it, and a readable session registry."""
     r = Rig(root)
@@ -364,13 +388,8 @@ def test_a_live_session_recorded_in_a_parent_tree_does_not_clear_a_sibling_it_is
     _commit(sibling, "built.txt")
     claim = _claim(rig, "9191", sibling)
 
-    # THE BASE INTERPRETER, NOT sys.executable. In a Windows virtual environment sys.executable is a
-    # launcher stub that starts the real interpreter as a child, and kill() below would end the stub
-    # and leave that child sleeping. Its cwd is the fixture root, so nothing here holds a checkout.
-    interpreter = getattr(sys, "_base_executable", None) or sys.executable
-    session = subprocess.Popen(
-        [interpreter, "-c", "import time; time.sleep(300)"], cwd=str(rig.root)
-    )
+    # Its cwd is the fixture root, so nothing here holds a checkout.
+    session = start_live_process(rig.root)
     try:
         sessions = rig.home / ".claude" / "sessions"
         (sessions / f"{session.pid}.json").write_text(
@@ -536,6 +555,35 @@ def test_a_tree_under_claude_worktrees_is_not_reached_and_name_still_removes_the
     assert foo.exists()
 
 
+def test_a_clone_below_a_claude_worktrees_segment_still_reaches_its_own_trees(
+    tmp_path: Path,
+) -> None:
+    """Vault BACKLOG #2985, item 3. The segment was matched anywhere in the path, so a clone that
+    lives inside another checkout's ``.claude/worktrees`` had every tree refused, and ``-List`` called
+    them all managed. A segment ABOVE the primary does not count now; the clone's own one still does.
+    Red before the fix: the sibling was refused as under .claude/worktrees."""
+    host = tmp_path / ".claude" / "worktrees" / "host"
+    host.mkdir(parents=True)
+    rig = build_rig(host)
+    sibling = rig.add(rig.primary.parent / "Repo-sib")
+    harness = rig.add(rig.primary / ".claude" / "worktrees" / "agent")
+
+    listing = rig.run("-List")
+    assert listing.returncode == 0, _out(listing)
+    assert "sibling 1, managed 1, other 0" in listing.stdout, listing.stdout
+
+    # The clone's own .claude/worktrees still refuses, -Force included.
+    proc = rig.run("-Path", str(harness), "-Force")
+    assert proc.returncode != 0, _out(proc)
+    assert "under .claude/worktrees" in _out(proc), _out(proc)
+    assert harness.exists() and rig.is_registered(harness)
+
+    proc = rig.run("-Path", str(sibling))
+    assert proc.returncode == 0, _out(proc)
+    assert not sibling.exists()
+    assert harness.exists()
+
+
 def test_a_target_holding_another_registered_worktree_is_refused(rig: Rig) -> None:
     outer = rig.add(rig.scratch("outer"))
     inner = rig.add(outer / "inner")
@@ -679,6 +727,278 @@ def test_a_readable_registry_with_no_records_clears_the_target(rig: Rig) -> None
 
     proc = rig.run("-Path", str(wt), home=empty)
 
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+def test_a_live_process_that_started_before_its_session_registered_occupies_the_target(
+    rig: Rig,
+) -> None:
+    """Vault BACKLOG #2985, item 9. The registry's default reads a record as STALE, which vetoes
+    nothing, when its running process started more than 15 minutes before the session registered.
+    A recycled pid belongs to a process started AFTER the record, so that process is the session
+    itself. Red before the fix: the tree went. Staged with a registration an hour after the process."""
+    wt = rig.add(rig.scratch("long-lived"))
+    session = start_live_process(rig.root)
+    try:
+        late = rig.root / "late-home"
+        sessions = late / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        (sessions / f"{session.pid}.json").write_text(
+            json.dumps(
+                {
+                    "cwd": str(wt),
+                    "pid": session.pid,
+                    "sessionId": "registered-late",
+                    "startedAt": int((time.time() + 3600) * 1000),
+                }
+            ),
+            encoding="utf-8",
+        )
+        proc = rig.run("-Path", str(wt), home=late)
+        assert proc.returncode != 0, _out(proc)
+        assert "Target is occupied" in _out(proc) and "LIVE" in _out(proc), _out(proc)
+        assert wt.exists() and rig.is_registered(wt)
+    finally:
+        session.kill()
+        session.wait(timeout=30)
+
+    # Control: the process is gone, so the same record is DEAD and the same call removes the tree.
+    proc = rig.run("-Path", str(wt), home=late)
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+def test_a_session_on_the_callers_config_root_outside_userprofile_occupies_the_target(
+    rig: Rig,
+) -> None:
+    """Vault BACKLOG #2985, item 6. The fence listed only ``%USERPROFILE%\\.claude*``, so a session on
+    a root CLAUDE_CONFIG_DIR names elsewhere was invisible. The caller's own root is read too now.
+    Red before the fix: the tree went."""
+    wt = rig.add(rig.scratch("pinned-root"))
+    pinned = rig.root / "config-elsewhere"
+    (pinned / "sessions").mkdir(parents=True)
+    # No pid fences as UNREADABLE, which vetoes: a session recorded in the target.
+    (pinned / "sessions" / "7.json").write_text(
+        json.dumps({"cwd": str(wt), "sessionId": "on-a-pinned-root"}), encoding="utf-8"
+    )
+
+    proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": str(pinned)})
+    assert proc.returncode != 0, _out(proc)
+    assert "Target is occupied" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    # A lone backtick refuses too: any backtick is refused, so a root such as o`brien is not read.
+    # The refusal fires before any read.
+    proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": str(rig.root / "o`brien")})
+    assert proc.returncode != 0, _out(proc)
+    assert "wildcard character" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    # A relative root names no fixed directory, so it refuses rather than be read.
+    proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": "cfg"})
+    assert proc.returncode != 0, _out(proc)
+    assert "relative path" in _out(proc), _out(proc)
+    assert wt.exists()
+
+    # Control: a CLAUDE_CONFIG_DIR that IS one of the USERPROFILE roots, whose registry clears the
+    # target, removes the tree. It does not tell a single read of that root from a double one.
+    proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": str(rig.home / ".claude")})
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+def test_a_doubled_backtick_config_root_refuses_rather_than_read_its_sibling(rig: Rig) -> None:
+    """Vault BACKLOG #2985, item 6. The registry's reads took a root as a wildcard pattern, which read
+    a doubled backtick as one, so CLAUDE_CONFIG_DIR=<root>\\o``brien was read as its sibling
+    <root>\\o`brien. Each holds one record, so the root and record counts of the two reads agreed,
+    the session recorded in the target went unseen, and the tree went with exit 0. Red at 93139cf657,
+    which stopped refusing a backtick. The registry reads literally now, and the refusal stays."""
+    wt = rig.add(rig.scratch("ticked-twice"))
+    doubled = rig.root / "o``brien"
+    (doubled / "sessions").mkdir(parents=True)
+    (doubled / "sessions" / "9.json").write_text(
+        json.dumps({"cwd": str(wt), "sessionId": "in-the-target"}), encoding="utf-8"
+    )
+    sibling = rig.root / "o`brien"
+    (sibling / "sessions").mkdir(parents=True)
+    (sibling / "sessions" / "9.json").write_text(
+        json.dumps(
+            {"cwd": str(rig.root / "elsewhere"), "pid": 1, "sessionId": "clear", "startedAt": 0}
+        ),
+        encoding="utf-8",
+    )
+
+    proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": str(doubled)})
+    assert proc.returncode != 0, _out(proc)
+    assert "wildcard character" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    # Control: with no CLAUDE_CONFIG_DIR, the USERPROFILE registry clears the target and it goes.
+    proc = rig.run("-Path", str(wt))
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+@pytest.mark.parametrize("char", ["[", "]", "*", "?"])
+def test_a_wildcard_character_in_the_config_root_refuses(rig: Rig, char: str) -> None:
+    """Vault BACKLOG #2985, item 6. The registry's reads took a root as a wildcard pattern, so a root
+    holding one of these could read another directory, or none. It refuses before anything is read,
+    so the root need not exist (``*`` and ``?`` cannot be in a Windows file name at all)."""
+    wt = rig.add(rig.scratch("wild"))
+    proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": str(rig.root / f"cfg{char}1")})
+    assert proc.returncode != 0, _out(proc)
+    assert "wildcard character" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    # Control: with no CLAUDE_CONFIG_DIR, the same call removes the tree.
+    proc = rig.run("-Path", str(wt))
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+@pytest.mark.parametrize("attrs", [("+h",), ("+h", "+s")], ids=["hidden", "hidden-system"])
+def test_a_hidden_record_is_read_and_occupies_the_target(rig: Rig, attrs: tuple[str, ...]) -> None:
+    """Vault BACKLOG #2985. The registry listed records without -Force, so it skipped a hidden one,
+    and here only the record-count guard refused. The registry lists with -Force now, so the record
+    is read and placed in the target. prune-merged.ps1 and the finished-tree removal have no such
+    guard, and their tests in tests/test_worktree_prune_merged.py and
+    tests/test_worktree_finished_claude_removal.py removed the tree before the fix."""
+    wt = rig.add(rig.scratch("hidden-record"))
+    hidden = rig.registry(wt) / ".claude" / "sessions" / "2.json"
+    subprocess.run(["attrib", *attrs, str(hidden)], check=True, capture_output=True)
+
+    proc = rig.run("-Path", str(wt))
+    assert proc.returncode != 0, _out(proc)
+    assert "Target is occupied" in _out(proc) and "in-2" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    # Control: without that record, the target is cleared.
+    rig.registry()
+    proc = rig.run("-Path", str(wt))
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+def test_the_record_count_guard_still_refuses_a_registry_read_that_skips_a_record(rig: Rig) -> None:
+    """remove.ps1 keeps its record-count guard behind the registry. A copy of the scripts whose
+    registry lists records without -Force stands in for a registry that regresses: the hidden record
+    it skips is counted by the second listing."""
+    wt = rig.add(rig.scratch("count-guard"))
+    copy = rig.root / "copy"
+    copy_real_scripts(copy)
+    registry = copy / "scripts" / "coord" / "session-registry.ps1"
+    text = registry.read_text(encoding="utf-8")
+    assert text.count("-Filter *.json -Force") == 1
+    registry.write_text(text.replace("-Filter *.json -Force", "-Filter *.json"), "utf-8")
+    script = copy / "scripts" / "worktree" / "remove.ps1"
+    hidden = rig.registry(wt) / ".claude" / "sessions" / "2.json"
+    subprocess.run(["attrib", "+h", str(hidden)], check=True, capture_output=True)
+
+    proc = rig.run("-Path", str(wt), script=script, repo_root=rig.primary)
+    assert proc.returncode != 0, _out(proc)
+    assert "the receipt examined 1 session record(s) and a second listing found 2" in _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    # Control: without the hidden record the two reads agree, and the copy removes the tree.
+    hidden.unlink()
+    proc = rig.run("-Path", str(wt), script=script, repo_root=rig.primary)
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+def test_a_directory_named_as_a_record_makes_the_registry_unreadable(rig: Rig) -> None:
+    """Vault BACKLOG #2985. A directory where a record belongs cannot be read, and could stand where
+    a session's record should be, so it reads as an unreadable record and the fence cannot clear.
+    Red at fa4663ab74, whose registry listed records with -File and skipped it: the tree went."""
+    wt = rig.add(rig.scratch("dir-record"))
+    stray = rig.registry() / ".claude" / "sessions" / "4242.json"
+    stray.mkdir()
+
+    proc = rig.run("-Path", str(wt))
+    assert proc.returncode != 0, _out(proc)
+    assert "could not clear" in _out(proc) and "a directory, not a file" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    # Control: without the directory, the target is cleared.
+    stray.rmdir()
+    proc = rig.run("-Path", str(wt))
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+def test_a_record_whose_name_holds_wildcard_characters_is_read_by_its_own_name(rig: Rig) -> None:
+    """Vault BACKLOG #2985. The registry read each record with a positional Get-Content, which takes
+    the name as a pattern, so [1].json was read as 1.json. Both files counted as records and both
+    read as the session elsewhere, so the counts agreed and the tree went with exit 0 at 0a7ccdca1c.
+    Every read is literal now."""
+    wt = rig.add(rig.scratch("bracketed-record"))
+    sessions = rig.registry() / ".claude" / "sessions"
+    assert (sessions / "1.json").is_file()
+    (sessions / "[1].json").write_text(
+        json.dumps({"cwd": str(wt), "sessionId": "brkt"}), encoding="utf-8"
+    )
+
+    proc = rig.run("-Path", str(wt))
+    assert proc.returncode != 0, _out(proc)
+    assert "Target is occupied" in _out(proc) and "brkt" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    # Control: without that record, the target is cleared.
+    (sessions / "[1].json").unlink()
+    proc = rig.run("-Path", str(wt))
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+def test_a_config_root_whose_name_holds_a_backtick_is_read_by_its_own_name(rig: Rig) -> None:
+    """Vault BACKLOG #2985, with CLAUDE_CONFIG_DIR unset. The registry tested and listed each
+    USERPROFILE root as a pattern, so .claude``x was read as its sibling .claude`x. Both siblings
+    count as roots and each read one record, so the root and record counts agreed, the session in
+    the target went unseen, and the tree went with exit 0 at 0a7ccdca1c. Every read is literal now."""
+    wt = rig.add(rig.scratch("ticked-root"))
+    doubled = rig.home / ".claude``x" / "sessions"
+    doubled.mkdir(parents=True)
+    (doubled / "9.json").write_text(
+        json.dumps({"cwd": str(wt), "sessionId": "ticked-twice"}), encoding="utf-8"
+    )
+    single = rig.home / ".claude`x" / "sessions"
+    single.mkdir(parents=True)
+    (single / "9.json").write_text(
+        json.dumps(
+            {"cwd": str(rig.root / "elsewhere"), "pid": 1, "sessionId": "clear", "startedAt": 0}
+        ),
+        encoding="utf-8",
+    )
+
+    proc = rig.run("-Path", str(wt))
+    assert proc.returncode != 0, _out(proc)
+    assert "Target is occupied" in _out(proc) and "ticked-t" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    # Control: without that record, the target is cleared.
+    (doubled / "9.json").unlink()
+    proc = rig.run("-Path", str(wt))
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+def test_a_file_where_a_session_registry_belongs_refuses_by_name(rig: Rig) -> None:
+    """Vault BACKLOG #2985, item 4. The receipt counts a root whose ``sessions`` is a file, the second
+    listing did not, and the run refused on a bare count mismatch. It still refuses, since no session
+    of that root can register there, and now says why."""
+    wt = rig.add(rig.scratch("stray-file"))
+    stray = rig.home / ".claude-account-9"
+    stray.mkdir()
+    (stray / "sessions").write_text("not a directory\n", encoding="utf-8")
+
+    proc = rig.run("-Path", str(wt))
+    assert proc.returncode != 0, _out(proc)
+    assert "is not a directory" in _out(proc) and "Occupancy unknown" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    (stray / "sessions").unlink()
+    proc = rig.run("-Path", str(wt))
     assert proc.returncode == 0, _out(proc)
     assert not wt.exists()
 

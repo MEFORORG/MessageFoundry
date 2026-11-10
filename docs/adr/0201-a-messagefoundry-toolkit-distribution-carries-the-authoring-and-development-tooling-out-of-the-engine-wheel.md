@@ -671,7 +671,9 @@ first lists missed, so each slice's builder runs the whole suite rather than tru
      `tests/test_anon_core.py`, `tests/test_anon_integration.py`, the slice 6 docs in section 6,
      `scripts/release/forbidden_members.py` (one more retired path).
 
-   On its own.
+   On its own. Done: the package lives at `messagefoundry_toolkit/anon/`, and the engine wheel and
+   sdist refuse a member under `messagefoundry/anon/`. The anon import searches in
+   `tests/test_dependency_boundaries.py` re-point to the new name in the same change.
 7. **Move `generators/`, `hl7schema.py` and `hl7structures.py`.** Files:
    - moved: those three into `messagefoundry_toolkit/`;
    - edit: `messagefoundry_toolkit/anon/_pools.py` and the moved handlers (re-pointed imports), the
@@ -681,6 +683,14 @@ first lists missed, so each slice's builder runs the whole suite rather than tru
      `tests/test_hl7structures.py`, `tests/test_anon_parity.py` (the `_hl7data` path),
      `tests/test_ide_artifacts.py`, `tests/test_verify.py` (it imports a generator as a positive
      control), `tests/test_packaging.py` (the harness's toolkit pin).
+
+   Done: the three live under `messagefoundry_toolkit/`, and the engine wheel and sdist refuse a
+   member under `messagefoundry/generators/` or at `messagefoundry/hl7schema.py` or
+   `messagefoundry/hl7structures.py`. The harness pins `messagefoundry-toolkit` at its own version
+   beside the engine. Two corrections to the lists above, read at build: the harness had seven
+   `generators` importer files, not five (`harness/scenarios.py` had become `harness/scenarios/`,
+   whose `_core.py` and `hostile.py` import it, and `harness/fuzz/mutate.py` does too), and `scripts/release/harness_resolution_check.py`, which
+   refused any harness base dependency besides the engine, now stubs the toolkit too.
 8. **Re-score 15.2.3.** Vault record work, done by a Manager's vault Builder under the 2026-09-23
    ruling, after a release carries slices 2 to 7. See section 8.
 

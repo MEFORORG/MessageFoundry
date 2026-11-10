@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Surrogate **production** — the code half of the rule model (ADR 0030 §2/§3).
 
-One pure function per :class:`~messagefoundry.anon.rules.SurrogateKind`, each turning a real field
+One pure function per :class:`~messagefoundry_toolkit.anon.rules.SurrogateKind`, each turning a real field
 value into a **structurally-faithful, fabricated** replacement of the same HL7 datatype — so the
 anonymized corpus still exercises field widths, repetitions, and routing-key shapes (ADR 0030 §3:
 *replace, don't blank*). Every choice is drawn from ``keyer.rng(kind, value)``, so the same real

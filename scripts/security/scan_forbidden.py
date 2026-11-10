@@ -447,46 +447,133 @@ _PR_VERSION_TAIL = re.compile(
 )
 #: Even a `V` lead is a version after "HL7": `HL7 V2.5.1` is the message standard, not a requirement.
 _PR_HL7_LEAD = re.compile(r"(?i)\bhl7[\s*`_]*$")
-_PR_FMT = r"[*`_\"']*"
+#: The markup characters markdown wraps around a value.
+_PR_MARKUP = r"[*`_\"']"
+_PR_FMT = _PR_MARKUP + "*"
 _PR_SEP = r"[\s*`_\"']+"
 #: Binds a label to a value: colon, equals, pipe, the dashes and arrows, a bracket or table cell edge.
 _PR_BIND = r"[:=|\-\u2013\u2014\u2192"
 #: The tree scan's verdict words plus the spellings prose uses for them, so a word added to the record
 #: vocabulary reaches both surfaces. "fail closed" and its kin name a control's failure MODE, which is
 #: what a security pull request describes; they are not a verdict.
-_PR_VERDICT = (
-    rf"(?:{_RECORD_VERDICT}|passes|fails|passing|failing|na|needs review|not met|unmet|met)"
-    r"(?![A-Za-z0-9/-])(?!\s+(?:closed|open|safe|fast|through|over)\b)"
-)
+_PR_VERDICT_WORDS = rf"{_RECORD_VERDICT}|na|needs review|not met|unmet|met"
+_PR_VERDICT_TAIL = r"(?![A-Za-z0-9/-])(?!\s+(?:closed|open|safe|fast|through|over)\b)"
+_PR_VERDICT = rf"(?:{_PR_VERDICT_WORDS}|passes|fails|passing|failing){_PR_VERDICT_TAIL}"
+#: The verdict words that name a STATE, without "passing"/"failing"/"passes"/"fails": a test "kept
+#: failing" or "keeps passing", and that is CI prose, not a requirement held at a verdict.
+_PR_VERDICT_STATE = rf"(?:{_PR_VERDICT_WORDS}){_PR_VERDICT_TAIL}"
+#: The record's verbs for keeping a requirement at a verdict ("held at", "capped at", "held partial").
+_PR_HOLD_VERB = r"(?:held|holds?|holding|kept|keeps?|capped|pinned)"
 #: Verbs that only a record uses of a verdict. A version does not "stay partial", so these bind even an
 #: identifier the version filter set aside ("Applies to <id>, which stays partial").
 _PR_STRONG_VERB = (
-    r"(?:stays?|remains?|held at|holds? at|holding at|went to|goes to|moves? to|moved to|back to"
+    rf"(?:stays?|remains?|{_PR_HOLD_VERB} at|went to|goes to|moves? to|moved to|back to"
     r"|re-?scored(?: as)?|scored(?: as)?|scores"
     # "<id> went from partial to pass" names the old verdict as surely as the new one.
     r"|(?:went|goes|moves?|moved) from)"
 )
-_PR_STATE_VERB = rf"(?:{_PR_STRONG_VERB}|is(?: now| still)?|was|are|reads|now|at|from)"
-_PR_QUALIFIER = r"(?:(?:a|an|the|its|permanent|genuine|accepted|honest)" + _PR_SEP + r")*"
+_PR_PLAIN_STATE_VERB = rf"(?:{_PR_STRONG_VERB}|is(?: now| still)?|was|are|reads|now|at|from)"
+#: The passive and negated forms ("were", "has been", "isn't", "has not been", "is no longer") bind an
+#: unmarked identifier only with a state verdict ending its clause (_pr_verdict_bound).
+_PR_STATE_VERB = (
+    rf"(?:{_PR_PLAIN_STATE_VERB}|were|(?:(?:has|have|had)(?: not|n['\u2019]t)? )?been"
+    r"|(?:is|was|are|were)n['\u2019]t|(?:is|was|are|were) no longer)"
+)
+_PR_PLAIN_QUALIFIER = r"(?:(?:a|an|the|its|permanent|genuine|accepted|honest)" + _PR_SEP + r")*"
+_PR_QUALIFIER = (
+    r"(?:(?:a|an|the|its|permanent|genuine|accepted|honest|recorded|known|interim|provisional"
+    r"|likely|probably|still|already)" + _PR_SEP + r")*"
+)
+#: Words that may stand between the identifier and its verb without unbinding it: a passive auxiliary
+#: ("<id> was held at partial"), a negated one ("<id> isn't met") and the adverbs a record sentence
+#: hedges with ("<id> likely stays").
+_PR_AUX = (
+    r"(?:(?:is|was|are|were|be|been|(?:has|have|had)(?: not)? been|(?:has|have|had)n['\u2019]t been"
+    r"|(?:is|was|are|were)n['\u2019]t|not|no longer|likely|probably|still|now|also|only|then"
+    r"|already|so)" + _PR_SEP + r")*"
+)
+#: A word boundary that markdown `_` emphasis does not defeat, as _PR_REQ_ID reads one.
+_PR_NB = r"(?<![A-Za-z0-9])"
+_PR_NA = r"(?![A-Za-z0-9])"
+#: A modal or a negation bound to a bare verdict verb: "<id> cannot pass", "<id> would not be met",
+#: "<id> needs to pass", "<id> will remain partial". On an identifier the text does not mark as a
+#: requirement it binds only where the verdict ends the clause (_PR_VERDICT_END), because
+#: "<version> will fail the handshake" is the same words with an object.
+_PR_MODAL = (
+    r"(?:can(?:not)?|can['\u2019]t|could|would|will|should|may|might|must|does|do|did"
+    r"|(?:does|did|wo|would|could|should)n['\u2019]t|needs? to|has to|is (?:un)?able to)"
+    rf"(?:{_PR_SEP}(?:not|now|still|yet|never|only|honestly|also|then|reach|have|be|been|stay"
+    r"|remain))*"
+)
 #: Read from the end of the identifier: "<id> stays partial", "<id> cell to pass", "<id> | fail".
 _PR_VERDICT_AFTER = re.compile(
-    rf"(?i)^{_PR_FMT}(?:\s+cell)?"
+    rf"(?i)^{_PR_FMT}(?:\s+(?:cell|row))?"
     rf"(?:\s*{_PR_BIND}>\](]+\s*|{_PR_SEP})"
-    rf"(?:{_PR_FMT}(?:(?:which|that){_PR_SEP})?"
-    rf"(?:(?P<strong>{_PR_STRONG_VERB})|{_PR_STATE_VERB}|(?P<to>to)){_PR_SEP}(?:at{_PR_SEP})?)?"
-    rf"{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
+    rf"(?:{_PR_FMT}(?:(?:which|that){_PR_SEP})?{_PR_AUX}"
+    rf"(?:(?P<strong>{_PR_STRONG_VERB})|(?P<modal>{_PR_MODAL})|{_PR_STATE_VERB}|(?P<as>as)"
+    rf"|(?P<to>to)){_PR_SEP}(?:at{_PR_SEP})?)?"
+    rf"{_PR_QUALIFIER}{_PR_FMT}(?P<verdict>{_PR_VERDICT})"
+)
+#: The same binding as engine PR 2448 read it, with no hedge, passive or negation: what it binds needs
+#: no mark. What only _PR_VERDICT_AFTER binds ("<version> still fail", "were failing") is CI prose as
+#: often as a record, so it binds an unmarked identifier only with a state verdict ending its clause.
+_PR_PLAIN_VERDICT_AFTER = re.compile(
+    rf"(?i)^{_PR_FMT}(?:\s+(?:cell|row))?"
+    rf"(?:\s*{_PR_BIND}>\](]+\s*|{_PR_SEP})"
+    rf"(?:{_PR_FMT}(?:(?:which|that){_PR_SEP})?{_PR_PLAIN_STATE_VERB}{_PR_SEP}(?:at{_PR_SEP})?)?"
+    rf"{_PR_PLAIN_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
+)
+_PR_VERDICT_STATE_RE = re.compile(rf"(?i){_PR_VERDICT_STATE}")
+#: A modal chained into a record verb ("<id> will remain partial") is as strong as the verb alone.
+_PR_MODAL_STRONG = re.compile(r"(?i)(?:stay|remain)$")
+#: What may follow a verdict a modal binds: the end of the clause, or a word that starts no object. A
+#: preposition is not one: "<version> will fail on the strict validator" is a verb and its phrase.
+_PR_VERDICT_END = re.compile(
+    rf"(?i){_PR_FMT}(?:\s*(?:$|[.,;:!?)\]|])"
+    r"|\s+(?:yet|today|now|either|again|until|unless|because)\b)"
+)
+#: A verb that states the verdict BEFORE the identifier: "does not meet <id>", "satisfies ASVS <id>",
+#: and the record's idiom for a requirement that does not pass yet, "an honest pass for <id>". "pass"
+#: and "fail" are not among the verbs: "callers can pass <version> explicitly" is ordinary English.
+_PR_VERB_BEFORE = re.compile(
+    rf"(?i){_PR_NB}(?:meets?|meeting|satisf(?:y|ies|ied|ying)"
+    rf"|honest{_PR_SEP}pass{_PR_SEP}(?:at|for|on))"
+    rf"(?:{_PR_SEP}(?:the|cells?|requirements?|its|all|any|of|ASVS|vault))*{_PR_SEP}{_PR_FMT}$"
 )
 #: "to <verdict>" with no move verb is ordinary English ("requires <version> to pass"), so a bare "to"
 #: binds only when the text before the identifier says the identifier is what moves.
+_PR_MOVE_OBJECT = rf"{_PR_SEP}(?:(?:the|vault|cells?|ASVS){_PR_SEP})*$"
 _PR_MOVE_LEAD = re.compile(
     r"(?i)\b(?:move[sd]?|moving|takes?|took|brings?|brought|re-?grade[sd]?|re-?score[sd]?|of"
     r"|upgrade[sd]?|downgrade[sd]?|sets?|flip(?:s|ped)?|raise[sd]?|lower(?:s|ed)?|drops?|dropped)"
-    rf"{_PR_SEP}(?:(?:the|vault|cells?|ASVS){_PR_SEP})*$"
+    + _PR_MOVE_OBJECT
 )
+#: Move verbs that are also ordinary English ("updates <version> to pass Z-segments through"), so they
+#: bind only an identifier the text marks as a requirement ("update the <id> row to na").
+_PR_MARKED_MOVE_LEAD = re.compile(r"(?i)\b(?:update[sd]?|updating|mark(?:s|ed)?)" + _PR_MOVE_OBJECT)
 #: Read up to the start of the identifier: "partial: <id>", "| fail | <id>".
 _PR_VERDICT_BEFORE = re.compile(rf"(?i)\b{_PR_VERDICT}{_PR_FMT}\s*{_PR_BIND}<\[(]+\s*{_PR_FMT}$")
 #: A table cell that is nothing but a verdict, optionally after a state verb ("Stay partial").
 _PR_CELL_VERDICT = re.compile(rf"(?i)(?:{_PR_STATE_VERB}{_PR_SEP})?{_PR_QUALIFIER}{_PR_VERDICT}")
+#: A cell that OPENS with a verdict and goes on: "unchanged, partial. No build reaches it."
+#: The dashes a cell sets a verdict off with: "unchanged - partial", "partial -- no build".
+_PR_CELL_DASH = r"\s+(?:--?|\u2013|\u2014)"
+#: A bare verdict that opens a cell ("Pass (12 messages)") is also how an HL7 conformance table reads,
+#: so with no "unchanged" or state verb before it, it binds only a row whose identifier is marked.
+_PR_CELL_VERDICT_LEAD = re.compile(
+    rf"(?i)(?:(?P<prefix>unchanged(?:[,;:]|{_PR_CELL_DASH})?|{_PR_STATE_VERB}){_PR_SEP})?"
+    rf"{_PR_QUALIFIER}{_PR_VERDICT}(?:[.;,:](?:\s|$)|\s*\(|{_PR_CELL_DASH}(?:\s|$)|$)"
+)
+#: The markup a table cell wraps around a value, and the separators of a cell that lists identifiers.
+_PR_CELL_MARKUP = re.compile(_PR_MARKUP)
+#: The characters _PR_MARKUP matches plus a space, as str.strip takes them, to trim only a cell's ends.
+_PR_CELL_EDGE = " *`_\"'"
+#: No "\s*" around a separator: on a long run of spaces it backtracks quadratically, so whitespace is a
+#: separator of its own and the empty parts are dropped.
+_PR_CELL_LIST = re.compile(r"[,;/&+]|(?i:\band\b)|\s+")
+#: A requirement lead ("ASVS", "ASVS V", "V") before a cell's identifier, dropped from both sides of
+#: the comparison, since an identifier's match carries its lead only when the lead touches the digits.
+_PR_CELL_ID_LEAD = re.compile(r"(?i)(?<![A-Za-z0-9])(?:asvs[\s:-]*v?|v)(?=\d)")
 #: The record's own nouns carrying the verdict when the identifier is a clause away: "held the cell at
 #: partial", "the cell stays partial", "its re-score to pass". Read inside _PR_WINDOW like a gap word,
 #: because "cell" or "re-score" beside a verdict is record vocabulary, not ordinary English.
@@ -494,12 +581,25 @@ _PR_PROSE_VERDICT = re.compile(
     rf"(?i)\b(?:cells?|row){_PR_SEP}(?:is{_PR_SEP}|was{_PR_SEP}|confirmed{_PR_SEP})?"
     rf"(?:{_PR_STATE_VERB}|held|reading){_PR_SEP}{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
     rf"|\bheld{_PR_SEP}(?:(?:the|both|its|each|that){_PR_SEP})?cells?{_PR_SEP}at{_PR_SEP}{_PR_FMT}{_PR_VERDICT}"
-    rf"|\bre-?(?:score|grade|read)\w*{_PR_SEP}(?:to|(?:can{_PR_SEP})?reach(?:es|ed)?){_PR_SEP}"
-    rf"{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
+    rf"|\bre-?(?:score|grade|read)\w*{_PR_SEP}(?:{_PR_MODAL}{_PR_SEP})?"
+    rf"(?:to|reach(?:es|ed)?){_PR_SEP}{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT}"
+)
+#: The verdict held with a pronoun or no object: "held it at partial", "holds partial". The same words
+#: are ordinary engine prose ("the framer holds partial frames", "capped at na fields"), so this binds
+#: only a marked identifier or a verdict that ends its clause (_PR_VERDICT_END).
+_PR_BARE_HOLD = re.compile(
+    rf"(?i){_PR_NB}{_PR_HOLD_VERB}(?:{_PR_SEP}(?:it|them|both|each))?{_PR_SEP}(?:at{_PR_SEP})?"
+    rf"{_PR_QUALIFIER}{_PR_FMT}{_PR_VERDICT_STATE}"
 )
 _PR_GAP = re.compile(
     r"(?i)\b(?:gaps?|residuals?|shortfalls?|unimplemented|unmet"
     r"|not (?:yet )?(?:implemented|built|covered|met|reachable))\b"
+)
+#: Gap words the record uses that are also ordinary English ("on the grounds that", "incomplete
+#: reads", "the router omits it"), so they bind only an identifier the text marks as a requirement.
+_PR_GAP_MARKED = re.compile(
+    rf"(?i){_PR_NB}(?:incomplete|lack(?:s|ed|ing)?|omit(?:s|ted)?|omissions?|grounds?"
+    rf"|(?:still|falls?|fell|falling){_PR_SEP}short){_PR_NA}"
 )
 #: A source path, a path under one of this repository's code roots, a dotted engine module, or a link to
 #: a file on GitHub. Docs are deliberately not code here: the ruled kind is a map to the code that
@@ -507,8 +607,33 @@ _PR_GAP = re.compile(
 _PR_CODE = re.compile(
     r"(?<![\w/.-])(?:[\w.-]+/)*[\w-]+\.(?:py|pyi|pyx|ts|tsx|js|mjs|cjs|ps1|psm1|sh|ya?ml)\b"
     r"|(?<![\w/.-])(?:messagefoundry\w*|harness|ide|tee|packaging|scripts|tests)/[\w./-]+"
-    r"|\bmessagefoundry\w*(?:\.\w+)+"
+    # A dotted engine module, also as a regular expression escapes it (`messagefoundry\.anon`).
+    r"|\bmessagefoundry\w*(?:\\?\.\w+)+"
     r"|\bgithub\.com/[\w.-]+/[\w.-]+/(?:blob|tree)/\S+"
+)
+#: A code symbol in backticks rather than a path: a call, a private name, a snake_case name, or a dotted
+#: attribute carrying an underscore or a class name. A plain word, a version, a hyphenated label and a
+#: file or domain name do not have that shape. A symbol is weaker evidence than a path, because a
+#: setting or an HL7 helper beside an HL7 version has it too, so it binds only a marked identifier.
+#: A call runs to the closing backtick (`f(g(x))`, `load(p).routers`) and takes no "->" tail, so one
+#: run of characters reaches the backtick and nothing overlaps it to backtrack on.
+_PR_SYMBOL = re.compile(
+    r"`(?:def\s+|class\s+)?(?:_?[A-Za-z]\w*(?:\.\w+)*\([^`\n]*"
+    r"|(?:_\w+(?:\.\w+)*"
+    r"|[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+"
+    r"|(?=[A-Z]|[\w.]*(?:_|\.[A-Z]))[A-Za-z]\w*"
+    r"(?:\.(?!(?i:md|rst|txt|toml|json|lock|html?|ini|cfg|hl7|xml|csv|log|org|com|io|net)`)"
+    r"[A-Za-z_]\w*)+)"
+    r"(?:\s*->[^`\n]*)?)`"
+)
+#: An identifier the text itself marks as a requirement: "ASVS <id>", "cell <id>", "<id> row". Weaker
+#: evidence may bind it. A bare `V` lead does not mark one: "V2.1.3" is also how a version is written,
+#: and so is a possessive ("2.5.1's segment grammar"). "ASVS" does, however it is set off from the
+#: identifier ("ASVS V<id>", "ASVS `<id>`", "ASVS: <id>", "asvs <id>").
+_PR_MARK_BEFORE = re.compile(rf"(?i){_PR_NB}(?:cells?|requirements?|asvs)[\s*`_:]*$")
+#: One separator class only: a markup class before _PR_SEP overlaps it and backtracks quadratically.
+_PR_MARK_AFTER = re.compile(
+    rf"(?i){_PR_SEP}(?:cell|row|requirement|anchor|limb|ground|clause|re-?score|re-?read)s?{_PR_NA}"
 )
 #: How far a gap word or a code path may sit from the identifier, inside one sentence.
 _PR_WINDOW = 80
@@ -581,24 +706,99 @@ def _pr_requirement_ids(text: str) -> list[tuple[re.Match[str], bool]]:
     return found
 
 
-def _pr_verdict_bound(text: str, m: re.Match[str], version: bool) -> bool:
+#: The gap and map evidence in one window: (gap word, marked-only gap word, code path, code symbol).
+_PrEvidence = tuple[bool, bool, bool, bool]
+
+
+def _pr_evidence(window: str) -> _PrEvidence:
+    return (
+        _PR_GAP.search(window) is not None,
+        _PR_GAP_MARKED.search(window) is not None,
+        _PR_CODE.search(window) is not None,
+        _PR_SYMBOL.search(window) is not None,
+    )
+
+
+def _pr_marked(text: str, m: re.Match[str]) -> bool:
+    """Whether the text names the identifier as a requirement, not just a number of that shape."""
+    return bool(
+        (m.group("lead") or "").startswith("ASVS")
+        or _PR_MARK_BEFORE.search(text, max(0, m.start() - 20), m.start())
+        or _PR_MARK_AFTER.match(text, m.end())
+    )
+
+
+def _pr_verdict_bound(text: str, m: re.Match[str], version: bool, marked: bool) -> bool:
     before = text[max(0, m.start() - 60) : m.start()]
     after = text[m.end() : m.end() + 80]
-    if not version and _PR_VERDICT_BEFORE.search(before):
+    if not version and (
+        _PR_VERDICT_BEFORE.search(before) or (marked and _PR_VERB_BEFORE.search(before))
+    ):
         return True
     hit = _PR_VERDICT_AFTER.match(after)
     if hit is None:
         return False
+    modal = hit.group("modal")
+    if hit.group("strong") is not None or (modal and _PR_MODAL_STRONG.search(modal)):
+        return True
     if version:
-        return hit.group("strong") is not None
+        return False
+    ends = _PR_VERDICT_END.match(after, hit.end()) is not None
+    if modal is not None:
+        return marked or ends
+    if hit.group("as") is not None:
+        return marked
     # A bare "to" is only a verdict binding after a move verb; every other state verb stands alone.
-    return hit.group("to") is None or _PR_MOVE_LEAD.search(before) is not None
+    if hit.group("to") is not None:
+        return _PR_MOVE_LEAD.search(before) is not None or (
+            marked and _PR_MARKED_MOVE_LEAD.search(before) is not None
+        )
+    return (
+        marked
+        or _PR_PLAIN_VERDICT_AFTER.match(after) is not None
+        or (ends and _PR_VERDICT_STATE_RE.fullmatch(hit.group("verdict")) is not None)
+    )
 
 
-def _pr_table_verdict(row: str, ids: set[str]) -> bool:
-    """A table row with an identifier cell and a cell that is nothing but a verdict, wherever it sits."""
-    cells = [c.strip(" *`_\"'") for c in row.strip().strip("|").split("|")]
-    return any(c in ids for c in cells) and any(_PR_CELL_VERDICT.fullmatch(c) for c in cells)
+def _pr_prose_verdict(window: str, marked: bool) -> bool:
+    """The record's nouns and hold verbs carrying a verdict a clause away from the identifier."""
+    if _PR_PROSE_VERDICT.search(window):
+        return True
+    return any(
+        marked or _PR_VERDICT_END.match(window, hold.end())
+        for hold in _PR_BARE_HOLD.finditer(window)
+    )
+
+
+def _pr_table_verdict(row: str, ids: set[str], marked: bool) -> bool:
+    """A table row with an identifier cell and a cell that is nothing but a verdict, wherever it sits.
+    The identifier cell may list several, split by a comma, semicolon, slash, "&", "+", "and" or
+    whitespace, each with or without its ASVS or V lead. A cell that opens with a bare verdict and
+    goes on binds only a row whose identifier is marked (_PR_CELL_VERDICT_LEAD).
+
+    Every cell, identifier or verdict, is read twice, and either reading may match. Trimmed at its
+    ends only, as engine PR 2448 read it, the markup inside it stays where the cell patterns expect
+    it ("stays`partial`" through _PR_SEP, "isn't met" as a contraction). With all its markup deleted,
+    a lead or a verdict reads beside its neighbour ("ASVS `<id>`", "unchanged, `partial`.")."""
+    if not ids:
+        return False
+    raw = row.strip().strip("|").split("|")
+    cells = [c.strip(_PR_CELL_EDGE) for c in raw] + [
+        _PR_CELL_MARKUP.sub("", c).strip() for c in raw
+    ]
+    keys = {_PR_CELL_ID_LEAD.sub("", i) for i in ids}
+
+    def lists_ids(cell: str) -> bool:
+        parts = [p for p in _PR_CELL_LIST.split(_PR_CELL_ID_LEAD.sub("", cell)) if p]
+        return bool(parts) and all(p in keys for p in parts)
+
+    def opens_with_verdict(cell: str) -> bool:
+        lead = _PR_CELL_VERDICT_LEAD.match(cell)
+        return lead is not None and (marked or lead.group("prefix") is not None)
+
+    return any(lists_ids(c) for c in cells) and any(
+        _PR_CELL_VERDICT.fullmatch(c) or opens_with_verdict(c) for c in cells
+    )
 
 
 def _pr_sentences(unit: str, is_row: bool) -> list[tuple[int, str]]:
@@ -631,26 +831,38 @@ def scan_pr_body(body: str) -> list[str]:
                     found["verdict"] = pair.start()
                     break
             ids = _pr_requirement_ids(sentence)
+            # A table pairs an identifier cell with any other cell, so a row is one whole window, and
+            # its searches run once rather than once per identifier: a row is unbounded in length.
+            evidence: _PrEvidence | None = None
+            row_marked = False
             for m, version in ids:
-                # A table pairs an identifier cell with any other cell, so a row is one whole window.
                 window = (
                     sentence
                     if is_row
                     else sentence[max(0, m.start() - _PR_WINDOW) : m.end() + _PR_WINDOW]
                 )
+                marked = not version and _pr_marked(sentence, m)
+                row_marked = row_marked or marked
                 if "verdict" not in found and (
-                    _pr_verdict_bound(sentence, m, version)
-                    or (not version and not is_row and _PR_PROSE_VERDICT.search(window))
+                    _pr_verdict_bound(sentence, m, version, marked)
+                    or (not version and not is_row and _pr_prose_verdict(window, marked))
                 ):
                     found["verdict"] = m.start()
-                if version:
+                if version or ("gap" in found and "map" in found):
                     continue
-                if "gap" not in found and _PR_GAP.search(window):
+                if evidence is None or not is_row:
+                    evidence = _pr_evidence(window)
+                gap, marked_gap, code, symbol = evidence
+                if "gap" not in found and (gap or (marked_gap and marked)):
                     found["gap"] = m.start()
-                if "map" not in found and _PR_CODE.search(window):
+                if "map" not in found and (code or (symbol and marked)):
                     found["map"] = m.start()
             requirement_ids = {m.group(0) for m, version in ids if not version}
-            if is_row and "verdict" not in found and _pr_table_verdict(sentence, requirement_ids):
+            if (
+                is_row
+                and "verdict" not in found
+                and _pr_table_verdict(sentence, requirement_ids, row_marked)
+            ):
                 found["verdict"] = 0
             for kind in PR_BODY_REASONS:
                 if kind in found:
@@ -741,7 +953,7 @@ def forbidden_path_reason(posix: str) -> str | None:
 
 # --------------------------------------------------------------------------------------------------
 # Token authority (EXTERNALIZED -- never committed). These module globals are (re)computed by
-# ``reload_tokens()`` and read by the anonymizer leak-check bridges (messagefoundry/anon/leak.py and
+# ``reload_tokens()`` and read by the anonymizer leak-check bridges (messagefoundry_toolkit/anon/leak.py and
 # tee/anon/leak.py) as the single source of truth, so their names/shapes are a stable public contract.
 # --------------------------------------------------------------------------------------------------
 

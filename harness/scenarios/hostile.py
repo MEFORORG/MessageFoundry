@@ -75,14 +75,14 @@ from harness.scenarios._core import (
     control_id_of,
 )
 from messagefoundry.apiclient import ApiError, EngineClient
-from messagefoundry.generators import (
-    _core,
-    all_types,  # noqa: F401  (registers the built-in message types)
-)
 from messagefoundry.parsing import HL7PeekError, normalize
 from messagefoundry.parsing._builtin_hl7 import _HEX_ESCAPED_CONTROLS
 from messagefoundry.parsing.message import Message, reencode_with_separators
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
+from messagefoundry_toolkit.generators import (
+    _core,
+    all_types,  # noqa: F401  (registers the built-in message types)
+)
 
 #: The data file of hostile values, loaded at run time.
 VALUES_FILE = Path(__file__).with_name("hostile_values.toml")

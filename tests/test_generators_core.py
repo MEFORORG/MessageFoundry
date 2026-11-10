@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The shared generator registry/core (``messagefoundry/generators/_core.py``)."""
+"""The shared generator registry/core (``messagefoundry_toolkit/generators/_core.py``)."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.generators import _core, adt  # importing adt registers the ADT spec
 from messagefoundry.parsing import Peek
+from messagefoundry_toolkit.generators import _core, adt  # importing adt registers the ADT spec
 
 
 def test_adt_is_registered() -> None:

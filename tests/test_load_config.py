@@ -20,10 +20,13 @@ from harness.load._lookup import SIBLING_PATTERNS
 from harness.load.profile import PROFILES_DIR, LoadProfileError, load_profile
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.wiring import load_config
-from messagefoundry.generators import _core, all_types  # noqa: F401  (registers message types)
 from messagefoundry.parsing import Peek, normalize
 from messagefoundry.pipeline.dryrun import dry_run
 from messagefoundry.transports.mllp import DEFAULT_MAX_CONNECTIONS_PER_HOST
+from messagefoundry_toolkit.generators import (  # noqa: F401  (registers message types)
+    _core,
+    all_types,
+)
 
 _CONFIG = "harness/config/load"
 

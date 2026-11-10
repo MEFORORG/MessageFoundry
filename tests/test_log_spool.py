@@ -1282,3 +1282,34 @@ def test_open_removes_only_the_directories_it_made_when_it_fails_partway(
         LogSpool(target, max_bytes=1_000).open()
     monkeypatch.undo()
     assert list(tmp_path.iterdir()) == []  # the parent it made on the way is gone too
+
+
+def test_a_replayed_lone_surrogate_is_sent_escaped_not_dropped(spool_dir: Path) -> None:
+    """BACKLOG #2279 item 2a. The spool writes a raw caller's lone surrogate (the encode fallback),
+    but the send's UTF-8 encode refused it, so replay dropped the entry as undeliverable. Replay
+    now escapes the surrogate the way the near-side scrub would, and nothing else: a spooled
+    text-format traceback keeps its real line breaks, as the same record sent live does."""
+    spool = LogSpool(spool_dir, max_bytes=1_000_000)
+    spool.open()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as collector:
+        collector.bind(("127.0.0.1", 0))
+        collector.settimeout(5.0)
+        target = _TimeoutSysLogHandler(
+            address=("127.0.0.1", collector.getsockname()[1]), socktype=socket.SOCK_DGRAM
+        )
+        fwd = _build_queued_forwarder(target, fmt="text", spool=spool)
+        try:
+            assert fwd._listener.stop_within(1.0)  # drive the listener by hand, deterministically
+            fwd._listener._drain_deadline = None  # replay runs only outside a drain
+            fwd._listener._retry_at = 0.0
+            assert spool.append(SpoolEntry(level="WARNING", line="bad byte \udc80 here"))
+            block = "failed \\u0085\n    | Traceback (most recent call last):\n    | ValueError: x"
+            assert spool.append(SpoolEntry(level="ERROR", line=block))
+            fwd._listener._replay()
+            first, second = collector.recv(4096), collector.recv(4096)
+            assert fwd._listener.undeliverable == 0
+            assert first.endswith(b"bad byte \\\\udc80 here\x00")
+            assert second.endswith(block.encode("ascii") + b"\x00")  # sent as spooled
+            assert not spool.pending
+        finally:
+            fwd.close()
