@@ -92,6 +92,7 @@ imports. It depends only on ``config`` (the :class:`RunContext` shape), its own 
 
 from __future__ import annotations
 
+import collections
 import contextvars
 import enum
 import logging
@@ -187,20 +188,27 @@ class SandboxMode(str, enum.Enum):  # noqa: UP042
 class KillCause(str, enum.Enum):  # noqa: UP042
     """Why a :class:`SandboxSession` killed its worker: a closed set (vault BACKLOG #3135).
 
-    A session records the cause of its last kill in :attr:`SandboxSession.last_kill_cause`, and
-    every kill but :attr:`GRAPH_MISMATCH` writes one WARNING naming the inbound, the dispatch phase
-    and this token, never any message content or exception text. A reap that is not a kill records
-    nothing: closing a session with no worker, the prior generation's reap at the top of a spawn,
-    and the reap after a queued EOF, which only says the peer died.
+    A session records each kill: the last cause in :attr:`SandboxSession.last_kill_cause` and a
+    count per cause in :attr:`SandboxSession.kill_counts`. Every kill but :attr:`GRAPH_MISMATCH`
+    and :attr:`SHUTDOWN` writes one WARNING naming the inbound, the phase of the dispatch that
+    killed the worker and this token, never any message content or exception text. The phase is the
+    dispatch running when the kill happened, which for :attr:`UNSOLICITED_BEFORE` is not
+    necessarily the code that wrote the frame.
+
+    A reap that is not a kill records nothing: closing a session with no live worker, the prior
+    generation's reap at the top of a spawn (a worker that died between dispatches on its own), and
+    the reap after a queued EOF, which only says the peer died.
 
     There is no CPU-cap cause: the engine sets no ``RLIMIT_CPU`` (engine PR 2133), and the wall
-    cap is the bound. A request the codec refuses before a byte is written kills nothing, so it
-    has no cause either."""
+    cap is the bound. A request the codec refuses, or one over the frame cap, is refused before a
+    byte is written and kills nothing, so it has no cause either."""
 
     #: The worker answered that it ran out of memory and exits, so it is reaped (vault BACKLOG #3133).
     MEMORY_CAP = "memory_cap"
-    #: The worker loaded a graph that differs from the engine's. No WARNING here: the runner raises
-    #: the ``sandbox_worker_refused`` alert for it.
+    #: The worker loaded a graph that differs from the engine's. No WARNING here: the runner logs
+    #: and raises the ``sandbox_worker_refused`` alert for a refusal against the graph it serves. A
+    #: refusal against a graph a reload has since replaced it drops silently, and this record is
+    #: then the only trace of the kill.
     GRAPH_MISMATCH = "graph_mismatch"
     #: The boot frame could not be written to the new worker.
     BOOT_WRITE = "boot_write"
@@ -230,12 +238,19 @@ class KillCause(str, enum.Enum):  # noqa: UP042
     UNSOLICITED_BEFORE = "unsolicited_before"
     #: A frame no request asked for was waiting after a dispatch's answer.
     UNSOLICITED_AFTER = "unsolicited_after"
-    #: The session was closed, at engine stop or when a reload replaced it.
+    #: The session was closed with a live worker, at engine stop or when a reload replaced it. An
+    #: orderly stop, not a fault, so it logs at INFO rather than WARNING.
     SHUTDOWN = "shutdown"
 
 
 #: The kill causes that write no WARNING of their own, because the runner already alerts on them.
 _RUNNER_ALERTED: Final = frozenset({KillCause.GRAPH_MISMATCH})
+
+#: The cause of an unsolicited frame, by when it was found.
+_UNSOLICITED: Final = {
+    "before": KillCause.UNSOLICITED_BEFORE,
+    "after": KillCause.UNSOLICITED_AFTER,
+}
 
 
 @dataclass(frozen=True)
@@ -777,9 +792,11 @@ class SandboxSession:
         self._generation = 0
         self._lock = threading.Lock()
         self._closed = False
-        # Why this session last killed its worker, or ``None`` before the first kill (vault BACKLOG
-        # #3135). A pooled worker or a per-lane kill budget reads it.
+        # Why this session last killed its worker, or ``None`` before the first kill, and how many
+        # kills it has made per cause (vault BACKLOG #3135). A pooled worker or a per-lane kill
+        # budget reads them.
         self.last_kill_cause: KillCause | None = None
+        self.kill_counts: collections.Counter[KillCause] = collections.Counter()
         # The [egress] lists whose empty-list refusal this session has logged.
         self._lookup_refusals_logged: set[str] = set()
         # Per (kind, connection), the completion event of the runner call running on it, removed by
@@ -818,6 +835,8 @@ class SandboxSession:
                 code_sets=self._code_sets,
                 broker=self.policy.mode is SandboxMode.ISOLATED,
             )
+            if len(boot) > _MAX_FRAME:
+                raise SandboxError(f"sandbox frame too large: {len(boot)} bytes")
         except (OSError, ValueError, SandboxError) as exc:  # WiringError is a ValueError
             raise SandboxError(f"failed to bootstrap sandbox worker: {exc}") from exc
         # A fresh response queue per spawn so a prior (killed) worker's trailing EOF can't leak into
@@ -993,13 +1012,16 @@ class SandboxSession:
 
         The WARNING is built from the inbound, ``phase`` and the cause token alone, never from a
         message's content or an exception's text, which can carry it (CLAUDE.md section 9). A cause
-        in :data:`_RUNNER_ALERTED` writes none. With no ``proc`` nothing is killed, so nothing is
-        recorded. A reap that is not a kill calls :meth:`_reap` instead."""
+        in :data:`_RUNNER_ALERTED` writes none, and :attr:`KillCause.SHUTDOWN` writes it at INFO.
+        With no ``proc`` nothing is killed, so nothing is recorded. A reap that is not a kill calls
+        :meth:`_reap` instead."""
         if proc is None:
             return
         self.last_kill_cause = cause
+        self.kill_counts[cause] += 1
         if cause not in _RUNNER_ALERTED:
-            log.warning(
+            log.log(
+                logging.INFO if cause is KillCause.SHUTDOWN else logging.WARNING,
                 "inbound %r: sandbox worker killed during %s (cause=%s)",
                 self._inbound,
                 phase,
@@ -1035,7 +1057,10 @@ class SandboxSession:
         """Stop the worker cleanly (idempotent). Safe to call from a shutdown path."""
         with self._lock:
             self._closed = True
-            self._kill(self._proc, KillCause.SHUTDOWN, "shutdown")
+            if self._proc is not None and self._proc.poll() is not None:
+                self._reap(self._proc)  # it died on its own: nothing is killed here
+            else:
+                self._kill(self._proc, KillCause.SHUTDOWN, "close")
             for thread in self._threads:
                 # A bounded join, and ONLY on the shutdown path. The stderr relay LOGS, and a daemon
                 # thread that logs can still be inside a handler's ``emit`` when ``logging.shutdown``
@@ -1050,7 +1075,7 @@ class SandboxSession:
             self._threads = []
 
     def _reject_unsolicited(
-        self, proc: subprocess.Popen[bytes] | None, when: str, phase: str = "dispatch"
+        self, proc: subprocess.Popen[bytes] | None, when: str, phase: str
     ) -> None:
         """Drop the worker if anything is pending that no outstanding request asked for.
 
@@ -1093,8 +1118,7 @@ class SandboxSession:
         if stray is _EOF:
             self._reap(proc)  # the peer is already gone
             return
-        cause = KillCause.UNSOLICITED_BEFORE if when == "before" else KillCause.UNSOLICITED_AFTER
-        self._kill(proc, cause, phase)
+        self._kill(proc, _UNSOLICITED[when], phase)
         raise SandboxError(
             f"sandbox worker wrote an unsolicited response frame {when} a dispatch — "
             "the pipe is not trustworthy"
@@ -1434,16 +1458,15 @@ class SandboxSession:
         with self._lock:
             if self._closed:
                 raise SandboxSessionClosed("sandbox session is closed")
-            proc = self._live_worker(phase)
-            assert proc.stdin is not None
             # A FRESH unpredictable id per dispatch, not a counter: the worker learns it only when it
-            # reads this request frame, which the check above proves is the first thing it can answer.
-            # A derivable id (a per-spawn nonce plus a sequence) let the code running dispatch N
-            # compute N+1's and pre-stage its answer.
+            # reads this request frame, so nothing it ran before can know it. A derivable id (a
+            # per-spawn nonce plus a sequence) let the code running dispatch N compute N+1's and
+            # pre-stage its answer.
             request_id = secrets.token_hex(16)
-            # Encoded BEFORE the write, outside its try: a payload or run-context outside the closed
-            # grammar is refused with no byte written, so the worker is still in step and is kept
-            # (vault BACKLOG #3135). Only this message fails.
+            # Encoded and size-checked BEFORE a worker is resolved and outside the write's try: a
+            # payload or run-context outside the closed grammar, or a frame over the cap, is refused
+            # with no byte written, so the worker is still in step and is kept, and no worker is
+            # started for a message that cannot be sent (vault BACKLOG #3135). Only this message fails.
             try:
                 request = codec.encode_request(
                     request_id=request_id,
@@ -1453,8 +1476,12 @@ class SandboxSession:
                     origin=origin,
                     run_context=run_context,
                 )
+                if len(request) > _MAX_FRAME:
+                    raise SandboxError(f"sandbox frame too large: {len(request)} bytes")
             except SandboxError as exc:
                 raise SandboxError(f"failed to marshal sandbox {phase} {name!r}: {exc}") from exc
+            proc = self._live_worker(phase)
+            assert proc.stdin is not None
             try:
                 _write_frame(proc.stdin, request)
             except (OSError, SandboxError) as exc:
@@ -1463,21 +1490,21 @@ class SandboxSession:
                 self._kill(proc, KillCause.REQUEST_WRITE, phase)
                 raise SandboxError(f"failed to send sandbox {phase} {name!r}: {exc}") from exc
             resp = self._await_answer(proc, request_id, phase, name)
+            if not resp.ok and resp.kind == codec.FAIL_MEMORY:
+                # The worker exits after this reply. Kill it now, before the unsolicited check,
+                # which would otherwise take the exit's EOF and reap it with no cause recorded; the
+                # next dispatch starts a fresh worker with a fresh queue (vault BACKLOG #3133, #3135).
+                self._kill(proc, KillCause.MEMORY_CAP, phase)
+                # The worker's text names the cap it set, or says it set none.
+                raise SandboxError(
+                    f"sandbox {phase} {name!r} ran out of memory, and its worker was "
+                    f"recycled: {resp.error}"
+                )
             # One request, one frame: a second FRAME already queued means the worker is writing frames
             # nobody asked for, so this answer is not trustworthy either. (A queued EOF is only a dead
             # peer — it reaps the worker and leaves this proven answer standing.)
             self._reject_unsolicited(proc, "after", phase)
             if not resp.ok:
-                if resp.kind == codec.FAIL_MEMORY:
-                    # The worker exits after this reply. Reap it now, so the next dispatch starts a
-                    # fresh one rather than writing to a worker on its way out (vault BACKLOG #3133).
-                    if proc is self._proc:
-                        self._kill(proc, KillCause.MEMORY_CAP, phase)
-                    # The worker's text names the cap it set, or says it set none.
-                    raise SandboxError(
-                        f"sandbox {phase} {name!r} ran out of memory, and its worker was "
-                        f"recycled: {resp.error}"
-                    )
                 verdict = "denied" if resp.kind == "denied" else "failed"
                 raise SandboxError(f"sandbox {verdict} {phase} {name!r}: {resp.error}")
             return resp.result

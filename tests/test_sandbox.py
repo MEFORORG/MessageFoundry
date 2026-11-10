@@ -343,6 +343,7 @@ def test_busy_loop_is_wall_capped_and_recovers(graph: tuple[Registry, str]) -> N
         elapsed = time.monotonic() - started
         # Capped near the wall bound (not hung indefinitely) — the parent killed the runaway child.
         assert elapsed < 10.0
+        assert session.last_kill_cause is sandbox_mod.KillCause.WALL_CAP
         # A fresh child respawns transparently for the next message (intake was never wedged).
         assert (
             _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())[0][0] == "OB_T"
@@ -688,6 +689,7 @@ def test_a_memory_error_is_reported_as_the_memory_cap_and_recycles_the_worker(
         with pytest.raises(SandboxError, match="ran out of memory, and its worker was recycled"):
             _deliveries(registry, "h_oom", sandbox=session, run_context=RunContext())
         assert session._proc is None
+        assert session.kill_counts == {sandbox_mod.KillCause.MEMORY_CAP: 1}
         assert _deliveries(
             registry, "h_ok", sandbox=session, run_context=RunContext()
         ) == _deliveries(registry, "h_ok")
@@ -1028,7 +1030,7 @@ def test_a_dead_peer_is_not_treated_as_a_forged_frame(graph: tuple[Registry, str
 
         # A dead peer: the worker is dropped (it is gone), but the answer in hand still stands.
         session._responses.put(_EOF)
-        session._reject_unsolicited(proc, "after")  # must NOT raise
+        session._reject_unsolicited(proc, "after", "transform")  # must NOT raise
         assert session._proc is None
 
         # A frame in the very same slot is still fatal, and still named as unsolicited.
@@ -1042,7 +1044,7 @@ def test_a_dead_peer_is_not_treated_as_a_forged_frame(graph: tuple[Registry, str
         session._responses = queue.Queue()
         session._responses.put(b"\x00\x00\x00\x02{}")
         with pytest.raises(SandboxError, match="unsolicited"):
-            session._reject_unsolicited(session._proc, "after")
+            session._reject_unsolicited(session._proc, "after", "transform")
 
         # Either way the next message is served by a clean child, identically to mode=off.
         assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == expected
@@ -1945,8 +1947,8 @@ def test_a_forged_frame_kill_records_its_cause_and_warns_without_content(
     graph: tuple[Registry, str], caplog: pytest.LogCaptureFixture
 ) -> None:
     """Steps 1 and 2: the kill records a cause from the closed set and writes one WARNING built
-    from the inbound, the phase and the cause token, never from the error text, which can quote
-    the message."""
+    from the inbound, the phase and the cause token. That no error text reaches it is pinned with a
+    positive control in the request-write test below."""
     registry, config_dir = graph
     session = _session(config_dir)
     caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
@@ -1959,9 +1961,6 @@ def test_a_forged_frame_kill_records_its_cause_and_warns_without_content(
         assert len(warnings) == 1
         assert warnings[0].levelno == logging.WARNING
         assert warnings[0].args == ("IB_T", "transform", "invalid_frame")
-        # Nothing from the message or the forged frame reaches the line.
-        assert "FORGED" not in warnings[0].getMessage()
-        assert "DOE" not in warnings[0].getMessage()
     finally:
         session.close()
 
@@ -2023,16 +2022,37 @@ def test_a_reap_that_is_not_a_kill_records_nothing_and_does_not_warn(
     assert _kill_warnings(caplog) == []
 
 
-def test_closing_a_live_session_records_shutdown(
+def test_closing_a_live_session_records_shutdown_at_info(
     graph: tuple[Registry, str], caplog: pytest.LogCaptureFixture
 ) -> None:
+    """An orderly close is a kill with a cause, but not a fault, so its line is INFO."""
     registry, config_dir = graph
     session = _session(config_dir)
-    caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
-    _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
-    session.close()
+    caplog.set_level(logging.INFO, logger=sandbox_mod.log.name)
+    try:
+        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+    finally:
+        session.close()
     assert session.last_kill_cause is KillCause.SHUTDOWN
-    assert [r.args for r in _kill_warnings(caplog)] == [("IB_T", "shutdown", "shutdown")]
+    lines = _kill_warnings(caplog)
+    assert [(r.levelno, r.args) for r in lines] == [(logging.INFO, ("IB_T", "close", "shutdown"))]
+
+
+def test_closing_a_session_whose_worker_died_records_no_kill(
+    graph: tuple[Registry, str],
+) -> None:
+    _, config_dir = graph
+    session = _session(config_dir)
+    try:
+        session._spawn("transform")
+        proc = session._proc
+        assert proc is not None
+        proc.kill()
+        proc.wait(timeout=10)
+    finally:
+        session.close()
+    assert session.last_kill_cause is None
+    assert not session.kill_counts
 
 
 def test_a_graph_refusal_records_its_cause_and_leaves_the_warning_to_the_runner(
@@ -2079,7 +2099,9 @@ def test_a_request_the_codec_refuses_keeps_the_worker(
 
 
 def test_a_request_write_that_fails_still_kills_the_worker(
-    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+    graph: tuple[Registry, str],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The control for step 3: a broken pipe or a partial write may leave part of a frame in the
     worker, so that path still fails closed and kills it."""
@@ -2091,13 +2113,40 @@ def test_a_request_write_that_fails_still_kills_the_worker(
         assert proc is not None
 
         def _broken(stream: object, body: bytes) -> None:
-            raise BrokenPipeError("the pipe broke")
+            # The error text carries a body token, so the WARNING check below can fail.
+            raise BrokenPipeError("the pipe broke on DOE^JANE")
 
         monkeypatch.setattr(sandbox_mod, "_write_frame", _broken)
-        with pytest.raises(SandboxError, match="failed to send"):
+        caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
+        with pytest.raises(SandboxError, match="failed to send") as caught:
             _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
         assert session._proc is None
         assert proc.poll() is not None
         assert session.last_kill_cause is KillCause.REQUEST_WRITE
+        # Positive control: the error text has the token; the WARNING does not.
+        assert "DOE^JANE" in str(caught.value)
+        warnings = _kill_warnings(caplog)
+        assert [r.args for r in warnings] == [("IB_T", "transform", "request_write")]
+        assert "DOE" not in warnings[0].getMessage()
+    finally:
+        session.close()
+
+
+def test_a_request_over_the_frame_cap_keeps_the_worker(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A frame over the cap is refused before a byte is written, like a codec refusal."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        proc = session._proc
+        assert proc is not None
+        monkeypatch.setattr(sandbox_mod, "_MAX_FRAME", 16)
+        with pytest.raises(SandboxError, match="frame too large"):
+            _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        assert session._proc is proc
+        assert proc.poll() is None
+        assert session.last_kill_cause is None
     finally:
         session.close()
