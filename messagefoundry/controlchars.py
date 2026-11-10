@@ -46,16 +46,17 @@ allowlist rather than by the predicate; its bullet below gives the encoding. The
     document from ``json.dumps`` without ``indent`` still parses after it (vault BACKLOG #3012):
     that output holds no character of the alphabet outside a string. A document with a CR or LF
     between tokens, an indented one for example, does not, because ``\\n`` is not JSON there.
-  * QUOTE -- one ``key=value`` field of a log line, :func:`log_field_token`. ESCAPE keeps a
-    value on one line but leaves its spaces, quotes and ``=`` alone, so a value logged before
-    another field can still write a field of its own. QUOTE writes everything but a safe alphabet
-    as ``_uXXXX_`` and wraps the result in quotes, so the value holds no space, quote, ``:`` or ``=``
-    with which to end its field or write another, nor any separator a handler filter's match needs
-    to reach past its quotes (BACKLOG #3770). A filter may still rewrite a run of kept characters
-    inside the field, a date for example. :func:`quote_log_text` is a separate JSON-quoted form for text printed to a terminal, such as a check line, which no handler filter reads; a
-    credential scrub can close it early, so it is not for any text a handler filter reads, a last
-    field or a whole message included. QUOTE changes the
-    value's spelling, so it does not replace ESCAPE on a whole line.
+  * QUOTE -- one ``key=value`` field of a log line, :func:`log_field_token`. ESCAPE keeps a value on
+    one line but leaves its spaces, quotes and ``=`` alone, so a value logged before another field
+    can still write a field of its own. QUOTE writes everything but a safe alphabet as ``_uXXXX_``
+    and wraps the result in quotes, so the value holds no space, quote, ``:`` or ``=`` with which to
+    end its field or write another, nor any separator a handler filter's match needs to reach past
+    its quotes (BACKLOG #3770). A filter may still rewrite a run of kept characters inside the
+    field, a date for example. :func:`quote_log_text` is a separate JSON-quoted form for text
+    printed to a terminal, such as a check line, which no handler filter reads; a credential scrub
+    can close it early, so it is not for any text a handler filter reads, a last field or a whole
+    message included. QUOTE changes the value's spelling, so it does not replace ESCAPE on a whole
+    line.
 
 WHY ESCAPE LIVES HERE, WHICH IS THE ONE FACT WORTH STATING ONCE (BACKLOG #1591). It was defined in
 ``logging_setup`` until ``logging_guard`` needed it, and ``logging_setup`` imports
@@ -326,25 +327,23 @@ def scrub_log_argument(text: str) -> str:
 
 
 def quote_log_text(text: str) -> str:
-    """``text`` as one double-quoted token that its own content cannot close or extend.
+    """``text`` as one double-quoted token that its own content cannot close or extend, in text no
+    handler filter reads.
 
-    JSON string quoting escapes every quote and backslash, writes ``\\n``, ``\\r``, ``\\t``,
-    ``\\b`` and ``\\f`` for those controls, and every other character outside printable ASCII,
-    DEL included, as ``\\uXXXX``, a character past U+FFFF as a surrogate pair of them. So a value
-    cannot end its token and write a separator, a second entry or a mark after it, and a lookalike
-    quote such as U+02BA or U+FF02, or a right-to-left letter, cannot fake that end for a human
-    reader (vault BACKLOG #3139). The output is printable ASCII, and :func:`scrub_log_argument`
-    changes nothing in it. It stays as a guard should the ``json.dumps`` call ever drop
-    ``ensure_ascii``, and because CodeQL's ``py/log-injection`` accepts its line-break ``replace``
-    as the neutraliser and does not see ``json.dumps``.
+    JSON string quoting escapes every quote and backslash, writes ``\\n``, ``\\r``, ``\\t``, ``\\b``
+    and ``\\f`` for those controls, and every other character outside printable ASCII, DEL included,
+    as ``\\uXXXX``, a character past U+FFFF as a surrogate pair of them. So, in text no handler
+    filter reads, a value cannot end its token and write a separator, a second entry or a mark after
+    it, and a lookalike quote such as U+02BA or U+FF02, or a right-to-left letter, cannot fake that
+    end for a human reader (vault BACKLOG #3139). The output is printable ASCII, and
+    :func:`scrub_log_argument` changes nothing in it. It stays as a guard should the ``json.dumps``
+    call ever drop ``ensure_ascii``, and because CodeQL's ``py/log-injection`` accepts its
+    line-break ``replace`` as the neutraliser and does not see ``json.dumps``.
 
-    NOT FOR ANY TEXT A CONFIGURED HANDLER'S FILTERS READ, WHEREVER IT SITS IN THE LINE. The
-    credential scrub filters read the backslash before an escaped quote as part of a credential
-    value and replace it, so the token can close early, and the text after that quote then reads
-    as fields of its own. ``password=a" admin=true`` measured that way: it logs a closed token
-    followed by ``admin=true``, at least when the token is the last field of a line and when it is
-    the whole message (BACKLOG #3770). :func:`log_field_token` carries no backslash and no double
-    quote, so it survives them."""
+    NOT FOR ANY TEXT A CONFIGURED HANDLER'S FILTERS READ, WHEREVER IT SITS IN THE LINE. At least
+    the credential scrub and the redaction filters can close the token early or erase its closing
+    quote, and the text after it then reads as fields of its own (BACKLOG #3770). For a logged
+    field, use :func:`log_field_token`."""
     # Imported here, not at the top: the remote-debug guard imports this module before its hook
     # goes in, and json, with re and enum under it, would lengthen that window.
     import json

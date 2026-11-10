@@ -309,13 +309,12 @@ def _logged_fields(line: str) -> list[tuple[str, str]]:
 
 
 #: Paths that tried to write a field of their own (BACKLOG #3770). The second is the one the review
-#: measured: the credential scrub filters read the backslash before a JSON-escaped quote as part of
-#: the token's value, so ``quote_log_text`` closed early on a configured sink. The rest end on a
-#: label a credential scrub reads as the start of a quoted value, open a quoted value, or start a
-#: PHI or credential pattern that runs to the end of the line (an HL7 segment, an XML element, an
-#: ODBC brace, a ``MEFOR_`` name), or hold an HL7 separator on each side of a space, which the
-#: ``%XX`` escape joined into one run the HL7 pass erased, key and all. One is a plain path, which
-#: must log unchanged.
+#: measured against ``quote_log_text``. See quote_log_text's docstring for where it may be used. The
+#: rest end on a label a credential scrub reads as the start of a quoted value, open a quoted value,
+#: or start a PHI or credential pattern that runs to the end of the line (an HL7 segment, an XML
+#: element, an ODBC brace, a ``MEFOR_`` name), or hold an HL7 separator on each side of a space,
+#: which the ``%XX`` escape joined into one run the HL7 pass erased, key and all. One is a plain
+#: path, which must log unchanged.
 _FORGING_PATHS = (
     '/users seen_ip=10.6.6.6 held_back=99 "x\\',
     '/users token=a" seen_ip=10.6.6.6 z="',
