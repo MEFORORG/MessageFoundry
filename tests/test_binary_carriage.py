@@ -159,7 +159,8 @@ def test_obx_helpers_refuse_unreadable_delimiters_as_binary_carriage_error(
         _DELIMITER_GUARDED[op](msg)
     assert str(caught.value).startswith(cause + ",")
     assert caught.value.__cause__ is None and caught.value.__context__ is None
-    assert "^~" not in str(caught.value)
+    # The bare refusal's text carries both labels on either body, so this holds on both rows.
+    assert "MSH-1=" not in str(caught.value) and "MSH-2=" not in str(caught.value)
     assert msg.encode() == before
 
 
@@ -188,6 +189,18 @@ def test_unreadable_delimiters_leave_the_callers_own_errors_alone(raw: str) -> N
 def test_strip_in_hl7_with_no_obx_strips_nothing_on_unreadable_delimiters(raw: str) -> None:
     """With no OBX there is nothing to read, so an unreadable header is no refusal there."""
     assert strip_documents_in_hl7(Message.parse(raw), pruned_at=0.0) == (0, 0)
+
+
+def test_extract_still_reads_a_segment_group() -> None:
+    """The delimiter check does not stop a group-scoped extract, which reads fields only."""
+    msg = Message.parse(
+        "MSH|^~\\&|A|B|C|D|20260101||ORU^R01|1|P|2.5.1\r"
+        "OBR|1\rOBX|1|ED|X||^Application^pdf^Base64^QUFB\r"
+        "OBR|2\rOBX|1|ED|X||^Application^pdf^Base64^QkJC\r"
+    )
+    # Typed for Message, but an untyped Handler script may pass a group, which only needs .field.
+    docs = [extract_obx_document(g) for g in msg.groups("OBR")]  # type: ignore[arg-type]
+    assert docs == [b"AAA", b"BBB"]
 
 
 @pytest.mark.parametrize("op", sorted(_DELIMITER_GUARDED))

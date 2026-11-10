@@ -304,7 +304,7 @@ def embed_obx_document(
     Recover the bytes with :func:`extract_obx_document`."""
     # occurrence < 1 and an absent OBX stay Message.set's own refusals, which it raises before it
     # reads any delimiter; the check runs before the first set, so a refusal leaves nothing half-set.
-    if not _delimiters_readable(message) and 1 <= occurrence <= message.count_segments("OBX"):
+    if 1 <= occurrence <= message.count_segments("OBX") and not _delimiters_readable(message):
         raise _unreadable_delimiters_refusal(message, "no OBX field can be set; refusing the embed")
     message.set("OBX-2", "ED", occurrence=occurrence)
     message.set("OBX-5.2", type_of_data, occurrence=occurrence)
@@ -322,8 +322,13 @@ def extract_obx_document(message: Message, *, occurrence: int = 1) -> bytes:
     :class:`BinaryCarriageError` too when ``Message._encoding_chars`` cannot read the message's
     delimiters, such as an MSH-2 shorter than four characters or no MSH at all (BACKLOG #2873)."""
     # occurrence < 1 is left to Message.field, which refuses it as the caller's error before it
-    # reads any delimiter.
-    if occurrence >= 1 and not _delimiters_readable(message):
+    # reads any delimiter. A SegmentGroup from Message.groups() reads fields too and has no
+    # _encoding_chars of its own, so the check is skipped for it and its reads behave as before.
+    if (
+        occurrence >= 1
+        and hasattr(message, "_encoding_chars")
+        and not _delimiters_readable(message)
+    ):
         raise _unreadable_delimiters_refusal(
             message, "no OBX field can be read; refusing the extract"
         )
