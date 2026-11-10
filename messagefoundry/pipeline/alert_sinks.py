@@ -277,19 +277,21 @@ class _ResolveFence:
                     )
                 )
             except Exception as exc:
+                # Assumed, not observed: its own line, so the log never states a cause it did not see.
+                self.superseded = True
                 log.warning(
                     "alert-instance resolve for %s %r closed nothing and the re-read failed (%s); "
-                    "keeping its in-memory alert state",
+                    "assuming the instance is still open and keeping its in-memory alert state",
                     self._event_type,
                     self._connection,
                     type(exc).__name__,
                 )
-                live = True
+                return closed
             if live:
                 self.superseded = True
                 log.info(
-                    "alert-instance resolve for %s %r closed nothing: another process raised it "
-                    "after this clear, so it stays open",
+                    "alert-instance resolve for %s %r closed nothing: a live instance remains "
+                    "whose newest raise this clear does not speak for, so it stays open",
                     self._event_type,
                     self._connection,
                 )

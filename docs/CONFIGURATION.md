@@ -1878,9 +1878,11 @@ renamed or retired `[cluster].node_id`.
 Every engine process with an alert sink checks the open `intake_paused` alerts of the OTHER
 processes once a minute, and resolves one whose occurrence count has not moved for 20 minutes, four
 reminder intervals, of its own clock. A paused process that is alive raises a reminder every 5
-minutes, so its alert stays open while those writes reach the store. One that is paused and cannot
-reach the store has its alert expired while it is still paused, and its first reminder that lands
-again opens a new alert. So an alert expires only while some other engine process with an
+minutes, so its alert stays open while those writes reach the store. **The expiry reads only
+whether a reminder landed, by design: a process that is still paused but whose reminders stop
+reaching the store has its alert resolved while its intake stays paused.** At least a process cut
+off from the store, one whose reminder writes keep failing, and one whose intake check keeps
+raising do that. Its first reminder that lands again opens a new alert. So an alert expires only while some other engine process with an
 alert sink runs on the same store; no process expires its own. A process stopped for longer than 20
 minutes while another runs finds its pause resolved, and a pause that still holds when it starts
 opens a new alert. An operator's acknowledgement on the old alert goes with it, as it does on any

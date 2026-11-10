@@ -435,3 +435,47 @@ async def test_a_cancel_passed_on_by_the_monitor_still_lets_the_engine_close_the
         await engine.stop()
     assert closed == [True], "the store closed before the cancel went on"
     assert engine._intake_monitor is None
+
+
+@pytest.mark.parametrize("monitor_cancels", [True, False], ids=["cancel-deferred", "no-cancel"])
+async def test_a_later_teardown_step_that_raises_still_closes_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, monitor_cancels: bool
+) -> None:
+    """Round-4 item 2: the teardown after the monitor runs inside try/finally. The store closes
+    even if a later step raises, and a cancel the monitor passed on is what Engine.stop raises."""
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline.engine import Engine
+
+    engine = await Engine.create(
+        tmp_path / "engine.db", egress_settings=EgressSettings(deny_by_default=False)
+    )
+    await engine.start()
+    assert engine._intake_monitor is not None
+    real_monitor: IntakeBoundMonitor = engine._intake_monitor
+
+    class _MaybeCancelledStop:
+        async def stop(self) -> None:
+            await real_monitor.stop()
+            if monitor_cancels:
+                raise asyncio.CancelledError
+
+    engine._intake_monitor = cast(IntakeBoundMonitor, _MaybeCancelledStop())
+    real_drain = engine.drain_config_writes
+
+    async def failing_drain(timeout: float) -> None:
+        await real_drain(timeout)
+        raise RuntimeError("synthetic teardown fault")
+
+    monkeypatch.setattr(engine, "drain_config_writes", failing_drain)
+    closed: list[bool] = []
+    real_close = engine.store.close
+
+    async def close() -> None:
+        closed.append(True)
+        await real_close()
+
+    monkeypatch.setattr(engine.store, "close", close)
+    expected: type[BaseException] = asyncio.CancelledError if monitor_cancels else RuntimeError
+    with pytest.raises(expected):
+        await engine.stop()
+    assert closed == [True], "the store closed although a later teardown step raised"

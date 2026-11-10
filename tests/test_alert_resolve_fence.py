@@ -248,7 +248,10 @@ async def test_a_superseded_clear_settles_as_not_landed_and_is_not_retried(
             await _drain(a)
         assert settled == [False]
         assert view_a.calls[_FENCED] == 1, "a superseded clear is not retried"
-        assert any("closed nothing" in r.getMessage() for r in caplog.records)
+        assert any("does not speak for" in r.getMessage() for r in caplog.records)
+        assert not any("assuming" in r.getMessage() for r in caplog.records), (
+            "observed, not assumed"
+        )
         assert not any(r.levelno >= logging.ERROR for r in caplog.records)
         [(_id, count)] = await _live(store)
         assert count == 2
@@ -411,7 +414,7 @@ async def test_a_failed_verdict_re_read_is_not_retried_and_logs_no_error(
         view_a = _ReReadFails(store)
         a = NotifierAlertSink([], store=view_a)
         settled: list[bool] = []
-        with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.alert_sinks"):
+        with caplog.at_level(logging.INFO, logger="messagefoundry.pipeline.alert_sinks"):
             a._record_state(
                 {"type": "intake_resumed", "connection": KEY}, "info", on_settled=settled.append
             )
@@ -421,5 +424,8 @@ async def test_a_failed_verdict_re_read_is_not_retried_and_logs_no_error(
         assert settled == [False], "not knowing, the clear is kept as not landed"
         assert not any(r.levelno >= logging.ERROR for r in caplog.records)
         assert any("re-read failed" in r.getMessage() for r in caplog.records)
+        assert not any("does not speak for" in r.getMessage() for r in caplog.records), (
+            "round-4 item 4: an assumed superseded is not logged as an observed one"
+        )
     finally:
         await store.close()

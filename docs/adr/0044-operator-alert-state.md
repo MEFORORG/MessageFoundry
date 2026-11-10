@@ -358,7 +358,10 @@ The generic "has not re-fired in N cooldowns, so it is stale" sweep this ADR def
 engine process (`intake:<reason>@<process>`), so one whose process never returns under that name had
 no inverse that could ever fire. Every `IntakeBoundMonitor` with a sink now resolves an open
 `intake_paused` instance of another process whose `count` has not moved for four reminder intervals
-of its own monotonic clock. The resolve is bounded by the `(id, count)` it read
+of its own monotonic clock. That rule reads only whether a reminder landed, by design: a process
+still paused whose reminders stop reaching the store (cut off, failing writes, or a check that keeps
+raising) has its alert resolved while its intake stays paused, a false clear accepted as the cost of
+a time-to-live. The resolve is bounded by the `(id, count)` it read
 (`resolve_alert_generation`, all three backends), so a raise that lands first keeps the row open, and
 no clock is compared across processes. It closes an acknowledged instance too, as every auto-resolve
 does; retention then treats it as any other resolved row. Other subjects that name a process, or a
