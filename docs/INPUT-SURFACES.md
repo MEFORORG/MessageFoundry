@@ -284,7 +284,7 @@ need and the engine does not enforce is written in your Handler, as
 
 | Payload | Rules the engine checks over two or more items | Where |
 |---|---|---|
-| HL7 v2 | The opt-in primitives `same_across` and `dates_in_order` compare fields and return the violations; they refuse nothing. HL7-VALIDATION.md, Tier 3, describes them. `extract_obx_document` reads an embedded document only when `OBX-2` is `ED` and `OBX-5.4` is `Base64`. | `parsing/consistency.py`; `parsing/binary.py` |
+| HL7 v2 | At ingress, both listeners refuse a body that holds the document handle marker where a delimiter is a base64 character or the delimiters cannot be read. Strict validation refuses an encoding character that repeats. On a streaming inbound that detaches a document, the detach refuses a body that raises `UnreadableDelimitersError`, `Base64DelimiterError`, `EscapedDocumentError`, `NonVerbatimDocumentError` or `InboundDocRefError`. The opt-in primitives `same_across` and `dates_in_order` compare fields and return the violations; they refuse nothing. HL7-VALIDATION.md, Tier 3, describes them. `extract_obx_document` reads an embedded document only when `OBX-2` is `ED` and `OBX-5.4` is `Base64`. | `doc_ref_marker_refusal` in `pipeline/ingress_guards.py`; `validate` in `parsing/validate.py`; `iter_obx_documents` and `parsing/consistency.py`; `parsing/binary.py` |
 | `json` | None. | |
 | `text` | None. | |
 | `binary` | None. | |
