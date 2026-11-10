@@ -5,6 +5,6 @@
   `[auth].ad_reconcile_outage_passes` of that account's probes running fail this way, the pass
   raises one `ad_reconcile_aborted` alert with reason `account_unreachable`, under the source
   `directory-reconciler-unreached:<username>`, and writes an `auth.ad_reconcile_unreached` audit
-  row. Where more than five such accounts stand at once, those entering page as one alert under the
-  bare `directory-reconciler-unreached` source. A whole-directory outage keeps its own alert.
+  row. On a rolled-up pass, those entering page as one alert under the bare
+  `directory-reconciler-unreached` source. A whole-directory outage keeps its own alert.
   CONFIGURATION.md, the `ad_reconcile_outage_passes` row, has the full rule (vault BACKLOG #3100).
