@@ -1135,10 +1135,12 @@ allowlist row, unallocated. The same ruling holds that the PHI-free alert claims
 [ADR 0133](0133-alert-escalation-tiers-schedule-aware-thresholds-and-content-triggered-alerts-the-56-remainder.md)
 and [ADR 0044](0044-operator-alert-state.md), false in the shipped code, become true again once
 that allowlist is built. Separately, a Manager decision (class B, Manager 30df8519, decision
-record `d20261110T082816880-1913c6`), not the owner ruling, holds that two exemptions justified
-by a PHI-free alert body are to be re-checked against that allowlist once it is built:
-[ADR 0029](0029-email-smtp-destination.md)'s ungated alert sender domain, and the `[alerts]`
-sinks sitting outside `[egress]` deny-by-default ([DEPLOYMENT.md](../DEPLOYMENT.md)).
+record `d20261110T082816880-1913c6`), not the owner ruling, names two exemptions stated beside,
+or justified by, a PHI-free alert body, to be re-checked against that allowlist once it is built:
+[ADR 0029](0029-email-smtp-destination.md)'s decline to gate the sender domain of the `[alerts]`
+sink and the security notifier, and the `[alerts]` sinks sitting outside `[egress]`
+deny-by-default ([DEPLOYMENT.md](../DEPLOYMENT.md)). This note does not establish that no other
+exemption rests on that premise.
 
 **Note 2026-10-04: the hops outside the reads, graded by name (BACKLOG #2194).** Read at engine
 `76355472a`. This note grades the hops the list above left ungraded. It builds no guard, documents
