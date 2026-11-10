@@ -412,21 +412,38 @@ def test_writer_none_chunk_size_selects_the_default() -> None:
 class _Trickle(io.BytesIO):
     """A source that serves at most ``step`` bytes per read, as a raw pipe or socket may.
 
-    A short read from such a source is legal and is NOT end of stream; only an empty read is. With
-    ``would_block`` set, every read reports "no data yet" as ``None``, as a non-blocking raw stream
-    does."""
+    A short read from such a source is legal and is NOT end of stream; only an empty read is. Once
+    ``block_after`` bytes have been served, every read reports "no data yet" as ``None``, as a
+    non-blocking raw stream does."""
 
-    def __init__(self, data: bytes, *, step: int = 1, would_block: bool = False) -> None:
+    def __init__(self, data: bytes, *, step: int = 1, block_after: int | None = None) -> None:
         super().__init__(data)
         self._step = step
-        self._would_block = would_block
+        self._block_after = block_after
 
     def read(self, size: int | None = -1, /) -> bytes:
-        if self._would_block:
+        if self._block_after is not None and self.tell() >= self._block_after:
             return None  # type: ignore[return-value]  # what a non-blocking raw stream returns
         if size is None or size < 0:
             size = self._step
         return super().read(min(size, self._step))
+
+
+class _Gush(io.BytesIO):
+    """A source that breaks the read contract by returning more than it was asked for."""
+
+    def read(self, size: int | None = -1, /) -> bytes:
+        return super().read()
+
+
+def _archive(payload: bytes, key: bytes) -> tuple[bytes, int, int]:
+    """A real 1024-byte-chunk archive, the offset its first frame starts at, and one frame's length."""
+    enc = io.BytesIO()
+    bc.encrypt_stream(io.BytesIO(payload), enc, key, chunk_size=1024)
+    blob = enc.getvalue()
+    off = len(bc.MAGIC) + 1
+    (hdrlen,) = _U32.unpack(blob[off : off + _U32.size])
+    return blob, off + _U32.size + hdrlen, _NONCE_BYTES + _U32.size + 1024 + bc._TAG_BYTES
 
 
 def test_the_trickle_source_actually_short_reads() -> None:
@@ -448,15 +465,24 @@ def test_decrypt_and_read_header_fill_short_reads(step: int) -> None:
     assert out.getvalue() == payload
 
 
-@pytest.mark.parametrize("cut", [3, 20, 60, -1])
-def test_a_truncated_archive_still_fails_through_short_reads(cut: int) -> None:
-    # Looping to fill must stop at true EOF: a cut archive is still refused, as a truncation.
+@pytest.mark.parametrize(
+    "where", ["magic", "header", "before frame 0", "after frame 0", "inside frame 1", "last byte"]
+)
+def test_a_truncated_archive_still_fails_through_short_reads(where: str) -> None:
+    # Looping to fill must stop at true EOF: a cut archive is still refused, as a truncation,
+    # whether the cut lands in the prefix, on a frame boundary, or inside a frame.
     key = os.urandom(32)
-    enc = io.BytesIO()
-    bc.encrypt_stream(io.BytesIO(os.urandom(3000)), enc, key, chunk_size=1024)
-    blob = enc.getvalue()[:cut]
+    blob, first, frame = _archive(os.urandom(3000), key)
+    cut = {
+        "magic": 3,
+        "header": first - 5,
+        "before frame 0": first,
+        "after frame 0": first + frame,
+        "inside frame 1": first + frame + 30,
+        "last byte": len(blob) - 1,
+    }[where]
     with pytest.raises(bc.BackupCodecError, match="truncated"):
-        bc.decrypt_stream(_Trickle(blob, step=5), io.BytesIO(), key)
+        bc.decrypt_stream(_Trickle(blob[:cut], step=5), io.BytesIO(), key)
 
 
 def test_encrypt_fills_each_frame_from_a_short_reading_source() -> None:
@@ -480,13 +506,40 @@ def test_encrypt_fills_each_frame_from_a_short_reading_source() -> None:
     assert out.getvalue() == payload
 
 
-def test_a_source_with_no_data_ready_is_refused_not_read_as_eof() -> None:
-    # A non-blocking raw stream returns None for "nothing yet". Reading that as EOF would let the
-    # writer seal a silently truncated backup as a complete, authentic archive.
+def test_a_writer_source_with_no_data_ready_is_refused_not_read_as_eof() -> None:
+    # A non-blocking raw stream returns None for "nothing yet". Reading that as EOF after two full
+    # chunks would let the writer seal a silently truncated backup as a complete, authentic archive.
+    for block_after in (0, 1024, 2048, 2500):
+        with pytest.raises(bc.BackupCodecError, match="no data"):
+            bc.encrypt_stream(
+                _Trickle(b"x" * 5000, step=300, block_after=block_after),
+                io.BytesIO(),
+                os.urandom(32),
+                chunk_size=1024,
+            )
+
+
+@pytest.mark.parametrize("where", ["prefix", "between frames", "inside a frame", "after final"])
+def test_a_reader_source_with_no_data_ready_is_refused_not_read_as_eof(where: str) -> None:
+    # On the read side, None after the final frame must not pass the trailing-byte check as EOF.
     key = os.urandom(32)
+    blob, first, frame = _archive(os.urandom(3000), key)
+    block_after = {
+        "prefix": 4,
+        "between frames": first + frame,
+        "inside a frame": first + frame + 30,
+        "after final": len(blob),
+    }[where]
     with pytest.raises(bc.BackupCodecError, match="no data"):
-        bc.encrypt_stream(_Trickle(b"x" * 10, would_block=True), io.BytesIO(), key)
-    enc = io.BytesIO()
-    bc.encrypt_stream(io.BytesIO(b"x" * 10), enc, key)
-    with pytest.raises(bc.BackupCodecError, match="no data"):
-        bc.read_header(_Trickle(enc.getvalue(), would_block=True))
+        bc.decrypt_stream(_Trickle(blob, step=7, block_after=block_after), io.BytesIO(), key)
+
+
+def test_a_source_that_returns_more_than_asked_is_refused() -> None:
+    # An over-long read would let the writer seal a frame past its declared chunk_size, which this
+    # build's own reader then rejects at restore time.
+    key = os.urandom(32)
+    with pytest.raises(bc.BackupCodecError, match="returned"):
+        bc.encrypt_stream(_Gush(b"x" * 3000), io.BytesIO(), key, chunk_size=1024)
+    blob, _, _ = _archive(b"x" * 3000, key)
+    with pytest.raises(bc.BackupCodecError, match="returned"):
+        bc.decrypt_stream(_Gush(blob), io.BytesIO(), key)
