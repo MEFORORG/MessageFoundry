@@ -20,9 +20,8 @@
   that holds `=`, such as `--index-url=URL` or `--ignore-vuln=ID`, still reaches pip-audit, which
   can print it in its own output, at least in its `--verbose` debug line of the arguments it
   parsed. (`BACKLOG #2587`)
-- **The dependency auditor refuses, after the lock, a pip-audit option that could let it exit 0
-  on a vulnerable lock**: `--dry-run`, `-d`, `--help`, `-h`, `--version` and `-V`, which audit
-  nothing, and `--fix`, which audits, then rewrites the auditor's copy of the lock to fixed versions
-  and exits 0 once every vulnerable package was rewritten. Each is refused in full, abbreviated, or
-  inside a cluster of short flags. The refusal names the word's position.
+- **The dependency auditor refuses, after the lock, pip-audit's `--dry-run`, `-d`, `--fix`,
+  `--help`, `-h`, `--version` and `-V`**, in full, abbreviated, or inside a cluster of short flags.
+  A dry run without `--fix`, help and version audit nothing and exit 0. `--fix` rewrites the
+  requirements files pip-audit was given and can exit 0 on a vulnerable lock. The refusal names the word's position.
   (`BACKLOG #2587`)
