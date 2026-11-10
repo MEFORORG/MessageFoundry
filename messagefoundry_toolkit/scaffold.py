@@ -349,12 +349,13 @@ jobs:
       # compares versions. The packaging copy pip carries parses each requirement, after a copy of
       # pip's line handling, and pip's own parser reads a line of options with no requirement. A
       # marker false here, an extra, a URL or path with no name, and an editable line (-e or
-      # --editable, abbreviated or attached as pip allows) are only noted: the lock records no extras, an
-      # unnamed URL has no name to look up, and an editable installs a source tree or checkout that
-      # no lock pin holds. A requirement it cannot parse fails, and so does a line of options with
-      # no requirement that pip cannot read. An include or constraint line (-r, --requirement, -c or
-      # --constraint, abbreviated or attached as pip allows, with no editable on the line) fails
-      # too: this step follows no file a line names, and no new lock clears such a line.
+      # --editable, abbreviated or attached as pip allows) are only noted: the lock records no
+      # extras, an unnamed URL has no name to look up, and an editable installs a source tree or
+      # checkout that no lock pin holds. A requirement it cannot parse fails, and so does a line of
+      # options with no requirement that pip cannot read. An include or constraint line (-r,
+      # --requirement, -c or --constraint, abbreviated or attached as pip allows, with no editable
+      # on the line) fails too: this step follows no file a line names, and no new lock clears
+      # such a line.
       - name: Check requirements.lock is not stale against requirements.txt
         if: ${{ !cancelled() && hashFiles('requirements.lock') != '' }}
         run: |
@@ -534,7 +535,9 @@ for group in logical_lines("requirements.lock"):
     if isinstance(req, Requirement) and (req.marker is None or req.marker.evaluate()):
         exact = [s.version for s in req.specifier if s.operator in ("==", "===")]
         locked.setdefault(canonicalize_name(req.name), set()).update(exact)
-REGENERATE = "regenerate requirements.lock from requirements.txt"
+REGENERATE = (
+    "regenerate requirements.lock from requirements.txt, keeping any -c FILE in the lock command"
+)
 # Each error with its remedy, in file order.
 errors = []
 for group in logical_lines("requirements.txt"):

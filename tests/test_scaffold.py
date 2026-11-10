@@ -816,7 +816,8 @@ _CONSTRAINT = (
 
 #: (the line after ``foo==1.0``, the ::error:: it raises, whether the pins audit's grep also sees it).
 #: pip's own parser reads each as an include or a constraint, abbreviated or attached as pip allows.
-#: Not every spelling: a line that becomes one only through a ${VAR} nested in another's value passes.
+#: Not every spelling: a line that is one only through a ${VAR} nested in another's value is not
+#: read as one.
 _INCLUDE_CASES = [
     ("--requirem extra.txt", f"--requirem extra.txt {_INCLUDE}", False),
     ("-\\\nr extra.txt", f"-r extra.txt {_INCLUDE}", False),
@@ -827,6 +828,9 @@ _INCLUDE_CASES = [
     ("--constraint=extra.txt", f"--constraint=extra.txt {_CONSTRAINT}", False),
     ("-rextra.txt", f"-rextra.txt {_INCLUDE}", True),
     ("-cextra.txt", f"-cextra.txt {_CONSTRAINT}", False),
+    # Lander hold 12 on PR 2840: removing it leaves `pip install -r requirements.txt` unconstrained
+    # unless every install applies the lock, so it stays refused, and its remedy says so.
+    ("-c requirements.lock", f"-c requirements.lock {_CONSTRAINT}", False),
     # pip follows the include when a line names both.
     ("-c other.txt -r extra.txt", f"-c other.txt -r extra.txt {_INCLUDE}", False),
     # Printed as written, before ${VAR} expansion.
@@ -864,22 +868,6 @@ def test_an_include_or_constraint_line_fails_the_stale_check(
     assert audited.exists()
 
 
-def test_a_constraint_on_the_lock_itself_stays_refused_and_keeps_the_lock_applied(
-    scaffolded_ci: tuple[str, Path, dict[str, Any]], tmp_path: Path
-) -> None:
-    """Lander hold 12 on PR 2840: removing ``-c requirements.lock`` leaves the ``check`` job's and
-    the README's ``pip install -r requirements.txt`` unconstrained unless every install applies the
-    lock, so the line is refused and its remedy says how to keep the lock applied first."""
-    lock = _STALE_LOCK + "foo==1.0 \\\n    --hash=sha256:ffff\n"
-    _, _, output, failed = _run_audit_job(
-        scaffolded_ci, tmp_path, lock, requirements="foo==1.0\n-c requirements.lock\n"
-    )
-    assert failed == [_STALE], output
-    errors = [ln for ln in output.splitlines() if ln.startswith("::error::")]
-    assert errors == [f"::error::-c requirements.lock {_CONSTRAINT}"]
-    assert "just remove the line" not in output
-
-
 def test_each_error_keeps_its_own_remedy_in_file_order(
     scaffolded_ci: tuple[str, Path, dict[str, Any]], tmp_path: Path
 ) -> None:
@@ -895,7 +883,7 @@ def test_each_error_keeps_its_own_remedy_in_file_order(
     assert errors == [
         f"::error::-c extra.txt {_CONSTRAINT}",
         "::error::acme-hl7-utils is in requirements.txt but not in requirements.lock;"
-        " regenerate requirements.lock from requirements.txt",
+        " regenerate requirements.lock from requirements.txt, keeping any -c FILE in the lock command",
     ]
 
 
