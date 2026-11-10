@@ -1732,7 +1732,7 @@ count is above `0` (vault BACKLOG #2613).
 - **What you lose:** the engine stops protecting that hop and takes your word that something else does.
   A cleartext or verify-off hop the enforcing gates would refuse is **allowed**: this is the one per-hop
   declaration that yields ALLOW rather than WARN. The crossing is logged, but the hop is recorded as
-  secure, not as an accepted risk. That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a verify-off HTTP-family egress hop that carries no credential (at least the MLLP, FTPS and email verify-off refusals do not read it) and a weakened database TLS
+  secure, not as an accepted risk. That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop and a weakened database TLS
   hop. If the claim is false, the payload and any credential the connection carries cross in the
   clear, and nothing about the hop looks wrong afterwards. The exception is an HTTP-family
   credential the refusal recognizes over cleartext `http` to a
