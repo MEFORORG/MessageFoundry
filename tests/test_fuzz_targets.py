@@ -634,7 +634,8 @@ def test_the_short_msh2_reproducer_is_refused_by_name_through_the_raw_helpers() 
 
     ``Peek.parse`` still accepts the body (see ``fuzz/README.md``, *Known findings*).
     ``extract_obx_document`` refuses it as ``UnreadableDelimitersError``, not a
-    ``BinaryCarriageError``, with nothing chained and neither MSH-1 nor MSH-2 quoted; ``strip_documents`` returns it unchanged and ``iter_obx_documents``
+    ``BinaryCarriageError``, with nothing chained and neither MSH-1 nor MSH-2 quoted;
+    ``strip_documents`` returns it unchanged and ``iter_obx_documents``
     refuses it as ``UnreadableDelimitersError`` (BACKLOG #5099).
     """
     assert SHORT_MSH2_REPRODUCER in TARGETS_BY_NAME["binary_carriage"].seeds
@@ -703,6 +704,21 @@ def test_the_binary_carriage_target_has_no_carve_out_left_on_a_retired_reproduce
             patch.setattr(fuzz_targets, name, planted)
             with pytest.raises(ValueError, match="planted"):
                 TARGETS_BY_NAME["binary_carriage"].run(reproducer)
+
+
+def test_the_binary_carriage_target_catches_an_unreadable_refusal_of_a_readable_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The target accepts ``UnreadableDelimitersError`` from the extract only on a body whose
+    delimiters the engine cannot read (BACKLOG #2873): an extract guard that refused a readable
+    body would otherwise pass every input silently."""
+    TARGETS_BY_NAME["binary_carriage"].run(_OBX_ED_ADT)  # control: the real extract runs clean
+    TARGETS_BY_NAME["binary_carriage"].run(SHORT_MSH2_REPRODUCER)  # control: a real refusal
+    monkeypatch.setattr(
+        fuzz_targets, "extract_obx_document", _boom(UnreadableDelimitersError("planted"))
+    )
+    with pytest.raises(AssertionError, match="refused readable delimiters"):
+        TARGETS_BY_NAME["binary_carriage"].run(_OBX_ED_ADT)
 
 
 def test_write_seed_corpus_materialises_every_seed(tmp_path: Path) -> None:

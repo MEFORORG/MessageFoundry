@@ -182,9 +182,12 @@ class NonVerbatimDocumentError(ValueError):
 
 
 class UnreadableDelimitersError(ValueError):
-    """A message has an OBX, and ``Message._encoding_chars`` cannot read its delimiters: it has no
-    MSH, its first MSH's MSH-2 is shorter than four characters, or (only where a Handler set it)
-    its MSH-1 is not one character (BACKLOG #5099, #2873). Where a received body has an MSH, the
+    """``Message._encoding_chars`` cannot read a message's delimiters: it has no MSH, its first
+    MSH's MSH-2 is shorter than four characters, or (only where a Handler set it) its MSH-1 is not
+    one character (BACKLOG #5099, #2873). :func:`iter_obx_documents` and
+    :func:`strip_documents_in_hl7` raise it only on a message that has an OBX;
+    :func:`extract_obx_document` raises it for any occurrence it is asked to read, and
+    :func:`embed_obx_document` for an OBX that exists. Where a received body has an MSH, the
     parser reads its MSH-1 as one character, so MSH-1 is never the cause there; with no MSH, MSH-1
     and MSH-2 both read empty.
 
@@ -317,7 +320,8 @@ def embed_obx_document(
     delimiters, such as an MSH-2 shorter than four characters or no MSH at all (BACKLOG #2873).
     Recover the bytes with :func:`extract_obx_document`."""
     # occurrence < 1 and an absent OBX stay Message.set's own refusals, which it raises before it
-    # reads any delimiter; the check runs before the first set, so a refusal leaves nothing half-set.
+    # reads any delimiter. The check runs before the first set, so this refusal leaves nothing
+    # half-set; a later set's own refusal, such as a CR in data_subtype, still can.
     if 1 <= occurrence <= message.count_segments("OBX") and not _delimiters_readable(message):
         raise _unreadable_delimiters_refusal(message, "no OBX field can be set; refusing the embed")
     message.set("OBX-2", "ED", occurrence=occurrence)
@@ -870,8 +874,8 @@ def strip_documents_in_hl7(
     (reads its MSH-2 separators, escapes the tombstone as a leaf value) so a re-encode round-trips and
     re-parses. Used by :func:`strip_documents` and directly testable against a parsed message.
     Raises :class:`UnreadableDelimitersError`, not a :class:`BinaryCarriageError`, when the message
-    has an OBX and ``Message._encoding_chars`` cannot read its delimiters, such as an MSH-2 shorter than four characters or no MSH at all
-    (BACKLOG #2873); :func:`strip_documents` checks for that first and skips such a body."""
+    has an OBX and ``Message._encoding_chars`` cannot read its delimiters, such as an MSH-2 shorter
+    than four characters or no MSH at all (BACKLOG #2873); :func:`strip_documents` checks for that first and skips such a body."""
     pruned_at = time.time() if pruned_at is None else pruned_at
     stripped = 0
     reclaimed = 0
