@@ -661,12 +661,12 @@ class ResealResult:
     not_regular: int = 0
     #: True when the uploads root could not be listed, as when it is missing or is not a directory
     #: (BACKLOG #4940). ``rotate-key`` refuses such a root before it writes anything, so this is a
-    #: backstop. A root it can list is not missing, so an empty mount point over a volume that is
-    #: not mounted reads as no uploads; docs/PHI.md's ``rotate-key`` passage, under "It refuses only
-    #: a path it cannot list", names that and the rest it leaves uncaught. Also True when a
-    #: non-empty listing is followed by a root that is no directory, at the check right after the
-    #: listing or at the pass's first pair-lock check. It is not a skip: ``rotate-key`` aborts on it
-    #: before its audit roll.
+    #: backstop. A root that stays listable is not missing, so an empty mount point over a volume
+    #: that is not mounted reads as no uploads; docs/PHI.md's ``rotate-key`` passage, under "It
+    #: refuses only a path it cannot list", names at least the cases it leaves uncaught. Also True
+    #: when a non-empty listing is followed by a root that is no directory, at the check right after
+    #: the listing or at the pass's first pair-lock check. It is not a skip: ``rotate-key`` aborts
+    #: on it before its audit roll.
     root_missing: bool = False
 
     @property
