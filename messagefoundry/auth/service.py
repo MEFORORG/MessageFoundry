@@ -262,8 +262,18 @@ def _sort_refused_reconciler_write(exc: Exception, action: str, actor: str) -> E
     :func:`~messagefoundry.store.base.audit_write_errors` names is logged at ERROR and ``None`` is
     returned; the caller then writes the row on its own. A defect
     (:data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`), or any other error, is returned for
-    the caller to raise once the revocation's own steps have run."""
+    the caller to raise once the revocation's own steps have run; it is logged here too, so a
+    later raise that ends the revocation first cannot lose it."""
     if isinstance(exc, AUDIT_WRITE_DEFECTS) or not isinstance(exc, audit_write_errors()):
+        _log.error(
+            "directory reconcile: the write behind the %s row for %s raised %s with its row in "
+            "its transaction; it was tried again without the row, and the error is raised once "
+            "the revocation's own steps have run",
+            action,
+            scrub_log_argument(actor),
+            type(exc).__name__,
+            exc_info=exc,
+        )
         return exc
     _log.error(
         "directory reconcile: the write behind the %s row for %s raised with its row in its "
@@ -7700,11 +7710,10 @@ class AuthService:
         # BACKLOG #2221: a change's `auth.ad_roles_resynced` row commits in the role write's
         # transaction, not after the revoke below, because the roles are what it records. A sync
         # that changes nothing writes the same roles and no row.
-        resynced_detail = _json({"from": sorted(previous), "to": role_ids})
+        changed = set(role_ids) != previous
+        resynced_detail = _json({"from": sorted(previous), "to": role_ids}) if changed else ""
         resynced: tuple[AuditAppend, ...] = (
-            ()
-            if set(role_ids) == previous
-            else (
+            (
                 AuditAppend(
                     "auth.ad_roles_resynced",
                     actor=user.username,
@@ -7712,21 +7721,29 @@ class AuthService:
                     client=client,
                 ),
             )
+            if changed
+            else ()
         )
         lost_row: Exception | None = None
         try:
             await self._store.set_user_roles(
                 user.id, role_ids, assigned_by="ad-sync", audits=resynced
             )
-        except audit_write_errors() as exc:
-            if not resynced or isinstance(exc, AUDIT_WRITE_DEFECTS):
+        except Exception as exc:  # noqa: BLE001 - logged, then sorted once the change is applied
+            if not resynced:
                 raise
-            # A store refusal, of the append or of the role write itself. The directory stays
-            # authoritative, so a refused row must not keep the old roles, or the stale sessions
-            # the revoke below ends. The roles land without it, and the row is written on its own
-            # after that revoke; only if that is refused too does the sign-in fail, as it did when
-            # the row was written after the revoke. Anything else raises here with nothing written,
-            # and the next sign-in redoes the write, the row and the notice.
+            # The directory stays authoritative, so a write refused with its row must not keep the
+            # old roles, or the stale sessions the revoke below ends. The roles land without it.
+            # After the revoke and the notice, a store refusal has its row written on its own, and
+            # only a second refusal fails the sign-in; a defect, or any other error, is raised
+            # then, as the reconciler's `_sort_refused_reconciler_write` sorts it.
+            _log.error(
+                "auth: the role sync for %s raised %s with its auth.ad_roles_resynced row in its "
+                "transaction; the roles are written again without it",
+                scrub_log_argument(user.username),
+                type(exc).__name__,
+                exc_info=exc,
+            )
             await self._store.set_user_roles(user.id, role_ids, assigned_by="ad-sync", audits=())
             lost_row = exc
         # Owner ruling 2026-10-13 (#3229): the directory stays authoritative, so a sync that takes
@@ -7740,7 +7757,7 @@ class AuthService:
         # held Administrator pages nobody on each sign-in.
         gained = frozenset(role_ids) - previous
         roles_gained = RolesGained(user.username, gained) if gained else None
-        if set(role_ids) != previous:
+        if changed:
             # Directory-side role change (often a downgrade): revoke the user's other live sessions
             # so stale elevated tokens don't linger until expiry (AUTH-AD-REVOKE). The new session
             # is issued below, after this, so the current login is unaffected. The role write's
@@ -7748,22 +7765,6 @@ class AuthService:
             await self._revoke_after_commit(
                 user.id, change="ad_roles_resynced", actor=user.username, client=client
             )
-            if lost_row is not None:
-                try:
-                    await self._audit(
-                        "auth.ad_roles_resynced",
-                        actor=user.username,
-                        detail=resynced_detail,
-                        client=client,
-                    )
-                except Exception as again:
-                    raise again from lost_row
-                _log.warning(
-                    "auth: the role sync for %s was refused with its auth.ad_roles_resynced row "
-                    "(%s); the roles were written without it and the row on its own",
-                    scrub_log_argument(user.username),
-                    type(lost_row).__name__,
-                )
             # A directory-pushed privilege change is the same privilege change to the same user as a
             # local one, so notify the affected user out-of-band too (ASVS 6.3.7), matching set_roles().
             # Best-effort; the change is also visible in the audited /me/security-events feed.
@@ -7776,6 +7777,17 @@ class AuthService:
                 client=client,
                 detail={"roles": role_ids, "source": "directory"},
             )
+            if lost_row is not None:
+                if isinstance(lost_row, AUDIT_WRITE_DEFECTS) or not isinstance(
+                    lost_row, audit_write_errors()
+                ):
+                    raise lost_row
+                await self._audit(
+                    "auth.ad_roles_resynced",
+                    actor=user.username,
+                    detail=resynced_detail,
+                    client=client,
+                )
         ad_roles = _roles_from_ids(role_ids)
         ad_custom_permissions = await self._custom_permissions_for_ids(role_ids)
         user = await self._sync_ad_channel_scope(user, ad_roles, principal.groups, client=client)
@@ -10689,8 +10701,8 @@ class AuthService:
             pending = _sort_refused_reconciler_write(
                 exc, AD_SESSION_REVOKED_ACTION, revocation.username
             )
-            if pending is not None:
-                raise pending from None
+        if pending is not None:
+            raise pending
         written = await self._audit_reconciler_row(
             AD_SESSION_REVOKED_ACTION,
             actor=revocation.username,
@@ -10713,10 +10725,9 @@ class AuthService:
         without the row, as :meth:`_revoke_with_row` applies a revoke and for its reason: the
         directory stays authoritative, so a refused record must not leave the old roles in place.
         If that second compare-and-set writes, the row is then written on its own, and pages if
-        that is refused too. If it finds the roles moved, the account is read again: the first
-        write may have committed with its reply lost, so a record already holding these roles is
-        counted as written, reported and recorded once more (a duplicate row and page are the safe
-        direction). Otherwise nothing was changed, so there is nothing to record.
+        that is refused too. If it finds the roles moved, it reports no write and records nothing.
+        **Not closed:** a first write that committed with its reply lost then reads as moved, so
+        the change goes unreported here.
 
         A defect, or any error that is not a store refusal, is returned rather than raised, so the
         roles that landed are still reported and their stale sessions still end (the caller raises
@@ -10740,12 +10751,20 @@ class AuthService:
                 assigned_by="ad-reconcile",
                 audits=(),
             )
-            if not written:
-                stored = await self._store.get_user_role_ids(revocation.user_id)
-                written = set(stored) == set(role_ids)
             pending = _sort_refused_reconciler_write(exc, row.action, revocation.username)
         if written and pending is None:
-            await self._audit_reconciler_row(row.action, actor=revocation.username, detail=detail)
+            try:
+                await self._audit_reconciler_row(
+                    row.action, actor=revocation.username, detail=detail
+                )
+            except Exception as defect:  # noqa: BLE001 - only a defect gets here; held, not lost
+                _log.error(
+                    "directory reconcile: the %s row for %s raised a defect on its own",
+                    row.action,
+                    scrub_log_argument(revocation.username),
+                    exc_info=defect,
+                )
+                pending = defect
         return written, pending
 
     async def _apply_reconcile_revocation(
@@ -10816,8 +10835,8 @@ class AuthService:
             # BACKLOG #3018 step 4. The role write is its own transaction, ahead of the revoke's,
             # so it carries its own row: a crash or a refused revoke after it cannot leave the new
             # roles unrecorded. The login sync's action, marked with this path. A defect in that
-            # write comes back as `pending`, raised only once the change is reported and the
-            # sessions have ended.
+            # write comes back as `pending`, raised only once the change is reported, the sessions
+            # have ended and the user is told.
             roles_changed, pending = await self._write_reconciled_roles(
                 revocation, revocation.role_ids, user.role_ids
             )
@@ -10860,8 +10879,6 @@ class AuthService:
             and await self._already_revoked_elsewhere(revocation, watermark=watermark)
         )
         revoked, written, retried = await self._revoke_with_row(revocation)
-        if pending is not None:
-            raise pending
         quiet = (
             not revoked
             and not roles_changed
@@ -10877,6 +10894,8 @@ class AuthService:
             # No notice either way; a refused row alerts instead (see the docstring). So does a
             # retried revoke: its zero can read low, if the first revoke committed with its reply
             # lost.
+            if pending is not None:
+                raise pending
             return "quiet" if written and not retried else "reported"
         # A directory-pushed disable or demotion is the same event to the user as a local one, so it
         # gets the same out-of-band notice the login-path re-sync sends (best-effort).
@@ -10907,6 +10926,10 @@ class AuthService:
                 email=user.notify_email,
                 detail={"reason": revocation.reason, "source": "directory"},
             )
+        if pending is not None:
+            # The role write's defect, held until the change was reported, the sessions ended and
+            # the user told (BACKLOG #3018 step 4).
+            raise pending
         return "reported"
 
     def _report_directory_admin_grant(
@@ -17442,9 +17465,9 @@ class AuthService:
                 raise
             raise UsernameTaken(USERNAME_TAKEN) from exc
         # BACKLOG #2221: the row commits with the roles it names, the account's second write, so a
-        # failed append rolls them back. A crash between the two writes, or a refused append, leaves an
-        # account with no role and no row, holding its username; its credential was never returned,
-        # so nobody holds it.
+        # failed append rolls them back. A crash between the two writes, or a refused append,
+        # leaves an account with no role and no row, holding its username; its credential was
+        # never returned, so nobody holds it.
         await self._store.set_user_roles(
             user_id,
             roles,
@@ -17516,8 +17539,8 @@ class AuthService:
 
         **Disabling the last enabled administrator is refused (vault BACKLOG #2779)**, with
         :class:`LastAdministratorRefused`. The guard is the disable write itself: the store checks
-        and writes in one transaction (``remove_unless_last_admin``), and the save's ``user.updated``
-        row commits in that transaction, so no lock-out lands without it (BACKLOG #2221). A read
+        and writes in one transaction (``remove_unless_last_admin``), and the save's
+        ``user.updated`` row commits in that transaction, so no lock-out lands without it (BACKLOG #2221). A read
         up front refuses the ordinary case before anything is written. Only a removal racing this
         one gets past that read; then the profile edit has landed, so it is still audited and
         announced, with ``disable_refused`` on the audit row, and the refusal is raised after that.

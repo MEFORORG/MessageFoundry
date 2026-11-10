@@ -256,3 +256,37 @@ async def test_a_directory_sign_in_commits_ad_roles_resynced_with_the_role_write
         "to": ["viewer"],
     }
     assert len(await _details(store, "auth.ad_roles_resynced")) == 3
+
+
+async def test_a_defect_in_the_sign_in_role_row_still_lands_the_roles_and_ends_the_sessions(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A defect, not a store refusal, in the sign-in's in-transaction row: the directory stays
+    authoritative, so the roles still land and the stale sessions still end before it is raised,
+    as the reconciler's role write does. No row is written for it."""
+    settings = AuthSettings(
+        ad_enabled=True,
+        ad_server="ldaps://x",
+        ad_user_search_base="DC=x",
+        ad_bind_dn="CN=svc,DC=x",
+        ad_bind_password="x",
+    )
+    service = await _service(store, settings, ldap=_FakeLdap())
+    await service.set_ad_group_map([("cn=mf-ops,dc=x", "operator")], actor="admin")
+    first = (await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)).token
+    assert first is not None
+    await service.set_ad_group_map([("cn=mf-ops,dc=x", "viewer")], actor="admin")
+    real = store._append_audits
+
+    async def defective(audits: Sequence[AuditAppend], *, now: float) -> list[AppendedAuditRow]:
+        if any(a.action == "auth.ad_roles_resynced" for a in audits):
+            raise NotImplementedError("synthetic defect")
+        return await real(audits, now=now)
+
+    monkeypatch.setattr(store, "_append_audits", defective)
+    with pytest.raises(NotImplementedError):
+        await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)
+    user = await store.get_user_by_username("jdoe")
+    assert user is not None and await store.get_user_role_ids(user.id) == ["viewer"]
+    assert await service.identity_for_token(first) is None, "a defect kept a stale session"
+    assert await _details(store, "auth.ad_roles_resynced") == [{"from": [], "to": ["operator"]}]
