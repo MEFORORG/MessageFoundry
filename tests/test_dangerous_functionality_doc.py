@@ -484,6 +484,55 @@ def test_every_library_load_names_its_library_with_a_literal() -> None:
     assert not unnamed, f"reviewed computed loads not named under 'What holds them': {unnamed}"
 
 
+#: The modules that reach the process's own symbols with ``CDLL(None)``, which section 5's "What
+#: holds them" paragraph names one by one (vault BACKLOG #6674 item 8).
+_REVIEWED_PROCESS_SYMBOL_LOADS = frozenset({"restricted_file.py", "store/crypto.py"})
+
+
+@functools.cache
+def _process_symbol_loads(source: str) -> int:
+    """How many ``ctypes`` loads in ``source`` are handed ``None``: ``CDLL(None)`` and its kin, which
+    load no library and reach the symbols already in the process."""
+    count = 0
+    for node in ast.walk(_parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        if name is None or not _LIBRARY_LOADER_RE.match(name):
+            continue
+        first = node.args[0] if node.args else None
+        if isinstance(first, ast.Constant) and first.value is None:
+            count += 1
+    return count
+
+
+def test_every_process_symbol_load_is_reviewed_and_named() -> None:
+    """``CDLL(None)`` passes the literal-name check above, yet it resolves from the process's global
+    symbol scope, so each site is pinned here and named under "What holds them"."""
+    found = frozenset(
+        rel for rel, source in _package_sources().items() if _process_symbol_loads(source)
+    )
+    assert found == _REVIEWED_PROCESS_SYMBOL_LOADS, (
+        f"modules that call CDLL(None) changed: {sorted(found)}. Review each, register it in "
+        "_REVIEWED_PROCESS_SYMBOL_LOADS and name it in docs/DANGEROUS-FUNCTIONALITY.md section 5."
+    )
+    holds = _section(_doc_text(), 5).partition("**What holds them.**")[2]
+    assert "`CDLL(None)`" in holds
+    unnamed = sorted(
+        rel
+        for rel in _REVIEWED_PROCESS_SYMBOL_LOADS
+        if f"`{rel}`" not in holds and f"`{rel.removesuffix('.py')}." not in holds
+    )
+    assert not unnamed, f"CDLL(None) sites not named under 'What holds them': {unnamed}"
+
+
+def test_the_process_symbol_load_check_fires() -> None:
+    assert _process_symbol_loads("import ctypes\nctypes.CDLL(None, use_errno=True)\n") == 1
+    assert _process_symbol_loads("import ctypes\nctypes.CDLL('libc.so.6')\n") == 0
+    assert _process_symbol_loads("ctypes.WinDLL(None)\nCDLL(None)\n") == 2
+
+
 def _register_gap(live: Mapping[str, object], register: Mapping[str, object]) -> set[str]:
     return set(live) ^ set(register)
 
