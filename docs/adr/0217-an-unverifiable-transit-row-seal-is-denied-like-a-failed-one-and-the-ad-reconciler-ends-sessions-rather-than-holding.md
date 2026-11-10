@@ -709,16 +709,31 @@ it supersedes, and only where it disagrees; the earlier text is kept as it was.
   `reconcile_directory_sessions`; the reconcile loop in `api/app.py` logged "pass failed" and the
   pass revoked nothing, offboardings included. Now `AuthService._reconcile_ad_map` catches both
   answers on either map. Each pass that meets one logs a WARNING and writes a soft audit row:
-  `integrity.authority_seal_unverifiable` with reason `directory_map_unverifiable`, or
-  `integrity.authority_seal_unavailable` with reason `seal_unavailable`. Its detail is the kind
-  `adset`, the map's name and `during: reconcile`. The pass then pages through the store's own
-  `SealPager`, with no cap or throttle: an Unverifiable map under
-  `authority-seal-transit-unverifiable:adset:<map name>`, an Outage under `authority-seal-transit`.
-  The pass reads that map as empty and plans as `main` plans on a Forged map, under the same
+  `integrity.authority_seal_unverifiable` with reason `directory_map_unverifiable`, its detail
+  carrying the kind `adset`, the map's name, `during: reconcile`, and (a)'s `stored_version` and
+  `probe_version`; or, for an Outage, the row the next bullet gives. The pass then pages through the
+  store's own `SealPager`. An Unverifiable map pages under
+  `authority-seal-transit-unverifiable:adset:<map name>`, with (a)'s two integers and recovery
+  order in the text; the pager applies no cap or throttle to it, and repetition is left to the
+  sink's own per-subject re-alert throttle. An Outage pages under the shared
+  `authority-seal-transit`, which revoke Outages page under too, so that throttle can hold a map's
+  Outage page behind theirs. Both texts are written before the pass is planned, so they say what
+  the pass plans to end, never what it ended; a tripped pass ends nothing. The pass reads that map
+  as empty and plans as `main` plans on a Forged map, under the same
   breaker. This is step 1 of (b): the holders that empty role map would demote, and the accounts an
   empty scope map would withdraw from, lose their sessions, and a trip applies nothing. No role is
   written from that pass, and each `auth.ad_session_revoked` row carries `map_unverified: true` and
   no `roles`.
+- **A map row's Outage writes a best-effort `auth.*` row, amending the four-answers table for this
+  case (decision d20261110T181645742-b9eccb).** The table's Outage row says "none for the row" and
+  "record no seal failure". For an AD map read by a reconcile pass, the build writes
+  `auth.ad_reconcile_map_unavailable` with reason `map_seal_unavailable`, its detail the kind
+  `adset`, the map's name and `during: reconcile`. It is an `auth.*` action, not `integrity.*`, and
+  it records no seal failure. Its reason is not `seal_unavailable`, which (b) reserves for the
+  Vault-wide abort. The row is best-effort: it is written softly, and on `vault_transit` the audit
+  chain's MAC itself goes through Transit, so during the Outage it reports may be written by
+  nothing; the WARNING line and the page are then the record. Every other Outage keeps the table's
+  row.
 - **What that ruling leaves unbuilt, filed under vault #8202.** At least: step 2 (the groups-moved
   set and its sealed group digest); the Forged map's change from `main`; the sealed empty map; a
   failing user row's probing for revocation, and an Unverifiable user row read by `_load_user` or

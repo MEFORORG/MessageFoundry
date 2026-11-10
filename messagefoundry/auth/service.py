@@ -179,7 +179,6 @@ from messagefoundry.store.row_seal import (
     ADSET_KIND,
     ROLE_KIND,
     SESSION_KIND,
-    TRANSIT_OUTAGE_SUBJECT,
     UNVERIFIABLE_SUBJECT_PREFIX,
     USER_KIND,
     AnyRowSealer,
@@ -3535,13 +3534,15 @@ AUTHORITY_SEAL_FAILED_ACTION: Final = "integrity.authority_seal_failed"
 #: The audit action an Unverifiable authority row writes (ADR 0217, *The four answers*); the
 #: store's own constant, so the two cannot drift.
 AUTHORITY_SEAL_UNVERIFIABLE_ACTION: Final = AUTHORITY_SEAL_UNVERIFIABLE_AUDIT_ACTION
-#: The audit action a reconcile pass writes when Vault transit was unavailable reading an AD map
-#: (owner ruling 2026-11-10 on ADR 0217, *"Hold, build AD-map piece"*).
-AUTHORITY_SEAL_UNAVAILABLE_ACTION: Final = "integrity.authority_seal_unavailable"
+#: The best-effort audit action a reconcile pass writes when Vault transit was unavailable reading
+#: an AD map (decision d20261110T181645742-b9eccb on ADR 0217). Not ``integrity.*``: an Outage
+#: records no seal failure.
+AD_RECONCILE_MAP_UNAVAILABLE_ACTION: Final = "auth.ad_reconcile_map_unavailable"
 #: The reason an AD map Vault transit could not verify is reported with (ADR 0217 (b)).
 DIRECTORY_MAP_UNVERIFIABLE: Final = "directory_map_unverifiable"
-#: The reason an AD map read during a Vault transit Outage is reported with (ADR 0217 (b)).
-SEAL_UNAVAILABLE: Final = "seal_unavailable"
+#: The reason an AD map read during a Vault transit Outage is reported with. Not
+#: ``seal_unavailable``, which ADR 0217 (b) reserves for the Vault-wide abort.
+MAP_SEAL_UNAVAILABLE: Final = "map_seal_unavailable"
 #: How many times :meth:`AuthService.finish_webauthn_assertion` reads the passkey set and then the
 #: holder while the account's passkey digest keeps moving between the two, before it refuses the
 #: factor as unverifiable (BACKLOG #3068).
@@ -10662,7 +10663,7 @@ class AuthService:
         revocation: reconcile.SessionRevocation,
         *,
         watermark: _AuditWatermark | None,
-        maps_held: bool = True,
+        maps_held: bool,
     ) -> _RevocationApplied:
         """Apply one planned revocation: persist a role re-diff (when that is why), drop the user's
         live sessions, audit, and notify the affected user out-of-band (ASVS 6.3.7). A scope
@@ -12121,43 +12122,79 @@ class AuthService:
         of the pass, so the reconcile loop logged it and the pass revoked nothing. Now it is
         reported (:meth:`_report_reconcile_map`) and read as empty with ``False``: the pass plans
         as ``main`` plans on a Forged map, under the same breaker, so the accounts the map governs
-        lose their sessions, and writes no role from it. Only this map piece of ADR 0217 slice 3
-        is built; the groups-moved second step and the rest stay filed (vault #8202)."""
+        lose their sessions unless the breaker trips, and writes no role from it. Only this map
+        piece of ADR 0217 slice 3 is built; the groups-moved second step and the rest stay filed
+        (vault #8202)."""
         try:
             return await self._ad_map(name), True
-        except (TransitSealUnverifiableError, RowSealUnverifiableError):
-            await self._report_reconcile_map(name, unverifiable=True)
+        except TransitSealUnverifiableError as exc:
+            await self._report_unverifiable_reconcile_map(name, exc)
         except TransitSealUnavailableError:
-            await self._report_reconcile_map(name, unverifiable=False)
+            await self._report_unavailable_reconcile_map(name)
         return AdMap(name), False
 
-    async def _report_reconcile_map(self, name: str, *, unverifiable: bool) -> None:
-        """Report one AD map a reconcile pass could not verify: a WARNING, a soft ``integrity.*``
-        audit row, and a page through the store's own seal pager.
+    async def _report_unverifiable_reconcile_map(
+        self, name: str, exc: TransitSealUnverifiableError
+    ) -> None:
+        """Report an AD map Vault transit could not verify, on every pass that meets it: a WARNING,
+        a soft :data:`AUTHORITY_SEAL_UNVERIFIABLE_ACTION` row with reason
+        :data:`DIRECTORY_MAP_UNVERIFIABLE`, and a page under the map's own fixed subject,
+        ``authority-seal-transit-unverifiable:adset:<map name>``. The store's pager applies no cap
+        or throttle to it (ADR 0217, *The map page has no latch*); repetition is left to the sink's
+        own per-subject re-alert throttle. The row and the page carry the triage integers and the
+        recovery order ADR 0217 (a) requires. Written before the pass is planned, so neither says
+        what the pass then ended."""
+        reason = (
+            f"the {name} integrity seal could not be verified by Vault transit (stored version"
+            f" {exc.stored_version}, probe version {exc.probe_version}); this directory reconcile"
+            " pass reads it as empty, writes no role from it, and plans to end the sessions it"
+            " governs, under the revocation breaker. The seal may be planted: check that Vault is"
+            " healthy and that every node holds the audit key's latest version, then retry; a map"
+            " that still does not verify is untrusted, so enter it again from its change record,"
+            " never from its stored pairs"
+        )
+        detail = {
+            "kind": ADSET_KIND,
+            "map": name,
+            "reason": DIRECTORY_MAP_UNVERIFIABLE,
+            "during": "reconcile",
+            "stored_version": exc.stored_version,
+            "probe_version": exc.probe_version,
+        }
+        await self._report_reconcile_map(AUTHORITY_SEAL_UNVERIFIABLE_ACTION, detail, reason)
+        pager = getattr(self._store, "seal_pager", None)
+        if callable(pager):
+            pager().page(f"{UNVERIFIABLE_SUBJECT_PREFIX}:{ADSET_KIND}:{name}", reason)
 
-        Unverifiable writes :data:`AUTHORITY_SEAL_UNVERIFIABLE_ACTION` with reason
-        :data:`DIRECTORY_MAP_UNVERIFIABLE` and pages under the map's own fixed subject,
-        ``authority-seal-transit-unverifiable:adset:<map name>``, which no cap or throttle holds
-        (ADR 0217, *The map page has no latch*). An Outage writes
-        :data:`AUTHORITY_SEAL_UNAVAILABLE_ACTION` with reason :data:`SEAL_UNAVAILABLE` and pages
-        under the shared ``authority-seal-transit``. Every pass that meets the map reports it. A
-        refused audit write is logged, not raised, so the pass still ends the sessions."""
-        if unverifiable:
-            action, slug = AUTHORITY_SEAL_UNVERIFIABLE_ACTION, DIRECTORY_MAP_UNVERIFIABLE
-            subject = f"{UNVERIFIABLE_SUBJECT_PREFIX}:{ADSET_KIND}:{name}"
-            reason = (
-                f"the {name} integrity seal could not be verified by Vault transit; this directory"
-                " reconcile pass wrote no role from it and ended the sessions it governs"
-            )
-        else:
-            action, slug = AUTHORITY_SEAL_UNAVAILABLE_ACTION, SEAL_UNAVAILABLE
-            subject = TRANSIT_OUTAGE_SUBJECT
-            reason = (
-                f"Vault transit was unavailable reading the {name}; this directory reconcile pass"
-                " wrote no role from it and ended the sessions it governs"
-            )
+    async def _report_unavailable_reconcile_map(self, name: str) -> None:
+        """Report an AD map read during a Vault transit Outage, on every pass that meets it: a
+        WARNING, a best-effort :data:`AD_RECONCILE_MAP_UNAVAILABLE_ACTION` row with reason
+        :data:`MAP_SEAL_UNAVAILABLE` (decision d20261110T181645742-b9eccb), which records no seal
+        failure, and a page under the shared ``authority-seal-transit`` subject, which revoke
+        Outages page under too, so the sink's per-subject re-alert throttle can hold it behind
+        theirs. Written before the pass is planned, so neither says what the pass then ended."""
+        reason = (
+            f"Vault transit was unavailable reading the {name}; this directory reconcile pass"
+            " reads it as empty, writes no role from it, and plans to end the sessions it governs,"
+            " under the revocation breaker"
+        )
+        detail: dict[str, object] = {
+            "kind": ADSET_KIND,
+            "map": name,
+            "reason": MAP_SEAL_UNAVAILABLE,
+            "during": "reconcile",
+        }
+        await self._report_reconcile_map(AD_RECONCILE_MAP_UNAVAILABLE_ACTION, detail, reason)
+        pager = getattr(self._store, "seal_pager", None)
+        if callable(pager):
+            pager().outage(reason)
+
+    async def _report_reconcile_map(
+        self, action: str, detail: dict[str, object], reason: str
+    ) -> None:
+        """The WARNING and the soft audit row both map reports write. A refused audit write is
+        logged, not raised."""
         _log.warning("%s", reason)
-        detail = {"kind": ADSET_KIND, "map": name, "reason": slug, "during": "reconcile"}
         await write_audit_soft(
             lambda: self._audit(action, detail=_json(detail)),
             log=_log,
@@ -12166,9 +12203,6 @@ class AuthService:
             errors=audit_write_errors(),
             defects=AUDIT_WRITE_DEFECTS,
         )
-        pager = getattr(self._store, "seal_pager", None)
-        if callable(pager):
-            pager().page(subject, reason)
 
     async def _ad_roles_for_groups(self, groups: Iterable[str]) -> set[str]:
         """The role ids the AD group-to-role map gives ``groups``; none when the map fails its

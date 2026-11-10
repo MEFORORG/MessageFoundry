@@ -110,11 +110,16 @@ moved message still shows in the other channel's message list by its plaintext c
 encrypted cells withheld. The engine keeps running. A refusal usually writes an `integrity.*`
 audit row and raises an `integrity_drift` alert, with at least these exceptions. Under
 `vault_transit`, a cell that fails its tag keeps the cipher's own error, with no integrity audit
-row or alert. On the read path, each process reports a row that keeps failing again only after an
-interval: five minutes for a sealed row, and an hour for a message or saved-search cell. A session
-revoke is not throttled: `RevokeSealOutcome._report` audits and pages every refusal on every
-revoke. `SealPager.forged` pages a Forged row with no interval, and `SealPager.unverifiable` pages
-an Unverifiable one every time too, its five-minute window choosing only the page's subject. So a
+row or alert. On most of the read path, each process reports a row that keeps failing again only
+after an interval: five minutes for a sealed row, and an hour for a message or saved-search cell.
+A directory reconcile pass is an exception: it reports an AD map Vault transit cannot verify or
+reach on every pass that meets it, with no interval (ADR 0217). A session revoke is not throttled
+either. `RevokeSealOutcome._report` audits and pages each Forged or Unverifiable refusal it holds,
+on every revoke; an Outage is paged but not audited. An exit that cannot await
+(`_report_unawaited`) writes no audit rows, only log lines and pages. After a revoke's first
+Outage it calls Transit no more, so a later account's seal is not checked and records no refusal.
+`SealPager.forged` pages a Forged row with no interval, and `SealPager.unverifiable` pages an
+Unverifiable one every time too, its five-minute window choosing only the page's subject. So a
 sealed session row that keeps failing is reported on each revoke that meets it. That is a filed residual (vault #8202). What each refusal does
 is in the changelog entries for vault BACKLOG #2592, #2593 and #3510 (in `changelog.d/` until the
 next release, then [CHANGELOG.md](../CHANGELOG.md)). The seal format is

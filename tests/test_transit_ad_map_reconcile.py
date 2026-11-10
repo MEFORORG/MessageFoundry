@@ -6,8 +6,10 @@ Synthetic data only.
 
 Before, an Unverifiable or Outage answer on a map raised out of the pass, the reconcile loop logged
 it, and the pass revoked nothing. SQLite runs a whole pass on a real store with the map's seal check
-replaced; Postgres and SQL Server run the map reader over their twins with the reads replaced,
-since a live server is not needed to see what the reader takes and where it pages.
+replaced. The Postgres and SQL Server cases are narrower: they give AuthService._reconcile_ad_map a
+twin store whose get_ad_map and row_sealer are stubs, so they show only that the reader reads the
+map empty, writes its row and pages through that store's own pager. They exercise neither backend's
+own map read nor a whole pass.
 """
 
 from __future__ import annotations
@@ -67,11 +69,20 @@ _EXPECT = {
         "authority-seal-transit-unverifiable:adset:",
     ),
     "outage": (
-        "integrity.authority_seal_unavailable",
-        "seal_unavailable",
+        "auth.ad_reconcile_map_unavailable",
+        "map_seal_unavailable",
         "authority-seal-transit",
     ),
 }
+_ACTIONS = ("integrity.authority_seal_unverifiable", "auth.ad_reconcile_map_unavailable")
+
+
+def _detail(name: str, kind: str) -> dict[str, Any]:
+    _, slug, _ = _EXPECT[kind]
+    detail: dict[str, Any] = {"kind": "adset", "map": name, "reason": slug, "during": "reconcile"}
+    if kind == "unverifiable":
+        detail.update(stored_version=5, probe_version=1)
+    return detail
 
 
 async def _estate(
@@ -115,13 +126,39 @@ async def test_an_unverified_role_map_ends_the_holders_sessions_and_writes_no_ro
         # No role written from a map read as empty.
         assert await store.get_user_role_ids(user.id) == ["administrator"]
         action, slug, subject = _EXPECT[kind]
-        assert await _audits(store, action) == [
-            {"kind": "adset", "map": AD_ROLE_MAP, "reason": slug, "during": "reconcile"}
-        ]
+        assert await _audits(store, action) == [_detail(AD_ROLE_MAP, kind)]
         (revoked,) = await _audits(store, "auth.ad_session_revoked")
         assert revoked["map_unverified"] is True and "roles" not in revoked
         expected = subject + (AD_ROLE_MAP if kind == "unverifiable" else "")
         assert [p.split("|")[0] for p in pages] == [expected]
+        (reason,) = [p.split("|", 1)[1] for p in pages]
+        # Written before the pass is planned, so it says what the pass plans, never what it ended.
+        assert "plans to end the sessions it governs" in reason and "ended" not in reason
+        if kind == "unverifiable":
+            assert "stored version 5, probe version 1" in reason
+            assert "may be planted" in reason and "change record" in reason
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("kind", ["unverifiable", "outage"])
+async def test_only_the_scope_map_failing_writes_no_role_row(
+    monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """ADR 0217 ruling 2: no role row is written when EITHER map fails to hold, so a demotion the
+    verified role map gives ends the session and leaves the stored role."""
+    store, ldap, service, tokens, _ = await _estate(("jdoe",), _ADMINS)
+    try:
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        ldap.present["jdoe"] = _principal("jdoe")  # left the admin group in the directory
+        _refuse(monkeypatch, AD_SCOPE_MAP, kind)
+        plan = await service.reconcile_directory_sessions()
+        assert [(r.username, r.reason) for r in plan.revocations] == [("jdoe", "roles_changed")]
+        assert await service.identity_for_token(tokens["jdoe"]) is None
+        assert await store.get_user_role_ids(user.id) == ["administrator"]
+        action, _, _ = _EXPECT[kind]
+        assert await _audits(store, action) == [_detail(AD_SCOPE_MAP, kind)]
     finally:
         await store.close()
 
@@ -195,7 +232,8 @@ async def test_a_holding_map_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> No
         assert plan.revocations == ()
         assert await service.identity_for_token(tokens["jdoe"]) is not None
         assert pages == []
-        assert await _audits(store, "integrity.authority_seal_unverifiable") == []
+        for action in _ACTIONS:
+            assert await _audits(store, action) == []
     finally:
         await store.close()
 
@@ -238,7 +276,5 @@ async def test_a_server_store_map_reader_reports_and_reads_empty(backend: str, k
     found, held = await service._reconcile_ad_map(AD_ROLE_MAP)
     assert found.pairs == () and held is False
     action, slug, subject = _EXPECT[kind]
-    assert written == [
-        (action, {"kind": "adset", "map": AD_ROLE_MAP, "reason": slug, "during": "reconcile"})
-    ]
+    assert written == [(action, _detail(AD_ROLE_MAP, kind))]
     assert pages == [subject + (AD_ROLE_MAP if kind == "unverifiable" else "")]
