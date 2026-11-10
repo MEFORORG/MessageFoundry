@@ -5406,8 +5406,15 @@ check and its directory gap.
 
 Three long responses ask again while they run (BACKLOG #1154). Each asks at least: a live session,
 the route's permissions, no pending password change, a met second factor and a notification address
-on file. None asks again for a fresh step-up, the client-network check or the new-address check;
-those ran at the gate. Each resolves the token it started with, so a session rotation (a step-up
+on file. None asks again for a fresh step-up, the client-network check or the new-address check,
+and what ran at the start differs by response (BACKLOG #3469). The client-network check
+(`[security].allowed_client_networks`) is middleware, so it ran once on each response's request or
+handshake. The bulk message export's gate, `require_step_up_action` with the export's action, also
+ran the new-address check, and the route spends a fresh step-up bound to the export before it
+streams. The `/ws/stats` gate
+(`authorize_ws`, or the console's cookie twin) and the audit export's gate
+(`require(Permission.AUDIT_EXPORT)`, or the console's `require_ui(Permission.AUDIT_EXPORT)`) run
+neither, so neither response is step-up gated at any point. Each resolves the token it started with, so a session rotation (a step-up
 on that session, for example) ends it as a revocation would.
 
 - The `/ws/stats` live feed asks before every frame, about one a second. A refusal closes the socket
@@ -5471,8 +5478,10 @@ on that session, for example) ends it as a revocation would.
   read and one chunk, so a withdrawn grant reaches it within one page. A refusal stops it as the
   bulk export bullet above says, with the reason `standing_changed`. The pages are read with the
   identity the export started with. A caller that may now read fewer rows, as after losing
-  `users:manage`, would still receive the lock rows. So that stops it too, with the reason
-  `scope_changed`. A stop records `audit.export.stopped` with the counted and streamed rows and
+  `users:manage`, would still receive the lock rows. A role change through the API revokes the
+  session, so that loss stops the export with the reason `standing_changed`. Only when the session
+  survives the loss, as after a direct store write or on a page checked before the revoke lands,
+  does it stop with the reason `scope_changed`. A stop records `audit.export.stopped` with the counted and streamed rows and
   the reason, then raises to abort the transfer, which reaches the client as a failed download,
   as the bulk export bullet above says. The idle clock moves as the bulk export's does, at most
   every quarter of the window.

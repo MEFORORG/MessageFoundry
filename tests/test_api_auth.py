@@ -1580,6 +1580,44 @@ async def test_audit_export_continues_when_the_lock_rows_become_readable(
     assert len(data) == 7 and stops == []
 
 
+@pytest.mark.parametrize("stalled", [False, True])
+async def test_audit_export_moves_the_idle_clock_only_once_a_quarter_window_has_passed(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, stalled: bool
+) -> None:
+    """RED when: the per-page re-check never moves the idle clock, so a long download ends its
+    own session, or moves it on every page (BACKLOG #3469 finding 3). Each page's clock read is
+    pushed a whole idle window on when ``stalled``; otherwise the test runs well inside a quarter
+    of the window, so no page touches. Only the export's own ``time`` is replaced, so the event
+    loop's clock is untouched."""
+    from messagefoundry.api import auth_routes
+
+    clock = [time.monotonic()]
+
+    def monotonic() -> float:
+        if not stalled:
+            return time.monotonic()
+        clock[0] += 86_400.0
+        return clock[0]
+
+    monkeypatch.setattr(auth_routes, "time", SimpleNamespace(monotonic=monotonic, time=time.time))
+    activity: list[bool] = []
+    real_recheck = auth_routes.recheck_standing
+
+    async def recording(*args: Any, **kwargs: Any) -> Any:
+        activity.append(bool(kwargs.get("activity")))
+        return await real_recheck(*args, **kwargs)
+
+    monkeypatch.setattr(auth_routes, "recheck_standing", recording)
+
+    async def nothing(_service: AuthService, _uid: str) -> None:
+        return None
+
+    data, stops = await _export_with_mid_stream_act(engine, monkeypatch, Role.AUDITOR, nothing)
+    assert len(data) == 7 and stops == []
+    assert len(activity) == 4  # seven rows at a page of two
+    assert activity == [stalled] * 4
+
+
 async def test_audit_export_denied_to_unauthorized_role(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "vw", Role.VIEWER)
