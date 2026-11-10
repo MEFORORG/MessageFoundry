@@ -161,11 +161,17 @@ it the notifier, or the logging sink when no notifier is configured.
   on an over-grant, since an unread token counted nothing) and the hop's detail with control
   characters escaped. Nothing about the token is in it.
 - **A clean read resolves it.** A hop read clean raises `vault_privilege_clean`, which pages nobody
-  and resolves the open warning for the same subject through the ADR 0044 auto-resolve map.
+  and resolves the open warning for the same subject through the ADR 0044 auto-resolve map, under
+  the conditions the next bullet names.
 - **The subject is the hop**, `vault:store` or `vault:secrets`. Keying it by the token's policies
   was rejected: the usual fix is a new token with other policies, and its clean start would never
   resolve the old warning. The cost, stated rather than fixed: engine processes that share one
-  store share each hop's alert, so one process's clean start resolves a warning another raised on
-  a different token. Each start's audit row still records every process's own reading.
+  store share each hop's alert, so one process's clean start can resolve a warning another raised
+  on a different token. It does so only when, at least, its process has a notifier with alert
+  state (the logging sink resolves nothing), it probes that hop, and the warning's raise landed
+  before the fenced auto-resolve's own read of the alert (ADR 0044, the vault BACKLOG #4916
+  amendment). A warning still open after a clean start may be a live finding: another process
+  still running on the over-granted or unread token. Each start's audit row still records every
+  process's own reading.
 - **Best effort.** A sink that raises is logged and never masks the finding, the audit row or the
   refusal.
