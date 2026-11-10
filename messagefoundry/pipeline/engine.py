@@ -2062,8 +2062,8 @@ class Engine:
         # reloads, and NOT leader-gated: whichever node runs the graph pauses its own listeners
         # against the one shared backlog. Built and measured ONCE here, BEFORE the graph comes up, so
         # a restart onto a backlog already over the bound binds its listeners paused rather than
-        # reading until the first tick. A no-op (no task) when the depth bound is off and the disk
-        # floor does not apply.
+        # reading until the first tick. With the depth bound off and no disk floor, its task only
+        # sweeps stale intake alerts, and only when a sink is wired (BACKLOG #3269).
         if self._intake_monitor is None:
             self._intake_monitor = IntakeBoundMonitor(
                 self.store,

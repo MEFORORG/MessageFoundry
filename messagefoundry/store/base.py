@@ -85,6 +85,7 @@ from messagefoundry.store.store import (
     AdminGrant,
     AdminHolderTest,
     AdminRemoval,
+    AlertGeneration,
     AlertInstance,
     AlertSummary,
     AuditAppend,
@@ -1547,6 +1548,23 @@ class QueueStore(StoreLifecycle, Protocol):
     ) -> int:
         """Auto-resolve the live instance(s) for a ``(event_type, connection)`` key on the inverse
         lifecycle signal (e.g. ``connection_restored``). Returns the count resolved."""
+        ...
+
+    async def open_alert_generations(
+        self, *, event_type: str, connection: str | None = None
+    ) -> list[AlertGeneration]:
+        """The live (``open`` or ``acknowledged``) instances of ``event_type``, for one
+        ``connection`` or for every one, as :class:`AlertGeneration` pairs (BACKLOG #3269). Lockfree
+        read; no reason cell is read."""
+        ...
+
+    async def resolve_alert_generation(
+        self, *, alert_id: int, through_count: int, now: float | None = None
+    ) -> int:
+        """Resolve instance ``alert_id`` only while it is live and its ``count`` is at most
+        ``through_count`` (BACKLOG #3269). Returns 1 when it resolved, 0 when the row was already
+        resolved, unknown, or has taken a raise since its generation was read. No clock is compared,
+        so a raise from another process that lands first keeps the row open whatever its clock."""
         ...
 
     async def suspend_alert_instance(

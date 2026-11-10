@@ -238,6 +238,7 @@ from messagefoundry.store.store import (
     AdminGrant,
     AdminHolderTest,
     AdminRemoval,
+    AlertGeneration,
     AlertInstance,
     AlertSummary,
     AppendedAuditRow,
@@ -8427,6 +8428,40 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
         return int(changed)
+
+    async def open_alert_generations(
+        self, *, event_type: str, connection: str | None = None
+    ) -> list[AlertGeneration]:
+        # BACKLOG #3269: (id, connection, count) of the live instances of one type. No reason read.
+        # status<>'resolved' is the live predicate spelled as ux_alert_instance_open's filter, so
+        # the read seeks that index.
+        where = ["event_type=?", "status<>'resolved'"]
+        params: list[Any] = [event_type]
+        if connection is not None:
+            where.append("connection=?")
+            params.append(connection)
+        rows = await self._fetchall(
+            "SELECT id, connection, [count] AS count FROM alert_instance WHERE "
+            + " AND ".join(where)
+            + " ORDER BY id",
+            tuple(params),
+        )
+        return [AlertGeneration(int(r["id"]), str(r["connection"]), int(r["count"])) for r in rows]
+
+    async def resolve_alert_generation(
+        self, *, alert_id: int, through_count: int, now: float | None = None
+    ) -> int:
+        # BACKLOG #3269: resolve one live instance only while no raise has folded in past
+        # through_count. Clock-free.
+        # OUTPUT, not rowcount: the caller acts on whether the row closed, and SET NOCOUNT ON
+        # cannot hide an output rowset.
+        now = time.time() if now is None else now
+        closed = await self._execute_output(
+            "UPDATE alert_instance SET status='resolved', resolved_at=? OUTPUT inserted.id"
+            " WHERE id=? AND [count]<=? AND status<>'resolved'",
+            (now, alert_id, through_count),
+        )
+        return len(closed)
 
     async def suspend_alert_instance(
         self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None

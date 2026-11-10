@@ -239,6 +239,7 @@ from messagefoundry.store.store import (
     AdminGrant,
     AdminHolderTest,
     AdminRemoval,
+    AlertGeneration,
     AlertInstance,
     AlertSummary,
     AppendedAuditRow,
@@ -6841,6 +6842,39 @@ class PostgresStore:
             now,
             event_type,
             connection,
+        )
+        return _rowcount(result)
+
+    async def open_alert_generations(
+        self, *, event_type: str, connection: str | None = None
+    ) -> list[AlertGeneration]:
+        # BACKLOG #3269: (id, connection, count) of the live instances of one type. No reason read.
+        # status<>'resolved': ux_alert_instance_open's own filter, so the read seeks that index.
+        where = ["event_type=$1", "status<>'resolved'"]
+        params: list[Any] = [event_type]
+        if connection is not None:
+            where.append("connection=$2")
+            params.append(connection)
+        rows = await self._pool.fetch(
+            "SELECT id, connection, count FROM alert_instance WHERE "
+            + " AND ".join(where)
+            + " ORDER BY id",
+            *params,
+        )
+        return [AlertGeneration(int(r["id"]), str(r["connection"]), int(r["count"])) for r in rows]
+
+    async def resolve_alert_generation(
+        self, *, alert_id: int, through_count: int, now: float | None = None
+    ) -> int:
+        # BACKLOG #3269: resolve one live instance only while no raise has folded in past
+        # through_count. Clock-free.
+        now = time.time() if now is None else now
+        result = await self._pool.execute(
+            "UPDATE alert_instance SET status='resolved', resolved_at=$1"
+            " WHERE id=$2 AND count<=$3 AND status<>'resolved'",
+            now,
+            alert_id,
+            through_count,
         )
         return _rowcount(result)
 

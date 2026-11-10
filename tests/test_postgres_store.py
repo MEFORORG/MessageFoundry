@@ -4816,6 +4816,13 @@ async def test_summary_access_census_survives_and_coalesces_pg(store) -> None:
 # --- ALERT-19: alert_instance CRUD lifecycle + reason cipher-at-rest, on real Postgres --------------
 
 
+async def test_alert_generation_bounds_the_resolve_pg(store) -> None:
+    """BACKLOG #3269: the generation-bounded resolve, the shared contract."""
+    from tests._alert_generation_contract import check_alert_generation_contract
+
+    await check_alert_generation_contract(store)
+
+
 async def test_alert_instance_lifecycle_pg(store) -> None:
     from messagefoundry.store.store import AlertSummary
 

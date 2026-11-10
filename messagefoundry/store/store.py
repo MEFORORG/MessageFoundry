@@ -1668,6 +1668,19 @@ class AlertInstance:
 
 
 @dataclass(frozen=True)
+class AlertGeneration:
+    """Which raise a live alert instance is at: its ``id`` and its occurrence ``count`` (BACKLOG
+    #3269). ``count`` only grows on a live row and a new row gets a new ``id``, so the pair names one
+    point in the instance's life without reading any clock. A resolve bounded by it
+    (:meth:`~messagefoundry.store.base.QueueStore.resolve_alert_generation`) cannot close a raise
+    that landed after the pair was read. Metadata only, never a reason or a message body."""
+
+    id: int
+    connection: str
+    count: int
+
+
+@dataclass(frozen=True)
 class AlertSummary:
     """The whole-of-scope aggregate over **active** (open + acknowledged) alert instances (BACKLOG
     #1564) — what the nav bell needs, and the one thing a page of rows cannot give it.
@@ -16530,6 +16543,42 @@ class MessageStore:
                 "UPDATE alert_instance SET status='resolved', resolved_at=?"
                 " WHERE event_type=? AND connection=? AND status!='resolved'",
                 (now, event_type, connection),
+            )
+            await self._commit()
+            return int(cur.rowcount)
+
+    async def open_alert_generations(
+        self, *, event_type: str, connection: str | None = None
+    ) -> list[AlertGeneration]:
+        # BACKLOG #3269: the live instances of one alert type, for one subject or all, as
+        # (id, connection, count) only. Lockfree read; no reason cell is read or decrypted.
+        # status!='resolved' is ux_alert_instance_open's own filter, so the read seeks that index.
+        where = ["event_type=?", "status!='resolved'"]
+        params: list[Any] = [event_type]
+        if connection is not None:
+            where.append("connection=?")
+            params.append(connection)
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT id, connection, count FROM alert_instance WHERE "
+                + " AND ".join(where)
+                + " ORDER BY id",
+                params,
+            )
+            rows = await cur.fetchall()
+        return [AlertGeneration(int(r[0]), str(r[1]), int(r[2])) for r in rows]
+
+    async def resolve_alert_generation(
+        self, *, alert_id: int, through_count: int, now: float | None = None
+    ) -> int:
+        # BACKLOG #3269: resolve one live instance only while no raise has folded into it past
+        # through_count. Clock-free, so a later raise from any process keeps the row open.
+        now = time.time() if now is None else now
+        async with _writer_guard(self._db, self._lock):
+            cur = await self._db.execute(
+                "UPDATE alert_instance SET status='resolved', resolved_at=?"
+                " WHERE id=? AND count<=? AND status!='resolved'",
+                (now, alert_id, through_count),
             )
             await self._commit()
             return int(cur.rowcount)

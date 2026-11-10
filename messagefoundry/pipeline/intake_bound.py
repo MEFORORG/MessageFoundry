@@ -30,6 +30,16 @@ A WARNING marks the start of each pause and an INFO its end. Slice 3 adds the Al
 house pattern of ``queue_buildup``: ``intake_paused`` when a pause starts, and again at most every
 :data:`REALERT_SECONDS` while it holds, so a notifier's re-alert, escalation and suspend logic see a
 condition that persists. ``intake_resumed``, its auto-resolving inverse, fires once when it ends.
+
+**A subject nobody reminds about expires (BACKLOG #3269).** Each process names itself in its
+subjects, so a subject whose process never comes back under that name has nobody left to clear it:
+an unpinned cluster node that crashed while paused, a lone engine that became several engine
+shards, a shard dropped from a shrinking shard count, or a renamed ``[cluster].node_id``. Every
+monitor with a sink therefore sweeps the store's open ``intake_paused`` instances for subjects that
+are not its own. One whose occurrence count has not moved for :data:`STALE_SECONDS` of this
+monitor's own clock is resolved, bounded by the count it saw. A live paused process raises a
+reminder every :data:`REALERT_SECONDS`, which moves the count, so its alert stays open. No clock is
+compared across processes.
 """
 
 from __future__ import annotations
@@ -56,6 +66,8 @@ __all__ = [
     "DISK_REASON",
     "INTAKE_SUBJECT_MAX_LENGTH",
     "PAUSE_EFFECT",
+    "STALE_SECONDS",
+    "SWEEP_SECONDS",
     "IntakeBoundMonitor",
     "depth_resume_at",
     "disk_resume_at",
@@ -93,6 +105,17 @@ PAUSE_EFFECT = (
     "database inbounds skip their tick (docs/CONFIGURATION.md). Nothing already received is dropped "
     "or NAKed."
 )
+
+#: The alert type the sweep expires (the event ``AlertSink.intake_paused`` records).
+_PAUSED_EVENT = "intake_paused"
+
+#: How long an open ``intake_paused`` subject that is not this process's may go with no new raise
+#: before the sweep resolves it (BACKLOG #3269). Three reminder intervals: a live paused process
+#: raises one every :data:`REALERT_SECONDS`, so two missed reminders in a row are still not enough.
+STALE_SECONDS = 3 * REALERT_SECONDS
+
+#: How often a monitor sweeps for expired subjects. Coarse on purpose: the read is store-wide.
+SWEEP_SECONDS = 60.0
 
 #: The reminder clock, a module name so a test can move it without moving the event loop's.
 _monotonic = time.monotonic
@@ -201,6 +224,7 @@ class IntakeBoundMonitor:
         # The alert subject per reason, fixed for this monitor's life so a raise and its clear always
         # name the same instance.
         self._subjects = {r: intake_alert_subject(r, node) for r in (DEPTH_REASON, DISK_REASON)}
+        self._own_subjects = frozenset(self._subjects.values())
         self._resolve_on_stop = resolve_on_stop
         # None = no notifier configured. Then nothing is raised: the monitor's own WARNING and INFO
         # lines are the log record, and a LoggingAlertSink would only repeat them.
@@ -235,6 +259,11 @@ class IntakeBoundMonitor:
         self._disk_failing = False
         # Whether check_once has run, so the loop does not repeat Engine.start's first measurement.
         self._measured = False
+        # BACKLOG #3269, the expiry sweep: per instance id, the count it last saw and the monotonic
+        # time it first saw that count.
+        self._watched: dict[int, tuple[int, float]] = {}
+        self._next_sweep = 0.0
+        self._sweep_failing = False
 
     @property
     def depth_bound_on(self) -> bool:
@@ -245,15 +274,26 @@ class IntakeBoundMonitor:
         return self._floor_path is not None
 
     @property
+    def _sweep_on(self) -> bool:
+        """Whether the expiry sweep runs (BACKLOG #3269): wherever a sink is wired, bounds on or
+        off, since a stale subject can outlive the config that raised it."""
+        return self._alert_sink is not None
+
+    @property
     def enabled(self) -> bool:
-        """True when either bound applies. When False, :meth:`start` spawns no task."""
+        """True when either bound applies. When False, :meth:`start` spawns only the expiry sweep,
+        and only when a sink is wired."""
         return self.depth_bound_on or self.disk_floor_on
 
     def start(self) -> None:
-        if self._task is not None or not self.enabled:
+        """Spawn the measuring loop when either bound applies, or the expiry sweep alone when only a
+        sink is wired. With neither, no task."""
+        if self._task is not None or not (self.enabled or self._sweep_on):
             return
         self._stop.clear()
         self._task = asyncio.create_task(self._run(), name="intake-bound-monitor")
+        if not self.enabled:
+            return
         log.info(
             "intake bounds on: [inbound].max_staged_depth=%d (resume at %d), "
             "[retention].min_free_disk_mb=%d on %s (every %gs)",
@@ -315,12 +355,67 @@ class IntakeBoundMonitor:
         # Engine.start measures once before the graph comes up, so the loop waits first rather
         # than repeating that read at once.
         skip_first = self._measured
+        interval = self._check_seconds if self.enabled else SWEEP_SECONDS
         while not self._stop.is_set():
-            if not skip_first:
+            if self.enabled and not skip_first:
                 await self.check_once()
             skip_first = False
+            if self._sweep_on and _monotonic() >= self._next_sweep:
+                await self.sweep_once()
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(self._stop.wait(), self._check_seconds)
+                await asyncio.wait_for(self._stop.wait(), interval)
+
+    async def sweep_once(self) -> int:
+        """Resolve each open ``intake_paused`` subject of another process that has taken no raise
+        for :data:`STALE_SECONDS` (BACKLOG #3269). Returns how many it resolved.
+
+        Staleness is judged on this monitor's own monotonic clock, from the first sweep that saw
+        the instance at its current count, so no other process's clock enters it. The resolve is
+        bounded by that count (``resolve_alert_generation``): a reminder that lands between the read
+        and the write moves the count past it, and the row stays open. A subject this process owns
+        is skipped, since its own measurement raises and clears it. A failed sweep is logged once
+        per failing streak and changes nothing."""
+        self._next_sweep = _monotonic() + SWEEP_SECONDS
+        try:
+            generations = await asyncio.wait_for(
+                self._store.open_alert_generations(event_type=_PAUSED_EVENT), PROBE_TIMEOUT_SECONDS
+            )
+            now = _monotonic()
+            watched: dict[int, tuple[int, float]] = {}
+            expired = 0
+            for gen in generations:
+                if gen.connection in self._own_subjects:
+                    continue
+                prev = self._watched.get(gen.id)
+                since = prev[1] if prev is not None and prev[0] == gen.count else now
+                if now - since < STALE_SECONDS:
+                    watched[gen.id] = (gen.count, since)
+                    continue
+                resolved = await asyncio.wait_for(
+                    self._store.resolve_alert_generation(alert_id=gen.id, through_count=gen.count),
+                    PROBE_TIMEOUT_SECONDS,
+                )
+                if resolved:
+                    expired += resolved
+                    # The subject is the operator's own node or shard label, never message content.
+                    log.info(
+                        "intake pause alert %s expired: no process has raised it for %ds",
+                        gen.connection,
+                        int(now - since),
+                    )
+        except Exception:
+            # Broad on purpose, as in _check_depth: an advisory sweep must not kill the loop.
+            if not self._sweep_failing:
+                self._sweep_failing = True
+                log.warning(
+                    "intake pause alert sweep failed; stale subjects stay open until a sweep "
+                    "succeeds",
+                    exc_info=True,
+                )
+            return 0
+        self._sweep_failing = False
+        self._watched = watched
+        return expired
 
     async def check_once(self) -> None:
         """One measurement of each enabled bound. A probe that fails, or hangs past
