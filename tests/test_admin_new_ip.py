@@ -1741,27 +1741,45 @@ def test_a_reading_still_changing_at_the_cap_logs_the_placeholder(
     assert _new_ip_path_field(path, "10.0.0.1") == _UNREADABLE_FIELD
 
 
-def test_a_path_past_the_read_bound_logs_the_placeholder() -> None:
+def test_a_path_past_the_read_bound_logs_the_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """RED when: a path longer than ``LOG_FIELD_READ_MAX`` is read through the filters, whose
-    passes run on the event loop in the branch a replayed token loops on, rather than logged as the
-    placeholder (BACKLOG #3770)."""
+    passes run on the event loop in the branch a replayed token loops on, or is logged as anything
+    but the placeholder (BACKLOG #3770)."""
+    import messagefoundry.logging_setup as logging_setup
+
     path = "/" + "a" * (LOG_FIELD_READ_MAX - 1)
     # The control: a path at the bound reads, cut by the field bound.
     assert _new_ip_path_field(path) != _UNREADABLE_FIELD
+
+    def _no_reading() -> tuple[logging.Filter, ...]:
+        raise AssertionError("an over-bound path was read")
+
+    # A reading of the over-bound path would raise here and log ``unloggable-AssertionError``.
+    monkeypatch.setattr(logging_setup, "_shipped_filters", _no_reading)
+    monkeypatch.setattr(logging_setup, "_UNLOGGABLE_REPORTED", set())
     assert _new_ip_path_field(path + "a") == _UNREADABLE_FIELD
     assert _new_ip_path_field(path + "a", "10.0.0.1") == _UNREADABLE_FIELD
+    # The control: the patch is live, so a path at the bound now fails to read.
+    assert _new_ip_path_field(path) == '"unloggable-AssertionError"'
 
 
 @pytest.mark.parametrize("label", ("token", "password", "secret", "id_token", "access_token"))
-def test_a_credential_matrix_parameter_blanks_every_past_cap_line(label: str) -> None:
+def test_a_credential_matrix_parameter_blanks_the_past_cap_line_for_the_named_seen_texts(
+    label: str,
+) -> None:
     """RED when: a path holding a credential matrix parameter stops logging the placeholder on the
-    past-cap line, a case ``redacted_log_field`` lists, or its repeat line stops hiding the value
+    past-cap line with a ``_BASELINE_SEEN`` text, or stops logging the repeat field with ``||`` or
+    ``a^b^c``, the cases ``redacted_log_field`` lists; or either line stops hiding the value
     (BACKLOG #3770)."""
     path = f"/x;{label}=abc"
     repeat = _new_ip_path_field(path)
     assert "abc" not in repeat and repeat.endswith('_u003D_<redacted>"'), repeat
     for seen in _BASELINE_SEEN:
         assert _new_ip_path_field(path, _bounded_address_text(seen)) == _UNREADABLE_FIELD, seen
+    for seen in ("||", "a^b^c"):
+        assert _new_ip_path_field(path, _bounded_address_text(seen)) == repeat, seen
 
 
 #: What the seeded corpora build paths from: labels, separators, encoded separators, controls,
