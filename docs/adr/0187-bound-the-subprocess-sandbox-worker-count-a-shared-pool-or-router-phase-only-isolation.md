@@ -362,11 +362,10 @@ from one added pointer to this amendment, at the end of its paragraph on what a 
   dead-letters in at least these cases: the fresh worker has a stray frame waiting too; a respawn
   fails; the workers spawned for it keep exiting, or closing their pipe, before its request is
   written; and any fault the request itself meets on the fresh worker, as for any other message,
-  such as a worker that exits as its request is written. A frame left after an answer still
-  dead-letters the message it follows when it is queued by the time the check after that answer
-  runs. [ADR 0087](0087-sandbox-subprocess-isolation.md) AC-10's 2026-11-09 amendment says when
-  each check runs, what a frame arriving later costs, and how a length header over the frame cap
-  changed.
+  such as a worker that exits as its request is written. A frame left after an answer can still
+  dead-letter the message it follows. [ADR 0087](0087-sandbox-subprocess-isolation.md) AC-10's
+  2026-11-09 amendment says when each check runs, what a frame arriving later costs, and how the
+  handling of a length header over the frame cap changed.
 - **Every kill records a cause from a closed set**, `KillCause` in `messagefoundry/pipeline/sandbox.py`,
   and writes one `WARNING` naming the inbound, the phase and the cause token, never message content.
   A graph refusal writes none, and a shutdown logs at `INFO`. The runner alerts on a graph refusal
