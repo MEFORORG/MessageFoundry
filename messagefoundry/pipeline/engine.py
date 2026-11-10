@@ -3990,6 +3990,11 @@ class Engine:
             drain = getattr(self._alert_sink, "drain_state", None)
             if drain is not None:
                 await drain(_ALERT_STATE_DRAIN_SECONDS)
+        except Exception:
+            # The cancel raised below replaces this error, so it is logged here or not at all.
+            if monitor_cancelled:
+                log.exception("an engine stop step failed after the stop was cancelled")
+            raise
         finally:
             await self.store.close()
             if monitor_cancelled:

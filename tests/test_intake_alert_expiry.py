@@ -439,7 +439,10 @@ async def test_a_cancel_passed_on_by_the_monitor_still_lets_the_engine_close_the
 
 @pytest.mark.parametrize("monitor_cancels", [True, False], ids=["cancel-deferred", "no-cancel"])
 async def test_a_later_teardown_step_that_raises_still_closes_the_store(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, monitor_cancels: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    monitor_cancels: bool,
 ) -> None:
     """Round-4 item 2: the teardown after the monitor runs inside try/finally. The store closes
     even if a later step raises, and a cancel the monitor passed on is what Engine.stop raises."""
@@ -476,6 +479,11 @@ async def test_a_later_teardown_step_that_raises_still_closes_the_store(
 
     monkeypatch.setattr(engine.store, "close", close)
     expected: type[BaseException] = asyncio.CancelledError if monitor_cancels else RuntimeError
-    with pytest.raises(expected):
+    with (
+        caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.engine"),
+        pytest.raises(expected),
+    ):
         await engine.stop()
     assert closed == [True], "the store closed although a later teardown step raised"
+    logged = any("failed after the stop was cancelled" in r.getMessage() for r in caplog.records)
+    assert logged is monitor_cancels, "the error the cancel replaces is logged, and only then"
