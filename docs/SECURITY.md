@@ -2648,12 +2648,13 @@ not hide a refusal: a later start failure that is not a store fault, a CA refuse
 changed included, replaces it in turn, with one alert. The class compared is only whether the line
 is a store fault (vault BACKLOG #5146). A later failure in the class the line already records keeps
 the line and alerts no more. So a refused CA after an unrelated line, such as a failed bind or
-build, keeps that line, and the lane's line does not name the refusal. It shows at least in the
-server log, the `auth.trust_anchor` rows and, on an operator start of that inbound, the 409's fixed
-detail `trust anchor refused; see the server log`, while the lane is still held failed across a
-reload that leaves its config unchanged. On an inbound the rule holds for any start failure. On an outbound it holds for a
-failure raised as a `TrustAnchorError`, as a refused or store-stopped CA check is; any other
-outbound start failure records its line and alerts each time. A refused-CA lane whose line a store
+build, keeps that line, and the lane's line does not name the refusal. The refusal shows at least
+in the server log and, on an operator start of an inbound, in the 409's fixed detail `trust anchor
+refused; see the server log`. Where the CA check wrote one, it shows in the `auth.trust_anchor`
+rows too; a CA setting refused before any audit row is written has none. The lane is still held
+failed across a reload that leaves its config unchanged. On an inbound the rule holds for any start
+failure. On an outbound it holds for a failure raised as a `TrustAnchorError`, as a refused or
+store-stopped CA check is; any other outbound start failure records its line and alerts each time. A refused-CA lane whose line a store
 fault replaced is no longer kept failed across a reload, so the next reload reads its CA again. An
 outbound checks its CA at a
 start only when it has no connector. An operator start of

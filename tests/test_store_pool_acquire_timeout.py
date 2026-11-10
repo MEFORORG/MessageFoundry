@@ -39,6 +39,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.settings import StoreSettings
+from messagefoundry.redaction import safe_exc
 from messagefoundry.store.base import (
     DEFAULT_STORE_ACQUIRE_TIMEOUT,
     StoreAcquireTimeout,
@@ -415,6 +416,11 @@ async def test_sqlserver_clamped_borrow_names_the_setting_that_set_its_limit() -
         async with store._acquire_clamped(FAST):
             pytest.fail("the body must never run on a wedged pool")
     assert "[store].acquire_timeout" not in str(clamped.value)
+    # The stepdown pause read can be cut by the fence timeout instead, and a logged error passes
+    # through safe_exc, whose default limit must keep both names (BACKLOG #5064).
+    assert safe_exc(clamped.value).endswith(
+        "[cluster].lease_renew_timeout_seconds or leader_fence_timeout_seconds"
+    ), safe_exc(clamped.value)
     # A tie names the clamp too: raising [store].acquire_timeout alone would not lengthen it.
     store = _sqlserver_store(_HangingPool(), timeout=FAST)
     with pytest.raises(StoreAcquireTimeout, match=r"lease_renew_timeout_seconds"):
