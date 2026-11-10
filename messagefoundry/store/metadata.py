@@ -185,7 +185,8 @@ def user_metadata(metadata_json: str | None) -> str | None:
     raises :class:`MetadataTooDeepError` instead: ``None`` would send a ``dynamic_headers`` delivery
     out without its headers. The delivery worker takes the error on its internal-error arm: under
     the default ``InternalErrorPolicy.CONTINUE`` it dead-letters the row, and under ``STOP`` it
-    re-pends the row and halts the lane for an operator. It does not retry on the backoff."""
+    re-pends the row on the retry policy's backoff (dead-lettering it once a finite attempt cap is
+    reached) and halts the lane until an operator reloads or restarts."""
     user = _load_object(metadata_json, too_deep_raises=True).get("user")
     if not isinstance(user, dict) or not user:
         return None
