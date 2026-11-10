@@ -413,6 +413,17 @@ def _is_package_sid(sid: str) -> bool:
     return sid.upper().startswith(_PACKAGE_SID_PREFIX)
 
 
+def _screened_principal(sid: str) -> str | None:
+    """What ``sid`` is, when a key file may name it neither as a read grant nor as its owner: an
+    application package, or a broad group. ``None`` when it may be named. One screen for both, so
+    a later screen reaches grants and owners alike."""
+    if _is_package_sid(sid):
+        return "an application package"
+    if _is_broad_group(sid):
+        return f"{describe_sid(sid)}, a group many accounts hold"
+    return None
+
+
 def _windows_access_problem(security: _WinPathSecurity, mask: int = _REACH_MASK) -> str | None:
     """Why a broad group or an application package can read or change the file this access list
     belongs to, or ``None``.
@@ -1539,26 +1550,15 @@ def _create_restricted_windows(
     # read-back compares like with like.
     owner_sid = None if owner is None else _resolve_sid(owner)
     for name, sid in zip(read_grants, read_sids, strict=True):
-        if _is_package_sid(sid):
+        # A grant that would make the file broadly readable is not a restricted create.
+        if (what := _screened_principal(sid)) is not None:
             raise RestrictedFileError(
-                f"{path} was not created: {name!r} is an application package, and a key file is "
-                "granted to the account the engine runs as, never to a package"
-            )
-        if _is_broad_group(sid):
-            # A grant that would make the file broadly readable is not a restricted create.
-            raise RestrictedFileError(
-                f"{path} was not created: {name!r} is {describe_sid(sid)}, a group many accounts "
-                "hold, and a key file cannot be granted to it. Name the one account the engine "
-                "runs as"
+                f"{path} was not created: {name!r} is {what}, and a key file cannot be granted "
+                "to it. Name the one account the engine runs as"
             )
     # An owner holds READ_CONTROL and WRITE_DAC whatever the list says, so it could grant itself
     # read: the owner gets the screens a read grant gets (vault BACKLOG #6674 item 1).
-    if owner_sid is not None and (_is_package_sid(owner_sid) or _is_broad_group(owner_sid)):
-        what = (
-            "an application package"
-            if _is_package_sid(owner_sid)
-            else f"{describe_sid(owner_sid)}, a group many accounts hold"
-        )
+    if owner_sid is not None and (what := _screened_principal(owner_sid)) is not None:
         raise RestrictedFileError(
             f"{path} was not created: {owner!r} is {what}, and a key file cannot be owned by it, "
             "because a file's owner may rewrite its access list"

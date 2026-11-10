@@ -227,7 +227,9 @@ def test_an_external_provider_whose_backend_import_breaks_fails_closed(
         raise error
 
     monkeypatch.setattr("messagefoundry.store.keyprovider.importlib.import_module", _import)
-    with pytest.raises(KeyProviderError, match="could not load its backend") as caught:
+    with pytest.raises(
+        KeyProviderError, match="could not load its provider module or backend"
+    ) as caught:
         resolve_key_provider(StoreSettings(key_provider="vault"))
     assert caught.value.__cause__ is error
     with pytest.raises(KeyProviderError):

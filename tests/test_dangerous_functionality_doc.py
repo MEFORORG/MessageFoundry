@@ -306,10 +306,12 @@ def _start_sites(sources: Mapping[str, str]) -> dict[str, frozenset[str]]:
 
 
 @functools.cache
-def _non_literal_library_loads(source: str) -> tuple[str, ...]:
-    """Each ``ctypes`` load handed anything but a string literal or ``None``, as
-    ``Loader(<first argument source>)``, so swapping one computed load for another is visible."""
-    loads: list[str] = []
+def _library_load_calls(source: str) -> tuple[tuple[str, ast.expr | None], ...]:
+    """Each ``ctypes`` library load in ``source``, as ``(loader name, first argument)``. The one
+    walk both library-load checks filter, so a loader form added here reaches both."""
+    if "DLL" not in source and "LoadLibrary" not in source:
+        return ()  # every loader name holds one of these; skips the parse for most modules
+    calls: list[tuple[str, ast.expr | None]] = []
     for node in ast.walk(_parse(source)):
         if not isinstance(node, ast.Call):
             continue
@@ -321,15 +323,22 @@ def _non_literal_library_loads(source: str) -> tuple[str, ...]:
             if isinstance(func, ast.Name)
             else None
         )
-        if name is None or not _LIBRARY_LOADER_RE.match(name):
-            continue
-        first = node.args[0] if node.args else None
+        if name is not None and _LIBRARY_LOADER_RE.match(name):
+            calls.append((name, node.args[0] if node.args else None))
+    return tuple(calls)
+
+
+def _non_literal_library_loads(source: str) -> tuple[str, ...]:
+    """Each ``ctypes`` load handed anything but a string literal or ``None``, as
+    ``Loader(<first argument source>)``, so swapping one computed load for another is visible."""
+    return tuple(
+        f"{name}({'' if first is None else ast.unparse(first)})"
+        for name, first in _library_load_calls(source)
         if not (
             isinstance(first, ast.Constant)
             and (first.value is None or isinstance(first.value, str))
-        ):
-            loads.append(f"{name}({'' if first is None else ast.unparse(first)})")
-    return tuple(loads)
+        )
+    )
 
 
 # --- reading the page ----------------------------------------------------------------------------
@@ -489,22 +498,14 @@ def test_every_library_load_names_its_library_with_a_literal() -> None:
 _REVIEWED_PROCESS_SYMBOL_LOADS = frozenset({"restricted_file.py", "store/crypto.py"})
 
 
-@functools.cache
 def _process_symbol_loads(source: str) -> int:
     """How many ``ctypes`` loads in ``source`` are handed ``None``: ``CDLL(None)`` and its kin, which
     load no library and reach the symbols already in the process."""
-    count = 0
-    for node in ast.walk(_parse(source)):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-        if name is None or not _LIBRARY_LOADER_RE.match(name):
-            continue
-        first = node.args[0] if node.args else None
-        if isinstance(first, ast.Constant) and first.value is None:
-            count += 1
-    return count
+    return sum(
+        1
+        for _name, first in _library_load_calls(source)
+        if isinstance(first, ast.Constant) and first.value is None
+    )
 
 
 def test_every_process_symbol_load_is_reviewed_and_named() -> None:

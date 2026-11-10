@@ -1003,11 +1003,25 @@ def _is_elevated() -> bool:
 #: restore privilege enabled. So a test that writes one with its real owner needs such a token. The
 #: hosted Windows legs run elevated; off-admin,
 #: :func:`test_windows_a_handoff_is_refused_up_front_off_admin` runs instead, and the tests that
-#: swap in an owner every token may assign (:func:`_owned_by_this_account`) run on every leg.
+#: swap in another owner (:func:`_handoff_owned_by`) run on every leg.
 elevated_only = pytest.mark.skipif(
     not _is_elevated(),
     reason="writing a handoff needs an elevated administrator, as provision-admin",
 )
+
+
+def _handoff_owned_by(monkeypatch: pytest.MonkeyPatch, owner_sid: str) -> None:
+    """Make :func:`custody.write_handoff_file` pass its up-front token check and ask the create for
+    ``owner_sid`` in place of the Administrators it asks for, so a test chooses whether the create
+    may assign that owner whatever token runs it."""
+    monkeypatch.setattr(restricted_file, "administrators_enabled", lambda: True)
+    real = restricted_file.write_restricted_file
+
+    def _write(path: Path, data: bytes, **kwargs: object) -> None:
+        assert kwargs.pop("owner") == _ADMINS  # what custody asked for
+        real(path, data, owner=f"*{owner_sid}", **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(restricted_file, "write_restricted_file", _write)
 
 
 @windows_only
@@ -1058,15 +1072,7 @@ def test_windows_a_create_refused_its_owner_is_a_custody_refusal_on_every_leg(
     # Vault BACKLOG #6674 item 2: the test above skips on the elevated hosted legs, so this one asks
     # for an owner no token there may assign either (one service's SID, without the restore
     # privilege enabled). Windows refuses it at the create on every leg, and custody translates it.
-    monkeypatch.setattr(restricted_file, "administrators_enabled", lambda: True)
-    real = restricted_file.write_restricted_file
-
-    # Not _owned_by_this_account: the owner swapped in here is one no token may assign.
-    def _unassignable_owner(path: Path, data: bytes, **kwargs: object) -> None:
-        assert kwargs.pop("owner") == _ADMINS  # what custody asked for
-        real(path, data, owner=f"*{_SERVICE}", **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(restricted_file, "write_restricted_file", _unassignable_owner)
+    _handoff_owned_by(monkeypatch, _SERVICE)
     path = tmp_path / "handoff.key"
     with pytest.raises(CustodyError, match="may not make") as excinfo:
         custody.write_handoff_file(path, _blob(), service_account=f"*{_SERVICE}")
@@ -1220,30 +1226,16 @@ def test_windows_a_handoff_made_for_this_account_round_trips(tmp_path: Path) -> 
     assert not path.exists()
 
 
-def _owned_by_this_account(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make :func:`custody.write_handoff_file` create its file owned by this process's account, an
-    owner every token may assign, in place of Administrators, which only some may. The read accepts
-    the service as an owner, and a handoff made for this account names it as the service."""
-    monkeypatch.setattr(restricted_file, "administrators_enabled", lambda: True)
-    real = restricted_file.write_restricted_file
-    me = _engine_sid()
-
-    def _write(path: Path, data: bytes, **kwargs: object) -> None:
-        assert kwargs.pop("owner") == _ADMINS
-        real(path, data, owner=f"*{me}", **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(restricted_file, "write_restricted_file", _write)
-
-
 @windows_only
 def test_windows_a_handoff_made_for_this_account_round_trips_on_every_leg(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dpapi_scopes: list[bool]
 ) -> None:
     # Vault BACKLOG #6674 item 5: the test above skips off-admin, which left read_handoff_file and
-    # the handoff's machine scope unexercised there. Owned by this account, it runs on every leg.
-    _owned_by_this_account(monkeypatch)
-    path = tmp_path / "handoff.key"
+    # the handoff's machine scope unexercised there. Owned by this account, an owner every token
+    # may assign and one the read accepts as the service, it runs on every leg.
     me = _engine_sid()
+    _handoff_owned_by(monkeypatch, me)
+    path = tmp_path / "handoff.key"
     custody.write_handoff_file(path, _blob(), service_account=f"*{me}", enforcing=False)
     assert dpapi_scopes == [True]  # machine scope, so the service account can open it
     assert _aces(path) == {(0, _FULL, _SYSTEM), (0, _FULL, _ADMINS), (0, _READ_DELETE, me)}
