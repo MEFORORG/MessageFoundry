@@ -2380,16 +2380,26 @@ def test_a_boot_frame_over_the_frame_cap_spawns_no_worker(
     """The boot frame's cap check runs before the child exists, so a refusal leaves no worker."""
     _registry, config_dir = graph
     session = _session(config_dir)
+    started: list[object] = []
+
+    def _no_popen(*args: object, **kwargs: object) -> None:
+        started.append(args)
+        raise OSError("spawn intercepted")
+
     try:
-        monkeypatch.setattr(sandbox_mod, "_MAX_FRAME", 16)
-
-        def _no_popen(*args: object, **kwargs: object) -> None:
-            raise AssertionError("an over-cap boot frame reached Popen")
-
         monkeypatch.setattr(subprocess, "Popen", _no_popen)
+        # Positive control: under the real cap the spawn reaches this patch, so a later empty
+        # ``started`` means the cap check refused first, not that the patch missed the spawn.
+        with pytest.raises(OSError, match="spawn intercepted"):
+            session._spawn("transform")
+        assert len(started) == 1
+        started.clear()
+        monkeypatch.setattr(sandbox_mod, "_MAX_FRAME", 16)
         with pytest.raises(SandboxError, match="frame too large"):
             session._spawn("transform")
-        assert session._proc is None
+        assert started == []
+        assert session.kill_counts == {}
+        assert session.last_kill_cause is None
     finally:
         session.close()
 
