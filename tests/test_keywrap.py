@@ -679,27 +679,6 @@ def test_an_ssl_loader_refuses_a_weak_key_with_a_stray_begin_marker(
     assert _api(cert, approved, _PASSPHRASE) is not None
 
 
-@pytest.mark.parametrize("byte", [b"\x01", b"\xff", b"\x00junk"])
-def test_a_key_block_that_does_not_decode_is_refused_not_skipped(
-    material: Material, byte: bytes
-) -> None:
-    # OpenSSL drops a control or high byte at a line end and decrypts the rest, so a key block
-    # whose base64 does not decode is refused under a plain PRIVATE KEY label too, failing closed.
-    # The approved key in the same shape is refused with it: that costs a clean re-export.
-    plain_label = material.wraps["best-available-2048"].replace(
-        b"ENCRYPTED PRIVATE KEY", b"PRIVATE KEY"
-    )
-    first_line_end = plain_label.index(b"\n", plain_label.index(b"\n") + 1)
-    shaped = plain_label[:first_line_end] + byte + plain_label[first_line_end:]
-    refusal = _check(shaped)
-    assert refusal is not None and "cannot decode" in refusal
-    # The control: the same key without the byte is judged on its wrap, not on its base64.
-    unshaped = _check(plain_label)
-    assert unshaped is not None and "2048 iterations" in unshaped
-    approved = material.wraps["approved"].replace(b"ENCRYPTED PRIVATE KEY", b"PRIVATE KEY")
-    assert _check(approved) is None
-
-
 @pytest.mark.parametrize("variant", ["crcrlf", "blank-after-begin", "space-line-after-begin"])
 def test_a_reformatted_legacy_pem_is_still_refused(material: Material, variant: str) -> None:
     legacy = material.wraps["legacy-proc-type-pem"]

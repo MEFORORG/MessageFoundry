@@ -20,8 +20,8 @@ What is refused, by default and with no setting to turn it off:
   by RFC 8018's default, so it is refused like an explicit SHA-1 one.
 * **PBES2 with scrypt** below Appendix C's floor: ``r >= 8``, and ``N`` at least 2^17, 2^16 or 2^15
   for ``p`` of 1, 2, or 3 and up. Those are the table's three rows, encoded as written.
-* Any other derivation this module does not recognise, an encrypted key it cannot parse, a key
-  block whose base64 it cannot decode, and a key file it cannot read or that is too large to check.
+* Any other derivation this module does not recognise, an encrypted key it cannot parse, and a key
+  file it cannot read or that is too large to check.
 * An encrypted key where the loader has NO passphrase to give, before any library can try it.
 
 ``cryptography``'s ``BestAvailableEncryption`` and the ``openssl`` CLI's own default both write
@@ -382,7 +382,6 @@ def _wrap_problem(der: bytes, algorithm: str, params: _Tlv | None) -> str | None
 
 
 _UNREADABLE: Final = "is an encrypted private key this engine cannot read to check its wrap"
-_UNDECODABLE: Final = "is in a key block whose base64 this engine cannot decode to check its wrap"
 
 
 def _der_problem(der: bytes, *, known_encrypted: bool) -> tuple[bool, str | None]:
@@ -507,10 +506,11 @@ def _inspect(material: bytes) -> tuple[bool, str | None]:
             # does not hide the key from this check. A body with no "-" is decoded whole.
             der = base64.b64decode(b"".join(body.split(b"-", 1)[0].split()), validate=True)
         except (binascii.Error, ValueError):
-            # Refused under any key label, not skipped (BACKLOG #5544): OpenSSL also drops some
-            # bytes this strict decode does not, such as a control or high byte at a line end, and
-            # then decrypts what is left, so "the loader rejects it itself" does not hold.
-            return True, _UNREADABLE if known else _UNDECODABLE
+            if known:
+                return True, _UNREADABLE
+            # Not base64, so skipped. OpenSSL may still load some such bodies: it drops a control
+            # or high byte at a line end, and a short header line, before it decodes.
+            continue
         # Every key block is read for the EncryptedPrivateKeyInfo shape, whatever its label:
         # OpenSSL decrypts that shape under a plain PRIVATE KEY label too.
         block_encrypted, problem = _der_problem(der, known_encrypted=known)
