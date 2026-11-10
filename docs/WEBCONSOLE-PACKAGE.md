@@ -167,7 +167,7 @@ The engine injects a single frozen `UiDeps` dataclass (defined in `api/_ui_seam.
 - `core: CoreHandlers` — the ~30 `create_app`-nested JSON handlers the moved `/ui` routes call directly
   (`list_connections`, `get_message`, `replay_message`, `purge_connection`, `search_messages`, …);
 - `admin: AdminHandlers` — the ~26 `add_auth_routes`-nested admin/account/audit handlers plus two sync
-  DTO-projection helpers (`user_summary`, `current_user`). `add_auth_routes(app)` **returns** this
+  DTO-projection helpers (`user_summary_scoped`, `current_user`). `add_auth_routes(app)` **returns** this
   bundle (it runs before `create_app`'s own handlers exist, so the bundle is the only way to reach them).
 
 Handler fields are typed `Callable[..., Awaitable[Any]]` (engine/gate params inside their signatures are

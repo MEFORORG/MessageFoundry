@@ -125,7 +125,6 @@ from messagefoundry.auth import (
 )
 from messagefoundry.auth.audit_visibility import (
     AUDIT_WITHHELD_HEADER,
-    CHANNEL_LIST_ACTIONS,
     audit_detail_for,
     audit_exclusion_for,
     narrows_scope_rows_for,
@@ -494,10 +493,10 @@ def _console_user_summary(
 ) -> UserSummary:
     """:func:`_user_summary` as the console seam hands it on, with ``show_scope`` REQUIRED (vault
     BACKLOG #3748 item 5). Each console page decides, and one that forgets raises rather than
-    discloses. A console from before the engine's default flipped calls without it, and the seam
-    digest records no parameter, so that console still mounts: its users:manage page then fails
-    loudly, where a withholding default would read a real scope as deny-all and offer to save that
-    over it."""
+    discloses, where a withholding default would read a real scope as deny-all and offer to save
+    that over it. The seam field is named ``user_summary_scoped`` so the rename moves the seam
+    digest: a console from before the keyword refuses to mount, rather than mounting and failing on
+    its user pages (``_ui_seam.py`` history)."""
     return _user_summary(
         user,
         role_ids,
@@ -2205,9 +2204,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         Every filter value is passed as a keyword to the store, which binds it as a SQL parameter
         across all three backends (BACKLOG #170) -- never string-interpolated into the query.
 
-        Each row's ``detail`` is the one ``identity`` may read (:func:`audit_detail_for`), so a
-        scope change's channel list is withheld here, for every caller without ``users:manage``,
-        on all three reads (vault BACKLOG #3748)."""
+        Each row's ``detail`` is the one ``identity`` may read (:func:`audit_detail_for`), so the
+        channel lists and scope sources of the rows ``CHANNEL_LIST_ACTIONS`` names are withheld
+        here, for every caller without ``users:manage``, on all three reads (vault BACKLOG #3748)."""
         rows = await service.store.list_audit(
             limit=limit,
             actor=actor,
@@ -2222,8 +2221,6 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             return rows
         return [
             {**row, "detail": audit_detail_for(identity, row["action"], row["detail"])}
-            if row["action"] in CHANNEL_LIST_ACTIONS
-            else row
             for row in rows
         ]
 

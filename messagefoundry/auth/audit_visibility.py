@@ -88,7 +88,6 @@ __all__ = [
     "AD_SCOPE_RESYNCED_ACTION",
     "AD_SESSION_REVOKED_ACTION",
     "AUDIT_WITHHELD_HEADER",
-    "CHANNELS_WITHHELD",
     "CHANNEL_LIST_ACTIONS",
     "CHANNEL_SCOPE_CHANGED_ACTION",
     "CHANNEL_SCOPE_CHANGE_REFUSED_ACTION",
@@ -100,10 +99,11 @@ __all__ = [
     "LOCK_NOTICE_ACTION",
     "LOCK_NOTICE_UNDELIVERED_ACTION",
     "LOGIN_LOCKED_ACTION",
+    "SCOPE_WITHHELD",
     "audit_detail_for",
     "audit_exclusion_for",
-    "narrows_scope_rows_for",
     "is_audit_copy_line",
+    "narrows_scope_rows_for",
     "reads_audit_copies_in_the_log",
     "withholds_rows_from",
 ]
@@ -159,6 +159,14 @@ HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE: Final = AuditExclusion(
 #: :mod:`messagefoundry.auth.service` use these constants, so the written action and the narrowed
 #: one cannot drift apart.
 CHANNEL_SCOPE_CHANGED_ACTION: Final = "user.channel_scope_changed"
+#: BACKLOG #2271: the row a refused :meth:`~messagefoundry.auth.service.AuthService.set_channel_scope`
+#: writes. Its detail names the account, the caller's ``expected_source``, the raw stored source the
+#: write read (``read_source``), the scope's ``owner`` and a ``reason`` from
+#: :data:`~messagefoundry.auth.service.ChannelScopeRefusal`. Never the scope itself. On
+#: ``source_changed`` the owner is the one read after the write failed, so it names whoever took the
+#: scope: at least a directory sign-in or another administrator's save. A legacy AD scope reads
+#: ``read_source`` null and ``owner`` ``"ad"`` (BACKLOG #2252). A store that refuses the row leaves
+#: an ERROR log line instead, and the 409 still stands.
 CHANNEL_SCOPE_CHANGE_REFUSED_ACTION: Final = "user.channel_scope_change_refused"
 AD_SCOPE_RESYNCED_ACTION: Final = "auth.ad_scope_resynced"
 AD_SESSION_REVOKED_ACTION: Final = "auth.ad_session_revoked"
@@ -167,7 +175,7 @@ AD_SESSION_REVOKED_ACTION: Final = "auth.ad_session_revoked"
 @dataclass(frozen=True, slots=True)
 class _Narrowed:
     """How a reader without ``users:manage`` reads one action's detail. ``shown`` keys keep their
-    value. ``always`` keys read :data:`CHANNELS_WITHHELD` whether or not the row holds them, so
+    value. ``always`` keys read :data:`SCOPE_WITHHELD` whether or not the row holds them, so
     the row's shape cannot say what was stored. ``if_present`` keys read it where the row holds
     them. Every other key is dropped: an allowlist, so a key a later writer adds is withheld until
     someone decides it holds no scope."""
@@ -205,14 +213,14 @@ _NARROWED: Final[Mapping[str, _Narrowed]] = MappingProxyType(
         ),
         CHANNEL_SCOPE_CHANGE_REFUSED_ACTION: _Narrowed(
             shown=("user_id", "username"),
-            if_present=("reason", "expected_source", "read_source", "owner"),
+            always=("reason", "expected_source", "read_source", "owner"),
         ),
     }
 )
 CHANNEL_LIST_ACTIONS: Final[frozenset[str]] = frozenset(_NARROWED)
 #: What a withheld value reads as. A string, so it cannot be read as a stored ``null``, which
 #: denies, or as a list.
-CHANNELS_WITHHELD: Final = "withheld"
+SCOPE_WITHHELD: Final = "withheld"
 
 
 def narrows_scope_rows_for(identity: Identity) -> bool:
@@ -224,18 +232,18 @@ def narrows_scope_rows_for(identity: Identity) -> bool:
 def audit_detail_for(identity: Identity, action: str, detail: str | None) -> str | None:
     """``detail`` as ``identity`` may read it: for a reader :func:`narrows_scope_rows_for`
     names, a :data:`CHANNEL_LIST_ACTIONS` row reads as its action's :class:`_Narrowed` rule says.
-    A detail that is not a JSON object, or that does not parse, depth limit included, reads as
+    A detail that is null, is not a JSON object, or does not parse, depth limit included, reads as
     its ``always`` keys alone. Every other row is unchanged."""
     rule = _NARROWED.get(action)
-    if rule is None or detail is None or not narrows_scope_rows_for(identity):
+    if rule is None or not narrows_scope_rows_for(identity):
         return detail
-    parsed, _refusal = json_loads_or_refusal(detail)
+    parsed = None if detail is None else json_loads_or_refusal(detail)[0]
     stored: dict[str, object] = parsed if isinstance(parsed, dict) else {}
     return json.dumps(
         {
             **{key: stored[key] for key in rule.shown if key in stored},
-            **{key: CHANNELS_WITHHELD for key in rule.if_present if key in stored},
-            **dict.fromkeys(rule.always, CHANNELS_WITHHELD),
+            **{key: SCOPE_WITHHELD for key in rule.if_present if key in stored},
+            **dict.fromkeys(rule.always, SCOPE_WITHHELD),
         }
     )
 

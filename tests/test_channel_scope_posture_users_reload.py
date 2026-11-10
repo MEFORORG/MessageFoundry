@@ -27,6 +27,7 @@ import pytest
 from messagefoundry.api import create_app
 from messagefoundry.api.models import POSTURE_NARROWED_TO_SCOPE, RELOAD_REFUSED_CHANNEL_SCOPED
 from messagefoundry.auth import Role
+from messagefoundry.auth.audit_visibility import audit_detail_for
 from messagefoundry.auth.identity import ALL_CHANNELS, AuthProvider, Identity
 from messagefoundry.auth.permissions import permissions_for_roles
 from messagefoundry.auth.service import AuthService
@@ -296,9 +297,10 @@ async def test_a_user_summary_withholds_the_scope_unless_asked(engine: Engine) -
 
 
 async def test_the_console_seam_user_summary_needs_show_scope(engine: Engine) -> None:
-    """Vault BACKLOG #3748 item 5: the seam digest records no parameter, so a console from before
-    the flip still mounts. Its call without ``show_scope`` raises rather than reading a real scope
-    as deny-all, and a call that names it gets what it asked for."""
+    """Vault BACKLOG #3748 item 5: the seam's ``user_summary_scoped`` needs ``show_scope``. A call
+    without it raises rather than reading a real scope as deny-all, and a call that names it gets
+    what it asked for. (A console from before the keyword does not reach this call: the field's
+    rename moved the seam digest, so it refuses to mount.)"""
     from fastapi import FastAPI
 
     from messagefoundry.api.auth_routes import add_auth_routes
@@ -369,22 +371,12 @@ def test_a_withheld_scope_row_has_one_shape_whatever_it_held() -> None:
     """Vault BACKLOG #3748 item 6: a withheld row keeps only the keys known to hold no scope, so a
     withdraw, which adds ``withdrawn``, reads as a set does, a key a later writer adds is withheld,
     and a detail that is not an object reads as withheld, never as a stored null."""
-    from messagefoundry.auth.audit_visibility import audit_detail_for
-    from messagefoundry.auth.identity import AuthProvider, Identity
-    from messagefoundry.auth.permissions import permissions_for_roles
-
-    reader = Identity(
-        user_id="u",
-        username="auditor",
-        auth_provider=AuthProvider.LOCAL,
-        roles=frozenset({Role.AUDITOR}),
-        permissions=permissions_for_roles([Role.AUDITOR]),
-    )
+    reader = _auditor_identity()
     withheld = {"channels": "withheld"}
     withdraw = json.dumps({"channels": None, "withdrawn": [THEIRS]})
     set_one = json.dumps({"channels": [THEIRS]})
     too_deep = "[" * 100_000 + "]" * 100_000  # json's depth limit raises RecursionError
-    for detail in (withdraw, set_one, "[1]", "not json", too_deep):
+    for detail in (withdraw, set_one, "[1]", "not json", too_deep, None):
         shown = audit_detail_for(reader, "auth.ad_scope_resynced", detail)
         assert shown is not None and json.loads(shown) == withheld, detail
     added = json.dumps({"user_id": "x", "channels": [THEIRS], "previous": [THEIRS]})
@@ -408,8 +400,6 @@ def test_a_reconciler_revocation_row_withholds_its_scope_delta() -> None:
     ``scope_from`` and ``scope_to`` on a scope delta. A reader without ``users:manage`` reads both
     withheld and keeps ``scope_changed``, so the row still says a scope moved. A row with no delta
     is unchanged in what it shows."""
-    from messagefoundry.auth.audit_visibility import audit_detail_for
-
     reader = _auditor_identity()
     delta = json.dumps(
         {
@@ -458,17 +448,11 @@ async def test_a_refused_scope_save_withholds_the_scope_owner(engine: Engine) ->
     stored = json.loads(whole["detail"])
     assert stored["owner"] not in (None, "withheld"), "control: the row names an owner"
     shown = json.loads(seen["detail"])
-    assert shown["user_id"] == target and shown["username"] == "other"
-    for key in ("owner", "read_source", "expected_source", "reason"):
-        if key in stored:
-            assert shown[key] == "withheld", key
-    assert set(shown) <= {
-        "user_id",
-        "username",
-        "owner",
-        "read_source",
-        "expected_source",
-        "reason",
+    # One shape for every refused row: each source key reads withheld whether or not it was stored.
+    assert shown == {
+        "user_id": target,
+        "username": "other",
+        **dict.fromkeys(("owner", "read_source", "expected_source", "reason"), "withheld"),
     }
 
 

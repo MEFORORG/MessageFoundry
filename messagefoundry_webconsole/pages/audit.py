@@ -35,8 +35,8 @@ def _ts(ts: float) -> str:
 #: sentence appears whether or not a hidden row falls in range, and cannot say a lock happened.
 WITHHELD_NOTE = (
     "Your permissions leave account-lock entries out of this list, its count and the export, "
-    "and show channel scope entries with each account's channels and scope owner withheld. A "
-    "user with users:manage sees them."
+    "and show entries about an account's channel scope, directory session revocations among "
+    "them, with the channels and the scope's owner withheld. A user with users:manage sees them."
 )
 
 

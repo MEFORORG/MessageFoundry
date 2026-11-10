@@ -2379,7 +2379,10 @@ the same permission set on the same method reds CI until it is listed here.
 >   allowlist, so a key a later writer adds to one of those four is withheld, but a NEW action
 >   whose detail names a scope is shown whole until it is added to `CHANNEL_LIST_ACTIONS` in
 >   `messagefoundry/auth/audit_visibility.py`. `GET /logs/tail` gives such a reader no audit copies
->   at all.
+>   at all. **Left open:** this hides the stored lists and sources, not every inference. Rows left
+>   whole can still let such a reader piece a scope together: at least an `auth.channel_denied`
+>   row or a channel-attributed access row, each naming an actor and one channel, and the actors of
+>   `auth.ad_scope_resynced` rows, which say the directory owned that account's scope.
 > - `POST /config/reload` refuses a scoped caller 403, a dry run included, because a reload loads
 >   the whole graph and a dry run's reply describes it. So a deployer needs the all-channels grant.
 >   The refusal writes one `auth.channel_denied` row naming no channel. The approval gate refuses

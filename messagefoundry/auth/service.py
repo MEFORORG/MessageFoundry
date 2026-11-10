@@ -1790,15 +1790,8 @@ class ChannelScopeSourceConflict(RuntimeError):
     Each refusal writes one :data:`CHANNEL_SCOPE_CHANGE_REFUSED_ACTION` row first (BACKLOG #2271)."""
 
 
-# BACKLOG #2271: the row a refused :meth:`AuthService.set_channel_scope` writes. Its detail names the
-# account, the caller's ``expected_source``, the raw stored source the write read
-# (``read_source``), the scope's ``owner`` and a ``reason`` from :data:`ChannelScopeRefusal`. Never
-# the scope itself. On ``source_changed`` the owner is the one read after the write failed, so it
-# names whoever took the scope: at least a directory sign-in or another administrator's save. A
-# legacy AD scope reads ``read_source`` null and ``owner`` ``"ad"`` (BACKLOG #2252). A store that
-# refuses the row leaves an ERROR log line instead, and the 409 still stands.
-# The name is imported from audit_visibility, beside the rule that narrows the row (vault
-# BACKLOG #3748), and re-exported here for the callers that read it from this module.
+# CHANNEL_SCOPE_CHANGE_REFUSED_ACTION is documented in audit_visibility, beside the rule that
+# narrows its row (vault BACKLOG #3748), and re-exported above for the callers that read it here.
 
 ChannelScopeRefusal = Literal["directory_owned", "expected_source_mismatch", "source_changed"]
 
