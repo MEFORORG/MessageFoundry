@@ -2027,6 +2027,27 @@ class UsernameTaken(RuntimeError):
     directory account's name or id (BACKLOG #2021)."""
 
 
+#: The text :class:`UserSealRefused` carries. Fixed, so it names no field of the record it refuses.
+USER_SEAL_REFUSED: Final = "the user record fails its integrity check, so it is not shown"
+
+
+class UserSealRefused(RuntimeError):
+    """:meth:`AuthService.checked_user` found the account's row, and its record fails its integrity
+    seal (BACKLOG #5520). The failure is already audited and alerted. Not "no such user": the row
+    is there, and an administrator may still delete it. The admin routes answer it 423."""
+
+
+@dataclass(frozen=True)
+class ListedUser:
+    """One account as :meth:`AuthService.list_checked_users` reads it (BACKLOG #5520): ``user`` with
+    its whole record checked against its seal, or ``None`` when that record fails, which has been
+    reported. ``id`` is all a caller may show of a failing account; every other field of it is
+    unchecked."""
+
+    id: str
+    user: VerifiedUser | None
+
+
 class DirectoryAccountNotFound(ValueError):
     """:meth:`AuthService.create_directory_account` found no enabled directory account by the name
     given (BACKLOG #2021). ``POST /users/directory`` answers it 404."""
@@ -11471,9 +11492,9 @@ class AuthService:
     async def _load_user(self, user_id: str) -> VerifiedUser | None:
         """The account ``user_id`` names, its integrity seal checked, or ``None``. With
         :meth:`_lookup_user`, :meth:`_lookup_by_username`, :meth:`_lookup_by_directory_object_id`,
-        :meth:`_load_user_by_federated_subject`, :meth:`_load_users` and :meth:`_verified`, the
-        ONLY readers of the store's user readers in this service, beside the two existence
-        questions; ``tests/test_user_seal.py`` holds that. See
+        :meth:`_load_user_by_federated_subject`, :meth:`_load_users`, :meth:`list_checked_users`
+        and :meth:`_verified`, the ONLY readers of the store's user readers in this service,
+        beside the two existence questions; ``tests/test_user_seal.py`` holds that. See
         :meth:`_verified` for what ``None`` covers."""
         return (await self._lookup_user(user_id)).user
 
@@ -11512,6 +11533,47 @@ class AuthService:
         is reported by :meth:`_verified` and left out, so a scan never counts it."""
         loaded = [await self._verified(user) for user in await self._store.list_users()]
         return [user for user in loaded if user is not None]
+
+    async def checked_user(self, user_id: str) -> VerifiedUser | None:
+        """The account ``user_id`` names, its whole record checked against its seal, for a caller
+        outside this service that SHOWS it (BACKLOG #5520). ``None`` when no row is there. Raises
+        :class:`UserSealRefused` when a row is there and its record fails, which
+        :meth:`_verified` has audited and alerted, so the caller can say so rather than answer
+        "no such user".
+
+        A row read as failing is read once more by id before it is refused. :meth:`_verified`
+        returns ``None`` unreported for a row deleted or renamed between its reads, and that race
+        must read as gone or as the renamed row, not as a record that fails its check."""
+        found = await self._settled(await self._lookup_user(user_id), user_id)
+        if found.refused:
+            raise UserSealRefused(USER_SEAL_REFUSED)
+        return found.user
+
+    async def list_checked_users(self) -> list[ListedUser]:
+        """Every account, in the store's order, each with its record checked (BACKLOG #5520). One
+        that fails stays in the list with ``user=None``, reported, as :meth:`_load_custom_roles`
+        keeps a failing role, so an administrator can still see that it is there and delete it.
+        :meth:`_load_users` drops it instead, for the scans that must not count it.
+
+        A failing row is read once more by id, as :meth:`checked_user` says why: one deleted
+        meanwhile is left out, and one renamed meanwhile is listed as it now reads."""
+        out: list[ListedUser] = []
+        for raw in await self._store.list_users():
+            found = await self._settled(_UserLookup(await self._verified(raw), True), raw.id)
+            if found.held:
+                out.append(ListedUser(raw.id, found.user))
+        return out
+
+    async def _settled(self, found: _UserLookup, user_id: str) -> _UserLookup:
+        """``found``, or, where it reads as refused, the account read once more by id. The one
+        statement of the re-read :meth:`checked_user` describes (BACKLOG #5520)."""
+        return await self._lookup_user(user_id) if found.refused else found
+
+    async def identity_for_checked_user(self, user: VerifiedUser) -> Identity:
+        """:meth:`identity_for_user_id` for an account the caller already read through
+        :meth:`checked_user`, so the identity and the caller's record are one read (BACKLOG
+        #5520)."""
+        return await self._build_identity(user)
 
     async def _username_held(self, username: str) -> bool:
         """Whether any row holds ``username``, sealed or not (BACKLOG #2592). A name question, not

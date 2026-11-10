@@ -27,7 +27,7 @@ from typing import Literal, TypeVar
 from urllib.parse import quote, urlsplit
 
 import httpx
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, RootModel, ValidationError
 
 from messagefoundry.api.auth_models import (
     STEP_UP_VIA_HEADER,
@@ -50,7 +50,7 @@ from messagefoundry.api.auth_models import (
     SessionList,
     SimpleMessage,
     UserCreatedResponse,
-    UserSummary,
+    UserListEntry,
 )
 from messagefoundry.api.models import (
     AlertInstanceInfo,
@@ -280,6 +280,10 @@ def _decode_list(response: httpx.Response, model: type[_Model]) -> list[_Model]:
     except (ValidationError, TypeError) as exc:
         invalid = _invalid_reply(exc)
     raise ApiError(f"invalid response from engine: {invalid}")
+
+
+class _UserListRow(RootModel[UserListEntry]):
+    """One ``GET /users`` row, either shape (BACKLOG #5520), so :func:`_decode_list` reads it."""
 
 
 def _invalid_reply(exc: Exception) -> str:
@@ -1915,8 +1919,10 @@ class EngineClient:
             self._request("DELETE", f"/roles/custom/{_seg(role_id)}"), SimpleMessage
         ).detail
 
-    def list_users(self) -> list[UserSummary]:
-        return _decode_list(self._get("/users"), UserSummary)
+    def list_users(self) -> list[UserListEntry]:
+        """Every account. One whose record fails its integrity seal is an
+        :class:`IntegrityFailedUser`, its id alone (BACKLOG #5520)."""
+        return [row.root for row in _decode_list(self._get("/users"), _UserListRow)]
 
     def create_user(
         self,

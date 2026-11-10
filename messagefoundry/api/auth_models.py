@@ -174,6 +174,30 @@ class UserSummary(BaseModel):
     lock_state: UserLockState | None = None
 
 
+class IntegrityFailedUser(BaseModel):
+    """A ``GET /users`` row for an account whose record fails its integrity seal (BACKLOG #5520).
+
+    Only the id, which locates the row, and ``integrity_failed``, always true. Every other field of
+    such a row is unchecked, so none is sent: not the name, the provider, the disabled flag or the
+    roles, which a row altered outside the store could have set to anything. The row stays in the
+    list, as a custom role that fails its seal stays in ``GET /roles/custom``, so an administrator
+    can see that it is there and delete it. The single-account reads answer 423 for it instead.
+
+    A shape of its own rather than optional fields on :class:`UserSummary`, which every other
+    account read returns and whose readers rely on its name, provider and roles being set.
+    ``integrity_failed`` is REQUIRED, so a :class:`UserSummary` payload never reads as one of these.
+    """
+
+    id: str
+    integrity_failed: Literal[True]
+
+
+#: One ``GET /users`` row: an account whose record passed its seal, or one that failed it. A plain
+#: union, not a tagged one, so an older engine's rows, which carry no ``integrity_failed``, still
+#: read as :class:`UserSummary`; neither shape validates the other's payload.
+UserListEntry = UserSummary | IntegrityFailedUser
+
+
 class FederatedIdentityView(BaseModel):
     """One account's federated binding, as the console's federated-identity screen renders it
     (BACKLOG #1143 / #295, ADR 0184 slice B).

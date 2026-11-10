@@ -129,6 +129,30 @@ def test_users_page_hides_the_scope_columns_from_a_reader_who_is_not_shown_scope
     assert "(none)" in shown
 
 
+def test_users_page_lists_an_integrity_failed_account_by_id_alone() -> None:
+    """BACKLOG #5520: an account whose record fails its seal arrives as its id alone. Its row names
+    the id and says the check failed, keeps the table's column count, and links nowhere, since the
+    detail page still reads the row unchecked. The control is an intact account beside it."""
+    from messagefoundry.api.auth_models import IntegrityFailedUser, UserSummary
+    from messagefoundry_webconsole.pages.admin import users_page
+
+    intact = UserSummary(
+        id="u1",
+        username="intact",
+        auth_provider="local",
+        disabled=False,
+        roles=["operator"],
+        channel_scope_withheld=False,
+    )
+    failed = IntegrityFailedUser(id="f" * 32, integrity_failed=True)
+    rendered = str(users_page([intact, failed]))
+    assert "integrity check failed" in rendered and "f" * 32 in rendered
+    assert f'href="/ui/users/{"f" * 32}"' not in rendered
+    assert 'href="/ui/users/u1"' in rendered  # control
+    rows = re.findall(r"<tr>(.*?)</tr>", rendered, re.S)
+    assert len({row.count("<td") for row in rows if "<td" in row}) == 1
+
+
 async def test_users_page_shows_scopes_only_to_a_users_manage_holder(engine: Engine) -> None:
     """The route half of the rule above: a users:read-only reader, here a custom role, sees no
     account's channels on /ui/users, while an administrator sees them (BACKLOG #3189)."""
