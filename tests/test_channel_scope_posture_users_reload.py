@@ -275,6 +275,90 @@ async def test_users_list_shows_scopes_only_to_a_users_manage_holder(engine: Eng
         assert THEIRS not in by_reader[who].text
 
 
+async def test_a_user_summary_withholds_the_scope_unless_asked(engine: Engine) -> None:
+    """Vault BACKLOG #3748 item 5: ``_user_summary`` withholds the channel scope and its source
+    by default, so a new caller that forgets the argument discloses nothing. It defaulted to
+    disclosing, and so failed open."""
+    from messagefoundry.api.auth_routes import _user_summary
+
+    service = await _service(engine)
+    user_id = await _user(service, "other", [Role.OPERATOR.value], [THEIRS])
+    user = await service.store.get_user(user_id)
+    assert user is not None
+    default = _user_summary(user, [])
+    assert default.channel_scope is None and default.channel_scope_source is None
+    assert default.channel_scope_withheld is True
+    # The control: asking for it discloses the stored scope.
+    shown = _user_summary(user, [], show_scope=True)
+    assert shown.channel_scope == [THEIRS] and shown.channel_scope_source == "manual"
+    assert shown.channel_scope_withheld is False
+
+
+async def test_the_users_manage_create_routes_still_show_the_scope(engine: Engine) -> None:
+    """Vault BACKLOG #3748 item 5: the ``users:manage`` routes that build a summary pass
+    ``show_scope=True`` now that the default withholds, so their answer says the scope is shown."""
+    service = await _service(engine)
+    await _user(service, "boss", [Role.ADMINISTRATOR.value], None)
+    async with _client(engine, service) as c:
+        r = await c.post(
+            "/users",
+            json={
+                "username": "newbie",
+                "email": "newbie@example.test",
+                "roles": [Role.OPERATOR.value],
+            },
+            headers=await _login(c, "boss"),
+        )
+    assert r.status_code == 201, r.text
+    assert r.json()["channel_scope_withheld"] is False
+
+
+async def test_a_scope_change_row_withholds_its_channels_from_a_reader_without_users_manage(
+    engine: Engine,
+) -> None:
+    """Vault BACKLOG #3748 item 6: a ``user.channel_scope_changed`` row named every account's
+    channels to any ``audit:read`` holder. A reader without ``users:manage`` now reads the row with
+    its list withheld, on ``GET /audit`` and the CSV export; an administrator reads it whole."""
+    service = await _service(engine)
+    await _user(service, "other", [Role.OPERATOR.value], [THEIRS])  # writes the row
+    await _user(service, "auditor", [Role.AUDITOR.value], None)
+    await _user(service, "boss", [Role.ADMINISTRATOR.value], None)
+    query = {"action": "user.channel_scope_changed"}
+    async with _client(engine, service) as c:
+        auditor = await _login(c, "auditor")
+        by_auditor = await c.get("/audit", params=query, headers=auditor)
+        exported = await c.get("/audit/export", params=query, headers=auditor)
+        by_boss = await c.get("/audit", params=query, headers=await _login(c, "boss"))
+    for r in (by_auditor, exported, by_boss):
+        assert r.status_code == 200, r.text
+    (seen,) = by_auditor.json()["entries"]
+    assert json.loads(seen["detail"])["channels"] == "withheld"
+    assert "user_id" in json.loads(seen["detail"]), "the row itself stays readable"
+    assert THEIRS not in by_auditor.text and THEIRS not in exported.text
+    assert "user.channel_scope_changed" in exported.text, "control: the export holds the row"
+    # The control: users:manage reads the list.
+    (whole,) = by_boss.json()["entries"]
+    assert json.loads(whole["detail"])["channels"] == [THEIRS]
+
+
+def test_a_scope_row_detail_that_is_not_an_object_is_withheld_whole() -> None:
+    """Vault BACKLOG #3748 item 6: a detail that cannot be shown to hold no list is withheld."""
+    from messagefoundry.auth.audit_visibility import audit_detail_for
+    from messagefoundry.auth.identity import AuthProvider, Identity
+    from messagefoundry.auth.permissions import permissions_for_roles
+
+    reader = Identity(
+        user_id="u",
+        username="auditor",
+        auth_provider=AuthProvider.LOCAL,
+        roles=frozenset({Role.AUDITOR}),
+        permissions=permissions_for_roles([Role.AUDITOR]),
+    )
+    assert audit_detail_for(reader, "user.channel_scope_changed", "[1]") is None
+    assert audit_detail_for(reader, "user.channel_scope_changed", "not json") is None
+    assert audit_detail_for(reader, "auth.login_failed", "not json") == "not json"
+
+
 # --- POST /config/reload -------------------------------------------------------------------------
 
 

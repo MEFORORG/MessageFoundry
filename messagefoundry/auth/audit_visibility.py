@@ -60,6 +60,10 @@ branch refused, and the answer still goes out on its slot.
 no visible stand-in row: only a holder of the account's session or ticket causes one, and that
 holder's unrefused attempt would differ anyway (``auth.mfa_verified``, ``auth.login_success``).
 
+**One detail is narrowed, not the row** (vault BACKLOG #3748 item 6): the channel lists on a
+scope change, through :func:`audit_detail_for`, on ``GET /audit``, its console page and the CSV
+export.
+
 ``/me/security-events`` is not filtered. It selects rows by the caller's own username, so it shows
 the holder their own lock and never another account's.
 """
@@ -78,6 +82,8 @@ __all__ = [
     "ACCOUNT_LOCKED_ACTION",
     "ADMIN_UNLOCKED_ACTION",
     "AUDIT_WITHHELD_HEADER",
+    "CHANNELS_WITHHELD",
+    "CHANNEL_LIST_ACTIONS",
     "DIRECTORY_LOCKED_REFUSAL_DETAIL",
     "DIRECTORY_LOGIN_LOCKED_ACTION",
     "HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE",
@@ -86,6 +92,7 @@ __all__ = [
     "LOCK_NOTICE_ACTION",
     "LOCK_NOTICE_UNDELIVERED_ACTION",
     "LOGIN_LOCKED_ACTION",
+    "audit_detail_for",
     "audit_exclusion_for",
     "is_audit_copy_line",
     "reads_audit_copies_in_the_log",
@@ -137,6 +144,45 @@ HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE: Final = AuditExclusion(
         }
     ),
 )
+
+
+#: The rows whose detail names an account's channel list (vault BACKLOG #3748 item 6). Every
+#: account's scope goes only to a ``users:manage`` holder, the tier ``GET /users`` shows it to
+#: (BACKLOG #3189), so a reader without it reads these rows with the list withheld. The row itself
+#: stays visible: who changed whose scope, and when, is not the scope.
+CHANNEL_LIST_ACTIONS: Final[frozenset[str]] = frozenset(
+    {"user.channel_scope_changed", "auth.ad_scope_resynced"}
+)
+#: The detail keys of those rows that hold a channel list.
+_CHANNEL_LIST_KEYS: Final = ("channels", "withdrawn")
+#: What a withheld list reads as. A string, so it cannot be read as a stored ``null``, which
+#: denies, or as a list.
+CHANNELS_WITHHELD: Final = "withheld"
+
+
+def audit_detail_for(identity: Identity, action: str, detail: str | None) -> str | None:
+    """``detail`` as ``identity`` may read it: a :data:`CHANNEL_LIST_ACTIONS` row's channel lists
+    read as :data:`CHANNELS_WITHHELD` for a reader without ``users:manage``, and every other row
+    is returned unchanged. A detail that is not a JSON object is withheld whole, as ``None``,
+    since it cannot be shown to hold no list."""
+    if (
+        action not in CHANNEL_LIST_ACTIONS
+        or detail is None
+        or audit_exclusion_for(identity) is None
+    ):
+        return detail
+    try:
+        parsed = json.loads(detail)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return json.dumps(
+        {
+            key: CHANNELS_WITHHELD if key in _CHANNEL_LIST_KEYS else value
+            for key, value in parsed.items()
+        }
+    )
 
 
 def audit_exclusion_for(identity: Identity) -> AuditExclusion | None:

@@ -269,6 +269,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     credential_expires_at=pending_credential_deadline(service, user),
                     # BACKLOG #1131 (ASVS 6.1.1): this page is users:manage, so it shows the locks.
                     lock_state_at=time.time(),
+                    # And the channel scope, which the summary withholds unless asked (vault
+                    # BACKLOG #3748 item 5).
+                    show_scope=True,
                 ),
                 all_roles,
                 error=error,
@@ -551,7 +554,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # Read through the summary, not the record: the console never reads a UserRecord attribute
         # itself, so the seam snapshot covers the field. The role list is not read. A missing user
         # falls through to the handler's own 404. The record is the one read before the guard.
-        summary = None if user is None else admin.user_summary(user, [])
+        summary = None if user is None else admin.user_summary(user, [], show_scope=True)
         ticked = form.get(CONFIRM_MANUAL_SCOPE_FIELD) == CONFIRM_MANUAL_SCOPE_VALUE
         if not ticked and summary is not None and needs_manual_scope_confirm(summary):
             return await _user_detail(

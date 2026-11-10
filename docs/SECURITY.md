@@ -2368,7 +2368,10 @@ the same permission set on the same method reds CI until it is listed here.
 > - `GET /users` sends each account's `channel_scope` and `channel_scope_source` only to a
 >   `users:manage` holder, the tier `GET /users/{user_id}/channel-scope` reads on. Everyone else
 >   gets null for both and `channel_scope_withheld: true`, so a null there means "not shown". The
->   console's user list reads that flag and drops both scope columns for such a reader.
+>   console's user list reads that flag and drops both scope columns for such a reader. On the
+>   same rule, `GET /audit`, its console page and `GET /audit/export` show such a reader a
+>   `user.channel_scope_changed` or `auth.ad_scope_resynced` row with its `channels` and
+>   `withdrawn` lists read as `"withheld"`, and the row otherwise as written (vault BACKLOG #3748).
 > - `POST /config/reload` refuses a scoped caller 403, a dry run included, because a reload loads
 >   the whole graph and a dry run's reply describes it. So a deployer needs the all-channels grant.
 >   The refusal writes one `auth.channel_denied` row naming no channel. The approval gate refuses

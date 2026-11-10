@@ -125,6 +125,7 @@ from messagefoundry.auth import (
 )
 from messagefoundry.auth.audit_visibility import (
     AUDIT_WITHHELD_HEADER,
+    audit_detail_for,
     audit_exclusion_for,
     withholds_rows_from,
 )
@@ -456,12 +457,14 @@ def _user_summary(
     *,
     credential_expires_at: float | None = None,
     lock_state_at: float | None = None,
-    show_scope: bool = True,
+    show_scope: bool = False,
 ) -> UserSummary:
     """``lock_state_at`` is the instant to evaluate the account's locks at, and passing it is what
     DISCLOSES them: pass it only on a ``users:manage`` surface (BACKLOG #1131). Left ``None``, the
     summary carries ``lock_state=None``, which reads as "not shown", never as "not locked".
-    ``show_scope=False`` withholds the channel scope and its source the same way (BACKLOG #3189)."""
+    The channel scope and its source are withheld the same way unless ``show_scope=True`` is
+    passed, again only on a ``users:manage`` surface (BACKLOG #3189). Withholding is the default,
+    so a new caller that forgets the argument discloses nothing (vault BACKLOG #3748 item 5)."""
     return UserSummary(
         id=user.id,
         username=user.username,
@@ -1431,6 +1434,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             sorted(body.roles),
             credential_expires_at=pending_credential_deadline(service, user),
             lock_state_at=time.time(),
+            show_scope=True,  # users:manage, under step-up
         )
         return UserCreatedResponse(
             **summary.model_dump(), temp_password=created.credential.password
@@ -1473,7 +1477,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         user = await service.store.get_user(user_id)
         assert user is not None
-        return _user_summary(user, [], lock_state_at=time.time())
+        return _user_summary(user, [], lock_state_at=time.time(), show_scope=True)
 
     @app.patch("/users/{user_id}", response_model=SimpleMessage)
     async def update_user(
@@ -2260,7 +2264,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                     action=r["action"],
                     client=r["client"],
                     channel_id=r["channel_id"],
-                    detail=r["detail"],
+                    # Vault BACKLOG #3748 item 6: a scope change's channel list, by permission.
+                    detail=audit_detail_for(identity, r["action"], r["detail"]),
                 )
                 for r in rows
             ],
@@ -2504,7 +2509,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                                 r["action"],
                                 r["channel_id"],
                                 r["client"],
-                                r["detail"],
+                                # As GET /audit reads it (vault BACKLOG #3748 item 6). The
+                                # starting identity's, as the rows are; a lost users:manage
+                                # stops the export above.
+                                audit_detail_for(identity, r["action"], r["detail"]),
                             )
                         ]
                         for r in page[:remaining]

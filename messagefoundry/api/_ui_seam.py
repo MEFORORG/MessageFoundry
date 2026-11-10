@@ -507,8 +507,9 @@ from typing import Any
 #: its review repairs, which this branch had already taken. Re-derived with ``--write`` on the
 #: merged tree; the digest did not move. Main carries that branch at 6d7dcabe1103f08d (PR 2352).
 #:
-#: Vault BACKLOG #3189 and #3031 (at 0b2a8d6524e4acc6) merged with main after PR 2352 landed
-#: there at 6d7dcabe1103f08d. The #3192 review-repair entry above is that branch's own, kept once.
+#: Vault BACKLOG #3189 and #3031 (at seam digest 0b2a8d6524e4acc6) merged with main after PR 2352
+#: landed there, at seam digest 6d7dcabe1103f08d. That value, here and in the entry above, is a
+#: seam digest, not a commit. The #3192 review-repair entry above is that branch's own, kept once.
 #: Re-derived with ``--write`` on the merged tree; the digest did not move, so the value below
 #: covers every entry above.
 #:

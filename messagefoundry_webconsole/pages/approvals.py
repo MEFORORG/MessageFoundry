@@ -119,8 +119,10 @@ _BLOCKED: dict[ReleaseBlocked, str] = {
         "cannot be approved. {verb} it; if it is still needed, request it again."
     ),
     "requester_not_authorized": (
-        "The requester no longer holds the authority this operation requires, so it cannot be "
-        "approved while that lasts. If their authority is restored, it can be approved then. "
+        "The engine cannot confirm that the requester still holds the authority this operation "
+        "requires: at least, their account is deleted or disabled, lacks the permission or the "
+        "channel scope, or no auth service is bound to check it. It cannot be approved while that "
+        "lasts, and can be approved once it is put right, though never for a deleted account. "
         "Otherwise, {verb} it, and have an authorized user request it again if it is still needed."
     ),
     "seal_failed": (
