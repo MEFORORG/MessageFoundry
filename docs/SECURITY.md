@@ -1238,29 +1238,39 @@ so a wildcard grant such as `secret/data/*` would read clean, and a token made w
 as not observed at every start unless its policy grants the two paths the probe reads. Neither
 limit was measured against a live Vault.
 
-**Every Vault finding also raises an alert, and a clean read resolves it** (vault BACKLOG #2903
+**Every Vault finding also raises an alert, and a clean read can resolve it** (vault BACKLOG #2903
 slice B). A hop that is over-granted, in either class, or that could not be read raises
 `vault_privilege_warning` under the subject `vault:store` or `vault:secrets`, before any refusal,
 so a refused start still pages, and an accepted opt-out quiets nothing. The payload is the finding,
 the count of refusing-class grants and the hop's judgment, which names policy names, paths and
 capabilities, never a token, an accessor or a digest of either. A later start that reads that
 hop's token clean raises `vault_privilege_clean`, which pages nobody and can resolve the open
-instance, under the conditions below, as `store_privilege_clean` does for the store. The subject names the hop and nothing
+instance, as `store_privilege_clean` does for the store. The subject names the hop and nothing
 about the token, because a fix is usually a new token: so engine processes that share one store
 share each hop's alert, and a clean start by one can resolve a warning another raised on a
-different token. It resolves it only when, at least, that start's process has an `[alerts]`
-notifier (the logging sink a process without one gets resolves nothing), it probes that hop and
-reads it clean, and the warning's raise landed in the store before the fenced auto-resolve's last
-read of the alert (a retry reads it again) ([ADR 0044, the vault BACKLOG #4916
-amendment](adr/0044-operator-alert-state.md#amendment-2026-11-09----an-auto-resolve-is-fenced-to-the-raises-it-speaks-for-backlog-4916)).
-**A warning still open after a clean start may be a live finding:** another engine process on the
-same store still running on an over-granted or unread token. Before you resolve it by hand, find
-that process. Neither the audit row's detail nor the preflight's log line names the process that
-wrote it, and engine shards share one log, so check the Vault token each engine process on the
-store is configured with. Fix an over-granted token. For an unread one, fix whatever kept its
-grants from being read, which may be reachability or the probe paths rather than the token. Then
-restart that process, since the check runs only at start. The log line and the audit row of every
-start stay the record.
+different token.
+
+**A warning still open after a clean start.** A clean start can leave another process's warning
+open ([ADR 0044, the vault BACKLOG #4916 amendment](adr/0044-operator-alert-state.md#amendment-2026-11-09----an-auto-resolve-is-fenced-to-the-raises-it-speaks-for-backlog-4916)).
+Treat an open warning as live until you have found and fixed its cause. The cause may be, at
+least, the token, reachability, the probe paths, or the engine's own Vault client setup (a missing
+extra, address or token variable, or a refused TLS or cleartext address). Neither the log line nor
+the audit row names the process that raised or cleared it, and under the engine-shard supervisor
+every engine shard shares one log, so check each process's configuration and restart it after
+the fix: only a serve start's preflight raises this warning or resolves it automatically
+(`messagefoundry check-privileges` runs the same probe on demand but changes no alert). A start whose process has no `[alerts]`
+transport, such as a webhook or email, gets the logging sink, which resolves nothing. It also
+raises nothing durable, so that process's warning never appears in the alert list; an empty
+list does not prove every process is clean. A resolve can also fail to land, at least: it logs an
+ERROR such as `alert-instance resolve gave up` or `alert-instance resolve was cancelled before it
+landed`, or it can be dropped with no line at all. A resolve the fence kept open logs, at least,
+an INFO line containing `closed nothing: a live instance remains`, or a WARNING containing
+`closed nothing and the re-read failed` when the re-read fails. If the cause is fixed and the
+warning is still open, resolve it by hand from the alert list. Resolving it by hand needs, at
+least, an identity with no channel scope (by default an administrator) and `monitoring:diagnose`;
+a channel-scoped identity never sees this subject.
+
+The log line and the audit row of every start stay the record.
 
 ### Data-layer hops refuse cleartext on their defaults (ASVS 12.3.1 census)
 

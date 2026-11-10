@@ -3935,6 +3935,10 @@ class Engine:
             await self._registry_runner.stop()
         # After the graph, so the listeners are already closed when the monitor opens the gate on its
         # way out; stopping it first would let a paused listener read again during shutdown.
+        # A count, not a flag, as in IntakeBoundMonitor.stop: a cancel of this stop from any step
+        # below is held until the store has closed, then raised in place of any error.
+        me = asyncio.current_task()
+        baseline = me.cancelling() if me is not None else 0
         monitor_cancelled = False
         if self._intake_monitor is not None:
             monitor, self._intake_monitor = self._intake_monitor, None
@@ -3944,9 +3948,11 @@ class Engine:
                 # The monitor passes a cancel of this stop on once its gate is open (BACKLOG
                 # #3269). Finish the teardown below first, so the store still drains and closes.
                 monitor_cancelled = True
-        # The rest of the teardown runs inside try/finally (BACKLOG #3269): the store closes even if a
-        # later step raises, and a cancel the monitor passed on is raised last, in place of any
-        # error a later step raised.
+        # The rest of the teardown is guarded (BACKLOG #3269): the store closes even if a later step
+        # raises or is cancelled. A pending cancel is raised last, in place of any error a step or the
+        # close raised, which is then logged. A SystemExit or KeyboardInterrupt is never replaced.
+        cancelled = monitor_cancelled
+        failure: BaseException | None = None
         try:
             # Vault BACKLOG #2613: after the graph, so a clear raised here does not say a graph that is
             # still serving has gone, and ahead of the alert-state drain, which gives its write a chance.
@@ -4000,12 +4006,27 @@ class Engine:
             drain = getattr(self._alert_sink, "drain_state", None)
             if drain is not None:
                 await drain(_ALERT_STATE_DRAIN_SECONDS)
-        except Exception:
-            # The cancel raised below replaces this error, so it is logged here or not at all.
-            if monitor_cancelled:
-                log.exception("an engine stop step failed after the stop was cancelled")
-            raise
-        finally:
+        except asyncio.CancelledError:
+            cancelled = True
+        except BaseException as exc:  # noqa: BLE001 - held until the store closes, then re-raised
+            failure = exc
+        try:
             await self.store.close()
-            if monitor_cancelled:
-                raise asyncio.CancelledError
+        except Exception as exc:
+            if failure is None:
+                failure = exc
+            else:
+                log.exception("the store close failed after an engine stop step failed")
+        cancelled = cancelled or (me is not None and me.cancelling() > baseline)
+        if failure is not None and not isinstance(failure, Exception):
+            raise failure  # SystemExit, KeyboardInterrupt: never swallowed by a cancel
+        if cancelled:
+            if failure is not None:
+                # The cancel replaces this error, so it is logged here or not at all.
+                log.error(
+                    "an engine stop step or the store close failed after the stop was cancelled",
+                    exc_info=failure,
+                )
+            raise asyncio.CancelledError
+        if failure is not None:
+            raise failure

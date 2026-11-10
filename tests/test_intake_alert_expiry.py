@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
@@ -196,7 +197,7 @@ async def test_a_failed_read_changes_nothing_and_warns_once_per_streak(
             monkeypatch.setattr(store, "open_alert_generations", real)
             assert await _is_open(store, stale), "a failed read resolves nothing"
             assert await monitor.sweep_once() == 0, (
-                "a failed read forgot the watch: the outage time does not count toward staleness"
+                "the outage time does not count toward staleness"
             )
             clock[0] += STALE_SECONDS
             assert await monitor.sweep_once() == 1
@@ -487,3 +488,212 @@ async def test_a_later_teardown_step_that_raises_still_closes_the_store(
     assert closed == [True], "the store closed although a later teardown step raised"
     logged = any("failed after the stop was cancelled" in r.getMessage() for r in caplog.records)
     assert logged is monitor_cancels, "the error the cancel replaces is logged, and only then"
+
+
+async def test_one_failed_read_costs_a_watch_only_that_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lander hold on engine PR 2863, item 4: a failed read cleared every watch, so one transient
+    failure threw away all the staleness already counted. It now keeps the watch and discounts
+    the gap from the last good read to the next one, and holds what it counted to 380 s short of
+    stale (the grace, pinned here as a number), so a live process's next reminder can land."""
+    clock = [1000.0]
+    monkeypatch.setattr(intake_bound, "_monotonic", lambda: clock[0])
+    store = await MessageStore.open(tmp_path / "s.db")
+    try:
+        stale = intake_alert_subject(DEPTH_REASON, "node:gone")
+        await _raise_pause(store, stale)
+        monitor = _sweeper(store, "node:a")
+        assert await monitor.sweep_once() == 0  # watched from t=1000
+        clock[0] += STALE_SECONDS - 10
+        assert await monitor.sweep_once() == 0  # S-10 counted
+        real = store.open_alert_generations
+
+        async def broken(**_kw: object) -> list[object]:
+            raise RuntimeError("store unavailable")
+
+        monkeypatch.setattr(store, "open_alert_generations", broken)
+        clock[0] += 5
+        assert await monitor.sweep_once() == 0
+        monkeypatch.setattr(store, "open_alert_generations", real)
+        clock[0] += 5
+        assert await monitor.sweep_once() == 0, "the 10s gap around the failure is not counted"
+        assert await _is_open(store, stale)
+        clock[0] += 379
+        assert await monitor.sweep_once() == 0, "the watch is held to 380 s short of stale"
+        clock[0] += 1
+        assert await monitor.sweep_once() == 1, (
+            "the S-380 kept across the failure still counts: the watch was not cleared"
+        )
+    finally:
+        await store.close()
+
+
+async def test_a_store_close_that_raises_does_not_replace_the_deferred_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Lander hold on engine PR 2863, item 4: with a cancel deferred from the monitor's stop, a
+    store close that raised propagated in its place, so the caller never saw its cancel."""
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline.engine import Engine
+
+    engine = await Engine.create(
+        tmp_path / "engine.db", egress_settings=EgressSettings(deny_by_default=False)
+    )
+    await engine.start()
+    assert engine._intake_monitor is not None
+    real_monitor: IntakeBoundMonitor = engine._intake_monitor
+
+    class _CancelledStop:
+        async def stop(self) -> None:
+            await real_monitor.stop()
+            raise asyncio.CancelledError
+
+    engine._intake_monitor = cast(IntakeBoundMonitor, _CancelledStop())
+    real_close = engine.store.close
+
+    async def failing_close() -> None:
+        await real_close()
+        raise RuntimeError("synthetic close fault")
+
+    monkeypatch.setattr(engine.store, "close", failing_close)
+    with (
+        caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.engine"),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await engine.stop()
+    assert any(
+        "store close failed after the stop was cancelled" in r.getMessage() for r in caplog.records
+    ), "the close error the cancel replaces is logged"
+
+
+async def _sweep_schedule(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fails: Callable[[float], bool],
+    raises_at: tuple[float, ...] = (),
+    until: float,
+) -> float | None:
+    """Sweep ``node:gone``'s subject every 60 s from t=30 until ``until``, with the read failing
+    at each sweep time ``fails`` names and the subject's own process raising at ``raises_at``.
+    Returns when the sweep resolved it, or None."""
+    clock = [0.0]
+    monkeypatch.setattr(intake_bound, "_monotonic", lambda: clock[0])
+    subject = intake_alert_subject(DEPTH_REASON, "node:gone")
+    await _raise_pause(store, subject)
+    monitor = _sweeper(store, "node:a")
+    real = store.open_alert_generations
+
+    async def broken(**_kw: object) -> list[object]:
+        raise RuntimeError("store unavailable")
+
+    pending = sorted(raises_at)
+    t = 30.0
+    while t <= until:
+        while pending and pending[0] <= t:
+            await _raise_pause(store, subject)
+            pending.pop(0)
+        clock[0] = t
+        monkeypatch.setattr(store, "open_alert_generations", broken if fails(t) else real)
+        if await monitor.sweep_once():
+            return t
+        t += 60.0
+    return None
+
+
+async def test_flapping_reads_still_expire_a_dead_subject(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The grace is held, not stacked (the review of d148527dbe): with one failed read in every
+    ten sweeps a dead subject expires, by t=1650 here against t=1230 with no failure. Stacked
+    graces never expired it at all."""
+    store = await MessageStore.open(tmp_path / "s.db")
+    try:
+        never = await _sweep_schedule(store, monkeypatch, fails=lambda t: False, until=5000)
+        assert never == 1230.0
+    finally:
+        await store.close()
+    store = await MessageStore.open(tmp_path / "f.db")
+    try:
+        flapping = await _sweep_schedule(
+            store, monkeypatch, fails=lambda t: int((t - 30) // 60) % 10 == 9, until=86400
+        )
+        assert flapping is not None and flapping <= 1650.0, flapping
+    finally:
+        await store.close()
+
+
+async def test_a_live_alert_survives_an_outage_that_ate_its_reminder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The review of 37215543de: the subject's process raises at 0, its reminders at 300, 600 and
+    900 fail on its side, an outage from 1150 to 1250 fails the sweeper's reads and eats the 1200
+    one, and its 1500 reminder lands. With the watch kept but no grace, the sweep resolved it at
+    t=1410, while the process was still paused."""
+    store = await MessageStore.open(tmp_path / "s.db")
+    try:
+        resolved = await _sweep_schedule(
+            store,
+            monkeypatch,
+            fails=lambda t: 1150 <= t <= 1250,
+            raises_at=(1500.0, 1800.0, 2100.0),
+            until=2200,
+        )
+        assert resolved is None, f"a live alert expired at t={resolved}"
+    finally:
+        await store.close()
+
+
+async def _started_engine(tmp_path: Path) -> object:
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline.engine import Engine
+
+    engine = await Engine.create(
+        tmp_path / "engine.db", egress_settings=EgressSettings(deny_by_default=False)
+    )
+    await engine.start()
+    return engine
+
+
+@pytest.mark.parametrize(
+    ("step_raises", "expected"),
+    [
+        (None, RuntimeError),
+        (asyncio.CancelledError, asyncio.CancelledError),
+        (KeyboardInterrupt, KeyboardInterrupt),
+    ],
+    ids=["close-raises-no-cancel", "later-step-cancelled", "later-step-interrupt"],
+)
+async def test_engine_stop_keeps_the_right_exception_when_the_close_also_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    step_raises: type[BaseException] | None,
+    expected: type[BaseException],
+) -> None:
+    """The review of 37215543de: a raising close replaced a cancel from a later step, and a cancel
+    deferred from the monitor swallowed a KeyboardInterrupt. A close that raises with nothing
+    pending still propagates its own error."""
+    from messagefoundry.pipeline.engine import Engine
+
+    engine = cast(Engine, await _started_engine(tmp_path))
+    real_drain = engine.drain_config_writes
+
+    async def drain(timeout: float) -> None:
+        await real_drain(timeout)
+        if step_raises is not None:
+            raise step_raises
+
+    monkeypatch.setattr(engine, "drain_config_writes", drain)
+    real_close = engine.store.close
+    closed: list[bool] = []
+
+    async def failing_close() -> None:
+        await real_close()
+        closed.append(True)
+        raise RuntimeError("synthetic close fault")
+
+    monkeypatch.setattr(engine.store, "close", failing_close)
+    with pytest.raises(expected):
+        await engine.stop()
+    assert closed == [True], "the store closed whatever the later step raised"

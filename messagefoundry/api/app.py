@@ -12293,7 +12293,7 @@ def create_managed_app(
         # it (audited), and so does a probe failure that is not a network failure, a timeout or a
         # 403, which the opt-out does not lift; every other finding warns and audits
         # (vault_preflight_outcome). Every finding raises vault_privilege_warning, and a clean read
-        # resolves it. It names the consumers from the
+        # can resolve it (see docs/SECURITY.md). It names the consumers from the
         # resolved service settings, which serve always passes; an embedding that passes none has
         # no Vault consumer this lifespan could name.
         _security = security_settings or SecuritySettings()
@@ -12320,7 +12320,7 @@ def create_managed_app(
                     probe=partial(
                         probe_vault, settings=static_credential_settings, posture=_hop_posture
                     ),
-                    # #2903 slice B: each hop pages, or resolves its page, through the same sink.
+                    # #2903 slice B: each hop pages, or can resolve its page, through the same sink.
                     alert_sink=notifier or LoggingAlertSink(),
                 )
         except BaseException:
