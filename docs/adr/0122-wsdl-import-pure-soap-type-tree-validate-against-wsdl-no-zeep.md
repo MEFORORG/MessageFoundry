@@ -174,3 +174,24 @@ and `requirements.lock` are untouched.
   ValueError` routes it to the error/dead-letter path — count-and-log holds for free).
 - The `[xml]` extra absence → the clear `RuntimeError` from `_deps` (distinct from the `ValueError` data
   errors), unchanged.
+
+## Amendment (2026-11-10) -- any import location is refused, and the XSD build opens nothing (BACKLOG #5537, #5539)
+
+Two statements above were false in the shipped code, and both are corrected here rather than in place.
+
+- *"A relative/local location is not fetched either."* It was. The guard refused only a location with a
+  scheme or a `//host` authority, so a relative, rooted or Windows backslash UNC location passed, and
+  `xmlschema`, built with `allow="local"` and `base_url=None`, resolved a relative one against the
+  process's working directory and opened it. `xsd:override` was never inspected at all, even with an
+  `http:` URL. `parse_wsdl` now refuses **any** non-empty `location`/`schemaLocation` on `wsdl:import`,
+  `xsd:import`, `xsd:include`, `xsd:redefine` and `xsd:override` with `WsdlSecurityError`, naming the
+  element and the scheme (or "a local path" / "a network path"), never the location. An `xsd:import`
+  that names only a `namespace` stays legal: it loads nothing. This is the end state the decision above
+  already asked for, a contract inlined into the one WSDL document.
+- *"`schema.py` builds `xmlschema.XMLSchema(..., allow="local", base_url=None)`."* It now builds an
+  inline schema, which is how every embedded WSDL schema arrives, with `allow="none"` and
+  `defuse="always"`, so no include, import, redefine or override location is opened; and a schema given
+  as a path with `allow="sandbox"`, `defuse="always"` and `base_url` set to its own directory.
+
+No SMB fetch through the backslash UNC form was shown with `xmlschema` 4.3.2; it rewrote that form to a
+drive-rooted local path. The guard refuses the form either way.

@@ -62,8 +62,9 @@ class WsdlError(XmlError):
 
 
 class WsdlSecurityError(WsdlError):
-    """A WSDL import could not be resolved without leaving the machine (ADR 0122). ``parse_wsdl`` refuses a
-    ``wsdl:import`` / ``xsd:import`` / ``xsd:include`` whose ``location``/``schemaLocation`` points over the
-    network (``http:``/``https:``/``ftp:``/a network-path ``//host`` reference) — the distinct WSDL-layer
-    resolution seam the ``xmlschema`` ``allow="local"`` no-network config does **not** cover — so a crafted
-    WSDL can't SSRF past the XSD lockdown. **PHI-safe**: names the URI *scheme* only, never the full URL."""
+    """A WSDL names another document to load (ADR 0122). ``parse_wsdl`` refuses a ``wsdl:import`` /
+    ``xsd:import`` / ``xsd:include`` / ``xsd:redefine`` / ``xsd:override`` carrying any non-empty
+    ``location``/``schemaLocation``: a remote one (``http:``/``https:``/``ftp:``/a network-path ``//host``
+    reference), so a crafted WSDL can't SSRF past the XSD lockdown, and a relative, rooted or backslash UNC
+    one, so it can't make the validator open a local file either (BACKLOG #5539). **PHI-safe**: names the
+    element and the URI *scheme* only, never the location."""
