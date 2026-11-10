@@ -198,8 +198,9 @@ class KillCause(str, enum.Enum):  # noqa: UP042
     those :func:`_reap_process_tree` and :mod:`messagefoundry.proctree` write when a signal fails or
     the worker was already reaped.
 
-    A reap that is not a kill records nothing, and writes no kill line. At least these are such reaps: closing a session
-    whose worker is gone, the prior generation's reap at the top of a spawn (a worker that died
+    A reap that is not a kill records nothing, and writes no kill line. At least these are such
+    reaps: closing a session whose worker is gone, the prior generation's reap at the top of a
+    spawn (a worker that died
     between dispatches on its own), and the reap after a queued EOF from a worker that has exited,
     which only says the peer died, the check after an answer included unless the answer announced
     the exit (:attr:`MEMORY_CAP`). A worker that
@@ -215,8 +216,8 @@ class KillCause(str, enum.Enum):  # noqa: UP042
     #: The worker loaded a graph that differs from the engine's. No WARNING here: the runner logs
     #: and raises the ``sandbox_worker_refused`` alert for a refusal against the graph it serves. A
     #: refusal against a graph a reload has since replaced gets neither, and this record does not
-    #: outlast it: the reload discards this session. That kill then writes no line anywhere; only
-    #: the refused dispatch's own error reaches the runner's internal-error policy.
+    #: outlast it: the reload discards this session. That kill then writes no kill line anywhere;
+    #: only the refused dispatch's own error reaches the runner's internal-error policy.
     GRAPH_MISMATCH = "graph_mismatch"
     #: The boot frame could not be written to the new worker.
     BOOT_WRITE = "boot_write"
@@ -643,12 +644,14 @@ _LIVE_WORKER_EOF_RESPAWNS: Final = 2
 def _has_exited(proc: subprocess.Popen[bytes]) -> bool:
     """Whether ``proc`` has exited, WITHOUT reaping it on POSIX.
 
-    ``Popen.poll`` and ``wait`` reap an exited child, and a reaped worker's pid is free for the
-    kernel to give to another process. :func:`_reap_process_tree` would then reach the worker's
-    group only through :func:`proctree.kill_reaped_leader_group`, which signals nothing when the
-    pid names a live process, so a grandchild still in the group may survive. ``WNOWAIT`` leaves
-    the zombie in place, holding the pid, so the reap signals the worker's own group through
-    :func:`proctree.kill_process_group`. Windows has no such state to lose."""
+    ``Popen.poll`` and ``wait`` reap an exited child. :func:`_reap_process_tree` would then take
+    its already-reaped path, :func:`proctree.kill_reaped_leader_group`. That still reaches a group
+    with a member left, since POSIX does not reuse the pid while the group has one, but once the
+    group is empty and the pid reused it signals nothing and writes a WARNING. ``WNOWAIT`` leaves
+    the zombie in place, holding the pid, so the reap takes the ordinary path,
+    :func:`proctree.kill_process_group`, which reads the zombie's group by its pid. Linux allows
+    that read; whether every other POSIX kernel does is not measured here. Windows has no such
+    state to lose."""
     if sys.platform == "win32":
         return proc.poll() is not None
     return _posix_child_state(proc) != "running"
@@ -658,12 +661,20 @@ def _posix_child_state(proc: subprocess.Popen[bytes]) -> Literal["running", "zom
     """``proc``'s state on POSIX, read with ``WNOWAIT`` so a zombie stays in place: ``running``,
     ``zombie`` (exited, and nobody has reaped it), or ``reaped``. A reap through ``Popen`` sets
     ``returncode``. A reap by anything else makes ``waitid`` raise ``ChildProcessError`` only while
-    the pid is unused. Once that reap frees it, the kernel may give the pid to a later child of this
-    engine, and a targeted ``waitpid`` on the worker's pid by code in the engine's process is
-    enough for that. ``waitid`` then reads that child, and this returns its state as the worker's,
-    ``running`` or ``zombie``. :func:`_reap_process_tree` then signals that child as if it were the
-    worker: its whole process group when it leads one, which another sandbox worker does, so the
-    reap can kill another worker's group."""
+    the pid names no child of this engine. That reap frees the pid, and the kernel may give it to a
+    later child of this engine. At least a targeted ``waitpid`` on the worker's pid, any wait for
+    any child (``os.wait``, ``waitpid(-1)``), and an ignored ``SIGCHLD`` are such reaps. The engine
+    makes none of them, but code loaded into its process could. ``waitid`` then reads that later
+    child, and this returns its state as the worker's, ``running`` or ``zombie``.
+
+    Every caller then takes that child for the worker. :func:`_reap_process_tree` signals it: its
+    whole process group when it leads one, which another sandbox worker does, so the reap can kill
+    another worker's group; otherwise the single-process fallback signals that one process, or
+    reaps it if it has exited.
+    :meth:`SandboxSession._reap` then waits on the pid and so can reap that child, taking its exit
+    status from its own session. :func:`_has_exited`'s callers read a live worker where there is
+    none, so at least a kill can be recorded under the wrong cause, or a shutdown kill recorded
+    where only a reap was due."""
     if sys.platform == "win32":  # pragma: no cover - every caller returns first there
         raise AssertionError("_posix_child_state is POSIX only")
     if proc.returncode is not None:
@@ -820,14 +831,11 @@ def _reap_process_tree(proc: subprocess.Popen[bytes], job: int | None, inbound: 
         # Reaped by ``Popen``, by something else, or by the kernel under ``SIGCHLD`` set to
         # ``SIG_IGN``. A running or zombie child's pid cannot have been given to another process,
         # so only this state needs the reuse-safe signal. The state check cannot see a pid reaped
-        # elsewhere and then reused by another child of this engine. Any reap other than Popen's
-        # frees the pid for that: a targeted ``waitpid`` on this worker's pid, a ``waitpid(-1)``
-        # loop, or an ignored ``SIGCHLD``. The engine does none of these, but code loaded into its
-        # process could. The check then reads the new child as ``running`` or ``zombie``, and this
-        # reap takes the path below and signals that child: its whole process group when it leads
-        # one, as another sandbox worker does, so another worker's group is killed; otherwise the
-        # single-process fallback signals that one process, or reaps it if it has exited. A zombie reaped between the state
-        # check and the signal is missed too: its group is not signalled, and nothing is logged.
+        # elsewhere and then reused by another child of this engine: it reads that child as
+        # ``running`` or ``zombie``, and the path below then signals it, which can kill another
+        # worker's group. :func:`_posix_child_state` states that limit. A zombie reaped between the
+        # state check and the signal is missed too: its group is not signalled, and nothing is
+        # logged.
         if proctree.kill_reaped_leader_group(proc.pid) is None:
             log.warning(
                 "inbound %r: sandbox worker pid %d was already reaped and its process group could "

@@ -22,8 +22,8 @@ these escape: on POSIX a descendant that leaves the group (``setsid``, and ``sud
 another process outside its tree (a WMI provider, Task Scheduler, a service). A failure to set up
 the job degrades to a single-process kill, logged. When :func:`kill_process_group` sends no signal,
 its callers degrade to a single-process kill too, but only a failed signal is logged: at least a
-group that cannot be read, a group ``pid`` does not lead, and the caller's own group return
-``False`` with nothing logged.
+group that cannot be read, a group ``pid`` does not lead, and, with ``started_as_leader=True``,
+the caller's own group return ``False`` with nothing logged.
 :func:`kill_reaped_leader_group` has no process left to fall back to, and says so in its return
 value; it logs a failed signal and nothing else.
 

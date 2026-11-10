@@ -1366,16 +1366,19 @@ ruling 2026-11-09); [ADR 0187](adr/0187-bound-the-subprocess-sandbox-worker-coun
 Each worker kill writes one `WARNING` naming the inbound, the phase and a cause token, and no message
 content, except a graph refusal, which writes none, and a shutdown, logged at `INFO`. The runner alerts
 on a graph refusal against the graph the engine serves; one against a graph a reload has replaced
-writes no line. The line says the worker was `killed`, or that it `exited` for a cause recorded only
-once the worker is seen gone (a crash, an exit during boot or right after it), which may still be a
-signal from outside the engine. The reap that ends a worker can write more lines, kill or not. On
+writes no kill line. The line says the worker was `killed`, or that it `exited` for a cause recorded
+only once the worker is seen gone (a crash, an exit during boot or right after it), which may still be
+a signal from outside the engine. The reap that ends a worker can write more lines, kill or not. On
 POSIX a `WARNING` naming the inbound and the pid says a worker that was already reaped could not have
-its process group signalled safely, so a process it started may survive. At least these cases
-differ: after a kill that writes a line, it follows that line; after a reap that is not a kill, such as closing
-a session whose worker had already died, it is the only line naming the inbound; and when the signal
-itself failed, such as `EPERM`, a line naming the process group and the error, but not the inbound,
-comes before it. That unattributed line is also written when a live worker's group cannot be
-signalled, and the kill then falls back to the worker alone.
+its process group signalled safely, so a process it started may survive. It is written both when the
+signal failed and when the pid had been reused, and in the second case the group already had no
+member left. At least these cases differ: after a kill that writes a line, it follows that line;
+after a reap that is not a kill, such as closing a session whose worker had already died, no kill
+line comes before it; and when the signal itself failed, for example for want of permission, a line
+naming the process group and the system's error text, but not the inbound, comes before it. A
+failed signal to a live worker's group writes that unattributed line too, and the kill then falls
+back to the worker alone; a live worker's group that cannot be read or that it does not lead falls
+back the same way with no line.
 **Read once at engine start — a `/config/reload` does NOT re-read it (restart to change).**
 
 **`mode` is engine-wide — there is no per-connection sandbox setting.** One policy is rendered for the
