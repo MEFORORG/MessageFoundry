@@ -694,6 +694,69 @@ def test_expect_error_passes_on_a_strict_validation_content_refusal(tmp_path: Pa
     assert "timed out" not in dr.detail and "PV1" in dr.detail, dr.detail
 
 
+def test_expect_error_reason_passes_when_the_error_contains_it(tmp_path: Path) -> None:
+    # BACKLOG #5107: `ERROR <reason>` pins why the run failed. ADT_A01 has no PV1, and hl7apy's
+    # refusal names it.
+    cfg = _strict_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "ERROR PV1\n")
+    dr = _run_dryrun(cfg, msgs)
+    assert dr.ok and "expectation-checked" in dr.detail, dr.detail
+
+
+@pytest.mark.parametrize("reason", ["ZZ9-not-in-the-error", "pv1"])
+def test_expect_error_reason_fails_when_the_error_lacks_it(tmp_path: Path, reason: str) -> None:
+    # A different reason fails, and the match is case-sensitive. The detail prints neither the
+    # error nor the reason: both can quote message content, and the detail lands in a CI log.
+    cfg = _strict_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), f"ERROR {reason}\n")
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
+    assert "reason does not match" in dr.detail, dr.detail
+    assert reason not in dr.detail and "PV1" not in dr.detail, dr.detail
+
+
+def test_expect_error_reason_matches_a_late_content_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # On a late refusal the reason is matched against the validator's verdict, not the timeout
+    # text that stands in the run's error.
+    _slow_clock(monkeypatch)
+    cfg = _strict_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "ERROR PV1")
+    dr = _run_dryrun(cfg, msgs)
+    assert dr.ok and "expectation-checked" in dr.detail, dr.detail
+
+
+def test_expect_error_reason_still_fails_on_a_strict_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A timeout with no content verdict fails the reason form too, even a reason the timeout text
+    # itself contains.
+    _slow_clock(monkeypatch)
+    _late_validate(monkeypatch, "pass")
+    cfg = _strict_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "ERROR timed out")
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
+    assert "got a strict-validation timeout" in dr.detail, dr.detail
+
+
+@pytest.mark.parametrize(
+    ("expect", "says"),
+    [
+        ("FILTERED some reason", "only ERROR takes a reason"),
+        ("ERROR first line\nsecond line", "must fit on one line"),
+    ],
+)
+def test_expect_reason_form_refuses_a_malformed_sidecar(
+    tmp_path: Path, expect: str, says: str
+) -> None:
+    cfg = _delivering_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), expect)
+    dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
+    assert says in dr.detail, dr.detail
+    # The refusal names the word, never the reason, which can quote message content.
+    assert "some reason" not in dr.detail and "first line" not in dr.detail, dr.detail
+
+
 def test_expect_unrouted_is_case_insensitive(tmp_path: Path) -> None:
     cfg = _unrouted_config(tmp_path)  # router returns [] → UNROUTED
     msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "unrouted\n")

@@ -110,7 +110,7 @@ import sys
 from collections.abc import Iterator, Mapping, Sequence, Set
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import ServiceSettings
@@ -1774,6 +1774,7 @@ def _check_validate(config_dir: str | Path, *, allow_empty: bool = False) -> Che
 # router-handler failure). ``PROCESSED``/``ROUTED`` are live-only post-delivery states, so they alias
 # to ``RECEIVED`` for authoring ergonomics. A strict-validation timeout satisfies ``ERROR`` only when
 # the validate, though late, returned a content refusal; a late pass or a late raise does not.
+# ``ERROR <reason>`` also requires the run's error to contain the reason (``_expected_disposition``).
 _DRYRUN_DISPOSITIONS = frozenset({"RECEIVED", "UNROUTED", "FILTERED", "NOT_DEPLOYED", "ERROR"})
 _DISPOSITION_ALIASES = {
     "PROCESSED": "RECEIVED",
@@ -1783,14 +1784,25 @@ _DISPOSITION_ALIASES = {
 }
 
 
-def _expected_disposition(fixture_path: str | Path, *, cap: int) -> str | None:
+class _Expectation(NamedTuple):
+    """A fixture's declared expectation: the disposition name, and for ``ERROR <reason>`` the
+    substring the run's error must contain (``None`` for every other form)."""
+
+    disposition: str
+    reason: str | None = None
+
+
+def _expected_disposition(fixture_path: str | Path, *, cap: int) -> _Expectation | None:
     """Read an optional ``<fixture>.expect`` sidecar declaring the expected dry-run disposition.
 
-    Returns the normalized disposition name (one of :data:`_DRYRUN_DISPOSITIONS`), or
-    ``None`` when no sidecar exists — then the fixture keeps the default "must not ERROR" semantics.
-    Raises ``ValueError`` for an unreadable, over-cap or unrecognized declaration (a fixture-authoring
-    mistake). The sidecar is read under its fixture's ``cap``, so it never lands in memory whole
-    (ASVS 5.1.1, BACKLOG #1127).
+    The sidecar holds one disposition name, case-insensitive, or ``ERROR <reason>``: ``ERROR``, one
+    space, then the rest of the line, matched case-sensitively as a substring of the run's error
+    (BACKLOG #5107). Surrounding whitespace is ignored. Returns the normalized name (one of
+    :data:`_DRYRUN_DISPOSITIONS`) with the reason, or ``None`` when no sidecar exists — then the
+    fixture keeps the default "must not ERROR" semantics. Raises ``ValueError`` for an unreadable,
+    over-cap or unrecognized declaration (a fixture-authoring mistake); the error names only the
+    disposition word, since a reason can quote message content. The sidecar is read under its
+    fixture's ``cap``, so it never lands in memory whole (ASVS 5.1.1, BACKLOG #1127).
     """
     from messagefoundry.pipeline.dryrun import read_fixture
 
@@ -1802,14 +1814,21 @@ def _expected_disposition(fixture_path: str | Path, *, cap: int) -> str | None:
         cap,
         advice="an .expect sidecar holds one disposition name",
     )
-    raw = data.decode("utf-8").strip().upper()
+    word, sep, reason = data.decode("utf-8").strip().partition(" ")
+    raw = word.upper()
     normalized = _DISPOSITION_ALIASES.get(raw, raw)
     if normalized not in _DRYRUN_DISPOSITIONS:
         valid = ", ".join(sorted(_DRYRUN_DISPOSITIONS))
         raise ValueError(
             f"invalid .expect disposition {raw!r} (use one of {valid}; PROCESSED/ROUTED alias RECEIVED)"
         )
-    return normalized
+    if not sep:
+        return _Expectation(normalized)
+    if normalized != "ERROR":
+        raise ValueError(f"invalid .expect: only ERROR takes a reason, not {raw!r}")
+    if "\n" in reason or "\r" in reason:
+        raise ValueError("invalid .expect: an ERROR reason must fit on one line")
+    return _Expectation(normalized, reason)
 
 
 def _resolve_snapshot_on_send(
@@ -1952,9 +1971,11 @@ def _check_dryrun(
             if expected is not None:
                 asserted += 1
                 actual = result.disposition.name
-                if actual != expected:
+                if actual != expected.disposition:
                     got = safe_error(result.error) or actual
-                    errors.append(f"{label} @ {ic_name}: expected {expected}, got {got}")
+                    errors.append(
+                        f"{label} @ {ic_name}: expected {expected.disposition}, got {got}"
+                    )
                 elif result.strict_timed_out and result.strict_late_refusal is None:
                     # A timeout is the validator's wall clock, not the message, so on its own it
                     # never proves a fixture that expects ERROR (BACKLOG #5107). A content refusal
@@ -1962,9 +1983,21 @@ def _check_dryrun(
                     # only its arrival was slow. The detail names the refusal kind only: the
                     # timeout text carries no message content.
                     errors.append(
-                        f"{label} @ {ic_name}: expected {expected}, got a strict-validation "
-                        "timeout, which does not show the content is invalid"
+                        f"{label} @ {ic_name}: expected {expected.disposition}, got a "
+                        "strict-validation timeout, which does not show the content is invalid"
                     )
+                elif expected.reason is not None:
+                    # Matched against the raw text, never safe_error's: redaction must not decide
+                    # whether the gate fails. On a late refusal the reason is the validator's own
+                    # verdict, not the timeout text that stands in ``error`` for listener parity.
+                    said = result.strict_late_refusal if result.strict_timed_out else result.error
+                    if expected.reason not in (said or ""):
+                        # Neither text is printed: the error and the reason can both quote the
+                        # message, and this detail lands in a CI log.
+                        errors.append(
+                            f"{label} @ {ic_name}: expected ERROR with the .expect reason, got "
+                            "an ERROR whose reason does not match it"
+                        )
             elif result.error or result.disposition is MessageStatus.ERROR:
                 shown = safe_error(result.error) or result.disposition.value
                 errors.append(f"{label} @ {ic_name}: {shown}")

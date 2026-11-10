@@ -289,6 +289,17 @@ failed** — advisory checks and skips never block.
 dry-run **only** against that feed; a fixture not under such a subdir is cross-producted against
 **every** inbound. This lets you assert "this message belongs to this feed and only this feed."
 
+**Declaring the expected disposition (`.expect`).** A fixture `a.hl7` may have a sibling
+`a.hl7.expect` holding one disposition name, case-insensitive: `RECEIVED`, `UNROUTED`, `FILTERED`,
+`NOT_DEPLOYED` or `ERROR` (`PROCESSED`, `ROUTED`, `DELIVERED` and `DELIVERS` alias `RECEIVED`). The
+fixture then passes only when its dry run lands in that disposition, instead of only when it does
+not error. To pin *why* a fixture errors, write `ERROR <reason>`: `ERROR`, one space, then the
+rest of the line. The run must then be `ERROR` and its error text must contain the reason, matched
+case-sensitively; on a mismatch the gate says the reason did not match and prints neither text,
+since both can quote the message. A plain `ERROR` accepts any error. A strict-validation timeout
+satisfies neither form unless the validator, though late, returned a content refusal: a timeout
+measures the runner, not the message.
+
 ---
 
 ## 4. How this maps to "interface quality"
