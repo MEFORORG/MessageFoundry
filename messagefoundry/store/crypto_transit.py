@@ -103,8 +103,10 @@ _ENV_AUDIT_KEY = "MEFOR_STORE_TRANSIT_AUDIT_KEY"
 #: ``sdk/helper/keysutil/policy.go`` (``HMACKey``, ``safeGetKeyEntry``) at commit cbc874e2358f, and
 #: from OpenBao, which says the same, at 80e208bf4f83 and 79e101fe2e59: a version above the latest or
 #: below zero, one the key no longer holds, one below ``min_encryption_version``, and one with no HMAC
-#: key. Every other 400 on that path, such as an input that is not base64, is about the request. A
-#: reworded text fails closed to CipherError: the walk reports a check that could not run.
+#: key. At least the other 400s read there, such as an input that is not base64 or a missing key, are
+#: not about the version. A refusal whose text is missing here reads as plain CipherError, never as a
+#: refused version: the startup walk then logs a check that could not run and raises no chain-break
+#: alert, and a genesis row refuses the open. So re-read these texts on a Vault or OpenBao upgrade.
 _VERSION_REFUSAL_TEXTS = (
     "key version does not exist",
     "no such key version",
@@ -115,8 +117,9 @@ _VERSION_REFUSAL_TEXTS = (
 
 def _names_a_version_refusal(exc: Exception) -> bool:
     """Whether Vault's own error list on ``exc``, which hvac carries on ``exc.errors``, names only a
-    refused key version (BACKLOG #6707). A missing or empty list, or any entry that is not text or
-    not a version refusal, is not evidence, so the caller fails closed to :class:`CipherError`.
+    refused key version (BACKLOG #6707). A missing or empty list, or any entry that is not text, not
+    a version refusal, or holds several lines (a joined multi-error), is not evidence, so the caller
+    raises :class:`CipherError`.
 
     hvac parses the reply into ``errors`` only when its Content-Type is exactly ``application/json``,
     so a proxy that adds a charset leaves the same JSON in ``exc.text``; that is read the same way."""
@@ -130,7 +133,7 @@ def _names_a_version_refusal(exc: Exception) -> bool:
     if not isinstance(errors, list) or not errors:
         return False
     for text in errors:
-        if not isinstance(text, str):
+        if not isinstance(text, str) or "\n" in text:
             return False
         lowered = text.lower()
         if not any(known in lowered for known in _VERSION_REFUSAL_TEXTS):
@@ -306,8 +309,8 @@ class TransitCipher(_UnmarkedPolicy):
         if not _names_a_version_refusal(exc):
             # Vault's own text stays out of the log, as it stays out of the error.
             log.warning(
-                "Transit refused audit key version %d with HTTP 400, and its reply does not name a "
-                "refused version, so the check could not run (key=%r)",
+                "Transit answered an audit HMAC pinned to key version %d with HTTP 400 whose reply "
+                "does not name a refused version, so it is not read as one (key=%r)",
                 key_version,
                 self._audit_key,
             )

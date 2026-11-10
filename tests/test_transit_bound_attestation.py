@@ -554,6 +554,10 @@ def test_each_vault_version_refusal_text_is_a_refused_version(text: str) -> None
         pytest.param(None, id="no-vault-text"),
         pytest.param([], id="empty-list"),
         pytest.param(["no such key version", "missing input for HMAC"], id="mixed"),
+        pytest.param(
+            ["2 errors occurred:\n\t* no such key version\n\t* missing input for HMAC"],
+            id="joined-multi-error",
+        ),
     ],
 )
 def test_a_pinned_400_vault_does_not_name_as_a_version_refusal_is_a_plain_cipher_error(
