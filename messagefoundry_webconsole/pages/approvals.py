@@ -38,6 +38,7 @@ Every value goes through the escaping ``el`` builder.
 from __future__ import annotations
 
 import json
+import re
 
 from messagefoundry.api.models import (
     ApprovalDecisionResult,
@@ -118,6 +119,11 @@ _BLOCKED: dict[ReleaseBlocked, str] = {
         "Its parameters record no requester, so the operation could not name who ran it and it "
         "cannot be approved. {verb} it; if it is still needed, request it again."
     ),
+    "params_no_fingerprint": (
+        "Its parameters record no config digest, or one not of the form the engine writes, so "
+        "the release could not be bound to the config it names, and it cannot be approved. {verb} "
+        "it; if it is still needed, request it again."
+    ),
     "requester_not_authorized": (
         "The engine cannot confirm that the requester still holds the authority this operation "
         "requires: at least, their account is deleted or disabled, lacks the permission or the "
@@ -143,9 +149,23 @@ _NONE_MEANS: dict[str, str] = {
     "channel_id": "any inbound connection",
     "destination_name": "any destination",
     "config_dir": "the engine's startup config directory",
-    # A held reload's digest (vault BACKLOG #2596): with none, the engine refuses the release.
-    "fingerprint": "no config digest was taken, so the engine will refuse this release",
 }
+
+# A held reload's digest (vault BACKLOG #2596). A value the engine's own test,
+# messagefoundry.config.fingerprint.is_config_digest, refuses reads as this note, never raw, so it
+# does not pass for a digest (vault BACKLOG #3192). This console may not import that package, so
+# _is_config_digest restates the test; tests/test_approval_release_blocked.py pins the two together.
+# The note is true on a pending row and an interrupted one alike.
+_RELOAD = "config_reload"
+_CONFIG_DIGEST = re.compile(r"[0-9a-f]{64}")
+_NO_DIGEST = (
+    "no usable config digest was recorded, and the engine will not release this reload without one"
+)
+
+
+def _is_config_digest(value: object) -> bool:
+    return isinstance(value, str) and _CONFIG_DIGEST.fullmatch(value) is not None
+
 
 # Guidance for a refusal, keyed by the status the engine raised. The engine's own message follows it
 # verbatim, because one status covers several causes (a 409 is at least already decided, expired,
@@ -211,7 +231,9 @@ def _when(value: float | None) -> str:
     return "—" if value is None else _ts(value)
 
 
-def _param_value(key: str, value: object) -> str:
+def _param_value(operation: str, key: str, value: object) -> str:
+    if operation == _RELOAD and key == "fingerprint" and not _is_config_digest(value):
+        return _NO_DIGEST
     if value is None:
         return _NONE_MEANS.get(key, "not set")
     return value if isinstance(value, str) else json.dumps(value)
@@ -230,7 +252,10 @@ def _params(a: PendingApprovalInfo) -> Markup:
     shown = sorted(k for k in a.params if k != "requester" or a.params[k] != a.requester)
     if not shown:
         return el("span", "none", class_="muted")
-    return el("div", *(el("div", f"{key}: {_param_value(key, a.params[key])}") for key in shown))
+    return el(
+        "div",
+        *(el("div", f"{key}: {_param_value(a.operation, key, a.params[key])}") for key in shown),
+    )
 
 
 def _pending_row(a: PendingApprovalInfo) -> list[object]:

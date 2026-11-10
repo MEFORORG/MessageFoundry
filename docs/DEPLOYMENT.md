@@ -151,30 +151,36 @@ client request first, so its parser decides for the whole chain. The engine's ow
 only the hop it can see, and it cannot see what your proxy accepted from the client.
 
 The engine API parses requests with llhttp, through `httptools`, which `serve` pins (BACKLOG
-#1125). That parser refuses at least the shapes below with a `400`, and the engine closes the
-connection. For most shapes llhttp refuses the request head before any engine code runs, so the
-`400` is the only response.
+#1125). Sent in one write, each shape below gets a `400` and a closed connection. For most of
+them llhttp refuses the request head before any engine code runs, so the `400` is the only
+response. llhttp passes an empty `Transfer-Encoding` that comes before any `Content-Length`, and
+the engine refuses it itself.
 
 The two chunk shapes in the last row fail in the body instead. The engine starts handling a request
-once its head is read, and it answers any chunked body with `411` from the head alone. When the bad
-body arrives in the same read as the head, the engine writes only the `400`, and nothing after it.
-When the head arrives first and the bad body later, the engine can send its `411` and then the
-`400`: two responses to one request. Rule 1 below keeps a proxy clear of this, because a proxy that
-sends one `Content-Length` never forwards a chunked body.
+once its head is read, and its body limit answers a chunked request with no `Content-Length`
+with `411` from the head alone, then closes the connection. When the bad body arrives in the same read as
+the head, the engine writes only the `400`, and nothing after it. When the head arrives first
+and the bad body later, the body limit sends its `411` and closes, so the bad body is never parsed
+and no `400` follows. A client still sending its body when the engine closes after a body-limit
+refusal gets a connection reset, not the refusal.
 
 llhttp refuses more than this table lists, so treat it
 as the shapes that were measured, not as the whole set. `tests/test_api_request_framing_wire.py` sends each one on a real
-socket, and its `_REFUSED` table holds the exact bytes.
+socket, and its `_REFUSED` and `_APP_REFUSED` tables hold the exact bytes.
 
 | A request that carries | What your proxy must do |
 |---|---|
 | Both `Content-Length` and `Transfer-Encoding` | Refuse it. Do not forward it with either header removed. |
-| `Transfer-Encoding` twice, or as a list whose last coding is not `chunked`, or `identity`, or a list ending in an empty element | Refuse it. |
+| `Transfer-Encoding: chunked` on two lines, or `Transfer-Encoding` as a list whose last coding is not `chunked`, or `identity`, or a list ending in an empty element | Refuse it. |
 | `Content-Length` twice, even with equal values, or as a list such as `2, 2`, or holding anything but digits, such as `+2` or `0_2` | Refuse it. |
 | Whitespace between a field name and its colon, such as `Content-Length : 2` | Refuse it. |
 | A header line folded onto the next line (obs-fold) | Refuse it. Do not unfold it and forward the result. |
 | Head lines ended by a bare LF, or a bare CR inside a header line | Refuse it. |
 | A chunk size that is not hex digits, or chunk lines ended by a bare LF | Refuse it. |
+
+Refuse a request carrying `Transfer-Encoding` on more than one line too. llhttp frames
+`Transfer-Encoding: gzip` followed by `Transfer-Encoding: chunked` as chunked, so a proxy that reads
+only the first line would disagree with it about where the request ends.
 
 "Refuse" means answer the client with an error yourself, `400` or `501`, and close that client
 connection. A proxy that rewrites an ambiguous request into a clean one is the danger: the engine
@@ -183,12 +189,13 @@ then reads a request the client did not send.
 Your proxy must also meet at least these four rules.
 
 1. **Send each request body to the engine with one `Content-Length`.** Buffer the body first. The
-   engine answers a chunked request body with `411`. nginx buffers by default
+   engine refuses any request carrying `Transfer-Encoding`. nginx buffers by default
    (`proxy_request_buffering on`).
 2. **Do not reuse a connection to the engine after an error.** After an engine `400`, or a response
-   the proxy could not read to its framed end, drop that connection. The engine closes it too. One
-   request per connection to the engine is the simplest safe setting. nginx works that way unless
-   you configure keep-alive to the upstream.
+   the proxy could not read to its framed end, drop that connection. The engine closes it after
+   its parser's `400` and after every body-limit refusal. One request per connection to the
+   engine is the simplest safe setting. nginx works that way unless you configure keep-alive to
+   the upstream.
 3. **Re-check requests that arrive over HTTP/2 or HTTP/3.** If the proxy speaks HTTP/1.1 to the
    engine, it must refuse such a request when it carries `Transfer-Encoding`, or a `content-length`
    that does not match the body it received. It must also refuse a CR, LF or NUL in any field name
@@ -202,8 +209,8 @@ Your proxy must also meet at least these four rules.
 **Check your proxy, because nothing in the engine can.** Replay each shape in `_REFUSED` through the
 proxy with a second request appended, in one write, as that test does. The client must get exactly one response,
 an error, and the appended request must never be answered. Two responses mean the proxy and the
-engine framed the bytes differently. For the two chunk shapes, a `411` then a `400` instead means
-the proxy forwarded a chunked body, which breaks rule 1. Passing this check covers only the shapes in that table. A copy of a reference terminator config (see
+engine framed the bytes differently. For the two chunk shapes, a `411` instead means the proxy
+forwarded a chunked body, which breaks rule 1. Passing this check covers only the shapes in that table. A copy of a reference terminator config (see
 [REMOTE-CONSOLE.md](REMOTE-CONSOLE.md#option-b--tls-terminated-upstream-reverse-proxy--load-balancer))
 needs the same check.
 
@@ -411,7 +418,7 @@ the management API, and it does not inherit the API's auth: harden it deliberate
   `tls_ca_file` and `intake_client_subjects`, keyed by the CA that issues each partner's
   certificate), DoS caps (`max_connections`, `receive_timeout`,
   `max_body_bytes`, `max_header_bytes`, and the per-address handshake budget
-  `max_handshakes_per_host`, which applies only with `tls = true` on the stdlib loop; see
+  `max_handshakes_per_host`, which applies only with `tls = true`; see
   [Per-address listener caps behind the VIP](#per-address-listener-caps-behind-the-vip)), the off-loopback exposed-gate (`check_http_tls_exposure`), and
   the peer-control gate (`check_http_intake_auth`).
 - **Not built:** an HTTP Basic credential check. Use one of the three `intake_auth` modes, or front the
@@ -491,11 +498,8 @@ socket leaves the count when its handshake ends, so the cap does not bound how m
 address holds once their handshakes are done. It does bound how many can start at once: `Http()`
 answers every request with `Connection: close`, so each request opens a new connection and runs
 its own handshake, and one address could have at most 32 requests in their handshakes together.
-It applies only on a `tls = true` listener where the engine upgrades the socket itself, which is
-the stdlib event loop. uvloop does not run on Windows, so the Windows service always takes this
-path. On uvloop the loop runs the handshake before the engine sees the socket, so no engine cap
-counts a socket in its handshake, this one included. The loop's 10 s handshake bound is the only
-bound there.
+It applies only on a `tls = true` listener, on every event loop: the engine admits each socket
+before its handshake, on uvloop as on the stdlib loop (BACKLOG #2479).
 
 Without it, one address that opens sockets and never finishes a handshake could hold every
 `max_connections` slot (256) for up to the 10 s handshake bound each. Any peer that reaches the
@@ -537,13 +541,11 @@ are the ones *Without a balancer* above describes. If `at_capacity` events with 
 `max_handshakes_per_host` name the balancer's address under ordinary load, raise
 `max_handshakes_per_host`, or set it to `None` or `0` to turn it off.
 
-**`source_ip_allowlist` is a further mitigation, not a replacement.** On the stdlib loop it refuses
-an unlisted peer before any TLS byte; on uvloop it runs after the loop's handshake. A listed peer
-with no client certificate passes it. On the stdlib loop each socket it holds in a handshake takes
-a slot, so this budget, `max_connections` and `max_connections_per_host` where it is set all bound
-how many it holds, each for up to the 10 s handshake bound. On uvloop such a socket takes no slot,
-so no engine cap counts it, this budget included, and only the loop's 10 s handshake bound limits
-each one. Behind a balancer that collapses addresses, the allowlist sees the balancer's address, so
+**`source_ip_allowlist` is a further mitigation, not a replacement.** It refuses an unlisted peer
+before any TLS byte, on every event loop. A listed peer with no client certificate passes it. Each
+socket it holds in a handshake takes a slot, so this budget, `max_connections` and
+`max_connections_per_host` where it is set all bound how many it holds, each for up to the 10 s
+handshake bound. Behind a balancer that collapses addresses, the allowlist sees the balancer's address, so
 it cannot tell clients apart either.
 
 Two other shapes were weighed and not built:
@@ -1138,7 +1140,7 @@ bind-guard ladder above:
     reason. A relay with no login stays ungated (the table below).
   - **The https webhook.** The POST carries the webhook's path token. Its one lever is
     `[alerts].webhook_tls_revocation_attested = true` with its reason: it dials through one
-    opener built at import, so no CRL reaches it, as on the Vault hops.
+    shared opener, so no CRL reaches it, as on the Vault hops.
   - **A build with no instance posture is judged as enforcing**, as on the Vault hops and the
     AI-broker endpoint, and unlike at least the LDAPS bind, the OIDC legs and the FTPS hops,
     which do not refuse there.

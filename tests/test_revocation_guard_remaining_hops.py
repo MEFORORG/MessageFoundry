@@ -52,6 +52,7 @@ from messagefoundry.config.tls_policy import (
     context_checks_revocation,
     relax_verify_expiry,
     skips_validity_period,
+    verifies_peer_fully,
 )
 from messagefoundry.config.wiring import WiringError, load_config
 from messagefoundry.transports import dicom as dicom_module
@@ -65,7 +66,7 @@ from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.mllp import MLLPDestination
 from messagefoundry.transports.remotefile import RemoteFileDestination, RemoteFileSource
 from messagefoundry.transports.rest import (
-    _NO_REDIRECT_OPENER,
+    _shared_no_redirect_opener,
     http_family_trust_anchor,
     opener_tls_context,
 )
@@ -195,6 +196,21 @@ def _guard_log(*names: str) -> Iterator[_GuardLog]:
             lg.setLevel(level)
             lg.disabled = disabled
         logging.disable(disable_level)
+
+
+def _spy_guard_contexts(monkeypatch: pytest.MonkeyPatch) -> list[ssl.SSLContext | None]:
+    """The ``context`` each later ``RevocationHopGuard.capture`` call is handed, in call order.
+
+    The real call still runs, so every refusal and log line is unchanged."""
+    seen: list[ssl.SSLContext | None] = []
+    real = RevocationHopGuard.__dict__["capture"].__func__  # unbound, so cls is forwarded
+
+    def spy(cls: type[RevocationHopGuard], /, **kwargs: Any) -> RevocationHopGuard:
+        seen.append(kwargs.get("context"))
+        return real(cls, **kwargs)
+
+    monkeypatch.setattr(RevocationHopGuard, "capture", classmethod(spy))
+    return seen
 
 
 def _without_the_policy[T](real: Callable[..., T]) -> Callable[..., T]:
@@ -328,9 +344,9 @@ def test_a_fhir_lookup_read_hop_is_admitted_when_a_crl_reaches_its_own_opener(
 ) -> None:
     with active_hop_posture(ENFORCING):
         executor = _lookup({"url": f"https://{REMOTE}/fhir"}, policy=_crl_policy(bare_crl))
-    # The opener this lookup will really dial through, not the shared import-time one.
+    # The opener this lookup will really dial through, not the shared one.
     opener = executor._opener["epic"]
-    assert opener is not _NO_REDIRECT_OPENER
+    assert opener is not _shared_no_redirect_opener()
     assert context_checks_revocation(opener_tls_context(opener, connector="probe")) is True
 
 
@@ -347,7 +363,9 @@ def test_a_configured_crl_does_not_admit_a_fhir_lookup_it_cannot_reach(bare_crl:
         executor = FhirLookupExecutor(
             both, egress=_OPEN_EGRESS, trust_anchor_policy=_crl_policy(bare_crl)
         )
-    assert executor._opener["onbox"] is _NO_REDIRECT_OPENER  # no CRL reached the on-box hop
+    assert (
+        executor._opener["onbox"] is _shared_no_redirect_opener()
+    )  # no CRL reached the on-box hop
     with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused, match="fhir_lookup:epic"):
         FhirLookupExecutor(both, egress=_OPEN_EGRESS)
     with active_hop_posture(ENFORCING):
@@ -713,6 +731,48 @@ def test_a_plaintext_dicom_association_is_the_cleartext_refusal_not_this_one() -
         DicomScuDestination(_scu(REMOTE, tls=False))
     assert "plaintext DIMSE" in str(exc.value)
     assert "revocation" not in str(exc.value)
+
+
+@pytest.mark.parametrize("allow_expired", [False, True], ids=["strict", "expiry-relaxed"])
+@pytest.mark.parametrize("crl", [False, True], ids=["no-crl", "crl"])
+def test_the_context_the_dicom_guard_is_handed_verifies_the_peer(
+    bare_crl: str, crl: bool, allow_expired: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The DICOM guard is taken on any TLS context, with no verify-off check of its own as the FTPS
+    guard has, because this connector has no setting that turns verification off. That rested on a
+    comment (BACKLOG #2987, Part B item 3). This pins it on the system-roots anchor, with and
+    without a CRL and ``tls_allow_expired``; at least a ``tls_ca_file`` pin, an internal CA and
+    mTLS are not covered here. It matters most on the CRL arm: ``context_checks_revocation`` reads only the
+    context's flags, so a context that verified nothing but carried a CRL flag would still earn
+    the CRL's credit."""
+    policy = _crl_policy(bare_crl) if crl else None
+    seen = _spy_guard_contexts(monkeypatch)
+    with active_hop_posture(NOT_ENFORCING):
+        dest = DicomScuDestination(_scu(REMOTE, allow_expired=allow_expired, policy=policy))
+    ctx = dest._ssl
+    assert ctx is not None and seen == [ctx], seen  # the guard ran, on the context it dials with
+    assert ctx.verify_mode is ssl.CERT_REQUIRED
+    assert ctx.check_hostname is True
+    assert skips_validity_period(ctx) is allow_expired
+    assert context_checks_revocation(ctx) is crl
+
+
+def test_a_dicom_association_ignores_the_verify_off_keys_other_connectors_read() -> None:
+    """The premise the test above leans on: the keys that turn verification down on EMAIL, DIRECT
+    and FTPS are not read here, so naming them leaves the association verifying the peer."""
+    settings: dict[str, object] = {
+        "ae_title": "MF_SCU",
+        "host": REMOTE,
+        "port": 11112,
+        "tls": True,
+        "tls_verify": False,
+        "tls_check_hostname": False,
+    }
+    with active_hop_posture(NOT_ENFORCING):
+        dest = DicomScuDestination(_dest("OB_PACS", ConnectorType.DIMSE, settings))
+    assert dest._ssl is not None
+    assert dest._ssl.verify_mode is ssl.CERT_REQUIRED
+    assert dest._ssl.check_hostname is True
 
 
 # --- FTPS upload, the destination (transports/remotefile.py) ---------------------------------------
@@ -1199,6 +1259,58 @@ def test_a_direct_hop_with_no_credential_still_takes_no_revocation_guard(
         assert not log.has("revocation"), log.state()
         DirectDestination(_direct(direct_material, REMOTE))
         assert log.has("revocation"), log.state()
+
+
+@pytest.mark.parametrize("crl", [False, True], ids=["no-crl", "crl"])
+def test_the_context_the_direct_guard_is_handed_verifies_the_peer(
+    direct_material: dict[str, str], bare_crl: str, crl: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The DIRECT guard, like the DICOM one, has no verify-off check of its own: its comment says
+    the credential refusal before it already requires a verifying context (BACKLOG #2987, Part B
+    item 3). This pins the context it is handed on a credentialed hop."""
+    policy = _crl_policy(bare_crl) if crl else None
+    seen = _spy_guard_contexts(monkeypatch)
+    with active_hop_posture(NOT_ENFORCING):
+        dest = DirectDestination(_direct(direct_material, REMOTE, policy=policy))
+    assert dest._tls_context is not None and seen == [dest._tls_context], seen
+    assert verifies_peer_fully(dest._tls_context)
+    assert context_checks_revocation(dest._tls_context) is crl
+
+
+@pytest.mark.parametrize("weak", ["use_tls", "tls_verify", "tls_check_hostname"])
+def test_a_credentialed_direct_hop_that_verifies_less_never_reaches_the_guard_even_with_the_escape(
+    direct_material: dict[str, str], monkeypatch: pytest.MonkeyPatch, weak: str
+) -> None:
+    """The other half of the claim the test above pins: a credentialed hop that verifies less is
+    refused before the guard is taken, even with the weakened TLS escape live. For ``use_tls`` and
+    ``tls_verify`` the escape is what lets the uncredentialed build through, which the refused
+    build without it shows; ``tls_check_hostname=false`` builds without the escape on an
+    uncredentialed hop, so for that arm the escape is not under test."""
+
+    def build(*, credential: bool) -> DirectDestination:
+        # Every named parameter is passed, so the one weakened setting can only land in **extra.
+        return DirectDestination(
+            _direct(
+                direct_material,
+                REMOTE,
+                credential=credential,
+                attested=False,
+                policy=None,
+                **{weak: False},
+            )
+        )
+
+    if weak != "tls_check_hostname":
+        with active_hop_posture(NOT_ENFORCING), pytest.raises(ValueError, match=weak):
+            build(credential=False)  # the CONTROL: without the escape this arm is refused
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    seen = _spy_guard_contexts(monkeypatch)
+    with active_hop_posture(NOT_ENFORCING):
+        weakened = build(credential=False)
+        with pytest.raises(ValueError, match="authentication credentials"):
+            build(credential=True)
+    assert not verifies_peer_fully(weakened._tls_context)
+    assert seen == [], seen  # neither build took the guard: no credential, then refused first
 
 
 def test_a_credentialed_direct_hop_on_loopback_still_crosses(
