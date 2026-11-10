@@ -1967,6 +1967,8 @@ started together, can each raise it; the alert list folds them into one instance
   `unreadable_files` of the digest the initiating node took of what it applied, stored with the
   version by the same bump and read with it in one statement (vault BACKLOG #3109). Compare the
   two as a start compares digests: only under one `scheme` and with the same `unreadable_files`.
+  The digest is the one stored with `config_version`, but the node reads its own directory when it
+  reloads, so its `fingerprint` can be of files deployed after that version was bumped.
   The key is absent when that digest is not known, at least when the initiator took none, when
   the node's cached version had already moved on to a later bump, and for a version bumped by an
   engine that does not write `cluster_config.config_digest` and the version it stamps beside it.

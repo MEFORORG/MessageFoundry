@@ -2757,24 +2757,27 @@ class Engine:
 
         The digest is an advisory field on the row, so no fault in reading it reaches the reload: a
         stored value that is not a digest, or a coordinator that raises, reads as unknown. Either is
-        logged at WARNING once per version, since the runner retries a failing version every tick."""
+        logged at WARNING once per version, since the runner retries a failing version every tick;
+        a raise is logged with its traceback, as it is a fault in this code rather than in the row."""
         from messagefoundry.config.fingerprint import shared_digest_of
 
         fault: str | None = None
+        error: Exception | None = None
         try:
             stored = self._coordinator.config_digest_cached(version)
             digest = shared_digest_of(stored)
             if stored is not None and digest is None:
                 fault = "is not a digest"
         except Exception as exc:  # noqa: BLE001 - see the docstring
-            digest, fault = None, f"could not be read ({type(exc).__name__})"
+            digest, fault, error = None, f"could not be read ({type(exc).__name__})", exc
         if fault is not None and self._initiator_digest_warned != version:
             self._initiator_digest_warned = version
             log.warning(
-                "cluster: what is stored with shared config version %d %s, so its convergence row "
-                "names no initiator's digest",
+                "cluster: the initiator's digest stored with shared config version %d %s, so it "
+                "reads as unknown",
                 version,
                 fault,
+                exc_info=error,
             )
         return digest
 
@@ -3624,14 +3627,19 @@ class Engine:
         # leave the cluster converging on a graph the initiator never took.
         config_version: int | None = None
         if propagate and self._coordinator.is_clustered():
-            from messagefoundry.config.fingerprint import shared_digest_text
+            from messagefoundry.config.fingerprint import digest_coverage, shared_digest_text
 
-            try:
-                # The bump stores this node's digest with the new version, so a follower's
-                # convergence row can name the operator's bytes beside its own (vault BACKLOG #3109).
-                config_version = await self._coordinator.bump_config_version(
-                    digest=shared_digest_text(fingerprint)
+            # The bump stores this node's digest with the new version, so a follower's
+            # convergence row can name the operator's bytes beside its own (vault BACKLOG #3109).
+            digest_text = shared_digest_text(fingerprint)
+            if digest_text is None and digest_coverage(fingerprint) is not None:
+                # Said here, since a follower reads the NULL as "the initiator took none".
+                log.warning(
+                    "cluster: this reload's digest is not in a shape another node can compare, or "
+                    "is too long to share, so the version bump stores it as unknown"
                 )
+            try:
+                config_version = await self._coordinator.bump_config_version(digest=digest_text)
                 self._applied_config_version = config_version
             except Exception as exc:
                 # This node IS running the new graph; only the cluster-wide announcement is missing, so

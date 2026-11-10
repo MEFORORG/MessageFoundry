@@ -1438,9 +1438,43 @@ def test_a_shared_digest_reads_back_only_as_a_digest() -> None:
         "{" + fold + ', "scheme": "s", "files": 1}',  # a key it never writes
         "{" + fold + ', "scheme": "s", "scheme": "t"}',  # a repeated key, read two ways
         "{" + fold + ', "scheme": "' + "s" * 70_000 + '"}',  # over the bound
-        "[" * 100_000,  # json's depth limit, which is no ValueError
+        "[" * 5_000,  # json's depth limit, which is no ValueError, inside the length bound
     ):
         assert shared_digest_of(bad) is None, bad[:80]
+
+
+async def test_a_digest_the_bump_cannot_share_is_stored_as_unknown_and_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """vault BACKLOG #3109: a digest the shared text cannot carry, such as one over the length
+    bound, is stored as unknown. The initiator logs it, since a follower reads the stored NULL as
+    a digest that was never taken."""
+    import messagefoundry.config.fingerprint as fingerprint_module
+
+    coord = _BumpRecordingCoordinator()
+    cfgdir = tmp_path / "cfg"
+    _minimal_config(cfgdir, tmp_path)
+    eng = await Engine.create(
+        tmp_path / "e.db",
+        poll_interval=0.05,
+        config_dir=cfgdir,
+        coordinator=coord,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    eng.add_registry(load_config(cfgdir))
+    await eng.start()
+    try:
+        with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
+            await eng.reload_detail(propagate=True)
+        assert coord.bumps == 1 and coord.config_digest_cached(1) is not None, "control"
+        assert "stores it as unknown" not in caplog.text
+        monkeypatch.setattr(fingerprint_module, "shared_digest_text", lambda detail: None)
+        with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
+            await eng.reload_detail(propagate=True)
+        assert coord.bumps == 2 and coord.config_digest_cached(2) is None
+        assert "stores it as unknown" in caplog.text
+    finally:
+        await eng.stop()
 
 
 def test_a_stored_digest_belongs_only_to_the_version_stamped_beside_it() -> None:

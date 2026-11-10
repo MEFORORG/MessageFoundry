@@ -3272,6 +3272,7 @@ async def test_cluster_config_gains_its_digest_column_in_place(store) -> None:
     from messagefoundry.pipeline.cluster import DbCoordinator
     from messagefoundry.store.postgres import _SCHEMA
 
+    (create,) = [s for s in _SCHEMA if "CREATE TABLE IF NOT EXISTS cluster_config" in s]
     migrations = [s for s in _SCHEMA if "'cluster_config'" in s and "config_digest" in s]
     assert len(migrations) == 2, migrations
     try:
@@ -3289,10 +3290,10 @@ async def test_cluster_config_gains_its_digest_column_in_place(store) -> None:
         assert await a.bump_config_version(digest="d") == 6 and a.config_digest_cached(6) == "d"
     finally:
         # The schema marker still matches, so a later open would not restore a table this test
-        # left without its columns; put them back whatever happened above.
+        # dropped or left without its columns; put both back whatever happened above.
         async with store._pool.acquire() as conn:
-            for migration in migrations:
-                await conn.execute(migration)
+            for statement in (create, *migrations):
+                await conn.execute(statement)
 
 
 async def test_a_bump_that_writes_no_digest_leaves_none_beside_its_version(store) -> None:
