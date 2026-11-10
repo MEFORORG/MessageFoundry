@@ -2549,6 +2549,11 @@ def test_a_server_no_store_read_mints_only_when_the_whole_catalog_shows_none(
     assert not _advises_changing(err), err
     if anywhere is False:  # external: no store schema, and none is built here
         assert provision in err and "'external'" in err, err
+        # It claims only what this login resolves, and keeps the open's own hint at the setting
+        # and grant that hide a store provisioned elsewhere (round 2 of the #8119 review).
+        assert "this login resolves no store schema" in err, err
+        hint = "[store].db_schema" if backend is StoreBackend.POSTGRES else "default schema"
+        assert hint in err and "the database holds no store schema" not in err, err
         return
     assert provision not in err, err  # the catalog's own refusal, not the external one
     # Fifteenth hold, review round 1: the text names only this backend's cause, and a found
@@ -3466,31 +3471,78 @@ def _failing_backend(failure: Exception, *, after_the_pin: bool) -> Any:
     return _open_backend
 
 
-@pytest.mark.parametrize(
-    "case", ["before the pin", "after the pin", "not minting", "sqlite", "pin refusal", "batch"]
-)
-def test_a_minting_server_open_that_fails_before_its_pin_check_is_typed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
-) -> None:
-    # Vault BACKLOG #8119 item 2: a server open's connection, TLS, schema or settings failure
-    # comes before its pin check, the last step before its first write under the key, so nothing was sealed
-    # under the key a minting open carries. The open now types it, as a failed create batch is
-    # typed, so provision-admin removes the void key and a re-run can mint. Every other open, and
-    # a failure once the pin check passed, keeps the error as it was.
-    import asyncio
+class _DriverError(Exception):
+    """A server driver's error as ``driver_sqlstate`` reads one: a ``sqlstate`` attribute."""
 
-    from messagefoundry.store import base
+    def __init__(self, sqlstate: str) -> None:
+        super().__init__(f"driver error {sqlstate} (stand-in)")
+        self.sqlstate = sqlstate
+
+
+def _open_failure(case: str) -> Exception:
+    """The error each case's backend open raises."""
+    import socket
+
+    from messagefoundry.config.tls_policy import InsecureHopRefused
     from messagefoundry.store.store import (
         StoreCreateBatchFailedBeforeKeyUse,
         StoreIdPinRefusedBeforeWrite,
     )
 
+    return {
+        "refused address": ConnectionRefusedError("the server did not answer (stand-in)"),
+        "unresolved name": socket.gaierror("no such host (stand-in)"),
+        "hop refused": InsecureHopRefused("the store hop was refused (stand-in)"),
+        "login refused": _DriverError("28P01"),
+        "not established": _DriverError("08001"),
+        "lost mid-open": _DriverError("08006"),
+        "connection reset": ConnectionResetError("reset (stand-in)"),
+        "runtime": RuntimeError("an engine refusal (stand-in)"),
+        "pin refusal": StoreIdPinRefusedBeforeWrite("refusing to open the store (stand-in)"),
+        "batch": StoreCreateBatchFailedBeforeKeyUse(_collision()),
+    }.get(case, ConnectionRefusedError("the server did not answer (stand-in)"))
+
+
+#: The failures only a connection's establishment raises: typed on a minting server open.
+_BEFORE_CONNECTING = (
+    "refused address",
+    "unresolved name",
+    "hop refused",
+    "login refused",
+    "not established",
+)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        *_BEFORE_CONNECTING,
+        "lost mid-open",
+        "connection reset",
+        "runtime",
+        "after the pin",
+        "not minting",
+        "sqlite",
+        "pin refusal",
+        "batch",
+    ],
+)
+def test_only_a_failure_before_connecting_is_typed_on_a_minting_server_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    # Vault BACKLOG #8119 item 2, under the Manager's ruling of 2026-11-10: removing a minted key
+    # rests on the failure's own class, never on an ordering nothing enforces end to end. Only a
+    # failure a connection's establishment alone raises, before the pin check passed, is typed as
+    # one that sealed nothing, so provision-admin removes the void key. Every other failure, a
+    # RuntimeError or a connection lost mid-open among them, keeps the error, and the key, as it
+    # was; so does every other open, and every failure once the pin check passed.
+    import asyncio
+
+    from messagefoundry.store import base
+    from messagefoundry.store.store import StoreCreateBatchFailedBeforeKeyUse
+
     monkeypatch.setenv("MEFOR_SECRETS_DIRECTORY", str(tmp_path))
-    failure: Exception = ConnectionRefusedError("the server did not answer (stand-in)")
-    if case == "pin refusal":
-        failure = StoreIdPinRefusedBeforeWrite("refusing to open the store (stand-in)")
-    if case == "batch":  # the backend typed it already, and it is not wrapped twice
-        failure = StoreCreateBatchFailedBeforeKeyUse(_collision())
+    failure = _open_failure(case)
     backend = StoreBackend.SQLITE if case == "sqlite" else StoreBackend.POSTGRES
     settings = _settings(tmp_path, backend=backend, server="db.invalid", database="mefor")
     monkeypatch.setattr(
@@ -3500,7 +3552,7 @@ def test_a_minting_server_open_that_fails_before_its_pin_check_is_typed(
     wrap = b"" if case == "not minting" else b"wrap"
     with pytest.raises(Exception) as raised:
         asyncio.run(open_store(settings, create=True, custody=blob, recovery_wrap=wrap))
-    if case == "before the pin":
+    if case in _BEFORE_CONNECTING:
         assert isinstance(raised.value, StoreCreateBatchFailedBeforeKeyUse), raised.value
         assert raised.value.failure is failure and raised.value.__cause__ is failure
     else:
@@ -3510,22 +3562,25 @@ def test_a_minting_server_open_that_fails_before_its_pin_check_is_typed(
 @host_file_platforms
 @pytest.mark.parametrize("after_the_pin", [False, True])
 @pytest.mark.parametrize("schema", ["auto", "external"])
-def test_a_server_create_that_fails_before_its_pin_check_removes_the_minted_key(
+@pytest.mark.parametrize("failure", ["hop refused", "runtime"])
+def test_a_server_create_that_fails_before_connecting_removes_the_minted_key(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     after_the_pin: bool,
     schema: str,
+    failure: str,
 ) -> None:
     # Vault BACKLOG #8119 item 2, through provision-admin and the real open: a hop refusal at the
-    # create, before its pin check, wrote nothing under the minted key, so the key is removed and
-    # the next run mints a new one rather than stop at the file. The control fails after the pin
-    # check passed, where the open may have written, so the key is kept as before. Under auto the
-    # probe finds no store schema; under external, the server default, it finds a provisioned
-    # schema with an empty chain and no data, the default's one way to a mint.
+    # create, a failure only a connection's establishment raises, wrote nothing under the minted
+    # key, so the key is removed and the next run mints a new one rather than stop at the file.
+    # Kept, as before: an arbitrary RuntimeError before the pin check, whose class proves nothing
+    # (the Manager's ruling of 2026-11-10), and any failure after the pin check passed, where the
+    # open may have written. Under auto the probe finds no store schema; under external, the
+    # server default, it finds a provisioned schema with an empty chain and no data, the
+    # default's one way to a mint.
     from messagefoundry import __main__ as cli
     from messagefoundry.__main__ import main
-    from messagefoundry.config.tls_policy import InsecureHopRefused
     from messagefoundry.store import base
     from messagefoundry.store.custody_host import MintedCustody
 
@@ -3535,9 +3590,7 @@ def test_a_server_create_that_fails_before_its_pin_check_removes_the_minted_key(
         secrets.chmod(0o700)
     monkeypatch.setenv("MEFOR_SECRETS_DIRECTORY", str(secrets))
     host_file = secrets / custody_host.HOST_FILE_NAME
-    create = _failing_backend(
-        InsecureHopRefused("the store hop was refused (stand-in)"), after_the_pin=after_the_pin
-    )
+    create = _failing_backend(_open_failure(failure), after_the_pin=after_the_pin)
 
     async def _open_backend(settings: StoreSettings, **kwargs: object) -> Any:
         if kwargs.get("read_only"):  # the pre-check's probe
@@ -3568,9 +3621,12 @@ def test_a_server_create_that_fails_before_its_pin_check_removes_the_minted_key(
     argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
     code = main([*argv, "--no-totp"])
     err = " ".join(capsys.readouterr().err.split())
-    assert code == 2, err
-    assert "the store hop was refused (stand-in)" in err, err  # the open's own refusal
-    if after_the_pin:
+    if failure == "hop refused":
+        assert code == 2, err
+        assert "the store hop was refused (stand-in)" in err, err  # the open's own refusal
+    else:
+        assert code != 0, err  # the dispatch floor, as any unrecognised open failure ends
+    if after_the_pin or failure == "runtime":
         assert host_file.read_bytes() == b"minted (stand-in)", err
         assert "Keep both, and do not delete either" in err, err
     else:

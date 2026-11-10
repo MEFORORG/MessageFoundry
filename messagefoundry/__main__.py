@@ -9066,14 +9066,15 @@ def _provision_admin(args: argparse.Namespace) -> int:
         the prompts, as the ordinary pre-check's do."""
         return await server_store_found() != "held"
 
-    async def no_store_anywhere() -> Literal["none"]:
+    async def no_store_anywhere(missing: StoreNotFoundError) -> Literal["none"]:
         """``none`` once the server database's catalog shows no table under a store table name in
         the schemas the open resolves (PR 2804 fourteenth and fifteenth holds). An open's "no
         store" is only what its login may see there, so a store it cannot see reads the same.
         Raises :class:`HostCustodyRefused` for at least such a table there, whoever made it, a
         catalog it cannot show, a search_path it cannot read included, and, after those, no store
-        schema under external schema management, which the create would not build (vault BACKLOG
-        #8119 item 1): none is minted over. What the catalog read cannot see, at least, is in
+        schema this login resolves under external schema management, which the create would not
+        build, quoting ``missing``, the read-only open's refusal (vault BACKLOG #8119 item 1): none
+        is minted over. What the catalog read cannot see, at least, is in
         :func:`~messagefoundry.store.base.server_store_schema_found_anywhere`."""
         from messagefoundry.store import base as store_base
         from messagefoundry.store.base import store_connect_errors, store_driver_errors
@@ -9121,12 +9122,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # The create open runs no DDL under external schema management, so over a database
             # with no store schema it would refuse only after the recovery key was shown and
             # proved (vault BACKLOG #8119 item 1). Refused here instead, before the prompts.
+            # The read-only open's own refusal is kept whole: it names the schema setting and the
+            # grant that hide a store provisioned elsewhere, which provision-schema cannot fix.
             raise HostCustodyRefused(
-                "the database holds no store schema, and [store].schema_management is 'external' "
+                "this login resolves no store schema, and [store].schema_management is 'external' "
                 "(the default on a server store), under which this command builds none, so no key "
-                f"was minted. Have a DDL-capable login run `{store_base.PROVISION_SCHEMA_COMMAND}` "
-                "against this database first (DEPLOY-SERVER-DB.md section 2), then run the "
-                "command again"
+                f"was minted. {_sentence(missing)} Then run the command again"
             )
         return "none"
 
@@ -9156,8 +9157,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
                 custody=throwaway,
             )
-        except StoreNotFoundError:
-            return await no_store_anywhere()
+        except StoreNotFoundError as missing:
+            return await no_store_anywhere(missing)
         except (StoreIdPinRefused, CipherError):
             return "held"
         try:

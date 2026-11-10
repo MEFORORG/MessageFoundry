@@ -5723,14 +5723,16 @@ class StoreChainNeverStarted(StoreIdPinRefusedBeforeWrite):
 
 class StoreCreateBatchFailedBeforeKeyUse(Exception):
     """A minting server open failed before anything was sealed under the store key: its create
-    batch failed before its commit (PR 2804 hold 17), or the open failed before its store id pin
-    check passed, at least on the connection, the hop's TLS, the schema or the settings (vault
-    BACKLOG #8119 items 1 and 2). The batch is one transaction on each server backend, and the
-    first seal follows ``bind_store_salt``, after the batch and after the pin check, which only
-    reads. So nothing was sealed under the key, and a minting command may remove the key it
-    minted, as for :class:`StoreIdPinRefusedBeforeWrite`. ``failure`` is the open's own error,
-    also the cause. Raised only on a minting open (:func:`minting_open`), so no other caller sees a
-    new class; a failure once the pin check has passed is never this."""
+    batch failed before its commit (PR 2804 hold 17), or, before its store id pin check passed, it
+    failed in a way only a connection's establishment fails, at least the hop's TLS settings, a
+    refused address or a refused login (vault BACKLOG #8119 item 2; ``store.base``'s
+    ``_failed_before_connecting`` names them). The batch is one transaction on each server
+    backend, and the first seal follows ``bind_store_salt``, after the batch and after the pin
+    check, which only reads. So nothing was sealed under the key, and a minting command may remove
+    the key it minted, as for :class:`StoreIdPinRefusedBeforeWrite`. ``failure`` is the open's own
+    error, also the cause. Raised only on a minting open (:func:`minting_open`), so no other caller
+    sees a new class; a failure once the pin check has passed is never this, and any other failure
+    before it, a ``RuntimeError`` or a connection lost mid-open among them, keeps the key."""
 
     def __init__(self, failure: Exception) -> None:
         # The failure itself is the one argument, so a copy or an unpickle rebuilds it whole.

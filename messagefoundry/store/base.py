@@ -131,7 +131,6 @@ from messagefoundry.store.store import (
     SignCountAnswer,
     Stage,
     StoreCreateBatchFailedBeforeKeyUse,
-    StoreIdPinRefused,
     StorePin,
     StreamingAttachmentsUnsupported,
     TotpUsable,
@@ -4497,10 +4496,27 @@ def _absent_sqlite_store(settings: StoreSettings) -> Path | None:
     return None
 
 
-#: What the minting open's wrap passes as it is (vault BACKLOG #8119 item 2): a batch failure the
-#: backend already typed, so it is not wrapped twice, and every pin refusal, whose own class
-#: (``StoreIdPinRefusedBeforeWrite`` or not) is what decides whether the minted key is removed.
-_ALREADY_BEFORE_KEY_USE: Final = (StoreIdPinRefused, StoreCreateBatchFailedBeforeKeyUse)
+#: SQLSTATEs a server driver reports only while it establishes a connection, never on one it
+#: already holds: 08001 (unable to establish one) and 08004 (the server rejected it). The
+#: invalid-authorization class, 28, a refused login, is matched by its prefix.
+_CONNECT_ONLY_SQLSTATES: Final = frozenset({"08001", "08004"})
+
+
+def _failed_before_connecting(exc: Exception) -> bool:
+    """Whether ``exc`` is a failure that happens only before the open holds a connection to the
+    database, so it can have written nothing, under any key (vault BACKLOG #8119 item 2). At
+    least: the hop's own TLS settings refused (``InsecureHopRefused``, which the backends raise
+    while building the connection), a refused or unresolvable address (``ConnectionRefusedError``,
+    ``socket.gaierror``), and a driver's connection or login refusal named by its SQLSTATE
+    (:data:`_CONNECT_ONLY_SQLSTATES`, class 28). Every other class answers ``False``, at least a
+    connection lost mid-open, a timeout, a schema refusal and any ``RuntimeError``, so a minting
+    open that fails with one keeps its key (the Manager's ruling of 2026-11-10 on #8119)."""
+    import socket
+
+    if isinstance(exc, (InsecureHopRefused, ConnectionRefusedError, socket.gaierror)):
+        return True
+    state = driver_sqlstate(exc)
+    return state is not None and (state in _CONNECT_ONLY_SQLSTATES or state.startswith("28"))
 
 
 async def open_store(
@@ -4641,8 +4657,11 @@ async def open_store(
     # The pin rides a context variable to the genesis read every backend shares (vault BACKLOG
     # #3411); reset at once, so no later open in this context inherits it.
     pinned = OPEN_STORE_PIN.set(pin)
-    # A minting server open learns whether its pin check passed, so a failure before it is typed
-    # as one that sealed nothing under the minted key (vault BACKLOG #8119 items 1 and 2).
+    # A minting server open learns whether its pin check passed. A failure that is one only a
+    # connection's establishment raises, and that came before the pin check, is typed as one that
+    # sealed nothing under the minted key, so the minting command removes it; every other failure
+    # keeps the key (vault BACKLOG #8119 item 2). The batch failures a backend typed itself, and the
+    # pin refusals, are re-raised as they are.
     check = PinCheck() if minting_open() and settings.backend is not StoreBackend.SQLITE else None
     checking = OPEN_STORE_PIN_CHECK.set(check)
     try:
@@ -4657,7 +4676,7 @@ async def open_store(
             read_only=read_only,
         )
     except Exception as exc:
-        if check is None or check.passed or isinstance(exc, _ALREADY_BEFORE_KEY_USE):
+        if check is None or check.passed or not _failed_before_connecting(exc):
             raise
         raise StoreCreateBatchFailedBeforeKeyUse(exc) from exc
     finally:
