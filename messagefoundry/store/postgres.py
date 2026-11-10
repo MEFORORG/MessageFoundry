@@ -240,6 +240,7 @@ from messagefoundry.store.store import (
     AdminGrant,
     AdminHolderTest,
     AdminRemoval,
+    AlertGeneration,
     AlertInstance,
     AlertSummary,
     AppendedAuditRow,
@@ -811,7 +812,8 @@ _SCHEMA: list[str] = [
         acked_at    DOUBLE PRECISION,
         resolved_at DOUBLE PRECISION,
         suspended_until DOUBLE PRECISION,
-        escalation_tier INTEGER NOT NULL DEFAULT 0
+        escalation_tier INTEGER NOT NULL DEFAULT 0,
+        raised_by   TEXT
     )""",
     # #143: windowed NOTIFICATION-mute end-epoch (NULL/past = not suspended). ADD COLUMN IF NOT EXISTS
     # for a pre-existing (from #56) alert_instance table; a no-op on a fresh DB (the CREATE above has it).
@@ -820,6 +822,8 @@ _SCHEMA: list[str] = [
     # #81 (ADR 0133): highest occurrence-driven escalation tier reached (0=base). ADD COLUMN IF NOT EXISTS
     # for a pre-existing alert_instance; NOT NULL DEFAULT 0 backfills existing rows. No-op on a fresh DB.
     "ALTER TABLE alert_instance ADD COLUMN IF NOT EXISTS escalation_tier INTEGER NOT NULL DEFAULT 0",
+    # #4916: the notifier that wrote the newest raise (a per-process random id); NULL on old rows.
+    "ALTER TABLE alert_instance ADD COLUMN IF NOT EXISTS raised_by TEXT",
     """CREATE UNIQUE INDEX IF NOT EXISTS ux_alert_instance_open
         ON alert_instance(event_type, connection) WHERE status <> 'resolved'""",
     "CREATE INDEX IF NOT EXISTS ix_alert_instance_status ON alert_instance(status, connection)",
@@ -1188,10 +1192,15 @@ _SCHEMA: list[str] = [
     # every other node's config-convergence loop sees the higher version and reloads its OWN (identically
     # deployed) config dir to converge. The DbCoordinator owns it (read/cache/bump); it lands in
     # db_schema via the pool's search_path like every other table. CREATE TABLE IF NOT EXISTS is safe on
-    # a fresh OR existing DB (no ALTER/migration).
+    # a fresh OR existing DB; the gated ADD COLUMNs below migrate an existing one. config_digest is
+    # the initiating node's digest of what it applied, and config_digest_version the version it was
+    # stored with, both written by the same bump as the version, so a follower reads them as one
+    # pair (vault BACKLOG #3109; stamped_config_digest in pipeline/cluster.py). NULL is unknown.
     """CREATE TABLE IF NOT EXISTS cluster_config (
         id              INTEGER PRIMARY KEY,
         config_version  BIGINT NOT NULL,
+        config_digest   TEXT,
+        config_digest_version BIGINT,
         updated_at      DOUBLE PRECISION NOT NULL
     )""",
     # Track B Step 6b: the per-namespace transform-STATE version token (mirrors reference_version's role
@@ -1260,6 +1269,10 @@ CLUSTER_SCHEMA: tuple[str, ...] = (
     _gated_add_column("leader_lease", "leader_epoch", "BIGINT NOT NULL DEFAULT 0"),
 )
 _SCHEMA.extend(CLUSTER_SCHEMA)
+# Vault BACKLOG #3109: the initiator's digest beside the shared config version, for a cluster_config
+# created before the column. An existing row gets NULL, which reads as an unknown digest.
+_SCHEMA.append(_gated_add_column("cluster_config", "config_digest", "TEXT"))
+_SCHEMA.append(_gated_add_column("cluster_config", "config_digest_version", "BIGINT"))
 # BACKLOG #2143: the IdP auth_time an oidc session's step-up is compared with, for a sessions table
 # created before the column. In _SCHEMA rather than _migrate_lease_columns, so it moves the schema
 # hash itself and its catalog read is scoped to current_schema(). Pre-existing rows get NULL, which
@@ -6616,6 +6629,7 @@ class PostgresStore:
         reason: str | None = None,
         escalation_tier: int = 0,
         now: float | None = None,
+        raised_by: str | None = None,
     ) -> None:
         # Pure observer (ADR 0044 D2): no queue row, no finalizer. De-dup grain = ADR 0014's
         # (event_type, connection) key. ON CONFLICT on the partial unique index folds a re-fire into the
@@ -6637,18 +6651,20 @@ class PostgresStore:
         await self._pool.execute(
             "INSERT INTO alert_instance"
             " (event_type, connection, severity, status, first_seen, last_seen, count, reason,"
-            " escalation_tier)"
-            " VALUES ($1,$2,$3,'open',$4,$4,1,$5,$6)"
+            " escalation_tier, raised_by)"
+            " VALUES ($1,$2,$3,'open',$4,$4,1,$5,$6,$7)"
             " ON CONFLICT (event_type, connection) WHERE status <> 'resolved' DO UPDATE SET"
             " last_seen=EXCLUDED.last_seen, count=alert_instance.count+1,"
             " severity=EXCLUDED.severity, reason=EXCLUDED.reason,"
-            " escalation_tier=GREATEST(alert_instance.escalation_tier, EXCLUDED.escalation_tier)",
+            " escalation_tier=GREATEST(alert_instance.escalation_tier, EXCLUDED.escalation_tier),"
+            " raised_by=EXCLUDED.raised_by",
             event_type,
             connection,
             severity,
             now,
             reason_enc,
             escalation_tier,
+            raised_by,
         )
 
     async def list_active_alert_instances(
@@ -6847,6 +6863,65 @@ class PostgresStore:
             connection,
         )
         return _rowcount(result)
+
+    async def open_alert_generations(
+        self, *, event_type: str, connection: str | None = None
+    ) -> list[AlertGeneration]:
+        # BACKLOG #3269: (id, connection, count) of the live instances of one type. No reason read.
+        # status<>'resolved': ux_alert_instance_open's own filter, so the read seeks that index.
+        where = ["event_type=$1", "status<>'resolved'"]
+        params: list[Any] = [event_type]
+        if connection is not None:
+            where.append("connection=$2")
+            params.append(connection)
+        # Bounded borrow (BACKLOG #1052): every engine process polls this once a minute.
+        rows = await self._fetchall(
+            "SELECT id, connection, count FROM alert_instance WHERE "
+            + " AND ".join(where)
+            + " ORDER BY id",
+            *params,
+        )
+        return [AlertGeneration(int(r["id"]), str(r["connection"]), int(r["count"])) for r in rows]
+
+    async def resolve_alert_instances_fenced(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        raised_by: str,
+        seen: AlertGeneration | None,
+        now: float | None = None,
+    ) -> int:
+        # BACKLOG #4916: close the key's live instance only when its newest raise is one this writer
+        # saw at the clear (seen_id/seen_count) or is this writer's own (raised_by). Clock-free.
+        # A bounded borrow (BACKLOG #1052); a timed-out borrow is a failed attempt the sink retries.
+        now = time.time() if now is None else now
+        seen_id, seen_count = (seen.id, seen.count) if seen is not None else (-1, -1)
+        return await self._execute(
+            "UPDATE alert_instance SET status='resolved', resolved_at=$1"
+            " WHERE event_type=$2 AND connection=$3 AND status<>'resolved'"
+            " AND (raised_by=$4 OR (id=$5 AND count<=$6))",
+            now,
+            event_type,
+            connection,
+            raised_by,
+            seen_id,
+            seen_count,
+        )
+
+    async def resolve_alert_generation(
+        self, *, alert_id: int, through_count: int, now: float | None = None
+    ) -> int:
+        # BACKLOG #3269: resolve one live instance only while no raise has folded in past
+        # through_count. Clock-free.
+        now = time.time() if now is None else now
+        return await self._execute(
+            "UPDATE alert_instance SET status='resolved', resolved_at=$1"
+            " WHERE id=$2 AND count<=$3 AND status<>'resolved'",
+            now,
+            alert_id,
+            through_count,
+        )
 
     async def suspend_alert_instance(
         self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None

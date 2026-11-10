@@ -85,6 +85,7 @@ from messagefoundry.store.store import (
     AdminGrant,
     AdminHolderTest,
     AdminRemoval,
+    AlertGeneration,
     AlertInstance,
     AlertSummary,
     AuditAppend,
@@ -1448,6 +1449,7 @@ class QueueStore(StoreLifecycle, Protocol):
         reason: str | None = None,
         escalation_tier: int = 0,
         now: float | None = None,
+        raised_by: str | None = None,
     ) -> None:
         """Record/fold one operator-alert occurrence into a resolvable ``alert_instance`` (ADR 0044),
         de-duped on ADR 0014's ``(event_type, connection)`` throttle key: if a live (``open`` or
@@ -1460,7 +1462,11 @@ class QueueStore(StoreLifecycle, Protocol):
         transaction, touching no ``queue`` row and calling no finalizer, so it can never pin a message's
         disposition. ``reason`` is ``safe_text``-scrubbed (#120) and encrypted at rest on every backend;
         no message body is ever passed here. The caller (the ``_emit`` chokepoint) wraps it fail-soft, so
-        a store error here can never wedge a delivery worker."""
+        a store error here can never wedge a delivery worker.
+
+        ``raised_by`` names the writer of this raise, stored on the instance as its newest raiser
+        (BACKLOG #4916): the notifier passes its per-process random id, and
+        :meth:`resolve_alert_instances_fenced` reads it."""
         ...
 
     async def list_active_alert_instances(
@@ -1547,6 +1553,39 @@ class QueueStore(StoreLifecycle, Protocol):
     ) -> int:
         """Auto-resolve the live instance(s) for a ``(event_type, connection)`` key on the inverse
         lifecycle signal (e.g. ``connection_restored``). Returns the count resolved."""
+        ...
+
+    async def open_alert_generations(
+        self, *, event_type: str, connection: str | None = None
+    ) -> list[AlertGeneration]:
+        """The live (``open`` or ``acknowledged``) instances of ``event_type``, for one
+        ``connection`` or for every one, as :class:`AlertGeneration` pairs (BACKLOG #3269). Lockfree
+        read; no reason cell is read."""
+        ...
+
+    async def resolve_alert_instances_fenced(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        raised_by: str,
+        seen: AlertGeneration | None,
+        now: float | None = None,
+    ) -> int:
+        """Auto-resolve the key's live instance only when its newest raise is one the resolving
+        writer had seen or wrote itself (BACKLOG #4916): it is the instance ``seen`` names, at most
+        ``seen.count`` raises in, or its newest raise carries ``raised_by``. A raise another writer
+        wrote after ``seen`` was read keeps it open. Returns the count resolved. No clock is
+        compared."""
+        ...
+
+    async def resolve_alert_generation(
+        self, *, alert_id: int, through_count: int, now: float | None = None
+    ) -> int:
+        """Resolve instance ``alert_id`` only while it is live and its ``count`` is at most
+        ``through_count`` (BACKLOG #3269). Returns 1 when it resolved, 0 when the row was already
+        resolved, unknown, or has taken a raise since its generation was read. No clock is compared,
+        so a raise from another process that lands first keeps the row open whatever its clock."""
         ...
 
     async def suspend_alert_instance(

@@ -480,7 +480,7 @@ _SEAM_FIELDS: dict[str, Field] = {
     "admin.my_security_events": _endpoint("GET /me/security-events"),
     # The presentation helpers. GET /users and the user writes project through user_summary, but
     # no JSON route returns one account, which the user page shows.
-    "admin.user_summary": Field("helper", ("ADD GET /users/{user_id}",)),
+    "admin.user_summary_scoped": Field("helper", ("ADD GET /users/{user_id}",)),
     "admin.current_user": _core("GET /auth/me"),
     "admin.federated_identity_view": _core("GET /users/{user_id}/federated-identity"),
 }
@@ -650,45 +650,45 @@ _UI_ROUTES: dict[str, Ui] = {
     ),
     "GET /ui/users/{user_id}": _J(
         "ADD GET /users/{user_id};GET /roles;GET /users/{user_id}/federated-identity",
-        f"{_AS} admin.federated_identity_view admin.list_roles admin.user_summary "
+        f"{_AS} admin.federated_identity_view admin.list_roles admin.user_summary_scoped "
         "service.store.get_user service.store.get_user_role_ids",
     ),
     "POST /ui/users": _J("POST /users", f"{_AS} admin.create_user admin.list_roles"),
     "POST /ui/users/{user_id}/update": _J(
         "PATCH /users/{user_id}",
-        f"{_AS} admin.federated_identity_view admin.list_roles admin.update_user admin.user_summary "
+        f"{_AS} admin.federated_identity_view admin.list_roles admin.update_user admin.user_summary_scoped "
         "service.store.get_user service.store.get_user_role_ids",
     ),
     "POST /ui/users/{user_id}/roles": _J(
         "PUT /users/{user_id}/roles",
         f"{_AS} admin.federated_identity_view admin.list_roles admin.set_user_roles "
-        "admin.user_summary service.store.get_user service.store.get_user_role_ids",
+        "admin.user_summary_scoped service.store.get_user service.store.get_user_role_ids",
     ),
     "POST /ui/users/{user_id}/channel-scope": _J(
         "PUT /users/{user_id}/channel-scope",
         f"{_AS} admin.federated_identity_view admin.list_roles admin.refuse_own_channel_scope "
-        "admin.set_channel_scope admin.user_summary service.store.get_user "
+        "admin.set_channel_scope admin.user_summary_scoped service.store.get_user "
         "service.store.get_user_role_ids",
     ),
     "POST /ui/users/{user_id}/reset-password": _J(
         "POST /users/{user_id}/reset-password",
         f"{_AS} admin.federated_identity_view admin.list_roles admin.reset_user_password "
-        "admin.user_summary service.store.get_user service.store.get_user_role_ids",
+        "admin.user_summary_scoped service.store.get_user service.store.get_user_role_ids",
     ),
     "POST /ui/users/{user_id}/reset-mfa": _J(
         "POST /users/{user_id}/reset-mfa",
         f"{_AS} admin.federated_identity_view admin.list_roles admin.reset_user_mfa "
-        "admin.user_summary service.store.get_user service.store.get_user_role_ids",
+        "admin.user_summary_scoped service.store.get_user service.store.get_user_role_ids",
     ),
     "POST /ui/users/{user_id}/enrolment-code": _J(
         "POST /users/{user_id}/enrolment-code",
         f"{_AS} admin.federated_identity_view admin.issue_user_enrolment_code admin.list_roles "
-        "admin.user_summary service.store.get_user service.store.get_user_role_ids",
+        "admin.user_summary_scoped service.store.get_user service.store.get_user_role_ids",
     ),
     "POST /ui/users/{user_id}/enrolment-code/revoke": _J(
         "DELETE /users/{user_id}/enrolment-code",
         f"{_AS} admin.federated_identity_view admin.list_roles admin.revoke_user_enrolment_code "
-        "admin.user_summary service.store.get_user service.store.get_user_role_ids",
+        "admin.user_summary_scoped service.store.get_user service.store.get_user_role_ids",
     ),
     "GET /ui/users/{user_id}/federated-identity": _J(
         "GET /users/{user_id}/federated-identity;ADD GET /users/{user_id}",
@@ -711,12 +711,12 @@ _UI_ROUTES: dict[str, Ui] = {
     "POST /ui/users/{user_id}/revoke-sessions": _J(
         "DELETE /users/{user_id}/sessions",
         f"{_AS} admin.admin_revoke_user_sessions admin.federated_identity_view admin.list_roles "
-        "admin.user_summary service.store.get_user service.store.get_user_role_ids",
+        "admin.user_summary_scoped service.store.get_user service.store.get_user_role_ids",
     ),
     "POST /ui/users/{user_id}/delete": _J(
         "DELETE /users/{user_id}",
         f"{_AS} admin.delete_user admin.federated_identity_view admin.list_roles "
-        "admin.user_summary service.store.get_user service.store.get_user_role_ids",
+        "admin.user_summary_scoped service.store.get_user service.store.get_user_role_ids",
     ),
     "GET /ui/roles": _J("GET /roles", f"{_AS} admin.list_roles"),
     "GET /ui/roles/new": Ui("check", "ADD GET /auth/check/users:manage", ""),
@@ -1525,7 +1525,7 @@ def test_a_wrong_seam_field_class_is_reported(live: _Live) -> None:
         # A route to add that the app already serves, a carrier that is no operation, and two
         # entries with no carrier at all.
         "core.prior_resend": Field("helper", ("ADD GET /connections",)),
-        "admin.user_summary": Field("helper", ("ADD the user route",)),
+        "admin.user_summary_scoped": Field("helper", ("ADD the user route",)),
         "core.audit_channel_denied": Field("helper", ()),
         "core.list_connection_events": _endpoint(),
     }
@@ -1534,7 +1534,7 @@ def test_a_wrong_seam_field_class_is_reported(live: _Live) -> None:
     assert "core.reload_config: classed endpoint" in problems
     assert "admin.list_audit: does not reach _not_a_helper" in problems
     assert "GET /connections now exists" in problems
-    assert "admin.user_summary: 'ADD the user route' names no METHOD /path" in problems
+    assert "admin.user_summary_scoped: 'ADD the user route' names no METHOD /path" in problems
     assert "core.audit_channel_denied: classed helper with no carrier" in problems
     assert "core.list_connection_events: classed endpoint with no carrier" in problems
 

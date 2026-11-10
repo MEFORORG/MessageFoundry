@@ -221,6 +221,7 @@ __all__ = [
     "path_form_fhir_updates_without_if_match",
     "query_credential_hops",
     "revocation_attested_hops",
+    "odbc_hops",
     "unverified_generic_db_hops",
     "refused_generic_db_drivers",
     "POSSIBLY_GENERIC_DB_HOP",
@@ -7281,6 +7282,56 @@ def _dark_env_dialect(conn: InboundConnection | OutboundConnection) -> bool:
     unresolved, so neither reader lists a connection that is not built because of a value it never
     reads. A not-deployed connection with a literal dialect resolves nothing and is read as before."""
     return not conn.deployed and isinstance(conn.spec.settings.get("dialect"), EnvRef)
+
+
+def odbc_hops(registry: Registry) -> list[tuple[str, str, str | None, str | None]]:
+    """Entries of the graph that open an ODBC connection, as ``(kind, record name, dialect,
+    driver)``, for ``messagefoundry verify``'s ``host.odbc`` and ``host.ciphers`` rows (BACKLOG
+    #3803 R3).
+
+    Kept beside the factories that write the settings it reads, so the verifier does not re-derive
+    them. The entries are each deployed ``DATABASE`` connection, on either dialect, each
+    database-backed reference set and each database lookup; the last two are always on the
+    ``sqlserver`` preset. ``dialect`` is that preset or ``generic``, in lower case, and ``driver``
+    the ``odbc_driver`` setting as written, the factories' ``ODBC Driver 18 for SQL Server`` when
+    unset; either is ``None`` when it is an ``env()`` reference, read with no values. Which driver
+    a name is, and so which TLS the hop takes, is the caller's to judge. A connection that is not
+    deployed is left out, since the engine never builds it (ADR 0111). A connection is named by its
+    record name, as the other readers here name it, so an inbound and an outbound of one name stay
+    apart. The connections come first, then the reference sets, then the lookups, each by name."""
+
+    # Imported lazily: messagefoundry.transports imports this module at its top level.
+    from messagefoundry.transports.db_endpoint import SQLSERVER_DEFAULT_DRIVER
+
+    def driver(settings: Mapping[str, Any]) -> str | None:
+        value = _db_setting(settings, "odbc_driver", SQLSERVER_DEFAULT_DRIVER, None)
+        return None if value is _UNRESOLVED else str(value)
+
+    connections = [
+        (
+            "DATABASE connection",
+            record_name(conn.name),
+            _db_dialect(conn.spec.settings, None),
+            driver(conn.spec.settings),
+        )
+        for record_name, table in (
+            (_outbound_record_name, registry.outbound),
+            (inbound_record_name, registry.inbound),
+        )
+        for conn in table.values()
+        if conn.spec.type is ConnectorType.DATABASE and conn.deployed
+    ]
+    connections.sort(key=lambda hop: hop[1])
+    references = [
+        ("DatabaseRef reference set", name, "sqlserver", driver(ref.source.settings))
+        for name, ref in sorted(registry.references.items())
+        if ref.source.kind == "database"
+    ]
+    lookups = [
+        ("DatabaseLookup", name, "sqlserver", driver(spec.settings))
+        for name, spec in sorted(registry.lookups.items())
+    ]
+    return [*connections, *references, *lookups]
 
 
 def unverified_generic_db_hops(

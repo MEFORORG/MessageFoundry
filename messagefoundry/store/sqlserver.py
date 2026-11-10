@@ -239,6 +239,7 @@ from messagefoundry.store.store import (
     AdminGrant,
     AdminHolderTest,
     AdminRemoval,
+    AlertGeneration,
     AlertInstance,
     AlertSummary,
     AppendedAuditRow,
@@ -1988,10 +1989,18 @@ CLUSTER_SCHEMA: tuple[str, ...] = (
     "IF COL_LENGTH(N'leader_lease', N'leader_epoch') IS NULL"
     " ALTER TABLE leader_lease ADD leader_epoch BIGINT NOT NULL"
     " CONSTRAINT DF_leader_lease_epoch DEFAULT 0;",
+    # config_digest is the initiating node's digest of what it applied, and config_digest_version
+    # the version it was stored with, both written by the same bump as the version, so a follower
+    # reads them as one pair (vault BACKLOG #3109; stamped_config_digest). NULL is unknown.
     "IF OBJECT_ID(N'cluster_config', N'U') IS NULL"
     " CREATE TABLE cluster_config ("
     " id INT NOT NULL PRIMARY KEY, config_version INT NOT NULL,"
+    " config_digest NVARCHAR(MAX) NULL, config_digest_version INT NULL,"
     " updated_at FLOAT NOT NULL);",
+    "IF COL_LENGTH(N'cluster_config', N'config_digest') IS NULL"
+    " ALTER TABLE cluster_config ADD config_digest NVARCHAR(MAX) NULL;",
+    "IF COL_LENGTH(N'cluster_config', N'config_digest_version') IS NULL"
+    " ALTER TABLE cluster_config ADD config_digest_version INT NULL;",
 )
 
 
@@ -2205,7 +2214,7 @@ _SCHEMA: list[str] = [
         status NVARCHAR(16) NOT NULL, first_seen FLOAT NOT NULL, last_seen FLOAT NOT NULL,
         [count] BIGINT NOT NULL, reason NVARCHAR(MAX) NULL, acked_by NVARCHAR(256) NULL,
         acked_at FLOAT NULL, resolved_at FLOAT NULL, suspended_until FLOAT NULL,
-        escalation_tier INT NOT NULL DEFAULT 0)""",
+        escalation_tier INT NOT NULL DEFAULT 0, raised_by NVARCHAR(64) NULL)""",
     # #143: windowed NOTIFICATION-mute end-epoch (NULL/past = not suspended). COL_LENGTH-gated ADD for a
     # pre-existing (from #56) alert_instance table; a no-op on a fresh DB (the CREATE above already has it).
     """IF COL_LENGTH('alert_instance','suspended_until') IS NULL
@@ -2214,6 +2223,9 @@ _SCHEMA: list[str] = [
     # a pre-existing alert_instance; NOT NULL DEFAULT 0 backfills existing rows. No-op on a fresh DB.
     """IF COL_LENGTH('alert_instance','escalation_tier') IS NULL
         ALTER TABLE alert_instance ADD escalation_tier INT NOT NULL DEFAULT 0""",
+    # #4916: the notifier that wrote the newest raise (a per-process random id); NULL on old rows.
+    """IF COL_LENGTH('alert_instance','raised_by') IS NULL
+        ALTER TABLE alert_instance ADD raised_by NVARCHAR(64) NULL""",
     """IF INDEXPROPERTY(OBJECT_ID('alert_instance'),'ux_alert_instance_open','IndexID') IS NULL
         CREATE UNIQUE INDEX ux_alert_instance_open ON alert_instance(event_type, connection)
         WHERE status <> 'resolved'""",
@@ -8135,6 +8147,7 @@ class SqlServerStore:
         reason: str | None = None,
         escalation_tier: int = 0,
         now: float | None = None,
+        raised_by: str | None = None,
     ) -> None:
         # Pure observer (ADR 0044 D2): no queue row, no finalizer. De-dup grain = ADR 0014's
         # (event_type, connection) key. UPDATE-then-conditional-INSERT in one serializable transaction
@@ -8156,7 +8169,8 @@ class SqlServerStore:
             try:
                 await cur.execute(
                     "UPDATE alert_instance SET last_seen=?, [count]=[count]+1, severity=?, reason=?,"
-                    " escalation_tier=CASE WHEN escalation_tier < ? THEN ? ELSE escalation_tier END"
+                    " escalation_tier=CASE WHEN escalation_tier < ? THEN ? ELSE escalation_tier END,"
+                    " raised_by=?"
                     " WHERE event_type=? AND connection=? AND status<>'resolved'",
                     (
                         now,
@@ -8164,6 +8178,7 @@ class SqlServerStore:
                         reason_enc,
                         escalation_tier,
                         escalation_tier,
+                        raised_by,
                         event_type,
                         connection,
                     ),
@@ -8172,8 +8187,18 @@ class SqlServerStore:
                     await cur.execute(
                         "INSERT INTO alert_instance"
                         " (event_type, connection, severity, status, first_seen, last_seen,"
-                        " [count], reason, escalation_tier) VALUES (?,?,?,'open',?,?,1,?,?)",
-                        (event_type, connection, severity, now, now, reason_enc, escalation_tier),
+                        " [count], reason, escalation_tier, raised_by)"
+                        " VALUES (?,?,?,'open',?,?,1,?,?,?)",
+                        (
+                            event_type,
+                            connection,
+                            severity,
+                            now,
+                            now,
+                            reason_enc,
+                            escalation_tier,
+                            raised_by,
+                        ),
                     )
                 await self._commit(conn)
             except Exception:
@@ -8431,6 +8456,63 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
         return int(changed)
+
+    async def open_alert_generations(
+        self, *, event_type: str, connection: str | None = None
+    ) -> list[AlertGeneration]:
+        # BACKLOG #3269: (id, connection, count) of the live instances of one type. No reason read.
+        # status<>'resolved' is the live predicate spelled as ux_alert_instance_open's filter, so
+        # the read seeks that index.
+        where = ["event_type=?", "status<>'resolved'"]
+        params: list[Any] = [event_type]
+        if connection is not None:
+            where.append("connection=?")
+            params.append(connection)
+        rows = await self._fetchall(
+            "SELECT id, connection, [count] AS count FROM alert_instance WHERE "
+            + " AND ".join(where)
+            + " ORDER BY id",
+            tuple(params),
+        )
+        return [AlertGeneration(int(r["id"]), str(r["connection"]), int(r["count"])) for r in rows]
+
+    async def resolve_alert_instances_fenced(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        raised_by: str,
+        seen: AlertGeneration | None,
+        now: float | None = None,
+    ) -> int:
+        # BACKLOG #4916: close the key's live instance only when its newest raise is one this writer
+        # saw at the clear (seen_id/seen_count) or is this writer's own (raised_by). Clock-free.
+        # OUTPUT, not rowcount: the sink reads a zero as "a newer raise kept it open", and SET
+        # NOCOUNT ON cannot hide an output rowset.
+        now = time.time() if now is None else now
+        seen_id, seen_count = (seen.id, seen.count) if seen is not None else (-1, -1)
+        closed = await self._execute_output(
+            "UPDATE alert_instance SET status='resolved', resolved_at=? OUTPUT inserted.id"
+            " WHERE event_type=? AND connection=? AND status<>'resolved'"
+            " AND (raised_by=? OR (id=? AND [count]<=?))",
+            (now, event_type, connection, raised_by, seen_id, seen_count),
+        )
+        return len(closed)
+
+    async def resolve_alert_generation(
+        self, *, alert_id: int, through_count: int, now: float | None = None
+    ) -> int:
+        # BACKLOG #3269: resolve one live instance only while no raise has folded in past
+        # through_count. Clock-free.
+        # OUTPUT, not rowcount: the caller acts on whether the row closed, and SET NOCOUNT ON
+        # cannot hide an output rowset.
+        now = time.time() if now is None else now
+        closed = await self._execute_output(
+            "UPDATE alert_instance SET status='resolved', resolved_at=? OUTPUT inserted.id"
+            " WHERE id=? AND [count]<=? AND status<>'resolved'",
+            (now, alert_id, through_count),
+        )
+        return len(closed)
 
     async def suspend_alert_instance(
         self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None

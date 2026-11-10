@@ -1238,17 +1238,39 @@ so a wildcard grant such as `secret/data/*` would read clean, and a token made w
 as not observed at every start unless its policy grants the two paths the probe reads. Neither
 limit was measured against a live Vault.
 
-**Every Vault finding also raises an alert, and a clean read resolves it** (vault BACKLOG #2903
+**Every Vault finding also raises an alert, and a clean read can resolve it** (vault BACKLOG #2903
 slice B). A hop that is over-granted, in either class, or that could not be read raises
 `vault_privilege_warning` under the subject `vault:store` or `vault:secrets`, before any refusal,
 so a refused start still pages, and an accepted opt-out quiets nothing. The payload is the finding,
 the count of refusing-class grants and the hop's judgment, which names policy names, paths and
 capabilities, never a token, an accessor or a digest of either. A later start that reads that
-hop's token clean raises `vault_privilege_clean`, which pages nobody and resolves the open
+hop's token clean raises `vault_privilege_clean`, which pages nobody and can resolve the open
 instance, as `store_privilege_clean` does for the store. The subject names the hop and nothing
 about the token, because a fix is usually a new token: so engine processes that share one store
-share each hop's alert, and a clean start by one resolves a warning another raised on a different
-token. The log line and the audit row of every start stay the record.
+share each hop's alert, and a clean start by one can resolve a warning another raised on a
+different token.
+
+**A warning still open after a clean start.** A clean start can leave another process's warning
+open ([ADR 0044, the vault BACKLOG #4916 amendment](adr/0044-operator-alert-state.md#amendment-2026-11-09----an-auto-resolve-is-fenced-to-the-raises-it-speaks-for-backlog-4916)).
+Treat an open warning as live until you have found and fixed its cause. The cause may be, at
+least, the token, reachability, the probe paths, or the engine's own Vault client setup (a missing
+extra, address or token variable, or a refused TLS or cleartext address). Neither the log line nor
+the audit row names the process that raised or cleared it, and under the engine-shard supervisor
+every engine shard shares one log, so check each process's configuration and restart it after
+the fix: only a serve start's preflight raises this warning or resolves it automatically
+(`messagefoundry check-privileges` runs the same probe on demand but changes no alert). A start whose process has no `[alerts]`
+transport, such as a webhook or email, gets the logging sink, which resolves nothing. It also
+raises nothing durable, so that process's warning never appears in the alert list; an empty
+list does not prove every process is clean. A resolve can also fail to land, at least: it logs an
+ERROR such as `alert-instance resolve gave up` or `alert-instance resolve was cancelled before it
+landed`, or it can be dropped with no line at all. A resolve the fence kept open logs, at least,
+an INFO line containing `closed nothing: a live instance remains`, or a WARNING containing
+`closed nothing and the re-read failed` when the re-read fails. If the cause is fixed and the
+warning is still open, resolve it by hand from the alert list. Resolving it by hand needs, at
+least, an identity with no channel scope (by default an administrator) and `monitoring:diagnose`;
+a channel-scoped identity never sees this subject.
+
+The log line and the audit row of every start stay the record.
 
 ### Data-layer hops refuse cleartext on their defaults (ASVS 12.3.1 census)
 
@@ -2186,7 +2208,10 @@ the same permission set on the same method reds CI until it is listed here.
 > source counts as `ad` here (BACKLOG #2252):** it predates the source column, the sync withdraws
 > it like a directory scope, and the GET still reports it as null. The 409 detail names the
 > conflict, never the scope. Each 409 writes one `user.channel_scope_change_refused` audit row
-> naming the administrator, the account and the conflict, never the scope (BACKLOG #2271). A store
+> naming the administrator, the account and the conflict, never the scope (BACKLOG #2271); a
+> reader without `users:manage` reads its conflict fields withheld (the `GET /users` bullet under
+> *Every route of the default JSON API has a channel-scope class*, below, in
+> [The `/ui` console plane](#the-ui-console-plane-serve_uitrue)). A store
 > that refuses that row leaves an ERROR log line instead, and the 409 stands. The web console sends `expected_source` when the administrator ticks "Make this scope
 > manual", and shows a race as a refused save with the edits kept.
 >
@@ -2394,7 +2419,29 @@ the same permission set on the same method reds CI until it is listed here.
 > - `GET /users` sends each account's `channel_scope` and `channel_scope_source` only to a
 >   `users:manage` holder, the tier `GET /users/{user_id}/channel-scope` reads on. Everyone else
 >   gets null for both and `channel_scope_withheld: true`, so a null there means "not shown". The
->   console's user list reads that flag and drops both scope columns for such a reader.
+>   console's user list reads that flag and drops both scope columns for such a reader. On the
+>   same rule, `GET /audit`, its console page and `GET /audit/export` narrow, for such a reader,
+>   the detail of the four audit actions a census of the writers on 2026-11-09 found naming a
+>   channel list or who owns a scope: `user.channel_scope_changed` reads as the account's
+>   `user_id`, where the row has one, and `"channels": "withheld"`; `auth.ad_scope_resynced` reads
+>   as `"channels": "withheld"` alone, since its writer stores no `user_id` and the row names the
+>   account only as its actor;
+>   `auth.ad_session_revoked` reads `scope_from` and `scope_to` as `"withheld"` on a scope-delta
+>   row, the only row that carries them, and keeps `scope_changed`; and
+>   `user.channel_scope_change_refused` reads `owner`, `read_source`, `expected_source` and
+>   `reason` as `"withheld"` (vault BACKLOG #3748). Each rule is an
+>   allowlist, so a key a later writer adds to one of those four is withheld, but a NEW action
+>   whose detail names a scope is shown whole until a rule for it is added to `_NARROWED` in
+>   `messagefoundry/auth/audit_visibility.py`, which holds each action's kept and withheld keys.
+>   `tests/test_audit_scope_census.py` fails on some such writers, not all: its docstring lists at
+>   least the shapes it misses, among them a detail built outside the call and a key it does not
+>   know. `GET /logs/tail` gives such a reader no audit
+>   copies at all. **Left open:** this hides the stored lists and sources, not every inference.
+>   Rows left whole can still let such a reader piece a scope together: at least an `auth.channel_denied`
+>   row or a channel-attributed access row, each naming an actor and one channel, and the actors of
+>   `auth.ad_scope_resynced` rows, which say the directory owned that account's scope.
+>   `/me/security-events` is not narrowed either: it shows a holder its own `auth.*` rows whole,
+>   and, on the residuals its own bullet under *Single-route data rules* names, another account's.
 > - `POST /config/reload` refuses a scoped caller 403, a dry run included, because a reload loads
 >   the whole graph and a dry run's reply describes it. So a deployer needs the all-channels grant.
 >   The refusal writes one `auth.channel_denied` row naming no channel. The approval gate refuses
@@ -2664,7 +2711,9 @@ read as a completed action.
 
 **An inline, released or cluster convergence reload's `config_reload` row names that reload's own
 config (vault BACKLOG #2257, #3109).** It is built from the reload's own result: its directory,
-connection counts and the digest it took before the swap. The row is written after the swap, so a
+connection counts and the digest it took before the swap. A convergence reload's row can also
+carry `initiator_digest`: the unsigned digest read from the shared `cluster_config` row, never
+authenticated. The row is written after the swap, so a
 second reload can move the engine on first. The row then still names
 its own config, but is marked `superseded` and `baseline_unchecked`, so the next start passes over
 it and does not compare against it. Only a committed reload that moves the engine's loaded
@@ -7150,7 +7199,11 @@ behind it, `"logout"` at a sign-out, and `"superseded"` at another sign-in on th
 which may be another account's (BACKLOG #2298, #3749; see [Admin password reset](#admin-password-reset-wp-l3-12-asvs-646)). The permission decides, not the role name; no custom role can grant
 `users:manage` (ADR 0045 D1). The store applies the filter in the query before `limit`, so a page
 never comes back short. The account holder's own `/me/security-events` feed is not filtered: it
-selects rows by the caller's own username, so it shows the holder their own lock and no one else's.
+selects rows by the caller's own username at or after the account's `created_at`, so it shows the
+holder their own rows. It can show another account's, at least where an account keeps its
+`created_at` while its name or holder changes, and on the store-side name-compare residuals
+`_security_events_where` in `messagefoundry/store/store.py` lists (the `GET /me/security-events` bullet under *Single-route data rules*, in
+[The `/ui` console plane](#the-ui-console-plane-serve_uitrue)).
 **The cost, accepted in the ruling: the Auditor can no longer review lockouts.** The list and its
 reasons are in `messagefoundry/auth/audit_visibility.py`.
 
@@ -7227,7 +7280,14 @@ open. The detector reads `config_loaded` rows and no `config_reload` row, so at 
 unseen. A reload whose swap lands after that read leaves the alert resolved while the loosened graph
 runs. A reload onto a loosened graph after a clean start raises nothing until a later start. A
 reload onto a clean graph resolves nothing either. `GET /security/posture` reads the live graph, so
-read that for the current posture.
+read that for the current posture. A cluster convergence reload's `config_reload` row, under
+`system:cluster-convergence`, carries a `loosenings` key read off the graph that reload loaded,
+as a start's row does, and the detector does not read it either (vault BACKLOG #3814). The key is
+`null`, which says unknown, at least when the list could not be read and when the reload ran
+before the start had put in place the settings it reads, as one inside the start's own
+convergence does. A convergence whose row is lost writes no list at all. An operator reload's row
+has no such key. So on a single node, no row names the loosenings an operator reload brings in
+until a later start's row lists them; on a cluster, the other nodes' convergence rows can.
 
 **`posture_loosened` may not name a given switch, the layer's own included.** Its sentence gives the
 count of every loosening, then their names, cut at 200 characters and ending in `...`. The
@@ -7624,10 +7684,14 @@ to the forwarded stream as to stdout (see [PHI.md §7](PHI.md#7-logging--phi-red
   as built on 2026-10-08.
 
 The **`audit_log`** rows *themselves* are **also** forwarded off-box (sec-offbox-log #361/#363): every
-committed audit row ships as metadata, with only best-effort PHI redaction
+audit row `serve` or `supervise` commits ships as metadata, with only best-effort PHI redaction
 ([PHI.md §7](PHI.md#7-logging--phi-redaction)), through the `messagefoundry.audit` logger to the same
 forwarder — so it inherits the TLS transport automatically — across all three store backends, so both the
-operational log and the tamper-evident audit trail survive a host/DB compromise.
+operational log and the tamper-evident audit trail survive a host/DB compromise. A row any other CLI
+subcommand commits, such as `admin-unlock`'s, is **not** forwarded: those processes install no
+forwarder, so the row reaches only their stderr, and a collector would see a gap in the anchor
+chain on a first deployment. [PHI.md §7](PHI.md#7-logging--phi-redaction) row 18 states it, and
+BACKLOG #3767 holds it.
 
 **Clock-sync gate (ASVS 16.2.2; ADR 0080).** Cross-host log/audit correlation assumes the engine host's
 clock tracks a reference. `[logging].require_time_sync` + `ntp_peer` arms an **opt-in**, fully-bounded SNTP

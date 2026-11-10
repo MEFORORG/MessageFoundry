@@ -41,6 +41,7 @@ __all__ = [
     "intake_pause_detail",
     "remote_debug_refused_detail",
     "sandbox_worker_refused_detail",
+    "shown_error_class",
     "store_restored_detail",
     "utc_or_unknown",
 ]
@@ -210,6 +211,14 @@ def sandbox_worker_refused_detail(*, content_only: bool) -> str:
         'dead-lettered as ERROR under internal_error = "continue", or the inbound stops under '
         '"stop". A WARNING line in the engine log names what differs.'
     )
+
+
+def shown_error_class(error_class: str | None) -> str:
+    """The exception class a ``connection_error`` alert shows in the log and off the box, or the
+    fixed token ``unnamed error`` for one that is not a plain identifier (BACKLOG #3210, #5021)."""
+    if type(error_class) is str and error_class.isascii() and error_class.isidentifier():
+        return error_class
+    return "unnamed error"
 
 
 #: The subject a ``store_restored`` alert is raised under (BACKLOG #2614). No connection can be
@@ -407,7 +416,8 @@ class AlertSink(Protocol):
         (``DeliveryError``) after the lane was healthy, edge-triggered so a retry storm fires at most
         one alert per lane per cooldown (#46, Corepoint "connection lost"). ``kind`` is the connection-
         event kind (``connection_lost``); ``detail`` is a ``safe_exc`` reason, and it can echo
-        transport text, so an implementation must not assume it is free of message content.
+        transport text, so an implementation must not assume it is free of message content, and must
+        not send it off the box (BACKLOG #5021).
         ``error_class`` is the failing exception's class name (BACKLOG #3210). A partner *rejection*
         (``NegativeAckError``) is NOT a connection error and never fires this."""
         ...
@@ -435,7 +445,10 @@ class AlertSink(Protocol):
         a lone engine, so each bound on each process is its own instance: a drained backlog cannot
         resolve a low-disk pause, and one node's clear cannot resolve another node's pause (BACKLOG
         #2272). An unpinned cluster node's id changes on every restart, so that node clears its own
-        instances when it stops. It is not
+        instances when it stops, and a subject no process raises again for
+        :data:`~messagefoundry.pipeline.intake_bound.STALE_SECONDS` is resolved by the sweep of
+        another engine process with an alert sink on the same store, where one runs (BACKLOG
+        #3269). It is not
         a connection-scoped event, so no rule's ``control_action`` fires on it (BACKLOG #1898).
         Its colon also keeps ``name`` outside the connection-name grammar, which guards only the
         default target, never a rule's ``control_target``. Carries counts and sizes only: no
@@ -915,7 +928,8 @@ class AlertSink(Protocol):
     def store_privilege_clean(self, name: str) -> None:
         """The INVERSE of :meth:`store_privilege_warning`: a start whose preflight OBSERVED a clean
         store principal. No page; when alert-state is wired (ADR 0044) it auto-resolves the open
-        warning for the same subject, so a fixed grant clears the dashboard."""
+        warning for the same subject, so a fixed grant clears the dashboard, fenced as the ADR 0044
+        BACKLOG #4916 amendment states, so a warning another process raised may stay open."""
         ...
 
     def vault_privilege_warning(
@@ -936,8 +950,9 @@ class AlertSink(Protocol):
 
     def vault_privilege_clean(self, name: str) -> None:
         """The INVERSE of :meth:`vault_privilege_warning`: a start whose preflight read a Vault
-        token and found it clean. No page; when alert-state is wired (ADR 0044) it auto-resolves
-        the open warning for the same subject, so a fixed token clears the dashboard."""
+        token and found it clean. No page; when alert-state is wired (ADR 0044) it can auto-resolve
+        the open warning for the same subject; see ``docs/SECURITY.md``'s *A warning still open
+        after a clean start*."""
         ...
 
     def config_changed(
@@ -1115,8 +1130,8 @@ class AlertSink(Protocol):
 
 
 class LoggingAlertSink:
-    """Default :class:`AlertSink`: log each event at ``WARNING``. No PHI — only the connection name
-    and queue shape are recorded, never a message body."""
+    """Default :class:`AlertSink`: log each event at ``WARNING``. No message-body field, but not
+    PHI-free: an event's free-text detail or reason can go into the line (docs/PHI.md row 13)."""
 
     def connection_stopped(self, name: str, *, detail: str) -> None:
         # Not "outbound ... internal error": a start failure, an inbound router or transform halt and
@@ -1174,12 +1189,11 @@ class LoggingAlertSink:
     ) -> None:
         """This line is general-log text, so it names the caller's exception class and never reads
         ``detail``, which can echo transport text (BACKLOG #3210)."""
-        plain = error_class is not None and error_class.isascii() and error_class.isidentifier()
         log.warning(
             "ALERT connection_error: outbound %r %s (%s); the reason is not logged",
             name,
             kind,
-            error_class if plain else "unnamed error",
+            shown_error_class(error_class),
         )
 
     def log_write_failed(

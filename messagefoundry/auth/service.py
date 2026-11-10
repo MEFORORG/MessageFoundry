@@ -51,10 +51,16 @@ from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
 from messagefoundry.auth import channel_scope, oidc, reconcile, totp, webauthn
 from messagefoundry.auth.audit_visibility import (
     ACCOUNT_LOCKED_ACTION,
+    AD_SCOPE_RESYNCED_ACTION,
+    AD_SESSION_REVOKED_ACTION,
+    CHANNEL_SCOPE_CHANGED_ACTION,
     DIRECTORY_LOGIN_LOCKED_ACTION,
     LOCK_NOTICE_ACTION,
     LOCKED_REFUSAL_DETAIL,
     LOGIN_LOCKED_ACTION,
+)
+from messagefoundry.auth.audit_visibility import (
+    CHANNEL_SCOPE_CHANGE_REFUSED_ACTION as CHANNEL_SCOPE_CHANGE_REFUSED_ACTION,
 )
 from messagefoundry.auth.identity import ALL_CHANNELS, AuthProvider, Identity, SessionMechanism
 from messagefoundry.auth.ldap import (
@@ -1836,14 +1842,9 @@ class ChannelScopeSourceConflict(RuntimeError):
     Each refusal writes one :data:`CHANNEL_SCOPE_CHANGE_REFUSED_ACTION` row first (BACKLOG #2271)."""
 
 
-#: BACKLOG #2271: the row a refused :meth:`AuthService.set_channel_scope` writes. Its detail names the
-#: account, the caller's ``expected_source``, the raw stored source the write read
-#: (``read_source``), the scope's ``owner`` and a ``reason`` from :data:`ChannelScopeRefusal`. Never
-#: the scope itself. On ``source_changed`` the owner is the one read after the write failed, so it
-#: names whoever took the scope: at least a directory sign-in or another administrator's save. A
-#: legacy AD scope reads ``read_source`` null and ``owner`` ``"ad"`` (BACKLOG #2252). A store that
-#: refuses the row leaves an ERROR log line instead, and the 409 still stands.
-CHANNEL_SCOPE_CHANGE_REFUSED_ACTION: Final = "user.channel_scope_change_refused"
+# CHANNEL_SCOPE_CHANGE_REFUSED_ACTION is documented in audit_visibility, beside the rule that
+# narrows its row (vault BACKLOG #3748), and re-exported above for the callers that read it here.
+
 ChannelScopeRefusal = Literal["directory_owned", "expected_source_mismatch", "source_changed"]
 
 
@@ -7993,7 +7994,7 @@ class AuthService:
             )
             # ``withdrawn`` keeps the removed grant, which the row itself no longer holds.
             await self._audit(
-                "auth.ad_scope_resynced",
+                AD_SCOPE_RESYNCED_ACTION,
                 actor=user.username,
                 detail=_json({"channels": None, "withdrawn": user.channel_scope}),
                 client=client,
@@ -8010,7 +8011,7 @@ class AuthService:
                 user.id, change="ad_scope_resynced", actor=user.username, client=client
             )
         await self._audit(
-            "auth.ad_scope_resynced",
+            AD_SCOPE_RESYNCED_ACTION,
             actor=user.username,
             detail=_json(
                 {"channels": ALL_CHANNELS if decision.wildcard else list(decision.channels)}
@@ -10619,7 +10620,7 @@ class AuthService:
             return False
         try:
             row = await store.newest_keyed_audit_row(
-                "auth.ad_session_revoked", actor=revocation.username, after_seq=watermark.seq
+                AD_SESSION_REVOKED_ACTION, actor=revocation.username, after_seq=watermark.seq
             )
             if row is None:
                 return False
@@ -10749,7 +10750,7 @@ class AuthService:
         # Soft (BACKLOG #3018): the writes above are already applied, so a raise would only cost
         # the notice below, the later accounts and the alerts. See `_audit_reconciler_row`.
         written = await self._audit_reconciler_row(
-            "auth.ad_session_revoked",
+            AD_SESSION_REVOKED_ACTION,
             actor=revocation.username,
             detail=_json(
                 {
@@ -18762,7 +18763,7 @@ class AuthService:
             )
         await self._revoke_after_commit(user_id, change="channel_scope_changed", actor=actor)
         await self._audit(
-            "user.channel_scope_changed",
+            CHANNEL_SCOPE_CHANGED_ACTION,
             actor=actor,
             detail=_json(
                 {

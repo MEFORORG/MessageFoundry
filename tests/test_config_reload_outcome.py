@@ -119,7 +119,7 @@ class _BumpFailsCoordinator(NullCoordinator):
     def is_clustered(self) -> bool:
         return True
 
-    async def bump_config_version(self) -> int:
+    async def bump_config_version(self, *, digest: str | None) -> int:
         raise RuntimeError("cluster_config table is unreachable")
 
 
