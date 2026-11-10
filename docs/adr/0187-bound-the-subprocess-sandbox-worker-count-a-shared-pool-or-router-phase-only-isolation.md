@@ -418,6 +418,7 @@ argument above stands for every fault that does kill.
   > kills the worker and is never consumed, but its message is retried once on a fresh worker, and
   > raises in at least the cases *Amendment B* lists. `test_a_frame_staged_between_dispatches_can_never_answer_the_next_one`
   > was changed to pin that. A request outside the codec grammar still raises, and keeps the worker.
+  > A forged answer that carries the request's id is in [ADR 0087](0087-sandbox-subprocess-isolation.md) AC-10's 2026-11-09 amendment.
 
 ## Consequences
 
