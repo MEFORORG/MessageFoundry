@@ -4850,21 +4850,9 @@ AUDIT_CHAIN_KEYLESS_ROWS = (
 )
 
 
-#: The phrase :func:`audit_prefix_verdict` puts in its failure message, exported so a CALLER can tell a
-#: TRUNCATED/REWRITTEN TAIL from a BROKEN CHAIN without walking the log twice (BACKLOG #328).
-#:
-#: ``verify_audit_chain`` folds both verdicts into one ``(ok, message)`` pair and reports the chain break
-#: FIRST, returning before the prefix comparator runs. So a caller holding only ``ok=False`` cannot say
-#: which fired -- and the two want different handling: a break names a row an operator can go and read,
-#: while a truncation names rows that are no longer there to read. ``Engine._verify_audit_chain_on_start``
-#: routes them to DIFFERENT alert subjects on the strength of this marker, so they throttle and route
-#: independently.
-#:
-#: IT IS A SHARED CONSTANT RATHER THAN A STRING THE CALLER RESTATES, and that is the whole point: a
-#: restated copy drifts silently the day this message is reworded, and the caller then quietly
-#: reclassifies every truncation as a chain break. Substring-matching a message is a weak seam either
-#: way; making the producer and the consumer read the SAME name is what stops the seam rotting
-#: unobserved. Pinned by ``test_prefix_break_marker_appears_in_a_real_prefix_failure``.
+#: The phrase :func:`audit_prefix_verdict` puts in its failure message (BACKLOG #328): the operator-
+#: facing text of a truncated or rewritten tail. A caller classifies on
+#: :attr:`AuditVerdict.prefix_break`, never on this text (vault BACKLOG #3054, item 11).
 AUDIT_PREFIX_BREAK_MARKER = "is not an extension of the recorded prefix"
 
 
@@ -6078,11 +6066,18 @@ class AuditVerdict(tuple[bool, str | None]):
     It is set only with ``ok`` true. A caller whose settings require a key must not report it as a
     pass: ``audit-verify`` exits 5, "not checked", on it (vault BACKLOG #3054).
 
-    ``==`` and ``hash`` are the tuple's and ignore both flags and ``rows``; ``__reduce__`` keeps all three through a
-    copy."""
+    ``prefix_break`` says the ``expected_prefix`` comparator failed: the tail was truncated, or the
+    chain rewritten at or before the anchored row. It is set only with ``ok`` false, and only by that
+    comparator, so a caller tells a truncation from a chain break by this flag, never by matching the
+    message (vault BACKLOG #3054, item 11). A chain break returns before the comparator runs, so a
+    break with a cut tail still reads as a break alone.
+
+    ``==`` and ``hash`` are the tuple's and ignore the flags and ``rows``; ``__reduce__`` keeps them
+    all through a copy."""
 
     key_unavailable: bool
     keyless_walk: bool
+    prefix_break: bool
     #: How many rows the walk covered, on a clean verdict; -1 where it does not say. Read from the
     #: walk itself, so a caller needs no second query that could fail or see other rows.
     rows: int
@@ -6094,17 +6089,26 @@ class AuditVerdict(tuple[bool, str | None]):
         key_unavailable: bool = False,
         keyless_walk: bool = False,
         rows: int = -1,
+        prefix_break: bool = False,
     ) -> Self:
         verdict = super().__new__(cls, (ok, message))
         verdict.key_unavailable = key_unavailable and not ok
         verdict.keyless_walk = keyless_walk and ok
         verdict.rows = rows
+        verdict.prefix_break = prefix_break and not ok
         return verdict
 
     def __reduce__(self) -> tuple[Any, ...]:
         return (
             type(self),
-            (self[0], self[1], self.key_unavailable, self.keyless_walk, self.rows),
+            (
+                self[0],
+                self[1],
+                self.key_unavailable,
+                self.keyless_walk,
+                self.rows,
+                self.prefix_break,
+            ),
         )
 
 
@@ -6356,6 +6360,7 @@ def verify_audit_rows(
     # returned and each failing one is reported. A break still hides them, as it always hid the
     # prefix: the break is reported first, at its own row.
     failures: list[str] = []
+    prefix_break = False
     if expected_anchor is not None:
         exp_count, exp_head = expected_anchor
         # Evaluate the head compare UNCONDITIONALLY (not behind `or`): the anchor head is a MAC too,
@@ -6369,7 +6374,8 @@ def verify_audit_rows(
             )
     if prefix_pair is not None:
         ok, msg = audit_prefix_verdict(prefix_pair, witness_heads.get(prefix_pair[0]), count)
-        if not ok:  # its own message: the engine routes on its marker (#328)
+        if not ok:  # the engine routes on the flag this sets (#328, vault BACKLOG #3054)
+            prefix_break = True
             failures.append(msg or f"audit log {AUDIT_PREFIX_BREAK_MARKER}")
     missing = 0
     first: tuple[int, str] | None = None
@@ -6393,7 +6399,7 @@ def verify_audit_rows(
             + " — truncated or rewritten"
         )
     if failures:
-        return AuditVerdict(False, "; ".join(failures))
+        return AuditVerdict(False, "; ".join(failures), prefix_break=prefix_break)
     if key_unavailable:
         # Last, after every check that needs no key has passed: a break those checks found is a
         # break, and outranks "could not check".

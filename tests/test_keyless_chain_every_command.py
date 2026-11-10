@@ -654,6 +654,10 @@ def test_the_verdict_keeps_its_flag_through_a_copy() -> None:
     clean = AuditVerdict(True, "m", keyless_walk=True)
     assert pickle.loads(pickle.dumps(clean)).keyless_walk
     assert not AuditVerdict(False, "m", keyless_walk=True).keyless_walk  # only with ok
+    cut = AuditVerdict(False, "m", prefix_break=True)  # vault BACKLOG #3054, item 11
+    for clone in (copy.copy(cut), copy.deepcopy(cut), pickle.loads(pickle.dumps(cut))):
+        assert clone.prefix_break
+    assert not AuditVerdict(True, "m", prefix_break=True).prefix_break  # only with not-ok
 
 
 def _keyless_chain(db: Path) -> None:
