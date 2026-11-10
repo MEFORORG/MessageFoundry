@@ -161,16 +161,18 @@ def _fake_digits(rng: random.Random, length: int) -> str:
 
 
 def _fake_like(rng: random.Random, sample: str) -> str:
-    """A fabricated value with the **same shape** as ``sample``: each digit → a digit, each ASCII
-    letter → an upper-case letter, anything else kept verbatim. Preserves the original width AND the
-    alphanumeric shape (so ``A0049`` → ``X7321``, not a shrunk digit-only string)."""
+    """A fabricated value with the **same shape** as ``sample``: each digit → an ASCII digit, each
+    letter and each other non-ASCII character → an upper-case ASCII letter, ASCII punctuation and
+    spaces kept verbatim. Preserves the original width AND the alphanumeric shape (so ``A0049`` →
+    ``X7321``, not a shrunk digit-only string). A non-ASCII letter used to be kept as it was, so
+    an accented letter of a real id reached the output (BACKLOG #5534)."""
     if not sample:
         return _fake_digits(rng, 6)
     out: list[str] = []
     for ch in sample:
         if ch.isdigit():
             out.append(str(rng.randrange(10)))
-        elif ch.isascii() and ch.isalpha():
+        elif ch.isalpha() or not ch.isascii():
             out.append(chr(rng.randrange(ord("A"), ord("Z") + 1)))
         else:
             out.append(ch)
@@ -199,14 +201,35 @@ def surrogate_address(rep: str, keyer: Keyer, seps: Seps) -> str:
     return seps.component.join([street, "", city, state, zip_code, "USA"])
 
 
+#: The 1-based CX components an identifier surrogate keeps as captured: CX.3 check-digit scheme,
+#: CX.4 assigning authority, CX.5 identifier type, CX.6 assigning facility, CX.9 assigning
+#: jurisdiction and CX.10 assigning agency. They name who issued the id, not whose it is, and
+#: routing and correlation read them. Every other component past the first is blanked: CX.2, the
+#: check digit, is computed from the real id and is wrong for the fabricated one; CX.7 and CX.8
+#: are the effective and expiration dates; and a component past CX.10, such as a security check,
+#: is blanked until someone decides it is safe to keep (BACKLOG #5534).
+_CX_KEPT_COMPONENTS = frozenset({3, 4, 5, 6, 9, 10})
+
+
+def _kept_tail(comps: list[str], kept: frozenset[int]) -> list[str]:
+    """Components 2 onward of ``comps``, each one whose 1-based position is not in ``kept``
+    blanked, and the empty components that leaves at the end dropped, so a blanked date is not
+    left behind as a run of separators."""
+    tail = [comp if index in kept else "" for index, comp in enumerate(comps[1:], start=2)]
+    while tail and not tail[-1]:
+        tail.pop()
+    return tail
+
+
 def _surrogate_identifier(kind: str, rep: str, keyer: Keyer, seps: Seps) -> str:
     """Replace the **id** component (component 1) with a fabricated value of the same length and
-    alphanumeric shape, keeping the assigning authority / id-type components (non-PHI, routing-
-    relevant) intact — so an alphanumeric MRN keeps its width and shape, not just its digit count."""
+    alphanumeric shape, keep the authority components :data:`_CX_KEPT_COMPONENTS` names (non-PHI,
+    routing-relevant) and blank the rest — so an alphanumeric MRN keeps its width and shape, not
+    just its digit count, and its check digit and dates do not survive (BACKLOG #5534)."""
     rng = keyer.rng(kind, rep)
     comps = _components(rep, seps)
-    comps[0] = _fake_like(rng, comps[0])
-    return seps.component.join(comps)
+    fabricated = _fake_like(rng, comps[0])
+    return seps.component.join([fabricated, *_kept_tail(comps, _CX_KEPT_COMPONENTS)])
 
 
 def surrogate_mrn(rep: str, keyer: Keyer, seps: Seps) -> str:
@@ -215,21 +238,37 @@ def surrogate_mrn(rep: str, keyer: Keyer, seps: Seps) -> str:
 
 
 def surrogate_id(rep: str, keyer: Keyer, seps: Seps) -> str:
-    """A generic identifier — fabricated id, trailing components preserved."""
+    """A generic identifier — fabricated id, authority components kept, the rest blanked."""
     return _surrogate_identifier("id", rep, keyer, seps)
+
+
+#: The 1-based DLN components a driver's licence surrogate keeps: DLN.2, the issuing state,
+#: province or country. DLN.3, the expiration date, is blanked (BACKLOG #5534).
+_DLN_KEPT_COMPONENTS = frozenset({2})
+
+
+def surrogate_dln(rep: str, keyer: Keyer, seps: Seps) -> str:
+    """A DLN driver's licence number (PID-20): a fabricated number of the same shape, the issuing
+    state kept and the expiration date blanked. The generic identifier reads a field as a CX, so
+    it would blank the state as a check digit and could not tell the expiry was a date."""
+    rng = keyer.rng("dln", rep)
+    comps = _components(rep, seps)
+    fabricated = _fake_like(rng, comps[0])
+    return seps.component.join([fabricated, *_kept_tail(comps, _DLN_KEPT_COMPONENTS)])
 
 
 def surrogate_ssn(rep: str, keyer: Keyer, seps: Seps) -> str:
     """A fabricated SSN/national id — preserves a dashed ``NNN-NN-NNNN`` shape if present, and keeps
-    any trailing CX components (an assigning authority) so a CX-shaped national id is not collapsed."""
+    the CX authority components a CX-shaped national id carries, blanking the rest as
+    :func:`_surrogate_identifier` does (BACKLOG #5534)."""
     rng = keyer.rng("ssn", rep)
     comps = _components(rep, seps)
     id_part = comps[0]
     if re.fullmatch(r"\d{3}-\d{2}-\d{4}", id_part):
-        comps[0] = f"{_fake_digits(rng, 3)}-{_fake_digits(rng, 2)}-{_fake_digits(rng, 4)}"
+        fabricated = f"{_fake_digits(rng, 3)}-{_fake_digits(rng, 2)}-{_fake_digits(rng, 4)}"
     else:
-        comps[0] = _fake_digits(rng, sum(c.isdigit() for c in id_part) or 9)
-    return seps.component.join(comps)
+        fabricated = _fake_digits(rng, sum(c.isdigit() for c in id_part) or 9)
+    return seps.component.join([fabricated, *_kept_tail(comps, _CX_KEPT_COMPONENTS)])
 
 
 def surrogate_phone(rep: str, keyer: Keyer, seps: Seps) -> str:
@@ -361,6 +400,7 @@ _SURROGATES: dict[SurrogateKind, _Surrogate] = {
     SurrogateKind.ADDRESS: surrogate_address,
     SurrogateKind.MRN: surrogate_mrn,
     SurrogateKind.ID: surrogate_id,
+    SurrogateKind.DLN: surrogate_dln,
     SurrogateKind.SSN: surrogate_ssn,
     SurrogateKind.PHONE: surrogate_phone,
     SurrogateKind.DOB: surrogate_dob,

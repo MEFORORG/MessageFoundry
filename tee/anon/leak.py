@@ -761,8 +761,9 @@ def retarget_residue_hits(
     (BACKLOG #3493). Reasons name the shape and the field address only, never a value.
 
     A rule that points a default field at a different kind (:func:`.rules.retargeted_defaults`)
-    maps the field, so :func:`structural_phi_hits` never scans it. ``id``, ``mrn`` and ``ssn``
-    rewrite component 1 only, and the rest of the captured value stays. So each repetition of
+    maps the field, so :func:`structural_phi_hits` never scans it. ``id``, ``mrn``, ``ssn`` and
+    ``dln`` rewrite component 1 and keep some components after it as captured (BACKLOG #5534).
+    So each repetition of
     such a field is scanned here with its component 1 left out, for the dashed SSN and the
     punctuated phone. The MRN-typed shape needs a component 1, so it never fires here, which is
     right: the id there is the surrogate. The other kinds add no hit: ``name``, ``address`` and

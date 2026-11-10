@@ -103,15 +103,16 @@ def _refusal(rules: ModuleType, overlay: Path) -> str:
 _RETARGETS = pytest.mark.parametrize(
     ("path", "default", "kind", "left_behind"),
     [
-        # id, mrn and ssn rewrite the first component only.
-        ("PID-5", "name", "id", "^ZZTESTGIVEN^ZZTESTMID"),
-        ("PID-5", "name", "mrn", "^ZZTESTGIVEN^ZZTESTMID"),
-        ("PID-5", "name", "ssn", "^ZZTESTGIVEN^ZZTESTMID"),
+        # id, mrn and ssn rewrite the first component, blank the second, seventh and eighth and
+        # anything past the tenth, and keep the rest as CX authority components (BACKLOG #5534).
+        ("PID-5", "name", "id", "^^ZZTESTMID"),
+        ("PID-5", "name", "mrn", "^^ZZTESTMID"),
+        ("PID-5", "name", "ssn", "^^ZZTESTMID"),
         ("PID-11", "address", "id", "^^FAKECITY^ZZ^99999"),
         ("PID-11", "address", "ssn", "^^FAKECITY^ZZ^99999"),
-        ("PID-13", "phone", "id", "^PRN^PH^zz@example.invalid"),
-        ("PID-13", "phone", "ssn", "^PRN^PH^zz@example.invalid"),
-        ("PV1-7", "provider", "id", "^ZZDOCLAST^ZZDOCGIVEN"),
+        ("PID-13", "phone", "id", "^^PH^zz@example.invalid"),
+        ("PID-13", "phone", "ssn", "^^PH^zz@example.invalid"),
+        ("PV1-7", "provider", "id", "^^ZZDOCGIVEN"),
         # date keeps the year, so on a date of birth it keeps the birth year. The year is one the
         # default dob scrub never draws (it draws 1920 to 2021), so its absence from the default
         # output holds for any salt (BACKLOG #3609 finding 6).

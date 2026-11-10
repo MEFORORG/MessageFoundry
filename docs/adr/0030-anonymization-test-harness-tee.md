@@ -127,6 +127,15 @@
   tee's token scan reads the guard's tables at each call rather than a copy taken at import, and
   its no-guard reason no longer claims a refusal: `require_live_denylist` stays the opt-in
   that refuses, as the 2026-08-06 bullet above records. [PHI.md](../PHI.md) §9 is the long form.
+- **AMENDED 2026-11-10 (BACKLOG #5534): an identifier surrogate keeps only its issuer.** The
+  `MRN`, `ID` and `SSN` kinds fabricated component 1 and kept every other component as captured,
+  and kept a non-ASCII letter of the id. They now fabricate every letter as ASCII, keep CX.3 to
+  CX.6, CX.9 and CX.10, the components that name who issued the id, and blank the rest: CX.2,
+  the check digit, the CX.7 and CX.8 dates, and anything past CX.10. A new `DLN` kind takes
+  `PID-20`, a driver's licence rather than a CX: it fabricates the number, keeps the issuing state
+  and blanks the expiry. **This changes one §3 choice:** `PID-20` moves from `ID` to `DLN`. An
+  overlay that points `PID-20` back at `id` is now a retarget and must list it. Nothing else in
+  the `KEEP` set or the field list moves.
 - **Decision in one line:** ship a **pure-stdlib, dependency-free `anon` package** that turns real,
   messy HL7 v2 into structurally-faithful **PHI-free** datasets via a **two-layer rule model — a
   declarative field-*selection* map (data) over a code registry of pure surrogate *functions* (logic)** —
@@ -291,7 +300,7 @@ exercise the pipeline. The surrogate *functions* (the `SURROGATES` code registry
 NANP-reserved fictional phones) rendered by `cx()`/`xpn()`/`xad()`/`xcn()`.
 
 The **default field map** (`DEFAULT_RULES`) scrubs the standard PHI fields and `KEEP`s the routing/coded
-ones: PID-3/4/18 (`MRN`/`ID`), PID-19 (`SSN`), PID-20 (`ID`), PID-5/6/9 (`NAME`), PID-7 (`DOB`), PID-11
+ones: PID-3/4/18 (`MRN`/`ID`), PID-19 (`SSN`), PID-20 (`ID`; *amended 2026-11-10, #5534: `DLN`*), PID-5/6/9 (`NAME`), PID-7 (`DOB`), PID-11
 (`ADDRESS`), PID-13/14 (`PHONE`); **MRG-1 (`MRN`), MRG-3 (`MRN`), MRG-4 (`NAME`), MRG-7 (`NAME`)** so an A40
 patient-merge does not leak the prior MRN/name; NK1-2 (`NAME`), NK1-4 (`ADDRESS`), NK1-5/6/7 (`PHONE`),
 **NK1-3 relationship `KEEP`** (table-coded, not identifying); GT1-3 (`NAME`), GT1-5 (`ADDRESS`), GT1-6/7

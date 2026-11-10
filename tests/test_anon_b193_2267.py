@@ -36,7 +36,7 @@ _FAILED = "failed anonymization"
 def _raw(control_id: str) -> bytes:
     return (
         f"MSH|^~\\&|SAPP|SFAC|RAPP|RFAC|20260101||ADT^A01|{control_id}|P|2.5.1\r"
-        "PID|1||999^^^H^MR||DOE^JOHN||19800101|M"
+        "PID|1||999^^^H^MR||DOE^JOHN^QUINCY||19800101|M"
     ).encode("latin-1")
 
 
@@ -194,8 +194,9 @@ def test_keeping_a_default_scrubbed_field_is_printed(
 def test_retargeting_a_default_scrubbed_field_is_printed(
     db: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # PID-5 pointed at the id kind rewrites the family name only (BACKLOG #3000). Listed, so the
-    # run loads it; unlisted, test_a_bad_overlay_refuses_the_run_once refuses it.
+    # PID-5 pointed at the id kind rewrites the family name, blanks the given name as a CX check
+    # digit and keeps the middle name as a CX check-digit scheme (BACKLOG #3000, #5534). Listed,
+    # so the run loads it; unlisted, test_a_bad_overlay_refuses_the_run_once refuses it.
     overlay = _overlay(
         tmp_path,
         '[hl7]\nkeep = ["EVN-1"]\nretarget_acknowledged = ["PID-5", "PID-7"]\n'
@@ -211,11 +212,11 @@ def test_retargeting_a_default_scrubbed_field_is_printed(
     assert "PID-7 (dob to date)" in line
     assert "as [hl7].retarget_acknowledged allows" in line
     assert "EVN-1" not in line
-    # What the warning is about: the given name really is in the dataset, and the run passed.
+    # What the warning is about: the middle name really is in the dataset, and the run passed.
     dataset = out.read_text(encoding="utf-8")
-    assert "^JOHN" in dataset
+    assert "^^QUINCY" in dataset
     assert "DOE" not in dataset
-    assert "JOHN" not in line
+    assert "QUINCY" not in line
 
 
 _RESIDUE_ROW = "PID|1||999^^^H^MR||DOE^JOHN||19800101|M|||||5550100^PRN^PH^^^^^^(555) 555-0199"

@@ -2391,7 +2391,13 @@ Properties of the anonymizer:
   alphabet. The rates and the stated bound are in the docstring of `_estimated_entropy_bits` in
   [`keying.py`](../messagefoundry_toolkit/anon/keying.py) (vault BACKLOG #3359).
 - **Width/shape-preserving surrogates** — a surrogate keeps the original's width/shape so the
-  scrubbed dataset stays structurally realistic.
+  scrubbed dataset stays structurally realistic. An identifier surrogate (`mrn`, `id`, `ssn`)
+  fabricates every letter and digit of the id, as ASCII, and keeps only the CX components that
+  name who issued it: CX.3 to CX.6, CX.9 and CX.10. It blanks CX.2, the check digit, the CX.7 and
+  CX.8 dates, and anything past CX.10. `PID-20`, a driver's licence, takes the `dln` kind: the
+  number is fabricated, the issuing state kept and the expiry blanked (BACKLOG #5534). A kept
+  component is not leak-scanned, because a rule maps the field, so text a sender puts in one
+  passes.
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
   loose string search. With no site prefix loaded it matches nothing, and
   `python -m tee anonymize-captures` prints a warning saying so (vault BACKLOG #3516).
@@ -2747,7 +2753,8 @@ field with no default rule logs nothing. `python -m tee anonymize-captures` also
 
 **An overlay can also point a default field at a different kind, and that can leave part of the
 field as captured.** The kinds do not rewrite the same parts of a field. `id`, `mrn` and `ssn`
-rewrite the first component only, so `PID-5` pointed at `id` leaves the given name. `date` keeps
+rewrite the first component and keep CX components 3 to 6, 9 and 10, so `PID-5` pointed at `id`
+leaves the middle name. `dln` keeps the second component, so it would leave the given name. `date` keeps
 the year, so `PID-7` pointed at `date` keeps the birth year. The leak-check scans what such a
 field has left past its first component for a dashed SSN and a punctuated phone number, as the
 table above says, and refuses either. A name, a city or a year left there passes, and so does a

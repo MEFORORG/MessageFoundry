@@ -49,12 +49,13 @@ class SurrogateKind(StrEnum):
 
     NAME = "name"  # XPN person name (PID-5/6/9, NK1-2, GT1-3, IN1-16, MRG-4/7)
     ADDRESS = "address"  # XAD address (PID-11, NK1-4, GT1-5, IN1-19)
-    MRN = "mrn"  # CX medical-record / patient identifier (PID-3, MRG-1/3)
+    MRN = "mrn"  # CX medical-record / patient identifier (PID-2/3/21, MRG-1/3)
     SSN = "ssn"  # social-security / national id (PID-19, GT1-12, IN2-2)
     PHONE = "phone"  # XTN phone/contact (PID-13/14, NK1-5/6/7, GT1-6/7)
     DOB = "dob"  # DT/TS date of birth (PID-7)
     DATE = "date"  # DTM/TS event date: keep the year, fill the rest (EVN-2, PV1-44, OBR-7, ...)
-    ID = "id"  # a generic identifier (PID-4/18/20, IN1-36/49, PV1-19)
+    ID = "id"  # a generic identifier (PID-4/18, IN1-36/49, PV1-19)
+    DLN = "dln"  # DLN driver's licence: number, issuing state, expiry (PID-20)
     PROVIDER = "provider"  # XCN clinician (PV1-7/8/9/17, PD1-4, ORC-12, OBR-16/32, OBX-16)
     FREETEXT = "freetext"  # narrative that may embed identifiers — blunt full-redact (OBX-5, NTE-3)
     KEEP = "keep"  # leave the field intact (overlay: cancel a default scrub)
@@ -176,7 +177,7 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("PID-14", SurrogateKind.PHONE),
     FieldRule("PID-18", SurrogateKind.ID),
     FieldRule("PID-19", SurrogateKind.SSN),
-    FieldRule("PID-20", SurrogateKind.ID),
+    FieldRule("PID-20", SurrogateKind.DLN),  # driver's licence, a DLN rather than a CX
     FieldRule("PID-21", SurrogateKind.MRN),  # mother's identifier, a CX
     FieldRule("PID-23", SurrogateKind.FREETEXT),  # birth place, free text that names a place
     FieldRule("PID-29", SurrogateKind.DATE),  # death date/time
@@ -389,8 +390,9 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     An overlay that points a :data:`DEFAULT_RULES` path at a DIFFERENT kind is REFUSED, unless the
     path is also listed under ``[hl7].retarget_acknowledged``. :func:`retargeted_defaults` names
     the retargets this covers. A different kind can leave part of the field as captured: ``id``,
-    ``mrn`` and ``ssn`` rewrite the first component only, so on ``PID-5`` they leave the given
-    name. A retarget to the same kind changes nothing, and ``drop`` and ``freetext`` write a
+    ``mrn`` and ``ssn`` rewrite the first component and keep the components a CX names its issuer
+    in, so on ``PID-5`` they leave the middle name, and ``dln`` keeps the second, so it leaves the
+    given name (BACKLOG #5534). A retarget to the same kind changes nothing, and ``drop`` and ``freetext`` write a
     constant, so none of those needs the list. A path on the list that is not such a retarget is
     refused too, so a misspelt entry cannot sit there doing nothing. Each acknowledged retarget is
     logged at WARNING, by field address, default kind and new kind (BACKLOG #3000).
@@ -569,8 +571,9 @@ def retargeted_defaults(rules: tuple[FieldRule, ...]) -> tuple[tuple[FieldRule, 
     The kinds do not rewrite the same parts of a field, so a retarget can leave part of a real
     value behind, and the leak-check scans what is left only for a dashed SSN or a punctuated
     phone (``leak.retarget_residue_hits``). ``id``, ``mrn`` and
-    ``ssn`` rewrite the first component only: on ``PID-5`` that leaves the given name, on
-    ``PID-11`` the city and postal code, on ``PV1-7`` the clinician's name. ``date`` keeps the
+    ``ssn`` rewrite the first component and keep CX components 3 to 6, 9 and 10: on ``PID-5``
+    that leaves the middle name, on ``PID-11`` the city and postal code, on ``PV1-7`` the
+    clinician's given name. ``dln`` keeps the second component (BACKLOG #5534). ``date`` keeps the
     year, so on ``PID-7`` it keeps the birth year. No ordering of the kinds says which retarget is
     safe, because what ``date`` leaves depends on the value. So every change of kind is listed,
     with three exceptions: ``drop`` and ``freetext``, which write a constant in place of the whole
