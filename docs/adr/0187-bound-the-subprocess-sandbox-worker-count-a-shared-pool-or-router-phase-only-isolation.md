@@ -358,7 +358,9 @@ The Context section above describes `main` before vault BACKLOG #3135, and is ke
   dead-letters the message it follows.
 - **Every kill records a cause from a closed set**, `KillCause` in `messagefoundry/pipeline/sandbox.py`,
   and writes one `WARNING` naming the inbound, the phase and the cause token, never message content.
-  A graph refusal writes none, because the runner alerts on it, and a shutdown logs at `INFO`. This
+  A graph refusal writes none, and a shutdown logs at `INFO`. The runner alerts on a graph refusal
+  only when it is against the graph the engine serves; one against a graph a reload has replaced
+  writes no line anywhere. This
   is the kill-cause record design point 1 of *Amendment A* puts ahead of any kill budget; the budget
   itself is still unbuilt.
 
@@ -399,6 +401,11 @@ argument above stands for every fault that does kill.
   the closed codec grammar, a desynchronized or forged frame, an unsolicited frame, and a
   `wall_seconds` overrun SHALL each still raise rather than degrade.
   → the existing ADR 0087 sandbox suites, which must continue to pass unchanged
+  > **Amended 2026-11-09 (vault BACKLOG #3135 step 4, owner ruling 2026-11-09).** One refusal
+  > changed by ruling, not by degradation: an unsolicited frame found **before** a request still
+  > kills the worker and is never consumed, but its message is retried once on a fresh worker and
+  > raises only if that worker has one waiting too. `test_a_frame_staged_between_dispatches_can_never_answer_the_next_one`
+  > was changed to pin that. A request outside the codec grammar still raises, and keeps the worker.
 
 ## Consequences
 

@@ -352,6 +352,12 @@ target, no `pickle` import left to mis-suppress:
   `mode=off`. Request ids SHALL be unpredictable and never reused. A **dead peer** (EOF) is NOT a
   frame — it has no wire form, so a worker cannot manufacture one — and SHALL drop the worker without
   failing a call that already has a correlation-proven answer.
+  > **Amended 2026-11-09 (vault BACKLOG #3135 step 4, owner ruling 2026-11-09).** A frame found
+  > waiting **before** a request still drops that worker and is still never consumed as an answer,
+  > but the call is no longer failed: its message never reached the worker, so it is retried once on
+  > a fresh worker, and fails closed only if that worker has a stray frame waiting too. A frame left
+  > **after** an answer still fails the call closed. Every kill records a cause and writes a WARNING
+  > (ADR 0187 *Amendment B*).
   → `tests/test_sandbox.py::test_a_desynced_or_forged_response_is_rejected`,
   `tests/test_sandbox.py::test_a_frame_staged_between_dispatches_can_never_answer_the_next_one`,
   `tests/test_sandbox.py::test_a_dead_peer_is_not_treated_as_a_forged_frame`,
@@ -554,7 +560,9 @@ it is the constraint any proposal to make `subprocess` a *default* has to clear 
   taken as an answer, and its mere presence kills the worker) — not the process teardown. On POSIX,
   `/proc/<pid>/fd/1` is additionally openable by any same-UID process subject to
   `ptrace_scope`/`hidepid`. What it **can** still do is force a kill-and-respawn, i.e. dead-letter
-  messages on that inbound: a compromised worker can deny its own feed.
+  messages on that inbound: a compromised worker can deny its own feed. (Since 2026-11-09 a frame
+  staged before a request costs that message one retry on a fresh worker rather than its dead-letter;
+  see AC-10.)
 - **One Handler is not confined from another inside a worker.** All of an inbound's Routers/Handlers
   share one child and one `Registry`, so admin code can rebind a sibling in-process. This seam does
   not change that — `mode=off` shares an address space too — and any claim that the pipe protects

@@ -1360,9 +1360,12 @@ worker crash, an invalid or forged answer) routes the message to `ERROR`/dead-le
 NAK, never dropped). Two cases differ (vault BACKLOG #3135). A request the codec refuses, or one over
 the frame cap, dead-letters only that message and keeps the worker, since no byte of it was written. A
 stray frame found waiting **before** a request kills the worker and retries the message once on a fresh
-one (owner ruling 2026-11-09); it dead-letters only if the fresh worker has a stray frame waiting too.
+one (owner ruling 2026-11-09). It dead-letters if the fresh worker has a stray frame waiting too, or
+if the respawn itself fails, as any respawn failure does.
 Each worker kill writes one `WARNING` naming the inbound, the phase and a cause token, and no message
-content, except a graph refusal, which the runner alerts on instead, and a shutdown, logged at `INFO`.
+content, except a graph refusal, which writes none, and a shutdown, logged at `INFO`. The runner alerts
+on a graph refusal against the graph the engine serves; one against a graph a reload has replaced
+writes no line.
 **Read once at engine start — a `/config/reload` does NOT re-read it (restart to change).**
 
 **`mode` is engine-wide — there is no per-connection sandbox setting.** One policy is rendered for the
