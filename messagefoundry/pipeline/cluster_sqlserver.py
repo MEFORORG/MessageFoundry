@@ -63,6 +63,7 @@ from messagefoundry.pipeline.cluster import (
     members_from_node_rows,
     paused_read_budget_seconds,
     rows_affected,
+    stamped_config_digest,
     stepdown_pause_seconds,
     stop_tasks_within,
 )
@@ -295,7 +296,8 @@ class SqlServerCoordinator:
             " WHEN MATCHED THEN UPDATE SET id = t.id"  # no-op update so OUTPUT yields the current row
             " WHEN NOT MATCHED THEN INSERT (id, config_version, updated_at) VALUES (1, 0, ?)"
             " OUTPUT inserted.config_version AS config_version,"
-            " inserted.config_digest AS config_digest;",
+            " inserted.config_digest AS config_digest,"
+            " inserted.config_digest_version AS config_digest_version;",
             (time.time(),),
         )
         assert row is not None, "cluster_config upsert returned no row"
@@ -303,17 +305,21 @@ class SqlServerCoordinator:
 
     async def bump_config_version(self, *, digest: str | None) -> int:
         """Atomically increment + cache the cluster config version (operator reload on THIS node).
-        ``digest`` replaces the stored one in the same statement (vault BACKLOG #3109)."""
+        ``digest`` replaces the stored one in the same statement, stamped with the new version
+        (vault BACKLOG #3109); :func:`~messagefoundry.pipeline.cluster.stamped_config_digest` says
+        why."""
         now = time.time()
         row = await self._store._fetchone(
             "SET NOCOUNT ON;"
             " MERGE cluster_config WITH (HOLDLOCK) AS t USING (SELECT 1 AS id) AS s ON t.id = s.id"
             " WHEN MATCHED THEN UPDATE SET config_version = t.config_version + 1,"
-            " config_digest = ?, updated_at = ?"
-            " WHEN NOT MATCHED THEN INSERT (id, config_version, config_digest, updated_at)"
-            " VALUES (1, 1, ?, ?)"
+            " config_digest = ?, config_digest_version = t.config_version + 1, updated_at = ?"
+            " WHEN NOT MATCHED THEN INSERT"
+            " (id, config_version, config_digest, config_digest_version, updated_at)"
+            " VALUES (1, 1, ?, 1, ?)"
             " OUTPUT inserted.config_version AS config_version,"
-            " inserted.config_digest AS config_digest;",
+            " inserted.config_digest AS config_digest,"
+            " inserted.config_digest_version AS config_digest_version;",
             (digest, now, digest, now),
         )
         assert row is not None, "cluster_config upsert returned no row"
@@ -323,7 +329,7 @@ class SqlServerCoordinator:
     def _cache_config_row(self, row: dict[str, Any]) -> int:
         """Cache a ``cluster_config`` row's version and digest together, and return the version."""
         self._config_version = int(row["config_version"])
-        self._config_digest = row["config_digest"]
+        self._config_digest = stamped_config_digest(row)
         return self._config_version
 
     # --- observability -------------------------------------------------------

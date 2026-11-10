@@ -208,6 +208,26 @@ async def test_cluster_config_gains_its_digest_column_in_place(store) -> None:
     assert await c.bump_config_version(digest="d") == 6 and c.config_digest_cached(6) == "d"
 
 
+async def test_a_bump_that_writes_no_digest_leaves_none_beside_its_version(store) -> None:
+    """vault BACKLOG #3109: an engine that predates the digest still bumps the version, and leaves
+    the previous bump's digest in the row. That digest is stamped with the earlier version, so no
+    reader sets it beside the new one."""
+    a = _coord(store, "nodeA:1:aaaa")
+    await a._ensure_tables()
+    b = _coord(store, "nodeB:2:bbbb")
+    await a.config_version()
+    assert await a.bump_config_version(digest="digest-1") == 1
+    async with store._pool.acquire() as conn:
+        cur = await conn.cursor()
+        await cur.execute(
+            "UPDATE cluster_config SET config_version = config_version + 1, updated_at = 0"
+        )
+        await conn.commit()
+    assert await b.config_version() == 2 and b.config_digest_cached(2) is None
+    assert await a.bump_config_version(digest="digest-3") == 3
+    assert await b.config_version() == 3 and b.config_digest_cached(3) == "digest-3"
+
+
 async def test_config_convergence_runner_reloads_from_real_db(store) -> None:
     """HA-16 clause 2 (sibling reload propagation) over a REAL coordinator: a ConfigConvergenceRunner
     on node B converges when a SECOND coordinator A bumps the shared ``cluster_config`` token in the DB

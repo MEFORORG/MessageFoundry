@@ -40,7 +40,7 @@ from messagefoundry.config.snapshot import (
     value_file_rel,
 )
 from messagefoundry.credential import constant_time_equal
-from messagefoundry.redaction import json_loads_or_refusal
+from messagefoundry.redaction import json_loads_or_refusal, refuse_repeated_keys
 
 __all__ = [
     "FINGERPRINT_SCHEME",
@@ -272,37 +272,57 @@ def describe_left_out(left_out: Iterable[str]) -> str:
 _SHARED_DIGEST_KEYS: frozenset[str] = frozenset({"fingerprint", "scheme", UNREADABLE_FILES_KEY})
 
 
+#: The longest text a bump stores or a follower reads back (vault BACKLOG #3109). Another node wrote
+#: it, and each follower parses it on the event loop and copies it into its audit row, so a larger
+#: value reads as no digest. The writer applies the same bound, so it never stores what the reader
+#: refuses; a digest that leaves out enough files to pass it is stored as unknown.
+_SHARED_DIGEST_MAX_CHARS = 65_536
+
+#: A fold as :func:`_fold` writes it: a SHA-256 in lower-case hex.
+_FOLD_CHARS = frozenset("0123456789abcdef")
+
+
 def shared_digest_text(detail: Mapping[str, object] | None) -> str | None:
     """The text a cluster config-version bump stores beside the version it writes: the JSON of the
     initiating node's digest, cut to :data:`_SHARED_DIGEST_KEYS` (vault BACKLOG #3109). ``None``
-    when ``detail`` holds no digest, or none under a named scheme; the bump then stores the
-    digest as unknown. :func:`shared_digest_of` reads it back."""
-    if detail is None or not _is_comparable_digest(detail):
+    when ``detail`` holds no digest :func:`shared_digest_of` would read back; the bump then stores
+    the digest as unknown."""
+    if detail is None:
         return None
     shared = {key: value for key, value in detail.items() if key in _SHARED_DIGEST_KEYS}
-    return json.dumps(shared, sort_keys=True, separators=(",", ":"))
+    if not _is_comparable_digest(shared):
+        return None
+    text = json.dumps(shared, sort_keys=True, separators=(",", ":"))
+    return text if len(text) <= _SHARED_DIGEST_MAX_CHARS else None
 
 
 def _is_comparable_digest(detail: Mapping[str, object]) -> bool:
-    """Whether ``detail`` is a digest another node can compare with: a fold, a scheme, and a
-    well-formed list of what it left out. The writer and the reader apply this one rule, so the
-    writer never stores what the reader refuses."""
-    coverage = digest_coverage(detail)
+    """Whether ``detail`` is a digest another node can compare with, in the shape
+    :func:`config_fingerprint_detail` writes one: a 64-character lower-case hex fold, a non-empty
+    scheme, and an ``unreadable_files`` that is absent or a non-empty list of strings. The writer
+    and the reader apply this one rule, so the writer never stores what the reader refuses."""
+    fold = detail.get("fingerprint")
+    scheme = detail.get("scheme")
+    if not (isinstance(fold, str) and len(fold) == 64 and set(fold) <= _FOLD_CHARS):
+        return False
+    if not (isinstance(scheme, str) and scheme):
+        return False
+    if UNREADABLE_FILES_KEY not in detail:
+        return True
+    left_out = detail[UNREADABLE_FILES_KEY]
     return (
-        coverage is not None
-        and coverage.left_out != ("?",)
-        and isinstance(detail.get("scheme"), str)
+        isinstance(left_out, list) and bool(left_out) and all(isinstance(r, str) for r in left_out)
     )
 
 
-def shared_digest_of(text: str | None) -> dict[str, object] | None:
-    """The digest :func:`shared_digest_text` wrote, or ``None`` when ``text`` is ``None`` or is not
-    one: not JSON, not an object, a key outside :data:`_SHARED_DIGEST_KEYS`, no fold, no scheme, or
-    an ``unreadable_files`` that is not a list of strings. Another node wrote it, so it is read as
-    data and checked rather than trusted."""
-    if text is None:
+def shared_digest_of(text: object) -> dict[str, object] | None:
+    """The digest :func:`shared_digest_text` wrote, or ``None`` when ``text`` is not one: not a
+    string, longer than :data:`_SHARED_DIGEST_MAX_CHARS`, not JSON, a repeated key, not an object,
+    a key outside :data:`_SHARED_DIGEST_KEYS`, or a value :func:`_is_comparable_digest` refuses.
+    Another node wrote it, so it is read as data and checked rather than trusted."""
+    if not isinstance(text, str) or len(text) > _SHARED_DIGEST_MAX_CHARS:
         return None
-    value, refusal = json_loads_or_refusal(text)
+    value, refusal = json_loads_or_refusal(text, object_pairs_hook=refuse_repeated_keys)
     if refusal is not None or not isinstance(value, dict) or not set(value) <= _SHARED_DIGEST_KEYS:
         return None
     return value if _is_comparable_digest(value) else None

@@ -65,7 +65,7 @@ import math
 import os
 import socket
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple, Protocol, runtime_checkable
 from uuid import uuid4
@@ -805,7 +805,9 @@ class ClusterCoordinator(Protocol):
         returned: once a refresh has moved the cache on to a later bump, the digest stored with
         ``version`` is gone, and this answers ``None`` rather than the later bump's. So a convergence
         reload reads it at once, beside the version it is handed. ``None`` also when the initiator
-        stored none, and always on :class:`NullCoordinator`. Cheap + synchronous."""
+        stored none, when what is stored is not stamped with the cached version
+        (:func:`stamped_config_digest`), and always on :class:`NullCoordinator`. Cheap +
+        synchronous."""
         ...
 
     async def bump_config_version(self, *, digest: str | None) -> int:
@@ -916,6 +918,21 @@ class ClusterCoordinator(Protocol):
         reads it to decide whether to offer the stepdown control; the console's own
         ``_control_blocker`` says where it offers less than this."""
         ...
+
+
+def stamped_config_digest(row: Mapping[str, Any]) -> str | None:
+    """A ``cluster_config`` row's ``config_digest``, when its ``config_digest_version`` stamp names
+    the row's ``config_version``, else ``None`` (vault BACKLOG #3109).
+
+    A bump writes the digest and the stamp in the same statement as the version. An engine that
+    does not write the digest still moves the version, and leaves the previous bump's digest and
+    stamp behind: the stamp then names an older version, so that digest is not set beside the new
+    one. Both coordinators read the pair through here."""
+    stamp = row["config_digest_version"]
+    digest = row["config_digest"]
+    if stamp is None or int(stamp) != int(row["config_version"]):
+        return None
+    return digest if isinstance(digest, str) else None
 
 
 class NullCoordinator:
@@ -1344,7 +1361,7 @@ class DbCoordinator:
             "fetchrow",
             "INSERT INTO cluster_config (id, config_version, updated_at) VALUES (1, 0, $1) "
             "ON CONFLICT (id) DO UPDATE SET id = cluster_config.id "  # no-op update → RETURNING current
-            "RETURNING config_version, config_digest",
+            "RETURNING config_version, config_digest, config_digest_version",
             time.time(),
         )
         # An INSERT ... ON CONFLICT ... RETURNING always yields a row; a None here is an impossible
@@ -1358,15 +1375,18 @@ class DbCoordinator:
         operator reload succeeds on THIS node, so every other node's convergence loop sees the higher
         version and reloads its own config dir. Updates the cache immediately so this node's own loop
         sees no change (feedback-avoidance — the initiator does not re-reload). ``digest`` replaces
-        the stored one in the same statement, so no reader sees the new version beside the previous
-        bump's digest (vault BACKLOG #3109)."""
+        the stored one in the same statement, stamped with the new version (vault BACKLOG #3109);
+        :func:`stamped_config_digest` says why."""
         row = await self._call(
             "fetchrow",
-            "INSERT INTO cluster_config (id, config_version, config_digest, updated_at) "
-            "VALUES (1, 1, $2, $1) ON CONFLICT (id) DO UPDATE SET "
+            "INSERT INTO cluster_config "
+            "(id, config_version, config_digest, config_digest_version, updated_at) "
+            "VALUES (1, 1, $2, 1, $1) ON CONFLICT (id) DO UPDATE SET "
             "config_version = cluster_config.config_version + 1, "
-            "config_digest = excluded.config_digest, updated_at = excluded.updated_at "
-            "RETURNING config_version, config_digest",
+            "config_digest = excluded.config_digest, "
+            "config_digest_version = cluster_config.config_version + 1, "
+            "updated_at = excluded.updated_at "
+            "RETURNING config_version, config_digest, config_digest_version",
             time.time(),
             digest,
         )
@@ -1378,7 +1398,7 @@ class DbCoordinator:
     def _cache_config_row(self, row: Any) -> int:
         """Cache a ``cluster_config`` row's version and digest together, and return the version."""
         self._config_version = int(row["config_version"])
-        self._config_digest = row["config_digest"]
+        self._config_digest = stamped_config_digest(row)
         return self._config_version
 
     async def cluster_members(self) -> list[ClusterMember]:

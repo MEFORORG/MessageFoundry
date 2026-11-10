@@ -1968,8 +1968,8 @@ started together, can each raise it; the alert list folds them into one instance
   version by the same bump and read with it in one statement (vault BACKLOG #3109). Compare the
   two as a start compares digests: only under one `scheme` and with the same `unreadable_files`.
   The key is absent when that digest is not known, at least when the initiator took none, when
-  the node's cached version had already moved on to a later bump, and for a version bumped before
-  the `cluster_config.config_digest` column existed.
+  the node's cached version had already moved on to a later bump, and for a version bumped by an
+  engine that does not write `cluster_config.config_digest` and the version it stamps beside it.
 - A convergence reload that fails writes a `config_reload_failed` row under the same actor, or
   `config_reload_denied` when its directory is outside the reload roots (vault BACKLOG #3109). The loop retries that version every interval and logs each failure. An
   engine process writes each distinct row once per version: rows that differ in action, `reason`

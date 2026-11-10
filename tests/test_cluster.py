@@ -42,6 +42,7 @@ from messagefoundry.pipeline.cluster import (
     has_promotable_sibling,
     heartbeat_is_fresh,
     members_from_node_rows,
+    stamped_config_digest,
 )
 from messagefoundry.pipeline.config_convergence import ConfigConvergenceRunner
 from messagefoundry.pipeline.engine import Engine, ReloadOutcome
@@ -1339,6 +1340,10 @@ async def test_the_initiators_digest_rides_the_bump_to_a_followers_convergence_o
         eng.add_registry(load_config(cfgdir))
         await eng.start()
         engines.append(eng)
+        # The test drives each convergence itself; a live runner would add its own outcomes
+        # once its interval passed, as it can on a loaded machine.
+        assert eng._config_convergence is not None
+        await eng._config_convergence.stop()
     initiator, follower = engines
     outcomes: list[ReloadOutcome] = []
 
@@ -1374,8 +1379,20 @@ async def test_the_initiators_digest_rides_the_bump_to_a_followers_convergence_o
         coord._digest = '{"fingerprint": 7}'  # stored, but not a digest
         with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
             await follower._converge_reload(2)
+            await follower._converge_reload(2)  # a retry of the same version
         assert outcomes[-1].initiator_digest is None
-        assert "is not a digest" in caplog.text
+        assert caplog.text.count("is not a digest") == 1, "logged once per version"
+
+        # A coordinator that raises reading the digest costs the row its digest, never the reload.
+        def _raises(version: int) -> str | None:
+            raise RuntimeError("cache unreadable")
+
+        coord.config_digest_cached = _raises  # type: ignore[method-assign]
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
+            await follower._converge_reload(3)
+        assert outcomes[-1].config_version == 3 and outcomes[-1].initiator_digest is None
+        assert "could not be read (RuntimeError)" in caplog.text
     finally:
         for eng in engines:
             await eng.stop()
@@ -1400,17 +1417,45 @@ def test_a_shared_digest_reads_back_only_as_a_digest() -> None:
     assert shared_digest_text(None) is None
     assert shared_digest_text({"scheme": FINGERPRINT_SCHEME, "files": 0}) is None, "no fold"
     assert shared_digest_text({"fingerprint": "a" * 64}) is None, "no scheme: not comparable"
+    assert shared_digest_text({"fingerprint": "a" * 64, "scheme": ""}) is None, "empty scheme"
+    long_list = {"fingerprint": "a" * 64, "scheme": "s", "unreadable_files": ["x" * 70_000]}
+    assert shared_digest_text(long_list) is None, "over the bound: stored as unknown"
     assert shared_digest_of(None) is None
+    assert shared_digest_of(7) is None, "not text"
+    fold = '"fingerprint": "' + "a" * 64 + '"'
+    assert shared_digest_of("{" + fold + ', "scheme": "s"}') is not None, "control: a digest"
     for bad in (
         "not json",
         "[1]",
-        '{"fingerprint": "' + "a" * 64 + '"}',  # no scheme
+        "{" + fold + "}",  # no scheme
+        "{" + fold + ', "scheme": ""}',  # an empty scheme
         '{"fingerprint": "", "scheme": "s"}',  # no fold
-        '{"fingerprint": "f", "scheme": "s", "unreadable_files": "x.py"}',  # not a list
-        '{"fingerprint": "f", "scheme": "s", "files": 1}',  # a key it never writes
+        '{"fingerprint": "f", "scheme": "s"}',  # a fold that is not a SHA-256 in hex
+        '{"fingerprint": "' + "A" * 64 + '", "scheme": "s"}',  # nor upper-case hex
+        "{" + fold + ', "scheme": "s", "unreadable_files": "x.py"}',  # not a list
+        "{" + fold + ', "scheme": "s", "unreadable_files": null}',  # a value it never writes
+        "{" + fold + ', "scheme": "s", "unreadable_files": []}',  # nor an empty list
+        "{" + fold + ', "scheme": "s", "files": 1}',  # a key it never writes
+        "{" + fold + ', "scheme": "s", "scheme": "t"}',  # a repeated key, read two ways
+        "{" + fold + ', "scheme": "' + "s" * 70_000 + '"}',  # over the bound
         "[" * 100_000,  # json's depth limit, which is no ValueError
     ):
-        assert shared_digest_of(bad) is None, bad
+        assert shared_digest_of(bad) is None, bad[:80]
+
+
+def test_a_stored_digest_belongs_only_to_the_version_stamped_beside_it() -> None:
+    """vault BACKLOG #3109: a bump stamps the digest with the version it writes. A bump by an
+    engine that writes no digest moves the version and leaves the previous stamp, so the digest
+    left behind is not set beside the new version."""
+    row: dict[str, object] = {
+        "config_version": 4,
+        "config_digest": "d",
+        "config_digest_version": 4,
+    }
+    assert stamped_config_digest(row) == "d", "control: stamped with its own version"
+    assert stamped_config_digest({**row, "config_version": 5}) is None, "a later, unstamped bump"
+    assert stamped_config_digest({**row, "config_digest_version": None}) is None
+    assert stamped_config_digest({**row, "config_digest": None}) is None
 
 
 @pytest.mark.parametrize("seed_first", [True, False], ids=["seeded_before_load", "seeded_at_start"])

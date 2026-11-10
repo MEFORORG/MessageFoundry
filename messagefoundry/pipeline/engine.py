@@ -898,6 +898,9 @@ class Engine:
             Callable[[Exception, int, set[str]], Awaitable[None]] | None
         ) = None
         self._convergence_failures: tuple[int, set[str]] | None = None
+        # vault BACKLOG #3109: the shared version whose stored initiator's digest was last logged
+        # as unreadable, so a version the runner retries every tick logs it once.
+        self._initiator_digest_warned: int | None = None
 
     def _engine_owned_dirs(self) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
         """The engine's own directories and trees for the ``.processed`` sweep's guard (BACKLOG
@@ -2725,16 +2728,7 @@ class Engine:
         coordinator's cache before anything here awaits (vault BACKLOG #3109). The runner read
         ``version`` from that cache with no await since, so the two come from one read of the
         shared row; read after the reload, a refresh could have moved the cache to a later bump."""
-        from messagefoundry.config.fingerprint import shared_digest_of
-
-        stored = self._coordinator.config_digest_cached(version)
-        initiator_digest = shared_digest_of(stored)
-        if stored is not None and initiator_digest is None:
-            log.warning(
-                "cluster: what is stored with shared config version %d is not a digest, so its "
-                "convergence row names no initiator's digest",
-                version,
-            )
+        initiator_digest = self._initiator_digest(version)
         try:
             outcome = await self.reload_detail(propagate=False)
         except Exception as exc:
@@ -2756,6 +2750,33 @@ class Engine:
             await self.convergence_reload_audit(outcome)
         except Exception:  # noqa: BLE001 - see the docstring; the API's writer already logs its own
             log.exception("cluster: the convergence reload swapped the graph, but its audit failed")
+
+    def _initiator_digest(self, version: int) -> Mapping[str, object] | None:
+        """The initiating node's digest stored with shared config ``version``, as a convergence row
+        names it, or ``None`` when it is not known (vault BACKLOG #3109).
+
+        The digest is an advisory field on the row, so no fault in reading it reaches the reload: a
+        stored value that is not a digest, or a coordinator that raises, reads as unknown. Either is
+        logged at WARNING once per version, since the runner retries a failing version every tick."""
+        from messagefoundry.config.fingerprint import shared_digest_of
+
+        fault: str | None = None
+        try:
+            stored = self._coordinator.config_digest_cached(version)
+            digest = shared_digest_of(stored)
+            if stored is not None and digest is None:
+                fault = "is not a digest"
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            digest, fault = None, f"could not be read ({type(exc).__name__})"
+        if fault is not None and self._initiator_digest_warned != version:
+            self._initiator_digest_warned = version
+            log.warning(
+                "cluster: what is stored with shared config version %d %s, so its convergence row "
+                "names no initiator's digest",
+                version,
+                fault,
+            )
+        return digest
 
     async def set_connection_flag(
         self,

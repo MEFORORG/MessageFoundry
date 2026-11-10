@@ -3267,24 +3267,51 @@ async def test_db_coordinator_config_version_bump_and_round_trip(store) -> None:
 
 
 async def test_cluster_config_gains_its_digest_column_in_place(store) -> None:
-    """vault BACKLOG #3109: a cluster_config created before config_digest gets the column from the
-    schema batch, and its existing row reads as an unknown digest."""
+    """vault BACKLOG #3109: a cluster_config created before config_digest gets its two columns from
+    the schema batch, and its existing row reads as an unknown digest."""
     from messagefoundry.pipeline.cluster import DbCoordinator
     from messagefoundry.store.postgres import _SCHEMA
 
-    async with store._pool.acquire() as conn:
-        await conn.execute("DROP TABLE cluster_config")
-        await conn.execute(
-            "CREATE TABLE cluster_config (id INTEGER PRIMARY KEY, config_version BIGINT NOT NULL,"
-            " updated_at DOUBLE PRECISION NOT NULL)"
-        )
-        await conn.execute("INSERT INTO cluster_config VALUES (1, 5, 0)")
-        (migration,) = [s for s in _SCHEMA if "'cluster_config'" in s and "config_digest" in s]
-        await conn.execute(migration)
-        await conn.execute(migration)  # a second run is a no-op
+    migrations = [s for s in _SCHEMA if "'cluster_config'" in s and "config_digest" in s]
+    assert len(migrations) == 2, migrations
+    try:
+        async with store._pool.acquire() as conn:
+            await conn.execute("DROP TABLE cluster_config")
+            await conn.execute(
+                "CREATE TABLE cluster_config (id INTEGER PRIMARY KEY,"
+                " config_version BIGINT NOT NULL, updated_at DOUBLE PRECISION NOT NULL)"
+            )
+            await conn.execute("INSERT INTO cluster_config VALUES (1, 5, 0)")
+            for migration in (*migrations, *migrations):  # a second run is a no-op
+                await conn.execute(migration)
+        a = DbCoordinator(store._pool, "node-A")
+        assert await a.config_version() == 5 and a.config_digest_cached(5) is None
+        assert await a.bump_config_version(digest="d") == 6 and a.config_digest_cached(6) == "d"
+    finally:
+        # The schema marker still matches, so a later open would not restore a table this test
+        # left without its columns; put them back whatever happened above.
+        async with store._pool.acquire() as conn:
+            for migration in migrations:
+                await conn.execute(migration)
+
+
+async def test_a_bump_that_writes_no_digest_leaves_none_beside_its_version(store) -> None:
+    """vault BACKLOG #3109: an engine that predates the digest still bumps the version, with the
+    statement it always ran, and leaves the previous bump's digest in the row. That digest is
+    stamped with the earlier version, so no reader sets it beside the new one."""
+    from messagefoundry.pipeline.cluster import DbCoordinator
+
     a = DbCoordinator(store._pool, "node-A")
-    assert await a.config_version() == 5 and a.config_digest_cached(5) is None
-    assert await a.bump_config_version(digest="d") == 6 and a.config_digest_cached(6) == "d"
+    b = DbCoordinator(store._pool, "node-B")
+    await a.config_version()
+    assert await a.bump_config_version(digest="digest-1") == 1
+    async with store._pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE cluster_config SET config_version = config_version + 1, updated_at = 0"
+        )
+    assert await b.config_version() == 2 and b.config_digest_cached(2) is None
+    assert await a.bump_config_version(digest="digest-3") == 3
+    assert await b.config_version() == 3 and b.config_digest_cached(3) == "digest-3"
 
 
 async def test_config_convergence_runner_reloads_from_real_db(store) -> None:
