@@ -659,12 +659,15 @@ class ResealResult:
     #: removes it by hand. A symlink is not counted here: its target may be under the prior key, so
     #: it is a skip.
     not_regular: int = 0
-    #: True when the uploads root could not be listed, as when it is missing or is not a directory,
-    #: or was gone after the listing, before the pass's first write (BACKLOG #4940). An unmounted volume and a directory never created
-    #: both look like this, and the pass cannot tell them apart: read as zero uploads, an unmounted
-    #: volume's uploads would stay under the prior key while the run reported success.
-    #: ``rotate-key`` refuses such a root before it writes anything, so this is the backstop for one
-    #: that goes away mid-run. It is not a skip: ``rotate-key`` aborts on it before its audit roll.
+    #: True when the uploads root could not be listed, as when it is missing or is not a directory
+    #: (BACKLOG #4940). Also True when a non-empty listing is followed by a root that is no
+    #: directory, at the check right after the listing or at the pass's first pair-lock check. An
+    #: unmounted volume and a directory never created both look like this, and the pass cannot tell
+    #: them apart: read as zero uploads, an unmounted volume's uploads would stay under the prior key
+    #: while the run reported success. ``rotate-key`` refuses such a root before it writes anything,
+    #: so this is a backstop for one that goes away in those windows. It is not a skip:
+    #: ``rotate-key`` aborts on it before its audit roll. What that leaves uncaught is in
+    #: docs/PHI.md, at the ``rotate-key`` passage.
     root_missing: bool = False
 
     @property
@@ -3309,9 +3312,9 @@ def _pair_lock_failure(exc: OSError, root: Path) -> _PairLockFailure:
     another holder kept it past the wait. ``gone``: the root is missing (:func:`_root_gone`).
     ``timeout``: the OS timed out (``ETIMEDOUT``), as a network file system can. ``refused``:
     the file system refused this account (``atomic_edit._REFUSED``), such as a lock file another
-    account owns; a ``_PairLockBusy`` chained from an ``ELOOP`` is one too, as is what
-    ``_NOT_A_FILE`` names, and a ``FileNotFoundError`` while ``root`` is there. ``failed``: any other error, such as ``EIO`` or
-    ``ESTALE`` from a network file system."""
+    account owns; a ``_PairLockBusy`` with a cause is one too, as is what ``_NOT_A_FILE`` names,
+    and a ``FileNotFoundError`` while ``root`` is there. ``failed``: any other error, such as
+    ``EIO`` or ``ESTALE`` from a network file system."""
     if isinstance(exc, _PairLockBusy):
         return "refused" if exc.__cause__ is not None else "busy"
     if isinstance(exc, FileNotFoundError):
