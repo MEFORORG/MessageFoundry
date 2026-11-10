@@ -57,6 +57,7 @@ from messagefoundry.pipeline.sandbox import (
     graph_shape,
 )
 from messagefoundry.store.store import MessageStore
+from tests._log_absence import assert_capture_sees
 from tests.test_db_lookup import sandbox_run_one  # noqa: F401 - a fixture
 
 # A minimal, conformant synthetic ADT^A01 (no PHI — fabricated ids/names).
@@ -2601,10 +2602,19 @@ def test_a_worker_reaped_elsewhere_has_its_group_signalled_only_while_its_pid_is
     unread: list[int] = []
     killpg_calls: list[int] = []
     real_killpg = os.killpg
+    real_reaped = proctree.kill_reaped_leader_group
+    reaped: list[int] = []
+    reaped_results: list[bool | None] = []
 
     def _spy_unread(pid: int, **kwargs: Any) -> bool:
         unread.append(pid)
         return False
+
+    def _spy_reaped(pid: int) -> bool | None:
+        reaped.append(pid)
+        result = real_reaped(pid)
+        reaped_results.append(result)
+        return result
 
     def _spy_killpg(pgid: int, sig: int) -> None:
         killpg_calls.append(pgid)
@@ -2620,17 +2630,25 @@ def test_a_worker_reaped_elsewhere_has_its_group_signalled_only_while_its_pid_is
         monkeypatch.setattr(os, "killpg", _spy_killpg)  # the module proctree calls
         if pid_now == "reused":
             monkeypatch.setattr(os, "getpgid", lambda pid: pid)  # a live process has it
+        monkeypatch.setattr(proctree, "kill_reaped_leader_group", _spy_reaped)
         caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
         session.close()
         assert unread == []
-        # One scan, one capture setup, for both arms: the "reused" arm finds the refusal through
-        # this exact filter, so it is the positive control that makes the "free" arm's empty result
-        # mean "not logged" rather than "not captured" or "the wording moved".
-        refused = [r.args for r in caplog.records if "not be signalled safely" in r.getMessage()]
-        expected_refused = [("IB_T", proc.pid)] if pid_now == "reused" else []
-        assert killpg_calls == ([] if pid_now == "reused" else [proc.pid])
-        assert sandbox_mod.log.isEnabledFor(logging.WARNING)
-        assert refused == expected_refused
+        # The refusal WARNING is written exactly when the reap returns None, so the return value
+        # is the positive observation in both arms; the log check below only pins the wording.
+        assert reaped == [proc.pid]
+        reused = pid_now == "reused"
+        assert (reaped_results[0] is None) is reused
+        assert killpg_calls == ([] if reused else [proc.pid])
+        # In-arm control: the capture sees a WARNING from this logger, so an empty scan in the
+        # "free" arm means nothing was logged, not that nothing could have been captured.
+        assert_capture_sees(caplog, sandbox_mod.log)
+        refused = [
+            (r.levelno, r.args)
+            for r in caplog.records
+            if r.name == sandbox_mod.log.name and "not be signalled safely" in r.getMessage()
+        ]
+        assert refused == ([(logging.WARNING, ("IB_T", proc.pid))] if reused else [])
     finally:
         monkeypatch.undo()
         session.close()
