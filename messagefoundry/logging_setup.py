@@ -404,8 +404,20 @@ def _scrub_credential_query(text: str) -> str:
 def redact_log_value(text: str) -> str:
     """``text`` through the three text passes :func:`_install_phi_filters` applies, in its order:
     PHI redaction, the credential query scrub, the credential scrub (BACKLOG #3770). The list is
-    copied from that function by hand; a pass added there must be added here too."""
-    return scrub_credentials(_scrub_credential_query(redact_untrusted(text)))
+    copied from that function by hand; a pass added there must be added here too.
+
+    Then the control-character escape and the three passes again, which is what a second handler
+    reads of a raw value: a pass skips text it cannot read, such as the encoded HL7 run in text that
+    is not printable, so ``/x\\x01DOE%5EJANE%5EQ`` was hidden only by the second handler's passes on
+    the escaped text. The field's own escape later hides that text from every handler, so this
+    value must already carry what the second one would have hidden. A tab, which that escape keeps
+    and which the PHI pass also reads as not printable, is written ``\\t`` here too, so the sweep
+    covers every C0 control; that hides more than main's handlers did, never less."""
+
+    def passes(value: str) -> str:
+        return scrub_credentials(_scrub_credential_query(redact_untrusted(value)))
+
+    return passes(scrub_control_chars(passes(text)).replace("\t", "\\t"))
 
 
 def redacted_log_field(text: str, limit: int) -> str:

@@ -332,6 +332,7 @@ _FORGING_PATHS = (
     "/ꄣ-45-6789",
     "/" + "19800101é/" * 30,
     "/" + "x" * 230 + "/19800505" + "9" * 50,
+    "/x\x01DOE%5EJANE%5EQ",
     "/u" + "\U0001f600" * 300,
     "/u" + "x" * 5000,
 )
@@ -430,6 +431,7 @@ async def test_a_path_cannot_forge_a_field_of_the_new_address_warnings() -> None
             assert logged_ip.startswith(want), lines[2 * i + 1]
         assert len(over[1][1]) <= _NEW_IP_LOG_FIELD_MAX
     assert "SECRETVALUE" not in "\n".join(lines)
+    assert "JANE" not in "\n".join(lines)
     plain = _FORGING_PATHS.index("/plain/path-with.dots-and-hyphens")
     assert _logged_fields(lines[2 * plain + 1]) == [
         ("seen_ip", f"10.9.9.{plain}"),
@@ -1316,6 +1318,50 @@ def test_a_redaction_that_raises_logs_a_placeholder_not_an_exception(
     assert got == '"unloggable-RuntimeError"'
     errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
     assert errors and all("RuntimeError" in m and "SECRETVALUE" not in m for m in errors)
+
+
+#: Every C0 control and DEL, each before a percent-encoded HL7 name: the PHI pass skips the encoded
+#: run in text that is not printable, so on main only a second handler, reading the first one's
+#: escaped text, hid the name (BACKLOG #3770).
+_CONTROL_HL7_PATHS = tuple(
+    f"/x{chr(c)}DOE{sep}JANE{sep}Q"
+    for c in [*range(0x20), 0x7F]
+    for sep in ("%5E", "%7C", "%7E", "%26")
+)
+
+
+def _sink_lines(path_arg: str) -> list[str]:
+    """What each of two shipped handlers writes for one ``path=%s`` WARNING."""
+    streams, handlers = _two_shipped_handlers()
+    logger = logging.getLogger("tests.control_hl7")
+    logger.propagate = False
+    for handler in handlers:
+        logger.addHandler(handler)
+    try:
+        logger.warning("path=%s", path_arg)
+    finally:
+        for handler in handlers:
+            logger.removeHandler(handler)
+            handler.close()
+        logger.propagate = True
+    return [s.getvalue() for s in streams]
+
+
+@pytest.mark.parametrize("path", _CONTROL_HL7_PATHS)
+def test_a_control_character_does_not_unhide_an_encoded_hl7_name(path: str) -> None:
+    """RED when: the path field prints a percent-encoded HL7 name that follows a control
+    character, on any sink, or prints any word main's line hid on its last sink. The pre-pass
+    must read the value as the second handler would, because the field's escape hides it from
+    every handler (BACKLOG #3770)."""
+    ours = _sink_lines(redacted_log_field(path, _NEW_IP_LOG_FIELD_MAX))
+    for line in ours:
+        assert "DOE" not in line and "JANE" not in line, ascii(line)
+    # No less than main, whose line carried the raw path: a word hidden on main's last sink is
+    # hidden on every one of ours.
+    main_last = _sink_lines(path)[-1]
+    for word in ("DOE", "JANE", "Q"):
+        if word not in main_last:
+            assert all(word not in line for line in ours), (word, ascii(ours))
 
 
 def test_an_unparsed_address_logs_a_keyed_digest() -> None:
