@@ -120,25 +120,33 @@ def _control_number(value: str | None) -> str | None:
 
 def _sent_isa13(payload: str) -> str | None:
     """ISA13 of the interchange this destination sent, space-trimmed (``""`` when blank), or ``None``
-    when the payload has no ISA whose layout reads. Read by fixed offset through the pure codec
-    (:class:`X12Peek`), the same way the codec reads every ISA field.
+    when the payload has no ISA whose layout reads. Read at its fixed offset, through the pure codec
+    (:class:`X12Peek`) where the codec accepts the ISA.
 
-    The codec also refuses an ISA whose delimiters clash, or whose element data holds a delimiter
-    (BACKLOG #5536). ISA13 still sits at its fixed offset in such an ISA, and a sender upstream may
-    have put the delimiter there, so it is read at that offset anyway: falling back to ``None`` would
-    switch correlation off, and a TA1 naming another interchange would then be acted on."""
+    The codec also refuses an ISA whose delimiters clash, or whose element data holds the element
+    separator or segment terminator (BACKLOG #5536). ISA13 still sits at its fixed offset in such an
+    ISA, and a sender upstream may have put the delimiter there, so it is read at that offset here:
+    falling back to ``None`` would switch correlation off, and a TA1 naming another interchange would
+    then be acted on."""
     try:
         return X12Peek.parse(payload, max_bytes=None).control_number or ""
     except X12PeekError:
-        pass
+        pass  # logged below, once the fallback has read the header
     try:
         isa = find_isa_start(payload)
     except X12PeekError:
         return None
     header = payload[isa : isa + ISA_SEGMENT_LEN]
     # The layout reads only when the element separator sits at every position the ISA fixes.
-    if len(header) < ISA_SEGMENT_LEN or any(header[o] != header[3] for o in ELEMENT_SEP_OFFSETS):
+    if len(header) < ISA_SEGMENT_LEN or any(
+        header[o] != header[3] for o in ELEMENT_SEP_OFFSETS[1:]
+    ):
         return None
+    # The refusal's text is not logged: it names a delimiter, and the header is partner data.
+    logger.warning(
+        "X12 sent interchange has an ISA the codec refuses; ISA13 read at its fixed offset for "
+        "TA1 correlation"
+    )
     return header[_ISA13_START:_ISA13_END].strip()
 
 
@@ -470,8 +478,10 @@ class X12Destination(DestinationConnector):
 
         Only a **TA1** (interchange acknowledgement) is a transport-level retry gate; a 999/997 functional
         ack or a 271/277/278 application response is **content** that rides re-ingress. Uses only the
-        existing ``parsing/x12`` codec (separators discovered from the ISA, never hardcoded — CLAUDE.md §8);
-        the socket read and retry decision stay in the transport, so ``parsing/x12`` gains nothing.
+        existing ``parsing/x12`` codec (separators discovered from the ISA, never hardcoded — CLAUDE.md §8),
+        except that the sent payload's ISA13 is read at its fixed offset when the codec refuses that
+        ISA (:func:`_sent_isa13`); the socket read and retry decision stay in the transport, so
+        ``parsing/x12`` gains nothing.
 
         ``payload`` is the interchange just written; a TA1 is acted on only when it names that
         interchange. The matching rule is stated in the X12 section of ``docs/CONNECTIONS.md``. A TA1

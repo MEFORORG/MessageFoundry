@@ -91,7 +91,8 @@ class X12Peek:
         """Peek the interchange that starts ``raw`` (after any leading whitespace/BOM).
 
         Raises :class:`X12PeekError` if the bytes are not a parseable X12 interchange (no ISA,
-        truncated/malformed ISA, non-distinct delimiters) or exceed ``max_bytes``."""
+        truncated/malformed ISA, non-distinct delimiters, the element separator or segment terminator
+        in ISA element data) or exceed ``max_bytes``."""
         if isinstance(raw, (bytes, bytearray)):
             raw = bytes(raw).decode("utf-8", "replace")
         if max_bytes is not None and len(raw) > max_bytes:

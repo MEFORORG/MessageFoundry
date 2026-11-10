@@ -42,7 +42,7 @@ __all__ = ["split", "X12FrameReader", "check_integrity"]
 
 # A segment that is the IEA trailer, after cosmetic whitespace. Matched in place with pos/endpos, so the
 # check never copies a segment, however long.
-_IEA_SEGMENT = re.compile(rb"[ \t\r\n\x0b\x0c]*IEA")
+_IEA_SEGMENT = re.compile(b"[" + re.escape(_SEGMENT_WHITESPACE.encode("ascii")) + b"]*IEA")
 #: Line-end bytes a sender may put after an interchange's closing terminator, such as a newline after
 #: ``IEA*...~``. Up to :data:`_FRAME_TAIL_MAX` of them directly after a completed interchange are its
 #: ending, however reads split them (vault BACKLOG #2938). The cap keeps a peer from trickling them

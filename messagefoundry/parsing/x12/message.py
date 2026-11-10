@@ -18,9 +18,7 @@ from __future__ import annotations
 import re
 
 from messagefoundry.parsing.x12.delimiters import (
-    _ISA_COMPONENT,
     _ISA_ELEMENT_WIDTHS,
-    _ISA_REPETITION,
     _REPETITION_MIN_VERSION,
     Delimiters,
     discover_delimiters,
@@ -41,8 +39,9 @@ _ENVELOPE_SEGMENTS = {"ISA", "IEA"}
 # repetition separator from 00501) and ISA-16 (the component separator) hold delimiters this model
 # has already split on, so a write to either is refused rather than leaving the cached delimiters out
 # of step. Before 00501 ISA-11 is data (the standards identifier) and may be written; an ISA-12 write
-# that would turn it into a delimiter, or back, is refused below. The element numbers are
-# delimiters._ISA_REPETITION and _ISA_COMPONENT, which the read-side refusal skips the same way.
+# that would turn it into a delimiter, or back, is refused below.
+_ISA_REPETITION = 11
+_ISA_COMPONENT = 16
 # Only the free-text ids and authorization/security information (ISA-02/04/06/08) are space-padded.
 # Every other element is a code, date, time, version or number with one exact width, where a padded
 # short value would be malformed data, so a short value there is refused.

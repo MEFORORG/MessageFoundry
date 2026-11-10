@@ -292,8 +292,6 @@ _REFUSE_STR_SURFACES = [
         pytest.param("ISA-06", {"sender": "A~GS*HC~ST*999"}, id="ISA06-forged-GS"),
         pytest.param("ISA-06", {"sender": "A~IEA*1"}, id="ISA06-forged-IEA"),
         pytest.param("ISA-08", {"receiver": "B*SHIFT"}, id="ISA08-element-separator"),
-        pytest.param("ISA-08", {"receiver": "B:C"}, id="ISA08-component-separator"),
-        pytest.param("ISA-06", {"sender": "A^B"}, id="ISA06-repetition-separator"),
         pytest.param("ISA-06", {"sender": "A\nB", "term": "\r\n"}, id="ISA06-LF-of-CRLF"),
         pytest.param("ISA-08", {"receiver": "B\rC", "term": "\r\n"}, id="ISA08-CR-of-CRLF"),
     ],
@@ -314,6 +312,27 @@ def test_isa11_is_data_before_00501_so_a_delimiter_there_is_refused(surface: Any
     # terminator there is data that would end the ISA at +82.
     with pytest.raises(X12PeekError, match="ISA-11 holds a delimiter character"):
         surface(interchange(version="00401", rep="~"))
+
+
+@pytest.mark.parametrize("surface", _REFUSE_STR_SURFACES)
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        pytest.param({"receiver": "B:C"}, id="ISA08-component-separator"),
+        pytest.param({"sender": "A^B"}, id="ISA06-repetition-separator"),
+        pytest.param({"rep": "U", "sender": "UHC"}, id="00501-legacy-ISA11-U"),
+    ],
+)
+def test_the_component_and_repetition_separators_are_not_refused_in_isa_data(
+    surface: Any, kwargs: dict[str, Any]
+) -> None:
+    # Nothing splits the ISA on these two, so they cannot forge a segment or shift an element, and a
+    # 00501 header still carrying ISA11 "U" must not refuse every id that holds a U.
+    raw = interchange(**kwargs)
+    surface(raw)
+    assert X12Peek.parse(raw).transaction_ids() == ["270"]
+    msg = X12Message.parse(raw)
+    assert msg["ISA-13"] == "000000001" and msg["ISA-16"] == ":"
 
 
 def test_a_clean_isa_still_parses_on_every_surface() -> None:
