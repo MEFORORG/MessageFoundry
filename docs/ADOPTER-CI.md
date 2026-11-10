@@ -305,11 +305,14 @@ prints neither text, since both can quote the message.
 A strict-validation timeout needs a reason to pass. Past `validation.strict_timeout_s` the run's
 error is the timeout text, `strict-validation timed out after <N>s`, which the live listener
 records as a final `AR` ([`HL7-VALIDATION.md`](HL7-VALIDATION.md)). A fixture that pins that DoS
-backstop, a valid but slow body, writes a reason that text contains, such as `ERROR
-strict-validation timed out`. A plain `ERROR` accepts any other error, but never a timeout alone,
-because a timeout measures the runner, not the message. It does accept a timed-out run whose
-validator, though late, still returned a content refusal, and the reason form is then matched
-against that refusal as well as the timeout text.
+backstop writes a reason holding `timed out`, such as `ERROR strict-validation timed out`; the
+timeout text satisfies no other reason, so a reason written for a content refusal, such as
+`ERROR strict-validation`, cannot pass on a slow runner. Such a fixture still measures the
+runner: its body must take longer than the inbound's timeout on every machine the gate runs on,
+or a fast runner fails it with the run's real disposition. A plain `ERROR` accepts any other
+error, but never a timeout alone, because a timeout measures the runner, not the message. It does
+accept a timed-out run whose validator, though late, still returned a content refusal, and the
+reason form is then matched against that refusal too.
 
 ---
 

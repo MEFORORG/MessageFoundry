@@ -652,8 +652,15 @@ def _late_validate(monkeypatch: pytest.MonkeyPatch, outcome: str) -> None:
 
 @pytest.mark.parametrize(
     ("outcome", "expect"),
-    # The reason form fails too, on a reason the timeout text does not contain.
-    [("pass", "ERROR\n"), ("raise", "ERROR\n"), ("pass", "ERROR PV1"), ("raise", "ERROR PV1")],
+    # The reason form fails too, on a reason the timeout text lacks, and on one it holds that does
+    # not name the timeout, which a content-refusal fixture could carry.
+    [
+        ("pass", "ERROR\n"),
+        ("raise", "ERROR\n"),
+        ("pass", "ERROR PV1"),
+        ("raise", "ERROR PV1"),
+        ("pass", "ERROR strict-validation"),
+    ],
 )
 def test_expect_error_does_not_pass_on_a_strict_validation_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str, expect: str
@@ -668,7 +675,7 @@ def test_expect_error_does_not_pass_on_a_strict_validation_timeout(
     dr = _assert_the_gate_blocks_on_dryrun(cfg, msgs)
     if expect.startswith("ERROR "):
         assert "reason does not match" in dr.detail, dr.detail
-        assert "PV1" not in dr.detail, dr.detail
+        assert expect.split(" ", 1)[1] not in dr.detail, dr.detail
     else:
         assert "expected ERROR, got a strict-validation timeout" in dr.detail, dr.detail
 
@@ -776,10 +783,13 @@ def test_expect_error_reason_fails_when_the_error_lacks_it(tmp_path: Path, reaso
     ("expect", "says"),
     [
         ("FILTERED some reason", "only ERROR takes a reason"),
-        ("ERROR first line\nsecond line", "must fit on one line"),
+        ("ERROR first line\nsecond line", "holds one line"),
         ("ERROR\tsome reason", "with one space"),
         ("ERROR  some reason", "with one space"),
-        ("RECEIVED\n# some reason", "holds one disposition name"),
+        ("RECEIVED\n# some reason", "holds one line"),
+        # A stray second line under a bare word is named as such, not as a separator fault.
+        ("ERROR\n# some reason", "holds one line"),
+        ("ERROR\r\nsome reason", "holds one line"),
     ],
 )
 def test_expect_reason_form_refuses_a_malformed_sidecar(

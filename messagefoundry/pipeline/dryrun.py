@@ -997,8 +997,10 @@ def _strict_validation_error(text: str, ic: InboundConnection) -> _StrictRefusal
     starts after :func:`~messagefoundry.parsing.validate.warm_validation`, so it does not count the
     process's cold ``hl7apy`` import or its choice-group probe, nor, when the warm-up can parse the
     body's MSH, the version's library or the structure's reference load (BACKLOG #5107), where the listener's clock counts them on the first
-    validate of each after a start. Below the timeout the verdict matches; the wall clock, the
-    concurrency, that boundary case and a listener's first validate do not."""
+    validate of each after a start. Nor does the listener keep a late validate's content refusal,
+    which the preview returns as ``verdict`` for ``check``. Below the timeout the verdict matches;
+    at least the wall clock, the concurrency, that boundary case, a listener's first validate and
+    a late verdict do not."""
     timeout = strict_validate_timeout(ic)
     if timeout is not None:
         warm_validation(text)

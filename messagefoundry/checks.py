@@ -1774,8 +1774,10 @@ def _check_validate(config_dir: str | Path, *, allow_empty: bool = False) -> Che
 # router-handler failure). ``PROCESSED``/``ROUTED`` are live-only post-delivery states, so they alias
 # to ``RECEIVED`` for authoring ergonomics. A strict-validation timeout satisfies a bare ``ERROR`` only
 # when the validate, though late, returned a content refusal; a late pass or a late raise does not.
-# ``ERROR <reason>`` requires the run's error (past the timeout, the timeout text) or the validator's
-# content refusal to contain the reason. docs/ADOPTER-CI.md section 3 states the rule for adopters.
+# ``ERROR <reason>`` requires the run's error or the validator's content refusal to contain the
+# reason; past the timeout the error is the timeout text, which counts only for a reason holding
+# _TIMEOUT_REASON_WORDS. docs/ADOPTER-CI.md section 3 states the rule for adopters.
+_TIMEOUT_REASON_WORDS = "timed out"  # in the dry run's (and the listener's) timeout text
 _DRYRUN_DISPOSITIONS = frozenset({"RECEIVED", "UNROUTED", "FILTERED", "NOT_DEPLOYED", "ERROR"})
 _DISPOSITION_ALIASES = {
     "PROCESSED": "RECEIVED",
@@ -1787,7 +1789,8 @@ _DISPOSITION_ALIASES = {
 
 class _Expectation(NamedTuple):
     """A fixture's declared expectation: the disposition name, and for ``ERROR <reason>`` the
-    substring the run's error must contain (``None`` for every other form)."""
+    substring the run must show (``None`` for every other form). Which texts it is matched
+    against is ``_check_dryrun``'s rule, stated in ``docs/ADOPTER-CI.md`` section 3."""
 
     disposition: str
     reason: str | None = None
@@ -1817,7 +1820,15 @@ def _expected_disposition(fixture_path: str | Path, *, cap: int) -> _Expectation
         advice="an .expect sidecar holds one disposition name, or ERROR and a reason",
     )
     # utf-8-sig: a Windows editor's BOM must not turn a correct sidecar into an unknown name.
-    word, sep, reason = data.decode("utf-8-sig").strip().partition(" ")
+    text = data.decode("utf-8-sig").strip()
+    if len(text.splitlines()) > 1:
+        # Checked first, so a stray second line under a bare word is named as such rather than
+        # read as a malformed reason separator. Not echoed, as below.
+        raise ValueError(
+            "invalid .expect: a sidecar holds one line (one disposition name, or ERROR and a "
+            "reason); remove the other lines"
+        )
+    word, sep, reason = text.partition(" ")
     if any(ch.isspace() for ch in word):
         # Not echoed: what follows another whitespace separator can be a reason, which can quote
         # the message.
@@ -1832,7 +1843,7 @@ def _expected_disposition(fixture_path: str | Path, *, cap: int) -> _Expectation
         valid = ", ".join(sorted(_DRYRUN_DISPOSITIONS))
         raise ValueError(
             f"invalid .expect disposition {raw!r} (use one of {valid}, or ERROR <reason>; "
-            "PROCESSED/ROUTED alias RECEIVED)"
+            "PROCESSED, ROUTED, DELIVERED and DELIVERS alias RECEIVED)"
         )
     if not sep:
         return _Expectation(normalized)
@@ -1840,8 +1851,6 @@ def _expected_disposition(fixture_path: str | Path, *, cap: int) -> _Expectation
         raise ValueError(f"invalid .expect: only ERROR takes a reason, not {raw!r}")
     if reason[:1].isspace():
         raise ValueError("invalid .expect: separate ERROR from its reason with one space")
-    if len(reason.splitlines()) != 1:
-        raise ValueError("invalid .expect: an ERROR reason must fit on one line")
     return _Expectation(normalized, reason)
 
 
@@ -1992,12 +2001,18 @@ def _check_dryrun(
                     )
                 elif expected.reason is not None:
                     # Matched against the raw texts, never safe_error's: redaction must not decide
-                    # whether the gate fails. The run's error is one candidate: past the timeout it
-                    # is the timeout text, so a fixture pinning the DoS backstop (a valid but slow
-                    # body, which the listener answers with a final AR) passes on a reason that
-                    # text contains (BACKLOG #5107). A content refusal the validate returned, on
-                    # time or late, is the other; ``is not None``: an empty verdict still counts.
-                    said = [t for t in (result.error, result.strict_refusal) if t is not None]
+                    # whether the gate fails. A content refusal the validate returned, on time or
+                    # late, is one candidate; ``is not None``: an empty verdict still counts. The
+                    # run's error is the other, except that past the timeout it is the timeout
+                    # text, which counts only for a reason naming the timeout itself: a fixture
+                    # pinning the DoS backstop, which the listener answers with a final AR
+                    # (BACKLOG #5107). Otherwise a reason such as ``strict-validation``, written
+                    # for a content refusal, would pass on every slow runner.
+                    error_counts = (
+                        not result.strict_timed_out or _TIMEOUT_REASON_WORDS in expected.reason
+                    )
+                    candidates = (result.strict_refusal, result.error if error_counts else None)
+                    said = [t for t in candidates if t is not None]
                     if not any(expected.reason in text for text in said):
                         # Neither text is printed: the error and the reason can both quote the
                         # message, and this detail lands in a CI log.
