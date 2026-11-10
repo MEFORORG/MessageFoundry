@@ -103,8 +103,10 @@ _ENV_AUDIT_KEY = "MEFOR_STORE_TRANSIT_AUDIT_KEY"
 #: Read on 2026-11-10 from Vault ``builtin/logical/transit/path_hmac.go`` and
 #: ``sdk/helper/keysutil/policy.go`` (``HMACKey``, ``safeGetKeyEntry``) at commit cbc874e2358f, and
 #: from OpenBao, which says the same, at 80e208bf4f83 and 79e101fe2e59. They choose only the label of
-#: the error, never whether the row is a break: a reply naming one is labelled a refused version even
-#: beside a reason in :data:`_NOT_VERSION_TEXTS`, and unknown Vault wording is labelled one too.
+#: the error, never whether the row is a break, and are read only inside an ``errors`` value that is
+#: a list (:func:`_names_no_version_reason`): a list entry holding one is labelled a refused version
+#: even beside a reason in :data:`_NOT_VERSION_TEXTS`. One anywhere else, such as in a bare JSON
+#: list or a string ``errors`` value, is not read, and that reply is labelled unconfirmed.
 _VERSION_REFUSAL_TEXTS = (
     "key version does not exist",
     "no such key version",
@@ -119,12 +121,15 @@ _NOT_VERSION_TEXTS = frozenset({"missing input for hmac", "encryption key not fo
 
 
 def _names_no_version_reason(exc: Exception) -> bool:
-    """Whether a pinned ``hmac`` 400 gives no reason that names the version (BACKLOG #6707): no
-    Vault JSON ``errors`` list at all (a proxy or WAF page, or text that is not JSON), or a list
-    every entry of which is a whole text in :data:`_NOT_VERSION_TEXTS` and none of which names a
-    refused version. Such a 400 may still be a refusal of the version, so this chooses only the
+    """Whether a pinned ``hmac`` 400 is NOT read as a version refusal (BACKLOG #6707). Only an
+    ``errors`` value that is a list is read. With none, this is True whatever the reply says: at
+    least a proxy or WAF page, text that is not JSON, a bare JSON list, and a string or object
+    ``errors`` value. A list is True only when it is non-empty, every entry is text whose whole
+    value is in :data:`_NOT_VERSION_TEXTS`, and no entry holds a :data:`_VERSION_REFUSAL_TEXTS`
+    text; any other list, an empty one, one with a non-text entry and unknown Vault wording
+    included, is False. A True 400 may still be a refusal of the version, so this chooses only the
     error's text: :class:`~messagefoundry.store.crypto.AuditKeyVersionUnverifiedError` rather than
-    its parent. Anything else, unknown Vault wording included, keeps the parent.
+    its parent.
 
     hvac fills ``exc.errors`` only when the reply's Content-Type is exactly ``application/json``,
     so a proxy that adds a charset leaves the same JSON in ``exc.text``; that is read the same way."""
@@ -135,7 +140,7 @@ def _names_no_version_reason(exc: Exception) -> bool:
         if refused is None and isinstance(parsed, dict):
             errors = parsed.get("errors")
     if not isinstance(errors, list):
-        return True  # no Vault error list, so no reason at all
+        return True  # no errors list, so nothing in the reply is read
     texts = [text.strip().lower() for text in errors if isinstance(text, str)]
     if any(known in text for text in texts for known in _VERSION_REFUSAL_TEXTS):
         return False
@@ -271,8 +276,8 @@ class TransitCipher(_UnmarkedPolicy):
         stored MAC passes the version that MAC names (BACKLOG #2337), so a key rotation does not make
         an older row read as forged. A pinned call Transit refuses for its version alone raises
         :class:`AuditKeyVersionRefusedError` (see :meth:`_refuses_only_version`), or its subclass
-        :class:`AuditKeyVersionUnverifiedError` when the 400 gives no reason that names the version
-        (:func:`_names_no_version_reason`, BACKLOG #6707)."""
+        :class:`AuditKeyVersionUnverifiedError` when :func:`_names_no_version_reason` does not read
+        the 400 as a version refusal (BACKLOG #6707)."""
         inp = base64.b64encode(data).decode("ascii")
         kwargs: dict[str, Any] = {
             "name": self._audit_key,

@@ -551,14 +551,14 @@ def test_a_pinned_400_the_probe_does_not_clear_is_a_plain_cipher_error(answer: A
         pytest.param(None, '{"errors": ["reworded refusal"]}', id="unknown-wording-in-text-only"),
     ],
 )
-def test_a_pinned_vault_400_with_a_possible_version_reason_is_a_refused_version(
+def test_a_pinned_400_read_as_a_version_refusal_keeps_the_refused_label(
     errors: Any, text: str | None
 ) -> None:
-    """BACKLOG #6707: a 400 carrying Vault's JSON error list is labelled a refused version unless
-    no entry could name the version. Unknown Vault wording keeps that label, so a reworded refusal
-    on an upgraded Vault is labelled as before. hvac fills ``errors`` only for a Content-Type of
-    exactly ``application/json``, so the same JSON in the body (a charset-tagged reply) must read
-    the same way."""
+    """BACKLOG #6707: a 400 whose ``errors`` value is a list is labelled a refused version unless
+    that list is non-empty and holds only whole known non-version texts. An empty list and unknown
+    Vault wording keep that label, so a reworded refusal on an upgraded Vault is labelled as
+    before. hvac fills ``errors`` only for a Content-Type of exactly ``application/json``, so the
+    same JSON in the body (a charset-tagged reply) must read the same way."""
     from messagefoundry.store.crypto import (
         AuditKeyVersionRefusedError,
         AuditKeyVersionUnverifiedError,
@@ -580,20 +580,21 @@ def test_a_pinned_vault_400_with_a_possible_version_reason_is_a_refused_version(
         pytest.param(["  Encryption key not found "], None, id="known-non-version-any-case"),
     ],
 )
-def test_a_pinned_400_without_a_version_reason_is_labelled_unverified(
+def test_a_pinned_400_not_read_as_a_version_refusal_is_labelled_unconfirmed(
     errors: Any, text: str | None
 ) -> None:
     """BACKLOG #6707: after a rotation the probe answers under a newer version, so the probe alone
-    labelled ANY pinned 400 a refused version. A 400 with no Vault error list, or whose Vault
-    reason is something else, is labelled unconfirmed instead. It stays a subclass, so its
-    handlers handle the row as on main."""
+    labelled ANY pinned 400 a refused version. A 400 with no ``errors`` value that is a list, even
+    one whose reply holds a refusal text elsewhere, or with a list of only whole known non-version
+    texts, is labelled unconfirmed instead. It stays a subclass, so its handlers handle the row as
+    on main."""
     from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
 
     refused = _pinned_refusal("vault:v2:AAAA", errors, text=text)
     assert isinstance(refused, AuditKeyVersionUnverifiedError)
     assert str(refused) == (
-        "the Transit audit MAC pinned to key version 3 got HTTP 400 without a reason that names "
-        "the version, so the version could not be confirmed"
+        "the Transit audit MAC pinned to key version 3 got HTTP 400 that was not read as a "
+        "version refusal, so the version could not be confirmed"
     )
     assert _KEY_NAME not in str(refused)  # the walk puts this text in the tamper alert
 

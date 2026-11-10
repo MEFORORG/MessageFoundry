@@ -644,8 +644,9 @@ class AuditKeyVersionRefusedError(CipherError):
 
 
 class AuditKeyVersionUnverifiedError(AuditKeyVersionRefusedError):
-    """Transit answered an audit MAC pinned to one key version with HTTP 400 whose reply gives no
-    reason naming the version, and still answers under the latest (BACKLOG #6707).
+    """An audit MAC pinned to one key version got HTTP 400 that
+    :func:`~messagefoundry.store.crypto_transit._names_no_version_reason` does not read as a version
+    refusal, while the key still answers under the latest (BACKLOG #6707).
 
     The 400 may still be a refusal of the version: a proxy can replace Vault's reply with its own
     page, and that cannot be told apart from a tamper behind it. So this is a subclass, and a
@@ -655,8 +656,8 @@ class AuditKeyVersionUnverifiedError(AuditKeyVersionRefusedError):
 
     def __str__(self) -> str:
         return (
-            f"the Transit audit MAC pinned to key version {self.version} got HTTP 400 without a "
-            "reason that names the version, so the version could not be confirmed"
+            f"the Transit audit MAC pinned to key version {self.version} got HTTP 400 that was not "
+            "read as a version refusal, so the version could not be confirmed"
         )
 
 
