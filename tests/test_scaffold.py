@@ -807,17 +807,18 @@ _INCLUDE = (
 )
 _CONSTRAINT = (
     "names a constraints file, which this check does not follow;"
-    " remove the line only once its limits apply elsewhere: give the file to every command that"
-    " writes requirements.lock (uv pip compile -c FILE), keeping it in the README's lock commands,"
-    " and make every install apply the lock, with PIP_CONSTRAINT=requirements.lock wherever"
-    " requirements.txt is installed or pip install --require-hashes -r requirements.lock in its"
-    " place (for requirements.lock itself, the install step alone)"
+    " remove the line only once its limits apply elsewhere, as the engine's docs/ADOPTER-CI.md,"
+    " Job 3, says: for any other file, pass -c FILE to every command that writes requirements.lock"
+    " and keep it in the README's, and for any file, make every install of requirements.txt apply"
+    " the lock, with PIP_CONSTRAINT=requirements.lock for that command only or pip install"
+    " --require-hashes -r requirements.lock in its place, using a lock that covers that install's"
+    " platform"
 )
 
 #: (the line after ``foo==1.0``, the ::error:: it raises, whether the pins audit's grep also sees it).
 #: pip's own parser reads each as an include or a constraint, abbreviated or attached as pip allows.
-#: Not every spelling: a line that is one only through a ${VAR} nested in another's value is not
-#: read as one.
+#: Not every spelling: pip can read a line as one only through a ${VAR} nested in another's
+#: value, and this step does not read that line as one.
 _INCLUDE_CASES = [
     ("--requirem extra.txt", f"--requirem extra.txt {_INCLUDE}", False),
     ("-\\\nr extra.txt", f"-r extra.txt {_INCLUDE}", False),

@@ -223,12 +223,13 @@ that package's build code may run in CI:
     (a lock records none), a URL or path with no package name, and an editable line (`-e` or
     `--editable`, abbreviated or attached as pip allows, which installs a source tree or checkout
     no lock pin holds) are only noted. A requirement it cannot parse fails, and so does a line of
-    options with no requirement that pip cannot read. An include or constraint line (`-r`,
-    `--requirement`, `-c` or `--constraint`, abbreviated or attached as pip allows, with no
-    editable on the line) fails too, because the step follows no file a line names, so it cannot
-    check an included file's pins or a constraints file's limits against the lock. No new lock
-    clears it. For an included file, move its lines into `requirements.txt`. For a constraints
-    file, remove the line only once its limits apply elsewhere, in two places:
+    options with no requirement that pip cannot read. The options on a line that also holds a
+    requirement are not read. An include or constraint line (`-r`, `--requirement`, `-c` or
+    `--constraint`, abbreviated or attached as pip allows, with no editable on the line) fails
+    too, because the step follows no file a line names, so it cannot check an included file's pins
+    or a constraints file's limits against the lock. No new lock clears it. For an included file,
+    move its lines into `requirements.txt`. For a constraints file, remove the line only once its
+    limits apply elsewhere, in two places:
     - The lock. While the line is in `requirements.txt`, a lock command that reads that file, such
       as `uv pip compile`, reads the line on every regeneration. Once it is gone, nothing passes
       the file unless you do, every time, so add `-c <file>` to each of the README's lock commands
@@ -236,20 +237,23 @@ that package's build code may run in CI:
       lock, so it cannot see a limit a regeneration dropped.
     - The install. Every `pip install -r requirements.txt` reads the line too: at least the `check`
       job, step 1 of the README's "Use it", and each deploying host's install. Once it is gone
-      those installs resolve live, with none of its limits, unless each applies the lock: set
-      `PIP_CONSTRAINT=requirements.lock` for that command only, because pip applies it to every
-      package it installs while it is set, or install with `pip install --require-hashes -r requirements.lock` in its
-      place. The scaffolded `check` job and the README's "Use it" do neither; the README offers
-      both only as optional hardening. The lock must also cover the platform each install runs
-      on. The `check` job runs on `ubuntu-latest` and the README's lock commands lock Windows
-      alone, so pip can refuse that install when a hashed lock misses a package Linux needs; a
-      universal lock covers both (read "Job 3" first).
+      those installs resolve live, with none of its limits, unless each passes `-c <file>` itself
+      or applies the lock. To apply the lock, set `PIP_CONSTRAINT=requirements.lock` for that
+      command only, or install with `pip install --require-hashes -r requirements.lock` in its
+      place. Do not export `PIP_CONSTRAINT` for the whole shell or job, as the README's hardening
+      example does: a hashed constraints file turns on hash checking for everything pip installs
+      under it, so an install the lock does not cover, such as `requirements-dev.txt`, is refused.
+      The scaffolded `check` job and the README's "Use it" apply the lock in neither way; the
+      README recommends both as hardening for any PHI-handling adopter. The lock must also cover
+      the platform of each install it is applied to. The `check` job runs on `ubuntu-latest`, the
+      engine depends on `uvloop` on Linux, and the README's lock commands lock Windows alone, so
+      that lock cannot be applied there. A universal lock covers both (read the
+      universal-lock note in this section first).
 
-    A `-c requirements.lock` line is refused too. Only the install step applies to it: removing it
-    is safe only once every install applies the lock in one of those two ways. While it is there,
-    it also limits each regeneration to the lock's own pins, so a requirement moved off its locked
-    version cannot resolve until the line is gone. The options on a line that also holds a
-    requirement are not read.
+    A `-c requirements.lock` line is refused too, and only the install step applies to it: do not
+    pass the lock to the command that writes it. Removing the line is safe only once every install
+    applies the lock as above. While it is there, it also limits each regeneration to the lock's
+    own pins, so a requirement moved off its locked version cannot resolve until the line is gone.
   - The job takes the engine's pin out of the lock, as pip reads the lock, and installs that pin
     alone with `--no-deps --require-hashes`. The lock must pin `messagefoundry` exactly once, or the
     job says so and fails; pip refuses the pin if it carries no hash. No other locked package is

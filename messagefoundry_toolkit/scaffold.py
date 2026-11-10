@@ -561,12 +561,13 @@ for group in logical_lines("requirements.txt"):
             errors.append(
                 (
                     f"{line} names a constraints file, which this check does not follow",
-                    "remove the line only once its limits apply elsewhere: give the file to every"
-                    " command that writes requirements.lock (uv pip compile -c FILE), keeping it in"
-                    " the README's lock commands, and make every install apply the lock, with"
-                    " PIP_CONSTRAINT=requirements.lock wherever requirements.txt is installed or"
-                    " pip install --require-hashes -r requirements.lock in its place (for"
-                    " requirements.lock itself, the install step alone)",
+                    "remove the line only once its limits apply elsewhere, as the engine's"
+                    " docs/ADOPTER-CI.md, Job 3, says: for any other file, pass -c FILE to every"
+                    " command that writes requirements.lock and keep it in the README's, and for"
+                    " any file, make every install of requirements.txt apply the lock, with"
+                    " PIP_CONSTRAINT=requirements.lock for that command only or pip install"
+                    " --require-hashes -r requirements.lock in its place, using a lock that covers"
+                    " that install's platform",
                 )
             )
         continue
