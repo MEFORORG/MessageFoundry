@@ -8740,7 +8740,8 @@ def create_app(
         def __init__(self) -> None:
             super().__init__(
                 503,
-                "the store's key service did not answer, so nothing was read, stored or removed. "
+                "the store's key service could not complete the request, so nothing was read, "
+                "stored or removed. "
                 "Try again shortly",
                 headers={"Retry-After": str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)},
             )

@@ -293,6 +293,10 @@ def is_vault_bad_request(exc: BaseException) -> bool:
 #: #3734). Named rather than imported, so this module adds no ``ssl`` use to the crypto inventory.
 _TLS_SESSION_DROPS = ("SSLEOFError", "SSLZeroReturnError")
 
+#: urllib3's text for a CONNECT the proxy answered with a status other than 200. A 4xx there (a 407
+#: or a 403) is the proxy refusing the engine; a 5xx is the proxy unable to reach Vault.
+_TUNNEL_STATUS = re.compile(r"Tunnel connection failed: (\d{3})")
+
 
 def is_vault_unavailable(exc: BaseException) -> bool:
     """Whether ``exc`` says Vault could not serve the request, so a later try may succeed (BACKLOG
@@ -304,7 +308,8 @@ def is_vault_unavailable(exc: BaseException) -> bool:
     standby node answers 503). False for everything else, at least a 400 (a value whose tag Transit
     refused), a 403, a 404, any other status hvac raises as ``UnexpectedError`` (a 504 among them),
     any other TLS failure (a certificate the hop refuses) wherever it sits in the chain, a proxy
-    error (a 407 among them), and a refusal of the hop or of its reply.
+    that answered the tunnel with a 4xx (a 407 among them), and a refusal of the hop or of its
+    reply.
     A connection error that carries such a refusal anywhere in its chain is a refusal too: the
     strict reply adapter wraps a reply head it would not read in one. A refusal keeps the 423 it
     had before this split, which is the safe side of a wrong guess."""
@@ -334,12 +339,15 @@ def is_vault_unavailable(exc: BaseException) -> bool:
         return True  # bounded_read documents it as a connection cut mid-body, transient
     if not isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
         return False
-    if isinstance(exc, requests.exceptions.ProxyError):
-        return False  # a proxy that refuses the engine (a 407 among them) refuses it again
     try:
         chain = list(exception_chain(exc))
     except ExceptionChainTooLong:
         return False
+    if isinstance(exc, requests.exceptions.ProxyError) and any(
+        (status := _TUNNEL_STATUS.search(str(link))) is not None and status[1].startswith("4")
+        for link in chain
+    ):
+        return False  # the proxy refused the engine (a 407 or a 403), and will again
 
     def dropped(link: BaseException) -> bool:
         return any(is_ssl_error(link, name) for name in _TLS_SESSION_DROPS)

@@ -233,9 +233,9 @@ UPLOADS_UNAVAILABLE_NOTICE = (
 #: (BACKLOG #3734). The no-store 503 above carries no ``Retry-After``, which is how the two are told
 #: apart. One text serves browse, resend and delete, so it names no single action.
 KEY_SERVICE_BUSY_NOTICE = (
-    "That request did not complete, and nothing was opened, injected or removed. The engine could "
-    "not reach the service that holds the store's encryption key. Try again in a moment. If it "
-    "keeps happening, an administrator should check that service."
+    "That request did not complete, and nothing was opened, injected or removed. The service that "
+    "holds the store's encryption key could not complete it. Try again in a moment. If it keeps "
+    "happening, an administrator should check that service."
 )
 
 #: The allow-list itself: an EXACT-match lookup from code to fixed module text. ``e`` is compared, never

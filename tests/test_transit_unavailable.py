@@ -89,6 +89,11 @@ _OUTAGES: list[Exception] = [
     # A reply cut off mid-body: bare, as the strict adapter lets it out, and wrapped.
     _cut_off(),
     requests.exceptions.ConnectionError(_cut_off()),
+    # A proxy that cannot reach Vault, or cannot be reached, is an outage on a proxied hop.
+    requests.exceptions.ProxyError(
+        "Unable to connect to proxy", OSError("Tunnel connection failed: 503 Service Unavailable")
+    ),
+    requests.exceptions.ProxyError("Unable to connect to proxy", OSError("connection refused")),
     requests.exceptions.ConnectTimeout("connect timed out"),
     requests.exceptions.ReadTimeout("read timed out"),
     VaultDown("Vault is sealed"),
@@ -106,7 +111,10 @@ _REFUSALS: list[Exception] = [
     requests.exceptions.ConnectionError(ssl.SSLError(1, "bad record mac")),
     requests.exceptions.ConnectionError(ssl.SSLCertVerificationError(1, "verify failed")),
     # A proxy that refuses the engine refuses it again.
-    requests.exceptions.ProxyError("Unable to connect to proxy", OSError("407 Proxy Auth")),
+    requests.exceptions.ProxyError(
+        "Unable to connect to proxy",
+        OSError("Tunnel connection failed: 407 Proxy Authentication Required"),
+    ),
     # A dropped session or a cut-off reply beside a refusal is still a refusal.
     _tls_error(ssl.SSLEOFError(8, "EOF"), VaultHopRefused("store: the Vault hop is refused")),
     requests.exceptions.ConnectionError(

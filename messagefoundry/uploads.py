@@ -1033,9 +1033,13 @@ class UploadStore:
             try:
                 out.append(self._decrypt_meta(entry.read_text(encoding="utf-8"), fid))
             except CipherError as exc:
-                if outage_raises and isinstance(exc, CipherUnavailableError):
+                if isinstance(exc, CipherUnavailableError):
                     # A count with a sidecar it could not read is not a count (BACKLOG #3734).
-                    raise UploadUnavailableError(str(exc)) from exc
+                    if outage_raises:
+                        raise UploadUnavailableError(str(exc)) from exc
+                    # Its own line, so an outage never reads as the refusal logged below.
+                    _log.warning("uploaded-file sidecar %s: key service unavailable: %s", fid, exc)
+                    continue
                 # The cipher declined the value: a wrong/rotated-away key, a blob relocated into
                 # another cell, or the refusal of an unmarked (legacy, planted or downgraded)
                 # sidecar. Named on its own so these can be told apart from a damaged file.
