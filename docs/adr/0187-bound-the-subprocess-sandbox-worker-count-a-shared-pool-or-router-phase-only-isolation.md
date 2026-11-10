@@ -346,7 +346,8 @@ for the build, open to the build's own review.
 
 ## Amendment B (2026-11-09) -- a refused request keeps its worker, and a kill records its cause
 
-The Context section above describes `main` before vault BACKLOG #3135, and is kept as written. Since
+The Context section above describes `main` before vault BACKLOG #3135, and is kept as written apart
+from one added pointer to this amendment, at the end of its paragraph on what a fault kills. Since
 #3135:
 
 - **A request the codec refuses, or one over the frame cap, no longer kills the worker.** It is

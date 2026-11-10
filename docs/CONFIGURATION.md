@@ -1357,7 +1357,7 @@ with zero overhead**. `mode="subprocess"` runs each inbound's Router/Handler in 
 per-inbound worker child** (never a per-message fork), enforcing a forbidden-import guard
 (socket/store/crypto) and the resource caps below. An isolation denial (forbidden op, cap overrun,
 worker crash, an invalid or forged answer) routes the message to `ERROR`/dead-letter **post-ACK** (no
-NAK, never dropped). Two cases differ (vault BACKLOG #3135). A request the codec refuses, or one over
+NAK, never dropped). At least two cases differ (vault BACKLOG #3135). A request the codec refuses, or one over
 the frame cap, dead-letters only that message and keeps the worker, since no byte of it was written. A
 stray frame found waiting **before** a request kills the worker and retries the message once on a fresh
 one (owner ruling 2026-11-09). It dead-letters if the fresh worker has a stray frame waiting too, or
