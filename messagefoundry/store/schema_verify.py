@@ -347,8 +347,8 @@ async def verify_live_schema(
 #: by recreating the store, so the code alone is not enough. An expected name held by an object of
 #: another kind is not "already exists": SQLite names the kind, or refuses the index or ALTER the
 #: script or a migration then runs on it (BACKLOG #6720; the texts are measured in
-#: tests/test_schema_verify_6719_6720.py). "no such module" is left out: it is also what a local
-#: SQLite built without a module says.
+#: tests/test_schema_verify_6719_6720.py). "no such module" names a virtual table in the file:
+#: this build creates none, which that test file pins, so the module is never this build's own.
 _SHAPE_MESSAGES = (
     "no such column",
     "no such table",
@@ -362,6 +362,7 @@ _SHAPE_MESSAGES = (
     "Cannot add a column to a view",
     "virtual tables may not be altered",
     "because it is a view",
+    "no such module",
 )
 
 
@@ -428,8 +429,10 @@ async def _counts_under_a_dek(db: aiosqlite.Connection) -> bool:
         async with db.execute("SELECT EXISTS (SELECT 1 FROM store_salt)") as cur:
             salted = await cur.fetchone()
     except sqlite3.OperationalError as exc:
-        if "no such table" in str(exc):
-            return True  # no salt table: this file never had a salt minted
+        if "no such table" in str(exc) or "no such module" in str(exc):
+            # No salt table, or a virtual table under its name that this build never creates
+            # (BACKLOG #6719): either way this file never had a salt minted.
+            return True
         # Anything else (a busy or unreadable file) answers nothing about the salt: say so, and
         # fall back to the plain remedy, as an unreadable count does above.
         log.warning("could not read store_salt to pick the schema remedy: %s", exc)

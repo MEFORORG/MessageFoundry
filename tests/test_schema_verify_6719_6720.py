@@ -4,7 +4,7 @@
 
 #6719: the index read skipped virtual tables, but the table and column reads did not, so a virtual
 table whose module this process does not load made the check raise "no such module" instead of
-reporting a difference.
+reporting a difference. The same text from a schema step or the read-only load is now a refusal too.
 
 #6720: an expected name held by an object of another kind (an index, a table or a view) fails the
 schema script or a migration with a SQLite message the step-error test did not know, so the failure
@@ -105,6 +105,50 @@ async def test_an_expected_table_held_by_an_unloaded_virtual_table_is_reported(
         await _fresh(path)
 
 
+async def test_an_unindexed_expected_table_held_by_an_unloaded_virtual_table_is_refused(
+    tmp_path: Path,
+) -> None:
+    # The script indexes nothing on users, so the first step to touch it is a migration's pragma,
+    # which fails on the module rather than on an index.
+    path = tmp_path / "users.db"
+    await _fresh(path)
+    _sql(path, "DROP TABLE users")
+    _plant_unloaded_virtual_table(path, "users")
+    with pytest.raises(SchemaMismatchError) as info:
+        await _fresh(path)
+    assert str(info.value).startswith(f"store {path} is from an incompatible version; recreate it:")
+    assert info.value.cause is not None and "no such module" in info.value.cause
+
+
+async def test_the_read_only_open_refuses_an_audit_log_held_by_an_unloaded_virtual_table(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "ro.db"
+    await _fresh(path)
+    _sql(path, "DROP TABLE audit_log")
+    _plant_unloaded_virtual_table(path, "audit_log")
+    with pytest.raises(
+        SchemaMismatchError, match="opened read-only and lacks what this build reads"
+    ):
+        await (await MessageStore.open(path, read_only=True)).close()
+
+
+async def test_a_counted_store_whose_salt_table_is_virtual_gets_the_new_key_remedy(
+    tmp_path: Path,
+) -> None:
+    from messagefoundry.store.schema_verify import _counts_under_a_dek
+
+    path = tmp_path / "counted.db"
+    _sql(
+        path,
+        "CREATE TABLE cipher_meta (key_id TEXT, invocations INTEGER)",
+        "INSERT INTO cipher_meta VALUES ('k', 1)",
+    )
+    _plant_unloaded_virtual_table(path, "store_salt")
+    async with _connected(path) as db:
+        assert await _counts_under_a_dek(db) is True
+
+
 async def test_the_expected_shape_holds_no_virtual_table() -> None:
     # The reads skip virtual tables, so one this build created would never be verified. Adding one
     # must fail here until the check learns to compare it.
@@ -185,9 +229,9 @@ def test_a_name_held_by_another_kind_of_object_is_a_schema_step_error(
     assert is_schema_step_error(info.value), str(info.value)
 
 
-def test_no_such_module_stays_its_own_error(tmp_path: Path) -> None:
-    # A local SQLite built without a module says the same thing, and recreating the store fixes that
-    # nothing, so this message keeps its own error.
+def test_no_such_module_is_a_schema_step_error(tmp_path: Path) -> None:
+    # This build creates no virtual table (pinned above), so a module the open cannot find belongs
+    # to an object some other tool left in the file.
     path = tmp_path / "module.db"
     _plant_unloaded_virtual_table(path, "vt")
     conn = sqlite3.connect(path)
@@ -197,7 +241,8 @@ def test_no_such_module_stays_its_own_error(tmp_path: Path) -> None:
     finally:
         conn.close()
     assert "no such module" in str(info.value)
-    assert not is_schema_step_error(info.value)
+    assert info.value.sqlite_errorcode & 0xFF == sqlite3.SQLITE_ERROR
+    assert is_schema_step_error(info.value)
 
 
 @pytest.mark.parametrize(
