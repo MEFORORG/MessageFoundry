@@ -4,8 +4,9 @@
 
 ``make_spec`` keeps a needle exactly as given (only an all-whitespace value counts as not sent),
 refuses a ``field_value`` sent beside ``content`` rather than dropping it unread, and refuses a
-``scan_limit`` that is not an ``int`` with :class:`ContentSearchError` (the type every caller maps to
-a 400) instead of coercing it or leaking a bare ``ValueError``/``TypeError``. The clamp stays a clamp.
+``scan_limit`` that is not an ``int`` with :class:`ContentSearchError` (the type the search routes
+catch for a 400) instead of coercing it or leaking a bare ``ValueError``/``TypeError``. The clamp
+stays a clamp.
 
 ``newest_first`` breaks equal timestamps on the id in code-point order; the test pins the premise
 that makes that agree with each backend's ``ORDER BY ... id DESC``: every message id is 32 lowercase
@@ -25,6 +26,8 @@ from messagefoundry.api.validation import RESOURCE_ID_PATTERN
 from messagefoundry.store.content_search import (
     MAX_SCAN_LIMIT,
     ContentSearchError,
+    SearchSpec,
+    SearchTarget,
     make_spec,
     newest_first,
     row_matches,
@@ -42,6 +45,11 @@ def test_a_content_needle_keeps_its_leading_and_trailing_spaces() -> None:
     spec = make_spec(content=" DOE", field_path=None, field_value=None)
     assert spec.substring == " DOE"
     assert row_matches(spec, raw=ADT, summary=None) is False
+    trailing = make_spec(content="DOE ", field_path=None, field_value=None)
+    assert trailing.substring == "DOE "
+    assert (
+        row_matches(trailing, raw=ADT, summary=None) is False
+    )  # JDOE is followed by ^, not a space
     assert row_matches(
         make_spec(content="DOE", field_path=None, field_value=None), raw=ADT, summary=None
     )
@@ -51,6 +59,8 @@ def test_a_field_value_keeps_its_spaces() -> None:
     spec = make_spec(content=None, field_path="PID-5.1", field_value=" DOE")
     assert spec.field_value == " DOE"
     assert row_matches(spec, raw=ADT, summary=None) is False
+    control = make_spec(content=None, field_path="PID-5.1", field_value="DOE")
+    assert row_matches(control, raw=ADT, summary=None) is True  # the path does resolve
 
 
 def test_an_all_whitespace_value_still_counts_as_not_sent() -> None:
@@ -133,5 +143,29 @@ def test_newest_first_tie_order_matches_a_case_insensitive_sql_order() -> None:
                 )
             ]
             assert ours == sql_order, collation
+        # Control: the NOCASE leg can tell the orders apart. On ids that differ in case, code-point
+        # order puts "B..." below "a..." and NOCASE puts it above, so the premise is what agrees.
+        mixed = [{"id": "a" * 32, "received_at": 1.0}, {"id": "B" * 32, "received_at": 1.0}]
+        db.executemany("INSERT INTO m VALUES (:id, :received_at)", mixed)
+        nocase = [
+            r[0]
+            for r in db.execute(
+                "SELECT id FROM m WHERE received_at = 1.0 ORDER BY id COLLATE NOCASE DESC"
+            )
+        ]
+        assert [r["id"] for r in newest_first(mixed)] != nocase
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("bad", [True, "5"])
+def test_a_spec_built_outside_make_spec_refuses_a_non_int_cap(bad: Any) -> None:
+    """``True == 1`` passes the range check, so ``SearchSpec`` refuses a non-int by type (#6700)."""
+    with pytest.raises(ValueError, match="scan_limit must be an int"):
+        SearchSpec(
+            substring="x",
+            field_path=None,
+            field_value=None,
+            target=SearchTarget.BOTH,
+            scan_limit=bad,
+        )

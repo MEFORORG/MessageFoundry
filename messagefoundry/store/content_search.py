@@ -61,6 +61,9 @@ class SearchSpec:
     def __post_init__(self) -> None:
         # make_spec clamps; a spec built any other way must already be in range, or SQLite would take
         # `LIMIT 0` / `LIMIT -1` (no limit at all) from fetch_limit and the cap would vanish (#2068).
+        # A bool passes the range check (True == 1), so it is refused by type first (#6700).
+        if isinstance(self.scan_limit, bool) or not isinstance(self.scan_limit, int):
+            raise ValueError(f"scan_limit must be an int, not {type(self.scan_limit).__name__}")
         if not 1 <= self.scan_limit <= MAX_SCAN_LIMIT:
             raise ValueError(f"scan_limit must be in [1, {MAX_SCAN_LIMIT}], got {self.scan_limit}")
 
@@ -86,7 +89,8 @@ def newest_first(rows: Iterable[Any]) -> list[Any]:
 
 
 class ContentSearchError(ValueError):
-    """A malformed content-search request (empty needle, both/neither needle kinds, bad field path)."""
+    """A malformed content-search request: at least an empty needle, both or neither needle kinds, a
+    ``field_value`` beside a content substring, a bad field path, or a ``scan_limit`` not an ``int``."""
 
 
 def _sent(value: str | None) -> str | None:
