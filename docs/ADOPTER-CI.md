@@ -218,10 +218,13 @@ that package's build code may run in CI:
     or pins it only under a marker false on the Windows runner, or at a version the requirement's
     specifier does not allow. The step copies pip 26's line handling (continuation lines, comments,
     options) and expands `${VAR}`, but not as pip does: it expands each `${VAR}` the line names
-    once, in one pass, while pip replaces them one after another, so pip also expands a `${VAR}`
-    that a variable's value brings in when the line names that variable later. On such a line the
-    step and pip can read different options, and a line pip follows as an include or a constraint
-    can pass the step. The step parses each requirement with the `packaging` copy pip
+    once, in one pass, while pip replaces them one after another, so pip can also expand a
+    `${VAR}` that a variable's value brings in, whole or in part, when the line names that variable
+    later. On such a line the step can read different text from pip, in the requirement or in its
+    options. At least two results follow: a line pip follows as an include or a constraint can
+    pass the step, and a requirement whose marker pip reads as true can be only noted as false on
+    the runner, so pip installs a package the step did not check against the lock. The step
+    parses each requirement with the `packaging` copy pip
     carries, so versions compare as pip compares them, and reads a line of options with no
     requirement with pip's own parser. A requirement whose marker is false on the runner, an extra
     (a lock records none), a URL or path with no package name, and an editable line (`-e` or
@@ -241,7 +244,7 @@ that package's build code may run in CI:
       lock, so it cannot see a limit a regeneration dropped.
     - The install. Every `pip install -r requirements.txt` reads the line too: at least the `check`
       job, step 1 of the README's "Use it", the VS Code extension's "Set Up Python Environment"
-      command, and each deploying host's install. Once it is gone
+      command in the layout below, and each deploying host's install. Once it is gone
       those installs resolve live, with none of its limits, unless each passes `-c <file>` itself
       or applies the lock. To apply the lock, set `PIP_CONSTRAINT=requirements.lock` for that
       command only, or install with `pip install --require-hashes -r requirements.lock` in its
@@ -257,15 +260,20 @@ that package's build code may run in CI:
       The extension's command applies the lock in neither way either: in a repository
       with both `requirements.txt` and `requirements-dev.txt` and no `pyproject.toml`, it runs
       `pip install -r requirements.txt -r requirements-dev.txt` as one command that passes no
-      `-c` and names no lock, and it has no setting that adds either. On a machine whose
-      environment that command sets up, the line is what carries its limits to that install, so
-      keep the line for as long as anyone sets up an environment that way.
+      `-c` and names no lock, and it has no setting that adds either. In any other layout it
+      installs something else and does not read the line. On a machine whose environment that
+      command sets up, a constraints file with no hashes reaches that install through the line,
+      so keep the line for as long as anyone sets up an environment that way. A constraints file
+      with hashes, `requirements.lock` among them, turns on hash checking for that whole command,
+      and pip 26 refuses it while `requirements-dev.txt` holds a pin with no hash, as the
+      scaffolded one does.
 
     A `-c requirements.lock` line is refused too, and only the install step applies to it: do not
     pass the lock to the command that writes it. Removing the line is safe only once every install
     applies the lock as above. While it is there, it also limits each regeneration to the lock's
     own pins, so a requirement moved off its locked version cannot resolve until the line is gone.
-  - The job takes the engine's pin out of the lock, as pip reads the lock, and installs that pin
+  - The job takes the engine's pin out of the lock, reading it as the stale-lock step reads
+    `requirements.txt` (`${VAR}` expansion included, as above), and installs that pin
     alone with `--no-deps --require-hashes`. The lock must pin `messagefoundry` exactly once, or the
     job says so and fails; pip refuses the pin if it carries no hash. No other locked package is
     installed into the interpreter that runs the auditor, pip and `pip-audit`, so no other locked

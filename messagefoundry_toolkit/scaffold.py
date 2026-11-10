@@ -346,8 +346,9 @@ jobs:
       # audit the closure the old file named, while CI and your deployment install the new one. Each
       # requirement in requirements.txt whose marker holds on this Windows runner must be in the
       # lock, under a marker that holds here too, at a version its specifier allows, compared as pip
-      # compares versions. The packaging copy pip carries parses each requirement, after a copy of
-      # pip's line handling, and pip's own parser reads a line of options with no requirement. A
+      # compares versions. The packaging copy pip carries parses each requirement, after this
+      # step's version of pip's line handling, whose ${VAR} expansion is not pip's (split_line
+      # below says how), and pip's own parser reads a line of options with no requirement. A
       # marker false here, an extra, a URL or path with no name, and an editable line (-e or
       # --editable, abbreviated or attached as pip allows) are only noted: the lock records no
       # extras, an unnamed URL has no name to look up, and an editable installs a source tree or
@@ -452,11 +453,12 @@ def split_line(group):
     # A logical line's requirement text and its options, after this script's version of pip 26's
     # line handling: join_lines (a continued line loses its backslashes and joins with nothing, a
     # file's last line included, and a comment joins after a space), the comment strip, ${VAR}
-    # expansion and break_args_options (options start at the first word beginning with "-"). The
-    # expansion is not pip's: it expands each ${VAR} once, in one pass, where pip replaces them in
-    # turn and so also expands a ${VAR} a value brings in when the line names that variable later.
-    # Then the line before expansion, for a message that echoes it, so a value kept out of the file, such as a
-    # token in a URL, stays out of the log. pip leaves an unset or empty variable as written.
+    # expansion and break_args_options (options start at the first word beginning with "-"). Then
+    # the line before expansion, for a message that echoes it, so a value kept out of the file,
+    # such as a token in a URL, stays out of the log. pip leaves an unset or empty variable as
+    # written. The expansion is not pip's: this expands each ${VAR} once, in one pass, while pip
+    # replaces them in turn, so pip can also expand a ${VAR} that a value brings in, whole or in
+    # part, when the line names that variable later.
     joined = "".join(
         ln.strip("\\") if continued(ln) else f" {ln}" if comment(ln) else ln for ln in group
     )
@@ -567,7 +569,8 @@ for group in logical_lines("requirements.txt"):
                     " docs/ADOPTER-CI.md, Job 3, says: for a file other than requirements.lock,"
                     " pass -c FILE to every command that writes requirements.lock and keep it in"
                     " the README's, and for any file, make every install of requirements.txt"
-                    " apply the lock, with"
+                    " apply the lock (Job 3 names one that never does, the VS Code extension's"
+                    " setup, so keep the line where it runs), with"
                     " PIP_CONSTRAINT=requirements.lock for that command only or pip install"
                     " --require-hashes -r requirements.lock in its place, using a lock that covers"
                     " that install's platform",
