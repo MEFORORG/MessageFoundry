@@ -576,24 +576,46 @@ async def test_the_coordinator_claim_runs_under_its_renew_clamp_end_to_end() -> 
     assert conn.raw.timeout == 30
 
 
-async def test_the_paused_owner_read_is_not_clamped() -> None:
-    """The paused tick's owner read is out of the clamp's scope: it keeps its own BACKLOG #2540 bound."""
-    calls: list[str] = []
+async def test_the_paused_owner_read_is_clamped_at_the_smaller_of_clamp_and_budget() -> None:
+    """The paused tick's owner read reaches the driver clamped, like the tick's other statements
+    (BACKLOG #5064), at the smaller of the renew clamp and its own BACKLOG #2540 budget. Before,
+    it went through the plain ``_fetchone`` and was bounded on the event loop alone."""
+    clamps: list[float] = []
 
     class _Store:
         async def _fetchone(self, sql: str, params: tuple[object, ...]) -> dict[str, object]:
-            calls.append("plain")
-            return {"owner": "A"}
+            raise AssertionError("the paused read must be clamped at the driver")
 
         async def _fetchone_clamped(
             self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
         ) -> dict[str, object]:
-            raise AssertionError("a paused node must not send the claim")
+            assert sql.startswith("SELECT owner"), "a paused node must not send the claim"
+            clamps.append(timeout_clamp)
+            return {"owner": "A"}
 
     coord = SqlServerCoordinator(_Store(), "A", monotonic=lambda: 0.0)
     coord._no_claim_until = 10.0
     assert await coord._claim_or_renew_lease() is False
-    assert calls == ["plain"]
+    assert clamps == [min(coord._renew_timeout, coord._paused_read_budget)]
+
+
+async def test_a_stalled_paused_owner_read_ends_at_the_driver_not_at_command_timeout() -> None:
+    """Over the real store seam: a paused read the server never answers is ended by the driver's
+    clamped statement timeout, not by [store].command_timeout (30 s here, which the fake would
+    sleep out), and well inside the event-loop budget, which stays as the backstop."""
+    conn = _Conn()
+    conn.stalls = True
+    coord = SqlServerCoordinator(
+        _store(conn), "A", lease_renew_timeout_seconds=1.0, monotonic=lambda: 0.0
+    )
+    coord._no_claim_until = 10.0
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="HYT00"):
+        await coord._claim_or_renew_lease()
+    assert time.monotonic() - started < 2.0
+    assert conn.statement_timeouts == [1]
+    assert conn.raw.timeout == 30
+    assert not coord._leadership_lock.locked()
 
 
 # --- the two-times bound, and the loop's other statements (BACKLOG #5064, #6472) -----------
@@ -693,6 +715,56 @@ async def test_the_lease_release_is_bounded_at_the_driver(
     assert (was_leader, wrote) == (True, True)
     assert conn.statement_timeouts == [expected]
     assert conn.raw.timeout == 30
+
+
+class _FailingReleasePool(_Pool):
+    """A pool whose release raises after the write committed."""
+
+    async def release(self, conn: _Conn) -> None:
+        raise RuntimeError("pool release failed")
+
+
+@pytest.mark.parametrize("clamp", [None, 3.25])
+async def test_a_failed_pool_release_after_a_committed_write_keeps_its_row_count(
+    clamp: float | None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A write that committed returns its row count when only the pool release then fails, as
+    cluster._call_within does on Postgres, and the release fault is logged (BACKLOG #5064). Before,
+    the release error replaced the count, so a stepdown's landed release read as
+    ``503 release-unconfirmed``; origin/main's ``_execute`` behaved the same way."""
+
+    class _CountingCursor(_Cursor):
+        rowcount = 1
+
+    class _CountingConn(_Conn):
+        async def cursor(self) -> _Cursor:
+            return _CountingCursor(self)
+
+    conn = _CountingConn()
+    store = _store(conn)
+    store._pool = _FailingReleasePool(conn)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.store.sqlserver"):
+        if clamp is None:
+            rows = await store._execute("UPDATE leader_lease SET owner = ?", ("A",))
+        else:
+            rows = await store._execute_clamped(
+                "UPDATE leader_lease SET owner = ?", ("A",), timeout_clamp=clamp
+            )
+    assert rows == 1
+    assert conn.rolled_back == 0
+    assert any("pool release failed" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_failed_write_still_raises_when_its_pool_release_also_fails() -> None:
+    """Control: a write that did NOT commit is never reported as landed because the release failed
+    afterwards; the error still reaches the caller."""
+    conn = _Conn()
+    conn.fail = RuntimeError("the write failed")
+    store = _store(conn)
+    store._pool = _FailingReleasePool(conn)
+    with pytest.raises(RuntimeError):
+        await store._execute_clamped("UPDATE nodes SET status = ?", ("x",), timeout_clamp=3.0)
+    assert conn.rolled_back == 1
 
 
 async def test_the_unclamped_write_is_unchanged() -> None:

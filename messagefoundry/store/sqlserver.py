@@ -86,7 +86,7 @@ from messagefoundry.odbc_call_gate import raw_cursor as _raw_cursor
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
-from messagefoundry.redaction import codec_safe_str, safe_text
+from messagefoundry.redaction import codec_safe_str, safe_exc, safe_text
 from messagefoundry.store import server_schema_verify
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
@@ -5953,25 +5953,44 @@ class SqlServerStore:
         self, sql: str, params: tuple[Any, ...], timeout_clamp: float | None = None
     ) -> int:
         """The body of :meth:`_execute` and :meth:`_execute_clamped`; :meth:`_clamp_bounds` says
-        what ``timeout_clamp`` sets."""
+        what ``timeout_clamp`` sets.
+
+        A failure of the pool release alone, after the write committed, is logged and the row count
+        returned, as ``cluster._call_within`` does on Postgres: reporting that write as failed would
+        tell the cluster stepdown its release is unconfirmed when it landed (BACKLOG #5064). Before
+        #5064, :meth:`_execute` lost the count the same way."""
         borrow, statement_timeout, floored_clamp = self._clamp_bounds(timeout_clamp)
-        async with borrow as conn:
-            try:
-                async with (
-                    self._statement_timeout(conn, statement_timeout),
-                    self._cursor(conn) as cur,
-                ):
-                    await cur.execute(sql, params)
-                    # getattr: some test cursors model no row count, and -1 is the DB-API 'unknown'.
-                    count = getattr(cur, "rowcount", -1)
-                    rows = count if isinstance(count, int) else -1
-                    await self._commit(conn)
-            except Exception:
-                # A rollback that fails would otherwise recycle a connection still holding the
-                # write's X locks; _rollback_or_discard discards it instead. After the cursor block,
-                # so a detached close cannot race the cursor's own close.
-                await self._rollback_or_discard(conn, within=floored_clamp)
+        committed: int | None = None
+        try:
+            async with borrow as conn:
+                try:
+                    async with (
+                        self._statement_timeout(conn, statement_timeout),
+                        self._cursor(conn) as cur,
+                    ):
+                        await cur.execute(sql, params)
+                        # getattr: some test cursors model no row count, and -1 is the DB-API
+                        # 'unknown'.
+                        count = getattr(cur, "rowcount", -1)
+                        rows = count if isinstance(count, int) else -1
+                        await self._commit(conn)
+                except Exception:
+                    # A rollback that fails would otherwise recycle a connection still holding the
+                    # write's X locks; _rollback_or_discard discards it instead. After the cursor
+                    # block, so a detached close cannot race the cursor's own close.
+                    await self._rollback_or_discard(conn, within=floored_clamp)
+                    raise
+                # Set only once the body finished cleanly, so an exception past here is the borrow's
+                # exit, the pool release, and never the write itself.
+                committed = rows
+        except Exception as exc:
+            if committed is None:
                 raise
+            log.warning(
+                "sqlserver store: a write committed, then its pool release failed: %s",
+                safe_exc(exc),
+            )
+            return committed
         return rows
 
     async def _execute_output(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
