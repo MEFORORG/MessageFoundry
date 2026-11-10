@@ -603,8 +603,8 @@ function Get-DecisionOutcome($Record, [hashtable]$Outcomes) {
 # STICKY: once logged it counts, and no later outcome cancels it.
 $script:DecisionSignalOutcomes = @('red-after-merge', 'held')
 # A PR close is the T1 undo, so closed, abandoned and withdrawn are reversals too (Manager
-# decision 2026-11-09, plan section 12).
-$script:DecisionReversalOutcomes = @('reversed', 'reopened', 'rebriefed', 're-briefed', 'overridden', 'closed', 'abandoned', 'withdrawn')
+# decision 2026-11-09, plan section 12), and so are the other words a close is logged under.
+$script:DecisionReversalOutcomes = @('reversed', 'reopened', 'rebriefed', 're-briefed', 'overridden', 'closed', 'abandoned', 'withdrawn', 'cancelled', 'canceled', 'superseded', 'rejected', 'discarded')
 # The status outcomes that are a result, an allowlist: any other status, a typo included, is not
 # one. A status counts only from a later `outcome` record, never from the decision's own log-time
 # -Outcome, which is written before the act exists.
@@ -759,8 +759,9 @@ function Get-DecisionCalibration {
 # messagefoundry/parsing/ is eligible (Manager decision 2026-11-09): every module there holds a
 # bound, a PHI-safe message, a ReDoS-pinned pattern or a hardening, or is pinned as one.
 $script:DecisionFastPathAllow = @(
-    # Not _core.py, which holds write_corpus's out-of-root refusal.
-    '^messagefoundry_toolkit/generators/(readme\.md|_hl7data\.py|(adt|all_types|bar|dft|documents|mdm|mfn|oml|orl|orm|oru|ras|rde|siu|vxu)\.py)$',
+    # Not _core.py, which holds write_corpus's out-of-root refusal, or adt.py, which withholds a
+    # failed message from stderr (docs/PHI.md section 7) and scopes its corpus cleanup.
+    '^messagefoundry_toolkit/generators/(readme\.md|_hl7data\.py|(all_types|bar|dft|documents|mdm|mfn|oml|orl|orm|oru|ras|rde|siu|vxu)\.py)$',
     '^messagefoundry_toolkit/hl7(schema|structures)\.py$',
     # Synthetic sample messages only: sample config carries connection, TLS and credential settings.
     '^samples/messages/[a-z0-9_.-]+\.hl7$',
@@ -768,9 +769,9 @@ $script:DecisionFastPathAllow = @(
     # exposure prose is never here.
     '^docs/(hl7-message-ordering-reference|message-ordering-design)\.md$',
     # Their tests, named one by one.
-    # Only tests a grep for guard, injection, refusal, PHI, bound, ReDoS and hardening words finds
-    # nothing in: not test_generators_core (an out-of-root refusal) or test_message (HL7 injection).
-    '^tests/test_(generate_cli|generated_adt|generators_(choice|types)|hl7schema)\.py$'
+    # Only tests that pin no control: not test_generators_core (an out-of-root refusal),
+    # test_message (HL7 injection) or test_generated_adt (the withheld message body).
+    '^tests/test_(generate_cli|generators_(choice|types)|hl7schema)\.py$'
 )
 
 function Get-DecisionPathKey([string]$Path) {
@@ -865,8 +866,8 @@ function Get-DecisionClassCPath([string]$Path) {
 
 function Get-DecisionReversals($Records) {
     <#
-      Each reversed decision once: an `outcome` record with a reversal word (`reversed`,
-      `reopened`, `rebriefed`, `re-briefed`, `overridden`), deduplicated by its ref, and the
+      Each reversed decision once: an `outcome` record with a reversal word
+      (DecisionReversalOutcomes), deduplicated by its ref, and the
       earliest such record is when it was reversed. A reversal is sticky: no later outcome cancels
       it (Manager decision 2026-11-09).
       Seat and Item are the DECISION's, joined through the ref, never the seat that logged the

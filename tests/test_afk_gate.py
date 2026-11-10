@@ -186,7 +186,7 @@ def _thresholds(sb: Sandbox) -> Path:
     return sb.state_path.parent / "thresholds.json"
 
 
-PLAIN = ("-Touches", "messagefoundry_toolkit/generators/adt.py")
+PLAIN = ("-Touches", "messagefoundry_toolkit/generators/oru.py")
 SID = "sess-test-0001"
 _BOXES: dict[str, str] = {}
 
@@ -212,11 +212,12 @@ def _box(sb: Sandbox) -> str:
     return _BOXES[key]
 
 
-def declare(sb: Sandbox, seat: str, sid: str = SID) -> None:
+def declare(sb: Sandbox, seat: str, sid: str = SID, source: str = "declared") -> None:
     """Write the seat record ``sid`` declared, where seat.ps1 writes it in the sandbox."""
     box = sb.coord / "seats" / _box(sb)
     box.mkdir(parents=True, exist_ok=True)
-    (box / f"{sid}.json").write_text(json.dumps({"seat": seat}), encoding="utf-8")
+    record = {"seat": seat, "seatSource": source}
+    (box / f"{sid}.json").write_text(json.dumps(record), encoding="utf-8")
 
 
 def gate(
@@ -273,7 +274,7 @@ def test_the_declared_seat_is_this_sessions_own_whatever_session_names(sb: Sandb
     seed_vault(sb, calibrated("manager"))
     declare(sb, "manager", sid="other-sess")
     code, doc = gate_touching(sb, PLAIN, "-Session", "other-sess", declared="no")
-    assert code == REVIEW and "no seat record names this session" in why(doc), why(doc)
+    assert code == REVIEW and "no seat record this session DECLARED" in why(doc), why(doc)
 
 
 def test_no_session_id_reviews(sb: Sandbox) -> None:
@@ -294,6 +295,23 @@ def test_the_special_seat_has_no_fast_path(sb: Sandbox) -> None:
     seed_vault(sb, calibrated("special"))
     code, doc = gate(sb, seat="special")
     assert code == REVIEW and "the Special seat" in why(doc), why(doc)
+
+
+def test_a_derived_seat_is_not_a_declaration(sb: Sandbox) -> None:
+    seed_vault(sb, calibrated("manager"))
+    declare(sb, "manager", source="derived:caller")
+    code, doc = gate_touching(sb, PLAIN, declared="no")
+    assert code == REVIEW and "no seat record this session DECLARED" in why(doc), why(doc)
+
+
+def test_an_owner_rating_logs_from_a_session_with_a_declared_seat(sb: Sandbox) -> None:
+    """digest.ps1 -Rate logs the owner's verdict as -Seat owner, which is no seat's label."""
+    declare(sb, "manager")
+    ref = rec()["id"]
+    proc = sb.run(
+        DECISION, "-Log", "-Kind", "rating", "-Seat", "owner", "-Ref", ref, "-Rating", "agree"
+    )
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
 
 
 def test_log_refuses_a_record_under_another_seats_label(sb: Sandbox) -> None:
@@ -350,9 +368,7 @@ def test_a_decisions_own_log_time_outcome_does_not_resolve_it(sb: Sandbox) -> No
     assert code == REVIEW and "resolved outcomes 0/20 BELOW FLOOR" in why(doc), why(doc)
 
 
-@pytest.mark.parametrize(
-    "status", ["deferred", "rejected", "pending.", "in-progress", "done", "kept"]
-)
+@pytest.mark.parametrize("status", ["deferred", "pending.", "in-progress", "done", "kept"])
 def test_a_status_off_the_resolved_list_does_not_resolve(sb: Sandbox, status: str) -> None:
     decided = [rec(at=ago(days=3, minutes=i), item=f"o{i}") for i in range(FLOOR)]
     later = [
@@ -427,9 +443,9 @@ def test_an_act_that_names_nothing_it_touches_reviews(sb: Sandbox) -> None:
     "path",
     [
         "samples/messages/adt_a01.hl7",
-        "messagefoundry_toolkit/generators/adt.py",
+        "messagefoundry_toolkit/generators/oru.py",
         "docs/MESSAGE-ORDERING-DESIGN.md",
-        "tests/test_generated_adt.py",
+        "tests/test_hl7schema.py",
     ],
 )
 def test_a_path_on_the_allowlist_may_take_the_fast_path(sb: Sandbox, path: str) -> None:
@@ -680,6 +696,8 @@ def test_an_alias_shares_its_seats_calibration(sb: Sandbox) -> None:
         "tests/test_generators_core.py",
         "messagefoundry_toolkit/generators/_core.py",
         "docs/STEPS-PALETTE.md",
+        "messagefoundry_toolkit/generators/adt.py",
+        "tests/test_generated_adt.py",
     ],
 )
 def test_a_class_c_or_unclassifiable_path_reviews(sb: Sandbox, path: str) -> None:
@@ -823,17 +841,17 @@ def test_the_json_answer_carries_the_paths_it_classified(sb: Sandbox) -> None:
     code, doc = gate(sb)
     assert code == NO_REVIEW, why(doc)
     assert sorted(doc["paths"]) == [
-        "messagefoundry_toolkit/generators/adt.py",
+        "messagefoundry_toolkit/generators/oru.py",
         "samples/messages/a.hl7",
     ]
 
 
 def test_a_deleted_test_reviews(sb: Sandbox) -> None:
     (sb.repo / "tests").mkdir()
-    (sb.repo / "tests" / "test_generated_adt.py").write_text("x = 1\n", encoding="utf-8")
+    (sb.repo / "tests" / "test_hl7schema.py").write_text("x = 1\n", encoding="utf-8")
     resync(sb)
     seed_vault(sb, calibrated("manager"))
-    (sb.repo / "tests" / "test_generated_adt.py").unlink()
+    (sb.repo / "tests" / "test_hl7schema.py").unlink()
     code, doc = gate(sb)
     assert code == REVIEW and "is a deleted test" in why(doc), why(doc)
 
@@ -858,6 +876,17 @@ def test_an_ignored_agent_or_environment_file_reviews(sb: Sandbox, ignored: str)
     target.write_text("x\n", encoding="utf-8")
     code, doc = gate(sb)
     assert code == REVIEW and "git-ignored" in why(doc), why(doc)
+
+
+def test_an_ignored_directory_reviews_whatever_it_holds(sb: Sandbox) -> None:
+    """git lists an ignored directory as one entry, so the files inside it are never classified."""
+    (sb.repo / ".gitignore").write_text("venv/\n", encoding="utf-8")
+    resync(sb)
+    seed_vault(sb, calibrated("manager"))
+    (sb.repo / "venv").mkdir()
+    (sb.repo / "venv" / "CLAUDE.md").write_text("x\n", encoding="utf-8")
+    code, doc = gate(sb)
+    assert code == REVIEW and "touches: 'venv/' is a git-ignored directory" in why(doc), why(doc)
 
 
 def test_the_hook_written_seat_files_do_not_close_the_path(sb: Sandbox) -> None:
@@ -1785,7 +1814,19 @@ def test_a_reversal_is_sticky_whatever_is_logged_after_it(sb: Sandbox) -> None:
 
 @pytest.mark.parametrize(
     "word",
-    ["reopened", "rebriefed", "re-briefed", "Overridden", "closed", "abandoned", "withdrawn"],
+    [
+        "reopened",
+        "rebriefed",
+        "re-briefed",
+        "Overridden",
+        "closed",
+        "abandoned",
+        "withdrawn",
+        "cancelled",
+        "superseded",
+        "rejected",
+        "discarded",
+    ],
 )
 def test_every_reversal_word_is_a_reversal(sb: Sandbox, word: str) -> None:
     theirs = rec(at=ago(days=6), seat="builder", item="4242")

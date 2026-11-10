@@ -38,8 +38,10 @@
         REVIEW     exit 11  take the adversarial-review path first.
         HALT       exit 12  do not act; defer. The cost rung is hit.
     The conditions NO-REVIEW needs are docs/AUTONOMY-PLAN.md R4 and section 12, stated there once;
-    this header does not restate them. What the gate itself reads, in order: that -Seat agrees with
-    the seat this session declared, where it declared one; the cost rung (plan 4.7); a seat given;
+    this header does not restate them. What the gate itself reads, in order: the cost rung (plan
+    4.7), the Lander exempt from it only where its declared seat is the Lander; that a -Seat was
+    given or found, and that it is the seat CLAUDE_CODE_SESSION_ID's own record DECLARED (a derived
+    seat, a missing id or a -Session naming another record answers REVIEW); that it is not Special;
     that it runs in a checkout whose origin is MEFORORG/MessageFoundry; the paths the act touches,
     which it derives itself from git (the branch's diff against refs/remotes/origin/main, the
     working-tree and staged changes, and untracked files) joined with any -Touches (relative paths,
@@ -50,7 +52,8 @@
     reversal on the item; the reversal budgets (plan 4.5); and the chain (plan 4.6, below). A
     NO-REVIEW lists on stderr the conditions it did not check. The derived paths are the checkout's
     state when the gate runs, not the act's: an act made afterwards, outside git, in an ignored file
-    (an ignored path under .claude/ or any .env* is refused, as is a deleted test), or in another
+    (an ignored directory, or an ignored file Get-DecisionClassCPath names or cannot classify, is
+    refused, as is a deleted test; ignored files are not held to the allowlist), or in another
     checkout is not in them, so the session names in -Touches every path the act will
     change. -Json and the -Log record carry the paths the gate classified.
     IT FAILS CLOSED. No exit code but 10 is NO-REVIEW, so a crash (1), a usage error (2) or anything
@@ -85,8 +88,8 @@
     KINDS. `decision` is one Class A to D decision. `tripwire` is a tripwire hit. `rating` is the
     owner's blind-sample verdict on a decision (-Ref, -Rating). `outcome` updates a decision's
     outcome later (-Ref, -Outcome), and `-Outcome reversed` is what the digest counts as a reversal:
-    a revert, a reopen, a re-brief or an override; `reopened`, `rebriefed`, `re-briefed` and
-    `overridden` count the same. A reversal, a `red-after-merge` and a `held` are sticky: no later
+    a revert, a reopen, a re-brief, an override or a close; every word in _decisionlog.ps1
+    DecisionReversalOutcomes counts the same. A reversal, a `red-after-merge` and a `held` are sticky: no later
     outcome cancels one.
 
     THE FIELDS ARE ADR 0211's SCHEMA. -Predicate takes `name=evidence` strings, the predicates this
@@ -97,21 +100,24 @@
     each -Predicate and -Alternative value is also split at newlines: one argument may carry
     several, one per line. Called in-process (`& decision.ps1`), an array works as well.
 
-    The seat defaults to the one this session declared in the seat registry, found by its session
-    id; the session id defaults to $env:CLAUDE_CODE_SESSION_ID. Only this worktree's two boxes and
+    The seat defaults to the one this session declared in the seat registry, found by
+    $env:CLAUDE_CODE_SESSION_ID; only where that is unset does -Log fill a missing seat from the
+    record -Session names, and -Gate never does. -Log refuses a -Seat that is not the seat
+    CLAUDE_CODE_SESSION_ID's record names, where one is found, except a rating logged as `owner`
+    (digest.ps1 -Rate). Only this worktree's two boxes and
     this host's records count, so a seat declared from another worktree is not found. A record that
     cannot be read names no seat. Under -NoPost a registry on a share (above) names no seat.
 
 .EXAMPLE
     decision.ps1 -Log -Item 3905 -Class B -Recommendation 'split the fix into two PRs' `
       -Alternative 'one PR' -Predicate 'live-state=gh pr view 2460 read 17:02Z' `
-      -Undo 'close the second PR' -Confidence 80 -Touches "messagefoundry_toolkit/generators/adt.py`ntests/test_generated_adt.py"
+      -Undo 'close the second PR' -Confidence 80 -Touches "messagefoundry_toolkit/generators/oru.py`ntests/test_hl7schema.py"
 
 .EXAMPLE
     decision.ps1 -List -Day 2026-10-21 -Seat manager
 
 .EXAMPLE
-    decision.ps1 -Gate -Item 3905 -Touches messagefoundry_toolkit/generators/adt.py -BuildsOn d20261026T101500123-a1b2c3
+    decision.ps1 -Gate -Item 3905 -Touches messagefoundry_toolkit/generators/oru.py -BuildsOn d20261026T101500123-a1b2c3
 #>
 param(
     [switch]$Log,
@@ -251,7 +257,7 @@ function Get-SeatCandidate([string]$File) {
     }
 }
 
-function Resolve-SeatFromRegistry([string]$Sid, [switch]$Offline) {
+function Resolve-SeatFromRegistry([string]$Sid, [switch]$Offline, [switch]$DeclaredOnly) {
     # The seat this session declared, read where seat.ps1 writes it and picked by seat.ps1's rules.
     # The file name is seat.ps1's Get-SessionKey of the id (keep the two in step), sanitised so an id
     # cannot widen the match.
@@ -317,7 +323,9 @@ function Resolve-SeatFromRegistry([string]$Sid, [switch]$Offline) {
             }
             if ($cand.At -gt $best.At -or ($cand.At -eq $best.At -and $cand.Writes -gt $best.Writes)) { $best = $cand }
         }
-        if ($best) { return $best.Seat }
+        # -DeclaredOnly: the gate's seat must be one the session declared, never a derived label
+        # (seat.ps1: a derived label "can never be read as a declaration").
+        if ($best -and (-not $DeclaredOnly -or $best.Declared)) { return $best.Seat }
         return ''
     } catch {
         # An I/O error on the registry (an SMB share dropping, or one record that cannot be read) costs
@@ -342,14 +350,17 @@ function Test-DecisionEngineOrigin([string]$Top) {
     return ($u -match '^(https://|ssh://git@|git@)github\.com[/:]mefororg/messagefoundry$')
 }
 
-# The session-start hooks write these two ignored files into every worktree and regenerate them
-# each session, so their presence is not an act (Manager decision 2026-11-09, plan section 12).
-# Every other ignored entry is judged by Get-DecisionClassCPath's rules, and one it names or cannot
-# classify is refused: git cannot show its edit.
+# These two ignored files exist in every worktree: the session-start hooks write ROLE.local.md,
+# and seat.ps1 -Declare writes seat.local.txt, which the hooks read. So their presence is not an
+# act, and they are exempt (Manager decision 2026-11-09, plan section 12). An edit to either is
+# not seen. An ignored DIRECTORY entry is refused outright: git lists it as one entry, so the
+# files inside it are never classified. Every other ignored entry is judged by
+# Get-DecisionClassCPath's rules, and one it names or cannot classify is refused.
 $IgnoredHookFiles = @('.claude/role.local.md', '.claude/seat.local.txt')
 
 function Test-DecisionIgnoredRefused([string]$Entry) {
     if ($IgnoredHookFiles -contains (Get-DecisionPathKey $Entry).Key) { return $false }
+    if ($Entry.EndsWith('/')) { return $true }
     return [bool](Get-DecisionClassCPath $Entry)
 }
 
@@ -358,8 +369,8 @@ function Get-DecisionTouchedPaths([string]$Top) {
       The repository paths this checkout's act changes, from git: the branch's diff against
       origin/main, the uncommitted and staged changes against HEAD, and untracked files. Renames
       list both sides. Deleted holds the paths any of those reads shows deleted, and Ignored the
-      git-ignored entries (`git status --ignored`, a directory collapsed to one entry) that are
-      agent configuration or environment files: their edits are invisible to every other read.
+      git-ignored entries (`git status --ignored`) Test-DecisionIgnoredRefused refuses: their
+      edits are invisible to every other read.
       Error is set when any read fails, and the caller then treats the set as unknown.
     #>
     $paths = [System.Collections.Generic.List[string]]::new()
@@ -436,7 +447,7 @@ function Invoke-DecisionGate {
             } elseif (-not $env:CLAUDE_CODE_SESSION_ID) {
                 $why.Add('seat: CLAUDE_CODE_SESSION_ID is not set, so the seat cannot be shown to be this session''s')
             } elseif (-not $RegistrySeat) {
-                $why.Add('seat: no seat record names this session (CLAUDE_CODE_SESSION_ID), so the seat cannot be shown to be its own')
+                $why.Add('seat: no seat record this session DECLARED was read (none names CLAUDE_CODE_SESSION_ID, it is derived, or the registry could not be read), so the seat cannot be shown to be its own')
             } else {
                 $why.Add("seat: -Seat '$Seat' is not the seat this session declared ('$RegistrySeat'), so whose calibration applies is unknown")
             }
@@ -472,12 +483,12 @@ function Invoke-DecisionGate {
             return (New-GateAnswer 'REVIEW' $why)
         }
         $paths = @(@($derived.Paths) + @($Touches) | Where-Object { $_ } | Select-Object -Unique)
-        # Deleting a test removes a pin, and an ignored agent or environment file hides its edit:
-        # neither is ever eligible (Manager decision 2026-11-09).
+        # Deleting a test removes a pin, and a refused ignored entry hides its edit: neither is
+        # ever eligible (Manager decision 2026-11-09).
         $gone = @(@($derived.Deleted) | Where-Object { (Get-DecisionPathKey $_).Key.StartsWith('tests/') })
         if ($gone.Count -or @($derived.Ignored).Count) {
             foreach ($g in $gone) { $why.Add("touches: '$g' is a deleted test, so the T1 fast path does not apply") }
-            foreach ($g in @($derived.Ignored)) { $why.Add("touches: '$g' is a git-ignored path the class C rules name or cannot classify, whose edits git cannot show, so the T1 fast path does not apply") }
+            foreach ($g in @($derived.Ignored)) { $why.Add("touches: '$g' is a git-ignored directory, or a git-ignored path the class C rules name or cannot classify, whose edits git cannot show, so the T1 fast path does not apply") }
             return (New-GateAnswer 'REVIEW' $why $paths)
         }
         if (-not $paths.Count) {
@@ -595,6 +606,7 @@ function Invoke-DecisionGate {
                 'the act is not class C under plan R3 for a reason no path shows',
                 'every path the act will change is in the touched set, not only what git shows now',
                 'the act deletes or weakens no test',
+                'the declared seat is the session''s honest declaration: a session may declare any seat, and may set CLAUDE_CODE_SESSION_ID',
                 'the decision log''s other records were written by the seats they name')) {
             $why.Add("unchecked: $u; the session checks it before acting without review")
         }
@@ -617,9 +629,8 @@ $Touches = @($Touches | ForEach-Object { $_ -split '\r?\n' } | ForEach-Object { 
 
 if ($Gate) {
     if (-not $Item) { [Console]::Error.WriteLine('decision.ps1: -Gate needs -Item, the item the act is on.'); exit 2 }
-    if (-not $Session) { $Session = [string]$env:CLAUDE_CODE_SESSION_ID }
     # The declared seat is this process's own session's: -Session cannot name another one.
-    $declared = Resolve-SeatFromRegistry ([string]$env:CLAUDE_CODE_SESSION_ID)
+    $declared = Resolve-SeatFromRegistry ([string]$env:CLAUDE_CODE_SESSION_ID) -DeclaredOnly
     if (-not $Seat) { $Seat = $declared }
     $g = Invoke-DecisionGate -Item $Item -Seat $Seat -BuildsOn $BuildsOn -UsageScript $UsageScript -ThresholdsFile $ThresholdsFile `
         -Touches $Touches -RegistrySeat $declared
@@ -670,10 +681,16 @@ if ($List) {
 if (-not $Session) { $Session = [string]$env:CLAUDE_CODE_SESSION_ID }
 # The seat this process's own session declared; -Session cannot name another one.
 $declaredSeat = Resolve-SeatFromRegistry ([string]$env:CLAUDE_CODE_SESSION_ID) -Offline:$NoPost
-if (-not $Seat) { $Seat = $declaredSeat }
+# Only to fill a missing seat, and only with no session id of its own (the tripwire hook passes
+# its stdin id as -Session): the gate below reads CLAUDE_CODE_SESSION_ID's declared seat alone.
+if (-not $Seat) {
+    $Seat = if ($declaredSeat -or $env:CLAUDE_CODE_SESSION_ID) { $declaredSeat } else { Resolve-SeatFromRegistry $Session -Offline:$NoPost }
+}
 # A record written under another seat's label would feed that seat's calibration, so -Log refuses
 # one whose -Seat is not the caller's declared seat, gated or not (Manager decision 2026-11-09).
-if ($Seat -and $declaredSeat -and -not (Test-DecisionSameSeat $declaredSeat $Seat)) {
+# A rating logged as `owner` is the owner's verdict, which digest.ps1 -Rate records, not a seat's.
+$ownerRating = $Kind -eq 'rating' -and $Seat -eq 'owner'
+if ($Seat -and $declaredSeat -and -not $ownerRating -and -not (Test-DecisionSameSeat $declaredSeat $Seat)) {
     [Console]::Error.WriteLine("decision.ps1: -Seat '$Seat' is not the seat this session declared ('$declaredSeat'). Nothing was written.")
     exit 2
 }
@@ -692,13 +709,13 @@ if ($Ref -and -not (Get-DecisionIdDay $Ref)) {
     exit 2
 }
 $normOutcome = $Outcome.Trim().ToLowerInvariant()
-$nearMiss = 'hold|held|revers|revert|reopen|re-?brief|overrid|overrul|roll(ed)?[-_ ]?back|undo|undone|back(ed)?[-_ ]?out|(^|[-_ ])reds?($|[-_ ])|clos|abandon|withdr'
+$nearMiss = 'hold|held|revers|revert|reopen|re-?brief|overrid|overrul|roll(ed)?[-_ ]?back|undo|undone|back(ed)?[-_ ]?out|(^|[-_ ])reds?($|[-_ ])|clos|abandon|withdr|cancel|supersed|reject|discard'
 if ($Kind -eq 'decision' -and $normOutcome -and ((Test-DecisionMarkOutcome $normOutcome) -or $normOutcome -match $nearMiss)) {
     [Console]::Error.WriteLine("decision.ps1: -Outcome '$Outcome' on a decision record reads like a calibration signal, which a decision's own outcome never is: log it later with -Kind outcome -Ref <id>. Nothing was written.")
     exit 2
 }
 if ($Kind -eq 'outcome' -and -not (Test-DecisionMarkOutcome $normOutcome) -and $normOutcome -match $nearMiss) {
-    [Console]::Error.WriteLine("decision.ps1: -Outcome '$Outcome' reads like a calibration signal but is not one: use reversed, reopened, rebriefed, overridden, closed, abandoned, withdrawn, red-after-merge or held. A near miss would be read as a status and the signal lost. Nothing was written.")
+    [Console]::Error.WriteLine("decision.ps1: -Outcome '$Outcome' reads like a calibration signal but is not one: use reversed, reopened, rebriefed, overridden, closed, abandoned, withdrawn, cancelled, superseded, rejected, discarded, red-after-merge or held. A near miss would be read as a status and the signal lost. Nothing was written.")
     exit 2
 }
 if ($Reviewed -eq 'yes' -and -not $ReviewedBy) {
@@ -775,7 +792,7 @@ if ($gated) {
     try {
         Write-DecisionSpool -CoordRoot $coord -Record ([pscustomobject]$record)
         $gateAnswer = Invoke-DecisionGate -Item $Item -Seat $Seat -BuildsOn $BuildsOn -UsageScript $UsageScript `
-            -ThresholdsFile $ThresholdsFile -Offline:$NoPost -ExcludeId $record.id -Touches $Touches -RegistrySeat $declaredSeat
+            -ThresholdsFile $ThresholdsFile -Offline:$NoPost -ExcludeId $record.id -Touches $Touches -RegistrySeat $(Resolve-SeatFromRegistry ([string]$env:CLAUDE_CODE_SESSION_ID) -Offline:$NoPost -DeclaredOnly)
         $record.gate = $gateAnswer.Result
         # The record keeps the paths the gate classified, which hold the derived ones too.
         if (@($gateAnswer.Paths).Count) { $record.touches = @($gateAnswer.Paths) }

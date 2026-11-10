@@ -37,8 +37,8 @@
     CALIBRATION, per seat and class, over the records -Window days back (default 60). Since the
     owner ruling of 2026-11-09 (tier T1; docs/AUTONOMY-PLAN.md section 12) it is automated signals,
     and the blind sample is optional:
-      * the 14-day reversal rate -- decisions any `outcome` record marks `reversed`, `reopened`,
-        `rebriefed`, `re-briefed` or `overridden`, over the resolved decisions logged in the 14 days
+      * the 14-day reversal rate -- decisions any `outcome` record marks with a reversal word
+        (_decisionlog.ps1 DecisionReversalOutcomes, a close included), over the resolved decisions logged in the 14 days
         ending -Day (one answered HALT, left PENDING or dropped is left out unless marked); above 5
         percent is a breach. Every mark is sticky: no later outcome cancels it;
       * the 14-day rates of reds after merge and of Lander holds -- decisions any `outcome` record
