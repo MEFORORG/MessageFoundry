@@ -140,11 +140,11 @@ async def test_the_body_limit_admits_only_one_plain_content_length(
 async def test_a_latin_1_digit_is_not_a_content_length() -> None:
     """Header bytes are read as Latin-1, where byte 0xB2 is a superscript two. ``isdigit()``
     takes it, and ``int()`` then raises, so only the ASCII test keeps it from a 500."""
-    status, _ = await _drive_raw(
+    status, response_headers = await _drive_raw(
         create_app(allow_no_auth=True),
         method="POST",
         path="/auth/login",
         headers=(("content-length", b"\xb2"),),
         body=b"{",
     )
-    assert status == 400
+    assert status == 400 and ("connection", "close") in response_headers

@@ -731,8 +731,8 @@ def _end_the_open_cycles(cycles: Any) -> None:
     ``test_a_request_read_with_the_bad_bytes_gets_a_disconnect`` pins it.
 
     A cycle that already completed its response is not marked disconnected; its waiters are only
-    woken. That covers an answer sent in full BEFORE the ``400``, which this cannot recall (see
-    ``docs/DEPLOYMENT.md``). Nor does this help a response already part-written when the ``400``
+    woken. That covers an answer sent in full BEFORE the ``400``, which this cannot recall. Nor
+    does this help a response already part-written when the ``400``
     goes out: uvicorn writes the ``400`` into it either way."""
     for cycle in list(cycles):
         try:

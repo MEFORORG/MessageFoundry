@@ -9,8 +9,8 @@ Starlette places outside `user_middleware` entirely). These tests assert the SEC
 error paths themselves — a normal 200 carrying the headers was already true before the fix and proves
 nothing about it.
 
-Every short-circuit is driven through a hand-built ASGI scope rather than a client, because two of the
-four are unreachable through one: no HTTP client will emit `Content-Length` together with
+Every short-circuit is driven through a hand-built ASGI scope rather than a client, because two of
+them are unreachable through one: no HTTP client will emit `Content-Length` together with
 `Transfer-Encoding`, or a `Content-Length` that is not one plain decimal number.
 
 Two later requirements are pinned here as well, because both are properties of the same floor:

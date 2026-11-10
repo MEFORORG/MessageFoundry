@@ -4778,7 +4778,7 @@ def create_app(
         return middleware
 
     def _refuse_body(
-        request: Request, status: int, detail: str, what: str, *, close: bool = False
+        request: Request, status: int, detail: str, what: str, *, close: bool = True
     ) -> JSONResponse:
         _log.warning("rejected %s on %s from %s", what, request.url.path, client_ip(request))
         # `Connection: close` makes the server drop the connection after the refusal, so bytes it
@@ -4847,7 +4847,9 @@ def create_app(
         # Digit count first: int() raises past 4300 digits, and a longer number is over any cap.
         digits = value.lstrip("0") or "0"
         if len(digits) > len(str(cap)) or int(digits) > cap:
-            return _refuse_body(request, 413, "request body too large", "oversized request body")
+            return _refuse_body(
+                request, 413, "request body too large", "oversized request body", close=False
+            )
         return None
 
     # add_middleware inserts at index 0, so registering in this order keeps _limit_request_body

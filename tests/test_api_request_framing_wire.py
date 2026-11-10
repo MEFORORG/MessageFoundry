@@ -7,8 +7,8 @@ wire parser. This suite serves the real app through the HTTP protocol class ``se
 pinned llhttp parser, floored), writes raw bytes to a loopback socket, and reads every response.
 
 **Each probe carries a smuggled second request.** A well-framed request leaves that second request
-on the connection, and the server answers it. A refused one closes the connection with one ``400``,
-so the second request is never answered. Counting the responses is what tells a refusal from a
+on the connection, and the server answers it. A refused one closes the connection after one
+answer, so the second request is never answered. Counting the responses is what tells a refusal from a
 desync, where the server would answer bytes the sender meant as body.
 
 **The probe is shown to see acceptance.** The well-framed controls get two answers. The same
