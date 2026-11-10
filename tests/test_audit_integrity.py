@@ -1675,6 +1675,19 @@ async def test_startup_check_classifies_truncation_by_the_flag_not_the_text(
     assert await _subject_for_verdict(tmp_path, agreed) == "audit-chain-truncated"
 
 
+async def test_a_plain_tuple_verdict_files_a_chain_break_and_never_fails_start(
+    tmp_path: Path,
+) -> None:
+    """A store returning a plain ``(ok, message)`` pair, with no ``prefix_break``, must not fail the
+    alert-only start check: it files the ordinary ``audit-chain`` alert, even when its text quotes
+    the prefix phrase (vault BACKLOG #3054, item 11). Control: the flag-carrying twin is filed as a
+    truncation."""
+    plain = (False, f"audit log {AUDIT_PREFIX_BREAK_MARKER}")
+    assert await _subject_for_verdict(tmp_path, plain) == "audit-chain"  # type: ignore[arg-type]
+    flagged = AuditVerdict(*plain, prefix_break=True)
+    assert await _subject_for_verdict(tmp_path, flagged) == "audit-chain-truncated"
+
+
 async def test_a_planted_row_quoting_the_prefix_phrase_is_still_a_chain_break(
     tmp_path: Path,
 ) -> None:

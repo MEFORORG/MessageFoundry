@@ -1925,8 +1925,9 @@ class Engine:
                 "An engine runs with no key only under the audited keyless opt-out, where a chain "
                 "never names one: either the chain was altered, or the engine lost its key"
             )
-        # The flag, never the message text (vault BACKLOG #3054, item 11).
-        truncated = verdict.prefix_break
+        # The flag, never the message text (vault BACKLOG #3054, item 11). Read as `key_unavailable`
+        # is, so a store returning a plain (ok, message) pair files a chain break, never fails start.
+        truncated = bool(getattr(verdict, "prefix_break", False))
         subject = "audit-chain-truncated" if truncated else "audit-chain"
         log.warning(
             "startup audit-chain verification FAILED (alert-only, %s): %s",
