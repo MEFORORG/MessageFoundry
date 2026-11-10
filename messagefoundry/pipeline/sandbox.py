@@ -200,11 +200,10 @@ class KillCause(str, enum.Enum):  # noqa: UP042
 
     A reap that is not a kill records nothing, and writes no kill line. At least these are such
     reaps: closing a session whose worker is gone, the prior generation's reap at the top of a
-    spawn (a worker that died
-    between dispatches on its own), and the reap after a queued EOF from a worker that has exited,
-    which only says the peer died, the check after an answer included unless the answer announced
-    the exit (:attr:`MEMORY_CAP`). A worker that
-    exits right after its boot is the exception, recorded as :attr:`EXITED_AFTER_BOOT`, because a
+    spawn (a worker that died between dispatches on its own), and the reap after a queued EOF from
+    a worker that has exited, which only says the peer died, the check after an answer included
+    unless the answer announced the exit (:attr:`MEMORY_CAP`). A worker that exits right after its
+    boot is the exception, recorded as :attr:`EXITED_AFTER_BOOT`, because a
     feed whose workers keep doing so is a crash loop, not a peer that happened to die.
 
     There is no CPU-cap cause: the engine sets no ``RLIMIT_CPU`` (engine PR 2133), and the wall
@@ -216,8 +215,9 @@ class KillCause(str, enum.Enum):  # noqa: UP042
     #: The worker loaded a graph that differs from the engine's. No WARNING here: the runner logs
     #: and raises the ``sandbox_worker_refused`` alert for a refusal against the graph it serves. A
     #: refusal against a graph a reload has since replaced gets neither, and this record does not
-    #: outlast it: the reload discards this session. That kill then writes no kill line anywhere;
-    #: only the refused dispatch's own error reaches the runner's internal-error policy.
+    #: outlast it: the reload discards this session. That kill then writes no line of its own,
+    #: though its reap can (see :func:`_reap_process_tree`); only the refused dispatch's own error
+    #: reaches the runner's internal-error policy.
     GRAPH_MISMATCH = "graph_mismatch"
     #: The boot frame could not be written to the new worker.
     BOOT_WRITE = "boot_write"
@@ -661,20 +661,21 @@ def _posix_child_state(proc: subprocess.Popen[bytes]) -> Literal["running", "zom
     """``proc``'s state on POSIX, read with ``WNOWAIT`` so a zombie stays in place: ``running``,
     ``zombie`` (exited, and nobody has reaped it), or ``reaped``. A reap through ``Popen`` sets
     ``returncode``. A reap by anything else makes ``waitid`` raise ``ChildProcessError`` only while
-    the pid names no child of this engine. That reap frees the pid, and the kernel may give it to a
-    later child of this engine. At least a targeted ``waitpid`` on the worker's pid, any wait for
-    any child (``os.wait``, ``waitpid(-1)``), and an ignored ``SIGCHLD`` are such reaps. The engine
-    makes none of them, but code loaded into its process could. ``waitid`` then reads that later
-    child, and this returns its state as the worker's, ``running`` or ``zombie``.
+    the pid names no child of this engine. Once such a reap is done and the worker's group and
+    session have no member left, the pid is free, and the kernel may give it to a later child of
+    this engine. At least a targeted ``waitpid`` on the worker's pid, any wait for any child
+    (``os.wait``, ``waitpid(-1)``), and an ignored ``SIGCHLD`` are such reaps. The engine makes
+    none of them on its own; code loaded into its process could, and once one misread has
+    happened, the wait in :meth:`SandboxSession._reap` below is one too. ``waitid`` then reads that
+    later child, and this returns its state as the worker's, ``running`` or ``zombie``.
 
     Every caller then takes that child for the worker. :func:`_reap_process_tree` signals it: its
     whole process group when it leads one, which another sandbox worker does, so the reap can kill
     another worker's group; otherwise the single-process fallback signals that one process, or
-    reaps it if it has exited.
-    :meth:`SandboxSession._reap` then waits on the pid and so can reap that child, taking its exit
-    status from its own session. :func:`_has_exited`'s callers read a live worker where there is
-    none, so at least a kill can be recorded under the wrong cause, or a shutdown kill recorded
-    where only a reap was due."""
+    reaps it if it has exited. :meth:`SandboxSession._reap` then waits on the pid and so can reap
+    that child, taking its exit status from its own session. While that child is running,
+    :func:`_has_exited`'s callers read a live worker where there is none, so at least a kill can
+    be recorded under the wrong cause, or a shutdown kill recorded where only a reap was due."""
     if sys.platform == "win32":  # pragma: no cover - every caller returns first there
         raise AssertionError("_posix_child_state is POSIX only")
     if proc.returncode is not None:
@@ -830,12 +831,9 @@ def _reap_process_tree(proc: subprocess.Popen[bytes], job: int | None, inbound: 
     if _posix_child_state(proc) == "reaped":
         # Reaped by ``Popen``, by something else, or by the kernel under ``SIGCHLD`` set to
         # ``SIG_IGN``. A running or zombie child's pid cannot have been given to another process,
-        # so only this state needs the reuse-safe signal. The state check cannot see a pid reaped
-        # elsewhere and then reused by another child of this engine: it reads that child as
-        # ``running`` or ``zombie``, and the path below then signals it, which can kill another
-        # worker's group. :func:`_posix_child_state` states that limit. A zombie reaped between the
-        # state check and the signal is missed too: its group is not signalled, and nothing is
-        # logged.
+        # so only this state needs the reuse-safe signal, as far as the state check can tell; its
+        # pid-reuse limit is in :func:`_posix_child_state`. A zombie reaped between the state
+        # check and the signal is missed too: its group is not signalled, and nothing is logged.
         if proctree.kill_reaped_leader_group(proc.pid) is None:
             log.warning(
                 "inbound %r: sandbox worker pid %d was already reaped and its process group could "
@@ -1390,7 +1388,7 @@ class SandboxSession:
         :attr:`KillCause.REQUEST_WRITE` or :attr:`KillCause.CRASH`, and that message dead-letters.
 
         Liveness is read with :func:`_has_exited`, which leaves a dead worker unreaped so the
-        respawn's reap still reaches its process group."""
+        respawn's reap takes the ordinary group kill (see :func:`_has_exited`)."""
         stray_seen = False
         eof_respawns = 0
         while True:

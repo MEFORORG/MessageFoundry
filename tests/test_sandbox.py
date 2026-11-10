@@ -1449,8 +1449,8 @@ def _best_effort_kill_pid(pid: int) -> None:
 def _wait_exited(proc: Any) -> None:
     """Wait for ``proc`` to exit WITHOUT reaping it on POSIX, as the session's own check reads it.
     Reaping it here would send the session's reap down its already-reaped path,
-    ``proctree.kill_reaped_leader_group``, which signals nothing and writes a WARNING if the pid
-    has been reused meanwhile, rather than the group kill a worker that died on its own gets."""
+    ``proctree.kill_reaped_leader_group``. That signals the same group while it has a member, but
+    once the group is empty and the pid reused it writes a WARNING these tests do not expect."""
     deadline = time.monotonic() + 10.0
     while not sandbox_mod._has_exited(proc):
         assert time.monotonic() < deadline, "the worker did not exit"
@@ -2428,8 +2428,9 @@ def test_a_worker_that_died_on_its_own_still_has_its_group_reaped(
     tmp_path: Path, after: str
 ) -> None:
     """A worker that exits on its own leaves a grandchild in its process group. The next dispatch's
-    respawn, or ``close``, must still reach that group, so the liveness check must not reap the
-    worker first (vault BACKLOG #3135, the WNOWAIT fix).
+    respawn, or ``close``, must still reach that group (vault BACKLOG #3135, the WNOWAIT fix). The
+    liveness check leaves the worker unreaped, so the reap takes the ordinary group kill; a reaped
+    worker's group with a member left is still reached, as the next arm shows.
 
     The ``reaped_elsewhere`` arm reaps the worker behind the session's back first, so the reap
     must go through :func:`proctree.kill_reaped_leader_group`.
