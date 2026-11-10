@@ -849,7 +849,8 @@ from typing import Any
 #: ``WebSocketAcceptGate`` now refuses ``accept()`` on an in-body socket no gate admitted. An older
 #: console on this engine would have its browser socket refused; a newer console on an older
 #: engine would raise ImportError at mount. Both force a bump. Re-derived with ``--write`` (from
-#: 734e7007fb95eb75).
+#: 734e7007fb95eb75). This note and the two below it ran on main's own branch, beside the
+#: #3192/#3193 entry above, not after it; the merge note that follows them joins the two chains.
 #:
 #: Merged with main's ``2a4589213e5e782c`` and re-derived with ``--write`` over both, to
 #: ``44d2ecd02c8d2b1b``.
