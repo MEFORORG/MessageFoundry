@@ -45,7 +45,10 @@ def _no_host_cipher_probe(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_run_host_checks_never_errors(tmp_path: Path) -> None:
     results = checks.run_host_checks(
-        ports={"MLLP": 2575}, writable_dir=tmp_path, odbc_hops=checks.OdbcHops
+        ports={"MLLP": 2575},
+        writable_dir=tmp_path,
+        odbc_hops=checks.OdbcHops,
+        driver_hops=checks.OdbcHops,
     )
     assert results, "no host checks produced"
     for r in results:
@@ -183,7 +186,10 @@ def test_host_console_row_is_gone(tmp_path: Path) -> None:
     prerequisite left for it to check."""
     assert not hasattr(checks, "check_console_importable")
     results = checks.run_host_checks(
-        ports={"MLLP": 2575}, writable_dir=tmp_path, odbc_hops=checks.OdbcHops
+        ports={"MLLP": 2575},
+        writable_dir=tmp_path,
+        odbc_hops=checks.OdbcHops,
+        driver_hops=checks.OdbcHops,
     )
     assert "host.console" not in {r.id for r in results}
 
@@ -677,7 +683,11 @@ def test_run_verify_self_smoke_threads_resolved_setting(monkeypatch: pytest.Monk
     seen: list[bool] = []
 
     def _spy_smoke_self(
-        config_dir: str, *, inbound: str | None = None, snapshot_on_send: bool = False
+        config_dir: str,
+        *,
+        inbound: str | None = None,
+        snapshot_on_send: bool = False,
+        graph: object = None,
     ) -> CheckResult:
         seen.append(snapshot_on_send)
         return CheckResult("smoke.self", "spy", Status.PASS, "spy")
