@@ -4777,14 +4777,12 @@ def create_app(
 
         return middleware
 
-    def _refuse_body(
-        request: Request, status: int, detail: str, what: str, *, close: bool = True
-    ) -> JSONResponse:
+    def _refuse_body(request: Request, status: int, detail: str, what: str) -> JSONResponse:
         _log.warning("rejected %s on %s from %s", what, request.url.path, client_ip(request))
-        # `Connection: close` makes the server drop the connection after the refusal, so bytes it
-        # framed one way and a proxy another are never read as a next request (RFC 9112 §6.1, §6.3).
-        headers = {"Connection": "close"} if close else None
-        return JSONResponse({"detail": detail}, status_code=status, headers=headers)
+        # `Connection: close` makes the server drop the connection after every refusal, so bytes
+        # it framed one way and a proxy another, or a refused body the client never sent, are
+        # never read as a next request (RFC 9112 §6.1, §6.3).
+        return JSONResponse({"detail": detail}, status_code=status, headers={"Connection": "close"})
 
     def _body_refusal(request: Request) -> JSONResponse | None:
         """The response refusing ``request``'s body before any route runs, or None to admit it."""
@@ -4809,7 +4807,6 @@ def create_app(
                     400,
                     "ambiguous framing: Content-Length with Transfer-Encoding is not accepted",
                     "request with both Content-Length and Transfer-Encoding",
-                    close=True,
                 )
             codings = [c.strip(" \t").lower() for line in te_lines for c in line.split(",")]
             # RFC 9112 §7: chunked is the final coding and is applied once.
@@ -4819,24 +4816,20 @@ def create_app(
                     400,
                     "invalid framing: Transfer-Encoding must end in a single chunked",
                     "Transfer-Encoding not ending in a single chunked",
-                    close=True,
                 )
             return _refuse_body(
                 request,
                 411,
                 "Transfer-Encoding is not accepted; send a Content-Length",
                 "chunked request body",
-                close=True,
             )
         if not lengths:
             return None
         # One line holding `1*DIGIT` (RFC 9112 §6.2), not int(): int() takes `+2`, `-5` and `0_2`,
-        # and a repeated line is a second framing claim. An invalid length closes too (§6.3 item 5).
+        # and a repeated line is a second framing claim (an invalid length closes, §6.3 item 5).
         value = lengths[0].strip(" \t")
         if len(lengths) > 1 or not (value.isascii() and value.isdigit()):
-            return _refuse_body(
-                request, 400, "invalid Content-Length", "invalid Content-Length", close=True
-            )
+            return _refuse_body(request, 400, "invalid Content-Length", "invalid Content-Length")
         # ADR 0134: the uploaded-logs upload routes admit up to [store].max_upload_bytes; all else 1 MiB.
         upload_store = getattr(request.app.state, "upload_store", None)
         cap = (
@@ -4847,9 +4840,7 @@ def create_app(
         # Digit count first: int() raises past 4300 digits, and a longer number is over any cap.
         digits = value.lstrip("0") or "0"
         if len(digits) > len(str(cap)) or int(digits) > cap:
-            return _refuse_body(
-                request, 413, "request body too large", "oversized request body", close=False
-            )
+            return _refuse_body(request, 413, "request body too large", "oversized request body")
         return None
 
     # add_middleware inserts at index 0, so registering in this order keeps _limit_request_body

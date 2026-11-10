@@ -12,8 +12,8 @@ answer, so the second request is never answered. Counting the responses is what 
 desync, where the server would answer bytes the sender meant as body.
 
 **The probe is shown to see acceptance.** The well-framed controls get two answers. The same
-ambiguous shapes sent through uvicorn's h11 protocol, the one ``http="auto"`` falls back to, are
-answered twice where llhttp refuses them. That is the gap the pin closes.
+ambiguous shapes sent through uvicorn's h11 protocol, the one ``http="auto"`` falls back to,
+reach the app where llhttp refuses them. That is the gap the pin closes.
 
 Measured on uvicorn 0.54.0 and httptools 0.8.0. This suite pins httptools, and
 ``tests/test_header_floor_wire.py`` pins uvicorn.
@@ -456,6 +456,15 @@ async def test_a_late_bad_chunk_after_the_411_gets_no_second_answer(engine: Engi
             assert statuses == [411] and closed, raw
 
 
+async def test_the_413_closes_so_a_reused_connection_is_never_read_as_body(engine: Engine) -> None:
+    """A client declares an over-cap body, gets the 413 from the head, skips the body and reuses
+    the connection. The 413 closes it, so the next request is never read as the refused body."""
+    head = _POST + b"Content-Type: application/json\r\nContent-Length: 2000000\r\n\r\n"
+    async with _served(create_app(engine), http=floored_http_protocol_class()) as port:
+        statuses, raw, closed = await _split(port, head, _SMUGGLED)
+    assert statuses == [413] and closed, raw
+
+
 async def test_the_api_frames_unambiguous_requests_exactly(engine: Engine) -> None:
     misses = []
     async with _served(create_app(engine), http=floored_http_protocol_class()) as port:
@@ -468,7 +477,8 @@ async def test_the_api_frames_unambiguous_requests_exactly(engine: Engine) -> No
 
 async def test_the_probe_sees_the_shapes_h11_would_accept(engine: Engine) -> None:
     """The vacuity control. If ``serve`` followed ``http="auto"`` onto h11, these four shapes would
-    reach the app and the smuggled request would be answered too."""
+    reach the app: the Content-Length ones answered with the smuggled request behind them, and
+    the unfolded chunked one answered by the app's 411, which then closes."""
     h11 = floored_http_protocol_class(base=H11Protocol)
     async with _served(create_app(engine), http=h11) as port:
         for shape in _H11_ACCEPTS:

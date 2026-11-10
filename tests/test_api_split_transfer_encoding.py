@@ -131,9 +131,8 @@ async def test_the_body_limit_admits_only_one_plain_content_length(
         body=b"{",
     )
     assert status == expected_status
-    # Every framing refusal closes the connection (RFC 9112 6.1, 6.3); the 413 and an admitted
-    # request do not.
-    closes = expected_status in (400, 411)
+    # Every refusal closes the connection (RFC 9112 6.1, 6.3); an admitted request does not.
+    closes = expected_status != _ADMITTED
     assert (("connection", "close") in response_headers) == closes
 
 
