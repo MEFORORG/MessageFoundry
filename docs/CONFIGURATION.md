@@ -1828,9 +1828,8 @@ Where the delivery pipeline's operational alerts (e.g. `connection_stopped`, `qu
 `connection_error`, `message_stall`, `integrity_drift`) are
 delivered. **Both transports are off by default** — with neither configured, events are logged at
 `WARNING` (the `LoggingAlertSink`). A transport turns on when its essentials are present. Payloads
-**never carry a message body**, but they are **not** PHI-free: free-text detail still goes off the
-box for at least `connection_stopped`, `log_write_failed` and `backup_failed`.
-[PHI.md](PHI.md) row 10 is the record of what is sent. Delivery is
+**never carry a message body**, but they are **not** PHI-free: some events still send free-text
+detail off the box, and [PHI.md](PHI.md) row 10 records which. Delivery is
 best-effort and runs on a background task, so it never blocks or hangs a delivery lane.
 
 **`intake_paused` is the ingest-side alert** (BACKLOG #290). `queue_buildup` is about one lane.
