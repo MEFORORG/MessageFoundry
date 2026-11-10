@@ -1486,19 +1486,26 @@ async def test_a_digest_the_bump_cannot_share_is_stored_as_unknown_and_logged(
         assert "bump after reload failed" in caplog.text, "control: the bump was tried"
         assert "stored it as unknown" not in caplog.text
 
-        # Past a bump that landed, a fault telling why the digest was not shared fails nothing.
-        monkeypatch.undo()
-        monkeypatch.setattr(fingerprint_module, "shared_digest_text", lambda detail: None)
-
-        def _coverage_raises(detail: object) -> None:
+        # Past the swap, a fault preparing the digest fails nothing: the bump still runs, with
+        # the digest as unknown, whichever of the two reads raised.
+        def _raises(detail: object) -> None:
             raise TypeError("not a digest mapping")
 
-        monkeypatch.setattr(fingerprint_module, "digest_coverage", _coverage_raises)
-        caplog.clear()
-        with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
-            outcome = await eng.reload_detail(propagate=True)
-        assert outcome.config_version == coord.bumps and outcome.failures == ()
-        assert "could not tell why this reload's digest was not shared" in caplog.text
+        for name in ("shared_digest_text", "digest_coverage"):
+            monkeypatch.undo()
+            if name == "digest_coverage":
+                monkeypatch.setattr(fingerprint_module, "shared_digest_text", lambda detail: None)
+            monkeypatch.setattr(fingerprint_module, name, _raises)
+            bumps = coord.bumps
+            caplog.clear()
+            with caplog.at_level("WARNING", logger="messagefoundry.pipeline.engine"):
+                outcome = await eng.reload_detail(propagate=True)
+            assert outcome.failures == () and coord.bumps == bumps + 1, name
+            assert outcome.config_version == coord.bumps
+            assert coord.config_digest_cached(coord.bumps) is None
+            assert "could not be prepared to share (TypeError)" in caplog.text, name
+            (record,) = [r for r in caplog.records if "prepared to share" in r.getMessage()]
+            assert record.levelname == "WARNING" and record.exc_info is not None
     finally:
         await eng.stop()
 
@@ -1517,7 +1524,7 @@ def test_a_bad_stamp_caches_the_new_version_with_no_digest(backend: str) -> None
     assert coord.config_digest_cached(4) == "d4"
     rows: tuple[dict[str, object], ...] = (
         {"config_version": 5, "config_digest": "d5"},  # no stamp column
-        {"config_version": 6, "config_digest": "d6", "config_digest_version": "six"},
+        {"config_version": 6, "config_digest": "d6", "config_digest_version": "6"},
         {"config_version": 7, "config_digest": "d7", "config_digest_version": 6},
         {"config_version": 8, "config_digest": 8, "config_digest_version": 8},
     )
@@ -1538,7 +1545,7 @@ def test_a_stamp_fault_is_logged_once_per_version(
     coord: DbCoordinator | SqlServerCoordinator = (
         DbCoordinator(None, "n") if backend == "DbCoordinator" else SqlServerCoordinator(None, "n")
     )
-    bad = {"config_version": 5, "config_digest": "d5", "config_digest_version": "five"}
+    bad = {"config_version": 5, "config_digest": "d5", "config_digest_version": "5"}
     with caplog.at_level("WARNING"):
         coord._cache_config_row({**bad, "config_digest_version": 4})  # an older stamp: no fault
         assert "reads as unknown" not in caplog.text, "control"
@@ -1562,13 +1569,12 @@ def test_a_stored_digest_belongs_only_to_the_version_stamped_beside_it() -> None
     assert stamped_config_digest(row, 5) == (None, None), "a later, unstamped bump: no fault"
     assert stamped_config_digest({**row, "config_digest_version": None}, 4) == (None, None)
     assert stamped_config_digest({**row, "config_digest": None}, 4) == (None, None)
-    # A driver may return the integer column as a Decimal or a numeric string.
-    for integral in (Decimal("4"), Decimal("4.0"), "4", " 4 ", "4.0"):
-        stamped = {**row, "config_digest_version": integral}
-        assert stamped_config_digest(stamped, 4) == ("d", None), integral
-    for bad in (True, 4.0, Decimal("4.5"), Decimal("NaN"), "4.5", "four", b"4"):
+    # The stamp is read as the store reads its audit seq: an int that is not a bool.
+    for bad in (True, 4.0, Decimal("4"), "4", "1e3000000", b"4"):
         digest, fault = stamped_config_digest({**row, "config_digest_version": bad}, 4)
         assert digest is None and fault is not None, bad
+    # A stamp newer than the version no bump writes, so it is a fault; an older one is not.
+    assert stamped_config_digest(row, 3) == (None, "has a stamp (4) newer than its version")
     assert stamped_config_digest({**row, "config_digest": 7}, 4)[1] is not None, "not text"
     assert stamped_config_digest({"config_version": 4}, 4)[1] is not None, "no digest columns"
 

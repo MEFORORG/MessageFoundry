@@ -3634,7 +3634,17 @@ class Engine:
 
             # The bump stores this node's digest with the new version, so a follower's
             # convergence row can name the operator's bytes beside its own (vault BACKLOG #3109).
-            digest_text = shared_digest_text(fingerprint)
+            try:
+                digest_text = shared_digest_text(fingerprint)
+                unshared = digest_text is None and digest_coverage(fingerprint) is not None
+            except Exception as exc:  # noqa: BLE001 - past the swap, an advisory fault fails no reload
+                log.warning(
+                    "cluster: this reload's digest could not be prepared to share (%s), so it is "
+                    "shared as unknown",
+                    type(exc).__name__,
+                    exc_info=exc,
+                )
+                digest_text, unshared = None, False
             try:
                 config_version = await self._coordinator.bump_config_version(digest=digest_text)
             except Exception as exc:
@@ -3645,11 +3655,6 @@ class Engine:
                 failures.append(ReloadStepFailure("cluster_propagate", safe_exc(exc)))
             else:
                 self._applied_config_version = config_version
-                try:
-                    unshared = digest_text is None and digest_coverage(fingerprint) is not None
-                except Exception:  # noqa: BLE001 - past the swap, a fault here fails no reload
-                    log.exception("cluster: could not tell why this reload's digest was not shared")
-                    unshared = False
                 if unshared:
                     # Said here, since a follower reads the NULL as "the initiator took none".
                     log.warning(

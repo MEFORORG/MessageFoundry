@@ -67,7 +67,6 @@ import socket
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
 from typing import Any, Literal, NamedTuple, Protocol, runtime_checkable
 from uuid import uuid4
 
@@ -921,24 +920,6 @@ class ClusterCoordinator(Protocol):
         ...
 
 
-def _integral(value: object) -> int | None:
-    """``value`` as an int when it is an integral number other than a bool: an int, or a Decimal
-    or numeric string with an integral value, as a driver may return an integer column. Else
-    ``None``."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str):
-        try:
-            value = Decimal(value)
-        except InvalidOperation:
-            return None
-    if isinstance(value, Decimal) and value.is_finite() and value == value.to_integral_value():
-        return int(value)
-    return None
-
-
 def stamped_config_digest(row: Mapping[str, Any], version: int) -> tuple[str | None, str | None]:
     """A ``cluster_config`` row's ``config_digest`` and the fault that voided it, if any (vault
     BACKLOG #3109). The digest is returned when its ``config_digest_version`` stamp is
@@ -948,21 +929,22 @@ def stamped_config_digest(row: Mapping[str, Any], version: int) -> tuple[str | N
     does not write the digest still moves the version, and leaves the previous bump's digest and
     stamp behind: the stamp then names an older version, so that digest is not set beside the new
     one, and that is no fault. Both coordinators read the pair through here. It never raises: the
-    digest is advisory, so a stamp with no integral value, or a digest that is not text, reads as
-    unknown, is named as the fault for :func:`note_stamp_fault`, and never stops the version from
-    being cached."""
+    digest is advisory, so anything else that voids it reads as unknown, is named as the fault
+    for :func:`note_stamp_fault`, and never stops the version from being cached. The stamp is
+    read as the store reads its audit ``seq``: an int that is not a bool."""
     try:
-        raw_stamp = row["config_digest_version"]
+        stamp = row["config_digest_version"]
         digest = row["config_digest"]
     except KeyError as exc:
         return None, f"has no {exc.args[0]} column"
-    if raw_stamp is None:
-        return None, None
-    stamp = _integral(raw_stamp)
     if stamp is None:
-        return None, f"has a stamp that is not an integer ({type(raw_stamp).__name__})"
-    if stamp != version:
         return None, None
+    if not isinstance(stamp, int) or isinstance(stamp, bool):
+        return None, f"has a stamp that is not an integer ({type(stamp).__name__})"
+    if stamp < version:
+        return None, None
+    if stamp > version:
+        return None, f"has a stamp ({stamp}) newer than its version"
     if digest is None or isinstance(digest, str):
         return digest, None
     return None, f"has a digest that is not text ({type(digest).__name__})"
