@@ -530,7 +530,10 @@ def test_garbled_pem_is_checked_in_linear_time() -> None:
     blank_run = begin + b"RSA PRIVATE KEY-----\n" + b"\n" * (size - 64) + b"-----END X-----\n"
     long_label = begin + b"A" * (size // 2) + b"\n" * (size // 2 - 64)
     many_headers = b"Proc-Type: 4,NONE " * (size // 20)
-    for material in (garbled, blank_run, long_label, many_headers):
+    # Every BEGIN before the one END has an inner BEGIN, so this drives the restart and the kept
+    # END position (BACKLOG #5544); a rescan per BEGIN would make it quadratic.
+    stacked = (begin + b"X-----\n") * (size // 20) + b"-----END X-----\n"
+    for material in (garbled, blank_run, long_label, many_headers, stacked):
         started = time.monotonic()
         _check(material)
         assert time.monotonic() - started < 20.0
@@ -590,6 +593,111 @@ def test_a_reshaped_weak_pem_is_still_refused(material: Material, how: str) -> N
     refusal = _check(_reshape(material.wraps["best-available-2048"], how))
     assert refusal is not None and "2048 iterations" in refusal
     assert _check(_reshape(material.wraps["approved"], how)) is None
+
+
+#: A stray BEGIN marker in front of a key, or inside it before its END (BACKLOG #5544). The marker
+#: strings are assembled from parts so a secret scanner does not read a key block here.
+_STRAY_BEGIN = b"-----" + b"BEGIN "
+_PEM_END = b"-----" + b"END "
+
+
+def _before_end(pem_bytes: bytes, insert: bytes) -> bytes:
+    at = pem_bytes.index(_PEM_END)
+    return pem_bytes[:at] + insert + pem_bytes[at:]
+
+
+def _onto_last_line(pem_bytes: bytes, insert: bytes) -> bytes:
+    at = pem_bytes.index(_PEM_END) - 1  # the newline that ends the last base64 line
+    return pem_bytes[:at] + insert + pem_bytes[at:]
+
+
+#: Shapes measured to LOAD through OpenSSL (``ssl.SSLContext.load_cert_chain``) with the weak key
+#: and with the approved one. cryptography's PEM reader rejects every one, so a test through it
+#: would show no gap. The last two carry no BEGIN at all: OpenSSL's base64 reader stops at the
+#: first ``-``, so text after the base64 does not stop it loading the key.
+_OPENSSL_LOADS_STRAY: dict[str, Callable[[bytes], bytes]] = {
+    "comment-line-before": lambda p: b"# " + _STRAY_BEGIN + b"NOTE-----\n" + p,
+    "comment-no-dashes-before": lambda p: b"# " + _STRAY_BEGIN + b"NOTE\n" + p,
+    "no-dashes-before": lambda p: _STRAY_BEGIN + b"NOTE\n" + p,
+    "own-line-inside": lambda p: _before_end(p, _STRAY_BEGIN + b"NOTE-----\n"),
+    "no-dashes-inside": lambda p: _before_end(p, _STRAY_BEGIN + b"NOTE\n"),
+    "key-label-inside": lambda p: _before_end(p, _STRAY_BEGIN + b"PRIVATE KEY-----\n"),
+    "same-line-inside": lambda p: _onto_last_line(p, _STRAY_BEGIN + b"X-----"),
+    "dash-text-inside": lambda p: _before_end(p, b"-x\n"),
+    "dash-text-inside-plain-label": lambda p: _before_end(
+        p.replace(b"ENCRYPTED PRIVATE KEY", b"PRIVATE KEY"), b"-x\n"
+    ),
+    # A label window that crossed the line end used to close at the key's own END marker and
+    # read as a key block with no base64 in it, refusing the approved key.
+    "no-dashes-key-label-inside-then-a-block": lambda p: (
+        _before_end(p, _STRAY_BEGIN + b"ENCRYPTED PRIVATE KEY\n")
+        + _STRAY_BEGIN
+        + b"NOTE-----\n"
+        + _PEM_END
+        + b"NOTE-----\n"
+    ),
+}
+#: Shapes no loader was seen to load. They are refused all the same.
+_STRAY_SHAPES: dict[str, Callable[[bytes], bytes]] = {
+    **_OPENSSL_LOADS_STRAY,
+    "own-line-before": lambda p: _STRAY_BEGIN + b"NOTE-----\n" + p,
+    "same-line-before": lambda p: b"# " + _STRAY_BEGIN + b"X-----" + p,
+    "short-dashes-before": lambda p: _STRAY_BEGIN + b"X---" + p,
+    "key-label-no-end-before": lambda p: _STRAY_BEGIN + b"RSA PRIVATE KEY-----\n" + p,
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_STRAY_SHAPES))
+def test_a_weak_pem_with_a_stray_begin_marker_is_still_refused(
+    material: Material, shape: str
+) -> None:
+    # A stray BEGIN in front used to pair with the key's own END, so the key read as one block
+    # labelled NOTE (or as a key block whose body is not base64) and was skipped unchecked. A
+    # stray one inside, or text after the base64, made the body read as not base64.
+    reshape = _STRAY_SHAPES[shape]
+    refusal = _check(reshape(material.wraps["best-available-2048"]))
+    assert refusal is not None and "2048 iterations" in refusal
+    assert _check(reshape(material.wraps["approved"])) is None
+
+
+@pytest.mark.parametrize("shape", sorted(_OPENSSL_LOADS_STRAY))
+def test_an_ssl_loader_refuses_a_weak_key_with_a_stray_begin_marker(
+    tmp_path: Path, material: Material, shape: str
+) -> None:
+    cert = _write(tmp_path, "cert.pem", material.cert_pem)
+    reshape = _OPENSSL_LOADS_STRAY[shape]
+    weak = _write(tmp_path, "weak.pem", reshape(material.wraps["best-available-2048"]))
+    with pytest.raises(KeyWrapRefused, match="2048 iterations"):
+        _api(cert, weak, _PASSPHRASE)
+    # OpenSSL itself loads the weak key in this shape, so the refusal above is the check's. A
+    # stricter TLS library would refuse the shape itself, and there is then no gap to show.
+    try:
+        ssl.create_default_context(ssl.Purpose.CLIENT_AUTH).load_cert_chain(cert, weak, _PASSPHRASE)
+    except ssl.SSLError:
+        pytest.skip(f"{ssl.OPENSSL_VERSION} does not load this shape")
+    approved = _write(tmp_path, "approved.pem", reshape(material.wraps["approved"]))
+    assert _api(cert, approved, _PASSPHRASE) is not None
+
+
+@pytest.mark.parametrize("byte", [b"\x01", b"\xff", b"\x00junk"])
+def test_a_key_block_that_does_not_decode_is_refused_not_skipped(
+    material: Material, byte: bytes
+) -> None:
+    # OpenSSL drops a control or high byte at a line end and decrypts the rest, so a key block
+    # whose base64 does not decode is refused under a plain PRIVATE KEY label too, failing closed.
+    # The approved key in the same shape is refused with it: that costs a clean re-export.
+    plain_label = material.wraps["best-available-2048"].replace(
+        b"ENCRYPTED PRIVATE KEY", b"PRIVATE KEY"
+    )
+    first_line_end = plain_label.index(b"\n", plain_label.index(b"\n") + 1)
+    shaped = plain_label[:first_line_end] + byte + plain_label[first_line_end:]
+    refusal = _check(shaped)
+    assert refusal is not None and "cannot decode" in refusal
+    # The control: the same key without the byte is judged on its wrap, not on its base64.
+    unshaped = _check(plain_label)
+    assert unshaped is not None and "2048 iterations" in unshaped
+    approved = material.wraps["approved"].replace(b"ENCRYPTED PRIVATE KEY", b"PRIVATE KEY")
+    assert _check(approved) is None
 
 
 @pytest.mark.parametrize("variant", ["crcrlf", "blank-after-begin", "space-line-after-begin"])
@@ -1210,6 +1318,34 @@ def test_the_sftp_connector_still_builds_with_an_unencrypted_key(
     sftp_keys: dict[str, str], which: str
 ) -> None:
     assert _sftp(sftp_keys[which]) is not None
+
+
+#: Stray BEGIN lines measured to let paramiko, the SFTP connector's key loader, load the OpenSSH
+#: key behind them (BACKLOG #5544).
+_PARAMIKO_LOADS_BEHIND: dict[str, str] = {
+    "comment-line": "# " + _STRAY_BEGIN.decode() + "NOTE-----\n",
+    "comment-no-dashes": "# " + _STRAY_BEGIN.decode() + "NOTE\n",
+    "no-dashes": _STRAY_BEGIN.decode() + "NOTE\n",
+    "own-line": _STRAY_BEGIN.decode() + "NOTE-----\n",
+}
+
+
+@pytest.mark.parametrize("prefix", sorted(_PARAMIKO_LOADS_BEHIND))
+def test_the_sftp_connector_refuses_an_encrypted_openssh_key_behind_a_stray_begin_marker(
+    sftp_keys: dict[str, str], prefix: str
+) -> None:
+    stray = _PARAMIKO_LOADS_BEHIND[prefix]
+    encrypted = stray + sftp_keys["openssh-encrypted"]
+    assert keywrap.ssh_key_encrypted(encrypted.encode()) is True
+    with pytest.raises(ValueError, match="private_key is encrypted"):
+        _sftp(encrypted)
+    # A stray BEGIN inside the key, before its END, still reads as encrypted too.
+    inside = _before_end(sftp_keys["openssh-encrypted"].encode(), _STRAY_BEGIN + b"NOTE-----\n")
+    assert keywrap.ssh_key_encrypted(inside) is True
+    # The control: the plain key behind the same line builds, and the connector's loader opens it.
+    client = _sftp(stray + sftp_keys["openssh-plain"])
+    paramiko = pytest.importorskip("paramiko")
+    assert client._load_key(paramiko).get_bits() == 2048
 
 
 @pytest.mark.parametrize("which", ["plain-1024", "plain-1024-openssh"])

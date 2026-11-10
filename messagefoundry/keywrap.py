@@ -20,8 +20,8 @@ What is refused, by default and with no setting to turn it off:
   by RFC 8018's default, so it is refused like an explicit SHA-1 one.
 * **PBES2 with scrypt** below Appendix C's floor: ``r >= 8``, and ``N`` at least 2^17, 2^16 or 2^15
   for ``p`` of 1, 2, or 3 and up. Those are the table's three rows, encoded as written.
-* Any other derivation this module does not recognise, an encrypted key it cannot parse, and a key
-  file it cannot read or that is too large to check.
+* Any other derivation this module does not recognise, an encrypted key it cannot parse, a key
+  block whose base64 it cannot decode, and a key file it cannot read or that is too large to check.
 * An encrypted key where the loader has NO passphrase to give, before any library can try it.
 
 ``cryptography``'s ``BestAvailableEncryption`` and the ``openssl`` CLI's own default both write
@@ -382,6 +382,7 @@ def _wrap_problem(der: bytes, algorithm: str, params: _Tlv | None) -> str | None
 
 
 _UNREADABLE: Final = "is an encrypted private key this engine cannot read to check its wrap"
+_UNDECODABLE: Final = "is in a key block whose base64 this engine cannot decode to check its wrap"
 
 
 def _der_problem(der: bytes, *, known_encrypted: bool) -> tuple[bool, str | None]:
@@ -413,29 +414,54 @@ _MAX_LABEL: Final = 64
 
 
 def _pem_blocks(material: bytes) -> list[tuple[bytes, bytes]]:
-    """``(label, body)`` for every BEGIN/END pair in ``material``, in one linear pass.
+    """``(label, body)`` for every PEM block in ``material``, in one linear pass. A body runs from
+    its BEGIN marker to the next END, or to the next BEGIN when one comes first.
 
     Markers are found ANYWHERE, not only alone on a line: ``cryptography``'s PEM reader and
     OpenSSL both accept a key that is all on one line, has text before BEGIN, or has base64 on the
     BEGIN or END line, so a checker stricter than the loaders would wave those through unchecked.
-    Every search starts where the last one stopped, so a garbled file costs one pass."""
+    A label ends at its line, as OpenSSL reads it, so a label that runs across a line end is not one.
+
+    A BEGIN with another BEGIN before its END is read BOTH ways, because which one opens the key
+    depends on the shape (BACKLOG #5544). OpenSSL skips a ``# -----BEGIN NOTE-----`` comment line,
+    or a BEGIN line with no closing dashes, and loads the key after it, so the scan restarts at the
+    inner BEGIN. OpenSSL also loads a key from a proper BEGIN line with a stray BEGIN line between
+    its base64 and its END, so the outer block is kept too, its body cut at the inner BEGIN.
+    OpenSSL's base64 reader stops at the first ``-``, so it decodes nothing past that point. An
+    OpenSSH reader such as paramiko may decode past it, but the cipher name it reads is at the
+    start of the body, which the cut keeps. The cut also holds each body to the stretch between two
+    BEGINs, which keeps the pass linear.
+
+    Every search starts where the last one stopped, and the END found is kept until the scan
+    passes it, so a garbled file costs one pass."""
     blocks: list[tuple[bytes, bytes]] = []
     pos = 0
+    end = -1
     while True:
         begin = material.find(_BEGIN, pos)
         if begin < 0:
             return blocks
         label_start = begin + len(_BEGIN)
         label_end = material.find(_DASHES, label_start, label_start + _MAX_LABEL + 1)
-        if label_end < 0:
+        label = material[label_start:label_end] if label_end >= 0 else b""
+        if label_end < 0 or b"\n" in label or b"\r" in label:
             pos = label_start
             continue
         body_start = label_end + len(_DASHES)
-        end = material.find(_END, body_start)
-        if end < 0:
-            return blocks
-        blocks.append((material[label_start:label_end].strip(), material[body_start:end]))
-        pos = end + len(_END)
+        if end < body_start:
+            end = material.find(_END, body_start)
+            if end < 0:
+                return blocks
+        # Searched from the label, not the body: an inner BEGIN can start inside the dashes this
+        # BEGIN's label was closed by, as in ``-----BEGIN X--------BEGIN ...``.
+        inner = material.find(_BEGIN, label_start, end)
+        if inner < 0:
+            blocks.append((label.strip(), material[body_start:end]))
+            pos = end + len(_END)
+            continue
+        if inner > body_start:  # else the inner BEGIN starts in this one's own closing dashes
+            blocks.append((label.strip(), material[body_start:inner]))
+        pos = inner
 
 
 def _legacy_encrypted(material: bytes) -> bool:
@@ -477,11 +503,14 @@ def _inspect(material: bytes) -> tuple[bool, str | None]:
             continue  # a certificate or other non-key block
         der = b""
         try:
-            der = base64.b64decode(b"".join(body.split()), validate=True)
+            # Cut at the first "-", where OpenSSL's base64 reader stops, so text after the base64
+            # does not hide the key from this check. A body with no "-" is decoded whole.
+            der = base64.b64decode(b"".join(body.split(b"-", 1)[0].split()), validate=True)
         except (binascii.Error, ValueError):
-            if known:
-                return True, _UNREADABLE
-            continue  # not base64: the loader rejects it itself
+            # Refused under any key label, not skipped (BACKLOG #5544): OpenSSL also drops some
+            # bytes this strict decode does not, such as a control or high byte at a line end, and
+            # then decrypts what is left, so "the loader rejects it itself" does not hold.
+            return True, _UNREADABLE if known else _UNDECODABLE
         # Every key block is read for the EncryptedPrivateKeyInfo shape, whatever its label:
         # OpenSSL decrypts that shape under a plain PRIVATE KEY label too.
         block_encrypted, problem = _der_problem(der, known_encrypted=known)
