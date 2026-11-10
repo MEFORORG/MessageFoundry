@@ -1567,22 +1567,16 @@ async def test_a_resolve_the_store_failed_to_write_once_lands_in_the_same_pass(
         directory.uac.update({"u1": ABSENT, "u2": ABSENT})
         assert (await _alerted_pass(service, sink)).hold
         directory.uac.update({"u1": ENABLED, "u2": ENABLED})
-        # The notifier's fenced resolve writes through resolve_alert_generation (BACKLOG #4916),
-        # one call per instance id, so the failure is injected there, for the held instance.
-        held = await store.open_alert_generations(event_type="ad_reconcile_held")
-        held_ids = {g.id for g in held}
-        assert held_ids
-        real = store.resolve_alert_generation
+        # The notifier's resolve writes through resolve_alert_instances_fenced (BACKLOG #4916).
+        real = store.resolve_alert_instances_fenced
         failures = [sqlite3.OperationalError("synthetic: database is locked")]
 
-        async def failing_once(
-            *, alert_id: int, through_count: int, now: float | None = None
-        ) -> int:
-            if alert_id in held_ids and failures:
+        async def failing_once(*, event_type: str, **kwargs: Any) -> int:
+            if event_type == "ad_reconcile_held" and failures:
                 raise failures.pop()
-            return await real(alert_id=alert_id, through_count=through_count, now=now)
+            return await real(event_type=event_type, **kwargs)
 
-        monkeypatch.setattr(store, "resolve_alert_generation", failing_once)
+        monkeypatch.setattr(store, "resolve_alert_instances_fenced", failing_once)
         assert (await _alerted_pass(service, sink)).hold_clear
         assert not failures, "the synthetic failure never fired"
         assert await _open_alerts(store) == set()
@@ -1601,24 +1595,19 @@ async def test_a_resolve_the_store_never_wrote_is_retried_on_the_next_pass(
         directory.uac.update({"u1": ABSENT, "u2": ABSENT})
         assert (await _alerted_pass(service, sink)).hold
         directory.uac.update({"u1": ENABLED, "u2": ENABLED})
-        # Injected at resolve_alert_generation, the write the fenced resolve makes (BACKLOG #4916).
-        held = await store.open_alert_generations(event_type="ad_reconcile_held")
-        held_ids = {g.id for g in held}
-        assert held_ids
-        real = store.resolve_alert_generation
+        # The notifier's resolve writes through resolve_alert_instances_fenced (BACKLOG #4916).
+        real = store.resolve_alert_instances_fenced
         failing = True
         attempts = 0
 
-        async def failing_while_set(
-            *, alert_id: int, through_count: int, now: float | None = None
-        ) -> int:
+        async def failing_while_set(*, event_type: str, **kwargs: Any) -> int:
             nonlocal attempts
-            if alert_id in held_ids and failing:
+            if event_type == "ad_reconcile_held" and failing:
                 attempts += 1
                 raise sqlite3.OperationalError("synthetic: database is locked")
-            return await real(alert_id=alert_id, through_count=through_count, now=now)
+            return await real(event_type=event_type, **kwargs)
 
-        monkeypatch.setattr(store, "resolve_alert_generation", failing_while_set)
+        monkeypatch.setattr(store, "resolve_alert_instances_fenced", failing_while_set)
         assert (await _alerted_pass(service, sink)).hold_clear
         assert attempts == len(zeros) + 1  # every attempt failed, and the resolve gave up
         assert await _open_alerts(store) == {HELD}, "the failed resolve went through after all"

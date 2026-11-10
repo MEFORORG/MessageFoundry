@@ -322,6 +322,8 @@ class IntakeBoundMonitor:
         self._stop.set()
         tasks = (self._task, self._sweep_task)
         self._task = self._sweep_task = None
+        me = asyncio.current_task()
+        cancelled = False
         for task in tasks:
             if task is None:
                 continue
@@ -329,7 +331,9 @@ class IntakeBoundMonitor:
             try:
                 await task
             except asyncio.CancelledError:
-                pass
+                # The task's own cancel is expected; a cancel of the caller is passed on once the
+                # gate below has opened.
+                cancelled = cancelled or (me is not None and me.cancelling() > 0)
             except Exception:
                 # A task that died must not stop the stop: the gate below still opens.
                 log.warning("intake monitor task %s had failed", task.get_name(), exc_info=True)
@@ -340,6 +344,8 @@ class IntakeBoundMonitor:
             for reason in (DEPTH_REASON, DISK_REASON):
                 if reason in held or self._reported.get(reason):
                     self._report_clear_on_stop(reason)
+        if cancelled:
+            raise asyncio.CancelledError
 
     def _report_clear_on_stop(self, reason: str) -> None:
         sink = self._alert_sink
@@ -371,7 +377,12 @@ class IntakeBoundMonitor:
         skip_first = self._measured
         while not self._stop.is_set():
             if not skip_first:
-                await self.check_once()
+                try:
+                    await self.check_once()
+                except Exception:
+                    # As in _sweep_loop: a defect in one check must not end measuring, and with it
+                    # the gate's release, for the life of the process. Logged every time.
+                    log.exception("intake bound check raised; it runs again next interval")
             skip_first = False
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), self._check_seconds)

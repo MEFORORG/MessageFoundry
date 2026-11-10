@@ -4,9 +4,9 @@
 
 Two writers share one real SQLite store, as two engine shards or nodes would. Writer A's clear is
 held back, as the per-key FIFO and the retry backoff hold one back; writer B raises the same key in
-the window. Unfenced, A's late clear closes B's raise. The fence bounds the clear to the ``(id,
-count)`` the key had when the clear was emitted, plus A's own raises emitted before it (#2272 defect
-8), and compares no clock, so clock skew cannot leave an alert open for good.
+the window. Unfenced, A's late clear closes B's raise. The fence closes the instance only when its
+newest raise is A's own (#2272 defect 8) or it took no raise past A's snapshot, and compares no
+clock, so clock skew cannot leave an alert open for good.
 """
 
 from __future__ import annotations
@@ -24,29 +24,48 @@ from messagefoundry.store import MessageStore
 from tests.test_alert_state import _drain
 
 KEY = "intake:staged_depth@node:a"
+_FENCED = "resolve_alert_instances_fenced"
 
 
 class _Gated:
-    """One writer's view of the shared store: a named method can be held at a gate, or hidden."""
+    """One writer's view of the shared store. A named method can be held at a gate, hidden, or
+    counted; ``returned[name]`` is set once a call to it has returned."""
 
     def __init__(self, inner: MessageStore) -> None:
         self._inner = inner
         self.gates: dict[str, asyncio.Event] = {}
         self.hidden: set[str] = set()
+        self.returned: dict[str, asyncio.Event] = {}
+        self.calls: dict[str, int] = {}
 
     def __getattr__(self, name: str) -> Any:
         if name in self.hidden:
             raise AttributeError(name)
         attr = getattr(self._inner, name)
-        gate = self.gates.get(name)
-        if gate is None:
+        if not callable(attr):
             return attr
+        gate = self.gates.get(name)
+        done = self.returned.setdefault(name, asyncio.Event())
 
-        async def gated(*args: Any, **kwargs: Any) -> Any:
-            await gate.wait()
-            return await attr(*args, **kwargs)
+        async def wrapped(*args: Any, **kwargs: Any) -> Any:
+            self.calls[name] = self.calls.get(name, 0) + 1
+            if gate is not None:
+                await gate.wait()
+            try:
+                return await attr(*args, **kwargs)
+            finally:
+                done.set()
 
-        return gated
+        return wrapped
+
+    def gate(self, name: str) -> asyncio.Event:
+        self.returned[name] = asyncio.Event()  # only a call made from here on sets it
+        self.gates[name] = asyncio.Event()
+        return self.gates[name]
+
+    async def wait_returned(self, name: str) -> None:
+        await asyncio.wait_for(self.returned.setdefault(name, asyncio.Event()).wait(), 5.0)
+        self.returned[name] = asyncio.Event()
 
 
 def _raise(sink: NotifierAlertSink) -> None:
@@ -64,11 +83,6 @@ async def _live(store: MessageStore) -> list[tuple[int, int]]:
     ]
 
 
-async def _let_the_snapshot_land() -> None:
-    # The clear's snapshot read runs on aiosqlite's thread; give it real time, not just a tick.
-    await asyncio.sleep(0.2)
-
-
 @pytest.mark.parametrize("other_raises", [True, False], ids=["other-node-raises", "control"])
 async def test_a_held_back_clear_does_not_close_a_raise_that_landed_while_it_waited(
     tmp_path: Path, other_raises: bool
@@ -80,17 +94,20 @@ async def test_a_held_back_clear_does_not_close_a_raise_that_landed_while_it_wai
         b = NotifierAlertSink([], store=store)
         _raise(a)
         await _drain(a)
-        gate = view_a.gates["resolve_alert_generation"] = asyncio.Event()
+        gate = view_a.gate(_FENCED)
         _clear(a)  # emitted now; its write waits at the gate, as behind a slow write or a retry
-        await _let_the_snapshot_land()
+        await view_a.wait_returned("open_alert_generations")  # the snapshot
         if other_raises:
             _raise(b)
             await _drain(b)
         gate.set()
         await _drain(a)
         if other_raises:
-            [(alert_id, count)] = await _live(store)
-            assert count == 2, "B's raise, which landed after A's clear was emitted, stays open"
+            [(_id, count)] = await _live(store)
+            assert count == 2, "B's raise, which landed after A's snapshot, stays open"
+            _clear(b)
+            await _drain(b)
+            assert await _live(store) == [], "B's own clear then closes B's raise"
         else:
             assert await _live(store) == [], "the control: with no newer raise, the clear closes it"
     finally:
@@ -99,18 +116,18 @@ async def test_a_held_back_clear_does_not_close_a_raise_that_landed_while_it_wai
 
 async def test_unfenced_the_same_held_back_clear_closes_the_newer_raise(tmp_path: Path) -> None:
     """The race itself, on the path every store took before the fence: a store without the
-    generation methods resolves by key alone, and B's newer raise is closed."""
+    fence methods resolves by key alone, and B's newer raise is closed."""
     store = await MessageStore.open(tmp_path / "s.db")
     try:
         view_a = _Gated(store)
-        view_a.hidden = {"open_alert_generations", "resolve_alert_generation"}
+        view_a.hidden = {"open_alert_generations", _FENCED}
         a = NotifierAlertSink([], store=view_a)
         b = NotifierAlertSink([], store=store)
         _raise(a)
         await _drain(a)
-        gate = view_a.gates["resolve_alert_instances_for"] = asyncio.Event()
+        gate = view_a.gate("resolve_alert_instances_for")
         _clear(a)
-        await _let_the_snapshot_land()
+        await asyncio.sleep(0)
         _raise(b)
         await _drain(b)
         gate.set()
@@ -125,8 +142,8 @@ async def test_an_own_raise_emitted_before_the_clear_is_still_closed_by_it(
     tmp_path: Path, other_raises: bool
 ) -> None:
     """#2272 defect 8: A raises, then clears, and the raise is slow, so it lands after the clear's
-    snapshot. The clear still closes it. A raise from B that lands in the same window is not A's
-    to close, and keeps the row open."""
+    snapshot. The clear still closes it, since its newest raise is A's own. A raise from B that
+    lands after A's raise and before A's clear runs is not A's to close, and keeps it open."""
     store = await MessageStore.open(tmp_path / "s.db")
     try:
         view_a = _Gated(store)
@@ -134,20 +151,53 @@ async def test_an_own_raise_emitted_before_the_clear_is_still_closed_by_it(
         b = NotifierAlertSink([], store=store)
         _raise(a)
         await _drain(a)
-        gate = view_a.gates["upsert_alert_instance"] = asyncio.Event()
+        upsert = view_a.gate("upsert_alert_instance")
+        resolve = view_a.gate(_FENCED)
         _raise(a)  # slow: it holds the key's lock, so the clear queues behind it
         _clear(a)
-        await _let_the_snapshot_land()
+        await view_a.wait_returned("open_alert_generations")
+        upsert.set()
+        await view_a.wait_returned("upsert_alert_instance")
         if other_raises:
             _raise(b)
             await _drain(b)
-        gate.set()
+        resolve.set()
         await _drain(a)
         if other_raises:
             [(_id, count)] = await _live(store)
-            assert count == 3, "A's two raises and B's one; B's landed after the clear"
+            assert count == 3, "A's two raises and B's one; B's is the newest"
         else:
             assert await _live(store) == [], "A's own late raise came before its clear"
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("b_lands_last", [True, False], ids=["b-newest", "a-newest"])
+async def test_two_processes_raising_and_clearing_at_once_do_not_leave_it_open(
+    tmp_path: Path, b_lands_last: bool
+) -> None:
+    """Review finding F1: both raise and both clear the key at once, each raise slow enough to land
+    after both clears' snapshots. Whichever raise lands last, its writer's clear closes it."""
+    store = await MessageStore.open(tmp_path / "s.db")
+    try:
+        view_a, view_b = _Gated(store), _Gated(store)
+        a = NotifierAlertSink([], store=view_a)
+        b = NotifierAlertSink([], store=view_b)
+        up_a, up_b = view_a.gate("upsert_alert_instance"), view_b.gate("upsert_alert_instance")
+        _raise(a)
+        _clear(a)
+        _raise(b)
+        _clear(b)
+        await view_a.wait_returned("open_alert_generations")
+        await view_b.wait_returned("open_alert_generations")
+        first, second = (up_a, up_b) if b_lands_last else (up_b, up_a)
+        first_view = view_a if b_lands_last else view_b
+        first.set()
+        await first_view.wait_returned("upsert_alert_instance")
+        second.set()
+        await _drain(a)
+        await _drain(b)
+        assert await _live(store) == []
     finally:
         await store.close()
 
@@ -173,13 +223,59 @@ async def test_a_clear_whose_clock_runs_behind_the_raise_still_closes_it(
         await store.close()
 
 
+async def test_a_superseded_clear_settles_as_not_landed_and_is_not_retried(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Review finding F3: a zero-row resolve with a live instance left is not reported as landed,
+    so connection_started's in-memory clear goes back; nor is it retried or logged as given up."""
+    store = await MessageStore.open(tmp_path / "s.db")
+    try:
+        view_a = _Gated(store)
+        a = NotifierAlertSink([], store=view_a)
+        b = NotifierAlertSink([], store=store)
+        _raise(a)
+        await _drain(a)
+        gate = view_a.gate(_FENCED)
+        settled: list[bool] = []
+        with caplog.at_level(logging.INFO, logger="messagefoundry.pipeline.alert_sinks"):
+            a._record_state(
+                {"type": "intake_resumed", "connection": KEY}, "info", on_settled=settled.append
+            )
+            await view_a.wait_returned("open_alert_generations")
+            _raise(b)
+            await _drain(b)
+            gate.set()
+            await _drain(a)
+        assert settled == [False]
+        assert view_a.calls[_FENCED] == 1, "a superseded clear is not retried"
+        assert any("closed nothing" in r.getMessage() for r in caplog.records)
+        assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+        [(_id, count)] = await _live(store)
+        assert count == 2
+    finally:
+        await store.close()
+
+
+async def test_a_clear_with_nothing_open_settles_as_landed(tmp_path: Path) -> None:
+    store = await MessageStore.open(tmp_path / "s.db")
+    try:
+        a = NotifierAlertSink([], store=store)
+        settled: list[bool] = []
+        a._record_state(
+            {"type": "intake_resumed", "connection": KEY}, "info", on_settled=settled.append
+        )
+        await _drain(a)
+        assert settled == [True]
+    finally:
+        await store.close()
+
+
 async def test_a_failed_snapshot_resolves_unfenced_and_says_so(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     store = await MessageStore.open(tmp_path / "s.db")
     try:
-        view_a = _Gated(store)
-        a = NotifierAlertSink([], store=view_a)
+        a = NotifierAlertSink([], store=store)
         _raise(a)
         await _drain(a)
 
@@ -199,21 +295,5 @@ async def test_a_failed_snapshot_resolves_unfenced_and_says_so(
             await _drain(a)
         assert await _live(store) == [], "the behaviour before the fence, not a weaker one"
         assert any("resolving unfenced" in r.getMessage() for r in caplog.records)
-        assert a._raise_watchers == {}, "the fence unregistered its collector"
-    finally:
-        await store.close()
-
-
-async def test_an_upsert_returns_the_generation_it_left(tmp_path: Path) -> None:
-    store = await MessageStore.open(tmp_path / "s.db")
-    try:
-        first = await store.upsert_alert_instance(
-            event_type="intake_paused", connection=KEY, severity="warning"
-        )
-        second = await store.upsert_alert_instance(
-            event_type="intake_paused", connection=KEY, severity="warning"
-        )
-        assert (second.id, second.count) == (first.id, 2)
-        assert await _live(store) == [(first.id, 2)]
     finally:
         await store.close()

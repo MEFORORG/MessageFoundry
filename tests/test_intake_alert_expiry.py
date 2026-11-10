@@ -11,6 +11,7 @@ that keeps reminding and stays open.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import cast
 
@@ -265,10 +266,77 @@ async def test_an_acknowledged_stale_subject_expires_too(
 
 async def test_the_sqlite_store_keeps_the_generation_contract(tmp_path: Path) -> None:
     """The contract the Postgres and SQL Server suites run on their hosted legs."""
-    from tests._alert_generation_contract import check_alert_generation_contract
+    from tests._alert_generation_contract import (
+        check_alert_generation_contract,
+        check_fenced_resolve_contract,
+    )
 
     store = await MessageStore.open(tmp_path / "s.db")
     try:
         await check_alert_generation_contract(store)
+        await check_fenced_resolve_contract(store)
+    finally:
+        await store.close()
+
+
+async def test_a_cancelled_stop_still_opens_the_gate_and_passes_the_cancel_on(
+    tmp_path: Path,
+) -> None:
+    """Review finding F8: stop() awaits the tasks it cancelled, and a cancel of stop()'s own caller
+    arriving then is passed on, after the gate has opened, rather than swallowed."""
+    store = await MessageStore.open(tmp_path / "s.db")
+    try:
+        gate = IntakeGate()
+        monitor = IntakeBoundMonitor(cast(Store, store), gate, max_staged_depth=10)
+        gate.hold(DEPTH_REASON)
+        release = asyncio.Event()
+
+        async def slow_to_stop() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.shield(release.wait())
+
+        monitor._task = asyncio.ensure_future(slow_to_stop())
+        await asyncio.sleep(0)
+        stopping = asyncio.ensure_future(monitor.stop())
+        await asyncio.sleep(0)
+        stopping.cancel()
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await stopping
+        assert not gate.reasons, "the gate opened before the cancel went on"
+    finally:
+        await store.close()
+
+
+async def test_a_check_that_raises_does_not_end_measuring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review finding F4: one raising check is logged, and the loop measures again."""
+    store = await MessageStore.open(tmp_path / "s.db")
+    try:
+        monitor = IntakeBoundMonitor(
+            cast(Store, store), IntakeGate(), max_staged_depth=10, check_seconds=0.01
+        )
+        calls = 0
+
+        async def flaky() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("synthetic check defect")
+
+        monkeypatch.setattr(monitor, "check_once", flaky)
+        monitor.start()
+        try:
+            for _ in range(200):
+                if calls >= 2:
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            await monitor.stop()
+        assert calls >= 2
     finally:
         await store.close()

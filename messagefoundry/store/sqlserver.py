@@ -2203,7 +2203,7 @@ _SCHEMA: list[str] = [
         status NVARCHAR(16) NOT NULL, first_seen FLOAT NOT NULL, last_seen FLOAT NOT NULL,
         [count] BIGINT NOT NULL, reason NVARCHAR(MAX) NULL, acked_by NVARCHAR(256) NULL,
         acked_at FLOAT NULL, resolved_at FLOAT NULL, suspended_until FLOAT NULL,
-        escalation_tier INT NOT NULL DEFAULT 0)""",
+        escalation_tier INT NOT NULL DEFAULT 0, raised_by NVARCHAR(64) NULL)""",
     # #143: windowed NOTIFICATION-mute end-epoch (NULL/past = not suspended). COL_LENGTH-gated ADD for a
     # pre-existing (from #56) alert_instance table; a no-op on a fresh DB (the CREATE above already has it).
     """IF COL_LENGTH('alert_instance','suspended_until') IS NULL
@@ -2212,6 +2212,9 @@ _SCHEMA: list[str] = [
     # a pre-existing alert_instance; NOT NULL DEFAULT 0 backfills existing rows. No-op on a fresh DB.
     """IF COL_LENGTH('alert_instance','escalation_tier') IS NULL
         ALTER TABLE alert_instance ADD escalation_tier INT NOT NULL DEFAULT 0""",
+    # #4916: the notifier that wrote the newest raise (a per-process random id); NULL on old rows.
+    """IF COL_LENGTH('alert_instance','raised_by') IS NULL
+        ALTER TABLE alert_instance ADD raised_by NVARCHAR(64) NULL""",
     """IF INDEXPROPERTY(OBJECT_ID('alert_instance'),'ux_alert_instance_open','IndexID') IS NULL
         CREATE UNIQUE INDEX ux_alert_instance_open ON alert_instance(event_type, connection)
         WHERE status <> 'resolved'""",
@@ -8132,7 +8135,8 @@ class SqlServerStore:
         reason: str | None = None,
         escalation_tier: int = 0,
         now: float | None = None,
-    ) -> AlertGeneration:
+        raised_by: str | None = None,
+    ) -> None:
         # Pure observer (ADR 0044 D2): no queue row, no finalizer. De-dup grain = ADR 0014's
         # (event_type, connection) key. UPDATE-then-conditional-INSERT in one serializable transaction
         # (matching the SQLite path): the filtered unique index keeps it to one LIVE instance per key. The
@@ -8149,14 +8153,12 @@ class SqlServerStore:
             if reason
             else None
         )
-        # OUTPUT on both statements: the generation this write left (BACKLOG #4916), and a
-        # zero-match UPDATE read from its empty rowset, which SET NOCOUNT ON cannot hide.
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "UPDATE alert_instance SET last_seen=?, [count]=[count]+1, severity=?, reason=?,"
-                    " escalation_tier=CASE WHEN escalation_tier < ? THEN ? ELSE escalation_tier END"
-                    " OUTPUT inserted.id, inserted.[count]"
+                    " escalation_tier=CASE WHEN escalation_tier < ? THEN ? ELSE escalation_tier END,"
+                    " raised_by=?"
                     " WHERE event_type=? AND connection=? AND status<>'resolved'",
                     (
                         now,
@@ -8164,26 +8166,32 @@ class SqlServerStore:
                         reason_enc,
                         escalation_tier,
                         escalation_tier,
+                        raised_by,
                         event_type,
                         connection,
                     ),
                 )
-                row = await cur.fetchone()
-                if row is None:
+                if cur.rowcount == 0:
                     await cur.execute(
                         "INSERT INTO alert_instance"
                         " (event_type, connection, severity, status, first_seen, last_seen,"
-                        " [count], reason, escalation_tier)"
-                        " OUTPUT inserted.id, inserted.[count] VALUES (?,?,?,'open',?,?,1,?,?)",
-                        (event_type, connection, severity, now, now, reason_enc, escalation_tier),
+                        " [count], reason, escalation_tier, raised_by)"
+                        " VALUES (?,?,?,'open',?,?,1,?,?,?)",
+                        (
+                            event_type,
+                            connection,
+                            severity,
+                            now,
+                            now,
+                            reason_enc,
+                            escalation_tier,
+                            raised_by,
+                        ),
                     )
-                    row = await cur.fetchone()
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
-        assert row is not None  # an OUTPUT clause on the write that landed returns its row
-        return AlertGeneration(int(row[0]), connection, int(row[1]))
 
     async def list_active_alert_instances(
         self,
@@ -8455,6 +8463,29 @@ class SqlServerStore:
             tuple(params),
         )
         return [AlertGeneration(int(r["id"]), str(r["connection"]), int(r["count"])) for r in rows]
+
+    async def resolve_alert_instances_fenced(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        raised_by: str,
+        seen: AlertGeneration | None,
+        now: float | None = None,
+    ) -> int:
+        # BACKLOG #4916: close the key's live instance only when its newest raise is one this writer
+        # saw at the clear (seen_id/seen_count) or is this writer's own (raised_by). Clock-free.
+        # OUTPUT, not rowcount: the sink reads a zero as "a newer raise kept it open", and SET
+        # NOCOUNT ON cannot hide an output rowset.
+        now = time.time() if now is None else now
+        seen_id, seen_count = (seen.id, seen.count) if seen is not None else (-1, -1)
+        closed = await self._execute_output(
+            "UPDATE alert_instance SET status='resolved', resolved_at=? OUTPUT inserted.id"
+            " WHERE event_type=? AND connection=? AND status<>'resolved'"
+            " AND (raised_by=? OR (id=? AND [count]<=?))",
+            (now, event_type, connection, raised_by, seen_id, seen_count),
+        )
+        return len(closed)
 
     async def resolve_alert_generation(
         self, *, alert_id: int, through_count: int, now: float | None = None

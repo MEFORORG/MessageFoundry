@@ -809,7 +809,8 @@ _SCHEMA: list[str] = [
         acked_at    DOUBLE PRECISION,
         resolved_at DOUBLE PRECISION,
         suspended_until DOUBLE PRECISION,
-        escalation_tier INTEGER NOT NULL DEFAULT 0
+        escalation_tier INTEGER NOT NULL DEFAULT 0,
+        raised_by   TEXT
     )""",
     # #143: windowed NOTIFICATION-mute end-epoch (NULL/past = not suspended). ADD COLUMN IF NOT EXISTS
     # for a pre-existing (from #56) alert_instance table; a no-op on a fresh DB (the CREATE above has it).
@@ -818,6 +819,8 @@ _SCHEMA: list[str] = [
     # #81 (ADR 0133): highest occurrence-driven escalation tier reached (0=base). ADD COLUMN IF NOT EXISTS
     # for a pre-existing alert_instance; NOT NULL DEFAULT 0 backfills existing rows. No-op on a fresh DB.
     "ALTER TABLE alert_instance ADD COLUMN IF NOT EXISTS escalation_tier INTEGER NOT NULL DEFAULT 0",
+    # #4916: the notifier that wrote the newest raise (a per-process random id); NULL on old rows.
+    "ALTER TABLE alert_instance ADD COLUMN IF NOT EXISTS raised_by TEXT",
     """CREATE UNIQUE INDEX IF NOT EXISTS ux_alert_instance_open
         ON alert_instance(event_type, connection) WHERE status <> 'resolved'""",
     "CREATE INDEX IF NOT EXISTS ix_alert_instance_status ON alert_instance(status, connection)",
@@ -6613,7 +6616,8 @@ class PostgresStore:
         reason: str | None = None,
         escalation_tier: int = 0,
         now: float | None = None,
-    ) -> AlertGeneration:
+        raised_by: str | None = None,
+    ) -> None:
         # Pure observer (ADR 0044 D2): no queue row, no finalizer. De-dup grain = ADR 0014's
         # (event_type, connection) key. ON CONFLICT on the partial unique index folds a re-fire into the
         # live instance (bump last_seen + count, refresh severity/reason); an acknowledged instance stays
@@ -6631,26 +6635,24 @@ class PostgresStore:
             if reason
             else None
         )
-        # RETURNING: the generation this one statement left (BACKLOG #4916).
-        row = await self._pool.fetchrow(
+        await self._pool.execute(
             "INSERT INTO alert_instance"
             " (event_type, connection, severity, status, first_seen, last_seen, count, reason,"
-            " escalation_tier)"
-            " VALUES ($1,$2,$3,'open',$4,$4,1,$5,$6)"
+            " escalation_tier, raised_by)"
+            " VALUES ($1,$2,$3,'open',$4,$4,1,$5,$6,$7)"
             " ON CONFLICT (event_type, connection) WHERE status <> 'resolved' DO UPDATE SET"
             " last_seen=EXCLUDED.last_seen, count=alert_instance.count+1,"
             " severity=EXCLUDED.severity, reason=EXCLUDED.reason,"
-            " escalation_tier=GREATEST(alert_instance.escalation_tier, EXCLUDED.escalation_tier)"
-            " RETURNING id, count",
+            " escalation_tier=GREATEST(alert_instance.escalation_tier, EXCLUDED.escalation_tier),"
+            " raised_by=EXCLUDED.raised_by",
             event_type,
             connection,
             severity,
             now,
             reason_enc,
             escalation_tier,
+            raised_by,
         )
-        assert row is not None  # an upsert always returns its row
-        return AlertGeneration(int(row["id"]), connection, int(row["count"]))
 
     async def list_active_alert_instances(
         self,
@@ -6867,6 +6869,32 @@ class PostgresStore:
             *params,
         )
         return [AlertGeneration(int(r["id"]), str(r["connection"]), int(r["count"])) for r in rows]
+
+    async def resolve_alert_instances_fenced(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        raised_by: str,
+        seen: AlertGeneration | None,
+        now: float | None = None,
+    ) -> int:
+        # BACKLOG #4916: close the key's live instance only when its newest raise is one this writer
+        # saw at the clear (seen_id/seen_count) or is this writer's own (raised_by). Clock-free.
+        # A bounded borrow (BACKLOG #1052); a timed-out borrow is a failed attempt the sink retries.
+        now = time.time() if now is None else now
+        seen_id, seen_count = (seen.id, seen.count) if seen is not None else (-1, -1)
+        return await self._execute(
+            "UPDATE alert_instance SET status='resolved', resolved_at=$1"
+            " WHERE event_type=$2 AND connection=$3 AND status<>'resolved'"
+            " AND (raised_by=$4 OR (id=$5 AND count<=$6))",
+            now,
+            event_type,
+            connection,
+            raised_by,
+            seen_id,
+            seen_count,
+        )
 
     async def resolve_alert_generation(
         self, *, alert_id: int, through_count: int, now: float | None = None

@@ -1449,7 +1449,8 @@ class QueueStore(StoreLifecycle, Protocol):
         reason: str | None = None,
         escalation_tier: int = 0,
         now: float | None = None,
-    ) -> AlertGeneration:
+        raised_by: str | None = None,
+    ) -> None:
         """Record/fold one operator-alert occurrence into a resolvable ``alert_instance`` (ADR 0044),
         de-duped on ADR 0014's ``(event_type, connection)`` throttle key: if a live (``open`` or
         ``acknowledged``) instance for the key exists, bump ``last_seen`` + ``count`` (refresh
@@ -1463,8 +1464,9 @@ class QueueStore(StoreLifecycle, Protocol):
         no message body is ever passed here. The caller (the ``_emit`` chokepoint) wraps it fail-soft, so
         a store error here can never wedge a delivery worker.
 
-        Returns the live instance's :class:`AlertGeneration` as this write left it (BACKLOG #4916),
-        which the notifier uses to bound a later resolve to the raises it has seen."""
+        ``raised_by`` names the writer of this raise, stored on the instance as its newest raiser
+        (BACKLOG #4916): the notifier passes its per-process random id, and
+        :meth:`resolve_alert_instances_fenced` reads it."""
         ...
 
     async def list_active_alert_instances(
@@ -1559,6 +1561,22 @@ class QueueStore(StoreLifecycle, Protocol):
         """The live (``open`` or ``acknowledged``) instances of ``event_type``, for one
         ``connection`` or for every one, as :class:`AlertGeneration` pairs (BACKLOG #3269). Lockfree
         read; no reason cell is read."""
+        ...
+
+    async def resolve_alert_instances_fenced(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        raised_by: str,
+        seen: AlertGeneration | None,
+        now: float | None = None,
+    ) -> int:
+        """Auto-resolve the key's live instance only when its newest raise is one the resolving
+        writer had seen or wrote itself (BACKLOG #4916): it is the instance ``seen`` names, at most
+        ``seen.count`` raises in, or its newest raise carries ``raised_by``. A raise another writer
+        wrote after ``seen`` was read keeps it open. Returns the count resolved. No clock is
+        compared."""
         ...
 
     async def resolve_alert_generation(

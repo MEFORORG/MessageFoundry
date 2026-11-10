@@ -361,22 +361,30 @@ no inverse that could ever fire. Every `IntakeBoundMonitor` with a sink now reso
 of its own monotonic clock. The resolve is bounded by the `(id, count)` it read
 (`resolve_alert_generation`, all three backends), so a raise that lands first keeps the row open, and
 no clock is compared across processes. It closes an acknowledged instance too, as every auto-resolve
-does; retention then treats it as any other resolved row. Other process-labelled subjects
-(`crl_reload_refused`, `posture_loosened`, `log_forward_failed`, `remote_debug_refused`) are not
-swept by it.
+does; retention then treats it as any other resolved row. Other subjects that name a process, or a
+node that may not return, are not swept by it: at least `crl_reload_refused`, `posture_loosened`,
+`log_forward_failed`, `remote_debug_refused`, `leadership_acquired` and `dr_activated`.
 
-## Amendment (2026-11-09) -- an auto-resolve is fenced to the raises it saw (BACKLOG #4916)
+## Amendment (2026-11-09) -- an auto-resolve is fenced to the raises it speaks for (BACKLOG #4916)
 
 D2's auto-resolve closed every live instance of its key when it landed. It waits behind the key's
 FIFO lock (#2272 defect 8) and its retries (BACKLOG #3756), so another engine shard or node on the
-same store could raise the key in that window, and the late resolve closed the newer raise. The
-notifier now reads the key's live `(id, count)` when the resolve's task first runs, which is in
-emit order and before it queues, and closes each instance only through that count, plus one for
-each of its own raises that landed past it (the raises emitted before the clear, which defect 8
-still requires it to close). An upsert returns the generation it left, on all three backends, for
-that count. A raise from another process that lands later moves the count past the bound, and the
-instance stays open. No clock is compared: the `last_seen <= now` guard the PR for #3756 declined
-(decision d20261030T211551515-1de84e) would leave an alert open for good under cross-node clock
-skew. A resolve that closes nothing still landed, since nothing it observed is open or the instance
-it observed has taken a newer raise. A store without the generation methods, or a failed snapshot
-read, resolves unfenced, as before.
+same store could raise the key in that window, and the late resolve closed the newer raise.
+
+Each raise now stamps the instance with its writer's id: `alert_instance.raised_by`, a nullable
+column on all three backends holding a random id each notifier draws once per process. The
+notifier reads the key's live `(id, count)` when the resolve's task first runs, which is in emit
+order and before it queues on the lock, and `resolve_alert_instances_fenced` closes the instance
+only when its newest raise is the resolver's own, or it is the instance that read saw and has taken
+no raise past that count. The first case keeps defect 8: a raise emitted before the clear is
+closed by it, even when it lands after the read. A raise from another process that lands after the
+read, and is still the newest, keeps the instance open; that process's own clear closes it later.
+So when two processes raise and clear one key at once, the one whose raise landed last clears it,
+and neither leaves it open for good. The read runs a little after the emit, not at it, so a raise
+from another process in that gap is still closed, as before the fence.
+
+No clock is compared: the `last_seen <= now` guard the PR for #3756 declined (decision
+d20261030T211551515-1de84e) would leave an alert open for good under cross-node clock skew. A
+resolve that closes nothing while a live instance remains was superseded: it is settled as not
+landed, so `connection_started`'s in-memory clear goes back, and it is not retried. A store without
+the fence methods, or a failed read, resolves unfenced, as before.
