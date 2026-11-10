@@ -217,7 +217,11 @@ that package's build code may run in CI:
   - So the job fails on a stale lock: one that does not pin a package `requirements.txt` names,
     or pins it only under a marker false on the Windows runner, or at a version the requirement's
     specifier does not allow. The step copies pip 26's line handling (continuation lines, comments,
-    `${VAR}` expansion, options), then parses each requirement with the `packaging` copy pip
+    options) and expands `${VAR}`, but not as pip does: it expands each `${VAR}` the line names
+    once, in one pass, while pip replaces them one after another, so pip also expands a `${VAR}`
+    that a variable's value brings in when the line names that variable later. On such a line the
+    step and pip can read different options, and a line pip follows as an include or a constraint
+    can pass the step. The step parses each requirement with the `packaging` copy pip
     carries, so versions compare as pip compares them, and reads a line of options with no
     requirement with pip's own parser. A requirement whose marker is false on the runner, an extra
     (a lock records none), a URL or path with no package name, and an editable line (`-e` or
@@ -236,7 +240,8 @@ that package's build code may run in CI:
       and keep it there. This check compares only the requirements in `requirements.txt` with the
       lock, so it cannot see a limit a regeneration dropped.
     - The install. Every `pip install -r requirements.txt` reads the line too: at least the `check`
-      job, step 1 of the README's "Use it", and each deploying host's install. Once it is gone
+      job, step 1 of the README's "Use it", the VS Code extension's "Set Up Python Environment"
+      command, and each deploying host's install. Once it is gone
       those installs resolve live, with none of its limits, unless each passes `-c <file>` itself
       or applies the lock. To apply the lock, set `PIP_CONSTRAINT=requirements.lock` for that
       command only, or install with `pip install --require-hashes -r requirements.lock` in its
@@ -249,6 +254,12 @@ that package's build code may run in CI:
       engine depends on `uvloop` on Linux, and the README's lock commands lock Windows alone, so
       that lock cannot be applied there. A universal lock covers both (read the
       universal-lock note in this section first).
+      The extension's command applies the lock in neither way either: in a repository
+      with both `requirements.txt` and `requirements-dev.txt` and no `pyproject.toml`, it runs
+      `pip install -r requirements.txt -r requirements-dev.txt` as one command that passes no
+      `-c` and names no lock, and it has no setting that adds either. On a machine whose
+      environment that command sets up, the line is what carries its limits to that install, so
+      keep the line for as long as anyone sets up an environment that way.
 
     A `-c requirements.lock` line is refused too, and only the install step applies to it: do not
     pass the lock to the command that writes it. Removing the line is safe only once every install

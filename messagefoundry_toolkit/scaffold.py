@@ -449,11 +449,13 @@ def logical_lines(path):
 
 
 def split_line(group):
-    # A logical line's requirement text and its options, after this script's copy of pip 26's line
-    # handling: join_lines (a continued line loses its backslashes and joins with nothing, a file's
-    # last line included, and a comment joins after a space), the comment strip, ${VAR} expansion
-    # and break_args_options (options start at the first word beginning with "-"). Then the line
-    # before expansion, for a message that echoes it, so a value kept out of the file, such as a
+    # A logical line's requirement text and its options, after this script's version of pip 26's
+    # line handling: join_lines (a continued line loses its backslashes and joins with nothing, a
+    # file's last line included, and a comment joins after a space), the comment strip, ${VAR}
+    # expansion and break_args_options (options start at the first word beginning with "-"). The
+    # expansion is not pip's: it expands each ${VAR} once, in one pass, where pip replaces them in
+    # turn and so also expands a ${VAR} a value brings in when the line names that variable later.
+    # Then the line before expansion, for a message that echoes it, so a value kept out of the file, such as a
     # token in a URL, stays out of the log. pip leaves an unset or empty variable as written.
     joined = "".join(
         ln.strip("\\") if continued(ln) else f" {ln}" if comment(ln) else ln for ln in group
