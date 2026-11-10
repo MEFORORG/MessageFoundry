@@ -87,11 +87,13 @@ marker, as ``_pip_audit_may_see_marker`` reads it, which pip-audit would skip un
 host fails the marker (the ``;`` the strip leaves inside a bare URL's ``#egg=`` fragment, say); and
 a ``--skip-private`` that names the engine or another published
 MessageFoundry package, a package the lock does not pin, or every pin, or that comes after the lock
-as a word of its own (the ``=`` form or an abbreviation there reaches pip-audit, which fails on it
-as an unknown option); and a ``--pass-environment`` entry the paragraph above says it refuses, or
-any word after the lock that is that flag or an abbreviation of it down to ``--p``, in any case
-and in the ``=`` form, or that starts with ``--pas``, since pip-audit's usage error would print a
-``NAME=value`` typed there. Its own usage error withholds what follows the ``=`` in each word. It does not judge
+as a word of its own (an abbreviation there reaches pip-audit, which fails on it as an unknown
+option); and a ``--pass-environment`` entry the paragraph above says it refuses, or that comes
+after the lock as a word of its own; and any word after the lock that holds ``=`` and is not
+``--option=value`` for a pip-audit option that takes a value (``_equals_word_refusal``), since
+pip-audit's usage error would print a ``NAME=value`` typed there. The refusal names the word's
+position, not the word. What this module prints itself, its usage error and each ``::error::``
+line, withholds what follows the first ``=`` in every word it was given. It does not judge
 whether a non-empty lock is complete; released-line-audit carries its own floor for that.
 
 It reads lines as pip does: a requirement or option is any line that does not continue the one
@@ -135,7 +137,7 @@ import tempfile
 import urllib.parse
 from collections.abc import Callable, Collection, Sequence
 from pathlib import Path
-from typing import NoReturn
+from typing import NoReturn, TextIO
 
 from messagefoundry.childenv import (
     auditor_environment,
@@ -539,37 +541,136 @@ def _skip_private_refusal(private: Collection[str], pip_audit_args: Sequence[str
     )
 
 
-def _names_pass_environment(arg: str) -> bool:
-    """Whether ``arg``, up to any ``=`` and in any case, is ``--pass-environment`` or an
-    abbreviation of it down to ``--p``, or starts with ``--pas``. pip-audit's own ``--path`` and
-    ``--progress-spinner`` are not matched."""
-    head = arg.partition("=")[0].lower()
-    return (len(head) > 2 and "--pass-environment".startswith(head)) or head.startswith("--pas")
+#: pip-audit's long options, as the pinned pip-audit (2.10.1, in ``requirements-audit.lock``)
+#: declares them, with argparse's own ``--help``. These take no value.
+_PIP_AUDIT_FLAGS = frozenset(
+    {
+        "--help",
+        "--version",
+        "--local",
+        "--locked",
+        "--dry-run",
+        "--strict",
+        "--verbose",
+        "--fix",
+        "--require-hashes",
+        "--skip-editable",
+        "--no-deps",
+        "--disable-pip",
+    }
+)
+#: Those that take a value of a fixed form, a choice or a number: argparse's error for a bad one
+#: quotes the value, so one holding ``=`` is refused.
+_PIP_AUDIT_FIXED_VALUE_OPTIONS = frozenset(
+    {
+        "--format",
+        "--vulnerability-service",
+        "--desc",
+        "--aliases",
+        "--progress-spinner",
+        "--timeout",
+    }
+)
+#: Those that take free text, a path, a URL or an ID, which may hold ``=``.
+_PIP_AUDIT_TEXT_OPTIONS = frozenset(
+    {
+        "--requirement",
+        "--osv-url",
+        "--cache-dir",
+        "--path",
+        "--index-url",
+        "--extra-index-url",
+        "--output",
+        "--ignore-vuln",
+    }
+)
+_PIP_AUDIT_OPTIONS = _PIP_AUDIT_FLAGS | _PIP_AUDIT_FIXED_VALUE_OPTIONS | _PIP_AUDIT_TEXT_OPTIONS
+
+
+def _pip_audit_option(head: str) -> str | None:
+    """The pip-audit long option ``head`` names, exactly or as argparse's unique abbreviation of
+    it, or ``None``."""
+    if head in _PIP_AUDIT_OPTIONS:
+        return head
+    if not head.startswith("--") or len(head) < 3:
+        return None
+    matches = [option for option in _PIP_AUDIT_OPTIONS if option.startswith(head)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _equals_word_refusal(pip_audit_args: Sequence[str]) -> str | None:
+    """Why a word after the lock is not passed to pip-audit, or ``None``: one that holds ``=`` and
+    is not ``--option=value`` for a pip-audit option that takes a value, or whose fixed-form value
+    holds another ``=``.
+
+    pip-audit's usage error quotes such a word, or its value, whole, so ``NAME=value`` typed after
+    the lock in any spelling, a misspelled ``--pass-environment=NAME=value`` among them, would
+    carry the value into a CI log. The refusal names the word's position, never the word. A value
+    that holds ``=`` goes in the ``=`` form of its option, ``--index-url=URL``."""
+    for position, word in enumerate(pip_audit_args, 1):
+        head, equals, value = word.partition("=")
+        if not equals:
+            continue
+        option = _pip_audit_option(head)
+        if option in _PIP_AUDIT_TEXT_OPTIONS or (
+            option in _PIP_AUDIT_FIXED_VALUE_OPTIONS and "=" not in value
+        ):
+            continue
+        return (
+            f"word {position} after the lock holds '=' and is not a pip-audit option given as "
+            "--option=value; it is not passed on (a value that holds '=' goes in the = form of "
+            "its option)"
+        )
+    return None
+
+
+def _withholder(words: Sequence[str]) -> Callable[[str], str]:
+    """What withholds, in a text the auditor prints, the part after the first ``=`` of each of
+    ``words``, as typed and as ``repr`` quotes it (argparse's "ignored explicit argument" form and
+    an ``OSError`` filename), in one substitution, longest first, so no word that holds ``=`` is
+    printed whole (vault BACKLOG #2600). It may withhold the same characters elsewhere too."""
+    values = {word.partition("=")[2] for word in words if "=" in word} - {""}
+    forms = values | {repr(value)[1:-1] for value in values}
+    if not forms:
+        return lambda text: text
+    alternatives = "|".join(re.escape(f) for f in sorted(forms, key=len, reverse=True))
+    # Case-blind: --skip-private prints a name canonical_name lowercased.
+    pattern = re.compile(alternatives, re.IGNORECASE)
+    return lambda text: pattern.sub("<withheld>", text)
+
+
+class _WithheldStream:
+    """``stream``, with each write passed through ``withhold``."""
+
+    def __init__(self, stream: TextIO, withhold: Callable[[str], str]) -> None:
+        self._stream, self._withhold = stream, withhold
+
+    def write(self, text: str) -> int:
+        return self._stream.write(self._withhold(text))
+
+    def flush(self) -> None:
+        self._stream.flush()
 
 
 class _ValueWithholdingParser(argparse.ArgumentParser):
-    """A parser whose usage error withholds what follows the ``=`` wherever it quotes a whole word it
-    was given: a misspelled ``--pass-enviroment=NAME=value`` would otherwise reach the CI log through argparse's
-    own "unrecognized arguments" line (vault BACKLOG #2600)."""
+    """A parser whose usage error passes through :func:`_withholder` over the words it was given:
+    a misspelled ``--pass-enviroment=NAME=value`` would otherwise reach the CI log through
+    argparse's own "unrecognized arguments" line (vault BACKLOG #2600)."""
 
-    def __init__(self, words: Sequence[str], *, description: str | None) -> None:
+    def __init__(self, withhold: Callable[[str], str], *, description: str | None) -> None:
         super().__init__(description=description)
-        self._words = [word for word in words if "=" in word]
+        self._withhold = withhold
 
     def error(self, message: str) -> NoReturn:
-        for word in self._words:
-            message = message.replace(word, f"{word.partition('=')[0]}=<withheld>")
-        super().error(message)
+        super().error(self._withhold(message))
 
 
 def _pass_environment_refusal(names: Sequence[str], pip_audit_args: Sequence[str]) -> str | None:
     """Why a ``--pass-environment`` request is refused, or ``None``.
 
-    After the lock, any word that starts as the flag does is refused, the ``=`` form and an
-    abbreviation included, not only the exact word: argparse hands it to pip-audit, whose usage
-    error prints it, and ``--pass-environment=NAME=value`` typed by mistake would carry the value
-    into a CI log. The text echoes none of it."""
-    if any(_names_pass_environment(arg) for arg in pip_audit_args):
+    The flag after the lock, as a word of its own, is refused by name; its ``=`` form there is
+    :func:`_equals_word_refusal`'s. The text echoes no entry that is not a name."""
+    if "--pass-environment" in pip_audit_args:
         return "--pass-environment goes before the lock, not after it"
     refusals = (pass_environment_refusal(name) for name in names)
     first = next((refusal for refusal in refusals if refusal), None)
@@ -593,8 +694,11 @@ def _run(cmd: list[str], *, pass_environment: Sequence[str] = ()) -> int:
 
 def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | None = None) -> int:
     words = list(sys.argv[1:] if argv is None else argv)
+    withhold = _withholder(words)
+    # Every line below that can quote a word given goes to err, or through withhold.
+    err = _WithheldStream(sys.stderr, withhold)
     parser = _ValueWithholdingParser(
-        words, description=__doc__.splitlines()[0] if __doc__ else None
+        withhold, description=__doc__.splitlines()[0] if __doc__ else None
     )
     parser.add_argument(
         "--skip-private",
@@ -619,11 +723,20 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | No
         help="passed through to pip-audit, e.g. --ignore-vuln <ID>",
     )
     args = parser.parse_args(words)
+    lock = withhold(str(args.lock))
+    refusal = _equals_word_refusal(args.pip_audit_args)
+    if any("=" in name for name in args.skip_private):
+        # Refused here, unquoted: a refusal further down prints the name as canonical_name
+        # rewrote it, which withhold cannot match (vault BACKLOG #2600).
+        refusal = "a --skip-private entry is not a package name; name packages only"
+    if refusal:
+        print(f"::error::{lock}: {refusal}", file=err)
+        return 2
 
     try:
         raw = args.lock.read_bytes()
     except OSError as exc:
-        print(f"::error::{args.lock}: not readable: {exc}", file=sys.stderr)
+        print(f"::error::{lock}: not readable: {exc}", file=err)
         return 2
     try:
         source, copy_encoding = _decode_lock(raw)
@@ -632,43 +745,43 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | No
         # safe_exc names it by type, codec and position; a LookupError keeps its type and a
         # bounded text, since the codec name it quotes is the lock's own, of any length.
         print(
-            f"::error::{args.lock}: not decodable the way pip decodes a requirements file: "
+            f"::error::{lock}: not decodable the way pip decodes a requirements file: "
             f"{safe_exc(exc)}",
-            file=sys.stderr,
+            file=err,
         )
         return 2
     lines, kinds = _classify(source)
     stripped_lines, stripped, requirements = _strip(lines, kinds)
     if requirements == 0:
         print(
-            f"::error::{args.lock}: no requirement lines -- refusing an empty audit",
-            file=sys.stderr,
+            f"::error::{lock}: no requirement lines -- refusing an empty audit",
+            file=err,
         )
         return 2
     options = _lines_of(lines, kinds, "option")
     if options:
-        print(f"::error::{args.lock}: pip option lines are not audited: {options}", file=sys.stderr)
+        print(f"::error::{lock}: pip option lines are not audited: {options}", file=err)
         return 2
     continued = _lines_of(lines, kinds, "continued")
     if continued:
         print(
-            f"::error::{args.lock}: a requirement continues onto a line whose marker would not be "
+            f"::error::{lock}: a requirement continues onto a line whose marker would not be "
             f"removed: {continued}",
-            file=sys.stderr,
+            file=err,
         )
         return 2
     # The count is of the lock as committed, which _kinds reads once (L6); the copy is what
     # pip-audit's parser reads (see _pip_audit_requirement_count). Checked here, before _drop reads
     # the stripped lines by the lock's kinds, and again on the copy _drop leaves.
     if _pip_audit_requirement_count("".join(stripped_lines)) != requirements:
-        print(f"::error::{args.lock}: {_COUNT_REFUSAL}", file=sys.stderr)
+        print(f"::error::{lock}: {_COUNT_REFUSAL}", file=err)
         return 2
     private = {canonical_name(name) for name in args.skip_private}
     refusal = _skip_private_refusal(private, args.pip_audit_args) or _pass_environment_refusal(
         args.pass_environment, args.pip_audit_args
     )
     if refusal:
-        print(f"::error::{args.lock}: {refusal}", file=sys.stderr)
+        print(f"::error::{lock}: {refusal}", file=err)
         return 2
     # _strip rewrote lines one for one and kept each one's continuation, so their kinds stand: the
     # check above refuses a copy where they do not.
@@ -676,29 +789,29 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | No
     unmatched = private - {name for name, _ in skipped}
     if unmatched:
         print(
-            f"::error::{args.lock}: --skip-private names a package the lock does not pin: "
+            f"::error::{lock}: --skip-private names a package the lock does not pin: "
             f"{sorted(unmatched)}",
-            file=sys.stderr,
+            file=err,
         )
         return 2
     if len(skipped) == requirements:
-        print(f"::error::{args.lock}: --skip-private leaves no pin to audit", file=sys.stderr)
+        print(f"::error::{lock}: --skip-private leaves no pin to audit", file=err)
         return 2
     counted = requirements - len(skipped)
     audited = "".join(kept)
     read = _pip_audit_requirements(audited)
     if read is None or len(read) != counted:
-        print(f"::error::{args.lock}: {_COUNT_REFUSAL}", file=sys.stderr)
+        print(f"::error::{lock}: {_COUNT_REFUSAL}", file=err)
         return 2
     if any(map(_pip_audit_may_see_marker, read)):
-        print(f"::error::{args.lock}: {_MARKER_REFUSAL}", file=sys.stderr)
+        print(f"::error::{lock}: {_MARKER_REFUSAL}", file=err)
         return 2
     # A skipped pin is neither counted nor listed as audited.
     stripped = [
         e for e in stripped if not (m := _NAME.match(e)) or canonical_name(m[0]) not in private
     ]
     print(
-        f"{args.lock}: {counted} pinned requirements audited, {len(stripped)} "
+        f"{lock}: {counted} pinned requirements audited, {len(stripped)} "
         "un-gated from a marker the host would have evaluated:"
     )
     for entry in stripped:
@@ -724,9 +837,8 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | No
             copy.write_bytes(audited.encode(copy_encoding))
         except UnicodeError as exc:
             print(
-                f"::error::{args.lock}: its copy is not writable as {copy_encoding}: "
-                f"{safe_exc(exc)}",
-                file=sys.stderr,
+                f"::error::{lock}: its copy is not writable as {copy_encoding}: {safe_exc(exc)}",
+                file=err,
             )
             return 2
         # The count above is of `audited`, so pip-audit must decode exactly that. A codec whose
@@ -743,9 +855,9 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | No
             faithful = False
         if not faithful:
             print(
-                f"::error::{args.lock}: its copy does not read back, the way pip-audit reads it, "
+                f"::error::{lock}: its copy does not read back, the way pip-audit reads it, "
                 "as the text whose pins were counted",
-                file=sys.stderr,
+                file=err,
             )
             return 2
         audit = [*python_module_argv("pip_audit"), "-r", str(copy), "--desc", "--disable-pip"]

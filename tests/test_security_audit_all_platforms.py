@@ -1111,62 +1111,104 @@ def test_a_pass_environment_after_the_lock_is_refused_by_name(
     assert "goes before the lock" in capsys.readouterr().err
 
 
+#: The value each case below types, asserted absent from everything the auditor prints.
+_SECRET = "marker-not-a-key"
+
+
 @pytest.mark.parametrize(
     "after",
     [
-        ["--pass-environment=KEYRING_A=marker-not-a-key"],
-        ["--pass-env=KEYRING_A=marker-not-a-key"],
-        ["--pas=KEYRING_A=marker-not-a-key"],
-        ["--pa=KEYRING_A=marker-not-a-key"],
-        ["--p=KEYRING_A=marker-not-a-key"],
-        ["--PASS-ENVIRONMENT=KEYRING_A=marker-not-a-key"],
-        ["--pass-environment-x=marker-not-a-key"],
-        ["--pass-env", "KEYRING_A=marker-not-a-key"],
+        [f"--pass-environment=KEYRING_A={_SECRET}"],
+        [f"--pass-env=KEYRING_A={_SECRET}"],
+        [f"--p=KEYRING_A={_SECRET}"],
+        [f"--PASS-ENVIRONMENT=KEYRING_A={_SECRET}"],
+        [f"-pass-environment=KEYRING_A={_SECRET}"],
+        [f"--env=KEYRING_A={_SECRET}"],
+        [f"KEYRING_A={_SECRET}"],
+        ["--pass-env", f"KEYRING_A={_SECRET}"],
+        # A flag in the = form: argparse's "ignored explicit argument" error quotes the value.
+        [f"--strict={_SECRET}"],
+        [f"--help={_SECRET}"],
+        # A fixed-form value holding "=": its "invalid choice" error quotes the value.
+        [f"--format=json={_SECRET}"],
+        [f"--skip-private=idna={_SECRET}"],
     ],
 )
-def test_a_pass_environment_value_after_the_lock_never_reaches_pip_audit_or_the_log(
+def test_an_equals_word_after_the_lock_that_is_no_pip_audit_option_is_refused_unquoted(
     after: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """After the lock, argparse hands every word to pip-audit, whose usage error prints an unknown
-    option whole, so ``--pass-environment=NAME=value`` would carry the value into a CI log. The
-    ``=`` form and an abbreviation are refused as the exact word is: pip-audit never starts, and
-    nothing this module prints holds the value."""
+    """After the lock, argparse hands every word to pip-audit, whose usage error quotes a word it
+    does not take, or its value, whole, so ``NAME=value`` typed there in any spelling would carry
+    the value into a CI log. Any word holding ``=`` that is not ``--option=value`` for a pip-audit
+    option taking a value is refused: pip-audit never starts, and the refusal names the word's
+    position, not the word."""
     src = tmp_path / "x.lock"
     src.write_text(LOCK, encoding="utf-8")
     ran, run = _recorder(0)
     assert main([str(src), *after], run=run) == 2
     assert not ran
     out, err = capsys.readouterr()
-    assert "goes before the lock" in err
-    assert "marker-not-a-key" not in out + err
+    assert f"word {len(after)} after the lock holds '='" in err
+    assert _SECRET not in out + err
 
 
-def test_pip_audits_own_p_options_still_pass_through_after_the_lock(tmp_path: Path) -> None:
-    """The control for the refusal above: ``--progress-spinner`` and ``--path`` start with ``--p``
-    but are pip-audit's own, so they reach it."""
+def test_pip_audits_own_options_still_pass_through_after_the_lock(tmp_path: Path) -> None:
+    """The control for the refusal above: pip-audit's own options reach it, abbreviated, in the
+    ``=`` form, and with a value that holds ``=`` where that value is free text."""
     src = tmp_path / "x.lock"
     src.write_text(LOCK, encoding="utf-8")
     ran, run = _recorder(0)
-    assert main([str(src), "--progress-spinner=off", "--path", "x"], run=run) == 0
-    assert ran[-1][-3:] == ["--progress-spinner=off", "--path", "x"]
+    passed = [
+        "--progress-spinner=off",
+        "--pa=x",
+        "--path",
+        "x",
+        "--index-url=https://index.invalid/simple?a=b",
+        "--ignore-vuln",
+        "GHSA-0000-0000-0000",
+    ]
+    assert main([str(src), *passed], run=run) == 0
+    assert ran[-1][-len(passed) :] == passed
 
 
-@pytest.mark.parametrize("flag", ["--pass-enviroment", "--Pass-Environment"])
-def test_a_misspelled_pass_environment_before_the_lock_keeps_its_value_out_of_the_log(
-    flag: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    "words",
+    [
+        # argparse's own "unrecognized arguments" line.
+        [f"--pass-enviroment=KEYRING_A={_SECRET}", "LOCK"],
+        [f"--Pass-Environment=KEYRING_A={_SECRET}", "LOCK"],
+        # A word whose value a shorter word's value starts: one substitution, longest first.
+        ["--pass-enviroment=K=marker", f"--pass-enviroment=K=marker{_SECRET}", "LOCK"],
+        # argparse's "ignored explicit argument" error quotes only the value, as a repr.
+        [f"--help=K={_SECRET}", "LOCK"],
+        # A word with a space is read as the lock, so the "not readable" line quotes it.
+        [f"--pass-enviroment=K={_SECRET} b", "LOCK"],
+        # The flag forgotten: NAME=value is read as the lock.
+        [f"KEYRING_A={_SECRET}", "LOCK"],
+        # A package name canonical_name would rewrite past what withhold matches.
+        [f"--skip-private=idna=KEY_{_SECRET}", "LOCK"],
+    ],
+)
+def test_nothing_the_auditor_prints_holds_a_value_typed_before_the_lock(
+    words: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """argparse's own usage error names an unrecognized word; the parser withholds what follows
-    its ``=``, so a typo does not put a value in the CI log (vault BACKLOG #2600)."""
+    """Its usage error and every ``::error::`` line withhold what follows the first ``=`` of each
+    word it was given, so a typo does not put a value in the CI log (vault BACKLOG #2600)."""
     src = tmp_path / "x.lock"
     src.write_text(LOCK, encoding="utf-8")
     ran, run = _recorder(0)
-    with pytest.raises(SystemExit) as stopped:
-        main([f"{flag}=KEYRING_A=marker-not-a-key", str(src)], run=run)
-    assert stopped.value.code == 2
+    argv = [str(src) if word == "LOCK" else word for word in words]
+    status: int | str | None
+    try:
+        status = main(argv, run=run)
+    except SystemExit as stopped:
+        status = stopped.code
+    assert status == 2
     assert not ran
     out, err = capsys.readouterr()
-    assert f"{flag}=<withheld>" in err
-    assert "marker-not-a-key" not in out + err
+    # Withheld where a line quotes the word, or refused without quoting it.
+    assert "<withheld>" in err or "not a package name" in err
+    assert _SECRET not in out + err
 
 
 def test_a_relative_pythonpath_entry_does_not_reach_pip_or_pip_audit(

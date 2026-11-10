@@ -270,8 +270,9 @@ def outside_engine_namespace(name: str) -> bool:
 
 #: The interpreter variables :data:`_INTERPRETER_NAMES` leaves out that
 #: :func:`pass_environment_refusal` refuses: a child started with ``PYTHONINSPECT`` set waits at a
-#: prompt instead of exiting. The other two may be named. ``PYTHONSTARTUP`` is read only by an
-#: interactive interpreter, which none of these children is. ``PYTHONBREAKPOINT=0`` turns
+#: prompt instead of exiting. The other two may be named. ``PYTHONSTARTUP`` does not make an
+#: interpreter interactive; it runs a file the operator names when one already is.
+#: ``PYTHONBREAKPOINT=0`` turns
 #: ``breakpoint()`` into a no-op, and unset it calls ``pdb.set_trace`` anyway, so refusing it would
 #: only block the protective value.
 _INTERPRETER_CONTROL_NAMES: Final = frozenset({"PYTHONINSPECT"})

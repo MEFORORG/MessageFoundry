@@ -674,6 +674,22 @@ def test_pythonbreakpoint_may_be_passed_so_its_protective_zero_reaches_the_child
     assert childenv.auditor_environment(parent, extra_names=("PYTHONBREAKPOINT",)) == parent
 
 
+@pytest.mark.parametrize("section", ["sandbox", "dr"])
+def test_pythonstartup_may_be_passed(section: str, tmp_path: Path) -> None:
+    """Only ``PYTHONINSPECT`` is refused among the interpreter's console variables:
+    ``PYTHONSTARTUP`` is read only by an interactive interpreter and names the operator's own file.
+    Both settings, both builders and the auditor take it, and its value crosses."""
+    path = tmp_path / "messagefoundry.toml"
+    path.write_text(f'[{section}]\npass_environment = ["PYTHONSTARTUP"]\n', encoding="utf-8")
+    loaded = settings.load_settings(config_path=path, environ={})
+    assert getattr(loaded, section).pass_environment == ("PYTHONSTARTUP",)
+    assert childenv.pass_environment_refusal("PYTHONSTARTUP") is None
+    parent = {"PYTHONSTARTUP": "startup.py"}
+    assert childenv.worker_environment(parent, extra_names=("PYTHONSTARTUP",)) == parent
+    assert childenv.hook_environment(parent, extra_names=("PYTHONSTARTUP",)) == parent
+    assert childenv.auditor_environment(parent, extra_names=("PYTHONSTARTUP",)) == parent
+
+
 def test_dr_pass_environment_is_refused_at_load(tmp_path: Path) -> None:
     """Through the loader, from a file and from the environment, with an ordinary name as the
     control that the same path loads."""
