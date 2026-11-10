@@ -8,7 +8,8 @@ the free-text redaction writes ``[`` and ``]``, and every street in the address 
 The engine adapter writes through ``Message.set``, which refuses a whole-field value holding the
 field separator, so it refused these messages. The tee adapter joined the value back on the
 separator and emitted it, which would add fields and renumber every later field for any reader of
-the output, the leak-check included. These tests pin that the two now agree.
+the output, the leak-check included. These tests pin that the two now agree on these inputs. They
+do not agree on every input: ``docs/PHI.md`` section 9 names at least the cases known to differ.
 
 Every value here is synthetic.
 """
@@ -21,7 +22,7 @@ import pytest
 
 import messagefoundry_toolkit.anon as engine_anon
 import tee.anon as tee_anon
-from messagefoundry.parsing.message import _STRUCTURE_REFUSED
+from messagefoundry.parsing.message import Message
 from tee.anon import hl7 as tee_hl7
 from tee.anon.keying import Keyer
 
@@ -98,10 +99,24 @@ def test_the_guard_refuses_each_structure_character(value: str) -> None:
         tee_hl7._whole_field("PID-3", value, "+")
 
 
-def test_the_guard_refuses_what_the_engine_refuses() -> None:
-    """The tee cannot import the engine's list, so it keeps a copy; this pins the two equal. A byte
-    added to one side alone would be a new divergence."""
-    assert set(tee_hl7._REFUSED_IN_FIELD) == {"\r", "\n", *_STRUCTURE_REFUSED}
+@pytest.mark.parametrize("char", [chr(n) for n in (*range(0x20), 0x7F)] + ["|", "^", "~", "\\"])
+def test_the_guard_refuses_exactly_what_the_engine_whole_field_write_refuses(char: str) -> None:
+    """The tee cannot import the engine's checks, so it keeps a copy; this probes both with every C0
+    byte, DEL and each default delimiter. A byte refused on one side alone would be a new
+    divergence."""
+    msg = Message.parse("MSH|^~\\&|A|B\rPID|1")
+    value = f"A{char}1"
+    try:
+        msg.set("PID-3", value)
+        engine_refuses = False
+    except ValueError:
+        engine_refuses = True
+    try:
+        tee_hl7._whole_field("PID-3", value, "|")
+        tee_refuses = False
+    except tee_anon.AnonError:
+        tee_refuses = True
+    assert tee_refuses == engine_refuses
 
 
 def test_the_guard_passes_a_value_with_no_structure_character() -> None:

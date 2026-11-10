@@ -17,12 +17,12 @@ the same field on both sides, and both refuse a short later header line (BACKLOG
 Never string-slices in the forbidden sense: it splits only on the message's *actual* field separator
 (read from MSH) and replaces whole fields. A surrogate value CAN hold the field separator under a
 custom MSH-1. At least: the date fill writes ``+``, the free-text redaction writes ``[`` and ``]``,
-and the name, address and provider pools hold letters, digits and spaces. Joined back, such a value
-would add fields and renumber every later field for any reader of the output. So a surrogate a
-RULE writes that holds the field separator, CR, LF, an MLLP frame byte or NUL is refused, as the
-engine adapter's ``Message.set`` refuses it (BACKLOG #5540). Neither adapter checks what the
-shared site-code pass writes after the rules, or a surrogate holding a component, repetition,
-subcomponent or escape character.
+every street in the address pool holds a space, and the surrogate kinds write letters and digits.
+Joined back, such a value would add fields and renumber every later field for any reader of the
+output. So :func:`_whole_field` refuses the values a RULE writes that the engine adapter's
+whole-field ``Message.set`` refuses (BACKLOG #5540). Neither adapter checks what the shared
+site-code pass writes after the rules, or a surrogate holding a component, repetition, subcomponent
+or escape character.
 """
 
 from __future__ import annotations
@@ -104,18 +104,14 @@ def anonymize_message(
     return scrub_message_site_codes(encoded, keyer, rules)
 
 
-#: The segment separators, then the two MLLP frame bytes and NUL. With the field separator, this is
-#: what the engine's whole-field ``Message.set`` refuses (``_STRUCTURE_REFUSED`` in
-#: ``messagefoundry/parsing/message.py``, which the tee cannot import), so the tee refuses the same
-#: values the engine adapter does. Other control bytes pass on both sides.
+#: Beside the field separator, what the engine's whole-field ``Message.set`` refuses: CR, LF, then
+#: its ``_STRUCTURE_REFUSED``, which the tee cannot import. A test pins the two refusing alike.
 _REFUSED_IN_FIELD = ("\r", "\n", "\x0b", "\x1c", "\x00")
 
 
 def _whole_field(path: str, value: str, field_sep: str) -> str:
-    """``value``, unless it holds the field separator or a character in ``_REFUSED_IN_FIELD``.
-    Joined back, a separator would split it into more fields or lines than the rule wrote, so it is
-    refused, body-free, as the engine adapter refuses it (BACKLOG #5540). The error names the rule,
-    never the value."""
+    """``value``, unless it holds the field separator or a character in ``_REFUSED_IN_FIELD``; then a
+    body-free :class:`AnonError` naming the rule, never the value."""
     if field_sep in value or any(char in value for char in _REFUSED_IN_FIELD):
         raise AnonError(
             f"the surrogate for {path} would hold the field separator, a segment separator, an MLLP "
