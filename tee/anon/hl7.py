@@ -16,11 +16,11 @@ the same field on both sides, and both refuse a short later header line (BACKLOG
 
 Never string-slices in the forbidden sense: it splits only on the message's *actual* field separator
 (read from MSH) and replaces whole fields. A surrogate value CAN hold the field separator under a
-custom MSH-1: the date fill writes ``+``, the free-text redaction writes ``[`` and ``]``, and the
-name, address and provider pools hold letters, digits and spaces. Joined back, such a value would
-add fields and renumber every later field for any reader of the output. So a surrogate that holds
-the field separator, CR or LF is refused, as the engine adapter's ``Message.set`` refuses it
-(BACKLOG #5540).
+custom MSH-1. At least: the date fill writes ``+``, the free-text redaction writes ``[`` and ``]``,
+and the name, address and provider pools hold letters, digits and spaces. Joined back, such a value
+would add fields and renumber every later field for any reader of the output. So a surrogate that
+holds the field separator, CR, LF, an MLLP frame byte or NUL is refused, as the engine adapter's
+``Message.set`` refuses it (BACKLOG #5540).
 """
 
 from __future__ import annotations
@@ -92,30 +92,30 @@ def anonymize_message(
             if _skip_obx5(rule, fields, seps):
                 continue
             if index < len(fields):
-                fields[index] = _whole_field(
-                    rule.path,
-                    surrogate_field_recorded(
-                        rule.path, _kind_for(rule, fields), fields[index], keyer, seps, blanked
-                    ),
-                    field_sep,
+                value = surrogate_field_recorded(
+                    rule.path, _kind_for(rule, fields), fields[index], keyer, seps, blanked
                 )
+                fields[index] = _whole_field(rule.path, value, field_sep)
     encoded = "\r".join(field_sep.join(fields) for fields in segments)
     return scrub_message_site_codes(encoded, keyer, rules)
 
 
-#: Segment separators. With the field separator, what the engine's whole-field ``Message.set``
-#: refuses, so the tee refuses the same values the engine adapter does.
-_REFUSED_IN_FIELD = ("\r", "\n")
+#: The segment separators, then the two MLLP frame bytes and NUL. With the field separator, this is
+#: what the engine's whole-field ``Message.set`` refuses (``_STRUCTURE_REFUSED`` in
+#: ``messagefoundry/parsing/message.py``, which the tee cannot import), so the tee refuses the same
+#: values the engine adapter does. Other control bytes pass on both sides.
+_REFUSED_IN_FIELD = ("\r", "\n", "\x0b", "\x1c", "\x00")
 
 
 def _whole_field(path: str, value: str, field_sep: str) -> str:
-    """``value``, unless it holds the field separator or a segment separator. Joined back, either
-    would split it into more fields or lines than the rule wrote, so it is refused, body-free, as
-    the engine adapter refuses it (BACKLOG #5540). The error names the rule, never the value."""
+    """``value``, unless it holds the field separator or a character in ``_REFUSED_IN_FIELD``.
+    Joined back, a separator would split it into more fields or lines than the rule wrote, so it is
+    refused, body-free, as the engine adapter refuses it (BACKLOG #5540). The error names the rule,
+    never the value."""
     if field_sep in value or any(char in value for char in _REFUSED_IN_FIELD):
         raise AnonError(
-            f"the surrogate for {path} would hold the field separator or a segment separator, "
-            "which would split it into more fields than the rule wrote — refusing to emit"
+            f"the surrogate for {path} would hold the field separator, a segment separator, an MLLP "
+            "frame byte or NUL — refusing to emit"
         )
     return value
 

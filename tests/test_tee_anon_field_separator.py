@@ -7,8 +7,8 @@ Under a custom MSH-1, a surrogate value can hold the field separator: the date f
 the free-text redaction writes ``[`` and ``]``, and every street in the address pool holds a space.
 The engine adapter writes through ``Message.set``, which refuses a whole-field value holding the
 field separator, so it refused these messages. The tee adapter joined the value back on the
-separator and emitted it, which added fields and renumbered every later field for any reader of the
-output, the leak-check included. These tests pin that the two now agree.
+separator and emitted it, which would add fields and renumber every later field for any reader of
+the output, the leak-check included. These tests pin that the two now agree.
 
 Every value here is synthetic.
 """
@@ -25,74 +25,106 @@ from tee.anon import hl7 as tee_hl7
 from tee.anon.keying import Keyer
 
 _SALT = "b214-5540-salt-0123456789abcdef"
-#: A value after the scrubbed field that no rule rewrites, so a shifted field would be visible.
+#: A value in a field no rule rewrites, after the scrubbed one, so a shifted field would show.
 _MARK = "AFTERMARK"
 
 _SIDES = pytest.mark.parametrize("anon", [engine_anon, tee_anon], ids=["engine", "tee"])
 
 
-def _header(sep: str) -> str:
-    return sep.join(
+def _message(sep: str, seg_id: str, fields: dict[int, str]) -> str:
+    """A header and one ``seg_id`` line under ``sep``, with ``fields`` set by field number."""
+    header = sep.join(
         ("MSH", "^~\\&", "APP", "FAC", "RCV", "RFAC", "20260101120000", "", "ADT^A01", "M1", "P")
-    ) + (sep + "2.5.1")
+        + ("2.5.1",)
+    )
+    line = sep.join([seg_id, *(fields.get(n, "") for n in range(1, max(fields) + 1))])
+    return f"{header}\r{line}"
 
 
-def _pid(sep: str, fields: dict[int, str]) -> str:
-    """A PID line under ``sep`` with ``fields`` set by field number, every other field empty."""
-    width = max(fields)
-    return sep.join(["PID", *(fields.get(n, "") for n in range(1, width + 1))])
-
-
-#: (separator, a line whose rule writes that separator into its surrogate, the input value).
+#: (separator, segment, fields, the rule that writes the separator, the input value it scrubs).
 _CASES = {
     # PID-7 under the dob rule: a timestamp offset is filled as ``+0000``.
-    "date-offset-plus": ("+", lambda s: _pid(s, {1: "1", 7: "19800315-0500", 8: _MARK})),
+    "date-offset-plus": ("+", "PID", {1: "1", 7: "19800315-0500", 8: _MARK}, "PID-7", "19800315"),
     # NTE-3 under the free-text rule: the redaction constant holds ``[`` and ``]``.
-    "freetext-bracket": ("[", lambda s: s.join(("NTE", "1", "", "some note", _MARK))),
+    "freetext-bracket": ("[", "NTE", {1: "1", 3: "some note", 4: _MARK}, "NTE-3", "some note"),
     # PID-11 under the address rule: every street in the pool holds a space.
-    "address-space": (" ", lambda s: _pid(s, {1: "1", 11: "1 MAIN^^TOWN^ST^12345", 15: _MARK})),
+    "address-space": (
+        " ",
+        "PID",
+        {1: "1", 11: "1 MAIN^^TOWN^ST^12345", 15: _MARK},
+        "PID-11",
+        "MAIN",
+    ),
 }
-
-
-def _message(case: str) -> str:
-    sep, line = _CASES[case]
-    return "\r".join((_header(sep), line(sep)))
+_EACH_CASE = pytest.mark.parametrize("case", sorted(_CASES))
 
 
 @_SIDES
-@pytest.mark.parametrize("case", sorted(_CASES))
+@_EACH_CASE
 def test_a_surrogate_holding_the_field_separator_is_refused(anon: ModuleType, case: str) -> None:
+    sep, seg_id, fields, _, needle = _CASES[case]
     with pytest.raises(anon.AnonError) as caught:
-        anon.anonymize(_message(case), salt=_SALT)
+        anon.anonymize(_message(sep, seg_id, fields), salt=_SALT)
     # Body-free: the refusal names neither the input value nor anything after it.
+    assert needle not in str(caught.value)
     assert _MARK not in str(caught.value)
-    assert "19800315" not in str(caught.value)
-    assert "MAIN" not in str(caught.value)
 
 
-@pytest.mark.parametrize("case", sorted(_CASES))
-def test_the_tee_refusal_names_the_rule_and_not_the_value(case: str) -> None:
+@_EACH_CASE
+def test_the_tee_refusal_names_the_rule(case: str) -> None:
     """Called directly, the tee adapter names the rule whose surrogate it refused."""
+    sep, seg_id, fields, path, _ = _CASES[case]
     rules = tuple(r for r in tee_anon.DEFAULT_RULES if r.kind != tee_anon.SurrogateKind.KEEP)
-    with pytest.raises(tee_anon.AnonError, match=r"the surrogate for (PID-7|NTE-3|PID-11) would"):
-        tee_hl7.anonymize_message(_message(case), Keyer(_SALT), rules)
+    with pytest.raises(tee_anon.AnonError, match=f"the surrogate for {path} would"):
+        tee_hl7.anonymize_message(_message(sep, seg_id, fields), Keyer(_SALT), rules)
 
 
-@pytest.mark.parametrize("case", sorted(_CASES))
+@_EACH_CASE
 def test_the_same_values_under_a_pipe_agree_on_both_sides(case: str) -> None:
     """The positive control: under ``|`` no surrogate holds the separator, and both adapters emit
     the same output, with the unscrubbed field after the rule still in its place."""
-    _, line = _CASES[case]
-    message = "\r".join((_header("|"), line("|")))
+    _, seg_id, fields, _, _ = _CASES[case]
+    message = _message("|", seg_id, fields)
     engine_out = engine_anon.anonymize(message, salt=_SALT)
     assert engine_out == tee_anon.anonymize(message, salt=_SALT)
     assert f"|{_MARK}" in engine_out
 
 
-@pytest.mark.parametrize("value", ["A\r1", "A\n1", "A+1"])
+@pytest.mark.parametrize("value", ["A\r1", "A\n1", "A+1", "A\x0b1", "A\x1c1", "A\x001"])
 def test_the_guard_refuses_each_structure_character(value: str) -> None:
-    """CR and LF cannot reach a surrogate today, since the message is split on them first; the guard
-    refuses them anyway, as the engine's ``Message.set`` does."""
+    """CR, LF and the two MLLP frame bytes cannot reach a surrogate today, since the message is split
+    on the first two and stripped of the others first; the guard refuses them anyway, as the
+    engine's ``Message.set`` does."""
     with pytest.raises(tee_anon.AnonError):
         tee_hl7._whole_field("PID-3", value, "+")
-    assert tee_hl7._whole_field("PID-3", "A^1", "|") == "A^1"
+
+
+def test_the_guard_passes_a_value_with_no_structure_character() -> None:
+    assert tee_hl7._whole_field("PID-3", "A^1\x07", "|") == "A^1\x07"
+
+
+@_SIDES
+def test_a_nul_kept_by_an_identifier_surrogate_is_refused(anon: ModuleType) -> None:
+    """The identifier kinds keep every character that is not a letter or digit, NUL included. The
+    engine's ``Message.set`` refuses NUL in a whole-field write, so the tee must too."""
+    message = _message("|", "PID", {1: "1", 3: "A12\x0034^^^H^MR", 8: _MARK})
+    with pytest.raises(anon.AnonError) as caught:
+        anon.anonymize(message, salt=_SALT)
+    assert "A12" not in str(caught.value)
+    assert _MARK not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("fields", "why"),
+    [
+        ({1: "1", 3: "A12\x0734^^^H^MR"}, "a control byte the engine passes, in a ruled field"),
+        ({1: "1", 8: "F\x00M"}, "NUL in a field no rule rewrites"),
+    ],
+)
+def test_what_the_engine_passes_the_tee_passes_too(fields: dict[int, str], why: str) -> None:
+    """The refusal is no wider than the engine's: a value the engine adapter emits, the tee emits
+    the same way. A tee-only refusal here would be a new divergence."""
+    message = _message("|", "PID", fields)
+    assert engine_anon.anonymize(message, salt=_SALT) == tee_anon.anonymize(message, salt=_SALT), (
+        why
+    )
