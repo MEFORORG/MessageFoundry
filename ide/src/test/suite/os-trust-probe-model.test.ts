@@ -36,7 +36,7 @@ function report(settingRead: unknown, client: Outcome, overrides: Overrides = {}
     context: [["os", "linux"]],
     settingRead,
     settingEffective: settingRead,
-    storeControl: { source: "tls.getCACertificates", caPresent: true },
+    storeControl: { source: "proxy-agent", caPresent: true },
     records,
   };
 }
@@ -106,16 +106,20 @@ suite("OS trust store probe model (BACKLOG #4576)", () => {
 
   test("a store control that could not read the store, or did not find the CA, is broken", () => {
     const unread = launch(true, refused);
-    unread.report!.storeControl = { source: "none", caPresent: undefined, error: "no reader" };
+    unread.report!.storeControl = { source: "none", caPresent: undefined, error: "timed out" };
     assert.match(
       problemsOf(unread, launch(false, refused)),
-      /^http.systemCertificates on: the store control could not read the system store \(source none: no reader\)/,
+      /^http.systemCertificates on: the store control got no certificate list from proxy-agent \(timed out\)/,
     );
     const absent = launch(false, refused);
-    absent.report!.storeControl = { source: "proxy-agent", caPresent: false };
+    absent.report!.storeControl = {
+      source: "proxy-agent",
+      caPresent: false,
+      error: "proxy-agent logged: EACCES",
+    };
     assert.match(
       problemsOf(launch(true, trusted), absent),
-      /^http.systemCertificates off: the store control \(source proxy-agent\) did not find the test CA/,
+      /^http.systemCertificates off: proxy-agent's loadSystemCertificates did not return the test CA \(proxy-agent logged: EACCES\)/,
     );
   });
 
@@ -193,6 +197,10 @@ suite("OS trust store probe model (BACKLOG #4576)", () => {
     assert.ok(!isHostReport({ context: [], settingRead: true }));
     assert.ok(!isHostReport({ context: [], records: [1] }));
     assert.ok(!isHostReport({ context: [], records: [], settingRead: true }));
+    for (const caPresent of ["false", null, 1]) {
+      const shaped = { ...report(true, trusted), storeControl: { source: "proxy-agent", caPresent } };
+      assert.ok(!isHostReport(shaped), `caPresent ${JSON.stringify(caPresent)} must not pass`);
+    }
     assert.ok(!isHostReport(null));
   });
 

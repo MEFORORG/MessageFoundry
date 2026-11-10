@@ -14,9 +14,12 @@
 // effective one), a launch that failed or wrote no report, a store control that could not read the
 // system store or did not find the test CA in it, or a shipped bundle that imports `https`
 // differently from the copy the probe measures. The store control is the positive control that the
-// import reached the store the runtime loads: it reads that store inside the Extension Host,
-// independently of any request, so a refusal beside a found CA is a finding about the client or the
-// setting, not a CA the runtime never saw.
+// import reached the reader VS Code uses: inside the Extension Host, and independently of any
+// request, it calls proxy-agent's `loadSystemCertificates` as VS Code does, with the same
+// `http.systemCertificatesNode` value, and looks for the test CA in what comes back. So a refusal
+// beside a found CA is a finding about the client or the setting, not a CA that reader cannot see.
+// It shows what the loader returns when asked, not the set VS Code holds in memory; in a launch with
+// the setting off VS Code loads none.
 // {@link instrumentProblems} and {@link specifierProblems} are the judges, and the launcher adds
 // failures of its own setup. An empty list is the only green.
 
@@ -95,20 +98,19 @@ export interface HostReport {
   settingRead: unknown;
   /** `http.systemCertificates` as the Extension Host resolved it, the value VS Code acts on. */
   settingEffective: unknown;
-  /** The store control: whether the test CA is among the certificates the runtime loaded from the
-   *  OS store, read inside the Extension Host. */
+  /** The store control: whether the test CA is among the certificates proxy-agent's
+   *  `loadSystemCertificates` returns inside the Extension Host. */
   storeControl: StoreControl;
   records: ProbeRecord[];
 }
 
 /**
- * What the store control found. `source` names how the store was read: `tls.getCACertificates`
- * (Node's `tls.getCACertificates("system")`), `proxy-agent` (`loadSystemCertificates` from the
- * proxy-agent VS Code bundles), or `none` when neither could be read. `caPresent` is undefined when
- * the store was not read; `error` says why.
+ * What the store control found. `source` is `proxy-agent` when the bundled loader returned a list,
+ * and `none` when it could not be loaded, failed or timed out. `caPresent` is undefined when no list
+ * came back. `error` holds why, and any `error()` lines the loader logged, on one line.
  */
 export interface StoreControl {
-  source: "tls.getCACertificates" | "proxy-agent" | "none";
+  source: "proxy-agent" | "none";
   caPresent: boolean | undefined;
   error?: string;
 }
@@ -124,7 +126,8 @@ export function isHostReport(value: unknown): value is HostReport {
     v.records.every((r) => typeof r === "object" && r !== null && "path" in r && "outcome" in r) &&
     typeof v.storeControl === "object" &&
     v.storeControl !== null &&
-    typeof v.storeControl.source === "string"
+    typeof v.storeControl.source === "string" &&
+    (v.storeControl.caPresent === undefined || typeof v.storeControl.caPresent === "boolean")
   );
 }
 
@@ -206,15 +209,18 @@ export function instrumentProblems(plainNode: Outcome, launches: readonly Launch
       );
     }
     const store = report.storeControl;
+    const why = store.error === undefined ? "" : ` (${store.error})`;
     if (store.caPresent === undefined) {
       problems.push(
-        `${label}: the store control could not read the system store (source ${store.source}` +
-          `${store.error === undefined ? "" : `: ${store.error}`}), so no refusal can be credited`,
+        `${label}: the store control got no certificate list from proxy-agent${why}, so no ` +
+          "refusal can be credited",
       );
     } else if (!store.caPresent) {
+      // The workflow's import step has already checked the CA is in the OS store, so the miss is the
+      // loader's, not the import's.
       problems.push(
-        `${label}: the store control (source ${store.source}) did not find the test CA in the ` +
-          "system store the runtime loaded, so the import did not reach it",
+        `${label}: proxy-agent's loadSystemCertificates did not return the test CA${why}, though ` +
+          "the import step found it in the OS store, so that reader does not see it",
       );
     }
     for (const path of HOST_PATHS) {

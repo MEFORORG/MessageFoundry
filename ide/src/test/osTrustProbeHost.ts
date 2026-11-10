@@ -8,14 +8,13 @@
 // `engineClient.js` it imports, as the extension's code. That `engineClient.js` is the tsc build of
 // the same source esbuild bundles into dist/extension.js, and both keep its `node:https` specifier.
 //
-// It asserts nothing. It makes three requests, writes what each did to MF_OS_TRUST_PROBE_OUT, and
-// the launcher judges the run.
+// It asserts nothing. It makes three requests and runs one store control, writes what each did to
+// MF_OS_TRUST_PROBE_OUT, and the launcher judges the run.
 import { X509Certificate } from "node:crypto";
 import * as fs from "node:fs";
 import * as nodeHttps from "node:https";
 import * as os from "node:os";
 import * as path from "node:path";
-import * as tls from "node:tls";
 
 // The bare specifier on purpose: VS Code's loader substitutes it. See osTrustProbeModel.ts.
 import * as bareHttps from "https";
@@ -34,12 +33,24 @@ function required(name: string): string {
   return value;
 }
 
+/** Where VS Code may keep its bundled proxy-agent: unpacked, or in an asar archive. */
+function proxyAgentDirs(): string[] {
+  return ["node_modules", "node_modules.asar"].map((dir) =>
+    path.join(vscode.env.appRoot, dir, "@vscode", "proxy-agent"),
+  );
+}
+
+/** `err`'s message on one line, so it fits one `IDE-OS-TRUST-PROBE` line. */
+function oneLine(err: unknown): string {
+  return (err instanceof Error ? err.message : String(err)).replace(/\s+/g, " ").trim();
+}
+
 /** The version of the proxy agent VS Code bundles, best effort: it lives in an asar archive the
  *  Extension Host may or may not be able to read. */
 function proxyAgentVersion(): string {
-  for (const dir of ["node_modules", "node_modules.asar"]) {
+  for (const dir of proxyAgentDirs()) {
     try {
-      const file = path.join(vscode.env.appRoot, dir, "@vscode", "proxy-agent", "package.json");
+      const file = path.join(dir, "package.json");
       const version = (JSON.parse(fs.readFileSync(file, "utf8")) as { version?: unknown }).version;
       if (typeof version === "string") {
         return version;
@@ -60,50 +71,79 @@ function fingerprint(pem: string): string | undefined {
   }
 }
 
-/** The certificates the runtime loads from the OS store, and which reader gave them. Node's
- *  `tls.getCACertificates("system")` first, where this Electron's Node has it; otherwise the
- *  `loadSystemCertificates` the bundled proxy-agent exports. */
-async function systemCertificates(): Promise<{ source: StoreControl["source"]; certs: string[] }> {
-  const nodeTls = tls as { getCACertificates?: (type?: string) => string[] };
-  if (typeof nodeTls.getCACertificates === "function") {
-    return { source: "tls.getCACertificates", certs: nodeTls.getCACertificates("system") };
-  }
+/** How long the store control may take; past it the control is graded broken and the report is
+ *  still written with every measurement already taken. */
+const STORE_TIMEOUT_MS = 60_000;
+
+type LoadSystemCertificates = (params: {
+  loadSystemCertificatesFromNode: () => boolean | undefined;
+  log: Record<"trace" | "debug" | "info" | "warn" | "error", (...args: unknown[]) => void>;
+}) => Promise<string[]>;
+
+/** The bundled proxy-agent's `loadSystemCertificates`, from the first location that has it. */
+function loadSystemCertificatesFn(): LoadSystemCertificates {
   const errors: string[] = [];
-  for (const dir of ["node_modules", "node_modules.asar"]) {
+  for (const dir of proxyAgentDirs()) {
     try {
-      const file = path.join(vscode.env.appRoot, dir, "@vscode", "proxy-agent");
-      const agent = require(file) as {
-        loadSystemCertificates?: (params: { log: unknown }) => Promise<string[]>;
-      };
-      if (typeof agent.loadSystemCertificates !== "function") {
-        errors.push(`${dir}: no loadSystemCertificates`);
-        continue;
+      const agent = require(dir) as { loadSystemCertificates?: unknown };
+      if (typeof agent.loadSystemCertificates === "function") {
+        return agent.loadSystemCertificates as LoadSystemCertificates;
       }
-      const log = { trace() {}, debug() {}, info() {}, warn() {}, error() {} };
-      return { source: "proxy-agent", certs: await agent.loadSystemCertificates({ log }) };
+      errors.push(`${path.basename(path.dirname(path.dirname(dir)))}: no loadSystemCertificates`);
     } catch (err) {
-      errors.push(`${dir}: ${err instanceof Error ? err.message : String(err)}`);
+      errors.push(oneLine(err));
     }
   }
-  throw new Error(`no reader for the system store (${errors.join("; ")})`);
+  throw new Error(`the bundled proxy-agent could not be loaded (${errors.join("; ")})`);
 }
 
-/** The store control: is the test CA among the certificates the runtime loaded from the OS store?
- *  It makes no request, so it stands apart from every request it vouches for. */
-async function storeControl(caPem: string): Promise<StoreControl> {
+/**
+ * The store control: is the test CA among the certificates proxy-agent's `loadSystemCertificates`
+ * returns, called the way VS Code calls it, with `http.systemCertificatesNode` choosing Node's reader
+ * or the platform's? It makes no request, so it stands apart from every request it vouches for. It
+ * shows what that loader returns when asked; it does not read the set VS Code holds in memory, and in
+ * a launch with the setting off VS Code loads none. The loader logs a reader failure rather than
+ * throwing, so `error()` lines are kept and reported.
+ */
+async function storeControl(caPem: string, fromNode: boolean | undefined): Promise<StoreControl> {
   const wanted = fingerprint(caPem);
   if (wanted === undefined) {
     return { source: "none", caPresent: undefined, error: "the test CA does not parse" };
   }
+  const logged: string[] = [];
+  const ignore = (): void => {};
+  const log = {
+    trace: ignore,
+    debug: ignore,
+    info: ignore,
+    warn: ignore,
+    error: (...args: unknown[]) => logged.push(args.map(oneLine).join(" ")),
+  };
+  const errorText = (): string | undefined =>
+    logged.length === 0 ? undefined : `proxy-agent logged: ${logged.join(" | ")}`;
+  let timer: NodeJS.Timeout | undefined;
   try {
-    const { source, certs } = await systemCertificates();
-    return { source, caPresent: certs.some((pem) => fingerprint(pem) === wanted) };
+    const load = loadSystemCertificatesFn();
+    const expired = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`timed out after ${STORE_TIMEOUT_MS / 1000} s`)),
+        STORE_TIMEOUT_MS,
+      );
+    });
+    const certs = await Promise.race([
+      load({ loadSystemCertificatesFromNode: () => fromNode, log }),
+      expired,
+    ]);
+    const caPresent = certs.some((pem) => fingerprint(pem) === wanted);
+    const error = errorText();
+    return error === undefined
+      ? { source: "proxy-agent", caPresent }
+      : { source: "proxy-agent", caPresent, error };
   } catch (err) {
-    return {
-      source: "none",
-      caPresent: undefined,
-      error: err instanceof Error ? err.message : String(err),
-    };
+    const error = [oneLine(err), errorText()].filter((e) => e !== undefined).join("; ");
+    return { source: "none", caPresent: undefined, error };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -146,7 +186,11 @@ export async function run(): Promise<void> {
   );
   const bare = await getOutcome(bareHttps.get, health, {});
   const explicitCa = await getOutcome(nodeHttps.get, health, { ca: caPem });
-  const store = await storeControl(caPem);
+  const certificatesNode: unknown = http.get("systemCertificatesNode");
+  const store = await storeControl(
+    caPem,
+    typeof certificatesNode === "boolean" ? certificatesNode : undefined,
+  );
 
   const report: HostReport = {
     context: [
@@ -161,7 +205,7 @@ export async function run(): Promise<void> {
       ["http.systemCertificates.effective", String(settingEffective)],
       ["storeSource", store.source],
       ["caInSystemStore", String(store.caPresent)],
-      ["http.systemCertificatesNode", String(http.get("systemCertificatesNode"))],
+      ["http.systemCertificatesNode", String(certificatesNode)],
       ["http.experimental.systemCertificatesV2", String(http.get("experimental.systemCertificatesV2"))],
       ["http.proxySupport", String(http.get("proxySupport"))],
       // Diagnostics only: whether each specifier's `request` is the builtin's own, read past VS Code's

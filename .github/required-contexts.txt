@@ -401,7 +401,8 @@ a PR that implements BACKLOG #N must update BACKLOG.md
 #                                 as dispatch-only and never required (decision
 #                                 d20261106T101630309-6b6d34): it imports a disposable root CA into a
 #                                 hosted runner's OS store, and a refused client is a finding that
-#                                 leaves it green whenever the in-host store control finds the CA.
+#                                 leaves it green whenever the in-host store control finds the CA
+#                                 in what VS Code's certificate loader returns.
 #   freethread-smoke.yml       -- a 3.14t canary; informational only.
 #   invariant-mutations.yml    -- schedule/dispatch only, so it never reports on a PR
 #                                 (required-but-absent trap). Advisory by placement, not by

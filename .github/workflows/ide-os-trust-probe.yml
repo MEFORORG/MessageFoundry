@@ -10,15 +10,17 @@
 # launcher and ide/src/test/osTrustProbeHost.ts runs inside VS Code. Each leg prints one
 # `IDE-OS-TRUST-PROBE` line per request, into the log and the job summary. A line from inside VS Code
 # carries the OS, the VS Code, Electron, Node and proxy-agent versions, the settings as VS Code read
-# them, the path, and the result (trusted, or refused with its error code). Three controls ride along:
+# them, the path, and the result (trusted, or refused with its error code). Four controls ride along:
 # a request with the CA as its own `ca` (must be trusted), a plain-Node request outside VS Code (must
-# be refused; its line carries only the OS and Node), and a bare `https` request inside VS Code,
-# which says whether the setting reaches a request at all.
+# be refused; its line carries only the OS and Node), a bare `https` request inside VS Code, which
+# says whether the setting reaches a request at all, and a store control inside VS Code, which makes
+# no request (`storeSource`, `caInSystemStore`).
 #
 # HOW TO READ IT. A refused engine client is a FINDING and leaves the job green, provided the store
-# control inside VS Code found the test CA among the certificates the runtime loaded from the OS
-# store; its line names the reader it used (`storeSource`). Only a broken instrument or a failed setup
-# step turns a leg red; osTrustProbeModel.ts's header says which, and the launcher prints each as an
+# control found the test CA in what proxy-agent's `loadSystemCertificates` returns, called as VS Code
+# calls it; that shows the reader VS Code uses can see the CA, not that VS Code holds it in memory
+# (with the setting off it loads none). Only a broken instrument or a failed setup step turns a leg
+# red; osTrustProbeModel.ts's header says which, and the launcher prints each as an
 # `IDE-OS-TRUST-PROBE problem:` line.
 # Record the lines, with this run's URL, on #4576.
 #
