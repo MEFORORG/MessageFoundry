@@ -43,6 +43,7 @@ import sys
 import uuid
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -3061,6 +3062,74 @@ def test_a_secrets_directory_another_service_names_is_found(tmp_path: Path) -> N
         .splitlines()[-1]
     )
     assert sorted(got["hits"]) == ["Around", "Dots", "First", "Inside"], got
+
+
+_SHARER_FUNCTIONS = [
+    "Get-OtherServiceNamingPath",
+    "ConvertTo-NormalPath",
+    "Get-EnvironmentListValue",
+    "Test-EnvironmentEntryNames",
+]
+
+
+def _sharer_hits(
+    tmp_path: Path, services: list[tuple[str, str]], host: str = "pwsh", extra: str = ""
+) -> dict[str, Any]:
+    """Get-OtherServiceNamingPath for 'Mine' at C:\\PD\\MF-secrets, against a services key built
+    under HKCU holding ``services`` as (name, MEFOR_SECRETS_DIRECTORY value) pairs. ``extra`` is
+    PowerShell whose value is returned as ``extra``."""
+    assert _SCRIPT is not None
+    root = f"HKCU:\\Software\\MeforTest-{uuid.uuid4().hex[:8]}"
+    rows = ",\n".join(
+        f"@({_psq(name)}, {_psq('MEFOR_SECRETS_DIRECTORY=' + value)})" for name, value in services
+    )
+    body = rf"""
+  $root = {_psq(root)}
+  try {{
+    foreach ($s in @({rows})) {{
+      $k = New-Item -Path (Join-Path $root "$($s[0])\Parameters") -Force
+      Set-ItemProperty -LiteralPath $k.PSPath -Name AppEnvironmentExtra -Type MultiString `
+        -Value @('MEFOR_X=1', $s[1])
+    }}
+    $hits = @(Get-OtherServiceNamingPath -ServiceName 'Mine' -Name 'MEFOR_SECRETS_DIRECTORY' `
+      -Path 'C:\PD\MF-secrets' -ServicesKey $root)
+    [pscustomobject]@{{ hits = $hits; extra = $({extra or "$null"}) }} | ConvertTo-Json -Compress
+  }} finally {{ Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }}
+"""
+    out = _ok(_extract(_SCRIPT, _SHARER_FUNCTIONS, body), tmp_path, host)
+    got: dict[str, Any] = json.loads(out.strip().splitlines()[-1])
+    return got
+
+
+@_windows_only
+def test_a_secrets_directory_value_that_cannot_be_compared_counts_as_a_sharer(
+    tmp_path: Path,
+) -> None:
+    """An absolute value ConvertTo-NormalPath cannot read is returned, not skipped: on Windows
+    PowerShell 5.1 a path over 260 characters, which the engine may still read. It names no folder
+    that overlaps C:\\PD\\MF-secrets as written, so only the fail-closed rule reports it. The
+    precondition: the host really cannot read it. The control: a readable value naming another
+    directory is still not returned."""
+    long_value = "C:\\PD\\other\\" + "a" * 300
+    got = _sharer_hits(
+        tmp_path,
+        [("Long", long_value), ("Other", "C:\\PD\\elsewhere")],
+        host="powershell",
+        extra=f"$null -eq (ConvertTo-NormalPath {_psq(long_value)})",
+    )
+    assert got["extra"] is True, f"PRECONDITION FAILED: this host reads the long path: {got}"
+    assert sorted(got["hits"]) == ["Long"], got
+
+
+@_windows_only
+def test_a_secrets_directory_value_with_a_leading_space_is_a_sharer(tmp_path: Path) -> None:
+    """The engine strips MEFOR_SECRETS_DIRECTORY before reading it, so a value with a leading space
+    names the same directory and is returned. The control: a leading-space value naming another
+    directory is not."""
+    got = _sharer_hits(
+        tmp_path, [("Spaced", " C:\\PD\\MF-secrets"), ("Other", " C:\\PD\\elsewhere")]
+    )
+    assert sorted(got["hits"]) == ["Spaced"], got
 
 
 @_windows_only

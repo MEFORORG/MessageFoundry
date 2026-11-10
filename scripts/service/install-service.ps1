@@ -869,7 +869,8 @@ function Get-OtherServiceNamingPath {
     <#
       The names of the services, other than $ServiceName, whose NSSM environment names as $Name the
       directory $Path, a folder inside it, or a folder it sits inside, compared by ConvertTo-NormalPath
-      and ignoring case. Empty when none does. A spelling ConvertTo-NormalPath leaves apart is not
+      and ignoring case, or names an absolute value ConvertTo-NormalPath cannot read, which cannot
+      be compared. Empty when none does. A spelling ConvertTo-NormalPath leaves apart is not
       recognised, and a service whose Parameters key cannot be read is skipped: at least some
       protected Windows services deny administrators that read, and none of them is an NSSM service.
 
@@ -888,12 +889,15 @@ function Get-OtherServiceNamingPath {
         $params = Get-Item -LiteralPath (Join-Path $svc.PSPath "Parameters") -ErrorAction SilentlyContinue
         if (-not $params) { continue }
         $named = Get-EnvironmentListValue -List $params.GetValue('AppEnvironmentExtra', $null) -Name $Name
-        # The engine refuses a relative value, so only an absolute one names a directory.
+        # Trimmed because the engine strips the value before reading it, so a leading space still
+        # names a directory. The engine refuses a relative value, so only an absolute one names one.
+        if ($named) { $named = $named.Trim() }
         if (-not $named -or ($named -notmatch '^([A-Za-z]:[\\/]|[\\/]{2}[^\\/])')) { continue }
         # The same directory, or one inside the other: the lockdown of either reaches the other.
-        # A value .NET cannot read as a path is skipped.
+        # A value .NET cannot read here, such as a path over 260 characters on Windows PowerShell
+        # 5.1, may still name a directory that overlaps, so it counts as one rather than a miss.
         $theirs = ConvertTo-NormalPath $named
-        if (-not $theirs) { continue }
+        if (-not $theirs) { $found += $svc.PSChildName; continue }
         $theirs = $theirs.TrimEnd('\') + '\'
         if ($theirs.StartsWith($want, [StringComparison]::OrdinalIgnoreCase) -or
                 $want.StartsWith($theirs, [StringComparison]::OrdinalIgnoreCase)) {
@@ -2241,6 +2245,8 @@ else { $DbPath = Resolve-AbsolutePath $DbPath }
 # sits beside the data directory, not in it: its files are plain, and ADR 0214 keeps them out of
 # what a data-directory backup copies.
 $RegisteredSecretsDir = Get-RegisteredEnvironmentValue -ServiceName $ServiceName -Name "MEFOR_SECRETS_DIRECTORY"
+# Trimmed because the engine strips it, so a value the engine reads as absolute is not refused as relative.
+if ($RegisteredSecretsDir) { $RegisteredSecretsDir = $RegisteredSecretsDir.Trim() }
 # Every secrets-directory path is compared in one spelling, '..' segments and forward slashes
 # resolved: Get-LockPathProblem's rules and the named and sharer checks compare paths as written.
 if ($RegisteredSecretsDir -and ($RegisteredSecretsDir -match '^([A-Za-z]:[\\/]|[\\/]{2}[^\\/])')) {
@@ -2318,8 +2324,9 @@ if (-not $secretsProblem) {
     $SecretsDirSharers = @(Get-OtherServiceNamingPath -ServiceName $ServiceName -Name "MEFOR_SECRETS_DIRECTORY" -Path $SecretsDir)
     if ($SecretsDirSharers) {
         $secretsProblem = ("the service(s) $($SecretsDirSharers -join ', ') name it, a folder inside " +
-            "it or a folder around it as their secrets directory, and the lockdown here would reach " +
-            "theirs. Pass -SecretsDir with a folder for this service")
+            "it, a folder around it, or a path this installer cannot compare with it, as their secrets " +
+            "directory, and the lockdown here could reach theirs. Pass -SecretsDir with a folder for " +
+            "this service")
     }
 }
 # Does the service already name this directory? Then it is a rerun's own directory, and its files
