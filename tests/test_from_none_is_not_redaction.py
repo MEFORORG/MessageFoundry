@@ -108,8 +108,10 @@ _APP = "messagefoundry/api/app.py::create_app"
 _HTTP = "::HTTPException"
 _NOTHING_WITHHELD = "the detail is str(exc), so nothing is withheld"
 _UPLOAD_MISS = (
-    "the caught error names a file id or the cipher's own type-only text; below it sits the "
-    "Transit exception (may echo ciphertext, never plaintext) or, on malformed Transit output, a "
+    "the caught error names a file id or the cipher's own text (a type name, or a reply refusal's "
+    "fixed text); below it sits the Transit exception from a READ, a decrypt whose request holds "
+    "ciphertext and never plaintext (a save's encrypt outage is raised outside its handler, "
+    "BACKLOG #3734), or, on malformed Transit output, a "
     "UnicodeDecodeError that cannot hold stored content while both upload writers store ASCII "
     "(base64 body, json.dumps metadata)"
 )
