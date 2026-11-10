@@ -4810,10 +4810,10 @@ class LoginRoleReading:
 def classify_login_roles(row: Sequence[Any]) -> LoginRoleReading:
     """Judge one row of the role probe (BACKLOG #2617). Pure, so every verdict is unit-testable.
 
-    Read three ways, as ``store/sqlserver.py`` ``_probed_grant`` reads the store login: ``1`` held,
+    Read three ways, as ``store/privilege.py`` ``probed_grant`` reads the store login: ``1`` held,
     ``0`` not held, NULL **not read**. Only an int or a bool reads, so any other value, such as the
-    text ``"1"``, ``1.0`` or ``2``, is not read either; ``_probed_grant`` reads ``1.0`` as held and
-    the other two as not held. Not even a ``1`` of another type reads as held, because a held
+    text ``"1"``, ``1.0`` or ``2``, is not read either, and ``probed_grant`` reads all three the
+    same way (BACKLOG #6015). Not even a ``1`` of another type reads as held, because a held
     ``db_denydatawriter`` takes a finding away.
     ``IS_SRVROLEMEMBER`` and ``IS_ROLEMEMBER`` answer NULL for a name that does not resolve for this
     login, and a NULL folded to "not a member" would be a false clean. A role read as held is still
