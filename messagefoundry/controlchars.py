@@ -53,7 +53,8 @@ allowlist rather than by the predicate; its bullet below gives the encoding. The
     with which to end its field or write another, nor any separator a handler filter's match needs
     to reach past its quotes (BACKLOG #3770). A filter may still rewrite a run of kept characters
     inside the field, a date for example. :func:`quote_log_text` is a separate JSON-quoted form for text printed to a terminal, such as a check line, which no handler filter reads; a
-    credential scrub can close it early, so it is not for a logged field. QUOTE changes the
+    credential scrub can close it early, so it is not for any text a handler filter reads, a last
+    field or a whole message included. QUOTE changes the
     value's spelling, so it does not replace ESCAPE on a whole line.
 
 WHY ESCAPE LIVES HERE, WHICH IS THE ONE FACT WORTH STATING ONCE (BACKLOG #1591). It was defined in
@@ -337,10 +338,13 @@ def quote_log_text(text: str) -> str:
     ``ensure_ascii``, and because CodeQL's ``py/log-injection`` accepts its line-break ``replace``
     as the neutraliser and does not see ``json.dumps``.
 
-    NOT FOR A FIELD THAT OTHER FIELDS FOLLOW ON A CONFIGURED HANDLER. The credential scrub filters
-    read the backslash before an escaped quote as part of a credential value and replace it, so the
-    token can close early there (BACKLOG #3770). :func:`log_field_token` carries no backslash and no
-    double quote, so it survives them."""
+    NOT FOR ANY TEXT A CONFIGURED HANDLER'S FILTERS READ, WHEREVER IT SITS IN THE LINE. The
+    credential scrub filters read the backslash before an escaped quote as part of a credential
+    value and replace it, so the token can close early, and the text after that quote then reads
+    as fields of its own. ``password=a" admin=true`` measured that way: it logs a closed token
+    followed by ``admin=true``, at least when the token is the last field of a line and when it is
+    the whole message (BACKLOG #3770). :func:`log_field_token` carries no backslash and no double
+    quote, so it survives them."""
     # Imported here, not at the top: the remote-debug guard imports this module before its hook
     # goes in, and json, with re and enum under it, would lengthen that window.
     import json
