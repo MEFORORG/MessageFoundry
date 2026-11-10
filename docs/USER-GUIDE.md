@@ -468,7 +468,7 @@ The engine ships validators for some of these formats. All are opt-in: nothing r
 
 Only the first row is a cross-field check this guide can vouch for. The other three check a payload against a guide, a schema or a model. Which cross-field rules that covers depends on the guide, schema or model, so read it before you rely on it. `check_integrity` quotes the control numbers it compared in its problem text, so treat that text as message content when you log.
 
-**After an XML signature verifies, read the message from `signed_content` only.** `verify`, in `messagefoundry.parsing.xml.signature`, checks an enveloped XML-DSig signature and needs the `[xml]` extra. A `verified=True` result vouches for its `signed_content` bytes and nothing else. Your own parse of the document you passed in also holds the `ds:Signature` element, and text there, such as a `ds:KeyName`, verifies without being signed. The [`verify` docstring](../messagefoundry/parsing/xml/signature.py) states what is unsigned and why it is still accepted.
+**After an XML signature verifies, read the message from `signed_content` only.** `verify`, in `messagefoundry.parsing.xml.signature`, checks an enveloped XML-DSig signature and needs the `[xml]` extra. A `verified=True` result vouches for its `signed_content` bytes and nothing else. Your own parse of the document you passed in also holds the `ds:Signature` element, and text or an attribute there, such as a `ds:KeyName` or an `Id`, verifies without being signed. The [`verify` docstring](../messagefoundry/parsing/xml/signature.py) states what is unsigned and why it is still accepted.
 
 ### 4. Translation tables (code sets)
 

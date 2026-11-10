@@ -2,10 +2,9 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """XML-DSig ``verify()`` trusts a document only when the signature covers all of it (vault BACKLOG #2315).
 
-"All of it" means the document outside its ``ds:Signature`` element. Inside that element only
-``ds:SignedInfo`` is signed, and the text a verified document may still carry there is listed on
-``verify()``; ``test_unsigned_signature_text_verifies_but_is_not_signed_content`` pins it (vault
-BACKLOG #5538).
+"All of it" means the document outside its ``ds:Signature`` element. The unsigned content a
+verified document may still carry inside that element is listed on ``verify()``, and the tests
+after the KeyInfo positive control pin it (vault BACKLOG #5538).
 
 ``verify()`` used to return a bare ``verified=True`` and drop the subtree signxml reported as signed.
 A Handler then read its own parse of the whole document. So a document that carried a genuinely
@@ -232,52 +231,105 @@ def test_ordinary_key_info_shapes_still_verify(anchor: bytes, replacement: bytes
 
 #: Letters only, so it is also a well-formed base64 value where the schema wants one.
 _UNSIGNED_TEXT = b"UNSIGNEDXSIGNATUREXTEXTX"
+_DSIG11_DECL = f'xmlns:dsig11="{sigmod._DSIG11_NS}"'.encode()
 
 
 @pytest.mark.parametrize(
-    ("pattern", "replacement"),
+    ("anchor", "replacement"),
     [
-        (rb"<ds:KeyInfo>", b"<ds:KeyInfo><ds:KeyName>" + _UNSIGNED_TEXT + b"</ds:KeyName>"),
-        (rb"<ds:KeyInfo>", b"<ds:KeyInfo><ds:MgmtData>" + _UNSIGNED_TEXT + b"</ds:MgmtData>"),
+        (b"<ds:KeyInfo>", b"<ds:KeyInfo><ds:KeyName>" + _UNSIGNED_TEXT + b"</ds:KeyName>"),
+        (b"<ds:KeyInfo>", b"<ds:KeyInfo><ds:MgmtData>" + _UNSIGNED_TEXT + b"</ds:MgmtData>"),
         (
-            rb"</ds:X509Data>",
+            b"</ds:X509Data>",
             b"<ds:X509SubjectName>" + _UNSIGNED_TEXT + b"</ds:X509SubjectName></ds:X509Data>",
         ),
+        (b"<ds:Signature ", b'<ds:Signature Id="' + _UNSIGNED_TEXT + b'" '),
+        (b"<ds:SignatureValue>", b'<ds:SignatureValue Id="' + _UNSIGNED_TEXT + b'">'),
+        (b"<ds:KeyInfo>", b'<ds:KeyInfo Id="' + _UNSIGNED_TEXT + b'">'),
         (
-            rb"<ds:X509Certificate>[^<]*</ds:X509Certificate>",
-            b"<ds:X509Certificate>" + _UNSIGNED_TEXT + b"</ds:X509Certificate>",
+            b"<ds:KeyInfo>",
+            b"<ds:KeyInfo><dsig11:KeyInfoReference "
+            + _DSIG11_DECL
+            + b' URI="#'
+            + _UNSIGNED_TEXT
+            + b'"/>',
         ),
-        (rb"<ds:Signature ", b'<ds:Signature Id="' + _UNSIGNED_TEXT + b'" '),
-        (rb"<ds:SignatureValue>", b'<ds:SignatureValue Id="' + _UNSIGNED_TEXT + b'">'),
+        (
+            b"</ds:X509Data>",
+            b"<dsig11:X509Digest "
+            + _DSIG11_DECL
+            + b' Algorithm="urn:example:'
+            + _UNSIGNED_TEXT
+            + b'">AAAA</dsig11:X509Digest></ds:X509Data>',
+        ),
     ],
     ids=[
         "key-name",
         "mgmt-data",
         "x509-subject-name",
-        "certificate-under-a-pinned-signer",
         "signature-id",
         "signature-value-id",
+        "key-info-id",
+        "key-info-reference-uri",
+        "x509-digest-algorithm",
     ],
 )
 def test_unsigned_signature_text_verifies_but_is_not_signed_content(
-    pattern: bytes, replacement: bytes
+    anchor: bytes, replacement: bytes
 ) -> None:
     """The contract ``verify()``'s docstring states (vault BACKLOG #5538, reviewed not-a-bug).
 
-    Each case puts text inside ``ds:Signature`` that nothing signs, and the document still verifies.
-    The text is absent from ``signed_content``. The certificate case runs on the pinned path, where
-    signxml does not read ``ds:X509Data``, so a value that is not a certificate at all verifies.
-    The key-name and subject-name cases overlap the positive control above; this test is kept
-    separate so that the #2315 control stays as written, and adds the ``signed_content`` half.
+    Each case puts text or an attribute value inside ``ds:Signature`` that nothing signs; the
+    document still verifies and the value is absent from ``signed_content``. The key-name and
+    subject-name cases overlap the positive control above, which stays as written for #2315.
     """
     signed = _sign(_BODY)
-    edited = re.sub(pattern, replacement, signed, count=1)
-    assert _UNSIGNED_TEXT in edited, "the pattern did not match, so no text was placed"
+    edited = signed.replace(anchor, replacement, 1)
+    assert edited != signed
     result = _verify(edited)
     assert result.verified, f"a document with unsigned signature text was refused: {result.reason}"
     assert result.signed_content is not None
     assert b"SYNTHETIC-WIDGET" in result.signed_content, "signed_content lost the signed body"
     assert _UNSIGNED_TEXT not in result.signed_content
+
+
+def test_a_certificate_under_a_pinned_signer_is_not_signed_content() -> None:
+    """Text put in ``ds:X509Certificate`` never reaches ``signed_content`` (vault BACKLOG #5538).
+
+    Whether a value that is not a certificate verifies on the pinned path is not part of the
+    contract, so this asserts only that the text stays out of ``signed_content``.
+    """
+    signed = _sign(_BODY)
+    edited = re.sub(
+        rb"<ds:X509Certificate>[^<]*</ds:X509Certificate>",
+        b"<ds:X509Certificate>" + _UNSIGNED_TEXT + b"</ds:X509Certificate>",
+        signed,
+        count=1,
+    )
+    assert _UNSIGNED_TEXT in edited, "the pattern did not match, so no text was placed"
+    assert _UNSIGNED_TEXT not in (_verify(edited).signed_content or b"")
+
+
+def test_an_unsigned_key_info_id_may_repeat_a_payload_id() -> None:
+    """``verify()``'s docstring warns that an unsigned ``Id`` may repeat one the payload carries
+    (vault BACKLOG #5538). The document verifies, ``signed_content`` holds only the payload's
+    element, and a lookup by ``Id`` on the caller's own parse also finds the unsigned one.
+
+    The ``Id`` sits on a child rather than the document element on purpose: ``_BODY_WITH_ID`` is
+    signed by ``URI="#order-1"``, and signxml refuses a repeat of the Id a reference names."""
+    from lxml import etree
+
+    body = b'<Order><Item Id="item-1">SYNTHETIC-WIDGET</Item><Qty>1</Qty></Order>'
+    signed = _sign(body)
+    edited = signed.replace(b"<ds:KeyInfo>", b'<ds:KeyInfo Id="item-1">', 1)
+    assert edited != signed
+    result = _verify(edited)
+    assert result.verified, f"a repeated KeyInfo Id was refused: {result.reason}"
+    assert result.signed_content is not None
+    signed_root = etree.fromstring(result.signed_content)  # noqa: S320 - bytes this test signed
+    assert [el.tag for el in signed_root.xpath("//*[@Id='item-1']")] == ["Item"]
+    own_parse = etree.fromstring(edited)  # noqa: S320 - bytes this test built
+    assert [el.tag for el in own_parse.xpath("//*[@Id='item-1']")] == ["Item", f"{{{_DS}}}KeyInfo"]
 
 
 def test_an_xml_declaration_is_not_a_node_outside_the_document_element() -> None:

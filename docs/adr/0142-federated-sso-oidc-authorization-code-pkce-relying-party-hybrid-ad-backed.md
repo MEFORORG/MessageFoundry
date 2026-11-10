@@ -237,6 +237,14 @@ return value. It refuses any document the signature does not wholly cover and re
 bytes as `signed_content`. That refusal also rejects the SAML shape of a signed assertion inside an
 unsigned response, so the decline stands on the other grounds listed above.
 
+*Note 2026-11-10 (vault BACKLOG #5538, owner ruling 2026-11-10, reviewed not-a-bug):* "wholly
+cover" above is narrower than it reads. Inside `ds:Signature` only `ds:SignedInfo` is signed, and
+`verify` admits some unsigned content there: `ds:KeyInfo` leaf text and some `Id`, `URI` and
+`Algorithm` attributes. So `verified=True` covers `signed_content` only, not the document as
+received. The amendment above is left as written; the
+[`verify` docstring](../../messagefoundry/parsing/xml/signature.py) states what is refused and
+what is admitted.
+
 ## Consequences
 
 **Positive** — Closes #99(g) with a real (IdP-asserted, signature-verified) MFA signal instead of an
