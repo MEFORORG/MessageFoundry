@@ -18,9 +18,11 @@ Never string-slices in the forbidden sense: it splits only on the message's *act
 (read from MSH) and replaces whole fields. A surrogate value CAN hold the field separator under a
 custom MSH-1. At least: the date fill writes ``+``, the free-text redaction writes ``[`` and ``]``,
 and the name, address and provider pools hold letters, digits and spaces. Joined back, such a value
-would add fields and renumber every later field for any reader of the output. So a surrogate that
-holds the field separator, CR, LF, an MLLP frame byte or NUL is refused, as the engine adapter's
-``Message.set`` refuses it (BACKLOG #5540).
+would add fields and renumber every later field for any reader of the output. So a surrogate a
+RULE writes that holds the field separator, CR, LF, an MLLP frame byte or NUL is refused, as the
+engine adapter's ``Message.set`` refuses it (BACKLOG #5540). Neither adapter checks what the
+shared site-code pass writes after the rules, or a surrogate holding a component, repetition,
+subcomponent or escape character.
 """
 
 from __future__ import annotations
@@ -57,8 +59,10 @@ def anonymize_message(
 ) -> str:
     """De-identify one HL7 v2 message: apply ``rules`` field-by-field, then the site-code pass.
 
-    Pure + deterministic for a given ``keyer``. Raises :class:`AnonError` (carrying no body) when the
-    message has no parseable MSH / encoding characters — fail closed, matching the engine adapter.
+    Pure + deterministic for a given ``keyer``. Raises :class:`AnonError` (carrying no body) when it
+    cannot safely anonymize the message — fail closed, matching the engine adapter. The causes
+    include at least a message with no parseable MSH / encoding characters, and a surrogate that
+    would hold the field separator (see :func:`_whole_field`).
 
     ``blanked``, when given, collects the address of every field the ``DATE`` kind scrubbed to empty
     (``surrogate_field_recorded``), as the engine adapter does.

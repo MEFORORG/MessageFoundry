@@ -21,6 +21,7 @@ import pytest
 
 import messagefoundry_toolkit.anon as engine_anon
 import tee.anon as tee_anon
+from messagefoundry.parsing.message import _STRUCTURE_REFUSED
 from tee.anon import hl7 as tee_hl7
 from tee.anon.keying import Keyer
 
@@ -34,8 +35,7 @@ _SIDES = pytest.mark.parametrize("anon", [engine_anon, tee_anon], ids=["engine",
 def _message(sep: str, seg_id: str, fields: dict[int, str]) -> str:
     """A header and one ``seg_id`` line under ``sep``, with ``fields`` set by field number."""
     header = sep.join(
-        ("MSH", "^~\\&", "APP", "FAC", "RCV", "RFAC", "20260101120000", "", "ADT^A01", "M1", "P")
-        + ("2.5.1",)
+        ("MSH", "^~\\&", "APP", "FAC", "RCV", "RFAC", "20260101", "", "ADT^A01", "M1", "P", "2.5.1")
     )
     line = sep.join([seg_id, *(fields.get(n, "") for n in range(1, max(fields) + 1))])
     return f"{header}\r{line}"
@@ -47,14 +47,9 @@ _CASES = {
     "date-offset-plus": ("+", "PID", {1: "1", 7: "19800315-0500", 8: _MARK}, "PID-7", "19800315"),
     # NTE-3 under the free-text rule: the redaction constant holds ``[`` and ``]``.
     "freetext-bracket": ("[", "NTE", {1: "1", 3: "some note", 4: _MARK}, "NTE-3", "some note"),
-    # PID-11 under the address rule: every street in the pool holds a space.
-    "address-space": (
-        " ",
-        "PID",
-        {1: "1", 11: "1 MAIN^^TOWN^ST^12345", 15: _MARK},
-        "PID-11",
-        "MAIN",
-    ),
+    # PID-11 under the address rule: every street in the pool holds a space. The input holds none,
+    # since the line is split on it.
+    "address-space": (" ", "PID", {1: "1", 11: "12MAIN^^TOWN^ST^1", 15: _MARK}, "PID-11", "MAIN"),
 }
 _EACH_CASE = pytest.mark.parametrize("case", sorted(_CASES))
 
@@ -65,6 +60,9 @@ def test_a_surrogate_holding_the_field_separator_is_refused(anon: ModuleType, ca
     sep, seg_id, fields, _, needle = _CASES[case]
     with pytest.raises(anon.AnonError) as caught:
         anon.anonymize(_message(sep, seg_id, fields), salt=_SALT)
+    # The refusal is the field-separator check, not an earlier parse failure on an unusual MSH-1.
+    # The engine adapter relabels ``Message.set``'s ValueError, so its reason is the cause.
+    assert "field separator" in str(caught.value.__cause__ or caught.value)
     # Body-free: the refusal names neither the input value nor anything after it.
     assert needle not in str(caught.value)
     assert _MARK not in str(caught.value)
@@ -87,7 +85,8 @@ def test_the_same_values_under_a_pipe_agree_on_both_sides(case: str) -> None:
     message = _message("|", seg_id, fields)
     engine_out = engine_anon.anonymize(message, salt=_SALT)
     assert engine_out == tee_anon.anonymize(message, salt=_SALT)
-    assert f"|{_MARK}" in engine_out
+    mark_at = next(n for n, value in fields.items() if value == _MARK)
+    assert engine_out.split("\r")[1].split("|")[mark_at] == _MARK
 
 
 @pytest.mark.parametrize("value", ["A\r1", "A\n1", "A+1", "A\x0b1", "A\x1c1", "A\x001"])
@@ -97,6 +96,12 @@ def test_the_guard_refuses_each_structure_character(value: str) -> None:
     engine's ``Message.set`` does."""
     with pytest.raises(tee_anon.AnonError):
         tee_hl7._whole_field("PID-3", value, "+")
+
+
+def test_the_guard_refuses_what_the_engine_refuses() -> None:
+    """The tee cannot import the engine's list, so it keeps a copy; this pins the two equal. A byte
+    added to one side alone would be a new divergence."""
+    assert set(tee_hl7._REFUSED_IN_FIELD) == {"\r", "\n", *_STRUCTURE_REFUSED}
 
 
 def test_the_guard_passes_a_value_with_no_structure_character() -> None:
