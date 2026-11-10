@@ -12,12 +12,14 @@ hope rather than an enforced control.
 a cumulative reserved total. A process RESERVES a block of invocations — one atomic ``+=`` returning the
 new total — and only then spends them. Three properties fall out:
 
-* **An unclean exit can only OVER-count.** The reservation is durable *before* the encrypts happen, so a
-  hard kill forfeits at most the unspent remainder of a block — bounded slack in the conservative
+* **The reservation is durable *before* the encrypts happen** while the refill keeps up, so a hard kill
+  then forfeits at most the unspent remainder of a block — bounded slack in the conservative
   direction. A CLEAN close settles the exact figure instead (charging an overspend, refunding an unspent
   reserve), because forfeiting a whole block per open does not survive arithmetic: ~65k opens would
   exhaust a key on paper alone, and a crash-looping service under NSSM auto-restart would reach the
-  fail-closed ceiling in about a week with no cryptographic cause.
+  fail-closed ceiling in about a week with no cryptographic cause. The close takes its settlement
+  through :func:`settle_at_close`, which closes the bound in the same step, so the cipher refuses every
+  encrypt after the figure it writes (BACKLOG #3191).
 * **The reserve is topped up on DEMAND, not on a timer.** Crossing the half-block watermark fires the
   cipher's refill hook (:meth:`AesGcmCipher.set_refill_hook`) so the engine runner refills immediately;
   its poll interval is only a floor. A timer alone silently loses the "reserve leads spend" property
@@ -69,8 +71,11 @@ amendment traces the path by symbol (BACKLOG #2187; a seat decision under owner 
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+import weakref
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 
 from messagefoundry.store.crypto import (
     _GCM_RESERVE_BLOCK,
@@ -86,7 +91,9 @@ __all__ = [
     "bounded_cipher",
     "checkpoint_invocations",
     "counts_under_dek",
+    "reopen_invocation_bound",
     "reserve_invocations_ahead",
+    "settle_at_close",
 ]
 
 log = logging.getLogger(__name__)
@@ -103,6 +110,56 @@ AddInvocations = Callable[[str, int], Awaitable[int]]
 #: the candidate into its one-row ``store_salt`` table, then reads the row back, so concurrent first
 #: opens of one empty server database settle on ONE salt (ADR 0196 AC-2).
 EnsureSalt = Callable[[str], Awaitable[str]]
+
+
+class _InFlight:
+    """The reservations and settlements under way on one cipher, so the close's final settlement
+    can wait for them: one that lands after the close read the reserve would be a block, or a
+    refund, the figure the close writes leaves out (BACKLOG #3191)."""
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.idle = asyncio.Event()
+        self.idle.set()
+
+
+_IN_FLIGHT: weakref.WeakKeyDictionary[AesGcmCipher, _InFlight] = weakref.WeakKeyDictionary()
+
+
+def _in_flight(bound: AesGcmCipher) -> _InFlight:
+    entry = _IN_FLIGHT.get(bound)
+    if entry is None:
+        entry = _IN_FLIGHT[bound] = _InFlight()
+    return entry
+
+
+@contextmanager
+def _counted(bound: AesGcmCipher) -> Iterator[None]:
+    """Count a reservation or settlement as under way on ``bound`` for :func:`settle_at_close`."""
+    entry = _in_flight(bound)
+    entry.count += 1
+    entry.idle.clear()
+    try:
+        yield
+    finally:
+        entry.count -= 1
+        if entry.count == 0:
+            entry.idle.set()
+
+
+async def _apply(bound: AesGcmCipher, need: int, add: AddInvocations, failed: str) -> bool:
+    """Persist ``need`` and hand it to the cipher; log ``failed`` and return False when the DB
+    refuses."""
+    try:
+        total = await add(bound.invocation_key_id, need)
+    except Exception:  # noqa: BLE001 — advisory accounting must never fail an engine operation
+        log.warning(failed, exc_info=True)
+        return False
+    # A settlement grant zeroes the reserve exactly (remaining was `-need`), so a repeated settle is a
+    # no-op — in EITHER direction, an overspend charged or an unspent reserve refunded; a refill grant
+    # hands over a fresh block.
+    bound.grant_invocations(need, total)
+    return True
 
 
 def bounded_cipher(cipher: Cipher | None) -> AesGcmCipher | None:
@@ -131,7 +188,8 @@ async def checkpoint_invocations(
     ``settle=False`` (the periodic checkpoint) tops the reserve back up to a whole block once it falls
     below half, keeping the persisted total AHEAD of what has been spent.
 
-    ``settle=True`` (store close, and the end of a long offline burst) squares the persisted total with
+    ``settle=True`` (the end of a long offline burst; the store's close uses
+    :func:`settle_at_close`) squares the persisted total with
     what was ACTUALLY spent — charging an overspend, refunding an unspent reserve — and reserves nothing
     further. So ``rotate-key``'s millions of re-encrypts are accounted even where they outran the refill
     cadence, while a short-lived CLI process that encrypted a handful of values does not permanently burn
@@ -147,22 +205,53 @@ async def checkpoint_invocations(
         # First contact: switch the cipher onto the persisted bound so the very first block is
         # reserved before it is spent.
         bound.enable_invocation_bound()
-    need = bound.invocation_settlement() if settle else bound.invocation_reserve_shortfall()
-    if need:
-        try:
-            total = await add(bound.invocation_key_id, need)
-        except Exception:  # noqa: BLE001 — advisory accounting must never fail an engine operation
-            log.warning(
+    with _counted(bound):
+        need = bound.invocation_settlement() if settle else bound.invocation_reserve_shortfall()
+        if need:
+            await _apply(
+                bound,
+                need,
+                add,
                 "could not checkpoint the AES-GCM invocation bound for the active key; the "
                 "in-process ceiling still applies and the next pass retries",
-                exc_info=True,
             )
-            return bound.cumulative_invocations()
-        # A settlement grant zeroes the reserve exactly (remaining was `-need`), so a repeated settle is a
-        # no-op — in EITHER direction, an overspend charged or an unspent reserve refunded; a refill grant
-        # hands over a fresh block.
-        bound.grant_invocations(need, total)
     return bound.cumulative_invocations()
+
+
+async def settle_at_close(cipher: Cipher | None, add: AddInvocations) -> int | None:
+    """The store's close: settle the bound exactly and close it, in one step (BACKLOG #3191).
+
+    It first waits for every reservation and settlement under way on this cipher, so none lands
+    outside the figure. Then :meth:`AesGcmCipher.close_invocation_bound` reads the settlement and
+    closes the bound under one hold of the cipher's counter lock, so every later encrypt raises
+    :class:`~messagefoundry.store.crypto.CipherError` rather than seal a value the persisted total
+    leaves out, whatever is still running when the store closes. Same failure contract as
+    :func:`checkpoint_invocations`: a settlement the DB refuses is logged, and the bound stays
+    closed. Returns the cumulative total, or ``None`` when the cipher carries no bound."""
+    bound = bounded_cipher(cipher)
+    if bound is None:
+        return None
+    if not bound.invocation_bound_enabled:
+        bound.enable_invocation_bound()
+    await _in_flight(bound).idle.wait()
+    need = bound.close_invocation_bound()
+    if need:
+        await _apply(
+            bound,
+            need,
+            add,
+            "could not settle the AES-GCM invocation bound at close; the bound is closed, so "
+            "nothing more is encrypted under its key on this handle",
+        )
+    return bound.cumulative_invocations()
+
+
+def reopen_invocation_bound(cipher: Cipher | None) -> None:
+    """Open the bound a closed store left closed, for a store opening on the same cipher, before
+    anything on it encrypts. A no-op for a cipher with no bound."""
+    bound = bounded_cipher(cipher)
+    if bound is not None:
+        bound.reopen_invocation_bound()
 
 
 async def reserve_invocations_ahead(cipher: Cipher | None, add: AddInvocations, count: int) -> None:
@@ -183,19 +272,16 @@ async def reserve_invocations_ahead(cipher: Cipher | None, add: AddInvocations, 
         return
     if not bound.invocation_bound_enabled:
         bound.enable_invocation_bound()
-    need = bound.invocation_reserve_shortfall(ahead=count)
-    if not need:
-        return
-    try:
-        total = await add(bound.invocation_key_id, need)
-    except Exception:  # noqa: BLE001 — advisory accounting must never fail an engine operation
-        log.warning(
-            "could not reserve the AES-GCM invocation bound ahead of an at-rest seal; the "
-            "in-process ceiling still applies",
-            exc_info=True,
-        )
-        return
-    bound.grant_invocations(need, total)
+    with _counted(bound):
+        need = bound.invocation_reserve_shortfall(ahead=count)
+        if need:
+            await _apply(
+                bound,
+                need,
+                add,
+                "could not reserve the AES-GCM invocation bound ahead of an at-rest seal; the "
+                "in-process ceiling still applies",
+            )
 
 
 async def bind_store_salt(cipher: Cipher | None, ensure: EnsureSalt) -> None:

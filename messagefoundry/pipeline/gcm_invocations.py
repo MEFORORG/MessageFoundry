@@ -7,8 +7,9 @@ Two jobs, one small background task modelled on
 
 1. **Checkpoint the reserve.** ``AesGcmCipher.encrypt`` is synchronous and runs inside the store's write
    lock, so it cannot itself write to the DB. It spends from a pre-reserved block instead; this runner
-   tops the block up asynchronously, one DB round trip per ~2**15 encrypts. Because the reservation is
-   durable *before* the encrypts happen, an unclean exit can only ever over-count.
+   tops the block up asynchronously, one DB round trip per ~2**15 encrypts. While it keeps up, the
+   reservation is durable *before* the encrypts happen. The settlement is the store's own close, which
+   closes the bound as it settles, so no encrypt follows it (``store/gcm_bound.py``, BACKLOG #3191).
 
    The refill is **demand-driven**: the cipher fires a hook the moment its reserve crosses the half-block
    watermark and this runner wakes on it, so the interval below is a FLOOR (it still drives the alert
@@ -83,6 +84,7 @@ class GcmInvocationRunner:
         #: this loop waits on alongside `_stop`.
         self._refill = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        self._silenced = False
 
     # --- lifecycle -----------------------------------------------------------
 
@@ -116,31 +118,33 @@ class GcmInvocationRunner:
             bound.set_refill_hook(_wake)
         self._task = asyncio.create_task(self._run())
 
-    async def stop(self, *, settle: bool = True) -> None:
-        """Unhook the refill signal, signal the loop, await its exit, then SETTLE — squaring the key's
-        persisted total with what this process actually spent, so a shutdown neither loses invocations
-        the key performed nor permanently burns the unspent remainder of its reserved block. (The store's
-        own ``close()`` settles too; both are idempotent, since a settlement zeroes the reserve.)
-        ``settle=False`` skips the settlement, for a caller that closes the store next, since the
-        close settles (BACKLOG #3191)."""
+    async def stop(self) -> None:
+        """Unhook the refill signal, signal the loop and await its exit (idempotent).
+
+        It settles nothing: the store's close settles the bound and closes it, and engine.stop()
+        stops this runner only after that close (BACKLOG #3191), so it refills ahead of every encrypt
+        up to the settlement. A pass that starts after the close finds the bound closed and does
+        nothing. A cancel of the caller propagates; an error the loop ended with is raised."""
         bound = self._bound()
         if bound is not None:
             bound.set_refill_hook(None)
         self._stop.set()
         task = self._task
         self._task = None
-        if task is not None:
-            task.cancel()
-            try:  # noqa: SIM105
-                await task
-            except asyncio.CancelledError:
-                pass
-        if not settle:
+        if task is None:
             return
-        try:
-            await self._store.checkpoint_cipher_invocations(settle=True)
-        except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
-            log.warning("could not settle the AES-GCM invocation bound at stop", exc_info=True)
+        task.cancel()
+        # asyncio.wait, not ``await task``: the loop's own cancellation is expected, a cancel of
+        # this caller is not, and only wait tells the two apart.
+        await asyncio.wait({task})
+        if not task.cancelled() and (error := task.exception()) is not None:
+            raise error
+
+    def silence(self) -> None:
+        """Raise no more alerts, for engine.stop() once its alert-state drain begins: an alert
+        raised after it would schedule a state write nothing drains (BACKLOG #3191). The refill
+        goes on."""
+        self._silenced = True
 
     async def _run(self) -> None:
         # One isolated pass per interval; an error in a pass is logged and the loop continues (an
@@ -177,8 +181,11 @@ class GcmInvocationRunner:
         # Clear BEFORE the checkpoint: a crossing that happens while it is in flight re-arms the signal
         # and the loop comes straight back round rather than sleeping on a stale-clear.
         self._refill.clear()
+        bound = self._bound()
+        if bound is not None and bound.invocation_bound_closed:
+            return bound.cumulative_invocations()  # the store's close settled it; nothing to do
         total = await self._store.checkpoint_cipher_invocations()
-        if total is None or total < self._warn_at:
+        if total is None or total < self._warn_at or self._silenced:
             return total
         # The DEK's fingerprint, not the store data sub-key's (ADR 0196). The count is the sub-key's,
         # but the DEK is what an operator can see (posture, markers, the key-age clock, rotate-key)

@@ -160,7 +160,9 @@ from messagefoundry.store.gcm_bound import (
     bounded_cipher,
     checkpoint_invocations,
     counts_under_dek,
+    reopen_invocation_bound,
     reserve_invocations_ahead,
+    settle_at_close,
 )
 from messagefoundry.store.keyprovider import KeyProviderError
 from messagefoundry.store.metadata import (
@@ -10233,6 +10235,8 @@ class MessageStore:
                 except BaseException:
                     store._cipher_foreign = True
                     raise
+                # A store closed earlier on this cipher left its bound closed (BACKLOG #3191).
+                reopen_invocation_bound(cipher)
                 # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the
                 # first block BEFORE anything on this handle encrypts — the at-rest migration below
                 # included, since on a store that is having a key enabled for the first time it is
@@ -11836,24 +11840,26 @@ class MessageStore:
             )
 
     async def close(self) -> None:
-        # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store
-        # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
-        # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
-        # a failing settlement must never turn a clean shutdown into an error.
-        try:
-            # A read-only handle reserved nothing and cannot write the settlement (BACKLOG #1780).
-            if not self._cipher_foreign and not self._read_only:
-                await self.checkpoint_cipher_invocations(settle=True)
-        except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
-            log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
         # Stop the group-commit committer FIRST (if enabled) so it flushes any enrolled members and
         # resolves their futures before the write connection is closed — otherwise an in-flight handoff
-        # would hang forever on a future no committer will ever complete.
+        # would hang forever on a future no committer will ever complete. Ahead of the settlement too,
+        # since a member's body may encrypt, and the cipher refuses that once the bound is settled.
         if self._group_commit is not None:
             try:
                 await self._group_commit.aclose()
             except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
                 log.warning("error closing group-commit committer", exc_info=True)
+        # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store
+        # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
+        # store in one offline process is the extreme case) is accounted rather than lost. The
+        # settlement closes the bound, so the cipher refuses any encrypt after it (BACKLOG #3191).
+        # Best-effort: a failing settlement must never turn a clean shutdown into an error.
+        try:
+            # A read-only handle reserved nothing and cannot write the settlement (BACKLOG #1780).
+            if not self._cipher_foreign and not self._read_only:
+                await settle_at_close(self._cipher, self.add_cipher_invocations)
+        except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
+            log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
         # Close every pooled read connection (tracked in _read_conns regardless of pool checkout
         # state), then the writer. Best-effort: one failing close must not strand the rest.
         for conn in self._read_conns:

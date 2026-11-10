@@ -16,7 +16,14 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Final
 
-__all__ = ["CUT_GRACE_SECONDS", "INNER_SHARE", "TeardownStep", "run_teardown"]
+__all__ = [
+    "CUT_GRACE_SECONDS",
+    "INNER_SHARE",
+    "ROW_CANCEL_WAIT_SECONDS",
+    "ROW_UNWIND_MARGIN_SECONDS",
+    "TeardownStep",
+    "run_teardown",
+]
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +33,13 @@ INNER_SHARE: Final = 0.8
 #: How long a step cut at its bound gets to unwind its cancellation before the teardown stops waiting
 #: for it and moves on, leaving it to finish or fail on its own.
 CUT_GRACE_SECONDS: Final = 0.1
+#: How long a cancelled reload's audit row is waited for once its cancel lands, where no shutdown
+#: drain sets a shorter bound (``api.app._write_through_cancel``). Here because engine.stop() waits
+#: out what is left of it before the store's close, for a convergence reload its runner step's cut
+#: left unwinding (BACKLOG #3191), and ``pipeline/`` never imports ``api/``.
+ROW_CANCEL_WAIT_SECONDS: Final = 1.0
+#: The part of a row wait left for the reload's task to unwind once the row has landed.
+ROW_UNWIND_MARGIN_SECONDS: Final = 0.1
 
 #: Steps the teardown stopped waiting for. The event loop holds only a weak reference to a task, so
 #: this keeps one alive until it ends.

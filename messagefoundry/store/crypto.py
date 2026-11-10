@@ -1409,6 +1409,9 @@ class AesGcmCipher(_UnmarkedPolicy):
         self._bound_enabled = False
         self._bound_total = 0
         self._reserve_remaining = 0
+        # Set by the store's close as it takes its final settlement, under the counter lock, so no
+        # encrypt can follow the figure it settles (:meth:`close_invocation_bound`, BACKLOG #3191).
+        self._bound_closed = False
         # The counter is mutated from MORE THAN the event-loop thread: the ADR 0134 uploaded-logs store
         # shares this very instance and does its crypto in a worker thread (`asyncio.to_thread`), so a
         # bare `-= 1` could lose an update against a concurrent store write — an under-count, the one
@@ -1622,6 +1625,29 @@ class AesGcmCipher(_UnmarkedPolicy):
     def invocation_bound_enabled(self) -> bool:
         return self._bound_enabled
 
+    def close_invocation_bound(self) -> int:
+        """Close the persisted bound and return its final settlement (:meth:`invocation_settlement`).
+
+        The store's close calls this (BACKLOG #3191). The settlement is read and the bound closed
+        under one hold of the counter lock, so every encrypt either ran before it, and is in the
+        figure, or runs after it and raises :class:`CipherError` before it draws a nonce. A writer
+        still running when the store closes, such as a graph whose stop was cut, therefore cannot
+        seal a value the settled total leaves out. :meth:`reopen_invocation_bound` opens it again for
+        a store opened next on this cipher."""
+        with self._count_lock:
+            self._bound_closed = True
+            return -self._reserve_remaining
+
+    @property
+    def invocation_bound_closed(self) -> bool:
+        """Whether a store's close settled and closed the bound (:meth:`close_invocation_bound`)."""
+        return self._bound_closed
+
+    def reopen_invocation_bound(self) -> None:
+        """Open a bound :meth:`close_invocation_bound` closed, for a store opening on this cipher."""
+        with self._count_lock:
+            self._bound_closed = False
+
     def set_refill_hook(self, hook: Callable[[], None] | None) -> None:
         """Register the callback fired when the reserve crosses the refill watermark (``None`` clears it).
 
@@ -1687,7 +1713,7 @@ class AesGcmCipher(_UnmarkedPolicy):
         commit it half-sealed (BACKLOG #1169). The reserve is sized so it still holds more than half a
         block after the whole burst, which keeps the reservation ahead of every encrypt in it."""
         with self._count_lock:
-            if not self._bound_enabled:
+            if not self._bound_enabled or self._bound_closed:
                 return 0
             left_after = self._reserve_remaining - max(ahead, 0)
             if left_after > _GCM_RESERVE_REFILL_AT:
@@ -1708,9 +1734,9 @@ class AesGcmCipher(_UnmarkedPolicy):
         10 s restart) reaches the fail-closed 2**32 in about a week.
 
         The conservative bias is preserved where it is actually needed — an UNCLEAN exit, which never
-        reaches a settlement and therefore still forfeits its whole reserved block. A clean settlement is
-        durable and is followed by no further encrypts on this store handle (``close()`` settles before
-        tearing the connection down), so writing the exact figure cannot under-count."""
+        reaches a settlement and therefore still forfeits its whole reserved block. The store's close
+        takes its settlement through :meth:`close_invocation_bound`, after which this cipher refuses
+        to encrypt, so the exact figure it writes cannot under-count."""
         with self._count_lock:
             return -self._reserve_remaining
 
@@ -1741,9 +1767,17 @@ class AesGcmCipher(_UnmarkedPolicy):
         leaves HALF the birthday budget to rotate in.
 
         The arithmetic runs under :attr:`_count_lock` (this instance is shared with the off-loop
-        uploaded-logs store); the refill hook, the WARNING and the raise all happen OUTSIDE it, so a slow
-        hook or log handler never serializes concurrent encrypts."""
+        uploaded-logs store); the refill hook, the WARNING and the ceiling's raise all happen OUTSIDE
+        it, so a slow hook or log handler never serializes concurrent encrypts. The refusal after the
+        store's close (:meth:`close_invocation_bound`) is raised under it."""
         with self._count_lock:
+            if self._bound_closed:
+                # Raised under the lock, unlike the ceiling below: the check and the count must be
+                # one step, or an encrypt could slip past the store's final settlement.
+                raise CipherError(
+                    "the store this cipher's AES-GCM invocation bound belongs to has closed and "
+                    "settled it, so nothing more is encrypted under its key on this handle"
+                )
             self._invocations += 1
             write = self._write  # read under the lock bind_store_salt swaps it under
             want_refill = False

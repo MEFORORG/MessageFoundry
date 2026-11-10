@@ -492,6 +492,7 @@ from messagefoundry.pipeline.security_signals import (
     install_security_signals,
 )
 from messagefoundry.pipeline.teardown import INNER_SHARE as _INNER_SHARE
+from messagefoundry.pipeline.teardown import ROW_CANCEL_WAIT_SECONDS, ROW_UNWIND_MARGIN_SECONDS
 from messagefoundry.pipeline.teardown import TeardownStep as _TeardownStep
 from messagefoundry.pipeline.teardown import run_teardown as _run_teardown
 from messagefoundry.pipeline.wiring_runner import (
@@ -1308,7 +1309,7 @@ _SHUTDOWN_BUDGET_SECONDS: Final = 10.0
 #: from here: it ends in store.close(), and a store left open keeps a non-daemon worker thread alive,
 #: which is the hang BACKLOG #2087 fixed. It must cover engine.stop()'s own floors and cut graces,
 #: which tests/test_lifespan_teardown.py checks against the real steps.
-_ENGINE_STOP_RESERVE_SECONDS: Final = 3.0
+_ENGINE_STOP_RESERVE_SECONDS: Final = 3.7
 #: The part of the long-operations drain's share it spends waiting before it cancels, the rest being
 #: the grace for the rollback arms. A policy, not derived from the drain's defaults (vault BACKLOG
 #: #3740 item 17): their ratio, 0.5 s to 6 s, would leave the wait about 0.2 s under the shipped
@@ -2241,15 +2242,13 @@ async def _reload_and_record(
 #: (:func:`_write_through_cancel`). A store write may have no bound of its own, so a hung write must
 #: not hold the shutdown. A drain's cancel waits for what its grace has left instead
 #: (:func:`_row_cancel_wait`). This is the bound for the rest, at least the convergence reload
-#: engine.stop() cancels and awaits as one of its runner stops. This cap keeps that wait well inside
-#: _ENGINE_STOP_RESERVE_SECONDS, and tests/test_dual_control_reload.py pins it there. It is not
-#: always inside that step's share: under the managed lifespan engine.stop() cuts the step at its
-#: share of its budget (BACKLOG #3191), which a shutdown that spent its slack before engine.stop()
-#: leaves below this cap, and then the row is lost to the store's close.
-_ROW_CANCEL_WAIT_SECONDS: Final = 1.0
+#: engine.stop() cancels as one of its runner stops. Under the managed lifespan engine.stop() can cut
+#: that step first, and its store's close then waits out what is left of this wait, so the row lands
+#: before the store closes (BACKLOG #3191). The value lives in pipeline/teardown.py for that reason.
+_ROW_CANCEL_WAIT_SECONDS: Final = ROW_CANCEL_WAIT_SECONDS
 #: The part of a drain's remaining grace a row wait leaves for the reload's task to unwind, so the
 #: drain sees the task end rather than timing out beside it.
-_ROW_UNWIND_MARGIN_SECONDS: Final = 0.1
+_ROW_UNWIND_MARGIN_SECONDS: Final = ROW_UNWIND_MARGIN_SECONDS
 
 #: Row writes still running after the cancel bound. The event loop keeps only a weak reference to a
 #: task, so this set keeps each alive until it ends and its outcome is logged.

@@ -11,6 +11,7 @@ The whole shutdown also has to fit NSSM's graceful-stop window.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import re
@@ -859,14 +860,22 @@ async def test_a_supervisor_that_ignores_its_cancel_is_cut_and_the_stop_goes_on(
     assert any("the graph supervisor's exit did not finish within" in m for m in messages), messages
 
 
-def _gcm_runner(calls: list[str]) -> Any:
-    """A stand-in for the AES-GCM invocation runner whose stop is recorded, with or without its
-    settlement."""
+def _gcm_runner(engine: Engine, calls: list[str]) -> Any:
+    """A stand-in for the AES-GCM invocation runner. Its stop records whether the store's close had
+    finished by then, and its silencing is recorded too. Call after :func:`_record_close`."""
+    closed: list[bool] = []
+    recorded_close = engine.store.close
 
-    async def _stop(*, settle: bool = True) -> None:
-        calls.append("gcm settled" if settle else "gcm stopped unsettled")
+    async def _close() -> None:
+        await recorded_close()
+        closed.append(True)
 
-    return SimpleNamespace(stop=_stop)
+    engine.store.close = _close  # type: ignore[method-assign]
+
+    async def _stop() -> None:
+        calls.append("gcm stopped after the close" if closed else "gcm stopped before the close")
+
+    return SimpleNamespace(stop=_stop, silence=lambda: calls.append("gcm silenced"))
 
 
 async def test_a_hung_graph_stop_is_cut_and_the_later_steps_still_run(
@@ -889,9 +898,9 @@ async def test_a_hung_graph_stop_is_cut_and_the_later_steps_still_run(
     )
     engine.drain_config_writes = _drain  # type: ignore[method-assign]
     engine.on_graph_stopped = lambda: calls.append("graph-stopped clear")
-    # Settled before the store's close, the AES-GCM bound would stop refilling while the graph's
-    # workers may still encrypt (ASVS 11.3.4); the close settles it instead.
-    engine._gcm_invocation_runner = _gcm_runner(calls)
+    # Stopped before the store's close settles the AES-GCM bound, the runner would stop refilling
+    # while the graph's workers may still encrypt (ASVS 11.3.4).
+    engine._gcm_invocation_runner = _gcm_runner(engine, calls)
 
     async def _release_lease() -> None:
         calls.append("lease released")
@@ -904,8 +913,14 @@ async def test_a_hung_graph_stop_is_cut_and_the_later_steps_still_run(
         await asyncio.wait_for(engine.stop(budget_seconds=budget), _WAIT_S)
         elapsed = time.monotonic() - began
     # No clear says a graph that may still be serving has gone, and the AES-GCM runner keeps
-    # refilling for its workers until just before the store's close, which settles the bound.
-    assert calls == ["graph stop", "config drain", "gcm stopped unsettled", "close"]
+    # refilling until the store's close has settled and closed the bound.
+    assert calls == [
+        "graph stop",
+        "config drain",
+        "gcm silenced",
+        "close",
+        "gcm stopped after the close",
+    ]
     assert engine._gcm_invocation_runner is None
     assert elapsed < budget, f"engine.stop() took {elapsed:.2f}s"
     messages = [r.getMessage() for r in caplog.records]
@@ -923,7 +938,7 @@ async def test_a_graph_that_stopped_gets_its_graph_stopped_clear_under_a_budget(
     calls: list[str] = []
     _record_close(engine, calls)
     engine.on_graph_stopped = lambda: calls.append("graph-stopped clear")
-    engine._gcm_invocation_runner = _gcm_runner(calls)
+    engine._gcm_invocation_runner = _gcm_runner(engine, calls)
 
     async def _release_lease() -> None:
         calls.append("lease released")
@@ -932,7 +947,13 @@ async def test_a_graph_that_stopped_gets_its_graph_stopped_clear_under_a_budget(
     await asyncio.wait_for(
         engine.stop(budget_seconds=app_module._ENGINE_STOP_RESERVE_SECONDS), _WAIT_S
     )
-    assert calls == ["graph-stopped clear", "lease released", "gcm stopped unsettled", "close"]
+    assert calls == [
+        "graph-stopped clear",
+        "lease released",
+        "gcm silenced",
+        "close",
+        "gcm stopped after the close",
+    ]
 
 
 class _FakeRunner:
@@ -1084,6 +1105,57 @@ async def test_under_a_budget_a_crashed_supervisor_is_logged_and_the_store_still
         "the graph supervisor's exit failed" in r.getMessage() and r.exc_info is not None
         for r in caplog.records
     )
+
+
+async def test_the_store_still_closes_when_the_gcm_runner_s_stop_raises(tmp_path: Path) -> None:
+    engine = await _bare_engine(tmp_path / "gcm-stop-raises.db")
+    calls: list[str] = []
+    _record_close(engine, calls)
+
+    async def _stop() -> None:
+        calls.append("gcm stop")
+        raise RuntimeError("PROBE: the runner's stop failed")
+
+    engine._gcm_invocation_runner = SimpleNamespace(  # type: ignore[assignment]
+        stop=_stop, silence=lambda: None
+    )
+    with pytest.raises(RuntimeError, match="PROBE"):
+        await engine.stop()
+    assert calls == ["close", "gcm stop"]
+    assert engine._gcm_invocation_runner is None
+
+
+async def test_the_store_s_close_waits_out_a_cut_convergence_reload_s_audit_row(
+    tmp_path: Path,
+) -> None:
+    """Under the tightest budget the runners' step is cut at its floor, while a convergence reload
+    it cancelled is still writing its audit row. The store's close waits for that row, up to what
+    is left of the row's own wait, so the row is not lost to the close (BACKLOG #3191)."""
+    engine = await _bare_engine(tmp_path / "convergence-row.db")
+    calls: list[str] = []
+    _record_close(engine, calls)
+    row_takes = 0.6
+
+    class _Convergence:
+        async def stop(self) -> None:
+            # A reload's row write runs through cancels, as _write_through_cancel does.
+            loop = asyncio.get_running_loop()
+            done = loop.time() + row_takes
+            while (left := done - loop.time()) > 0:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.sleep(left)
+            calls.append("row landed")
+
+    engine._config_convergence = _Convergence()  # type: ignore[assignment]
+    # The tightest budget: every step gets just its floor, so the runners' step is cut at 0.2 s.
+    steps = engine._stop_steps()
+    budget = sum(step.floor for step in steps)
+    budget += sum(step.bounded for step in steps) * shutdown_steps.CUT_GRACE_SECONDS
+    began = time.monotonic()
+    await asyncio.wait_for(engine.stop(budget_seconds=budget), _WAIT_S)
+    elapsed = time.monotonic() - began
+    assert calls == ["row landed", "close"]
+    assert elapsed < budget, f"engine.stop() took {elapsed:.2f}s"
 
 
 # --- the embedded lifespan (create_app(engine=...)) ---------------------------------------------

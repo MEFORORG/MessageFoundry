@@ -581,34 +581,84 @@ async def test_runner_refills_ON_DEMAND_without_waiting_out_the_interval(
         await store.close()
 
 
-async def test_a_runner_stopped_unsettled_leaves_the_settlement_to_the_store_s_close(
+async def test_an_encrypt_racing_the_close_is_refused_and_the_total_is_the_exact_spend(
     tmp_path: Path,
 ) -> None:
-    """BACKLOG #3191: engine.stop() stops the runner just before the store's close, without its
-    own settlement, so the close's settlement counts every encrypt up to it. The runner unhooks
-    and ends; the close then squares the persisted total with what was spent."""
-    store, cipher = await _keyed_store(tmp_path / "unsettled.db")
-    runner = GcmInvocationRunner(store, alert_sink=_RecordingSink(), interval_seconds=600.0)  # type: ignore[arg-type]
+    """BACKLOG #3191: a writer still running when the store closes, as a graph whose stop was cut
+    is, must not seal a value the settled total leaves out. The close reads the settlement and
+    closes the bound in one step, so an encrypt that races it is refused, and the persisted total
+    is exactly what this handle spent."""
+    db = tmp_path / "race.db"
+    store, cipher = await _keyed_store(db)
+    key_id = cipher.invocation_key_id
+    for i in range(3):
+        await store.enqueue_ingress(channel_id="c", raw=_MSG.format(i=i))
+    real_add = store.add_cipher_invocations
+    raced: list[BaseException | None] = []
+
+    async def _add(add_key: str, count: int) -> int:
+        if cipher.invocation_bound_closed:
+            # The close's settlement is on its way to the DB: a writer encrypts now.
+            try:
+                cipher.encrypt("raced")
+                raced.append(None)
+            except CipherError as exc:
+                raced.append(exc)
+        return await real_add(add_key, count)
+
+    store.add_cipher_invocations = _add  # type: ignore[method-assign, assignment]
+    await store.close()
+    assert len(raced) == 1 and isinstance(raced[0], CipherError), raced
+    spent = cipher._invocations
+    assert spent > 0, "the control: the handle did encrypt"
+    plain = await MessageStore.open(db)  # keyless: reads the row and reserves nothing
+    try:
+        assert await plain.cipher_invocations(key_id) == spent
+    finally:
+        await plain.close()
+
+
+async def test_a_reopened_store_on_the_same_cipher_encrypts_again(tmp_path: Path) -> None:
+    """The close leaves the bound closed; a store opened next on the same cipher opens it again."""
+    db = tmp_path / "reopen.db"
+    store, cipher = await _keyed_store(db)
+    await store.close()
+    with pytest.raises(CipherError):
+        cipher.encrypt("after close")
+    again = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+    try:
+        await again.enqueue_ingress(channel_id="c", raw=_MSG.format(i=1))
+    finally:
+        await again.close()
+
+
+async def test_a_runner_pass_after_the_close_does_nothing_and_its_stop_ends_it(
+    tmp_path: Path,
+) -> None:
+    """engine.stop() stops the runner only after the store's close (BACKLOG #3191). A pass that
+    runs then finds the bound closed and touches no store; the stop unhooks and ends the loop."""
+    store, cipher = await _keyed_store(tmp_path / "after-close.db")
+    runner = GcmInvocationRunner(store, alert_sink=_RecordingSink(), warn_at=0)  # type: ignore[arg-type]
     runner.start()
     task = runner._task
     assert task is not None
     await asyncio.sleep(0)
-    real_checkpoint = store.checkpoint_cipher_invocations
-    settles: list[bool] = []
+    await store.close()
+    checkpoints: list[bool] = []
 
     async def _checkpoint(*, settle: bool = False) -> int | None:
-        settles.append(settle)
-        return await real_checkpoint(settle=settle)
+        checkpoints.append(settle)
+        return None
 
     store.checkpoint_cipher_invocations = _checkpoint  # type: ignore[method-assign]
-    try:
-        await runner.stop(settle=False)
-        assert task.done() and runner._task is None
-        assert cipher._refill_hook is None
-        assert settles == [], "the runner settled although its caller closes the store next"
-    finally:
-        await store.close()
-    assert settles == [True], "the store's close is what settles"
+    sink = runner._alert_sink
+    sink.calls.clear()  # type: ignore[attr-defined]  # the pass before the close may have alerted
+    assert await runner.run_once() == cipher.cumulative_invocations()
+    assert checkpoints == []
+    assert sink.calls == []  # type: ignore[attr-defined]
+    await runner.stop()
+    assert task.done() and runner._task is None
+    assert cipher._refill_hook is None
 
 
 async def test_runner_is_a_noop_on_a_keyless_store(tmp_path: Path) -> None:
@@ -741,13 +791,13 @@ def test_gcm_invocations_is_a_routable_alert_event_type() -> None:
 
 
 def test_the_bound_is_settled_only_AFTER_the_message_graph_has_quiesced() -> None:
-    """``Engine.stop()`` must stop the GCM runner AFTER the registry runner, never before.
+    """``Engine.stop()`` must touch the GCM runner only AFTER the registry runner, never before.
 
-    ``GcmInvocationRunner.stop()`` SETTLES: it writes back this process's unspent remainder and unhooks
-    the refill signal. Every encrypt performed after that point is charged against no reservation, with
-    no checkpointer left to refill one — so an early settle silently under-counts the whole shutdown
-    drain, which is exactly the "the durable figure trails what the key actually encrypted" defect the
-    persisted bound exists to remove. The registry runner is what drives those encrypts.
+    The runner keeps the reserve ahead of what the shutdown drain encrypts: ``GcmInvocationRunner.stop()``
+    unhooks the refill signal, and every encrypt after that point runs on no reservation, with no
+    checkpointer left to refill one. The registry runner is what drives those encrypts. The settlement
+    itself is the store's close (``store/gcm_bound.py`` ``settle_at_close``), the last step, which closes
+    the bound so nothing encrypts after it (BACKLOG #3191).
 
     Asserted on statement order because the fault IS an ordering one: a behavioural test would have to
     stand up a whole engine, drain it, and still would not say why it broke.
@@ -785,7 +835,7 @@ def test_the_bound_is_settled_only_AFTER_the_message_graph_has_quiesced() -> Non
         return min(found)
 
     assert step_of("_gcm_invocation_runner") > step_of("_registry_runner"), (
-        "Engine.stop() settles the AES-GCM invocation bound before the registry runner has quiesced, "
-        "so every encrypt performed during the shutdown drain is unreserved and uncheckpointed. Move "
-        "the _gcm_invocation_runner.stop() block to a step AFTER the graph's stop."
+        "Engine.stop() touches the AES-GCM invocation runner before the registry runner has quiesced, "
+        "so encrypts performed during the shutdown drain could go unreserved. Move the "
+        "_gcm_invocation_runner handling to a step AFTER the graph's stop."
     )

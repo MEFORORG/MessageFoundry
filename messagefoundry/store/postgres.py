@@ -162,7 +162,9 @@ from messagefoundry.store.document_strip import (
 from messagefoundry.store.gcm_bound import (
     bind_store_salt,
     checkpoint_invocations,
+    reopen_invocation_bound,
     reserve_invocations_ahead,
+    settle_at_close,
 )
 from messagefoundry.store.metadata import (
     decode_response_headers,
@@ -2192,6 +2194,8 @@ class PostgresStore:
                 # reserved next and every value sealed after it land under this store's own data
                 # sub-key. A read-only handle seals nothing; every stored value names its own salt.
                 await bind_store_salt(store._cipher, store._ensure_store_salt)
+                # A store closed earlier on this cipher left its bound closed (BACKLOG #3191).
+                reopen_invocation_bound(store._cipher)
                 # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the
                 # first block BEFORE anything on this handle encrypts — the at-rest migration below
                 # included, since on a store that is having a key enabled for the first time it is
@@ -2851,11 +2855,12 @@ class PostgresStore:
     async def close(self) -> None:
         # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
-        # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
-        # a failing settlement must never turn a clean shutdown into an error.
+        # store in one offline process is the extreme case) is accounted rather than lost. The
+        # settlement closes the bound, so the cipher refuses any encrypt after it (BACKLOG #3191).
+        # Best-effort: a failing settlement must never turn a clean shutdown into an error.
         try:
             if not self._read_only:  # #1780: a read-only handle reserved nothing to settle
-                await self.checkpoint_cipher_invocations(settle=True)
+                await settle_at_close(self._cipher, self.add_cipher_invocations)
         except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
             log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
         await self._pool.close()

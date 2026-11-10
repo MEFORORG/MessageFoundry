@@ -102,6 +102,8 @@ from messagefoundry.pipeline.state_convergence import StateConvergenceRunner
 from messagefoundry.pipeline.teardown import (
     CUT_GRACE_SECONDS,
     INNER_SHARE,
+    ROW_CANCEL_WAIT_SECONDS,
+    ROW_UNWIND_MARGIN_SECONDS,
     TeardownStep,
     run_teardown,
 )
@@ -171,6 +173,20 @@ _CONFIG_WRITE_LATE_DRAIN_SECONDS = 1.0
 #: before it cancels it. Under a budget the wait is the shorter of this and a share of its step's
 #: bound (BACKLOG #3191).
 _GRAPH_SUPERVISOR_STOP_SECONDS = 10.0
+
+
+#: The background runners' step's floor in :meth:`Engine._stop_steps`.
+_BACKGROUND_RUNNERS_FLOOR = 0.2
+#: The store's close step's floor: the close itself, plus the longest that step can wait for the
+#: audit row of a convergence reload the runners' step was cut beside. That row's wait began when
+#: the runners' step did, and a step is cut no sooner than its floor plus the cut grace, so that much
+#: of the wait is already spent (BACKLOG #3191).
+_STORE_CLOSE_FLOOR = 0.5 + max(
+    0.0,
+    ROW_CANCEL_WAIT_SECONDS
+    + ROW_UNWIND_MARGIN_SECONDS
+    - (_BACKGROUND_RUNNERS_FLOOR + CUT_GRACE_SECONDS),
+)
 
 
 def _within(bound: float, default: float) -> float:
@@ -699,6 +715,10 @@ class Engine:
         self._log_forward_watch: LogForwardWatch | None = None
         self._remote_debug_watch: RemoteDebugRefusalWatch | None = None
         self._gcm_invocation_runner: GcmInvocationRunner | None = None
+        # engine.stop()'s stop of the config-convergence runner, and when it began, for the store's
+        # close to wait out a reload's audit row (BACKLOG #3191, _await_convergence_row).
+        self._convergence_stop: asyncio.Future[None] | None = None
+        self._convergence_stop_began = 0.0
         # The store cipher whose unmarked-value refusals this engine forwards as an alert (BACKLOG
         # #1169); None until start() arms it, and again after stop() disarms it.
         self._cipher_refusal_armed: Any = None
@@ -3905,8 +3925,9 @@ class Engine:
         steps until the process exits, a claimed row stays INFLIGHT for ``reset_stale_inflight`` at
         the next start, and a step that raises no longer skips the store's close. A graph that did
         not stop keeps its intake gate, raises no graph-stopped clear and keeps its cluster lease
-        (:meth:`_graph_left_running`). The AES-GCM invocation runner stops just before the store's
-        close, which settles the bound (:meth:`_close_store_at_stop`).
+        (:meth:`_graph_left_running`). The store's close settles the AES-GCM invocation bound and
+        closes it, so nothing encrypts after it, and the invocation runner stops after that close
+        (:meth:`_close_store_at_stop`).
 
         Without a budget every step runs to completion, in order, with its fixed waits, and the
         first failure is raised once its step ends. That much is as before. At least these differ:
@@ -3930,21 +3951,28 @@ class Engine:
         which tests/test_lifespan_teardown.py checks against this list."""
         return [
             TeardownStep("the graph supervisor's exit", 0.2, self._stop_graph_supervisor),
-            TeardownStep("the background runners' stops", 0.2, self._stop_background_runners),
+            TeardownStep(
+                "the background runners' stops",
+                _BACKGROUND_RUNNERS_FLOOR,
+                self._stop_background_runners,
+            ),
             TeardownStep("the graph's stop", 0.6, self._stop_registry_runner),
             TeardownStep("the after-graph stops", 0.2, self._stop_after_graph),
             TeardownStep("the cluster coordinator's stop", 0.2, self._stop_coordinator),
             TeardownStep("the late config-write drain", 0.1, self._drain_config_writes_at_stop),
             TeardownStep("the alert-state drain", 0.2, self._drain_alert_state_at_stop),
-            TeardownStep("the store's close", 0.5, self._close_store_at_stop, bounded=False),
+            TeardownStep(
+                "the store's close", _STORE_CLOSE_FLOOR, self._close_store_at_stop, bounded=False
+            ),
         ]
 
     async def _stop_graph_supervisor(self, bound: float) -> None:
         # Quiesce the active-passive graph supervisor FIRST (Workstream A1) so it can't reconcile (and
         # re-start the graph) while we tear down. A no-op single-node (never spawned). Cooperative: set
-        # the stop event and let any in-flight reconcile finish under the lock (so we never abandon a
-        # half-started graph), falling back to cancel only if a reconcile hangs past the timeout. The
-        # graph itself is then stopped by the graph's stop step, as before.
+        # the stop event and give an in-flight reconcile until the wait below to finish under the
+        # lock, then cancel it. Under a tight budget that wait is a fraction of a second, so a
+        # reconcile can be cancelled part-way through starting the graph; the process is exiting, and
+        # the graph's stop step tears down whatever it left (BACKLOG #3191).
         if self._graph_supervisor is None:
             return
         self._graph_stop.set()
@@ -3999,15 +4027,20 @@ class Engine:
             if runner is not None
         ]
         crl = self._crl_reload_runner
-        results = await asyncio.gather(
-            *(
-                crl.stop(timeout=bound * INNER_SHARE)
-                if runner is crl and crl is not None
-                else runner.stop()
-                for runner in runners
-            ),
-            return_exceptions=True,
-        )
+        convergence = self._config_convergence
+        stops: list[Awaitable[None]] = []
+        for runner in runners:
+            if runner is crl and crl is not None:
+                stops.append(crl.stop(timeout=bound * INNER_SHARE))
+            elif runner is convergence and convergence is not None:
+                # Its own task, kept, so the store's close can wait out the audit row of a reload
+                # this stop cancels when a cut of this step leaves it unwinding (BACKLOG #3191).
+                self._convergence_stop = asyncio.ensure_future(convergence.stop())
+                self._convergence_stop_began = asyncio.get_running_loop().time()
+                stops.append(self._convergence_stop)
+            else:
+                stops.append(runner.stop())
+        results = await asyncio.gather(*stops, return_exceptions=True)
         stopped = [r for r, result in zip(runners, results, strict=True) if result is None]
         # Forgotten only once stopped, so a stop() run again after a failure retries them, as before.
         if self._crl_reload_runner in stopped:
@@ -4117,19 +4150,49 @@ class Engine:
     async def _drain_alert_state_at_stop(self, bound: float) -> None:
         # Clears raised on the way out are background writes: an unpinned cluster node's intake
         # alerts (BACKLOG #2272) and the coordinator's leadership release. Give them a bounded chance
-        # to land before the store closes. Last, so it covers every stop step above.
+        # to land before the store closes. Last, so it covers every stop step above. The GCM runner,
+        # which runs on past this step, raises no alert from here, so none schedules a state write
+        # after the drain began (BACKLOG #3191).
+        if self._gcm_invocation_runner is not None:
+            self._gcm_invocation_runner.silence()
         drain = getattr(self._alert_sink, "drain_state", None)
         if drain is not None:
             await drain(_within(bound, _ALERT_STATE_DRAIN_SECONDS))
 
     async def _close_store_at_stop(self, _bound: float) -> None:
-        # The GCM invocation runner stops here, after every other step, and without its own
-        # settlement: the store's close settles the bound, charging what this process spent past
-        # its reserve, so every encrypt the steps above drove is counted, a graph left running
-        # among them (ASVS 11.3.4, BACKLOG #3191). Settled any earlier, the encrypts after it were
-        # charged against no reservation. Stopped before the close, it cannot reserve a block the
-        # close would not refund, nor hold a pool connection the close waits for.
-        if self._gcm_invocation_runner is not None:
-            await self._gcm_invocation_runner.stop(settle=False)
-            self._gcm_invocation_runner = None
-        await self.store.close()
+        try:
+            await self._await_convergence_row()
+            # The close settles the AES-GCM invocation bound and closes it in one step, so the cipher
+            # refuses any encrypt after the figure it writes, a graph left running among them
+            # (ASVS 11.3.4, BACKLOG #3191).
+            await self.store.close()
+        finally:
+            # Only now: until the close took its settlement the runner kept the reserve ahead of
+            # every encrypt, and a pass that starts after it finds the bound closed and does
+            # nothing. Stopped here, a failure of its stop cannot keep the store open.
+            runner, self._gcm_invocation_runner = self._gcm_invocation_runner, None
+            if runner is not None:
+                await runner.stop()
+
+    async def _await_convergence_row(self) -> None:
+        """Wait out what is left of the audit-row wait of a convergence reload the runners' step
+        cancelled and a cut of that step left unwinding, so the row lands before the store closes
+        (BACKLOG #3191). The wait began with that step; its longest remainder is in
+        :data:`_STORE_CLOSE_FLOOR`."""
+        pending, self._convergence_stop = self._convergence_stop, None
+        if pending is None or pending.done():
+            return
+        loop = asyncio.get_running_loop()
+        left = (
+            self._convergence_stop_began
+            + ROW_CANCEL_WAIT_SECONDS
+            + ROW_UNWIND_MARGIN_SECONDS
+            - loop.time()
+        )
+        if left > 0:
+            await asyncio.wait({pending}, timeout=left)
+        if not pending.done():
+            log.error(
+                "engine stop: a convergence reload was still unwinding when the store closed; its "
+                "audit row may be lost"
+            )
