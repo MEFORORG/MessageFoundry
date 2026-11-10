@@ -730,7 +730,8 @@ _COMPRESSION_SEEDS = (
 )
 
 #: Binary-carriage seeds: an HL7 message with one OBX-5 ED Base64 document (a PDF header, synthetic),
-#: a bare base64 value, and a live document handle with a 64-hex content address.
+#: a bare base64 value, a live document handle with a 64-hex content address, and the two retired
+#: findings' reproducers (:data:`SHORT_MSH2_REPRODUCER`, :data:`BATCH_HEADER_REPRODUCER`).
 _BINARY_SEEDS = (
     _MINIMAL_HL7 + b"OBX|1|ED|DOC^Document||^Application^pdf^Base64^JVBERi0xLjQKJQ==\r",
     b"JVBERi0xLjQKJQ==",

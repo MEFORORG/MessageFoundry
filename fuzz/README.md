@@ -266,13 +266,15 @@ with its carve-out. Its reproducer stays on as the `hl7_peek` seed `BLANK_SEGMEN
 both a bare `ValueError("cannot determine HL7 separators ...")` out of `extract_obx_document`, on
 an MSH-led body whose MSH-2 carries fewer than four encoding characters and on an FHS- or BHS-led
 body with no MSH. Both were fixed under BACKLOG #2873: `extract_obx_document` now refuses either as
-`BinaryCarriageError`, the function's documented error, and the entries and the carve-out in
-`_binary_carriage` came out with them. Both reproducers stay on as `binary_carriage` seeds, so the
+`BinaryCarriageError`, the function's documented error, as do its siblings `embed_obx_document`
+and `strip_documents_in_hl7`, and the entries and the carve-out in `_binary_carriage` came out
+with them. Both reproducers stay on as `binary_carriage` seeds, so the
 fix cannot quietly regress.
 
-The short-MSH-2 body is still accepted by `Peek.parse` and `Message.parse`, by design: ADR 0054
-refuses at parse only a header too short for MSH-1 plus one encoding character, so the refusal sits
-in the readers. Such a body can still be ACKed `AA`, at least below the streaming threshold when no
+The short-MSH-2 body is still accepted by `Peek.parse` and `Message.parse`, by design: the parse
+refusals ADR 0054 sets include at least a header too short for MSH-1 plus one encoding character,
+and do not include a short MSH-2, so the refusal sits in the readers. ADR 0054 is the source of
+record for what the parse refuses. Such a body can still be ACKed `AA`, at least below the streaming threshold when no
 other ingress check refuses it. Over the threshold, a body with an OBX reaches the ingress document
 detach, where `iter_obx_documents` refuses it as `UnreadableDelimitersError` with an `ERROR` row and
 a refusal from the listener, `AR` over MLLP (BACKLOG #5099).
