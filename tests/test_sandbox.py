@@ -993,7 +993,11 @@ def test_a_frame_staged_between_dispatches_can_never_answer_the_next_one(
     delivery silently replaced by attacker-chosen content on a message it never saw, with no ERROR and
     no disposition anomaly. Two things close it, and this test proves both: the id is now a fresh
     ``secrets`` token the worker only learns from the request itself, and a frame queued before a
-    dispatch is fatal to the worker rather than consumed."""
+    dispatch is fatal to the worker rather than consumed.
+
+    Since the owner's ruling of 2026-11-09 (vault BACKLOG #3135 step 4) the victim message is
+    retried once on a fresh worker rather than dead-lettered, so this pins that the retry is served
+    by a NEW worker with a NEW queue, and that the staged frame answers nothing."""
     registry, config_dir = graph
     session = _session(config_dir)
     try:
@@ -1001,14 +1005,23 @@ def test_a_frame_staged_between_dispatches_can_never_answer_the_next_one(
         assert _deliveries(registry, "h_late_forge", sandbox=session, run_context=RunContext()) == [
             ("OB_T", "REAL")
         ]
-        time.sleep(2.5)  # let the staged frame land in the parent's queue
-        # The next dispatch refuses to run against a pipe that already has a frame on it.
-        with pytest.raises(SandboxError, match="unsolicited"):
-            _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
-        # ...and the victim message is never delivered attacker-chosen content: a clean child answers.
-        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == (
-            _deliveries(registry, "h_ok")
-        )
+        forger = session._proc
+        assert forger is not None
+        assert _await(lambda: not session._responses.empty(), 10.0), "the frame was never staged"
+        stale_queue = session._responses
+        generation = session._generation
+        # The next dispatch refuses the pipe that already has a frame on it, kills that worker, and
+        # runs the message on a fresh one: the honest answer, never the staged FORGED one.
+        delivered = _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        assert delivered == _deliveries(registry, "h_ok")
+        assert ("OB_T", "FORGED") not in delivered
+        assert forger.poll() is not None  # the forging worker was killed
+        assert session._proc is not forger
+        assert session._generation == generation + 1  # exactly one fresh worker: one retry
+        # _spawn discarded the old queue: the retry read from a new one, and the stale frame was
+        # taken out of the old one by the check rather than read as an answer.
+        assert session._responses is not stale_queue
+        assert session.last_kill_cause is KillCause.UNSOLICITED_BEFORE
     finally:
         session.close()
 
@@ -1972,14 +1985,63 @@ def test_an_unsolicited_frame_before_a_dispatch_is_its_own_cause(
     session = _session(config_dir)
     caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
     try:
-        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        expected = _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
         session._responses.put(b"{}")  # a frame nobody asked for, waiting before the next dispatch
-        with pytest.raises(SandboxError, match="unsolicited"):
-            _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        # Step 4: the message never reached that worker, so it is retried once on a fresh one.
+        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == expected
         assert session.last_kill_cause is KillCause.UNSOLICITED_BEFORE
         assert [r.args for r in _kill_warnings(caplog)] == [
             ("IB_T", "transform", "unsolicited_before")
         ]
+    finally:
+        session.close()
+
+
+def test_a_stray_frame_on_the_fresh_worker_too_dead_letters_the_message(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The retry happens once: a stray frame waiting on the fresh worker as well fails closed."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        session._responses.put(b"{}")
+        real_spawn = session._spawn
+        spawns: list[int] = []
+
+        def _spawn_with_a_stray(phase: str = "spawn") -> None:
+            real_spawn(phase)
+            spawns.append(session._generation)
+            session._responses.put(b"{}")
+
+        monkeypatch.setattr(session, "_spawn", _spawn_with_a_stray)
+        with pytest.raises(SandboxError, match="unsolicited response frame before"):
+            _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        assert len(spawns) == 1  # one retry, not a loop
+        assert session._proc is None
+        assert session.kill_counts[KillCause.UNSOLICITED_BEFORE] == 2
+    finally:
+        session.close()
+
+
+def test_an_unsolicited_frame_after_an_answer_still_dead_letters(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Step 4 covers only the check before a request: a frame after an answer still fails it."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        real_await = session._await_answer
+
+        def _await_then_stray(*args: Any) -> codec.Response:
+            answer = real_await(*args)
+            session._responses.put(b"{}")
+            return answer
+
+        monkeypatch.setattr(session, "_await_answer", _await_then_stray)
+        with pytest.raises(SandboxError, match="unsolicited response frame after"):
+            _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        assert session.last_kill_cause is KillCause.UNSOLICITED_AFTER
     finally:
         session.close()
 

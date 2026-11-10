@@ -581,6 +581,13 @@ class _StderrRelay:
         )
 
 
+def _unsolicited_error(when: str) -> SandboxError:
+    return SandboxError(
+        f"sandbox worker wrote an unsolicited response frame {when} a dispatch — "
+        "the pipe is not trustworthy"
+    )
+
+
 def _write_frame(stream: Any, body: bytes) -> None:
     """Write one length-prefixed frame body. Raises on an over-cap frame (fail-closed) or a broken
     pipe; the caller maps either to :class:`SandboxError`."""
@@ -1083,9 +1090,14 @@ class SandboxSession:
         left over **after** its answer was written by something other than the call we made — a
         Handler writing straight to fd 1, or a grandchild that inherited it while the worker was
         alive. Letting such a frame sit in the queue is the whole exploit: the next dispatch would
-        take it as its own answer. Drop the
-        worker and dead-letter the message in hand; :meth:`_kill` then reaps that grandchild along
-        with the rest of the worker's tree, so it cannot keep writing to the pipe.
+        take it as its own answer. Drop the worker, and :meth:`_kill` reaps that grandchild along
+        with the rest of the worker's tree, so it cannot keep writing to the pipe. A frame found
+        **after** an answer dead-letters the message in hand, whose answer it makes untrustworthy.
+        A frame found **before** a request is a different case since the owner's ruling of
+        2026-11-09 (vault BACKLOG #3135 step 4): that message never reached the worker, so
+        :meth:`_live_worker` retries it once on a fresh worker rather than raise, and dead-letters
+        it only if the fresh worker has a stray frame waiting too. The frame still never answers
+        anything: the fresh worker has a fresh queue (see :meth:`_spawn`).
 
         **The justification is the protocol violation, NOT a claim that fd 1 is unreachable.** An
         earlier version of this docstring said the ADR 0176 stdout rebind meant "the text layer cannot
@@ -1111,18 +1123,23 @@ class SandboxSession:
         writing a correct, correlation-proven answer would lose a message it had already answered, and
         a child that died between dispatches would lose the next one instead of respawning
         transparently. Reap it and let the caller carry on."""
+        if self._drop_unsolicited(proc, when, phase):
+            raise _unsolicited_error(when)
+
+    def _drop_unsolicited(
+        self, proc: subprocess.Popen[bytes] | None, when: str, phase: str
+    ) -> bool:
+        """:meth:`_reject_unsolicited`'s check without the raise: True when a stray FRAME killed
+        the worker, False when nothing was waiting or a queued EOF only reaped a dead one."""
         try:
             stray = self._responses.get_nowait()
         except queue.Empty:
-            return
+            return False
         if stray is _EOF:
             self._reap(proc)  # the peer is already gone
-            return
+            return False
         self._kill(proc, _UNSOLICITED[when], phase)
-        raise SandboxError(
-            f"sandbox worker wrote an unsolicited response frame {when} a dispatch — "
-            "the pipe is not trustworthy"
-        )
+        return True
 
     def _live_worker(self, phase: str) -> subprocess.Popen[bytes]:
         """The session's worker — spawned or respawned as needed — on a pipe nothing is waiting on.
@@ -1131,10 +1148,21 @@ class SandboxSession:
         discarded wholesale by :meth:`_spawn`, so its leftovers are neither reachable nor evidence
         about the *new* child. Only a REUSED worker can hand us a leftover, and only there is one worth
         judging. A leftover EOF reaps it (see :meth:`_reject_unsolicited`), so spawn once more rather
-        than dead-letter this message on a peer that merely died."""
-        if self._proc is None or self._proc.poll() is not None:
-            self._spawn(phase)
-        self._reject_unsolicited(self._proc, "before", phase)
+        than dead-letter this message on a peer that merely died.
+
+        A leftover FRAME kills the worker, and this message, which never reached it, is retried
+        once on a fresh worker (owner ruling 2026-11-09, vault BACKLOG #3135 step 4). The fresh
+        worker is checked the same way, and a stray frame there too raises, so the retry happens at
+        most once per dispatch."""
+        retried = False
+        while True:
+            if self._proc is None or self._proc.poll() is not None:
+                self._spawn(phase)
+            if not self._drop_unsolicited(self._proc, "before", phase):
+                break
+            if retried:
+                raise _unsolicited_error("before")
+            retried = True
         if self._proc is None:
             self._spawn(phase)
         proc = self._proc
@@ -1454,7 +1482,8 @@ class SandboxSession:
         isolation fault (crash / timeout / denial / codec rejection) raises :class:`SandboxError`;
         a plain, still-alive worker survives a *denied* call so the next message reuses it. The one
         thing it does **not** survive is writing a frame nobody asked for
-        (see :meth:`_reject_unsolicited`) — that is a lost worker and a dead-lettered message."""
+        (see :meth:`_reject_unsolicited`) — that is a lost worker, and a dead-lettered message when
+        the frame follows its answer; one waiting before the request is retried once instead."""
         with self._lock:
             if self._closed:
                 raise SandboxSessionClosed("sandbox session is closed")
