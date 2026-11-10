@@ -3984,7 +3984,7 @@ cleartext_reason   = "vendor firmware predates TLS; segment is not isolated"
 
 | Key | Dir | Type | Default | Meaning |
 |-----|-----|------|---------|---------|
-| `cleartext_accepted` | out | bool | `false` | this outbound's hop is cleartext and that is accepted. Yields **WARN, never ALLOW** — the hop crosses, but every construction logs it and records a line naming the connection, the cell, the host and the reason. It does **not** reach a `verify_tls = false` hop (encrypted-but-unauthenticated, not cleartext — that keeps the clamped `MEFOR_ALLOW_INSECURE_TLS` escape), an SMTP `AUTH` over cleartext (refused outright), or a `Rest()`, `Soap()`, `FHIR()`, `DICOMweb()` or `FhirLookup()` credential to a host off this machine, token endpoints and Digest included (refused with no escape, vault BACKLOG #3533 item 4; see [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)) |
+| `cleartext_accepted` | out | bool | `false` | this outbound's hop is cleartext and that is accepted. Yields **WARN, never ALLOW** — the hop crosses, but every construction logs it and records a line naming the connection, the cell, the host and the reason. It does **not** reach a `verify_tls = false` hop (encrypted-but-unauthenticated, not cleartext — that keeps the clamped `MEFOR_ALLOW_INSECURE_TLS` escape, except on a REST hop that sets `ech_egress` (why: the `refuse_verify_off` docstring in [`transports/rest.py`](../messagefoundry/transports/rest.py))), an SMTP `AUTH` over cleartext (refused outright), or a `Rest()`, `Soap()`, `FHIR()`, `DICOMweb()` or `FhirLookup()` credential to a host off this machine, token endpoints and Digest included (refused with no escape, vault BACKLOG #3533 item 4; see [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)) |
 | `cleartext_reason` | out | str | — | **mandatory** when the flag is set (and rejected without it). The engine checks a reason is present and non-blank; it cannot check that it is *true* — a placeholder is a review problem, not a load problem |
 
 **`Tcp()` and `X12()`: the declaration is permanent, not transitional.** Those connectors have **no TLS
@@ -4018,7 +4018,8 @@ An isolated segment with its own link-layer encryption is the other. An enforcin
 cleartext or verify-off hop then **ALLOWs** it
 ([ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md), owner ruling
 2026-09-24). That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a
-verify-off HTTP-family egress hop that sets no `ech_egress` and a weakened database TLS hop. It does **not** reach every
+weakened database TLS hop, and a verify-off HTTP-family egress hop that sets no `ech_egress`
+(why: the `refuse_verify_off` docstring in [`transports/rest.py`](../messagefoundry/transports/rest.py)). It does **not** reach every
 verify-off refusal: at least the MLLP, FTPS and email `tls_verify = false` refusals do not read it.
 Nor does it carry an HTTP-family credential: over cleartext `http` to a host off this machine, or
 over `verify_tls = false`, the credential is refused, attested or not (vault BACKLOG #3533 item 4,

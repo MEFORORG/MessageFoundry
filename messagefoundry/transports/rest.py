@@ -1409,6 +1409,10 @@ def refuse_verify_off(
     docs/CONNECTIONS.md, :func:`_shipped_strict_disposition` and the ``verify_tls`` parameter
     comments in ``config/wiring.py`` still restate parts of it; change them with it.
 
+    A REST destination that sets ``ech_egress`` never reaches this gate with ``verify_tls=false``:
+    ``RestDestination.__init__`` refuses that pair first, in every posture and whatever the
+    connection attests (vault BACKLOG #2977).
+
     Disabling certificate verification makes the ``https`` hop MITM-able, so it is an insecure hop:
     an enforcing hop REFUSES, an on-box loopback / per-hop-attested hop is allowed, and the CLAMPED
     global escape (``MEFOR_ALLOW_INSECURE_TLS``, honoured only at ``[security].enforcement = warn``

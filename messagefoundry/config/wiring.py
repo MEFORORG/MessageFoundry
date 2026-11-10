@@ -3766,7 +3766,7 @@ def Rest(
     | None = None,  # HTTP Basic (with basic_password); use env() for secrets
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
-    verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared, and in every case with a credential or a static header off the allowlist; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
+    verify_tls: bool = True,  # False (dev only) is refused off-box, and in every case with a credential or a static header off the allowlist; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain signatures+hostname still verified, not validity windows; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
