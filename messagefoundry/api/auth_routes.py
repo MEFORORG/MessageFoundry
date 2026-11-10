@@ -125,6 +125,7 @@ from messagefoundry.auth import (
 )
 from messagefoundry.auth.audit_visibility import (
     AUDIT_WITHHELD_HEADER,
+    CHANNEL_LIST_ACTIONS,
     audit_detail_for,
     audit_exclusion_for,
     narrows_scope_rows_for,
@@ -2219,13 +2220,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         )
         if not narrows_scope_rows_for(identity):
             return rows
-        # audit_detail_for hands back the stored detail itself for a row it leaves alone, so only
-        # a narrowed row is copied.
-        narrowed = []
-        for row in rows:
-            detail = audit_detail_for(identity, row["action"], row["detail"])
-            narrowed.append(row if detail is row["detail"] else {**row, "detail": detail})
-        return narrowed
+        # A row of a CHANNEL_LIST_ACTIONS action is copied with its narrowed detail, whether or not
+        # the narrowing changed it; every other row is returned as stored, uncopied.
+        return [
+            {**row, "detail": audit_detail_for(identity, row["action"], row["detail"])}
+            if row["action"] in CHANNEL_LIST_ACTIONS
+            else row
+            for row in rows
+        ]
 
     async def _count_audit(
         service: AuthService,

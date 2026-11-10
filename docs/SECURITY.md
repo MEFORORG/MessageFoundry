@@ -2161,7 +2161,9 @@ the same permission set on the same method reds CI until it is listed here.
 > it like a directory scope, and the GET still reports it as null. The 409 detail names the
 > conflict, never the scope. Each 409 writes one `user.channel_scope_change_refused` audit row
 > naming the administrator, the account and the conflict, never the scope (BACKLOG #2271); a
-> reader without `users:manage` reads its conflict fields withheld (Channel scope, below). A store
+> reader without `users:manage` reads its conflict fields withheld (the `GET /users` bullet under
+> *Every route of the default JSON API has a channel-scope class*, below, in
+> [The `/ui` console plane](#the-ui-console-plane-serve_uitrue)). A store
 > that refuses that row leaves an ERROR log line instead, and the 409 stands. The web console sends `expected_source` when the administrator ticks "Make this scope
 > manual", and shows a race as a refused save with the edits kept.
 >
@@ -2374,18 +2376,21 @@ the same permission set on the same method reds CI until it is listed here.
 >   the detail of the four audit actions a census of the writers on 2026-11-09 found naming a
 >   channel list or who owns a scope: `user.channel_scope_changed` and `auth.ad_scope_resynced`
 >   read as the account's `user_id`, where the row has one, and `"channels": "withheld"`;
->   `auth.ad_session_revoked` reads `scope_from` and `scope_to` as `"withheld"` and keeps
->   `scope_changed`; and `user.channel_scope_change_refused` reads `owner`, `read_source`,
->   `expected_source` and `reason` as `"withheld"` (vault BACKLOG #3748). Each rule is an
+>   `auth.ad_session_revoked` reads `scope_from` and `scope_to` as `"withheld"` on a scope-delta
+>   row, the only row that carries them, and keeps `scope_changed`; and
+>   `user.channel_scope_change_refused` reads `owner`, `read_source`, `expected_source` and
+>   `reason` as `"withheld"` (vault BACKLOG #3748). Each rule is an
 >   allowlist, so a key a later writer adds to one of those four is withheld, but a NEW action
 >   whose detail names a scope is shown whole until a rule for it is added to `_NARROWED` in
 >   `messagefoundry/auth/audit_visibility.py`, which holds each action's kept and withheld keys.
->   `GET /logs/tail` gives such a reader no audit copies at all. **Left open:** this hides the stored lists and sources, not every inference. Rows left
->   whole can still let such a reader piece a scope together: at least an `auth.channel_denied`
+>   `tests/test_audit_scope_census.py` fails on such a writer when its detail is a dict literal
+>   in the call, and misses one built elsewhere. `GET /logs/tail` gives such a reader no audit
+>   copies at all. **Left open:** this hides the stored lists and sources, not every inference.
+>   Rows left whole can still let such a reader piece a scope together: at least an `auth.channel_denied`
 >   row or a channel-attributed access row, each naming an actor and one channel, and the actors of
 >   `auth.ad_scope_resynced` rows, which say the directory owned that account's scope.
->   `/me/security-events` is not narrowed either: it shows a holder its own rows whole, and its own
->   residuals (a directory rename onto a name, among them) could show a predecessor's.
+>   `/me/security-events` is not narrowed either: it shows a holder its own rows whole, and, on the
+>   residual its own bullet under *Single-route data rules* names, a predecessor's.
 > - `POST /config/reload` refuses a scoped caller 403, a dry run included, because a reload loads
 >   the whole graph and a dry run's reply describes it. So a deployer needs the all-channels grant.
 >   The refusal writes one `auth.channel_denied` row naming no channel. The approval gate refuses
@@ -7114,7 +7119,10 @@ behind it, `"logout"` at a sign-out, and `"superseded"` at another sign-in on th
 which may be another account's (BACKLOG #2298, #3749; see [Admin password reset](#admin-password-reset-wp-l3-12-asvs-646)). The permission decides, not the role name; no custom role can grant
 `users:manage` (ADR 0045 D1). The store applies the filter in the query before `limit`, so a page
 never comes back short. The account holder's own `/me/security-events` feed is not filtered: it
-selects rows by the caller's own username, so it shows the holder their own lock and no one else's.
+selects rows by the caller's own username at or after the account's `created_at`, so it shows the
+holder their own rows, and another account's only where an account keeps its `created_at` while its
+name or holder changes (the `GET /me/security-events` bullet under *Single-route data rules*, in
+[The `/ui` console plane](#the-ui-console-plane-serve_uitrue)).
 **The cost, accepted in the ruling: the Auditor can no longer review lockouts.** The list and its
 reasons are in `messagefoundry/auth/audit_visibility.py`.
 

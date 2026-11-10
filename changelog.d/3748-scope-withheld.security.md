@@ -1,7 +1,7 @@
 - **The audit trail withholds the stored channel lists and scope sources of four actions from a
   reader without `users:manage`.** `GET /audit`, its console page and `GET /audit/export` narrow
   these four: `user.channel_scope_changed`, `auth.ad_scope_resynced`, `auth.ad_session_revoked` (its
-  `scope_from` and `scope_to`) and `user.channel_scope_change_refused` (its `owner`, `read_source`,
+  `scope_from` and `scope_to`, on a scope-delta row) and `user.channel_scope_change_refused` (its `owner`, `read_source`,
   `expected_source` and `reason`), as `GET /users` already withholds every account's scope. Those
   four are what a census of the writers found; a new action that names a scope is shown whole until
   it is added to the list. Rows left whole can still let such a reader infer a scope, at least
