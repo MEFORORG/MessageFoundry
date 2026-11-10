@@ -299,6 +299,18 @@ def _load_external_provider(
             f"[store].key_provider={name!r} could not load its backend ({exc.name!r} is missing) — "
             f"install the optional {extra!r} extra."
         ) from exc
+    except ImportError as exc:
+        # Present but broken: a C extension that fails to load, or a name its SDK or the provider
+        # module itself no longer has. resolve_active_key and resolve_decrypt_keys already refuse
+        # any provider error as a KeyProviderError with a fixed text, so this changes nothing
+        # there; it keeps this seam's own contract, KeyProviderError, for a provider module whose
+        # import fails. An ImportError raised later, inside build_provider, is the provider's to
+        # wrap, as keyprovider_vault wraps its lazy hvac import (vault BACKLOG #6709).
+        raise KeyProviderError(
+            f"[store].key_provider={name!r} could not load its provider module or backend (an "
+            f"import failed: {type(exc).__name__}, chained below) — reinstall MessageFoundry "
+            f"with the optional {extra!r} extra."
+        ) from exc
     # The provider module owns its own construction; annotate the local so mypy keeps the contract.
     provider: KeyProvider = module.build_provider(settings, posture=posture)
     return provider
