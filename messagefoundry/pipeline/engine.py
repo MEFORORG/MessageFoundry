@@ -207,10 +207,10 @@ class ConfigDigestMismatch(Exception):
     """A released reload's config is not the config its approval named (vault BACKLOG #2596).
 
     :meth:`Engine.reload_detail` raises it before anything is swapped. ``approved`` is the digest
-    the hold captured, or ``None`` when it captured none; ``current`` is the digest of the directory
-    now, or ``None`` when it could not be read. Both are content digests, never file content.
-    ``value_file`` is True when the two digests match and the environment value file is not the
-    one the approval bound, which neither digest covers."""
+    the release is bound to, or ``None``, which no config matches; ``current`` is the digest of
+    the directory now, or ``None`` when it could not be read. Both are content digests, never file
+    content. ``value_file`` is True when the two digests match and the environment value file is
+    not the one the approval bound, which neither digest covers."""
 
     def __init__(
         self, approved: str | None, current: str | None, *, value_file: bool = False
@@ -279,9 +279,8 @@ def _log_abandoned_config_write(task: asyncio.Task[None]) -> None:
 @dataclass(frozen=True, slots=True)
 class ApprovedConfig:
     """The config a dual-control approval released, which :meth:`Engine.reload_detail` binds a
-    reload to (vault BACKLOG #2596, step 3). ``fingerprint`` is the digest the hold captured at
-    request time, or ``None`` when it captured none; a reload bound to ``None`` refuses every
-    config.
+    reload to (vault BACKLOG #2596, step 3). ``fingerprint`` is the digest the release is bound
+    to; a reload bound to ``None`` refuses every config.
 
     ``value_file`` binds the environment value file the engine reads from outside the config
     directory, which ``fingerprint`` leaves out because that digest is published unkeyed: the
@@ -508,7 +507,7 @@ class Engine:
         engine_version: str = "",
         api_tls_cert_file: str | None = None,
         api_tls_client_cert_files: Sequence[str] = (),
-        settings_crls: Sequence[MonitoredCert] = (),
+        settings_monitored_files: Sequence[MonitoredCert] = (),
         api_listener: tuple[str, int] | None = None,
         reference_settings: ReferenceSettings | None = None,
         egress_settings: EgressSettings,
@@ -662,8 +661,9 @@ class Engine:
         # BACKLOG #299: the CRL files the service settings configure (crls_from_settings), mostly for
         # OUTBOUND hops. No connection carries them, so the registry scan cannot see them, and a stale
         # one would otherwise stay silent until the next context build failed. Vault BACKLOG #2223: the
-        # serve path also passes the SQL Server store pin here (certs_from_settings), a kind="cert" row.
-        self._settings_crls = tuple(settings_crls)
+        # serve path passes monitored_files_from_settings here, which adds the certificate settings
+        # (certs_from_settings) as kind="cert" rows.
+        self._settings_monitored_files = tuple(settings_monitored_files)
         # The engine's own API listener (host, port), reserved so no inbound listener can steal it (it
         # would collide with uvicorn at bind). None (embedding/tests with no API socket) → nothing
         # reserved. Rendered into the (label, host, port) tuples every runner consults for port-conflict
@@ -965,7 +965,7 @@ class Engine:
         update_check_settings: UpdateCheckSettings | None = None,
         api_tls_cert_file: str | None = None,
         api_tls_client_cert_files: Sequence[str] = (),
-        settings_crls: Sequence[MonitoredCert] = (),
+        settings_monitored_files: Sequence[MonitoredCert] = (),
         api_listener: tuple[str, int] | None = None,
         reference_settings: ReferenceSettings | None = None,
         egress_settings: EgressSettings,
@@ -1029,7 +1029,7 @@ class Engine:
             update_check_settings=update_check_settings,
             api_tls_cert_file=api_tls_cert_file,
             api_tls_client_cert_files=api_tls_client_cert_files,
-            settings_crls=settings_crls,
+            settings_monitored_files=settings_monitored_files,
             api_listener=api_listener,
             reference_settings=reference_settings,
             egress_settings=egress_settings,
@@ -1628,15 +1628,16 @@ class Engine:
         return runner.latest if runner is not None else None
 
     def _monitored_certs(self) -> list[MonitoredCert]:
-        """The TLS certs the engine serves with right now: the ``[api]`` cert + the wired graph's MLLP
-        ``tls_cert_file`` certs (read live off the registry, so a config reload is reflected). Passed to
-        the :class:`CertExpiryRunner` as its cert source so each scan reflects the current graph. The
-        settings-level CRL files (BACKLOG #299) ride along, since they are fixed for the process."""
+        """The files the expiry monitor watches right now: what :func:`certs_from_registry` returns
+        for the live registry (so a config reload of the graph is reflected) and the ``[api]`` cert
+        and service-caller certs fixed at construction, then the settings-level CRL and pin files
+        (BACKLOG #299, vault #2223), also fixed for the process. Passed to the
+        :class:`CertExpiryRunner` as its cert source so each scan reflects the current graph."""
         registry = self._registry_runner.registry if self._registry_runner is not None else None
         certs = certs_from_registry(
             registry, self._api_tls_cert_file, self._api_tls_client_cert_files
         )
-        certs.extend(self._settings_crls)
+        certs.extend(self._settings_monitored_files)
         return certs
 
     def _tracked_secrets(self) -> list[MonitoredSecret]:

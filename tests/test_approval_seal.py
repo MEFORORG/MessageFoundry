@@ -617,7 +617,6 @@ _APPROVAL_READERS = frozenset(
 _GATE_READS: dict[str, frozenset[str]] = {
     "_load": frozenset({"get_pending_approval"}),
     "_read_back_request": frozenset({"get_pending_approval"}),
-    "_reads_status": frozenset({"get_pending_approval"}),
     "list_pending": frozenset({"list_pending_approvals"}),
     "list_interrupted": frozenset({"list_interrupted_approvals"}),
     "list_executing": frozenset({"list_executing_approvals"}),
@@ -662,13 +661,12 @@ def test_the_gate_reads_requests_through_its_seal_check() -> None:
     assert {f for f, _, _ in calls} == set(_GATE_READS), calls
     stray = [(f, r) for f, r, _ in calls if r not in _GATE_READS[f]]
     assert not stray, stray
-    # `_load`, `_read_back_request` and `_reads_status` check what they read themselves, through
-    # `_verified`; every other read goes through `_verified_rows`, except the one reconcile read
-    # that only logs.
+    # `_load` and `_read_back_request` check what they read themselves, through `_verified`; every
+    # other read goes through `_verified_rows`, except the one reconcile read that only logs.
     unchecked = sorted(
         (f, r)
         for f, r, checked in calls
-        if not checked and f not in ("_load", "_read_back_request", "_reads_status")
+        if not checked and f not in ("_load", "_read_back_request")
     )
     assert unchecked == [("_reconcile", "list_executing_approvals")], unchecked
 

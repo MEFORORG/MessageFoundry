@@ -4838,7 +4838,7 @@ def alert_revocation_attestations(
     """Each ``[alerts]`` revocation attestation that is set: its switch name, the hop it covers,
     what that hop's own handshake can check, and its reason (BACKLOG #2193). The ``[alerts]``
     sibling of :func:`vault_revocation_attestations`, read by :func:`security_loosenings`. A CRL
-    reaches the SMTP hop's context; none can reach the webhook's import-time opener."""
+    reaches the SMTP hop's context; none can reach the webhook's shared opener."""
     pairs = (
         (
             "alerts.email_tls_revocation_attested",
@@ -5520,6 +5520,9 @@ _ALERT_EVENT_TYPES = frozenset(
         # BACKLOG #305 (ASVS 13.2.2): the store privilege preflight found the store principal
         # over-granted, or could not read it, at start.
         "store_privilege_warning",
+        # BACKLOG #2903 (ADR 0216): the Vault privilege preflight found a Vault token over-granted,
+        # or could not read it, at start.
+        "vault_privilege_warning",
         "leadership_acquired",  # #145 (ADR 0014 amendment): a node went non-leader→leader (HA failover / election)
         "dr_activated",  # #145 (ADR 0014 amendment, ADR 0048): a third-tier DR standby was promoted
         # ASVS 6.4.5 (BACKLOG #1141): an admin-issued temporary password is UNCLAIMED and near the
@@ -5557,6 +5560,9 @@ _ALERT_EVENT_TYPES = frozenset(
         # `approval:listing` (vault BACKLOG #3747). Since vault BACKLOG #2254 also an
         # inline config reload's lost config_reload_attempted row, keyed `config_reload:inline`.
         "audit_write_failed",
+        # vault BACKLOG #3193 N1: an approval audit row whose write the gate read back as
+        # committed, whose off-box copy was never sent. Keyed `approval:<id>`, as above.
+        "audit_offbox_copy_missing",
         # ADR 0079 mechanism 2: the directory reconciler's two audited outcomes, each routable apart:
         # a pass left accounts unrevoked, and one principal's sessions were revoked. The first is
         # raised for at least a breaker trip, a referral (BACKLOG #2538), a configuration refusal
@@ -5895,7 +5901,7 @@ class AlertsSettings(_Section):
     # the webhook host's certificate is covered outside the engine. The POST carries the webhook's
     # path token over https the engine verifies and checks no CRL or OCSP on, so an off-box https
     # webhook on an enforcing instance is refused at build unless this is true, with its mandatory
-    # reason. It is the only way across: the webhook rides one opener built at import, which no CRL
+    # reason. It is the only way across: the webhook rides one shared opener, which no CRL
     # can reach. A loosening, named in security_loosenings(). It never lifts the cleartext refusal.
     webhook_tls_revocation_attested: bool = False
     webhook_tls_revocation_attested_reason: str | None = None
@@ -8007,6 +8013,18 @@ def environment_named_by_env(environ: Mapping[str, str] | None = None) -> str | 
     return value if isinstance(value, str) and value.strip() else None
 
 
+def environments_dir_named_by_env(environ: Mapping[str, str] | None = None) -> str | None:
+    """The ``[environments].dir`` that ``MEFOR_ENVIRONMENTS_DIR`` sets, or ``None`` when it is unset.
+
+    Read through :func:`_env_overrides`, as :func:`load_settings` reads it, and returned as given, a
+    blank value included, since the loader takes that too. The offline subcommands locate
+    ``<dir>/<env>.toml`` without loading settings, so they need the variable that beats the file's
+    ``dir`` in ``serve``'s settings (vault BACKLOG #2355)."""
+    environ = os.environ if environ is None else environ
+    value = _env_overrides(environ).get("environments", {}).get("dir")
+    return value if isinstance(value, str) else None
+
+
 def insecure_bind_escape(settings: ServiceSettings, *, flag: bool = False) -> bool:
     """The cleartext-listener escape, folded the one way every caller folds it (ADR 0118, BACKLOG
     #1672): ``serve --allow-insecure-bind`` OR ``[security].require_encryption_for_remote = false``.
@@ -9032,9 +9050,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       Their ``[auth]`` spellings are refused at load, so the entries carry the ``[security]`` names.
       They are read off the ``[auth]`` copy, since this function is handed no ``[security]``. A
       caller whose two disagree reports the ``[auth]`` value, so it can miss a new loosening or
-      keep one just removed: at least the ``security set`` preview, which pairs the edited
-      ``[security]`` with the ``[auth]`` it loaded before the edit, and a ``security show`` that
-      could not load the whole file and fell back to a default ``[auth]``.
+      keep one just removed. A caller that pairs a ``[security]`` with an ``[auth]`` from another
+      read must copy the two in first, as ``messagefoundry security`` does (vault BACKLOG #2600).
       ``SessionRecord.is_live`` refuses a session idle past the first or older than the second (its
       expiry is stamped from it at sign-in), so a longer one is looser, and 0 or less
       ends every session at once, which is stricter.
@@ -9612,7 +9629,9 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"the directory reconciler runs every {interval} s, less often than the "
                     f"default of {_auth_default('ad_session_recheck_seconds')} s, so {late}. The "
                     f"interval also delays the page about a directory outage, which comes after "
-                    f"{floor}",
+                    f"{floor}, and the page about one account the directory keeps failing for, "
+                    f"which comes after at least {run} of that account's own probes running "
+                    f"fail, at least {(run - 1) * interval} s after its first such probe",
                 )
             )
         if run > _auth_default("ad_reconcile_outage_passes"):
@@ -9625,7 +9644,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     "configured interval. Until it does, a directory account disabled or deleted "
                     "meanwhile keeps its live engine sessions with only a WARNING and an audit row "
                     "per pass to show for it. The same count bounds one account the directory "
-                    "keeps failing for while it answers others, so that page waits longer too",
+                    "keeps failing for, so that page waits longer too",
                 )
             )
         strikes = auth.ad_session_recheck_strikes
@@ -9647,7 +9666,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     "a reconciler pass probes fewer accounts than the default of "
                     f"{_auth_default('ad_session_recheck_max_users')}, so a larger estate takes "
                     f"more passes to cover, and {late}. The smaller sample is also the breaker's "
-                    "denominator, so a smaller wave of revocations aborts the pass",
+                    "denominator, so a smaller wave of revocations aborts the pass. In an estate "
+                    "larger than the sample each account is probed less often, so the page about "
+                    "one account the directory keeps failing for, which counts that account's "
+                    "probes, comes more passes later too",
                 )
             )
         brake = (
@@ -10102,11 +10124,16 @@ def security_loosenings(
     SQLite store (vault BACKLOG #2619),
     ``[auth].ad_session_recheck_seconds``, ``[auth].admin_new_ip_step_up`` (#288),
     ``[auth].require_action_step_up`` and the three ``[auth].password_check_*`` screens (vault
-    BACKLOG #2600), the ``[auth]``
-    sign-in rate-limit, lockout, PHI-read, admin-write, time-floor, session-cap, OIDC flow-cache,
-    AD timeout, step-up window, TOTP skew and temporary-password life
-    settings :func:`_auth_limit_loosenings` lists, each set looser than its shipped default (#1131),
-    the ``[approvals]`` dwell and expiry :func:`_approvals_loosenings` lists, read the same way
+    BACKLOG #2600), the ``[auth]`` settings :func:`_auth_limit_loosenings` lists, each named only
+    when set looser than its shipped default (#1131, vault BACKLOG #2600 step 4): at least the
+    sign-in, PHI-read and admin-write limiters, the lockout, the time floors, the session cap, the
+    ``[security]`` session limits (read off their ``[auth]`` copies), the step-up window, TOTP
+    skew, temporary-password life, recovery-code count, password length floor, AD timeouts, the
+    directory reconciler and federated sign-in (that function's docstring reads each field, and
+    the numeric census in ``tests/test_security_posture_defaults.py`` is the field list, red on a
+    numeric ``[auth]`` field neither named nor exempt with a reason, so these groups name no
+    field to fall behind), the ``[approvals]`` dwell and expiry :func:`_approvals_loosenings`
+    lists, read the same way
     (#2489), an ``[approvals].operations`` list that leaves out a default operation (vault BACKLOG
     #3123), any ``[api].trusted_proxies`` entry covering more than one address, with its own
     wording where the entries together cover every peer of a family (#1131),
@@ -10250,9 +10277,9 @@ def security_loosenings(
     ``attested_hops`` declares ``tls_hop_attested`` (ADR 0092, owner ruling 2026-09-24),
     ``revocation_attested_hops`` declares ``tls_revocation_attested`` (ADR 0173), and
     ``path_form_fhir_hops`` is an outbound ``FHIR()`` connection that sets
-    ``update_url_form="path"`` (vault BACKLOG #2571), and ``ech_cleartext_sidecar_hops`` is a
-    ``REST`` outbound whose ECH sidecar is an ``http://`` URL (ADR 0139). They arrive as
-    plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
+    ``update_url_form="path"``, or may through an ``env()`` value (vault BACKLOG #2571), and
+    ``ech_cleartext_sidecar_hops`` is a ``REST`` outbound whose ECH sidecar is an ``http://`` URL
+    (ADR 0139). They arrive as plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
     caller resolves them through the shared readers in ``config.wiring``
     (``accepted_cleartext_hops``, which walks both outbound connections and ``FhirLookup`` read
     connections; ``expiry_relaxed_hops``, which walks outbound and the inbound REMOTEFILE pollers;
@@ -10260,8 +10287,11 @@ def security_loosenings(
     which walks outbound and ``FhirLookup``; ``unverified_generic_db_hops``, which walks inbound as well as
     outbound; ``attested_secure_hops``, which walks every carrier a hop gate reads;
     ``revocation_attested_hops``, which walks inbound, outbound and ``FhirLookup``;
-    ``path_form_fhir_updates``, which walks outbound and already returns plain names;
-    ``ech_cleartext_sidecar_hops``, which walks the ``REST`` outbounds). A caller that
+    ``path_form_fhir_updates``, which walks the ``FHIR()`` outbounds;
+    ``ech_cleartext_sidecar_hops``, which walks the ``REST`` outbounds). At least the path-form,
+    ECH and generic-DATABASE names can carry a ``possibly`` marker in parentheses after the name,
+    where the caller could not resolve an ``env()`` value, so an entry is not always a bare
+    connection name. A caller that
     genuinely has no graph — ``messagefoundry security show``, which reads a
     settings file and never loads the connection config — passes empty sequences and SAYS SO in its
     output, rather than reporting a subset as if it were everything.
@@ -10912,11 +10942,12 @@ def security_loosenings(
         out.append(
             (
                 "update_url_form",
-                f"{len(path_form_fhir_hops)} FHIR connection(s) send updates in the PATH form "
-                f"({named}) — each update puts the message's resource id in the request URL, "
-                "so the receiving server's access log, and any proxy log on the path, holds "
-                "it; an id can be a medical record number or another identifier. The shipped "
-                "transaction form keeps the id out of the URL",
+                f"{len(path_form_fhir_hops)} FHIR connection(s) send updates in the PATH form, "
+                f"or may where marked possibly ({named}) — each such update puts the message's "
+                "resource id in the request URL, so the receiving server's access log, and any "
+                "proxy log on the path, holds it; an id can be a medical record number or "
+                "another identifier. The shipped transaction form keeps the id out of the URL. "
+                "A name marked possibly has an env() value this reading could not resolve",
             )
         )
     # ADR 0139: the engine-to-sidecar hop of an ECH connection. docs/SECURITY-LOOSENING.md,

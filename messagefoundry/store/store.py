@@ -80,6 +80,7 @@ from typing import (
     TypedDict,
     assert_never,
     cast,
+    overload,
     runtime_checkable,
 )
 from uuid import uuid4
@@ -3138,22 +3139,17 @@ def passkey_is_way_past(cred: WebAuthnCredential) -> bool:
     under today's credential-id hash scheme, the only key the sign-in looks a passkey up by (BACKLOG
     #3423). A row the start-up rehash has not moved (a bare digest), or one it refused (an unknown
     tag, a malformed value), can never sign in, so it is no way past however it is recorded. The one
-    statement of the per-passkey rule: the store's conditional writes, the census, the service's
-    gates, the sign-in path and the lock notice all ask it."""
+    statement of the per-passkey way-past rule: at least the store's conditional writes, the census,
+    the service's gates, the sign-in path and the lock notice ask it. The census's reset list asks
+    only its hash-scheme half for a directory account's second factor, which needs no discoverable
+    record (:func:`~messagefoundry.auth.tokens.credential_id_hash_is_current`)."""
     if not cred.discoverable:
         return False
     # Lazy: a leaf module of the auth package (stdlib only), imported where the rule is asked so
     # the store module takes no import-time dependency on the auth package.
-    from messagefoundry.auth.tokens import (
-        CREDENTIAL_ID_HASH_SCHEME,
-        CredentialHashSchemeError,
-        credential_id_hash_scheme,
-    )
+    from messagefoundry.auth.tokens import credential_id_hash_is_current
 
-    try:
-        return credential_id_hash_scheme(cred.credential_id_hash) == CREDENTIAL_ID_HASH_SCHEME
-    except CredentialHashSchemeError:
-        return False
+    return credential_id_hash_is_current(cred.credential_id_hash)
 
 
 #: The caller's rule for which passkey counts as a way past at a factor-drop gate (BACKLOG #3937):
@@ -3204,12 +3200,19 @@ TotpUsable = Callable[[str | None], TotpState]
 TotpCounts = Callable[[UserAuthzRecord], bool]
 
 
-def require_totp_rule(require_way_past: bool, usable: TotpUsable | None) -> None:
-    """Refuse a conditional way-past write that brought no TOTP rule: without one an enrolment the
-    engine cannot compute with would count as a way past, which is the failure this rule exists to
-    stop (BACKLOG #3422). Raises :class:`ValueError`; every backend calls it first."""
-    if require_way_past and usable is None:
-        raise ValueError("a conditional way-past write needs totp_usable")
+def conditional_way_past(require_way_past: TotpUsable | None) -> bool:
+    """Whether a write's ``require_way_past`` makes it conditional on a way past the sign-in lock
+    (ADR 0197 Amendment A). The parameter IS the caller's TOTP rule (:data:`TotpUsable`, BACKLOG
+    #3422), so a conditional write that brings no rule cannot be written, where a flag beside an
+    optional rule allowed it (BACKLOG #3948 finding 14). A flag where the rule belongs, the old
+    ``require_way_past=True`` from a caller typed ``Any``, raises :class:`TypeError`: judged as
+    no rule, a TOTP the engine cannot compute with would count as a way past. Every backend's
+    conditional write calls it first."""
+    if require_way_past is None:
+        return False
+    if not callable(require_way_past):
+        raise TypeError("require_way_past takes the caller's TOTP rule (TotpUsable), not a flag")
+    return True
 
 
 #: When each account's TOTP cell was last logged as not opening (monotonic seconds), so a gate
@@ -3236,43 +3239,77 @@ def log_unopened_totp(user_id: str) -> None:
     )
 
 
+@overload
+async def judge_totp(
+    opener: Callable[[str, str | None], str | None],
+    usable: TotpUsable,
+    user: UserRecord | None,
+) -> TotpJudgement: ...
+
+
+@overload
 async def judge_totp(
     opener: Callable[[str, str | None], str | None],
     usable: TotpUsable | None,
     user: UserRecord | None,
-) -> TotpCounts | None:
-    """The :data:`TotpCounts` a backend passes to :func:`holds_way_past`,
-    :func:`removal_keeps_way_past`, :func:`totp_removal` and :func:`lockout_increment`.
+) -> TotpJudgement | None: ...
 
-    ``user`` is the account as read BEFORE the write takes its lock, so the cell is opened with
+
+async def judge_totp(
+    opener: Callable[[str, str | None], str | None],
+    usable: TotpUsable | None,
+    user: UserRecord | None,
+) -> TotpJudgement | None:
+    """The :data:`TotpCounts` a backend passes to the conditional-write rules, at least
+    :func:`removal_keeps_way_past`, :func:`totp_removal`, :func:`lockout_increment` and
+    :func:`password_change`. A caller outside a backend may call it too, with no lock to confirm
+    the cell under, and then reads only the judgement's ``state``.
+
+    ``user`` is the account as the caller read it, with no lock held, so the cell is opened with
     ``opener`` (the backend's ``open_totp_secret``) and judged by ``usable`` OFF THE EVENT LOOP and
     with no lock held: a Transit cipher's decrypt is a blocking HTTP call (CLAUDE.md section 6), and
-    holding SQLite's writer lock or a row lock across it would stall every other write. Under the
-    lock the verdict holds only for that exact cell (:meth:`TotpJudgement.moved`); each caller says
-    what a moved cell means for it. A cell that does not open is ``"unknown"``
-    (:func:`log_unopened_totp`), never a refusal. ``None`` for no ``usable``."""
+    holding SQLite's writer lock or a row lock across it would stall every other write. Under a
+    backend's lock the verdict holds only for that exact cell (:meth:`TotpJudgement.moved`); each
+    caller says what a moved cell means for it. The cell is judged by :func:`judge_totp_cell`.
+    ``None`` for no ``usable``."""
     if usable is None:
         return None
-    rule = usable
     cell = (
         None if user is None or user.row is None or not user.totp_enabled else user.row.totp_secret
     )
     state: TotpState = "refused"  # no cell: no TOTP to count
     if user is not None and cell is not None:
-
-        def judge(user_id: str, stored: str) -> TotpState:
-            return rule(opener(user_id, stored))
-
-        try:
-            state = await asyncio.to_thread(judge, user.id, cell)
-        except CipherError:
-            log_unopened_totp(user.id)
-            state = "unknown"
-        if state not in ("usable", "refused", "unknown"):
-            # A bool rule (the old shape) would read False as "not refused", which fails open.
-            raise TypeError(f"totp_usable answered {state!r}, not a TotpState")
-
+        state = await judge_totp_cell(opener, usable, user.id, cell)
     return TotpJudgement(cell=cell, state=state)
+
+
+async def judge_totp_cell(
+    opener: Callable[[str, str | None], str | None],
+    usable: TotpUsable,
+    user_id: str,
+    cell: str,
+) -> TotpState:
+    """What one stored TOTP ``cell`` is (:data:`TotpState`): opened with ``opener`` (a backend's
+    ``open_totp_secret``) and judged by ``usable``, both OFF THE EVENT LOOP, since a Transit
+    cipher's decrypt is a blocking HTTP call (CLAUDE.md section 6). A cell that does not open
+    (:class:`CipherError`) is ``"unknown"``, logged by :func:`log_unopened_totp`, never a refusal.
+
+    The one statement of the judgement (BACKLOG #3948 finding 17): :func:`judge_totp`, for the
+    store's conditional writes and the lock escalation, and the auth service's way-past gates
+    both ask it, so the two cannot drift apart."""
+
+    def judge() -> TotpState:
+        return usable(opener(user_id, cell))
+
+    try:
+        state = await asyncio.to_thread(judge)
+    except CipherError:
+        log_unopened_totp(user_id)
+        return "unknown"
+    if state not in ("usable", "refused", "unknown"):
+        # A bool rule (the old shape) would read False as "not refused", which fails open.
+        raise TypeError(f"the TOTP rule answered {state!r}, not a TotpState")
+    return state
 
 
 async def escalation_verdict(
@@ -3329,6 +3366,16 @@ def sets_a_later_sign_in_lock(row: UserRecord | UserRow, threshold: int, now: fl
 _SQLITE_DECODE_FAILURE = "Could not decode to UTF-8 column"
 
 
+def passkey_cell_undecodable(exc: BaseException) -> bool:
+    """Whether ``exc`` is a driver failing to decode a passkey cell while fetching, before any row
+    is parsed: pyodbc's ``UnicodeDecodeError``, or sqlite3's ``OperationalError`` told apart only by
+    its message (:func:`escalation_passkeys`). Every reader that counts such a set for nothing
+    asks it."""
+    if isinstance(exc, UnicodeDecodeError):
+        return True
+    return isinstance(exc, sqlite3.OperationalError) and str(exc).startswith(_SQLITE_DECODE_FAILURE)
+
+
 async def escalation_passkeys(
     counter: LockoutCounter,
     *,
@@ -3362,10 +3409,13 @@ async def escalation_passkeys(
         return None
     try:
         return await read_passkeys()
-    except (PasskeyRowMalformed, UnicodeDecodeError) as exc:
+    except PasskeyRowMalformed as exc:
         failure = type(exc).__name__
+    except UnicodeDecodeError:
+        # No name is bound: a decode error's message quotes the cell, so none is rendered.
+        failure = "UnicodeDecodeError"
     except sqlite3.OperationalError as exc:
-        if not str(exc).startswith(_SQLITE_DECODE_FAILURE):
+        if not passkey_cell_undecodable(exc):
             raise
         failure = type(exc).__name__
     # The class name only: a decode error's message and arguments quote the cell.
@@ -3578,6 +3628,15 @@ def lockout_increment(
         )
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord:
+        # The verdict the escalation reads below, where it judged the cell this locked row holds.
+        judged = (
+            totp_counts
+            if counter == "sign_in"
+            and isinstance(totp_counts, TotpJudgement)
+            and r.row.totp_enabled
+            and not totp_counts.moved(r)
+            else None
+        )
         state = next_lockout_state(
             failed_attempts=int(getattr(r.row, attempts_col)),
             locked_until=getattr(r.row, until_col),
@@ -3589,17 +3648,19 @@ def lockout_increment(
             escalate=lockout_escalates(
                 counter,
                 auth_provider=r.row.auth_provider,
-                totp_enabled=r.row.totp_enabled
-                and not (
-                    counter == "sign_in"
-                    and isinstance(totp_counts, TotpJudgement)
-                    and totp_counts.refuses(r)
-                ),
+                totp_enabled=r.row.totp_enabled and not (judged is not None and judged.refuses(r)),
                 passkey_way_past=passkey_way_past(r),
             ),
             lockable=lockout_arms(counter, password_generated=r.row.password_generated),
         )
-        out.append(LockoutIncrement(state.attempts, state.just_locked, state.cycles))
+        out.append(
+            LockoutIncrement(
+                state.attempts,
+                state.just_locked,
+                state.cycles,
+                None if judged is None else judged.state,
+            )
+        )
         return r.changed(
             **{
                 attempts_col: state.attempts,
@@ -8835,11 +8896,20 @@ class LockoutState:
 
 class LockoutIncrement(NamedTuple):
     """What ``increment_login_failure`` returns: the counter's new failure count, whether this
-    attempt set the lock, and the counter's cycle count after it (the notice reports it)."""
+    attempt set the lock, and the counter's cycle count after it (the notice reports it).
+
+    ``totp_state`` is the TOTP verdict the SIGN-IN lock's escalation used (:func:`judge_totp`), on
+    the cell the locked row still holds, or ``None`` where it used none: at least the second-step
+    counter, a cell that moved since the judgement, and a failure whose pre-lock read said it sets
+    no later-cycle lock. The judgement runs on that pre-lock read, so a racing write can leave a
+    verdict on a failure that sets a first lock or none: read it beside ``just_locked``, never as
+    proof of a later-cycle lock. The lock notice reads it, so it tells the owner what the
+    escalation decided on rather than judging the cell again (BACKLOG #3948 finding 16)."""
 
     attempts: int
     just_locked: bool
     cycles: int
+    totp_state: TotpState | None = None
 
 
 def next_lockout_state(
@@ -17882,17 +17952,16 @@ class MessageStore:
         password_hash: str,
         password_generated: bool,
         must_change_password: bool = True,
-        require_way_past: bool = False,
-        totp_usable: TotpUsable | None = None,
+        require_way_past: TotpUsable | None = None,
         passkey_counts: PasskeyCounts | None = None,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        require_totp_rule(require_way_past, totp_usable)
+        conditional = conditional_way_past(require_way_past)
         # The TOTP judged before the writer lock (judge_totp), confirmed under it by its cell.
         totp_counts = (
-            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
-            if require_way_past
+            await judge_totp(self.open_totp_secret, require_way_past, await self.get_user(user_id))
+            if conditional
             else None
         )
         async with _writer_guard(self._db, self._lock):
@@ -17901,9 +17970,9 @@ class MessageStore:
                 password_hash=password_hash,
                 password_generated=password_generated,
                 must_change_password=must_change_password,
-                require_way_past=require_way_past,
+                require_way_past=conditional,
                 now=now,
-                passkeys=await self._account_passkeys(user_id) if require_way_past else (),
+                passkeys=await self._account_passkeys(user_id) if conditional else (),
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
                 passkey_counts=passkey_counts,
@@ -17992,11 +18061,16 @@ class MessageStore:
         return None if written is None else sealed
 
     async def get_totp_secret(self, user_id: str) -> str | None:
-        """The user's decrypted base32 TOTP secret, or ``None`` when not enrolled/staged."""
+        """The user's decrypted base32 TOTP secret, or ``None`` when not enrolled/staged. The cell
+        is opened OFF THE EVENT LOOP (BACKLOG #3929): under a Transit cipher the decrypt is a
+        blocking HTTP call, and the lockable-account census reads every enrolled account through
+        here."""
         async with self._read() as db:
             cur = await db.execute("SELECT totp_secret FROM users WHERE id=?", (user_id,))
             row = await cur.fetchone()
-        return self.open_totp_secret(user_id, row["totp_secret"] if row else None)
+        return await asyncio.to_thread(
+            self.open_totp_secret, user_id, row["totp_secret"] if row else None
+        )
 
     def open_totp_secret(self, user_id: str, cell: str | None) -> str | None:
         """``cell``, a ``users.totp_secret`` value the caller already read, decrypted (BACKLOG
@@ -18130,19 +18204,19 @@ class MessageStore:
         user_id: str,
         *,
         now: float | None = None,
-        require_way_past: bool = False,
-        totp_usable: TotpUsable | None = None,
+        require_way_past: TotpUsable | None = None,
         passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         """Clear a user's TOTP enrollment entirely (secret, enabled flag, recovery codes). With
-        ``require_way_past``, a TOTP that is a way past (``totp_usable``) goes only while a
-        discoverable passkey remains, read under the same writer lock (:func:`totp_removal`).
+        ``require_way_past``, the caller's TOTP rule, a TOTP that is a way past by it goes only
+        while a discoverable passkey remains, read under the same writer lock
+        (:func:`totp_removal`).
         Returns whether a row was written."""
         now = time.time() if now is None else now
-        require_totp_rule(require_way_past, totp_usable)
+        conditional = conditional_way_past(require_way_past)
         totp_counts = (
-            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
-            if require_way_past
+            await judge_totp(self.open_totp_secret, require_way_past, await self.get_user(user_id))
+            if conditional
             else None
         )
         async with _writer_guard(self._db, self._lock):
@@ -18151,8 +18225,8 @@ class MessageStore:
             # repaired by ``provision-admin`` could use to block the repair.
             change = totp_removal(
                 now,
-                require_way_past=require_way_past,
-                passkeys=await self._account_passkeys(user_id) if require_way_past else (),
+                require_way_past=conditional,
+                passkeys=await self._account_passkeys(user_id) if conditional else (),
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
                 passkey_counts=passkey_counts,
@@ -18278,23 +18352,22 @@ class MessageStore:
         user_id: str,
         credential_id_hash: str,
         *,
-        require_way_past: bool = False,
-        totp_usable: TotpUsable | None = None,
+        require_way_past: TotpUsable | None = None,
         passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
         predicate keeps the action self-scoped even if a foreign id-hash is submitted). The
         account is re-sealed over its new passkey digest in the same transaction (BACKLOG #2592).
         With ``require_way_past``, only while a way past remains after it, judged under the same
-        writer lock (:func:`removal_keeps_way_past`, TOTP counted by ``totp_usable``)."""
-        require_totp_rule(require_way_past, totp_usable)
+        writer lock (:func:`removal_keeps_way_past`, TOTP counted by that rule)."""
+        conditional = conditional_way_past(require_way_past)
         totp_counts = (
-            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
-            if require_way_past
+            await judge_totp(self.open_totp_secret, require_way_past, await self.get_user(user_id))
+            if conditional
             else None
         )
         async with _writer_guard(self._db, self._lock):
-            if require_way_past:
+            if conditional:
                 current = await self._read_user_record(user_id)
                 if current is None or not removal_keeps_way_past(
                     current,
@@ -18588,8 +18661,8 @@ class MessageStore:
         BACKLOG #3422). The passkey half of the escalation is :func:`escalation_passkeys`
         (BACKLOG #3937 item 8). The count itself stays atomic.
 
-        Returns ``(0, False, 0)`` for an unknown user -- there is no row to count against, and a
-        caller that reached here on a missing account has already refused it."""
+        Returns ``LockoutIncrement(0, False, 0)`` for an unknown user -- there is no row to count
+        against, and a caller that reached here on a missing account has already refused it."""
         now = time.time() if now is None else now
         out: list[LockoutIncrement] = []
         totp_counts = await escalation_verdict(

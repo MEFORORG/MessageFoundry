@@ -104,6 +104,12 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # tooling predicate does name `docs/`, so those arms alone would be reached there, but they
         # are not the reason it stays.
         "test_architecture_diagrams.py",
+        # Starts uvicorn the way serve does (by host and port, on uvicorn's "auto" loop) and reads
+        # IPV6_V6ONLY off the API's listening socket (vault BACKLOG #3764 item 6). It imports no
+        # engine module, but its subject is the engine's API listener and the uvloop dependency in
+        # messagefoundry's own metadata, so a change that breaks it arrives as an ENGINE or
+        # dependency diff the tooling path gate does not see.
+        "test_api_listener_ipv6_only.py",
         "test_asvs_apply.py",
         "test_asvs_residual_lint.py",
         # Reads changelog.d/ and CHANGELOG.md (BACKLOG #2080). A changelog fragment arrives on an
@@ -198,6 +204,13 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # It loads scripts/release/forbidden_members.py by path; that is the RULE it reads, not its
         # subject.
         "test_packaged_tree_denylist.py",
+        # NOT engine source, so this entry widens the list's stated rule, as
+        # test_conftest_name_collision_guard.py does and for the same reason. Its subject is the
+        # test trees' log quiesce: it reads tests/conftest.py's ``_Baseline`` as pytest loaded it
+        # and parses packaging/messagefoundry-webconsole/tests/conftest.py off disk (vault
+        # BACKLOG #2990). A change to the console conftest sets `code=true` but NOT
+        # `tooling=true`, and the merge_group arm pins `tooling=false`. Ambiguous, so it stays.
+        "test_quiesce_baseline_reads_a_quieted_logger.py",
         "test_release_pipeline.py",
         # Reads messagefoundry/** (redaction.py and logging_setup.py among them), docs/** and the
         # other trees off disk, and fails when a comment or docstring names the exception-message

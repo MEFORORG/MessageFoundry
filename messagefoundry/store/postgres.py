@@ -324,6 +324,7 @@ from messagefoundry.store.store import (
     check_executing_owner_filter,
     check_open_store_pin,
     check_password_generated,
+    conditional_way_past,
     create_batch_failure,
     delivery_key,
     enrolment_code_issue,
@@ -373,7 +374,6 @@ from messagefoundry.store.store import (
     require_ingress_audit,
     require_notify_email,
     require_operator_audit,
-    require_totp_rule,
     role_seal_ok,
     roles_if_held,
     roll_audit_key_range,
@@ -9964,30 +9964,29 @@ class PostgresStore:
         password_hash: str,
         password_generated: bool,
         must_change_password: bool = True,
-        require_way_past: bool = False,
-        totp_usable: TotpUsable | None = None,
+        require_way_past: TotpUsable | None = None,
         passkey_counts: PasskeyCounts | None = None,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        require_totp_rule(require_way_past, totp_usable)
+        conditional = conditional_way_past(require_way_past)
         totp_counts = (
-            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
-            if require_way_past
+            await judge_totp(self.open_totp_secret, require_way_past, await self.get_user(user_id))
+            if conditional
             else None
         )
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             # The passkeys the condition reads are read in the write's own transaction, after the
             # account row is locked, so a concurrent removal waits for this write.
-            if require_way_past:
+            if conditional:
                 await self._read_user_record(conn, user_id)
             change = password_change(
                 password_hash=password_hash,
                 password_generated=password_generated,
                 must_change_password=must_change_password,
-                require_way_past=require_way_past,
+                require_way_past=conditional,
                 now=now,
-                passkeys=await self._account_passkeys(conn, user_id) if require_way_past else (),
+                passkeys=await self._account_passkeys(conn, user_id) if conditional else (),
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
                 passkey_counts=passkey_counts,
@@ -10014,8 +10013,11 @@ class PostgresStore:
         return None if written is None else sealed
 
     async def get_totp_secret(self, user_id: str) -> str | None:
+        """See :meth:`MessageStore.get_totp_secret`: opened off the event loop (BACKLOG #3929)."""
         d = await self._fetchone("SELECT totp_secret FROM users WHERE id=$1", user_id)
-        return self.open_totp_secret(user_id, d["totp_secret"] if d else None)
+        return await asyncio.to_thread(
+            self.open_totp_secret, user_id, d["totp_secret"] if d else None
+        )
 
     def open_totp_secret(self, user_id: str, cell: str | None) -> str | None:
         """See :meth:`MessageStore.open_totp_secret` (BACKLOG #3510)."""
@@ -10120,27 +10122,26 @@ class PostgresStore:
         user_id: str,
         *,
         now: float | None = None,
-        require_way_past: bool = False,
-        totp_usable: TotpUsable | None = None,
+        require_way_past: TotpUsable | None = None,
         passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        require_totp_rule(require_way_past, totp_usable)
+        conditional = conditional_way_past(require_way_past)
         totp_counts = (
-            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
-            if require_way_past
+            await judge_totp(self.open_totp_secret, require_way_past, await self.get_user(user_id))
+            if conditional
             else None
         )
         # ``last_totp_step`` too: see ``totp_disable`` (ADR 0197 Amendment A).
         async with self._timed_acquire(record=False) as conn, conn.transaction():
             passkeys: list[WebAuthnCredential] = []
-            if require_way_past:
+            if conditional:
                 # The account row first, locked, so a concurrent passkey removal waits for this.
                 await self._read_user_record(conn, user_id)
                 passkeys = await self._account_passkeys(conn, user_id)
             change = totp_removal(
                 now,
-                require_way_past=require_way_past,
+                require_way_past=conditional,
                 passkeys=passkeys,
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
@@ -10286,21 +10287,20 @@ class PostgresStore:
         user_id: str,
         credential_id_hash: str,
         *,
-        require_way_past: bool = False,
-        totp_usable: TotpUsable | None = None,
+        require_way_past: TotpUsable | None = None,
         passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
         predicate keeps the action self-scoped even if a foreign id-hash is submitted). The
         account is re-sealed over its new passkey digest in the same transaction (BACKLOG #2592)."""
-        require_totp_rule(require_way_past, totp_usable)
+        conditional = conditional_way_past(require_way_past)
         totp_counts = (
-            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
-            if require_way_past
+            await judge_totp(self.open_totp_secret, require_way_past, await self.get_user(user_id))
+            if conditional
             else None
         )
         async with self._timed_acquire(record=False) as conn, conn.transaction():
-            if require_way_past:
+            if conditional:
                 # ADR 0197 Amendment A: the account row locked first, so two removals serialize.
                 current = await self._read_user_record(conn, user_id)
                 if current is None or not removal_keeps_way_past(
@@ -10589,8 +10589,8 @@ class PostgresStore:
         TOTP's refusal is judged by ``totp_usable`` before the lock, only for a failure that would
         set a later-cycle lock, on a cell the locked row must still hold
         (``store.escalation_verdict``, BACKLOG #3422). The passkey half of the escalation is
-        ``store.escalation_passkeys`` (BACKLOG #3937 item 8). Returns ``(0, False, 0)`` for an
-        unknown user."""
+        ``store.escalation_passkeys`` (BACKLOG #3937 item 8). Returns
+        ``LockoutIncrement(0, False, 0)`` for an unknown user."""
         now = time.time() if now is None else now
         out: list[LockoutIncrement] = []
         totp_counts = await escalation_verdict(

@@ -509,10 +509,20 @@ false premise.
 - **Where it is reported:** `security_loosenings()` names a value above `30` minutes or `12` hours
   (vault BACKLOG #2600), so the serve-time warning, `messagefoundry security show` and
   `GET /security/posture` list it. A value of `0` or less ends every session at once, which is
-  stricter, and is not named. The registry reads the value the load copied into `[auth]`, so the
-  preview `messagefoundry security set` prints reflects the value from before the edit, and can
-  miss a new loosening or keep one just removed. The next `security show` is right, when it can
-  load the whole file.
+  stricter, and is not named. `messagefoundry security show` and the `security set` preview read
+  both limits from the file's `[security]`, the authored values `show` prints. When a
+  `MEFOR_SECURITY_*` variable in the operator's shell sets a limit to a value other than the
+  file's, and that value is itself a loosening, it is named too, after the authored entries and
+  beside any entry for the file's own value, with a risk that starts by naming the variable. Where
+  the load and the `[security]` read disagree with no such variable set, as a concurrent edit
+  between the two reads leaves them, the entry says the two reads disagreed instead. A
+  variable equal to the file's value, or one whose value is no loosening, adds no entry. Only the
+  two session limits get this: a `MEFOR_SECURITY_*` variable for another switch, at least
+  `require_mfa` and `block_unlisted_outbound`, is not named. It needs a whole-file load that ran
+  and succeeded, so a report the failed load left partial names none, and so does `security show` on a file that does
+  not exist yet; `security set` on a new file loads what it wrote, and names it. The variable also
+  feeds that load, so one the load refuses makes the report partial, or refuses the edit. The IDE
+  security editor marks a value above the default it is shown.
 
 ### `block_unlisted_outbound = false` — allow-any outbound egress
 - **What you lose:** deny-by-default egress; a transform may send to **any** destination (PHI exfiltration
@@ -938,6 +948,13 @@ count is above `0` (vault BACKLOG #2613).
   `ad_connect_timeout` stretches it too. Each outage pass still logs a WARNING and writes an
   `auth.ad_reconcile_skipped` audit row; only the page waits. The table row above gives the load's
   bound.
+- **What you lose, the unreachable-account page:** the page about one account the directory keeps
+  failing for (vault BACKLOG #3100) counts that account's own probes, not outage passes, so its
+  least delay runs from that account's first failing probe, not from the first outage pass. An
+  `ad_reconcile_outage_passes` above `3`, a longer
+  `ad_session_recheck_seconds`, or an `ad_session_recheck_max_users` below `200` in an estate larger
+  than the budget delays it. The `ad_reconcile_outage_passes` row of
+  [CONFIGURATION.md](CONFIGURATION.md) states when it comes.
 - **Not named:** fewer strikes, a larger budget, or a higher brake threshold. Each ends sessions
   sooner or ends more of them, and none keeps a session the directory withdrew, though a larger
   budget can stretch the outage page, as the bullet above says. Nor is a shorter
@@ -1725,8 +1742,9 @@ count is above `0` (vault BACKLOG #2613).
 - **What you lose:** the engine stops protecting that hop and takes your word that something else does.
   A cleartext or verify-off hop the enforcing gates would refuse is **allowed**: this is the one per-hop
   declaration that yields ALLOW rather than WARN. The crossing is logged, but the hop is recorded as
-  secure, not as an accepted risk. That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a verify-off HTTP-family egress hop that carries no credential (at least the MLLP, FTPS and email verify-off refusals do not read it) and a weakened database TLS
-  hop. If the claim is false, the payload and any credential the connection carries cross in the
+  secure, not as an accepted risk. That covers at least a non-loopback inbound bind without TLS, a cleartext egress hop, a weakened database TLS hop, and a verify-off HTTP-family
+  egress hop that carries no credential (at least the MLLP, FTPS and email verify-off refusals do not
+  read the attestation) and sets no `ech_egress` (why: the `refuse_verify_off` docstring in [`transports/rest.py`](../messagefoundry/transports/rest.py)). If the claim is false, the payload and any credential the connection carries cross in the
   clear, and nothing about the hop looks wrong afterwards. The exception is an HTTP-family
   credential the refusal recognizes over cleartext `http` to a
   host off this machine. It stays refused, attested or not (vault BACKLOG #3533 item 4). A secret
@@ -1820,8 +1838,7 @@ count is above `0` (vault BACKLOG #2613).
   the shapes its own controls pin. It reads call shapes by name, not what the code evaluates to, so
   some such call sites pass it; ADR 0173 §4.3's note of 2026-11-04 and the docstrings of that
   file's relaxed-hop census say what it reads. REST, SOAP
-  and FHIR hand the guard no context there, so their refusal names the `[tls].crl_file` default
-  (ADR 0173 §13, *Left open*).)* The engine will tell you *which* connections have it set,
+  and FHIR hand the guard no context there.)* The engine will tell you *which* connections have it set,
   for as long as they have it set; it has no notion of *until when*, so the removal date belongs in your
   own risk register. Where it is NOT reported is the same list as `cleartext_accepted` above —
   `messagefoundry security show` and a graphless `GET /security/posture` say so in `loosenings_scope`.
@@ -1920,12 +1937,22 @@ count is above `0` (vault BACKLOG #2613).
 - **Compensating controls:** treat the server's access logs as PHI-bearing, with the access control and
   retention that implies, and confirm who can read any proxy log on the path.
 - **It is never silent:** a WARNING at every construction naming the connection, never an id, a
-  `fhir-update-path-form` line in `messagefoundry check` naming every connection that sets it, and
+  `fhir-update-path-form` line in `messagefoundry check` naming the connections listed below, and
   an `update_url_form` entry in `security_loosenings()`, which `GET /security/posture` shows with
-  the same connection names (vault BACKLOG #2571). The last two read one list. That list holds a
-  connection whose `update_url_form` is written as the literal `"path"`. A value supplied
-  through `env()` is not resolved when the list is built, so such a connection is not named by
-  either.
+  the connections its own reading names (vault BACKLOG #2571). The last two apply one reader. A value of
+  `update_url_form`, `interaction`, `conditional` or a Bundle entry list supplied through `env()` is
+  read too. The posture route resolves it against the engine's current environment values, and
+  names the connection plainly only if it resolves to the path form on an update. `check` resolves
+  none, so the two can name different sets. A connection with a value the reading cannot resolve is
+  named and marked possibly. At least two kinds are left off instead. One is a connection whose
+  known values rule the path form out: a form other than `"path"`, which puts no path form in
+  force, or one of these, beside which the build refuses the path form: a `transaction` or `batch`
+  interaction, a conditional other than `if-match`, an interaction other than `update` with no
+  conditional, or Bundle entry lists that are set. The
+  other is a `deployed=False` connection whose `update_url_form` is an `env()` value, because it is
+  never built and that value is never read. A `deployed=False` connection with a literal `"path"`
+  is named, marked possibly where its interaction, conditional or an entry list is an `env()`
+  value.
 - **What it cannot do, and where it is NOT reported:** it is **advisory only**, on the precedent of
   `tls_allow_expired`, the other per-connection interoperability relaxation. No posture gate keys on it,
   and `[security].enforcement = enforce` does not refuse it. It is not in the
@@ -2145,7 +2172,9 @@ count is above `0` (vault BACKLOG #2613).
 - **When acceptable:** on a lab box run with a Vault dev-server root token. Not as a steady state.
 - **It is never silent:** a WARNING line starting `AUDIT:` at every start it lets through,
   `over_grant_accepted: true` on the `vault_privilege_preflight` audit row, and an entry here and in
-  `GET /security/posture`.
+  `GET /security/posture`. The warning and the `vault_privilege_warning` alert still fire, but the
+  alert is keyed on the hop alone, so where engine processes share one store, another process's
+  clean start resolves it; the audit row of each start is the record that stays.
 - **What it does not do:** it lifts that one refusal only. Every other Vault over-grant, such as a
   token shared by two hops or an extra capability on a path the engine calls, and a probe that could
   not read the token because of a network failure, a timeout or a 403, only warn, so there is

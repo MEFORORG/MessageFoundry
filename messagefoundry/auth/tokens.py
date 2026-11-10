@@ -122,3 +122,13 @@ def credential_id_hash_scheme(stored: str) -> str:
     if not _HEX64.fullmatch(digest):
         raise CredentialHashSchemeError("a credential-id hash's digest is not 64 lowercase hex")
     return scheme
+
+
+def credential_id_hash_is_current(stored: str) -> bool:
+    """Whether a stored ``credential_id_hash`` is under today's scheme, the only key the sign-in
+    looks a passkey up by (BACKLOG #3423). A bare digest the start-up rehash has not moved, an
+    unknown tag and a malformed value are all ``False``: no sign-in can find that passkey."""
+    try:
+        return credential_id_hash_scheme(stored) == CREDENTIAL_ID_HASH_SCHEME
+    except CredentialHashSchemeError:
+        return False
