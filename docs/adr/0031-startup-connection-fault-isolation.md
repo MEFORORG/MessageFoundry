@@ -67,7 +67,9 @@ ADT, X12, eligibility, and FHIR feeds with it.
 ### §1 Per-connection isolation at startup
 
 `start()` builds each Connection independently. The outbound build + the inbound bind are each wrapped
-so a failure of one is caught, **recorded** (`self._failed[(kind, name)] = FailedLine(reason, store_fault)`, keyed by direction), **logged** at ERROR with
+so a failure of one is caught, **recorded** (`self._failed[name] = reason` as decided; amended
+2026-11-09, vault BACKLOG #5146: the key is `(kind, name)` and the value a `FailedLine` holding the
+reason and whether it is a store fault), **logged** at ERROR with
 the cause, and **alerted** (`AlertSink.connection_stopped(name, detail="failed to start: …")`) — then
 startup **continues**. The outer `except` that unwinds + re-raises is retained as a backstop for
 genuinely fatal, *graph-wide* startup errors (the store, the lookup executor) — those are not a single
@@ -315,9 +317,9 @@ Context above names: feed #21's downstream cert should not stop the other 20.
    - a lane its CA refused, whose config has not changed since. The reload leaves it failed, so
      §4's reload self-heal does not apply to it. A config change rebuilds it, and the reload
      checks it then. An operator start, or a restart, checks and builds it too. A later start
-     whose check the store stopped ends this; [SECURITY.md](../SECURITY.md#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235),
-     under *The same store fault would not read as a refused anchor*, states how the lines replace
-     each other (vault BACKLOG #5146).
+     whose check the store stopped ends this; [SECURITY.md](../SECURITY.md), in the paragraph
+     *The same store fault would not read as a refused anchor*, states how the lines replace each
+     other (vault BACKLOG #5146).
 
    So the pin, permission and path checks of an idle lane never refuse a reload, a DR activation
    or a follower convergence. Each idle lane is checked when it is built, under rule 1. **One
