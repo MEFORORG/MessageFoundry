@@ -272,8 +272,9 @@ def test_path_schema_include_with_a_doctype_entity_is_refused(tmp_path: Path) ->
     assert "XmlSecurityError" in _causes(ei.value)
 
 
-#: Every os call through which the validator could touch a path. On Windows each of them opens a UNC
-#: path, which is an SMB connection, so none may be handed one.
+#: At least these os calls could touch a path for the validator. On Windows each opens a UNC path,
+#: which is an SMB connection, so none may be handed one. Not every route is spied on: builtin open,
+#: scandir and the os.path fast paths are not.
 _TOUCHING = ("lstat", "stat", "readlink", "open")
 
 
@@ -434,13 +435,77 @@ def test_a_link_to_a_unc_share_is_refused_before_it_is_followed(
     assert not [p for p in touched if "nonexist-5537" in p]
 
 
-def test_a_schema_file_that_is_a_link_resolves_includes_beside_its_target(tmp_path: Path) -> None:
+def test_a_schema_file_that_is_a_link_is_read_and_resolves_includes_beside_the_link(
+    tmp_path: Path,
+) -> None:
+    # The file the caller names is read through a link at it, and its includes resolve beside the
+    # name as written, as xmlschema resolved them before BACKLOG #5537. A lexical reading of a link's
+    # relative target can name a different file than the OS opens, so the named file is not resolved.
     (tmp_path / "real").mkdir()
-    (tmp_path / "real" / "inc.xsd").write_text(_CLEAN, encoding="utf-8")
     target = _write_path_schema(tmp_path / "real", "inc.xsd")
     (tmp_path / "cfg").mkdir()
+    (tmp_path / "cfg" / "inc.xsd").write_text(_CLEAN, encoding="utf-8")
     _symlink_or_skip(target, tmp_path / "cfg" / "main.xsd")
     assert validate_against("<patient>x</patient>", str(tmp_path / "cfg" / "main.xsd")).valid
+
+
+def test_an_unreadable_link_under_the_root_fails_the_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # xmlschema drops an include that raises OSError with only a warning, so a refusal surfacing as
+    # one would load the schema without the include. It must fail the build, like a link out.
+    (tmp_path / "lnk").mkdir()
+    (tmp_path / "lnk" / "inc.xsd").write_text(_CLEAN, encoding="utf-8")
+    main = _write_path_schema(tmp_path, "lnk/inc.xsd")
+    link = os.path.normcase(str(tmp_path / "lnk"))
+    real_lstat, real_readlink = os.lstat, os.readlink
+
+    def fake_lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if os.path.normcase(os.fsdecode(path)) == link:
+            return os.stat_result((stat.S_IFLNK | 0o777, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        return real_lstat(path, *args, **kwargs)
+
+    def fake_readlink(path: Any, *args: Any, **kwargs: Any) -> str:
+        if os.path.normcase(os.fsdecode(path)) == link:
+            raise OSError("not a link this platform can read")
+        return real_readlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", fake_lstat)
+    monkeypatch.setattr(os, "readlink", fake_readlink)
+    with pytest.raises(XmlValidationError) as ei:
+        validate_against("<patient>x</patient>", str(main))
+    assert "XMLResourceBlocked" in _causes(ei.value)
+
+
+def test_an_import_with_a_doctype_falls_back_to_the_bundled_copy(tmp_path: Path) -> None:
+    # The stock W3C xmldsig-core-schema.xsd carries a DOCTYPE, and SAML and WS-Security bundles import
+    # it by a local schemaLocation. The opener refuses that file as blocked, so xmlschema falls back to
+    # its bundled copy, as it does with defuse="always" alone, instead of failing the whole build.
+    ns = "http://www.w3.org/2000/09/xmldsig#"
+    (tmp_path / "xmldsig.xsd").write_text(
+        '<?xml version="1.0"?><!DOCTYPE schema [<!ENTITY x "y">]>'
+        f'<xs:schema {_XS} targetNamespace="{ns}"/>',
+        encoding="utf-8",
+    )
+    main = tmp_path / "main.xsd"
+    main.write_text(
+        f'<xs:schema {_XS} xmlns:w="{ns}">'
+        f'<xs:import namespace="{ns}" schemaLocation="xmldsig.xsd"/>'
+        '<xs:element name="patient"><xs:complexType><xs:sequence>'
+        '<xs:element ref="w:Signature" minOccurs="0"/></xs:sequence></xs:complexType></xs:element>'
+        "</xs:schema>",
+        encoding="utf-8",
+    )
+    assert validate_against("<patient/>", str(main)).valid
+    assert not validate_against("<other/>", str(main)).valid
+
+
+def test_a_percent_sequence_in_a_directory_name_is_decoded_once(tmp_path: Path) -> None:
+    (tmp_path / "v100%41").mkdir()
+    (tmp_path / "v100%41" / "inc.xsd").write_text(_CLEAN, encoding="utf-8")
+    main = _write_path_schema(tmp_path / "v100%41", "inc.xsd")
+    for source in (str(main), main.as_uri()):
+        assert validate_against("<patient>x</patient>", source).valid
 
 
 # --- schema_root: a bundle that includes across sibling directories ------------------------------
@@ -462,7 +527,7 @@ def test_a_cda_shaped_bundle_needs_schema_root(tmp_path: Path) -> None:
     with pytest.raises(XmlValidationError) as ei:
         validate_against("<patient>x</patient>", str(main))
     assert "XMLResourceBlocked" in _causes(ei.value)
-    for root in (tmp_path / "cda", str(tmp_path / "cda")):
+    for root in (tmp_path / "cda", str(tmp_path / "cda"), (tmp_path / "cda").as_uri()):
         assert validate_against("<patient>x</patient>", str(main), schema_root=root).valid
         assert not validate_against("<other>x</other>", str(main), schema_root=root).valid
 

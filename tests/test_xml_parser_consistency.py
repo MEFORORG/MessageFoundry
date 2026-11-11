@@ -439,3 +439,5 @@ def test_xmlschema_still_disables_remote_schema_resolution() -> None:
     with pytest.raises(XmlValidationError) as ei:
         validate_against("<patient>x</patient>", remote)
     assert type(ei.value.__cause__).__name__ == "XMLResourceBlocked"
+    # xmlschema's own allow="local" refusal, not the opener's, which would also block it.
+    assert "remote resource" in str(ei.value.__cause__)

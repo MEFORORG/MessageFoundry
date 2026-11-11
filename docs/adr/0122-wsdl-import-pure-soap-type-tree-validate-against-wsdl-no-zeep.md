@@ -195,7 +195,13 @@ Two statements above were false in the shipped code, and both are corrected here
 - *"`schema.py` builds `xmlschema.XMLSchema(..., allow="local", base_url=None)`."* It still passes
   `allow="local"`, now with `defuse="always"` and an `opener` whose only handler reads `file:` URLs
   under two roots: `xmlschema`'s bundled schemas, and, for a schema given as a path, a confinement
-  root, where each file is first checked by `parse_bytes`. The confinement root is the schema's own
+  root, where each file is first checked by `parse_bytes`. The schema file the caller names is read
+  as named, a link at that name included, checked by `parse_bytes`, and handed to `xmlschema` as a
+  tree with `base_url` set to the file URL of its directory, so only what it includes goes through
+  the opener. `base_url` stays unset for an inline schema. A file
+  under the root that declares a DOCTYPE, or a link the walk refuses, is reported to `xmlschema` as a
+  blocked resource, so an import of the stock W3C XML-DSig schema, which carries a DOCTYPE, falls back
+  to the bundled copy rather than failing the build. The confinement root is the schema's own
   directory, or the directory the caller passes as `validate_against`'s `schema_root` keyword. That
   keyword exists for a bundle whose schemas include across sibling directories: the HL7 CDA R2 entry
   schema includes `../../processable/coreschemas/...`, and IHE XDS bundles do the same, so confining
