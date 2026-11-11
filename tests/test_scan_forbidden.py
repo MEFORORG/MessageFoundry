@@ -917,6 +917,126 @@ def test_a_table_cell_is_read_both_trimmed_and_with_its_markup_deleted(sf, row: 
     assert "verdict" in _pr_kinds(sf, row), row
 
 
+#: BACKLOG #3364 step 4: the prose phrasings engine PR 2845's detector still missed, one group per lettered
+#: item of that step. Each fires with the kind it is listed under. The step lists them as examples, so
+#: the group is a sample of each shape, not the set of every phrasing of it.
+_MET = "met"
+_PR_STEP4_MUST_FIRE: list[tuple[str, str, str]] = [
+    # (a) A cell whose closing markup sits before a full stop.
+    ("a", "verdict", f"| {_REQ} | the outbound limb | stays`{_PARTIAL}`. |"),
+    ("a", "verdict", f"| ASVS {_REQ} | the outbound limb | isn't **{_MET}**. |"),
+    # (b) A cell padded with a tab or a no-break space, behind a spacer cell.
+    ("b", "verdict", f"| {_REQ} | the limb |\tisn't {_MET}\t|"),
+    ("b", "verdict", f"| {_REQ} | the limb |\u00a0isn't {_MET}\u00a0|"),
+    ("b", "verdict", f"| {_REQ} | the limb |\tisn't **{_MET}**\t|"),
+    ("b", "verdict", f"| {_REQ} | the limb |\tstays`{_PARTIAL}`\t|"),
+    # (c) An ASVS version between "ASVS" and the identifier, and the version-prefixed form.
+    ("c", "gap", f"ASVS 5.0 {_REQ} lacks a row-completeness pin."),
+    ("c", "verdict", f"ASVS v5.0.0 V{_REQ} would not be {_MET} by this change."),
+    ("c", "gap", f"v5.0.0-{_REQ} lacks a row-completeness pin."),
+    # (d) The second identifier of a list.
+    ("d", "verdict", f"ASVS {_REQ} and {_REQ_B} cannot {_PASS} under this design."),
+    ("d", "verdict", f"ASVS {_REQ}, {_REQ_B} or {_REQ} would not be {_MET} here."),
+    # (e) A hedge word one list takes and another does not, and a word inside "has ... been".
+    ("e", "verdict", f"ASVS {_REQ} will likely stay {_PARTIAL}."),
+    ("e", "verdict", f"ASVS {_REQ} was never {_MET}."),
+    ("e", "verdict", f"ASVS {_REQ} has since been {_MET}."),
+    ("e", "verdict", f"ASVS {_REQ} has still been {_MET}."),
+    ("e", "verdict", f"ASVS {_REQ} has now been {_MET}."),
+    ("e", "verdict", f"ASVS {_REQ} has never been {_MET}."),
+    # (f) The written-out negation.
+    ("f", "verdict", f"ASVS {_REQ} is not {_PARTIAL}."),
+    ("f", "verdict", f"ASVS {_REQ} was not {_PARTIAL}."),
+    # (g) Underscore emphasis on a move verb.
+    ("g", "verdict", f"_Downgrades_ ASVS {_REQ} to {_PARTIAL}."),
+    ("g", "verdict", f"__Moves__ the ASVS {_REQ} cell to {_PASS}."),
+    # (h) A cell that opens with a verdict and goes on in words.
+    ("h", "verdict", f"| ASVS {_REQ} | the outbound limb | stays {_PARTIAL} until #1 |"),
+    ("h", "verdict", f"| ASVS {_REQ} | the outbound limb | {_PARTIAL} pending the follow-up |"),
+    # (i) A comma before "which stays partial": the case the _PR_STRONG_VERB comment names.
+    ("i", "verdict", f"Applies to {_REQ}, which stays {_PARTIAL}."),
+    ("i", "verdict", f"ASVS {_REQ}, which is {_PARTIAL} today."),
+    # (j) A header row that names the column ASVS marks the column under it.
+    (
+        "j",
+        "verdict",
+        f"| ASVS | Note | Result |\n| --- | --- | --- |\n| {_REQ} | the limb | {_PASS.title()} (12 messages) |",
+    ),
+    (
+        "j",
+        "verdict",
+        f"| Test | ASVS ID | Note | Result |\n|:--|:--|:--|:--|\n| a | {_REQ} | x | {_PASS.title()} (12 messages) |",
+    ),
+]
+#: The quiet controls for step 4: each is the shape above with the part that made it a record taken out
+#: or put beside a version, so a rule widened until it flagged everything would fail here.
+_PR_STEP4_MUST_STAY_QUIET: list[tuple[str, str]] = [
+    ("a", f"| 2.5.1 | ADT^A01 | **{_PASS.title()}**. |"),
+    ("b", f"| {_REQ} | the limb |\tneeds a second signal\t|"),
+    ("b", f"| 2.5.1 | ADT^A01 |\u00a0{_PASS.title()} (12 messages)\u00a0|"),
+    ("c", f"Python 3.14 {_REQ_B} lacks wheels for this platform."),
+    ("c", f"ASVS 5.0 is the new baseline; {_REQ_B} ships with next week's release."),
+    ("d", f"Python 2.9.1 and {_REQ_B} cannot {_PASS} the probe without the patch."),
+    ("e", f"Inputs on 2.5.1 will likely {_FAIL} the strict profile."),
+    ("e", "Batches tagged 2.5.1 have since been failing on Windows."),
+    ("e", "Batches tagged 2.5.1 were never failing before this."),
+    ("f", "Batches on 2.5.1 are not failing."),
+    ("g", "_Updates_ 2.9.1 to pass Z-segments through unchanged."),
+    ("h", f"| 2.5.1 | ADT^A01 | {_PASS.title()} for 12 messages |"),
+    ("h", f"| 2.5.1 | the parser | is {_PARTIAL} frames until EOF |"),
+    ("i", "Updates 2.9.1, which is pass-through for Z segments."),
+    ("i", "Bumps lxml to 5.1.2, which passes the strict suite."),
+    (
+        "j",
+        f"| Version | Note | Result |\n| --- | --- | --- |\n| 2.5.1 | the limb | {_PASS.title()} (12 messages) |",
+    ),
+    (
+        "j",
+        f"| Test | ASVS | Result |\n|---|---|---|\n| 2.5.1 | the limb | {_PASS.title()} (12 messages) |",
+    ),
+    (
+        "j",
+        f"| ASVS | Note |\n|---|---|\n| a | b |\n\nA second table:\n\n| 2.5.1 | the limb | {_PASS.title()} (12 messages) |",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("item", "kind", "body"),
+    _PR_STEP4_MUST_FIRE,
+    ids=[f"{item}-{i}" for i, (item, _, _) in enumerate(_PR_STEP4_MUST_FIRE)],
+)
+def test_a_pr_body_phrasing_step_four_listed_is_flagged(
+    sf, item: str, kind: str, body: str
+) -> None:
+    """BACKLOG #3364 step 4, items (a) to (j): each phrasing went through engine PR 2845's detector."""
+    assert kind in _pr_kinds(sf, body), (item, body)
+
+
+@pytest.mark.parametrize(
+    ("item", "body"),
+    _PR_STEP4_MUST_STAY_QUIET,
+    ids=[f"{item}-{i}" for i, (item, _) in enumerate(_PR_STEP4_MUST_STAY_QUIET)],
+)
+def test_the_step_four_rules_leave_versions_and_other_tables_alone(
+    sf, item: str, body: str
+) -> None:
+    assert sf.scan_pr_body(body) == [], (item, body)
+
+
+def test_a_header_row_marks_only_its_own_table_and_column(sf) -> None:
+    """The ASVS header of one table must not mark the identifiers of the next one, or of prose below."""
+    row = f"| {_REQ} | the limb | {_PASS.title()} (12 messages) |"
+    one = f"| ASVS | Note | Result |\n| --- | --- | --- |\n{row}"
+    assert sf.scan_pr_body(one), "the control must fire, or the next two assert nothing"
+    two = one + "\n\n| Version | Note | Result |\n| --- | --- | --- |\n" + row
+    assert sf.scan_pr_body(two) == [f"pr-body:3: {sf.PR_BODY_REASONS['verdict']}"]
+    wrong_column = (
+        f"| ASVS | Note |\n| --- | --- |\n| the limb | {_REQ} | x | {_PASS.title()} (12 messages) |"
+    )
+    assert sf.scan_pr_body(wrong_column) == []
+
+
 @pytest.mark.parametrize("line", _PR_RESIDUE_MUST_STAY_QUIET)
 def test_the_residue_rules_leave_versions_and_plain_numbers_alone(sf, line: str) -> None:
     assert sf.scan_pr_body(line) == [], line
@@ -934,6 +1054,10 @@ def test_the_residue_rules_leave_versions_and_plain_numbers_alone(sf, line: str)
         "| x" + " " * 80000 + f"y | {_REQ} |",
         # A markup class overlapping the separator after an identifier backtracks on a markup run.
         f"| {_REQ}" + "*" * 80000 + " | `_x` |",
+        # Step 4: a header that marks a column, a run of dashes in a delimiter row, and a long list.
+        "| ASVS | x |\n|---|---|\n| " + ", ".join([_REQ] * 8000) + " | the outbound limb |",
+        "| ASVS | x |\n|" + "-" * 80000 + "x|\n| 1 | 2 |",
+        "ASVS " + " and ".join([_REQ] * 8000) + " cannot pass",
     ],
 )
 def test_a_long_table_row_scans_in_linear_time(sf, row: str) -> None:

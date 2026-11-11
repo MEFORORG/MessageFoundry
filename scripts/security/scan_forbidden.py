@@ -476,13 +476,15 @@ _PR_PLAIN_STATE_VERB = rf"(?:{_PR_STRONG_VERB}|is(?: now| still)?|was|are|reads|
 #: The passive and negated forms ("were", "has been", "isn't", "has not been", "is no longer") bind an
 #: unmarked identifier only with a state verdict ending its clause (_pr_verdict_bound).
 _PR_STATE_VERB = (
-    rf"(?:{_PR_PLAIN_STATE_VERB}|were|(?:(?:has|have|had)(?: not|n['\u2019]t)? )?been"
-    r"|(?:is|was|are|were)n['\u2019]t|(?:is|was|are|were) no longer)"
+    rf"(?:{_PR_PLAIN_STATE_VERB}|were"
+    # A word may stand between "has" and "been" ("has since been met", "has never been met").
+    r"|(?:(?:has|have|had)(?: not|n['\u2019]t)?(?: (?:since|still|now|yet|never|already))* )?been"
+    r"|(?:is|was|are|were)(?:n['\u2019]t| not| no longer))"
 )
 _PR_PLAIN_QUALIFIER = r"(?:(?:a|an|the|its|permanent|genuine|accepted|honest)" + _PR_SEP + r")*"
 _PR_QUALIFIER = (
     r"(?:(?:a|an|the|its|permanent|genuine|accepted|honest|recorded|known|interim|provisional"
-    r"|likely|probably|still|already)" + _PR_SEP + r")*"
+    r"|likely|probably|still|already|never)" + _PR_SEP + r")*"
 )
 #: Words that may stand between the identifier and its verb without unbinding it: a passive auxiliary
 #: ("<id> was held at partial"), a negated one ("<id> isn't met") and the adverbs a record sentence
@@ -503,12 +505,13 @@ _PR_MODAL = (
     r"(?:can(?:not)?|can['\u2019]t|could|would|will|should|may|might|must|does|do|did"
     r"|(?:does|did|wo|would|could|should)n['\u2019]t|needs? to|has to|is (?:un)?able to)"
     rf"(?:{_PR_SEP}(?:not|now|still|yet|never|only|honestly|also|then|reach|have|be|been|stay"
-    r"|remain))*"
+    r"|remain|likely|probably))*"
 )
 #: Read from the end of the identifier: "<id> stays partial", "<id> cell to pass", "<id> | fail".
 _PR_VERDICT_AFTER = re.compile(
     rf"(?i)^{_PR_FMT}(?:\s+(?:cell|row))?"
-    rf"(?:\s*{_PR_BIND}>\](]+\s*|{_PR_SEP})"
+    # A comma binds only before "which"/"that": "<id>, which stays partial".
+    rf"(?:\s*{_PR_BIND}>\](]+\s*|{_PR_SEP}|,\s*(?=(?:which|that)\b))"
     rf"(?:{_PR_FMT}(?:(?:which|that){_PR_SEP})?{_PR_AUX}"
     rf"(?:(?P<strong>{_PR_STRONG_VERB})|(?P<modal>{_PR_MODAL})|{_PR_STATE_VERB}|(?P<as>as)"
     rf"|(?P<to>to)){_PR_SEP}(?:at{_PR_SEP})?)?"
@@ -544,13 +547,15 @@ _PR_VERB_BEFORE = re.compile(
 #: binds only when the text before the identifier says the identifier is what moves.
 _PR_MOVE_OBJECT = rf"{_PR_SEP}(?:(?:the|vault|cells?|ASVS){_PR_SEP})*$"
 _PR_MOVE_LEAD = re.compile(
-    r"(?i)\b(?:move[sd]?|moving|takes?|took|brings?|brought|re-?grade[sd]?|re-?score[sd]?|of"
+    rf"(?i){_PR_NB}(?:move[sd]?|moving|takes?|took|brings?|brought|re-?grade[sd]?|re-?score[sd]?|of"
     r"|upgrade[sd]?|downgrade[sd]?|sets?|flip(?:s|ped)?|raise[sd]?|lower(?:s|ed)?|drops?|dropped)"
     + _PR_MOVE_OBJECT
 )
 #: Move verbs that are also ordinary English ("updates <version> to pass Z-segments through"), so they
 #: bind only an identifier the text marks as a requirement ("update the <id> row to na").
-_PR_MARKED_MOVE_LEAD = re.compile(r"(?i)\b(?:update[sd]?|updating|mark(?:s|ed)?)" + _PR_MOVE_OBJECT)
+_PR_MARKED_MOVE_LEAD = re.compile(
+    rf"(?i){_PR_NB}(?:update[sd]?|updating|mark(?:s|ed)?)" + _PR_MOVE_OBJECT
+)
 #: Read up to the start of the identifier: "partial: <id>", "| fail | <id>".
 _PR_VERDICT_BEFORE = re.compile(rf"(?i)\b{_PR_VERDICT}{_PR_FMT}\s*{_PR_BIND}<\[(]+\s*{_PR_FMT}$")
 #: A table cell that is nothing but a verdict, optionally after a state verb ("Stay partial").
@@ -558,16 +563,21 @@ _PR_CELL_VERDICT = re.compile(rf"(?i)(?:{_PR_STATE_VERB}{_PR_SEP})?{_PR_QUALIFIE
 #: A cell that OPENS with a verdict and goes on: "unchanged, partial. No build reaches it."
 #: The dashes a cell sets a verdict off with: "unchanged - partial", "partial -- no build".
 _PR_CELL_DASH = r"\s+(?:--?|\u2013|\u2014)"
+#: The words a verdict cell goes on with ("stays partial until #1"), each the record's own connective.
+_PR_CELL_GOES_ON = (
+    r"until|pending|because|since|while|unless|once|after|awaiting|but|due|for|per|as|at"
+)
 #: A bare verdict that opens a cell ("Pass (12 messages)") is also how an HL7 conformance table reads,
 #: so with no "unchanged" or state verb before it, it binds only a row whose identifier is marked.
 _PR_CELL_VERDICT_LEAD = re.compile(
     rf"(?i)(?:(?P<prefix>unchanged(?:[,;:]|{_PR_CELL_DASH})?|{_PR_STATE_VERB}){_PR_SEP})?"
-    rf"{_PR_QUALIFIER}{_PR_VERDICT}(?:[.;,:](?:\s|$)|\s*\(|{_PR_CELL_DASH}(?:\s|$)|$)"
+    rf"{_PR_QUALIFIER}{_PR_VERDICT}{_PR_FMT}(?:[.;,:](?:\s|$)|\s*\(|{_PR_CELL_DASH}(?:\s|$)"
+    rf"|\s+(?:{_PR_CELL_GOES_ON})\b|$)"
 )
 #: The markup a table cell wraps around a value, and the separators of a cell that lists identifiers.
 _PR_CELL_MARKUP = re.compile(_PR_MARKUP)
 #: The characters _PR_MARKUP matches plus a space, as str.strip takes them, to trim only a cell's ends.
-_PR_CELL_EDGE = " *`_\"'"
+_PR_CELL_EDGE = "".join(c for c in map(chr, range(0x3001)) if c.isspace()) + "*`_\"'"
 #: No "\s*" around a separator: on a long run of spaces it backtracks quadratically, so whitespace is a
 #: separator of its own and the empty parts are dropped.
 _PR_CELL_LIST = re.compile(r"[,;/&+]|(?i:\band\b)|\s+")
@@ -630,11 +640,23 @@ _PR_SYMBOL = re.compile(
 #: evidence may bind it. A bare `V` lead does not mark one: "V2.1.3" is also how a version is written,
 #: and so is a possessive ("2.5.1's segment grammar"). "ASVS" does, however it is set off from the
 #: identifier ("ASVS V<id>", "ASVS `<id>`", "ASVS: <id>", "asvs <id>").
-_PR_MARK_BEFORE = re.compile(rf"(?i){_PR_NB}(?:cells?|requirements?|asvs)[\s*`_:]*$")
+_PR_MARK_BEFORE = re.compile(
+    # "ASVS 5.0 <id>", "ASVS v5.0.0 V<id>", and the version-prefixed form "v5.0.0-<id>".
+    rf"(?i){_PR_NB}(?:(?:cells?|requirements?|asvs)[\s*`_:]*|asvs[\s*`_:]+v?\d+\.\d+(?:\.\d+)?[\s*`_:]*"
+    r"|v\d\.\d\.\d-)$"
+)
 #: One separator class only: a markup class before _PR_SEP overlaps it and backtracks quadratically.
 _PR_MARK_AFTER = re.compile(
     rf"(?i){_PR_SEP}(?:cell|row|requirement|anchor|limb|ground|clause|re-?score|re-?read)s?{_PR_NA}"
 )
+#: Only a list separator, as the words between "ASVS <id>" and the next identifier of the same list.
+_PR_ID_LIST_GAP = re.compile(r"(?:[\s,;/&+*`_\"']|(?i:and|or)(?![A-Za-z0-9]))+")
+#: A table header cell that names its column ASVS ("ASVS", "ASVS ID", "ASVS v5.0"), so a row under it
+#: has every identifier in that column marked as a requirement, though the row never says so itself.
+_PR_TABLE_ASVS_HEAD = re.compile(r"(?i)asvs(?:\s+(?:v?\d[\d.]*|id|ref|req|requirement|number))*")
+#: The characters of a markdown table's second line, which makes the line above it a header row. A set
+#: and not a pattern: a class holding "-" twice backtracks quadratically on a long run of dashes.
+_PR_TABLE_DELIMITER_CHARS = frozenset("|:- \t")
 #: How far a gap word or a code path may sit from the identifier, inside one sentence.
 _PR_WINDOW = 80
 #: A sentence ends at a full stop before a capital, or at an HTML tag: bot bodies carry release notes as
@@ -801,6 +823,26 @@ def _pr_table_verdict(row: str, ids: set[str], marked: bool) -> bool:
     )
 
 
+def _pr_is_delimiter(row: str) -> bool:
+    return "-" in row and set(row) <= _PR_TABLE_DELIMITER_CHARS
+
+
+def _pr_in_list(text: str, end: int, m: re.Match[str]) -> bool:
+    """Whether only a list separator lies between the end of the identifier before and this one, so a
+    second identifier in "ASVS <id> and <id>" is marked by the lead the first carries."""
+    return _PR_ID_LIST_GAP.fullmatch(text, end, m.start()) is not None
+
+
+def _pr_asvs_columns(header: str) -> set[int]:
+    """The columns of a table header row whose cell names the column ASVS."""
+    cells = header.strip().strip("|").split("|")
+    return {
+        i
+        for i, c in enumerate(cells)
+        if _PR_TABLE_ASVS_HEAD.fullmatch(_PR_CELL_MARKUP.sub("", c).strip())
+    }
+
+
 def _pr_sentences(unit: str, is_row: bool) -> list[tuple[int, str]]:
     if is_row:
         return [(0, unit)]
@@ -819,7 +861,13 @@ def scan_pr_body(body: str) -> list[str]:
     restate a verdict on the same line report it once, rather than storming.
     """
     hits: list[str] = []
-    for marks, unit, is_row in _pr_units(body):
+    units = _pr_units(body)
+    asvs_columns: set[int] = set()
+    for index, (marks, unit, is_row) in enumerate(units):
+        if not is_row:
+            asvs_columns = set()
+        elif index + 1 < len(units) and _pr_is_delimiter(units[index + 1][1]):
+            asvs_columns = _pr_asvs_columns(unit)
         for start, sentence in _pr_sentences(unit, is_row):
             found: dict[str, int] = {}
             # The tree scan's tight pair, before the version filter can set its identifier aside: what
@@ -835,13 +883,23 @@ def scan_pr_body(body: str) -> list[str]:
             # its searches run once rather than once per identifier: a row is unbounded in length.
             evidence: _PrEvidence | None = None
             row_marked = False
+            previous: tuple[int, bool] | None = None
             for m, version in ids:
                 window = (
                     sentence
                     if is_row
                     else sentence[max(0, m.start() - _PR_WINDOW) : m.end() + _PR_WINDOW]
                 )
-                marked = not version and _pr_marked(sentence, m)
+                marked = not version and (
+                    _pr_marked(sentence, m)
+                    or (
+                        previous is not None
+                        and previous[1]
+                        and _pr_in_list(sentence, previous[0], m)
+                    )
+                    or (bool(asvs_columns) and sentence[: m.start()].count("|") - 1 in asvs_columns)
+                )
+                previous = (m.end(), marked)
                 row_marked = row_marked or marked
                 if "verdict" not in found and (
                     _pr_verdict_bound(sentence, m, version, marked)
