@@ -1988,13 +1988,14 @@ started together, can each raise it; the alert list folds them into one instance
   applied, though not a `MEFOR_VALUE_*` variable or the secrets directory. Where the load could not
   read the value file, the start applies the values read when the engine was built, and the
   fingerprint leaves the file out. A value file anywhere but the config directory's
-  `environments/` folder is in no fingerprint, one inside the config directory under another
-  `[environments].dir` included. Just after the load, the start fingerprints
-  the directory once more, and compares both with the baseline, so `config_changed` fires when
-  either differs. When the two cover the same files and differ, an edit landed after the load read
-  that file, and the comparison is `changed_during_load`. The alert then names the directory's
-  fingerprint, or the loaded one when only that differs from the baseline. The `config_loaded` row
-  names the bytes that ran as `fingerprint`. It names what the alert named as
+  `environments/` folder is parsed from no start snapshot, one inside the config directory under
+  another `[environments].dir` included, so no fingerprint names it as the values the start applied;
+  one in `codesets/` can still be folded, as a code-set table. Just after the load, the start
+  fingerprints the directory once more, and compares both with the baseline, so `config_changed`
+  fires when either differs. When the two cover the same files and differ, an edit landed after the
+  load read that file, and the comparison is `changed_during_load`. The alert then names the
+  directory's fingerprint, or the loaded one when only that differs from the baseline. The
+  `config_loaded` row names the bytes that ran as `fingerprint`. It names what the alert named as
   `judged_fingerprint`, and what that left out as `judged_unreadable_files`. So
   the next start, on the edited bytes, raises the alert again, and
   `GET /config/provenance` reports drift until a reload. A start keeps its `git_head`, in the row
