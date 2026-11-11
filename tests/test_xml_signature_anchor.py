@@ -34,8 +34,9 @@ def test_verify_without_anchor_is_refused(kwargs: dict[str, object]) -> None:
 )
 def test_verify_with_an_anchor_gets_past_the_guard(kwargs: dict[str, object]) -> None:
     # Supplying either anchor must clear the no-anchor guard. The call then fails downstream (extra
-    # absent -> RuntimeError, or extra present -> XmlError / crypto error on the dummy doc/cert) — but
-    # never with the anchor-required ValueError.
+    # absent -> RuntimeError, or extra present -> the anchor read refuses the dummy before the
+    # document is parsed: ValueError for the certificate, OSError for the CA path, BACKLOG #5372) —
+    # but never with the anchor-required ValueError.
     try:
         verify(b"<root/>", **kwargs)  # type: ignore[arg-type]
     except ValueError as exc:  # pragma: no cover - only asserts the guard did not misfire

@@ -242,6 +242,47 @@ def test_a_ca_file_that_cannot_be_read_is_not_blamed_on_the_document(tmp_path: P
     assert not isinstance(caught.value, XmlError)
 
 
+def test_a_pinned_certificate_whose_key_cannot_be_loaded_is_not_blamed_on_the_document() -> None:
+    """The certificate parses, but its key names no type ``cryptography`` knows. signxml would read
+    the key inside its call, where the fault would be blamed on the document."""
+    from cryptography import x509
+
+    der = x509.load_pem_x509_certificate(_cert_pem()).public_bytes(serialization.Encoding.DER)
+    assert der.count(_RSA_OID) == 1
+    pem = x509.load_der_x509_certificate(der.replace(_RSA_OID, _UNKNOWN_OID)).public_bytes(
+        serialization.Encoding.PEM
+    )
+    with pytest.raises(ValueError) as caught:
+        verify(_sign(_BODY), x509_cert=pem)
+    assert not isinstance(caught.value, XmlError)
+    assert str(caught.value) == "x509_cert cannot be read: UnsupportedAlgorithm"
+
+
+def test_a_pinned_certificate_object_still_verifies() -> None:
+    """signxml takes a ``cryptography`` certificate object as the pin; the anchor read passes it."""
+    from cryptography import x509
+
+    result = verify(_sign(_BODY), x509_cert=x509.load_pem_x509_certificate(_cert_pem()))  # type: ignore[arg-type]
+    assert result.verified, result.reason
+
+
+def test_a_raw_cryptography_invalid_signature_is_still_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """signxml's InvalidSignature derives from cryptography's, and one signxml branch lets the raw
+    one through. Either is a bad signature, so either stays a ``verified=False`` result."""
+    import cryptography.exceptions
+    from signxml.verifier import XMLVerifier
+
+    def _raise(*_a: object, **_k: object) -> None:
+        raise cryptography.exceptions.InvalidSignature()
+
+    monkeypatch.setattr(XMLVerifier, "verify", _raise)
+    result = verify(_sign(_BODY), **_pinned())
+    assert result.verified is False
+    assert result.reason == "InvalidSignature"
+
+
 def test_a_ca_file_is_not_read_when_a_certificate_is_pinned(tmp_path: Path) -> None:
     """signxml ignores ``ca_pem_file`` when ``x509_cert`` is set, so a bad one there changes nothing."""
     bad = tmp_path / "unused-ca.pem"

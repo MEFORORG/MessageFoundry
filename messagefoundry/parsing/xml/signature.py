@@ -338,15 +338,32 @@ def _read_anchor(
 ) -> Any:
     """Fail on an unreadable anchor before signxml's call, whose errors :func:`verify` blames on the
     document. Returns the pinned certificate, or ``None``. Like signxml, it skips ``ca_pem_file``
-    when a certificate is pinned, and it reads that file through signxml's own loader.
-    """
-    if x509_cert is not None:
-        # Imported here, not at module top, as in _signing_key_refusal.
-        from cryptography import x509
+    when a certificate is pinned, and it reads that file through signxml's own loader. A pinned
+    ``cryptography`` certificate object, which signxml also takes, is passed through.
 
-        return x509.load_pem_x509_certificate(signxml.util.add_pem_header(x509_cert))
-    if ca_pem_file is not None:
-        signxml.util.X509CertChainVerifier(ca_pem_file=ca_pem_file).store  # noqa: B018 - it loads
+    A certificate, a key or a CA file that cannot be read raises :class:`ValueError` naming the
+    anchor and the type of the fault; a CA file that cannot be opened raises :class:`OSError`.
+    """
+    # Imported here, not at module top, as in _signing_key_refusal.
+    from cryptography import x509
+    from cryptography.exceptions import UnsupportedAlgorithm
+
+    fault: str | None = None
+    try:
+        if x509_cert is not None:
+            cert: Any = x509_cert
+            if isinstance(cert, (str, bytes)):
+                cert = x509.load_pem_x509_certificate(signxml.util.add_pem_header(cert))
+            # signxml reads the key inside its call, where a fault would be blamed on the document.
+            cert.public_key()
+            return cert
+        if ca_pem_file is not None:
+            signxml.util.X509CertChainVerifier(ca_pem_file=ca_pem_file).store  # noqa: B018 - loads
+    except (ValueError, UnsupportedAlgorithm) as exc:
+        fault = f"{'x509_cert' if x509_cert is not None else 'ca_pem_file'} cannot be read: "
+        fault += type(exc).__name__
+    if fault is not None:
+        raise ValueError(fault)
     return None
 
 
@@ -407,8 +424,9 @@ def verify(
     ``ds:X509Certificate`` there as checked: the anchor you pass is what checks the signer.
 
     Raises :class:`ValueError` if no anchor is supplied or the anchor cannot be read, such as a
-    pinned certificate that is not one or a CA file holding none, and :class:`OSError` if
-    ``ca_pem_file`` cannot be opened. Raises :class:`~messagefoundry.parsing.xml.errors.XmlError`
+    pinned certificate that is not one or whose key cannot be loaded, or a CA file holding none,
+    and :class:`OSError` if ``ca_pem_file`` cannot be opened. Both are raised before the document
+    is read. Raises :class:`~messagefoundry.parsing.xml.errors.XmlError`
     if the input is unparseable, or if signxml or a library under it cannot process the signature,
     such as a schema-invalid or empty ``ds:SignatureValue`` or key data it cannot read (vault BACKLOG
     #2816, #5372). That message names only the library's exception type, and the library's
@@ -426,6 +444,8 @@ def verify(
     root = parse_bytes(document)
     verifier = signxml.XMLVerifier()
     config = _approved_signature_config(signxml)
+    from cryptography.exceptions import InvalidSignature as cryptography_invalid_signature
+
     try:
         result = verifier.verify(
             root,
@@ -433,7 +453,9 @@ def verify(
             ca_pem_file=ca_pem_file,
             expect_config=config,
         )
-    except signxml.exceptions.InvalidSignature as exc:
+    except cryptography_invalid_signature as exc:
+        # The base class: signxml's own InvalidSignature derives from it, and one signxml branch
+        # lets the raw cryptography one through. A bad signature stays data.
         return XmlSignatureResult(verified=False, reason=type(exc).__name__)
     except Exception as exc:  # noqa: BLE001 - the anchor was read above; the rest is the document
         # Measured on signxml 5.2.0, malformed signature content raises at least nine types from
