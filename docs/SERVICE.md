@@ -653,9 +653,8 @@ environment.
   **The engine refuses to start when the store key, or a retired one, is in that list**, or in
   the service's own `Environment` registry value, whatever `[security].enforcement` says (vault
   BACKLOG #2595). Move the key to the DPAPI key file above. A retired key belongs in the shell
-  that runs `messagefoundry rotate-key`, not in the service. The other engine secrets there refuse
-  the start too; the next bullet is their way in. What the engine reads, what it refuses and what
-  it does not cover are in
+  that runs `messagefoundry rotate-key`, not in the service. What the engine reads, what it
+  refuses and what it does not cover are in
   [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#store_key_in_service_environment-and-service_environment_unobservable-secrets-in-the-windows-services-environment).
 
 - **The other secrets: a secrets directory (any platform).** At least the engine's own secret

@@ -96,8 +96,7 @@ _TOKEN_UNSET = (
 )
 #: The Windows twin. On Windows the token goes in the secrets directory only, never in the
 #: service's environment (owner ruling 2026-10-01; ``serviceenv`` refuses it in the service's own
-#: environment lists), so the
-#: refusal never points a Windows operator there.
+#: environment lists), so the refusal never points a Windows operator there.
 _TOKEN_UNSET_WINDOWS = (
     f"{_ENV_TOKEN} is not set or is empty, so the store token is not known. On Windows, supply "
     f"it only as the file named {_ENV_TOKEN} in the secrets directory MEFOR_SECRETS_DIRECTORY "

@@ -339,7 +339,7 @@ def test_every_other_secret_class_name_in_the_nssm_list_refuses(name: str) -> No
     assert refusal is not None
     assert f"{name} (in Parameters\\AppEnvironmentExtra) is set in" in refusal
     assert "'MessageFoundry'" in refusal
-    assert "MEFOR_SECRETS_DIRECTORY" in refusal
+    assert f"Put {name} in the secrets directory MEFOR_SECRETS_DIRECTORY names" in refusal
     assert 'enforcement = "warn" does not change this refusal' in refusal
     # The store key's remedy is not offered for a secret that is not the store key.
     assert "protect-key" not in refusal
@@ -380,7 +380,16 @@ def test_the_named_not_refused_entry_is_gone() -> None:
 
 
 def test_a_non_secret_variable_in_the_nssm_list_is_neither_refused_nor_named() -> None:
-    posture = _service(["MEFOR_AI_ENVIRONMENT=prod", "MEFOR_SECURITY_REQUIRE_MFA=false"])
+    """``MEFOR_VALUE_*`` names are an operator's ``env()`` values, not secret-class settings, and
+    the windows-service-smoke rig sets some in its NSSM list."""
+    posture = _service(
+        [
+            "MEFOR_AI_ENVIRONMENT=prod",
+            "MEFOR_SECURITY_REQUIRE_MFA=false",
+            "MEFOR_VALUE_REGISTRY_PASSWORD=x",
+            "MEFOR_SECRETS_DIRECTORY=C:/ProgramData/MessageFoundry-secrets",
+        ]
+    )
     assert service_env_refusal(posture) is None
     assert service_env_loosenings(posture) == []
 

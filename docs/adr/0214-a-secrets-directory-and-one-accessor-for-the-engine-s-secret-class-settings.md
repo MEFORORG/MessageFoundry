@@ -153,13 +153,14 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
 
 ## Amendments
 
-- **2026-11-11, slice B built: the NSSM reading refuses every secret-class name.** A name from
-  `DIRECTORY_SETTING_NAMES` in the service's own environment lists now refuses `serve` and
-  `supervise`, under every enforcement setting, as a store key there already did, and the refusal
-  names this directory as the way in. The `service_environment_secret` loosening is removed. Not
-  refused: such a secret reaching the engine from the machine-wide environment, or from its own
-  environment when the service's lists could not be read; only a store key is read there. The
-  owner's 2026-10-01 ruling covers it (vault BACKLOG #2595, step 2).
+- **2026-11-11, half of slice B built: the NSSM reading refuses every secret-class name.** A
+  name from `DIRECTORY_SETTING_NAMES` in the service's own environment lists now refuses `serve`
+  and `supervise`, under every enforcement setting, as a store key there already did, and the
+  refusal names this directory as the way in. The `service_environment_secret` loosening is
+  removed. The other half, refusing such a secret found in the environment elsewhere, is not
+  built: one reaching the engine from the machine-wide environment, or from its own environment
+  when the service's lists could not be read, is neither refused nor named, since only a store
+  key's names are read there (vault BACKLOG #2595).
 - **2026-11-05, slice D built.** `[store].key_provider` no longer accepts the four external names
   ADR 0019 declared and nobody built, `aws_kms`, `azure_kv`, `gcp_kms` and `pkcs11`; each is now
   refused as an unknown name. Question 12 of the maintainer-internal decisions index answered yes

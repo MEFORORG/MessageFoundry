@@ -33,9 +33,11 @@ something else, a launcher between NSSM and the interpreter that is not a Python
 the ``messagefoundry`` launcher, and a connector secret an operator names through ``env()``,
 whose name the engine cannot know.
 
-**Not a refusal when the read fails.** An engine that cannot walk its ancestors, or cannot read
-its service's lists, reports ``service_environment_unobservable`` and starts. A store key there
-would then go unrefused, and the entry says so.
+**Not a refusal when the read fails, with one exception.** An engine that cannot walk its
+ancestors, or cannot read its service's lists, reports ``service_environment_unobservable`` and
+starts, and a secret in those lists goes unrefused. The exception: a known service whose lists
+could not be read refuses a store key in this process's environment, since it most likely came
+from them.
 """
 
 from __future__ import annotations
@@ -396,14 +398,13 @@ def service_env_refusal(posture: ServiceEnvPosture) -> str | None:
         )
     if others:
         steps.append(
-            "Move each other secret to the secrets directory MEFOR_SECRETS_DIRECTORY names, one "
-            'restricted file per setting, named as its variable. See docs/CONFIGURATION.md, "The '
-            'secrets directory"'
+            f"Put {', '.join(others)} in the secrets directory MEFOR_SECRETS_DIRECTORY names, as "
+            "one restricted file per setting named as its variable. See docs/CONFIGURATION.md, "
+            '"The secrets directory"'
         )
-    exposed = "these secrets" if others else "the store key"
     return (
-        f"{found}. Any local user may be able to read that key, and with it {exposed}. Remove "
-        f"each one from the service's lists. {'. '.join(steps)}. "
+        f"{found}. Any local user may be able to read that key, and with it each value named. "
+        f"Remove each name from the service's lists. {'. '.join(steps)}. "
         '[security].enforcement = "warn" does not change this refusal'
     )
 
