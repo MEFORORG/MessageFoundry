@@ -2915,9 +2915,11 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
 - in a cluster, the release compares the digest with the disk of the node that handles the approve,
   which may not be the node that took it;
 - a value file outside the config directory is in no start digest, so a start records nothing
-  about the values it applied from it. A value file in the `environments/` folder is parsed from
-  the load's snapshot, the one the start's `config_loaded` digest folds, so that digest names the
-  bytes the start applied (vault BACKLOG #2596);
+  about the values it applied from it. With `serve`'s value provider, a value file in the
+  `environments/` folder is parsed from the load's snapshot, the one the start's `config_loaded`
+  digest folds, so that digest names the value-file bytes the start applied (vault BACKLOG
+  #2596). An embedded engine's provider that cannot read a snapshot still resolves its values
+  when the engine is built, so its digest may name `environments/` bytes it did not apply;
 - a restart, a cluster convergence reload, a DR activation and a sandbox worker respawn check no
   approved digest. Whether a restart under dual control refuses an unapproved digest is an open
   owner question.

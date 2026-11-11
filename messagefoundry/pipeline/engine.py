@@ -3284,10 +3284,11 @@ class Engine:
         digest is of the snapshot that load ran, as a reload's is, so an edit or a file lock after
         the load's read cannot reach it (vault BACKLOG #2944, #3765). Off a snapshot, only a file
         the load does not read, in ``environments/``, can be left out of it, and it holds that
-        folder as the load read it: a value file there is the one the start parsed its values from
-        (:meth:`apply_start_env_values`), so the digest names the bytes the start applied. A value
-        file outside the config directory is in no start digest. The directory is read for the
-        advisory VCS head alone.
+        folder as the load read it. Where the start's own value file sits in that folder, the start
+        parsed its values from those bytes (:meth:`apply_start_env_values`), so the digest names
+        the value-file bytes the start applied; the folder's other files are folded and not
+        parsed. A value file outside the config directory is in no start digest. The directory is
+        read for the advisory VCS head alone.
 
         A running graph that carries no snapshot gets none of that: the digest is of the directory
         as it is now, so any covered file can be left out and a later edit can reach it. A digest
@@ -3311,19 +3312,37 @@ class Engine:
         what the start's ``config_loaded`` digest folds (:meth:`capture_start_provenance`), so those
         bytes replace that read: an edit between the build and the load is then both applied and
         named. A value file outside the config directory is in no start snapshot and no published
-        digest, so the values read at the build stand. A no-op with no snapshot or no
-        :class:`~messagefoundry.config.environments.SnapshotEnvValuesProvider`.
+        digest, so the values read at the build stand. So do they where the load's snapshot could
+        not read the value file, as under an antivirus lock: the digest then leaves the file out
+        and names it as such, and a reload, which reads strictly, reads such a file from disk too.
+        A no-op with no snapshot or no
+        :class:`~messagefoundry.config.environments.SnapshotEnvValuesProvider`; another provider's
+        values stay the build's, a limit docs/SECURITY.md records.
 
         The managed app's start calls it after the load and before :meth:`guard_registry`, so the
-        guard, the preflight and the runner judge and run the values the digest names. Raises
-        ``WiringError`` when the snapshot's value file cannot be read or parsed, as a reload
-        refuses."""
+        guard, the preflight and the runner judge and run the values the digest names, and only
+        before the graph is added: a runner holds its own values. Raises ``WiringError`` when the
+        snapshot's value file cannot be parsed, or was created or removed since the build read
+        it."""
+        if self._registry_runner is not None:
+            raise RuntimeError("a start's environment values are applied before its graph runs")
         provider = self._env_values_provider
         snapshot = registry.config_snapshot
         if snapshot is None or not isinstance(provider, SnapshotEnvValuesProvider):
             return
+        value_file = provider.value_file
         refusal: str | None = None
         try:
+            if value_file is not None and await asyncio.to_thread(
+                snapshot.left_out_environment_file, value_file
+            ):
+                # A path only, never a value.
+                log.warning(
+                    "environment value file %s could not be read into the start's config "
+                    "snapshot; the start applies the values read when the engine was built",
+                    value_file,
+                )
+                return
             # None for a value file outside the snapshot, as in the default layout.
             read = await asyncio.to_thread(provider.from_snapshot, snapshot)
             if read is not None:
@@ -3542,7 +3561,7 @@ class Engine:
                 # Into a local: the running values change only at the swap (vault BACKLOG #2596).
                 if snapshot is not None and isinstance(provider, SnapshotEnvValuesProvider):
                     read = await asyncio.to_thread(provider.from_snapshot, snapshot)
-                    if read is None:
+                    if read is None and provider.value_file is not None:
                         # A path only, never a value. The engine reads the provider's value file
                         # into the snapshot, so this fires only where it could not. A WARNING: the
                         # release then rests on a second digest, which samples.
