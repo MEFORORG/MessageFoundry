@@ -21,12 +21,15 @@ What is refused, by default and with no setting to turn it off:
 * **PBES2 with scrypt** below Appendix C's floor: ``r >= 8``, and ``N`` at least 2^17, 2^16 or 2^15
   for ``p`` of 1, 2, or 3 and up. Those are the table's three rows, encoded as written.
 * Any other derivation this module does not recognise, an encrypted key it decodes but cannot
-  parse, and a key file it cannot read or that is too large to check. In an ``ENCRYPTED PRIVATE
-  KEY`` block whose BEGIN is paired with its END, bytes that are not DER, whether BER or cut short,
-  are refused whatever the wrap. Under another label or as raw DER, where OpenSSL decrypts the same
-  bytes, a BER key that names a password-based scheme is judged on its wrap, and refused where its
-  AlgorithmIdentifier is cut short or not DER, inside or out (BACKLOG #5543). So is an ``ENCRYPTED
-  PRIVATE KEY`` block found only behind a stray BEGIN, as :func:`_key_block_problem` says.
+  parse, and a key file it cannot read or that is too large to check. The DER reader also takes
+  some BER: a long length of up to four bytes with leading zeros, and bytes after the key, which
+  are judged on the wrap like DER. In an ``ENCRYPTED PRIVATE KEY`` block whose BEGIN is paired with
+  its END, bytes it cannot walk, other BER or bytes cut short, are refused whatever the wrap. Under
+  another label or as raw DER, where OpenSSL decrypts the same bytes, such a key that names a
+  password-based scheme is judged on its wrap, and refused where its AlgorithmIdentifier is cut
+  short or in a form the DER reader does not take, inside or out (BACKLOG #5543). So is an
+  ``ENCRYPTED PRIVATE KEY`` block found only behind a stray BEGIN, as :func:`_key_block_problem`
+  says.
 * An encrypted key where the loader has NO passphrase to give, before any library can try it.
 
 ``cryptography``'s ``BestAvailableEncryption`` and the ``openssl`` CLI's own default both write
@@ -334,8 +337,9 @@ _PBE_ARCS: Final = (_PKCS5_ARC, _PKCS12_PBE_ARC)
 
 
 def _ber_encrypted_pkcs8_algorithm(der: bytes) -> _Tlv | None:
-    """For bytes the DER reader could not walk: the AlgorithmIdentifier of an EncryptedPrivateKeyInfo
-    in a BER form, or ``None`` when ``der`` is not that shape (BACKLOG #5543).
+    """For bytes the DER reader could not walk: the AlgorithmIdentifier of an
+    EncryptedPrivateKeyInfo in a BER form, or ``None`` when ``der`` is not that shape (BACKLOG
+    #5543).
 
     OpenSSL's decoder takes BER, so it decrypts an EncryptedPrivateKeyInfo in forms DER forbids, at
     least: an indefinite length, a constructed OCTET STRING, a long length padded with leading
@@ -369,7 +373,7 @@ def _ber_encrypted_pkcs8_algorithm(der: bytes) -> _Tlv | None:
         return None
     if not scheme.startswith(_PBE_ARCS):
         return None
-    return _read_tlv(der, outer[1], len(der))  # raises when the AlgorithmIdentifier is not DER
+    return _read_tlv(der, outer[1], len(der))  # raises where the DER reader cannot walk it
 
 
 def _pbes2_problem(buf: bytes, params: _Tlv | None) -> str | None:
@@ -502,8 +506,9 @@ def _der_problem(der: bytes, *, known_encrypted: bool) -> tuple[bool, str | None
     ``known_encrypted`` is true for the body of an ``ENCRYPTED PRIVATE KEY`` PEM block, which must
     parse as an EncryptedPrivateKeyInfo. Bare DER need not: if its outer shape is not one, it is an
     unencrypted key or not a key at all, and the loader reports the second itself. Bytes the DER
-    reader cannot walk go to :func:`_ber_problem`, and so do bytes whose OCTET STRING is not DER
-    (constructed, a high tag or a long length), which :func:`_encrypted_pkcs8_algorithm` raises on.
+    reader cannot walk go to :func:`_ber_problem`, among them bytes whose OCTET STRING is
+    constructed, has a high tag or has a length of more than four bytes. A long length of up to
+    four bytes with leading zeros is BER the DER reader takes, so such a key is judged here.
     Where the DER reader walks the outer SEQUENCE and both its parts' headers, but not the
     AlgorithmIdentifier's contents, BER parameters or a BER scheme OID among them, the key gets
     :data:`_UNREADABLE`, the text for any wrap that does not parse, and the remedy that text gets,
@@ -532,8 +537,8 @@ def _judge(
 
 
 def _ber_problem(der: bytes, *, known_encrypted: bool) -> tuple[bool, str | None]:
-    """``(encrypted, problem)`` for bytes the DER reader cannot walk: BER, or bytes cut short
-    (BACKLOG #5543).
+    """``(encrypted, problem)`` for bytes the DER reader cannot walk: BER it does not take, or bytes
+    cut short (BACKLOG #5543).
 
     Under the ``ENCRYPTED PRIVATE KEY`` label they are refused whatever they hold, as they were
     before the BER reader existed: with the wrap's own text where
@@ -543,8 +548,8 @@ def _ber_problem(der: bytes, *, known_encrypted: bool) -> tuple[bool, str | None
     raw DER, where OpenSSL decrypts the same bytes, a password-based scheme is judged on its wrap:
     one not approved is refused, an approved one passes even when the bytes after its
     AlgorithmIdentifier are cut short (OpenSSL refuses those itself), and an AlgorithmIdentifier
-    that is cut short or not DER, inside or out, gets :data:`_UNREADABLE_BER`. Bytes that name no
-    password-based scheme pass there, as the DER reader passes a non-key."""
+    that is cut short or the DER reader cannot walk, inside or out, gets :data:`_UNREADABLE_BER`.
+    Bytes that name no password-based scheme pass there, as the DER reader passes a non-key."""
     try:
         found = _ber_encrypted_pkcs8_algorithm(der)
     except _Malformed:
