@@ -2889,10 +2889,10 @@ def _serve(args: argparse.Namespace) -> int:
     if _start_files_refused(service_config, env_file):
         return 2
 
-    # Vault BACKLOG #2595 and #2601: a store key in this engine's own Windows service environment,
-    # which NSSM keeps in a registry key any local user can read. Refused under EVERY enforcement
-    # setting (owner ruling 2026-10-01). Other engine secrets there are only named, in the
-    # loosening list below. messagefoundry/serviceenv.py says what the reading covers.
+    # Vault BACKLOG #2595 and #2601: a store key, or another secret-class setting, in this engine's
+    # own Windows service environment, which NSSM keeps in a registry key any local user can read.
+    # Refused under EVERY enforcement setting (owner ruling 2026-10-01).
+    # messagefoundry/serviceenv.py says what the reading covers.
     from messagefoundry.serviceenv import service_env_posture, service_env_refusal
 
     service_env = service_env_posture()
@@ -5402,7 +5402,7 @@ def _supervise(args: argparse.Namespace) -> int:
 
     # Vault BACKLOG #2595: the service-environment check each engine shard's `serve` makes. A
     # shard reads the same NSSM service as the supervisor, since that service is an ancestor of
-    # both, so every shard would refuse on a store key there. Refused under every enforcement
+    # both, so every shard would refuse on a secret there. Refused under every enforcement
     # setting, as in `serve`.
     from messagefoundry.serviceenv import (
         service_env_loosenings,

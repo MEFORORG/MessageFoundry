@@ -2767,7 +2767,7 @@ default; where to put it is the platform's choice (ADR 0214, slice C).
 - **On Windows, an administrator writes that file by hand.** That is the only route offered for a
   Vault token on Windows, apart from the dedicated-account agent route below. It needs no agent,
   no extra account and no LocalSystem. Never put the token in the service's environment
-  ([why](SECURITY-LOOSENING.md#service_environment_secret-store_key_in_service_environment-and-service_environment_unobservable-secrets-in-the-windows-services-environment)).
+  ([why](SECURITY-LOOSENING.md#store_key_in_service_environment-and-service_environment_unobservable-secrets-in-the-windows-services-environment)).
   The file does not renew itself: replace it before the token expires.
 - **On Windows, a SYSTEM scheduled task is not offered.** A scheduled task or script running as
   SYSTEM that writes or copies the token into this directory is a LocalSystem writer by another

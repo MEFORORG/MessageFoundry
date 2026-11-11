@@ -2577,7 +2577,7 @@ count is above `0` (vault BACKLOG #2613).
   a virtual environment. An engine shard reports `interpreter_not_isolated` for itself: the
   supervisor starts it with `-P`, not `-I`.
 
-### `service_environment_secret`, `store_key_in_service_environment` and `service_environment_unobservable`: secrets in the Windows service's environment
+### `store_key_in_service_environment` and `service_environment_unobservable`: secrets in the Windows service's environment
 
 > **OBSERVATIONS, not switches.** No setting declares them. They follow from where the engine's
 > Windows service gets its environment. Vault BACKLOG #2595 and #2601.
@@ -2585,22 +2585,19 @@ count is above `0` (vault BACKLOG #2613).
   NSSM's `AppEnvironmentExtra` and `AppEnvironment` under `Parameters`, and the service's own
   `Environment` value. Who can read that key, and how that was measured, is stated once in
   [`SERVICE.md`](SERVICE.md#protect-the-store-encryption-key-at-rest-wp-11d).
-- **What is refused:** a store key in those lists, `MEFOR_STORE_ENCRYPTION_KEY` or
-  `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`. `serve` and `supervise` refuse to start on it under
-  **every** `[security].enforcement` setting, before they open the store, and the refusal names
-  the registry value that holds it. That is the owner's 2026-10-01 ruling: a key in the
-  environment, and a secret in a Windows service's NSSM environment, are refused always. They also
+- **What is refused:** an engine secret in those lists. `serve` and `supervise` refuse to start on
+  one under **every** `[security].enforcement` setting, before they open the store, and the
+  refusal names the registry value that holds it. That is the owner's 2026-10-01 ruling: a key in
+  the environment, and a secret in a Windows service's NSSM environment, are refused always. The
+  names are the one list in `messagefoundry/engine_secrets.py`: a store key,
+  `MEFOR_STORE_ENCRYPTION_KEY` or `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`, whose way in is the DPAPI
+  key file ([`SERVICE.md`](SERVICE.md#protect-the-store-encryption-key-at-rest-wp-11d)), and each
+  other secret-class setting, whose way in is the secrets directory that `MEFOR_SECRETS_DIRECTORY`
+  names, one restricted file per setting
+  ([`CONFIGURATION.md`](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory)). They also
   refuse a store key in their own environment when they found their service but could not read
-  its lists, since the key most likely came from there. The DPAPI key file is the way in
-  ([`SERVICE.md`](SERVICE.md#protect-the-store-encryption-key-at-rest-wp-11d)).
-- **`service_environment_secret`: another engine secret is in that list.** The entry names each
-  one it finds: the store password, the AD bind password, the OIDC client secret, the OIDC
-  signing key and its passphrase, the SMTP password, the API TLS key passphrase, both Vault
-  tokens and the AI key. The same ruling would refuse them. The protected way in is the secrets
-  directory that `MEFOR_SECRETS_DIRECTORY` names, one restricted file per setting
-  ([`CONFIGURATION.md`](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory)): move each
-  one there and remove it from the list. A secret left in the list is still named and not refused;
-  the refusal is later work under vault BACKLOG #2595.
+  its lists, since the key most likely came from there; another secret in their own environment is
+  not refused then.
 - **`store_key_in_service_environment`: a store key reaches the service through its
   environment.** It is named wherever the key came from, once the engine knows its service. The
   machine-wide environment is readable by every local user too. A key in the service's own
@@ -2685,7 +2682,7 @@ chapter was not part of the verification above.
 | `audit_chain_unkeyed` (observed keyless audit chain on a keyed store) | V16 Security Logging and Error Handling | **AU-9** Protection of Audit Information · **AU-9(3)** Cryptographic Protection | §164.312(b) Audit Controls · §164.312(c)(1) Integrity |
 | `remote_debug_enabled` / `remote_debug_unguarded` (observed remote-debugging interface of the engine process) | V13 Configuration | **CM-7** Least Functionality | §164.312(a)(1) Access Control |
 | `interpreter_not_isolated` / `startup_code_unexpected` / `startup_directory_writable` / `startup_directory_unchecked` (observed launch flags and start-up code of the engine's interpreter) | V13 Configuration | **CM-7** Least Functionality · **SI-7** Software, Firmware, and Information Integrity · **CM-5** Access Restrictions for Change | §164.312(c)(1) Integrity · §164.312(a)(1) Access Control |
-| `service_environment_secret` / `store_key_in_service_environment` / `service_environment_unobservable` (observed engine secrets in the Windows service's environment) | V13 Configuration (13.3.1) | **SC-12** Cryptographic Key Establishment and Management · **SC-28** Protection of Information at Rest · **AC-3** Access Enforcement | §164.312(a)(1) Access Control · §164.312(a)(2)(iv) Encryption and Decryption |
+| `store_key_in_service_environment` / `service_environment_unobservable` (observed engine secrets in the Windows service's environment) | V13 Configuration (13.3.1) | **SC-12** Cryptographic Key Establishment and Management · **SC-28** Protection of Information at Rest · **AC-3** Access Enforcement | §164.312(a)(1) Access Control · §164.312(a)(2)(iv) Encryption and Decryption |
 
 > **There is no longer a synthetic-vs-PHI split to crosswalk.** It was risk-based tailoring keyed on
 > `handles_real_patient_data` — an instance carrying no ePHI being out of scope for the ePHI-specific

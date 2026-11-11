@@ -326,8 +326,9 @@ variable the service needs in one call, or the ones you leave out are gone at th
 That includes the `MEFOR_SECRETS_DIRECTORY` entry the installer wrote: without it the engine reads
 no file in the secrets directory, and every secret moved there is missing, with no error naming
 the directory. Read the list first with `nssm get MessageFoundry AppEnvironmentExtra`.
-**The store key does not go in that list:** the engine refuses to start with it there, because any
-local user can read the list. Use the DPAPI key file (see
+**No secret goes in that list:** the engine refuses to start with one of its own secret settings
+there, because any local user can read the list. Use the DPAPI key file for the store key, and the
+secrets directory for the rest (see
 [Protect the store encryption key at rest](#protect-the-store-encryption-key-at-rest-wp-11d)).
 
 **A `PYTHON*` variable in that list does nothing for the engine.** The service starts the
@@ -652,9 +653,10 @@ environment.
   **The engine refuses to start when the store key, or a retired one, is in that list**, or in
   the service's own `Environment` registry value, whatever `[security].enforcement` says (vault
   BACKLOG #2595). Move the key to the DPAPI key file above. A retired key belongs in the shell
-  that runs `messagefoundry rotate-key`, not in the service. Other engine secrets there are named,
-  not refused. What the engine reads, what it names and what it does not cover are in
-  [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#service_environment_secret-store_key_in_service_environment-and-service_environment_unobservable-secrets-in-the-windows-services-environment).
+  that runs `messagefoundry rotate-key`, not in the service. The other engine secrets there refuse
+  the start too; the next bullet is their way in. What the engine reads, what it refuses and what
+  it does not cover are in
+  [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#store_key_in_service_environment-and-service_environment_unobservable-secrets-in-the-windows-services-environment).
 
 - **The other secrets: a secrets directory (any platform).** At least the engine's own secret
   settings other than the store key, among them the database password, and every `MEFOR_VALUE_*`
@@ -683,9 +685,10 @@ environment.
   does not read it. `uninstall-service.ps1` leaves the directory and its files, names them, and
   with `-RemoveAccountAces` removes the account's entry there too. Which settings it supplies, the
   access list it needs, and the rest of the rules are stated once, in
-  [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). This is the
-  first part of the protected channel vault BACKLOG #2595 asks for, not the whole of it: a secret
-  left in the NSSM list is still named, not refused.
+  [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). **The engine
+  refuses to start when one of its own secret settings is in the service's NSSM list** or its own
+  `Environment` value, whatever `[security].enforcement` says (vault BACKLOG #2595): move it to a
+  file here and remove it from the list. A `MEFOR_VALUE_*` value there is not refused.
 
 > **External vault / managed identity.** DPAPI is the built-in on-box option. The engine can also call
 > HashiCorp Vault itself. These surfaces are separate, and each needs the optional `[vault]` extra:

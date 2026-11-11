@@ -155,7 +155,7 @@ def _env(directory: Path | None, **values: str) -> dict[str, str]:
 
 
 def test_serviceenv_takes_its_lists_from_the_one_list() -> None:
-    assert (*serviceenv.KEY_CLASS_NAMES, *serviceenv.LOOSENING_CLASS_NAMES) == SECRET_SETTING_NAMES
+    assert (*serviceenv.KEY_CLASS_NAMES, *serviceenv.DIRECTORY_CLASS_NAMES) == SECRET_SETTING_NAMES
     assert set(KEY_CLASS_NAMES).isdisjoint(DIRECTORY_SETTING_NAMES)
     assert set(KEY_CLASS_NAMES) | set(DIRECTORY_SETTING_NAMES) == set(SECRET_SETTING_NAMES)
 
