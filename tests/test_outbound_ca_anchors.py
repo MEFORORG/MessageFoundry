@@ -759,6 +759,33 @@ async def test_a_reload_still_refuses_whole_on_a_refused_lookup_ca_and_heals_onc
     assert dials == []
 
 
+async def _read_refuses(runner: Any, name: str) -> None:
+    """A read on an isolated lookup refuses before anything is sent, so the ``dials`` control
+    that follows it would catch a lookup that was built and dialled anyway."""
+    from messagefoundry.config.fhir_lookup import FhirLookupError
+
+    with pytest.raises(FhirLookupError, match="failed to start and is isolated"):
+        await runner._fhir_lookup_executor.read(name, "Patient/1")
+
+
+def test_the_lookup_line_names_its_fault_and_a_passive_standby() -> None:
+    """Review round 2 of vault BACKLOG #3582. The fixed line calls a fault a refusal only when the
+    check named one, and on a passive DR standby it says the activation needs the lookup, as a
+    lane's line does (vault BACKLOG #3263). Red under: any ``ValueError`` read as a refused file."""
+    from messagefoundry.pipeline import wiring_runner as wr
+
+    refused = wr._fhir_lookup_anchor_line("EPIC", TrustAnchorError("pin"))
+    assert "its tls_ca_file was refused" in str(refused) and refused.fixed_text
+    setting = wr._fhir_lookup_anchor_line("EPIC", ta.AnchorSettingRefused("blank pin"))
+    assert "tls_ca_pin or tls_ca_file setting was refused" in str(setting)
+    defect = wr._fhir_lookup_anchor_line("EPIC", WiringError("a defect"))
+    assert "could not be checked" in str(defect) and "audit rows" not in str(defect)
+    store_line = wr._fhir_lookup_anchor_line("EPIC", ta.AnchorStoreUnavailable("down"))
+    assert "the store refused the trust-anchor audit" in str(store_line)
+    passive = wr._fhir_lookup_anchor_line("EPIC", TrustAnchorError("pin"), passive=True)
+    assert "POST /dr/activate needs it" in str(passive)
+
+
 async def test_a_missing_lookup_ca_is_isolated_at_start_and_refused_as_an_anchor_at_reload(
     store: MessageStore, tmp_path: Path, judged: None, dials: list[str]
 ) -> None:
@@ -775,6 +802,7 @@ async def test_a_missing_lookup_ca_is_isolated_at_start_and_refused_as_an_anchor
         reason = runner.fhir_lookup_failed("EPIC")
         assert reason is not None and reason.startswith(_REFUSED_LOOKUP), reason
         assert {"OUT", "OB_OK"} <= set(runner._destinations)
+        await _read_refuses(runner, "EPIC")
         with pytest.raises(WiringError, match="fhir lookup 'EPIC' tls_ca_file") as refused:
             await engine.reload_detail(cfg)
         assert isinstance(refused.value.__cause__, TrustAnchorError)
@@ -812,6 +840,12 @@ async def test_a_lookup_whose_ca_check_the_store_stopped_is_isolated_and_named_s
         reason = runner.fhir_lookup_failed("EPIC")
         assert reason is not None and "the store refused the trust-anchor audit" in reason, reason
         assert {"OUT", "OB_OK"} <= set(runner._destinations)
+        await _read_refuses(runner, "EPIC")
+        # A reload whose lookup check the store stopped is refused whole, as a store fault and
+        # not as a refused file (BACKLOG #3091).
+        with pytest.raises(WiringError) as refused:
+            await engine.reload_detail(cfg)
+        assert isinstance(refused.value.__cause__, ta.AnchorStoreUnavailable)
     finally:
         await engine.stop()
     assert dials == []
@@ -836,6 +870,7 @@ async def test_a_long_lookup_name_keeps_the_advice_in_its_record(
         runner = await _start_like_serve(engine, cfg)
         reason = runner.fhir_lookup_failed(name)
         assert reason is not None and reason.endswith("audit rows say why"), reason
+        await _read_refuses(runner, name)
     finally:
         await engine.stop()
     assert dials == []

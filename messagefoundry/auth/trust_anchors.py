@@ -89,14 +89,16 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
      recorded failed and alerted, every Handler call to it fails closed, and the rest of the graph
      comes up. Nothing is dialled for it.
    * Before a reload quiesces, the runner checks each lane the reload builds or keeps running, and
-     a refusal refuses the whole reload. A reload builds every ``FhirLookup`` again, so before its
-     build check the runner checks each one the new graph declares, and a refusal refuses the
-     whole reload too. A DR activation checks them inside its bounded preflight as well. It does not read an idle lane: one not deployed, an
+     a refusal refuses the whole reload. It does not read an idle lane: one not deployed, an
      ``auto_start=False`` lane not running, one below a DR threshold, a poller outside its
      schedule window, or a lane its CA failed whose config has not changed. A reload leaves that
      last kind failed. A config change or an operator start builds it, and checks it then.
      Only these checks skip an idle lane. A reload's build check still builds every deployed
      connector, and those that read the file as they are built refuse one they cannot load.
+   * A reload builds every ``FhirLookup`` again, so before its build check the runner checks
+     each one the new graph declares, idle or not, and a refusal refuses the whole reload. A DR
+     activation also checks them inside its bounded preflight, then again, unbounded, in its
+     reload, as it reads a lane's CA there.
 
    **Not covered: the checked bytes are not the loaded bytes here.** These hops build their
    context from the path, with ``cafile=``, after the check. So a file swapped between the check

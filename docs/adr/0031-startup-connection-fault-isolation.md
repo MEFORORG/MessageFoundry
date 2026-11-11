@@ -313,8 +313,7 @@ Context above names: feed #21's downstream cert should not stop the other 20.
    running** (Manager decision, 2026-10-06). That keeps §4's fail-fast rule for what the reload
    touches. Before it quiesces, the runner checks each lane it will build or keep running, and
    each `FhirLookup`, and the engine's preflight checks each inbound listener CA. The reload does
-   not
-   read an idle lane's CA:
+   not read an idle lane's CA:
    - a lane below the DR threshold, which the reload parks;
    - an `auto_start = false` lane that is not running;
    - an `Ftp` poller outside its schedule window;
@@ -412,7 +411,8 @@ convergence still refuse whole (rule 2): a reload builds every lookup again, so 
 build check the runner checks each lookup's CA (`RegistryRunner.refuse_on_fhir_lookup_anchors`),
 and a refusal refuses the reload before anything changes, audited as a trust-anchor refusal. A DR
 activation also runs that check inside its preflight, which `[dr].takeover_timeout_seconds` bounds
-(vault BACKLOG #3094). A reload with the cause fixed builds the lookup again, and so does a
+(vault BACKLOG #3094), and its reload then reads each lookup CA again with no bound, as it reads a
+lane's. On a passive DR standby the lookup's line says that `POST /dr/activate` needs it. A reload with the cause fixed builds the lookup again, and so does a
 restart. Rule 3, the inbound listener CA, is untouched.
 
 **Consequences.** A start with a broken lookup CA comes up with that lookup failed, where before

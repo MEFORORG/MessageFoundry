@@ -3042,12 +3042,13 @@ class RegistryRunner:
             try:
                 await self._lane_anchor_check("fhir_lookup", name, settings)
             except Exception as exc:  # noqa: BLE001 - isolated per lookup, as a lane's check is
-                if isinstance(exc, (TrustAnchorError, ValueError)):
+                if isinstance(exc, (TrustAnchorError, AnchorSettingRefused)):
                     log.warning("fhir lookup %r: trust anchor refused: %s", name, exc)
                 elif not isinstance(exc, AnchorStoreUnavailable):
-                    # The check logged a store fault itself; anything else is a defect.
-                    log.error("fhir lookup %r: trust anchor check failed", name, exc_info=True)
-                line = _fhir_lookup_anchor_line(name, exc)
+                    # The check logged a store fault itself; anything else is a defect. Its
+                    # traceback is logged once, by the record below, through the line's cause.
+                    log.error("fhir lookup %r: trust anchor check failed: %s", name, safe_exc(exc))
+                line = _fhir_lookup_anchor_line(name, exc, passive=self._dr_passive)
                 line.__cause__ = exc
                 refused[name] = line
         return refused
@@ -3077,8 +3078,9 @@ class RegistryRunner:
         the new graph before its build check, as the engine's registry preflight did before this
         check moved here: a CA file the build could not load is refused here first, as a trust
         anchor, with its audit row. A DR activation runs it inside its bounded preflight too
-        (:meth:`Engine._dr_preflight`, vault BACKLOG #3094), so a share that stops answering times
-        the activation out rather than holding it. A check the store stopped refuses only if no
+        (:meth:`Engine._dr_preflight`, vault BACKLOG #3094), so a share that stops answering there
+        times the activation out. Its reload then runs it again with no bound, as it reads a
+        lane's CA. A check the store stopped refuses only if no
         lookup's CA is refused (BACKLOG #3091). A no-op with no lane check."""
         if self._lane_anchor_check is None:
             return
@@ -13458,12 +13460,23 @@ def _lane_anchor_line(
 _SETTING_KEYS = "tls_ca_pin or tls_ca_file"
 
 
-def _fhir_lookup_anchor_line(name: str, exc: BaseException) -> TrustAnchorError:
+def _fhir_lookup_anchor_line(
+    name: str, exc: BaseException, *, passive: bool = False
+) -> TrustAnchorError:
     """The fixed line a ``FhirLookup``'s CA check failure is recorded and alerted as (vault
     BACKLOG #3582), the lookup twin of :func:`_lane_anchor_line`. The failure's own text names the
     CA's path and its SHA-256, so it goes to the server log only. A lookup has no operator start,
-    so the advice is a reload or a restart, which check the file again."""
-    fault = _lane_anchor_fault(exc)
+    so the advice is a reload or a restart, which check the file again. Only a refusal the check
+    names is called one: an :class:`AnchorSettingRefused` is a setting, any other
+    :class:`TrustAnchorError` a file, and anything else a check that did not run. On a passive DR
+    standby the line says the activation needs it, as a lane's does (vault BACKLOG #3263)."""
+    fault = (
+        "setting"
+        if isinstance(exc, AnchorSettingRefused)
+        else "file"
+        if isinstance(exc, TrustAnchorError)
+        else "unchecked"
+    )
     if fault == "setting":
         what = f"{_SETTING_KEYS} setting was refused"
         advice = "Fix the setting, then reload or restart; the server log says why"
@@ -13477,8 +13490,9 @@ def _fhir_lookup_anchor_line(name: str, exc: BaseException) -> TrustAnchorError:
     else:
         what = "tls_ca_file could not be checked"
         advice = "The server log says why; reload or restart once the cause is fixed"
+    where = " on this passive DR standby, and POST /dr/activate needs it" if passive else ""
     return TrustAnchorError(
-        f"fhir lookup '{name}': its {what}. {advice}",
+        f"fhir lookup '{name}': its {what}{where}. {advice}",
         setting=_fhir_lookup_setting(name, fault),
         fixed_text=True,
     )
