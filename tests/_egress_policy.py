@@ -7,7 +7,8 @@ about a connector's own behaviour must hand it a policy that lets that connector
 is the audited allow-any opt-out plus at least these lists that stay deny-by-default under it: the
 forward-proxy host, the ECH sidecar's host and port (BACKLOG #5528) and the recipient domains, each
 taken from the connection's own settings. The recipient-domain list also gates an Email sender's
-domain (vault BACKLOG #2912), so the sender's domain is listed too. It permits exactly that connection and lists nothing else.
+domain (vault BACKLOG #2912), so the sender's domain is listed too. It permits exactly that
+connection and lists nothing else.
 """
 
 from __future__ import annotations

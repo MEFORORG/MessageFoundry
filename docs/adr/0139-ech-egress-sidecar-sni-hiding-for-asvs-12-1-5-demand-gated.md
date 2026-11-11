@@ -79,7 +79,7 @@ any listener on this host whose port the connection's author named.
   the sidecar is an intermediary, not where PHI is meant to end up, so it is not folded into
   `allowed_http`.
 - **Deny-by-default on its own terms.** An empty list refuses an `ech_egress` connection even under
-  `[security].block_unlisted_outbound = false`. An instance with no ECH connection never reads it.
+  `[security].block_unlisted_outbound = false`. An instance with no ECH connection is never refused for an empty list, though a malformed entry is refused at load either way.
 - **No entry stands for any port.** The port is required, and an entry with none is refused at load.
   The `host[:port]` lists, such as `allowed_http`, read a host-only entry as any port; on this list
   that would re-open the hole the list closes.

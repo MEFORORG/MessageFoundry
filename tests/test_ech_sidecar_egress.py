@@ -129,6 +129,7 @@ def test_a_bracketed_ipv6_loopback_entry_matches() -> None:
         "10.0.0.5:8123",  # the resolver refuses a sidecar off this machine
         "user@127.0.0.1:8123",
         "[127.0.0.1]:8123",  # urlsplit refuses a bracketed IPv4 literal in a URL
+        "[::1%31]:8123",  # a zone ID: urllib decodes it before it dials, so this is ::11
     ],
 )
 def test_an_entry_that_is_not_host_and_port_is_refused_at_load(entry: str) -> None:
@@ -230,6 +231,15 @@ def test_a_sidecar_refusal_never_points_a_credential_at_the_connection(
     assert "basic_user" not in message
     assert "bearer_token" not in message
     assert "sidecar's own configuration" in message
+
+
+@pytest.mark.parametrize("build", [_gate, _direct], ids=["egress-gate", "direct-build"])
+def test_a_sidecar_host_with_a_zone_id_is_refused(build: Any) -> None:
+    """urlsplit keeps ``%31`` encoded, so ``::1%31`` reads as loopback, and an entry spelled the
+    same way compared equal. urllib decodes it before it dials, and dials ``::11``, which is not
+    this machine. So a '%' in the sidecar's host is refused, on both paths."""
+    with pytest.raises(ValueError, match=r"loopback"):
+        build("http://[::1%31]:8123")
 
 
 def test_a_sidecar_at_port_0_is_refused_in_its_own_words() -> None:

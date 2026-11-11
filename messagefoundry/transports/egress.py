@@ -561,8 +561,8 @@ def check_egress_allowed(
     default ``deny_by_default`` an empty list refuses; only the audited opt-out makes an empty list
     unrestricted, and at least ``allowed_proxy``, ``allowed_ech_sidecar`` and
     ``allowed_recipient_domains`` stay deny-by-default on their own terms either way. Checked
-    against the resolved (``env()``-substituted) destination at config load/reload/start. Webhook/SMTP alert sinks carry no
-    PHI bodies and keep their own ``[alerts]`` host allowlists.
+    against the resolved (``env()``-substituted) destination at config load/reload/start.
+    Webhook/SMTP alert sinks carry no PHI bodies and keep their own ``[alerts]`` host allowlists.
 
     Under ``[egress].deny_by_default`` a destination whose transport has no allowlist is refused
     outright (fail-closed); with the list set, the per-list matching below is unchanged.

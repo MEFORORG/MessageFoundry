@@ -4926,7 +4926,7 @@ reading this page already applies to a file the scan never opened.
 | Syslog forwarder (`[logging].forward_host`) | 5 s pinned on the socket for both `tcp` and `tls` (the TLS handshake runs under it); UDP is connectionless and carries none | a single long-lived socket owned by the logging handler | on timeout the handler drops **that record** and continues | **single-shot** per record — no retry |
 | SNTP clock-sync probe (`[logging].ntp_peer`) | 2 s pinned with `sock.settimeout`, so a silent peer cannot block `serve()` | the datagram socket is closed after the single probe | skew warns loudly, or refuses to start under `time_sync_fail_closed` | **single-shot** — one probe per start |
 | Forward / egress web proxy (`[egress].proxy_url`) | **inherits the destination connector's `timeout_seconds`** — the proxy hop has no separate timeout | released with the destination request; the per-connection `ProxyHandler` never mutates the shared opener | a proxy error surfaces as the destination request's failure | the destination's `RetryPolicy` |
-| Loopback ECH sidecar (`ech_sidecar`) | **inherits the connection's `timeout_seconds`** | released with the destination request | fails closed at build on a missing or non-loopback sidecar | the destination's `RetryPolicy` |
+| Loopback ECH sidecar (`ech_sidecar`) | **inherits the connection's `timeout_seconds`** | released with the destination request | fails closed at build on at least a missing or non-loopback sidecar, or one with a credential in its URL, and at config load on one not in `[egress].allowed_ech_sidecar` (BACKLOG #5528) | the destination's `RetryPolicy` |
 
 ## Competitive parity — full connector catalog
 

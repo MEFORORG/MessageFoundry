@@ -2666,7 +2666,9 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
             f"ech_sidecar must be an http(s):// loopback URL, got {_redact_url(sidecar)!r} "
             "(ADR 0139)"
         )
-    if not is_never_proxied_host(parsed.hostname):
+    # A '%' in the host is refused with it (BACKLOG #5528): urlsplit keeps an IPv6 zone ID encoded
+    # and urllib decodes it before it dials, so `[::1%31]` reads as loopback here and dials `::11`.
+    if "%" in parsed.hostname or not is_never_proxied_host(parsed.hostname):
         raise ValueError(
             "ech_sidecar must be a loopback address (the ECH sidecar runs beside the engine; a remote "
             "sidecar would leak the SNI on the hop to it, defeating the purpose) (ADR 0139)"
@@ -2682,7 +2684,9 @@ def ech_sidecar_is_cleartext(sidecar: str) -> bool:
     resolver used, never a string prefix, so the two cannot read one value differently. What such
     a hop carries, and why it is listed although it is loopback, is in
     ``docs/SECURITY-LOOSENING.md``."""
-    parsed = _split_or_refuse(sidecar, "ech_sidecar", use=_URL_CREDENTIAL_USE, error=ValueError)
+    parsed = _split_or_refuse(
+        sidecar, "ech_sidecar", use=_ECH_SIDECAR_CREDENTIAL_USE, error=ValueError
+    )
     return parsed.scheme == "http"
 
 

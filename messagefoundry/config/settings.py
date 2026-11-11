@@ -5256,7 +5256,9 @@ def pinned_host_port(entry: str) -> tuple[str, int] | None:
     if not (port.isascii() and port.isdigit()) or len(port) > 5:
         return None
     number = int(port)
-    if not host or not 1 <= number <= 65535 or not is_loopback_hop_host(host):
+    # A '%' is refused: urlsplit keeps an IPv6 zone ID still encoded, and urllib decodes it before
+    # it dials, so `[::1%31]` would compare as one host here and be dialled as `::11`.
+    if not host or "%" in host or not 1 <= number <= 65535 or not is_loopback_hop_host(host):
         return None
     try:
         return ipaddress.ip_address(host).compressed, number
@@ -5354,16 +5356,17 @@ class EgressSettings(_Section):
     # The ECH-SIDECAR address allowlist (BACKLOG #5528, ADR 0139). Each entry is "host:port", and
     # the port is REQUIRED: an entry with none is refused at load rather than read as any port, as
     # the `host[:port]` lists such as `allowed_http` read it. The host must be one the sidecar
-    # resolver reads as this machine, or the entry could never match. NOT a destination list: it gates the loopback sidecar an
-    # `ech_egress` REST connection sends every request to, body and credential headers included,
-    # and the token-endpoint POST too on a SMART or OAuth2 connection. Loopback alone does not bound
-    # that hop: without this list a connection could name any port on this host, and whatever
-    # listened there would receive it. Its own list, not `allowed_http`, for the reason
+    # resolver reads as this machine, or the entry could never match. NOT a destination list: it
+    # gates the loopback sidecar an `ech_egress` REST connection sends every request to, body and
+    # credential headers included, and the token-endpoint POST too on a SMART or OAuth2
+    # connection. Loopback alone does not bound that hop: without this list a connection could
+    # name any port on this host, and whatever listened there would receive it. Its own list, not `allowed_http`, for the reason
     # `allowed_proxy` is: the sidecar is an intermediary, not where PHI is meant to end up.
     #
     # DENY-BY-DEFAULT EVEN UNDER THE OPT-OUT, like `allowed_proxy` above: an `ech_egress`
     # connection is refused at config load while this list is empty, whatever
-    # `[security].block_unlisted_outbound` says. An instance with no ECH connection never reads it.
+    # `[security].block_unlisted_outbound` says. An instance with no ECH connection is never refused
+    # for an empty list, though a malformed entry is refused at load either way.
     # The gate is `_check_ech_sidecar_egress` in messagefoundry/transports/egress.py, and it
     # parses each entry with `pinned_host_port`, defined above this class. Env (comma-separated):
     # MEFOR_EGRESS_ALLOWED_ECH_SIDECAR.
