@@ -75,9 +75,12 @@ address-space boundary and the codec are the load-bearing controls.
 
 **Fail-closed.** Any isolation denial — a forbidden import/op, a resource cap exceeded, a worker
 crash, a rejected frame, or an unmarshallable payload/run-context — raises :class:`SandboxError`. The
-caller (the router/transform worker) routes it to ``ERROR``/dead-letter **post-ACK** via the existing
-``_apply_router_internal_error`` / ``_apply_transform_internal_error`` paths — never a NAK, never an
-accept-and-drop, never a crashed connection.
+caller (the router/transform worker) hands it, **post-ACK**, to the ``[delivery] internal_error``
+policy via the existing ``_apply_router_internal_error`` / ``_apply_transform_internal_error`` paths:
+``ERROR``/dead-letter under the default ``continue``; under ``stop`` the inbound's routing or
+transform halts with a ``connection_stopped`` alert, and the head row is re-pended, or
+dead-lettered once its attempts reach the retry cap. Never a NAK, never an accept-and-drop, never
+a crashed connection.
 
 **Engine-side validation stays engine-side.** The worker describes only the *shape* of the
 Router/Handler return value; the fail-closed handler-name / outbound-name validation (see
@@ -92,9 +95,11 @@ imports. It depends only on ``config`` (the :class:`RunContext` shape), its own 
 
 from __future__ import annotations
 
+import collections
 import contextvars
 import enum
 import logging
+import os
 import queue
 import secrets
 import struct
@@ -105,7 +110,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Any, Final
+from typing import IO, Any, Final, Literal
 
 from messagefoundry import proctree
 from messagefoundry.childenv import python_child_argv, worker_environment
@@ -124,6 +129,7 @@ from messagefoundry.redaction import safe_exc
 
 __all__ = [
     "SandboxMode",
+    "KillCause",
     "SandboxError",
     "SandboxCodecError",
     "SandboxPolicy",
@@ -176,6 +182,98 @@ class SandboxMode(str, enum.Enum):  # noqa: UP042
     # check that means "runs in a worker" is `is not SandboxMode.OFF`, so this mode can never take an
     # in-process branch that only SUBPROCESS was excluded from (vault BACKLOG #3131).
     ISOLATED = "isolated"
+
+
+class KillCause(str, enum.Enum):  # noqa: UP042
+    """Why a :class:`SandboxSession` killed its worker: a closed set (vault BACKLOG #3135).
+
+    A session records each kill: the last cause in :attr:`SandboxSession.last_kill_cause` and a
+    count per cause in :attr:`SandboxSession.kill_counts`. Every kill but :attr:`GRAPH_MISMATCH`
+    and :attr:`SHUTDOWN` writes one WARNING naming the inbound, the phase of the dispatch that
+    killed the worker and this token, never any message content or exception text. The phase is the
+    dispatch running when the kill happened, which for :attr:`UNSOLICITED_BEFORE` is not
+    necessarily the code that wrote the frame. The kill's reap can write more lines, at least
+    those :func:`_reap_process_tree` and :mod:`messagefoundry.proctree` write when a signal fails or
+    the worker was already reaped.
+
+    A reap that is not a kill records nothing, and writes no kill line. At least these are such
+    reaps: closing a session whose worker is gone, the prior generation's reap at the top of a
+    spawn (a worker that died between dispatches on its own), and the reap after a queued EOF from
+    a worker that has exited, which only says the peer died, the check after an answer included
+    unless the answer announced the exit (:attr:`MEMORY_CAP`). A worker that exits right after its
+    boot is the exception, recorded as :attr:`EXITED_AFTER_BOOT`, because a
+    feed whose workers keep doing so is a crash loop, not a peer that happened to die.
+
+    There is no CPU-cap cause: the engine sets no ``RLIMIT_CPU`` (engine PR 2133), and the wall
+    cap is the bound. A request the codec cannot encode, or one over the frame cap, is refused before a
+    byte is written and kills nothing, so it has no cause either."""
+
+    #: The worker answered that it ran out of memory and exits, so it is reaped (vault BACKLOG #3133).
+    MEMORY_CAP = "memory_cap"
+    #: The worker loaded a graph that differs from the engine's. No WARNING here: the runner logs
+    #: and raises the ``sandbox_worker_refused`` alert for a refusal against the graph it serves. A
+    #: refusal against a graph a reload has since replaced gets neither, and this record does not
+    #: outlast it: the reload discards this session. That kill then writes no line of its own,
+    #: though its reap can (see :func:`_reap_process_tree`); only the refused dispatch's own error
+    #: reaches the runner's internal-error policy.
+    GRAPH_MISMATCH = "graph_mismatch"
+    #: The boot frame could not be written to the new worker.
+    BOOT_WRITE = "boot_write"
+    #: The worker did not answer its boot frame within ``startup_seconds``.
+    STARTUP_TIMEOUT = "startup_timeout"
+    #: The worker exited before it answered its boot frame.
+    BOOT_EXIT = "boot_exit"
+    #: A worker spawned for this dispatch answered its boot frame, then exited before its request
+    #: was written. Recorded as it is reaped, so a worker that keeps dying at start leaves a cause.
+    EXITED_AFTER_BOOT = "exited_after_boot"
+    #: The worker's boot reply was not a valid frame.
+    BOOT_REPLY_REJECTED = "boot_reply_rejected"
+    #: The worker reported that its bootstrap failed.
+    BOOT_FAILED = "boot_failed"
+    #: The request frame could not be written: a broken pipe or a partial write.
+    REQUEST_WRITE = "request_write"
+    #: The dispatch ran past ``wall_seconds``.
+    WALL_CAP = "wall_cap"
+    #: The dispatch ran past ``wall_seconds`` counting the lookups the engine served for it.
+    WALL_CAP_LOOKUPS = "wall_cap_lookups"
+    #: The worker exited while a dispatch was running.
+    CRASH = "crash"
+    #: The worker's answer was forged, desynchronized or out of sequence, or its length header
+    #: was over the frame cap.
+    INVALID_FRAME = "invalid_frame"
+    #: The engine itself failed while serving a brokered lookup (``mode=isolated``).
+    LOOKUP_FAULT = "lookup_fault"
+    #: The reply to a brokered lookup could not be written to the worker.
+    LOOKUP_REPLY_WRITE = "lookup_reply_write"
+    #: A frame no request asked for was waiting before a dispatch.
+    UNSOLICITED_BEFORE = "unsolicited_before"
+    #: A frame no request asked for was waiting after a dispatch's answer.
+    UNSOLICITED_AFTER = "unsolicited_after"
+    #: The worker closed its response pipe and was still running: EOF on fd 1 says every holder
+    #: closed it, not that the worker exited (see :func:`_eof_cause_within`).
+    STDOUT_CLOSED = "stdout_closed"
+    #: The session was closed with a live worker, at engine stop or when a reload replaced it. An
+    #: orderly stop, not a fault, so it logs at INFO rather than WARNING.
+    SHUTDOWN = "shutdown"
+
+
+#: The kill causes that write no WARNING of their own, because the runner already alerts on them.
+_RUNNER_ALERTED: Final = frozenset({KillCause.GRAPH_MISMATCH})
+
+#: A kill's line, and the line for a cause in :data:`_SELF_EXITS`.
+_KILL_LINE: Final = "inbound %r: sandbox worker killed during %s (cause=%s)"
+_SELF_EXIT_LINE: Final = "inbound %r: sandbox worker exited during %s (cause=%s)"
+#: The causes recorded only once the worker is seen to have exited, so its WARNING says it exited
+#: rather than that the engine killed it. The exit may still be a signal from outside the engine,
+#: such as the kernel's OOM killer. A crash or a boot exit is recorded only when the worker exits
+#: within the EOF grace (see :func:`_eof_cause_within`).
+_SELF_EXITS: Final = frozenset({KillCause.BOOT_EXIT, KillCause.EXITED_AFTER_BOOT, KillCause.CRASH})
+
+#: The cause of an unsolicited frame, by when it was found.
+_UNSOLICITED: Final = {
+    "before": KillCause.UNSOLICITED_BEFORE,
+    "after": KillCause.UNSOLICITED_AFTER,
+}
 
 
 @dataclass(frozen=True)
@@ -349,6 +447,24 @@ class _Eof:
 _EOF: Final = _Eof()
 
 
+class _Oversize:
+    """The sentinel the reader thread enqueues for a length header over the frame cap.
+
+    Like :data:`_EOF`, parent-private with no wire form, and the reader stops after it. Unlike
+    :data:`_EOF` it is not a dead peer: only a writer on fd 1 can produce the header, so the worker
+    may still be alive: a dispatch kills it as an invalid frame, a boot as a rejected boot reply,
+    and one queued between dispatches as an unsolicited write (vault BACKLOG #3135)."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return "<sandbox oversize frame>"
+
+
+_OVERSIZE: Final = _Oversize()
+_OVERSIZE_TEXT: Final = "its length is over the frame cap"
+
+
 # --- child stderr relay (BACKLOG #343, ADR 0176) ------------------------------
 
 #: One ``read(2)``. The child is spawned with ``bufsize=0``, so ``proc.stderr`` is RAW: this is the
@@ -506,6 +622,94 @@ class _StderrRelay:
         )
 
 
+#: How long a worker whose response pipe reached EOF gets to exit before it counts as still running.
+#: A BUDGET per dispatch, shared by every EOF the dispatch meets, not a wait per EOF: the wait runs
+#: under the session lock, and a dispatch can meet several EOFs (see
+#: :data:`_LIVE_WORKER_EOF_RESPAWNS`). Once it is spent, a worker not already exited counts as
+#: still running, but for :data:`_EOF_EXIT_FLOOR_SECONDS`.
+_EOF_EXIT_GRACE_SECONDS: Final = 0.5
+_EOF_EXIT_POLL_SECONDS: Final = 0.02
+#: The wait every EOF gets even once the budget is spent: a dying worker closes its fds before it
+#: is a zombie, so a lone instant check can land in that tail and read a crash as a closed pipe. A
+#: dispatch meets at most a handful of EOFs, so its total wait stays bounded.
+_EOF_EXIT_FLOOR_SECONDS: Final = 0.1
+
+#: How many times :meth:`SandboxSession._live_worker` respawns after a leftover EOF before it
+#: fails the call.
+_LIVE_WORKER_EOF_RESPAWNS: Final = 2
+
+
+def _has_exited(proc: subprocess.Popen[bytes]) -> bool:
+    """Whether ``proc`` has exited, WITHOUT reaping it on POSIX.
+
+    ``Popen.poll`` and ``wait`` reap an exited child. :func:`_reap_process_tree` would then take
+    its already-reaped path, :func:`proctree.kill_reaped_leader_group`. That still reaches a group
+    with a member left, since POSIX does not reuse the pid while the group has one, but once the
+    group is empty and the pid reused it signals nothing and writes a WARNING. ``WNOWAIT`` leaves
+    the zombie in place, holding the pid, so the reap takes the ordinary path,
+    :func:`proctree.kill_process_group`, which reads the zombie's group by its pid. Linux allows
+    that read; whether every other POSIX kernel does is not measured here. Windows has no such
+    state to lose."""
+    if sys.platform == "win32":
+        return proc.poll() is not None
+    return _posix_child_state(proc) != "running"
+
+
+def _posix_child_state(proc: subprocess.Popen[bytes]) -> Literal["running", "zombie", "reaped"]:
+    """``proc``'s state on POSIX, read with ``WNOWAIT`` so a zombie stays in place: ``running``,
+    ``zombie`` (exited, and nobody has reaped it), or ``reaped``. A reap through ``Popen`` sets
+    ``returncode``. A reap by anything else makes ``waitid`` raise ``ChildProcessError`` only while
+    the pid names no child of this engine. Once such a reap is done and the worker's group and
+    session have no member left, the pid is free, and the kernel may give it to a later child of
+    this engine. At least a targeted ``waitpid`` on the worker's pid, any wait for any child
+    (``os.wait``, ``waitpid(-1)``), and an ignored ``SIGCHLD`` are such reaps. The engine makes
+    none of them on its own; code loaded into its process could, and once one misread has
+    happened, the wait in :meth:`SandboxSession._reap` below is one too. ``waitid`` then reads that
+    later child, and this returns its state as the worker's, ``running`` or ``zombie``.
+
+    Every caller then takes that child for the worker. :func:`_reap_process_tree` signals it: its
+    whole process group when it leads one, which another sandbox worker does, so the reap can kill
+    another worker's group; otherwise the single-process fallback signals that one process, or
+    reaps it if it has exited. :meth:`SandboxSession._reap` then waits on the pid and so can reap
+    that child, taking its exit status from its own session. While that child is running,
+    :func:`_has_exited`'s callers read a live worker where there is none, so at least a kill can
+    be recorded under the wrong cause, or a shutdown kill recorded where only a reap was due."""
+    if sys.platform == "win32":  # pragma: no cover - every caller returns first there
+        raise AssertionError("_posix_child_state is POSIX only")
+    if proc.returncode is not None:
+        return "reaped"
+    try:
+        exited = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except ChildProcessError:
+        return "reaped"  # by something other than Popen
+    return "running" if exited is None else "zombie"
+
+
+def _eof_cause_within(
+    proc: subprocess.Popen[bytes], exited: KillCause | None, grace: float
+) -> KillCause | None:
+    """The cause for a worker whose response pipe reached EOF: ``exited`` if it exits within
+    ``grace`` seconds, else :attr:`KillCause.STDOUT_CLOSED`.
+
+    EOF says every holder of fd 1 closed it, which a crash does and a running worker that closed
+    its own fd 1 also does. Only the exit tells the two apart, and a crashing worker's exit may
+    trail its pipe's close by a moment, hence the grace (vault BACKLOG #3135). The check never
+    reaps the worker (see :func:`_has_exited`)."""
+    deadline = time.monotonic() + grace
+    while not _has_exited(proc):
+        if time.monotonic() >= deadline:
+            return KillCause.STDOUT_CLOSED
+        time.sleep(_EOF_EXIT_POLL_SECONDS)
+    return exited
+
+
+def _unsolicited_error(when: str) -> SandboxError:
+    return SandboxError(
+        f"sandbox worker wrote an unsolicited response frame {when} a dispatch — "
+        "the pipe is not trustworthy"
+    )
+
+
 def _write_frame(stream: Any, body: bytes) -> None:
     """Write one length-prefixed frame body. Raises on an over-cap frame (fail-closed) or a broken
     pipe; the caller maps either to :class:`SandboxError`."""
@@ -542,18 +746,27 @@ def _read_exact(stream: Any, n: int) -> bytes | None:
 
 
 def _read_frame_bytes(stream: Any) -> bytes | None:
-    """Read one length-prefixed frame **body**, or ``None`` on EOF / a dead peer.
+    """Read one length-prefixed frame **body**, or ``None`` on EOF / a dead peer. The child's
+    reader; the parent's reader thread runs :func:`_read_frame_or_oversize` instead.
 
-    Deliberately does **no** decoding: on the parent this runs on the daemon reader thread, whose
+    Deliberately does **no** decoding, and neither does that one: the parent's reader thread's
     ``except`` catches only ``OSError`` — a rejection raised there would kill the reader silently and
     the dispatch would HANG to the wall cap instead of failing closed. Decoding happens on the
     dispatch thread, inside its existing ``try``."""
+    body = _read_frame_or_oversize(stream)
+    # A corrupt or hostile length reads as a dead peer here.
+    return None if isinstance(body, _Oversize) else body
+
+
+def _read_frame_or_oversize(stream: Any) -> bytes | _Oversize | None:
+    """:func:`_read_frame_bytes`, but a length header over the cap returns :data:`_OVERSIZE`
+    rather than ``None``, so the parent's reader can tell it from a closed pipe."""
     header = _read_exact(stream, _LEN.size)
     if header is None:
         return None
     (length,) = _LEN.unpack(header)
     if length > _MAX_FRAME:
-        return None  # a corrupt/hostile length — treat as a dead peer
+        return _OVERSIZE
     return _read_exact(stream, length)
 
 
@@ -591,18 +804,41 @@ def _assign_kill_on_close_job(proc: subprocess.Popen[bytes]) -> int | None:
     return proctree.kill_on_close_job(handle, who="sandbox")
 
 
-def _reap_process_tree(proc: subprocess.Popen[bytes], job: int | None) -> None:
-    """Kill the worker AND every process it spawned.
+def _reap_process_tree(proc: subprocess.Popen[bytes], job: int | None, inbound: str) -> None:
+    """Kill the worker AND every process it spawned, as far as can be done safely.
 
     Windows: terminate the kill-on-close job the worker was assigned to (falling back to a
     single-process kill when none was assigned). POSIX: ``SIGKILL`` the worker's own process group,
     which ``start_new_session=True`` made it the leader of — guarded on ``pgid == proc.pid`` so this
-    only ever signals the worker's own group and never the caller's (e.g. the engine/pytest group)."""
+    signals only the group ``proc.pid`` leads and never the caller's (e.g. the engine/pytest group).
+    That is the worker's own group unless the pid was freed by a reap elsewhere and reused, which
+    :func:`_posix_child_state` describes.
+
+    A POSIX worker that :func:`_posix_child_state` reads as already reaped is the exception (vault
+    BACKLOG #3135): its group is signalled only through :func:`proctree.kill_reaped_leader_group`,
+    which sends nothing when the pid may name another process now or the signal fails. Then a
+    WARNING names ``inbound``, and a process the worker started may survive. When the signal
+    failed, :mod:`messagefoundry.proctree` has already written its own line, which names the group
+    but not the inbound."""
     if sys.platform == "win32":
         if job is not None:
             proctree.terminate_job(job)
         else:
             _kill_single(proc)
+        return
+    if _posix_child_state(proc) == "reaped":
+        # Reaped by ``Popen``, by something else, or by the kernel under ``SIGCHLD`` set to
+        # ``SIG_IGN``. A running or zombie child's pid cannot have been given to another process,
+        # so only this state needs the reuse-safe signal, as far as the state check can tell; its
+        # pid-reuse limit is in :func:`_posix_child_state`. A zombie reaped between the state
+        # check and the signal is missed too: its group is not signalled, and nothing is logged.
+        if proctree.kill_reaped_leader_group(proc.pid) is None:
+            log.warning(
+                "inbound %r: sandbox worker pid %d was already reaped and its process group could "
+                "not be signalled safely, so a process the worker started may survive",
+                inbound,
+                proc.pid,
+            )
         return
     if not proctree.kill_process_group(proc.pid):
         _kill_single(proc)
@@ -618,8 +854,8 @@ class SandboxSessionClosed(SandboxError):
     and a router or transform worker may have resolved that session just before. An earlier dispatch
     on the same session may have run (``route_only`` runs the Router, then each ``accepts=``
     predicate), which is safe to repeat because Routers are pure. The runner retries on a fresh
-    session or re-pends the row, and never dead-letters it as a Router or Handler fault (vault
-    BACKLOG #2772)."""
+    session or re-pends the row, and never hands it to the ``[delivery] internal_error`` policy as
+    a Router or Handler fault (vault BACKLOG #2772)."""
 
 
 class SandboxWorkerRefused(SandboxError):
@@ -717,6 +953,14 @@ class SandboxSession:
         self._generation = 0
         self._lock = threading.Lock()
         self._closed = False
+        # Why this session last killed its worker, or ``None`` before the first kill, and how many
+        # kills it has made per cause (vault BACKLOG #3135). Nothing in the engine reads them yet:
+        # a per-lane kill budget would, and it is unbuilt.
+        self.last_kill_cause: KillCause | None = None
+        self.kill_counts: collections.Counter[KillCause] = collections.Counter()
+        # What is left of the current dispatch's EOF grace (see _EOF_EXIT_GRACE_SECONDS); each
+        # dispatch refills it.
+        self._eof_grace_left = _EOF_EXIT_GRACE_SECONDS
         # The [egress] lists whose empty-list refusal this session has logged.
         self._lookup_refusals_logged: set[str] = set()
         # Per (kind, connection), the completion event of the runner call running on it, removed by
@@ -730,13 +974,19 @@ class SandboxSession:
 
     # -- lifecycle ------------------------------------------------------------
 
-    def _spawn(self) -> None:
-        """Launch the child and complete its bootstrap (config load + guard install). Fail-closed."""
-        # Reap any prior generation FIRST. A worker that died on its own (the ``_live_worker`` respawn
-        # path) leaves its kill-on-close job handle in ``self._job``; overwriting it below without
-        # reaping would leak the handle and let that dead worker's orphaned grandchild tree survive.
-        # A no-op on the first spawn and whenever there is no live proc.
-        self._kill(self._proc)
+    def _spawn(self, phase: str = "spawn") -> None:
+        """Launch the child and complete its bootstrap (config load + guard install). Fail-closed.
+
+        ``phase`` is the dispatch phase the spawn serves, named in a kill's WARNING."""
+        # A spawn replaces only a worker that is gone. Reaping a live one here would be a kill with
+        # no cause and no line, so a second spawn over a running worker is refused instead.
+        if self._proc is not None and not _has_exited(self._proc):
+            raise SandboxError("sandbox worker is still running: a spawn replaces only a dead one")
+        # Reap the prior generation FIRST. A worker that died on its own (the ``_live_worker``
+        # respawn path) leaves its kill-on-close job handle in ``self._job``; overwriting it below
+        # without reaping would leak the handle and let that dead worker's orphaned grandchild tree
+        # survive. A no-op on the first spawn and whenever there is no proc.
+        self._reap(self._proc)
         engine_graph = self._graph() if self._graph is not None else None
         if self._refused is not None and self._refused[0] is engine_graph:
             raise SandboxWorkerRefused(
@@ -762,8 +1012,9 @@ class SandboxSession:
         )
         # The boot frame and the environment are built BEFORE the child exists, so a snapshot that
         # cannot be read (a session given none reads its directory here), a frame that cannot be
-        # encoded, or a pass_environment name the builder refuses leaves no live child, job handle
-        # or drain thread behind, and is a SandboxError like any other failed spawn.
+        # encoded or is over the frame cap, or a pass_environment name the builder refuses leaves no
+        # live child, job handle or drain thread behind, and is a SandboxError like any other failed
+        # spawn.
         try:
             boot = codec.encode_boot(
                 snapshot=self._config_snapshot(),
@@ -772,6 +1023,8 @@ class SandboxSession:
                 code_sets=self._code_sets,
                 broker=self.policy.mode is SandboxMode.ISOLATED,
             )
+            if len(boot) > _MAX_FRAME:
+                raise SandboxError(f"sandbox frame too large: {len(boot)} bytes")
             env = worker_environment(extra_names=self.policy.pass_environment, defaults=arena)
         except (OSError, ValueError, SandboxError) as exc:  # WiringError is a ValueError
             raise SandboxError(f"failed to bootstrap sandbox worker: {exc}") from exc
@@ -834,32 +1087,38 @@ class SandboxSession:
         try:
             _write_frame(proc.stdin, boot)
         except (OSError, SandboxError) as exc:
-            self._kill(proc)
+            self._kill(proc, KillCause.BOOT_WRITE, phase)
             raise SandboxError(f"failed to bootstrap sandbox worker: {exc}") from exc
         try:
             frame = self._responses.get(timeout=self.policy.startup_seconds)
         except queue.Empty:
-            self._kill(proc)
+            self._kill(proc, KillCause.STARTUP_TIMEOUT, phase)
             raise SandboxError(
                 f"sandbox worker did not start within {self.policy.startup_seconds}s"
             ) from None
         if frame is _EOF:
-            self._kill(proc)
+            cause = self._eof_kill_cause(proc, KillCause.BOOT_EXIT)
+            self._kill(proc, cause, phase)
+            if cause is KillCause.STDOUT_CLOSED:
+                raise SandboxError("sandbox worker closed its response pipe during bootstrap")
             raise SandboxError("sandbox worker exited during bootstrap")
         try:
+            if frame is _OVERSIZE:
+                raise SandboxCodecError(_OVERSIZE_TEXT)
             worker_graph, detail = codec.decode_boot_reply(frame)
         except SandboxError as exc:
-            self._kill(proc)
+            self._kill(proc, KillCause.BOOT_REPLY_REJECTED, phase)
             raise SandboxError(f"sandbox worker bootstrap frame was rejected: {exc}") from exc
         if worker_graph is None:
-            self._kill(proc)
+            self._kill(proc, KillCause.BOOT_FAILED, phase)
             raise SandboxError(f"sandbox worker bootstrap failed: {detail}")
         if engine_graph is not None:
             differing = graph_differences(engine_graph, worker_graph)
             if differing:
                 # FAIL CLOSED. A worker that loaded a different graph would answer for this inbound
-                # from that graph, and nothing in its answers would say so.
-                self._kill(proc)
+                # from that graph, and nothing in its answers would say so. No WARNING: the runner
+                # raises the sandbox_worker_refused alert for this refusal.
+                self._kill(proc, KillCause.GRAPH_MISMATCH, phase)
                 # Module bytes alone differ only when the worker read its modules: a worker that
                 # could not read them reports no digest, and that is not the same bytes.
                 content_only = worker_graph.code_digest is not None and all(
@@ -879,8 +1138,9 @@ class SandboxSession:
                     "among them, so config must read such a value under another name. Every "
                     "Router and Handler can read what is listed, so never list a secret."
                 )
-                # Short before the differences: a dead-lettered message keeps about the first 200
-                # characters of this, behind its stage prefix and the exception's type name.
+                # Short before the differences: a failed message's stored error keeps about the
+                # first 200 characters of this, behind its stage prefix and the exception's type
+                # name.
                 refusal = (
                     f"sandbox worker for inbound {self._inbound!r} refused: its graph differs from "
                     f"the engine's. {'. '.join(differing)}. {causes}"
@@ -904,19 +1164,66 @@ class SandboxSession:
 
     def _reader_loop(self, stdout: Any, sink: queue.Queue[Any]) -> None:
         """Drain the child's stdout into ``sink`` — **framing only**, never decoding (see
-        :func:`_read_frame_bytes`). Runs on a daemon thread; a fresh queue per spawn means a stale
+        :func:`_read_frame_or_oversize`). Runs on a daemon thread; a fresh queue per spawn means a stale
         reader's writes are harmlessly ignored."""
         try:
             while True:
-                body = _read_frame_bytes(stdout)
+                body = _read_frame_or_oversize(stdout)
                 if body is None:
                     sink.put(_EOF)
                     return
                 sink.put(body)
+                if body is _OVERSIZE:
+                    return  # the stream is out of step, so nothing after the header is a frame
         except OSError:
             sink.put(_EOF)
 
-    def _kill(self, proc: subprocess.Popen[bytes] | None) -> None:
+    def _kill(self, proc: subprocess.Popen[bytes] | None, cause: KillCause, phase: str) -> None:
+        """Kill ``proc`` for ``cause``: record the cause, write its WARNING, and reap the tree.
+
+        The WARNING is built from the inbound, ``phase`` and the cause token alone, never from a
+        message's content or an exception's text, which can carry it (CLAUDE.md section 9). A cause
+        in :data:`_RUNNER_ALERTED` writes none, and :attr:`KillCause.SHUTDOWN` writes it at INFO.
+        With no ``proc`` nothing is killed, so nothing is recorded. A reap that is not a kill calls
+        :meth:`_reap` instead."""
+        if proc is None:
+            return
+        self._record_kill(cause, phase)
+        self._reap(proc)
+
+    def _record_kill(self, cause: KillCause, phase: str) -> None:
+        """Record a kill's cause and write its line, as :meth:`_kill` describes."""
+        self.last_kill_cause = cause
+        self.kill_counts[cause] += 1
+        if cause not in _RUNNER_ALERTED:
+            log.log(
+                logging.INFO if cause is KillCause.SHUTDOWN else logging.WARNING,
+                _SELF_EXIT_LINE if cause in _SELF_EXITS else _KILL_LINE,
+                self._inbound,
+                phase,
+                cause.value,
+            )
+
+    def _eof_kill_cause(self, proc: subprocess.Popen[bytes], exited: KillCause) -> KillCause:
+        """:meth:`_eof_cause` for a worker whose exit is itself a kill, ``exited``."""
+        return self._eof_cause(proc, exited) or exited
+
+    def _eof_cause(
+        self, proc: subprocess.Popen[bytes], exited: KillCause | None
+    ) -> KillCause | None:
+        """:func:`_eof_cause_within`, waiting what is left of this dispatch's grace, or the floor
+        once that is spent, and spending what it waits from the grace."""
+        started = time.monotonic()
+        try:
+            grace = max(self._eof_grace_left, _EOF_EXIT_FLOOR_SECONDS)
+            return _eof_cause_within(proc, exited, grace)
+        finally:
+            spent = time.monotonic() - started
+            self._eof_grace_left = max(0.0, self._eof_grace_left - spent)
+
+    def _reap(self, proc: subprocess.Popen[bytes] | None) -> None:
+        """Reap ``proc``'s whole tree, recording no kill and writing no kill line (see
+        :class:`KillCause`). The tree reap itself can still log (see :func:`_reap_process_tree`)."""
         if proc is None:
             return
         # Reap the WHOLE tree, not just ``proc``: a grandchild the Handler spawned inherited fd 1 (the
@@ -930,7 +1237,7 @@ class SandboxSession:
         # closing a file object under a mid-read thread raises ``ValueError``, which is not what either
         # drain's ``except OSError`` catches, so it would escape into ``threading.excepthook``. The
         # shutdown-only bounded join lives in :meth:`close`.
-        _reap_process_tree(proc, self._job)
+        _reap_process_tree(proc, self._job, self._inbound)
         self._job = None
         try:  # noqa: SIM105
             proc.wait(timeout=5)
@@ -943,7 +1250,10 @@ class SandboxSession:
         """Stop the worker cleanly (idempotent). Safe to call from a shutdown path."""
         with self._lock:
             self._closed = True
-            self._kill(self._proc)
+            if self._proc is not None and _has_exited(self._proc):
+                self._reap(self._proc)  # it died on its own: nothing is killed here
+            else:
+                self._kill(self._proc, KillCause.SHUTDOWN, "close")
             for thread in self._threads:
                 # A bounded join, and ONLY on the shutdown path. The stderr relay LOGS, and a daemon
                 # thread that logs can still be inside a handler's ``emit`` when ``logging.shutdown``
@@ -957,16 +1267,28 @@ class SandboxSession:
                 thread.join(timeout=_STDERR_JOIN_SECONDS)
             self._threads = []
 
-    def _reject_unsolicited(self, proc: subprocess.Popen[bytes] | None, when: str) -> None:
+    def _reject_unsolicited(
+        self,
+        proc: subprocess.Popen[bytes] | None,
+        when: str,
+        phase: str,
+        *,
+        announced_exit: KillCause | None = None,
+    ) -> None:
         """Drop the worker if anything is pending that no outstanding request asked for.
 
         The protocol is strictly one request, one frame, so a FRAME queued **before** a dispatch or
         left over **after** its answer was written by something other than the call we made — a
         Handler writing straight to fd 1, or a grandchild that inherited it while the worker was
         alive. Letting such a frame sit in the queue is the whole exploit: the next dispatch would
-        take it as its own answer. Drop the
-        worker and dead-letter the message in hand; :meth:`_kill` then reaps that grandchild along
-        with the rest of the worker's tree, so it cannot keep writing to the pipe.
+        take it as its own answer. Drop the worker, and :meth:`_kill` reaps that grandchild along
+        with the rest of the worker's tree, so it cannot keep writing to the pipe. A frame found
+        **after** an answer fails the call of the message in hand, whose answer it makes untrustworthy.
+        A frame found **before** a request is a different case since the owner's ruling of
+        2026-11-09 (vault BACKLOG #3135 step 4): that message never reached the worker, so
+        :meth:`_live_worker` retries it once on a fresh worker rather than raise; ADR 0187
+        *Amendment B* lists at least the cases in which its call still fails. The frame never answers
+        anything: the fresh worker has a fresh queue (see :meth:`_spawn`).
 
         **The justification is the protocol violation, NOT a claim that fd 1 is unreachable.** An
         earlier version of this docstring said the ADR 0176 stdout rebind meant "the text layer cannot
@@ -987,39 +1309,105 @@ class SandboxSession:
 
         :data:`_EOF` is the opposite case and must NOT be treated the same way. It is a parent-private
         singleton with no wire form (see :class:`_Eof`), so a worker cannot manufacture one — it
-        carries no trust information at all, only "the peer is gone". Dead-lettering on it would fail
-        closed against a signal that proves nothing: a child that crashes in the instant *after*
-        writing a correct, correlation-proven answer would lose a message it had already answered, and
-        a child that died between dispatches would lose the next one instead of respawning
-        transparently. Reap it and let the caller carry on."""
+        carries no trust information at all, only "the peer is gone". Failing the call on it would be
+        failing closed on a signal that proves nothing: a child that crashes in the instant *after*
+        writing a correct, correlation-proven answer would fail a message it had already answered, and
+        a child that died between dispatches would fail the next one instead of respawning
+        transparently. Reap it and let the caller carry on.
+
+        ``announced_exit`` is :meth:`_drop_unsolicited`'s."""
+        if self._drop_unsolicited(proc, when, phase, announced_exit=announced_exit):
+            raise _unsolicited_error(when)
+
+    def _drop_unsolicited(
+        self,
+        proc: subprocess.Popen[bytes] | None,
+        when: str,
+        phase: str,
+        *,
+        exited: KillCause | None = None,
+        announced_exit: KillCause | None = None,
+    ) -> bool:
+        """:meth:`_reject_unsolicited`'s check without the raise: True when a stray FRAME, or an
+        over-cap length header, killed the worker. False when nothing was waiting or a queued EOF
+        was found, which reaps the worker and may also record a kill, as below, so a False return
+        does not say that nothing was recorded.
+
+        A queued EOF is a kill as :attr:`KillCause.STDOUT_CLOSED` if the worker is still running
+        once the grace is spent. If it has exited, it is recorded as ``exited``, or not at all when
+        that is ``None``. ``announced_exit`` is for a worker that announced its own exit: its EOF
+        is recorded as that cause with no grace, so a slow exit cannot hide it behind
+        :attr:`KillCause.STDOUT_CLOSED`."""
         try:
             stray = self._responses.get_nowait()
         except queue.Empty:
-            return
-        self._kill(proc)
+            return False
         if stray is _EOF:
-            return
-        raise SandboxError(
-            f"sandbox worker wrote an unsolicited response frame {when} a dispatch — "
-            "the pipe is not trustworthy"
-        )
+            if proc is None:
+                cause = None
+            elif announced_exit is not None:
+                cause = announced_exit
+            else:
+                cause = self._eof_cause(proc, exited)
+            if cause is None:
+                self._reap(proc)  # the peer is already gone
+            else:
+                self._kill(proc, cause, phase)
+            return False
+        # A stray FRAME, or an over-cap length header, which only a writer on fd 1 produces either.
+        self._kill(proc, _UNSOLICITED[when], phase)
+        return True
 
-    def _live_worker(self) -> subprocess.Popen[bytes]:
+    def _live_worker(self, phase: str) -> subprocess.Popen[bytes]:
         """The session's worker — spawned or respawned as needed — on a pipe nothing is waiting on.
 
         The unsolicited check runs **after** the liveness check, not before: a killed worker's queue is
         discarded wholesale by :meth:`_spawn`, so its leftovers are neither reachable nor evidence
-        about the *new* child. Only a REUSED worker can hand us a leftover, and only there is one worth
-        judging. A leftover EOF reaps it (see :meth:`_reject_unsolicited`), so spawn once more rather
-        than dead-letter this message on a peer that merely died."""
-        if self._proc is None or self._proc.poll() is not None:
-            self._spawn()
-        self._reject_unsolicited(self._proc, "before")
-        if self._proc is None:
-            self._spawn()
-        proc = self._proc
-        assert proc is not None
-        return proc
+        about the *new* child. The check runs on every worker, a fresh one included, which can have
+        written a stray frame or exited between its boot reply and this check. A leftover EOF
+        reaps it (see :meth:`_reject_unsolicited`), so spawn once more rather
+        than fail this message's call on a peer that merely died.
+
+        A leftover FRAME kills the worker, and this message, which never reached it, is retried
+        once on a fresh worker (owner ruling 2026-11-09, vault BACKLOG #3135 step 4). Every fresh
+        worker is checked the same way, the one spawned after a leftover EOF included, and a second
+        stray frame raises, so the retry happens at most once per dispatch. The spawns are bounded
+        too: a worker that keeps exiting, or closing its pipe, before its request fails the call.
+        ADR 0187 *Amendment B* lists at least the cases in which such a message's call fails.
+
+        A worker spawned here and found exited by this check is recorded as
+        :attr:`KillCause.EXITED_AFTER_BOOT`, whether or not its EOF has reached the queue: the
+        check asks the process too. It cannot see an exit that comes after it, so a worker that
+        exits as its request is written is recorded under another cause, such as
+        :attr:`KillCause.REQUEST_WRITE` or :attr:`KillCause.CRASH`, and that message's call fails.
+
+        Liveness is read with :func:`_has_exited`, which leaves a dead worker unreaped so the
+        respawn's reap takes the ordinary group kill (see :func:`_has_exited`)."""
+        stray_seen = False
+        eof_respawns = 0
+        while True:
+            fresh = self._proc is None or _has_exited(self._proc)
+            if fresh:
+                self._spawn(phase)
+            exited = KillCause.EXITED_AFTER_BOOT if fresh else None
+            if self._drop_unsolicited(self._proc, "before", phase, exited=exited):
+                if stray_seen:
+                    raise _unsolicited_error("before")
+                stray_seen = True
+                continue
+            proc = self._proc
+            if proc is not None:
+                # The queue says nothing about a fresh worker whose exit the reader has not yet
+                # queued as an EOF, so ask the process itself, without reaping it.
+                if not (fresh and _has_exited(proc)):
+                    return proc
+                self._kill(proc, KillCause.EXITED_AFTER_BOOT, phase)
+            eof_respawns += 1
+            if eof_respawns > _LIVE_WORKER_EOF_RESPAWNS:
+                raise SandboxError(
+                    f"sandbox worker for inbound {self._inbound!r} kept exiting, or closing its "
+                    f"pipe, before its request: {eof_respawns} workers in a row"
+                )
 
     # -- the lookup broker (mode=isolated, ADR 0147) ----------------------------
 
@@ -1043,18 +1431,24 @@ class SandboxSession:
             except queue.Empty:
                 # Wall cap exceeded — the authoritative resource bound on every platform. Kill the
                 # runaway child (a busy-loop can't wedge intake) and fail closed.
-                self._kill(proc)
+                self._kill(proc, KillCause.WALL_CAP, phase)
                 raise SandboxError(
                     f"sandbox {phase} {name!r} exceeded the {self.policy.wall_seconds}s wall cap"
                 ) from None
             if frame is _EOF:
-                self._kill(proc)
+                cause = self._eof_kill_cause(proc, KillCause.CRASH)
+                self._kill(proc, cause, phase)
                 served = expected_seq - 1
                 after = f", after {served} brokered lookup(s)" if served else ""
-                raise SandboxError(f"sandbox worker crashed while running {phase} {name!r}{after}")
+                what = "closed its response pipe" if cause is KillCause.STDOUT_CLOSED else "crashed"
+                raise SandboxError(f"sandbox worker {what} while running {phase} {name!r}{after}")
             try:
                 # Decoding happens HERE, on the dispatch thread, inside this try — not on the daemon
                 # reader thread, where a rejection would be a silent reader death and a wall-cap hang.
+                # Only a writer on fd 1 produces an over-cap header, so the worker may be alive:
+                # an invalid frame, not a crash.
+                if frame is _OVERSIZE:
+                    raise SandboxCodecError(_OVERSIZE_TEXT)
                 answer = (
                     codec.decode_answer(frame, request_id=request_id, phase=phase, name=name)
                     if brokered
@@ -1067,7 +1461,7 @@ class SandboxSession:
             except SandboxError as exc:
                 # A desynchronized or forged frame: the worker's stream can no longer be trusted to
                 # line up with our requests, so drop it and respawn on the next message.
-                self._kill(proc)
+                self._kill(proc, KillCause.INVALID_FRAME, phase)
                 raise SandboxError(
                     f"sandbox {phase} {name!r} returned an invalid frame: {exc}"
                 ) from exc
@@ -1075,7 +1469,7 @@ class SandboxSession:
                 return answer
             expected_seq += 1
             if not self._serve_bounded(proc, request_id, phase, name, answer, deadline):
-                self._kill(proc)
+                self._kill(proc, KillCause.WALL_CAP_LOOKUPS, phase)
                 raise SandboxError(
                     f"sandbox {phase} {name!r} exceeded the {self.policy.wall_seconds}s wall cap, "
                     "which counts the lookups the engine served for it"
@@ -1157,13 +1551,13 @@ class SandboxSession:
             abandoned.set()
             return False
         if fault:
-            self._kill(proc)
+            self._kill(proc, KillCause.LOOKUP_FAULT, phase)
             raise SandboxError(
                 f"sandbox {phase} {name!r} failed while serving its worker's lookup: an "
                 "unexpected engine error, logged by type"
             )
         if failure:
-            self._kill(proc)
+            self._kill(proc, KillCause.LOOKUP_REPLY_WRITE, phase)
             raise SandboxError(f"could not answer the sandbox worker's lookup: {failure[0]}")
         return True
 
@@ -1270,7 +1664,8 @@ class SandboxSession:
     def _busy_refusal(lookup: codec.LookupRequest) -> str:
         fn = _LOOKUP_FN[lookup.kind]
         return (
-            # Short, scope first: a dead-letter keeps about the first 200 characters of this.
+            # Short, scope first: a failed message's stored error keeps about the first 200
+            # characters of this.
             f"{fn}({_shown_name(lookup.connection)!r}) refused: this inbound's sandbox session "
             "runs one lookup per connection, and one the wall cap cut off is still running "
             "(ADR 0147)"
@@ -1334,45 +1729,63 @@ class SandboxSession:
         isolation fault (crash / timeout / denial / codec rejection) raises :class:`SandboxError`;
         a plain, still-alive worker survives a *denied* call so the next message reuses it. The one
         thing it does **not** survive is writing a frame nobody asked for
-        (see :meth:`_reject_unsolicited`) — that is a lost worker and a dead-lettered message."""
+        (see :meth:`_reject_unsolicited`) — that is a lost worker, and a failed call when the
+        frame is found after its answer; one waiting before the request is retried once instead."""
         with self._lock:
             if self._closed:
                 raise SandboxSessionClosed("sandbox session is closed")
-            proc = self._live_worker()
-            assert proc.stdin is not None
             # A FRESH unpredictable id per dispatch, not a counter: the worker learns it only when it
-            # reads this request frame, which the check above proves is the first thing it can answer.
-            # A derivable id (a per-spawn nonce plus a sequence) let the code running dispatch N
-            # compute N+1's and pre-stage its answer.
+            # reads this request frame, so nothing it ran before can know it. A derivable id (a
+            # per-spawn nonce plus a sequence) let the code running dispatch N compute N+1's and
+            # pre-stage its answer.
             request_id = secrets.token_hex(16)
+            self._eof_grace_left = _EOF_EXIT_GRACE_SECONDS
+            # Resolved FIRST, so a session with a cached graph refusal refuses at once rather than
+            # encode each message (a reference view can be large) only to refuse it.
+            proc = self._live_worker(phase)
+            assert proc.stdin is not None
+            # Encoded and size-checked outside the write's try: a payload or run-context outside the
+            # closed grammar, or a frame over the cap, is refused with no byte written, so the worker
+            # is still in step and is kept (vault BACKLOG #3135). Only this message fails. An OSError
+            # raised while encoding is wrapped the same way: it, too, comes before any byte is
+            # written, and an unwrapped one would escape this method's SandboxError contract.
             try:
-                _write_frame(
-                    proc.stdin,
-                    codec.encode_request(
-                        request_id=request_id,
-                        phase=phase,
-                        name=name,
-                        payload=payload,
-                        origin=origin,
-                        run_context=run_context,
-                    ),
+                request = codec.encode_request(
+                    request_id=request_id,
+                    phase=phase,
+                    name=name,
+                    payload=payload,
+                    origin=origin,
+                    run_context=run_context,
                 )
+                if len(request) > _MAX_FRAME:
+                    raise SandboxError(f"sandbox frame too large: {len(request)} bytes")
             except (OSError, SandboxError) as exc:
-                # A payload/run-context outside the closed grammar, or a broken pipe: fail closed and
-                # reset the worker.
-                self._kill(proc)
                 raise SandboxError(f"failed to marshal sandbox {phase} {name!r}: {exc}") from exc
+            try:
+                _write_frame(proc.stdin, request)
+            except (OSError, SandboxError) as exc:
+                # A broken pipe or a partial write: the worker may hold part of a frame, so fail
+                # closed and reset it.
+                self._kill(proc, KillCause.REQUEST_WRITE, phase)
+                raise SandboxError(f"failed to send sandbox {phase} {name!r}: {exc}") from exc
             resp = self._await_answer(proc, request_id, phase, name)
             # One request, one frame: a second FRAME already queued means the worker is writing frames
             # nobody asked for, so this answer is not trustworthy either. (A queued EOF is only a dead
-            # peer — it reaps the worker and leaves this proven answer standing.)
-            self._reject_unsolicited(proc, "after")
+            # peer — it reaps the worker and leaves this proven answer standing.) A worker that
+            # answered with the memory cap exits after that reply, so its EOF is the memory cap
+            # whenever it lands, never a closed pipe (vault BACKLOG #3135).
+            memory = not resp.ok and resp.kind == codec.FAIL_MEMORY
+            self._reject_unsolicited(
+                proc, "after", phase, announced_exit=KillCause.MEMORY_CAP if memory else None
+            )
             if not resp.ok:
-                if resp.kind == codec.FAIL_MEMORY:
-                    # The worker exits after this reply. Reap it now, so the next dispatch starts a
-                    # fresh one rather than writing to a worker on its way out (vault BACKLOG #3133).
+                if memory:
+                    # Reap it now, so the next dispatch starts a fresh one rather than writing to a
+                    # worker on its way out (vault BACKLOG #3133), unless its EOF was already queued
+                    # and the check above killed it for this cause, so one death counts once.
                     if proc is self._proc:
-                        self._kill(proc)
+                        self._kill(proc, KillCause.MEMORY_CAP, phase)
                     # The worker's text names the cap it set, or says it set none.
                     raise SandboxError(
                         f"sandbox {phase} {name!r} ran out of memory, and its worker was "

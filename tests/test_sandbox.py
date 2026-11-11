@@ -12,11 +12,14 @@ answer a later dispatch, and the engine's code-set tables — not the child's ow
 
 from __future__ import annotations
 
+import dataclasses
+import io
 import logging
 import math
 import os
 import queue
 import signal
+import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -26,6 +29,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry import proctree
 from messagefoundry.config.code_sets import CodeSet
 from messagefoundry.config.response import CapturedResponse
 from messagefoundry.config.run_context import RunContext, run_contexts
@@ -43,13 +47,18 @@ from messagefoundry.pipeline._sandbox_codec import (
 from messagefoundry.pipeline.dryrun import route_only, transform_one
 from messagefoundry.pipeline.sandbox import (
     _EOF,
+    _OVERSIZE,
+    KillCause,
     SandboxError,
     SandboxMode,
     SandboxPolicy,
     SandboxSession,
+    SandboxWorkerRefused,
     _StderrRelay,
+    graph_shape,
 )
 from messagefoundry.store.store import MessageStore
+from tests._log_absence import assert_capture_sees
 from tests.test_db_lookup import sandbox_run_one  # noqa: F401 - a fixture
 
 # A minimal, conformant synthetic ADT^A01 (no PHI — fabricated ids/names).
@@ -151,6 +160,16 @@ def h_forge(msg):
         request_id="guess:1", phase="transform", name="h_ok", result=Send("OB_T", "FORGED")
     )
     os.write(1, len(frame).to_bytes(4, "big") + frame)
+    return Send("OB_T", "REAL")
+
+
+@handler("h_oversize")
+def h_oversize(msg):
+    # Write a length header over the frame cap straight onto fd 1, then answer normally. The
+    # worker stays alive: only its stream is out of step (vault BACKLOG #3135).
+    import os
+
+    os.write(1, (0xFFFFFFFF).to_bytes(4, "big"))
     return Send("OB_T", "REAL")
 
 
@@ -339,6 +358,7 @@ def test_busy_loop_is_wall_capped_and_recovers(graph: tuple[Registry, str]) -> N
         elapsed = time.monotonic() - started
         # Capped near the wall bound (not hung indefinitely) — the parent killed the runaway child.
         assert elapsed < 10.0
+        assert session.last_kill_cause is sandbox_mod.KillCause.WALL_CAP
         # A fresh child respawns transparently for the next message (intake was never wedged).
         assert (
             _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())[0][0] == "OB_T"
@@ -684,6 +704,7 @@ def test_a_memory_error_is_reported_as_the_memory_cap_and_recycles_the_worker(
         with pytest.raises(SandboxError, match="ran out of memory, and its worker was recycled"):
             _deliveries(registry, "h_oom", sandbox=session, run_context=RunContext())
         assert session._proc is None
+        assert session.kill_counts == {sandbox_mod.KillCause.MEMORY_CAP: 1}
         assert _deliveries(
             registry, "h_ok", sandbox=session, run_context=RunContext()
         ) == _deliveries(registry, "h_ok")
@@ -829,12 +850,12 @@ def _session(
 ) -> SandboxSession:
     # The default lives in this TEST helper only, never in the production constructor, where a default
     # would silently reinstate the unattributable relay ADR 0176 exists to close.
+    kw.setdefault("graph", None)
     return SandboxSession(
         policy or SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=15.0),
         inbound=inbound,
         config_dir=config_dir,
         env=None,
-        graph=None,
         **kw,  # type: ignore[arg-type]
     )
 
@@ -987,7 +1008,11 @@ def test_a_frame_staged_between_dispatches_can_never_answer_the_next_one(
     delivery silently replaced by attacker-chosen content on a message it never saw, with no ERROR and
     no disposition anomaly. Two things close it, and this test proves both: the id is now a fresh
     ``secrets`` token the worker only learns from the request itself, and a frame queued before a
-    dispatch is fatal to the worker rather than consumed."""
+    dispatch is fatal to the worker rather than consumed.
+
+    Since the owner's ruling of 2026-11-09 (vault BACKLOG #3135 step 4) the victim message is
+    retried once on a fresh worker rather than dead-lettered, so this pins that the retry is served
+    by a NEW worker with a NEW queue, and that the staged frame answers nothing."""
     registry, config_dir = graph
     session = _session(config_dir)
     try:
@@ -995,14 +1020,23 @@ def test_a_frame_staged_between_dispatches_can_never_answer_the_next_one(
         assert _deliveries(registry, "h_late_forge", sandbox=session, run_context=RunContext()) == [
             ("OB_T", "REAL")
         ]
-        time.sleep(2.5)  # let the staged frame land in the parent's queue
-        # The next dispatch refuses to run against a pipe that already has a frame on it.
-        with pytest.raises(SandboxError, match="unsolicited"):
-            _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
-        # ...and the victim message is never delivered attacker-chosen content: a clean child answers.
-        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == (
-            _deliveries(registry, "h_ok")
-        )
+        forger = session._proc
+        assert forger is not None
+        assert _await(lambda: not session._responses.empty(), 10.0), "the frame was never staged"
+        stale_queue = session._responses
+        generation = session._generation
+        # The next dispatch refuses the pipe that already has a frame on it, kills that worker, and
+        # runs the message on a fresh one: the honest answer, never the staged FORGED one.
+        delivered = _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        assert delivered == _deliveries(registry, "h_ok")
+        assert ("OB_T", "FORGED") not in delivered
+        assert forger.poll() is not None  # the forging worker was killed
+        assert session._proc is not forger
+        assert session._generation == generation + 1  # exactly one fresh worker: one retry
+        # _spawn discarded the old queue: the retry read from a new one, and the stale frame was
+        # taken out of the old one by the check rather than read as an answer.
+        assert session._responses is not stale_queue
+        assert session.last_kill_cause is KillCause.UNSOLICITED_BEFORE
     finally:
         session.close()
 
@@ -1023,8 +1057,12 @@ def test_a_dead_peer_is_not_treated_as_a_forged_frame(graph: tuple[Registry, str
         assert proc is not None
 
         # A dead peer: the worker is dropped (it is gone), but the answer in hand still stands.
+        # Dead for real first: an EOF queued from a RUNNING worker is a recorded kill instead (see
+        # test_a_queued_eof_from_a_running_worker_is_a_recorded_kill).
+        proc.kill()
+        _wait_exited(proc)
         session._responses.put(_EOF)
-        session._reject_unsolicited(proc, "after")  # must NOT raise
+        session._reject_unsolicited(proc, "after", "transform")  # must NOT raise
         assert session._proc is None
 
         # A frame in the very same slot is still fatal, and still named as unsolicited.
@@ -1038,7 +1076,7 @@ def test_a_dead_peer_is_not_treated_as_a_forged_frame(graph: tuple[Registry, str
         session._responses = queue.Queue()
         session._responses.put(b"\x00\x00\x00\x02{}")
         with pytest.raises(SandboxError, match="unsolicited"):
-            session._reject_unsolicited(session._proc, "after")
+            session._reject_unsolicited(session._proc, "after", "transform")
 
         # Either way the next message is served by a clean child, identically to mode=off.
         assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == expected
@@ -1228,7 +1266,7 @@ def test_an_unreloaded_codeset_edit_does_not_brick_the_inbound(tmp_path: Path) -
         (tmp_path / "codesets" / "cs.csv").write_text(
             "key,value\nA,EDITED_ON_DISK\n", encoding="utf-8"
         )
-        session._kill(session._proc)  # exactly what a wall-cap kill or a crash does
+        session._reap(session._proc)  # exactly what a wall-cap kill or a crash does
 
         second, _, _, _ = transform_one(registry, "h", RAW, sandbox=session, run_context=rc)
     finally:
@@ -1410,6 +1448,17 @@ def _best_effort_kill_pid(pid: int) -> None:
         pass
 
 
+def _wait_exited(proc: Any) -> None:
+    """Wait for ``proc`` to exit WITHOUT reaping it on POSIX, as the session's own check reads it.
+    Reaping it here would send the session's reap down its already-reaped path,
+    ``proctree.kill_reaped_leader_group``. That signals the same group while it has a member, but
+    once the group is empty and the pid reused it writes a WARNING these tests do not expect."""
+    deadline = time.monotonic() + 10.0
+    while not sandbox_mod._has_exited(proc):
+        assert time.monotonic() < deadline, "the worker did not exit"
+        time.sleep(0.01)
+
+
 def test_worker_kill_reaps_the_whole_process_tree(tmp_path: Path) -> None:
     """Killing the worker must take down the WHOLE tree, not just the immediate child.
 
@@ -1461,7 +1510,7 @@ def test_worker_kill_reaps_the_whole_process_tree(tmp_path: Path) -> None:
         responses = session._responses  # capture THIS generation's queue before the kill
 
         # The single funnel for a wall-cap kill / crash cleanup / shutdown.
-        session._kill(proc)
+        session._reap(proc)
 
         # PRIMARY: the response pipe reaches EOF only once EVERY holder of fd 1 is gone — the worker
         # AND the grandchild. The reader thread enqueues `_EOF` at that point.
@@ -1737,7 +1786,7 @@ def test_the_relay_thread_ends_when_the_worker_tree_is_reaped(tmp_path: Path) ->
         assert relay.name == "mf-sandbox-stderr-IB_ORPH-1", relay.name
         assert relay.is_alive()
 
-        session._kill(session._proc)
+        session._reap(session._proc)
         assert _await(lambda: not relay.is_alive()), (
             "the stderr relay thread outlived the worker tree reap -- fd 2 never reached EOF"
         )
@@ -1765,7 +1814,7 @@ def test_notices_carry_a_generation_so_a_recycled_pid_cannot_confuse_two_workers
     try:
         _deliveries(registry, "h_ctrl", sandbox=session, run_context=RunContext())
         assert _await(lambda: len(_notices(caplog)) >= 1)
-        session._kill(session._proc)  # forces a fresh generation on the next dispatch
+        session._reap(session._proc)  # forces a fresh generation on the next dispatch
         _deliveries(registry, "h_ctrl", sandbox=session, run_context=RunContext())
         assert _await(lambda: len(_notices(caplog)) >= 2)
     finally:
@@ -1924,3 +1973,754 @@ def test_the_sandbox_mode_default_is_off_and_lives_in_exactly_one_place() -> Non
     assert SandboxSettings(mode="subprocess").mode == "subprocess"
     assert SandboxPolicy(mode=SandboxMode.SUBPROCESS).mode is SandboxMode.SUBPROCESS
     assert SandboxPolicy(mode=SandboxMode.OFF).mode is SandboxMode.OFF
+
+
+# --- kill causes (vault BACKLOG #3135) ---------------------------------------
+
+
+def _kill_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r for r in caplog.records if r.name == sandbox_mod.log.name and "(cause=" in r.getMessage()
+    ]
+
+
+def test_a_forged_frame_kill_records_its_cause_and_warns_without_content(
+    graph: tuple[Registry, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Steps 1 and 2: the kill records a cause from the closed set and writes one WARNING built
+    from the inbound, the phase and the cause token. That no error text reaches it is pinned with a
+    positive control in the request-write test below."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
+    try:
+        assert session.last_kill_cause is None
+        with pytest.raises(SandboxError, match="invalid frame"):
+            _deliveries(registry, "h_forge", sandbox=session, run_context=RunContext())
+        assert session.last_kill_cause is KillCause.INVALID_FRAME
+        warnings = _kill_warnings(caplog)
+        assert len(warnings) == 1
+        assert warnings[0].levelno == logging.WARNING
+        assert warnings[0].args == ("IB_T", "transform", "invalid_frame")
+    finally:
+        session.close()
+
+
+def test_an_unsolicited_frame_before_a_dispatch_is_its_own_cause(
+    graph: tuple[Registry, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    registry, config_dir = graph
+    session = _session(config_dir)
+    caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
+    try:
+        expected = _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        session._responses.put(b"{}")  # a frame nobody asked for, waiting before the next dispatch
+        # Step 4: the message never reached that worker, so it is retried once on a fresh one.
+        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == expected
+        assert session.last_kill_cause is KillCause.UNSOLICITED_BEFORE
+        assert [r.args for r in _kill_warnings(caplog)] == [
+            ("IB_T", "transform", "unsolicited_before")
+        ]
+    finally:
+        session.close()
+
+
+def test_a_stray_frame_on_the_fresh_worker_too_dead_letters_the_message(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The retry happens once: a stray frame waiting on the fresh worker as well fails closed."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        session._responses.put(b"{}")
+        real_spawn = session._spawn
+        spawns: list[int] = []
+
+        def _spawn_with_a_stray(phase: str = "spawn") -> None:
+            real_spawn(phase)
+            spawns.append(session._generation)
+            session._responses.put(b"{}")
+
+        monkeypatch.setattr(session, "_spawn", _spawn_with_a_stray)
+        with pytest.raises(SandboxError, match="unsolicited response frame before"):
+            _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        assert len(spawns) == 1  # one retry, not a loop
+        assert session._proc is None
+        assert session.kill_counts[KillCause.UNSOLICITED_BEFORE] == 2
+    finally:
+        session.close()
+
+
+def test_an_unsolicited_frame_after_an_answer_still_dead_letters(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Step 4 covers only the check before a request: a frame after an answer still fails it."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        real_await = session._await_answer
+
+        def _await_then_stray(*args: Any) -> codec.Response:
+            answer = real_await(*args)
+            session._responses.put(b"{}")
+            return answer
+
+        monkeypatch.setattr(session, "_await_answer", _await_then_stray)
+        with pytest.raises(SandboxError, match="unsolicited response frame after"):
+            _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        assert session.last_kill_cause is KillCause.UNSOLICITED_AFTER
+    finally:
+        session.close()
+
+
+def test_a_reap_that_is_not_a_kill_records_nothing_and_does_not_warn(
+    graph: tuple[Registry, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """A queued EOF only says the peer died, and with no worker there is nothing to kill: neither is
+    a kill, so neither records a cause or writes a WARNING. Closing a session with no worker is the
+    same."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    caplog.set_level(logging.INFO, logger=sandbox_mod.log.name)
+    try:
+        session._spawn("transform")
+        proc = session._proc
+        assert proc is not None
+        # Dead for real, as a crash leaves it: a queued EOF from a RUNNING worker is a kill (see
+        # test_a_queued_eof_from_a_running_worker_is_a_recorded_kill).
+        proc.kill()
+        _wait_exited(proc)
+        session._responses.put(_EOF)
+        session._reject_unsolicited(proc, "before", "transform")
+        assert session._proc is None
+        session._kill(None, KillCause.CRASH, "transform")  # no worker: nothing to kill
+        assert session.last_kill_cause is None
+        assert _kill_warnings(caplog) == []
+    finally:
+        session.close()
+    assert session.last_kill_cause is None  # no live worker at close: nothing was killed
+    assert _kill_warnings(caplog) == []
+
+
+def test_closing_a_live_session_records_shutdown_at_info(
+    graph: tuple[Registry, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """An orderly close is a kill with a cause, but not a fault, so its line is INFO."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    caplog.set_level(logging.INFO, logger=sandbox_mod.log.name)
+    try:
+        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+    finally:
+        session.close()
+    assert session.last_kill_cause is KillCause.SHUTDOWN
+    lines = _kill_warnings(caplog)
+    assert [(r.levelno, r.args) for r in lines] == [(logging.INFO, ("IB_T", "close", "shutdown"))]
+
+
+def test_closing_a_session_whose_worker_died_records_no_kill(
+    graph: tuple[Registry, str],
+) -> None:
+    _, config_dir = graph
+    session = _session(config_dir)
+    try:
+        session._spawn("transform")
+        proc = session._proc
+        assert proc is not None
+        proc.kill()
+        _wait_exited(proc)
+    finally:
+        session.close()
+    assert session.last_kill_cause is None
+    assert not session.kill_counts
+
+
+def test_a_graph_refusal_records_its_cause_and_leaves_the_warning_to_the_runner(
+    graph: tuple[Registry, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """The runner already raises the ``sandbox_worker_refused`` alert for this, so the session
+    records the cause and writes no second line."""
+    registry, config_dir = graph
+    shape = graph_shape(registry)
+    differs = dataclasses.replace(shape, handlers=shape.handlers | {"h_not_in_the_worker"})
+    session = _session(config_dir, graph=lambda: differs)
+    caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
+    try:
+        with pytest.raises(SandboxWorkerRefused):
+            session._spawn("transform")
+        assert session.last_kill_cause is KillCause.GRAPH_MISMATCH
+        assert _kill_warnings(caplog) == []
+    finally:
+        session.close()
+
+
+def test_a_request_the_codec_refuses_keeps_the_worker(
+    graph: tuple[Registry, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Step 3: a payload outside the closed grammar is refused before a byte is written, so the
+    worker is still in step. Only that message fails, and the next one reuses the same worker."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
+    try:
+        expected = _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        proc = session._proc
+        assert proc is not None
+        with pytest.raises(SandboxError, match="failed to marshal"):
+            session.dispatch("transform", "h_ok", object(), RunContext())
+        assert session._proc is proc
+        assert proc.poll() is None
+        assert session.last_kill_cause is None
+        assert _kill_warnings(caplog) == []
+        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == expected
+        assert session._proc is proc
+    finally:
+        session.close()
+
+
+def test_an_oserror_while_encoding_is_wrapped_and_keeps_the_worker(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An OSError raised by the encoder comes before any byte is written, so it is wrapped as a
+    marshal SandboxError like a codec refusal, and the worker is kept.
+
+    FALSIFICATION: narrow the encode ``except`` to ``SandboxError`` alone and the OSError escapes
+    ``dispatch`` unwrapped, so ``pytest.raises(SandboxError)`` fails."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        expected = _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        proc = session._proc
+        assert proc is not None
+
+        def _fails(**kwargs: Any) -> bytes:
+            raise OSError("the encoder failed")
+
+        monkeypatch.setattr(codec, "encode_request", _fails)
+        with pytest.raises(SandboxError, match="failed to marshal") as caught:
+            _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        assert isinstance(caught.value.__cause__, OSError)
+        assert session._proc is proc
+        assert proc.poll() is None
+        assert session.last_kill_cause is None
+        monkeypatch.undo()
+        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == expected
+        assert session._proc is proc
+    finally:
+        session.close()
+
+
+def test_an_over_cap_length_header_from_a_live_worker_is_an_invalid_frame(
+    graph: tuple[Registry, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """A length header over the cap is written by the worker, which may still be alive, so the
+    kill is recorded as an invalid frame, not as a crash (vault BACKLOG #3135, finding 2).
+
+    FALSIFICATION: have the reader enqueue ``_EOF`` for the over-cap header again and the kill is
+    recorded as ``crash``."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
+    try:
+        with pytest.raises(SandboxError, match="invalid frame: its length is over the frame cap"):
+            _deliveries(registry, "h_oversize", sandbox=session, run_context=RunContext())
+        assert session.last_kill_cause is KillCause.INVALID_FRAME
+        assert [r.args for r in _kill_warnings(caplog)] == [("IB_T", "transform", "invalid_frame")]
+        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == (
+            _deliveries(registry, "h_ok")
+        )
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize("when", ["before", "after"])
+def test_a_queued_over_cap_header_kills_as_an_unsolicited_write(
+    graph: tuple[Registry, str], when: str
+) -> None:
+    """Between dispatches the same header is a stray write from a worker that may be alive, so it
+    is treated as a stray frame: the worker is killed as an unsolicited write, and one left after
+    an answer fails that call closed, where a queued EOF only reaps a dead peer."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        proc = session._proc
+        assert proc is not None
+        session._responses.put(_OVERSIZE)
+        with pytest.raises(SandboxError, match="unsolicited"):
+            session._reject_unsolicited(proc, when, "transform")
+        assert session._proc is None
+        assert proc.poll() is not None
+        assert session.last_kill_cause is sandbox_mod._UNSOLICITED[when]
+    finally:
+        session.close()
+
+
+def test_a_queued_eof_from_a_running_worker_is_a_recorded_kill(
+    graph: tuple[Registry, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """EOF on fd 1 says every holder closed it, not that the worker exited. A worker still running
+    after the grace is killed with a recorded cause and a WARNING, never reaped silently; the call
+    still carries on (vault BACKLOG #3135, finding 2).
+
+    FALSIFICATION: reap on every queued EOF again and ``last_kill_cause`` stays ``None``."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
+    try:
+        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        proc = session._proc
+        assert proc is not None
+        session._responses.put(_EOF)  # the worker is alive: only its pipe "closed"
+        session._reject_unsolicited(proc, "after", "transform")  # must NOT raise
+        assert session._proc is None
+        assert proc.poll() is not None
+        assert session.last_kill_cause is KillCause.STDOUT_CLOSED
+        assert [r.args for r in _kill_warnings(caplog)] == [("IB_T", "transform", "stdout_closed")]
+    finally:
+        session.close()
+
+
+def test_a_respawn_after_a_queued_eof_is_checked_for_a_stray_frame(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker spawned after a leftover EOF is checked like any fresh worker: a stray frame
+    waiting on it kills it and the call goes to one more fresh worker, rather than read the stray
+    as its answer."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        expected = _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        assert session._proc is not None
+        session._responses.put(_EOF)
+        real_spawn = session._spawn
+        spawned: list[int] = []
+
+        def _spawn_with_a_stray(phase: str = "spawn") -> None:
+            real_spawn(phase)
+            spawned.append(session._generation)
+            if len(spawned) == 1:
+                session._responses.put(b"{}")  # any frame body is a stray here
+
+        monkeypatch.setattr(session, "_spawn", _spawn_with_a_stray)
+        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == expected
+        assert len(spawned) == 2
+        assert session.last_kill_cause is KillCause.UNSOLICITED_BEFORE
+    finally:
+        session.close()
+
+
+def test_the_reader_tells_an_over_cap_header_from_a_closed_pipe() -> None:
+    """The parent's reader returns the over-cap sentinel; the child's ``_read_frame_bytes`` keeps
+    reading it as a dead peer."""
+    header = sandbox_mod._LEN.pack(sandbox_mod._MAX_FRAME + 1)
+    assert sandbox_mod._read_frame_or_oversize(io.BytesIO(header)) is _OVERSIZE
+    assert sandbox_mod._read_frame_bytes(io.BytesIO(header)) is None
+    assert sandbox_mod._read_frame_or_oversize(io.BytesIO(b"")) is None
+
+
+def test_a_request_write_that_fails_still_kills_the_worker(
+    graph: tuple[Registry, str],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The control for step 3: a broken pipe or a partial write may leave part of a frame in the
+    worker, so that path still fails closed and kills it."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        proc = session._proc
+        assert proc is not None
+
+        def _broken(stream: object, body: bytes) -> None:
+            # The error text carries a body token, so the WARNING check below can fail.
+            raise BrokenPipeError("the pipe broke on DOE^JANE")
+
+        monkeypatch.setattr(sandbox_mod, "_write_frame", _broken)
+        caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
+        with pytest.raises(SandboxError, match="failed to send") as caught:
+            _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        assert session._proc is None
+        assert proc.poll() is not None
+        assert session.last_kill_cause is KillCause.REQUEST_WRITE
+        # Positive control: the error text has the token; the WARNING does not.
+        assert "DOE^JANE" in str(caught.value)
+        warnings = _kill_warnings(caplog)
+        assert [r.args for r in warnings] == [("IB_T", "transform", "request_write")]
+        assert "DOE" not in warnings[0].getMessage()
+    finally:
+        session.close()
+
+
+def test_a_request_over_the_frame_cap_keeps_the_worker(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A frame over the cap is refused before a byte is written, like a codec refusal."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        proc = session._proc
+        assert proc is not None
+        monkeypatch.setattr(sandbox_mod, "_MAX_FRAME", 16)
+        with pytest.raises(SandboxError, match="frame too large"):
+            _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        assert session._proc is proc
+        assert proc.poll() is None
+        assert session.last_kill_cause is None
+    finally:
+        session.close()
+
+
+def test_a_boot_frame_over_the_frame_cap_spawns_no_worker(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The boot frame's cap check runs before the child exists, so a refusal leaves no worker."""
+    _registry, config_dir = graph
+    session = _session(config_dir)
+    started: list[object] = []
+
+    def _no_popen(*args: object, **kwargs: object) -> None:
+        started.append(args)
+        raise OSError("spawn intercepted")
+
+    try:
+        monkeypatch.setattr(subprocess, "Popen", _no_popen)
+        # Positive control: under the real cap the spawn reaches this patch, so a later empty
+        # ``started`` means the cap check refused first, not that the patch missed the spawn.
+        with pytest.raises(OSError, match="spawn intercepted"):
+            session._spawn("transform")
+        assert len(started) == 1
+        started.clear()
+        monkeypatch.setattr(sandbox_mod, "_MAX_FRAME", 16)
+        with pytest.raises(SandboxError, match="frame too large"):
+            session._spawn("transform")
+        assert started == []
+        assert session.kill_counts == {}
+        assert session.last_kill_cause is None
+    finally:
+        session.close()
+
+
+# --- vault BACKLOG #3135, repair round 3 -------------------------------------
+
+# A Handler that starts a grandchild NOT holding the response pipe, then has its worker exit on its
+# own after it answers. The grandchild stays in the worker's process group.
+_SELF_EXIT_GRAPH = """
+from messagefoundry import inbound, outbound, router, handler, MLLP, Send
+
+inbound("IB_X", MLLP(port=19353), router="r")
+outbound("OB_X", MLLP(host="127.0.0.1", port=19354))
+
+
+@router("r")
+def r(msg):
+    return "h_spawn_then_exit"
+
+
+@handler("h_spawn_then_exit")
+def h_spawn_then_exit(msg):
+    import os
+    import subprocess
+    import sys
+    import threading
+    import time
+
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    with open(__PIDFILE__, "w", encoding="utf-8") as fh:
+        fh.write(str(child.pid))
+
+    def _exit_on_go():
+        # The test creates the go file only after this dispatch has returned, so the exit can
+        # never race the after-answer check.
+        while not os.path.exists(__GOFILE__):
+            time.sleep(0.01)
+        os._exit(0)
+
+    threading.Thread(target=_exit_on_go, daemon=True).start()
+    return Send("OB_X", "SPAWNED")
+
+
+@handler("h_plain")
+def h_plain(msg):
+    return Send("OB_X", "PLAIN")
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the POSIX process-group reap")
+@pytest.mark.parametrize("after", ["dispatch", "close", "reaped_elsewhere"])
+def test_a_worker_that_died_on_its_own_still_has_its_group_reaped(
+    tmp_path: Path, after: str
+) -> None:
+    """A worker that exits on its own leaves a grandchild in its process group. The next dispatch's
+    respawn, or ``close``, must still reach that group (vault BACKLOG #3135, the WNOWAIT fix). The
+    liveness check leaves the worker unreaped, so the reap takes the ordinary group kill; a reaped
+    worker's group with a member left is still reached, as the next arm shows.
+
+    The ``reaped_elsewhere`` arm reaps the worker behind the session's back first, so the reap
+    must go through :func:`proctree.kill_reaped_leader_group`.
+
+    POSIX-only, so NOT RUN on the Windows host this was written on. FALSIFICATION: make
+    :func:`_reap_process_tree` return without a signal for a worker already reaped, and the
+    ``reaped_elsewhere`` arm reds; make :func:`_has_exited` reap with ``proc.poll()`` too, and
+    every arm reds, since the poll leaves every reap with an already-reaped worker. Making
+    ``_has_exited`` reap alone no longer reds: the reuse-safe signal still reaches the group.
+
+    The worker exits only once the test creates a go file, after the dispatch has returned, so
+    its exit cannot race the after-answer check."""
+    pidfile = tmp_path / "grandchild.pid"
+    gofile = tmp_path / "exit.go"
+    source = _SELF_EXIT_GRAPH.replace("__PIDFILE__", repr(str(pidfile))).replace(
+        "__GOFILE__", repr(str(gofile))
+    )
+    (tmp_path / "graph.py").write_text(source, encoding="utf-8")
+    registry = load_config(tmp_path)
+    session = _session(str(tmp_path), inbound="IB_X")
+    grandchild_pid: int | None = None
+    try:
+        assert _deliveries(
+            registry, "h_spawn_then_exit", sandbox=session, run_context=RunContext()
+        ) == [("OB_X", "SPAWNED")]
+        grandchild_pid = int(pidfile.read_text())
+        proc = session._proc
+        assert proc is not None
+        gofile.write_text("go", encoding="utf-8")  # only now may the worker exit
+        # The worker exits on its own; it is a zombie now, which nothing has reaped.
+        assert _wait_until_not_running(proc.pid, timeout=10.0) is not True
+        assert _pid_running(grandchild_pid) is True  # the control: the grandchild outlived it
+        if after == "dispatch":
+            assert _deliveries(registry, "h_plain", sandbox=session, run_context=RunContext()) == [
+                ("OB_X", "PLAIN")
+            ]
+        else:
+            if after == "reaped_elsewhere":
+                # Reaped behind the session's back. The grandchild keeps the group's id taken,
+                # so the pid is free and the reuse-safe group signal still reaches it.
+                os.waitpid(proc.pid, 0)
+            session.close()
+        assert _wait_until_not_running(grandchild_pid, timeout=5.0) is not True, (
+            "the grandchild of a worker that died on its own survived the reap of its group"
+        )
+    finally:
+        if grandchild_pid is not None:
+            _best_effort_kill_pid(grandchild_pid)
+        session.close()
+
+
+def test_a_memory_cap_exit_is_never_recorded_as_a_closed_pipe(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker that answered with the memory cap exits, and on a loaded host its EOF can land
+    before the exit does. That EOF is still the memory cap, not a closed pipe.
+
+    FALSIFICATION: give the memory-cap EOF the grace again, and with the slow exit below the kill is
+    recorded as ``stdout_closed``."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    real_await = session._await_answer
+
+    def _answer_then_eof(*args: Any) -> Any:
+        answer = real_await(*args)
+        session._responses.put(_EOF)  # its exit EOF, queued before the check reads the queue
+        return answer
+
+    try:
+        monkeypatch.setattr(session, "_await_answer", _answer_then_eof)
+        monkeypatch.setattr(sandbox_mod, "_has_exited", lambda proc: False)  # a slow exit
+        with pytest.raises(SandboxError, match="ran out of memory"):
+            _deliveries(registry, "h_oom", sandbox=session, run_context=RunContext())
+        assert session.kill_counts == {KillCause.MEMORY_CAP: 1}
+        assert session._proc is None
+    finally:
+        monkeypatch.undo()
+        session.close()
+
+
+def test_the_eof_grace_is_one_budget_per_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every EOF a dispatch meets draws on one grace, so the wait under the session lock is
+    bounded by the grace, not by the grace times the EOFs."""
+    monkeypatch.setattr(sandbox_mod, "_has_exited", lambda proc: False)  # never exits
+    session = _session(".")
+    proc: Any = object()
+    try:
+        started = time.monotonic()
+        for _ in range(3):
+            assert session._eof_cause(proc, KillCause.CRASH) is KillCause.STDOUT_CLOSED
+        # Three graces would be 1.5 s; one grace and two floors are 0.7 s. The rest is margin for
+        # a slow host's sleeps.
+        assert time.monotonic() - started < 2.8 * sandbox_mod._EOF_EXIT_GRACE_SECONDS
+        assert session._eof_grace_left == 0.0
+    finally:
+        session.close()
+
+
+def test_a_fresh_worker_that_keeps_exiting_records_a_cause_and_says_so(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker that exits right after its boot, three times in a row, is a crash loop: each one is
+    recorded, and the error says the worker kept exiting.
+
+    FALSIFICATION: reap a fresh worker's queued EOF with no cause again, and ``kill_counts`` stays
+    empty."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    real_spawn = session._spawn
+
+    def _spawn_then_die(phase: str = "spawn") -> None:
+        real_spawn(phase)
+        proc = session._proc
+        assert proc is not None
+        proc.kill()
+        _wait_exited(proc)
+        session._responses.put(_EOF)
+
+    try:
+        monkeypatch.setattr(session, "_spawn", _spawn_then_die)
+        with pytest.raises(SandboxError, match="kept exiting, or closing its pipe") as caught:
+            _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        assert "3 workers in a row" in str(caught.value)
+        assert session.kill_counts == {KillCause.EXITED_AFTER_BOOT: 3}
+    finally:
+        session.close()
+
+
+def test_a_second_spawn_over_a_live_worker_is_refused(graph: tuple[Registry, str]) -> None:
+    """A spawn replaces only a worker that is gone, so a second one cannot kill a live worker
+    without a cause."""
+    _, config_dir = graph
+    session = _session(config_dir)
+    try:
+        session._spawn("transform")
+        proc = session._proc
+        assert proc is not None
+        with pytest.raises(SandboxError, match="still running"):
+            session._spawn("transform")
+        assert session._proc is proc
+        assert proc.poll() is None
+        assert session._generation == 1
+        assert not session.kill_counts
+    finally:
+        session.close()
+
+
+# --- vault BACKLOG #3135, repair round 4 -------------------------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the POSIX process-group reap")
+@pytest.mark.parametrize("pid_now", ["free", "reused"])
+def test_a_worker_reaped_elsewhere_has_its_group_signalled_only_while_its_pid_is_free(
+    graph: tuple[Registry, str],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    pid_now: str,
+) -> None:
+    """A worker that something else reaped never has its pid's group signalled unread: the reap
+    goes through :func:`proctree.kill_reaped_leader_group`, which signals the old group while the
+    pid names no live process and refuses, with a WARNING naming the inbound, once it names one.
+
+    POSIX-only, so NOT RUN on the Windows host this was written on. FALSIFICATION: drop the
+    ``_posix_child_state`` check from :func:`_reap_process_tree`, and ``kill_process_group`` is
+    called with the reaped pid."""
+    _, config_dir = graph
+    session = _session(config_dir)
+    unread: list[int] = []
+    killpg_calls: list[int] = []
+    real_killpg = os.killpg
+    real_reaped = proctree.kill_reaped_leader_group
+    reaped: list[int] = []
+    reaped_results: list[bool | None] = []
+
+    def _spy_unread(pid: int, **kwargs: Any) -> bool:
+        unread.append(pid)
+        return False
+
+    def _spy_reaped(pid: int) -> bool | None:
+        reaped.append(pid)
+        result = real_reaped(pid)
+        reaped_results.append(result)
+        return result
+
+    def _spy_killpg(pgid: int, sig: int) -> None:
+        killpg_calls.append(pgid)
+        real_killpg(pgid, sig)
+
+    try:
+        session._spawn("transform")
+        proc = session._proc
+        assert proc is not None
+        os.kill(proc.pid, signal.SIGKILL)
+        os.waitpid(proc.pid, 0)  # reaped behind the session's back; Popen does not know
+        monkeypatch.setattr(proctree, "kill_process_group", _spy_unread)
+        monkeypatch.setattr(os, "killpg", _spy_killpg)  # the module proctree calls
+        if pid_now == "reused":
+            monkeypatch.setattr(os, "getpgid", lambda pid: pid)  # a live process has it
+        monkeypatch.setattr(proctree, "kill_reaped_leader_group", _spy_reaped)
+        caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
+        session.close()
+        assert unread == []
+        # The refusal WARNING is written exactly when the reap returns None, so the return value
+        # is the positive observation in both arms; the log check below only pins the wording.
+        assert reaped == [proc.pid]
+        reused = pid_now == "reused"
+        assert (reaped_results[0] is None) is reused
+        assert killpg_calls == ([] if reused else [proc.pid])
+        # In-arm control: the capture sees a WARNING from this logger, so an empty scan in the
+        # "free" arm means nothing was logged, not that nothing could have been captured.
+        assert_capture_sees(caplog, sandbox_mod.log)
+        refused = [
+            (r.levelno, r.args)
+            for r in caplog.records
+            if r.name == sandbox_mod.log.name and "not be signalled safely" in r.getMessage()
+        ]
+        assert refused == ([(logging.WARNING, ("IB_T", proc.pid))] if reused else [])
+    finally:
+        monkeypatch.undo()
+        session.close()
+
+
+def test_a_fresh_worker_exited_before_its_eof_is_queued_is_respawned(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A fresh worker that exits after its boot reply, with its EOF not yet in the queue, is
+    found by the exit probe, recorded as ``exited_after_boot`` and replaced, so the message is
+    served rather than dead-lettered as a write failure or a crash.
+
+    FALSIFICATION: return the fresh worker from ``_live_worker`` without probing its exit, and the
+    request goes to a dead worker: the dispatch raises, recorded under another cause such as ``request_write``."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    real_spawn = session._spawn
+    spawns = 0
+
+    def _first_spawn_dies_quietly(phase: str = "spawn") -> None:
+        nonlocal spawns
+        real_spawn(phase)
+        spawns += 1
+        if spawns > 1:
+            return
+        proc = session._proc
+        assert proc is not None
+        proc.kill()
+        _wait_exited(proc)
+        # Stand in for a reader thread that has not queued the EOF yet.
+        session._responses = queue.Queue()
+
+    try:
+        monkeypatch.setattr(session, "_spawn", _first_spawn_dies_quietly)
+        caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
+        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        assert spawns == 2
+        assert session.kill_counts == {KillCause.EXITED_AFTER_BOOT: 1}
+        # A self-exit, so its line does not say the engine killed it.
+        [line] = _kill_warnings(caplog)
+        assert "sandbox worker exited during" in line.getMessage()
+    finally:
+        monkeypatch.undo()
+        session.close()

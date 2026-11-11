@@ -1369,8 +1369,34 @@ chain, and every live socket. `mode="off"` (**the default**) runs them in-proces
 with zero overhead**. `mode="subprocess"` runs each inbound's Router/Handler in a **persistent
 per-inbound worker child** (never a per-message fork), enforcing a forbidden-import guard
 (socket/store/crypto) and the resource caps below. An isolation denial (forbidden op, cap overrun,
-worker crash, a rejected frame) routes the message to `ERROR`/dead-letter **post-ACK** (no NAK, never
-dropped).
+worker crash, an invalid answer or one forged without the request's id) fails that message's call as
+an internal error **post-ACK** (no NAK, never dropped), which the `[delivery] internal_error` policy
+then handles. A request the engine cannot
+encode, or one over the frame cap, keeps the worker, since no byte
+of it was written; a worker answer the codec rejects still kills the worker. A stray frame found
+waiting **before** a request kills the worker and retries the message once on a fresh one (owner
+ruling 2026-11-09); [ADR 0187](adr/0187-bound-the-subprocess-sandbox-worker-count-a-shared-pool-or-router-phase-only-isolation.md)
+*Amendment B* lists at least the cases in which that message's call still fails, which the
+`[delivery] internal_error` policy then handles. A forged answer
+that carries the request's id can instead be taken as the message's result; see the grandchild
+paragraph below.
+Each worker kill writes one `WARNING` naming the inbound, the phase and a cause token, and no message
+content, except a graph refusal, which writes none, and a shutdown, logged at `INFO`. The runner alerts
+on a graph refusal against the graph the engine serves; one against a graph a reload has replaced
+gets neither the alert nor the runner's line. The line says the worker was `killed`, or that it `exited` for a cause recorded
+only once the worker is seen gone (a crash, an exit during boot or right after it), which may still be
+a signal from outside the engine. The reap that ends a worker can write more lines, kill or not. On
+POSIX a `WARNING` naming the inbound and the pid says a worker that was already reaped could not have
+its process group signalled safely, so a process it started may survive. It is written at least when
+the signal failed and when the pid had been reused, and in the second case the group already had no
+member left. At least these cases differ: after a kill that writes a line, it follows that line;
+after a reap that is not a kill, such as closing a session whose worker had already died, no kill
+line comes before it; and when the signal itself failed, for example for want of permission, a line
+naming the process group and the system's error text, but not the inbound, comes before it. A
+failed signal to the group of a worker not yet reaped writes a similar unattributed line, which adds
+that the kill degrades to a single-process kill; a group that cannot be read, or that the worker
+does not lead, degrades the same way with no line. That single-process kill signals a running
+worker, and only reaps one that has already exited.
 **Read once at engine start — a `/config/reload` does NOT re-read it (restart to change).**
 
 **`mode` is engine-wide — there is no per-connection sandbox setting.** One policy is rendered for the
@@ -1429,11 +1455,11 @@ worker can. *What this boundary does NOT cover*, below, holds for both modes.
 | | At `mode="subprocess"` |
 |---|---|
 | **Live enrichment** | `db_lookup` / `fhir_lookup` are **refused, fail-closed**. They re-enter the event loop and a process boundary breaks that. **A Handler needing either must run `mode="off"`** — that escape is supported and is not going away, and per the note above it applies to the whole engine, not to that Handler alone. |
-| **`wall_seconds`** | Only **enforced** here. At `mode="off"` there is no timeout at all, so this is a cap you gain by turning the sandbox on: a busy-loop Router/Handler can no longer wedge intake, and a legitimately slow one that used to finish now dead-letters. `startup_seconds` and the POSIX `mem_mb` arm with it. |
+| **`wall_seconds`** | Only **enforced** here. At `mode="off"` there is no timeout at all, so this is a cap you gain by turning the sandbox on: a busy-loop Router/Handler can no longer wedge intake, and a legitimately slow one that used to finish now fails its call, which the `[delivery] internal_error` policy handles (`ERROR`/dead-letter under the default `continue`; under `stop` the inbound's routing or transform halts). `startup_seconds` and the POSIX `mem_mb` arm with it. |
 | **Throughput** | About **0.19 ms per dispatch** with no reference view; a 20k-entry crosswalk costs about **4.5 ms** marshalling and **6.2 ms** end-to-end, roughly 1.4x a pickle round-trip — inside the pipeline's existing per-interface bound. **One message is not one dispatch:** a message routed to one handler with an `accepts=` predicate costs **three** (router, predicate, transform), and fan-out to K handlers costs **1 + 2K**, each re-marshalling the reference view. |
 | **Imports** | The worker starts with the interpreter's remote debugging disabled. It starts by running a script, so it does not search the engine's working directory for imports. **One exception is a source checkout.** When the engine runs from its checkout, the worker has that checkout on its path too. That folder is often the working directory, so a module there would import in the worker. [DANGEROUS-FUNCTIONALITY.md](DANGEROUS-FUNCTIONALITY.md) section 3, in its `_child_bootstrap.py` paragraphs, says where on the path the checkout goes. The worker also starts with `-P`, which keeps the engine package's own folder off its import path. It repeats the engine's own `-I`, or its `-E` and `-s`, so it reads `PYTHONPATH` exactly when the engine does: never under the shipped service launch. Where the engine reads it, only the absolute entries reach the worker. A helper your config imports must be a `_`-prefixed file in the config directory, which the loader finds for its siblings, or an installed package. The same holds for each engine shard under `supervise`. `supervise` checks this rule before it starts a shard. It loads the config once in a child with an engine shard's import path, and refuses to start the fleet if that load fails. |
 | **Processes** | Per inbound **that receives traffic**: one child process (a full interpreter with its own re-loaded copy of your config dir), two parent daemon threads (frame reader + stderr relay), three parent pipe fds, and on Windows a job-object handle. Nothing is spawned for an idle inbound — the child starts lazily on first dispatch. |
-| **Environment variables** | The worker starts with a short allowlist, not the engine's environment: what the platform and the interpreter need to start (such as `PATH`, the temp and profile directories, `TZ` and the locale), the interpreter's own variables by name (such as `PYTHONPATH`, `PYTHONUTF8` and `PYTHONHASHSEED`, which an isolated worker then ignores, as the engine does), and the names you list in `pass_environment`. No `MEFOR_*` variable crosses. `messagefoundry/childenv.py` holds the full list. The worker runs your config modules again under that environment, from the bytes the engine read and checked. **Config code that reads any other variable from `os.environ` finds it unset in the worker and set at `mode="off"`**, at the top of a module as much as inside a Router or Handler. If the read has no default, the worker fails to start. If it has a default, the worker can build a different graph. **The engine compares the two graphs when a worker starts, and refuses a worker whose graph differs**: the inbound, router, handler and outbound names, each inbound's router, which handlers have an `accepts=` predicate, and a digest of the bytes of every `*.py` in the config directory, `_` helpers included, as each load read them. Each message on that inbound then dead-letters with an error that names what differs and on which side. Name the variable in `pass_environment` and restart. **A function that keeps its name and branches on a variable the worker lacks is not caught**: the names match, and so do the bytes. So list every variable your config reads. `current_environment()` names the active environment in both modes, and a value that differs by environment belongs in a connection spec (`env()`), a code set or a reference set. |
+| **Environment variables** | The worker starts with a short allowlist, not the engine's environment: what the platform and the interpreter need to start (such as `PATH`, the temp and profile directories, `TZ` and the locale), the interpreter's own variables by name (such as `PYTHONPATH`, `PYTHONUTF8` and `PYTHONHASHSEED`, which an isolated worker then ignores, as the engine does), and the names you list in `pass_environment`. No `MEFOR_*` variable crosses. `messagefoundry/childenv.py` holds the full list. The worker runs your config modules again under that environment, from the bytes the engine read and checked. **Config code that reads any other variable from `os.environ` finds it unset in the worker and set at `mode="off"`**, at the top of a module as much as inside a Router or Handler. If the read has no default, the worker fails to start. If it has a default, the worker can build a different graph. **The engine compares the two graphs when a worker starts, and refuses a worker whose graph differs**: the inbound, router, handler and outbound names, each inbound's router, which handlers have an `accepts=` predicate, and a digest of the bytes of every `*.py` in the config directory, `_` helpers included, as each load read them. Under the default `[delivery] internal_error = "continue"`, each message on that inbound then dead-letters with an error that names what differs and on which side; under `"stop"` the refusal halts the stage that asked for the worker, routing or transform, with a `connection_stopped` alert, and the other stage can halt the same way at its next dispatch on that inbound. Each stop raises the `connection_stopped` alert; the [`[alerts]`](#alerts) table states its cooldown, re-alert and fallback rules. Name the variable in `pass_environment` and restart. **A function that keeps its name and branches on a variable the worker lacks is not caught**: the names match, and so do the bytes. So list every variable your config reads. `current_environment()` names the active environment in both modes, and a value that differs by environment belongs in a connection spec (`env()`), a code set or a reference set. |
 
 **Edit a config file only as part of a reload.** A worker loads your config directory again
 whenever it starts: on the first message an inbound receives, and after a worker is recycled by a
@@ -1455,7 +1481,8 @@ worker ran an edited Router or Handler body nobody had reloaded. What you see wh
    bootstrap failure rather than this refusal: its messages fail the same way, with no alert.
 3. Under the default `[delivery].internal_error = "continue"` the message is dead-lettered with
    status `ERROR`, the error is its last error, and the log has a `WARNING` naming the inbound and
-   the error type. Under `"stop"` the inbound stops, the head message is held, and the
+   the error type. Under `"stop"` the inbound's routing or transform halts, the head message
+   is re-pended, or dead-lettered once its attempts reach the retry cap, and the
    `connection_stopped` alert fires as well.
 4. Every later message on that inbound is refused the same way, without starting another worker,
    until a reload changes the graph the engine serves. Those refusals raise no further alert and
@@ -1507,11 +1534,13 @@ as the same account as the engine, so it can still read what that account can re
 2026-10-01 correction in [ADR 0087](adr/0087-sandbox-subprocess-isolation.md). All of one inbound's Routers/Handlers
 share a single worker, so this does **not** confine one Handler from another — the boundary is between
 admin code and the engine, exactly as `mode=off` shares an address space. A grandchild the Handler
-spawns inherits the response pipe and can stage a frame while the worker is alive; killing the worker
-now reaps its whole process tree (a Windows kill-on-close job object / a POSIX process group), so such
-a grandchild no longer outlives the kill (BACKLOG #342). That reap is best-effort process hygiene: what
-makes a stray frame *harmless* is still the codec plus the request-answer binding (a live grandchild can
-force a respawn, i.e. dead-letter messages on that inbound, but nothing more), not the process teardown.
+spawns inherits the request and response pipes and can stage a frame while the worker is alive; killing the worker
+now reaps its whole process tree (a Windows kill-on-close job object / a POSIX process group), so a
+grandchild that stays in that tree no longer outlives the kill (BACKLOG #342); one that leaves it can. That reap is best-effort process hygiene, and
+neither it nor the request-answer binding stops a live grandchild from forging an answer:
+it can at least do that, and deny the feed. The grandchild residual in
+[ADR 0087](adr/0087-sandbox-subprocess-isolation.md) says what it can do, and AC-10's 2026-11-09
+amendment there says when.
 The child's **stderr is captured by the engine, not inherited** (ADR 0176): a Handler that prints is
 relayed into the engine's log attributed to the inbound, the child pid and the worker generation, with
 **the content itself only at `DEBUG`**. At `INFO` and above you get a rate-limited `WARNING` naming the
@@ -1540,7 +1569,7 @@ on a live feed; a Router that only reads is unaffected. Grep your config for `os
 |---|---|---|---|
 | `mode` | enum | `off` | `off` (in-process, byte-identical, no subprocess), `subprocess` (persistent per-inbound worker child), or `isolated` (the same worker, with `db_lookup`/`fhir_lookup` brokered through the engine; see *`mode="isolated"`* above). Any other value refuses to load. |
 | `wall_seconds` | float (>0) | 5.0 | **Authoritative** wall-clock cap per Router/Handler call on **every** platform — the parent kills a worker that overruns it, so a pathological busy-loop can't wedge intake. The worker sets no `RLIMIT_CPU`, so CPU that admin code spends outside a call, such as a thread left running or a grandchild that leaves the worker's process group, has no bound at all ([ADR 0087](adr/0087-sandbox-subprocess-isolation.md), amendment of 2026-10-07). |
-| `mem_mb` | int (≥1) or null | 512 | POSIX-only memory cap (MiB) inside the child (no-op on Windows). `null` disables it. **On Linux it is headroom above the loaded graph:** the worker measures its own `VmData` once it has loaded the graph, and sets `RLIMIT_DATA` to that plus `mem_mb`. So a graph bigger than `mem_mb` still starts, and address space a thread only reserves does not count. The worker also starts with `MALLOC_ARENA_MAX=2` unless you pass your own value through `pass_environment`, so threads cannot use up the headroom for the worker's whole life. On other POSIX systems it is an absolute `RLIMIT_AS` cap on the whole worker, and the worker logs a line saying so. A call that runs out of memory dead-letters with an error naming the memory cap, and its worker exits so the next message gets a fresh one ([ADR 0087](adr/0087-sandbox-subprocess-isolation.md), amendment of 2026-10-11). |
+| `mem_mb` | int (≥1) or null | 512 | POSIX-only memory cap (MiB) inside the child (no-op on Windows). `null` disables it. **On Linux it is headroom above the loaded graph:** the worker measures its own `VmData` once it has loaded the graph, and sets `RLIMIT_DATA` to that plus `mem_mb`. So a graph bigger than `mem_mb` still starts, and address space a thread only reserves does not count. The worker also starts with `MALLOC_ARENA_MAX=2` unless you pass your own value through `pass_environment`, so threads cannot use up the headroom for the worker's whole life. On other POSIX systems it is an absolute `RLIMIT_AS` cap on the whole worker, and the worker logs a line saying so. A call that runs out of memory fails with an error naming the memory cap, which the `[delivery] internal_error` policy handles (`ERROR`/dead-letter under the default `continue`; under `stop` the inbound's routing or transform halts), and its worker exits so the next message gets a fresh one ([ADR 0087](adr/0087-sandbox-subprocess-isolation.md), amendment of 2026-10-11). |
 | `pass_environment` | list of names | `[]` | Extra environment variable **names** the worker is given, beyond its allowlist. Use it for a variable your config code reads. Names only; the value comes from the engine's own environment at worker start. **Refused at load**: at least an entry that is not a variable name, such as `NAME=value`; any of the engine's own names, which are any `MEFOR_*` name and `VAULT_TOKEN` and `PGPASSWORD`; and `PYTHONINSPECT`, which leaves a child waiting at a prompt. `messagefoundry/childenv.py` (`pass_environment_refusal`) holds the rule. Give a variable your config reads a name outside `MEFOR_`. Whatever you list is readable by every Router and Handler, so do not list a secret of your own either. Env: `MEFOR_SANDBOX_PASS_ENVIRONMENT`, comma-separated. |
 | `startup_seconds` | float (>0) | 30.0 | Bound on the one-time child bootstrap (config load + guard install) before start fails closed. |
 
