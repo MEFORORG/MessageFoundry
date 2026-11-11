@@ -6726,7 +6726,8 @@ def _audit_row_mac(
     except TypeError:
         return None
     stored = row["row_hash"]
-    return stored if isinstance(stored, str) and mac.verify(data, stored) else None
+    # `is True`: only a bool True passes, so a provider answering a truthy non-bool fails closed.
+    return stored if isinstance(stored, str) and mac.verify(data, stored) is True else None
 
 
 def _audit_digest_line(r: Mapping[str, Any]) -> bytes:
@@ -18489,7 +18490,8 @@ class MessageStore:
         broken chain now pays the same N round trips a healthy one already pays — accepted: the
         healthy-verify cost is the bound, and a tamper alarm must not be cheaper to provoke than a
         clean pass. A row whose key version Transit refuses costs one more, the probe that tells the
-        refusal from an outage, BACKLOG #2337.)"""
+        refusal from an outage, BACKLOG #2337. There the compare of a row MAC is Transit's own
+        ``verify``, which Vault makes with Go's constant-time ``hmac.Equal``, BACKLOG #2720.)"""
         # The walk itself is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each
         # keyed row is checked under the key of its OWN range, so a rotation no longer reads as tampering.
         return verify_audit_rows(

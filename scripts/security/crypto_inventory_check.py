@@ -1590,8 +1590,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:.decrypt_data()",
             "cipher:.encrypt_data()",
             "mac:.generate_hmac()",
-            # ADR 0217: a row seal's HMAC checked INSIDE Transit (transit/verify), never compared
-            # in process. A MAC check, not a signature.
+            # ADR 0217: a row seal's HMAC, and BACKLOG #2720: an audit row's stored MAC, each
+            # checked INSIDE Transit (transit/verify), never compared in process. A MAC check, not
+            # a signature.
             "sign_verify:.verify_signed_data()",
             "tls_context:via messagefoundry.store.keyprovider_vault",
         }

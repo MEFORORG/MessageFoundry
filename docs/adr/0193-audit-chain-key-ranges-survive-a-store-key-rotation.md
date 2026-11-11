@@ -543,15 +543,20 @@ All against an in-process fake Transit client with key versions, never a real se
    `min_encryption_version`. So raising `min_encryption_version` leaves older rows verifying, and
    raising `min_decryption_version` above a version a stored row names makes that row a break.
    No Vault or OpenBao server was run to confirm it.
-3. **A malformed stored MAC is a break with no Transit call.** A stored string that
+3. **A malformed stored MAC is a break with no verify call.** A stored string that
    `row_seal.transit_mac_version` does not accept reads as not verified, so no malformed value
-   reaches Transit to draw a 400.
+   reaches Transit to draw a 400. It still costs one round trip, an unpinned `generate_hmac` whose
+   answer is discarded, so a malformed row is no cheaper to check than a clean one (the ASVS 11.2.4
+   note on `verify_audit_chain`).
 4. **Refusals and outages are classified as before.** A 400 on the verify call goes through
-   `_refuses_only_version` and `_names_no_version_reason` (2026-10-27 amendment, item 3), so it
+   `_refuses_only_version` and `_names_no_version_reason` (2026-10-27 amendment, item 3, where
+   "a pinned call" now reads as this verify call), so it
    raises `AuditKeyVersionRefusedError` or `AuditKeyVersionUnverifiedError` and is a break at that
    row with the alert, or a plain `CipherError`, and the walk could not run. Transit's
    `valid: false` is a break. A `valid` that is not a bool is a `CipherError`.
-5. **The in-process key paths are unchanged.** A plain MAC provider, an in-heap key and the keyless
+5. **A range row's handover tag is not moved.** `_audit_tag_ok` still regenerates the tag under
+   the outgoing key and compares it.
+6. **The in-process key paths are unchanged.** A plain MAC provider, an in-heap key and the keyless
    mode still recompute and compare in constant time.
 
 ### Evidence
@@ -563,4 +568,4 @@ In-process fake Transit, never a real server, in `tests/test_transit_bound_attes
 - `test_raising_min_encryption_version_past_v1_leaves_v1_rows_verifying`.
 - `test_raising_min_decryption_version_past_v1_is_a_break_with_the_alert`.
 - `test_a_tampered_row_in_a_mixed_chain_still_breaks` and
-  `test_a_malformed_stored_mac_is_a_break_with_no_transit_call`.
+  `test_a_malformed_stored_mac_is_a_break_with_no_verify_call`.

@@ -188,7 +188,7 @@ def test_audit_mac_key_is_none_but_chain_is_keyed_in_transit(
 
 
 def test_audit_hmac_is_deterministic_and_tamper_sensitive(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The Transit MAC must round-trip (verify recomputes and string-compares) yet change on any edit.
+    # The Transit MAC must round-trip (Transit verify checks it) yet change on any edit.
     _use_fake(monkeypatch)
     cipher = build_transit_cipher(StoreSettings())
     a = cipher.audit_hmac(b"row-canonical-bytes")

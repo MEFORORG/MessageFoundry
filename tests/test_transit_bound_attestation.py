@@ -294,8 +294,11 @@ class _RotatingTransit(_FakeTransit):
         return {"data": {"hmac": self._mac(name, version, hash_input)}}
 
     def verify_signed_data(
-        self, *, name: str, hash_input: str, hmac: str, hash_algorithm: str = "sha2-256", **_: Any
+        self, *, name: str, hash_input: str, hmac: str, hash_algorithm: str | None = None, **_: Any
     ) -> dict[str, Any]:
+        # A check that names no algorithm, or another one, fails here, where Transit
+        # would verify under its own default and read every row as forged.
+        assert hash_algorithm == "sha2-256", hash_algorithm
         version = transit_mac_version(hmac)
         assert version is not None, hmac  # the cipher hands Transit only a well-formed MAC
         self.verified.append(version)
@@ -472,11 +475,12 @@ async def test_a_tampered_row_in_a_mixed_chain_still_breaks(
         pytest.param("f" * 64, id="no-prefix"),
     ],
 )
-async def test_a_malformed_stored_mac_is_a_break_with_no_transit_call(
+async def test_a_malformed_stored_mac_is_a_break_with_no_verify_call(
     stored: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A stored MAC Transit would refuse for its shape never reaches Transit, so no 400 on it can
-    read as an outage: it is a break at that row."""
+    """A stored MAC Transit would refuse for its shape never reaches Transit's verify, so no 400
+    on it can read as an outage: it is a break at that row. It still costs one round trip, an
+    unpinned hmac, so a malformed row is no cheaper to check than a clean one."""
     transit = _RotatingTransit()
     _use_fake(monkeypatch, transit)
     db = tmp_path / "malformed.db"
@@ -484,11 +488,13 @@ async def test_a_malformed_stored_mac_is_a_break_with_no_transit_call(
     _dml(db, "UPDATE audit_log SET row_hash = ? WHERE seq = ?", (stored, seq))
     store = await _transit_store(db)
     transit.verified.clear()
+    transit.pinned.clear()
     try:
         ok, msg = await store.verify_audit_chain()
     finally:
         await store.close()
     assert not ok and f"seq={seq}," in str(msg), msg
+    assert transit.pinned == [None], transit.pinned
     con = sqlite3.connect(db)
     try:
         (rows,) = con.execute("SELECT COUNT(*) FROM audit_log").fetchone()
@@ -528,8 +534,8 @@ def _needs_hvac() -> None:
 async def test_a_transit_refusal_of_a_forged_key_version_is_a_gap(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A DML writer sets both hashes to a key version Transit does not hold. Transit refuses the
-    pinned recompute; that must read as unattested, so a warn start still starts."""
+    """A DML writer sets both hashes to a key version Transit does not hold. Transit refuses to
+    verify at it; that must read as unattested, so a warn start still starts."""
     _needs_hvac()
     _use_fake(monkeypatch, _RotatingTransit())
     db = tmp_path / "forged-version.db"
@@ -603,8 +609,8 @@ async def _walk_on_start(
 async def test_a_planted_unheld_key_version_is_a_chain_break_on_the_startup_walk(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A DML writer names a Transit key version Transit does not hold. Transit refuses the pinned
-    recompute, and that is the row's own evidence: the startup walk must raise the tamper alert at
+    """A DML writer names a Transit key version Transit does not hold. Transit refuses to verify
+    at it, and that is the row's own evidence: the startup walk must raise the tamper alert at
     that row, never stop with "could not run" and no alert (the sixth defect on PR 2167)."""
     _use_fake(monkeypatch, _RotatingTransit())
     db = tmp_path / "planted.db"
@@ -697,7 +703,7 @@ _PROXY_PAGE = "<html><body><h1>400 Bad Request</h1></body></html>"
 _V3_MAC = "vault:v3:" + base64.b64encode(bytes(32)).decode("ascii")
 
 
-def _pinned_refusal(
+def _verify_refusal(
     answer: Any, errors: Any = _VERSION_400, *, text: str | None = None
 ) -> CipherError:
     """What the cipher raises when its verify of a MAC naming version 3 gets a 400 carrying
@@ -725,10 +731,10 @@ def _pinned_refusal(
     return caught.value
 
 
-def test_a_pinned_400_with_a_working_probe_is_a_refused_version() -> None:
+def test_a_verify_400_with_a_working_probe_is_a_refused_version() -> None:
     from messagefoundry.store.crypto import AuditKeyVersionRefusedError
 
-    assert isinstance(_pinned_refusal("vault:v2:AAAA"), AuditKeyVersionRefusedError)
+    assert isinstance(_verify_refusal("vault:v2:AAAA"), AuditKeyVersionRefusedError)
 
 
 @pytest.mark.parametrize(
@@ -738,12 +744,12 @@ def test_a_pinned_400_with_a_working_probe_is_a_refused_version() -> None:
         pytest.param("vault:v3:AAAA", id="probe-names-the-same-version"),
     ],
 )
-def test_a_pinned_400_the_probe_does_not_clear_is_a_plain_cipher_error(answer: Any) -> None:
+def test_a_verify_400_the_probe_does_not_clear_is_a_plain_cipher_error(answer: Any) -> None:
     """A missing key also answers 400, and so may a refusal that has nothing to do with the version.
     Neither may read as a planted version, or a clean chain would read as tampered."""
     from messagefoundry.store.crypto import AuditKeyVersionRefusedError
 
-    assert not isinstance(_pinned_refusal(answer), AuditKeyVersionRefusedError)
+    assert not isinstance(_verify_refusal(answer), AuditKeyVersionRefusedError)
 
 
 @pytest.mark.parametrize(
@@ -763,11 +769,22 @@ def test_a_pinned_400_the_probe_does_not_clear_is_a_plain_cipher_error(answer: A
             ["missing input for HMAC: and more"], None, id="non-version-only-as-substring"
         ),
         pytest.param([], None, id="empty-vault-list"),
+        pytest.param(["invalid HMAC: version is too new"], None, id="verify-too-new"),
+        pytest.param(
+            ["invalid HMAC: version is too new", "encryption key not found"],
+            None,
+            id="verify-too-new-beside-non-version",
+        ),
+        pytest.param(
+            ["cannot verify HMAC: version is too old (disallowed by policy)"],
+            None,
+            id="verify-below-min-decryption",
+        ),
         pytest.param(None, '{"errors": ["no such key version"]}', id="vault-json-in-text-only"),
         pytest.param(None, '{"errors": ["reworded refusal"]}', id="unknown-wording-in-text-only"),
     ],
 )
-def test_a_pinned_400_read_as_a_version_refusal_keeps_the_refused_label(
+def test_a_verify_400_read_as_a_version_refusal_keeps_the_refused_label(
     errors: Any, text: str | None
 ) -> None:
     """BACKLOG #6707: a 400 whose ``errors`` value is a list is labelled a refused version unless
@@ -780,7 +797,7 @@ def test_a_pinned_400_read_as_a_version_refusal_keeps_the_refused_label(
         AuditKeyVersionUnverifiedError,
     )
 
-    refused = _pinned_refusal("vault:v2:AAAA", errors, text=text)
+    refused = _verify_refusal("vault:v2:AAAA", errors, text=text)
     assert isinstance(refused, AuditKeyVersionRefusedError)
     assert not isinstance(refused, AuditKeyVersionUnverifiedError)
 
@@ -796,20 +813,20 @@ def test_a_pinned_400_read_as_a_version_refusal_keeps_the_refused_label(
         pytest.param(["  Encryption key not found "], None, id="known-non-version-any-case"),
     ],
 )
-def test_a_pinned_400_not_read_as_a_version_refusal_is_labelled_unconfirmed(
+def test_a_verify_400_not_read_as_a_version_refusal_is_labelled_unconfirmed(
     errors: Any, text: str | None
 ) -> None:
     """BACKLOG #6707: after a rotation the probe answers under a newer version, so the probe alone
-    labelled ANY pinned 400 a refused version. A 400 with no ``errors`` value that is a list, even
+    labelled ANY 400 on a check a refused version. A 400 with no ``errors`` value that is a list, even
     one whose reply holds a refusal text elsewhere, or with a list of only whole known non-version
     texts, is labelled unconfirmed instead. It stays a subclass, so its handlers handle the row as
     on main."""
     from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
 
-    refused = _pinned_refusal("vault:v2:AAAA", errors, text=text)
+    refused = _verify_refusal("vault:v2:AAAA", errors, text=text)
     assert isinstance(refused, AuditKeyVersionUnverifiedError)
     assert str(refused) == (
-        "the Transit audit MAC pinned to key version 3 got HTTP 400 that was not read as a "
+        "the Transit audit MAC check at key version 3 got HTTP 400 that was not read as a "
         "version refusal, so the version could not be confirmed; the key may not hold it, or its "
         "policy may retire it"
     )
@@ -820,7 +837,7 @@ def test_a_proxy_400_the_probe_does_not_clear_is_a_plain_cipher_error() -> None:
     """The label changes nothing else: a proxy 400 whose probe also fails is an outage, as on main."""
     from messagefoundry.store.crypto import AuditKeyVersionRefusedError
 
-    refused = _pinned_refusal(RuntimeError("down"), None, text=_PROXY_PAGE)
+    refused = _verify_refusal(RuntimeError("down"), None, text=_PROXY_PAGE)
     assert not isinstance(refused, AuditKeyVersionRefusedError)
 
 
@@ -869,7 +886,7 @@ async def test_a_planted_version_behind_a_proxy_is_a_chain_break_on_the_startup_
     finally:
         await store.close()
     assert not ok and f"seq={seq}," in str(msg), msg
-    assert f"pinned to key version {_UNHELD_VERSION} got HTTP 400" in str(msg), msg
+    assert f"check at key version {_UNHELD_VERSION} got HTTP 400" in str(msg), msg
     assert [name for name, _ in sink.events] == ["audit-chain"], sink.events
     assert not any("could not run" in line for line in lines), lines
 
@@ -915,7 +932,7 @@ def test_an_oversized_vault_shaped_body_is_labelled_unconfirmed_unparsed(
     body = _past_the_reparse_bound('{"errors": ["no such key version"], "pad": "', '"}')
     assert len(body) == crypto_transit._REPARSED_BODY_MAX_CHARS + 1
     assert isinstance(
-        _pinned_refusal("vault:v2:AAAA", None, text=body), AuditKeyVersionUnverifiedError
+        _verify_refusal("vault:v2:AAAA", None, text=body), AuditKeyVersionUnverifiedError
     )
 
 
@@ -928,7 +945,7 @@ def test_a_vault_shaped_body_at_the_bound_is_still_read() -> None:
     )
 
     body = _past_the_reparse_bound('{"errors": ["no such key version"], "pad": "', '"}', over=0)
-    refused = _pinned_refusal("vault:v2:AAAA", None, text=body)
+    refused = _verify_refusal("vault:v2:AAAA", None, text=body)
     assert isinstance(refused, AuditKeyVersionRefusedError)
     assert not isinstance(refused, AuditKeyVersionUnverifiedError)
 
@@ -1010,7 +1027,7 @@ async def test_a_reply_too_large_to_read_is_still_a_chain_break_on_the_startup_w
     finally:
         await store.close()
     assert not ok and f"seq={seq}," in str(msg), msg
-    assert f"pinned to key version {_UNHELD_VERSION} got HTTP 400" in str(msg), msg
+    assert f"check at key version {_UNHELD_VERSION} got HTTP 400" in str(msg), msg
     assert [name for name, _ in sink.events] == ["audit-chain"], sink.events
     assert f"seq={seq}," in sink.events[0][1], sink.events
     assert not any("could not run" in line for line in lines), lines

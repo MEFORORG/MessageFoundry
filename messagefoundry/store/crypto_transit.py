@@ -23,7 +23,7 @@ same cell see the same stable AAD, so binding is symmetric by construction.
 **Audit chain (keyed IN Transit).** :meth:`audit_mac_key` returns ``None`` — there is no in-heap DEK to
 HKDF a raw HMAC key from — but the chain is **not** keyless: :meth:`audit_mac_fn` hands the store a
 Transit-backed MAC (:meth:`audit_hmac` → Transit ``generate_hmac``), so every audit row's MAC is computed
-INSIDE the isolated module and the key never enters heap. The walk checks each stored MAC with
+INSIDE the isolated module and the key never enters heap. The walk checks each stored row MAC with
 Transit ``verify`` (:meth:`verify_audit_hmac`), never by regenerating it. This lifts the audit chain
 from keyless SHA-256 (tamper-evident) to forgery-**resistant** (ADR 0138 §To-resolve, closing the
 ASVS 16.4.2 residual for this mode). The MAC key defaults to the data key and is overridable to a dedicated Transit key via
@@ -347,8 +347,10 @@ class TransitCipher(_UnmarkedPolicy):
         verifies.
 
         ``stored`` that :func:`~messagefoundry.store.row_seal.transit_mac_version` does not accept
-        is ``False`` with no Transit call, so no malformed value reaches Transit to draw a 400.
-        ``False`` is also Transit's ``valid: false``.
+        is ``False`` with no ``verify`` call, so no malformed value reaches Transit to draw a 400.
+        It still costs one round trip, an :meth:`audit_hmac` of ``data`` whose answer is
+        discarded, so a malformed row is no cheaper to check than a clean one. ``False`` is also
+        Transit's ``valid: false``.
 
         A 400 that hvac raises as ``InvalidRequest``, while a probe under the latest version
         answers with a string that does not start ``vault:v<N>:`` for the version ``stored``
@@ -369,6 +371,9 @@ class TransitCipher(_UnmarkedPolicy):
         unexpected shape, so the walk could not run and no tamper alert fires. Blocking."""
         version = transit_mac_version(stored)
         if version is None:
+            # Still one round trip, as a clean row costs, so a malformed row is not cheaper to
+            # check (``verify_audit_chain``, ASVS 11.2.4). Its answer cannot match ``stored``.
+            self.audit_hmac(data)
             return False
         try:
             valid = self._transit_verify(self._audit_key, data, stored)

@@ -672,7 +672,7 @@ class AuditKeyVersionRefusedError(CipherError):
     Transit still answers under the latest. Transit's own refusal is one cause; the subclass
     :class:`AuditKeyVersionUnverifiedError` covers a 400 whose reply does not read as one.
 
-    The pinned version comes from a stored audit hash, which a DML writer can plant (BACKLOG #2337).
+    The version comes from a stored audit hash, which a DML writer can plant (BACKLOG #2337).
     So the refusal is evidence about that ROW, and the chain walk reports a break there. It is never
     a walk that could not run. Transit also refuses a version its policy retires, so the break says
     both."""
@@ -703,7 +703,7 @@ class AuditKeyVersionUnverifiedError(AuditKeyVersionRefusedError):
 
     def __str__(self) -> str:
         return (
-            f"the Transit audit MAC pinned to key version {self.version} got HTTP 400 that was not "
+            f"the Transit audit MAC check at key version {self.version} got HTTP 400 that was not "
             "read as a version refusal, so the version could not be confirmed; the key may not "
             "hold it, or its policy may retire it"
         )

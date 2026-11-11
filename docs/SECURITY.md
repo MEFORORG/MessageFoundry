@@ -8050,9 +8050,9 @@ outage, a dropped connection, and a row too large for one request.
 version below the key's `min_decryption_version`, or one trimmed away. Every audit row sealed under
 that version then reads as a break, `audit-verify` exits 1, and the attestation counts as none. The
 audit key is the data key unless `MEFOR_STORE_TRANSIT_AUDIT_KEY` names another. So raising the data
-key's `min_decryption_version` breaks the chain too. Raising `min_encryption_version` does not:
-verify does not read it. Rotating is safe; retiring is not. The break text names both causes, a planted
-version and a retired one.
+key's `min_decryption_version` breaks the chain too; ADR 0193's 2026-11-11 amendment says which
+floor applies and what that rests on. Rotating is safe; retiring is not. The break text names both
+causes, a planted version and a retired one.
 
 **What this check does not catch: a replay after a deleted withdraw row.** A writer can delete the
 withdraw row and re-insert the old attestation row. This check does not see that. If other audit
