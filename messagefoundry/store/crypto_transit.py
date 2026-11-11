@@ -322,14 +322,15 @@ class TransitCipher(_UnmarkedPolicy):
         :func:`_names_no_version_reason` does not read the 400 as Vault's own refusal, for example a
         proxy's page, or when reading it runs out of memory or stack (BACKLOG #6707).
 
-        A 400 whose body hvac fails on raises neither of those (BACKLOG #6707). When the
-        Content-Type is exactly ``application/json`` and the body parses as JSON that is not an
-        object (a bare list or ``null``, for example), holds an ``errors`` list with an entry that
-        is not text, or has an ``errors`` value of a nonzero number or ``true``, hvac 2.4.0 raises
-        ``AttributeError`` or ``TypeError`` in place of ``InvalidRequest``. A ``MemoryError`` that
-        hvac raises while it joins a truthy ``errors`` value, before any ``InvalidRequest``
-        exists, ends the same way. Each raises plain :class:`CipherError`, so the walk could not
-        run and no tamper alert fires."""
+        A 400 whose body hvac fails on raises neither of those (BACKLOG #6707). Such bodies
+        include at least these, when the Content-Type is exactly ``application/json``: one that
+        parses as JSON that is not an object (a bare list or ``null``, for example), one whose
+        ``errors`` list holds an entry that is not text, and one whose ``errors`` value is a number
+        such as ``5``, or ``true``. On each, hvac 2.4.0 raises ``AttributeError`` or ``TypeError``
+        in place of ``InvalidRequest``. A ``MemoryError`` that hvac raises while it joins a truthy
+        ``errors`` value, before it raises any ``InvalidRequest``, is not read as a refusal either.
+        Each raises plain :class:`CipherError`, so the walk could not run and no tamper alert
+        fires."""
         inp = base64.b64encode(data).decode("ascii")
         kwargs: dict[str, Any] = {
             "name": self._audit_key,
