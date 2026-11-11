@@ -73,6 +73,7 @@ from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
     MessageStore,
+    UnknownRoleError,
     UserRecord,
     VerifiedUser,
     audit_row_hash,
@@ -7611,5 +7612,117 @@ async def test_a_held_role_error_is_raised_first_when_the_revoke_then_fails(
             )
         assert any("OperationalError" in note for note in raised.value.__notes__)
         assert [e.event_type for e in notifier.sent] == [ROLES_CHANGED]
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("retry_error", "unwritten"),
+    [
+        (UnknownRoleError([Role.ADMINISTRATOR.value]), True),
+        (RowSealError("synthetic"), True),
+        (sqlite3.OperationalError("synthetic retry"), False),
+    ],
+    ids=["unknown-role", "seal", "refused-control"],
+)
+async def test_a_reconciled_role_retry_refused_before_it_wrote_tells_nobody_and_ends_nothing(
+    monkeypatch: pytest.MonkeyPatch, retry_error: Exception, unwritten: bool
+) -> None:
+    """BACKLOG #2221, #3018 step 4. A role write whose retry its store refuses before it writes
+    changed nothing: the revocation raises it with no notice, no grant page, no noted row and no
+    session end. The control: a retry that may have committed still does all four."""
+    store, _, service, tokens = await _scoped_service(_GRP_A)
+    try:
+        notifier, revocation, _target = await _role_revocation(store, service)
+        revocation = replace(revocation, role_ids=(Role.ADMINISTRATOR.value,))
+        grants: list[tuple[str, str]] = []
+        service._admin_grant_alert = lambda name, via: grants.append((name, via))
+        calls: list[int] = []
+
+        async def failing(*_args: Any, **_kwargs: Any) -> bool:
+            calls.append(1)
+            if len(calls) == 1:
+                raise sqlite3.OperationalError("synthetic first")
+            raise retry_error
+
+        monkeypatch.setattr(store, "set_user_roles_if_held", failing)
+        with pytest.raises(type(retry_error)):
+            await service._apply_reconcile_revocation(
+                revocation, watermark=await service._audit_watermark()
+            )
+        assert len(calls) == 2
+        if unwritten:
+            assert notifier.sent == [] and grants == []
+            assert service._reconcile_refused_rows == []
+            assert await service.identity_for_token(tokens["jdoe"]) is not None
+        else:
+            assert [e.event_type for e in notifier.sent] == [ROLES_CHANGED]
+            assert grants == [("jdoe", "directory_reconcile")]
+            assert service._reconcile_refused_rows == ["auth.ad_roles_resynced"]
+            assert await service.identity_for_token(tokens["jdoe"]) is None
+    finally:
+        await store.close()
+
+
+async def test_an_error_building_the_reconciled_role_row_writes_nothing_and_tells_nobody(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #2221. An error building the role row comes before any write, so the revocation
+    raises it with no write, no notice and no session end."""
+    store, _, service, tokens = await _scoped_service(_GRP_A)
+    try:
+        notifier, revocation, _target = await _role_revocation(store, service)
+        before = await store.get_user_role_ids(revocation.user_id)
+        real = service_module._json
+
+        def failing(value: Any) -> str:
+            if isinstance(value, dict) and value.get("via") == "ad-reconcile":
+                raise TypeError("synthetic: the row would not build")
+            return real(value)
+
+        monkeypatch.setattr(service_module, "_json", failing)
+        with pytest.raises(TypeError):
+            await service._apply_reconcile_revocation(
+                revocation, watermark=await service._audit_watermark()
+            )
+        assert await store.get_user_role_ids(revocation.user_id) == before
+        assert notifier.sent == []
+        assert await service.identity_for_token(tokens["jdoe"]) is not None
+    finally:
+        await store.close()
+
+
+async def test_a_read_back_that_finds_the_account_gone_counts_as_not_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3018 step 4. A retried compare-and-set finds the roles moved, and the read-back
+    finds the account deleted after its row read, which ``_lookup_user`` reads as a seal failure.
+    It counts as not written, so the row is not written on its own either."""
+    store, _, service, _ = await _scoped_service(_GRP_A)
+    try:
+        _notifier, revocation, target = await _role_revocation(store, service)
+        calls: list[int] = []
+
+        async def moved(*_args: Any, **_kwargs: Any) -> bool:
+            calls.append(1)
+            if len(calls) == 1:
+                raise sqlite3.OperationalError("synthetic: the COMMIT reply was lost")
+            return False
+
+        lookups: list[int] = []
+
+        async def refused_then_gone(_user_id: str) -> _UserLookup:
+            # The row was read, then deleted before its role read; read again, it is gone.
+            lookups.append(1)
+            return _UserLookup(None, len(lookups) == 1)
+
+        rows_before = len(await store.list_audit(action="auth.ad_roles_resynced"))
+        monkeypatch.setattr(store, "set_user_roles_if_held", moved)
+        monkeypatch.setattr(service, "_lookup_user", refused_then_gone)
+        roles = await service._write_reconciled_roles(revocation, target, ("viewer",))
+        assert calls == [1, 1] and lookups == [1, 1]
+        assert roles.result is False and not roles.written and roles.retried
+        monkeypatch.undo()
+        assert len(await store.list_audit(action="auth.ad_roles_resynced")) == rows_before
     finally:
         await store.close()

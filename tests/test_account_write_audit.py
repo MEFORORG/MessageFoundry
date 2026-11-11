@@ -26,7 +26,12 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline.alerts import AlertSink, directory_sign_in_audit_alert
 from messagefoundry.store.row_seal import RowSealError
-from messagefoundry.store.store import AppendedAuditRow, AuditAppend, MessageStore
+from messagefoundry.store.store import (
+    AppendedAuditRow,
+    AuditAppend,
+    MessageStore,
+    UnknownRoleError,
+)
 from tests._account_write_audit_contract import assert_account_write_audit_contract, sign_in
 from tests._last_admin_store_contract import ADMIN, VIEWER, seed
 
@@ -526,3 +531,56 @@ async def test_a_sign_in_whose_role_retry_raises_still_ends_the_sessions_and_tel
     assert await service.identity_for_token(first) is None, "a raising retry kept a stale session"
     assert [e.username for e in service._security_notifier.sent] == ["jdoe"]
     assert audit_pages == ["auth.ad_roles_resynced"], "a retry that may have committed rowless"
+
+
+@pytest.mark.parametrize(
+    ("retry_error", "unwritten"),
+    [
+        (UnknownRoleError([ADMIN]), True),
+        (RowSealError("synthetic"), True),
+        (sqlite3.OperationalError("synthetic retry"), False),
+    ],
+    ids=["unknown-role", "seal", "refused-control"],
+)
+async def test_a_sign_in_role_retry_refused_before_it_wrote_tells_nobody_and_ends_nothing(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    retry_error: Exception,
+    unwritten: bool,
+) -> None:
+    """BACKLOG #2221. A retry its store refuses before it writes, for a role that does not exist
+    or a record that fails its seal, changed nothing: the sign-in raises it with no notice, no
+    grant page, no audit page and no session end. The control: a retry that may have committed
+    still does all four."""
+    service, _first, grants, audit_pages = await _signed_in(store, "viewer")
+    await service.set_ad_group_map([("cn=mf-ops,dc=x", ADMIN)], actor="admin")
+    service._security_notifier.sent.clear()
+    calls: list[int] = []
+
+    async def failing(*_args: object, **_kwargs: object) -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("synthetic first")
+        raise retry_error
+
+    # The group-map change already ended ``first``, so the session end is read at its call.
+    revokes: list[str] = []
+    real_revoke = service._revoke_after_commit
+
+    async def revoke(user_id: str, **kwargs: Any) -> Any:
+        revokes.append(user_id)
+        return await real_revoke(user_id, **kwargs)
+
+    monkeypatch.setattr(store, "set_user_roles", failing)
+    monkeypatch.setattr(service, "_revoke_after_commit", revoke)
+    with pytest.raises(type(retry_error)):
+        await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)
+    assert len(calls) == 2
+    if unwritten:
+        assert service._security_notifier.sent == []
+        assert grants == [] and audit_pages == [] and revokes == []
+    else:
+        assert [e.username for e in service._security_notifier.sent] == ["jdoe"]
+        assert grants == [("jdoe", "directory_sign_in")]
+        assert audit_pages == ["auth.ad_roles_resynced"]
+        assert len(revokes) == 1
