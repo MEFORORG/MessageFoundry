@@ -1988,13 +1988,20 @@ started together, can each raise it; the alert list folds them into one instance
   either fingerprint could not be taken, since then the engine compared nothing, and `loaded` is `false`
   when it is the loaded one. With no graph running, `drift` is `false`. A backup compares nothing:
   it records what its `config_fingerprint` left out as `config_unreadable_files`.
-- A start's fingerprint is of the bytes its load read. A start resolves `env()` values earlier, when the engine is built, so for `environments/` files that means the bytes the load
-  read, not the bytes the values came from. Just after the load it fingerprints
-  the directory once more, and compares both with the baseline, so `config_changed` fires when
-  either differs. When the two cover the same files and differ, an edit landed after the load read
-  that file, and the comparison is `changed_during_load`. The alert then names the directory's
-  fingerprint, or the loaded one when only that differs from the baseline. The `config_loaded` row
-  names the bytes that ran as `fingerprint`. It names what the alert named as
+- A start's fingerprint is of the bytes its load read. `serve` parses a value file in
+  `environments/` out of those bytes too, so the fingerprint names the value-file bytes the start
+  applied, though not a `MEFOR_VALUE_*` variable or the secrets directory. Where the load could not
+  read the value file, the start applies the values read when the engine was built, and the
+  fingerprint leaves the file out. A value file anywhere but the config directory's
+  `environments/` folder is parsed as values from no start snapshot, one inside the config directory
+  under another `[environments].dir` included, so no fingerprint names it as the values the start
+  applied; at least one in `codesets/` can still be loaded and folded, as a code-set table. Just
+  after the load, the start
+  fingerprints the directory once more, and compares both with the baseline, so `config_changed`
+  fires when either differs. When the two cover the same files and differ, an edit landed after the
+  load read that file, and the comparison is `changed_during_load`. The alert then names the
+  directory's fingerprint, or the loaded one when only that differs from the baseline. The
+  `config_loaded` row names the bytes that ran as `fingerprint`. It names what the alert named as
   `judged_fingerprint`, and what that left out as `judged_unreadable_files`. So
   the next start, on the edited bytes, raises the alert again, and
   `GET /config/provenance` reports drift until a reload. A start keeps its `git_head`, in the row
