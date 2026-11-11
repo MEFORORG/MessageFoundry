@@ -343,7 +343,17 @@ def test_every_other_secret_class_name_in_the_nssm_list_refuses(name: str) -> No
     assert 'enforcement = "warn" does not change this refusal' in refusal
     # The store key's remedy is not offered for a secret that is not the store key.
     assert "protect-key" not in refusal
+    assert "set no MEFOR_SECRETS_DIRECTORY" in refusal
     assert service_env_loosenings(posture) == []
+
+
+def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> None:
+    from messagefoundry.engine_secrets import SECRETS_DIRECTORY_VARIABLE
+
+    assert serviceenv._DIRECTORY_VARIABLE == SECRETS_DIRECTORY_VARIABLE
+    posture = _service(["MEFOR_STORE_PASSWORD=x", "MEFOR_SECRETS_DIRECTORY=C:/s"])
+    refusal = service_env_refusal(posture)
+    assert refusal is not None and "set no MEFOR_SECRETS_DIRECTORY" not in refusal
 
 
 def test_a_store_key_and_another_secret_in_the_nssm_list_name_both_remedies() -> None:

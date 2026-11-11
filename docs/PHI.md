@@ -2891,7 +2891,9 @@ For operators standing up the engine (see also [SERVICE.md](SERVICE.md)):
 - [ ] **Provision the first administrator at the host** with `messagefoundry provision-admin --email`; the engine creates no
       account on its own (see [SECURITY.md](SECURITY.md#provisioning-the-first-administrator-asvs-632)).
 - [ ] **Supply secrets via env**, never the TOML (`MEFOR_STORE_PASSWORD`,
-      `MEFOR_AUTH_AD_BIND_PASSWORD`, future `MEFOR_STORE_ENCRYPTION_KEY`).
+      `MEFOR_AUTH_AD_BIND_PASSWORD`, future `MEFOR_STORE_ENCRYPTION_KEY`). Under the Windows
+      service, not through its NSSM list, where the engine refuses them: see
+      [SERVICE.md](SERVICE.md#protect-the-store-encryption-key-at-rest-wp-11d).
 - [ ] **Never feed real PHI to `dryrun`/`generate`** or redirect their output to shared locations (§7).
 - [ ] **Treat the harness's real-feed files as PHI.** Before running `python -m harness.reconcile`
       against a real feed, put the capture (`--out`), the Corepoint export (`--corepoint`) and the

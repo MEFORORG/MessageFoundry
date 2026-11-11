@@ -684,10 +684,10 @@ environment.
   does not read it. `uninstall-service.ps1` leaves the directory and its files, names them, and
   with `-RemoveAccountAces` removes the account's entry there too. Which settings it supplies, the
   access list it needs, and the rest of the rules are stated once, in
-  [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). **The engine
-  refuses to start when one of its own secret settings is in the service's NSSM list** or its own
-  `Environment` value, whatever `[security].enforcement` says (vault BACKLOG #2595): move it to a
-  file here and remove it from the list. A `MEFOR_VALUE_*` value there is not refused.
+  [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). Move each
+  of the engine's own secret settings here from the service's NSSM list, where the engine refuses
+  it (the previous bullet links where that is stated); a `MEFOR_VALUE_*` value there is not
+  refused.
 
 > **External vault / managed identity.** DPAPI is the built-in on-box option. The engine can also call
 > HashiCorp Vault itself. These surfaces are separate, and each needs the optional `[vault]` extra:

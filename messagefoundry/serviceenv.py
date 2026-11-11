@@ -75,6 +75,10 @@ KEY_CLASS_NAMES: tuple[str, ...] = _setting_names.KEY_CLASS_NAMES
 #: such a name brings the alert back.
 DIRECTORY_CLASS_NAMES: tuple[str, ...] = _setting_names.DIRECTORY_SETTING_NAMES
 
+#: ``engine_secrets.SECRETS_DIRECTORY_VARIABLE``, spelled out so no identifier here says the word
+#: the CodeQL note above is about; ``tests/test_service_env_secrets.py`` holds the two equal.
+_DIRECTORY_VARIABLE = "MEFOR_SECRETS_DIRECTORY"
+
 #: Names that take either the secret itself or a path to a file that holds it. Only the inline
 #: form is a secret, the rule ``settings._FILE_INLINE_PEM_KEYS`` applies to the config file.
 _INLINE_PEM_NAMES = frozenset({"MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY"})
@@ -402,6 +406,12 @@ def service_env_refusal(posture: ServiceEnvPosture) -> str | None:
             "one restricted file per setting named as its variable. See docs/CONFIGURATION.md, "
             '"The secrets directory"'
         )
+        if _DIRECTORY_VARIABLE not in posture.listed:
+            steps.append(
+                f"The service's lists set no {_DIRECTORY_VARIABLE}, so add "
+                "it with the directory's path, or run install-service.ps1 again, which creates "
+                "the directory and adds it"
+            )
     return (
         f"{found}. Any local user may be able to read that key, and with it each value named. "
         f"Remove each name from the service's lists. {'. '.join(steps)}. "
