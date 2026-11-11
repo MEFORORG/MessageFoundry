@@ -212,8 +212,10 @@ probe (item 3.r6). The sign-in path checks a user row past both caches, (e) says
 skips the audit row or the throttled page a refusal writes.
 
 **The probe rule differs from the audit chain's.** The audit chain reads a 400 as a version
-refusal only when the probe names a different version (`crypto_transit._refuses_only_version` on
-`main`). A row seal reads **any** 400 with a working probe as Unverifiable, whatever version the
+refusal only when the probe answers with a string that does not start with `vault:v<pinned>:`, so
+an empty answer or one naming no version passes too (`crypto_transit._refuses_only_version` on
+`main`). That 400 need not be Transit's own: a proxy can author it (corrected 2026-11-11, BACKLOG
+#6707). A row seal reads **any** 400 with a working probe as Unverifiable, whatever version the
 probe names. A planted seal naming the latest version, checked on a lagging node while the probe
 reaches a caught-up one, would otherwise read as an Outage: a 503 that ends nothing and writes no
 integrity record, the loosening (a) rejects. Item 3.6's shared helper returns the probe's answer and

@@ -452,9 +452,24 @@ section 0): this is what the first deployment's first routine rotation would hav
    string in constant time (`hmac.compare_digest`).
 3. **A refused version is a break at that row; an outage is not.** A pinned call that Transit
    answers with HTTP 400 for that version alone raises `AuditKeyVersionRefusedError`
-   (`TransitCipher._refuses_only_version`). The walk records a break at that row, naming the
-   version, and goes on. Any other failure, an unreachable Vault among them, is a `CipherError`:
-   the walk could not run, and no tamper alert fires.
+   (`TransitCipher._refuses_only_version`). The test reads the reply, not who wrote it: a pinned
+   call that gets an HTTP 400 that hvac raises as `InvalidRequest`, while a probe under the latest
+   version answers with a string that does not start with `vault:v<pinned>:`, raises it. An empty
+   answer or one naming no version passes too, and a proxy, not Transit, can author the 400
+   (corrected 2026-11-11, BACKLOG #6707). The walk records a break at that row, naming the
+   version, and goes on. A 400 on which hvac raises an exception other than `InvalidRequest`
+   raises neither `AuditKeyVersionRefusedError` nor its subclass `AuditKeyVersionUnverifiedError`
+   (BACKLOG #6707). For example, these exact 400 bodies with the Content-Type exactly
+   `application/json`:
+   `[]`, `null`, `{"errors":[{"message":"x"}]}`, `{"errors":[1]}`, `{"errors":5}` and
+   `{"errors":true}`. On each, hvac 2.4.0 raises `AttributeError` or `TypeError` in place of
+   `InvalidRequest`. A `MemoryError` that hvac raises while it joins a
+   truthy `errors` value, before it raises any `InvalidRequest`, is not read as a refusal either.
+   Each is a plain `CipherError`, so a version planted behind a proxy that wrote such a body would
+   not read as a break. Any other failure, an unreachable Vault among them, is a `CipherError`
+   too. In every such case the walk could not run, and no tamper alert fires. The genesis-row
+   check at open (item 2) catches only `AuditKeyVersionRefusedError`, so there such a
+   `CipherError` can fail the store open.
 
 ### Why regenerating pinned stands in for Transit's verify call
 
@@ -484,7 +499,8 @@ named Transit's verify call as the fix for this limit; it is not built. Until it
 the audit key's `min_encryption_version` above the oldest version a stored row names: every older
 row would then read as a break in `audit-verify`, and in the startup walk where it is on.
 
-`_refuses_only_version` infers a refused version from Transit's reply; it does not read the key's
+`_refuses_only_version` infers a refused version from the reply, which a proxy can author (item
+3); it does not read the key's
 version range. So a node whose copy of the key lags a rotation can refuse a real, newer version, and
 that row reads as a break too.
 
