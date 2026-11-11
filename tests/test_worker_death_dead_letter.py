@@ -98,7 +98,7 @@ Drive = Callable[[str, OutboxItem], Awaitable[Any]]
 def _driver(runner: RegistryRunner, claim_mode: str, stage: str) -> Drive:
     """The per_lane loops call the per-item body; the pooled dispatcher calls the adapter around it."""
     attr = f"_process_{stage}_item" if claim_mode == "per_lane" else f"_dispatch_{stage}"
-    return getattr(runner, attr)  # type: ignore[no-any-return]
+    return getattr(runner, attr)
 
 
 @pytest.fixture
