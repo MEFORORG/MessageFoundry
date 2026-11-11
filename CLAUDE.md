@@ -533,8 +533,8 @@ and is not part of the signature. The signature covers R1-R9 as they stand in va
 The copy on vault `main` is `docs/LEDGER-INFLOW-RULINGS.md`, from vault PR 2818 (`a03b25550`). At
 `a03b25550` it keeps R1-R9 as signed, edits the sections around them, and adds, as its last
 section, the Manager's reading that this file calls "recorded beside the signed text".
-The owner's R5 exemption for the autonomy-tier change is recorded in
-[`docs/AUTONOMY-PLAN.md`](docs/AUTONOMY-PLAN.md) section 12.
+The owner's exemption from ledger ruling R5, for the minimal T4 empower widening only, is
+recorded in [`docs/AUTONOMY-PLAN.md`](docs/AUTONOMY-PLAN.md) section 12.
 
 The brief is disposable. The BACKLOG item is the record.
 
