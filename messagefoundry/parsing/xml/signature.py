@@ -355,9 +355,9 @@ def _read_anchor(
     such as a pyOpenSSL one, is converted through it, and anything else is read as PEM text.
 
     It raises at least these: :class:`ValueError` naming the anchor and the type of the fault, for
-    a pinned certificate or its key, or a CA file, that cannot be read; and :class:`OSError` for a
-    CA file that cannot be opened. A fault it does not catch, such as a pyOpenSSL pin whose
-    ``to_cryptography()`` raises ``OpenSSL.crypto.Error``, escapes as raised.
+    a pinned certificate or its key, or a CA file, that cannot be parsed; and :class:`OSError` for
+    a CA file that cannot be opened or read from. A fault it does not catch, such as a pyOpenSSL
+    pin whose ``to_cryptography()`` raises ``OpenSSL.crypto.Error``, escapes as raised.
     """
     # Imported here, not at module top, as in _signing_key_refusal.
     from cryptography import x509

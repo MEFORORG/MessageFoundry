@@ -6,5 +6,5 @@
   with `UnsignedContent`. The `x509_cert` or `ca_pem_file` anchor is now read before the
   document. An anchor that cannot be read is refused there, at least with `ValueError` (`OSError`
   for a CA file that cannot be opened); `verify()`'s docstring says what that read checks. The CA
-  file is read once per call, and signxml's chain check uses that read, so the call does not open
-  the file again. (`BACKLOG #2816`, `BACKLOG #5372`)
+  file is read at most once per call, and signxml's chain check uses that read, so the call does
+  not open the file again. (`BACKLOG #2816`, `BACKLOG #5372`)

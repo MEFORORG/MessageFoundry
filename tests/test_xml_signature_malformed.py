@@ -10,8 +10,8 @@ and each now raises :class:`XmlError` naming only the exception type, with nothi
 ``__cause__`` or ``__context__``. A coverage comparison that cannot canonicalize the document fails
 with ``UnsignedContent`` instead, because the cryptography has already passed by then.
 
-A bad ANCHOR is the caller's fault, not the document's, so it is refused before the document is
-read, at least with ``ValueError``.
+An ANCHOR that cannot be read is the caller's fault, not the document's, so it is refused before
+the document is read, at least with ``ValueError``.
 
 All material is minted at run time, and every planted value is synthetic.
 """
@@ -226,7 +226,7 @@ def test_a_relative_namespace_outside_the_signed_element_is_unsigned_content() -
     assert result.signed_content is None
 
 
-# --- a bad anchor is the caller's fault and keeps its own error ------------------------------------
+# --- an anchor that cannot be read is the caller's fault and keeps its own error -----------------
 
 
 def test_a_pinned_certificate_that_cannot_be_read_is_not_blamed_on_the_document() -> None:
