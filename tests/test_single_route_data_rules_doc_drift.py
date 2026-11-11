@@ -3,7 +3,7 @@
 """BACKLOG #1151 -- the single-route data rules, executed and documented.
 
 ``docs/SECURITY.md`` carries a blockquote headed *Single-route data rules*. It states at least
-eleven data rules that each sit on one route, or one family of routes, and that the route rows
+thirteen data rules that each sit on one route, or one family of routes, and that the route rows
 themselves only point to. This file keeps that blockquote true in the same two halves as
 ``tests/test_monitoring_scope_doc_drift.py``, on the same seeded estate (inbounds ``IB_A`` and
 ``IB_B``, shared outbound ``OB_X``):
@@ -11,7 +11,9 @@ themselves only point to. This file keeps that blockquote true in the same two h
 * one measurement per rule EXECUTES the route against a channel-scoped operator, with an
   all-channels operator in the same run as the positive control. The security-event feed has no
   channel axis: it is keyed on the caller's own account, and its control is the raw audit log. The
-  approval release narrows its REQUESTER's scope, and its control is a release that runs;
+  approval release narrows its REQUESTER's scope, and its control is a release that runs. The
+  suspend refusal page's rules gate is a permission fact, and its control is a ``monitoring:read``
+  holder;
 * :func:`test_security_doc_states_each_single_route_rule` reads the blockquote and requires each
   rule's routes and key facts in that rule's own bullet, every bullet to belong to a rule, and each
   route's row in the route map to point at the blockquote.
@@ -415,37 +417,46 @@ async def _ui_sessions(k: _Callers, *usernames: str) -> AsyncIterator[dict[str, 
 async def _measure_ui_resend_done(k: _Callers) -> None:
     pytest.importorskip("messagefoundry_webconsole")
     ids = await k.message_ids()
-    # A resend of IB_A's message to OB_X under one key. The store call the JSON resend makes; the
-    # route under test reads only its record, so the lane state is not part of the rule.
+    # A resend of IB_A's message, copied from its OB_X body, to the target OB_Y under one key. The
+    # store call the JSON resend makes; the route under test reads only its record, so the lane
+    # state, and whether OB_Y is registered, is not part of the rule. Source and target differ, so
+    # a page that named the source would show a name the target does not.
     outcome = await k.engine.store.resend_to(
-        message_id=ids["IB_A"], to="OB_X", idempotency_key="k-ran", audit=lambda _o: None
+        message_id=ids["IB_A"],
+        to="OB_Y",
+        from_="OB_X",
+        idempotency_key="k-ran",
+        audit=lambda _o: None,
     )
-    assert outcome.status == "resent", outcome
-    path, ran = f"/ui/messages/{ids['IB_A']}/resend-done", {"to": "OB_X", "key": "k-ran"}
+    assert (outcome.status, outcome.from_destination) == ("resent", "OB_X"), outcome
+    path, ran = f"/ui/messages/{ids['IB_A']}/resend-done", {"to": "OB_Y", "key": "k-ran"}
     # Scoped to the target alone, with no scope on the origin IB_A.
     target_only = await _operator(k.service, "target_only")
-    await k.service.set_channel_scope(target_only, ["OB_X"], actor="admin")
+    await k.service.set_channel_scope(target_only, ["OB_Y"], actor="admin")
     async with _ui_sessions(k, "scoped", "allchannels", "target_only") as ui:
-        # Scoped to IB_A, the ORIGIN channel, but not to the target OB_X: no record, as for a bad
+        # Scoped to IB_A, the ORIGIN channel, but not to the target OB_Y: no record, as for a bad
         # key.
         hidden = await ui["scoped"].get(path, params=ran)
         assert hidden.status_code == 404 and "No such resend" in hidden.text, hidden.status_code
         # Control: the all-channels caller sees the page; a key, a target or a message the record
         # does not name is "No such resend" for it too.
         shown = await ui["allchannels"].get(path, params=ran)
-        assert shown.status_code == 200 and "No such resend" not in shown.text, shown.status_code
+        assert shown.status_code == 200 and "OB_Y" in shown.text, shown.status_code
         for p, to, key in (
-            (path, "OB_X", "never-used"),
-            (path, "IB_B", "k-ran"),
-            (f"/ui/messages/{ids['IB_B']}/resend-done", "OB_X", "k-ran"),
+            (path, "OB_Y", "never-used"),
+            (path, "OB_X", "k-ran"),
+            (f"/ui/messages/{ids['IB_B']}/resend-done", "OB_Y", "k-ran"),
         ):
             r = await ui["allchannels"].get(p, params={"to": to, "key": key})
             assert r.status_code == 404 and "No such resend" in r.text, (p, to, key)
+        # A target that fails the connection-name rule is refused before any lookup.
+        bad = await ui["allchannels"].get(path, params={"to": "<b>x</b>", "key": "k-ran"})
+        assert bad.status_code == 422, bad.status_code
         # The origin channel is not checked: the target-only caller is shown the page, which
-        # names no source.
+        # names the target and neither the origin channel nor the source lane.
         alone = await ui["target_only"].get(path, params=ran)
-        assert alone.status_code == 200 and "No such resend" not in alone.text, alone.status_code
-        assert "IB_A" not in alone.text and "copied from" not in alone.text
+        assert alone.status_code == 200 and "OB_Y" in alone.text, alone.status_code
+        assert "IB_A" not in alone.text and "OB_X" not in alone.text
 
 
 async def _measure_ui_suspend_refusal(k: _Callers) -> None:
@@ -604,6 +615,7 @@ _RULES: dict[str, _Rule] = {
         (
             "404",
             "`key`",
+            "422",
             "outside the caller's channel scope",
             "does not check scope on the message's origin channel",
             "target alone",

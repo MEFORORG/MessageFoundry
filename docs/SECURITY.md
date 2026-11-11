@@ -2410,12 +2410,14 @@ the same permission set on the same method reds CI until it is listed here.
 > - `GET /ui/messages/{message_id}/resend-done` answers 404 "No such resend" unless the store holds
 >   a resend record under the `key` it names, for that message and for the target `to` names. It
 >   also answers 404 when that target is outside the caller's channel scope, the same answer an
->   unknown `key` gets. It does not read the message, so it
->   does not check scope on the message's origin channel, and a caller scoped to the target alone
->   is shown the page. The page names the target and no source. Whether the origin channel should be
->   checked here is an open question (vault BACKLOG #4776 item 1).
-> - `POST /ui/alerts/{alert_id}/suspend` refuses a `minutes` window the JSON route would refuse with
->   400, and re-renders the alerts page carrying the refusal. It refuses before it reads the alert,
+>   unknown `key` gets. A `to` that fails the connection-name rule is refused with 422 before any
+>   lookup. It does not read the message, so it does not check scope on the message's origin
+>   channel, and a caller scoped to the target alone is shown the page. The page names the target
+>   and no source. Whether the origin channel should be checked here is an open question (vault
+>   BACKLOG #4776 item 1).
+> - `POST /ui/alerts/{alert_id}/suspend` refuses with 400 a `minutes` value that does not parse as a
+>   number or falls outside the suspend window's bounds, which the JSON route refuses with 422, and
+>   re-renders the alerts page carrying the refusal. It refuses before it reads the alert,
 >   so an alert id outside the scope, or an unknown one, gets the same 400. The page lists only the
 >   active alerts in the caller's channel scope. It shows the alert rules only to a caller that also
 >   holds `monitoring:read`, since the route itself needs only `monitoring:diagnose`.
@@ -2433,7 +2435,8 @@ the same permission set on the same method reds CI until it is listed here.
 >
 > `tests/test_single_route_data_rules_doc_drift.py` executes the main facts of each bullet, with an
 > all-channels caller as the control. The security-event feed has no channel axis, so its control
-> is the raw audit log. It reds if a bullet loses its route, a named fact, or its
+> is the raw audit log. The suspend page's rules gate is a permission fact, so its control is a
+> `monitoring:read` holder. It reds if a bullet loses its route, a named fact, or its
 > route-map pointer, or names a route nothing executes. It does not execute this console paragraph,
 > the outbound-by-name case, or the administrator case; those are read from the code.
 
