@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, StrictInt, model_validator
 
 from messagefoundry.api.phi_gate import PhiGatedModel
 from messagefoundry.api.request_model import RequestModel
@@ -140,7 +140,8 @@ class MessageSearchRequest(RequestModel):
     message_type: MessageTypeFilter | None = None
     control_id: ControlIdFilter | None = None
     limit: int = Field(default=50, ge=1, le=500)
-    scan_limit: int | None = Field(default=None, ge=1)
+    # StrictInt: a lax int would take JSON ``true`` as 1 and ``"7"`` as 7 (BACKLOG #6700).
+    scan_limit: StrictInt | None = Field(default=None, ge=1)
 
 
 class MessageExportRequest(MessageSearchRequest):

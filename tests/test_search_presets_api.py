@@ -728,3 +728,137 @@ async def test_a_recreated_username_does_not_inherit_the_departed_operators_pres
         # ...and the layered compose, which is the route that returns the PHI-shaped criteria.
         layered = await c.get("/search/layered", params={"presets": pid}, headers=h2)
         assert layered.status_code == 404, layered.text
+
+
+async def test_a_lone_field_value_is_refused_not_saved_unread(engine: Engine) -> None:
+    """BACKLOG #6700: create_search_preset ran make_spec only beside content or field_path, so a
+    criteria holding only field_value was saved and never applied. Control: beside a field path it
+    saves, and an all-whitespace content beside a field path audits as a field-path needle."""
+    pytest.importorskip("psutil")
+    import json
+
+    from messagefoundry.api import create_app
+
+    service = await _user(engine, Role.OPERATOR, "op")
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        lone = await c.post(
+            "/search/presets", json={"name": "n", "criteria": {"field_value": "MRN999"}}, headers=h
+        )
+        assert lone.status_code == 400, lone.text
+        assert "field_value needs an HL7 field path" in lone.json()["detail"]
+        ok = await c.post(
+            "/search/presets",
+            json={
+                "name": "p",
+                "criteria": {"content": "   ", "field_path": "PID-3", "field_value": "MRN999"},
+            },
+            headers=h,
+        )
+        assert ok.status_code == 200, ok.text
+        # A blank field_value is not a needle: a metadata-only preset still saves.
+        meta_only = await c.post(
+            "/search/presets",
+            json={"name": "m", "criteria": {"channel_id": "IB_A", "field_value": "   "}},
+            headers=h,
+        )
+        assert meta_only.status_code == 200, meta_only.text
+        # A content of only spaces is refused, as on origin/main, not saved as a needle never applied.
+        spaces = await c.post(
+            "/search/presets", json={"name": "s", "criteria": {"content": "   "}}, headers=h
+        )
+        assert spaces.status_code == 400, spaces.text
+        # A stored lone field_value (saved before the refusal existed) is refused on the layered
+        # read rather than dropped by the compose.
+        pid = meta_only.json()["id"]
+        assert isinstance(engine.store, MessageStore)  # a SQLite engine: the raw write needs _db
+        await engine.store._db.execute(
+            "UPDATE search_presets SET criteria=? WHERE id=?",
+            (json.dumps({"field_value": "MRN999"}), pid),
+        )
+        await engine.store._db.commit()
+        r = await c.get("/search/layered", params={"presets": pid}, headers=h)
+        assert r.status_code == 400, r.text
+        assert "field_value needs an HL7 field path" in r.json()["detail"]
+    rows = await engine.store.list_audit(action="preset.create")
+    shapes = sorted(json.loads(r["detail"])["needle_shape"] or "" for r in rows)
+    assert shapes == ["", "field_path"]
+
+
+async def test_a_non_str_stored_field_value_beside_the_needle_is_not_a_500(engine: Engine) -> None:
+    """The compose reads every preset's field_value to find a lone one (BACKLOG #6700). A stored
+    non-str field_value on a preset that is NOT the needle was never read on origin/main, so it must
+    not become a 500 now. Control: the same layering with an intact second preset also answers 200."""
+    pytest.importorskip("psutil")
+    import json
+
+    from messagefoundry.api import create_app
+
+    service = await _user(engine, Role.OPERATOR, "op")
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        ids = []
+        for name, criteria in (("a", {"content": "MRN999"}), ("b", {"channel_id": "ch1"})):
+            r = await c.post(
+                "/search/presets", json={"name": name, "criteria": criteria}, headers=h
+            )
+            assert r.status_code == 200, r.text
+            ids.append(r.json()["id"])
+        control = await c.get("/search/layered", params={"presets": ",".join(ids)}, headers=h)
+        assert control.status_code == 200, control.text
+        assert isinstance(engine.store, MessageStore)  # a SQLite engine: the raw write needs _db
+        await engine.store._db.execute(
+            "UPDATE search_presets SET criteria=? WHERE id=?",
+            (json.dumps({"channel_id": "ch1", "field_value": 5}), ids[1]),
+        )
+        await engine.store._db.commit()
+        r = await c.get("/search/layered", params={"presets": ",".join(ids)}, headers=h)
+        assert r.status_code == 200, r.text
+        # On the NEEDLE preset the same malformed field_value is read by make_spec, which refuses a
+        # non-text needle value: a 400, never an AttributeError's 500.
+        await engine.store._db.execute(
+            "UPDATE search_presets SET criteria=? WHERE id=?",
+            (json.dumps({"content": "MRN999", "field_value": 5}), ids[0]),
+        )
+        await engine.store._db.commit()
+        r = await c.get("/search/layered", params={"presets": ",".join(ids)}, headers=h)
+        assert r.status_code == 400, r.text
+        assert "field_value must be text" in r.json()["detail"]
+
+
+async def test_a_blank_stored_content_on_a_non_needle_preset_is_not_a_second_needle(
+    engine: Engine,
+) -> None:
+    """The compose counts needles on stripped values, as on origin/main: a stored content of only
+    spaces beside a channel filter is not a second content predicate, so the layered search runs
+    the other preset's DOE search inside IB_A (BACKLOG #6700)."""
+    pytest.importorskip("psutil")
+    import json
+
+    from messagefoundry.api import create_app
+
+    await engine.store.enqueue_message(
+        channel_id="IB_A", raw=ADT, deliveries=[("o", ADT)], control_id="MSG1"
+    )
+    service = await _user(engine, Role.OPERATOR, "op")
+    transport = httpx.ASGITransport(app=create_app(engine, auth=service))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        ids = []
+        for name, criteria in (("doe", {"content": "DOE"}), ("ch", {"channel_id": "IB_A"})):
+            r = await c.post(
+                "/search/presets", json={"name": name, "criteria": criteria}, headers=h
+            )
+            assert r.status_code == 200, r.text
+            ids.append(r.json()["id"])
+        assert isinstance(engine.store, MessageStore)  # a SQLite engine: the raw write needs _db
+        await engine.store._db.execute(
+            "UPDATE search_presets SET criteria=? WHERE id=?",
+            (json.dumps({"content": "   ", "channel_id": "IB_A"}), ids[1]),
+        )
+        await engine.store._db.commit()
+        r = await c.get("/search/layered", params={"presets": ",".join(ids)}, headers=h)
+        assert r.status_code == 200, r.text
+        assert r.json()["matched"] == 1

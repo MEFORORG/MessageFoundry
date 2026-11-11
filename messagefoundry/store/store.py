@@ -5091,7 +5091,8 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
     producible only from an empty log, so ``5:`` is a head the store can never emit and falls under the
     refusal above. Left accepted it parses to ``(5, "")``, which no intact chain can match — so a line
     truncated while being copied, or an anchor file caught half-written, would be reported as
-    ``truncated or rewritten`` on a chain nobody touched.
+    ``truncated or rewritten`` on a chain nobody touched. The converse holds too: a log with rows has
+    a newest seq of 1 or more, so ``0:<head>`` is refused for the same reason.
 
     IT LIVES HERE, BESIDE THE COMPARATORS AND THE PRODUCER, BECAUSE IT NOW HAS TWO CONSUMERS: the
     ``audit-verify`` CLI and the engine's ``[integrity].audit_anchor_file`` startup check (BACKLOG #328).
@@ -5122,6 +5123,14 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
                 text,
             )
         return count, head
+    if count == 0:
+        # The converse of the pairing above: a log with rows has a newest seq of 1 or more, so a head
+        # beside a zero count is one the store can never emit, and a comparator would report it as
+        # `truncated or rewritten` on an intact chain (vault BACKLOG #5987 item 1).
+        raise AuditAnchorError(
+            "a zero row count is only producible from an EMPTY log, so it cannot carry a head",
+            text,
+        )
     refusal, head = _audit_head_shape(head)
     if refusal is not None:
         raise AuditAnchorError(refusal, text)
@@ -5743,13 +5752,17 @@ class StoreChainNeverStarted(StoreIdPinRefusedBeforeWrite):
 
 
 class StoreCreateBatchFailedBeforeKeyUse(Exception):
-    """A minting open's create batch failed before its commit (PR 2804 hold 17). The batch is one
-    transaction on each server backend, and nothing is sealed under the store key before it commits:
-    the first seal follows ``bind_store_salt``, after the batch and the pin check, which only reads.
-    So nothing was sealed under the key, and a minting command may remove the key
-    it minted, as for :class:`StoreIdPinRefusedBeforeWrite`. ``failure`` is the batch's own error,
-    also the cause. Raised only on a minting open (:func:`minting_open`), so no other caller sees a
-    new class; a failure at or after the commit is never this."""
+    """A minting server open failed before anything was sealed under the store key: its create
+    batch failed before its commit (PR 2804 hold 17), or it failed while building its pool, before
+    the store that holds the cipher existed, with a class only a failed dial raises, at least the
+    hop's TLS settings, a refused address or a refused login (vault BACKLOG #8119 item 2;
+    ``store.base``'s ``_failed_before_connecting`` names them). The batch is one transaction on each server
+    backend, and the first seal follows ``bind_store_salt``, after the batch and after the pin
+    check, which only reads. So nothing was sealed under the key, and a minting command may remove
+    the key it minted, as for :class:`StoreIdPinRefusedBeforeWrite`. ``failure`` is the open's own
+    error, also the cause. Raised only on a minting open (:func:`minting_open`), so no other caller
+    sees a new class; a failure once the pin check has passed is never this, and any other failure
+    before it, a ``RuntimeError`` or a connection lost mid-open among them, keeps the key."""
 
     def __init__(self, failure: Exception) -> None:
         # The failure itself is the one argument, so a copy or an unpickle rebuilds it whole.
@@ -5762,6 +5775,26 @@ class StoreCreateBatchFailedBeforeKeyUse(Exception):
 #: than a parameter of each backend's open, as the hop posture is held during connector
 #: construction; ``None`` for every open that is not under the ``host`` key provider.
 OPEN_STORE_PIN: ContextVar[StorePin | None] = ContextVar("mefor_open_store_pin", default=None)
+
+
+class PinCheck:
+    """Whether the open in progress has passed its store id pin check (:func:`check_open_store_pin`),
+    the last step before its first write under the store key. Under ``auto`` schema management the
+    open may already have committed its schema, and on SQL Server altered the database's options,
+    before it; neither is under the key. A mutable cell rather than a flag in a context variable,
+    so a pass recorded under a copied context still reaches the open that set it (vault BACKLOG
+    #8119 item 2)."""
+
+    __slots__ = ("passed",)
+
+    def __init__(self) -> None:
+        self.passed = False
+
+
+#: The cell ``store.base.open_store`` sets around a minting open's backend open; ``None`` otherwise.
+OPEN_STORE_PIN_CHECK: ContextVar[PinCheck | None] = ContextVar(
+    "mefor_open_store_pin_check", default=None
+)
 
 
 def minting_open() -> bool:
@@ -5892,6 +5925,8 @@ async def check_open_store_pin(host: AuditRangeHost) -> None:
         return
     refusal = await _store_pin_refusal(host, await host._audit_genesis_row(), pin, writable=True)
     if refusal is None:
+        if (check := OPEN_STORE_PIN_CHECK.get()) is not None:
+            check.passed = True  # the open may write under the key from here on
         return
     refused = StoreChainNeverStarted if refusal.never_started else StoreIdPinRefusedBeforeWrite
     raise refused(f"refusing to open the store: {refusal.text}")
