@@ -82,13 +82,16 @@ async def keyed() -> AsyncIterator[tuple[Any, str]]:
         await _clear(janitor)
         key = generate_key()
         cipher = make_cipher(key, write_v2=True)
-        # With its audit MAC key, as a keyed service open holds it, so this open writes the chain's
-        # genesis row. Without it the log stays empty, and a keyless `cipher-audit` is then refused
-        # for starting a keyless chain (BACKLOG #1916) before it can report KEY_MISMATCH.
+        # With the aesgcm cipher's audit MAC key, as a keyed service open passes it, so this open
+        # writes the chain's genesis row. Without it the log stays empty, and open_store refuses a
+        # keyless open of an empty log, read-only too, under the shared #1916 verdict the command
+        # passes: a keyless `cipher-audit` would exit 2 there, never reaching KEY_MISMATCH.
         store = await PostgresStore.open(
             settings, cipher=cipher, audit_mac_key=cipher.audit_mac_key()
         )
         try:
+            count, _head = await store.audit_anchor()
+            assert count >= 1, "the keyed open wrote no genesis row"
             await write_every_cell(store)
             yield store, key
         finally:
@@ -130,7 +133,7 @@ async def test_cipher_audit_opens_every_written_cell(
 
     store, _key = keyed
     columns = await store.cipher_walk_columns(server_walk_tables(POSTGRES_CIPHER_CELLS))
-    # Positive controls: neither absence check below may pass over an empty walk.
+    # A floor on the population the absence check walks, so it cannot pass over no cells.
     assert len(POSTGRES_CIPHER_CELLS) > 0
     absent = [c for c in POSTGRES_CIPHER_CELLS if not server_cell_present(c, columns)]
     assert not absent, f"the inventory names columns this schema lacks: {absent}"
@@ -143,9 +146,12 @@ async def test_cipher_audit_opens_every_written_cell(
     for tally in audit.tallies:
         assert tally.opened == await _sealed(store, tally.table, tally.column), tally
     written = {f"{t}.{c}" for t, c in cells_in_scope("postgres.py")}
-    assert len(audit.tallies) > 0
-    assert len(written & {t.name for t in audit.tallies}) > 0, written
-    unread = sorted(t.name for t in audit.tallies if t.name in written and t.opened == 0)
+    tallies = {t.name: t for t in audit.tallies}
+    # Every written cell is one the audit walks, so none drops out of the check below unread; and a
+    # floor on that population, so the check cannot pass over no cells.
+    assert written <= set(tallies), sorted(written - set(tallies))
+    assert written
+    unread = sorted(name for name in written if tallies[name].opened == 0)
     assert not unread, f"written cells the audit opened nothing in: {unread}"
 
 
