@@ -1664,7 +1664,8 @@ def _schema_opener_is_confined() -> None:
     def never(*args: object) -> None:
         raise AssertionError("an injected open method ran")
 
-    # An https_open set on the one handler, which the tables carry in under "https", is never called.
+    # An https_open set on the one handler, which the tables carry in under "https", is not called
+    # through the opener's own open().
     injected = _ConfinedFiles(())
     injected.https_open = never  # type: ignore[attr-defined]
     carrying = _ConfinedOpener(injected)

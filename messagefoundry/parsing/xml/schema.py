@@ -358,8 +358,8 @@ class _ConfinedFiles(urllib.request.BaseHandler):
     other scheme before this handler runs. It does not see every location a schema names: one
     xmlschema reads as XML text is parsed, not opened, so :func:`_refuse_text_locations` refuses it
     first in the inline schema, the named file and each file under a vetted root, though not in the
-    bundled copies, and ``allow="local"`` refuses a remote URL before it is opened. The named file is read as named, a
-    link at it included. One root is xmlschema's bundled ``schemas`` directory, which holds
+    bundled copies, and ``allow="local"`` refuses a remote URL before it is opened. The named file
+    is read as named, a link at it included. One root is xmlschema's bundled ``schemas`` directory, which holds
     the copies of well-known namespaces (SOAP encoding, XML-DSig, xlink and others) a location-free
     ``xs:import`` resolves to; those are library files and are read as they are, links included. For
     a schema given as a path, the other root is its own directory, or the ``schema_root`` the caller
@@ -459,17 +459,19 @@ class _ConfinedOpener(urllib.request.OpenerDirector):
     that read an HTTP reply. That one goes through ``build_opener``, which adds urllib's defaults,
     ``FileHandler``, ``FTPHandler`` and ``DataHandler`` among them, each able to open what
     ``_ConfinedFiles`` refuses; and ``parsing/`` may not import ``transports/``. Its own code opens
-    no ``http`` or ``https`` URL, so it reads no reply head, the hazard that function exists for,
-    and the refusals below keep at least these additions from opening one. It takes a :class:`_ConfinedFiles` and no subclass, which could add an ``https_open``;
+    no ``http`` or ``https`` URL, so it reads no reply head, the hazard that function exists for.
+    It takes a :class:`_ConfinedFiles` and no subclass, which could add an ``https_open``, and
     :meth:`add_handler` refuses any handler after the first. Before any handler runs, :meth:`open`
     refuses any URL whose scheme is not ``file``, so an ``https_open`` set on the
-    :class:`_ConfinedFiles` instance or class is never called; refuses to run if any other handler
-    got in another way, such as through ``super`` or the handler list itself; and refuses to run if
-    the one handler registered an open method besides ``file_open`` and ``unknown_open``, such as a
-    ``default_open`` set on its instance or class, which would run before ``file_open``. A
-    ``file_open`` or ``unknown_open`` replaced on that instance or class is not detected. The
-    stock-opener scan in ``tests/test_reply_framing.py`` sanctions this class by name, and checks
-    each of these refusals."""
+    :class:`_ConfinedFiles` instance or class is not called through it; refuses to run if any other
+    handler got in another way, such as through ``super`` or the handler list itself; and refuses
+    to run if the one handler registered an open method besides ``file_open`` and
+    ``unknown_open``, such as a ``default_open`` set on its instance or class, which would run
+    before ``file_open``. These hold only through this class's :meth:`open`: a caller that runs
+    ``OpenerDirector.open`` on it directly skips all three. A ``file_open`` or ``unknown_open``
+    replaced on that instance or class is not detected. The stock-opener scan in
+    ``tests/test_reply_framing.py`` sanctions this class by name, and checks each refusal on an
+    instance."""
 
     def __init__(self, files: _ConfinedFiles) -> None:
         if type(files) is not _ConfinedFiles:

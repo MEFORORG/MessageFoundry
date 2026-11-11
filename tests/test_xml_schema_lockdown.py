@@ -1239,9 +1239,8 @@ def test_an_open_method_set_on_the_confined_handler_is_never_called(
     )
 
     def injected(*args: object) -> None:
-        raise AssertionError(
-            "an injected open method ran"
-        )  # pytest.raises below would not catch it
+        # An AssertionError, which the pytest.raises below would not catch.
+        raise AssertionError("an injected open method ran")
 
     (tmp_path / "main.xsd").write_text(_CLEAN, encoding="utf-8")
     roots = (_Root(str(tmp_path), vet=True),)
