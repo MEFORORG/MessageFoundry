@@ -954,7 +954,10 @@ with answers, or one instance under the bare `directory-reconciler-unreached`
 source on a rolled-up pass, which the `ad_reconcile_outage_passes` row states. Nothing resolves
 either automatically.
 Resolve a per-account one by hand once the WARNING says the account was answered for on each of its
-last probes, and the
+last probes, which takes `2 * ad_reconcile_outage_passes - 1` answers in a row (vault BACKLOG #3709),
+or once the account has no live session left, since the account then leaves the reconciler's record
+with no WARNING. A new run of failures that starts before that WARNING pages nothing more, so
+resolving earlier can leave it unpaged. Resolve the
 bare one once each account its rows name has been.
 
 A lasting directory outage opens its own `ad_reconcile_aborted` instance, with reason

@@ -444,7 +444,7 @@ class ReconcilePlan:
         failed (:attr:`directory_outage`), and not every probe failed or faulted
         (:attr:`probe_fault`), since a fault says nothing about reach. A pass of referrals or
         configuration refusals only reached it. The outage run reads it (BACKLOG #3709). An
-        account's unreached run does not: it counts on every pass that probes the account, an
+        account's unreached window does not: it fills on every pass that probes the account, an
         outage pass included (BACKLOG #3100, ``AuthService._note_unreached_accounts``)."""
         return self.asked > 0 and not self.directory_outage and not self.probe_fault
 

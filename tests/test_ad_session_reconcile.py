@@ -2990,7 +2990,7 @@ async def test_a_later_rollup_says_it_counts_only_the_accounts_entering() -> Non
             "Accounts newly unreachable: 7",
             "Accounts newly unreachable: 1",
         ]
-        assert "each failed 3+ of its last 5 directory probes" in rollups[1]["detail"]
+        assert "each failed 3+ of its last 5 probes" in rollups[1]["detail"]
         assert all("sessions are not revoked;" in p["detail"] for p in rollups)
     finally:
         await store.close()
@@ -3553,7 +3553,7 @@ async def test_alternating_accounts_past_the_rollup_bound_page_as_one() -> None:
         rollups = [p for _k, s, p in sink.events if s == _UNREACHED_ALERT_SOURCE]
         assert len(rollups) == 1 and _unreached_events(sink) == []
         assert rollups[0]["detail"].startswith("Accounts newly unreachable: 7.")
-        assert "each failed 3+ of its last 5 directory probes" in rollups[0]["detail"]
+        assert "each failed 3+ of its last 5 probes" in rollups[0]["detail"]
         assert len(rollups[0]["detail"]) <= 200
         assert sorted(a for a, _n in await _unreached_rows(store)) == sorted(names[1:])
     finally:

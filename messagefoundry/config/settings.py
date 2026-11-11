@@ -9162,7 +9162,9 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       pass is the least delay, not an estimate (each pass's own run adds to it), and the
       interval's entry says so too. The same value bounds one account the directory keeps failing
       for, at that many of its last ``ad_reconcile_unreached_window`` probes (BACKLOG #3100, #3709),
-      so that page waits longer too.
+      so that page waits longer too, and a failure pattern that pages at the default can then
+      never page: an account down for three probes and up for four, in a cycle, pages at 3 and
+      never holds four failures in seven at 4.
       ``ad_session_revoke_max`` and ``ad_session_revoke_max_fraction`` feed ``breaker_tripped``,
       which aborts a pass that would revoke more than both, and an aborted pass revokes nothing.
       Below the default a smaller wave of genuine revocations aborts, so that is named, as the 0
@@ -9740,7 +9742,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     "meanwhile keeps its live engine sessions with only a WARNING and an audit row "
                     "per pass to show for it. The same count bounds one account the directory "
                     f"keeps failing for, at {run} of its last {window} probes, so that page "
-                    "waits longer too",
+                    "waits longer too, and some patterns that page at the default never page, "
+                    "such as an account down for three probes and up for four, in a cycle",
                 )
             )
         strikes = auth.ad_session_recheck_strikes

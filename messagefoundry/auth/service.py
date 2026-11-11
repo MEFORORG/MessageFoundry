@@ -9035,8 +9035,9 @@ class AuthService:
         directory layer has no server pool, but its one host name can stand for several domain
         controllers behind DNS round-robin, a VIP or a referral. Where one of them answers and
         another does not, the account's probes alternate, and a run that one answer ends never
-        reached K. Two failures in three probes still page nothing: a window of ``2K - 1`` needs
-        failures to outnumber answers in it before it pages, so a lone flake does not.
+        reached K. Fewer than K failures in the window page nothing, so a window of ``2K - 1``
+        needs failures to outnumber answers in it before it pages; at the default of 3, two
+        failures in three probes do not, and neither does a lone flake.
 
         **Every pass that probes the account counts, an outage pass too.** A probe sample can
         hold only unreachable accounts, at a budget of one always, and such a pass reads as an
@@ -9080,7 +9081,9 @@ class AuthService:
                         "directory reconcile: %s was answered for again (%s) on each of its last "
                         "%d probes, so its unreachable page has ended",
                         scrub_log_argument(probe.username),
-                        probe.outcome.value,
+                        # A group search refused for its bound is an answer whose outcome reads
+                        # "unavailable"; its cause says what answered.
+                        probe.detail or probe.outcome.value,
                         len(window),
                     )
                 continue
