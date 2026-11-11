@@ -9026,10 +9026,11 @@ class AuthService:
         strike and no revocation. On a pass where every probe fails that is a whole-directory
         outage, which pages once it lasts (:meth:`_note_directory_outage`). An account the
         directory fails for while it answers the rest would, without this, have no bound short of
-        the absolute session cap and page nobody. Once K of its last ``2K - 1`` probes read it so,
-        the failing probe that makes it K pages for it once, naming the account, as a paging
-        refusal pages (:meth:`_note_paging_refusals`). The same setting, so one knob says how long
-        a failure lasts before it pages; at the default of 3, three of the last five.
+        the absolute session cap and page nobody. A failing probe pages for it once its window
+        holds K or more failures, the account is not latched and no outage page covers it, naming
+        the account, as a paging refusal pages (:meth:`_note_paging_refusals`). The same setting,
+        so one knob says how long a failure lasts before it pages; at the default of 3, three of
+        up to the last five.
 
         **A window, not a run, so an alternating account pages (#3709 closing step 6).** The
         directory layer has no server pool, but its one host name can stand for several domain
@@ -9037,7 +9038,8 @@ class AuthService:
         another does not, the account's probes alternate, and a run that one answer ends never
         reached K. Fewer than K failures in the window page nothing, so a window of ``2K - 1``
         needs failures to outnumber answers in it before it pages; at the default of 3, two
-        failures in three probes do not, and neither does a lone flake.
+        failures in three probes do not. A lone flake pages only when the window already holds
+        K - 1 earlier failures, an outage's or any other.
 
         **Every pass that probes the account counts, an outage pass too.** A probe sample can
         hold only unreachable accounts, at a budget of one always, and such a pass reads as an
@@ -9125,7 +9127,7 @@ class AuthService:
 
         def warn(username: str, probes: int) -> None:
             _log.warning(
-                "directory reconcile: %d of the last %d probes of %s failed to reach the "
+                "directory reconcile: %d of up to the last %d probes of %s failed to reach the "
                 "directory, so its sessions are not revoked while this lasts",
                 probes,
                 plan.unreached_window,
@@ -9144,7 +9146,7 @@ class AuthService:
                     {
                         "reason": reconcile.UNREACHED_ACCOUNT,
                         "probes": probes,
-                        "window": plan.unreached_window,
+                        "window_up_to": plan.unreached_window,
                         "asked": plan.asked,
                         "aborted": plan.aborted,
                     }

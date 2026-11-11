@@ -349,17 +349,17 @@ class ReconcilePlan:
     paging_refused: tuple[tuple[str, str, str], ...] = ()
     #: Set by the auth service after the pass, never by :func:`plan_pass` (BACKLOG #3100 closing
     #: step 2): ``(user_id, username, probes)`` of each account that has just ENTERED the state
-    #: :data:`UNREACHED_ACCOUNT` names, ``probes`` being how many of its last
+    #: :data:`UNREACHED_ACCOUNT` names, ``probes`` being how many of up to its last
     #: :attr:`unreached_window` probes read it unreachable. An account already in that state is
     #: not here, so each pages once per state change. An outage-shaped pass can carry entries,
-    #: where its probe sample held only
-    #: unreachable accounts, but none on a pass that raises the lasting outage page or while that
-    #: page stands (``AuthService._note_unreached_accounts``).
+    #: where its probe sample held only unreachable accounts, but none on a pass that raises the
+    #: lasting outage page or while that page stands (``AuthService._note_unreached_accounts``).
     unreached: tuple[tuple[str, str, int], ...] = ()
-    #: Set by the auth service with :attr:`unreached` (BACKLOG #3709 closing step 6): how many of
-    #: each account's last probes its window holds, ``2K - 1`` for K
-    #: ``[auth].ad_reconcile_outage_passes``, so the page and the row can say "K of the last
-    #: ``2K - 1``". 0 on a plan the service has not yet read.
+    #: Set by the auth service on every pass, in the same call that sets :attr:`unreached`, so a
+    #: plan with entries always carries it (BACKLOG #3709 closing step 6): the most probes an
+    #: account's window holds, ``2K - 1`` for K ``[auth].ad_reconcile_outage_passes``. A window
+    #: can hold fewer, an account probed fewer times, so the page and the row say "K of up to the
+    #: last ``2K - 1``" (the row as ``window_up_to``). 0 only on a plan the service has not read.
     unreached_window: int = 0
     #: Set by ``AuthService._record_unreached_accounts`` (BACKLOG #3100, #3709), on the rows it
     #: wrote: True when those entering whose row was written, plus the accounts latched as paged

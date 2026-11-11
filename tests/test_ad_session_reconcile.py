@@ -2781,12 +2781,12 @@ async def test_an_account_the_directory_keeps_failing_for_pages_once_naming_it(
         [(kind, source, payload)] = _unreached_events(sink)
         assert (kind, source) == ("ad_reconcile_aborted", f"{_UNREACHED_PREFIX}alice")
         assert payload["reason"] == reconcile.UNREACHED_ACCOUNT and payload["probed"] == 2
-        assert f"{threshold} of its last {span} directory probes failed" in payload["detail"]
+        assert f"{threshold} of up to its last {span} directory probes failed" in payload["detail"]
         assert "sessions are not revoked" in payload["detail"][:200]
         assert len(payload["detail"]) <= 200 and "alice" not in payload["detail"]
         assert await _unreached_rows(store) == [("alice", threshold)]
         [row] = [dict(r) for r in await store.list_audit(action="auth.ad_reconcile_unreached")]
-        assert json.loads(str(row["detail"]))["window"] == span
+        assert json.loads(str(row["detail"]))["window_up_to"] == span
 
         assert (await _pass(service, sink)).unreached == ()  # latched: no second page
         assert len(_unreached_events(sink)) == 1 and len(await _unreached_rows(store)) == 1
@@ -2990,7 +2990,7 @@ async def test_a_later_rollup_says_it_counts_only_the_accounts_entering() -> Non
             "Accounts newly unreachable: 7",
             "Accounts newly unreachable: 1",
         ]
-        assert "each failed 3+ of its last 5 probes" in rollups[1]["detail"]
+        assert "each failed 3+ of up to its last 5 probes" in rollups[1]["detail"]
         assert all("sessions are not revoked;" in p["detail"] for p in rollups)
     finally:
         await store.close()
@@ -3229,7 +3229,7 @@ async def test_a_raise_outside_an_unreached_row_write_warns_only_the_accounts_wr
                 return real_json(obj)
 
             monkeypatch.setattr(service_module, "_json", raise_second)
-        plan = replace(reconcile.ReconcilePlan(), unreached=entries)
+        plan = replace(reconcile.ReconcilePlan(), unreached=entries, unreached_window=5)
         raises: dict[str, tuple[type[Exception], str]] = {
             "first-entry": (RuntimeError, "entries gone"),
             "second-detail": (RuntimeError, "detail gone"),
@@ -3463,9 +3463,46 @@ async def test_an_account_whose_probes_alternate_pages_on_k_of_the_last_2k_minus
             assert plans[pages_on - 1].unreached == ((alice.id, "alice", 3),)
             [(_kind, source, payload)] = _unreached_events(sink)
             assert source == f"{_UNREACHED_PREFIX}alice"
-            assert "3 of its last 5 directory probes failed" in payload["detail"]
+            assert "3 of up to its last 5 directory probes failed" in payload["detail"]
         assert all(not plan.directory_outage for plan in plans)
         assert await store.list_sessions(alice.id), "the account's sessions were revoked"
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "detail", "adds"),
+    [
+        (reconcile.ProbeOutcome.UNAVAILABLE, None, (True,)),
+        (reconcile.ProbeOutcome.UNAVAILABLE, reconcile.PAGING_DEADLINE, (False,)),
+        (reconcile.ProbeOutcome.UNAVAILABLE, reconcile.PAGING_CAP, (False,)),
+        (reconcile.ProbeOutcome.REFERRED, "synthetic: referred to dc2", (False,)),
+        (reconcile.ProbeOutcome.MISCONFIGURED, "synthetic: search noSuchObject", (False,)),
+        (reconcile.ProbeOutcome.PRESENT, None, (False,)),
+        (reconcile.ProbeOutcome.ABSENT, None, (False,)),
+        (reconcile.ProbeOutcome.FAULT, "ValueError", ()),
+        (reconcile.ProbeOutcome.UNKEYED, None, ()),
+    ],
+)
+async def test_only_an_unavailable_probe_with_no_detail_adds_a_failure_to_the_window(
+    outcome: reconcile.ProbeOutcome, detail: str | None, adds: tuple[bool, ...]
+) -> None:
+    """BACKLOG #3709 closing step 6. Only UNAVAILABLE with no detail failed to reach the
+    directory. A group search refused for its bound, a referral and a configuration refusal are
+    answers, each paging on its own; a fault or an unkeyed row adds nothing. The window starts
+    with one failure, so an answer shows as an appended False and nothing as no change.
+
+    RED when: a paging refusal, a referral or a configuration refusal counts as a failure, so it
+    pages ``account_unreachable`` for a directory that answered."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _ldap = await _outage_service(store)
+        seed = reconcile.Probe("u1", "alice", reconcile.ProbeOutcome.UNAVAILABLE)
+        probe = reconcile.Probe("u1", "alice", outcome, detail=detail)
+        plan = service._note_unreached_accounts(reconcile.ReconcilePlan(), [seed])
+        assert plan.unreached_window == 5
+        service._note_unreached_accounts(plan, [probe])
+        assert service._reconcile_unreached_windows == {"u1": (True, *adds)}
     finally:
         await store.close()
 
@@ -3553,7 +3590,7 @@ async def test_alternating_accounts_past_the_rollup_bound_page_as_one() -> None:
         rollups = [p for _k, s, p in sink.events if s == _UNREACHED_ALERT_SOURCE]
         assert len(rollups) == 1 and _unreached_events(sink) == []
         assert rollups[0]["detail"].startswith("Accounts newly unreachable: 7.")
-        assert "each failed 3+ of its last 5 probes" in rollups[0]["detail"]
+        assert "each failed 3+ of up to its last 5 probes" in rollups[0]["detail"]
         assert len(rollups[0]["detail"]) <= 200
         assert sorted(a for a, _n in await _unreached_rows(store)) == sorted(names[1:])
     finally:
