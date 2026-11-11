@@ -8950,9 +8950,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
     if settings is None:
         return _emit_error(detail or "could not load the service settings", as_json=args.json)
 
-    # AC-15: the argument checks, before the prompt and before any open. The limits are the web
-    # console's (`UserCreateRequest`), so this offline surface admits nothing the console refuses,
-    # and the address limit is the one `admin-set-notify-email` applies.
+    # AC-15: the argument checks, before the prompt and before any open. The length limits are the
+    # web console's (`UserCreateRequest`), and the address limit is the one `admin-set-notify-email`
+    # applies. The new-username rule (BACKLOG #5521, `auth/usernames.py`) is NOT applied here: this
+    # trims the name rather than refusing white space at either end, and admits a control character
+    # and the audit trail's synthetic actor forms, which `POST /users` refuses. `POST
+    # /users/directory` and an AD sign-in that creates its mirror row do not apply it either.
     username = args.username.strip()
     if not username:
         return _emit_error(_BLANK_USERNAME_REFUSAL, as_json=args.json)

@@ -232,7 +232,7 @@ from messagefoundry.api.models import (
 from messagefoundry.api.multipart import (
     MultipartError,
     MultipartTooLargeError,
-    parse_single_file_upload,
+    parse_upload_off_loop,
 )
 from messagefoundry.api.outlive import (
     CANCEL_GRACE_SECONDS,
@@ -8986,8 +8986,10 @@ def create_app(
         the name while the file exists. A refused file has no id, so its row carries the reason only."""
         us = _require_upload_store(request)
         body = await request.body()
+        # BACKLOG #5522: the parse walks a body of up to [store].max_upload_bytes part by part, so
+        # it runs on the parser's own two-thread executor rather than on the event loop.
         try:
-            part = parse_single_file_upload(
+            part = await parse_upload_off_loop(
                 request.headers.get("content-type"), body, max_file_bytes=us.max_bytes
             )
         except MultipartTooLargeError as exc:

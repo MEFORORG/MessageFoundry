@@ -20,7 +20,9 @@ from messagefoundry.api.auth_models import (
     AdGroupScopeEntry,
     CustomRoleInfo,
     FederatedIdentityView,
+    IntegrityFailedUser,
     RoleInfo,
+    UserListEntry,
     UserLockState,
     UserSummary,
 )
@@ -256,7 +258,7 @@ def _lock_card(user: UserSummary) -> Markup:
     )
 
 
-def users_page(users: Sequence[UserSummary]) -> Markup:
+def users_page(users: Sequence[UserListEntry]) -> Markup:
     """The user list: every account with provider, roles, scope, and status; links to the admin forms.
 
     The Lock column appears only when the engine disclosed lock state, which it does only to a
@@ -265,11 +267,29 @@ def users_page(users: Sequence[UserSummary]) -> Markup:
     The two scope columns appear only when the engine sent at least one account's scope, which its
     ``channel_scope_withheld`` says (BACKLOG #3189), as the Lock column does. A withheld scope is
     null, which would otherwise render as "(none)", "reaches nothing", so its cells read "not
-    shown". The engine decides who is shown them; this page does not re-derive the rule."""
-    show_lock = any(u.lock_state is not None for u in users)
-    show_scope = any(not u.channel_scope_withheld for u in users)
+    shown". The engine decides who is shown them; this page does not re-derive the rule.
+
+    An account whose record fails its integrity seal arrives as an :class:`IntegrityFailedUser`, its
+    id alone (BACKLOG #5520). Its row names the id and says the check failed, and every other cell
+    is blank: the engine sent nothing else of it, so nothing here may read as its name or roles."""
+    summaries = [u for u in users if isinstance(u, UserSummary)]
+    show_lock = any(u.lock_state is not None for u in summaries)
+    show_scope = any(not u.channel_scope_withheld for u in summaries)
+    headers = ["Username", "Provider", "Display name", "Email", "Roles"]
+    if show_scope:
+        headers += ["Channel scope", "Scope source"]
+    headers.append("Status")
+    if show_lock:
+        headers.append("Lock")
     rows: list[list[object]] = []
     for u in users:
+        if isinstance(u, IntegrityFailedUser):
+            # Not linked: the detail page still reads the row unchecked (BACKLOG #5559).
+            failed: list[object] = [""] * len(headers)
+            failed[0] = u.id
+            failed[headers.index("Status")] = "integrity check failed"
+            rows.append(failed)
+            continue
         row: list[object] = [
             el("a", u.username, href=f"/ui/users/{u.id}"),
             u.auth_provider,
@@ -283,12 +303,6 @@ def users_page(users: Sequence[UserSummary]) -> Markup:
         if show_lock:
             row.append(_lock_cell(u))
         rows.append(row)
-    headers = ["Username", "Provider", "Display name", "Email", "Roles"]
-    if show_scope:
-        headers += ["Channel scope", "Scope source"]
-    headers.append("Status")
-    if show_lock:
-        headers.append("Lock")
     return page(
         "Users",
         el("h1", "Users"),
