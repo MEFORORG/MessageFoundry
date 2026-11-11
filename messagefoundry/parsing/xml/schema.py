@@ -26,12 +26,13 @@ import io
 import ntpath
 import os
 import stat
+import sys
 import urllib.request
 import urllib.response
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from messagefoundry.parsing.xml._deps import load_lxml, load_xmlschema
 from messagefoundry.parsing.xml.errors import XmlParseError, XmlSecurityError, XmlValidationError
@@ -257,17 +258,23 @@ def _bundled_root(module_file: str) -> tuple[_Root, ...]:
     return () if directory is None else (_Root(directory, vet=False),)
 
 
-def _url_path(path: str) -> str | None:
-    """``url2pathname(path)``, or ``None`` where the path names a host, refused on its text.
+def _url_path(path: str) -> str:
+    """The filesystem path a ``file:`` URL's ``path`` names, any authority in it kept as written, for
+    :func:`_local` to judge.
 
-    ``url2pathname`` reads a path that opens with two slashes, as in ``file:////server/share/x.xsd``,
-    as naming a host the URL's empty authority did not. Left to it, that host became a UNC path on
-    Windows, was dropped where it is ``localhost`` or this machine's name, so ``\\\\localhost\\x``
-    read a local file, and on POSIX raised ``URLError``, an ``OSError``, which xmlschema took for a
-    missing include and skipped with a warning instead of failing the build."""
-    if urlsplit("file:" + path).netloc:
-        return None
-    return urllib.request.url2pathname(path)
+    A path that opens with two slashes and a name, as in ``file:////server/share/x.xsd``, names an
+    authority the URL's own empty one did not. ``url2pathname`` dropped one it reads as local
+    (``localhost``, this machine's name), so ``\\\\localhost\\x`` read a local file, and on POSIX
+    raised ``URLError``, an ``OSError``, for any other, which xmlschema took for a missing include
+    and skipped with a warning. Kept, as ``url2pathname`` keeps any other on Windows, it is a UNC
+    or device path, or on Windows a ``\\\\?\\C:`` long path, each judged on its text."""
+    if not urlsplit("file:" + path).netloc:
+        return urllib.request.url2pathname(path)
+    return unquote(
+        path.replace("/", os.sep),
+        encoding=sys.getfilesystemencoding(),
+        errors=sys.getfilesystemencodeerrors(),
+    )
 
 
 def _file_url_path(url: str) -> str | None:
@@ -275,8 +282,7 @@ def _file_url_path(url: str) -> str | None:
     parts = urlsplit(url)
     if parts.scheme.lower() != "file" or parts.netloc.lower() not in ("", "localhost"):
         return None
-    path = _url_path(parts.path)
-    return None if path is None else _local(path)
+    return _local(_url_path(parts.path))
 
 
 class _ResourceRefused(ValueError):
@@ -475,10 +481,7 @@ def _local_path(text: str | bytes | os.PathLike[str], what: str) -> str:
     if scheme == "file":
         if parts.netloc.lower() not in ("", "localhost"):
             raise _SourceRefused(f"{what} that is a file URL naming a host")
-        named = _url_path(parts.path)
-        if named is None:
-            raise _SourceRefused(f"{what} that is a file URL naming a host")
-        source = named.strip()
+        source = _url_path(parts.path).strip()
         if not source:  # "file:" or "file://localhost" names no path, so none is supplied
             raise _SourceRefused(f"{what} that is a file URL naming no path")
     elif scheme and not (len(scheme) == 1 and source[1:2] == ":"):  # a drive letter is not a scheme

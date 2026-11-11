@@ -448,11 +448,8 @@ def test_a_network_or_device_location_is_refused_before_anything_touches_it(
 def test_a_file_url_path_naming_a_host_is_refused_on_its_text(
     host: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A path that opens with two slashes, as in ``file:////server/share/x.xsd``, names a host.
-    POSIX ``url2pathname`` raised ``URLError``, an ``OSError``, for a remote one, and xmlschema
-    skipped the include with a warning, so the test above went green on Windows and red on POSIX.
-    For ``localhost`` or this machine's own name it dropped the host and read the local file the
-    rest named. Both are refused on the text now, on every platform."""
+    """``schema._url_path`` says why each host form here was read, skipped or refused before; the
+    remote one is why the test above went green on Windows and red on POSIX."""
     import ntpath
     import socket
 
@@ -468,7 +465,7 @@ def test_a_file_url_path_naming_a_host_is_refused_on_its_text(
             validate_against("<patient>x</patient>", source)
         assert "_ResourceRefused" in _causes(ei.value)
     # The same URL named as the schema itself is refused on its text with a fixed reason.
-    with pytest.raises(XmlValidationError, match="a schema location that is a file URL naming"):
+    with pytest.raises(XmlValidationError, match="a schema location that is a UNC or device path"):
         validate_against("<patient>x</patient>", location)
 
 
@@ -508,6 +505,11 @@ def test_a_long_path_prefix_on_a_drive_letter_is_a_local_path(tmp_path: Path) ->
     (tmp_path / "inc.xsd").write_text(_CLEAN, encoding="utf-8")
     main = _write_path_schema(tmp_path, "inc.xsd")
     assert validate_against("<patient>x</patient>", "\\\\?\\" + str(main)).valid
+    # The same prefix on an include, which xmlschema hands the opener as file:////%3F/C%3A/...,
+    # and on the schema itself as a file URL.
+    long_inc = _write_path_schema(tmp_path / "sub", "\\\\?\\" + str(tmp_path / "inc.xsd"))
+    assert validate_against("<patient>x</patient>", str(long_inc), schema_root=tmp_path).valid
+    assert validate_against("<patient>x</patient>", "file:////%3F/" + main.as_posix()).valid
 
 
 @pytest.mark.skipif(os.name != "nt", reason="drive and UNC syntax is Windows path text")
