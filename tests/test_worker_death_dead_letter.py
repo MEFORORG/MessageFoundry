@@ -129,47 +129,49 @@ async def _claim(store: MessageStore, lane: str, stage: Stage, now: float = FAR)
     return item
 
 
-def _held(claim_mode: str) -> str:
-    """A per_lane death re-pends the row; a pooled one keeps it in flight, where the in-flight
-    watch still pages the lane its dead serializer left wedged (#4607 step 2 respawns it)."""
-    return "pending" if claim_mode == "per_lane" else "inflight"
+async def _restart(store: MessageStore) -> None:
+    """The next start's recovery: what brings a dead worker's in-flight row back (#4607 steps 1,
+    2 and 5 would do it without a restart)."""
+    await store.reset_stale_inflight()
 
 
-async def _restart_if_pooled(store: MessageStore, claim_mode: str) -> None:
-    """The restart a pooled lane needs after its serializer died: the next start's recovery."""
-    if claim_mode == "pooled":
-        await store.reset_stale_inflight()
+def _spy_stopped(runner: RegistryRunner, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    stopped: list[str] = []
+    monkeypatch.setattr(
+        runner._alert_sink, "connection_stopped", lambda name, *, detail: stopped.append(name)
+    )
+    return stopped
+
+
+LIMIT = wiring_runner._WORKER_DEATH_LIMIT
 
 
 @pytest.mark.parametrize("claim_mode", ["per_lane", "pooled"])
 async def test_a_row_that_kills_the_router_worker_every_time_is_dead_lettered(
-    tmp_path: Path, store: MessageStore, claim_mode: str
+    tmp_path: Path, store: MessageStore, claim_mode: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runner = _runner(_registry(tmp_path, router=_kill_on("KILL")), store, claim_mode)
+    stopped = _spy_stopped(runner, monkeypatch)
     drive = _driver(runner, claim_mode, "ingress")
     killer = await store.enqueue_ingress(channel_id="IB", raw=_hl7("KILL"))
     after = await store.enqueue_ingress(channel_id="IB", raw=_hl7("OK"))
 
-    for attempt in range(1, wiring_runner._WORKER_DEATH_LIMIT):
+    for attempt in range(1, LIMIT + 1):
         item = await _claim(store, "IB", Stage.INGRESS)
-        assert item.message_id == killer  # nothing overtook the killer
-        with pytest.raises(_Kill):
+        assert item.message_id == killer  # back at its lane position after each restart
+        with pytest.raises(_Kill):  # the death still goes on; respawning is #4607 steps 1, 2, 5
             await drive("IB", item)
-        assert await _row(store, killer, Stage.INGRESS) == (_held(claim_mode), attempt)
-        if claim_mode == "per_lane":
-            # The re-pended head still holds its lane: a claim before its backoff takes no row.
-            assert await store.claim_next_fifo("IB", time.time(), stage="ingress") is None
-        assert await _status(store, after) == MessageStatus.RECEIVED.value
-        await _restart_if_pooled(store, claim_mode)
-
-    item = await _claim(store, "IB", Stage.INGRESS)
-    assert item.message_id == killer
-    with pytest.raises(_Kill):  # the death still goes on; respawning is #4607 steps 1, 2 and 5
-        await drive("IB", item)
-    assert await _row(store, killer, Stage.INGRESS) == ("dead", wiring_runner._WORKER_DEATH_LIMIT)
+        if attempt < LIMIT:
+            # Below the cap nothing is written: the row is in flight, as the death left it.
+            assert await _row(store, killer, Stage.INGRESS) == ("inflight", attempt)
+            await _restart(store)
+    assert await _row(store, killer, Stage.INGRESS) == ("dead", LIMIT)
     assert await _status(store, killer) == MessageStatus.ERROR.value
+    # A pooled serializer is not respawned, so each death pages the lane it leaves stopped.
+    assert stopped == (["IB"] * LIMIT if claim_mode == "pooled" else [])
 
     # The next row is the one after it, untouched by the dead-lettering, and it routes.
+    assert await _status(store, after) == MessageStatus.RECEIVED.value
     item = await _claim(store, "IB", Stage.INGRESS)
     assert item.message_id == after and item.attempts == 1
     await drive("IB", item)
@@ -194,8 +196,8 @@ async def test_a_single_death_then_a_clean_pass_is_not_dead_lettered(
 
     with pytest.raises(_Kill):
         await drive("IB", await _claim(store, "IB", Stage.INGRESS))
-    assert await _row(store, mid, Stage.INGRESS) == (_held(claim_mode), 1)
-    await _restart_if_pooled(store, claim_mode)
+    assert await _row(store, mid, Stage.INGRESS) == ("inflight", 1)
+    await _restart(store)
 
     await drive("IB", await _claim(store, "IB", Stage.INGRESS))
     assert await _status(store, mid) == MessageStatus.ROUTED.value
@@ -216,15 +218,14 @@ async def test_a_row_that_kills_the_transform_worker_every_time_is_dead_lettered
     mid = await store.enqueue_ingress(channel_id="IB", raw=_hl7("XFORM"))
     await runner._process_ingress_item("IB", await _claim(store, "IB", Stage.INGRESS))
 
-    for attempt in range(1, wiring_runner._WORKER_DEATH_LIMIT + 1):
+    for attempt in range(1, LIMIT + 1):
         with pytest.raises(_Kill):
             await drive("IB", await _claim(store, "IB", Stage.ROUTED))
-        last = attempt == wiring_runner._WORKER_DEATH_LIMIT
         assert await _row(store, mid, Stage.ROUTED) == (
-            "dead" if last else _held(claim_mode),
+            "dead" if attempt == LIMIT else "inflight",
             attempt,
         )
-        await _restart_if_pooled(store, claim_mode)
+        await _restart(store)
     assert await _status(store, mid) == MessageStatus.ERROR.value
 
 
@@ -237,11 +238,11 @@ class _KillingConnector:
 
 
 @pytest.mark.parametrize("claim_mode", ["per_lane", "pooled"])
-async def test_a_delivery_death_is_a_failed_attempt_under_the_lanes_retry_policy(
+async def test_a_delivery_death_is_capped_by_the_lanes_retry_policy(
     tmp_path: Path, store: MessageStore, claim_mode: str
 ) -> None:
-    """An outbound row's ``attempts`` already counts its failed sends, so a death there is one more
-    failed attempt and the lane's own ``max_attempts`` dead-letters it."""
+    """An outbound row's ``attempts`` already counts its failed sends, so its cap is the lane's own
+    ``max_attempts``."""
     runner = _runner(_registry(tmp_path), store, claim_mode)
     runner._retry["OB"] = RetryPolicy(max_attempts=2, backoff_seconds=0.01)
     runner._destinations["OB"] = _KillingConnector()  # type: ignore[assignment]
@@ -254,19 +255,23 @@ async def test_a_delivery_death_is_a_failed_attempt_under_the_lanes_retry_policy
 
     with pytest.raises(_Kill):
         await drive("OB", await _claim(store, "OB", Stage.OUTBOUND))
-    assert await _row(store, mid, Stage.OUTBOUND) == (_held(claim_mode), 1)
-    await _restart_if_pooled(store, claim_mode)
+    assert await _row(store, mid, Stage.OUTBOUND) == ("inflight", 1)
+    await _restart(store)
     with pytest.raises(_Kill):
         await drive("OB", await _claim(store, "OB", Stage.OUTBOUND))
     assert await _row(store, mid, Stage.OUTBOUND) == ("dead", 2)
     assert await _status(store, mid) == MessageStatus.ERROR.value
 
 
-async def test_a_store_fault_while_counting_leaves_the_row_in_flight_and_the_death_raised(
+async def test_a_store_fault_at_the_cap_leaves_the_row_in_flight_and_the_death_raised(
     tmp_path: Path, store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runner = _runner(_registry(tmp_path, router=_kill_on("KILL")), store, "per_lane")
     mid = await store.enqueue_ingress(channel_id="IB", raw=_hl7("KILL"))
+    for _ in range(LIMIT - 1):
+        with pytest.raises(_Kill):
+            await runner._process_ingress_item("IB", await _claim(store, "IB", Stage.INGRESS))
+        await _restart(store)
 
     async def broken(*a: Any, **k: Any) -> Any:
         raise RuntimeError("store down")
@@ -274,7 +279,7 @@ async def test_a_store_fault_while_counting_leaves_the_row_in_flight_and_the_dea
     monkeypatch.setattr(store, "mark_failed", broken)
     with pytest.raises(_Kill):  # the store fault never replaces the death
         await runner._process_ingress_item("IB", await _claim(store, "IB", Stage.INGRESS))
-    assert await _row(store, mid, Stage.INGRESS) == ("inflight", 1)
+    assert await _row(store, mid, Stage.INGRESS) == ("inflight", LIMIT)
 
 
 @pytest.mark.parametrize(
@@ -294,29 +299,32 @@ def test_only_a_death_is_counted(exc: BaseException, counted: bool) -> None:
     assert _kills_the_worker(exc) is counted
 
 
-async def test_a_live_per_lane_worker_dead_letters_the_killer_and_drains_the_lane_in_order(
-    tmp_path: Path, store: MessageStore, monkeypatch: pytest.MonkeyPatch
+async def test_a_live_per_lane_engine_dead_letters_the_killer_across_restarts(
+    tmp_path: Path, store: MessageStore
 ) -> None:
-    """End to end in per_lane mode: the router worker dies on the killer each pass, its supervisor
-    respawns it, the re-pend's wake re-drives the row, and the third death dead-letters it with no
-    restart. The next message is routed only after that, so nothing overtook the killer."""
-    monkeypatch.setattr(
-        wiring_runner,
-        "_WORKER_DEATH_RETRY",
-        RetryPolicy(max_attempts=wiring_runner._WORKER_DEATH_LIMIT, backoff_seconds=0.01),
-    )
+    """End to end in per_lane mode: each start re-claims the killer, its router worker dies and is
+    respawned, and the start on which it reaches the cap dead-letters it. The next message routes
+    at once, as it did before this change, since the killer is left in flight below the cap."""
     calls: list[str] = []
     killer = await store.enqueue_ingress(channel_id="IB", raw=_hl7("KILL"))
     after = await store.enqueue_ingress(channel_id="IB", raw=_hl7("OK"))
-    runner = _runner(_registry(tmp_path, router=_kill_on("KILL", calls)), store, "per_lane")
-    await runner.start()
-    try:
-        deadline = time.monotonic() + 10.0
-        while await _status(store, after) == MessageStatus.RECEIVED.value:
-            assert time.monotonic() < deadline, calls
-            await asyncio.sleep(0.02)
-        assert calls[: wiring_runner._WORKER_DEATH_LIMIT + 1] == ["KILL"] * 3 + ["OK"]
-        assert await _status(store, killer) == MessageStatus.ERROR.value
-        assert await _row(store, killer, Stage.INGRESS) == ("dead", 3)
-    finally:
-        await runner.stop()
+    reg = _registry(tmp_path, router=_kill_on("KILL", calls))
+    for attempt in range(1, LIMIT + 1):
+        await _restart(store)  # the engine's start runs this before the runner's
+        runner = _runner(reg, store, "per_lane")
+        await runner.start()
+        try:
+            deadline = time.monotonic() + 10.0
+            while (await _row(store, killer, Stage.INGRESS))[1] < attempt or calls.count(
+                "KILL"
+            ) < attempt:
+                assert time.monotonic() < deadline, calls
+                await asyncio.sleep(0.02)
+            while await _status(store, after) == MessageStatus.RECEIVED.value:
+                assert time.monotonic() < deadline, calls
+                await asyncio.sleep(0.02)
+        finally:
+            await runner.stop()
+    assert calls.count("KILL") == LIMIT
+    assert await _row(store, killer, Stage.INGRESS) == ("dead", LIMIT)
+    assert await _status(store, killer) == MessageStatus.ERROR.value
