@@ -537,7 +537,7 @@ def test_garbled_pem_is_checked_in_linear_time() -> None:
     # The check stops at 1 MiB, where a rescan of the rest per BEGIN still ends in seconds, so the
     # scanner is driven directly at sixteen times that: a rescan per BEGIN is then minutes.
     started = time.monotonic()
-    assert keywrap._pem_blocks(stacked * 16)
+    assert keywrap._split_pem_blocks(stacked * 16)
     assert time.monotonic() - started < 20.0
 
 
@@ -635,8 +635,7 @@ _OPENSSL_LOADS_STRAY: dict[str, Callable[[bytes], bytes]] = {
     "dash-text-inside-plain-label": lambda p: _before_end(
         p.replace(b"ENCRYPTED PRIVATE KEY", b"PRIVATE KEY"), b"-x\n"
     ),
-    # A label window that crossed the line end used to close at the key's own END marker and
-    # read as a key block with no base64 in it, refusing the approved key.
+    # A label window that crosses the line end closes at the key's own END marker.
     "no-dashes-key-label-inside-then-a-block": lambda p: (
         _before_end(p, _STRAY_BEGIN + b"ENCRYPTED PRIVATE KEY\n")
         + _STRAY_BEGIN
@@ -653,6 +652,22 @@ _STRAY_SHAPES: dict[str, Callable[[bytes], bytes]] = {
     "short-dashes-before": lambda p: _STRAY_BEGIN + b"X---" + p,
     "key-label-no-end-before": lambda p: _STRAY_BEGIN + b"RSA PRIVATE KEY-----\n" + p,
 }
+#: Shapes that put a "-" inside an ENCRYPTED PRIVATE KEY block, so the block's body, read from
+#: its BEGIN to its END, is not base64. Such a block is refused whatever it holds, as it was before
+#: stray BEGIN markers were read, so the approved key is refused too, although OpenSSL loads it.
+_INSIDE_THE_ENCRYPTED_BLOCK = frozenset(
+    {
+        "own-line-inside",
+        "no-dashes-inside",
+        "key-label-inside",
+        "encrypted-label-inside",
+        "encrypted-label-same-line",
+        "same-line-inside",
+        "dash-text-inside",
+        "no-dashes-key-label-inside-then-a-block",
+    }
+)
+_UNREADABLE_TEXT = "cannot read to check its wrap"
 
 
 @pytest.mark.parametrize("shape", sorted(_STRAY_SHAPES))
@@ -665,7 +680,11 @@ def test_a_weak_pem_with_a_stray_begin_marker_is_still_refused(
     reshape = _STRAY_SHAPES[shape]
     refusal = _check(reshape(material.wraps["best-available-2048"]))
     assert refusal is not None and "2048 iterations" in refusal
-    assert _check(reshape(material.wraps["approved"])) is None
+    approved = _check(reshape(material.wraps["approved"]))
+    if shape in _INSIDE_THE_ENCRYPTED_BLOCK:
+        assert approved is not None and _UNREADABLE_TEXT in approved
+    else:
+        assert approved is None
 
 
 @pytest.mark.parametrize("shape", sorted(_OPENSSL_LOADS_STRAY))
@@ -684,23 +703,87 @@ def test_an_ssl_loader_refuses_a_weak_key_with_a_stray_begin_marker(
     except ssl.SSLError:
         pytest.skip(f"{ssl.OPENSSL_VERSION} does not load this shape")
     approved = _write(tmp_path, "approved.pem", reshape(material.wraps["approved"]))
-    assert _api(cert, approved, _PASSPHRASE) is not None
+    if shape in _INSIDE_THE_ENCRYPTED_BLOCK:
+        with pytest.raises(KeyWrapRefused, match=_UNREADABLE_TEXT):
+            _api(cert, approved, _PASSPHRASE)
+    else:
+        assert _api(cert, approved, _PASSPHRASE) is not None
 
 
-@pytest.mark.parametrize("shape", ["encrypted-label-inside", "encrypted-label-same-line"])
+#: A stray ENCRYPTED BEGIN line inside an unencrypted key, before its END, with the text after it.
+_STRAY_ENCRYPTED_INSIDE: dict[str, Callable[[bytes], bytes]] = {
+    "encrypted-label-inside": _OPENSSL_LOADS_STRAY["encrypted-label-inside"],
+    "encrypted-label-same-line": _OPENSSL_LOADS_STRAY["encrypted-label-same-line"],
+    "encrypted-label-inside-then-base64": lambda p: _before_end(
+        p, _STRAY_BEGIN + b"ENCRYPTED PRIVATE KEY-----\nQUJDRA==\n"
+    ),
+    "encrypted-label-inside-then-long-base64": lambda p: _before_end(
+        p,
+        _STRAY_BEGIN + b"ENCRYPTED PRIVATE KEY-----\n" + base64.b64encode(bytes(range(48))) + b"\n",
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_STRAY_ENCRYPTED_INSIDE))
 def test_an_unencrypted_key_with_a_stray_encrypted_begin_line_still_passes_and_loads(
     tmp_path: Path, material: Material, shape: str
 ) -> None:
-    # The stray line opens a block with no key bytes. Read as an encrypted key, it would refuse a
-    # plain key that OpenSSL loads.
+    # The stray line opens a block with no key bytes, or with base64 that is no key. Read as an
+    # encrypted key, it would refuse a plain key that OpenSSL loads, which nothing refused before
+    # stray BEGIN markers were read.
     plain = material.key.private_bytes(
         serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
     )
-    key_bytes = _OPENSSL_LOADS_STRAY[shape](plain)
+    key_bytes = _STRAY_ENCRYPTED_INSIDE[shape](plain)
     assert _check(key_bytes, given=False) is None
     cert = _write(tmp_path, "cert.pem", material.cert_pem)
     key = _write(tmp_path, "key.pem", key_bytes)
     assert _api(cert, key, None) is not None
+
+
+def test_a_weak_key_with_a_garbled_line_behind_a_stray_begin_is_still_refused(
+    tmp_path: Path, material: Material
+) -> None:
+    # Why the check still refuses a stray ENCRYPTED block whose body is not base64, even inside an
+    # unencrypted key: OpenSSL drops a control byte at a line end, so it loads this weak key, and
+    # behind a stray BEGIN comment only that block holds it.
+    lines = material.wraps["best-available-2048"].split(b"\n")
+    garbled = b"\n".join([lines[0], lines[1] + b"\x01", *lines[2:]])
+    for key_bytes in (garbled, b"# " + _STRAY_BEGIN + b"NOTE-----\n" + garbled):
+        refusal = _check(key_bytes)
+        assert refusal is not None and _UNREADABLE_TEXT in refusal
+    cert = _write(tmp_path, "cert.pem", material.cert_pem)
+    weak = _write(tmp_path, "weak.pem", b"# " + _STRAY_BEGIN + b"NOTE-----\n" + garbled)
+    try:
+        ssl.create_default_context(ssl.Purpose.CLIENT_AUTH).load_cert_chain(cert, weak, _PASSPHRASE)
+    except ssl.SSLError:
+        pytest.skip(f"{ssl.OPENSSL_VERSION} does not load this shape")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"",
+        b"\n",
+        b"-\n",
+        b"-x\n",
+        b"-MIIB\n",
+        b"\n-x\n",
+    ],
+)
+def test_an_encrypted_block_with_nothing_before_a_dash_is_refused(body: bytes) -> None:
+    # An ENCRYPTED PRIVATE KEY block holds an EncryptedPrivateKeyInfo or is refused: one with no
+    # base64, or with a "-" first, is no key this check can read, whatever a loader makes of it.
+    key_bytes = (
+        _STRAY_BEGIN
+        + b"ENCRYPTED PRIVATE KEY-----\n"
+        + body
+        + _PEM_END
+        + b"ENCRYPTED PRIVATE KEY-----\n"
+    )
+    for given in (True, False):
+        refusal = _check(key_bytes, given=given)
+        assert refusal is not None and _UNREADABLE_TEXT in refusal
 
 
 # --- BER forms of an EncryptedPrivateKeyInfo (BACKLOG #5543) ------------------------------------
@@ -789,7 +872,7 @@ _UNWALKED_BER_FORMS = [
 ]
 
 #: What the refusal of an unwalked form says, and the remedy it gives a loader that takes a
-#: passphrase: the encoding is unread, not the wrap weak.
+#: passphrase: the encoding is not accepted, not the wrap weak.
 _UNWALKED_TEXT = "BER that is not DER, or bytes cut short"
 _UNWALKED_REMEDY = "Supply the whole key DER-encoded"
 
@@ -803,9 +886,31 @@ def test_a_weak_ber_wrap_is_judged_under_any_label_and_as_raw_der(
     for shaped in (weak, pem(weak, "PRIVATE KEY"), pem(weak)):
         refusal = _check(shaped)
         assert refusal is not None and "2048 iterations" in refusal
-    # The control: the approved wrap in the same BER form is judged on its wrap and passes.
-    for shaped in (approved, pem(approved, "PRIVATE KEY"), pem(approved)):
+    # The control: the approved wrap in the same BER form is judged on its wrap and passes, as raw
+    # DER and under a plain label.
+    for shaped in (approved, pem(approved, "PRIVATE KEY")):
         assert _check(shaped) is None
+    # Under the ENCRYPTED label, bytes the DER reader cannot walk stay refused whatever the wrap,
+    # as before BER was read, with the encoding remedy rather than a re-wrap.
+    refusal = _check(pem(approved))
+    assert refusal is not None and _UNWALKED_TEXT in refusal and _UNWALKED_REMEDY in refusal
+
+
+@pytest.mark.parametrize("cut", [1, 7, 40])
+def test_a_cut_short_encrypted_key_is_refused_under_the_encrypted_label(
+    material: Material, cut: int
+) -> None:
+    # The AlgorithmIdentifier is whole and approved, and only the ciphertext is cut short. Under
+    # the ENCRYPTED label that is refused, as bytes cut short. Under a plain label or as raw DER it
+    # passes, as it always did: OpenSSL refuses the bytes itself, and the wrap named is approved.
+    der = _der_of(material.wraps["approved"])
+    short = der[: len(der) - cut]
+    first = keywrap.der_children(der, keywrap.read_der_tlv(der, 0, len(der)))[0]
+    assert len(short) > first.end  # the AlgorithmIdentifier survives the cut
+    refusal = _check(pem(short))
+    assert refusal is not None and _UNWALKED_TEXT in refusal and _UNWALKED_REMEDY in refusal
+    assert _check(pem(short, "PRIVATE KEY")) is None
+    assert _check(short) is None
 
 
 @pytest.mark.parametrize("form", _UNWALKED_BER_FORMS)
@@ -814,7 +919,7 @@ def test_a_ber_wrap_the_check_cannot_walk_is_refused_not_passed(
 ) -> None:
     # A BER key that names a password-based scheme, in a form whose scheme this check cannot read,
     # is refused whatever its wrap rather than passed as an unencrypted key. The text says the
-    # encoding is unread; it does not call the wrap weak or tell the operator to re-wrap.
+    # encoding is not accepted; it does not call the wrap weak or tell the operator to re-wrap.
     for wrap in ("best-available-2048", "approved"):
         ber = _to_ber(_der_of(material.wraps[wrap]), form)
         for shaped in (ber, pem(ber, "PRIVATE KEY"), pem(ber)):
@@ -1571,8 +1676,6 @@ _PARAMIKO_LOADS_BEHIND: dict[str, str] = {
     "comment-no-dashes": "# " + _STRAY_BEGIN.decode() + "NOTE\n",
     "no-dashes": _STRAY_BEGIN.decode() + "NOTE\n",
     "own-line": _STRAY_BEGIN.decode() + "NOTE-----\n",
-    # A stray line with the key's own label opens a block with no key bytes, which is skipped.
-    "comment-key-label": "# " + _STRAY_BEGIN.decode() + "OPENSSH PRIVATE KEY-----\n",
 }
 
 
@@ -1592,6 +1695,37 @@ def test_the_sftp_connector_refuses_an_encrypted_openssh_key_behind_a_stray_begi
     client = _sftp(stray + sftp_keys["openssh-plain"])
     paramiko = pytest.importorskip("paramiko")
     assert client._load_key(paramiko).get_bits() == 2048
+
+
+_OPENSSH_BEGIN = _STRAY_BEGIN + b"OPENSSH PRIVATE KEY-----\n"
+
+
+def _after_begin_line(pem_bytes: bytes, insert: bytes) -> bytes:
+    at = pem_bytes.index(b"\n") + 1
+    return pem_bytes[:at] + insert + pem_bytes[at:]
+
+
+def test_an_openssh_block_that_cannot_be_read_still_reads_as_encrypted(
+    sftp_keys: dict[str, str],
+) -> None:
+    # An unreadable OpenSSH block reads as encrypted, so it is refused rather than passed: one
+    # with no key bytes, and one whose body, read from its BEGIN to its END, is not base64. That
+    # holds when a stray BEGIN line sits right after the key's own, and when a stray line with
+    # the key's own label sits in front of an unencrypted key.
+    empty = _OPENSSH_BEGIN + _PEM_END + b"OPENSSH PRIVATE KEY-----\n"
+    encrypted = sftp_keys["openssh-encrypted"].encode()
+    plain = sftp_keys["openssh-plain"].encode()
+    for key_bytes in (
+        empty,
+        _after_begin_line(encrypted, _STRAY_BEGIN + b"NOTE-----\n"),
+        _after_begin_line(encrypted, _OPENSSH_BEGIN),
+        b"# " + _OPENSSH_BEGIN + plain,
+    ):
+        assert keywrap.ssh_key_encrypted(key_bytes) is True
+    with pytest.raises(ValueError, match="private_key is encrypted"):
+        _sftp(empty.decode())
+    # The control: the unencrypted key alone does not read as encrypted.
+    assert keywrap.ssh_key_encrypted(plain) is False
 
 
 @pytest.mark.parametrize("which", ["plain-1024", "plain-1024-openssh"])
