@@ -12436,12 +12436,13 @@ class RegistryRunner:
         asked :func:`_kills_the_worker`.
 
         **An ingress, routed or response row** is counted in its own ``worker_deaths`` by
-        ``store.record_worker_death``, which raises it only while the row is in flight and reads
-        back the count its own increment left. No claim raises it, so a batch tail claimed beside
-        the dying row is never counted, and a crash, a stop or a STOP-policy re-pend never adds to
-        it. At :data:`_WORKER_DEATH_LIMIT` the same transaction dead-letters the row, its message
-        ``ERROR``. Below it the row stays in flight, as on ``main``: the in-flight watch pages it,
-        and ``reset_stale_inflight`` brings it back at the next start with its count kept.
+        ``store.record_worker_death``, which raises it only while the row is in flight or pending
+        and reads back the count its own increment left. No claim raises it, so a batch tail
+        claimed beside the dying row is never counted, and a crash, a stop or a STOP-policy re-pend
+        never adds to it. At :data:`_WORKER_DEATH_LIMIT` the same transaction dead-letters the row,
+        its message ``ERROR``. Below it nothing else is written, as on ``main``: a row still in
+        flight stays there, the in-flight watch pages it, and ``reset_stale_inflight`` brings it
+        back at the next start with its count kept.
         "Repeatedly" therefore means across passes that each claimed the row anew, after a restart
         or a Postgres lease reclaim. A per_lane worker is respawned, but its dying row stays in
         flight, so this process does not re-claim it unless a lease sweep re-pends it; recovering a
@@ -12453,7 +12454,8 @@ class RegistryRunner:
         carries the count too. At the lane's ``max_attempts`` the row goes through ``mark_failed``,
         whose DEAD branch leaves a row already DONE, DEAD or CANCELLED as it is; below it nothing is
         written. Where the store counted fewer attempts than the claim, ``mark_failed`` takes its
-        retry branch instead, and its retry wake is armed. A lane that retries forever
+        retry branch instead, and :meth:`_arm_retry` arms its retry wake on a lane a per-lane
+        worker drains while ``_per_lane_wake`` is on. A lane that retries forever
         (``max_attempts = None``) never dead-letters on a death.
 
         **A pooled lane's serializer is not respawned** (#4607 step 2), so its lane claims nothing
@@ -12494,13 +12496,15 @@ class RegistryRunner:
                     )
                     return
                 # Through _mark_failed_and_arm, so a re-pend (the store's attempts lower than the
-                # claim's copy) arms the lane's retry wake.
+                # claim's copy) arms the lane's retry wake where _arm_retry arms one (a
+                # per-lane-drained lane, per-lane wake on).
                 failed = await self._mark_failed_and_arm(name, item.id, error, retry)
                 if failed.retry_at is not None:
                     # mark_failed took its retry branch. Its retry_at comes back even when the
                     # status term skipped a row already resolved (ADR 0157 Amendment A), so it
-                    # does not prove a re-pend, and the log does not claim one. The wake it arms
-                    # then claims nothing, as for the other _mark_failed_and_arm callers.
+                    # does not prove a re-pend, and the log does not claim one. A wake it arms
+                    # finds this row resolved and claims only the lane's other due rows, as for
+                    # the other _mark_failed_and_arm callers.
                     log.error(
                         "%s worker %r: row %s (message %s) killed the worker with %s; the store "
                         "counted fewer attempts than the claim, so mark_failed took its retry "
@@ -12521,7 +12525,7 @@ class RegistryRunner:
             # No traceback: the fault's context is the death, whose text can carry the message.
             log.warning(
                 "%s worker %r: %s killed the worker on row %s and recording the death failed (%s); "
-                "the row stays in flight",
+                "the row is left as it was",
                 worker,
                 name,
                 kind,
@@ -12557,11 +12561,11 @@ class RegistryRunner:
             item.id,
             item.message_id,
             kind,
-            f"death {deaths} of {_WORKER_DEATH_LIMIT}, so the row stays in flight until the next "
-            "start"
+            f"death {deaths} of {_WORKER_DEATH_LIMIT}, so nothing else is written: a row still in "
+            "flight stays there until the next start"
             if deaths
-            else "nothing written: the row was no longer in flight, or the store's leader fence "
-            "refused the write",
+            else "nothing written: the row was already resolved or gone, or the store's leader "
+            "fence refused the write",
         )
 
     def _drained_by_dispatcher(self, stage: Stage, lane: str) -> bool:

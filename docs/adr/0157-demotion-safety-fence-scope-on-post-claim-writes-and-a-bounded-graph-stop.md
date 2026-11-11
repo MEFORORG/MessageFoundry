@@ -1452,6 +1452,7 @@ commit, so its dead-letter cannot find the row resolved. SQLite does both under 
 `mark_batch_failed`'s DEAD branch is unchanged.
 
 **The increment is not fenced.** It neither resolves the row nor returns it to PENDING. A fenced
-dead-letter rolls it back with the rest of the transaction and re-pends the row (C3). That death
-is lost, not counted again, so a row whose dead-letter is fenced needs more deaths than the cap
-before one lands.
+dead-letter rolls it back with the rest of the transaction and re-pends a row still in flight
+(C3). The count loses that death and nothing raises it again, though the runner's ERROR line and
+the store's fence WARNING and counter still record it. So a row whose dead-letter is fenced needs
+more deaths than the cap before a dead-letter lands.
