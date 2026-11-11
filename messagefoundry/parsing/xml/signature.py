@@ -344,24 +344,42 @@ def _coverage_refusal(root: Any, result: Any, location: str) -> str | None:
     return None
 
 
+@functools.cache
+def _anchor_faults() -> tuple[type[Exception], ...]:
+    """The exception types :func:`_read_anchor` reports as an anchor that cannot be read.
+
+    pyOpenSSL is optional, so its error joins only when it imports; without it no pin can be a
+    pyOpenSSL object, so nothing can raise that error.
+    """
+    from cryptography.exceptions import UnsupportedAlgorithm
+
+    faults: tuple[type[Exception], ...] = (
+        ValueError,
+        TypeError,
+        AttributeError,
+        UnsupportedAlgorithm,
+    )
+    try:
+        from OpenSSL.crypto import Error as openssl_error
+    except ImportError:
+        return faults
+    return (*faults, openssl_error)
+
+
 def _read_anchor(
     signxml: Any, x509_cert: str | bytes | Certificate | None, ca_pem_file: str | bytes | None
 ) -> tuple[Any, Any]:
-    """Fail on an unreadable anchor before signxml's call, whose errors :func:`verify` blames on the
-    document. Returns ``(pinned certificate, None)`` or ``(None, CA store)``. Like signxml, it skips
-    ``ca_pem_file`` when a certificate is pinned, and it reads that file through signxml's own
-    loader; :func:`_verifier_type` hands the store to signxml's chain check. A pinned
-    ``cryptography`` certificate object is passed through, any object with ``to_cryptography()``,
-    such as a pyOpenSSL one, is converted through it, and anything else is read as PEM text.
-
-    It raises at least these: :class:`ValueError` naming the anchor and the type of the fault, for
-    a pinned certificate or its key, or a CA file, that cannot be parsed; and :class:`OSError` for
-    a CA file that cannot be opened or read from. A fault it does not catch, such as a pyOpenSSL
-    pin whose ``to_cryptography()`` raises ``OpenSSL.crypto.Error``, escapes as raised.
+    """Read the anchor before signxml's call, whose errors :func:`verify` blames on the document,
+    and refuse one that cannot be read as :func:`verify`'s docstring states. Returns ``(pinned
+    certificate, None)`` or ``(None, CA store)``. Like signxml, it skips ``ca_pem_file`` when a
+    certificate is pinned, and it reads that file through signxml's own loader;
+    :func:`_verifier_type` hands the store to signxml's chain check. A pinned ``cryptography``
+    certificate object is passed through, any object with ``to_cryptography()``, such as a
+    pyOpenSSL one, is converted through it, and anything else is read as PEM text. A caught fault
+    becomes a new :class:`ValueError` raised after the handler ends, so nothing is chained.
     """
     # Imported here, not at module top, as in _signing_key_refusal.
     from cryptography import x509
-    from cryptography.exceptions import UnsupportedAlgorithm
 
     if x509_cert is None and ca_pem_file is None:
         # verify() refuses this first; kept closed so signxml never falls back to the system store.
@@ -384,8 +402,15 @@ def _read_anchor(
             # signxml reads the key inside its call, where a fault would be blamed on the document.
             cert.public_key()
             return cert, None
+        if (isinstance(ca_pem_file, str) and "\0" in ca_pem_file) or (
+            isinstance(ca_pem_file, bytes) and b"\0" in ca_pem_file
+        ):
+            # open() refuses such a path with ValueError, which would read as a file that does not
+            # parse. No file has that path, so it is one that cannot be opened. OSError is not one
+            # of the faults caught below, so it is raised as is.
+            raise OSError("ca_pem_file cannot be opened: the path holds a NUL")
         return None, chain_verifier(ca_pem_file=ca_pem_file).store
-    except (ValueError, TypeError, AttributeError, UnsupportedAlgorithm) as exc:
+    except _anchor_faults() as exc:
         fault = f"{name} cannot be read: {type(exc).__name__}"
     raise ValueError(fault)
 
@@ -481,14 +506,17 @@ def verify(
     not take the signer's identity from ``ds:KeyInfo`` either, and do not treat a
     ``ds:X509Certificate`` there as checked: the anchor you pass is what checks the signer.
 
-    Raises :class:`ValueError` if no anchor is supplied. An anchor that cannot be read is refused
-    before the document is read, at least with :class:`ValueError`, such as for a pinned certificate
-    that is not one or whose key cannot be loaded, or a CA file holding none, and with
-    :class:`OSError` if ``ca_pem_file`` cannot be opened. A fault that read does not catch escapes
-    as raised, and :func:`_read_anchor` names one. Only reading is checked there: a pin whose key
-    type signxml cannot verify with, such as Ed25519, or a CA certificate in the file whose key
-    cannot be loaded, fails per document instead, as an ``XmlError`` or an ``InvalidCertificate``
-    result.
+    Raises :class:`ValueError` if no anchor is supplied. When both are supplied, only ``x509_cert``
+    is read and ``ca_pem_file`` is ignored, as signxml does (vault BACKLOG #6120), so a
+    ``ca_pem_file`` that cannot be read beside a pin is not refused. The anchor that is used is read
+    before the document, and one that cannot be read is refused there with at least these types:
+    :class:`ValueError`, whose fixed message names only the anchor and the fault's type and chains
+    nothing, such as for a pinned certificate that is not one, whose key cannot be loaded or whose
+    pyOpenSSL conversion fails, or a CA file holding no certificate; and :class:`OSError` if
+    ``ca_pem_file`` cannot be opened or read from, including a path holding a NUL. Only reading is
+    checked there: a pin whose key type signxml cannot verify with, such as Ed25519, or a CA
+    certificate in the file whose key cannot be loaded, fails per document instead, as an
+    ``XmlError`` or an ``InvalidCertificate`` result.
     Raises :class:`~messagefoundry.parsing.xml.errors.XmlError` if signxml or a library
     under it cannot process the signature, such as a schema-invalid or empty ``ds:SignatureValue``
     or key data it cannot read (vault BACKLOG #2816, #5372). That message names only the library's

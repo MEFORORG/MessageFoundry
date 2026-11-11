@@ -10,8 +10,8 @@ and each now raises :class:`XmlError` naming only the exception type, with nothi
 ``__cause__`` or ``__context__``. A coverage comparison that cannot canonicalize the document fails
 with ``UnsignedContent`` instead, because the cryptography has already passed by then.
 
-An ANCHOR that cannot be read is the caller's fault, not the document's, so it is refused before
-the document is read, at least with ``ValueError``.
+An ANCHOR ``verify()`` uses that cannot be read is the caller's fault, not the document's, so it is
+refused before the document is read, as ``verify()``'s docstring states.
 
 All material is minted at run time, and every planted value is synthetic.
 """
@@ -296,6 +296,32 @@ def test_a_pin_that_converts_to_something_else_is_an_anchor_fault() -> None:
         verify(_sign(_BODY), x509_cert=_NotACertificate())  # type: ignore[arg-type]
     assert not isinstance(caught.value, XmlError)
     assert str(caught.value) == "x509_cert cannot be read: TypeError"
+
+
+def test_a_pyopenssl_pin_whose_conversion_fails_is_an_anchor_fault() -> None:
+    """A pin whose ``to_cryptography()`` raises pyOpenSSL's own error is refused as the documented
+    anchor ``ValueError``, with a fixed message and nothing chained. A stand-in raises it, because a
+    real pyOpenSSL certificate converts; the planted text shows nothing of the error is carried."""
+    crypto = pytest.importorskip("OpenSSL.crypto")
+
+    class _UnconvertiblePin:
+        def to_cryptography(self) -> object:
+            raise crypto.Error([("lib", "func", _PLANTED)])
+
+    with pytest.raises(ValueError) as caught:
+        verify(_sign(_BODY), x509_cert=_UnconvertiblePin())  # type: ignore[arg-type]
+    assert not isinstance(caught.value, XmlError)
+    assert str(caught.value) == "x509_cert cannot be read: Error"
+    assert_chain_severed(caught.value)
+
+
+@pytest.mark.parametrize("nul_path", ["ca\0.pem", b"ca\0.pem"])
+def test_a_ca_path_holding_a_nul_is_one_that_cannot_be_opened(nul_path: str | bytes) -> None:
+    """``open()`` refuses such a path with ``ValueError``, which would read as a CA file that does
+    not parse; ``verify()`` documents a CA file that cannot be opened as :class:`OSError`."""
+    with pytest.raises(OSError, match="cannot be opened") as caught:
+        verify(_sign(_BODY), ca_pem_file=nul_path)
+    assert_chain_severed(caught.value)
 
 
 def test_a_pin_of_no_readable_type_is_an_anchor_fault() -> None:
