@@ -596,6 +596,36 @@ def test_the_reading_before_holds_none_of_the_camelcase_fragments() -> None:
         assert "(?(camel)" not in before and "(?(compound)" not in before, name
 
 
+def test_the_member_key_is_the_member_patterns_own_head() -> None:
+    """``_union`` keeps the reading before where a member key's ";" would be lost; the key it looks
+    for must be the one the member pass opens with."""
+    head = secretscrub._MEMBER_KEY.pattern.removeprefix("(?i)").removesuffix("=")
+    assert secretscrub._CONNECTION_STRING_MEMBER.pattern.startswith(f"(?i)({head})=")
+
+
+def test_a_semicolon_inside_a_camelcase_value_keeps_the_camelcase_reading() -> None:
+    """Only a member key's ";" sends the line back to the reading before, so a camelCase value
+    holding a ";" is still hidden beside another label (found by code review)."""
+    for line in (
+        'refresh failed: refreshToken="zqA;zqB" password=zqC',
+        "auth failed {'clientSecret': 'zqA;zqB', 'password': 'zqC'}",
+    ):
+        out = scrub_credentials(line)
+        assert "zqA" not in out and "zqC" not in out, out
+
+
+def test_a_camelcase_token_value_keeps_its_ampersands_and_commas() -> None:
+    """A camelCase token value ends at ";" alone, as its snake_case spelling ends at none of these,
+    so a SAS signature after "&" is hidden (found by code review); and a camelCase start before a
+    retired-key list keeps the list whole."""
+    for line, value in (
+        ("blob upload failed sasToken=sv=zz&ss=b&sig=zqSIGzq", "zqSIGzq"),
+        ("refresh accessToken=zqA,zqB", "zqB"),
+        ("cfg storeEncryption_keys_retired=k1,k2,zqK3", "zqK3"),
+    ):
+        assert value not in scrub_credentials(line), line
+
+
 def test_no_camelcase_fragment_sits_inside_a_later_one() -> None:
     """``_CAMEL_FRAGMENTS`` is replaced in order, which is safe only while no fragment sits inside
     one replaced after it: replacing it first would leave the later one half rewritten, unmatched."""

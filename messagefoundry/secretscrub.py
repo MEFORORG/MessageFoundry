@@ -151,8 +151,10 @@ unit, costs 1.4 against 0.084 ms. A line that does hold one pays for both readin
 that joins them (:func:`_union`), and these are stated rather than hidden: a camelCase credential
 line 13 against 5.2 us, a 6 KB run of alternating letters naming every family and a compound key
 word 3.1 against 0.51 ms, the quote-ended value above under ``accessToken=`` 1.1 against 0.19 ms,
-and 6 KB of nothing but ``aToken=b;`` labels, one traced match each, 6.0 against 1.7 ms. Each grows
-linearly, as ``tests/test_secretscrub_camelcase_label.py`` times, and each sits under the ceiling.
+and 6 KB of nothing but ``aToken=b;`` labels, one traced match each, 6.0 against 1.7 ms. Each sits
+under the ceiling. ``tests/test_secretscrub_camelcase_label.py`` times four of these shapes for
+linear growth: ``_BEARER`` alone on a mixed-case run, the quote-ended value under both labels, and
+the line of labels. The others were measured at 6 KB alone.
 """
 
 from __future__ import annotations
@@ -358,8 +360,9 @@ _CAMEL_INITIALS = "".join(sorted({word[0].upper() for word in _CAMEL_WORDS}))
 # AT LEAST THESE ARE NOT READ, and each is a residual: an all-capitals run before the keyword
 # (``SASToken=``, where the capital follows a capital), a keyword spelled with a fold character such
 # as U+017F as its first letter (the case-sensitive class reads only ASCII capitals), a label word
-# glued on with no capital at all (``accesstoken=``), which no start can find inside a word, and a
-# camelCase or compound label whose value starts on the next line. And a
+# glued on with no capital at all (``accesstoken=``), which no start can find inside a word, a
+# camelCase or compound label whose value starts on the next line, and one whose value opens with
+# "{" (``clientSecret={v}``), which :data:`_SAME_LINE_VALUE` refuses whether or not it closes. And a
 # braced value under a camelCase label after an earlier plain value, ``token=a;userPwd={pp ww}``,
 # still prints the braced tail " ww}", because :data:`_BRACED_HEAD` keeps its ``\b``. The support
 # bundle's own copy of these patterns, in ``support/redact.py``, has neither this start nor the split
@@ -983,27 +986,28 @@ _PLAIN_SCHEME_VALUE = (
 
 
 def _narrowed_value(
-    value: str, terminators: str, *groups: str
+    value: str, terminators: str, group: str, extra: str
 ) -> tuple[str, tuple[tuple[str, str], ...]]:
-    """``value``, a plain value class built on ``terminators``, that also ends at ";", "," and "&"
-    when any of ``groups`` took part in the match (BACKLOG #5545); and each class it wrote, with the
-    class it replaced, for :data:`_CAMEL_FRAGMENTS`.
+    """``value``, a plain value class built on ``terminators``, that also ends at each of ``extra``
+    when ``group`` took part in the match (BACKLOG #5545); and each class it wrote, with the class
+    it replaced, for :data:`_CAMEL_FRAGMENTS`.
 
     A camelCase or compound key label is read where no label was read before, so its value must not
-    run over what an earlier reading left for a later pass. ";" in particular opens a
-    connection-string member, whose key ``_CONNECTION_STRING_MEMBER`` reads after this pass: in
-    ``accessToken: a,b;token: 'c d='`` the token value took ``;token`` and the support bundle's
-    member mask, which hid "d" on ``origin/main``, found no key (found by code review). It also ends
-    ``accessKey=X,region=y`` at the comma rather than taking the rest of the line."""
-    wider = terminators + "".join(c for c in ";,&" if c not in terminators)
+    run over what an earlier reading left for a later pass. ";" opens a connection-string member,
+    whose key ``_CONNECTION_STRING_MEMBER`` reads after this pass: in ``accessToken: a,b;token: 'c d='``
+    the token value took ``;token`` and the support bundle's member mask, which hid "d" on
+    ``origin/main``, found no key (found by code review). A compound key word also ends at ",", so
+    ``accessKey=X,region=y`` keeps its region. Nothing else is added: a camelCase token value keeps
+    "&" and "," as ``access_token`` does, so ``sasToken=sv=a&sig=b`` hides its signature, and a
+    camelCase start before ``encryption_keys_retired`` keeps that list's commas (found by code
+    review)."""
+    wider = terminators + "".join(c for c in extra if c not in terminators)
     written: list[tuple[str, str]] = []
     for plain, narrow in (
         (f"[^{terminators}{{]++", f"[^{wider}{{]++"),
         (f"[^A-Za-z0-9{terminators}]", f"[^A-Za-z0-9{wider}]"),
     ):
-        chosen = plain
-        for group in reversed(groups):
-            chosen = f"(?({group}){narrow}|{chosen})"
+        chosen = f"(?({group}){narrow}|{plain})"
         if plain not in value:
             raise ValueError(f"no {plain} to narrow")
         value = value.replace(plain, chosen)
@@ -1011,14 +1015,15 @@ def _narrowed_value(
     return value, tuple(written)
 
 
-#: ``_BEARER``'s and ``_KEY_MATERIAL``'s plain values, narrowed under a camelCase start (the
-#: ``camel`` group of :data:`_LABEL_OR_CAMEL_START`) or a compound key word (the ``compound`` group
-#: of :data:`_KEY_LABEL_ALTERNATION`). ``_CREDENTIAL_KV``'s class already ends at all three.
+#: ``_BEARER``'s plain value, ending at ";" under a camelCase start (the ``camel`` group of
+#: :data:`_LABEL_OR_CAMEL_START`), and ``_KEY_MATERIAL``'s, ending at "," under a compound key word
+#: (the ``compound`` group of :data:`_KEY_LABEL_ALTERNATION`); its class already ends at ";".
+#: ``_CREDENTIAL_KV``'s class already ends at both.
 _CAMEL_PLAIN_VALUE, _CAMEL_VALUE_CLASSES = _narrowed_value(
-    _PLAIN_VALUE, _PLAIN_TERMINATORS, "camel"
+    _PLAIN_VALUE, _PLAIN_TERMINATORS, "camel", ";"
 )
 _CAMEL_PLAIN_KEY_VALUE, _CAMEL_KEY_VALUE_CLASSES = _narrowed_value(
-    _PLAIN_KEY_VALUE, _KEY_TERMINATORS, "camel", "compound"
+    _PLAIN_KEY_VALUE, _KEY_TERMINATORS, "compound", ","
 )
 
 # A bearer/authorization token or an opaque session token in a header-ish or "token=" shape.
@@ -1712,9 +1717,11 @@ _DSN_HINT = (_DSN_MARKER,)
 #: The compound key words alone, for :func:`_reads_camel`. Not a pass gate: ``_KEY_MATERIAL_HINT``
 #: holds them for that.
 _COMPOUND_HINT = _folded(_COMPOUND_KEY_WORDS)
-#: :data:`_CAMEL_START` on its own, for :func:`_reads_camel`. Folded as the label patterns are, so it
-#: finds a start after any lower-case letter any of them reads.
-_CAMEL_PROBE = re.compile(_CAMEL_START, re.IGNORECASE)
+#: :data:`_CAMEL_START` followed by the ":" or "=" every camelCase read, stop and run-on needs, for
+#: :func:`_reads_camel`, so a stack frame such as ``getAccessToken (`` takes one reading (found by
+#: code review). Folded as the label patterns are, so it finds a start after any lower-case letter
+#: any of them reads.
+_CAMEL_PROBE = re.compile(_camel_start(r"\b['\"]?\s*+[:=]"), re.IGNORECASE)
 
 #: The union of every per-pass gate, reduced by SUBSUMPTION: a word containing another word of the set
 #: is dropped, because any text holding it holds the shorter one too. Derived, so it cannot drift from
@@ -2065,6 +2072,14 @@ def _run(text: str, placeholder: str, folded: str | None, sub: _Sub | None = Non
 #: The group :func:`_keep_label` and ``_AUTH_SCHEME``'s replacement write back masked at their end.
 _BRACED = "braced_tail"
 
+#: A connection-string member's key, ``;<key>=``, as :data:`_CONNECTION_STRING_MEMBER` opens it, for
+#: :func:`_union`. Spelled literally, so the regex scanner reads it;
+#: ``tests/test_secretscrub_camelcase_label.py`` holds it to that pattern's own head.
+_MEMBER_KEY = re.compile(
+    r"(?i);[A-Za-z0-9_]++(?:(?<=password)|(?<=passwd)|(?<=passphrase)|(?<=pass)|(?<=pwd)"
+    r"|(?<=secret)|(?<=credential)|(?<=token))="
+)
+
 #: What the reading before did with a character of the line, in :func:`_union`.
 _HIDDEN = b"\x00"
 _PRINTED = b"\x01"
@@ -2240,14 +2255,15 @@ def _union(text: str, placeholder: str, folded: str | None) -> str:
     if ";" in text:
         # A ";" opens a connection-string member, whose key a pass AFTER this module reads: the
         # support bundle's member mask runs over the joined line. Where the shipped reading hid a
-        # ";" the reading before printed, that pass would lose the key and print the value it masked
-        # on origin/main (found by code review), so the line keeps the reading before.
+        # member key's ";" the reading before printed, that pass would lose the key and print the
+        # value it masked on origin/main (found by code review), so the line keeps the reading
+        # before. Only a member key: any other ";" a value holds costs the line nothing.
         carried = bytearray(len(text))
         for start, end, origin, _masked in shipped.runs:
             carried[origin : origin + end - start] = b"\x01" * (end - start)
         at = text.find(";")
         while at != -1:
-            if state[at] == _PRINTED[0] and not carried[at]:
+            if state[at] == _PRINTED[0] and not carried[at] and _MEMBER_KEY.match(text, at):
                 return old
             at = text.find(";", at + 1)
     out: list[str] = []

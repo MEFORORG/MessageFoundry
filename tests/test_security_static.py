@@ -668,8 +668,9 @@ _UNSCANNABLE_RE_PATTERNS = {
     # ``_LABEL_START``. The start sits inside group 1, beside an empty ``camel`` group, and
     # ``_BEARER`` and ``_KEY_MATERIAL`` take a value class narrowed when that group took part.
     #
-    # Two more since BACKLOG #5545's union. ``_CAMEL_PROBE`` compiles ``_CAMEL_START`` alone, which
-    # holds no repetition outside a lookaround. ``_pre_camel`` compiles each shipped pattern with its
+    # Two more since BACKLOG #5545's union. ``_CAMEL_PROBE`` compiles ``_CAMEL_START``'s builder
+    # with a separator after the label word, which holds no repetition outside a lookaround and the
+    # possessive ``\s*+``. ``_pre_camel`` compiles each shipped pattern with its
     # camelCase fragments swapped back for what ``origin/main`` held there, so it compiles exactly the
     # patterns this file scanned before #5545; ``tests/test_secretscrub_camelcase_label.py`` holds
     # each to carrying none of those fragments.
@@ -679,7 +680,7 @@ _UNSCANNABLE_RE_PATTERNS = {
         "'\\\\b(' + re.escape(_ENV_PREFIX) + '[A-Z0-9_]+)\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_NO_SPACE + f'(?![^{_PLAIN_TERMINATORS}])' + '[\\'\\\\\"]?|' + _GUARDED_BRACED_VALUE + f'(?![^{_PLAIN_TERMINATORS}])' + '|(?=' + _GUARDED_QUOTED_VALUE + ')[\\'\\\\\"][^\\\\s\\'\\\\\"]++[\\'\\\\\"]|' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_VALUE + '[\\'\\\\\"]?)'",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_CREDENTIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _ODBC_BRACED + '|' + _KV_QUOTED_VALUE + '|' + _ODBC_BRACED_OVERRUN + '|' + _PLAIN_KV_VALUE + ')'",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _KEY_LABEL_ALTERNATION + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_VALUE + f'(?![^{_KEY_TERMINATORS}])|' + _GUARDED_QUOTED_VALUE + '|' + _CAMEL_PLAIN_KEY_VALUE + ')'",
-        "_CAMEL_START",
+        "_camel_start('\\\\b[\\'\\\\\"]?\\\\s*+[:=]')",
         "source",
     ),
     "messagefoundry/parsing/_builtin_hl7.py": ("f'{e}\\\\.({prefixes})(?!{e})'",),  # ASVS 1.3.3

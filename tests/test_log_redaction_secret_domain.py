@@ -3591,7 +3591,13 @@ def test_both_copies_of_each_stopped_pattern_agree() -> None:
     They differ on purpose in spelling -- a scoped fold here, a derived alternation there -- so the
     check is on what they MATCH, over an ASCII corpus where those spellings are equivalent. The quoted
     values, the review shapes and the structured lines are in it because they are what reach the
-    braced and quoted alternates; the swallow family alone never does."""
+    braced and quoted alternates; the swallow family alone never does.
+
+    Since BACKLOG #5545 this module's patterns also read camelCase and compound key labels, which
+    the copy does not, so the copy is compared with ``secretscrub._pre_camel`` of each: the reading
+    without them, which ``scrub_credentials`` keeps beside the shipped one. The camelCase lines
+    below are there so that comparison meets the shapes the two readings differ on (found by code
+    review)."""
     corpus = [
         *_swallow_family(),
         *(line for line, _values, _labels in SWALLOW_EXAMPLES),
@@ -3602,10 +3608,15 @@ def test_both_copies_of_each_stopped_pattern_agree() -> None:
         *_structured_lines(2000),
         # Every fifth nested line: the braced MEFOR_ value's trailing quote is spelled in both copies.
         *_nested_label_lines()[::5],
+        "accessToken=zq1",
+        'token=zq1;accessToken="zq2 zq3"',
+        "AccountKey=zq1;x=1",
+        "storageAccountKey=zq1,region=x",
+        "clientSecret:\npassword: zq1",
     ]
     compared = 0
     for name in _STOPPED_PATTERNS:
-        ours, theirs = getattr(redact_mod, name), getattr(scrub_mod, name)
+        ours, theirs = getattr(redact_mod, name), scrub_mod._pre_camel(getattr(scrub_mod, name))
         for line in corpus:
             spans = [m.span() for m in ours.finditer(line)]
             assert spans == [m.span() for m in theirs.finditer(line)], f"{name} differs on {line!r}"

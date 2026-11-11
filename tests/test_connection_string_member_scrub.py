@@ -216,12 +216,13 @@ def test_the_phi_passes_see_the_text_they_saw_before(line: str) -> None:
 #: (``state=``, ``?code=``, ``Token=``, ``MEFOR_X=``), a segment ID, a DICOM element, the userinfo
 #: opener, or the length of a base64 run. The word mask keeps each, so none may print.
 #:
-#: A key in these shapes, the mask-rule shapes and the seeded differential's member keys below is
-#: spelled with no camelCase capital on its
+#: A key in these shapes and the mask-rule shapes below is spelled with no camelCase capital on its
 #: credential word (``;Accesstoken=``, ``;KeyStorepwd=``). Since BACKLOG #5545 the label patterns
 #: read ``;AccessToken=`` and ``;KeyStorePwd=`` at the capital and hide the value before the member
 #: pass runs, so that spelling no longer reaches the word mask these shapes exist to exercise. The
-#: spelling with no capital reaches it exactly as ``;AccessToken=`` did before that change.
+#: spelling with no capital reaches it exactly as ``;AccessToken=`` did before that change. The
+#: seeded differential's pieces hold both spellings, so a camelCase member key still meets the
+#: member pass there (found by code review).
 _SHAPES_A_SECOND_PASS_PRINTED = (
     ";sslpassword=%2Cpassword=&state=,;f6q",
     'password":;xpass=&state=[REDACTED];}%7Cb2q',
@@ -426,7 +427,8 @@ _RULE_CONTROLS = (
 _DIFFERENTIAL_PIECES = (
     "mfb64:v1:", "amfb64:v1:", "x_mfb64:v1:", "mfb64:", ":v1:", "mfb64:v2:", "MFB64:v1:", "key=",
     '"family": ',
-    ";PWD=", ";sslpassword=", ";xpass=", ";Accesstoken=", ";Token=", "password=", "password'=",
+    ";PWD=", ";sslpassword=", ";xpass=", ";Accesstoken=", ";AccessToken=", ";Token=", "password=",
+    "password'=",
     'password":', "secret=", "secret: ", "api_token=", "token=", "private_key=", "encryption_key={",
     "MEFOR_X=", "postgres://svc:", "@db", "%2Cpassword=", "Bearer ", "?code=", "&state=",
     "nonnumeric port: '", "PID|1||", "(0010,1000)", "MRN", "DOE^JOHN", "Jane Doe", "19800505",
