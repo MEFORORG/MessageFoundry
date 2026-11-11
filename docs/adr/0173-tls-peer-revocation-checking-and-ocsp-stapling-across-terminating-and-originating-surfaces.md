@@ -1240,14 +1240,20 @@ ruling:
 - **The ruling rests on Microsoft's driver.** The question cited Microsoft's driver documentation,
   and the test names ODBC Driver 18 only. Another driver can serve these hops, as the second
   bullet of the 2026-10-04 reading below says. No owner answer and no planned test covers one.
-- **The drivers' own revocation behaviour is still unmeasured.** The ruling's "then test it" half
-  is owed. It needs a SQL Server whose certificate can be revoked. A control connection to a
-  certificate that is not revoked shows that a refusal comes from the revocation. Until #3009
-  runs, nothing here says whether Driver 18 checks revocation.
+- **The drivers' own revocation behaviour is measured for one driver build on one operating
+  system only.** The ruling's "then test it" half has run for ODBC Driver 18 on Windows, with a
+  control certificate that is not revoked. The amendment of 2026-11-11 below holds what was
+  measured and its limits. No other driver and no other operating system was measured. *(Until
+  2026-11-11 this bullet read: "**The drivers' own revocation behaviour is still unmeasured.** The
+  ruling's "then test it" half is owed. It needs a SQL Server whose certificate can be revoked. A
+  control connection to a certificate that is not revoked shows that a refusal comes from the
+  revocation. Until #3009 runs, nothing here says whether Driver 18 checks revocation.")*
 - **What a result would mean for the grade is not ruled.** If Driver 18 checks, the text can say
   under what conditions. If it does not, R6 does not say whether the gap stands or the owner's
   other two options come back. BACKLOG #3009's third closing step says the gap stands. That is
   the ledger row's wording, not the owner's, so it is the owner's to decide when a result exists.
+  *(Note 2026-11-11: a result exists, in the amendment below. The owner has not ruled on what it
+  means for the grade, so the five rows keep the grade R6 gives them.)*
 
 *(Until 2026-10-11 this paragraph read: "**What is open on the five ODBC hops.** BACKLOG #2194 names
 three outcomes for a hop: a guard, a documented driver control, or an accepted gap. This note
@@ -1279,6 +1285,46 @@ chosen option gives for building no guard:
   (*code*). A guard on `db_lookup`, reference-sync or the store would therefore refuse every
   off-loopback hop under `enforce`, unless a new lever were built with it. No declared egress
   terminator exists for these hops either.
+
+**Amendment 2026-11-11 -- what the ODBC Driver 18 test measured (vault BACKLOG #3009).** This is a
+public summary of two private test records in the vault, one per run of the vault's ODBC
+revocation runbook. Their contents beyond this summary are not repeated here. It changes no grade
+and no code.
+
+- **Where it ran.** Two runs, on 2026-10-16 and 2026-10-17, on one disposable virtual machine
+  built for the test, not on a SQL Server test box. The client ran on the same machine as SQL
+  Server.
+- **Versions.** ODBC Driver 18 for SQL Server, 64-bit, the 18.7 build, which reported itself as
+  `18.07.0001`. Windows Server 2022 Datacenter, build 20348. SQL Server 2022 RTM,
+  16.0.1000.6. pyodbc 5.3.0, the only part of the engine's Python environment the test used.
+- **How the revocation was published.** A throwaway test root, with no intermediate CA, issued two
+  server certificates. It revoked one, and served a signed CRL listing it over HTTP. The other
+  was the control. SQL Server ran on each in turn. Before the legs, Windows' own chain check
+  reported the revoked certificate as revoked, fetching the list to do so, and passed the
+  control. No OCSP responder was offered.
+- **Which shapes were tried.** Connection strings carried by the runbook, copied from the engine's
+  code: the store and the DATABASE SQL Server preset (one string), `db_lookup`, the generic
+  dialect naming Driver 18, and the store with a matching `ServerCertificate` pin under
+  `Encrypt=yes`. Each ran on both certificates with the CRL cache cleared, and again with the list
+  already cached. The second run added the pinned string with `Encrypt=strict` in place of
+  `Encrypt=yes`, which the runbook's strings did not carry, on a cleared cache only.
+- **What the driver did.** Every leg of the four runbook shapes connected, on the revoked
+  certificate as on the control, with the cache cleared and with the list cached. The list's
+  server logged no request during any leg. Read by the runbook's own table, the driver did not use
+  this list for those shapes, fetched or cached. The strict pinned leg on the revoked certificate
+  also connected, with no list request.
+  No strict leg ran without a pin or with the list cached, so this does not show that the pin is
+  the reason.
+- **The limits.** At least these. Only that driver build, and only Windows Server 2022. Linux,
+  macOS, other Driver 18 builds, and other drivers, which the generic dialect and the
+  `odbc_driver` setting can name, were not measured. Only a CRL over HTTP: OCSP was not offered,
+  so this does not show that the driver never checks revocation. The strings were the runbook's,
+  so the result says nothing directly about how the engine builds or sends its own strings. One
+  machine, one throwaway root.
+
+The same runs' pin legs are the record behind the amendment of 2026-10-17 below, and are not
+repeated here. **What the result means for the five rows' grade is not decided here.** The limits
+bullet above says it is not ruled, and the owner has not ruled on it.
 
 **What is open on the three Vault hops.** *(Built on 2026-10-13, under vault BACKLOG #2983;
 §12 is the record. This paragraph and its two facts are kept as written. Fact 1 no longer holds:
@@ -1363,7 +1409,10 @@ DIRECT; §11 lists the edit.)* Add these rows to it:
   read "Five more rows wait on an owner answer, beside DIRECT.")*
 - Three more hops could take a guard, beside the seven BACKLOG #2193 tracks. *(Since 2026-10-13
   those three, the Vault hops, are guarded by attestation; §12.)*
-- The ODBC drivers' own revocation behaviour is still not established. BACKLOG #3009 is the test.
+- Whether the ODBC drivers check revocation is still not established in general. BACKLOG #3009's
+  test measured one driver build on one operating system; the amendment of 2026-11-11 above holds
+  what it found and its limits. *(Until 2026-11-11 this read: "The ODBC drivers' own revocation
+  behaviour is still not established. BACKLOG #3009 is the test.")*
 
 The heading in section 7, "SOME HOPS ARE STILL UNGRADED", now holds only in this sense: **read the
 eight as "at least these", per SDS-3.6.** This note re-read the hops the list named. It did not
