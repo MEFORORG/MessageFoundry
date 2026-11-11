@@ -209,7 +209,8 @@ Two statements above were false in the shipped code, and both are corrected here
   carries a DOCTYPE, needs. A refusal inside a file such an import did open still fails the build.
   A `schema_root` that is a filesystem root is refused, and so is a schema path or `schema_root`
   that is not absolute as written, such as `C:`, `C:.` or `file:///C:`, which would otherwise
-  resolve against the working directory, `System32` under the Windows service. Skipping any other
+  resolve against the working directory, the engine install root under the shipped Windows
+  service. Skipping any other
   refused import would leave its namespace undeclared, and a `lax` or `skip` wildcard would then admit
   that namespace's content unchecked. The confinement root is the schema's own
   directory, or the directory the caller passes as `validate_against`'s `schema_root` keyword. That

@@ -17,7 +17,8 @@ Three limbs, each pinned against the behaviour it replaces:
   invalid result, and the docstring now says so.
 
 Every file a test writes is under ``tmp_path``; nothing depends on the process's working directory
-except the tests that set it with ``monkeypatch.chdir`` to show a relative path is refused.
+except the tests that set it with ``monkeypatch.chdir``: those showing a relative path is refused,
+and their control.
 """
 
 from __future__ import annotations
@@ -199,7 +200,7 @@ _WINDOWS_ONLY = pytest.mark.skipif(os.name != "nt", reason="a drive-relative pat
 def test_a_relative_schema_root_is_refused(
     form: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # It resolves against the working directory, System32 under the Windows service.
+    # It resolves against the working directory, the engine install root under the service.
     main = _outside_include_under_cwd(tmp_path, monkeypatch)
     root = form.format(d=tmp_path.drive)
     with pytest.raises(XmlValidationError, match="a schema_root that is not an absolute path"):
@@ -703,13 +704,28 @@ def test_a_refusal_names_its_fixed_reason(tmp_path: Path) -> None:
     assert "o.xsd" not in str(ei.value)  # PHI-safe: the location is not quoted
 
 
-def test_an_include_that_is_a_directory_names_a_true_reason(tmp_path: Path) -> None:
-    # Opening a directory raises an OSError (PermissionError on Windows, IsADirectoryError on read
-    # elsewhere). It used to fail the build as "a link out, or a file parse_bytes refuses", neither of
-    # which happened.
+@pytest.mark.parametrize(
+    ("location", "reason"),
+    [
+        # Opening a directory raises an OSError (PermissionError on Windows, IsADirectoryError on
+        # read elsewhere), and a NUL in the path a ValueError. Both used to fail the build as "a link
+        # out, or a file parse_bytes refuses", neither of which happened.
+        pytest.param("dir5537.xsd", "a location that cannot be read as a file", id="directory"),
+        pytest.param("dir5537%00.xsd", "a location that cannot be read as a file", id="nul-byte"),
+        # abspath maps a reserved device name to a device path, which used to read as outside the
+        # root.
+        pytest.param(
+            "nul",
+            "a resource that is not a local file path",
+            id="device-name",
+            marks=pytest.mark.skipif(os.name != "nt", reason="a reserved device name is Windows"),
+        ),
+    ],
+)
+def test_a_refused_include_names_a_true_reason(location: str, reason: str, tmp_path: Path) -> None:
     (tmp_path / "dir5537.xsd").mkdir()
-    main = _write_path_schema(tmp_path, "dir5537.xsd")
-    with pytest.raises(XmlValidationError, match="a location that cannot be read as a file") as ei:
+    main = _write_path_schema(tmp_path, location)
+    with pytest.raises(XmlValidationError, match=reason) as ei:
         validate_against("<patient>x</patient>", str(main))
     assert "dir5537" not in str(ei.value)  # PHI-safe: the location is not quoted
 
@@ -799,7 +815,7 @@ def test_a_reparse_point_readlink_rejects_fails_the_build(
 
     monkeypatch.setattr(os, "lstat", fake_lstat)
     monkeypatch.setattr(os, "readlink", fake_readlink)
-    with pytest.raises(XmlValidationError, match="a link that cannot be read") as ei:
+    with pytest.raises(XmlValidationError, match="a location that cannot be read as a file") as ei:
         validate_against("<patient>x</patient>", str(main))
     assert "_ResourceRefused" in _causes(ei.value)
 
@@ -888,7 +904,7 @@ def test_schema_root_is_refused_for_an_inline_schema(tmp_path: Path) -> None:
 @pytest.mark.parametrize("url", ["file:", "file://", "file://localhost", "file:///"])
 def test_a_file_url_naming_no_path_is_refused(url: str, tmp_path: Path) -> None:
     # url2pathname gives "" (or "/"), and abspath("") is the working directory: under the Windows
-    # service that can be C:\Windows\System32, so as a schema_root it widened reads to all of it.
+    # service that is the engine install root, so as a schema_root it widened reads to all of it.
     main = _write_path_schema(tmp_path, "inc.xsd")
     with pytest.raises(
         XmlValidationError, match="naming no path|filesystem root|not an absolute path"
