@@ -1233,7 +1233,7 @@ class WorkerDeathOutcome:
     """What one ``record_worker_death`` call did (vault BACKLOG #4607 step 6).
 
     ``deaths`` is the row's ``worker_deaths`` as this call's own increment left it, read inside the
-    same write, never the value a claim returned. It is 0 when the row was not in flight, so nothing
+    same write, never the value a claim returned. It is 0 when the row was already resolved, so nothing
     was counted. ``dead`` is True when this call dead-lettered the row at its cap. On Postgres and
     SQL Server both are reset to the empty outcome when the H1 epoch fence rolled the dead-letter
     back, increment included (ADR 0157 C3)."""
@@ -14563,8 +14563,8 @@ class MessageStore:
         async def _body() -> WorkerDeathOutcome:
             # Not updated_at: the in-flight watch measures a held row's age from its claim.
             cur = await self._db.execute(
-                "UPDATE queue SET worker_deaths = worker_deaths + 1 WHERE id=? AND status=?",
-                (outbox_id, OutboxStatus.INFLIGHT.value),
+                "UPDATE queue SET worker_deaths = worker_deaths + 1 WHERE id=? AND status IN (?, ?)",
+                (outbox_id, OutboxStatus.INFLIGHT.value, OutboxStatus.PENDING.value),
             )
             if cur.rowcount == 0:
                 raise _AbortMember(WorkerDeathOutcome())
@@ -14577,7 +14577,7 @@ class MessageStore:
             deaths = int(row["worker_deaths"])
             if deaths < cap:
                 return WorkerDeathOutcome(deaths=deaths)
-            # No status term: the increment matched this row INFLIGHT under the writer lock.
+            # No status term: the increment matched this row unresolved, under the writer lock.
             await self._db.execute(
                 "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=? WHERE id=?",
                 (

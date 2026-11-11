@@ -11607,8 +11607,12 @@ class SqlServerStore:
         now = time.time() if now is None else now
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
+                # UPDLOCK (a plain read takes no lock under RCSI): the DEAD branch's decline below
+                # reads the row this transaction then writes, so no writer moves it in between
+                # (ADR 0157 Amendment C).
                 await cur.execute(
-                    "SELECT message_id, destination_name, attempts FROM queue WHERE id=?",
+                    "SELECT message_id, destination_name, attempts, status"
+                    " FROM queue WITH (UPDLOCK, ROWLOCK) WHERE id=?",
                     (outbox_id,),
                 )
                 row = await cur.fetchone()
@@ -11619,21 +11623,10 @@ class SqlServerStore:
                 # max_attempts None = retry forever (never dead-letter here); a finite cap dead-letters
                 # once exhausted (mirrors the SQLite backend's mark_failed).
                 if retry.max_attempts is not None and attempts >= retry.max_attempts:
-                    # ADR 0157 Amendment C (vault BACKLOG #4607 step 6): a row already DONE, DEAD
-                    # or CANCELLED is left as it is, and so is one a replay reset since the read
-                    # above. Both halves of the decision are read again under the update lock (a
-                    # plain read takes none under RCSI), on this branch alone, so no writer moves the
-                    # row before the UPDATE and an empty OUTPUT rowset there is still the fence alone.
-                    await cur.execute(
-                        "SELECT status, attempts FROM queue WITH (UPDLOCK, ROWLOCK) WHERE id=?",
-                        (outbox_id,),
-                    )
-                    held = await cur.fetchone()
-                    if (
-                        held is None
-                        or held[0] in _RESOLVED_STATUSES
-                        or held[1] < retry.max_attempts
-                    ):
+                    if row[3] in _RESOLVED_STATUSES:
+                        # ADR 0157 Amendment C (vault BACKLOG #4607 step 6): a row already DONE,
+                        # DEAD or CANCELLED is left as it is. Read under the lock and kept out of the
+                        # UPDATE, so an empty OUTPUT rowset there is still the epoch fence alone.
                         await self._commit(conn)
                         return FailOutcome()
                     status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
@@ -12284,8 +12277,8 @@ class SqlServerStore:
         self, outbox_id: str, cap: int, error: str, now: float | None = None
     ) -> WorkerDeathOutcome:
         """See the base contract (vault BACKLOG #4607 step 6). The increment is neither terminal nor
-        a re-pend, so it carries no fence (ADR 0157 C1). It matches only an INFLIGHT row and takes
-        its lock, so the dead-letter that follows at the cap cannot find the row resolved and needs
+        a re-pend, so it carries no fence (ADR 0157 C1). It matches only an INFLIGHT or PENDING row
+        and takes its lock, so the dead-letter that follows at the cap cannot find the row resolved and needs
         no status term (Amendment C); a miss there is the resolve fence alone, handled as C3 says. Both statements read
         their match from an ``OUTPUT`` rowset, never ``cursor.rowcount`` (Inc 3, as built)."""
         error = safe_text(error)  # PHI chokepoint (#120): scrub first, then cipher last_error (H4)
@@ -12297,8 +12290,8 @@ class SqlServerStore:
                 await cur.execute(
                     "UPDATE queue SET worker_deaths = worker_deaths + 1"
                     " OUTPUT inserted.worker_deaths, inserted.message_id, inserted.destination_name"
-                    " WHERE id=? AND status=?",
-                    (outbox_id, OutboxStatus.INFLIGHT.value),
+                    " WHERE id=? AND status IN (?, ?)",
+                    (outbox_id, OutboxStatus.INFLIGHT.value, OutboxStatus.PENDING.value),
                 )
                 hit = await cur.fetchone()
                 if hit is None:

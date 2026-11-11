@@ -968,21 +968,23 @@ class QueueStore(StoreLifecycle, Protocol):
         the worker; the runner decides that and never counts a cancellation.
 
         One transaction. It raises the row's ``worker_deaths`` by one only while the row is
-        ``inflight``, and reads the count that increment left. Nothing else writes that column but a
+        unresolved, ``inflight`` or ``pending`` (a Postgres lease sweep may have re-pended it before
+        the death), and reads the count that increment left. Nothing else writes that column but a
         replay, which resets it with ``attempts``: no claim raises it, and no release, reschedule or
         ``reset_stale_inflight`` lowers it. So a batch tail claimed beside a dying row is never
         counted, and the count survives a restart. Below ``cap`` that is the whole write: the row stays
         in flight, as a death leaves it, and ``updated_at`` is untouched. At ``cap`` or above the same
         transaction dead-letters the row as :meth:`dead_letter_now` does, a ``dead`` event written and
         its message finalized. A row already DONE, DEAD or CANCELLED is never changed: the increment
-        matches only an INFLIGHT row and holds it locked until the commit (ADR 0157 Amendment C). On
+        matches only an unresolved row and holds it locked until the commit (ADR 0157 Amendment C). On
         Postgres and SQL Server that dead-letter takes the fail-open resolve fence (ADR 0157 C1, C2);
         a fenced rejection rolls the whole transaction back, increment included, and re-pends the row
         (C3), so the successor counts that death again.
 
         "Every time" therefore means across passes that each claimed the row anew: after a restart,
-        or a Postgres lease reclaim. A dead worker's row is not re-claimed in the same process
-        (#4607 steps 1, 2 and 5 are not built). A row not in flight is not counted, and the empty
+        or a Postgres lease reclaim. A per_lane worker is respawned, but its dying row stays in
+        flight, so it is not re-claimed in the same process unless a lease sweep re-pends it
+        (#4607 steps 1, 2 and 5 are not built). A resolved row is not counted, and the empty
         :class:`WorkerDeathOutcome` comes back."""
         ...
 

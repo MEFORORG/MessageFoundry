@@ -6512,14 +6512,23 @@ async def test_record_worker_death_counts_then_dead_letters_at_the_cap(store) ->
     assert msg is not None and msg["status"] == MessageStatus.ERROR.value
 
 
-async def test_record_worker_death_leaves_a_row_not_in_flight_alone(store) -> None:
+async def test_record_worker_death_counts_a_re_pended_row_and_skips_a_resolved_one(store) -> None:
+    """A lease sweep may re-pend the row before the death is recorded; it still counts. A row
+    already resolved is never counted."""
     await store.enqueue_ingress(channel_id="IB", raw=RAW, now=100.0)
     item = await store.claim_next_fifo("IB", now=200.0, stage=Stage.INGRESS.value)
     assert item is not None
     await store.reset_stale_inflight(now=300.0)
-    counted = await store.record_worker_death(item.id, 1, "router worker killed by _Kill")
+    counted = await store.record_worker_death(item.id, 3, "router worker killed by _Kill")
+    assert (counted.deaths, counted.dead) == (1, False)
+    assert await _pg_death_row(store, item.id) == ("pending", 1, 1)
+    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0)
+    sent = await store.claim_next_fifo("OB1", now=200.0)
+    assert sent is not None
+    assert await store.mark_done(sent.id, now=201.0)
+    counted = await store.record_worker_death(sent.id, 1, "delivery worker killed by _Kill")
     assert (counted.deaths, counted.dead) == (0, False)
-    assert await _pg_death_row(store, item.id) == ("pending", 1, 0)
+    assert await _pg_death_row(store, sent.id) == ("done", 1, 0)
 
 
 async def test_record_worker_death_fenced_rolls_back_whole_and_re_pends(store) -> None:

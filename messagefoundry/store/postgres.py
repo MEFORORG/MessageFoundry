@@ -5744,8 +5744,8 @@ class PostgresStore:
         self, outbox_id: str, cap: int, error: str, now: float | None = None
     ) -> WorkerDeathOutcome:
         """See the base contract (vault BACKLOG #4607 step 6). The increment is neither terminal nor
-        a re-pend, so it carries no fence (ADR 0157 C1). It matches only an INFLIGHT row and takes
-        its lock, so the dead-letter that follows at the cap cannot find the row resolved and needs
+        a re-pend, so it carries no fence (ADR 0157 C1). It matches only an INFLIGHT or PENDING row
+        (a lease sweep may have re-pended the row before the death) and takes its lock, so the dead-letter that follows at the cap cannot find the row resolved and needs
         no status term (Amendment C); a miss there is the resolve fence alone, handled as C3 says."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
@@ -5754,10 +5754,12 @@ class PostgresStore:
             async with self._timed_acquire() as conn, conn.transaction():
                 # Not updated_at: the in-flight watch measures a held row's age from its claim.
                 hit = await conn.fetchrow(
-                    "UPDATE queue SET worker_deaths = worker_deaths + 1 WHERE id=$1 AND status=$2"
+                    "UPDATE queue SET worker_deaths = worker_deaths + 1"
+                    " WHERE id=$1 AND status IN ($2, $3)"
                     " RETURNING worker_deaths, message_id, destination_name",
                     outbox_id,
                     OutboxStatus.INFLIGHT.value,
+                    OutboxStatus.PENDING.value,
                 )
                 if hit is None:
                     return WorkerDeathOutcome()
@@ -7119,25 +7121,18 @@ class PostgresStore:
         now = time.time() if now is None else now
         try:
             async with self._timed_acquire() as conn, conn.transaction():
-                row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
+                # FOR UPDATE: the DEAD branch's decline below reads the row this transaction then
+                # writes, so no writer moves it in between (ADR 0157 Amendment C).
+                row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1 FOR UPDATE", outbox_id)
                 if row is None:
                     return FailOutcome()
                 attempts = row["attempts"]
                 # max_attempts None = retry forever; a finite cap dead-letters once exhausted.
                 if retry.max_attempts is not None and attempts >= retry.max_attempts:
-                    # ADR 0157 Amendment C (vault BACKLOG #4607 step 6): a row already DONE, DEAD
-                    # or CANCELLED is left as it is, and so is one a replay reset since the read
-                    # above. Both halves of the decision are read again under the row lock, on this
-                    # branch alone, so no writer moves the row before the UPDATE and a miss there is
-                    # still the epoch fence alone.
-                    held = await conn.fetchrow(
-                        "SELECT status, attempts FROM queue WHERE id=$1 FOR UPDATE", outbox_id
-                    )
-                    if (
-                        held is None
-                        or held["status"] in _RESOLVED_STATUSES
-                        or held["attempts"] < retry.max_attempts
-                    ):
+                    if row["status"] in _RESOLVED_STATUSES:
+                        # ADR 0157 Amendment C (vault BACKLOG #4607 step 6): a row already DONE,
+                        # DEAD or CANCELLED is left as it is. Read under the lock and kept out of the
+                        # UPDATE, so a miss there is still the epoch fence alone.
                         return FailOutcome()
                     status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
                 else:

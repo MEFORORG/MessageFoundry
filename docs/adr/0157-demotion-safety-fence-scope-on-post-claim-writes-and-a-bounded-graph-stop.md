@@ -201,7 +201,7 @@ firing, and firing is worse.
 > carry no status conjunct. `mark_failed`'s retry branch, which C1 leaves unfenced, now carries one.
 > The amendment says why the argument above does not reach it. *Amendment C (2026-11-11)* makes
 > `mark_failed`'s DEAD branch and `record_worker_death`'s dead-letter decline an already-resolved row,
-> never an INFLIGHT or PENDING one, by a locked read rather than a conjunct; it says why.
+> never an INFLIGHT or PENDING one, so neither is this conjunct; it says why.
 
 **C3 — A fenced write is all-or-nothing, and it RE-PENDS the row. It must not leave it INFLIGHT.**
 Zero rows affected ⇒ roll back the enclosing transaction (discarding the `delivered_keys` row, the
@@ -1445,9 +1445,9 @@ retry term does. C1 is unchanged: both writes keep the fail-open resolve fence.
 
 **Neither UPDATE carries a status term, so a miss stays the fence's alone.** On Postgres and SQL
 Server a fenced write is told apart by its empty result (C3), so the status must not be a second
-reason for one. `mark_failed`'s DEAD branch, and only that branch, reads the status and attempts
-again under a row lock (`FOR UPDATE`, `UPDLOCK`) and returns the empty outcome before its UPDATE for
-a resolved row, or for one whose attempts a replay reset below the cap since the first read. `record_worker_death`'s increment matches only an INFLIGHT row and holds its lock until the
+reason for one. `mark_failed` now takes its first read under a row lock (`FOR UPDATE`, `UPDLOCK`),
+and its DEAD branch returns the empty outcome before its UPDATE for a resolved row. The increment
+in `record_worker_death` matches only an INFLIGHT or PENDING row and holds its lock until the
 commit, so its dead-letter cannot find the row resolved. SQLite does both under its single writer.
 `mark_batch_failed`'s DEAD branch is unchanged.
 
