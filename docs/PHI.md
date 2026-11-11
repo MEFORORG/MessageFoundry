@@ -2399,7 +2399,16 @@ Properties of the anonymizer:
   alphabet. The rates and the stated bound are in the docstring of `_estimated_entropy_bits` in
   [`keying.py`](../messagefoundry_toolkit/anon/keying.py) (vault BACKLOG #3359).
 - **Width/shape-preserving surrogates** — a surrogate keeps the original's width/shape so the
-  scrubbed dataset stays structurally realistic.
+  scrubbed dataset stays structurally realistic. An identifier surrogate (`mrn`, `id`) fabricates
+  every letter and digit of the id, as ASCII; `ssn` writes fabricated digits. Each keeps only the
+  CX components that describe the id rather than hold it: CX.3 to CX.6, CX.9 and CX.10. They are
+  the check-digit scheme, the identifier type and the issuer's names. It blanks CX.2, the check digit, the CX.7 and
+  CX.8 dates, and anything past CX.10. `PID-20`, a driver's licence, takes the `dln` kind: the
+  number is fabricated, the issuing state kept and the expiry blanked (BACKLOG #5534). The
+  leak-check still scans a kept component, as written and decoded. A dashed SSN or a punctuated
+  phone number there refuses, as it would in a field no rule maps. Any other text a sender puts
+  in one, such as a name, passes. The kept positions are
+  CX positions whatever the field's type, so an overlay that points an EI field such as `OBR-3` at `id` blanks EI.2, the namespace id.
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
   loose string search. With no site prefix loaded it matches nothing, and
   `python -m tee anonymize-captures` prints a warning saying so (vault BACKLOG #3516).
@@ -2424,8 +2433,8 @@ both are described below:
 | The message has no parseable MSH, or its structure cannot be parsed (`AnonError`) | The whole message |
 | A known partner, vendor or site token, or a routable IP address, survives | The whole message |
 | The header's `MSH-12` version is made of digits and dots, and one run of digits is longer than 32 (`AnonError`, raised by the anonymizer before the leak-check runs) | The header |
-| A dashed SSN (`NNN-NN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, and what a retarget of a default field leaves past its first component. A cut shape counts when at least one of its fields is one no rule maps |
-| A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, and what a retarget of a default field leaves past its first component. A cut shape counts when at least one of its fields is one no rule maps |
+| A dashed SSN (`NNN-NN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
+| A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
 | A CX identifier typed `MR` or `MRN` appears | Fields no rule maps |
 | A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule rewriting a field of that segment names. A wrapped `LEE` or `ZOE` is such a line, and with no readable version in MSH-12 the version defines no id. Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields, the header included. Or it is an `MSH` line ahead of the header. | Every line but a header of three or more split fields whose first field is `MSH`, in capitals or not. The header is the one line the separators are read from. It is the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
 | The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
@@ -2437,8 +2446,37 @@ known; it does not prove there are no others.
 
 **Everything else in a field no rule maps passes.** That includes a name, a date, an undashed SSN,
 a bare ten-digit phone number, an account number and a free-text note. A Z-segment is the common
-case, since no default rule names one. A name in `PV1-11`, the temporary location, passes the same
-way. The detectors stay narrow on purpose: a broad digit search flags almost every HL7 body.
+case, since no default rule names one. A name in a standard field no rule maps, such as `NK1-26`,
+the next of kin's mother's maiden name, passes the same way. The detectors stay narrow on purpose: a broad digit search flags almost every HL7 body.
+
+**An escaped value is read decoded too (BACKLOG #5532).** HL7 lets a sender write any character
+as an escape sequence, so `123\X2D\45\X2D\6789` is a dashed SSN and `M\X52\` is the id type
+`MR`. The engine's readers decode a part in two ways: `Message` decodes a whole component on a
+component read and one subcomponent on a subcomponent read, and `Peek` decodes a subcomponent,
+reading the first one where a component has several. An escape can pair across the subcomponent
+separator in the first reading and not in the second, so the check takes both. The shape
+detectors read each unmapped value as written, then each of its components decoded whole and each
+of its subcomponents decoded on its own. The MRN-typed check reads the id type as written,
+decoded whole, and as its first subcomponent decoded. The token scan reads the whole message as
+written, then decoded a subcomponent at a time, then decoded a component at a time. The escape
+character is the one the message's own `MSH-2` declares. Each sequence decodes as the engine's
+own parser reads it: `\F\`, `\S\`, `\T\`, `\R\` and `\E\` become that message's own
+delimiters, `\H\` and `\N\` become `_`, and a hex escape `\Xhh\` becomes the character with
+each pair's code. A sequence the parser cannot map, an empty one included, decodes to nothing, so
+`123\Q\-45-6789` reads as the SSN a receiver would see. One difference: a formatting command
+that writes a line break or spaces, such as `\.br\`, decodes to one space, so two runs of digits
+never join. An escape character that no second one closes is kept as written. Decoding only adds
+hits: a value the check refuses as written is still refused, so an MRN-typed identifier whose id
+is an unmappable sequence such as `\Z98765\`, which decodes to nothing, is refused. At least these
+still pass:
+
+- No part wider than a component is decoded, as neither engine reader decodes one, so a shape
+  whose parts sit in different components is not joined, and an escape character with no closing
+  one in a component never pairs with a sequence in the next.
+- The site-code check does not decode, so a site code written with an escape sequence passes it.
+- The check for a shape cut across fields by the field separator does not decode.
+- A hex escape decodes one byte to one character. A non-ASCII character a UTF-8 sender wrote as
+  several hex pairs reads as several characters, so a token holding it is not found in that form.
 
 **A shape cut across fields by the message's own field separator is refused, but not in every
 form.** Under a field separator of `-`, the line `ZZZ-1-123-45-6789` holds the number as three
@@ -2453,8 +2491,6 @@ these still get through, on both anonymizers:
   typed `ST`, `OBX-1-ST-8480^S^LN--123-45-6789` leaves as `...--[REDACTED]-45-6789`, and
   `OBX-1-ST-123-45-6789` as `OBX-1-ST-123-45-[REDACTED]`. `NTE-3` and `OBX-5` typed `TX` leave
   such a rest too.
-- A shape whose separators the sender escaped, as HL7 asks: `123\F\45\F\6789`. No detector
-  decodes an escape.
 - A shape cut by a digit field separator, such as `4`, when a separator sits right before or after
   it. The detectors read that digit as part of a longer number.
 - A shape in the header line, which the check skips whole.
@@ -2615,6 +2651,8 @@ and fills the rest of the value at the same width. BACKLOG #2248 added it.
 | `GT1-8`, `IN1-18`, `NK1-16` | Dates of birth of the guarantor, the insured and a contact | `dob`, a fabricated date, like `PID-7`. A time after the eight date digits keeps its width as zeros, and an offset becomes `+0000` (vault BACKLOG #2767). Anything else after them is dropped |
 | `PID-12` | County code | `freetext`, the whole field becomes `[REDACTED]` |
 | `PV1-3` | Assigned patient location | `freetext`, the whole field becomes `[REDACTED]` |
+| `PV1-6`, `PV1-11`, `PV1-42`, `PV1-43` | Prior, temporary, pending and prior temporary patient locations (BACKLOG #5533) | `freetext`, the whole field becomes `[REDACTED]` |
+| `PID-23` | Birth place (BACKLOG #5533) | `freetext`, the whole field becomes `[REDACTED]` |
 
 What the `date` kind does to a value:
 
@@ -2741,7 +2779,8 @@ field with no default rule logs nothing. `python -m tee anonymize-captures` also
 
 **An overlay can also point a default field at a different kind, and that can leave part of the
 field as captured.** The kinds do not rewrite the same parts of a field. `id`, `mrn` and `ssn`
-rewrite the first component only, so `PID-5` pointed at `id` leaves the given name. `date` keeps
+rewrite the first component and keep CX components 3 to 6, 9 and 10, so `PID-5` pointed at `id`
+leaves the middle name. `dln` keeps the second component, so it would leave the given name. `date` keeps
 the year, so `PID-7` pointed at `date` keeps the birth year. The leak-check scans what such a
 field has left past its first component for a dashed SSN and a punctuated phone number, as the
 table above says, and refuses either. A name, a city or a year left there passes, and so does a
@@ -2775,8 +2814,8 @@ after the store read, so a run on an empty store prints neither.
 came from `messagefoundry-toolkit generate --count 2 --seed 1710`, run for every type: 186 messages. With
 the switch on, all 186 refused. Mapping the dates and locations above did not change that count.
 It removed 6 of the 72 undecided field addresses, and 553 of the 2,115 undecided fields across the
-corpus. These counts predate the rules BACKLOG #2330 and #2645 added, and nobody has measured them
-again. Every message still carries at least one coded field that needs a rule or a `keep`:
+corpus. These counts predate the rules BACKLOG #2330, #2645 and #5533 added, and nobody has
+measured them again. Every message still carries at least one coded field that needs a rule or a `keep`:
 
 | Undecided field | Messages |
 | --- | --- |

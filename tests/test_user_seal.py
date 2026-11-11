@@ -372,7 +372,11 @@ _LOADERS: dict[str, frozenset[str]] = {
     "_lookup_by_username": frozenset({"get_user_by_username"}),
     "_lookup_by_directory_object_id": frozenset({"get_user_by_directory_object_id"}),
     "_load_user_by_federated_subject": frozenset({"get_user_by_federated_subject"}),
-    "_load_users": frozenset({"list_users"}),
+    # BACKLOG #5520: the public list, which checks each row through `_checked_by_id`; the scans'
+    # `_load_users` reads through it, so the two agree on every row.
+    "list_checked_users": frozenset({"list_users"}),
+    # The re-read by id after a check that raced a delete or a re-key (BACKLOG #5520).
+    "_checked_by_id": frozenset({"get_user"}),
     # The role rows, and one re-read by id before a failing pair is reported.
     "_verified": frozenset({"get_user_role_grants", "get_user"}),
     "_verified_passkeys": frozenset({"list_webauthn_credentials"}),
@@ -385,9 +389,36 @@ _LOADERS: dict[str, frozenset[str]] = {
 }
 
 
-def _service_reader_calls() -> list[tuple[str, str]]:
-    tree = ast.parse(_SERVICE.read_text("utf-8"))
-    found: list[tuple[str, str]] = []
+_ROUTES = _ROOT / "messagefoundry" / "api" / "auth_routes.py"
+
+#: BACKLOG #5520: the auth routes allowed to call a raw user reader through ``service.store``, and
+#: why. Every read that SHOWS an account goes through ``AuthService.checked_user`` or
+#: ``list_checked_users`` instead. Function names, so a nested handler is named by its own name.
+_ROUTE_READS: dict[str, frozenset[str]] = {
+    # An id question: only whether the target is the caller's own account leaves it.
+    "_refuse_if_self": frozenset({"get_user"}),
+    # The duplicate-name check before the create (a name question), and the read-back of the row
+    # this request just wrote, for its reply.
+    "create_user": frozenset({"get_user_by_username", "get_user"}),
+    "create_directory_user": frozenset({"get_user"}),
+    # The write routes the row left alone, each acting by id; the store's own write refuses a row
+    # that fails its seal. Their replies carry no field of the row, but ``set_user_roles`` decides
+    # its AD refusal on the unchecked ``auth_provider`` and names the unchecked ``username`` in its
+    # administrator-granted alert. Left for a later item, not covered by this row.
+    # The scan sees only ``<x>.store.<reader>`` chains in this one file: an alias, a ``getattr`` or
+    # a read in another module is not seen.
+    "delete_user": frozenset({"get_user"}),
+    "admin_revoke_user_sessions": frozenset({"get_user"}),
+    "set_user_roles": frozenset({"get_user", "get_user_role_ids"}),
+}
+
+
+def _reader_calls(source: str, receiver: str) -> list[tuple[str, str]]:
+    """Every ``<x>.<receiver>.<reader>`` in ``source``, named by the innermost function holding it."""
+    tree = ast.parse(source)
+    found: dict[int, tuple[str, str]] = {}
+    # ast.walk is breadth-first, so an inner function is reached after the one holding it, and
+    # its name overwrites the outer one for the reads inside it.
     for func in ast.walk(tree):
         if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
@@ -396,22 +427,50 @@ def _service_reader_calls() -> list[tuple[str, str]]:
                 isinstance(node, ast.Attribute)
                 and node.attr in _USER_READERS
                 and isinstance(node.value, ast.Attribute)
-                and node.value.attr == "_store"
+                and node.value.attr == receiver
             ):
-                found.append((func.name, node.attr))
-    return found
+                found[id(node)] = (func.name, node.attr)
+    return list(found.values())
+
+
+def _assert_reads_only_where_listed(
+    calls: list[tuple[str, str]], allowed: dict[str, frozenset[str]]
+) -> None:
+    # Liveness, before the absence check: the walk finds every listed function's own read, so it is
+    # reading the file, and an empty walk cannot pass for a clean one. A subset rather than an
+    # equality, so a stray read in a new function still reaches the stray check below.
+    assert len(calls) >= len(allowed), calls
+    assert set(allowed) <= {f for f, _ in calls}, set(allowed) - {f for f, _ in calls}
+    stray = [(f, r) for f, r in calls if r not in allowed.get(f, frozenset())]
+    assert not stray, stray
 
 
 def test_the_service_reads_users_through_its_loaders() -> None:
     """A raw user read outside the loaders would act on a record nobody checked."""
-    calls = _service_reader_calls()
-    # Liveness, before the absence check: the walk finds every loader's own read, so it is reading
-    # this file, and an empty walk cannot pass for a clean one. A subset rather than an equality, so
-    # a stray read in a new function still reaches the stray check below and is named there.
-    assert len(calls) >= len(_LOADERS), calls
-    assert set(_LOADERS) <= {f for f, _ in calls}, set(_LOADERS) - {f for f, _ in calls}
-    stray = [(f, r) for f, r in calls if r not in _LOADERS.get(f, frozenset())]
-    assert not stray, stray
+    _assert_reads_only_where_listed(_reader_calls(_SERVICE.read_text("utf-8"), "_store"), _LOADERS)
+
+
+def test_the_auth_routes_read_users_through_the_checked_readers() -> None:
+    """BACKLOG #5520: a route that serves a raw user row, or its raw role rows, serves a record
+    nobody checked, with a 200 and no seal-failure row. Only the existence questions and the write
+    routes listed above may read the store directly."""
+    _assert_reads_only_where_listed(
+        _reader_calls(_ROUTES.read_text("utf-8"), "store"), _ROUTE_READS
+    )
+
+
+def test_the_route_scan_names_a_raw_read_it_was_not_told_of() -> None:
+    """The control for the scan above: the shape GET /users had before BACKLOG #5520 is caught."""
+    source = (
+        "def add(app):\n"
+        "    async def list_users(service):\n"
+        "        for user in await service.store.list_users():\n"
+        "            await service.store.get_user_role_ids(user.id)\n"
+    )
+    calls = _reader_calls(source, "store")
+    assert sorted(calls) == [("list_users", "get_user_role_ids"), ("list_users", "list_users")]
+    with pytest.raises(AssertionError):
+        _assert_reads_only_where_listed(calls, {"list_users": frozenset({"list_users"})})
 
 
 def test_only_the_loader_builds_a_checked_user() -> None:

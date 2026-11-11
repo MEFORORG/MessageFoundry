@@ -1029,6 +1029,13 @@ class FhirDestination(DestinationConnector):
         self.base_url = url
         # BACKLOG #2060: names this hop in a bounded-read refusal, which never carries the URL.
         self._hop = hop_identity("FHIR", config.name)
+        # BACKLOG #5529: refused before any hop gate logs a crossing for a connection that never builds.
+        from messagefoundry.transports.http_auth import (
+            refuse_authorization_signer_beside_digest,
+            refuse_http_digest_conflicts,
+        )
+
+        digest_selected = refuse_http_digest_conflicts(s)
         self.fhir_version: str = str(s.get("fhir_version", "R4B"))
         self.format: str = str(s.get("format", "json"))
         if self.format != "json":
@@ -1173,6 +1180,11 @@ class FhirDestination(DestinationConnector):
         # ASVS 4.1.5 (ADR 0018): opt-in detached-JWS signing; None = off (byte-identical). Built here so
         # a bad key fails loud at construction; the signature is minted in _post over the body bytes.
         self._signer: MessageSigner | None = signer_from_destination(config)
+        refuse_authorization_signer_beside_digest(
+            None if self._signer is None else self._signer.header_name,
+            digest=digest_selected,
+            connection=config.name,
+        )
         # ASVS 4.2.5: the detached-JWS headers are added after the URL/header gate above.
         # Message-independent, so they are bounded once here rather than on every send.
         enforce_signature_header_limits(self._signer, connector="FHIR destination")
@@ -1249,11 +1261,7 @@ class FhirDestination(DestinationConnector):
 
         digest = digest_handler_from_settings(s, url=self.base_url)
         if digest is not None:
-            if self._token_provider is not None:
-                raise HttpAuthError(
-                    "a connection cannot use BOTH a bearer-token provider and HTTP Digest auth "
-                    "(mutually exclusive — configure exactly one)"
-                )
+            # A bearer provider beside Digest was refused in refuse_http_digest_conflicts (#5529).
             if _is_shared_no_redirect_opener(self._opener):
                 # _no_redirect_opener, not a bare build_opener: the bare form lets urllib fill in an
                 # HTTPSHandler whose context the engine never names, so the forward-secrecy assertion
@@ -1483,7 +1491,7 @@ class FhirDestination(DestinationConnector):
         # credentials), and that token is the one value the construction gate could not see -- the URL
         # and the static headers were already bounded there. Gated here so an operator's "test
         # connection" fails with the real reason rather than an opaque wire error. The SOAP probe
-        # deliberately has no equivalent: it mints nothing, so a gate there could not fire.
+        # mints and gates the same way (BACKLOG #5526).
         try:
             enforce_send_time_length_limits(
                 req.full_url,

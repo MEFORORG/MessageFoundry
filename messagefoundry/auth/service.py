@@ -149,6 +149,7 @@ from messagefoundry.auth.tokens import (
 from messagefoundry.auth.tokens import (
     credential_id_hash as _credential_id_hash,  # locals and parameters here use the bare name
 )
+from messagefoundry.auth.usernames import BLANK_USERNAME_REFUSAL, username_refusal
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.secretprovider import (
     SecretProvider,
@@ -166,6 +167,7 @@ from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.keyed_lock import KeyedLock as _KeyedLock
 from messagefoundry.keyed_lock import hold_keyed_lock as _hold_keyed_lock
+from messagefoundry.logging_setup import redacted_log_field
 from messagefoundry.store.base import (
     AdminStore,
     audit_write_errors,
@@ -567,7 +569,8 @@ _NEW_IP_DEDUP_MAX = 4096
 _NEW_IP_PER_SESSION_MAX = 8
 
 # BACKLOG #3772: the longest client-address text the new-address signal keeps as it is, in its dedupe
-# keys, the seen_ip, known_ip and client of its audit row, its notice and its past-cap log line. Every
+# keys, and the seen_ip, known_ip and client of its audit row and its notice. Its past-cap log line
+# carries a parsed address's canonical form or a digest instead (``_address_log_field``). Every
 # IPv4 or IPv6 address without a zone id fits, the longest being 45 characters; only text that does
 # not parse, or an IPv6 address with a long zone id, is longer. That text is caller-supplied on a
 # proxied hop, and without a bound each session could hold nine copies of it. Longer text keeps a
@@ -576,6 +579,38 @@ _NEW_IP_PER_SESSION_MAX = 8
 # Other sinks of the same text, such as sessions.client and other audit rows, are not bounded here.
 _NEW_IP_TEXT_MAX = 64
 _NEW_IP_TEXT_PREFIX = 24
+# BACKLOG #3770: the longest path value, counted after its escape, that the new-address WARNINGs log
+# (``logging_setup.redacted_log_field``). The path is caller-supplied and bounded only by the HTTP
+# server's request-line limit. The seen address logs as ``_address_log_field``, which is short.
+_NEW_IP_LOG_FIELD_MAX = 256
+# The two new-address WARNINGs up to their first field. The repeat line's head ends "path=" as on
+# main; the past-cap line's head is followed by "path=" on main and by "seen_ip=" here.
+_NEW_IP_REPEAT_HEAD = (
+    "a request from a new client address must re-verify; the address was already flagged since "
+    "the session's last re-verification (audit suppressed): path="
+)
+_NEW_IP_OVER_CAP_HEAD = (
+    "a request from a new client address must re-verify; the address is past the per-session cap "
+    f"of {_NEW_IP_PER_SESSION_MAX} (audit suppressed): "
+)
+
+
+def _new_ip_path_field(path: str, seen_text: str | None = None) -> str:
+    """The path field of a new-address WARNING (BACKLOG #3770): the path as
+    ``logging_setup.redacted_log_field`` reads it in the pre-#3770 repeat line, as the shipped
+    handler filters read it whatever the number of handlers, escaped and bounded; or a
+    placeholder; never seen-address text. With ``seen_text``, the past-cap line's, that reading is
+    also compared with the pre-#3770 past-cap line. When either line logs the placeholder is the
+    rule ``redacted_log_field`` states."""
+    checks = (
+        ()
+        if seen_text is None
+        else ((_NEW_IP_OVER_CAP_HEAD + "path=", " seen_ip=" + scrub_log_argument(seen_text)),)
+    )
+    return redacted_log_field(
+        path, _NEW_IP_LOG_FIELD_MAX, before=_NEW_IP_REPEAT_HEAD, checks=checks
+    )
+
 
 # The first-seen login-address signal (BACKLOG #288, ASVS 8.2.4). Its baseline is the store's
 # per-account ``known_login_addresses`` record (vault BACKLOG #2145), read at every session mint with
@@ -654,6 +689,13 @@ def _client_limiter_key(client: str | None) -> str:
     return _host_key(client) if client else "unknown"
 
 
+#: The per-process key of the digest the past-cap log line gives an address that does not parse
+#: (BACKLOG #3770). Keyed, because that text is caller-supplied and unredacted: a plain digest of a
+#: low-entropy value, a name or a password a client put in a forwarded header, could be recovered
+#: from the general log by hashing guesses. Lines of one process still compare by it.
+_ADDRESS_LOG_KEY = secrets.token_urlsafe(16).encode("ascii")
+
+
 def _bounded_address_text(address: str) -> str:
     """``address`` itself when it is at most ``_NEW_IP_TEXT_MAX`` characters, else a short prefix
     and the SHA-256 of the whole (BACKLOG #3772).
@@ -670,6 +712,32 @@ def _bounded_address_text(address: str) -> str:
     # and the result can be stored. Text within the bound is returned as it is, as on main.
     prefix = address[:_NEW_IP_TEXT_PREFIX].encode("utf-8", "replace").decode("utf-8")
     return f"{prefix}...sha256:{digest}"
+
+
+def _address_log_field(address: str) -> str:
+    """``address`` as a quoted log field value that never carries its raw text (BACKLOG #3770): the
+    canonical form of an IP address, or ``unparsed-sha256-`` and 16 hex digits of a SHA-256 of the
+    whole text, keyed by :data:`_ADDRESS_LOG_KEY`, when it does not parse. A zone id is text, so an
+    address with one logs its canonical address, ``-zone-sha256-`` and that digest.
+
+    The canonical form holds only hex digits, ``.`` and ``:``, and the digest forms only letters,
+    digits, ``.``, ``:`` and ``-``, so the address still reads as an address; the tests read the
+    past-cap line through two shipped handlers and check, for the addresses they name, that this
+    field closes, merges with and erases no other. Its spelling may differ from the raw text the
+    audit rows keep, ``2001:db8::1`` for ``2001:DB8:0:0:0:0:0:1`` for one. The address is
+    caller-supplied on a proxied hop, so this field never carries its text as it is; the audit
+    rows still do."""
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        parsed = None
+    if parsed is not None and not getattr(parsed, "scope_id", None):
+        return f'"{parsed}"'
+    keyed = _ADDRESS_LOG_KEY + address.encode("utf-8", "surrogatepass")
+    digest = hashlib.sha256(keyed).hexdigest()[:16]
+    if parsed is None:
+        return f'"unparsed-sha256-{digest}"'
+    return f'"{ipaddress.IPv6Address(int(parsed))}-zone-sha256-{digest}"'
 
 
 #: The refusals on an IdP step-up's return that draw :meth:`AuthService.allow_step_up_return_audit`
@@ -2061,6 +2129,36 @@ class UsernameTaken(RuntimeError):
     (BACKLOG #1808). ``POST /users`` answers it 409, with its own pre-check's text.
     :meth:`AuthService.create_directory_account` raises it too, when a row already holds the
     directory account's name or id (BACKLOG #2021)."""
+
+
+#: The text :class:`UserSealRefused` carries. Fixed, so it names no field of the record it refuses.
+USER_SEAL_REFUSED: Final = "the user record fails its integrity check, so it was refused"
+
+
+class UserSealRefused(RuntimeError):
+    """:meth:`AuthService.checked_user` found the account's row, and its record fails its integrity
+    seal (BACKLOG #5520). The failure was handed to the seal-failure report, which writes the audit
+    row and raises the alert only for the first failure of the account in each report interval
+    (:data:`~messagefoundry.store.row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS`) of this
+    service's process, so a refusal inside that interval adds no row. Not "no such user": the row is there, and an administrator
+    may still delete it. The admin routes answer it 423."""
+
+
+@dataclass(frozen=True)
+class ListedUser:
+    """One account as :meth:`AuthService.list_checked_users` reads it (BACKLOG #5520): ``user`` with
+    its whole record checked against its seal, or ``None`` when that record fails, which was handed
+    to the seal-failure report, as :class:`UserSealRefused` says. ``id`` is all a caller may show of
+    a failing account; every other field of it is unchecked."""
+
+    id: str
+    user: VerifiedUser | None
+
+
+class InvalidUsername(ValueError):
+    """:meth:`AuthService.create_local_user` refused the name a new account was to take (BACKLOG
+    #5521), before anything was generated or written. ``POST /users`` answers it 400. The message
+    is :func:`~messagefoundry.auth.usernames.username_refusal`'s, which never echoes the value."""
 
 
 class DirectoryAccountNotFound(ValueError):
@@ -3570,8 +3668,9 @@ _ADMINISTRATOR_EXISTS_REFUSAL: Final = (
     " `admin-unlock` if that administrator is locked out"
 )
 #: The first refusal of both :meth:`AuthService.provision_first_administrator` and its pre-check
-#: :meth:`AuthService.provision_refusal`, so the two answer a blank name alike (BACKLOG #3391).
-_BLANK_USERNAME_REFUSAL: Final = "a username is required and must not be blank"
+#: :meth:`AuthService.provision_refusal`, so the two answer a blank name alike (BACKLOG #3391), and
+#: the new-username rule's, so `POST /users` answers it alike too (BACKLOG #5521).
+_BLANK_USERNAME_REFUSAL: Final = BLANK_USERNAME_REFUSAL
 
 
 def _lookup_keys(user: UserRecord) -> tuple[str | None, ...]:
@@ -3599,6 +3698,32 @@ class _UserLookup:
     def refused(self) -> bool:
         """A row is there and fails its seal."""
         return self.held and self.user is None
+
+
+@dataclass(frozen=True)
+class _SealCheck:
+    """What :meth:`AuthService._verified` established about one account read (BACKLOG #2592,
+    #5520). Three outcomes: ``user`` set, the record passes its seal; ``failed``, it fails, and the
+    failure was handed to :meth:`AuthService._user_seal_failed`; neither, no account, or one whose
+    row was deleted, renamed, rebound or re-keyed between its reads, which is not reported. Only
+    ``failed`` reads as a record that fails its seal. From :meth:`AuthService._verified` it means
+    two reads naming the same account both failed, which two honest role writes committing across
+    both reads can also produce: a false alarm that docs/SECURITY.md, *What an admin user read
+    reports*, states. :meth:`AuthService._checked_by_id` also sets it when it fails closed."""
+
+    user: VerifiedUser | None = None
+    failed: bool = False
+
+    @property
+    def settled(self) -> bool:
+        """The check established something: the record passes, or it fails."""
+        return self.user is not None or self.failed
+
+
+#: How many times :meth:`AuthService.checked_user` and :meth:`AuthService.list_checked_users` check
+#: an account by id while each check races a write that deletes or re-keys the row (BACKLOG #5520).
+#: What happens once every pass has raced is :meth:`AuthService._checked_by_id`'s to say.
+_CHECKED_READ_PASSES: Final = 3
 
 
 @dataclass
@@ -11846,18 +11971,19 @@ class AuthService:
     async def _load_user(self, user_id: str) -> VerifiedUser | None:
         """The account ``user_id`` names, its integrity seal checked, or ``None``. With
         :meth:`_lookup_user`, :meth:`_lookup_by_username`, :meth:`_lookup_by_directory_object_id`,
-        :meth:`_load_user_by_federated_subject`, :meth:`_load_users` and :meth:`_verified`, the
-        ONLY readers of the store's user readers in this service, beside the two existence
-        questions; ``tests/test_user_seal.py`` holds that. See
-        :meth:`_verified` for what ``None`` covers."""
+        :meth:`_load_user_by_federated_subject`, :meth:`list_checked_users`,
+        :meth:`_checked_by_id` and :meth:`_verified`, the ONLY readers of the store's user readers
+        in this service, beside the three existence questions; ``tests/test_user_seal.py`` holds
+        that. See :meth:`_verified` for what ``None`` covers."""
         return (await self._lookup_user(user_id)).user
 
     async def _lookup_user(self, user_id: str) -> _UserLookup:
         """The read behind :meth:`_load_user`, also saying whether the row is there at all, so a
         caller can tell a record that fails its seal from one that is gone (vault BACKLOG #3069).
-        ``refused`` also reads true for a row deleted between the row and role reads."""
+        ``refused`` also reads true for a row deleted or re-keyed between the row and role reads;
+        :meth:`checked_user` tells those apart."""
         raw = await self._store.get_user(user_id)
-        return _UserLookup(await self._verified(raw), raw is not None)
+        return _UserLookup((await self._verified(raw)).user, raw is not None)
 
     async def _load_user_by_username(self, username: str) -> VerifiedUser | None:
         """:meth:`_load_user`, by username."""
@@ -11867,26 +11993,90 @@ class AuthService:
         """:meth:`_load_user_by_username`, also saying whether a row holds the name at all, from
         the same read: a row that fails its seal still holds its name."""
         raw = await self._store.get_user_by_username(username)
-        return _UserLookup(await self._verified(raw), raw is not None)
+        return _UserLookup((await self._verified(raw)).user, raw is not None)
 
     async def _lookup_by_directory_object_id(self, object_id: str) -> _UserLookup:
         """:meth:`_lookup_by_username`, by the directory's immutable id."""
         raw = await self._store.get_user_by_directory_object_id(object_id)
-        return _UserLookup(await self._verified(raw), raw is not None)
+        return _UserLookup((await self._verified(raw)).user, raw is not None)
 
     async def _load_user_by_federated_subject(
         self, issuer: str, subject: str
     ) -> VerifiedUser | None:
         """:meth:`_load_user`, by the federated ``(issuer, sub)`` pair."""
-        return await self._verified(
-            await self._store.get_user_by_federated_subject(issuer, subject)
-        )
+        raw = await self._store.get_user_by_federated_subject(issuer, subject)
+        return (await self._verified(raw)).user
 
     async def _load_users(self) -> list[VerifiedUser]:
-        """Every account whose record passes its seal, in the store's order. An account that fails
-        is reported by :meth:`_verified` and left out, so a scan never counts it."""
-        loaded = [await self._verified(user) for user in await self._store.list_users()]
-        return [user for user in loaded if user is not None]
+        """Every account whose record passes its seal, in the store's order: the accounts
+        :meth:`list_checked_users` reads, so the scans and the admin list agree on every row. An
+        account that fails is reported by :meth:`_verified` and left out, so a scan never counts
+        it."""
+        return [
+            listed.user for listed in await self.list_checked_users() if listed.user is not None
+        ]
+
+    async def checked_user(self, user_id: str) -> VerifiedUser | None:
+        """The account ``user_id`` names, its whole record checked against its seal, for a caller
+        outside this service that SHOWS it (BACKLOG #5520). ``None`` when no row is there. Raises
+        :class:`UserSealRefused` only when :meth:`_verified` established that the record fails,
+        or :meth:`_checked_by_id` failed closed, and handed that to the seal-failure report, so
+        the caller can say so rather than answer "no such user". :meth:`_checked_by_id` says how a
+        row read mid-write is answered."""
+        found = await self._checked_by_id(user_id)
+        if found.failed:
+            raise UserSealRefused(USER_SEAL_REFUSED)
+        return found.user
+
+    async def list_checked_users(self) -> list[ListedUser]:
+        """Every account, in the store's order, each with its record checked (BACKLOG #5520). One
+        that fails stays in the list with ``user=None``, reported, as :meth:`_load_custom_roles`
+        keeps a failing role, so an administrator can still see that it is there and delete it.
+        :meth:`_load_users` drops it instead, for the scans that must not count it.
+
+        Each row is checked by :meth:`_checked_by_id`, which says how a row read mid-write is
+        answered: one it reads as gone is left out, and one renamed meanwhile is listed as it now
+        reads."""
+        out: list[ListedUser] = []
+        for raw in await self._store.list_users():
+            found = await self._checked_by_id(raw.id, raw)
+            if found.settled:
+                out.append(ListedUser(raw.id, found.user))
+        return out
+
+    async def _checked_by_id(self, user_id: str, listed: UserRecord | None = None) -> _SealCheck:
+        """The account ``user_id`` names, checked by :meth:`_verified`, starting from the row a list
+        read already holds where ``listed`` is given (BACKLOG #5520). A check that races a delete or
+        a re-key is unreported and establishes nothing, so the account is read again by id, up to
+        :data:`_CHECKED_READ_PASSES` checks in all. Only a row absent on a re-read is gone. One
+        still there after every check raced fails closed: each of its checks failed its seal, so
+        it is handed to :meth:`_user_seal_failed` and answered ``failed``, rather than read as gone,
+        which would let a writer that keeps re-keying a tampered row hide it from the admin list.
+        One that keeps changing the row's own id still reads as gone under the old id: a re-read
+        by that id finds nothing, as docs/SECURITY.md, *What an admin user read reports*, says."""
+        raw = listed
+        for _ in range(_CHECKED_READ_PASSES):
+            if raw is None:
+                raw = await self._store.get_user(user_id)
+                if raw is None:
+                    return _SealCheck()
+            found = await self._verified(raw)
+            if found.settled:
+                return found
+            raw = None
+        still_there = await self._store.get_user(user_id)
+        if still_there is None:
+            return _SealCheck()
+        # Keyed by the stored id, as _verified reports, so a caller's other spelling of the id on a
+        # store that compares ids case-insensitively shares the account's report interval.
+        await self._user_seal_failed(still_there.id)
+        return _SealCheck(failed=True)
+
+    async def identity_for_checked_user(self, user: VerifiedUser) -> Identity:
+        """:meth:`identity_for_user_id` for an account the caller already read through
+        :meth:`checked_user`, so the identity and the caller's record are one read (BACKLOG
+        #5520)."""
+        return await self._build_identity(user)
 
     async def _username_held(self, username: str) -> bool:
         """Whether any row holds ``username``, sealed or not (BACKLOG #2592). A name question, not
@@ -11904,40 +12094,43 @@ class AuthService:
         #3068)."""
         return await self._store.get_user(user_id) is not None
 
-    async def _verified(self, user: UserRecord | None) -> VerifiedUser | None:
+    async def _verified(self, user: UserRecord | None) -> _SealCheck:
         """``user`` with its whole authorization record checked against its seal (BACKLOG #2592):
         the ``users`` row, the account's role rows and its passkey digest. The ONLY place a
         :class:`VerifiedUser` is built.
 
-        ``None`` for no account, and for an account whose record fails its seal, which is handed
-        to :meth:`_user_seal_failed`. A failing account is denied, never written: the store's write
-        helper refuses to re-seal it. On a keyless store there is no seal to check. One statement
-        more than the row read, for the role rows; the identity build reads them from the result
-        instead of reading them again.
+        The result's ``user`` is ``None`` for no account, and for an account whose record fails its
+        seal, which is handed to :meth:`_user_seal_failed` and marked ``failed`` (BACKLOG #5520). A
+        failing account is denied, never written: the store's write helper refuses to re-seal it.
+        On a keyless store there is no seal to check. One statement more than the row read, for
+        the role rows; the identity build reads them from the result instead of reading them
+        again.
 
         The row and the role rows are two reads, so an honest role write committing between them
         can make one pair disagree. A failing pair is therefore read once more, by id, before it is
         reported: a record changed outside the store fails both times, a raced honest write passes
-        the second."""
+        the second. A row deleted or re-keyed by then is neither: this check reports nothing and
+        is not ``failed``. :meth:`_checked_by_id` reads such a row again, and fails closed on one
+        whose every check raced."""
         if user is None:
-            return None
+            return _SealCheck()
         sealer = self._store.row_sealer()
         for attempt in range(2):
             grants = await self._store.get_user_role_grants(user.id)
             record = None if user.row is None else UserAuthzRecord.of(user.row, grants)
             if sealer is None or (record is not None and await user_seal_ok_async(sealer, record)):
-                return VerifiedUser.of(user, sorted(g.role_id for g in grants))
+                return _SealCheck(VerifiedUser.of(user, sorted(g.role_id for g in grants)))
             if attempt == 0:
                 reread = await self._store.get_user(user.id)
                 if reread is None:
-                    return None  # deleted meanwhile: nothing to report
+                    return _SealCheck()  # deleted meanwhile: nothing to report
                 if _lookup_keys(reread) != _lookup_keys(user):
                     # The account was renamed, rebound or re-keyed meanwhile, so it may no longer be
                     # the one the caller looked up. Not reported, and the next request reads afresh.
-                    return None
+                    return _SealCheck()
                 user = reread
         await self._user_seal_failed(user.id)
-        return None
+        return _SealCheck(failed=True)
 
     async def _open_totp_cell(self, user: VerifiedUser) -> str | None:
         """``user``'s TOTP cell, the one the checked record's seal covered (BACKLOG #3510), opened
@@ -12561,7 +12754,9 @@ class AuthService:
         """Resolve a user id directly to its :class:`Identity` (roles + custom-role overlay), or
         ``None`` when no such user exists — WITHOUT a bearer session.
 
-        Used by the effective-permission inspector (BACKLOG #177): an admin resolves the FLATTENED
+        Used by the approval gate. The effective-permission inspector (BACKLOG #177) reads its
+        account through :meth:`checked_user` and builds with :meth:`identity_for_checked_user`
+        instead (BACKLOG #5520). Either way, an admin resolves the FLATTENED
         effective permission set (built-in-role ∪ custom-role ∪ extras) for an arbitrary user via the
         same :meth:`Identity.build` path :meth:`identity_for_token` uses for the caller. Unlike the
         token / username auth paths, a *disabled* user still resolves here — the point is to inspect a
@@ -14462,29 +14657,33 @@ class AuthService:
         # addresses, so a replayed token cannot amplify the audit log / notifications even when it
         # alternates between addresses (BACKLOG #2159).
         flag = self._first_new_ip_flag(token_hash, seen_key)
+        # BACKLOG #3770: the path logs as an escaped, bounded field holding only its own redacted
+        # text, and the address only as a canonical address or a keyed digest. The tests read
+        # both lines through two shipped handlers and check that no field closes, merges with or
+        # erases another for the vectors they name, and that the second handler changes nothing,
+        # which leaves the line the same for every later handler. The path still comes last, a
+        # second guard.
+        # Only when the line will be written: this branch is the one a replayed token loops on.
         if flag == "repeat":
-            _log.warning(
-                "a request from a new client address must re-verify; the address was already "
-                "flagged since the session's last re-verification (audit suppressed): path=%s",
-                path,
-            )
+            if _log.isEnabledFor(logging.WARNING):
+                _log.warning(_NEW_IP_REPEAT_HEAD + "%s", _new_ip_path_field(path))
             return True
-        # What the row, the notice and the past-cap log line carry. Text within _NEW_IP_TEXT_MAX,
-        # which is every address without a long zone id, is unchanged, so a search by address still
-        # finds the row (vault BACKLOG #3197); longer text is bounded, so this row's client then
-        # differs from the raw text other rows of the request carry. Text that does not parse is its
-        # own host key, so its bounded form is reused rather than hashed twice.
+        # What the row, the notice and the past-cap line's comparison reading carry. Text within
+        # _NEW_IP_TEXT_MAX, which is every address without a long zone id, is unchanged, so a search
+        # by address still finds the row (vault BACKLOG #3197); longer text is bounded, so this
+        # row's client then differs from the raw text other rows of the request carry. Text that
+        # does not parse is its own host key, so its bounded form is reused rather than hashed twice.
         seen_text = seen_key if host_key == client_ip else _bounded_address_text(client_ip)
         if flag == "over_cap":
             # Past the cap no new-address row is written, so this line carries the address. The
-            # address is attacker-supplied text on a proxied hop.
-            _log.warning(
-                "a request from a new client address must re-verify; the address is past the "
-                "per-session cap of %d (audit suppressed): path=%s seen_ip=%s",
-                _NEW_IP_PER_SESSION_MAX,
-                path,
-                scrub_log_argument(seen_text),
-            )
+            # address is attacker-supplied text on a proxied hop, so only its parsed form or a
+            # digest is logged.
+            if _log.isEnabledFor(logging.WARNING):
+                _log.warning(
+                    _NEW_IP_OVER_CAP_HEAD + "seen_ip=%s path=%s",
+                    _address_log_field(client_ip),
+                    _new_ip_path_field(path, seen_text),
+                )
             return True
         known_text = _bounded_address_text(session.client)
         detail: dict[str, object] = {
@@ -17755,8 +17954,16 @@ class AuthService:
         :class:`InvalidNotifyEmail`. ``None`` is still accepted here, for internal callers: both admin
         surfaces require an address before they reach this method (``UserCreateRequest.email``).
 
+        **``username`` IS CHECKED FIRST (BACKLOG #5521)**, by
+        :func:`~messagefoundry.auth.usernames.username_refusal`, whose module states the rule: a
+        name it refuses raises :class:`InvalidUsername` before any credential is generated or
+        anything is written.
+
         Raises :class:`UsernameTaken` when a concurrent create took ``username`` after the caller's
         own check (BACKLOG #1808)."""
+        refusal = username_refusal(username)
+        if refusal is not None:
+            raise InvalidUsername(refusal)
         if email is not None:
             email = _require_account_email(
                 email, blank="a new account needs a notification address, such as name@example.org"

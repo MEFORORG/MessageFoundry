@@ -2880,7 +2880,7 @@ follow-on and is **not** built.
 | `soap_version` | `1.1` | `1.1` (`text/xml`) or `1.2` (`application/soap+xml`) |
 | `headers` | `{}` | extra **static** headers (no secrets — an `env()` ref *inside* the table is refused at load; `env()` for the whole table is fine) |
 | `bearer_token` | — | `Authorization: Bearer …` (a **secret** — via `env()`) |
-| `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
+| `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`). Set both or neither: one alone is refused at construction (BACKLOG #5526). A configured `bearer_token` or Basic pair replaces a static `Authorization` header of any casing. With OAuth2 or SMART configured, that static header is purged too, and the minted bearer replaces a configured `bearer_token` or Basic pair on every request |
 | `timeout_seconds` | `30` | per-request timeout |
 | `verify_tls` | `true` | TLS cert verification — the same posture-keyed cell as [REST](#rest--rest): `false` is **refused at construction** off loopback, and the `MEFOR_ALLOW_INSECURE_TLS` escape is **clamped inert** while `[security].enforcement = enforce` (the shipped default) |
 | `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert with the chain's signatures + hostname still verified (not the other chain certificates' validity periods; see the MLLP row). **No posture gate and no escape variable covers the setting itself**. It takes one lever away from the revocation gate: a `[tls].crl_file` cannot admit a hop that sets it, so off-box on an enforcing instance only `tls_revocation_attested` with its reason crosses (ADR 0173 §13). It **is reported**: a WARNING at each build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture` (CORRECTED 2026-10-01: this row said `security_loosenings()` never reports it, stale since BACKLOG #333) — see the [MLLP row](#mllp--mllp) |
@@ -2924,7 +2924,7 @@ wrapping an HL7 payload) — **not** the full envelope. The transport builds the
 | `client_cert_file` / `client_key_file` | — | **mutual TLS** client cert + key (PEM path or `env()` text). Must be set together; server verification stays on, so **incompatible with `verify_tls=false`**. |
 | `client_key_password` | — | key passphrase (a **secret** — via `env()`); it must meet the [wrap floor](#encrypted-private-keys-must-meet-the-wrap-floor) |
 | `ws_security` | `false` | stamp `<wsse:Security>` (a `Timestamp` + optional `UsernameToken`) |
-| `ws_username` / `ws_password` | `basic_*` | `UsernameToken` credentials (secrets — via `env()`) |
+| `ws_username` / `ws_password` | — | `UsernameToken` credentials (secrets — via `env()`). With `ws_security` on, set both or neither: one alone is refused at construction, and neither stamps the `Timestamp` alone. They do **not** fall back to `basic_*` (BACKLOG #5526; ADR 0015 amendment 2026-11-10), so HTTP Basic and a `UsernameToken` are separate credentials |
 | `ws_password_type` | `text` | `text` (PasswordText) only. `digest` (PasswordDigest) was **retired** in BACKLOG #1171 (ASVS 11.4.1): the construction is SHA-1 by profile definition, and a UsernameToken over a cleartext hop is refused anyway, so the channel already carried the credential. Setting it raises |
 | `ws_addressing` | `false` | stamp `<wsa:Action>` (from `soap_action`), `<wsa:To>` (from `url`), `<wsa:MessageID>` (per-call) |
 | `ws_timestamp_ttl_seconds` | `300` | the `Created`→`Expires` window |

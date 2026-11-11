@@ -112,6 +112,34 @@
   > ratified, until that sign-off is recorded in this bullet. This builds nothing either way: the
   > package is still at `messagefoundry/anon/`, and every path in this ADR describes the tree until
   > ADR 0201 slice 6 moves it."*
+- **AMENDED 2026-11-10 (BACKLOG #5533): fourteen more default rules, inside segments the map
+  already scrubbed.** The default map adds `PID-2` and `PID-21` as `MRN`, `PID-23` (birth place) as
+  `FREETEXT`, `NK1-13` (an organization name, whose numeric XON.3 a person name would break) as
+  `FREETEXT`, `NK1-30` as `NAME`, `NK1-31` as `PHONE`, `NK1-32` as `ADDRESS`, `NK1-33`
+  and `GT1-2` as `ID`, `NK1-37` as `SSN`, and the prior, temporary, pending and prior temporary
+  locations `PV1-6`, `PV1-11`, `PV1-42` and `PV1-43` as `FREETEXT`, like `PV1-3`. **This adds to
+  the §3 field list and changes none of its ratified choices:** the coded fields of those segments
+  stay `KEEP` by omission, and `rules.py` names them with the reason. A field of those segments
+  that is neither mapped nor named there still has no rule; the coverage report names it.
+- **AMENDED 2026-11-10 (BACKLOG #5532, #5541): the leak-check reads an escaped value decoded.**
+  The structural detectors read each unmapped value as written and each of its components and
+  subcomponents decoded from its HL7 escape sequences, the parts the engine's `Message` and `Peek`
+  readers decode, and the token scan reads the message as written and decoded both ways, by the
+  escape character `MSH-2` declares. `Seps` gains that `escape` character. The
+  tee's token scan reads the guard's tables at each call rather than a copy taken at import, and
+  its no-guard reason no longer claims a refusal: `require_live_denylist` stays the opt-in
+  that refuses, as the 2026-08-06 bullet above records. [PHI.md](../PHI.md) §9 is the long form.
+- **AMENDED 2026-11-10 (BACKLOG #5534): an identifier surrogate keeps only its issuer.** The
+  `MRN`, `ID` and `SSN` kinds fabricated component 1 and kept every other component as captured,
+  and kept a non-ASCII letter of the id. They now fabricate every letter as ASCII, keep CX.3 to
+  CX.6, CX.9 and CX.10, the components that name who issued the id, and blank the rest: CX.2,
+  the check digit, the CX.7 and CX.8 dates, and anything past CX.10. A new `DLN` kind takes
+  `PID-20`, a driver's licence rather than a CX: it fabricates the number, keeps the issuing state
+  and blanks the expiry. **This changes one §3 choice:** `PID-20` moves from `ID` to `DLN`. An
+  overlay that points `PID-20` back at `id` is now a retarget and must list it. Nothing else in
+  the `KEEP` set or the field list moves. The leak-check scans the components these kinds keep
+  for a dashed SSN and a punctuated phone, as written and decoded, though a rule maps the field,
+  so the fields #5533 mapped refuse those shapes as they did unmapped.
 - **Decision in one line:** ship a **pure-stdlib, dependency-free `anon` package** that turns real,
   messy HL7 v2 into structurally-faithful **PHI-free** datasets via a **two-layer rule model — a
   declarative field-*selection* map (data) over a code registry of pure surrogate *functions* (logic)** —
@@ -276,7 +304,7 @@ exercise the pipeline. The surrogate *functions* (the `SURROGATES` code registry
 NANP-reserved fictional phones) rendered by `cx()`/`xpn()`/`xad()`/`xcn()`.
 
 The **default field map** (`DEFAULT_RULES`) scrubs the standard PHI fields and `KEEP`s the routing/coded
-ones: PID-3/4/18 (`MRN`/`ID`), PID-19 (`SSN`), PID-20 (`ID`), PID-5/6/9 (`NAME`), PID-7 (`DOB`), PID-11
+ones: PID-3/4/18 (`MRN`/`ID`), PID-19 (`SSN`), PID-20 (`ID`; *amended 2026-11-10, #5534: `DLN`*), PID-5/6/9 (`NAME`), PID-7 (`DOB`), PID-11
 (`ADDRESS`), PID-13/14 (`PHONE`); **MRG-1 (`MRN`), MRG-3 (`MRN`), MRG-4 (`NAME`), MRG-7 (`NAME`)** so an A40
 patient-merge does not leak the prior MRN/name; NK1-2 (`NAME`), NK1-4 (`ADDRESS`), NK1-5/6/7 (`PHONE`),
 **NK1-3 relationship `KEEP`** (table-coded, not identifying); GT1-3 (`NAME`), GT1-5 (`ADDRESS`), GT1-6/7
@@ -289,7 +317,9 @@ merge linkage survives. **MSH-7/9/10/12 are `KEEP`** so tee correlation + parity
 routing/validation realism survive, and the coded clinical segments (DG1/AL1/PR1) are `KEEP`.
 *(AMENDED 2026-09-28, #2248: the event, visit, order and observation dates plus `PID-12` and `PV1-3`
 were added to this list; see the status banner. AMENDED 2026-10-05, #2330: eight more date fields
-were added, `PR1-5` among them, and the PR1 codes are still `KEEP`.)*
+were added, `PR1-5` among them, and the PR1 codes are still `KEEP`. AMENDED 2026-11-10, #5533:
+`PID-2/21/23`, `NK1-13/30/31/32/33/37`, `GT1-2` and `PV1-6/11/42/43` were added; see the status
+banner.)*
 
 **Free-text default = full redaction.** `OBX-5` and `NTE-3` carry narrative that *commonly embeds
 identifiers* (name/MRN/DOB/phone) which field-level surrogation cannot reach, and the leak-check (§5) only

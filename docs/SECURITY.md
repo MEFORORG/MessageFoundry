@@ -1629,28 +1629,59 @@ tuple: they act only on the caller's own account.
 | `POST` | `/roles/custom` | `users:manage` | `require_step_up` |
 | `PUT` | `/roles/custom/{role_id}` | `users:manage` | `require_step_up_action` (action `save_ends_own_sessions`) **only when the save would end the caller's own sessions**, else the session window (BACKLOG #3401) |
 | `DELETE` | `/roles/custom/{role_id}` | `users:manage` | `require_step_up_action` (action `save_ends_own_sessions`) **only when the save would end the caller's own sessions**, else the session window (BACKLOG #3401) |
-| `GET` | `/users` | `users:read` | `require` |
-| `GET` | `/users/{user_id}/permissions` | `users:read` | `require` — the effective-permission inspector |
-| `POST` | `/users` | `users:manage` | `require_step_up` |
+| `GET` | `/users` | `users:read` | `require`. Each account's record is checked against its integrity seal (BACKLOG #5520); one that fails is listed by its `id` alone, with `integrity_failed: true` (`IntegrityFailedUser`). What that reports: *What an admin user read reports* below this table |
+| `GET` | `/users/{user_id}/permissions` | `users:read` | `require` — the effective-permission inspector. The account is read with its record checked against its integrity seal (BACKLOG #5520): 423 when the record fails it, with nothing of the row answered. What the 423 reports, and when a row read mid-write is not refused: *What an admin user read reports* below this table; 404 for an unknown user |
+| `POST` | `/users` | `users:manage` | `require_step_up`. Refuses (422) a `username` the new-username rule refuses, before anything is generated or written (BACKLOG #5521). The rule, and what it admits, is stated once, in the docstring of `messagefoundry/auth/usernames.py`; the service refuses the same name 400 for a caller that skips the request model. `provision-admin`, `POST /users/directory` and an AD sign-in that creates its account do not apply this rule |
 | `POST` | `/users/directory` | `users:manage` | `require_step_up`. Creates a directory (AD) account's mirror row by name, without a sign-in (BACKLOG #2021). The row's `objectGUID`, display name and `mail` come from a service-account directory lookup, never from the request: the body carries `username` and an optional `notify_email`, and an unknown key is refused 422. The row is never born without a notification address: the directory's `mail` is it when BACKLOG #2014's rule adopts it, and `notify_email` is then refused; otherwise `notify_email` is required and checked as `POST /users` checks `email` (400). 404 when the directory has no enabled account by that name, 400 when it returns no readable `objectGUID`, 409 when a row already holds the name or id, 503 when the directory cannot be reached. No roles: they come from the AD-group map at sign-in |
-| `PATCH` | `/users/{user_id}` | `users:manage` | `require_step_up_action` (action `admin_user_update`) |
+| `PATCH` | `/users/{user_id}` | `users:manage` | `require_step_up_action` (action `admin_user_update`). The account is read with its record checked against its integrity seal (BACKLOG #5520): 423 when the record fails it, with nothing of the row answered. What the 423 reports, and when a row read mid-write is not refused: *What an admin user read reports* below this table; 404 for an unknown user |
 | `DELETE` | `/users/{user_id}` | `users:manage` | `require_step_up` |
 | `DELETE` | `/users/{user_id}/sessions` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) -- end your own from `DELETE /me/sessions` and sign-out instead |
 | `DELETE` | `/sessions` | `users:manage` | `require_step_up_action` (action `revoke_all_sessions`). Ends the sessions it finds and keeps the caller's current session, except at least when that session's seal fails, when it is ended too, and when the revoke declines to re-stamp it, because an earlier revoke's sweep missed it or its account's record fails its seal, when the revoke ends it in the same transaction (BACKLOG #4975 and its follow-up). Whether it kept that session, in the reply and in the audit row's scope, is the store's answer from the revoke's own transaction, not a read made after it (BACKLOG #4975). Writes one `auth.session_revoked` row with the count, even a zero (BACKLOG #2614); the count includes the caller's own session wherever the call ended it. What it may miss: *Limits of the session sweep* under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142). `messagefoundry admin-revoke-sessions` is the same act from the host, for when the API is not trusted |
 | `PUT` | `/users/{user_id}/roles` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) |
 | `POST` | `/users/{user_id}/reset-password` | `users:manage` | `require_step_up_action` (action `admin_reset_password`) |
-| `GET` | `/users/{user_id}/federated-identity` | `users:manage` | `require` (a read on the `users:manage` tier, like `GET /users/{user_id}/channel-scope`). The account's stored `issuer`/`subject`, the issuer a bind would use, and whether the account carries its directory id: the pair the console's federated-identity screen shows, for a JSON caller to send back as `expected_issuer`/`expected_subject` (BACKLOG #2331). No step-up, so it spends no grant. Audited as every satisfied route is, by its `auth.permission_granted` row, as the channel-scope read is. The console page of the same pair asks for the step-up window, because it also offers the link and unlink forms. 404 for an unknown user |
+| `GET` | `/users/{user_id}/federated-identity` | `users:manage` | `require` (a read on the `users:manage` tier, like `GET /users/{user_id}/channel-scope`). The account's stored `issuer`/`subject`, the issuer a bind would use, and whether the account carries its directory id: the pair the console's federated-identity screen shows, for a JSON caller to send back as `expected_issuer`/`expected_subject` (BACKLOG #2331). No step-up, so it spends no grant. Audited as every satisfied route is, by its `auth.permission_granted` row, as the channel-scope read is. The console page of the same pair asks for the step-up window, because it also offers the link and unlink forms. 404 for an unknown user. The account is read with its record checked against its integrity seal (BACKLOG #5520): 423 when the record fails it, with nothing of the row answered. What the 423 reports, and when a row read mid-write is not refused: *What an admin user read reports* below this table |
 | `PUT` | `/users/{user_id}/federated-identity` | `users:manage` | `require_step_up_action` (action `admin_federated_identity`). Binds the account to an IdP `sub` under the configured `[auth].oidc_issuer`, or rebinds it; either one revokes every live session of the account, in the same transaction as the write (vault BACKLOG #2609). **The only path that creates a federated binding** (ADR 0184, BACKLOG #1143): a federated login never binds, and an unbound one is refused. Directory (AD) accounts only, and only one that carries its immutable directory id (`users.directory_object_id`, the `objectGUID`): 400 `directory_object_id_missing` otherwise, audited as `auth.federated_bind_refused` (BACKLOG #1143 slice C). A local account is refused 400 too, audited with reason `not_a_directory_account` (BACKLOG #3174). 409 when another account holds the identity, audited with reason `federated_subject_held` (BACKLOG #3174), and 409 `federated_binding_changed` when the account no longer holds the body's required `expected_issuer`/`expected_subject`, the pair the caller saw (BACKLOG #2026), also audited as `auth.federated_bind_refused`, with reason `federated_binding_changed`, the expected pair (BACKLOG #2331), and the pair the row held as `held_issuer`/`held_subject` wherever the refusal read it (BACKLOG #3174). 404 for an unknown user, including one deleted while the bind ran (BACKLOG #2331). A rebind is still a clear then a separate set: if another bind lands between them the rebind is refused 409 without that code, and its clear has already removed the old binding, audited as `auth.federated_subject_unbound`. The refusal itself is audited as `auth.federated_bind_refused` with reason `account_bound_concurrently`; that row and the `federated_subject_held` one carry `previous_binding_removed`, which says whether this request's clear had removed a binding first (BACKLOG #3174). **A bound account is refused Windows SSO from then on**, whether or not `oidc_enabled` is on (vault BACKLOG #2609; [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) has the limits) |
 | `DELETE` | `/users/{user_id}/federated-identity` | `users:manage` | `require_step_up_action` (action `admin_federated_identity`). Removes the binding and revokes the account's sessions (BACKLOG #1474's service method); its next federated login is refused until it is bound again. The body's required `expected_issuer`/`expected_subject` is the pair the caller saw: a stored pair that differs is refused 409 `federated_binding_changed` with nothing changed, compared under the clear's row lock (BACKLOG #2026). That refusal writes an `auth.federated_unbind_refused` audit row naming the actor, with reason `federated_binding_changed` and the expected pair (BACKLOG #2331) |
 | `POST` | `/users/{user_id}/reset-mfa` | `users:manage` | `require_step_up_action` (action `admin_reset_mfa`); **refuses (400) when `user_id` is the caller's own** — use the self-service MFA settings instead. Targeting yourself here was a third route to zero factors that skipped the last-factor refusal both self-service paths make (BACKLOG #1022). Cross-user reset is untouched: it is the always-available recovery for a locked-out passkey user (ADR 0068 §2) |
 | `POST` | `/users/{user_id}/enrolment-code` | `users:manage` | `require_step_up_action` (action `admin_enrolment_code_issue`). Issues a directory account's single-use enrolment code, returned once and `no-store` ([Directory-account enrolment codes](#directory-account-enrolment-codes-adr-0207), ADR 0207). **Refuses (400) the caller's own account**, a local account, an account holding a factor and a disabled account; 404 for an unknown one |
 | `DELETE` | `/users/{user_id}/enrolment-code` | `users:manage` | `require_step_up_action` (action `admin_enrolment_code_revoke`). Clears an outstanding code; `revoked` says whether one was. Refuses (400) the caller's own account; 404 for an unknown one |
-| `GET` | `/users/{user_id}/channel-scope` | `users:manage` | `require` (a read on the `users:manage` tier, not `users:read`) |
+| `GET` | `/users/{user_id}/channel-scope` | `users:manage` | `require` (a read on the `users:manage` tier, not `users:read`). The account is read with its record checked against its integrity seal (BACKLOG #5520): 423 when the record fails it, with nothing of the row answered. What the 423 reports, and when a row read mid-write is not refused: *What an admin user read reports* below this table; 404 for an unknown user |
 | `PUT` | `/users/{user_id}/channel-scope` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) |
 | `GET` | `/ad-group-map` | `users:manage` | `require` |
 | `PUT` | `/ad-group-map` | `users:manage` | `require_step_up_action` (action `save_ends_own_sessions`) **only when the save would end the caller's own sessions**, else the session window (BACKLOG #3401) |
 | `GET` | `/ad-group-scope-map` | `users:manage` | `require` |
 | `PUT` | `/ad-group-scope-map` | `users:manage` | `require_step_up_action` (action `save_ends_own_sessions`) **only when the save would end the caller's own sessions**, else the session window (BACKLOG #3401) |
+
+**What an admin user read reports (BACKLOG #5520).** `GET /users`, `GET /users/{user_id}/permissions`,
+`PATCH /users/{user_id}`, `GET /users/{user_id}/federated-identity` and `GET /users/{user_id}/channel-scope`
+read each account with its whole record checked against its integrity seal. A failure is reported
+per account and rate-limited, in each engine process: only the first refusal of an account in
+each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs a WARNING, writes
+the `integrity.authority_seal_failed` audit row and raises the `integrity_drift` alert. A refusal
+inside that interval, from any of these routes or any other reader of the same account in that
+process, answers 423 or lists the account as failed and adds no row and no alert. Each engine
+process sharing the store keeps its own interval, so each may report the same account once. The
+interval holds only while the process still remembers the account: it remembers at most
+`SEAL_FAILURE_TRACK_MAX` failing rows of every kind together, and past that it forgets the oldest,
+so an account it forgot is reported again on its next refusal. A
+record is refused only after two failing reads that name the same account, or when it fails
+closed as this paragraph says below. A check whose row is
+deleted, renamed, rebound or re-keyed while it is read is unreported and read again by id, up to
+three checks: one that then passes is served, or listed as it now reads, and one absent on a
+re-read reads as gone, a 404 or left out of the list. **A row still there after every check raced
+fails closed**: each of its checks failed, so it is reported and answered as a failing record, and
+a writer with direct database access that keeps changing a tampered row's username, directory id
+or federated pair cannot make it vanish from these reads. One that keeps changing the row's own
+`id` still can: a re-read by the old id finds nothing, so the row reads as gone under that id,
+unreported. Honest writes that race all three checks the same way would be a false alarm
+too. **Two honest role writes to the account that commit across both of those reads
+are still answered as a failing record and reported**, a false alarm the reads cannot tell from
+tampering, because the role rows are read apart from the account's row. Where
+`[auth].require_action_step_up` is on, the default, `PATCH /users/{user_id}` reads the account
+after its gate has spent the single-use `admin_user_update` grant, so its 423 and its 404 cost that
+proof, as the console's `POST /ui/users/{user_id}/update` does after its own gate. Where it is
+off, the gate checks the step-up session window instead and spends nothing, so neither answer
+costs a proof.
 
 #### Audit
 
@@ -2608,7 +2639,7 @@ itself still needs no step-up.
 
 This row records what that listing disclosed, and only that. It does not record every route to the
 fact. The same audience can learn much of it elsewhere: an Administrator holds `approvals:approve`,
-and `GET /users` shows an Administrator each account's disabled flag, roles and channel scope. The
+and `GET /users` shows an Administrator each account's disabled flag, roles and channel scope, for every account whose record passes its integrity seal. The
 console's user pages write no grant row. So a missing `approval.standing_shown` row does not show
 that a caller never learned a requester's standing.
 
@@ -4488,22 +4519,23 @@ each nested `OutboxInfo` / `EventInfo` individually, because the redactor keys o
 dashboard `GET /connections`, and `GET /connections/{name}/metadata` (all BACKLOG #2443). Its `/ws/stats` push redacts the same rows. The four
 alert-mutation replies (`ack`, `resolve`, `suspend`, `resume`) redact their `AlertInstanceInfo` too.
 
-**Audit.** Four of those additionally feed the **coalesced per-actor/hour PHI-summary exposure
-census** (`/dead-letters`, `/messages`, `/messages/search`, `/messages/{id}`), so a scripted bulk read
-cannot harvest the patient census unaudited. The rest do **not** call the coalescer — they write
-their own dedicated audit rows instead (`response.read` for `GET /messages/{id}/responses`,
-`preset.layered_search` for `GET /search/layered`, a `connection_event_reveal` or `alert_reveal`
+**Audit.** At least five of those additionally feed the **coalesced per-actor/hour PHI-summary exposure
+census** (`/dead-letters`, `/messages`, `/messages/search`, `/messages/{id}`, and
+`/search/layered` since BACKLOG #5523), so a scripted bulk read cannot harvest the patient census
+unaudited. The rest do **not** call the coalescer — they write their own dedicated audit rows
+instead (`response.read` for `GET /messages/{id}/responses`, a `connection_event_reveal` or `alert_reveal`
 row for each per-item reveal on the three monitoring reads, and a `connection_error_reveal` row for
 each per-connection reveal on `GET /connections` and `GET /connections/{name}/metadata`; those
-five write nothing on a masked load). The four census surfaces are audited **only when a
-gated property is actually returned** — `count_exposed()` is computed *post*-redaction and the
-coalescer is called under `if exposed:` — so a fully-redacted list read by a caller without
+five write nothing on a masked load). The census surfaces are audited **only when a
+gated property is actually returned** — `count_exposed()` and `count_masked()` are computed
+*post*-redaction and the coalescer is called under `if exposed or masked:`, so a display-masked row
+counts (vault BACKLOG #1187) — so a fully-redacted list read by a caller without
 `messages:view_summary` (a Viewer paging `GET /messages` or `GET /dead-letters`) writes **no audit row
 at all**. That is accepted: those reads carry no PHI, and auditing them would let an unprivileged
 caller amplify into unbounded `audit_log` growth. `GET /messages/{id}` and `GET /messages/search` write
 unconditional dedicated rows (`message_view`, `message_search`) regardless, and so does the body fetch
-`GET /messages/{id}/raw` (`message_body_view`, whose detail names the `surface` that asked), as do the other two
-(`response.read`, `preset.layered_search`).
+`GET /messages/{id}/raw` (`message_body_view`, whose detail names the `surface` that asked), as do
+`GET /messages/{id}/responses` (`response.read`) and `GET /search/layered` (`preset.layered_search`).
 
 **Roles and visibility.** `messages:view_raw` is **not** a superset of `messages:view_summary` —
 `Identity.has()` is a flat membership check. The built-in roles happen to grant them nested
@@ -5564,8 +5596,17 @@ check and its directory gap.
 
 Three long responses ask again while they run (BACKLOG #1154). Each asks at least: a live session,
 the route's permissions, no pending password change, a met second factor and a notification address
-on file. None asks again for a fresh step-up, the client-network check or the new-address check;
-those ran at the gate. Each resolves the token it started with, so a session rotation (a step-up
+on file. None asks again for a fresh step-up, the client-network check or the new-address check,
+and what ran at the start differs by response (BACKLOG #3469). The client-network check
+(`[security].allowed_client_networks`) is middleware, so it ran once on each response's request or
+handshake. The bulk message export's gate, `require_step_up_action` with the export's action, also
+ran the new-address check, and the route spends a fresh step-up bound to the export before it
+streams. With `[auth].require_action_step_up = false` that spend reads the session's step-up window
+instead; [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)
+says what opens that window. The `/ws/stats` gate
+(`authorize_ws`, or the console's cookie twin) and the audit export's gate
+(`require(Permission.AUDIT_EXPORT)`, or the console's `require_ui(Permission.AUDIT_EXPORT)`) run
+no step-up and no new-address check, so neither response is step-up gated at any point. Each of the three responses resolves the token it started with, so a session rotation (a step-up
 on that session, for example) ends it as a revocation would.
 
 - The `/ws/stats` live feed asks before every frame, about one a second. A refusal closes the socket
@@ -5629,11 +5670,17 @@ on that session, for example) ends it as a revocation would.
   read and one chunk, so a withdrawn grant reaches it within one page. A refusal stops it as the
   bulk export bullet above says, with the reason `standing_changed`. The pages are read with the
   identity the export started with. A caller that may now read fewer rows, as after losing
-  `users:manage`, would still receive the lock rows. So that stops it too, with the reason
-  `scope_changed`. A stop records `audit.export.stopped` with the counted and streamed rows and
+  `users:manage`, would still receive the lock rows. A role change through the API revokes the
+  session, so that loss stops the export with the reason `standing_changed`. Only when the session
+  survives the loss, as after a direct store write or on a page checked before the revoke lands,
+  does it stop with the reason `scope_changed`. A stop records `audit.export.stopped` with the counted and streamed rows and
   the reason, then raises to abort the transfer, which reaches the client as a failed download,
-  as the bulk export bullet above says. The idle clock moves as the bulk export's does, at most
-  every quarter of the window.
+  as the bulk export bullet above says. The idle clock moves at most every quarter of the window,
+  as the bulk export's does, but the quarter is counted from when the stream starts sending, not
+  from the gate's own move. The row count, the first page's read and the `audit.export` row run
+  between the two, so on a large trail the first move can come more than a quarter window after
+  the gate's. The first page moves it only if sending the CSV header stalled for a quarter window,
+  where the bulk export's first row always does.
 
 **At least these paths do not see a change on the next request.** The table is not a complete list.
 On a first deployment, each would let a caller keep acting on a withdrawn grant for the time shown.
