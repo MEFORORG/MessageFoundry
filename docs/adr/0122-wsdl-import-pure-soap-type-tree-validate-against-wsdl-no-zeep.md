@@ -202,8 +202,10 @@ Two statements above were false in the shipped code, and both are corrected here
   document past the opener, is refused in every schema document read. A location the opener
   refuses, such as a file under the root that declares a DOCTYPE or is malformed, a link the walk
   refuses, or a file outside the root, fails the build on an include, redefine or override, and on an
-  import too, unless `xmlschema` bundles a copy of the imported namespace: then the import falls back
-  to that copy, as the stock W3C XML-DSig schema, which carries a DOCTYPE, needs. Skipping any other
+  import too, unless the refused file is the one the import names and `xmlschema` bundles a copy of
+  that namespace: then the import falls back to that copy, as the stock W3C XML-DSig schema, which
+  carries a DOCTYPE, needs. A refusal inside a file such an import did open still fails the build.
+  A `schema_root` that is a filesystem root is refused. Skipping any other
   refused import would leave its namespace undeclared, and a `lax` or `skip` wildcard would then admit
   that namespace's content unchecked. The confinement root is the schema's own
   directory, or the directory the caller passes as `validate_against`'s `schema_root` keyword. That

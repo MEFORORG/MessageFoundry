@@ -66,12 +66,11 @@ def _is_inline_xml(schema_source: str | bytes) -> bool:
     a path: a ``str`` failed to load, and a ``bytes`` one skipped the hardened pre-parse below, so
     xmlschema parsed the raw text itself and expanded a DOCTYPE entity (BACKLOG #5537)."""
     if isinstance(schema_source, (bytes, bytearray)):
-        head = schema_source[:4]
-        # A path never holds a NUL; UTF-16/32 text without a BOM opens with one beside its "<".
+        # A path never holds a NUL, and UTF-16/32 text without a BOM holds one in every ASCII char.
         return (
             schema_source.startswith(_BOMS)
             or schema_source.lstrip()[:1] == b"<"
-            or (b"\x00" in head and b"<" in head)
+            or b"\x00" in schema_source
         )
     return schema_source.removeprefix("\N{BYTE ORDER MARK}").lstrip()[:1] == "<"
 
@@ -219,18 +218,31 @@ class _ResourceRefused(ValueError):
     """A resource :class:`_ConfinedFiles` refuses to hand xmlschema. Not an ``OSError`` and not one of
     xmlschema's resource errors, so neither its include path nor its import path catches it and the
     build stops; :func:`_fallback_loader` alone turns it into a skipped import. Its message is fixed
-    text, never the location."""
+    text, never the location, so :func:`_build_schema` may repeat it; ``url`` is the refused URL, for
+    that comparison only."""
+
+    def __init__(self, message: str, url: str) -> None:
+        super().__init__(message)
+        self.url = url
+
+
+def _same_resource(url: str, other: str) -> bool:
+    """Whether two URLs name the same resource: the same local path where both are host-less ``file:``
+    URLs, else the same text. A mismatch only withholds a fallback, so it errs closed."""
+    path = _file_url_path(url)
+    return url == other or (path is not None and path == _file_url_path(other))
 
 
 @functools.cache
 def _fallback_loader(xmlschema_mod: Any, bundled: tuple[_Root, ...]) -> type:
-    """xmlschema's ``SchemaLoader`` with one change: an import the opener refused is skipped, so
-    xmlschema tries its next location, only when one of those locations is a bundled copy of the
-    namespace (BACKLOG #5537). The stock W3C ``xmldsig-core-schema.xsd`` carries a DOCTYPE, and SAML
-    and WS-Security bundles import it by a local location; xmlschema's own copy then stands in.
+    """xmlschema's ``SchemaLoader`` with one change: an import whose own location the opener refused is
+    skipped, so xmlschema tries its next location, only when one of those locations is a bundled copy
+    of the namespace (BACKLOG #5537). The stock W3C ``xmldsig-core-schema.xsd`` carries a DOCTYPE, and
+    SAML and WS-Security bundles import it by a local location; xmlschema's own copy then stands in.
 
-    Any other refused import stops the build. Skipped, it would leave the namespace undeclared, and a
-    ``lax`` or ``skip`` wildcard would then admit that namespace's content unchecked."""
+    Any other refusal stops the build, one met while loading a file the import did open included: the
+    partly loaded file would stay registered beside the bundled copy. Skipped, an import would leave
+    the namespace undeclared, and a ``lax`` or ``skip`` wildcard would admit its content unchecked."""
     blocked = xmlschema_mod.exceptions.XMLResourceBlocked
 
     def has_bundled_copy(loader: Any, namespace: str, location: str) -> bool:
@@ -246,7 +258,9 @@ def _fallback_loader(xmlschema_mod: Any, bundled: tuple[_Root, ...]) -> type:
         try:
             return base.import_schema(self, target_schema, namespace, location, *args, **kwargs)
         except _ResourceRefused as exc:
-            if not has_bundled_copy(self, namespace, location):
+            if not _same_resource(exc.url, location) or not has_bundled_copy(
+                self, namespace, location
+            ):
                 raise
             raise blocked("block a refused import that a bundled copy stands in for") from exc
 
@@ -266,10 +280,8 @@ class _ConfinedFiles(urllib.request.BaseHandler):
     root is its own directory, or the ``schema_root`` the caller named. Each file under it is reached by
     :func:`_resolve_within` and checked by :func:`~messagefoundry.parsing.xml.harden.parse_bytes`
     first, so a path schema's includes meet the same DOCTYPE refusal as an inline schema. Anything else,
-    and a refused link, a DOCTYPE or a malformed file there, raises :class:`_ResourceRefused`, which
-    fails the build; :func:`_fallback_loader` says the one case where an import is skipped instead. A
-    missing file still raises ``FileNotFoundError``, which xmlschema reports as a warning and skips, as
-    it always has.
+    and a refused link, a DOCTYPE or a malformed file there, raises :class:`_ResourceRefused`; a
+    missing file raises ``FileNotFoundError``. :func:`_build_schema` says what each does to the build.
 
     The location is judged on its text by :func:`_local`, then compared with each root by whole
     components, so a sibling directory sharing a name prefix (``schemas-old`` beside ``schemas``) is
@@ -312,16 +324,16 @@ class _ConfinedFiles(urllib.request.BaseHandler):
                     # OSError with only a warning. ValueError covers the parse_bytes refusals and a
                     # reparse point readlink rejects.
                     raise _ResourceRefused(
-                        "refuse a link out, or a file parse_bytes refuses"
+                        "a resource reached through a link out, or a file parse_bytes refuses", url
                     ) from exc
                 return urllib.response.addinfourl(io.BytesIO(data), email.message.Message(), url)
         # PHI-safe: names no part of the location.
-        raise _ResourceRefused("refuse a resource outside the schema's confinement root")
+        raise _ResourceRefused("a resource outside the schema's confinement root", url)
 
     def unknown_open(self, req: urllib.request.Request) -> urllib.response.addinfourl:
         # allow="local" refuses a remote URL first; this keeps any scheme it lets through from reaching
         # OpenerDirector's no-handler path, which returns None and surfaces as an AttributeError.
-        raise _ResourceRefused("refuse a resource that is not a local file")
+        raise _ResourceRefused("a resource that is not a local file", req.full_url)
 
 
 class _SourceRefused(ValueError):
@@ -353,9 +365,12 @@ def _local_path(text: str | bytes | os.PathLike[str], what: str) -> str:
 def _confinement_root(source: str, schema_root: str | os.PathLike[str] | None) -> _Root:
     """The directory a path schema's reads are confined to: ``schema_root`` when given, which must hold
     the schema, else the schema's own directory. A schema at a filesystem root with no ``schema_root``
-    is confined to itself, since its directory would be every file on that volume."""
+    is confined to itself, and a ``schema_root`` that is a filesystem root is refused, since either
+    would make every file on that volume readable."""
     if schema_root is not None:
         root = _local_path(schema_root, "a schema_root")
+        if os.path.dirname(root) == root:
+            raise _SourceRefused("a schema_root that is a filesystem root")
         if not _within(source, root):
             raise _SourceRefused("a schema that does not lie under schema_root")
         return _Root(root, vet=True)
@@ -387,14 +402,15 @@ def _build_schema(
 
     **A refused location** is a local one outside those bounds, one reached through a link out of the
     root or to a UNC or device path, a UNC or device path itself, or a file there that ``parse_bytes``
-    refuses (a DOCTYPE, malformed or empty). On an include, redefine or override it fails the build. On
-    an import it fails the build too, with one exception: when xmlschema bundles a copy of the
-    imported namespace, the import falls back to that copy, as the stock W3C XML-DSig schema with its
-    DOCTYPE needs. A **remote** location never reaches the opener; ``allow="local"`` refuses it first,
-    which fails the build on an include, redefine or override, and on an import makes xmlschema skip
-    that location with a warning and try the next, as it did before BACKLOG #5537. A **missing** file
-    is handled by xmlschema as it always was: an include or an import of one is skipped with a
-    warning, and a redefine or override that carries components fails. A skipped import with no location left
+    refuses (a DOCTYPE, malformed or empty). It fails the build, and the error repeats the refusal's
+    fixed reason. The one exception is an import's own location, when xmlschema bundles a copy of the
+    imported namespace: the import then falls back to that copy, as the stock W3C XML-DSig schema with
+    its DOCTYPE needs. A refusal met further in, inside a file such an import did open, still fails the
+    build. A **remote** location never reaches the opener; ``allow="local"`` refuses it first, which
+    fails the build on an include, redefine or override, and on an import makes xmlschema skip that
+    location with a warning and try the next, as it did before BACKLOG #5537. A **missing** file is
+    handled by xmlschema as it always was: an include or an import of one is skipped with a warning,
+    and a redefine or override that carries components fails. A skipped import with no location left
     leaves its namespace undeclared: a reference to one of its types fails the build, but a ``lax`` or
     ``skip`` wildcard admits that namespace's elements unchecked.
 
@@ -431,7 +447,7 @@ def _build_schema(
             opener=opener,
             loader_class=_fallback_loader(xmlschema_mod, bundled),
         )
-    except _SourceRefused as exc:
+    except (_SourceRefused, _ResourceRefused) as exc:
         raise XmlValidationError(f"could not load XSD schema: {exc}") from exc
     except Exception as exc:  # xmlschema (and now harden) raise their own hierarchies
         # The exception TYPE names which gate refused it (XmlSecurityError = the XSD carried a

@@ -584,6 +584,60 @@ def test_a_nested_include_refused_under_an_import_fails_the_build(tmp_path: Path
     assert _lax_import_outcome(str(main)) == "build-fails"
 
 
+_DSIG = "http://www.w3.org/2000/09/xmldsig#"
+
+
+@pytest.mark.parametrize(
+    "inner",
+    [
+        pytest.param('<xs:include schemaLocation="bad.xsd"/>', id="include-doctype"),
+        pytest.param('<xs:import namespace="urn:o" schemaLocation="../o.xsd"/>', id="import-out"),
+    ],
+)
+def test_a_refusal_inside_an_opened_bundled_namespace_import_fails_the_build(
+    inner: str, tmp_path: Path
+) -> None:
+    # Only the import's OWN location falls back to the bundled copy. ds.xsd opens cleanly, so a
+    # refusal inside it is not that location: falling back there left ds.xsd half registered, and in
+    # the import-out shape its lax wildcard admitted o:id unchecked, valid=True.
+    (tmp_path / "o.xsd").write_text(_URN_O, encoding="utf-8")
+    (tmp_path / "schemas").mkdir()
+    (tmp_path / "schemas" / "bad.xsd").write_text(
+        '<?xml version="1.0"?><!DOCTYPE xs:schema [<!ENTITY x "y">]>'
+        f'<xs:schema {_XS} targetNamespace="{_DSIG}"/>',
+        encoding="utf-8",
+    )
+    (tmp_path / "schemas" / "ds.xsd").write_text(
+        f'<xs:schema {_XS} targetNamespace="{_DSIG}">{inner}'
+        '<xs:element name="Holder"><xs:complexType><xs:sequence>'
+        '<xs:any namespace="urn:o" processContents="lax"/>'
+        "</xs:sequence></xs:complexType></xs:element></xs:schema>",
+        encoding="utf-8",
+    )
+    main = tmp_path / "schemas" / "main.xsd"
+    main.write_text(
+        f'<xs:schema {_XS} xmlns:w="{_DSIG}">'
+        f'<xs:import namespace="{_DSIG}" schemaLocation="ds.xsd"/>'
+        '<xs:element name="patient"><xs:complexType><xs:sequence>'
+        '<xs:element ref="w:Holder"/></xs:sequence></xs:complexType></xs:element></xs:schema>',
+        encoding="utf-8",
+    )
+    doc = (
+        f'<patient><w:Holder xmlns:w="{_DSIG}"><o:id xmlns:o="urn:o">x</o:id></w:Holder></patient>'
+    )
+    with pytest.raises(XmlValidationError) as ei:
+        validate_against(doc, str(main))
+    assert "_ResourceRefused" in _causes(ei.value)
+
+
+def test_a_refusal_names_its_fixed_reason(tmp_path: Path) -> None:
+    (tmp_path / "o.xsd").write_text(_URN_O, encoding="utf-8")
+    main = _write_path_schema(tmp_path / "schemas", "../o.xsd")
+    with pytest.raises(XmlValidationError, match="outside the schema's confinement root") as ei:
+        validate_against("<patient>x</patient>", str(main))
+    assert "o.xsd" not in str(ei.value)  # PHI-safe: the location is not quoted
+
+
 def test_bytearray_inline_schema_is_read_as_the_schema() -> None:
     # origin/main pre-parsed a bytearray schema as text; 12e253ecb7 sent it to the path branch, where
     # os.fsdecode refused it and the schema failed to load.
@@ -769,6 +823,13 @@ def test_a_unc_schema_root_is_refused(tmp_path: Path) -> None:
         validate_against("<patient>x</patient>", str(main), schema_root="//nonexist-5537.invalid/s")
 
 
+def test_a_filesystem_root_schema_root_is_refused(tmp_path: Path) -> None:
+    # It would make every file on the volume readable, the widening a schema at a root is denied.
+    main = _write_path_schema(tmp_path, "inc.xsd")
+    with pytest.raises(XmlValidationError, match="a schema_root that is a filesystem root"):
+        validate_against("<patient>x</patient>", str(main), schema_root=tmp_path.anchor)
+
+
 def test_a_schema_at_a_filesystem_root_is_confined_to_itself(tmp_path: Path) -> None:
     from messagefoundry.parsing.xml.schema import _confinement_root
 
@@ -839,6 +900,10 @@ def test_bomless_utf16_schema_bytes_are_read_as_the_schema(codec: str) -> None:
     # Without one it still goes to the hardened parser, never to the filesystem as a path.
     with pytest.raises(XmlValidationError) as ei:
         validate_against("<patient>x</patient>", _CLEAN.encode(codec))
+    assert "XmlParseError" in _causes(ei.value)
+    # Leading whitespace puts the "<" past the first four bytes; the NUL still marks it as text.
+    with pytest.raises(XmlValidationError) as ei:
+        validate_against("<patient>x</patient>", ("  " + _CLEAN).encode(codec))
     assert "XmlParseError" in _causes(ei.value)
 
 
