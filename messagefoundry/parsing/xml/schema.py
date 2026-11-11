@@ -353,12 +353,12 @@ class _ConfinedFiles(urllib.request.BaseHandler):
     """The only way xmlschema can open a resource here: ``file:`` URLs under fixed roots (BACKLOG #5537).
 
     The only handler inside :class:`_ConfinedOpener`, xmlschema's ``opener``, so it sees every
-    location xmlschema opens as a URL, the schema file the caller named and each include, import,
-    redefine and override location among them; the opener refuses every scheme but ``file:``
-    before this handler runs, and ``unknown_open`` refuses any that reaches it. It does not see
-    every location a schema names: one xmlschema reads as XML text is parsed, not opened, so
-    :func:`_refuse_text_locations` refuses it first in the inline schema, the named file and each file under a vetted root, though not in the bundled copies, and
-    ``allow="local"`` refuses a remote URL before it is opened. The named file is read as named, a
+    ``file:`` location xmlschema opens as a URL, the schema file the caller named and each include,
+    import, redefine and override location among them; :meth:`_ConfinedOpener.open` refuses any
+    other scheme before this handler runs. It does not see every location a schema names: one
+    xmlschema reads as XML text is parsed, not opened, so :func:`_refuse_text_locations` refuses it
+    first in the inline schema, the named file and each file under a vetted root, though not in the
+    bundled copies, and ``allow="local"`` refuses a remote URL before it is opened. The named file is read as named, a
     link at it included. One root is xmlschema's bundled ``schemas`` directory, which holds
     the copies of well-known namespaces (SOAP encoding, XML-DSig, xlink and others) a location-free
     ``xs:import`` resolves to; those are library files and are read as they are, links included. For
@@ -446,9 +446,9 @@ class _ConfinedFiles(urllib.request.BaseHandler):
         raise _ResourceRefused("a resource outside the schema's confinement root", url)
 
     def unknown_open(self, req: urllib.request.Request) -> urllib.response.addinfourl:
-        # allow="local" refuses a remote URL first and _ConfinedOpener.open any other scheme; this keeps
-        # one that reaches the handler by another route from reaching OpenerDirector's no-handler path,
-        # which returns None and surfaces as an AttributeError.
+        # Unreachable through _ConfinedOpener.open, which refuses a non-file scheme first. A backstop
+        # for a call that reaches the handler another way, which would otherwise take
+        # OpenerDirector's no-handler path, return None, and surface as an AttributeError.
         raise _ResourceRefused("a resource that is not a local file", req.full_url)
 
 
@@ -458,15 +458,18 @@ class _ConfinedOpener(urllib.request.OpenerDirector):
     Not made by ``build_strict_opener`` (``transports/bounded_read.py``), which builds the openers
     that read an HTTP reply. That one goes through ``build_opener``, which adds urllib's defaults,
     ``FileHandler``, ``FTPHandler`` and ``DataHandler`` among them, each able to open what
-    ``_ConfinedFiles`` refuses; and ``parsing/`` may not import ``transports/``. This opener opens no
-    ``http`` or ``https`` URL, so it reads no reply head, the hazard that function exists for. It
-    takes a :class:`_ConfinedFiles` and no subclass, which could add an ``https_open``;
-    :meth:`add_handler` refuses any handler after the first; :meth:`open` refuses to run if any other
-    handler got in another way, such as through ``super`` or the handler list itself; and
-    :meth:`open` then refuses any URL whose scheme is not ``file`` before a handler runs, so an
-    ``https_open`` set on the :class:`_ConfinedFiles` instance or class, which the one handler
-    carries in under ``https``, is never called. The stock-opener scan in
-    ``tests/test_reply_framing.py`` sanctions this class by name, and checks all four."""
+    ``_ConfinedFiles`` refuses; and ``parsing/`` may not import ``transports/``. Its own code opens
+    no ``http`` or ``https`` URL, so it reads no reply head, the hazard that function exists for,
+    and the refusals below keep at least these additions from opening one. It takes a :class:`_ConfinedFiles` and no subclass, which could add an ``https_open``;
+    :meth:`add_handler` refuses any handler after the first. Before any handler runs, :meth:`open`
+    refuses any URL whose scheme is not ``file``, so an ``https_open`` set on the
+    :class:`_ConfinedFiles` instance or class is never called; refuses to run if any other handler
+    got in another way, such as through ``super`` or the handler list itself; and refuses to run if
+    the one handler registered an open method besides ``file_open`` and ``unknown_open``, such as a
+    ``default_open`` set on its instance or class, which would run before ``file_open``. A
+    ``file_open`` or ``unknown_open`` replaced on that instance or class is not detected. The
+    stock-opener scan in ``tests/test_reply_framing.py`` sanctions this class by name, and checks
+    each of these refusals."""
 
     def __init__(self, files: _ConfinedFiles) -> None:
         if type(files) is not _ConfinedFiles:
@@ -479,20 +482,10 @@ class _ConfinedOpener(urllib.request.OpenerDirector):
         raise TypeError("the schema opener holds its confined-file handler and no other")
 
     def open(self, fullurl: str | urllib.request.Request, *args: Any, **kwargs: Any) -> Any:
-        state = vars(self)  # the handler tables are instance attributes typeshed omits
-        tables = ("handle_error", "process_request", "process_response")
-        if (
-            state["handlers"] != [self._files]
-            or any(chain != [self._files] for chain in state["handle_open"].values())
-            or any(state[table] for table in tables)  # _ConfinedFiles puts nothing in these
-        ):
-            raise TypeError("the schema opener holds a handler besides its confined-file handler")
-        # The checks above compare handlers, not the methods on them: an https_open set on the
-        # _ConfinedFiles instance or class before it got here is registered under "https" by the one
-        # handler they allow. So the scheme is judged as OpenerDirector.open dispatches on it, the
-        # Request's own type, and anything but file is refused before a handler runs. A URL Request
-        # cannot type, whose ValueError would quote it, is refused the same way, after the suppress,
-        # so nothing is chained to the refusal.
+        # The scheme is judged as OpenerDirector.open dispatches on it, the Request's own type, and
+        # anything but file is refused before a handler runs. A URL Request cannot type, whose
+        # ValueError would quote it, is refused the same way, after the suppress, so nothing is
+        # chained to the refusal.
         req: urllib.request.Request | None = None
         if isinstance(fullurl, urllib.request.Request):
             req = fullurl
@@ -501,7 +494,20 @@ class _ConfinedOpener(urllib.request.OpenerDirector):
                 req = urllib.request.Request(fullurl)
         if req is None or req.type != "file":
             url = fullurl if req is None else req.full_url
-            raise _ResourceRefused("a resource that is not a local file", str(url))
+            raise _ResourceRefused("a resource whose scheme is not file", str(url))
+        state = vars(self)  # the handler tables are instance attributes typeshed omits
+        tables = ("handle_error", "process_request", "process_response")
+        if (
+            state["handlers"] != [self._files]
+            or any(chain != [self._files] for chain in state["handle_open"].values())
+            or any(state[table] for table in tables)  # _ConfinedFiles puts nothing in these
+        ):
+            raise TypeError("the schema opener holds a handler besides its confined-file handler")
+        # The check above compares handlers, not the methods on them: a default_open, or any other
+        # <name>_open, set on the _ConfinedFiles instance or class before it got here is registered
+        # by the one handler it allows, and a default_open runs before file_open.
+        if state["handle_open"].keys() != {"file", "unknown"}:
+            raise TypeError("the schema opener's handler carries an open method it does not define")
         return super().open(req, *args, **kwargs)
 
 

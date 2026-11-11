@@ -1625,12 +1625,8 @@ def _strict_connections_read_strictly() -> None:
 def _schema_opener_is_confined() -> None:
     """xmlschema's opener in parsing/xml/schema.py, which parsing/ cannot build with
     build_strict_opener from transports/, and which build_opener would fill with urllib's default
-    handlers. It holds one _ConfinedFiles, which opens file: and refuses every other scheme in
-    unknown_open; it takes no subclass of that handler, add_handler refuses any other, open
-    refuses to run with any other in any of its handler tables, however it got there, and open
-    then refuses any URL whose scheme is not file before a handler runs, so an https_open set on
-    the _ConfinedFiles instance or class is never called. So the opener opens no http or https
-    URL and reads no reply head. That such a URL is refused is
+    handlers. The _ConfinedOpener docstring lists the refusals that keep it from opening an http
+    or https URL or reading a reply head; this checks each. That such a URL is refused is also
     ``tests/test_xml_schema_lockdown.py::test_a_non_file_url_reaching_the_opener_is_a_refused_resource``.
     """
     from messagefoundry.parsing.xml.schema import _ConfinedFiles, _ConfinedOpener, _ResourceRefused
@@ -1649,23 +1645,37 @@ def _schema_opener_is_confined() -> None:
 
     with pytest.raises(TypeError, match="no subclass"):
         _ConfinedOpener(_WithHttps(()))
+    # A non-file scheme is refused before any handler runs.
+    with pytest.raises(_ResourceRefused, match="scheme is not file"):
+        opener.open("https://127.0.0.1:9/x.xsd")
+    # A file URL meets the handler checks; the file is never reached, so it need not exist.
+    file_url = "file:///nonexistent-5537/x.xsd"
     # A handler that skips add_handler's refusal, as super(_ConfinedOpener, o).add_handler does.
     urllib.request.OpenerDirector.add_handler(opener, urllib.request.HTTPSHandler())
     with pytest.raises(TypeError, match="besides its confined-file handler"):
-        opener.open("https://127.0.0.1:9/x.xsd")
+        opener.open(file_url)
     # Or one placed straight in a handler table add_handler fills.
     for table in ("handle_error", "process_request", "process_response"):
         tampered = _ConfinedOpener(_ConfinedFiles(()))
         vars(tampered)[table].setdefault("https", []).append(urllib.request.HTTPSHandler())
         with pytest.raises(TypeError, match="besides its confined-file handler"):
-            tampered.open("https://127.0.0.1:9/x.xsd")
+            tampered.open(file_url)
+
+    def never(*args: object) -> None:
+        raise AssertionError("an injected open method ran")
+
     # An https_open set on the one handler, which the tables carry in under "https", is never called.
     injected = _ConfinedFiles(())
-    injected.https_open = urllib.request.HTTPSHandler().https_open  # type: ignore[attr-defined]
+    injected.https_open = never  # type: ignore[attr-defined]
     carrying = _ConfinedOpener(injected)
     assert vars(carrying)["handle_open"]["https"] == [injected]
-    with pytest.raises(_ResourceRefused, match="not a local file"):
+    with pytest.raises(_ResourceRefused, match="scheme is not file"):
         carrying.open("https://127.0.0.1:9/x.xsd")
+    # A default_open on it, which would run before file_open for a file URL, is refused too.
+    defaulted = _ConfinedFiles(())
+    defaulted.default_open = never  # type: ignore[attr-defined]
+    with pytest.raises(TypeError, match="open method it does not define"):
+        _ConfinedOpener(defaulted).open(file_url)
 
 
 #: ``(module under messagefoundry/, origin as _stock_calls reports it) -> the check it rests on``,
