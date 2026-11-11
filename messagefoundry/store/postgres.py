@@ -11388,9 +11388,11 @@ class PostgresStore:
         require_operator_audit(audit, "store.revoke_user_sessions")  # BACKLOG #5069
         now = time.time() if now is None else now
         outcome = RevokeSealOutcome(self._seal_pager)
+        # AuditedWrite inside the seal report: the operator row's tee runs as the commit
+        # lands, before the report awaits, so a report that raises cannot cost the tee.
         async with (
-            AuditedWrite(now) as written,
             outcome.committing(self.record_audit),
+            AuditedWrite(now) as written,
             self._after_commit_txn() as conn,
         ):
             raised = await self._bump_session_epoch(conn, user_id, outcome)

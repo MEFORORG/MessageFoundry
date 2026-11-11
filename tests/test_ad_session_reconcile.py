@@ -70,9 +70,11 @@ from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import CipherError, generate_key, make_cipher
 from messagefoundry.store.row_seal import RowSealError
 from messagefoundry.store.store import (
+    _REVOKE_CARRY,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
     MessageStore,
+    RevokeResult,
     UnknownRoleError,
     UserRecord,
     VerifiedUser,
@@ -7014,6 +7016,39 @@ async def test_a_verified_repeat_whose_row_is_refused_alerts_without_a_notice(
             == "reported"
         )
         assert [e.event_type for e in notifier.sent] == [ACCOUNT_DISABLED]
+    finally:
+        await store.close()
+
+
+async def test_the_rowless_revoke_retry_shares_one_deferred_seal_report_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reconciler's revoke that fails with its row is applied again without it, and both
+    attempts run inside one ``deferred_revoke_reports`` scope (ADR 0217 item 4), so a seal refusal
+    the committing retry also met is reported once, by the retry, not again as a failed attempt."""
+    store, _, service, _ = await _scoped_service(_GRP_A)
+    try:
+        user = await _signed_out(store, "jdoe")
+        real = store.revoke_user_sessions
+        carries: list[object] = []
+
+        async def first_refused(user_id: str, **kwargs: Any) -> RevokeResult:
+            carries.append(_REVOKE_CARRY.get())
+            if len(carries) == 1:
+                raise sqlite3.OperationalError("synthetic: disk I/O error")
+            return await real(user_id, **kwargs)
+
+        monkeypatch.setattr(store, "revoke_user_sessions", first_refused)
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="directory_disabled"
+        )
+        ended = await service._revoke_with_row(revocation, maps_held=True)
+        assert ended.retried
+        assert len(carries) == 2
+        assert carries[0] is not None and carries[0] is carries[1], (
+            "the two revoke attempts did not share one deferred report scope"
+        )
+        assert _REVOKE_CARRY.get() is None, "the scope outlived the revoke"
     finally:
         await store.close()
 
