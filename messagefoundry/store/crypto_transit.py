@@ -290,7 +290,7 @@ class TransitCipher(_UnmarkedPolicy):
         :meth:`_refuses_only_version`); Transit refusing the version is one cause, not the only one.
         It raises the subclass :class:`AuditKeyVersionUnverifiedError` when
         :func:`_names_no_version_reason` does not read the 400 as Vault's own refusal, for example a
-        proxy's page, or when the reply is too large to read (BACKLOG #6707)."""
+        proxy's page, or when reading it runs out of memory or stack (BACKLOG #6707)."""
         inp = base64.b64encode(data).decode("ascii")
         kwargs: dict[str, Any] = {
             "name": self._audit_key,
@@ -304,12 +304,20 @@ class TransitCipher(_UnmarkedPolicy):
             mac = response["data"]["hmac"]  # "vault:v1:…" — no key, no plaintext
         except Exception as exc:
             if key_version is not None and self._refuses_only_version(exc, key_version):
-                # The same flow, labelled apart (BACKLOG #6707). A reply too large to read, such as
-                # a huge errors list, is not read as a refusal: escaping here, the error would make
-                # the walk "could not run" and drop the row's break and its alert.
+                # The same flow, labelled apart (BACKLOG #6707). A reply that runs out of memory or
+                # stack while it is read, such as a huge errors list, is not read as a refusal:
+                # escaping here, the error would make the walk "could not run" and drop the row's
+                # break and its alert.
                 try:
                     unverified = _names_no_version_reason(exc)
-                except (MemoryError, RecursionError):
+                except (MemoryError, RecursionError) as read_exc:
+                    log.warning(
+                        "could not read Transit's 400 for audit key version %d (%s); labelled "
+                        "unconfirmed (key=%r)",
+                        key_version,
+                        type(read_exc).__name__,
+                        self._audit_key,
+                    )
                     unverified = True
                 if unverified:
                     raise AuditKeyVersionUnverifiedError(key_version) from exc

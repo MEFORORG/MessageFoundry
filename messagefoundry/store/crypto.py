@@ -648,8 +648,8 @@ class AuditKeyVersionRefusedError(CipherError):
 class AuditKeyVersionUnverifiedError(AuditKeyVersionRefusedError):
     """An audit MAC pinned to one key version got HTTP 400 that
     :func:`~messagefoundry.store.crypto_transit._names_no_version_reason` does not read as a version
-    refusal, or whose reply is too large to read, while the key still answers under the latest
-    (BACKLOG #6707).
+    refusal, or whose reading runs out of memory or stack, while the key still answers under the
+    latest (BACKLOG #6707).
 
     The 400 may still be a refusal of the version: a proxy can replace Vault's reply with its own
     page, and that cannot be told apart from a tamper behind it. So this is a subclass, and a

@@ -675,11 +675,12 @@ async def test_a_planted_genesis_version_behind_a_proxy_opens_and_reads_as_a_bre
     assert not ok and "seq=1," in str(msg), msg
 
 
-def _past_the_reparse_bound(head: str, tail: str) -> str:
-    """``head`` + padding + ``tail``, one character longer than the body the cipher re-parses."""
+def _past_the_reparse_bound(head: str, tail: str, *, over: int = 1) -> str:
+    """``head`` + padding + ``tail``, ``over`` characters longer than the longest body the cipher
+    re-parses (0 gives a body of exactly that length)."""
     from messagefoundry.store.crypto_transit import _REPARSED_BODY_MAX_CHARS
 
-    return head + " " * (_REPARSED_BODY_MAX_CHARS + 1 - len(head) - len(tail)) + tail
+    return head + " " * (_REPARSED_BODY_MAX_CHARS + over - len(head) - len(tail)) + tail
 
 
 def test_an_oversized_vault_shaped_body_is_labelled_unconfirmed_unparsed(
@@ -696,9 +697,41 @@ def test_an_oversized_vault_shaped_body_is_labelled_unconfirmed_unparsed(
 
     monkeypatch.setattr(crypto_transit, "json_loads_or_refusal", must_not_parse)
     body = _past_the_reparse_bound('{"errors": ["no such key version"], "pad": "', '"}')
+    assert len(body) == crypto_transit._REPARSED_BODY_MAX_CHARS + 1
     assert isinstance(
         _pinned_refusal("vault:v2:AAAA", None, text=body), AuditKeyVersionUnverifiedError
     )
+
+
+def test_a_vault_shaped_body_at_the_bound_is_still_read() -> None:
+    """The bound is inclusive: a body of exactly ``_REPARSED_BODY_MAX_CHARS`` is parsed, so its
+    refusal text keeps the refused-version label (BACKLOG #6707)."""
+    from messagefoundry.store.crypto import (
+        AuditKeyVersionRefusedError,
+        AuditKeyVersionUnverifiedError,
+    )
+
+    body = _past_the_reparse_bound('{"errors": ["no such key version"], "pad": "', '"}', over=0)
+    refused = _pinned_refusal("vault:v2:AAAA", None, text=body)
+    assert isinstance(refused, AuditKeyVersionRefusedError)
+    assert not isinstance(refused, AuditKeyVersionUnverifiedError)
+
+
+def test_a_body_hvac_already_parsed_is_not_parsed_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    """hvac sets ``json`` when it parsed the reply; an ``errors`` it did not find there is not
+    looked for in the same text again (BACKLOG #6707)."""
+    _needs_hvac()
+    from hvac.exceptions import InvalidRequest
+
+    from messagefoundry.store import crypto_transit
+
+    def must_not_parse(*_a: Any, **_kw: Any) -> Any:
+        raise AssertionError("a body hvac parsed was parsed again")
+
+    monkeypatch.setattr(crypto_transit, "json_loads_or_refusal", must_not_parse)
+    reply = '{"message": "bad request"}'
+    exc = InvalidRequest(reply, text=reply, json={"message": "bad request"})
+    assert crypto_transit._names_no_version_reason(exc)
 
 
 class _PaddedProxiedRotatingTransit(_ProxiedRotatingTransit):
@@ -765,7 +798,9 @@ async def test_a_reply_too_large_to_read_is_still_a_chain_break_on_the_startup_w
     assert [name for name, _ in sink.events] == ["audit-chain"], sink.events
     assert f"seq={seq}," in sink.events[0][1], sink.events
     assert not any("could not run" in line for line in lines), lines
-    assert parsed == [], parsed  # the bound, not the MemoryError catch, kept the parser away
+    # For the padded body the bound, not the MemoryError catch, kept the parser away; hvac's own
+    # errors list is never re-parsed at all.
+    assert parsed == [], parsed
 
 
 def test_a_refused_key_version_survives_a_pickle_with_its_text() -> None:
