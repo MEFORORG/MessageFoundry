@@ -51,6 +51,7 @@ from messagefoundry.auth.service import (
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.store import no_audit_row
 from tests._doc_blockquote import blockquote_lines, plant_in_blockquote, route_tokens, unwrap
 from tests.test_approvals import ON, _add, _token
 from tests.test_approvals import _client as _approvals_client
@@ -426,7 +427,7 @@ async def _measure_ui_resend_done(k: _Callers) -> None:
         to="OB_Y",
         from_="OB_X",
         idempotency_key="k-ran",
-        audit=lambda _o: None,
+        audit=no_audit_row,
     )
     assert (outcome.status, outcome.from_destination) == ("resent", "OB_X"), outcome
     path, ran = f"/ui/messages/{ids['IB_A']}/resend-done", {"to": "OB_Y", "key": "k-ran"}
@@ -482,7 +483,10 @@ async def _measure_ui_suspend_refusal(k: _Callers) -> None:
         rows = [await store.get_alert_instance(i, allowed_channels=None) for i in ids.values()]
         return [row.suspended_until if row is not None else None for row in rows]
 
-    before = await suspended()
+    async def suspend_rows() -> int:
+        return len(await store.list_audit(action="alert_suspend", limit=500))
+
+    before, rows_before = await suspended(), await suspend_rows()
     async with _ui_sessions(k, "suspender", "scoped", "allchannels") as ui:
 
         async def refuse(username: str, alert_id: int) -> httpx.Response:
@@ -496,19 +500,22 @@ async def _measure_ui_suspend_refusal(k: _Callers) -> None:
         # one alike.
         pages: dict[tuple[str, int], str] = {}
         for alert_id in (ids["IB_A"], ids["IB_B"], 999_999):
-            for username in ("suspender", "scoped"):
+            for username in ("suspender", "scoped", "allchannels"):
                 r = await refuse(username, alert_id)
                 assert r.status_code == 400 and "suspend window" in r.text, (username, alert_id)
                 pages[username, alert_id] = r.text
-        assert await suspended() == before
+        # No refusal muted an alert or wrote a suspend audit row.
+        assert await suspended() == before and await suspend_rows() == rows_before
         narrow = pages["suspender", ids["IB_A"]]
-        # The list is the caller's scoped one, and without monitoring:read the rules are left out.
-        assert "IB_A" in narrow and "IB_B" not in narrow
+        # The list is the caller's scoped one, which leaves out the shared outbound IB_A feeds, and
+        # without monitoring:read the rules are left out.
+        assert "IB_A" in narrow and "IB_B" not in narrow and "OB_X" not in narrow
         assert ">Rules<" not in narrow
         # Control: an operator holds monitoring:read, so the same refusal shows the rules; the
-        # all-channels operator's list carries the alert the scoped one's does not.
+        # all-channels operator's list carries the alerts the scoped one's does not.
         assert ">Rules<" in pages["scoped", ids["IB_A"]]
-        assert "IB_B" in (await refuse("allchannels", ids["IB_A"])).text
+        wide = pages["allchannels", ids["IB_A"]]
+        assert "IB_B" in wide and "OB_X" in wide
 
 
 class _Rule(NamedTuple):
@@ -623,7 +630,8 @@ _RULES: dict[str, _Rule] = {
         ),
         _measure_ui_resend_done,
         # Vault BACKLOG #4776 item 1 is open: the route does not check the origin channel today.
-        forbidden=("403", "checks scope on the origin", "origin channel is checked"),
+        # A caller without messages:resend does get a 403, from the gate, so the verb is pinned.
+        forbidden=("answers 403", "checks scope on the origin", "origin channel is checked"),
     ),
     "ui-suspend-refusal": _Rule(
         ("POST /ui/alerts/{alert_id}/suspend",),
@@ -636,7 +644,8 @@ _RULES: dict[str, _Rule] = {
             "`monitoring:diagnose`",
         ),
         _measure_ui_suspend_refusal,
-        forbidden=("404",),
+        # A valid window can 404 through the alert-writes rule, so only the refusal's 404 is wrong.
+        forbidden=("the same 404",),
     ),
 }
 

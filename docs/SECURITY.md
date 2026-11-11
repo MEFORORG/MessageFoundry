@@ -2417,10 +2417,12 @@ the same permission set on the same method reds CI until it is listed here.
 >   BACKLOG #4776 item 1).
 > - `POST /ui/alerts/{alert_id}/suspend` refuses with 400 a `minutes` value that does not parse as a
 >   number or falls outside the suspend window's bounds, which the JSON route refuses with 422, and
->   re-renders the alerts page carrying the refusal. It refuses before it reads the alert,
->   so an alert id outside the scope, or an unknown one, gets the same 400. The page lists only the
->   active alerts in the caller's channel scope. It shows the alert rules only to a caller that also
->   holds `monitoring:read`, since the route itself needs only `monitoring:diagnose`.
+>   re-renders the alerts page carrying the refusal. It refuses before it reads the alert, so for
+>   such a value an alert id outside the scope, or an unknown one, gets the same 400; a valid window
+>   reaches the alert-writes rule above. A blank or missing `minutes` is not refused: the route reads
+>   it as 60 minutes, where the JSON route refuses it with 422. The page lists only the active
+>   alerts in the caller's channel scope. It shows the alert rules only to a caller that also holds
+>   `monitoring:read`, since the route itself needs only `monitoring:diagnose`.
 >
 > The console reaches the same rules, because its routes call these handlers in-process. That
 > covers at least `/ui/messages/search/layered`, the `/ui/statistics/reset*` routes, the four
@@ -2431,7 +2433,8 @@ the same permission set on the same method reds CI until it is listed here.
 > `POST /ui/messages/search/presets/{preset_id}/delete` swallows the 404 and redirects, so another
 > user's preset id looks like one already deleted. `/ui/connections/purge-confirm` checks the
 > purge rule itself, before any purge: a scoped caller gets its own 403 and denial row. The
-> `/ui/nav-status` alert bell is null without `monitoring:diagnose`.
+> `/ui/nav-status` alert bell is null without `monitoring:diagnose`. The `/ui` suspend refuses a
+> bad window before any scope read, as its own bullet above says.
 >
 > `tests/test_single_route_data_rules_doc_drift.py` executes the main facts of each bullet, with an
 > all-channels caller as the control. The security-event feed has no channel axis, so its control
