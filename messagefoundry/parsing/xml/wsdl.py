@@ -206,9 +206,9 @@ def _resolve_qname(prefixed: str | None, nsmap: Mapping[str | None, str]) -> str
     return f"{{{ns}}}{local}" if ns else local
 
 
-#: Every element that names another document to load, with the attribute that names it. ADR 0122 requires
-#: a split contract to be inlined, so a location on any of them is refused, local or remote (BACKLOG
-#: #5539). ``xsd:override`` is XSD 1.1, in the same namespace; xmlschema honours it.
+#: At least these elements name another document to load, each with the attribute that names it. ADR
+#: 0122 requires a split contract to be inlined, so a location on any of them is refused, local or
+#: remote (BACKLOG #5539). ``xsd:override`` is XSD 1.1, in the same namespace; xmlschema honours it.
 _LOCATION_ATTRS = (
     (f"{{{_WSDL_NS}}}import", "location", "wsdl:import"),
     (f"{{{_XSD_NS}}}import", "schemaLocation", "xsd:import"),
@@ -247,6 +247,10 @@ def _locator(location: str) -> str:
     if not text:
         return "an empty location"
     slashed = text.replace("\\", "/")
+    if slashed.lower().startswith("//?/unc/"):
+        return "a network path"
+    if slashed.startswith("//?/") and slashed[5:6] == ":" and slashed[4:5].isalpha():
+        return "a local path"
     if slashed.startswith(("//./", "//?/")):
         return "a device path"
     if slashed.startswith("//"):

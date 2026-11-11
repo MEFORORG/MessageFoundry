@@ -508,6 +508,103 @@ def test_a_percent_sequence_in_a_directory_name_is_decoded_once(tmp_path: Path) 
         assert validate_against("<patient>x</patient>", source).valid
 
 
+def test_a_circular_include_back_to_the_named_file_loads(tmp_path: Path) -> None:
+    # XSD allows it, and xmlschema skips a document it already holds by URL. Handed a tree with no URL
+    # it loaded the named file a second time and failed on duplicate globals.
+    main = tmp_path / "main.xsd"
+    main.write_text(
+        f'<xs:schema {_XS}><xs:include schemaLocation="a.xsd"/>'
+        '<xs:element name="patient" type="xs:string"/></xs:schema>',
+        encoding="utf-8",
+    )
+    (tmp_path / "a.xsd").write_text(
+        f'<xs:schema {_XS}><xs:include schemaLocation="main.xsd"/></xs:schema>', encoding="utf-8"
+    )
+    assert validate_against("<patient>x</patient>", str(main)).valid
+
+
+#: Loads only if the DOCTYPE inside the location text takes effect: its ATTLIST default types the
+#: element as an integer, so "5" validates and "x" does not.
+_TEXT_LOCATION = (
+    "&#10;&lt;!DOCTYPE xs:schema [&lt;!ATTLIST xs:element type CDATA 'xs:int'&gt;]&gt;"
+    "&lt;xs:schema xmlns:xs='http://www.w3.org/2001/XMLSchema'&gt;"
+    "&lt;xs:element name='patient'/&gt;&lt;/xs:schema&gt;"
+)
+
+
+def test_a_location_xmlschema_would_parse_as_text_is_refused(tmp_path: Path) -> None:
+    # xmlschema reads a location holding a newline, or opening with "<", as an inline document,
+    # which never reaches the opener or parse_bytes.
+    inline = f'<xs:schema {_XS}><xs:include schemaLocation="{_TEXT_LOCATION}"/></xs:schema>'
+    with pytest.raises(XmlValidationError) as ei:
+        validate_against("<patient>5</patient>", inline)
+    assert "XmlSecurityError" in _causes(ei.value)
+    (tmp_path / "inc.xsd").write_text(inline, encoding="utf-8")
+    included = _write_path_schema(tmp_path, "inc.xsd")
+    named = tmp_path / "named.xsd"
+    named.write_text(inline, encoding="utf-8")
+    for source in (included, named):
+        with pytest.raises(XmlValidationError):
+            validate_against("<patient>5</patient>", str(source))
+    # Control: an ordinary location in the same position still loads.
+    (tmp_path / "inc2.xsd").write_text(_CLEAN, encoding="utf-8")
+    control = _write_path_schema(tmp_path, "inc2.xsd")
+    assert validate_against("<patient>x</patient>", str(control)).valid
+
+
+def test_a_reparse_point_readlink_rejects_fails_the_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # On Windows os.readlink raises ValueError, not OSError, for a name surrogate it cannot read,
+    # such as a WSL symlink.
+    (tmp_path / "lnk").mkdir()
+    (tmp_path / "lnk" / "inc.xsd").write_text(_CLEAN, encoding="utf-8")
+    main = _write_path_schema(tmp_path, "lnk/inc.xsd")
+    link = os.path.normcase(str(tmp_path / "lnk"))
+    real_lstat, real_readlink = os.lstat, os.readlink
+
+    def fake_lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if os.path.normcase(os.fsdecode(path)) == link:
+            return os.stat_result((stat.S_IFLNK | 0o777, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        return real_lstat(path, *args, **kwargs)
+
+    def fake_readlink(path: Any, *args: Any, **kwargs: Any) -> str:
+        if os.path.normcase(os.fsdecode(path)) == link:
+            raise ValueError("not a symbolic link")
+        return real_readlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", fake_lstat)
+    monkeypatch.setattr(os, "readlink", fake_readlink)
+    with pytest.raises(XmlValidationError) as ei:
+        validate_against("<patient>x</patient>", str(main))
+    assert "XMLResourceBlocked" in _causes(ei.value)
+
+
+def test_a_path_object_schema_source_is_a_path(tmp_path: Path) -> None:
+    (tmp_path / "inc.xsd").write_text(_CLEAN, encoding="utf-8")
+    main = _write_path_schema(tmp_path, "inc.xsd")
+    assert validate_against("<patient>x</patient>", main, schema_root=tmp_path).valid
+
+
+@pytest.mark.skipif(os.name != "nt", reason="MAX_PATH and the \\\\?\\ prefix are Windows")
+def test_a_long_drive_path_gets_its_prefix_back_for_the_os(tmp_path: Path) -> None:
+    from messagefoundry.parsing.xml.schema import _native
+
+    long = "C:\\" + "d\\" * 140 + "main.xsd"
+    assert _native(long) == "\\\\?\\" + long
+    assert _native("C:\\s\\main.xsd") == "C:\\s\\main.xsd"
+    # A real one, past MAX_PATH, read through validate_against.
+    deep = tmp_path.joinpath(*(["d" * 40] * 6))
+    try:
+        deep.mkdir(parents=True)
+        (deep / "inc.xsd").write_text(_CLEAN, encoding="utf-8")
+    except OSError as exc:
+        pytest.skip(f"cannot create a long path here: {type(exc).__name__}")
+    main = _write_path_schema(deep, "inc.xsd")
+    assert len(str(main)) > 260
+    assert validate_against("<patient>x</patient>", str(main)).valid
+
+
 # --- schema_root: a bundle that includes across sibling directories ------------------------------
 
 
@@ -562,6 +659,14 @@ def test_schema_root_must_hold_the_schema(tmp_path: Path) -> None:
 def test_schema_root_is_refused_for_an_inline_schema(tmp_path: Path) -> None:
     with pytest.raises(XmlValidationError, match="inline schema"):
         validate_against("<patient>x</patient>", _CLEAN, schema_root=tmp_path)
+
+
+@pytest.mark.parametrize("root", ["", "   "])
+def test_an_empty_schema_root_is_refused(root: str, tmp_path: Path) -> None:
+    # abspath("") is the working directory, which would widen the root past the schema's own.
+    main = _write_path_schema(tmp_path, "inc.xsd")
+    with pytest.raises(XmlValidationError, match="empty"):
+        validate_against("<patient>x</patient>", str(main), schema_root=root)
 
 
 def test_a_unc_schema_root_is_refused(tmp_path: Path) -> None:
