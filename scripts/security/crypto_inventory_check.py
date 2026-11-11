@@ -344,7 +344,8 @@ INVENTORY: dict[str, frozenset[str]] = {
     # ADR 0197 Amendment A (AC-A9): store.crypto for CipherError alone, so the lockable-account census
     # can tell a TOTP cell the store key does not open apart from any other store error.
     # BACKLOG #3772: hashlib for the SHA-256 that bounds over-long client-address text in the
-    # new-address signal's dedupe keys and rows. A dedupe key over caller text, not a secret.
+    # new-address signal's dedupe keys and rows. A dedupe key over caller text, not a secret. And
+    # (BACKLOG #3770) the keyed digest of the past-cap log line, prefixed with a per-process secret.
     "messagefoundry/auth/service.py": frozenset(
         {"hashlib", "messagefoundry.config.tls_policy", "messagefoundry.store.crypto", "secrets"}
     ),
@@ -1241,6 +1242,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:via messagefoundry.auth.oidc_http",
             "hash:via messagefoundry.auth.tokens",
             # BACKLOG #3772: _bounded_address_text, a SHA-256 dedupe key over over-long client text.
+            # BACKLOG #3770: _address_log_field, a SHA-256 over a per-process secret prefix
+            # (_ADDRESS_LOG_KEY, from secrets.token_urlsafe) and the text, a keyed digest that keeps
+            # an unparsed address out of the log; a reading aid, not an authenticator.
             "hash:hashlib.sha256",
             # BACKLOG #2592: the passkey set is checked against the digest the account's integrity
             # seal covers (store.passkey_digest, a SHA-256 the seal authenticates).

@@ -57,7 +57,11 @@ from messagefoundry.config.tls_policy import (
 # controlchars, which imports only the standard library and is therefore reachable from
 # ``logging_guard`` too. That
 # module's docstring carries the reasoning; this is now an ordinary import of a leaf.
-from messagefoundry.controlchars import escape_lone_surrogates, scrub_control_chars
+from messagefoundry.controlchars import (
+    escape_lone_surrogates,
+    log_field_token,
+    scrub_control_chars,
+)
 from messagefoundry.keywrap import load_checked_cert_chain
 from messagefoundry.log_spool import LogSpool, SpoolEntry, SpoolUnavailable
 from messagefoundry.logging_guard import (
@@ -66,6 +70,7 @@ from messagefoundry.logging_guard import (
     LogWriteGuard,
     set_active_guard,
 )
+from messagefoundry.redaction import _REDACTED as PHI_PLACEHOLDER
 from messagefoundry.redaction import (
     ExcInfo,
     prepare_log_record,
@@ -97,6 +102,10 @@ __all__ = [
     "JsonFormatter",
     "CredentialQueryScrubFilter",
     "CredentialScrubFilter",
+    "redact_log_value",
+    "redacted_log_field",
+    "UNREADABLE_LOG_VALUE",
+    "LOG_FIELD_READ_MAX",
     "SyslogForward",
     "ForwarderStatus",
     "FORWARD_LOSS_COUNTERS",
@@ -392,6 +401,202 @@ def _scrub_credential_query(text: str) -> str:
     able to carry two spellings of "a credential was here", and a hand-copied literal is how it
     would."""
     return _CREDENTIAL_QUERY_RE.sub(lambda m: f"{m.group(1)}={CREDENTIAL_PLACEHOLDER}", text)
+
+
+def _shipped_filters() -> tuple[logging.Filter, ...]:
+    """The ``logging.Filter`` objects :func:`_install_phi_filters` puts on a shipped handler, built
+    by that function, so the reading :func:`redact_log_value` takes follows the text rewrites those
+    objects make to a record (BACKLOG #3770). It would not model, at least, a filter that is not a
+    ``logging.Filter`` instance, which this drops, or a filter's return value (a veto or a
+    replacement record), which :func:`_settled_reading` ignores."""
+    handler = logging.NullHandler()
+    _install_phi_filters(handler)
+    return tuple(f for f in handler.filters if isinstance(f, logging.Filter))
+
+
+#: The most handler passes :func:`_settled_reading` runs before it gives up on a line that is still
+#: changing (BACKLOG #3770); one that is still changing is read as unreadable rather than as any one
+#: pass's output. The cap is the only bound on the passes: the count has no limit of its own, and a
+#: run of quotes can add a pass per quote (review round-c0b0d12d measured a 59-character path that
+#: changed on 13 passes, which logs the placeholder). Review round-5454441c measured, over 6,000
+#: seeded paths of quote and label pieces, at most 8 passes that changed the line. A line stops at
+#: the first pass that changes nothing.
+_SHIPPED_READING_MAX_PASSES = 12
+
+#: The longest text :func:`redact_log_value` reads through the filters; it reads longer text as
+#: unreadable, so :func:`redacted_log_field` logs :data:`UNREADABLE_LOG_VALUE` (BACKLOG #3770).
+#: This bounds the work on the caller's thread: one field can run several readings, each of up to
+#: :data:`_SHIPPED_READING_MAX_PASSES` passes of the whole chain and as many again for the tab
+#: round. Review round-c0b0d12d measured one past-cap field near this bound at about 76 ms, against
+#: about 10 ms for main's three-handler line, on a loaded box. Blanking is safe because the
+#: placeholder carries none of the text. Never cut the text to the field bound before reading it
+#: instead: a quote that closes past the cut decides what the logged head hides. The value is set
+#: above the 5,000-character path ``tests/test_admin_new_ip.py`` pins as logging a cut form.
+LOG_FIELD_READ_MAX = 8192
+
+
+def _settled_reading(text: str, filters: tuple[logging.Filter, ...]) -> str | None:
+    """What a shipped handler writes for a record whose message is ``text`` once further handlers
+    change it no more, or ``None`` when it is still changing after
+    :data:`_SHIPPED_READING_MAX_PASSES` passes (BACKLOG #3770). Each handler runs the whole chain
+    over the one shared record, as on a configured logger, so the Nth sink writes what N passes
+    leave; a reading taken at a fixed count would hide less than a logger with more handlers, and
+    :func:`configure_logging` installs up to three. The settled line is what every later pass
+    leaves, so it does not depend on the handler count."""
+    record = logging.LogRecord(__name__, logging.WARNING, __file__, 0, "%s", (text,), None)
+    # The filters keep no state, so a first pass that leaves the text as it was already settles.
+    previous = text
+    for _ in range(_SHIPPED_READING_MAX_PASSES):
+        for log_filter in filters:
+            log_filter.filter(record)
+        out = record.getMessage()
+        if out == previous:
+            return out
+        previous = out
+    return None
+
+
+def _shipped_reading(line: str) -> str | None:
+    """``line`` as :func:`_settled_reading` reads it, then, when that holds a tab, read again with
+    each tab written as a space: a tab, which the control-character escape keeps, makes the
+    encoded-HL7-run pass of :func:`messagefoundry.redaction.redact` (its
+    ``_HL7_ENCODED_FIELD_RUN`` substitution) read the text as not printable and skip it; its other
+    passes still run (BACKLOG #3770). ``None`` when either reading did not settle."""
+    filters = _shipped_filters()
+    out = _settled_reading(line, filters)
+    if out is not None and "\t" in out:
+        out = _settled_reading(out.replace("\t", " "), filters)
+    return out
+
+
+def redact_log_value(text: str, *, before: str = "", after: str = "") -> str | None:
+    """``text`` as :func:`_shipped_reading` reads it in the line ``before`` + ``text`` + ``after``,
+    or ``None`` when that line's context did not survive, the reading did not settle within
+    :data:`_SHIPPED_READING_MAX_PASSES` passes, or ``text`` is longer than
+    :data:`LOG_FIELD_READ_MAX`, which is not read (BACKLOG #3770). It takes no ``checks``, so a
+    caller does not call it directly for a logged field: it calls :func:`redacted_log_field`.
+
+    The field's own escape hides its text from every handler, so this value is meant to carry what
+    the handlers would have hidden in that line. The filters are the ones
+    :func:`_install_phi_filters` installs, not a copy, and the context is kept because some passes
+    read past a value.
+
+    The value is what lies between ``before`` and ``after``, each found exactly at its end of the
+    result. When a pass rewrote either, the boundary is unknown, so this returns ``None`` rather
+    than a value that may carry the context's text; a caller logs a fixed placeholder then. A
+    control logs as its escape spelling and a tab as a space, so the value no longer tells either
+    from that text."""
+    if len(text) > LOG_FIELD_READ_MAX:
+        return None
+    out = _shipped_reading(before + text + after)
+    if out is None or len(out) < len(before) + len(after):
+        return None
+    if not (out.startswith(before) and out.endswith(after)):
+        return None
+    return out[len(before) : len(out) - len(after)]
+
+
+#: What :func:`redacted_log_field` logs when its value cannot be read apart from its context,
+#: escaped and bounded like any value, so it logs as ``"unreadable-redacted"`` at every limit of
+#: 19 or more; a limit of 16 to 18 gives a cut form, its first 0 to 2 characters and a checksum,
+#: and a limit under 16 gives ``"unloggable-ValueError"``. Spelled apart from the two
+#: placeholders, so it does not read as a credential or PHI redaction. The escape keeping a
+#: character does not stop a filter reading it, so what keeps this spelling whole is only that the
+#: shipped handlers leave it unchanged, which ``tests/test_admin_new_ip.py`` checks through two of
+#: them: a second handler that changes nothing leaves the line the same for every later one. A
+#: respelling needs that check again.
+UNREADABLE_LOG_VALUE = "unreadable-redacted"
+
+
+def redacted_log_field(
+    text: str,
+    limit: int,
+    *,
+    before: str = "",
+    after: str = "",
+    checks: tuple[tuple[str, str], ...] = (),
+) -> str:
+    """``text`` as one ``key="value"`` field value of a log line (BACKLOG #3770): ``text`` as
+    :func:`redact_log_value` reads it in the line ``before`` + ``text`` + ``after``, escaped and
+    bounded by :func:`~messagefoundry.controlchars.log_field_token`; or
+    :data:`UNREADABLE_LOG_VALUE`, escaped and bounded by ``limit``; or ``unloggable-`` and an
+    exception type when a reading or the bound raises, since a log argument must never raise. A
+    ``checks`` pair is read only to compare with, never logged, so its text never reaches the field.
+    The placeholders the passes write are kept as they are, not escaped, so a search for
+    ``<redacted>`` or ``[redacted]`` finds a value they wrote unless the bound cuts it off; a search
+    for redactions also needs :data:`UNREADABLE_LOG_VALUE`, which a limit under 19 cuts, and the
+    ``unloggable-`` spelling. Its hides-no-less-than-main tests cover only the call in
+    :func:`messagefoundry.auth.service._new_ip_path_field`, and no rule for what to pass in
+    ``before``, ``after`` and ``checks`` is stated beyond this one, which is necessary and not
+    enough: text from a request, a message, configuration or another field never goes in ``before``
+    or ``after``. What a caller passes there decides what the field hides, and empty or wrongly
+    spelled context can leave readable what the shipped filters would redact in the full line. A new
+    caller adds its own hides-no-less-than-main test, as tests/test_admin_new_ip.py does, before it
+    ships.
+
+    The reading is the one every later shipped handler leaves, not a fixed number of handler
+    passes, so the field hides what the last sink of a logger with any number of handlers would
+    have hidden; :func:`_settled_reading` gives up after a fixed number of passes, and a line still
+    changing then reads as unreadable.
+
+    Apart from a bound under 16, which gives ``unloggable-ValueError``, and a bound of 16 to 18,
+    which gives the cut form :data:`UNREADABLE_LOG_VALUE` states where that value is due, the field
+    is :data:`UNREADABLE_LOG_VALUE` at least when ``text`` is longer than
+    :data:`LOG_FIELD_READ_MAX`, when the reading of ``before`` + ``text`` + ``after`` does not keep
+    ``before`` and ``after`` whole at its ends, or when, for a
+    ``(head, tail)`` of ``checks``, the reading of ``head`` + ``text`` + ``tail`` does not read as
+    ``head``, the value, and the tail either as it was or as written alone; or when a reading
+    does not settle. This rule is stated here once for callers to link to.
+
+    For example (measured, each pinned in ``tests/test_admin_new_ip.py`` through the new-address
+    path field, whose check puts ``seen_ip=`` and the seen address after the path):
+
+    - a percent-encoded HL7 run, as ``/api/x a%7Cb%7Cc``, with a seen address that turns a pass
+      off for the whole line, as ``code=SECRETVALUE`` or ``10.0.0.1`` and a no-break space;
+    - a path ending in a credential label followed by ``:`` or ``=``, as ``/x/password:`` or
+      ``/x/password=``, or in the Bearer word, as ``/api/auth/bearer``;
+    - a path holding a no-break space or a credential shape, as ``/x code=SECRETVALUE``, with a
+      seen address holding an encoded HL7 run and a tab, as ``a%7Cb%7Cc``, a tab and ``x``;
+    - a path holding a credential matrix parameter, as ``/x;password=abc``, ``;token=``,
+      ``;secret=``, ``;id_token=`` or ``;access_token=``: the repeat line logs the label and the
+      placeholder, and the past-cap line logs :data:`UNREADABLE_LOG_VALUE` with ``10.0.0.1``,
+      ``2001:DB8:0:0:0:0:0:1`` and the hostile seen texts the tests name. Not with every seen
+      text: with ``||`` or ``a^b^c`` that line logs what the repeat line logs, the value still
+      replaced by the placeholder."""
+    try:
+        value = redact_log_value(text, before=before, after=after)
+        if value is None or not all(_reads_as(value, head, text, tail) for head, tail in checks):
+            return log_field_token(UNREADABLE_LOG_VALUE, limit)
+        return log_field_token(value, limit, literals=(CREDENTIAL_PLACEHOLDER, PHI_PLACEHOLDER))
+    except Exception as exc:  # noqa: BLE001 -- a log argument must never raise
+        name = type(exc).__name__
+        # Reported by type only, since the message and traceback may carry the value, and once per
+        # type, since a replayed request reaches this on every call.
+        if name not in _UNLOGGABLE_REPORTED:
+            _UNLOGGABLE_REPORTED.add(name)
+            logging.getLogger(__name__).error(
+                "a log field could not be redacted (%s); it logs as a placeholder", name
+            )
+        # No space or ":": a type name is an identifier, so this holds nothing that ends a field.
+        return f'"unloggable-{name}"'
+
+
+def _reads_as(value: str, head: str, text: str, tail: str) -> bool:
+    """Whether the line ``head`` + ``text`` + ``tail`` reads with ``value`` unchanged where ``text``
+    stood, then ``tail`` as it was or as the passes write it alone (BACKLOG #3770). The tail is read
+    alone only when the line is not exactly ``head``, ``value`` and ``tail``. A reading that did not
+    settle matches nothing."""
+    line = _shipped_reading(head + text + tail)
+    if line is None:
+        return False
+    if line == head + value + tail:
+        return True
+    alone = _shipped_reading(tail)
+    return alone is not None and line == head + value + alone
+
+
+#: The exception types :func:`redacted_log_field` has reported, so each is reported once.
+_UNLOGGABLE_REPORTED: set[str] = set()
 
 
 class CredentialQueryScrubFilter(logging.Filter):
