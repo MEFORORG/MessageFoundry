@@ -173,8 +173,9 @@ from messagefoundry.auth.service import (
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
-from messagefoundry.store.row_seal import RowSealError
+from messagefoundry.store.row_seal import RowSealError, TransitSealUnavailableError
 from messagefoundry.store.store import SessionRecord, UserRecord, VerifiedUser
+from messagefoundry.transports.http_listener import TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS
 
 _VALID_ROLE_IDS = {role.value for role in Role}
 
@@ -342,6 +343,16 @@ async def _refuse_if_self(
     raise HTTPException(status.HTTP_400_BAD_REQUEST, detail)
 
 
+def _seal_outage_503() -> HTTPException:
+    """The 503 an admin user read answers when Vault transit could not check a record's seal (ADR
+    0217, the Outage row): nothing was read, so retry once Vault answers."""
+    return HTTPException(
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+        str(TransitSealUnavailableError()),
+        headers={"Retry-After": str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)},
+    )
+
+
 async def _checked_user(service: AuthService, user_id: str) -> VerifiedUser:
     """The account an admin route reads, its record checked against its seal (BACKLOG #5520), or
     the route's refusal: 404 when no row is there, 423 when the row's record fails its check, with
@@ -352,6 +363,8 @@ async def _checked_user(service: AuthService, user_id: str) -> VerifiedUser:
         user = await service.checked_user(user_id)
     except UserSealRefused as exc:
         raise HTTPException(status.HTTP_423_LOCKED, str(exc)) from exc
+    except TransitSealUnavailableError as exc:
+        raise _seal_outage_503() from exc
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
     return user
@@ -1390,7 +1403,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         summaries: list[UserListEntry] = []
         # BACKLOG #5520: through the service's checked reader, roles included, which the seal
         # covers. An account whose record fails stays listed by id alone (IntegrityFailedUser).
-        for listed in await service.list_checked_users():
+        try:
+            checked = await service.list_checked_users()
+        except TransitSealUnavailableError as exc:
+            raise _seal_outage_503() from exc
+        for listed in checked:
             user = listed.user
             if user is None:
                 summaries.append(IntegrityFailedUser(id=listed.id, integrity_failed=True))

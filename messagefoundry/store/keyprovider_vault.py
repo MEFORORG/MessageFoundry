@@ -291,6 +291,16 @@ def is_vault_bad_request(exc: BaseException) -> bool:
     return isinstance(exc, InvalidRequest)
 
 
+def is_vault_forbidden(exc: BaseException) -> bool:
+    """Whether ``exc`` is Vault's HTTP 403, which hvac raises as ``Forbidden`` (ADR 0217: a token
+    may hold no capability on a retired Transit key). ``False`` without the ``[vault]`` extra."""
+    try:
+        from hvac.exceptions import Forbidden  # noqa: PLC0415
+    except ImportError:
+        return False
+    return isinstance(exc, Forbidden)
+
+
 #: The ``ssl`` errors that are a TLS session the peer closed, not a refusal of the hop (BACKLOG
 #: #3734). Named rather than imported, so this module adds no ``ssl`` use to the crypto inventory.
 _TLS_SESSION_DROPS = ("SSLEOFError", "SSLZeroReturnError")

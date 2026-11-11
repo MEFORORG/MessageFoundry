@@ -7,6 +7,9 @@
   design only, no code yet. Every answer below marked `CONTROL DECISION: yes` changes what a
   sign-in, a reconcile or a write refuses, pages or audits. *Owner rulings asked*, below, is the
   list the owner was asked at `94b485c2e1`, with the differences *Owner rulings* names.
+  **Build status, 2026-11-08:** "no code yet" above is superseded. Slice 1b-i is built on its
+  branch (the Transit sealer, its start probe and the SQLite seal seams); slices 1b-ii to 1b-iv
+  and 2 to 5 are not. The record of what is built is the code, not this line.
 - **Date:** 2026-11-05
 - **Related:** vault BACKLOG #4739 (this design), #2592 (its parent: identity and authorization
   row seals), #4350 and #6357 (the `vault_transit` seal gap; see *The duplicate question*), #3411
@@ -111,12 +114,141 @@ in this file, apart from this section, the status line and *Open findings carrie
    told of both.
 5. The retry paragraph: a sentence that `main`'s `revoke_all_sessions` already raises the global
    epoch first (#5091). It states `main` and changes nothing. The owner was not told.
+6. *The strict parse*: a sentence that a Transit MAC whose body does not re-encode to the same
+   text is Forged. It narrows what is well-formed, so a planted pad-bit variant of a genuine seal
+   is Forged with no Transit call. The owner ruled it on 2026-11-07 (below).
 
 Confirmed 2026-11-06 (UTC): the owner was asked about the five differences above, and about the
 carried findings below, and selected 'Confirm current text (Recommended)'. Record:
 https://github.com/MEFORORG/MessageFoundry/pull/2565#issuecomment-6682609779. Anchors: branch
 anchor/adr0217-owner-ruled-20261106 (94b485c2e1) and branch anchor/adr0217-owner-confirmed-20261106
 (ae898dc817).
+
+Difference 6 was added to the list after that confirmation. The five it confirmed are differences
+1 to 5; difference 6 rests on the owner's ruling of 2026-11-07, recorded next. Read "the five
+differences above" in the confirmation as differences 1 to 5 only. The 2026-11-07 rulings are
+anchored at branch `anchor/adr0217-build-rulings-20261107` (116049cb02), the commit that recorded
+them here.
+
+**Build rulings, 2026-11-07.** The owner answered three questions the slice 1 build raised, in the
+Manager's chat (`AskUserQuestion`), and the Manager relayed them to the build. No PR comment or
+anchor records them yet; this paragraph is the record in this file. (Note added 2026-11-09: that
+sentence was true when written. Since then the anchor branch named above,
+`anchor/adr0217-build-rulings-20261107` at 116049cb02, records them.)
+
+- **The strict parse:** "add the sentence" -- difference 6 above.
+- **The start probe:** it also makes a fixed-input `transit/verify`, so a token without the verify
+  grant on the audit key is refused at start, not at the first request.
+- **A session sealed under a retired key:** the store's write check reports it as its own type,
+  `RowSealKeyRetiredError`, not `RowSealError`, found in the one check with no further Transit
+  call. Asked where the quiet end happens, the owner selected **"Quiet end at callers"**: the
+  store raises the type, and the four `AuthService` session sites (`_sealed_stamp`,
+  `rotate_session`, `revoke_other_sessions`, `revoke_every_session`) and the store's
+  `_keep_or_end_session` end the session quietly with `key_changed=True`, built with the catch
+  census on all three backends together. Until then the SQLite session writer turns the type back
+  into `RowSealError`, as `main` raises. In that list, `rotate_session` names the rotation site in
+  `AuthService`, `_rotate_session_hash`, which calls the store's `rotate_session`. A session
+  under a retired key rarely reaches that call: `_rotate_session_hash` loads the session first,
+  and the loader already ends such a session quietly. The store's type reaches the rotation only
+  when the row changes between the load and the re-key. The 1b-iv catch census decides whether
+  that site needs a handler of its own.
+
+**Build rulings, 2026-11-08.** The owner answered two more questions from slice 1b-i, again in the
+Manager's chat (`AskUserQuestion`), relayed to the build.
+
+- **Amendment to the Outage answer, at a session rotation: "Revoke both".** A Transit Outage at a
+  rotation, in the session load or the store's re-key, revokes the session under its old hash and
+  its new one, as BACKLOG #3023 does for a store refusal. This is an exception to the Outage row's
+  "end nothing" in *The four answers, defined once*; that row's text is unchanged.
+- **The session loader's retired-key lookup: "Revoke, then report".** When the lookup that tells a
+  retired-key session apart raises under Transit, the row is ended first and then reported as an
+  integrity failure (`key_changed=False`), never left live.
+
+Two notes on the 2026-11-08 rulings as built, added 2026-11-09. "Revoke both" names two hashes,
+but at the session load no new hash exists yet, so there only the old hash is revoked; at the
+re-key both are. On the elevation path the first load is the lapse check in `_elevated_hash`, and
+the Outage is caught there. Every revoke under either ruling is best effort: a revoke the store
+refuses is logged and leaves the row live until it lapses, so "never left live" holds only when
+the revoke lands. A rotation refused by an Outage is audited as `auth.session_rotation_failed`
+with reason `transit_unavailable`, not `store_error`.
+
+A correction to that note, added 2026-11-09: "the first load is the lapse check" means the first
+load after the ceremony's stamp. The route's own session check, and the stamp write's check, run
+through Transit before `_elevated_hash` does; an Outage there refuses the request and writes no
+stamp, so nothing is left elevated. The lapse check also reads the account record, and an Outage
+on that check revokes the session too, though the session's own seal held.
+
+A second correction, added 2026-11-09, which RETRACTS the two notes above where they disagree:
+the lapse check is NOT always the first Transit call after a stamp lands, and an Outage before it
+is NOT always harmless. A review that day found Transit calls between a committed stamp and
+`_elevated_hash` in at least `verify_mfa` (its second stamp and `record_login_success`), the
+passkey assertion (`record_login_success`), and `reauth` and the federated re-auth callback (the
+factor-binding check). An Outage at any of them escapes as a 500 and leaves the stamped old hash
+live and unrotated. "Revoke both" as built covers the lapse check and the rotation only; whether
+it should cover the whole window from the first stamp to the rotation is an open question for the
+owner. Separately, the sentence above that says "the SQLite session writer turns the type back
+into `RowSealError`" is out of date: since slice 1b-ii every backend's session writer does, through
+`session_writer_seal_check`.
+
+**The stamp-to-rotation window, decided 2026-11-09 (decisions d20261109T165402853-83b348 and
+d20261109T165406730-2505f2).** The open question above is answered by the Manager under the
+Owner's standing instruction of 2026-10-22, widening "Revoke both" (Q1) to the whole window from
+the stamp to the rotation. The adversarial review split only on whose call it was, and the guard
+is strictly safer. This supersedes the Outage row's "end nothing" in *The four answers, defined
+once* for this window only; that row's text is unchanged. It is the **Owner's open reversal
+point**: the Owner may reverse it, and until then it stands. One guard,
+`AuthService._stamp_to_rotation`, is armed when a `_sealed_stamp` lands and closed when
+`_elevated_hash` begins. On a refusal `_rotation_store_errors()` names, raised between the two, it
+revokes the stamped old hash, best effort, writes `auth.session_rotation_failed` with Q1's
+`reason` and `revokes_landed`, and the ceremony answers `session_lost`. It covers at least the
+second stamp and `record_login_success` in `verify_mfa`, the passkey assertion, the factor-binding
+check in `reauth` and in the federated re-auth callback, and the audit row written after the
+stamp. The `_load_user` arm before the federated callback's stamp is unchanged. A refusal before
+any stamp lands still refuses the request with nothing elevated. **Limit:** on a `vault_transit`
+store a Transit Outage at that audit row raises `CipherError` from the audit-chain MAC, which
+`_rotation_store_errors()` does not take, so there the guard fires only on a store refusal of the
+audit write.
+
+**The window takes any exception, decided 2026-11-09 (decision d20261109T200352805-599b24, item
+1).** This closes the Limit above. Once the guard is armed, any exception before the rotation
+revokes the stamped hash, run to completion through a cancel as `_write_through_cancellation`
+runs a refused sign-in's rows. Two kinds are answered: a refusal `_rotation_store_errors()` names,
+and the `CipherError` of the window's own success audit row (`auth.mfa_verified`,
+`auth.webauthn_verified`), recorded with reason `audit_refused`. For those the ceremony answers
+`session_lost` and the exception is suppressed. Every other exception is re-raised after the
+revoke, at least Forged, Unverifiable, any other `CipherError`, a cancel and a code defect.
+
+**A lost step-up's `auth.reauth` row (decision d20261109T200352805-599b24, item 3).** In `reauth`
+and the federated re-auth callback, the ceremony writes its `auth.reauth` row softly, through
+`audit_write_errors()`, only when the window answered `session_lost`. The outage that ended the
+session would otherwise refuse that row's audit MAC and turn the answer into a 500. Every other
+`auth.reauth` row is written as before. When the factor-binding check never ran, the row's
+`grant_refused` is null.
+
+**A step-up lost at the rotation writes its row softly too, decided 2026-11-10 (decision
+d20261110T004916856-814db8, Q1).** The window closes before the re-key, so a Transit Outage at the
+lapse check or the re-key is answered `session_lost` by `_elevated_hash`, not by the window, and
+item 3's soft write did not cover it. `_StampWindow.rotation_lost` is set when that lapse check or
+re-key answers `session_lost`, and `reauth` and the federated re-auth callback write their
+`auth.reauth` row softly on `lost` or `rotation_lost`. The flag is the rotation's own and is not
+`Elevation.session_lost`: a failed re-proof that spends the session's budget sets that too, and
+its row stays hard. `auth.login_after_failures` stays hard (decision d20261110T004922661-14430e).
+
+**An Unverifiable answer at the rotation revokes the stamped hash, decided 2026-11-10 (decision
+d20261110T004916856-814db8, Q3).** It arrives after the window has closed, so the window does not
+revoke for it. `_rotate_session_hash` now does: `TransitSealUnverifiableError` at the load, or
+`RowSealUnverifiableError` at the re-key's write check, revokes the old hash, best effort and
+shielded from a cancel as the window's revoke is, then propagates. The re-key wrote nothing, so
+there is no new hash to revoke.
+
+**The window is armed before the first stamp's write, decided 2026-11-10 (decision
+d20261110T004920629-fb8ff6, Q4).** This replaces "armed when a `_sealed_stamp` lands" above. A
+stamp write whose commit landed and that then raised, a connection dropped before the commit's
+acknowledgement for example, is ambiguous, so `_sealed_stamp` now arms the window before the
+write runs, and any exception the write raises reaches the armed window. It may revoke a session
+whose stamp never landed; the decision accepts that cost, which is availability only. A Forged or
+retired-key refusal of the stamp is still handled inside `_sealed_stamp` and ends the session
+there.
 
 ## Context
 
@@ -158,6 +290,15 @@ give, or freeze a revocation a failed seal would not**. That is the test each an
 | **Unverifiable** | `verify` HTTP 400, and the fixed-input key probe (`hmac` over a constant) then answers with a well-formed MAC, whatever version it names | `TransitSealUnverifiableError` | deny the row, with three limits: it never tombstones or raw-deletes a user, role, map or approval where Forged would (ending a session is allowed, since signing in replaces it); the AD maps follow (b) and (d); a write that keeps the row's stored values is refused, while an operator's explicit delete of the row, full replacement of it (a map's only with `replace_unverifiable`, (d)), or Reject of a pending approval (below), which keep none of its values, is allowed and audited | `integrity.authority_seal_unverifiable` | `authority-seal-transit-unverifiable:<kind>:<ref>:<digest suffix>` (*A ref is for reading*), capped; the two Unverifiable AD map subjects, fixed names with no ref or suffix, are exempt from the cap |
 | **Outage** | any other `verify` failure (network, timeout, 5xx, 403, malformed reply), or a 400 the probe cannot clear; except that a 400 or 403 on a seal naming a retired key, while the active key's probe works, is Unverifiable (*The key id, and a retired key*) | `TransitSealUnavailableError` | refuse the request or roll back the write; end nothing, except that (c) ends an account's sessions after a refused narrowing write; record no seal failure | none for the row; the refused request itself is audited where the audit append still works (many outages, such as a 403 on `verify` alone or a timeout, leave it working), a refused sign-in as `auth.login_refused_unavailable`, (e); a throttled ERROR log line is the record only when the append fails too | `authority-seal-transit` |
 
+A correction, added 2026-11-11: the Outage row's "the refused request itself is audited where the
+audit append still works" does not hold for a request the approval gate refuses on an Outage, which
+writes no row; that path and two others are named in *Open audit gaps, a correction added
+2026-11-11*, in (c).
+
+A correction, added 2026-11-11: the Unverifiable row's audit action and page do not hold on at
+least gaps (1), (2), (5) and (6) of *Open audit gaps, a correction added 2026-11-11*, and its
+extension, in (c).
+
 **The seal input is a fixed-length digest.** The sealer sends Transit not the row's encoding but its
 SHA-256: `seal = Transit hmac(SHA-256(label || store id || seal_bytes(kind, fields)))`, each part
 length-prefixed as today. So every `hmac` and `verify` call carries 32 bytes whatever the row
@@ -173,7 +314,8 @@ so out of any Transit error text a chained exception carries (item 12).
 **The strict parse.** A stored seal is well-formed only when it is `mfseal:v1:<key id>:` then
 `vault:v<N>:` with `N` of 1 to 10 digits and no leading zero, then base64 that decodes **strictly**
 (`validate=True`) to exactly the SHA-256 digest length. Anything else is Forged with no Transit
-call, so no malformed body reaches Transit to draw a 400.
+call, so no malformed body reaches Transit to draw a 400. A Transit MAC whose body does not
+re-encode to the same text is Forged (owner ruling 2026-11-07).
 
 **The key id, and a retired key.** `<key id>` is `row_seal_key_id` of the SHA-256 of the Transit
 mount and the audit key's name, which is not secret. A seal naming another key id is checked as the
@@ -212,8 +354,10 @@ probe (item 3.r6). The sign-in path checks a user row past both caches, (e) says
 skips the audit row or the throttled page a refusal writes.
 
 **The probe rule differs from the audit chain's.** The audit chain reads a 400 as a version
-refusal only when the probe names a different version (`crypto_transit._refuses_only_version` on
-`main`). A row seal reads **any** 400 with a working probe as Unverifiable, whatever version the
+refusal only when the probe answers with a string that does not start with `vault:v<pinned>:`, so
+an empty answer or one naming no version passes too (`crypto_transit._refuses_only_version` on
+`main`). That 400 need not be Transit's own: a proxy can author it (corrected 2026-11-11, BACKLOG
+#6707). A row seal reads **any** 400 with a working probe as Unverifiable, whatever version the
 probe names. A planted seal naming the latest version, checked on a lagging node while the probe
 reaches a caught-up one, would otherwise read as an Outage: a 503 that ends nothing and writes no
 integrity record, the loosening (a) rejects. Item 3.6's shared helper returns the probe's answer and
@@ -235,6 +379,25 @@ never the whole hash, everywhere: log line, audit detail, alert subject, excepti
 which a database writer chooses, so it is scrubbed of control characters and bounded with
 `main`'s one rule for shortening an alert subject (`shorten_with_checksum`) before it reaches a
 subject, a reason or an exception. No other field of a row ever does.
+
+A correction, added 2026-11-11: "bounded with `main`'s one rule for shortening an alert subject
+(`shorten_with_checksum`) before it reaches a subject, a reason or an exception" does not hold for
+the reasons of at least two reporters this build adds, `AuthService._user_seal_unverifiable` in
+`auth/service.py` and `ApprovalGate._approval_seal_unverifiable` in `api/approvals.py`. Each embeds
+the stored id through `scrub_log_argument`, which escapes control characters and bounds nothing,
+so its reason, and the WARNING line that logs that reason, carries the id at whatever length a
+database writer stored it. Their Unverifiable page subjects are bounded: `SealPager.unverifiable`
+builds each through `unverifiable_subject`, and so through `seal_row_ref`. The approval reporter
+reaches at least one subject that is not: it hands the same unbounded id to `_record_audit_soft`,
+so a failed audit write pages `audit_write_failed` under `approval:<id>` and logs the id in its
+ERROR line. The next paragraph's "every throttle and the unverifiable-row cap are keyed by the
+SHA-256 of the kind and the **whole** stored id" does not hold for their throttles either: each
+`SealFailureThrottle` keeps its keys as given, and the user reporter's key is
+`unverifiable:user:<stored id>`, the approval reporter's the stored id itself. The Forged reports
+this build's reads reach have the unbounded reason too, at least `_user_seal_failed`, whose reason
+carries the stored id unscrubbed, and `ApprovalGate._approval_seal_failed`. All of these are named
+here for filing on vault BACKLOG #8202. The claim holds for at least the revoke report:
+`RevokeSealOutcome._entry` in `store/store.py` names a row in its reason by `seal_row_ref`.
 
 **A ref is for reading, never a key.** A 12-character prefix and a shortened id both collide, and a
 database writer who can read a genuine row can plant one that shares its ref. So every throttle and
@@ -270,6 +433,30 @@ call per refused check stays (see item 3).
 - **Control kept:** an unverifiable row never grants, never keeps a session, and is always
   audited and paged as an integrity event. A planted unheld version is never downgraded to a
   retryable 503 that ends nothing and records nothing.
+- **A correction, added 2026-11-11:** "always audited and paged" does not hold on at least three
+  open paths, each failing closed; *Open audit gaps, a correction added 2026-11-11*, in (c), names
+  them.
+- **A correction, added 2026-11-11:** "A planted unheld version is never downgraded to a retryable
+  503 that ends nothing and records nothing" does not hold on at least the approve claim and
+  `_decide_or_503`, gaps (2) and (6) of *Open audit gaps, a correction added 2026-11-11*, and its
+  extension, in (c).
+- **A correction, added 2026-11-11:** "the audit row and the page carry `stored_version` [...] and
+  `probe_version`" and "The recovery text tells the operator, in this order" do not hold for the
+  pages of at least two reporters this build adds. `AuthService._user_seal_unverifiable` in
+  `auth/service.py`, which every read through `_checked_by_id` reaches (at least the admin user
+  reads and every `_load_users` scan, start-up's passkey rehash and the directory reconcile pass
+  among them), and `ApprovalGate._approval_seal_unverifiable` in `api/approvals.py` each write
+  both integers into their `integrity.authority_seal_unverifiable` audit detail, but their page
+  reason, which is also their WARNING line, carries neither. Neither reason states the recovery
+  order. The user reporter's gives only its middle step, to check that Vault is healthy and that
+  every node holds the audit key's latest version and then retry. It does not say the seal may be
+  planted, or that a row that still does not verify is re-created from an authoritative source.
+  The approval reporter's gives none of the order. (c) item 4's "gives the recovery text from (a)"
+  does not hold for these two pages either. The revoke report's Unverifiable page, built by
+  `RevokeSealOutcome._entry` in `store/store.py`, carries neither integer and no recovery order
+  either. All three are named here for filing on vault BACKLOG #8202. The claim holds for at least
+  `AuthService._report_unverifiable_reconcile_map`, whose page and WARNING carry both integers and
+  the recovery order.
 - **Failure accepted:** a genuine seal checked against a node that lags a key rotation is denied
   for the length of the lag: a session so checked is ended, and its user signs in again (on a node
   that has caught up); a write so refused is retried by its caller; an approval is denied, never
@@ -466,6 +653,190 @@ repetition left to the sink's re-alert throttle, as for the map page.
 the revoked session rows revives them once the user row verifies. That is a rollback of store
 state, the class #2592 step 7 owns, and it needs the write access the seals assume an attacker has.
 
+**The interim step, built before the owed raise (decisions d20261109T165402853-83b348 and
+d20261109T165406730-2505f2, 2026-11-09).** `session_epoch_owed` and its retry task stay unbuilt.
+Until they land, `_bump_session_epoch` on all three backends, and so every account's raise in the
+`revoke_all_sessions` loop, catches each refusal by its own class: `RowSealError` (Forged),
+`RowSealUnverifiableError` and `TransitSealUnverifiableError` (Unverifiable), and
+`TransitSealUnavailableError` (Outage). It logs the class name, pages `authority-seal-transit` on
+an Outage, and returns no raised epoch, so the transaction still marks every session revoked, as
+`main` already did for a Forged row. A Transit refusal (Unverifiable or Outage) of the kept
+session's re-stamp in `_write_session` declines it, so `_keep_or_end_session` ends that session
+with the rest. A Forged kept session still raises, as on `main`. Until the owed raise is built, an
+account whose raise went without has no raised epoch, so the residual the owed row closes (a
+restored earlier copy of a revoked session row) stays open for that account on a per-account
+revoke; `revoke_all_sessions` still raises the global session epoch first, with no seal.
+
+**After the first Outage, a revoke stops calling Transit (decision d20261109T200352805-599b24,
+item 2).** Without this, an Outage left each account in a revoke-all to wait out its own Transit
+timeout inside one writer transaction. On all three backends, the first
+`TransitSealUnavailableError` a revoke meets now trips it. Every later account goes without its
+epoch raise and makes no Transit call, every session is still marked revoked, and the count of
+skipped accounts is logged. The kept session's re-stamp is skipped on that Outage only, so the
+session is ended with the rest. A Forged or Unverifiable answer does not trip it: the accounts
+after it still call Transit, and a Forged account's kept session still runs its seal check.
+
+**Each store pages through its own hook (decision d20261109T200352805-599b24, item 5).** The
+decision reads: *"Replace the process-global page with a per-store hook that follows the
+`set_refusal_hook` plumbing and never raises. Register it before `_record_a_restore`. Make sure
+the admin-revoke-sessions CLI and a bare Engine page too. One lifespan's teardown must not silence
+another's page."* Each of the three backends holds a `SealPager` (`store/row_seal.py`), reached
+through `seal_pager()`. Its `arm` registers a hook and returns a disarm that removes that
+registration only, and the newest live registration takes each page, so neither an engine's stop
+nor a lifespan's teardown clears a hook another armed, in either order. The serve lifespan arms it
+on the authority-seal sink before the start probe and `_record_a_restore`; `Engine.start` arms its
+own on the engine's sink, or the logging sink, so an engine started without that lifespan pages,
+and `Engine.stop` removes it; `admin-revoke-sessions` arms the logging sink, `serve`'s fallback,
+since the CLI holds no notifier. A hook that raises is logged at WARNING and the revoke goes on.
+
+**A revoke audits and pages each seal refusal it went ahead without (decision
+d20261109T200352805-599b24, item 4).** The decision reads: *"During a revoke, an Unverifiable
+answer writes `integrity.authority_seal_unverifiable` and a Forged answer writes
+`integrity.authority_seal_failed`. Each pages with the ADR's capped subject. Write the row after
+the revoke commits, or softly, and never inside the writer transaction."* On all three backends a
+revoke, the restore's revoke on SQLite included, holds each Forged or Unverifiable answer of an
+account's epoch raise, and each Unverifiable answer of the kept session's re-stamp, and once its
+transaction has committed writes the row through the store's own `record_audit`, softly, then
+pages: Unverifiable under `authority-seal-transit-unverifiable:<kind>:<ref>:<digest suffix>`,
+capped per store at `MAX_SUBJECT_ALERTS` distinct rows per window and then `:*`; Forged under
+`AUTHORITY_SEAL_SUBJECT`, as the table above gives it. The row names the kind, `during: revoke`,
+an account by its whole stored id (`user_id`, as `main`'s own seal-failure rows name one) or a
+session by its 12-character ref (`session`), and for Unverifiable the two triage integers; never a
+token hash.
+A refused row is logged at ERROR and the page still goes. An Outage is still paged at once and is
+not audited, as the table says.
+
+**A revoke's Outage page goes after the commit, decided 2026-11-10 (decision
+d20261110T004916856-814db8, Q5).** This replaces "paged at once" in the paragraph above.
+`RevokeSealOutcome` holds the Outage, as it holds the other answers, and `report` pages
+`authority-seal-transit` once the revoke has committed, with the text that says the revoke went
+ahead. Each revoke runs its transaction inside `RevokeSealOutcome.committing`, on all three
+backends: if the transaction raises, a held Outage is paged with its own text, that the revoke
+failed before its commit was confirmed and its sessions may not have been ended, and the error
+propagates. That text does not say the revoke rolled back, because an error after a commit landed
+reaches it too. The Outage is still not audited.
+
+**What the branch built after the text above, recorded 2026-11-10 (decisions
+d20261110T042322305-2ffc60 and d20261110T063908944-857965).** Each item says which earlier sentence
+it supersedes, and only where it disagrees; the earlier text is kept as it was.
+
+- **The two enrolment ceremonies arm the stamp window.** `confirm_mfa_enrollment` and
+  `finish_webauthn_registration` run their stamp and rotation inside `_stamp_to_rotation`, as the
+  other four elevation sites do, so a refusal of the enrolment's stamp revokes the stamped hash and
+  answers `session_lost`, and MFA stays off. A registration whose window or rotation was lost
+  writes its `auth.webauthn_enrolled` row softly, as Q1 does for `auth.reauth`. This adds to the
+  window paragraph's "It covers at least ...", which named no enrolment.
+- **An Unverifiable answer at the rotation step writes a row.** At the lapse check,
+  `_elevated_hash` now revokes the stamped hash itself, shielded, after closing the window so the
+  window does not revoke it again; at the rotation's load or re-key, `_rotate_session_hash`
+  revokes it as Q3 says. Either way `auth.session_rotation_failed` is written softly with reason
+  `transit_unverifiable` and `revokes_landed`, and then the answer propagates. This supersedes
+  Q3's "revokes the old hash, best effort and shielded from a cancel as the window's revoke is,
+  then propagates", which wrote no row, and, for an Unverifiable answer at the lapse check only,
+  item 1's "Every other exception is re-raised after the revoke, at least Forged, Unverifiable".
+- **A failed revoke reports its Forged and Unverifiable refusals, not only an Outage.** When a
+  revoke's transaction raises, `RevokeSealOutcome.committing` logs, audits softly and pages every
+  held refusal, with text saying the revoke failed before its commit was confirmed and its sessions
+  may not have been ended; the audit detail carries `committed: false`. This supersedes Q5's "if
+  the transaction raises, a held Outage is paged with its own text", and item 4's "once its
+  transaction has committed writes the row", which held for a committed revoke only. On a clean
+  exit `committing` itself runs the report, so no path between the commit and a later call can
+  skip it; an exit by an exception that cannot await (an interpreter exit, a `GeneratorExit`)
+  writes the log lines and the pages and an ERROR line for the audit rows it could not write.
+- **A retried revoke reports each refusal once.** `AuthService`'s three callers that retry a
+  failed revoke (`_revoke_after_commit`, `revoke_other_sessions`, `revoke_every_session`) open a
+  `deferred_revoke_reports` scope. A failed attempt's report is held for the scope; an attempt that
+  commits reports its own refusals with the committed wording and drops them from the held ones, so
+  the last page an operator sees for a row is accurate. What only a failed attempt met is reported
+  when the scope ends, as failed, or with `retry_committed: true` and text saying a retry then
+  committed.
+- **Correction, recorded 2026-11-10: "A retried revoke reports each refusal once" is false.** Only
+  an attempt that commits deduplicates: `_RevokeCarry.covered_by` drops from the held attempts what
+  the committing attempt reports. The held attempts are not deduplicated against each other, and
+  `_RevokeCarry._report` reports every held failed attempt in full. So a refusal that only failed
+  attempts met is audited, logged and paged once per failed attempt that met it: up to
+  `_POST_COMMIT_REVOKE_ATTEMPTS` (3) times from `_revoke_after_commit`, and up to twice from
+  `revoke_other_sessions` and `revoke_every_session`, which retry once. A refusal that an attempt
+  which committed also met is reported once, by that attempt.
+- **The AD-map piece of slice 3 is built (owner ruling 2026-11-10, in session: *"Hold, build AD-map
+  piece"*).** Before it, an Unverifiable or Outage answer on an AD map raised out of
+  `reconcile_directory_sessions`; the reconcile loop in `api/app.py` logged "pass failed" and the
+  pass revoked nothing, offboardings included. Now `AuthService._reconcile_ad_map` catches both
+  answers on either map. Each pass that meets one logs a WARNING and writes a soft audit row:
+  `integrity.authority_seal_unverifiable` with reason `directory_map_unverifiable`, its detail
+  carrying the kind `adset`, the map's name, `during: reconcile`, and (a)'s `stored_version` and
+  `probe_version`; or, for an Outage, the row the next bullet gives. The pass then pages through the
+  store's own `SealPager`. An Unverifiable map pages under
+  `authority-seal-transit-unverifiable:adset:<map name>`, with (a)'s two integers and recovery
+  order in the text; the pager applies no cap or throttle to it, and repetition is left to the
+  sink's own per-subject re-alert throttle. An Outage pages under the shared
+  `authority-seal-transit`, which revoke Outages page under too, so that throttle can hold a map's
+  Outage page behind theirs. Both texts are written before the pass is planned, so they say what
+  the pass plans to end, never what it ended; a tripped pass ends nothing. The pass reads that map
+  as empty and plans as `main` plans on a Forged map, under the same
+  breaker. This is step 1 of (b): the holders that empty role map would demote, and the accounts an
+  empty scope map would withdraw from, lose their sessions, and a trip applies nothing. No role is
+  written from that pass, and each `auth.ad_session_revoked` row carries `map_unverified: true` and
+  no `roles`.
+- **A map row's Outage writes a best-effort `auth.*` row, amending the four-answers table for this
+  case (decision d20261110T181645742-b9eccb).** The table's Outage row says "none for the row" and
+  "record no seal failure". For an AD map read by a reconcile pass, the build writes
+  `auth.ad_reconcile_map_unavailable` with reason `map_seal_unavailable`, its detail the kind
+  `adset`, the map's name and `during: reconcile`. It is an `auth.*` action, not `integrity.*`, and
+  it records no seal failure. Its reason is not `seal_unavailable`, which (b) reserves for the
+  Vault-wide abort. The row is best-effort: it is written softly, and on `vault_transit` the audit
+  chain's MAC itself goes through Transit, so during the Outage it reports may be written by
+  nothing; the WARNING line and the page are then the record. Other Outages keep the table's row,
+  with at least the exceptions the 2026-11-08 rulings above make: an Outage that refuses a
+  rotation revokes the session, and under "Revoke, then report" an Outage in the session loader's
+  retired-key lookup ends the session and reports it as an integrity failure
+  (`integrity.authority_seal_failed`, `key_changed=False`).
+- **What that ruling leaves unbuilt, filed under vault #8202.** At least: step 2 (the groups-moved
+  set and its sealed group digest); the Forged map's change from `main`; the sealed empty map; a
+  failing user row's probing for revocation, and an Unverifiable user row read by `_load_user`,
+  which still raises out of the pass; the Vault-wide `seal_unavailable` abort and its
+  `seal_clear`; and a pass where a map did not hold still confirming accounts. An Outage on a map row
+  takes step 1 here, where (b) gives it step 2 alone. (b) says a single timed-out call must not sign
+  out every role holder, and below the brake's thresholds this build lets one do that. With no
+  step 2 built, the only alternative was the old behaviour, which revoked nothing.
+  **A correction, added 2026-11-11:** this bullet read "an Unverifiable user row read by
+  `_load_user` or `_load_users`, which still raises out of the pass". `_load_users` reads every
+  account through `list_checked_users` and `_checked_by_id`, and since this build's admin user read
+  change (commit 67c274348b on PR 2860) `_checked_by_id` catches an Unverifiable answer, reports it
+  with `_user_seal_unverifiable` and lists the row as failed, which `_load_users` drops. The pass
+  then reads that account as one that left its candidates: it neither probes it nor revokes its
+  sessions, and the ledger prunes discard its reconcile state, its strikes among it, so an account
+  that reads Unverifiable on a pass loses its progress toward a revocation. Its effect reaches past
+  that account: `_forfeit_clears_on_attrition` reads it as an account that left, so a breaker,
+  hold or referral clear it stood behind is forfeited, and where its outcome was the only
+  undetermined one left, the pass releases the ADR 0195 hold latch. A Vault transit Outage on any
+  account's row still raises out of `_load_users`, and so out of the pass. At least two later
+  reads still raise on an Unverifiable row: `_load_user`, in the re-read of each account its probe
+  found present and in `_apply_reconcile_revocation`, and `_load_user_by_username` in the rename
+  step. The rename step runs after the revocations are applied, so a raise there ends a pass that
+  has already ended sessions, before the rest of its renames and its bookkeeping and alerts run.
+  The rename step's read and the dropped account's lost state are named here for filing on vault
+  #8202.
+- **The held `refused()` log.** `RevokeSealOutcome.refused` no longer logs at refusal time, inside
+  the writer transaction. Its line is held and written once the outcome is known, with the
+  committed or the failed wording, as the skipped-raise count is, which is logged after a commit
+  only. Item 2's "the count of skipped accounts is logged" said nothing of when.
+- **A report that fails is raised.** A failure of the report after a commit is logged at ERROR
+  with its class, its traceback at DEBUG only, and re-raised; a report task that ends cancelled is
+  logged too. A failing revoke's own report never raises, so the revoke's exception stands.
+
+**Slice 1b-iv builds the quiet end at the callers (build ruling 3 of 2026-11-07).** Every
+backend's session writer now raises `RowSealKeyRetiredError` itself, writing nothing. The store's
+`write_kept_session`, which `_keep_or_end_session` runs on all three backends, reads it as
+declined, so the kept session is ended and counted with the rest, with an INFO line and no audit
+row or page. `AuthService._sealed_stamp` and `_rotate_session_hash` end it through
+`_session_seal_failed(..., key_changed=True)`, as the loader does, and the stamp still reads as
+refused, so no success is recorded. The census answers the ruling's open question: the rotation
+site needs its own handler, since without one the type escapes it as an error.
+`revoke_other_sessions` and `revoke_every_session` need none, because the store's revoke no longer
+raises the type. The census covered at least the three store backends and `auth/`, not the API
+routes or the CLI. Within it, no other catch site was found to fail open, so no other site changed.
+
 **Other legs that read a map** decide access and write nothing: at least the client-certificate
 identity (`identity_for_cert_user_id`), the step-up role test (`_directory_roles_lost`) and the
 enrolment and re-bind legs. On the step-up, enrolment and re-bind legs an Unverifiable map takes
@@ -622,6 +993,20 @@ session, approval, on SQLite, PostgreSQL and SQL Server):
    test drives each type through each named path and asserts the audit row, and a new path is added
    to that list by the slice that adds it. In a process with no alert sink, such as the CLI, the
    audit row is written and the page is not; the engine pages the row when it next reads it.
+   **A correction, added 2026-11-11:** "the CLI maps the typed error to its own refusal text and
+   exit code, never to the CLI's defect report" does not hold at this head:
+   `messagefoundry/__main__.py` and `cli_common.py` catch neither `TransitSealUnverifiableError`
+   nor `TransitSealUnavailableError`. For `provision-admin` the service now answers the
+   Unverifiable case itself. `AuthService._unverifiable_account_held`, asked by both
+   `provision_refusal` and `provision_first_administrator` before any account write, refuses
+   while any account reads Unverifiable, the named one included, since such a record's roles are
+   part of what its seal covers. The command then ends in its own refusal text and exit code,
+   having changed no account (its scan may write `integrity.authority_seal_unverifiable` audit
+   rows, as the seal-failure throttle allows);
+   `tests/test_provision_admin_unverifiable_administrator.py::test_an_unverifiable_administrator_refuses_provision_before_any_write`
+   pins that. At least two cases still reach the CLI's defect report: a Vault transit Outage on any
+   account, and an account that first reads Unverifiable after that check, at the grant's guard
+   (`admin_guard_counts`). Both are named here for filing on vault BACKLOG #8202.
 4. **Wording follows the cause.** An unverifiable refusal never says "forged" or "does not
    verify"; it says Vault transit could not verify the seal, and gives the recovery text from (a).
    An Outage says the seal "could not be made or checked through Vault transit", never that Vault
@@ -632,6 +1017,67 @@ session, approval, on SQLite, PostgreSQL and SQL Server):
   alert sink is wired; neither cause's
   reports throttle the other's, on the same row or across rows; a refusal reached from a CLI is
   still a refusal, and still audited.
+- **Open audit gaps, a correction added 2026-11-11.** The *Control kept* above, (a)'s "always
+  audited and paged", the Outage row's "the refused request itself is audited" in *The four
+  answers, defined once*, and *Consequences*' "Each refusal is audited under its true cause" do not
+  hold on at least three paths. Each is open and filed on vault BACKLOG #8202, and each fails
+  closed: the request is refused. (1) The last-administrator guard: `admin_guard_counts` and
+  `user_seal_ok_async` in `store/store.py` have no Transit catch, so an Unverifiable or Outage
+  answer on another administrator's row is a 500, with no audit row and no page. (2) The approve
+  claim: an Unverifiable answer there goes to `ApprovalGate._store_fault`, which answers 503 and
+  pages `audit_write_failed`; no `integrity.authority_seal_unverifiable` row is written. (3) A
+  request refused by an Outage at `ApprovalGate._verified`: `_approval_seal_outage` pages and
+  writes no row. The owner ruled on 2026-11-11, in the Lander's session, that this ADR names them
+  as open and the build merges with them filed: "do it"
+  (https://github.com/MEFORORG/MessageFoundry/pull/2860#issuecomment-6785384065).
+- **Open audit gaps, extended 2026-11-11.** The three paths above are not the whole list. At least
+  these are open too, named here for filing on vault BACKLOG #8202, and each fails closed. (4) A
+  disable reads every account: `update_user` asks `is_last_enabled_admin`, which reads every
+  account through `_load_users`, so an Outage on any account's row, not only another
+  administrator's, refuses the disable with a 500 and no audit row, though the Outage is paged; an
+  Unverifiable row there counts as no enabled administrator, which can refuse a disable as the last
+  administrator's but never allow one. (5) Rejecting an Unverifiable pending approval takes the
+  Forged path, `_reject_seal_failed`, whose store write meets the Unverifiable answer again: it
+  answers 503, pages `audit_write_failed`, writes the Forged action
+  `integrity.authority_seal_failed`, and leaves the request pending, against the four answers'
+  Reject rule. (6) `ApprovalGate._requester_authority` at approve, and
+  `ApprovalGate._decide_or_503` behind reject, `resolve_interrupted` and `interrupt_stranded`, can
+  turn a Transit refusal into a 500, or into a `_store_fault` 503 that pages `audit_write_failed`
+  and writes no integrity row; and outside the admin user reads, a request-path caller of
+  `AuthService._verified`, at least local sign-in and the bearer identity, can let a Transit
+  refusal escape as a 500 with no row. (7) `provision-admin` reaches gap (1) through
+  `grant_first_admin_unless_admin_exists`, where it is the CLI's top-level defect report rather
+  than a 500, with no audit row and no page from the grant itself. **A correction, added
+  2026-11-11:** (7) read "rather than a 500, with no audit row and no page", which still holds for
+  the grant's own refusal but not for the command as a whole. The command reads the accounts
+  through `_administrator_standing` twice: first in its pre-check, `AuthService.provision_refusal`
+  by way of `has_self_sufficient_administrator`, before any prompt, and again in
+  `provision_first_administrator`. Each read goes through `_load_users`, and since this build's
+  admin user read change (commit 67c274348b on PR 2860) an Unverifiable account is reported there
+  with `_user_seal_unverifiable`: a WARNING and a soft `integrity.authority_seal_unverifiable` row,
+  written at the pre-check. One service runs both reads, and its per-account report throttle
+  (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) usually keeps the second read from
+  reporting again. The page reaches no sink on this path, since the command arms no `SealPager`.
+  The scan drops the account, so the self-sufficient-Administrator refusal cannot count it, and
+  each of the two steps then asks `AuthService._unverifiable_account_held`, which refuses while
+  any account reads Unverifiable, before any account write: the command ends in its own refusal
+  text, having cleared no holder's factors or sessions and written no credential. (c) item 3's
+  correction names the test that pins this. **This replaces an earlier text of this same
+  correction (2026-11-11), which described the head before that check:** the command created or
+  took over the named local account, on the takeover branch cleared the earlier holder's TOTP,
+  passkeys and sessions, and wrote the password, TOTP and notice address before the grant's guard
+  raised on the same row, leaving the account roleless, and a re-run failed the same way. That path
+  is closed for an account that reads Unverifiable at the check. It stays open for one that first
+  reads Unverifiable, or meets an Outage, at the grant's guard, after those writes. A Vault transit
+  Outage on the first read raises before any account write, with no audit row of its own, and its
+  page reaches no sink either. Beneath all of these, (c) item 2's catch census test,
+  (c) item 3's API backstop for both refusal types, and *The four answers*' "The API answers an
+  Outage with HTTP 503 and `Retry-After`" are not yet built on every path: a refusal no caller maps
+  reaches the engine's generic handler as a 500. The sign-in audit actions this ADR names,
+  `auth.login_refused_unavailable` in the Outage row and in (e), `auth.login_refused_unverifiable`
+  in (e), and the audit rows (e)'s *Control kept* and *The refusal cache* promise a sign-in refusal
+  writes, are slice 2's sign-in refusals, which the 2026-11-08 build status line lists as not
+  built; neither action is in the code yet.
 - **Failure accepted:** an unverifiable row pages under the cap with other rows. Past five
   distinct rows in a window a row's page goes to the shared `:*` subject, which the sink's
   re-alert throttle may already hold, and a database writer who keeps more than five planted rows
@@ -844,7 +1290,7 @@ Lander files them (korus `roles/BUILDER.md` 1c routes filings to the Lander):
 | 3.r7 | The same base64 line at three call sites | **Fixed in build:** with 3.6's helper. |
 | 4 | Unverifiable AD map holds every diff; demotions stop revoking; no reconcile alert; page can fold into the cap | **Moot under design:** (b) ends `main`'s own set below the brake and the groups-moved set above it, writes no role, and pages every such pass under the map's uncapped subject. |
 | 5 | Role delete raw-deletes map pairs of an unverifiable map | **Fixed in build:** (d) step 3 leaves an Unverifiable map untouched. |
-| 6 | `provision-admin` unverifiable refusal falls to the CLI defect report | **Fixed in build:** (c) step 3. |
+| 6 | `provision-admin` unverifiable refusal falls to the CLI defect report | **Fixed in build, in part (corrected 2026-11-11; this cell read "Fixed in build: (c) step 3").** The service refuses `provision-admin` in its own words before any account write while any account reads Unverifiable; an Outage, and an account that first reads Unverifiable at the grant, still reach the defect report. (c) item 3's correction says what the head does. |
 | 7 | Writes and the approval gate page under the request id | **Fixed in build:** (c) step 1, the stored id. |
 | 8 | `directory_map_unverifiable` audited as `auth.login_failed`, weight 1 | **Fixed in build:** (e). |
 | 9 | Forgery wording on unverifiable refusals; stale changelog fragment and `docs/PHI.md` lines; simplifications | **Fixed in build:** (c) step 4 wording; the docs slice rewrites the fragment and the `docs/PHI.md` recovery and seal text to this ADR; simplifications are taken where a slice touches the code. |
@@ -968,6 +1414,13 @@ forged one does not: it denies, audits and pages. (It counts 0 toward the sign-i
 Forged row counts 1, (e); the guesses it hides cannot succeed.) A map that does not hold revokes
 everything `main` revokes below the brake and more above it, the brake is unchanged, and no
 session end rolls back on a Transit fault. Each refusal is audited under its true cause.
+
+A correction, added 2026-11-11: "Each refusal is audited under its true cause" does not hold on at
+least three open paths, each failing closed; *Open audit gaps, a correction added 2026-11-11*, in
+(c), names them.
+
+A correction, added 2026-11-11: "it denies, audits and pages" does not hold on at least the paths
+*Open audit gaps, a correction added 2026-11-11*, and its extension, in (c), names.
 
 **Negative.** Offboarding still freezes when step 2 of (b) trips, which a mass change to unmapped
 groups can cause, and when Vault is down everywhere (when no request is served either). Below the

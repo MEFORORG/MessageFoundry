@@ -127,6 +127,8 @@ if TYPE_CHECKING:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from cryptography.hazmat.primitives.hmac import HMAC
 
+    from messagefoundry.store.row_seal import TransitSealBackend
+
 _log = logging.getLogger(__name__)
 
 # Version-agnostic marker prefix. Every encrypted value — v1, v2 or v4 — starts with this; the store's
@@ -608,6 +610,16 @@ class CipherError(Exception):
     JSON. The message says which, so an operator is not sent looking for a missing key."""
 
 
+class TransitSealRefused(Exception):
+    """Transit answered a row seal ``verify`` with HTTP 400 or 403 (ADR 0217). ``status`` is that
+    code and nothing else; the row sealer classifies it with its probe. Raised by the backend
+    (``crypto_transit``), read by the sealer (``row_seal``). Not a :class:`CipherError`."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(status)
+        self.status = status
+
+
 class UnauthenticatedCipherError(CipherError):
     """No configured key's AEAD tag verified the value (BACKLOG #2593).
 
@@ -640,7 +652,9 @@ class CipherUnavailableError(CipherError):
 
 
 class AuditKeyVersionRefusedError(CipherError):
-    """Transit refused an audit MAC pinned to one key version, and still answers under the latest.
+    """An audit MAC pinned to one key version got HTTP 400 read as a refusal of that version, while
+    Transit still answers under the latest. Transit's own refusal is one cause; the subclass
+    :class:`AuditKeyVersionUnverifiedError` covers a 400 whose reply does not read as one.
 
     The pinned version comes from a stored audit hash, which a DML writer can plant (BACKLOG #2337).
     So the refusal is evidence about that ROW, and the chain walk reports a break there. It is never
@@ -656,6 +670,26 @@ class AuditKeyVersionRefusedError(CipherError):
         return (
             f"Transit refused audit key version {self.version}: the key does not hold it, or its "
             "policy retires it"
+        )
+
+
+class AuditKeyVersionUnverifiedError(AuditKeyVersionRefusedError):
+    """An audit MAC pinned to one key version got HTTP 400 that
+    :func:`~messagefoundry.store.crypto_transit._names_no_version_reason` does not read as a version
+    refusal, or whose reading runs out of memory or stack, while the key still answers under the
+    latest (BACKLOG #6707).
+
+    The 400 may still be a refusal of the version: a proxy can replace Vault's reply with its own
+    page, and that cannot be told apart from a tamper behind it. So this is a subclass, and a
+    handler of its parent handles it as it handles a refused version; the chain walk, for one,
+    reports a break at that row and goes on. Only the text differs. It names the version only,
+    never the key or the reply, because the walk puts it in the tamper alert."""
+
+    def __str__(self) -> str:
+        return (
+            f"the Transit audit MAC pinned to key version {self.version} got HTTP 400 that was not "
+            "read as a version refusal, so the version could not be confirmed; the key may not "
+            "hold it, or its policy may retire it"
         )
 
 
@@ -735,6 +769,11 @@ class Cipher(Protocol):
     def authz_root(self) -> bytes | None: ...
 
     def retired_authz_roots(self) -> Sequence[bytes]: ...
+
+    def row_seal_backend(self) -> TransitSealBackend | None:
+        """The Transit backend this cipher's store seals authority rows through, or ``None`` when
+        its seals, if any, are keyed in-process from :meth:`authz_root` (ADR 0217, item 3.7)."""
+        ...
 
 
 def _fingerprint(key: bytes | bytearray) -> str:
@@ -1360,6 +1399,10 @@ class IdentityCipher:
         """No DEK, so no authorization root: a keyless store writes and checks no row seals."""
         return None
 
+    def row_seal_backend(self) -> None:
+        """No Transit backend: a keyless store writes and checks no row seals (ADR 0217)."""
+        return None
+
     def retired_authz_roots(self) -> Sequence[bytes]:
         """No DEK, so no retired roots either."""
         return ()
@@ -1607,6 +1650,10 @@ class AesGcmCipher(_UnmarkedPolicy):
         """The authorization root derived from the ACTIVE DEK (BACKLOG #2592). Row seals are keyed
         from it (:func:`derive_row_seal_key`). Held in-process like the audit key; never logged."""
         return self._authz_root
+
+    def row_seal_backend(self) -> None:
+        """No Transit backend: this cipher's row seals are keyed from :meth:`authz_root`."""
+        return None
 
     def retired_authz_roots(self) -> Sequence[bytes]:
         """The authorization roots of the retired keys (BACKLOG #2592). A session seal is never

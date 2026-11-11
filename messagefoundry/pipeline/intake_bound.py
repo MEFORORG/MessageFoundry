@@ -51,7 +51,6 @@ clock is compared across processes.
 from __future__ import annotations
 
 import asyncio
-import binascii
 import contextlib
 import logging
 import time
@@ -65,6 +64,9 @@ from messagefoundry.pipeline.alerts import (
 )
 from messagefoundry.pipeline.retention import read_disk_floor, sqlite_store_file
 from messagefoundry.store import Store
+from messagefoundry.subject_checksum import (  # re-exported: its callers import it from here
+    shorten_with_checksum as shorten_with_checksum,
+)
 from messagefoundry.transports.base import IntakeGate
 
 __all__ = [
@@ -152,33 +154,6 @@ def disk_resume_at(floor_bytes: int) -> int:
 #: ``alert_instance.connection`` column, with room to spare. ``[cluster].node_id`` has no length limit,
 #: so a node label too long to fit is shortened to a prefix plus a checksum of the whole label.
 INTAKE_SUBJECT_MAX_LENGTH = 200
-
-#: Hex digits of the CRC-32 that stands in for the part of a text :func:`shorten_with_checksum`
-#: cuts. A checksum, not a cryptographic digest: every text it shortens is the operator's own
-#: setting (a node label, a CRL path), so it only has to tell two honest texts apart, never resist a
-#: forged one.
-_CHECKSUM_HEX = 8
-
-
-def shorten_with_checksum(text: str, limit: int, *, keep_tail: bool = False) -> str:
-    """``text`` when it is at most ``limit`` characters, else a form at most that long that stands
-    for it: the head of ``text``, ``~`` and a checksum of the whole text, or with ``keep_tail``,
-    ``~``, the checksum, ``~`` and the tail. The same text always gives the same result, and two
-    texts with one head (or tail) almost never do. The one shortening rule for alert subjects
-    (vault BACKLOG #3543): a node label keeps its head, a CRL path its tail, which holds the file
-    name. ``limit`` is assumed to leave room for the checksum.
-
-    binascii, not zlib: the same CRC-32, and this module reads no archive or compressed stream.
-    ``backslashreplace``, so a text with a lone surrogate still gets a checksum instead of
-    raising."""
-    if len(text) <= limit:
-        return text
-    digest = f"{binascii.crc32(text.encode('utf-8', 'backslashreplace')):0{_CHECKSUM_HEX}x}"
-    if keep_tail:
-        # Sliced from a start index, never ``text[-n:]``: n = 0 would keep the whole text.
-        start = len(text) - max(0, limit - _CHECKSUM_HEX - len("~~"))
-        return f"~{digest}~{text[start:]}"
-    return f"{text[: max(0, limit - _CHECKSUM_HEX - len('~'))]}~{digest}"
 
 
 def intake_alert_subject(reason: str, node: str | None = None) -> str:

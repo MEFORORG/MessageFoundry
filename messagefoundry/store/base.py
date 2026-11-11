@@ -77,7 +77,7 @@ from messagefoundry.store.privilege import (
     probe_failure,
     sqlite_not_applicable,
 )
-from messagefoundry.store.row_seal import RowSealer
+from messagefoundry.store.row_seal import AnyRowSealer
 from messagefoundry.store.store import (
     ANY_CLAIM_OWNER,
     OPEN_STORE_PIN,
@@ -3208,13 +3208,20 @@ class AuthStore(Protocol):
     async def set_ad_group_scope_map(self, entries: Iterable[tuple[str, str]]) -> None: ...
 
     # --- sessions ------------------------------------------------------------
-    def row_sealer(self) -> RowSealer | None:
+    def row_sealer(self) -> AnyRowSealer | None:
         """The sealer this store writes authority-row integrity seals with, or ``None`` when its
-        cipher holds no in-process key, in which case no seal is written or checked (BACKLOG #2592).
+        cipher is keyless, in which case no seal is written or checked (BACKLOG #2592).
+        ``row_sealer_for_cipher`` returns a
+        :class:`~messagefoundry.store.row_seal.TransitRowSealer` for a ``vault_transit`` cipher
+        (ADR 0217 slice 1b-iii), else the local
+        :class:`~messagefoundry.store.row_seal.RowSealer`.
 
         The store writes the seals: every session write that changes a sealed column goes through
-        one helper per backend, which verifies the row it read before it re-seals it and raises
-        :class:`~messagefoundry.store.row_seal.RowSealError` rather than re-seal a row that fails.
+        one helper per backend, which verifies the row it read before it re-seals it and refuses
+        rather than re-seal a row that fails. On every backend that refusal goes through
+        :func:`~messagefoundry.store.row_seal.require_seal_for_write`, which says what it raises
+        (ADR 0217 slices 1b-i and 1b-ii), the retired-key type included, which its callers end
+        quietly (slice 1b-iv).
         A revoke blanks the seal, which needs no key. :class:`AuthService` checks the seals, in its
         one session loader; the store's readers return rows unchecked."""
         ...

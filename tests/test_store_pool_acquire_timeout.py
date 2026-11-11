@@ -46,6 +46,7 @@ from messagefoundry.store.base import (
     acquire_pooled,
 )
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
+from messagefoundry.store.row_seal import SealPager
 from messagefoundry.store.store import RevokeResult, no_audit_row
 
 FAST = 0.05  # a timeout short enough to keep the suite quick, long enough not to be flaky
@@ -118,6 +119,7 @@ def _sqlserver_store(pool: Any, timeout: float = FAST) -> Any:
     store._acquire_wait = AcquireWaitHistogram()
     store.committed_txns = 0
     store.body_copies = 0
+    store._seal_pager = SealPager()  # ADR 0217: a revoke builds its outcome on the store's pager
     return store
 
 
@@ -128,6 +130,7 @@ def _postgres_store(pool: Any, timeout: float = FAST) -> Any:
     store._pool = pool
     store._settings = StoreSettings(acquire_timeout=timeout)
     store._acquire_wait = AcquireWaitHistogram()
+    store._seal_pager = SealPager()  # ADR 0217: a revoke builds its outcome on the store's pager
     return store
 
 
@@ -655,7 +658,7 @@ async def test_sqlserver_post_commit_session_writes_wait_out_a_busy_pool(
         async with store._acquire():
             pytest.fail("the bounded borrow must time out on a busy pool")
 
-    async def bump(cur: Any, user_id: str) -> None:
+    async def bump(cur: Any, user_id: str, _outcome: Any) -> None:
         # The sealed epoch write needs a users row this stand-in cannot serve; it runs live in CI.
         pool.statements.append("raise the epoch")
 

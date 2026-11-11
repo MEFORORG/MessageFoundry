@@ -14,6 +14,7 @@ import base64
 import getpass
 import hashlib
 import hmac
+import hmac as _hmac_lib
 import json
 import logging
 import sqlite3
@@ -267,11 +268,24 @@ class _RotatingTransit(_FakeTransit):
             # unheld version reaches this, and _needs_hvac() skips those without the extra.
             from hvac.exceptions import InvalidRequest  # type: ignore[import-untyped]
 
-            raise InvalidRequest("cannot generate HMAC: invalid key version")
+            # hvac carries Vault's JSON `errors` list; this is the text Vault's HMACKey answers.
+            raise InvalidRequest(
+                errors=[f"key version does not exist; latest key version is {self.latest}"]
+            )
         version = self.latest if key_version is None else key_version
         secret = self._hmac_secret[name] + version.to_bytes(4, "big")
         digest = hmac.new(secret, base64.b64decode(hash_input), hashlib.sha256).digest()
         return {"data": {"hmac": f"vault:v{version}:" + base64.b64encode(digest).decode("ascii")}}
+
+    def verify_signed_data(
+        self, *, name: str, hash_input: str, hmac: str, hash_algorithm: str = "sha2-256", **_: Any
+    ) -> dict[str, Any]:
+        # Transit `verify` at the version the MAC names, for the row sealer's start probe (ADR 0217).
+        version = int(hmac.removeprefix("vault:v").partition(":")[0])
+        secret = self._hmac_secret[name] + version.to_bytes(4, "big")
+        digest = _hmac_lib.new(secret, base64.b64decode(hash_input), hashlib.sha256).digest()
+        expected = f"vault:v{version}:" + base64.b64encode(digest).decode("ascii")
+        return {"data": {"valid": _hmac_lib.compare_digest(expected, hmac)}}
 
 
 async def test_rotating_the_transit_key_keeps_the_attestation(
@@ -474,9 +488,17 @@ async def test_a_transient_failure_of_a_pinned_call_is_not_a_planted_version(
     assert any("could not run" in line for line in lines), lines
 
 
-def _pinned_refusal(answer: Any) -> CipherError:
-    """What the cipher raises when a pinned call gets Transit's 400 and the probe gets ``answer``
-    (a reply, or an exception to raise)."""
+#: Vault's own text for a pinned ``hmac`` call refused for its version, as hvac carries it.
+_VERSION_400 = ("key version does not exist; latest key version is 2",)
+#: A proxy's or WAF's own 400 page: no Vault JSON at all.
+_PROXY_PAGE = "<html><body><h1>400 Bad Request</h1></body></html>"
+
+
+def _pinned_refusal(
+    answer: Any, errors: Any = _VERSION_400, *, text: str | None = None
+) -> CipherError:
+    """What the cipher raises when a pinned call gets a 400 carrying ``errors`` (hvac's ``errors``
+    list) and body ``text``, and the probe gets ``answer`` (a reply, or an exception to raise)."""
     _needs_hvac()
     from hvac.exceptions import InvalidRequest
 
@@ -486,7 +508,8 @@ def _pinned_refusal(answer: Any) -> CipherError:
     class _Transit(_FakeTransit):
         def generate_hmac(self, **kw: Any) -> dict[str, Any]:
             if kw.get("key_version") is not None:
-                raise InvalidRequest("bad request")
+                listed = list(errors) if errors is not None else None
+                raise InvalidRequest("bad request", errors=listed, text=text)
             if isinstance(answer, Exception):
                 raise answer
             return {"data": {"hmac": answer}}
@@ -518,15 +541,295 @@ def test_a_pinned_400_the_probe_does_not_clear_is_a_plain_cipher_error(answer: A
     assert not isinstance(_pinned_refusal(answer), AuditKeyVersionRefusedError)
 
 
+@pytest.mark.parametrize(
+    ("errors", "text"),
+    [
+        pytest.param(["no such key version"], None, id="known-refusal-text"),
+        pytest.param(
+            ["cannot generate HMAC: version is too old (disallowed by policy)"],
+            None,
+            id="known-policy-refusal",
+        ),
+        pytest.param(["key version 3 is not held by this key"], None, id="unknown-wording"),
+        pytest.param(
+            ["no such key version", "missing input for HMAC"], None, id="refusal-beside-non-version"
+        ),
+        pytest.param(
+            ["missing input for HMAC: and more"], None, id="non-version-only-as-substring"
+        ),
+        pytest.param([], None, id="empty-vault-list"),
+        pytest.param(None, '{"errors": ["no such key version"]}', id="vault-json-in-text-only"),
+        pytest.param(None, '{"errors": ["reworded refusal"]}', id="unknown-wording-in-text-only"),
+    ],
+)
+def test_a_pinned_400_read_as_a_version_refusal_keeps_the_refused_label(
+    errors: Any, text: str | None
+) -> None:
+    """BACKLOG #6707: a 400 whose ``errors`` value is a list is labelled a refused version unless
+    that list is non-empty and holds only whole known non-version texts. An empty list and unknown
+    Vault wording keep that label, so a reworded refusal on an upgraded Vault is labelled as
+    before. hvac fills ``errors`` only for a Content-Type of exactly ``application/json``, so the
+    same JSON in the body (a charset-tagged reply) must read the same way."""
+    from messagefoundry.store.crypto import (
+        AuditKeyVersionRefusedError,
+        AuditKeyVersionUnverifiedError,
+    )
+
+    refused = _pinned_refusal("vault:v2:AAAA", errors, text=text)
+    assert isinstance(refused, AuditKeyVersionRefusedError)
+    assert not isinstance(refused, AuditKeyVersionUnverifiedError)
+
+
+@pytest.mark.parametrize(
+    ("errors", "text"),
+    [
+        pytest.param(None, _PROXY_PAGE, id="proxy-page"),
+        pytest.param(None, None, id="no-body"),
+        pytest.param(None, '["no such key version"]', id="json-but-not-vault-shaped"),
+        pytest.param(None, '{"message": "bad request"}', id="json-without-errors"),
+        pytest.param(["missing input for HMAC"], None, id="known-non-version-text"),
+        pytest.param(["  Encryption key not found "], None, id="known-non-version-any-case"),
+    ],
+)
+def test_a_pinned_400_not_read_as_a_version_refusal_is_labelled_unconfirmed(
+    errors: Any, text: str | None
+) -> None:
+    """BACKLOG #6707: after a rotation the probe answers under a newer version, so the probe alone
+    labelled ANY pinned 400 a refused version. A 400 with no ``errors`` value that is a list, even
+    one whose reply holds a refusal text elsewhere, or with a list of only whole known non-version
+    texts, is labelled unconfirmed instead. It stays a subclass, so its handlers handle the row as
+    on main."""
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    refused = _pinned_refusal("vault:v2:AAAA", errors, text=text)
+    assert isinstance(refused, AuditKeyVersionUnverifiedError)
+    assert str(refused) == (
+        "the Transit audit MAC pinned to key version 3 got HTTP 400 that was not read as a "
+        "version refusal, so the version could not be confirmed; the key may not hold it, or its "
+        "policy may retire it"
+    )
+    assert _KEY_NAME not in str(refused)  # the walk puts this text in the tamper alert
+
+
+def test_a_proxy_400_the_probe_does_not_clear_is_a_plain_cipher_error() -> None:
+    """The label changes nothing else: a proxy 400 whose probe also fails is an outage, as on main."""
+    from messagefoundry.store.crypto import AuditKeyVersionRefusedError
+
+    refused = _pinned_refusal(RuntimeError("down"), None, text=_PROXY_PAGE)
+    assert not isinstance(refused, AuditKeyVersionRefusedError)
+
+
+def test_a_non_text_entry_in_vault_errors_is_labelled_a_refused_version() -> None:
+    """A Vault error list holding an entry that is not text could name the version, so it keeps
+    the refused-version label (BACKLOG #6707)."""
+    _needs_hvac()
+    from hvac.exceptions import InvalidRequest
+
+    from messagefoundry.store.crypto_transit import _names_no_version_reason
+
+    exc = InvalidRequest(errors=["missing input for HMAC"])
+    exc.errors = ["missing input for HMAC", 7]  # hvac's constructor joins entries, so set it after
+    assert not _names_no_version_reason(exc)
+
+
+class _ProxiedRotatingTransit(_RotatingTransit):
+    """``_RotatingTransit`` behind a proxy that replaces every 400 reply with its own: the body
+    ``page`` and, as hvac fills it from JSON, the ``errors`` list."""
+
+    page: str | None = _PROXY_PAGE
+    errors: list[str] | None = None
+
+    def generate_hmac(self, **kw: Any) -> dict[str, Any]:
+        from hvac.exceptions import InvalidRequest
+
+        try:
+            return super().generate_hmac(**kw)
+        except InvalidRequest:
+            raise InvalidRequest(self.page, errors=self.errors, text=self.page) from None
+
+
+async def test_a_planted_version_behind_a_proxy_is_a_chain_break_on_the_startup_walk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6707: a proxy's page in place of Transit's refusal changes the label only. The walk
+    still reports the planted row as a break, raises the tamper alert and keeps going."""
+    _needs_hvac()
+    _use_fake(monkeypatch, _ProxiedRotatingTransit())
+    db = tmp_path / "proxied-planted.db"
+    seq = await _chain_with_a_planted_version(db)
+    store = await _transit_store(db)
+    try:
+        ok, msg = await store.verify_audit_chain()
+        sink, lines = await _walk_on_start(store, caplog)
+    finally:
+        await store.close()
+    assert not ok and f"seq={seq}," in str(msg), msg
+    assert f"pinned to key version {_UNHELD_VERSION} got HTTP 400" in str(msg), msg
+    assert [name for name, _ in sink.events] == ["audit-chain"], sink.events
+    assert not any("could not run" in line for line in lines), lines
+
+
+async def test_a_planted_genesis_version_behind_a_proxy_opens_and_reads_as_a_break(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #6707: the genesis row behaves as on main behind a proxy too; the open goes on."""
+    _needs_hvac()
+    _use_fake(monkeypatch, _ProxiedRotatingTransit())
+    db = tmp_path / "proxied-genesis.db"
+    await _chain_with_a_planted_version(db)
+    _dml(db, "UPDATE audit_log SET row_hash = ? WHERE seq = 1", (_PLANTED,))
+    store = await _transit_store(db)
+    try:
+        ok, msg = await store.verify_audit_chain()
+    finally:
+        await store.close()
+    assert not ok and "seq=1," in str(msg), msg
+
+
+def _past_the_reparse_bound(head: str, tail: str, *, over: int = 1) -> str:
+    """``head`` + padding + ``tail``, ``over`` characters longer than the longest body the cipher
+    re-parses (0 gives a body of exactly that length)."""
+    from messagefoundry.store.crypto_transit import _REPARSED_BODY_MAX_CHARS
+
+    return head + " " * (_REPARSED_BODY_MAX_CHARS + over - len(head) - len(tail)) + tail
+
+
+def test_an_oversized_vault_shaped_body_is_labelled_unconfirmed_unparsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6707 item 48: a body past the bound is never parsed, so a huge reply cannot raise
+    a MemoryError out of the label. It is labelled unconfirmed, even though it holds Vault's own
+    refusal text."""
+    from messagefoundry.store import crypto_transit
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    def must_not_parse(*_a: Any, **_kw: Any) -> Any:
+        raise AssertionError("an oversized body was parsed")
+
+    monkeypatch.setattr(crypto_transit, "json_loads_or_refusal", must_not_parse)
+    body = _past_the_reparse_bound('{"errors": ["no such key version"], "pad": "', '"}')
+    assert len(body) == crypto_transit._REPARSED_BODY_MAX_CHARS + 1
+    assert isinstance(
+        _pinned_refusal("vault:v2:AAAA", None, text=body), AuditKeyVersionUnverifiedError
+    )
+
+
+def test_a_vault_shaped_body_at_the_bound_is_still_read() -> None:
+    """The bound is inclusive: a body of exactly ``_REPARSED_BODY_MAX_CHARS`` is parsed, so its
+    refusal text keeps the refused-version label (BACKLOG #6707)."""
+    from messagefoundry.store.crypto import (
+        AuditKeyVersionRefusedError,
+        AuditKeyVersionUnverifiedError,
+    )
+
+    body = _past_the_reparse_bound('{"errors": ["no such key version"], "pad": "', '"}', over=0)
+    refused = _pinned_refusal("vault:v2:AAAA", None, text=body)
+    assert isinstance(refused, AuditKeyVersionRefusedError)
+    assert not isinstance(refused, AuditKeyVersionUnverifiedError)
+
+
+def test_a_body_hvac_already_parsed_is_not_parsed_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    """hvac sets ``json`` when it parsed the reply; an ``errors`` it did not find there is not
+    looked for in the same text again (BACKLOG #6707)."""
+    _needs_hvac()
+    from hvac.exceptions import InvalidRequest
+
+    from messagefoundry.store import crypto_transit
+
+    def must_not_parse(*_a: Any, **_kw: Any) -> Any:
+        raise AssertionError("a body hvac parsed was parsed again")
+
+    monkeypatch.setattr(crypto_transit, "json_loads_or_refusal", must_not_parse)
+    reply = '{"message": "bad request"}'
+    exc = InvalidRequest(reply, text=reply, json={"message": "bad request"})
+    assert crypto_transit._names_no_version_reason(exc)
+
+
+class _PaddedProxiedRotatingTransit(_ProxiedRotatingTransit):
+    """A proxy whose 400 page is padded past the body the cipher re-parses."""
+
+    page = _past_the_reparse_bound(_PROXY_PAGE, "")
+
+
+class _ExplodingText(str):
+    """An ``errors`` entry whose ``strip``, the first step of the cipher's lower-cased copy, fails
+    as copying a huge list would: with MemoryError."""
+
+    __slots__ = ()
+
+    def strip(self, chars: str | None = None) -> str:
+        raise MemoryError
+
+
+class _HugeErrorsRotatingTransit(_ProxiedRotatingTransit):
+    """A 400 carrying a huge Vault ``errors`` list, as hvac fills it, and no body to re-parse."""
+
+    page = None
+    errors = [_ExplodingText("no such key version")] * 20_000
+
+
+@pytest.mark.parametrize(
+    "transit_class",
+    [
+        pytest.param(_PaddedProxiedRotatingTransit, id="oversized-body"),
+        pytest.param(_HugeErrorsRotatingTransit, id="oversized-errors-list"),
+    ],
+)
+async def test_a_reply_too_large_to_read_is_still_a_chain_break_on_the_startup_walk(
+    transit_class: type[_RotatingTransit],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #6707 item 48: a MemoryError while reading the 400 must not escape as a non-cipher
+    error, or the walk logs "could not run" and drops the row's break and its alert. The parser
+    raises MemoryError if it is reached at all, and it must not be reached for a body past the
+    bound; a huge ``errors`` list, which hvac parsed, fails in the lower-cased copy instead."""
+    from messagefoundry.store import crypto_transit
+
+    parsed: list[int] = []
+
+    def out_of_memory(raw: str, **_kw: Any) -> Any:
+        parsed.append(len(raw))
+        raise MemoryError
+
+    monkeypatch.setattr(crypto_transit, "json_loads_or_refusal", out_of_memory)
+    _needs_hvac()
+    _use_fake(monkeypatch, transit_class())
+    db = tmp_path / "oversized-reply.db"
+    seq = await _chain_with_a_planted_version(db)
+    store = await _transit_store(db)
+    try:
+        ok, msg = await store.verify_audit_chain()
+        sink, lines = await _walk_on_start(store, caplog)
+    finally:
+        await store.close()
+    assert not ok and f"seq={seq}," in str(msg), msg
+    assert f"pinned to key version {_UNHELD_VERSION} got HTTP 400" in str(msg), msg
+    assert [name for name, _ in sink.events] == ["audit-chain"], sink.events
+    assert f"seq={seq}," in sink.events[0][1], sink.events
+    assert not any("could not run" in line for line in lines), lines
+    # For the padded body the bound, not the MemoryError catch, kept the parser away; hvac's own
+    # errors list is never re-parsed at all.
+    assert parsed == [], parsed
+
+
 def test_a_refused_key_version_survives_a_pickle_with_its_text() -> None:
     import pickle
 
-    from messagefoundry.store.crypto import AuditKeyVersionRefusedError
+    from messagefoundry.store.crypto import (
+        AuditKeyVersionRefusedError,
+        AuditKeyVersionUnverifiedError,
+    )
 
     exc = AuditKeyVersionRefusedError(7)
     again = pickle.loads(pickle.dumps(exc))
     assert isinstance(again, AuditKeyVersionRefusedError) and isinstance(again, CipherError)
     assert again.version == 7 and str(again) == str(exc)
+    unverified = AuditKeyVersionUnverifiedError(7)
+    back = pickle.loads(pickle.dumps(unverified))
+    assert isinstance(back, AuditKeyVersionUnverifiedError)
+    assert back.version == 7 and str(back) == str(unverified)
 
 
 def test_cli_audit_verify_exits_1_on_a_planted_unheld_key_version(

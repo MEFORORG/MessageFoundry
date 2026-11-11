@@ -5932,10 +5932,13 @@ async def test_the_pass_judges_the_scope_stored_after_its_probes() -> None:
         apply = service._apply_reconcile_revocation
 
         async def spy(
-            revocation: reconcile.SessionRevocation, *, watermark: _AuditWatermark | None
+            revocation: reconcile.SessionRevocation,
+            *,
+            watermark: _AuditWatermark | None,
+            maps_held: bool = True,
         ) -> _RevocationApplied:
             planned.append(revocation)
-            return await apply(revocation, watermark=watermark)
+            return await apply(revocation, watermark=watermark, maps_held=maps_held)
 
         service._apply_reconcile_revocation = spy  # type: ignore[method-assign]
         plan = await service.reconcile_directory_sessions()
@@ -5956,12 +5959,15 @@ async def test_a_scope_revocation_is_skipped_when_the_scope_moved_before_it_appl
         apply = service._apply_reconcile_revocation
 
         async def login_then_apply(
-            revocation: reconcile.SessionRevocation, *, watermark: _AuditWatermark | None
+            revocation: reconcile.SessionRevocation,
+            *,
+            watermark: _AuditWatermark | None,
+            maps_held: bool = True,
         ) -> _RevocationApplied:
             await store.set_user_channel_scope(
                 revocation.user_id, json.dumps(["IB_B"]), source=SCOPE_SOURCE_AD
             )
-            return await apply(revocation, watermark=watermark)
+            return await apply(revocation, watermark=watermark, maps_held=maps_held)
 
         service._apply_reconcile_revocation = login_then_apply  # type: ignore[method-assign]
         plan = await service.reconcile_directory_sessions()
@@ -6050,7 +6056,7 @@ async def test_each_revocation_reason_sends_its_decided_notice(reason: str) -> N
         revocation = reconcile.SessionRevocation(user.id, user.username, reason=reason, **extra)
         assert (
             await service._apply_reconcile_revocation(
-                revocation, watermark=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark(), maps_held=True
             )
             == "reported"
         )
@@ -6078,7 +6084,7 @@ async def test_an_undecided_whole_account_reason_falls_to_the_neutral_notice() -
         )
         assert (
             await service._apply_reconcile_revocation(
-                revocation, watermark=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark(), maps_held=True
             )
             == "reported"
         )
@@ -6674,7 +6680,7 @@ async def test_a_disabled_account_that_signs_out_mid_pass_still_alerts_and_is_to
         )
         assert (
             await service._apply_reconcile_revocation(
-                revocation, watermark=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark(), maps_held=True
             )
             == "reported"
         )
@@ -6698,7 +6704,9 @@ async def test_a_repeat_revocation_on_an_unkeyed_chain_still_reports(reason: str
         revocation = reconcile.SessionRevocation(user.id, user.username, reason=reason)
         for _ in range(2):
             assert (
-                await service._apply_reconcile_revocation(revocation, watermark=watermark)
+                await service._apply_reconcile_revocation(
+                    revocation, watermark=watermark, maps_held=True
+                )
                 == "reported"
             )
         assert len(notifier.sent) == 2
@@ -6748,7 +6756,10 @@ async def test_a_forged_revocation_row_does_not_silence_a_repeat_on_a_keyed_chai
         await _forge_revocation_row(store, reason)
         revocation = reconcile.SessionRevocation(user.id, user.username, reason=reason)
         assert (
-            await service._apply_reconcile_revocation(revocation, watermark=watermark) == "reported"
+            await service._apply_reconcile_revocation(
+                revocation, watermark=watermark, maps_held=True
+            )
+            == "reported"
         ), "a forged row silenced the alert"
         assert len(notifier.sent) == 1
     finally:
@@ -6768,18 +6779,32 @@ async def test_a_verified_repeat_revocation_on_a_keyed_chain_is_quiet(reason: st
         watermark = await service._audit_watermark()
         revocation = reconcile.SessionRevocation(user.id, user.username, reason=reason)
         assert (
-            await service._apply_reconcile_revocation(revocation, watermark=watermark) == "reported"
+            await service._apply_reconcile_revocation(
+                revocation, watermark=watermark, maps_held=True
+            )
+            == "reported"
         )
-        assert await service._apply_reconcile_revocation(revocation, watermark=watermark) == "quiet"
+        assert (
+            await service._apply_reconcile_revocation(
+                revocation, watermark=watermark, maps_held=True
+            )
+            == "quiet"
+        )
         assert len(notifier.sent) == 1
         assert len(_revoked_rows(await store.list_audit())) == 2
         # The controls: a verified row at or below the watermark, and a newest row with another
         # reason, do not count.
         later = await service._audit_watermark()
-        assert await service._apply_reconcile_revocation(revocation, watermark=later) == "reported"
+        assert (
+            await service._apply_reconcile_revocation(revocation, watermark=later, maps_held=True)
+            == "reported"
+        )
         newest = await service._audit_watermark()
         await store.record_audit("auth.ad_session_revoked", actor="jdoe", detail='{"reason": "x"}')
-        assert await service._apply_reconcile_revocation(revocation, watermark=newest) == "reported"
+        assert (
+            await service._apply_reconcile_revocation(revocation, watermark=newest, maps_held=True)
+            == "reported"
+        )
         assert len(notifier.sent) == 3
         assert (await store.verify_audit_chain())[0]
     finally:
@@ -6809,7 +6834,10 @@ async def test_a_verified_row_older_than_the_skew_allowance_is_not_a_repeat(
         )
         watermark = _AuditWatermark(seq, time.time())
         assert (
-            await service._apply_reconcile_revocation(revocation, watermark=watermark) == expected
+            await service._apply_reconcile_revocation(
+                revocation, watermark=watermark, maps_held=True
+            )
+            == expected
         )
     finally:
         await store.close()
@@ -6849,9 +6877,18 @@ async def test_the_watermark_fails_toward_reporting(
         user = await _signed_out(store, "jdoe")
         mark = await service._audit_watermark()
         revocation = reconcile.SessionRevocation(user.id, user.username, reason="directory_absent")
-        assert await service._apply_reconcile_revocation(revocation, watermark=mark) == "reported"
-        assert await service._apply_reconcile_revocation(revocation, watermark=None) == "reported"
-        assert await service._apply_reconcile_revocation(revocation, watermark=mark) == "quiet"
+        assert (
+            await service._apply_reconcile_revocation(revocation, watermark=mark, maps_held=True)
+            == "reported"
+        )
+        assert (
+            await service._apply_reconcile_revocation(revocation, watermark=None, maps_held=True)
+            == "reported"
+        )
+        assert (
+            await service._apply_reconcile_revocation(revocation, watermark=mark, maps_held=True)
+            == "quiet"
+        )
     finally:
         await store.close()
 
@@ -6870,18 +6907,18 @@ async def test_a_fault_reading_the_evidence_reports_and_still_writes_the_row(
         user = await _signed_out(store, "jdoe")
         watermark = await service._audit_watermark()
         revocation = reconcile.SessionRevocation(user.id, user.username, reason="directory_absent")
-        assert await service._apply_reconcile_revocation(revocation, watermark=watermark) == (
-            "reported"
-        )
+        assert await service._apply_reconcile_revocation(
+            revocation, watermark=watermark, maps_held=True
+        ) == ("reported")
 
         async def broken(*_: object, **__: object) -> dict[str, Any] | None:
             raise defect("synthetic")
 
         monkeypatch.setattr(store, "newest_keyed_audit_row", broken)
         with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
-            assert await service._apply_reconcile_revocation(revocation, watermark=watermark) == (
-                "reported"
-            )
+            assert await service._apply_reconcile_revocation(
+                revocation, watermark=watermark, maps_held=True
+            ) == ("reported")
         assert len(notifier.sent) == 2
         assert len(_revoked_rows(await store.list_audit())) == 2
         assert any(
@@ -6906,7 +6943,7 @@ async def test_an_undetermined_revocation_that_ends_nothing_stays_quiet() -> Non
         )
         assert (
             await service._apply_reconcile_revocation(
-                revocation, watermark=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark(), maps_held=True
             )
             == "quiet"
         )
@@ -6932,14 +6969,14 @@ async def test_a_quiet_revocation_whose_row_is_refused_reports_instead(
         )
         assert (
             await service._apply_reconcile_revocation(
-                revocation, watermark=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark(), maps_held=True
             )
             == "quiet"
         )
         _refuse_every_append(monkeypatch, store, "auth.ad_session_revoked")
         assert (
             await service._apply_reconcile_revocation(
-                revocation, watermark=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark(), maps_held=True
             )
             == "reported"
         )
@@ -6963,10 +7000,19 @@ async def test_a_verified_repeat_whose_row_is_refused_alerts_without_a_notice(
         revocation = reconcile.SessionRevocation(
             user.id, user.username, reason="directory_disabled"
         )
-        assert await service._apply_reconcile_revocation(revocation, watermark=mark) == "reported"
-        assert await service._apply_reconcile_revocation(revocation, watermark=mark) == "quiet"
+        assert (
+            await service._apply_reconcile_revocation(revocation, watermark=mark, maps_held=True)
+            == "reported"
+        )
+        assert (
+            await service._apply_reconcile_revocation(revocation, watermark=mark, maps_held=True)
+            == "quiet"
+        )
         _refuse_every_append(monkeypatch, store, "auth.ad_session_revoked")
-        assert await service._apply_reconcile_revocation(revocation, watermark=mark) == "reported"
+        assert (
+            await service._apply_reconcile_revocation(revocation, watermark=mark, maps_held=True)
+            == "reported"
+        )
         assert [e.event_type for e in notifier.sent] == [ACCOUNT_DISABLED]
     finally:
         await store.close()
@@ -6987,13 +7033,13 @@ async def test_a_role_revocation_another_reconciler_applied_first_is_quiet() -> 
         )
         assert (
             await service._apply_reconcile_revocation(
-                revocation, watermark=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark(), maps_held=True
             )
             == "reported"
         )
         assert (
             await service._apply_reconcile_revocation(
-                revocation, watermark=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark(), maps_held=True
             )
             == "quiet"
         )
@@ -7062,7 +7108,7 @@ async def test_a_defect_in_the_roles_row_still_ends_the_sessions_before_it_is_ra
         )
         with pytest.raises(NotImplementedError):
             await service._apply_reconcile_revocation(
-                revocation, watermark=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark(), maps_held=True
             )
         assert sorted(await store.get_user_role_ids(user.id)) == sorted(target)
         assert len(_revoked_rows(await store.list_audit())) == 1, "the revoke did not run"
@@ -7103,7 +7149,7 @@ async def test_a_role_revocation_commits_its_roles_row_with_the_role_write(
         )
         assert (
             await service._apply_reconcile_revocation(
-                revocation, watermark=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark(), maps_held=True
             )
             == "reported"
         )
@@ -7172,8 +7218,12 @@ async def test_two_reconcilers_that_both_read_the_old_roles_report_the_change_on
         watermark = await service._audit_watermark()
         async with asyncio.timeout(10):
             outcomes = await asyncio.gather(
-                service._apply_reconcile_revocation(revocation, watermark=watermark),
-                service._apply_reconcile_revocation(revocation, watermark=watermark),
+                service._apply_reconcile_revocation(
+                    revocation, watermark=watermark, maps_held=True
+                ),
+                service._apply_reconcile_revocation(
+                    revocation, watermark=watermark, maps_held=True
+                ),
             )
 
         assert sorted(writes) == [False, True], "both applies must reach the write"
@@ -7212,7 +7262,7 @@ async def test_a_stale_role_plan_does_not_overwrite_a_newer_role_write() -> None
         service._load_user = _read_then_sign_in  # type: ignore[method-assign]
 
         outcome = await service._apply_reconcile_revocation(
-            revocation, watermark=await service._audit_watermark()
+            revocation, watermark=await service._audit_watermark(), maps_held=True
         )
 
         assert outcome == "quiet"
@@ -7241,7 +7291,7 @@ async def test_a_role_change_that_ends_no_session_still_reports() -> None:
         )
         assert (
             await service._apply_reconcile_revocation(
-                revocation, watermark=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark(), maps_held=True
             )
             == "reported"
         )
@@ -7283,7 +7333,7 @@ async def test_a_role_write_whose_commit_reply_was_lost_still_reports_the_change
         )
         assert (
             await service._apply_reconcile_revocation(
-                revocation, watermark=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark(), maps_held=True
             )
             == "reported"
         )
@@ -7328,7 +7378,7 @@ async def test_held_errors_are_raised_after_the_notice_and_neither_is_dropped(
         )
         with pytest.raises(NotImplementedError) as raised:
             await service._apply_reconcile_revocation(
-                revocation, watermark=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark(), maps_held=True
             )
         assert any("RecursionError" in note for note in raised.value.__notes__)
         assert [e.username for e in notifier.sent] == ["jdoe"]
@@ -7370,7 +7420,7 @@ async def test_a_role_defect_whose_row_is_refused_on_its_own_too_is_noted_and_ra
         )
         with pytest.raises(NotImplementedError):
             await service._apply_reconcile_revocation(
-                revocation, watermark=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark(), maps_held=True
             )
         assert errors == []
         assert service._reconcile_refused_rows == ["auth.ad_roles_resynced"]
@@ -7422,7 +7472,7 @@ async def test_an_unclassified_error_in_the_roles_row_still_ends_the_sessions_an
         monkeypatch.setattr(store, "_append_audit_row", failing)
         with pytest.raises(type(error)):
             await service._apply_reconcile_revocation(
-                revocation, watermark=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark(), maps_held=True
             )
         assert sorted(await store.get_user_role_ids(revocation.user_id)) == sorted(target)
         assert await service.identity_for_token(tokens["jdoe"]) is None
@@ -7469,7 +7519,7 @@ async def test_a_raising_read_back_after_a_lost_reply_still_ends_the_sessions_an
         monkeypatch.setattr(store, "get_user", read_fails)
         with pytest.raises(type(error)):
             await service._apply_reconcile_revocation(
-                revocation, watermark=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark(), maps_held=True
             )
         assert calls == [True, False]
         assert read_raised == [True], "the read-back was not reached"
@@ -7512,7 +7562,7 @@ async def test_a_refused_read_back_counts_as_written_and_its_row_says_so(
         monkeypatch.setattr(store, "get_user", read_refused)
         assert (
             await service._apply_reconcile_revocation(
-                revocation, watermark=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark(), maps_held=True
             )
             == "reported"
         )
@@ -7546,7 +7596,7 @@ async def test_a_revoke_that_fails_twice_after_a_committed_role_change_still_tel
         monkeypatch.setattr(store, "revoke_user_sessions", revoke_fails)
         with pytest.raises(sqlite3.OperationalError, match="revoke"):
             await service._apply_reconcile_revocation(
-                revocation, watermark=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark(), maps_held=True
             )
         assert sorted(await store.get_user_role_ids(revocation.user_id)) == sorted(target)
         assert [e.event_type for e in notifier.sent] == [ROLES_CHANGED]
@@ -7578,7 +7628,7 @@ async def test_an_unclassified_error_in_the_revoke_row_still_ends_the_sessions(
         revocation = reconcile.SessionRevocation(user.id, user.username, reason="directory_absent")
         with pytest.raises(TypeError):
             await service._apply_reconcile_revocation(
-                revocation, watermark=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark(), maps_held=True
             )
         assert await service.identity_for_token(tokens["jdoe"]) is None
         assert len(_revoked_rows(await store.list_audit())) == 1
@@ -7611,7 +7661,7 @@ async def test_a_held_role_error_is_raised_first_when_the_revoke_then_fails(
         monkeypatch.setattr(store, "revoke_user_sessions", revoke_fails)
         with pytest.raises(NotImplementedError) as raised:
             await service._apply_reconcile_revocation(
-                revocation, watermark=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark(), maps_held=True
             )
         assert any("OperationalError" in note for note in raised.value.__notes__)
         assert [e.event_type for e in notifier.sent] == [ROLES_CHANGED]
@@ -7652,7 +7702,9 @@ async def test_a_reconciled_role_retry_refused_before_it_wrote_still_fails_close
         monkeypatch.setattr(store, "set_user_roles_if_held", failing)
         watermark = await service._audit_watermark()
         with pytest.raises(type(retry_error)):
-            await service._apply_reconcile_revocation(revocation, watermark=watermark)
+            await service._apply_reconcile_revocation(
+                revocation, watermark=watermark, maps_held=True
+            )
         assert len(calls) == 2
         assert [e.event_type for e in notifier.sent] == [ROLES_CHANGED]
         assert grants == [("jdoe", "directory_reconcile")]
@@ -7682,7 +7734,7 @@ async def test_an_error_building_the_reconciled_role_row_still_ends_the_sessions
         monkeypatch.setattr(service_module, "_json", failing)
         with pytest.raises(TypeError):
             await service._apply_reconcile_revocation(
-                revocation, watermark=await service._audit_watermark()
+                revocation, watermark=await service._audit_watermark(), maps_held=True
             )
         monkeypatch.undo()
         assert await store.get_user_role_ids(revocation.user_id) == before
