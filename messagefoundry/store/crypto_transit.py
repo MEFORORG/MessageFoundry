@@ -314,13 +314,21 @@ class TransitCipher(_UnmarkedPolicy):
 
         ``key_version`` pins the Transit key version; ``None`` means Transit's latest. A check of a
         stored MAC passes the version that MAC names (BACKLOG #2337), so a key rotation does not make
-        an older row read as forged. A pinned call that gets HTTP 400 while a probe under the
-        latest version answers with a string that does not start ``vault:v<pinned>:`` raises
-        :class:`AuditKeyVersionRefusedError` (see
+        an older row read as forged. A pinned call that gets an HTTP 400 that hvac raises as
+        ``InvalidRequest``, while a probe under the latest version answers with a string that does
+        not start ``vault:v<pinned>:``, raises :class:`AuditKeyVersionRefusedError` (see
         :meth:`_refuses_only_version`); Transit refusing the version is one cause, not the only one.
         It raises the subclass :class:`AuditKeyVersionUnverifiedError` when
         :func:`_names_no_version_reason` does not read the 400 as Vault's own refusal, for example a
-        proxy's page, or when reading it runs out of memory or stack (BACKLOG #6707)."""
+        proxy's page, or when reading it runs out of memory or stack (BACKLOG #6707).
+
+        A 400 whose body hvac fails on is not one (PR 2877 hold 6790543984). When the Content-Type
+        is exactly ``application/json`` and the body is not a JSON object (a bare list or ``null``,
+        for example), holds an ``errors`` list with an entry that is not text, or has an ``errors``
+        value such as a number, hvac 2.4.0 raises ``AttributeError`` or ``TypeError`` in place of
+        ``InvalidRequest``. hvac running out of memory while it joins a very large ``errors`` list
+        fails the same way. Each raises plain :class:`CipherError`, so the walk could not run and
+        no tamper alert fires."""
         inp = base64.b64encode(data).decode("ascii")
         kwargs: dict[str, Any] = {
             "name": self._audit_key,
