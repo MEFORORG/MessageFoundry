@@ -158,7 +158,10 @@ The four delimiters **must be mutually distinct**, and the ISA must pass the **s
 gate**: every element-separator position implied by the fixed ISA element widths — offsets
 `6, 17, 20, 31, 34, 50, 53, 69, 76, 81, 83, 89, 99, 101, 103` (all element-separator offsets except the
 defining one at `+3`) — must equal the element separator. (Derive these in code from the ISA width table,
-not a hand-typed list.) On a delimiter collision or a sanity-gate failure, the codec raises
+not a hand-typed list.) No ISA element's data may hold the element separator or the segment terminator
+(either character of a `CR+LF` one), and every tokenizer starts the body past the ISA, so the fixed-width
+header is never read as more than one segment (BACKLOG #5536). On a delimiter collision, a sanity-gate
+failure or such a delimiter in ISA element data, the codec raises
 **`X12PeekError`** — the Router routes the message to the **error/dead-letter** path (status `ERROR`) rather
 than guessing, honouring the count-and-log invariant (never accept-and-drop). Hardcoding `*~:^` is **wrong** —
 trading partners legitimately vary all four.

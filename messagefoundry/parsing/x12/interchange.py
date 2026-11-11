@@ -28,20 +28,22 @@ import re
 from collections.abc import Iterator
 
 from messagefoundry.parsing.x12.delimiters import (
+    _SEGMENT_TERM_OFFSET,
+    _SEGMENT_WHITESPACE,
     ISA_SEGMENT_LEN,
     discover_delimiters,
     find_isa_start,
+    isa_end,
+    iter_segments,
 )
 from messagefoundry.parsing.x12.errors import X12FrameError, X12PeekError
 
 __all__ = ["split", "X12FrameReader", "check_integrity"]
 
-# Offset of the segment terminator within the ISA (mirrors delimiters._SEGMENT_TERM_OFFSET, but kept
-# local so the byte reader needs only this module + the public ISA length).
-_SEGMENT_TERM_OFFSET = 105
-_WHITESPACE_STR = " \t\r\n\x0b\x0c"
 # A segment that is the IEA trailer, after cosmetic whitespace. Matched in place with pos/endpos, so the
-# check never copies a segment, however long.
+# check never copies a segment, however long. The class is a literal copy of _SEGMENT_WHITESPACE, not
+# built from it, so the static ReDoS scan in tests/test_security_static.py can read the pattern;
+# test_iea_segment_whitespace_matches_the_shared_set in tests/test_x12_parsing.py keeps the two equal.
 _IEA_SEGMENT = re.compile(rb"[ \t\r\n\x0b\x0c]*IEA")
 #: Line-end bytes a sender may put after an interchange's closing terminator, such as a newline after
 #: ``IEA*...~``. Up to :data:`_FRAME_TAIL_MAX` of them directly after a completed interchange are its
@@ -71,8 +73,8 @@ def split(raw: str) -> list[str]:
             isa = find_isa_start(raw, pos)
         except X12PeekError:
             break  # no further interchange — only trailing noise remains
-        terminator = discover_delimiters(raw, isa).segment
-        end = _find_iea_end_str(raw, isa, terminator)
+        delims = discover_delimiters(raw, isa)
+        end = _find_iea_end_str(raw, isa_end(isa, delims), delims.segment)
         if end is None:
             out.append(raw[isa:])  # unterminated final interchange — surface it, don't lose it
             break
@@ -81,15 +83,16 @@ def split(raw: str) -> list[str]:
     return out
 
 
-def _find_iea_end_str(raw: str, isa: int, terminator: str) -> int | None:
-    """Index just past the terminator that closes the ``IEA`` segment of the interchange at ``isa``,
+def _find_iea_end_str(raw: str, body_start: int, terminator: str) -> int | None:
+    """Index just past the terminator that closes the ``IEA`` segment of the interchange whose body
+    begins at ``body_start`` (just past its ISA terminator, so the fixed-width ISA is never searched),
     or None if it is not complete. ``IEA`` is matched only at a segment boundary."""
-    seg_start = isa
+    seg_start = body_start
     while True:
         idx = raw.find(terminator, seg_start)
         if idx == -1:
             return None
-        if raw[seg_start:idx].lstrip(_WHITESPACE_STR)[:3] == "IEA":
+        if raw[seg_start:idx].lstrip(_SEGMENT_WHITESPACE)[:3] == "IEA":
             return idx + len(terminator)
         seg_start = idx + len(terminator)
 
@@ -178,6 +181,13 @@ class X12FrameReader:
             self._check_cap()
             return None
         terminator = self._terminator(buf)
+        if self._seg_start == 0:
+            # The walk starts past the ISA's own terminator. The ISA is fixed-width, so a terminator
+            # byte inside its element data (a "~IEA" in ISA06) must not end a segment there: that
+            # cut the frame at the ISA and dropped the real body as noise (BACKLOG #5536). Such an
+            # ISA is framed whole here. The codec refuses it only where something parses it, a
+            # Router or Handler that peeks or parses; this reader does not.
+            self._seg_start = self._scan = _SEGMENT_TERM_OFFSET + len(terminator)
         # Walk the segments, resuming where the last feed stopped. The ISA stays at the front of the
         # buffer until its frame is taken or the buffer is cleared, and both reset the resume points,
         # so they always describe this interchange. Each byte is searched about once in total.
@@ -247,25 +257,15 @@ def check_integrity(raw: str) -> list[str]:
     implementation-guide validation (deferred) — just the envelope self-consistency a receiver can cheaply
     confirm. Raises :class:`X12PeekError` only if the interchange header itself is unparseable."""
     isa = find_isa_start(raw)
-    delims = discover_delimiters(raw, isa)
-    element, terminator = delims.element, delims.segment
-    segments: list[list[str]] = []
-    for chunk in raw[isa:].split(terminator):
-        stripped = chunk.lstrip(_WHITESPACE_STR)
-        if not stripped:
-            continue
-        segments.append(stripped.split(element))
-        if segments[-1][0] == "IEA":
-            break
+    segments = list(iter_segments(raw, isa, discover_delimiters(raw, isa)))
 
     problems: list[str] = []
 
     def get(fields: list[str], i: int) -> str:
         return fields[i].strip() if i < len(fields) else ""
 
-    isa_seg = segments[0] if segments and segments[0][0] == "ISA" else None
     iea_seg = next((s for s in segments if s[0] == "IEA"), None)
-    if isa_seg is not None and iea_seg is not None:
+    if iea_seg is not None:  # iter_segments always yields the ISA first
         # ISA13 is read by offset (fixed-width); IEA02 from the tokenized IEA segment.
         isa13 = raw[isa + 90 : isa + 99].strip()
         if isa13 != get(iea_seg, 2):
