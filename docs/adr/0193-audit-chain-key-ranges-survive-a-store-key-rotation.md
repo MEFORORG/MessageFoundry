@@ -459,11 +459,10 @@ section 0): this is what the first deployment's first routine rotation would hav
    (corrected 2026-11-11, BACKLOG #6707). The walk records a break at that row, naming the
    version, and goes on. A 400 whose body hvac fails on raises neither
    `AuditKeyVersionRefusedError` nor its subclass `AuditKeyVersionUnverifiedError` (BACKLOG
-   #6707). Such bodies include at least these, when the Content-Type is exactly
-   `application/json`: one that parses as JSON that is not an object (a bare list or `null`, for
-   example), one whose `errors` list holds an entry that is not text, and one whose `errors`
-   value is a nonzero number such as `5`, or `true`. On each, hvac 2.4.0 raises `AttributeError` or
-   `TypeError` in place of `InvalidRequest`. A `MemoryError` that hvac raises while it joins a
+   #6707). For example, these exact 400 bodies with the Content-Type exactly `application/json`:
+   `[]`, `null`, `{"errors":[{"message":"x"}]}`, `{"errors":[1]}`, `{"errors":5}` and
+   `{"errors":true}`. On each, hvac 2.4.0 raises `AttributeError` or `TypeError` in place of
+   `InvalidRequest`. A `MemoryError` that hvac raises while it joins a
    truthy `errors` value, before it raises any `InvalidRequest`, is not read as a refusal either.
    Each is a plain `CipherError`, so a version planted behind a proxy that wrote such a body would
    not read as a break. Any other failure, an unreachable Vault among them, is a `CipherError`
