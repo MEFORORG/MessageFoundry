@@ -207,6 +207,53 @@ def _bundled_root(module_file: str) -> tuple[_Root, ...]:
     return () if directory is None else (_Root(directory, vet=False),)
 
 
+def _file_url_path(url: str) -> str | None:
+    """The local path a host-less ``file:`` URL names, in :func:`_local` form, else ``None``."""
+    parts = urlsplit(url)
+    if parts.scheme.lower() != "file" or parts.netloc.lower() not in ("", "localhost"):
+        return None
+    return _local(urllib.request.url2pathname(parts.path))
+
+
+class _ResourceRefused(ValueError):
+    """A resource :class:`_ConfinedFiles` refuses to hand xmlschema. Not an ``OSError`` and not one of
+    xmlschema's resource errors, so neither its include path nor its import path catches it and the
+    build stops; :func:`_fallback_loader` alone turns it into a skipped import. Its message is fixed
+    text, never the location."""
+
+
+@functools.cache
+def _fallback_loader(xmlschema_mod: Any, bundled: tuple[_Root, ...]) -> type:
+    """xmlschema's ``SchemaLoader`` with one change: an import the opener refused is skipped, so
+    xmlschema tries its next location, only when one of those locations is a bundled copy of the
+    namespace (BACKLOG #5537). The stock W3C ``xmldsig-core-schema.xsd`` carries a DOCTYPE, and SAML
+    and WS-Security bundles import it by a local location; xmlschema's own copy then stands in.
+
+    Any other refused import stops the build. Skipped, it would leave the namespace undeclared, and a
+    ``lax`` or ``skip`` wildcard would then admit that namespace's content unchecked."""
+    blocked = xmlschema_mod.exceptions.XMLResourceBlocked
+
+    def has_bundled_copy(loader: Any, namespace: str, location: str) -> bool:
+        for url in loader.get_locations(namespace):
+            path = None if url == location else _file_url_path(url)
+            if path is not None and any(_within(path, root.path) for root in bundled):
+                return True
+        return False
+
+    def import_schema(
+        self: Any, target_schema: Any, namespace: str, location: str, *args: Any, **kwargs: Any
+    ) -> Any:
+        try:
+            return base.import_schema(self, target_schema, namespace, location, *args, **kwargs)
+        except _ResourceRefused as exc:
+            if not has_bundled_copy(self, namespace, location):
+                raise
+            raise blocked("block a refused import that a bundled copy stands in for") from exc
+
+    base = xmlschema_mod.SchemaLoader
+    return type("_FallbackLoader", (base,), {"import_schema": import_schema})
+
+
 class _ConfinedFiles(urllib.request.BaseHandler):
     """The only way xmlschema can open a resource here: ``file:`` URLs under fixed roots (BACKLOG #5537).
 
@@ -219,28 +266,26 @@ class _ConfinedFiles(urllib.request.BaseHandler):
     root is its own directory, or the ``schema_root`` the caller named. Each file under it is reached by
     :func:`_resolve_within` and checked by :func:`~messagefoundry.parsing.xml.harden.parse_bytes`
     first, so a path schema's includes meet the same DOCTYPE refusal as an inline schema. Anything else,
-    and a refused link or a DOCTYPE there, raises xmlschema's own ``XMLResourceBlocked``: an include
-    then fails the build, and an import is skipped with a warning and falls back to its next location,
-    such as a bundled copy. A missing file still raises ``FileNotFoundError``, which xmlschema reports
-    for an include as a warning, as it always has.
+    and a refused link, a DOCTYPE or a malformed file there, raises :class:`_ResourceRefused`, which
+    fails the build; :func:`_fallback_loader` says the one case where an import is skipped instead. A
+    missing file still raises ``FileNotFoundError``, which xmlschema reports as a warning and skips, as
+    it always has.
 
     The location is judged on its text by :func:`_local`, then compared with each root by whole
     components, so a sibling directory sharing a name prefix (``schemas-old`` beside ``schemas``) is
     outside. Only then is any of it touched, by the ``lstat`` walk."""
 
-    def __init__(
-        self, blocked: type[Exception], roots: tuple[_Root, ...], entry: str | None = None
-    ) -> None:
-        self._blocked = blocked
+    def __init__(self, roots: tuple[_Root, ...], entry: str | None = None) -> None:
         self._roots = roots
-        self._entry = None if entry is None else os.path.normcase(entry)
+        self._entry = entry
 
     def file_open(self, req: urllib.request.Request) -> urllib.response.addinfourl:
         url = req.full_url
-        parts = urlsplit(url)
-        written = _local(urllib.request.url2pathname(parts.path))
-        if parts.netloc.lower() in ("", "localhost") and written is not None:
-            if os.path.normcase(written) == self._entry:
+        written = _file_url_path(url)
+        if written is not None:
+            # The exact text, not a normcase'd form: in a case-sensitive Windows directory a sibling
+            # differing only in case is another file, and it must take the walk below.
+            if written == self._entry:
                 # The file the caller named is read as named, a link at it included; a DOCTYPE or
                 # text location in it raises unconverted, since the build has nowhere to fall back to.
                 data = _read(written, no_follow=False)
@@ -263,21 +308,20 @@ class _ConfinedFiles(urllib.request.BaseHandler):
                 except FileNotFoundError:
                     raise  # a missing file, as xmlschema has always reported it
                 except (OSError, ValueError) as exc:
-                    # Blocked, not an OSError or a ValueError: xmlschema drops an include that raises
-                    # OSError with only a warning, and stops the whole build on a ValueError where an
-                    # import would otherwise fall back to its next location, such as a bundled copy.
-                    # ValueError covers the parse_bytes refusals and a reparse point readlink rejects.
-                    raise self._blocked(
-                        "block a refused link, or a file parse_bytes refuses"
+                    # Refused, not an OSError: xmlschema drops an include or an import that raises
+                    # OSError with only a warning. ValueError covers the parse_bytes refusals and a
+                    # reparse point readlink rejects.
+                    raise _ResourceRefused(
+                        "refuse a link out, or a file parse_bytes refuses"
                     ) from exc
                 return urllib.response.addinfourl(io.BytesIO(data), email.message.Message(), url)
-        # PHI-safe: names no part of the location. xmlschema adds the URL to its own warning.
-        raise self._blocked("block access to a resource outside the schema's confinement root")
+        # PHI-safe: names no part of the location.
+        raise _ResourceRefused("refuse a resource outside the schema's confinement root")
 
     def unknown_open(self, req: urllib.request.Request) -> urllib.response.addinfourl:
         # allow="local" refuses a remote URL first; this keeps any scheme it lets through from reaching
         # OpenerDirector's no-handler path, which returns None and surfaces as an AttributeError.
-        raise self._blocked("block access to a resource that is not a local file")
+        raise _ResourceRefused("refuse a resource that is not a local file")
 
 
 class _SourceRefused(ValueError):
@@ -321,7 +365,7 @@ def _confinement_root(source: str, schema_root: str | os.PathLike[str] | None) -
 
 def _build_schema(
     xmlschema_mod: Any,
-    schema_source: str | bytes | os.PathLike[str],
+    schema_source: str | bytes | bytearray | os.PathLike[str],
     schema_root: str | os.PathLike[str] | None = None,
 ) -> Any:
     """Construct an ``xmlschema.XMLSchema`` that opens no file outside its confinement root.
@@ -333,15 +377,26 @@ def _build_schema(
     ``<!DOCTYPE xs:schema [<!ENTITY nm "patient">]>`` was parsed and its internal entity **expanded**,
     while ``parse_bytes`` refuses a DOCTYPE outright. An inline schema has no directory, so its own
     include, import, redefine or override location is opened only when it names a file in xmlschema's
-    bundled ``schemas`` directory; any other, local or remote, is refused: an include or a redefine that
-    needs one fails the build, and an import that needs one is skipped, so a type only it defines fails
-    the build. ``schema_root`` is refused for an inline schema.
+    bundled ``schemas`` directory. ``schema_root`` is refused for an inline schema.
 
     A schema given as a **path** (or a host-less ``file:`` URL) is read as the caller named it, a link
     at that name included, and checked by ``parse_bytes``. What it includes is opened only under its
     confinement root, each file checked the same way: its own directory, or ``schema_root`` when the
     caller names one, for a bundle such as HL7 CDA R2 whose schemas include across sibling directories
     (``../../processable/coreschemas/...``). Its includes resolve beside the name as written.
+
+    **A refused location** is a local one outside those bounds, one reached through a link out of the
+    root or to a UNC or device path, a UNC or device path itself, or a file there that ``parse_bytes``
+    refuses (a DOCTYPE, malformed or empty). On an include, redefine or override it fails the build. On
+    an import it fails the build too, with one exception: when xmlschema bundles a copy of the
+    imported namespace, the import falls back to that copy, as the stock W3C XML-DSig schema with its
+    DOCTYPE needs. A **remote** location never reaches the opener; ``allow="local"`` refuses it first,
+    which fails the build on an include, redefine or override, and on an import makes xmlschema skip
+    that location with a warning and try the next, as it did before BACKLOG #5537. A **missing** file
+    is handled by xmlschema as it always was: an include or an import of one is skipped with a
+    warning, and a redefine or override that carries components fails. A skipped import with no location left
+    leaves its namespace undeclared: a reference to one of its types fails the build, but a ``lax`` or
+    ``skip`` wildcard admits that namespace's elements unchecked.
 
     Both rely on :class:`_ConfinedFiles` as xmlschema's opener, with ``allow="local"`` so xmlschema
     refuses a remote URL before it reaches the opener, and ``defuse="always"`` so its own entity check
@@ -351,8 +406,10 @@ def _build_schema(
     compares URL string prefixes, and it narrows to each includer's own directory, so a nested include
     that climbs back inside the top-level directory was refused.
     """
-    blocked = xmlschema_mod.exceptions.XMLResourceBlocked
-    roots = _bundled_root(xmlschema_mod.__file__)
+    bundled = _bundled_root(xmlschema_mod.__file__)
+    roots = bundled
+    if isinstance(schema_source, bytearray):
+        schema_source = bytes(schema_source)
     try:
         entry = None
         if isinstance(schema_source, (str, bytes)) and _is_inline_xml(schema_source):
@@ -361,13 +418,19 @@ def _build_schema(
             source: Any = _refuse_text_locations(parse_bytes(schema_source))
         else:
             entry = _local_path(schema_source, "a schema location")
-            roots += (_confinement_root(entry, schema_root),)
+            roots = (*bundled, _confinement_root(entry, schema_root))
             # A file URL, not the bare path: xmlschema decodes a path's %XX a second time, and keeps
             # a URL's identity, so an include that includes the entry back is not loaded twice.
             source = Path(entry).as_uri()
         opener = urllib.request.OpenerDirector()
-        opener.add_handler(_ConfinedFiles(blocked, roots, entry))
-        return xmlschema_mod.XMLSchema(source, allow="local", defuse="always", opener=opener)
+        opener.add_handler(_ConfinedFiles(roots, entry))
+        return xmlschema_mod.XMLSchema(
+            source,
+            allow="local",
+            defuse="always",
+            opener=opener,
+            loader_class=_fallback_loader(xmlschema_mod, bundled),
+        )
     except _SourceRefused as exc:
         raise XmlValidationError(f"could not load XSD schema: {exc}") from exc
     except Exception as exc:  # xmlschema (and now harden) raise their own hierarchies
@@ -379,7 +442,7 @@ def _build_schema(
 
 def validate_against(
     document: str | bytes,
-    schema_source: str | bytes | os.PathLike[str],
+    schema_source: str | bytes | bytearray | os.PathLike[str],
     *,
     schema_root: str | os.PathLike[str] | None = None,
 ) -> XmlSchemaResult:

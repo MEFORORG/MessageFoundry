@@ -199,10 +199,13 @@ Two statements above were false in the shipped code, and both are corrected here
   as named, a link at that name included, and checked by `parse_bytes`; it is handed to `xmlschema`
   as a file URL, so an include that includes it back is recognised rather than loaded twice. A
   location that holds a newline or opens with `<`, which `xmlschema` would parse as an inline
-  document past the opener, is refused in every schema document read. A file
-  under the root that declares a DOCTYPE, or a link the walk refuses, is reported to `xmlschema` as a
-  blocked resource, so an import of the stock W3C XML-DSig schema, which carries a DOCTYPE, falls back
-  to the bundled copy rather than failing the build. The confinement root is the schema's own
+  document past the opener, is refused in every schema document read. A location the opener
+  refuses, such as a file under the root that declares a DOCTYPE or is malformed, a link the walk
+  refuses, or a file outside the root, fails the build on an include, redefine or override, and on an
+  import too, unless `xmlschema` bundles a copy of the imported namespace: then the import falls back
+  to that copy, as the stock W3C XML-DSig schema, which carries a DOCTYPE, needs. Skipping any other
+  refused import would leave its namespace undeclared, and a `lax` or `skip` wildcard would then admit
+  that namespace's content unchecked. The confinement root is the schema's own
   directory, or the directory the caller passes as `validate_against`'s `schema_root` keyword. That
   keyword exists for a bundle whose schemas include across sibling directories: the HL7 CDA R2 entry
   schema includes `../../processable/coreschemas/...`, and IHE XDS bundles do the same, so confining

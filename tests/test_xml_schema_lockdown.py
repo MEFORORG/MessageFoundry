@@ -101,7 +101,7 @@ def test_inline_schema_include_of_a_local_file_is_refused(tmp_path: Path) -> Non
     # On origin/main allow="local" opened inc.xsd and the include defined <patient>: valid=True.
     with pytest.raises(XmlValidationError) as ei:
         validate_against("<patient>x</patient>", schema)
-    assert "XMLResourceBlocked" in _causes(ei.value)
+    assert "_ResourceRefused" in _causes(ei.value)
     # Control: the included file itself is a sound schema, so the refusal is the include.
     assert validate_against("<patient>x</patient>", str(inc)).valid
 
@@ -118,10 +118,11 @@ def test_inline_schema_import_of_a_local_file_is_not_opened(tmp_path: Path) -> N
         f'<xs:import namespace="urn:o" schemaLocation="{other.as_uri()}"/>'
         '<xs:element name="patient" type="o:Id"/></xs:schema>'
     )
-    # A refused import is skipped with a warning, so the type it would have defined is unknown and
-    # the build fails. On origin/main the import read other.xsd and the schema loaded.
-    with pytest.warns(Warning, match="block access"), pytest.raises(XmlValidationError):
+    # urn:o has no bundled copy, so the refused import fails the build itself rather than being
+    # skipped. On origin/main the import read other.xsd and the schema loaded.
+    with pytest.raises(XmlValidationError) as ei:
         validate_against("<patient>x</patient>", schema)
+    assert "_ResourceRefused" in _causes(ei.value)
 
 
 def test_inline_schema_still_resolves_a_namespace_xmlschema_already_holds() -> None:
@@ -195,7 +196,7 @@ def test_path_schema_include_of_a_prefix_sharing_sibling_is_refused(tmp_path: Pa
     main = _write_path_schema(tmp_path / "schemas", "../schemas-old/inc.xsd")
     with pytest.raises(XmlValidationError) as ei:
         validate_against("<patient>x</patient>", str(main))
-    assert "XMLResourceBlocked" in _causes(ei.value)
+    assert "_ResourceRefused" in _causes(ei.value)
 
 
 def test_path_schema_remote_include_is_refused(tmp_path: Path) -> None:
@@ -239,7 +240,7 @@ def test_path_schema_include_outside_its_directory_is_refused(tmp_path: Path) ->
     # On origin/main allow="local" opened ../outside/inc.xsd: valid=True.
     with pytest.raises(XmlValidationError) as ei:
         validate_against("<patient>x</patient>", str(main))
-    assert "XMLResourceBlocked" in _causes(ei.value)
+    assert "_ResourceRefused" in _causes(ei.value)
 
 
 def test_path_schema_with_a_doctype_entity_is_refused(tmp_path: Path) -> None:
@@ -319,7 +320,7 @@ def test_a_network_or_device_location_is_refused_before_anything_touches_it(
         touched.clear()
         with pytest.raises(XmlValidationError) as ei:
             validate_against("<patient>x</patient>", source)
-        assert "XMLResourceBlocked" in _causes(ei.value)
+        assert "_ResourceRefused" in _causes(ei.value)
         assert not [p for p in touched if "nonexist-5537" in p]
 
 
@@ -398,7 +399,7 @@ def test_a_link_out_of_the_root_is_refused(tmp_path: Path, make_link: Any) -> No
     main = _write_path_schema(tmp_path / "schemas", "out/inc.xsd")
     with pytest.raises(XmlValidationError) as ei:
         validate_against("<patient>x</patient>", str(main))
-    assert "XMLResourceBlocked" in _causes(ei.value)
+    assert "_ResourceRefused" in _causes(ei.value)
     # Control: a link that stays inside the root is followed.
     main = _write_path_schema(tmp_path / "schemas", "in/inc.xsd")
     assert validate_against("<patient>x</patient>", str(main)).valid
@@ -431,7 +432,7 @@ def test_a_link_to_a_unc_share_is_refused_before_it_is_followed(
     touched = _spy_on_paths(monkeypatch)
     with pytest.raises(XmlValidationError) as ei:
         validate_against("<patient>x</patient>", str(main))
-    assert "XMLResourceBlocked" in _causes(ei.value)
+    assert "_ResourceRefused" in _causes(ei.value)
     assert not [p for p in touched if "nonexist-5537" in p]
 
 
@@ -474,7 +475,7 @@ def test_an_unreadable_link_under_the_root_fails_the_build(
     monkeypatch.setattr(os, "readlink", fake_readlink)
     with pytest.raises(XmlValidationError) as ei:
         validate_against("<patient>x</patient>", str(main))
-    assert "XMLResourceBlocked" in _causes(ei.value)
+    assert "_ResourceRefused" in _causes(ei.value)
 
 
 def test_an_import_with_a_doctype_falls_back_to_the_bundled_copy(tmp_path: Path) -> None:
@@ -498,6 +499,99 @@ def test_an_import_with_a_doctype_falls_back_to_the_bundled_copy(tmp_path: Path)
     )
     assert validate_against("<patient/>", str(main)).valid
     assert not validate_against("<other/>", str(main)).valid
+
+
+#: Imports urn:o, which no bundled copy covers, and admits its content through a LAX wildcard. Loaded,
+#: urn:o types o:id as an integer, so the instance below is invalid; with the import skipped, a lax
+#: wildcard admits the unknown element unchecked and the same instance validates.
+_LAX_IMPORTER = (
+    f'<xs:schema {_XS}><xs:import namespace="urn:o" schemaLocation="{{location}}"/>'
+    '<xs:element name="patient"><xs:complexType><xs:sequence>'
+    '<xs:any namespace="urn:o" processContents="lax"/>'
+    "</xs:sequence></xs:complexType></xs:element></xs:schema>"
+)
+_URN_O = (
+    f'<xs:schema {_XS} targetNamespace="urn:o"><xs:element name="id" type="xs:int"/></xs:schema>'
+)
+_URN_O_DOCTYPE = '<?xml version="1.0"?><!DOCTYPE xs:schema [<!ENTITY x "y">]>' + _URN_O
+_LAX_INSTANCE = '<patient><o:id xmlns:o="urn:o">x</o:id></patient>'
+
+
+def _lax_import_outcome(schema: str) -> str:
+    """``build-fails``, ``valid`` or ``invalid`` for :data:`_LAX_INSTANCE` against ``schema``."""
+    try:
+        result = validate_against(_LAX_INSTANCE, schema)
+    except XmlValidationError:
+        return "build-fails"
+    return "valid" if result.valid else "invalid"
+
+
+@pytest.mark.parametrize(
+    "imported",
+    [
+        pytest.param("<xs:schema", id="malformed"),
+        pytest.param(_URN_O_DOCTYPE, id="doctype"),
+        pytest.param("", id="empty"),
+    ],
+)
+def test_a_refused_import_with_no_bundled_copy_fails_the_build(
+    imported: str, tmp_path: Path
+) -> None:
+    # On 12e253ecb7 the opener raised XMLResourceBlocked for these, xmlschema skipped the import with
+    # only a warning, and the lax wildcard admitted o:id unchecked: valid=True. origin/main failed the
+    # build on a malformed file, and read a DOCTYPE one and found o:id invalid.
+    (tmp_path / "o.xsd").write_text(imported, encoding="utf-8")
+    main = tmp_path / "main.xsd"
+    main.write_text(_LAX_IMPORTER.format(location="o.xsd"), encoding="utf-8")
+    assert _lax_import_outcome(str(main)) == "build-fails"
+    # Control: the same import of a sound urn:o loads it, and o:id is checked.
+    (tmp_path / "o.xsd").write_text(_URN_O, encoding="utf-8")
+    assert _lax_import_outcome(str(main)) == "invalid"
+
+
+@pytest.mark.parametrize(
+    "make_link", [_symlink_or_skip, _junction_or_skip], ids=["symlink", "junction"]
+)
+def test_an_import_through_a_link_out_fails_the_build(tmp_path: Path, make_link: Any) -> None:
+    (tmp_path / "outside").mkdir()
+    (tmp_path / "outside" / "o.xsd").write_text(_URN_O, encoding="utf-8")
+    (tmp_path / "schemas").mkdir()
+    make_link(tmp_path / "outside", tmp_path / "schemas" / "out")
+    main = tmp_path / "schemas" / "main.xsd"
+    main.write_text(_LAX_IMPORTER.format(location="out/o.xsd"), encoding="utf-8")
+    assert _lax_import_outcome(str(main)) == "build-fails"
+
+
+def test_an_import_outside_the_root_fails_the_build(tmp_path: Path) -> None:
+    (tmp_path / "o.xsd").write_text(_URN_O, encoding="utf-8")
+    (tmp_path / "schemas").mkdir()
+    main = tmp_path / "schemas" / "main.xsd"
+    main.write_text(_LAX_IMPORTER.format(location="../o.xsd"), encoding="utf-8")
+    assert _lax_import_outcome(str(main)) == "build-fails"
+    # An inline schema has no root, so its local import is refused the same way.
+    inline = _LAX_IMPORTER.format(location=(tmp_path / "o.xsd").as_uri())
+    assert _lax_import_outcome(inline) == "build-fails"
+
+
+def test_a_nested_include_refused_under_an_import_fails_the_build(tmp_path: Path) -> None:
+    (tmp_path / "o.xsd").write_text(
+        f'<xs:schema {_XS} targetNamespace="urn:o"><xs:include schemaLocation="bad.xsd"/></xs:schema>',
+        encoding="utf-8",
+    )
+    (tmp_path / "bad.xsd").write_text(_URN_O_DOCTYPE, encoding="utf-8")
+    main = tmp_path / "main.xsd"
+    main.write_text(_LAX_IMPORTER.format(location="o.xsd"), encoding="utf-8")
+    assert _lax_import_outcome(str(main)) == "build-fails"
+
+
+def test_bytearray_inline_schema_is_read_as_the_schema() -> None:
+    # origin/main pre-parsed a bytearray schema as text; 12e253ecb7 sent it to the path branch, where
+    # os.fsdecode refused it and the schema failed to load.
+    assert validate_against("<patient>x</patient>", bytearray(_CLEAN.encode("utf-8"))).valid
+    assert not validate_against("<other>x</other>", bytearray(_CLEAN.encode("utf-8"))).valid
+    with pytest.raises(XmlValidationError) as ei:
+        validate_against("<patient>x</patient>", bytearray(_ENTITY.encode("utf-8")))
+    assert "XmlSecurityError" in _causes(ei.value)
 
 
 def test_a_percent_sequence_in_a_directory_name_is_decoded_once(tmp_path: Path) -> None:
@@ -577,7 +671,7 @@ def test_a_reparse_point_readlink_rejects_fails_the_build(
     monkeypatch.setattr(os, "readlink", fake_readlink)
     with pytest.raises(XmlValidationError) as ei:
         validate_against("<patient>x</patient>", str(main))
-    assert "XMLResourceBlocked" in _causes(ei.value)
+    assert "_ResourceRefused" in _causes(ei.value)
 
 
 def test_a_path_object_schema_source_is_a_path(tmp_path: Path) -> None:
@@ -623,7 +717,7 @@ def test_a_cda_shaped_bundle_needs_schema_root(tmp_path: Path) -> None:
     # Confined to its own directory, the cross-directory include is refused.
     with pytest.raises(XmlValidationError) as ei:
         validate_against("<patient>x</patient>", str(main))
-    assert "XMLResourceBlocked" in _causes(ei.value)
+    assert "_ResourceRefused" in _causes(ei.value)
     for root in (tmp_path / "cda", str(tmp_path / "cda"), (tmp_path / "cda").as_uri()):
         assert validate_against("<patient>x</patient>", str(main), schema_root=root).valid
         assert not validate_against("<other>x</other>", str(main), schema_root=root).valid
@@ -646,7 +740,7 @@ def test_an_include_climbing_above_schema_root_is_refused(tmp_path: Path) -> Non
         validate_against(
             "<patient>x</patient>", str(main), schema_root=tmp_path / "cda" / "infrastructure"
         )
-    assert "XMLResourceBlocked" in _causes(ei.value)
+    assert "_ResourceRefused" in _causes(ei.value)
 
 
 def test_schema_root_must_hold_the_schema(tmp_path: Path) -> None:
@@ -686,15 +780,33 @@ def test_a_schema_at_a_filesystem_root_is_confined_to_itself(tmp_path: Path) -> 
     assert _confinement_root(nested, None).path == os.path.join(top, "d")
 
 
-def test_a_non_file_url_reaching_the_opener_is_a_blocked_resource() -> None:
-    from xmlschema.exceptions import XMLResourceBlocked
+def test_only_the_exact_named_file_skips_the_link_walk(tmp_path: Path) -> None:
+    # The named file may be a link out of its directory and is read as named. A name differing from it
+    # only in case is another file in a case-sensitive Windows directory, so it takes the walk; it used
+    # to match on normcase and be read through the link unwalked.
+    from messagefoundry.parsing.xml.schema import _ConfinedFiles, _ResourceRefused, _Root
 
-    from messagefoundry.parsing.xml.schema import _ConfinedFiles
+    (tmp_path / "real").mkdir()
+    (tmp_path / "real" / "main.xsd").write_text(_CLEAN, encoding="utf-8")
+    (tmp_path / "cfg").mkdir()
+    entry = tmp_path / "cfg" / "main.xsd"
+    _symlink_or_skip(tmp_path / "real" / "main.xsd", entry)
+    opener = urllib.request.OpenerDirector()
+    opener.add_handler(_ConfinedFiles((_Root(str(tmp_path / "cfg"), vet=True),), str(entry)))
+    assert b"patient" in opener.open(entry.as_uri()).read()  # control: the named file itself
+    variant = (tmp_path / "cfg" / "MAIN.xsd").as_uri()
+    # Case-insensitive here: the walk finds the link and refuses its target. Case-sensitive: no file.
+    with pytest.raises((_ResourceRefused, FileNotFoundError)):
+        opener.open(variant)
+
+
+def test_a_non_file_url_reaching_the_opener_is_a_refused_resource() -> None:
+    from messagefoundry.parsing.xml.schema import _ConfinedFiles, _ResourceRefused
 
     opener = urllib.request.OpenerDirector()
-    opener.add_handler(_ConfinedFiles(XMLResourceBlocked, ()))
+    opener.add_handler(_ConfinedFiles(()))
     for url in ("http://127.0.0.1:9/x.xsd", "data:text/plain,x"):
-        with pytest.raises(XMLResourceBlocked):
+        with pytest.raises(_ResourceRefused):
             opener.open(url)
 
 
