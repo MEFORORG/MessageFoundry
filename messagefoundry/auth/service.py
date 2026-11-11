@@ -7762,7 +7762,7 @@ class AuthService:
             except Exception as exc:  # noqa: BLE001 -- raised below; see the comment above
                 _log.error(
                     "auth: the directory sign-in's role write for %s raised %s after its retry; "
-                    "the other sessions are revoked and the user told before it is raised",
+                    "the revoke of the other sessions is tried and the user told before it is raised",
                     scrub_log_argument(user.username),
                     type(exc).__name__,
                     exc_info=exc,
@@ -10687,18 +10687,21 @@ class AuthService:
         **A failed write-with-row must not keep the old state.** The directory stays
         authoritative, so a refused record must not leave the old roles in place, or the stale
         sessions. So, in order: the error is sorted by :func:`_is_held_write_error` and logged at
-        ERROR, before anything can raise past it; the write is applied again without the row, and
-        an error there raises at once, chained to the first; and, where that write landed, the row
-        is written on its own, whatever the first error was. A row that fails there too is lost
-        and logged at ERROR; a store refusal of it is handed to ``on_refused``, which reports its
-        action for a page, and returned. A row that lands on its own is logged at WARNING. A held
-        error, the first or one from the row written on its own, is returned for the caller to
-        raise once its own steps have run: the revoke, the user's notice and the pages. Every
-        ``Exception`` is caught at those two points, so an error
+        ERROR, before anything can raise past it; the write is applied again without the row; and,
+        where that write landed, the row is written on its own, whatever the first error was. A
+        row that fails there too is lost and logged at ERROR; a store refusal of it is handed to
+        ``on_refused``, which reports its action for a page, and returned. A row that lands on its
+        own is logged at WARNING. A held error, the first or one from the row written on its own,
+        is returned for the caller to raise once its own steps have run: the revoke, the user's
+        notice and the pages. Every ``Exception`` is caught at those two points, so an error
         :func:`~messagefoundry.store.base.audit_write_errors` does not name still gets the retry
-        without the row; :func:`_is_held_write_error` decides only how it is logged and paged. An
-        error from the retry raises out of here, and the callers still end the sessions and tell
-        the user, since the write may have committed."""
+        without the row; :func:`_is_held_write_error` decides only how it is logged and paged.
+
+        **An error from the retry raises out of here.** The retry may have committed with no row,
+        so it is logged at ERROR, ``on_refused`` reports the action, and the first error is raised
+        when it was held, with the retry's named on it; otherwise the retry's is raised, chained
+        to the first. The role-write callers then still revoke the sessions and tell the user. The
+        revoke's caller cannot: its retry is the session end."""
         try:
             result = await write(True)
         except Exception as exc:  # noqa: BLE001 -- sorted below; see the docstring
@@ -10717,7 +10720,29 @@ class AuthService:
                 exc_info=exc,
             )
             first = exc
-            result = await write(False)
+            try:
+                result = await write(False)
+            except Exception as again:  # noqa: BLE001 -- raised below; see the docstring
+                _log.error(
+                    "%s: the write behind the %s row for %s raised %s again without the row; it "
+                    "may have committed with no row",
+                    where,
+                    action,
+                    scrub_log_argument(actor),
+                    type(again).__name__,
+                    exc_info=again,
+                )
+                on_refused(action)
+                if held is None:
+                    raise
+                _hold(held, again)
+                reraise_first = True
+            else:
+                reraise_first = False
+            if reraise_first:
+                # ``held`` is ``exc``, the error this handler caught; re-raised outside the
+                # retry's handler, so it keeps its own context.
+                raise
         else:
             return _RowWrite(result, landed(result), retried=False, held=None, refused=None)
         if not landed(result):
@@ -10833,20 +10858,24 @@ class AuthService:
         **Not closed:** a first write that committed, then another writer's move to a third set
         before the read, reads as not written, and this write goes unreported. A row lost twice is
         noted for the pass's ``audit_write_failed`` page."""
-        moved = {"from": sorted(previous), "to": sorted(role_ids), "via": "ad-reconcile"}
-        resynced = AuditAppend(
-            "auth.ad_roles_resynced", actor=revocation.username, detail=_json(moved)
-        )
+        detail = _json({"from": sorted(previous), "to": sorted(role_ids), "via": "ad-reconcile"})
+        resynced = AuditAppend("auth.ad_roles_resynced", actor=revocation.username, detail=detail)
         read_back_refused = False
 
         def row(_written: bool) -> AuditAppend:
             if not read_back_refused:
                 return resynced
-            # The detail is a literal here, where the audit scope census reads it.
             return AuditAppend(
-                resynced.action,
+                "auth.ad_roles_resynced",
                 actor=revocation.username,
-                detail=_json({**moved, "read_back": "refused"}),
+                detail=_json(
+                    {
+                        "from": sorted(previous),
+                        "to": sorted(role_ids),
+                        "via": "ad-reconcile",
+                        "read_back": "refused",
+                    }
+                ),
             )
 
         async def write(with_row: bool) -> bool:
@@ -10860,15 +10889,14 @@ class AuthService:
             )
             if written or with_row:
                 return written
+            # Fail toward a report on a refused read or a record that fails its seal: the first
+            # write may have landed, and a revoke skipped then would leave its sessions on the old
+            # roles. Read through the seal, so the roles compared are ones the seal vouches for.
             try:
-                if await self._store.get_user(revocation.user_id) is None:
-                    return False
-                stored = await self._store.get_user_role_ids(revocation.user_id)
+                stored = await self._lookup_user(revocation.user_id)
             except audit_write_errors() as exc:
                 if _is_held_write_error(exc):
                     raise
-                # Fail toward a report: the first write may have landed, and a revoke skipped on
-                # a refused read would leave its sessions on the old roles.
                 _log.error(
                     "directory reconcile: the roles of %s could not be read back after a retried "
                     "write found them moved; the change is counted as written",
@@ -10877,7 +10905,17 @@ class AuthService:
                 )
                 read_back_refused = True
                 return True
-            return set(stored) == set(role_ids)
+            if not stored.held:
+                return False
+            if stored.user is None:
+                _log.error(
+                    "directory reconcile: the record of %s fails its seal on the read-back after a "
+                    "retried write found its roles moved; the change is counted as written",
+                    scrub_log_argument(revocation.username),
+                )
+                read_back_refused = True
+                return True
+            return set(stored.user.role_ids) == set(role_ids)
 
         return await self._write_with_row(
             write,
@@ -10969,11 +11007,11 @@ class AuthService:
                 )
             except Exception as exc:  # noqa: BLE001 -- held and raised below; see the comment
                 # The retry or its read-back raised, and the role change may have committed. Fail
-                # closed: count it as changed, so the sessions still end, the change reports and
-                # the user is told, then raise it.
+                # closed: count it as changed, so the revoke is still tried and the user told,
+                # then raise it.
                 _log.error(
                     "directory reconcile: the role write for %s raised %s after its retry; it is "
-                    "counted as changed, the sessions are ended and the user is told, then it is "
+                    "counted as changed, the revoke is tried and the user is told, then it is "
                     "raised",
                     scrub_log_argument(revocation.username),
                     type(exc).__name__,
@@ -11020,18 +11058,22 @@ class AuthService:
             and revocation.reason in _ALWAYS_REPORTED_REASONS
             and await self._already_revoked_elsewhere(revocation, watermark=watermark)
         )
+        revoke_error: Exception | None = None
         try:
             ended = await self._revoke_with_row(revocation)
         except Exception as exc:  # noqa: BLE001 -- raised below, after the notice
+            revoke_error = exc
+        if revoke_error is not None:
             # A failed revoke without its row raises, as a failed revoke always did. A committed
             # role change is still told to its user first, as the sign-in does. The role write's
             # held error, logged when it was held, is raised first, with this one named on it.
+            # Raised outside the handler, so the held error keeps its own context.
             if pending is not None:
                 _log.error(
                     "directory reconcile: the revoke for %s raised %s after its retry",
                     scrub_log_argument(revocation.username),
-                    type(exc).__name__,
-                    exc_info=exc,
+                    type(revoke_error).__name__,
+                    exc_info=revoke_error,
                 )
             if roles_changed and user is not None and revocation.reason != reconcile.SCOPE_CHANGED:
                 await self._notify_security(
@@ -11040,11 +11082,7 @@ class AuthService:
                     email=user.notify_email,
                     detail={"reason": revocation.reason, "source": "directory"},
                 )
-            if pending is None:
-                raise
-            _hold(pending, exc)
-            # The revoke's error did not cause the held one; it is logged above and noted on it.
-            raise pending from pending.__cause__
+            raise _hold(pending, revoke_error) or revoke_error
         revoked, written, retried = ended.result, ended.written, ended.retried
         pending = _hold(pending, ended.held)
         quiet = (

@@ -7444,7 +7444,8 @@ async def test_a_raising_read_back_after_a_lost_reply_still_ends_the_sessions_an
     try:
         notifier, revocation, target = await _role_revocation(store, service)
         real_write = store.set_user_roles_if_held
-        real_read = store.get_user_role_ids
+        real_read = store.get_user
+        read_raised: list[bool] = []
         calls: list[bool] = []
 
         async def reply_lost(*args: Any, **kwargs: Any) -> bool:
@@ -7454,18 +7455,20 @@ async def test_a_raising_read_back_after_a_lost_reply_still_ends_the_sessions_an
                 raise sqlite3.OperationalError("synthetic: the COMMIT reply was lost")
             return written
 
-        async def read_fails(user_id: str) -> list[str]:
-            if len(calls) == 2:
+        async def read_fails(user_id: str) -> Any:
+            if len(calls) == 2 and not read_raised:
+                read_raised.append(True)
                 raise error
             return await real_read(user_id)
 
         monkeypatch.setattr(store, "set_user_roles_if_held", reply_lost)
-        monkeypatch.setattr(store, "get_user_role_ids", read_fails)
+        monkeypatch.setattr(store, "get_user", read_fails)
         with pytest.raises(type(error)):
             await service._apply_reconcile_revocation(
                 revocation, watermark=await service._audit_watermark()
             )
         assert calls == [True, False]
+        assert read_raised == [True], "the read-back was not reached"
         monkeypatch.undo()
         assert sorted(await store.get_user_role_ids(revocation.user_id)) == sorted(target)
         assert await service.identity_for_token(tokens["jdoe"]) is None
@@ -7484,7 +7487,8 @@ async def test_a_refused_read_back_counts_as_written_and_its_row_says_so(
     try:
         notifier, revocation, target = await _role_revocation(store, service)
         real_write = store.set_user_roles_if_held
-        real_read = store.get_user_role_ids
+        real_read = store.get_user
+        read_raised: list[bool] = []
         calls: list[bool] = []
 
         async def reply_lost(*args: Any, **kwargs: Any) -> bool:
@@ -7494,19 +7498,21 @@ async def test_a_refused_read_back_counts_as_written_and_its_row_says_so(
                 raise sqlite3.OperationalError("synthetic: the COMMIT reply was lost")
             return written
 
-        async def read_refused(user_id: str) -> list[str]:
-            if len(calls) == 2:
+        async def read_refused(user_id: str) -> Any:
+            if len(calls) == 2 and not read_raised:
+                read_raised.append(True)
                 raise sqlite3.OperationalError("synthetic: the read was refused")
             return await real_read(user_id)
 
         monkeypatch.setattr(store, "set_user_roles_if_held", reply_lost)
-        monkeypatch.setattr(store, "get_user_role_ids", read_refused)
+        monkeypatch.setattr(store, "get_user", read_refused)
         assert (
             await service._apply_reconcile_revocation(
                 revocation, watermark=await service._audit_watermark()
             )
             == "reported"
         )
+        assert read_raised == [True], "the read-back was not reached"
         assert [e.event_type for e in notifier.sent] == [ROLES_CHANGED]
         rows = [
             json.loads(r["detail"]) for r in await store.list_audit(action="auth.ad_roles_resynced")

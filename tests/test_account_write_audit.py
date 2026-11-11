@@ -421,7 +421,8 @@ async def test_a_sign_in_logs_its_first_role_error_before_the_retry_can_raise(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #2221. The first error is logged at ERROR before the write is tried again, so a
-    retry that raises cannot lose it; the retry's error carries it as its context."""
+    retry that raises cannot lose it. A held first error is the one raised, with the retry's named
+    on it."""
     service, _first, _grants, _audit_pages = await _signed_in(store)
     await service.set_ad_group_map([("cn=mf-ops,dc=x", "viewer")], actor="admin")
     calls: list[int] = []
@@ -435,10 +436,10 @@ async def test_a_sign_in_logs_its_first_role_error_before_the_retry_can_raise(
     monkeypatch.setattr(store, "set_user_roles", failing)
     with (
         caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"),
-        pytest.raises(sqlite3.OperationalError) as raised,
+        pytest.raises(NotImplementedError) as raised,
     ):
         await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)
-    assert isinstance(raised.value.__context__, NotImplementedError)
+    assert any("OperationalError" in note for note in raised.value.__notes__)
     assert any(
         r.levelno == logging.ERROR
         and "NotImplementedError" in r.getMessage()
@@ -478,7 +479,7 @@ async def test_an_unclassified_error_in_the_sign_in_role_row_still_ends_the_sess
     """BACKLOG #2221. An error outside ``audit_write_errors()`` in the sign-in's in-transaction
     row: the write may have committed, so the roles are written again without it, the stale
     sessions end and the user is told, and only then does the sign-in fail with the error."""
-    service, first, _grants, _audit_pages = await _signed_in(store)
+    service, first, _grants, audit_pages = await _signed_in(store)
     await service.set_ad_group_map([("cn=mf-ops,dc=x", "viewer")], actor="admin")
     service._security_notifier.sent.clear()
     raised = _append_fails(monkeypatch, store, error)
@@ -489,6 +490,11 @@ async def test_an_unclassified_error_in_the_sign_in_role_row_still_ends_the_sess
     assert user is not None and await store.get_user_role_ids(user.id) == ["viewer"]
     assert await service.identity_for_token(first) is None, "the error kept a stale session"
     assert [e.username for e in service._security_notifier.sent] == ["jdoe"]
+    assert (await _details(store, "auth.ad_roles_resynced"))[0] == {
+        "from": ["operator"],
+        "to": ["viewer"],
+    }, "the row was not written on its own"
+    assert audit_pages == [], "an error that is not a store refusal paged as one"
 
 
 @pytest.mark.parametrize(
@@ -502,7 +508,7 @@ async def test_a_sign_in_whose_role_retry_raises_still_ends_the_sessions_and_tel
     """BACKLOG #2221. The role write raises with its row and again without it. Either may have
     committed, so the account's other sessions still end and the user is still told before the
     sign-in fails with the retry's error."""
-    service, first, _grants, _audit_pages = await _signed_in(store)
+    service, first, _grants, audit_pages = await _signed_in(store)
     await service.set_ad_group_map([("cn=mf-ops,dc=x", "viewer")], actor="admin")
     service._security_notifier.sent.clear()
     calls: list[int] = []
@@ -519,3 +525,4 @@ async def test_a_sign_in_whose_role_retry_raises_still_ends_the_sessions_and_tel
     assert len(calls) == 2
     assert await service.identity_for_token(first) is None, "a raising retry kept a stale session"
     assert [e.username for e in service._security_notifier.sent] == ["jdoe"]
+    assert audit_pages == ["auth.ad_roles_resynced"], "a retry that may have committed rowless"
