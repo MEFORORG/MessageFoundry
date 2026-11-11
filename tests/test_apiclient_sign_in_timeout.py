@@ -137,12 +137,13 @@ def test_the_timeout_matches_the_ides_sign_in_timeout() -> None:
 
 
 def test_the_sign_in_read_outlasts_the_engines_request_deadline() -> None:
-    """RED when: ``SIGN_IN_TIMEOUT_SECONDS`` is at or below the engine's default request deadline
-    (vault BACKLOG #2950 step 1). A shorter read lets a sign-in still waiting in the per-account
-    queue outlast the client while the engine goes on to finish it; a longer one means that, at the
-    default, the engine's reply or its 503 arrives first. The client cannot import the engine's
-    constant (``tests/test_dependency_boundaries.py``), so the order is pinned here."""
-    assert SIGN_IN_TIMEOUT_SECONDS > DEFAULT_REQUEST_TIMEOUT_SECONDS
+    """RED when: ``SIGN_IN_TIMEOUT_SECONDS`` is less than 30 s above the engine's default request
+    deadline (vault BACKLOG #2950 step 1). At or below it, a sign-in still waiting in the
+    per-account queue outlasts the client while the engine goes on to finish; a hair above it, the
+    engine's 503 can still arrive after the read expires. 30 s is the margin ``cluster_stepdown``
+    takes over the same deadline. The client cannot import the engine's constant
+    (``tests/test_dependency_boundaries.py``), so the order is pinned here."""
+    assert SIGN_IN_TIMEOUT_SECONDS - DEFAULT_REQUEST_TIMEOUT_SECONDS >= 30.0
 
 
 def test_confirm_mfa_sends_the_enrolment_code_only_when_given() -> None:

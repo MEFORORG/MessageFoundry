@@ -146,13 +146,16 @@ _HTTP_PENDING_APPROVAL = 202
 #: the IDE's ``SIGN_IN_TIMEOUT_MS`` (``ide/src/signInSession.ts``). The lock itself takes no
 #: timeout (``keyed_lock.hold_keyed_lock``), but the engine's default request deadline,
 #: ``api.request_timeout.DEFAULT_REQUEST_TIMEOUT_SECONDS``, cancels a handler still waiting on it
-#: and answers 503. This value is LONGER than that deadline, so at the default the engine answers,
-#: with its reply or its 503, before this client gives up on the read: a queue can no longer
-#: outlast the client while the engine goes on to finish. A lost reply is still possible, from the
-#: transport itself or from an engine whose deadline was raised past this value. The order is
-#: pinned by ``tests/test_apiclient_sign_in_timeout.py``. It is a floor on the read phase only
+#: and answers 503. This value is LONGER than that deadline, by the 30 s margin
+#: ``cluster_stepdown`` also takes, so a reply or 503 the engine sends at its default deadline
+#: arrives inside this read. It narrows the lost outcome; it does not close it. At least these
+#: still leave the client unsure whether the engine finished: a 503 from a deadline that cancelled
+#: the handler after the sign-in or change had committed; shielded work that delays the 503 past
+#: this read; a terminating proxy with a shorter read timeout; a deadline raised past this value or
+#: disabled; and a reply the transport drops. The order is pinned by
+#: ``tests/test_apiclient_sign_in_timeout.py``. It is a floor on the read phase only
 #: (:meth:`EngineClient._sign_in_timeout`); every other request keeps the client's timeout.
-SIGN_IN_TIMEOUT_SECONDS = 130.0
+SIGN_IN_TIMEOUT_SECONDS = 150.0
 
 
 @dataclass(frozen=True, slots=True)

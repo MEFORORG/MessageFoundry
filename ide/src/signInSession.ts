@@ -48,8 +48,10 @@ export interface TokenCache {
  *  per-account queue, so it gets far more than a status read, and outlasts the engine's default
  *  request deadline (vault BACKLOG #2950). Matches the Python client's `SIGN_IN_TIMEOUT_SECONDS`
  *  (`messagefoundry/apiclient/client.py`, which says why); `tests/test_apiclient_sign_in_timeout.py`
- *  pins both. */
-export const SIGN_IN_TIMEOUT_MS = 130_000;
+ *  pins both. The match is for the reply wait only: the Python client raises just its read phase,
+ *  while this one idle timeout also bounds the connect and the TLS handshake, and every cache reader
+ *  waits behind a sign-in for up to SIGN_IN_WAIT_MS. */
+export const SIGN_IN_TIMEOUT_MS = 150_000;
 
 /** The longest any wait here lasts, in ms: past the request timeout, so a waiter outlasts the attempt. */
 export const SIGN_IN_WAIT_MS = SIGN_IN_TIMEOUT_MS + 5_000;
