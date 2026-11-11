@@ -7,8 +7,12 @@ The token tables (customer/partner names + estate-vendor tokens) are the owner-m
 same way ``messagefoundry_toolkit/anon/leak.py`` does) rather than vendoring a copy — so **no
 literal or fragmented customer/vendor token appears in this tracked, published file**, and there is nothing to
 drift (``test_anon_parity`` still pins the two equal). Loading by path keeps the tee ``messagefoundry``-free.
-The tables are read from the guard at each scan, not copied at import, so a ``reload_tokens()`` on
-the guard reaches the scan and the liveness flag together (BACKLOG #5541).
+The name and estate tables are read from the guard at each scan, not copied at import, so a
+``reload_tokens()`` on the guard reaches those tables and the liveness flag together (BACKLOG
+#5541). It does not reach the site-code check: ``surrogates.message_has_site_code`` keeps the
+prefixes ``surrogates.py`` loaded at import until ``surrogates.reload_site_prefixes()`` runs, so
+after a guard reload alone a report can call the denylist live while that check uses the old
+prefixes.
 
 The real tokens themselves are EXTERNALIZED out of the guard (a git-ignored token file /
 ``MEFOR_FORBIDDEN_TOKENS``), so a token-less checkout (a fork, or an installed wheel with no
@@ -861,7 +865,8 @@ def leak_report(
     token hits come from the tee's local :func:`scan_text` (and the field-anchored site-code check)
     rather than the toolkit's ``_scanner()`` delegate, but the structural walk, coverage report, and
     token-floor signal are the byte-identical shared logic above. Structural detection engages **only
-    when ``rules`` is supplied**; a bare-string call is the legacy token-only behaviour.
+    when ``rules`` is supplied**; a bare-string call is token-only, as the legacy one was, except
+    that the token scan also reads the text decoded from its HL7 escape sequences (BACKLOG #5532).
 
     ``version`` is the HL7 version a bare line is judged by. A caller that checks the OUTPUT of
     ``anonymize`` passes the version of the INPUT (:func:`message_version`), because a rule may

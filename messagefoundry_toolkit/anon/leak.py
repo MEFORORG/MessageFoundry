@@ -821,7 +821,9 @@ def leak_report(
     detectors run over those fields, over what a retarget of a default field left past its
     first component (:func:`retarget_residue_hits`), and over the components an identifier rule
     keeps past its first (:func:`kept_component_hits`). With ``rules is None`` (a direct/legacy
-    call over a bare string) structural detection is skipped and the result is byte-for-byte the legacy token-only behaviour.
+    call over a bare string) structural detection is skipped and the check is token-only, as the
+    legacy one was, except that the token scan also reads the text decoded from its HL7 escape
+    sequences (BACKLOG #5532), so it can name a token the legacy check missed.
 
     ``version`` is the HL7 version a bare line is judged by. A caller that checks the OUTPUT of
     ``anonymize`` passes the version of the INPUT (:func:`message_version`), because a rule may
