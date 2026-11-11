@@ -10,8 +10,8 @@ and each now raises :class:`XmlError` naming only the exception type, with nothi
 ``__cause__`` or ``__context__``. A coverage comparison that cannot canonicalize the document fails
 with ``UnsignedContent`` instead, because the cryptography has already passed by then.
 
-A bad ANCHOR is the caller's fault, not the document's, so it keeps raising ``ValueError`` and is
-never reported as an ``XmlError``.
+A bad ANCHOR is the caller's fault, not the document's, so it is refused before the document is
+read, at least with ``ValueError``.
 
 All material is minted at run time, and every planted value is synthetic.
 """

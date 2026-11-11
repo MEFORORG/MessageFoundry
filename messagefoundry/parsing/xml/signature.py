@@ -354,9 +354,10 @@ def _read_anchor(
     ``cryptography`` certificate object is passed through, any object with ``to_cryptography()``,
     such as a pyOpenSSL one, is converted through it, and anything else is read as PEM text.
 
-    A pinned certificate or its key, or a CA file, that cannot be read raises :class:`ValueError`
-    naming the anchor and the type of the fault; a CA file that cannot be opened raises
-    :class:`OSError`.
+    It raises at least these: :class:`ValueError` naming the anchor and the type of the fault, for
+    a pinned certificate or its key, or a CA file, that cannot be read; and :class:`OSError` for a
+    CA file that cannot be opened. A fault it does not catch, such as a pyOpenSSL pin whose
+    ``to_cryptography()`` raises ``OpenSSL.crypto.Error``, escapes as raised.
     """
     # Imported here, not at module top, as in _signing_key_refusal.
     from cryptography import x509
@@ -480,12 +481,14 @@ def verify(
     not take the signer's identity from ``ds:KeyInfo`` either, and do not treat a
     ``ds:X509Certificate`` there as checked: the anchor you pass is what checks the signer.
 
-    Raises :class:`ValueError` if no anchor is supplied or the anchor cannot be read, such as a
-    pinned certificate that is not one or whose key cannot be loaded, or a CA file holding none,
-    and :class:`OSError` if ``ca_pem_file`` cannot be opened. Both are raised before the document
-    is read. Only reading is checked there: a pin whose key type signxml cannot verify with, such
-    as Ed25519, or a CA certificate in the file whose key cannot be loaded, fails per document
-    instead, as an ``XmlError`` or an ``InvalidCertificate`` result.
+    Raises :class:`ValueError` if no anchor is supplied. An anchor that cannot be read is refused
+    before the document is read, at least with :class:`ValueError`, such as for a pinned certificate
+    that is not one or whose key cannot be loaded, or a CA file holding none, and with
+    :class:`OSError` if ``ca_pem_file`` cannot be opened. A fault that read does not catch escapes
+    as raised, and :func:`_read_anchor` names one. Only reading is checked there: a pin whose key
+    type signxml cannot verify with, such as Ed25519, or a CA certificate in the file whose key
+    cannot be loaded, fails per document instead, as an ``XmlError`` or an ``InvalidCertificate``
+    result.
     Raises :class:`~messagefoundry.parsing.xml.errors.XmlError` if signxml or a library
     under it cannot process the signature, such as a schema-invalid or empty ``ds:SignatureValue``
     or key data it cannot read (vault BACKLOG #2816, #5372). That message names only the library's
