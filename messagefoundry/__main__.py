@@ -11609,16 +11609,17 @@ def _restore_verify(args: argparse.Namespace) -> int:
     # No #1670 clause here on purpose: this one never opens `settings.store`. Its only open_store
     # call is inside `_full_open_check`, which catches broadly around that open and reports FAIL
     # with a reason -- and the leak that made that hang is fixed in `MessageStore.open` itself.
-    # Its decrypt pass runs before that open; a RuntimeError, ValueError, OSError or sqlite3.Error
-    # from it is reported as a FAIL too (BACKLOG #1719).
+    # Its decrypt pass runs before that open and again after it; a RuntimeError, ValueError,
+    # OSError or sqlite3.Error from either is reported as a FAIL too (BACKLOG #1719).
     try:
         result = run_guarded(
             run_restore_verify(args.archive, store_settings=settings.store, full=args.full)
         )
     except _key_unresolved() as exc:
         # The keyring is resolved before the archive is read, so this is "could not start", not a
-        # FAIL (BACKLOG #3471). A --full verify builds the cipher again, for its decrypt pass and
-        # its open, and reports a key error there as that check's FAIL, after the archive was read.
+        # FAIL (BACKLOG #3471). A --full verify builds the cipher again, for each of its two decrypt
+        # passes and its open, and reports a key error there as that check's FAIL, after the archive
+        # was read.
         return _emit_key_unresolved(exc, as_json=args.json)
     payload = {
         "status": result.status,

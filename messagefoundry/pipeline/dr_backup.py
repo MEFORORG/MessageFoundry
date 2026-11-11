@@ -3900,8 +3900,8 @@ def _full_open_check(
     engine_version: str = "",
     posture: HopPosture | None = None,
 ) -> tuple[str, str, int]:
-    """Decrypt + authenticate the snapshot's PHI as archived, then open it through the real
-    ``open_store`` path.
+    """Decrypt + authenticate the snapshot's PHI as archived, open it through the real
+    ``open_store`` path, then decrypt + authenticate the opened, migrated copy's PHI.
     Returns ``(status, message, decrypted_cells)`` — the ``VerifyResult`` status this leg earned, so the
     caller can hand it straight on. Heavier; only run for ``full_restore_verify``.
 
@@ -3945,8 +3945,9 @@ def _full_open_check(
         except (RuntimeError, ValueError, OSError, sqlite3.Error) as exc:
             # Its cipher build and its read-only connect are the open's own, so a failure there (a
             # key provider or DPAPI, a cipher config or a refused hop, a file the connect cannot
-            # read) is the FAIL the open's handler gave it when the open ran first. Still a verdict,
-            # and still behind an incompatible snapshot's, so the open runs and the order decides.
+            # read) is reported as the FAIL the open's handler gives the same failure. Before the
+            # open it is still behind an incompatible snapshot's verdict, so the open runs and the
+            # order below decides; after the open it is the verdict.
             return "FAIL", safe_exc(exc), 0
 
     # The cells are read FIRST, from the snapshot as the archive holds it (BACKLOG #1719). The open
@@ -4011,10 +4012,8 @@ def _full_open_check(
     # It decides a verdict only. Its count would include a value the open's own sweep sealed, which
     # the archive did not hold sealed, so the count reported is the first walk's: the archive's
     # cells that decrypted as it holds them.
-    rewalked = _walk()
-    if rewalked[0] != "PASS":
-        return rewalked
-    return walked
+    status, reason, _rewalked_cells = _walk()
+    return status, reason, walked[2]
 
 
 #: Longer than safe_exc's default, so the remedy and at least the first differences survive.
