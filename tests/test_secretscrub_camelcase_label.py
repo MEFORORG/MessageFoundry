@@ -1,0 +1,666 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""BACKLOG #5545: a camelCase or PascalCase credential label, such as ``accessToken=`` or
+``clientSecret=``, is read by the credential scrub.
+
+Every label pattern in :mod:`messagefoundry.secretscrub` started at a word boundary, a "%XX" escape or
+a "._-" separated prefix, so a keyword glued to a lower-case letter by a capital had no start
+position, and its value would print in the write-time log on first deployment. The same module
+already read those spellings as credentials in a URL query (``_camel_tail``). The fix adds a second
+label start, ``_LABEL_OR_CAMEL_START``, at a capital after a lower-case letter or a digit, where a
+label word starts and ends the word.
+
+Each value here is built from parts at import time, so no credential-shaped literal sits in this
+file. Every value is synthetic."""
+
+from __future__ import annotations
+
+import logging
+import random
+import re
+from collections.abc import Callable
+from functools import partial
+
+import pytest
+
+from messagefoundry import logging_setup, secretscrub
+from messagefoundry.logging_setup import _install_phi_filters
+from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER, scrub_credentials
+from messagefoundry.support import redact as redact_mod
+from messagefoundry.support.redact import redact_log_line
+from tests._growth import _growth_between
+
+#: A synthetic value, joined from parts so the file holds no credential-shaped literal.
+_VALUE = "".join(("zq", "7", "cml", "-", "Vx", "_", "42"))
+
+#: Lines whose label is glued on by a camelCase capital, with the label as it must survive.
+_CAMEL_LINES = (
+    (f"accessToken={_VALUE}", "accessToken="),
+    (f"clientSecret={_VALUE}", "clientSecret="),
+    (f"refreshToken: {_VALUE}", "refreshToken"),
+    (f"userPassword={_VALUE}", "userPassword="),
+    (f"idToken={_VALUE}", "idToken="),
+    (f"sessionToken={_VALUE}", "sessionToken="),
+    (f"oauth2Token={_VALUE}", "oauth2Token="),
+    (f"cfg.clientSecret={_VALUE}", "cfg.clientSecret="),
+    (f'token response {{"accessToken": "{_VALUE}", "expiresIn": 3600}}', "accessToken"),
+    (f"grant failed: refreshToken={_VALUE}&scope=read", "refreshToken="),
+    (f"ldap bind: bindPassword='{_VALUE}' refused", "bindPassword="),
+    (f"vault: rootPwd={_VALUE}", "rootPwd="),
+)
+
+
+def _through_the_chain(text: str) -> str:
+    """``text`` as a log message through the filters ``_install_phi_filters`` puts on a handler."""
+    handler = logging.NullHandler()
+    _install_phi_filters(handler)
+    record = logging.LogRecord("t", logging.ERROR, __file__, 1, "%s", (text,), None)
+    assert handler.filter(record)
+    return record.getMessage()
+
+
+#: The three surfaces a log line reaches.
+_SURFACES = (
+    ("scrub_credentials", scrub_credentials),
+    ("write-time chain", _through_the_chain),
+    ("support bundle", redact_log_line),
+)
+
+
+@pytest.mark.parametrize(("line", "label"), _CAMEL_LINES, ids=[line for line, _ in _CAMEL_LINES])
+def test_a_camelcase_label_loses_its_value_on_every_surface(line: str, label: str) -> None:
+    printed = [name for name, apply in _SURFACES if _VALUE in apply(line)]
+    assert not printed, (line, printed)
+    out = scrub_credentials(line)
+    assert label in out and CREDENTIAL_PLACEHOLDER in out, out
+
+
+def _without_the_camel_start(patch: pytest.MonkeyPatch) -> None:
+    """The three label patterns with the camelCase start never matching, so only ``_LABEL_START``
+    starts a label. The ``camel`` group stays, since the narrowed value class reads it."""
+    for name in ("_BEARER", "_CREDENTIAL_KV", "_KEY_MATERIAL"):
+        pattern: re.Pattern[str] = getattr(secretscrub, name)
+        assert pattern.pattern.count(secretscrub._CAMEL_LABEL_START) == 1, name
+        old = pattern.pattern.replace(secretscrub._CAMEL_LABEL_START, "(?!)")
+        patch.setattr(secretscrub, name, re.compile(old, pattern.flags))
+
+
+def test_every_camelcase_line_prints_its_value_without_the_camel_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE POSITIVE CONTROL: with the camelCase start taken back out, every line above prints its
+    value on the credential scrub, so the green above is that start's work."""
+    _without_the_camel_start(monkeypatch)
+    printed = [line for line, _ in _CAMEL_LINES if _VALUE in scrub_credentials(line)]
+    assert printed == [line for line, _ in _CAMEL_LINES]
+
+
+#: Words that hold a capital and are no label, or a label word that does not END the word.
+_NOT_LABELS = (
+    "accessTokenValue=abc",
+    "pageSize=20 isEnabled=true",
+    "compassHeading=12 bypassMode=on",
+    "userName=jdoe sessionCount=4",
+    "PasswordPolicy=strict TokenEndpoint=https://idp.example.invalid/t",
+    # A database primary key, which is why ``primarykey`` is not a compound key word.
+    "insert failed: primaryKey=patient_id",
+)
+
+
+@pytest.mark.parametrize("line", _NOT_LABELS)
+def test_a_capital_that_opens_no_label_word_leaves_the_line_alone(line: str) -> None:
+    assert scrub_credentials(line) == line
+
+
+#: Spellings the camelCase start does not reach, each a residual its comment names: a capital
+#: after a capital, and a label word glued on with no capital at all.
+_RESIDUALS = (f"SASToken={_VALUE}", f"accesstoken={_VALUE}")
+
+
+@pytest.mark.parametrize("line", _RESIDUALS)
+def test_the_named_residuals_still_print(line: str) -> None:
+    """Pinned so a change that reaches one of these updates the comment on ``_CAMEL_START`` too."""
+    assert _VALUE in scrub_credentials(line)
+
+
+#: A later camelCase label with a quoted value, after a first label of every family, glued on by
+#: each separator the stop is written for and by none at all. The stop before a later quoted label
+#: checks in front of every camelCase unit of a run, so the first label's plain value stops there
+#: and the later label's own pattern takes its quoted value.
+_SWALLOW_FIRST = (
+    "password",
+    "client_secret",
+    "api_token",
+    "session",
+    "private_key",
+    "MEFOR_STORE_PW",
+    "Authorization: Bearer",
+)
+_SWALLOW_SEPARATORS = (";", "&", ",", ":", "=", "|", ".", "-", "_", "", " ")
+_SWALLOW_SECOND = ("accessToken", "clientSecret", "userPassword", "refreshToken", "bindPwd")
+_SWALLOW_VALUES = tuple(f"{_VALUE}{n}" for n in range(3))
+
+
+def _swallow_lines() -> list[str]:
+    first_value, head, tail = _SWALLOW_VALUES
+    return [
+        f"connect failed {first}={first_value}{sep}{second}={q}{head} {tail}{q} for svc"
+        if not first.endswith("Bearer")
+        else f"connect failed {first} {first_value}{sep}{second}={q}{head} {tail}{q} for svc"
+        for first in _SWALLOW_FIRST
+        for sep in _SWALLOW_SEPARATORS
+        for second in _SWALLOW_SECOND
+        for q in ("'", '"')
+    ]
+
+
+def _printing(lines: list[str], apply: Callable[[str], str]) -> list[str]:
+    return [line for line in lines if any(value in apply(line) for value in _SWALLOW_VALUES)]
+
+
+def test_a_plain_value_does_not_swallow_a_later_quoted_camelcase_label() -> None:
+    """On the write-time surfaces, no value of any line prints."""
+    lines = _swallow_lines()
+    assert len(lines) == 7 * 11 * 5 * 2
+    for name, apply in _SURFACES[:2]:
+        printed = _printing(lines, apply)
+        assert not printed, f"{name}: {len(printed)} lines printed, first {printed[:3]}"
+
+
+def test_the_support_bundle_still_prints_a_swallowed_camelcase_label() -> None:
+    """A RESIDUAL, pinned so its closing is noticed. ``support/redact.py`` runs its own copy of the
+    label patterns first, and that copy has neither the camelCase start nor the split walk, so its
+    plain value runs over the later camelCase label as every copy did before BACKLOG #5545. Its
+    second layer, this module, then sees only the placeholder and the quoted value after it."""
+    assert _printing(_swallow_lines(), redact_log_line)
+
+
+def test_the_swallow_lines_print_without_the_split_walk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE POSITIVE CONTROL: with each walk taking a whole run of letters and digits again, as
+    before BACKLOG #5545, most lines print, so the green above is the split walk's work."""
+    for name in ("_MEFOR_SECRET", "_BEARER", "_AUTH_SCHEME", "_CREDENTIAL_KV", "_KEY_MATERIAL"):
+        pattern: re.Pattern[str] = getattr(secretscrub, name)
+        assert secretscrub._RUN_UNIT in pattern.pattern, name
+        old = pattern.pattern.replace(secretscrub._RUN_UNIT, "[A-Za-z0-9]++")
+        monkeypatch.setattr(secretscrub, name, re.compile(old, pattern.flags))
+    lines = _swallow_lines()
+    printed = _printing(lines, scrub_credentials)
+    # Measured 2026-11-10: every line but those whose first value class already stops at the
+    # separator. A floor, so a later change to a terminator set does not red this for the wrong
+    # reason.
+    assert len(printed) >= len(lines) // 2, f"only {len(printed)} of {len(lines)} printed"
+
+
+# --- The compound key-material words: AccountKey, SharedAccessKey and the like ----------------------
+
+#: Synthetic Azure-shaped connection strings and SDK settings, each with its key value in the middle.
+_COMPOUND_KEY_LINES = (
+    f"DefaultEndpointsProtocol=https;AccountName=zqacct;AccountKey={_VALUE};EndpointSuffix=x.invalid",
+    f"Endpoint=sb://zq.example.invalid/;SharedAccessKeyName=RootManage;SharedAccessKey={_VALUE}",
+    f"storage init failed: storageAccountKey={_VALUE}",
+    f'{{"accessKey": "zqid", "secretKey": "{_VALUE}"}}',
+    f"cfg AUTHKEY={_VALUE}",
+    f'jwk load failed {{"privateKey": "{_VALUE}"}}',
+    f"smart: smartPrivateKey={_VALUE} encryptionKey=zq",
+    f"listKeys: secondaryKey={_VALUE} cosmos masterKey={_VALUE} apim subscriptionKey={_VALUE}",
+)
+
+
+@pytest.mark.parametrize("line", _COMPOUND_KEY_LINES)
+def test_a_compound_key_label_loses_its_value_on_every_surface(line: str) -> None:
+    printed = [name for name, apply in _SURFACES if _VALUE in apply(line)]
+    assert not printed, (line, printed)
+
+
+def test_the_compound_key_lines_print_without_the_compound_words(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE POSITIVE CONTROL: with ``_KEY_MATERIAL`` reading only ``_KEY_MATERIAL_WORDS`` again, every
+    line above prints its value on the credential scrub."""
+    pattern = secretscrub._KEY_MATERIAL
+    words = secretscrub._KEY_LABEL_ALTERNATION
+    assert pattern.pattern.count(words) == 1
+    # The ``compound`` group stays, never matching, since the narrowed value class reads it.
+    old = pattern.pattern.replace(
+        words, secretscrub._alternation(secretscrub._KEY_MATERIAL_WORDS) + "|(?P<compound>(?!))"
+    )
+    monkeypatch.setattr(secretscrub, "_KEY_MATERIAL", re.compile(old, pattern.flags))
+    printed = [line for line in _COMPOUND_KEY_LINES if _VALUE in scrub_credentials(line)]
+    assert printed == list(_COMPOUND_KEY_LINES)
+
+
+def test_the_compound_key_words_stay_clear_of_the_query_exclusions() -> None:
+    """``_QUERY_NOT_CREDENTIAL_TAILS`` names keys that are not secrets, such as ``partitionKey``. No
+    compound word may end one of them, or be ended by one, and each key exclusion, written in
+    camelCase as a whole word and after a lower-case word, keeps its value. Driven by both tuples, so
+    a word added to either is checked."""
+    exclusions = secretscrub._QUERY_NOT_CREDENTIAL_TAILS
+    for word in secretscrub._COMPOUND_KEY_WORDS:
+        for excluded in exclusions:
+            assert not word.endswith(excluded) and not excluded.endswith(word), (word, excluded)
+    key_exclusions = [word for word in exclusions if word.endswith("key")]
+    assert len(key_exclusions) >= 5, key_exclusions
+    for excluded in key_exclusions:
+        camel = excluded[:-3] + "Key"
+        line = f"lookup {camel}={_VALUE} and x{camel.capitalize()[:-3]}Key={_VALUE}"
+        assert scrub_credentials(line) == line, line
+
+
+def test_a_key_name_that_only_names_a_key_keeps_its_value() -> None:
+    """A compound word must END the label: ``SharedAccessKeyName`` names a key and holds none."""
+    line = "SharedAccessKeyName=RootManage;accessKeyId=zqid"
+    assert scrub_credentials(line) == line
+
+
+def test_every_compound_key_word_is_a_stop_label() -> None:
+    """The stop and the run-on read the compound words too, so a plain value stops before one whose
+    value is quoted, as it does before ``private_key``."""
+    quoted = re.compile(secretscrub._QUOTED_LABEL)
+    run_on = re.compile(secretscrub._RUN_ON_LABEL)
+    for word in secretscrub._COMPOUND_KEY_WORDS:
+        for spelling in (word, word.upper()):
+            assert quoted.match(f'{spelling}="v w"'), spelling
+            assert run_on.match(f"{spelling}= "), spelling
+        line = f"token=x;{word}='{_VALUE} {_VALUE}'"
+        assert _VALUE not in scrub_credentials(line), line
+
+
+# --- Found by code review: the split walk must keep what the whole-run walk kept ------------------
+
+
+def test_the_walk_unit_reads_a_fold_letter_as_its_pattern_does() -> None:
+    """``(?i)[A-Za-z0-9]`` takes the four fold letters and ``[A-Za-z0-9]`` takes none, so the unit
+    must do each under the same flags. Held to ``_GATE_FOLDS``, the module's measured set."""
+    folded = re.compile(secretscrub._RUN_UNIT, re.IGNORECASE)
+    plain = re.compile(secretscrub._RUN_UNIT)
+    for char, _letter in secretscrub._GATE_FOLDS:
+        assert folded.fullmatch(f"ab{char}cd"), hex(ord(char))
+        assert not plain.fullmatch(f"ab{char}cd"), hex(ord(char))
+
+
+#: Values opening on, or holding, a fold letter, each hidden on ``origin/main``. Built with ``chr``.
+_FOLD_LINES = (
+    (f"ValueError('login failed password={chr(0x131)}lk{_VALUE}')", _VALUE),
+    (f'error: "api_key={chr(0x130)}st{_VALUE}"', _VALUE),
+    (f'token=abc{chr(0x17F)}{_VALUE};password="v w"', _VALUE),
+    (f"password='pw1 s{chr(0x131)}{_VALUE} pw3, private_key='p w q'", _VALUE),
+    # ``_MEFOR_SECRET`` has no ``(?i)``: a fold letter there ends the run, so the stop still sees the
+    # later quoted label (found by code review round two).
+    (f'MEFOR_STORE_PW=ab{chr(0x131)}password="{_VALUE} two" end', _VALUE),
+    (f"MEFOR_STORE_PW=ab{chr(0x17F)}secret='{_VALUE} w'", _VALUE),
+)
+
+
+@pytest.mark.parametrize(("line", "value"), _FOLD_LINES, ids=ascii)
+def test_a_value_holding_a_fold_letter_is_still_walked_whole(line: str, value: str) -> None:
+    for name, apply in _SURFACES[:2]:
+        assert value not in apply(line), (name, ascii(apply(line)))
+
+
+def test_a_later_quoted_value_holding_a_camelcase_label_is_hidden_whole() -> None:
+    """The inner run-on walk keeps its whole ASCII run: split at a camelCase label inside the later
+    value, it refused the run-on, and the later value's head printed."""
+    for inner in ("userPwd= ", "isPass:"):
+        line = f"password='a, private_key='{_VALUE} {inner}zq2'"
+        assert _VALUE not in scrub_credentials(line), line
+
+
+#: The length span and the growth allowed across it, as ``tests/test_log_redaction_secret_domain.py``
+#: sets them for the label patterns' other growth arms: 8x the length, linear near 8.
+_SPAN = (2048, 16384)
+_MAX_GROWTH = 24.0
+
+
+def _mixed_case_run(length: int) -> str:
+    """A mixed-case run with a capital after every lower-case letter, then a label, so the
+    admission gate admits the line and every capital in the run is a candidate start."""
+    return "aB" * (length // 2) + " token=x"
+
+
+def _quote_ended_value(length: int) -> str:
+    """A token value of camelCase units whose capitals open label-word initials, ending on a quote."""
+    return "token=" + "pS" * (length // 2) + '"'
+
+
+def _camel_quote_ended_value(length: int) -> str:
+    """:func:`_quote_ended_value` under a camelCase label, so :func:`scrub_credentials` takes the
+    union of both readings."""
+    return "accessToken=" + "pS" * (length // 2) + '"'
+
+
+def _many_labels(length: int) -> str:
+    """Nothing but short camelCase labels, each with a value, glued by ";"."""
+    return "aToken=b;" * (length // 9)
+
+
+def test_the_camelcase_start_grows_linearly_in_line_length() -> None:
+    """The start runs on every admitted record, on text an attacker can influence. THE POSITIVE
+    CONTROL is ``_BEARER`` with the same capital start and no label-word lookahead: every capital in
+    the run then starts a prefix walk to the run's end, the quadratic. The control runs at a quarter
+    of the span's lengths, the same 8x, so it stays fast."""
+    shipped = secretscrub._BEARER
+    growth = _growth_between(
+        partial(shipped.sub, "x"), _mixed_case_run(_SPAN[0]), _mixed_case_run(_SPAN[1]), rounds=5
+    )
+    assert growth < _MAX_GROWTH, f"the shipped camelCase start grew {growth:.1f}x for 8x the length"
+    # The split walk: a value of alternating lower-case and capital letters ending on a quote, so the
+    # fast path refuses it and the stop is checked before every unit.
+    walk = _growth_between(
+        scrub_credentials, _quote_ended_value(_SPAN[0]), _quote_ended_value(_SPAN[1]), rounds=5
+    )
+    assert walk < _MAX_GROWTH, f"the split value walk grew {walk:.1f}x for 8x the length"
+    # The union: both readings, traced, on a line the camelCase probe admits. One long value, and a
+    # line of nothing but short camelCase labels, so the trace has a run per label to map.
+    for shape, build in (("long value", _camel_quote_ended_value), ("many labels", _many_labels)):
+        union = _growth_between(scrub_credentials, build(_SPAN[0]), build(_SPAN[1]), rounds=5)
+        assert union < _MAX_GROWTH, f"the union on {shape} grew {union:.1f}x for 8x the length"
+    no_lookahead = secretscrub._LABEL_OR_CAMEL_START.replace(
+        r"(?=(?i:"
+        + secretscrub._alternation(secretscrub._CAMEL_WORDS)
+        + r")"
+        + secretscrub._SAME_LINE_VALUE
+        + r")",
+        "",
+    )
+    assert no_lookahead != secretscrub._LABEL_OR_CAMEL_START
+    control = re.compile(
+        shipped.pattern.replace(secretscrub._LABEL_OR_CAMEL_START, no_lookahead), shipped.flags
+    )
+    control_growth = _growth_between(
+        partial(control.sub, "x"), _mixed_case_run(512), _mixed_case_run(4096), rounds=5
+    )
+    assert control_growth > _MAX_GROWTH, (
+        f"the quadratic control grew only {control_growth:.1f}x, so this box cannot tell the two apart"
+    )
+
+
+# --- Found by code review: the camelCase reading must not print what the reading before it hid ---
+
+#: Each printed, on this change's earlier head, a value the reading before BACKLOG #5545 hid. The
+#: first three on the credential scrub: a newly read token value took ``secret:``, whose value then
+#: printed, and a camelCase or compound label with nothing after its ":" took the next line's label
+#: as its value. The last in the support bundle: the newly read value took ``;token``, so the
+#: bundle's member mask, which runs after this module, found no key. "Jane" is a synthetic
+#: placeholder.
+_REVIEW_REGRESSIONS = (
+    ("^accessToken=secret: Jane DoexToken=", "Jane"),
+    (f"clientSecret:\npassword: {_VALUE}", _VALUE),
+    (f"AccountKey:\npassword: {_VALUE}", _VALUE),
+    (f"accessToken: zq0,zq1;token: 'zq2 {_VALUE}='", _VALUE),
+)
+
+
+@pytest.mark.parametrize(("line", "value"), _REVIEW_REGRESSIONS, ids=ascii)
+def test_a_value_the_reading_before_hid_stays_hidden_on_every_surface(
+    line: str, value: str
+) -> None:
+    printed = [name for name, apply in _SURFACES if value in apply(line)]
+    assert not printed, (line, printed)
+
+
+def test_a_camelcase_label_with_its_value_on_the_next_line_is_left_alone() -> None:
+    """A traceback line ending in a camelCase label word and a colon is no label, so the next line
+    keeps its line break and its text (found by code review: the two lines were joined into
+    ``MonitoredSecret=<redacted> str``)."""
+    for line in ("class MonitoredSecret:\n  name: str", "AccountKey:\n  name: str"):
+        assert scrub_credentials(line) == line
+
+
+def test_a_scheme_word_or_brace_ending_a_camelcase_line_is_left_alone() -> None:
+    """A camelCase label whose same-line value is only a scheme word, or opens a "{", is no label
+    either: ``_BEARER``'s scheme word and a braced value both run over the line break (found by code
+    review: ``refreshToken: Bearer`` then a traceback line lost that line's head)."""
+    for line in (
+        "refreshToken: Bearer\n  at module.fn (line 3)",
+        "sessionToken = Digest\nnext line here",
+        "clientSecret: {\n  name: str\n}",
+    ):
+        assert scrub_credentials(line) == line
+
+
+def test_the_union_keeps_only_what_the_reading_before_printed() -> None:
+    """Where the reading before hid a braced value whole, the camelCase reading's masked tail of it
+    does not show through as "x" letters, and a hidden stretch is one placeholder (found by code
+    review: ``<redacted>xx<redacted>`` showed the masked word's length)."""
+    for line in ("accessToken=a|PWD={pp ww}", "accessToken=a.PWD={pp wx}"):
+        assert scrub_credentials(line) == f"accessToken={CREDENTIAL_PLACEHOLDER}", line
+
+
+def test_a_member_key_the_reading_before_printed_survives_for_the_bundle() -> None:
+    """The support bundle masks a ``;<key>=`` member after this module, over the joined line. A
+    camelCase value that took such a ";" hid the key, and the bundle printed the value it masked on
+    ``origin/main`` (found by code review), so that line keeps the reading before."""
+    line = "login refused userPwd={hunter;sslpassword=Bearer abcd2 efgh3"
+    assert "efgh3" not in redact_log_line(line)
+    assert "efgh3" not in scrub_credentials(line)
+
+
+def test_a_camelcase_or_compound_value_ends_at_a_field_separator() -> None:
+    """The narrowed value class: ";", "," and "&" end it, so the fields after it survive, and the
+    value itself is still hidden."""
+    for line, kept in (
+        (f"accessKey={_VALUE},region=us-east-1", ",region=us-east-1"),
+        (f"accessToken={_VALUE};expiresIn=3600", ";expiresIn=3600"),
+        (f"AccountKey={_VALUE}&sv=2020", "&sv=2020"),
+    ):
+        out = scrub_credentials(line)
+        assert _VALUE not in out and out.endswith(kept), out
+
+
+#: Labels for the differential corpus: plain ones, camelCase ones and compound key words.
+_DENSE_LABELS = (
+    "password", "pwd", "pass", "secret", "client_secret", "token", "api_key", "session",
+    "Authorization", "private_key", "encryption_key", "MEFOR_A", "Bearer",
+    "accessToken", "clientSecret", "userPassword", "refreshToken", "bindPwd", "xToken",
+    "aSession", "dbPass", "AccountKey", "SharedAccessKey", "storageAccountKey", "secretKey",
+    ";sslpassword", ";PWD", ";AccessToken", "userPwd",
+)  # fmt: skip
+#: ":\n" and "=Bearer\n" put a value on the next line. The ";"-led labels above are the
+#: connection-string member keys the support bundle masks after this module, which a review found
+#: missing from this corpus.
+_DENSE_ASSIGNMENTS = ("=", ": ", " = ", "'=", "=Bearer ", ":\n", ": ", ": Bearer\n", "={")
+_DENSE_SEPARATORS = (";", "&", ",", "|", " ", ".", "=", ":", "-", "_", "", "x", "\n")
+
+
+def _dense_lines(count: int, seed: int) -> list[str]:
+    """Seeded lines dense with every label kind, each value built of ``vq<n>`` atoms."""
+    rng = random.Random(seed)
+    lines = []
+    for _ in range(count):
+        parts = []
+        for k in range(0, 2 * rng.randint(1, 4), 2):
+            a, b = f"vq{k}", f"vq{k + 1}"
+            value = rng.choice(
+                (
+                    a, f"{a}-{b}_x", f"'{a} {b}'", f'"{a} {b}"', "{" + f"{a} {b}" + "}", f"'{a} {b}",
+                    f'"{a}', f"{a},{b}", f"{a}={b}", f"{a}:{b}", f"{a}X{b}", f"{a}Token={b}",
+                    f"{a} {b}", f"{a};{b}", f"secret: {a} {b}xToken=",
+                )
+            )  # fmt: skip
+            label = rng.choice(_DENSE_LABELS)
+            assign = " " if label == "Bearer" else rng.choice(_DENSE_ASSIGNMENTS)
+            parts.append(f"{label}{assign}{value}")
+            parts.append(rng.choice(_DENSE_SEPARATORS))
+        lines.append("".join(parts[:-1]))
+    return lines
+
+
+_ATOM = re.compile(r"vq\d+(?!\d)")
+
+
+def _prints(atom: str, text: str) -> bool:
+    return re.search(re.escape(atom) + r"(?!\d)", text) is not None
+
+
+def _scrub_before(text: str, *, placeholder: str = CREDENTIAL_PLACEHOLDER) -> str:
+    """``scrub_credentials`` as it read before BACKLOG #5545: every pattern through ``_pre_camel``."""
+    folded = secretscrub._gate_fold(text)
+    if not secretscrub._admits(folded, secretscrub._ANY_HINT):
+        return text
+    return secretscrub._run(text, placeholder, folded, secretscrub._pre_camel_sub)
+
+
+def _surfaces_before(patch: pytest.MonkeyPatch) -> None:
+    """Every surface reading ``scrub_credentials`` as before BACKLOG #5545. Only this module changed,
+    so that is the whole of the reading before it on the chain and in the bundle."""
+    patch.setattr(secretscrub, "scrub_credentials", _scrub_before)
+    patch.setattr(logging_setup, "scrub_credentials", _scrub_before)
+    patch.setattr(redact_mod, "scrub_credentials", _scrub_before)
+
+
+#: Every surface a line reaches, plus the two that read a surface's output again: a record two
+#: handlers filter in turn, and a written line the support bundle reads back. ``scrub_credentials``
+#: is looked up at call time, so a patch reaches it.
+_DIFFERENTIAL: tuple[tuple[str, Callable[[str], str]], ...] = (
+    ("scrub_credentials", lambda line: secretscrub.scrub_credentials(line)),
+    ("write-time chain", _through_the_chain),
+    ("support bundle", redact_log_line),
+    ("chain twice", lambda line: _through_the_chain(_through_the_chain(line))),
+    ("bundle of chain", lambda line: redact_log_line(_through_the_chain(line))),
+)
+#: The derived surfaces, each with the surface whose output it reads.
+_READS = {"chain twice": "write-time chain", "bundle of chain": "write-time chain"}
+
+
+def _newly_printed(monkeypatch: pytest.MonkeyPatch, corpus: list[str]) -> tuple[list[str], int]:
+    """``(atoms a surface prints that the reading before BACKLOG #5545 hid, the count the reverse
+    way)``. On a derived surface, an atom the reading before printed on the surface it reads is not
+    counted: the log held it under both readings."""
+    after = {name: [apply(line) for line in corpus] for name, apply in _DIFFERENTIAL}
+    with monkeypatch.context() as patch:
+        _surfaces_before(patch)
+        before = {name: [apply(line) for line in corpus] for name, apply in _DIFFERENTIAL}
+    newly: list[str] = []
+    hidden_now = 0
+    for name, _apply in _DIFFERENTIAL:
+        for i, line in enumerate(corpus):
+            for atom in set(_ATOM.findall(line)):
+                was, now = _prints(atom, before[name][i]), _prints(atom, after[name][i])
+                upstream = name in _READS and _prints(atom, before[_READS[name]][i])
+                if now and not was and not upstream:
+                    newly.append(f"{name}: {atom} in {line!r} -> {after[name][i]!r}")
+                hidden_now += was and not now
+    return newly, hidden_now
+
+
+def test_the_camelcase_reading_prints_no_atom_the_reading_before_it_hid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE GUARANTEE, measured: over 2,000 seeded lines dense with every label kind, no surface prints
+    an atom the reading before BACKLOG #5545 hid. ``_pre_camel`` of each shipped pattern is that
+    reading; measured 2026-11-10, its source equals ``origin/main``'s at ``0d240bad62`` for all seven
+    patterns ``_run`` applies. The reverse count must be above zero, or the two never differed."""
+    newly, hidden_now = _newly_printed(monkeypatch, _dense_lines(2000, 5545))
+    assert not newly, f"{len(newly)} newly printed, first: {newly[:3]}"
+    assert hidden_now > 0
+
+
+def test_the_differential_finds_the_trade_without_the_union(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE POSITIVE CONTROL: with the shipped patterns applied alone, as this change's earlier head
+    did, the same corpus prints atoms the reading before hid, so the green above is the union's."""
+    monkeypatch.setattr(
+        secretscrub, "_union", lambda text, ph, folded: secretscrub._run(text, ph, folded)
+    )
+    newly, _hidden = _newly_printed(monkeypatch, _dense_lines(2000, 5545))
+    assert newly
+
+
+def test_a_line_the_probe_refuses_reads_the_same_both_ways() -> None:
+    """``scrub_credentials`` runs one reading on a line ``_reads_camel`` refuses, which is safe only if
+    both readings agree there. The comment above ``_CAMEL_FRAGMENTS`` argues it; this checks it on
+    every refused line of the corpus, which holds mixed-case values that are no label."""
+    corpus = _dense_lines(4000, 1)
+    refused = [
+        line
+        for line in corpus
+        if not secretscrub._reads_camel(line, secretscrub._gate_fold(line), CREDENTIAL_PLACEHOLDER)
+    ]
+    assert len(refused) > 200, len(refused)
+    for line in refused:
+        assert secretscrub._run(line, CREDENTIAL_PLACEHOLDER, None) == secretscrub._run(
+            line, CREDENTIAL_PLACEHOLDER, None, secretscrub._pre_camel_sub
+        ), line
+
+
+def test_the_reading_before_holds_none_of_the_camelcase_fragments() -> None:
+    """``_pre_camel`` takes every camelCase fragment out of each shipped label pattern, and each held
+    at least one, so a fragment renamed without updating ``_CAMEL_FRAGMENTS`` reds here."""
+    for name in ("_MEFOR_SECRET", "_BEARER", "_AUTH_SCHEME", "_CREDENTIAL_KV", "_KEY_MATERIAL"):
+        shipped: re.Pattern[str] = getattr(secretscrub, name)
+        before = secretscrub._pre_camel(shipped).pattern
+        assert before != shipped.pattern, name
+        for marker in ("(?P<camel>)", "(?P<compound>)", secretscrub._RUN_UNIT, "sharedaccesskey"):
+            assert marker not in before, (name, marker)
+        assert "(?(camel)" not in before and "(?(compound)" not in before, name
+
+
+def test_the_member_key_is_the_member_patterns_own_head() -> None:
+    """``_union`` keeps the reading before where a member key's ";" would be lost; the key it looks
+    for must be the one the member pass opens with."""
+    head = secretscrub._MEMBER_KEY.pattern.removeprefix("(?i)").removesuffix("=")
+    assert secretscrub._CONNECTION_STRING_MEMBER.pattern.startswith(f"(?i)({head})=")
+
+
+def test_a_semicolon_inside_a_camelcase_value_keeps_the_camelcase_reading() -> None:
+    """Only a member key's ";" sends the line back to the reading before, so a camelCase value
+    holding a ";" is still hidden beside another label (found by code review)."""
+    for line in (
+        'refresh failed: refreshToken="zqA;zqB" password=zqC',
+        "auth failed {'clientSecret': 'zqA;zqB', 'password': 'zqC'}",
+    ):
+        out = scrub_credentials(line)
+        assert "zqA" not in out and "zqC" not in out, out
+
+
+def test_a_camelcase_token_value_keeps_its_ampersands_and_commas() -> None:
+    """A camelCase token value ends at ";" alone, as its snake_case spelling ends at none of these,
+    so a SAS signature after "&" is hidden (found by code review); and a camelCase start before a
+    retired-key list keeps the list whole."""
+    for line, value in (
+        ("blob upload failed sasToken=sv=zz&ss=b&sig=zqSIGzq", "zqSIGzq"),
+        ("refresh accessToken=zqA,zqB", "zqB"),
+        ("cfg storeEncryption_keys_retired=k1,k2,zqK3", "zqK3"),
+    ):
+        assert value not in scrub_credentials(line), line
+
+
+def test_no_camelcase_fragment_sits_inside_a_later_one() -> None:
+    """``_CAMEL_FRAGMENTS`` is replaced in order, which is safe only while no fragment sits inside
+    one replaced after it: replacing it first would leave the later one half rewritten, unmatched."""
+    fragments = [fragment for fragment, _before in secretscrub._CAMEL_FRAGMENTS]
+    for i, fragment in enumerate(fragments):
+        for later in fragments[i + 1 :]:
+            assert fragment not in later, (fragment[:40], later[:40])
+
+
+def test_an_untraceable_replacement_falls_back_to_the_reading_before(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replacement that does not start with the label it kept cannot be traced, so the line takes
+    the reading before BACKLOG #5545 alone rather than an untraced union."""
+    monkeypatch.setattr(secretscrub, "_keep_label", lambda m, ph: f"[{m.group(1)}]={ph}")
+    line = f"accessToken={_VALUE} password={_VALUE}"
+    assert scrub_credentials(line) == _scrub_before(line)
+    assert f"accessToken={_VALUE}" in scrub_credentials(line)
+
+
+def test_the_chain_twice_residual_is_a_value_the_first_pass_already_printed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A RESIDUAL, pinned so its closing is noticed. The write-time chain is not idempotent, so a
+    record two handlers filter in turn can lose more on the second. Here the reading before printed
+    "vq3" on the first pass and hid it on the second, where the PHI pass read its rewrite as a field
+    run; the camelCase reading changes the first pass, so the second prints it. The first handler
+    printed it under both readings. Measured 2026-11-10 against ``origin/main``'s module, on three
+    seeded 40,000-line corpora dense with camelCase labels, this file's among them: 102, 2 and 148
+    lines on this surface, and about as many on a chain line the bundle reads back, each an atom the
+    first pass already printed under ``origin/main``, and none otherwise; on the credential scrub,
+    the chain and the bundle, none."""
+    line = "dbPass = vq0_vq1|client_secret: vq2&vq3"
+    assert _prints("vq3", _through_the_chain(_through_the_chain(line)))
+    with monkeypatch.context() as patch:
+        _surfaces_before(patch)
+        assert _prints("vq3", _through_the_chain(line))
+        assert not _prints("vq3", _through_the_chain(_through_the_chain(line)))
