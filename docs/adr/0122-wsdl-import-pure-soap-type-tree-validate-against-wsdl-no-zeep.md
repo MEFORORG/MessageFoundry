@@ -225,8 +225,8 @@ than in place.
   them to the entry schema's directory refused a load that worked before. Below the root, each path is
   walked one component at a time with `lstat`, and a symlink or junction whose target text is a UNC or
   device path, or lies outside the root, is refused before it is followed. Nothing in `schema.py` calls
-  `realpath`: on Windows it opens the path, and it rewrites a mapped drive to its UNC path and a long
-  path to its `\\?\` form, which the text check would then refuse. An inline schema, which is how
+  `realpath`: on Windows it opens the path, and it rewrites a mapped drive to its UNC path, which the
+  text check would then refuse, and a long path to its `\\?\` form. An inline schema, which is how
   every embedded WSDL schema arrives, has no confinement root, so its own include, import, redefine or
   override location is opened only when it names a file in `xmlschema`'s bundled schemas. `xmlschema`'s
   `allow="sandbox"` was tried and not used: it compares URL string prefixes, narrows to each includer's

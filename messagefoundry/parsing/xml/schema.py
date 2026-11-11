@@ -96,7 +96,7 @@ def _local(path: str) -> str | None:
     POSIX a backslash is an ordinary file-name character, so only a path that ``abspath`` leaves with two
     leading slashes is refused there. ``realpath`` is not used anywhere here: on Windows
     it opens the path, which for a UNC path is an SMB connection, and it rewrites a mapped drive to the
-    UNC path behind it and a long path to its ``\\\\?\\`` form, both of which this would then refuse. A
+    UNC path behind it, which this would then refuse, and a long path to its ``\\\\?\\`` form. A
     ``\\\\?\\`` prefix on a drive letter is a local long path on Windows and is dropped here, then
     restored by :func:`_native` for a path too long to open without it; ``\\\\?\\UNC\\``, ``\\\\.\\``
     and any other two-separator drive are not local, nor is any on POSIX. Neither is ``\\\\?\\C:``
