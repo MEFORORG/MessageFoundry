@@ -7,11 +7,12 @@ rest bind to a composite or natural key, so each has its own migration and rotat
 store, and until this module no caller outside it could read them back. This module names those cells
 and the columns each writer binds into ``cell_aad``, in the order it binds them, and joins both kinds
 into :data:`SQLITE_CIPHER_CELLS`. :data:`POSTGRES_CIPHER_CELLS` and :data:`SQLSERVER_CIPHER_CELLS`
-are the same cells as each server store seals them, paged by primary key. The full restore-verify
-reads every sealed value in them back through the cipher, so a ciphertext whose tag no longer
+are the same cells as each server store seals them, paged by primary key, and only ``cipher-audit``
+reads them. The full restore-verify, whose snapshot is always SQLite, reads every sealed value in
+:data:`SQLITE_CIPHER_CELLS` back through the cipher, so a ciphertext whose tag no longer
 authenticates fails the verify instead of surfacing at first use. It also reads the non-blank values
 with no marker, so a text value whose marker itself is damaged fails it on a surface the keyed store
-has sealed.
+has sealed, unless ``[store].allow_unmarked_ciphertext`` is set.
 
 :func:`read_cipher_cells` is the one walk over a SQLite store's cells, and
 :func:`read_server_cipher_cells` its twin for a server store. The restore-verify stops at its first
