@@ -16,8 +16,9 @@ import pytest
 
 from messagefoundry.parsing.xml.signature import verify
 
-# Any non-None value clears the anchor guard (it is never parsed as a certificate on this code path),
-# so a plain sentinel is used instead of a certificate-shaped blob — the latter compiles into the
+# Any non-None value clears the anchor guard, which reads only whether an anchor was passed. Past the
+# guard the anchor read refuses this value (BACKLOG #5372), and these tests stop there, so a plain
+# sentinel is used instead of a certificate-shaped blob — the latter compiles into the
 # .pyc and trips antivirus "embedded certificate" heuristics (Gen:Heur.PHS.1), a false positive.
 _DUMMY_ANCHOR = b"unit-test-anchor-sentinel"
 

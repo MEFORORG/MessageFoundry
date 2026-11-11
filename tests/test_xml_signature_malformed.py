@@ -33,6 +33,7 @@ from cryptography.hazmat.primitives.asymmetric import x25519  # noqa: E402
 from messagefoundry.parsing.xml import signature as sigmod  # noqa: E402
 from messagefoundry.parsing.xml.errors import XmlError  # noqa: E402
 from messagefoundry.parsing.xml.signature import verify  # noqa: E402
+from tests import _fs_spy  # noqa: E402
 from tests._content_free import assert_chain_severed  # noqa: E402
 from tests.test_xml_signature_coverage import (  # noqa: E402
     _BODY,
@@ -262,8 +263,67 @@ def test_a_pinned_certificate_object_still_verifies() -> None:
     """signxml takes a ``cryptography`` certificate object as the pin; the anchor read passes it."""
     from cryptography import x509
 
-    result = verify(_sign(_BODY), x509_cert=x509.load_pem_x509_certificate(_cert_pem()))  # type: ignore[arg-type]
+    result = verify(_sign(_BODY), x509_cert=x509.load_pem_x509_certificate(_cert_pem()))
     assert result.verified, result.reason
+
+
+def _break_the_ca_file_after_the_anchor_read(
+    monkeypatch: pytest.MonkeyPatch, ca_file: Path, replacement: bytes | None
+) -> None:
+    """Delete ``ca_file``, or overwrite it with ``replacement``, right after ``_read_anchor`` returns.
+
+    signxml's chain verifier used to open the file again inside the call whose errors ``verify``
+    reports as the document's, so a CA file changed in between surfaced as an ``XmlError``.
+    """
+    read = sigmod._read_anchor
+
+    def _read_then_break(*args: Any) -> Any:
+        out = read(*args)
+        if replacement is None:
+            ca_file.unlink()
+        else:
+            ca_file.write_bytes(replacement)
+        return out
+
+    monkeypatch.setattr(sigmod, "_read_anchor", _read_then_break)
+
+
+@pytest.mark.parametrize("replacement", [None, b"", b"not a certificate"])
+def test_a_ca_file_broken_after_the_anchor_read_verifies_on_the_anchor_read(
+    replacement: bytes | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    doc, kwargs = _signed_and_anchor(_key(), "ca_pem_file", tmp_path)
+    _break_the_ca_file_after_the_anchor_read(monkeypatch, Path(kwargs["ca_pem_file"]), replacement)
+    result = verify(doc, **kwargs)
+    assert result.verified, result.reason
+
+
+@pytest.mark.parametrize("replacement", [None, b"not a certificate"])
+def test_a_ca_file_broken_after_the_anchor_read_still_refuses_another_signer(
+    replacement: bytes | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The chain is checked against the CA read first, so a signer under another CA is refused as
+    data rather than reported as an ``XmlError`` about the CA file. The CA keys are cached per size,
+    so the anchor's CA takes another size to be a different key."""
+    (tmp_path / "signer").mkdir()
+    (tmp_path / "anchor").mkdir()
+    doc, _ = _signed_and_anchor(_key(), "ca_pem_file", tmp_path / "signer")
+    _, kwargs = _signed_and_anchor(_key(), "ca_pem_file", tmp_path / "anchor", ca_bits=3072)
+    _break_the_ca_file_after_the_anchor_read(monkeypatch, Path(kwargs["ca_pem_file"]), replacement)
+    result = verify(doc, **kwargs)
+    assert result.verified is False
+    assert result.reason == "InvalidCertificate"
+
+
+def test_a_ca_file_is_read_once_per_verify(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The anchor read and the chain check use one read of the CA file. The count of one is its own
+    control: a spy that saw nothing would read zero."""
+    doc, kwargs = _signed_and_anchor(_key(), "ca_pem_file", tmp_path)
+    calls = _fs_spy.install(monkeypatch)
+    result = verify(doc, **kwargs)
+    opens = [c for c in _fs_spy.naming(calls, Path(kwargs["ca_pem_file"]).name) if "open" in c[0]]
+    assert result.verified, result.reason
+    assert len(opens) == 1, opens
 
 
 def test_a_raw_cryptography_invalid_signature_is_still_data(

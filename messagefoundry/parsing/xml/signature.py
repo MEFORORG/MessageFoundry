@@ -12,8 +12,14 @@ The signed document is parsed through **our** hardened lxml parser
 (:mod:`messagefoundry.parsing.xml.harden`), so an untrusted signed body still goes through the
 XXE/DTD lockdown before any signature processing.
 
-**PHI rule:** a verification failure is reported by *reason category* only (signxml's exception type,
-or one of this module's fixed names such as :data:`WEAK_SIGNING_KEY`), never the document content.
+**PHI rule:** a verification failure is reported by *reason category* only, never the document
+content. A returned ``reason`` is the class name of the bad-signature exception signxml or
+``cryptography`` raised, ``InvalidSignature`` or a subclass such as ``InvalidDigest``, or one of this
+module's fixed names such as :data:`WEAK_SIGNING_KEY`. An
+:class:`XmlError` for a signature the libraries cannot process names only the class of the exception
+raised, which can come from signxml, lxml, ``cryptography`` or the standard library. One exception:
+input the hardened parser refuses as not well-formed raises that parser's error, whose text can
+quote the document; :func:`verify` says what it carries.
 
 Pure: no engine imports.
 """
@@ -21,13 +27,17 @@ Pure: no engine imports.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import hashlib  # noqa: F401 - crypto-inventory anchor: XML-DSig digests run via signxml/cryptography
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from messagefoundry.parsing.xml._deps import load_lxml, load_signxml
 from messagefoundry.parsing.xml.errors import XmlError
 from messagefoundry.parsing.xml.harden import parse_bytes
+
+if TYPE_CHECKING:
+    from cryptography.x509 import Certificate
 
 __all__ = [
     "UNREADABLE_SIGNING_KEY",
@@ -334,11 +344,12 @@ def _coverage_refusal(root: Any, result: Any, location: str) -> str | None:
 
 
 def _read_anchor(
-    signxml: Any, x509_cert: str | bytes | None, ca_pem_file: str | bytes | None
-) -> Any:
+    signxml: Any, x509_cert: str | bytes | Certificate | None, ca_pem_file: str | bytes | None
+) -> tuple[Any, Any]:
     """Fail on an unreadable anchor before signxml's call, whose errors :func:`verify` blames on the
-    document. Returns the pinned certificate, or ``None``. Like signxml, it skips ``ca_pem_file``
-    when a certificate is pinned, and it reads that file through signxml's own loader. A pinned
+    document. Returns ``(pinned certificate, None)`` or ``(None, CA store)``. Like signxml, it skips
+    ``ca_pem_file`` when a certificate is pinned, and it reads that file through signxml's own
+    loader; :func:`_verifier_type` hands the store to signxml's chain check. A pinned
     ``cryptography`` certificate object, which signxml also takes, is passed through.
 
     A certificate, a key or a CA file that cannot be read raises :class:`ValueError` naming the
@@ -356,21 +367,55 @@ def _read_anchor(
                 cert = x509.load_pem_x509_certificate(signxml.util.add_pem_header(cert))
             # signxml reads the key inside its call, where a fault would be blamed on the document.
             cert.public_key()
-            return cert
+            return cert, None
         if ca_pem_file is not None:
-            signxml.util.X509CertChainVerifier(ca_pem_file=ca_pem_file).store  # noqa: B018 - loads
+            return None, signxml.util.X509CertChainVerifier(ca_pem_file=ca_pem_file).store
     except (ValueError, UnsupportedAlgorithm) as exc:
         fault = f"{'x509_cert' if x509_cert is not None else 'ca_pem_file'} cannot be read: "
         fault += type(exc).__name__
     if fault is not None:
         raise ValueError(fault)
-    return None
+    return None, None
+
+
+@functools.cache
+def _verifier_type(signxml: Any) -> Any:
+    """signxml's ``XMLVerifier``, made to check a certificate chain against a CA store already read.
+
+    signxml's chain verifier reads ``ca_pem_file`` again each time it checks a chain, inside the call
+    whose errors :func:`verify` reports as the document's. A CA file deleted or rewritten after
+    :func:`_read_anchor` read it would then surface as an :class:`XmlError`. This subclass builds the
+    chain verifier signxml would, with its time and policies, and swaps in only the store
+    :func:`_read_anchor` returned, so the call never opens the file. Built once per signxml module,
+    because signxml loads lazily.
+    """
+
+    class _ReadChainVerifier(signxml.util.X509CertChainVerifier):  # type: ignore[misc]
+        def __init__(self, store: Any, built: Any) -> None:
+            # Every field signxml set, not a hand-kept list, so a field a later signxml adds is kept.
+            self.__dict__.update(vars(built))
+            self._read_store = store
+
+        @property
+        def store(self) -> Any:
+            return self._read_store
+
+    class _Verifier(signxml.XMLVerifier):  # type: ignore[misc]
+        def __init__(self, ca_store: Any) -> None:
+            super().__init__()
+            self._ca_store = ca_store
+
+        def get_cert_chain_verifier(self, ca_pem_file: Any, ee_policy: Any, ca_policy: Any) -> Any:
+            built = super().get_cert_chain_verifier(ca_pem_file, ee_policy, ca_policy)
+            return _ReadChainVerifier(self._ca_store, built)
+
+    return _Verifier
 
 
 def verify(
     document: str | bytes,
     *,
-    x509_cert: str | bytes | None = None,
+    x509_cert: str | bytes | Certificate | None = None,
     ca_pem_file: str | bytes | None = None,
 ) -> XmlSignatureResult:
     """Verify the enveloped XML-DSig signature on ``document``.
@@ -426,11 +471,21 @@ def verify(
     Raises :class:`ValueError` if no anchor is supplied or the anchor cannot be read, such as a
     pinned certificate that is not one or whose key cannot be loaded, or a CA file holding none,
     and :class:`OSError` if ``ca_pem_file`` cannot be opened. Both are raised before the document
-    is read. Raises :class:`~messagefoundry.parsing.xml.errors.XmlError`
-    if the input is unparseable, or if signxml or a library under it cannot process the signature,
-    such as a schema-invalid or empty ``ds:SignatureValue`` or key data it cannot read (vault BACKLOG
-    #2816, #5372). That message names only the library's exception type, and the library's
-    exception is on neither ``__cause__`` nor ``__context__``, because several quote the document.
+    is read. Raises :class:`~messagefoundry.parsing.xml.errors.XmlError` if signxml or a library
+    under it cannot process the signature, such as a schema-invalid or empty ``ds:SignatureValue``
+    or key data it cannot read (vault BACKLOG #2816, #5372). That message names only the library's
+    exception type, and the library's exception is on neither ``__cause__`` nor ``__context__``,
+    because several quote the document.
+
+    Input the hardened parser refuses raises an :class:`XmlError` subclass from
+    :func:`~messagefoundry.parsing.xml.harden.parse_bytes` instead, before any signature
+    processing, and that path does NOT hold to the paragraph above. A document that declares a
+    DOCTYPE raises :class:`~messagefoundry.parsing.xml.errors.XmlSecurityError` with a fixed
+    message. A document that is not well-formed XML raises
+    :class:`~messagefoundry.parsing.xml.errors.XmlParseError`, whose message carries lxml's
+    syntax-error text and which is chained from lxml's ``XMLSyntaxError``. That text can quote the
+    document, such as an element or entity name or the bytes at the fault.
+
     Raises :class:`RuntimeError` if the ``[xml]`` extra is absent."""
     if x509_cert is None and ca_pem_file is None:
         # Refuse origin-blind verification. Require the caller to pin the expected signer or a partner
@@ -440,9 +495,9 @@ def verify(
             "ca_pem_file (a trusted CA). Refusing to trust any system-CA-trusted certificate."
         )
     signxml = load_signxml()
-    pinned = _read_anchor(signxml, x509_cert, ca_pem_file)
+    pinned, ca_store = _read_anchor(signxml, x509_cert, ca_pem_file)
     root = parse_bytes(document)
-    verifier = signxml.XMLVerifier()
+    verifier = signxml.XMLVerifier() if ca_store is None else _verifier_type(signxml)(ca_store)
     config = _approved_signature_config(signxml)
     from cryptography.exceptions import InvalidSignature as cryptography_invalid_signature
 
@@ -457,14 +512,16 @@ def verify(
         # The base class: signxml's own InvalidSignature derives from it, and one signxml branch
         # lets the raw cryptography one through. A bad signature stays data.
         return XmlSignatureResult(verified=False, reason=type(exc).__name__)
-    except Exception as exc:  # noqa: BLE001 - the anchor was read above; the rest is the document
-        # Measured on signxml 5.2.0, malformed signature content raises at least nine types from
-        # signxml, lxml, cryptography and builtins, and several quote the document (BACKLOG #2816,
-        # #5372). A list of types would let the next one escape with that text. The anchor is read
-        # before this call and the config is signxml's own default narrowed, so what the call
-        # raises is about the document. The type name is kept, so a library fault still names
-        # itself. Raised after the handler ends, so the exception is on neither __cause__ nor
-        # __context__ (BACKLOG #1796).
+    except Exception as exc:
+        # Broad on purpose, and it wraps ONLY the verifier call (Manager decision, batch 214). It
+        # converts every library exception into a typed, body-free XmlError naming the type, and
+        # swallows nothing, so it keeps CLAUDE.md section 6. Measured on signxml 5.2.0, malformed
+        # signature content raises at least nine types from signxml, lxml, cryptography and
+        # builtins, and several quote the document (BACKLOG #2816, #5372); a list of types was
+        # shown to let the next unmeasured one escape with that text. A fault reading the anchor
+        # does not land here: _read_anchor reads it first, and _verifier_type says why the CA file
+        # is not read again. Raised after the handler ends, so the exception is on neither
+        # __cause__ nor __context__ (BACKLOG #1796).
         fault = type(exc).__name__
     else:
         refusal = _signing_key_refusal(result) or _coverage_refusal(root, result, config.location)
