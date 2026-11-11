@@ -36,6 +36,9 @@ from tests.test_inbound_http_intake_auth import (
 PROXY = "127.0.0.1"
 CLIENT_A = "203.0.113.10"
 CLIENT_B = "203.0.113.20"
+#: The client a Teredo address with the obfuscated field 3fff:1234 carries, built rather than
+#: written, since the leak gate reads a dotted literal of it as a routable host.
+_TEREDO_CLIENT = str(ipaddress.IPv4Address(~0x3FFF1234 & 0xFFFFFFFF))
 
 
 async def _proxied(**settings: Any) -> HttpSource:
@@ -360,6 +363,39 @@ def test_the_setting_is_refused_with_the_per_peer_budget_off(per_peer: int | Non
     assert limiter.check(CLIENT_A)
 
 
+@pytest.mark.parametrize("knob", ["intake_auth_rate_limit", "intake_auth_rate_limit_global"])
+@pytest.mark.parametrize("budget", [0.5, 1.5, -1, True, "10", env("budget", default=10)])
+def test_a_budget_that_is_not_a_whole_number_of_at_least_1_is_refused(
+    knob: str, budget: object
+) -> None:
+    """The runner reads each budget with ``int()``, so 0.5 passed the truthiness test and turned
+    that arm off. Red on b6ed93ab18, which tested only truthiness."""
+    knobs: dict[str, Any] = {knob: budget}
+    with pytest.raises(WiringError, match=f"{knob} is not a whole number of at least 1") as exc:
+        Http(
+            port=8080,
+            intake_auth="api_key",
+            intake_api_key=env("k"),
+            trusted_proxies=["10.0.0.5"],
+            **knobs,
+        )
+    assert str(budget) not in str(exc.value)
+    # Its control: without trusted_proxies this refusal does not read the budget.
+    Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), **knobs)
+
+
+def test_whole_number_budgets_load_with_trusted_proxies() -> None:
+    Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), trusted_proxies=["10.0.0.5"])
+    Http(
+        port=8080,
+        intake_auth="api_key",
+        intake_api_key=env("k"),
+        trusted_proxies=["10.0.0.5"],
+        intake_auth_rate_limit=1,
+        intake_auth_rate_limit_global=1,
+    )
+
+
 def test_a_bare_string_is_refused_rather_than_read_as_characters() -> None:
     with pytest.raises(WiringError, match="must be a list"):
         Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), trusted_proxies="10.0.0.5")
@@ -396,6 +432,7 @@ def _v6(first_hextet: int, prefix: int) -> str:
         ["64:ff9b::/96"],
         ["64:ff9b::/64"],
         ["2001::/32"],
+        ["2002:c000::/31"],  # 131,072 6to4 sites
     ],
 )
 def test_a_list_spanning_more_than_the_floor_is_refused(entries: list[str]) -> None:
@@ -417,6 +454,9 @@ def test_a_list_spanning_more_than_the_floor_is_refused(entries: list[str]) -> N
         ["2001:db8::/49", "2001:db8:1::5"],
         ["10.0.0.0/16", "2001:db8::/48"],  # each family is bounded on its own
         ["64:ff9b::c000:200/120"],  # 256 NAT64 addresses
+        # A 6to4 range counts its /48 networks, one IPv4 holder each, so a whole site is one.
+        ["2002:c000:221::/48"],
+        ["2002:c000::/32"],
     ],
 )
 def test_a_list_within_the_floor_loads(entries: list[str]) -> None:
@@ -440,9 +480,23 @@ def test_a_list_within_the_floor_loads(entries: list[str]) -> None:
         ("2001:db8::7", ["2001:db8::/64"]),
         ("2001:db8::a:b", ["2001:db8::/64"]),
         # A NAT64 client keys as the IPv4 client it carries, never on the /64 every IPv4 client
-        # behind NAT64 shares. A bare hop there always reads two keys.
+        # behind NAT64 shares.
         ("[64:ff9b::c000:221]:80", ["192.0.2.33"]),
-        ("64:ff9b::c000:221", ["192.0.2.33", "0.0.192.0"]),
+        # A bare NAT64 hop's other reading is no client's: 64:ff9b::c000 carries 0.0.192.0, and
+        # 64:ff9b::c000:221:80 sits outside the /96. Each is dropped, never folded to a key that
+        # unrelated NAT64 clients share; the real reading is charged with or without a port.
+        ("64:ff9b::c000:221", ["192.0.2.33"]),
+        ("64:ff9b::c000:221:80", ["192.0.2.33"]),
+        # So is a bare Teredo hop's misreading, whose client field is 255.255.192.0, and a hex
+        # mapped hop's, which is an IPv4-compatible address carrying that.
+        ("2001:0:c000:201::3fff:1234", [_TEREDO_CLIENT]),
+        ("::ffff:c000:221", ["192.0.2.33"]),
+        # Its control: NAT64's local-use prefix carries the client at a place the operator chose,
+        # so neither reading can be told for a misreading, and both are keyed.
+        ("64:ff9b:1::c000:221", ["64:ff9b:1::c000:221", "64:ff9b:1::c000"]),
+        # A 6to4 client keys as the IPv4 holder of its /48, never on one of its 65,536 /64s.
+        ("[2002:c000:221::1]:80", ["192.0.2.33"]),
+        ("[2002:c000:221:ffff::9]", ["192.0.2.33"]),
     ],
 )
 async def test_an_ipv6_client_keys_on_its_64_and_an_ambiguous_hop_on_both_readings(
@@ -512,6 +566,56 @@ async def test_rotating_ipv6_addresses_inside_one_64_mints_no_budget() -> None:
     assert other.status == 202, other.status
 
 
+async def test_rotating_6to4_networks_inside_one_ipv4_holder_mints_no_budget() -> None:
+    """One IPv4 holder owns all 65,536 /64 networks of its 6to4 /48. Ten failures from ten of
+    them spend one budget. Red on b6ed93ab18, which keyed each /64 apart."""
+    limiter = _IntakeRateLimiter(per_peer=10, glob=60)
+    src = await _proxied(trusted_proxies=[PROXY])
+    src.intake_rate_limiter = limiter
+    try:
+        for i in range(10):
+            await _request(
+                src.sockport,
+                headers={"x-api-key": "wrong", "X-Forwarded-For": f"[2002:c000:221:{i:x}::1]"},
+            )
+        rotated = await _request(
+            src.sockport, headers={"x-api-key": KEY, "X-Forwarded-For": "[2002:c000:221:ff::1]"}
+        )
+        other = await _request(
+            src.sockport, headers={"x-api-key": KEY, "X-Forwarded-For": "[2002:c000:222::1]"}
+        )
+    finally:
+        await src.stop()
+    assert rotated.status in (429, 0), rotated.status
+    assert other.status == 202, other.status
+
+
+async def test_one_nat64_clients_misread_hop_cannot_refuse_another() -> None:
+    """Every bare NAT64 hop 64:ff9b::c000:NNNN misreads, without its last group, to 64:ff9b::c000,
+    which folded to 0.0.192.0 for all of them. One client's ten failures then refused the other
+    NAT64 clients whose IPv4 starts 192.0. Red on b6ed93ab18; the misreading is now dropped."""
+    limiter = _IntakeRateLimiter(per_peer=10, glob=60)
+    src = await _proxied(trusted_proxies=[PROXY])
+    src.intake_rate_limiter = limiter
+    try:
+        for _ in range(10):
+            await _request(
+                src.sockport,
+                headers={"x-api-key": "wrong", "X-Forwarded-For": "64:ff9b::c000:221"},
+            )
+        spent = await _request(
+            src.sockport, headers={"x-api-key": KEY, "X-Forwarded-For": "64:ff9b::c000:221"}
+        )
+        other = await _request(
+            src.sockport, headers={"x-api-key": KEY, "X-Forwarded-For": "64:ff9b::c000:222"}
+        )
+    finally:
+        await src.stop()
+    # Its control: the attacker's own budget is spent, so dropping the misreading lost no charge.
+    assert spent.status in (429, 0), spent.status
+    assert other.status == 202, other.status
+
+
 @pytest.mark.parametrize(
     ("peer", "key"),
     [
@@ -530,6 +634,9 @@ async def test_rotating_ipv6_addresses_inside_one_64_mints_no_budget() -> None:
         ("2001:0:c000:201:0:0:3fff:fdf5", "192.0.2.10"),
         ("2001:0:c000:201:8000:63bf:3fff:fdf5", "192.0.2.10"),
         ("64:ff9b:1::c000:221", "64:ff9b:1::c000:221"),
+        # 6to4 keys as the IPv4 holder of the /48, whichever of its /64 networks it sends from.
+        ("2002:c000:221:1::5", "192.0.2.33"),
+        ("2002:c000:221:ffff::5", "192.0.2.33"),
         ("::1", "::1"),
         (None, "unknown"),
     ],

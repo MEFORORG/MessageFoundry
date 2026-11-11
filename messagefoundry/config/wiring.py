@@ -3297,6 +3297,21 @@ def Http(
             "partner's address is bounded by the per-peer budget alone, and without it nothing "
             "bounds guessing there. Set intake_auth_rate_limit, or remove the setting"
         )
+    if trusted_proxies:
+        # The runner reads each budget with int(), so a fraction below 1 passes the truthiness
+        # tests above and turns that arm off; a negative, a bool or an env() is no checked budget
+        # either. Each must be a whole number of at least 1. The value is withheld.
+        for knob, budget in (
+            ("intake_auth_rate_limit_global", intake_auth_rate_limit_global),
+            ("intake_auth_rate_limit", intake_auth_rate_limit),
+        ):
+            if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+                raise WiringError(
+                    f"Http sets trusted_proxies but {knob} is not a whole number of at least 1 "
+                    "(value withheld). The listener reads it as a whole number, so a fraction "
+                    "below 1 would turn that budget off. Set it to a whole number of failed "
+                    "attempts per minute, or remove the setting"
+                )
     settings["trusted_proxies"] = (
         trusted_proxies if isinstance(trusted_proxies, EnvRef) else list(trusted_proxies or ())
     )

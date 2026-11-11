@@ -10980,7 +10980,7 @@ def security_loosenings(
                 f"{len(listener_trusted_proxy_hops)} HTTP listener(s) key the failed-attempt budget "
                 f"on the client address a listed proxy writes in X-Forwarded-For ({named}) -- "
                 "each listed proxy, and every host inside a listed range, may write any address "
-                "there and so hold a fresh per-peer budget per address (per /64 for IPv6). Guessing "
+                "there and so hold a fresh per-peer budget per address (for most IPv6, per /64). Guessing "
                 "through it is then bounded by the global budget, plus the per-peer budget of each "
                 "address it writes that authenticated recently, which the global budget exempts; "
                 "writing a partner's address also spends that partner's budget. A name marked "

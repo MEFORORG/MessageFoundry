@@ -58,6 +58,8 @@ from typing import TYPE_CHECKING, Any, ClassVar, assert_never, cast
 
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.settings import (
+    _IPV4_MAPPED_BASE,
+    _THIS_NETWORK,
     _classify_proxy_entries,
     _ipv4_meaning,
     _parse_trusted_proxy,
@@ -735,16 +737,29 @@ _MAX_FORWARDED_HOPS = 32
 #: The prefix an IPv6 budget key keeps. A host is usually handed a whole ``/64`` and may pick any
 #: address in it, so keying on the full address would let it mint a fresh budget per address.
 _IPV6_KEY_PREFIX = 64
-#: IPv6 prefixes whose addresses carry an IPv4 client, so one ``/64`` of them holds unrelated
-#: hosts: the NAT64 well-known and local-use prefixes (RFC 6052, RFC 8215), Teredo (RFC 4380) and
-#: the deprecated IPv4-compatible form. An address in one never keys on its ``/64``
-#: (:func:`_budget_key`), and a listed range in one counts its addresses toward the span limit,
-#: not its ``/64`` networks.
+#: IPv6 prefixes whose addresses carry an IPv4 client, so one ``/64`` of them may hold unrelated
+#: hosts, or one IPv4 holder may hold many ``/64`` networks of them: the NAT64 well-known and
+#: local-use prefixes (RFC 6052, RFC 8215), Teredo (RFC 4380), 6to4 (RFC 3056) and the deprecated
+#: IPv4-compatible form. An address in one never keys on its ``/64`` (:func:`_budget_key`), and a
+#: listed range in one counts its keys toward the span limit (:func:`_v6_key_count`), not its
+#: ``/64`` networks.
 _NAT64_WELL_KNOWN = ipaddress.IPv6Network("64:ff9b::/96")
-_IPV4_EMBEDDING_PREFIXES = tuple(
-    ipaddress.IPv6Network(prefix)
-    for prefix in ("64:ff9b::/96", "64:ff9b:1::/48", "2001::/32", "::/96")
+_NAT64_LOCAL_USE = ipaddress.IPv6Network("64:ff9b:1::/48")
+_SIX_TO_FOUR = ipaddress.IPv6Network("2002::/16")
+_IPV4_COMPATIBLE = ipaddress.IPv6Network("::/96")
+_IPV4_EMBEDDING_PREFIXES = (
+    _NAT64_WELL_KNOWN,
+    _NAT64_LOCAL_USE,
+    ipaddress.IPv6Network("2001::/32"),
+    _SIX_TO_FOUR,
+    _IPV4_COMPATIBLE,
 )
+#: Where no client holds an address (:func:`_is_phantom`): the IETF-reserved ``::/8``, outside the
+#: parts of it that are assigned, which are the IPv4-compatible ``::/96``, the IPv4-mapped
+#: ``::ffff:0:0/96`` (read as IPv4 before this is asked), NAT64's well-known ``/96`` and its
+#: local-use ``/48``; and, inside an embedding, IPv4 that is no host's (``_THIS_NETWORK``,
+#: multicast and the reserved class E block, the rule ``_not_a_host_address`` applies).
+_IETF_RESERVED = ipaddress.IPv6Network("::/8")
 #: The most budget keys the listed ranges of one family may hold together: addresses for IPv4, and
 #: ``/64`` networks for IPv6, the unit an IPv6 key is. ``2**16`` is one ``/16`` of IPv4 or one
 #: ``/48`` of IPv6. Every host inside a listed range is trusted as a proxy and may write any
@@ -841,7 +856,9 @@ def _validated_proxy_networks(value: tuple[str, ...]) -> tuple[_ProxyNetwork, ..
 def _v6_key_count(network: ipaddress.IPv6Network) -> int:
     """How many budget keys an IPv6 range holds: its ``/64`` networks, or, where it overlaps an
     IPv4-embedding prefix, where a key is an address or an embedded IPv4 client, its addresses,
-    which bound the keys there."""
+    which bound the keys there. Inside 6to4 a key is one ``/48``, its IPv4 holder's site."""
+    if network.subnet_of(_SIX_TO_FOUR):
+        return max(1, network.num_addresses >> 80)
     if any(network.overlaps(prefix) for prefix in _IPV4_EMBEDDING_PREFIXES):
         return network.num_addresses
     return max(1, network.num_addresses >> (128 - _IPV6_KEY_PREFIX))
@@ -904,10 +921,10 @@ def _hop_readings(text: str) -> tuple[_HopAddress, ...]:
     ambiguous when its last group is decimal digits and dropping that group still leaves an
     address: ``2001:db8::1:1234`` is an address, and also ``2001:db8::1`` with a port. Such a hop
     yields both, the whole address first, as uvicorn reads it. The caller keys the budget on every
-    reading, so a client cannot escape its own budget by choosing an interface identifier that
-    makes its hop ambiguous: one of the two readings is its real address, and that one is always
-    charged. The bracketed form says where the address ends and yields one. Each address is read
-    by :func:`_peer_address`."""
+    reading but a phantom one (:func:`_client_readings`), so a client cannot escape its own budget
+    by choosing an interface identifier that makes its hop ambiguous: one of the two readings is
+    its real address, and that one is always charged. The bracketed form says where the address
+    ends and yields one. Each address is read by :func:`_peer_address`."""
     host = text.strip(" \t")
     bracketed = host.startswith("[")
     if bracketed:
@@ -956,21 +973,89 @@ def _budget_key(address: _HopAddress) -> str:
     """The failed-attempt budget key for ``address``: an IPv4 address as written, an IPv6 address
     as its ``/64``, so rotating addresses inside one ``/64`` mints no budget (BACKLOG #5525).
 
-    An address in an IPv4-embedding prefix does not key on its ``/64``, which holds unrelated
-    clients. Where the IPv4 client sits at a fixed place, it keys as that IPv4 address, so a client
-    holds one budget whichever way it arrives: the low 32 bits under NAT64's well-known
-    ``64:ff9b::/96``, and the client field under Teredo, whose other bits a client may vary. In
-    the rest, NAT64's local-use ``64:ff9b:1::/48``, whose embedding depends on the operator's
-    prefix length, and ``::/96``, the address keys on itself."""
+    An address in an IPv4-embedding prefix does not key on its ``/64``. Where the IPv4 client sits
+    at a fixed place (:func:`_embedded_client`), it keys as that IPv4 address, so a client holds
+    one budget whichever way it arrives: under NAT64's well-known ``64:ff9b::/96``, whose ``/64``
+    holds unrelated clients, under Teredo, whose other bits a client may vary, and under 6to4,
+    whose one IPv4 holder holds 65,536 ``/64`` networks. In the rest, NAT64's local-use
+    ``64:ff9b:1::/48``, whose embedding depends on the operator's prefix length, and ``::/96``,
+    the address keys on itself."""
     if isinstance(address, ipaddress.IPv4Address):
         return str(address)
-    if address in _NAT64_WELL_KNOWN:
-        return str(ipaddress.IPv4Address(int(address) & 0xFFFFFFFF))
-    if address.teredo is not None:
-        return str(address.teredo[1])
-    if any(address in prefix for prefix in _IPV4_EMBEDDING_PREFIXES):
+    embedded = _embedded_client(address)
+    if embedded is not None:
+        return str(embedded)
+    # The other three embedding prefixes all carry a fixed-place client, answered above.
+    if address in _NAT64_LOCAL_USE or address in _IPV4_COMPATIBLE:
         return str(address)
     return str(ipaddress.IPv6Network((address, _IPV6_KEY_PREFIX), strict=False))
+
+
+def _low_ipv4(address: ipaddress.IPv6Address) -> ipaddress.IPv4Address:
+    return ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
+
+
+def _embedded_client(address: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
+    """The IPv4 client ``address`` carries at a fixed place, or ``None``: the low 32 bits under
+    NAT64's well-known ``64:ff9b::/96``, Teredo's client field, or 6to4's ``2002:V4ADDR::/48``."""
+    if address in _NAT64_WELL_KNOWN:
+        return _low_ipv4(address)
+    teredo = address.teredo
+    if teredo is not None:
+        return teredo[1]
+    return address.sixtofour
+
+
+def _is_client_ipv4(address: ipaddress.IPv4Address) -> bool:
+    # The rule config.settings._not_a_host_address applies to an entry, read on a parsed address.
+    return not (address in _THIS_NETWORK or address.is_multicast or address.is_reserved)
+
+
+def _is_phantom(address: _HopAddress) -> bool:
+    """Whether no client can hold ``address``: an embedding whose IPv4 client, or Teredo server,
+    is in space no host sends from, an IPv4-compatible address other than ``::1`` whose IPv4 is,
+    or an address in the unassigned rest of ``::/8``, NAT64's well-known ``/48`` outside its
+    ``/96`` included (see :data:`_IETF_RESERVED`)."""
+    if isinstance(address, ipaddress.IPv4Address):
+        return False
+    teredo = address.teredo
+    if teredo is not None:
+        return not (_is_client_ipv4(teredo[0]) and _is_client_ipv4(teredo[1]))
+    embedded = _embedded_client(address)
+    if embedded is not None:
+        return not _is_client_ipv4(embedded)
+    if address in _IPV4_COMPATIBLE:
+        return not address.is_loopback and not _is_client_ipv4(_low_ipv4(address))
+    return address in _IETF_RESERVED and address not in _NAT64_LOCAL_USE
+
+
+def _network_64(address: _HopAddress) -> int:
+    """The ``/64`` an address sits in, as an integer; an IPv4 address as its mapped form."""
+    value = int(address)
+    if isinstance(address, ipaddress.IPv4Address):
+        value |= _IPV4_MAPPED_BASE
+    return value >> (128 - _IPV6_KEY_PREFIX)
+
+
+def _client_readings(readings: tuple[_HopAddress, ...]) -> tuple[_HopAddress, ...]:
+    """The readings of the client's hop the budget is keyed on: every reading, except that of an
+    ambiguous hop's two, one that no client can hold (:func:`_is_phantom`) is dropped where the
+    other is one a client can hold and both share a ``/64`` (BACKLOG #5525).
+
+    Each reading is otherwise checked and charged, so a client cannot leave its own budget. A
+    misreading such as ``64:ff9b::c000``, from the NAT64 hop ``64:ff9b::c000:221`` without its
+    last group, would fold to the IPv4 key ``0.0.192.0``, which every NAT64 client whose
+    IPv4 starts ``192.0`` and whose hop ends in decimal digits misreads to too, so one of them could spend
+    that key's budget and so refuse the rest. A real address is never dropped, since no client
+    holds a phantom one; and the kept reading sits in the same ``/64`` as the dropped one, so a
+    host that could send from the dropped address keys no budget it could not reach by sending
+    from the kept one."""
+    if len(readings) != 2:
+        return readings
+    kept = tuple(reading for reading in readings if not _is_phantom(reading))
+    if len(kept) == 1 and _network_64(readings[0]) == _network_64(readings[1]):
+        return kept
+    return readings
 
 
 def _peer_budget_key(peer_host: str | None, address: _HopAddress | None = None) -> str:
@@ -1704,7 +1789,7 @@ class HttpSource(SourceConnector):
         peer = _peer_address(peer_host)
         forwarded = self._forwarded_client(head, peer)
         keys = (
-            tuple(dict.fromkeys(_budget_key(reading) for reading in forwarded))
+            tuple(dict.fromkeys(_budget_key(reading) for reading in _client_readings(forwarded)))
             if forwarded
             else (_peer_budget_key(peer_host, peer),)
         )
@@ -1730,8 +1815,11 @@ class HttpSource(SourceConnector):
         uvicorn takes the left-most hop when every hop is listed, and this walk does not: it falls
         back to the socket peer then, as it does for a missing header or a hop that is not an
         address, so no budget is ever keyed on text a client wrote. An ambiguous hop is a listed
-        hop only where every reading is listed; otherwise it is the client, keyed on every reading,
-        so no reading a client can steer onto a listed address moves the walk past it."""
+        hop only where every reading is listed, a phantom one included; otherwise it is the client,
+        keyed as :func:`_client_readings` says, so no reading a client can steer onto a listed
+        address moves the walk past it. A listed inner proxy whose hop is ambiguous is therefore
+        skipped only where its other reading is listed too; otherwise every client behind it keys
+        on its budget."""
         if not self._trusted_proxies or not head.forwarded_header:
             return ()
         if peer is None or not self._is_trusted_proxy(peer):
