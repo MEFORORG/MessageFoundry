@@ -41,8 +41,10 @@ from messagefoundry.parsing.x12.errors import X12FrameError, X12PeekError
 __all__ = ["split", "X12FrameReader", "check_integrity"]
 
 # A segment that is the IEA trailer, after cosmetic whitespace. Matched in place with pos/endpos, so the
-# check never copies a segment, however long.
-_IEA_SEGMENT = re.compile(b"[" + re.escape(_SEGMENT_WHITESPACE.encode("ascii")) + b"]*IEA")
+# check never copies a segment, however long. The class is a literal copy of _SEGMENT_WHITESPACE, not
+# built from it, so the static ReDoS scan in tests/test_security_static.py can read the pattern;
+# test_iea_segment_whitespace_matches_the_shared_set in tests/test_x12_parsing.py keeps the two equal.
+_IEA_SEGMENT = re.compile(rb"[ \t\r\n\x0b\x0c]*IEA")
 #: Line-end bytes a sender may put after an interchange's closing terminator, such as a newline after
 #: ``IEA*...~``. Up to :data:`_FRAME_TAIL_MAX` of them directly after a completed interchange are its
 #: ending, however reads split them (vault BACKLOG #2938). The cap keeps a peer from trickling them

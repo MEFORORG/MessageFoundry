@@ -248,6 +248,19 @@ def test_frame_reader_byte_at_a_time() -> None:
     assert out == [data]
 
 
+def test_iea_segment_whitespace_matches_the_shared_set() -> None:
+    """The frame reader's IEA pattern skips exactly the whitespace the codec strips before a segment.
+
+    _IEA_SEGMENT spells its class as a literal so the static ReDoS scan can read it; this keeps that
+    literal equal to _SEGMENT_WHITESPACE, byte for byte, so the two cannot drift apart.
+    """
+    from messagefoundry.parsing.x12.delimiters import _SEGMENT_WHITESPACE
+    from messagefoundry.parsing.x12.interchange import _IEA_SEGMENT
+
+    skipped = {chr(b) for b in range(256) if _IEA_SEGMENT.fullmatch(bytes([b, b, *b"IEA"]))}
+    assert skipped == set(_SEGMENT_WHITESPACE)
+
+
 def test_frame_reader_two_in_one_feed() -> None:
     a = interchange(control="000000001").encode("utf-8")
     b = interchange(control="000000002").encode("utf-8")
