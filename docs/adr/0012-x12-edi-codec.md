@@ -168,13 +168,16 @@ trading partners legitimately vary all four.
 
 Every codec tokenizer, at least `iter_segments` (which `X12Peek`, `X12Message` and `check_integrity`
 read through), `split` and `X12FrameReader`, starts the body past the ISA, so the fixed-width header is
-never read as more than one segment (BACKLOG #5536). `X12FrameReader` runs none of the ISA checks above:
-it frames such an ISA whole, and the refusal comes where a Router or Handler peeks or parses it. The
-strict `validate()` in `parsing/x12/validate.py` runs neither the delimiter discovery nor these
-tokenizers. It hands the raw text to pyx12, which reads its delimiters from the fixed-width ISA but then
-splits from the start of the ISA on the one character at `+105`, so a segment forged in ISA element data
-can reach that split. pyx12 refuses some such headers on its own ISA element count, but not all: a
-measured forgery that kept the count came back `valid=False` with an acknowledgment, not refused.
+never read as more than one segment (BACKLOG #5536). `X12FrameReader` counts the ISA in bytes, not
+characters, so that holds for it only while every ISA character is one byte; a multi-byte character in
+ISA element data moves the byte it reads as the terminator. It runs none of the ISA checks above: it
+frames such an ISA whole, and the codec refuses it only where something peeks or parses it. The strict
+`validate()` in `parsing/x12/validate.py` runs neither the delimiter discovery nor these tokenizers. It
+hands the raw text to pyx12, which reads its delimiters from the fixed-width ISA but then splits from
+the start of the ISA on the one character at `+105`, so a segment forged in ISA element data can reach
+that split. Measured on pyx12 4.0.1 on 2026-11-11, pyx12 refused some such headers, but not all: a
+forgery that kept pyx12's 16-element ISA count came back `valid=False`, with an acknowledgment that
+accepted the transaction set (`AK5*A`, `AK9*A`), identical to the one for the unforged interchange.
 
 ### 5. Tolerant peek + structural integrity for MVP; strict guide-driven validation deferred
 
