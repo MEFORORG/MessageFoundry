@@ -135,14 +135,8 @@ class EnvironmentValuesReader(SnapshotEnvValuesProvider):
                 snapshot=snapshot,
             )
         except NotInSnapshot:
-            # A path only, never a value. The engine reads this provider's value file into the
-            # snapshot, so this fires only where it could not, as when the snapshot was read
-            # without it. A WARNING: the release then rests on a second digest, which samples.
-            _log.warning(
-                "environment value file %s is outside the config snapshot; the reload reads it "
-                "from disk",
-                self.value_file,
-            )
+            # Quietly: a start's snapshot never holds a value file outside the config directory,
+            # so only a reload's caller, which read it into its own, warns (vault BACKLOG #2596).
             return None
 
 

@@ -12779,6 +12779,10 @@ def create_managed_app(
                 # still converged on (vault BACKLOG #3076). Never raises; a no-op on a single node.
                 await engine.seed_config_version()
                 loaded = load_config(config_dir)
+                # The values from the bytes the load read, as a reload parses them, so the guard,
+                # the preflight and the runner use what the config_loaded digest names (vault
+                # BACKLOG #2596, step 6). A refusal is a bad config, as the load's own is.
+                await engine.apply_start_env_values(loaded)
                 # Before the shard filter, as the reload path does inside the engine: the guard judges
                 # the whole graph.
                 engine.guard_registry(loaded)

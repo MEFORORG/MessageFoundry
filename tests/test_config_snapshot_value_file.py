@@ -902,3 +902,111 @@ def test_a_stat_fault_on_the_value_file_is_a_fault_to_a_start_too(
         )
     with pytest.raises(PermissionError):
         with_value_file(read_config_snapshot(cfg, strict=True), value_file, strict=True)
+
+
+# --- a start (step 6) ------------------------------------------------------------------------------
+
+
+async def _start_with_edit(
+    tmp_path: Path, cfg: Path, value_file: Path, base_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[dict[str, Any], dict[str, object] | None, list[dict[str, Any]], ConfigSnapshot | None]:
+    """One managed start whose value file is edited after the engine is built and before its load
+    reads the directory. Returns the running values, the start's digest, its ``config_loaded``
+    rows and the snapshot its graph ran."""
+    import messagefoundry.api.app as app_module
+    from messagefoundry.__main__ import _environment_values_reader
+    from messagefoundry.api import create_managed_app
+
+    def _edit_then_load(*args: Any, **kwargs: Any) -> Any:
+        value_file.write_text(_UNREVIEWED, encoding="utf-8")
+        return load_config(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "load_config", _edit_then_load)
+    provider = _environment_values_reader(
+        base_dir=base_dir, dir_name="environments", environment="dev"
+    )
+    app = create_managed_app(
+        db_path=tmp_path / "start.db",
+        config_dir=cfg,
+        poll_interval=0.05,
+        allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
+        env_values_provider=provider,
+    )
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        rr = engine.registry_runner
+        assert rr is not None and rr.running, "control: the graph is serving"
+        rows = [
+            json.loads(r["detail"]) for r in await engine.store.list_audit(action="config_loaded")
+        ]
+        return (
+            dict(rr.env_values),
+            engine.loaded_config_fingerprint,
+            rows,
+            rr.registry.config_snapshot,
+        )
+
+
+async def test_a_start_applies_the_environments_value_file_its_digest_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before, a start resolved its values from disk when the engine was built and its digest read
+    ``environments/`` later, in the load's snapshot, so an edit in between was named and not
+    applied. The start now parses the values from that snapshot."""
+    cfg = tmp_path / "cfg"
+    _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
+    value_file = cfg / "environments" / "dev.toml"
+    value_file.parent.mkdir()
+    value_file.write_text(_APPROVED, encoding="utf-8")
+    built = config_fingerprint(cfg)
+    values, loaded, rows, _snapshot = await _start_with_edit(
+        tmp_path, cfg, value_file, cfg, monkeypatch
+    )
+    applied = config_fingerprint(cfg)
+    assert applied != built, "control: the digest folds the value file in environments/"
+    assert loaded is not None and loaded["fingerprint"] == applied
+    assert [row["fingerprint"] for row in rows] == [applied]
+    assert values == {"host": "unreviewed.example.invalid"}, "the values are the bytes it names"
+
+
+async def test_a_start_leaves_a_value_file_outside_the_config_directory_out_of_its_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Unchanged by step 6: no start snapshot holds the default layout's value file, so no
+    published digest folds it, and the values the engine read when it was built stand. Nor does
+    the start log the WARNING a reload gives a value file it could not read into its snapshot,
+    which a reload still logs (the next test)."""
+    cfg, value_file = _layout(tmp_path)
+    before = config_fingerprint(cfg)
+    with caplog.at_level("WARNING", logger="messagefoundry"):
+        values, loaded, rows, snapshot = await _start_with_edit(
+            tmp_path, cfg, value_file, tmp_path, monkeypatch
+        )
+    assert value_file.read_text(encoding="utf-8") == _UNREVIEWED, "control: the edit landed"
+    assert loaded is not None and loaded["fingerprint"] == before == config_fingerprint(cfg)
+    assert [row["fingerprint"] for row in rows] == [before]
+    assert snapshot is not None and snapshot.value_file is None
+    assert not any(rel.startswith("@value-file/") for rel in snapshot.files)
+    assert values == {"host": "approved.example.invalid"}, "the build's read stands"
+    assert "outside the config snapshot" not in caplog.text
+
+
+async def test_a_reload_whose_snapshot_lacks_the_value_file_still_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The WARNING moved from the provider to the reload, so a start can parse quietly; a reload
+    that could not read the value file into its snapshot still says it reads it from disk."""
+    cfg, value_file = _layout(tmp_path)
+    engine = await _engine(tmp_path, cfg)
+
+    async def _without_value_file(path: Path) -> ConfigSnapshot:
+        return read_config_snapshot(path, strict=True)
+
+    monkeypatch.setattr(engine, "_reload_snapshot", _without_value_file)
+    try:
+        with caplog.at_level("WARNING", logger="messagefoundry"):
+            await engine.reload_detail(dry_run=True)
+    finally:
+        await engine.stop()
+    assert f"environment value file {value_file} is outside the config snapshot" in caplog.text

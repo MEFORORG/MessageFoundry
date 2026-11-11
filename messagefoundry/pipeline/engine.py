@@ -293,6 +293,12 @@ class ApprovedConfig:
     value_file: object = None
 
 
+#: Every way reading a value file fails that an engine refuses as a bad config rather than a
+#: fault, for a reload (:meth:`Engine.reload_detail`, whose comment says why each is here) and a
+#: start (:meth:`Engine.apply_start_env_values`).
+_VALUE_READ_ERRORS = (ValueError, TypeError, RecursionError, OSError)
+
+
 def _require_approved(
     snapshot: ConfigSnapshot | None, approval: ApprovedConfig, cipher: Cipher
 ) -> None:
@@ -3278,8 +3284,10 @@ class Engine:
         digest is of the snapshot that load ran, as a reload's is, so an edit or a file lock after
         the load's read cannot reach it (vault BACKLOG #2944, #3765). Off a snapshot, only a file
         the load does not read, in ``environments/``, can be left out of it, and it holds that
-        folder as the load read it: a start resolves its values earlier, when the engine is built,
-        not from these bytes. The directory is read for the advisory VCS head alone.
+        folder as the load read it: a value file there is the one the start parsed its values from
+        (:meth:`apply_start_env_values`), so the digest names the bytes the start applied. A value
+        file outside the config directory is in no start digest. The directory is read for the
+        advisory VCS head alone.
 
         A running graph that carries no snapshot gets none of that: the digest is of the directory
         as it is now, so any covered file can be left out and a later edit can reach it. A digest
@@ -3293,6 +3301,43 @@ class Engine:
             self.config_dir, snapshot
         )
         return reason
+
+    async def apply_start_env_values(self, registry: Registry) -> None:
+        """Parse the start's environment values from the snapshot its first load read, as
+        :meth:`reload_detail` does for a reload (vault BACKLOG #2596, step 6).
+
+        The engine read its values from disk when it was built, before any snapshot existed. A value
+        file in the config directory's ``environments/`` folder is in the load's snapshot, which is
+        what the start's ``config_loaded`` digest folds (:meth:`capture_start_provenance`), so those
+        bytes replace that read: an edit between the build and the load is then both applied and
+        named. A value file outside the config directory is in no start snapshot and no published
+        digest, so the values read at the build stand. A no-op with no snapshot or no
+        :class:`~messagefoundry.config.environments.SnapshotEnvValuesProvider`.
+
+        The managed app's start calls it after the load and before :meth:`guard_registry`, so the
+        guard, the preflight and the runner judge and run the values the digest names. Raises
+        ``WiringError`` when the snapshot's value file cannot be read or parsed, as a reload
+        refuses."""
+        provider = self._env_values_provider
+        snapshot = registry.config_snapshot
+        if snapshot is None or not isinstance(provider, SnapshotEnvValuesProvider):
+            return
+        refusal: str | None = None
+        try:
+            # None for a value file outside the snapshot, as in the default layout.
+            read = await asyncio.to_thread(provider.from_snapshot, snapshot)
+            if read is not None:
+                self._env_values = dict(read)
+        except WiringError:
+            raise
+        except _VALUE_READ_ERRORS as exc:
+            refusal = safe_exc(exc)
+        if refusal is not None:
+            # After the handler, so the caught error rides neither __cause__ nor __context__: a
+            # TOMLDecodeError keeps the whole value file on .doc (BACKLOG #2307).
+            raise WiringError(
+                f"could not read this environment's values from the start's config snapshot: {refusal}"
+            )
 
     def guard_registry(
         self, registry: Registry, env_values: Mapping[str, Any] | None = None
@@ -3497,6 +3542,15 @@ class Engine:
                 # Into a local: the running values change only at the swap (vault BACKLOG #2596).
                 if snapshot is not None and isinstance(provider, SnapshotEnvValuesProvider):
                     read = await asyncio.to_thread(provider.from_snapshot, snapshot)
+                    if read is None:
+                        # A path only, never a value. The engine reads the provider's value file
+                        # into the snapshot, so this fires only where it could not. A WARNING: the
+                        # release then rests on a second digest, which samples.
+                        log.warning(
+                            "environment value file %s is outside the config snapshot; the reload "
+                            "reads it from disk",
+                            provider.value_file,
+                        )
                 reads_snapshot = read is not None
                 if read is None:  # no snapshot, or one that cannot vouch for the value file
                     read = await asyncio.to_thread(provider)
@@ -3505,7 +3559,7 @@ class Engine:
                 # Already a wiring failure that names its own source. Re-raise unwrapped rather than
                 # nesting the same sentence twice.
                 raise
-            except (ValueError, TypeError, RecursionError, OSError) as exc:
+            except _VALUE_READ_ERRORS as exc:
                 # The tuple is specific rather than a blanket Exception (section 6), and each entry is
                 # a MEASURED escape, not a guess. ValueError covers tomllib.TOMLDecodeError and
                 # UnicodeDecodeError (the CLI shapes). RecursionError covers a deeply nested value
