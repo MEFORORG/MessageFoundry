@@ -121,6 +121,7 @@ from messagefoundry.config.wiring import (
     resolve_listener_binding,
     resolved_encoding_problems,
 )
+from messagefoundry.config.wiring import _type_name as _exc_type_name
 from messagefoundry.connection_events import CONNECTION_EVENT_KINDS
 from messagefoundry.connection_names import fhir_lookup_record_name, inbound_record_name
 from messagefoundry.fhirsearch import FhirSearchParams
@@ -11335,7 +11336,15 @@ class RegistryRunner:
                 _snap: Mapping[tuple[str, str], Any] = state_snapshot,
             ) -> _RoutedPrep:
                 async with _sem:
-                    return await self._prepare_routed(name, _ic, it, state_snapshot=_snap)
+                    try:
+                        return await self._prepare_routed(name, _ic, it, state_snapshot=_snap)
+                    except BaseException as exc:
+                        # Counted here, in the sibling's own task, as _process_routed_item counts
+                        # a sequential death (#4607): a KeyboardInterrupt leaves the event loop
+                        # from this task's step, before the gather below returns.
+                        if _kills_the_worker(exc):
+                            await self._record_worker_death("transform", name, it, exc)
+                        raise
 
             preps = await asyncio.gather(*(_compute(it) for it in run), return_exceptions=True)
             for it, prep in zip(run, preps, strict=True):
@@ -11344,10 +11353,7 @@ class RegistryRunner:
                     # captured as data). Mirror the sequential path: propagate to the worker's backoff.
                     # Lower-claim siblings already handed off (committed, in order); this row + any
                     # higher un-applied rows stay INFLIGHT and recover in claim order via
-                    # reset_stale_inflight (ADR 0058 INV-3 / ADR 0001 at-least-once). A row that
-                    # killed its compute is counted first, as _process_routed_item counts it (#4607).
-                    if _kills_the_worker(prep):
-                        await self._record_worker_death("transform", name, it, prep)
+                    # reset_stale_inflight (ADR 0058 INV-3 / ADR 0001 at-least-once).
                     raise prep
                 if (await self._apply_routed(name, it, prep))[0] is _ItemOutcome.STOPPED:
                     return True
@@ -12419,48 +12425,84 @@ class RegistryRunner:
         (``release_claimed``, ``reschedule_claimed``) answer a store fault or a stop, never this. So
         it survives the worker's death, a respawn and a restart. On an ingress, routed or response
         row every resolved pass consumes or ends the row, so the count holds the passes that did not
-        resolve it: deaths, and at least a crash or a stop mid-row and a STOP-policy re-pend.
-        :data:`_WORKER_DEATH_LIMIT` caps those rows. An outbound row's ``attempts`` also counts its
-        failed sends, so a death there is one more failed attempt under the lane's own retry policy,
-        and only a finite ``max_attempts`` dead-letters it.
+        resolve it: deaths, and at least a crash or a stop mid-row, a STOP-policy or missing-inbound
+        re-pend, and a Postgres lease reclaim. So a row with earlier unresolved passes can be
+        dead-lettered on its first death. :data:`_WORKER_DEATH_LIMIT` caps those rows. An outbound
+        row's ``attempts`` also counts its failed sends, so a death there is one more failed attempt
+        under the lane's own retry policy, and only a finite ``max_attempts`` dead-letters it.
+
+        **A dispatcher-drained lane keeps a below-cap row in flight.** Its serializer died with the
+        row and is not respawned (#4607 step 2), so the lane claims nothing until a restart. A
+        re-pend there would hide the row from the in-flight watch, its only page; in flight, the
+        watch pages it, and ``reset_stale_inflight`` brings it back at the next start with its count.
 
         Never raises: the caller re-raises the death, and a store fault here must not replace it.
         The row then stays in flight, as before this count existed. Logs names, ids and the
-        exception's type, never its text, which can carry the message (section 9)."""
-        error = f"{worker} worker killed by {type(exc).__name__}"
-        try:
-            if item.stage == Stage.OUTBOUND.value:
-                retry = self._retry.get(name) or RetryPolicy()
-                failed = await self._mark_failed_and_arm(name, item.id, error, retry)
-            else:
-                failed = self._arm_retry(
-                    name,
-                    await self.store.mark_failed(item.id, error, _WORKER_DEATH_RETRY),
-                    Stage(item.stage),
-                )
-        except Exception:  # noqa: BLE001 - the death is re-raised by the caller; see the docstring
-            log.warning(
-                "%s worker %r: %s killed the worker on row %s and recording it failed; the row "
-                "stays in flight",
+        exception's type, read by its builtin descriptor, never its text, which can carry the
+        message (section 9)."""
+        kind = _exc_type_name(exc)
+        stage = Stage(item.stage)
+        outbound = stage is Stage.OUTBOUND
+        retry = (self._retry.get(name) or RetryPolicy()) if outbound else _WORKER_DEATH_RETRY
+        at_cap = retry.max_attempts is not None and item.attempts >= retry.max_attempts
+        if not at_cap and not self._drained_by_worker(stage, name):
+            log.error(
+                "%s worker %r: row %s (message %s) killed the serializer with %s on attempt %d; "
+                "the row stays in flight for the next start, and is dead-lettered if it keeps "
+                "doing so",
                 worker,
                 name,
-                type(exc).__name__,
                 item.id,
-                exc_info=True,
+                item.message_id,
+                kind,
+                item.attempts,
             )
             return
+        try:
+            failed = self._arm_retry(
+                name,
+                await self.store.mark_failed(item.id, f"{worker} worker killed by {kind}", retry),
+                stage,
+            )
+        except Exception as fault:  # noqa: BLE001 - the death is re-raised by the caller; see above
+            # No traceback: the fault's context is the death, whose text can carry the message.
+            log.warning(
+                "%s worker %r: %s killed the worker on row %s and recording it failed (%s); the "
+                "row stays in flight",
+                worker,
+                name,
+                kind,
+                item.id,
+                _exc_type_name(fault),
+            )
+            return
+        if failed.head_id is None:
+            outcome = "the row was no longer there, so nothing was written"
+        elif failed.dead:
+            outcome = "at its cap, so dead-lettered as a content fault"
+        else:
+            outcome = "re-pended at its lane position if it was still in flight"
         log.error(
             "%s worker %r: row %s (message %s) killed the worker with %s on attempt %d; %s",
             worker,
             name,
             item.id,
             item.message_id,
-            type(exc).__name__,
+            kind,
             failed.attempts if failed.attempts is not None else item.attempts,
-            "at its cap, so dead-lettered as a content fault"
-            if failed.dead
-            else "re-pended at its lane position, and dead-lettered if it keeps doing so",
+            outcome,
         )
+        if outbound and failed.dead:
+            await self._delivery_failure_alert_checks(name)
+
+    def _drained_by_worker(self, stage: Stage, lane: str) -> bool:
+        """Whether a per-lane WORKER drains ``lane`` at ``stage``, rather than a pooled dispatcher.
+        An outbound lane asks :meth:`_per_lane_delivery`, which knows the unordered lanes a worker
+        drains under pooled too; an ingress, routed or response lane is worker-drained exactly in
+        per_lane mode."""
+        if stage is Stage.OUTBOUND:
+            return self._per_lane_delivery(lane)
+        return self._claim_mode != "pooled"
 
     async def _mark_failed_and_arm(
         self, lane: str, outbox_id: str, error: str, retry: RetryPolicy
@@ -12490,16 +12532,9 @@ class RegistryRunner:
     ) -> FailOutcome:
         """Arm the one-shot retry wake for ``failed``'s ``retry_at`` on a lane a per-lane WORKER
         drains, and hand ``failed`` back. The shared tail of :meth:`_mark_failed_and_arm`,
-        :meth:`_mark_batch_failed_and_arm` and :meth:`_record_worker_death`. An ingress, routed or
-        response lane is worker-drained exactly in per_lane mode. A pooled one is the dispatcher's,
-        and its only caller here is a death, whose serializer died with the row (#4607)."""
+        :meth:`_mark_batch_failed_and_arm` and :meth:`_record_worker_death`."""
         next_at = failed.retry_at
-        drained_by_worker = (
-            self._per_lane_delivery(lane)
-            if stage is Stage.OUTBOUND
-            else self._claim_mode != "pooled"
-        )
-        if drained_by_worker and self._per_lane_wake and next_at is not None:
+        if self._drained_by_worker(stage, lane) and self._per_lane_wake and next_at is not None:
             delay = max(0.0, next_at - time.time()) + _RETRY_WAKE_SLACK_SECONDS
             asyncio.get_running_loop().call_later(delay, self._wake_lane, stage, lane)
         return failed

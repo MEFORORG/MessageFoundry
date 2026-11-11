@@ -129,6 +129,18 @@ async def _claim(store: MessageStore, lane: str, stage: Stage, now: float = FAR)
     return item
 
 
+def _held(claim_mode: str) -> str:
+    """A per_lane death re-pends the row; a pooled one keeps it in flight, where the in-flight
+    watch still pages the lane its dead serializer left wedged (#4607 step 2 respawns it)."""
+    return "pending" if claim_mode == "per_lane" else "inflight"
+
+
+async def _restart_if_pooled(store: MessageStore, claim_mode: str) -> None:
+    """The restart a pooled lane needs after its serializer died: the next start's recovery."""
+    if claim_mode == "pooled":
+        await store.reset_stale_inflight()
+
+
 @pytest.mark.parametrize("claim_mode", ["per_lane", "pooled"])
 async def test_a_row_that_kills_the_router_worker_every_time_is_dead_lettered(
     tmp_path: Path, store: MessageStore, claim_mode: str
@@ -143,10 +155,12 @@ async def test_a_row_that_kills_the_router_worker_every_time_is_dead_lettered(
         assert item.message_id == killer  # nothing overtook the killer
         with pytest.raises(_Kill):
             await drive("IB", item)
-        assert await _row(store, killer, Stage.INGRESS) == ("pending", attempt)
-        # The re-pended head still holds its lane: a claim before its backoff takes no row.
-        assert await store.claim_next_fifo("IB", time.time(), stage=Stage.INGRESS.value) is None
+        assert await _row(store, killer, Stage.INGRESS) == (_held(claim_mode), attempt)
+        if claim_mode == "per_lane":
+            # The re-pended head still holds its lane: a claim before its backoff takes no row.
+            assert await store.claim_next_fifo("IB", time.time(), stage="ingress") is None
         assert await _status(store, after) == MessageStatus.RECEIVED.value
+        await _restart_if_pooled(store, claim_mode)
 
     item = await _claim(store, "IB", Stage.INGRESS)
     assert item.message_id == killer
@@ -180,7 +194,8 @@ async def test_a_single_death_then_a_clean_pass_is_not_dead_lettered(
 
     with pytest.raises(_Kill):
         await drive("IB", await _claim(store, "IB", Stage.INGRESS))
-    assert await _row(store, mid, Stage.INGRESS) == ("pending", 1)
+    assert await _row(store, mid, Stage.INGRESS) == (_held(claim_mode), 1)
+    await _restart_if_pooled(store, claim_mode)
 
     await drive("IB", await _claim(store, "IB", Stage.INGRESS))
     assert await _status(store, mid) == MessageStatus.ROUTED.value
@@ -204,8 +219,12 @@ async def test_a_row_that_kills_the_transform_worker_every_time_is_dead_lettered
     for attempt in range(1, wiring_runner._WORKER_DEATH_LIMIT + 1):
         with pytest.raises(_Kill):
             await drive("IB", await _claim(store, "IB", Stage.ROUTED))
-        expected = "dead" if attempt == wiring_runner._WORKER_DEATH_LIMIT else "pending"
-        assert await _row(store, mid, Stage.ROUTED) == (expected, attempt)
+        last = attempt == wiring_runner._WORKER_DEATH_LIMIT
+        assert await _row(store, mid, Stage.ROUTED) == (
+            "dead" if last else _held(claim_mode),
+            attempt,
+        )
+        await _restart_if_pooled(store, claim_mode)
     assert await _status(store, mid) == MessageStatus.ERROR.value
 
 
@@ -235,7 +254,8 @@ async def test_a_delivery_death_is_a_failed_attempt_under_the_lanes_retry_policy
 
     with pytest.raises(_Kill):
         await drive("OB", await _claim(store, "OB", Stage.OUTBOUND))
-    assert await _row(store, mid, Stage.OUTBOUND) == ("pending", 1)
+    assert await _row(store, mid, Stage.OUTBOUND) == (_held(claim_mode), 1)
+    await _restart_if_pooled(store, claim_mode)
     with pytest.raises(_Kill):
         await drive("OB", await _claim(store, "OB", Stage.OUTBOUND))
     assert await _row(store, mid, Stage.OUTBOUND) == ("dead", 2)
