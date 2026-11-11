@@ -3012,7 +3012,7 @@ class RegistryRunner:
             except Exception as exc:
                 errors[name] = exc
         errors = {name: errors[name] for name in specs if name in errors}  # in graph order
-        failed = {name: safe_exc(err) for name, err in errors.items()}
+        failed = {name: _lookup_failure_reason(err) for name, err in errors.items()}
         survivors = {name: s for name, s in settled.items() if name not in errors}
         # Before the final build, so a graph-wide failure there still leaves each lookup's own
         # failure for the start's backstop to log.
@@ -3053,18 +3053,48 @@ class RegistryRunner:
         return refused
 
     def _fhir_lookup_anchor_settings(
-        self, registry: Registry
+        self, registry: Registry, env_values: Mapping[str, Any] | None = None
     ) -> Iterable[tuple[str, dict[str, Any]]]:
         """``(name, resolved settings)`` for each ``FhirLookup`` in ``registry`` whose CA a check
-        reads, at start and before a reload (vault BACKLOG #3582). A lookup whose settings do not
-        resolve is skipped: its build, or a reload's build check, records why."""
+        reads, at start and before a reload (vault BACKLOG #3582), resolved against
+        ``env_values``, the runner's own by default. A lookup whose settings do not resolve is
+        skipped: its build, or a reload's build check, records why."""
+        values = self._env_values if env_values is None else env_values
         for name, spec in registry.fhir_lookups.items():
             try:
-                settings = _fhir_lookup_settings(spec, self._env_values, self._egress)
+                settings = _fhir_lookup_settings(spec, values, self._egress)
             except Exception as exc:  # noqa: BLE001 - see the docstring
                 log.debug("fhir lookup %r: CA check skipped: %s", name, safe_exc(exc))
             else:
                 yield name, settings
+
+    async def refuse_on_fhir_lookup_anchors(
+        self, registry: Registry, env_values: Mapping[str, Any] | None = None
+    ) -> None:
+        """Check the CA of each ``FhirLookup`` ``registry`` declares, and refuse on the first one
+        refused, as a ``WiringError`` whose cause is the :class:`TrustAnchorError` (vault BACKLOG
+        #3582, ADR 0031 rule 2). A reload builds every lookup again, so :meth:`reload` runs it on
+        the new graph before its build check, as the engine's registry preflight did before this
+        check moved here: a CA file the build could not load is refused here first, as a trust
+        anchor, with its audit row. A DR activation runs it inside its bounded preflight too
+        (:meth:`Engine._dr_preflight`, vault BACKLOG #3094), so a share that stops answering times
+        the activation out rather than holding it. A check the store stopped refuses only if no
+        lookup's CA is refused (BACKLOG #3091). A no-op with no lane check."""
+        if self._lane_anchor_check is None:
+            return
+        store_fault: AnchorStoreUnavailable | None = None
+        for name, settings in self._fhir_lookup_anchor_settings(registry, env_values):
+            try:
+                await self._lane_anchor_check("fhir_lookup", name, settings)
+            except AnchorStoreUnavailable as exc:
+                store_fault = store_fault or exc
+            except (TrustAnchorError, ValueError) as exc:
+                setting = _fhir_lookup_setting(name, _lane_anchor_fault(exc))
+                error = connection_anchor_failure(exc, setting=setting)
+                raise error from error.__cause__
+        if store_fault is not None:
+            error = connection_anchor_failure(store_fault)
+            raise error from error.__cause__
 
     def _record_fhir_lookup_failed(self, name: str, reason: str, exc: BaseException) -> None:
         """Log and alert a ``FhirLookup`` that failed to build at start, as :meth:`_record_failed`
@@ -4699,18 +4729,6 @@ class RegistryRunner:
                 error = connection_anchor_failure(exc, setting=_lane_setting(direction, name, key))
                 raise error from error.__cause__
             passed.append((direction, name))
-        # Vault BACKLOG #3582: a reload builds every FhirLookup again, so each one's CA is read
-        # here, and a refusal refuses the reload, as it did when the engine's registry preflight
-        # checked it.
-        for name, settings in self._fhir_lookup_anchor_settings(new):
-            try:
-                await self._lane_anchor_check("fhir_lookup", name, settings)
-            except AnchorStoreUnavailable as exc:
-                store_fault = store_fault or exc
-            except (TrustAnchorError, ValueError) as exc:
-                setting = _fhir_lookup_setting(name, _lane_anchor_fault(exc))
-                error = connection_anchor_failure(exc, setting=setting)
-                raise error from error.__cause__
         if store_fault is not None:
             error = connection_anchor_failure(store_fault)
             raise error from error.__cause__
@@ -8236,6 +8254,9 @@ class RegistryRunner:
             # Raises before any change on a bad connector. The check awaits a worker thread, so the
             # values go live only once it passes: a reader that takes no lock, such as a
             # connection test, never sees values the check then refuses (engine PR 2815).
+            # Vault BACKLOG #3582: before the build check, so a lookup CA the build could not load
+            # is refused as a trust anchor, with its row, as the registry preflight refused it.
+            await self.refuse_on_fhir_lookup_anchors(new_registry, new_env_values)
             await self.build_check_off_loop(new_registry, new_env_values, now=now)
             if new_env_values is not None:
                 self._env_values = new_env_values
@@ -13450,6 +13471,9 @@ def _fhir_lookup_anchor_line(name: str, exc: BaseException) -> TrustAnchorError:
         what = "tls_ca_file was refused"
         rows = "the server log and the auth.trust_anchor audit rows say why"
         advice = f"Fix the file, then reload or restart; {rows}"
+    elif isinstance(exc, AnchorStoreUnavailable):
+        what = "tls_ca_file could not be checked, because the store refused the trust-anchor audit"
+        advice = "Reload or restart once the store is back; the server log says why"
     else:
         what = "tls_ca_file could not be checked"
         advice = "The server log says why; reload or restart once the cause is fixed"
@@ -13458,6 +13482,15 @@ def _fhir_lookup_anchor_line(name: str, exc: BaseException) -> TrustAnchorError:
         setting=_fhir_lookup_setting(name, fault),
         fixed_text=True,
     )
+
+
+def _lookup_failure_reason(exc: BaseException) -> str:
+    """A failed ``FhirLookup``'s recorded reason. A fixed CA line is kept to
+    :data:`_ANCHOR_LINE_LIMIT`, as :meth:`RegistryRunner._record_failed` keeps a lane's, so a long
+    lookup name does not cut off its advice (vault BACKLOG #3498, #3582)."""
+    if isinstance(exc, TrustAnchorError) and exc.fixed_text:
+        return safe_exc(exc, limit=_ANCHOR_LINE_LIMIT)
+    return safe_exc(exc)
 
 
 def _fhir_lookup_setting(name: str, fault: str) -> str:

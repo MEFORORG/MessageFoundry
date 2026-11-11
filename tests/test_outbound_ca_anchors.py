@@ -759,6 +759,88 @@ async def test_a_reload_still_refuses_whole_on_a_refused_lookup_ca_and_heals_onc
     assert dials == []
 
 
+async def test_a_missing_lookup_ca_is_isolated_at_start_and_refused_as_an_anchor_at_reload(
+    store: MessageStore, tmp_path: Path, judged: None, dials: list[str]
+) -> None:
+    """Review round 1 of vault BACKLOG #3582. A lookup CA that cannot be read is isolated at
+    start like a refused one. At a reload the lookup check runs before the build check, so the
+    refusal is a trust-anchor refusal, as it was when the registry preflight made it, and not the
+    build's ``invalid_config``. Red under: the reload check moved after the build check."""
+    gone = tmp_path / "gone.pem"
+    cfg = tmp_path / "cfg"
+    _lookup_graph(cfg, gone, "00" * 32)
+    engine = _engine(store)
+    try:
+        runner = await _start_like_serve(engine, cfg)
+        reason = runner.fhir_lookup_failed("EPIC")
+        assert reason is not None and reason.startswith(_REFUSED_LOOKUP), reason
+        assert {"OUT", "OB_OK"} <= set(runner._destinations)
+        with pytest.raises(WiringError, match="fhir lookup 'EPIC' tls_ca_file") as refused:
+            await engine.reload_detail(cfg)
+        assert isinstance(refused.value.__cause__, TrustAnchorError)
+    finally:
+        await engine.stop()
+    assert dials == []
+
+
+async def test_a_lookup_whose_ca_check_the_store_stopped_is_isolated_and_named_so(
+    store: MessageStore, tmp_path: Path, judged: None, dials: list[str]
+) -> None:
+    """Review round 1 of vault BACKLOG #3582: a check the store stopped is not a refused file,
+    but the lookup is still not built, as a lane is failed at start. Its line names the store,
+    and the other feeds start. Red under: the store fault reaching the start's backstop."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _lookup_graph(cfg, ca, _sha(ca))
+    check = ta.make_lane_anchor_check(store, enforcing=True)
+
+    async def stopped(direction: str, name: str, settings: Any) -> None:
+        if direction == "fhir_lookup":
+            raise ta.AnchorStoreUnavailable("the store refused the audit read")
+        await check(direction, name, settings)
+
+    from messagefoundry.pipeline import Engine
+
+    engine = Engine(
+        store,
+        registry_preflight=ta.make_registry_anchor_preflight(store, enforcing=True),
+        lane_anchor_check=stopped,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        runner = await _start_like_serve(engine, cfg)
+        reason = runner.fhir_lookup_failed("EPIC")
+        assert reason is not None and "the store refused the trust-anchor audit" in reason, reason
+        assert {"OUT", "OB_OK"} <= set(runner._destinations)
+    finally:
+        await engine.stop()
+    assert dials == []
+
+
+async def test_a_long_lookup_name_keeps_the_advice_in_its_record(
+    store: MessageStore, tmp_path: Path, judged: None, dials: list[str]
+) -> None:
+    """Review round 1 of vault BACKLOG #3582: the record keeps a fixed line to the anchor-line
+    limit, as a lane's does (vault BACKLOG #3498), so a long name does not cut the advice off.
+    Red under: the record taken at ``safe_exc``'s default limit."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _lookup_graph(cfg, ca, "00" * 32)
+    name = "EPIC_" + "X" * 90
+    lookup = cfg / "lookup.py"
+    lookup.write_text(
+        lookup.read_text(encoding="utf-8").replace("'EPIC'", repr(name)), encoding="utf-8"
+    )
+    engine = _engine(store)
+    try:
+        runner = await _start_like_serve(engine, cfg)
+        reason = runner.fhir_lookup_failed(name)
+        assert reason is not None and reason.endswith("audit rows say why"), reason
+    finally:
+        await engine.stop()
+    assert dials == []
+
+
 async def test_a_missing_outbound_ca_names_the_connection(
     store: MessageStore, tmp_path: Path
 ) -> None:

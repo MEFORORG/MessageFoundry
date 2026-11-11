@@ -1279,6 +1279,11 @@ class Engine:
             async with bound:
                 await self.preflight_settings()
                 await self.preflight_registry(registry)
+                rr = self._registry_runner
+                if rr is not None:
+                    # Vault BACKLOG #3582: the FhirLookup CAs moved out of the registry preflight
+                    # into the runner, and are read here so they stay under this bound.
+                    await rr.refuse_on_fhir_lookup_anchors(registry)
         except TimeoutError as exc:
             if not bound.expired():
                 raise  # a TimeoutError from inside the preflight is its own error

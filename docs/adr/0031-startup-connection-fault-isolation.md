@@ -408,13 +408,19 @@ too, as it fails a lane at start.
 
 **Not changed.** A pin, permission or path refusal still writes its `auth.trust_anchor` rows and
 still fails closed: the lookup is never built. A reload, a DR activation and a follower
-convergence still refuse whole (rule 2): a reload builds every lookup again, so before it
-quiesces the runner checks each lookup's CA, and a refusal refuses the reload before anything
-changes. A reload with the cause fixed builds the lookup again, and so does a restart. Rule 3, the
-inbound listener CA, is untouched.
+convergence still refuse whole (rule 2): a reload builds every lookup again, so before its
+build check the runner checks each lookup's CA (`RegistryRunner.refuse_on_fhir_lookup_anchors`),
+and a refusal refuses the reload before anything changes, audited as a trust-anchor refusal. A DR
+activation also runs that check inside its preflight, which `[dr].takeover_timeout_seconds` bounds
+(vault BACKLOG #3094). A reload with the cause fixed builds the lookup again, and so does a
+restart. Rule 3, the inbound listener CA, is untouched.
 
 **Consequences.** A start with a broken lookup CA comes up with that lookup failed, where before
-it did not come up. The alert is the same `connection_stopped` alert a lookup that fails to build
-already sends, so no refusal is quieter than before: the start's refusal becomes an ERROR line and
-an alert, and the audit rows are written as before. The tests are in
+it did not come up. The signal changes from a start that fails to an ERROR line, the
+`connection_stopped` alert a lookup that fails to build already sends, and `fhir_lookups_failed`
+in `/status`. A site with no alert sink wired sees only the log line and `/status`. The check
+writes its `auth.trust_anchor` rows through the lane check, so a repeat of the same refusal, or of
+the same clean pass, writes no new rows, as for a lane. The check runs only where the runner is
+given the lane check, as `serve` gives it; an engine built with the registry preflight alone no
+longer checks a lookup CA, as it never checked a lane CA. The tests are in
 `tests/test_outbound_ca_anchors.py`.

@@ -77,7 +77,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
    an inbound ``Ftp`` poller. Each takes the checks of items 1 to 4 under the label
    ``outbound:<name>``, ``fhir_lookup:<name>`` or ``inbound:<name>``, on the inbound dial. A pin
    mismatch always refuses, and an exposed or unjudged CA refuses at ``enforce``. **When** a
-   refusal lands follows ADR 0031, as amended on 2026-10-06:
+   refusal lands follows ADR 0031, as amended on 2026-10-06, and for a ``FhirLookup`` on
+   2026-11-11:
 
    * An outbound or an ``Ftp`` poller is checked when its lane is built, at start and at an
      operator start (:func:`make_lane_anchor_check`). A refusal fails that lane only, with the
@@ -88,8 +89,9 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
      recorded failed and alerted, every Handler call to it fails closed, and the rest of the graph
      comes up. Nothing is dialled for it.
    * Before a reload quiesces, the runner checks each lane the reload builds or keeps running, and
-     each ``FhirLookup`` the new graph declares, since a reload builds every lookup again. A
-     refusal refuses the whole reload. It does not read an idle lane: one not deployed, an
+     a refusal refuses the whole reload. A reload builds every ``FhirLookup`` again, so before its
+     build check the runner checks each one the new graph declares, and a refusal refuses the
+     whole reload too. A DR activation checks them inside its bounded preflight as well. It does not read an idle lane: one not deployed, an
      ``auto_start=False`` lane not running, one below a DR threshold, a poller outside its
      schedule window, or a lane its CA failed whose config has not changed. A reload leaves that
      last kind failed. A config change or an operator start builds it, and checks it then.
