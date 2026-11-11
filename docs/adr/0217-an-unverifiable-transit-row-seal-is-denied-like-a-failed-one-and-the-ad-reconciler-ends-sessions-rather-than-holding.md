@@ -290,6 +290,11 @@ give, or freeze a revocation a failed seal would not**. That is the test each an
 | **Unverifiable** | `verify` HTTP 400, and the fixed-input key probe (`hmac` over a constant) then answers with a well-formed MAC, whatever version it names | `TransitSealUnverifiableError` | deny the row, with three limits: it never tombstones or raw-deletes a user, role, map or approval where Forged would (ending a session is allowed, since signing in replaces it); the AD maps follow (b) and (d); a write that keeps the row's stored values is refused, while an operator's explicit delete of the row, full replacement of it (a map's only with `replace_unverifiable`, (d)), or Reject of a pending approval (below), which keep none of its values, is allowed and audited | `integrity.authority_seal_unverifiable` | `authority-seal-transit-unverifiable:<kind>:<ref>:<digest suffix>` (*A ref is for reading*), capped; the two Unverifiable AD map subjects, fixed names with no ref or suffix, are exempt from the cap |
 | **Outage** | any other `verify` failure (network, timeout, 5xx, 403, malformed reply), or a 400 the probe cannot clear; except that a 400 or 403 on a seal naming a retired key, while the active key's probe works, is Unverifiable (*The key id, and a retired key*) | `TransitSealUnavailableError` | refuse the request or roll back the write; end nothing, except that (c) ends an account's sessions after a refused narrowing write; record no seal failure | none for the row; the refused request itself is audited where the audit append still works (many outages, such as a 403 on `verify` alone or a timeout, leave it working), a refused sign-in as `auth.login_refused_unavailable`, (e); a throttled ERROR log line is the record only when the append fails too | `authority-seal-transit` |
 
+A correction, added 2026-11-11: the Outage row's "the refused request itself is audited where the
+audit append still works" does not hold for a request the approval gate refuses on an Outage, which
+writes no row; that path and two others are named in *Open audit gaps, a correction added
+2026-11-11*, in (c).
+
 **The seal input is a fixed-length digest.** The sealer sends Transit not the row's encoding but its
 SHA-256: `seal = Transit hmac(SHA-256(label || store id || seal_bytes(kind, fields)))`, each part
 length-prefixed as today. So every `hmac` and `verify` call carries 32 bytes whatever the row
@@ -403,6 +408,9 @@ call per refused check stays (see item 3).
 - **Control kept:** an unverifiable row never grants, never keeps a session, and is always
   audited and paged as an integrity event. A planted unheld version is never downgraded to a
   retryable 503 that ends nothing and records nothing.
+- **A correction, added 2026-11-11:** "always audited and paged" does not hold on at least three
+  open paths, each failing closed; *Open audit gaps, a correction added 2026-11-11*, in (c), names
+  them.
 - **Failure accepted:** a genuine seal checked against a node that lags a key rotation is denied
   for the length of the lag: a session so checked is ended, and its user signs in again (on a node
   that has caught up); a write so refused is retried by its caller; an approval is denied, never
@@ -931,6 +939,19 @@ session, approval, on SQLite, PostgreSQL and SQL Server):
   alert sink is wired; neither cause's
   reports throttle the other's, on the same row or across rows; a refusal reached from a CLI is
   still a refusal, and still audited.
+- **Open audit gaps, a correction added 2026-11-11.** The *Control kept* above, (a)'s "always
+  audited and paged", the Outage row's "the refused request itself is audited" in *The four
+  answers, defined once*, and *Consequences*' "Each refusal is audited under its true cause" do not
+  hold on at least three paths. Each is open and filed on vault BACKLOG #8202, and each fails
+  closed: the request is refused. (1) The last-administrator guard: `admin_guard_counts` and
+  `user_seal_ok_async` in `store/store.py` have no Transit catch, so an Unverifiable or Outage
+  answer on another administrator's row is a 500, with no audit row and no page. (2) The approve
+  claim: an Unverifiable answer there goes to `ApprovalGate._store_fault`, which answers 503 and
+  pages `audit_write_failed`; no `integrity.authority_seal_unverifiable` row is written. (3) A
+  request refused by an Outage at `ApprovalGate._verified`: `_approval_seal_outage` pages and
+  writes no row. The owner ruled on 2026-11-11, in the Lander's session, that this ADR names them
+  as open and the build merges with them filed: "do it"
+  (https://github.com/MEFORORG/MessageFoundry/pull/2860#issuecomment-6785384065).
 - **Failure accepted:** an unverifiable row pages under the cap with other rows. Past five
   distinct rows in a window a row's page goes to the shared `:*` subject, which the sink's
   re-alert throttle may already hold, and a database writer who keeps more than five planted rows
@@ -1267,6 +1288,10 @@ forged one does not: it denies, audits and pages. (It counts 0 toward the sign-i
 Forged row counts 1, (e); the guesses it hides cannot succeed.) A map that does not hold revokes
 everything `main` revokes below the brake and more above it, the brake is unchanged, and no
 session end rolls back on a Transit fault. Each refusal is audited under its true cause.
+
+A correction, added 2026-11-11: "Each refusal is audited under its true cause" does not hold on at
+least three open paths, each failing closed; *Open audit gaps, a correction added 2026-11-11*, in
+(c), names them.
 
 **Negative.** Offboarding still freezes when step 2 of (b) trips, which a mass change to unmapped
 groups can cause, and when Vault is down everywhere (when no request is served either). Below the
