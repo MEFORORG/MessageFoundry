@@ -1157,9 +1157,11 @@ bind-guard ladder above:
 
   **The AI-broker endpoint is gated the same way** (BACKLOG #2193, owner ruling 2026-10-27). An
   off-box `[ai].endpoint` is refused under `enforce` unless a `[tls].crl_file` reaches it, as it
-  does since BACKLOG #5527, or `[ai].endpoint_revocation_attested = true` is set with an
-  `[ai].endpoint_revocation_attested_reason`. The broker also verifies the endpoint against
-  `[tls].internal_ca_file` under `augment` or `pinned`. The refusal comes at
+  can since BACKLOG #5527 on an engine `messagefoundry serve` started, or
+  `[ai].endpoint_revocation_attested = true` is set with an
+  `[ai].endpoint_revocation_attested_reason`. On that engine the broker also verifies the endpoint
+  against `[tls].internal_ca_file` under `augment` or `pinned`. An app built by a direct
+  `create_app` hands the broker no `[tls]` policy, so neither file reaches the endpoint there. The refusal comes at
   `POST /ai/chat`, not at start, and `messagefoundry check` neither reports it nor lists the
   pair. Unlike a Vault hop, a loopback endpoint is on the box even with a proxy set, because
   every opener dials a loopback host direct.

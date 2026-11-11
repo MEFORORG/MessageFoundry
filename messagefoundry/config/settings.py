@@ -4731,7 +4731,8 @@ class AiSettings(_Section):
     # Attest that revocation of the AI endpoint's server certificate is covered outside the engine
     # (BACKLOG #2193 slice (e), on the ADR 0173 section 12 pattern). The broker verifies that
     # certificate and checks no OCSP, and no CRL unless [tls].crl_file reaches the hop (BACKLOG
-    # #5527), so without that CRL an off-box endpoint is REFUSED under
+    # #5527; security_loosenings() names the paths it does not reach). So without that CRL an
+    # off-box endpoint is REFUSED under
     # [security].enforcement = enforce unless this is set. What
     # the refusal keys on is stated once, on transports.ai_broker._refuse_an_unrevoked_ai_hop.
     # Setting it adds no check on the wire. The reason is MANDATORY; at least a flag without one, a
@@ -10740,17 +10741,23 @@ def security_loosenings(
     # BACKLOG #2193 slice (e), on the ADR 0173 section 12 pattern: the AI endpoint's revocation
     # attestation. Named whenever the flag is set, whatever [ai].mode is, so the text claims no hop
     # is dialled. The reason is in the entry for the same reason as the Vault pairs above.
+    # BACKLOG #5527: the CRL clause names the paths [tls].crl_file does NOT reach, because this
+    # function cannot see which path renders it: whether the app was handed the [tls] section is a
+    # fact of the app (create_managed_app's stash, which the route reads), not of these arguments.
     if ai.endpoint_revocation_attested:
         out.append(
             (
                 "ai.endpoint_revocation_attested",
                 "revocation of the [ai].endpoint server certificate is attested as covered outside "
                 f"the engine (reason: {ai.endpoint_revocation_attested_reason}) -- the AI broker "
-                "verifies that certificate but its own handshake checks no OCSP, and no CRL unless "
-                "[tls].crl_file is set; the attestation adds no check. Wherever the revocation "
-                "refusal would apply to that hop it is lifted, so a revoked certificate is caught "
-                "only if what the reason names really covers it. It never lifts a cleartext "
-                "refusal",
+                "verifies that certificate but its own handshake checks no OCSP, and checks "
+                "[tls].crl_file only where the engine's [tls] policy reaches the hop: an engine "
+                "`messagefoundry serve` started, for an endpoint that is not loopback. A loopback "
+                "endpoint, and an app built without the [tls] settings, such as a direct "
+                "create_app (the embedded path), check no CRL whatever [tls].crl_file says. The "
+                "attestation adds no check. Wherever the revocation refusal would apply to that "
+                "hop it is lifted, so a revoked certificate is caught only if what the reason "
+                "names really covers it. It never lifts a cleartext refusal",
             )
         )
     # --- the [alerts] SMTP hop (#323 layer 3). Two SEPARATE entries, deliberately: the deviation and the

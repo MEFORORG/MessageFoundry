@@ -14,6 +14,7 @@ All endpoints, keys, certificates and CRLs here are synthetic.
 from __future__ import annotations
 
 import datetime
+import inspect
 import json
 import ssl
 from collections.abc import AsyncIterator, Iterator
@@ -372,8 +373,8 @@ def test_the_attestation_is_a_named_loosening_that_carries_its_reason() -> None:
     )
     assert switch in named
     assert _REASON in named[switch]
-    # BACKLOG #5527: a CRL reaches this hop now, so the entry says when it does.
-    assert "no CRL unless [tls].crl_file is set" in named[switch]
+    # BACKLOG #5527: a CRL reaches this hop on some paths now, so the entry says which.
+    assert "only where the engine's [tls] policy reaches the hop" in named[switch]
     assert "No CRL lever is built" not in named[switch]
 
 
@@ -694,3 +695,61 @@ async def test_the_route_hands_the_broker_the_instance_tls_policy(
     assert r.status_code == 200
     assert len(seen) == 1
     assert seen[0].verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+
+
+# --- the posture entry claims no CRL check where [tls].crl_file does not reach (#5527) ---------
+
+
+@pytest.mark.parametrize(
+    ("path", "names_the_path"),
+    [
+        ("direct-create-app", "a direct create_app (the embedded path)"),
+        ("loopback", "A loopback endpoint"),
+    ],
+)
+async def test_the_posture_entry_claims_no_crl_check_where_crl_file_does_not_reach(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, pki: _Pki, path: str, names_the_path: str
+) -> None:
+    """With ``[tls].crl_file`` set, the ``GET /security/posture`` entry must not say a CRL is
+    checked on a path where none is. Two such paths: a direct ``create_app``, which takes no
+    ``[tls]`` section, so the instance's ``crl_file`` cannot reach its route; and a loopback
+    endpoint on an app that holds the ``[tls]`` section, as ``serve`` stashes it, which
+    ``resolve_trust_anchor`` exempts from the CRL. Each arm first proves, on the context the route
+    really dials with, that no CRL is checked, then reads the entry. Red on 547561b4da: the entry
+    said "no CRL unless [tls].crl_file is set", a CRL check on both paths."""
+    seen: list[ssl.SSLContext] = []
+
+    def fake_chat(self: AiBroker, prompt: str) -> str:
+        seen.append(_context(self))
+        return "synthetic reply"
+
+    monkeypatch.setattr(ai_broker_mod.AiBroker, "chat", fake_chat)
+    if path == "direct-create-app":
+        # The fact the entry's clause rests on: create_app has no [tls] parameter, so whatever
+        # crl_file the instance's [tls] names has no way into this app.
+        assert "tls_settings" not in inspect.signature(create_app).parameters
+        ai = _managed_ai(
+            endpoint_revocation_attested=True, endpoint_revocation_attested_reason=_REASON
+        )
+        app = create_app(engine, ai_settings=ai, allow_no_auth=True)
+        assert getattr(app.state, "tls_settings", None) is None
+    else:
+        ai = _managed_ai(
+            endpoint="https://127.0.0.1:8443/v1/messages",
+            allowed_endpoints=["127.0.0.1"],
+            endpoint_revocation_attested=True,
+            endpoint_revocation_attested_reason=_REASON,
+        )
+        app = create_app(engine, ai_settings=ai, allow_no_auth=True)
+        app.state.tls_settings = TlsSettings(crl_file=pki.crl_file)
+    async with _client(app) as c:
+        chat = await c.post("/ai/chat", json={"prompt": "synthetic prompt"})
+        posture = await c.get("/security/posture")
+    assert chat.status_code == 200
+    assert len(seen) == 1
+    assert not seen[0].verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+    assert posture.status_code == 200
+    risk = {e["switch"]: e["risk"] for e in posture.json()["loosenings"]}[_SWITCH]
+    assert "unless [tls].crl_file is set" not in risk
+    assert "check no CRL whatever [tls].crl_file says" in risk
+    assert names_the_path in risk
