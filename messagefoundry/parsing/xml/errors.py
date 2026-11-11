@@ -63,8 +63,9 @@ class WsdlError(XmlError):
 
 class WsdlSecurityError(WsdlError):
     """A WSDL names another document to load (ADR 0122). ``parse_wsdl`` refuses a ``wsdl:import`` /
-    ``xsd:import`` / ``xsd:include`` / ``xsd:redefine`` / ``xsd:override`` carrying any non-empty
-    ``location``/``schemaLocation``: a remote one (``http:``/``https:``/``ftp:``/a network-path ``//host``
-    reference), so a crafted WSDL can't SSRF past the XSD lockdown, and a relative, rooted or backslash UNC
-    one, so it can't make the validator open a local file either (BACKLOG #5539). **PHI-safe**: names the
-    element and a well-known URI *scheme* or the kind of reference only, never the location."""
+    ``xsd:import`` / ``xsd:include`` / ``xsd:redefine`` / ``xsd:override`` carrying any
+    ``location``/``schemaLocation``: a remote one (``http:``/``https:``/``ftp:``/a network-path
+    ``//host`` reference), so a crafted WSDL can't SSRF past the XSD lockdown, and a relative, rooted,
+    backslash UNC or empty one, so it can't make the validator open a local file either (BACKLOG
+    #5539). **PHI-safe**: names the element and a well-known URI *scheme* or the kind of reference
+    only, never the location."""

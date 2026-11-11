@@ -468,6 +468,8 @@ The engine ships validators for some of these formats. All are opt-in: nothing r
 
 Only the first row is a cross-field check this guide can vouch for. The other three check a payload against a guide, a schema or a model. Which cross-field rules that covers depends on the guide, schema or model, so read it before you rely on it. `check_integrity` quotes the control numbers it compared in its problem text, so treat that text as message content when you log.
 
+A schema you pass to `validate_against` as a path may read only the files in its own directory and the directories below it. A bundle whose schemas include across sibling directories, such as HL7 CDA R2, where `infrastructure/cda/CDA.xsd` includes `../../processable/coreschemas/...`, fails to load until you also pass `schema_root`, the top directory of the bundle: `validate_against(body, "schemas/cda/infrastructure/cda/CDA.xsd", schema_root="schemas/cda")`. Every schema file under `schema_root` becomes readable, so name the bundle's own top directory, never a parent of it. Each file read is still refused if it declares a `DOCTYPE`, and a link that leads out of `schema_root` or to a network share is refused.
+
 ### 4. Translation tables (code sets)
 
 A Router or Handler often maps a coded value to a downstream one — a sending-facility code to a mnemonic (the `FACILITY_MNEMONICS` lookup in the Handler above), an order code to a partner's code, a bed location to a room. Rather than hand-maintain a Python dict, you can back that lookup with a **translation table** (internally a *code set*): a `codesets/<name>.csv` file in your config dir (the name is the file stem). It **loads with the graph and reloads on promote**, and the lookup is **pure**, so it's safe under the staged pipeline.

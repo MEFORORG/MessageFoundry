@@ -8,9 +8,10 @@ Three limbs, each pinned against the behaviour it replaces:
   hardened pre-parse. A BOM-prefixed ``bytes`` schema used to skip that pre-parse, and xmlschema then
   expanded a DOCTYPE entity in it;
 * every open goes through ``schema._ConfinedFiles``, xmlschema's opener: an inline schema opens none
-  of its own locations, a path schema opens files only under its own directory, each checked by
-  ``parse_bytes``, and either may read xmlschema's bundled copies of well-known namespaces.
-  ``allow="local"`` still refuses a remote URL before the opener sees it;
+  of its own locations outside xmlschema's bundled copies of well-known namespaces, which either kind
+  may read, and a path schema opens files only under its own directory or the ``schema_root`` its
+  caller names, each checked by ``parse_bytes`` and reached without following a link out of that root
+  or to a UNC or device path. ``allow="local"`` still refuses a remote URL before the opener sees it;
 * a malformed or DOCTYPE ``document`` raises the hardened parser's error rather than returning an
   invalid result, and the docstring now says so.
 
@@ -22,6 +23,9 @@ from __future__ import annotations
 
 import codecs
 import os
+import stat
+import sys
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -268,34 +272,260 @@ def test_path_schema_include_with_a_doctype_entity_is_refused(tmp_path: Path) ->
     assert "XmlSecurityError" in _causes(ei.value)
 
 
+#: Every os call through which the validator could touch a path. On Windows each of them opens a UNC
+#: path, which is an SMB connection, so none may be handed one.
+_TOUCHING = ("lstat", "stat", "readlink", "open")
+
+
+def _spy_on_paths(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    touched: list[str] = []
+
+    def wrap(fn: Any) -> Any:
+        def spy(path: Any, *args: Any, **kwargs: Any) -> Any:
+            if isinstance(path, (str, bytes, os.PathLike)):
+                touched.append(os.fsdecode(path))
+            return fn(path, *args, **kwargs)
+
+        return spy
+
+    for name in _TOUCHING:
+        monkeypatch.setattr(os, name, wrap(getattr(os, name)))
+    monkeypatch.setattr(os.path, "realpath", wrap(os.path.realpath))
+    return touched
+
+
 @pytest.mark.parametrize(
     "location",
     [
         pytest.param("\\\\nonexist-5537.invalid\\share\\x.xsd", id="unc-backslash"),
         pytest.param("file:////nonexist-5537.invalid/share/x.xsd", id="unc-file-url"),
+        pytest.param("\\\\?\\UNC\\nonexist-5537.invalid\\share\\x.xsd", id="unc-long"),
         pytest.param("\\\\.\\pipe\\nonexist-5537", id="device"),
     ],
 )
-def test_a_network_or_device_location_is_refused_before_it_is_resolved(
+def test_a_network_or_device_location_is_refused_before_anything_touches_it(
     location: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # On Windows realpath opens the path, so resolving one of these would already connect to it.
-    resolved: list[str] = []
-    real_realpath = os.path.realpath
-
-    def spy(path: Any, *args: Any, **kwargs: Any) -> Any:
-        resolved.append(os.fsdecode(path))
-        return real_realpath(path, *args, **kwargs)
-
-    main = _write_path_schema(tmp_path, location)
+    main = _write_path_schema(tmp_path / "bad", location)
+    (tmp_path / "good" / "inc-5537.xsd").parent.mkdir()
+    (tmp_path / "good" / "inc-5537.xsd").write_text(_CLEAN, encoding="utf-8")
+    control = _write_path_schema(tmp_path / "good", "inc-5537.xsd")
+    touched = _spy_on_paths(monkeypatch)
+    # Positive control: the spy does see the walk and the open of a local include.
+    assert validate_against("<patient>x</patient>", str(control)).valid
+    assert [p for p in touched if p.endswith("inc-5537.xsd")]
     for source in (main.read_text(encoding="utf-8"), str(main)):
-        resolved.clear()
-        monkeypatch.setattr(os.path, "realpath", spy)
+        touched.clear()
         with pytest.raises(XmlValidationError) as ei:
             validate_against("<patient>x</patient>", source)
-        monkeypatch.setattr(os.path, "realpath", real_realpath)
         assert "XMLResourceBlocked" in _causes(ei.value)
-        assert not [p for p in resolved if "nonexist-5537" in p]
+        assert not [p for p in touched if "nonexist-5537" in p]
+
+
+# --- a mapped drive, a long path, and links (BACKLOG #5537 repair) ---------------------------------
+
+
+def test_no_path_is_resolved_with_realpath(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # On Windows realpath rewrites a mapped drive (Z:) to the UNC path behind it, contacting the SMB
+    # server to learn it, and a long path to its \\?\ form; either output was then refused as a UNC or
+    # device path. Simulate the mapped drive: if anything still resolves through realpath, it gets UNC.
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "inc.xsd").write_text(_CLEAN, encoding="utf-8")
+    main = _write_path_schema(tmp_path, "sub/inc.xsd")
+
+    def as_if_mapped(path: Any, *args: Any, **kwargs: Any) -> str:
+        return "\\\\fileserver-5537.invalid\\share\\" + os.path.basename(os.fsdecode(path))
+
+    monkeypatch.setattr(os.path, "realpath", as_if_mapped)
+    assert validate_against("<patient>x</patient>", str(main)).valid
+    assert validate_against("<patient>x</patient>", str(main), schema_root=tmp_path).valid
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the \\\\?\\ long-path prefix is Windows syntax")
+def test_a_long_path_prefix_on_a_drive_letter_is_a_local_path(tmp_path: Path) -> None:
+    (tmp_path / "inc.xsd").write_text(_CLEAN, encoding="utf-8")
+    main = _write_path_schema(tmp_path, "inc.xsd")
+    assert validate_against("<patient>x</patient>", "\\\\?\\" + str(main)).valid
+
+
+@pytest.mark.skipif(os.name != "nt", reason="drive and UNC syntax is Windows path text")
+@pytest.mark.parametrize(
+    ("written", "local"),
+    [
+        ("C:\\s\\x.xsd", "C:\\s\\x.xsd"),
+        ("\\\\?\\C:\\s\\..\\x.xsd", "C:\\x.xsd"),
+        ("//?/C:/s/x.xsd", "C:\\s\\x.xsd"),
+        ("\\\\host\\share\\x.xsd", None),
+        ("//host/share/x.xsd", None),
+        ("\\\\?\\UNC\\host\\share\\x.xsd", None),
+        ("\\\\.\\C:\\x.xsd", None),
+        ("\\\\.\\pipe\\x", None),
+        ("\\\\?\\GLOBALROOT\\Device\\x", None),
+    ],
+)
+def test_local_judges_the_written_text(written: str, local: str | None) -> None:
+    from messagefoundry.parsing.xml.schema import _local
+
+    assert _local(written) == local
+
+
+def _symlink_or_skip(target: Path, link: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=target.is_dir())
+    except (OSError, NotImplementedError) as exc:  # Windows without Developer Mode or the privilege
+        pytest.skip(f"cannot create a symlink here: {type(exc).__name__}")
+
+
+def _junction_or_skip(target: Path, link: Path) -> None:
+    if sys.platform != "win32":
+        pytest.skip("a junction is a Windows mount point")
+    import _winapi  # CPython's own junction maker; needs no privilege, unlike a symlink
+
+    _winapi.CreateJunction(str(target), str(link))
+
+
+@pytest.mark.parametrize(
+    "make_link", [_symlink_or_skip, _junction_or_skip], ids=["symlink", "junction"]
+)
+def test_a_link_out_of_the_root_is_refused(tmp_path: Path, make_link: Any) -> None:
+    (tmp_path / "outside").mkdir()
+    (tmp_path / "outside" / "inc.xsd").write_text(_CLEAN, encoding="utf-8")
+    (tmp_path / "schemas" / "inside").mkdir(parents=True)
+    (tmp_path / "schemas" / "inside" / "inc.xsd").write_text(_CLEAN, encoding="utf-8")
+    make_link(tmp_path / "outside", tmp_path / "schemas" / "out")
+    make_link(tmp_path / "schemas" / "inside", tmp_path / "schemas" / "in")
+    main = _write_path_schema(tmp_path / "schemas", "out/inc.xsd")
+    with pytest.raises(XmlValidationError) as ei:
+        validate_against("<patient>x</patient>", str(main))
+    assert "XMLResourceBlocked" in _causes(ei.value)
+    # Control: a link that stays inside the root is followed.
+    main = _write_path_schema(tmp_path / "schemas", "in/inc.xsd")
+    assert validate_against("<patient>x</patient>", str(main)).valid
+
+
+def test_a_link_to_a_unc_share_is_refused_before_it_is_followed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Runs everywhere: lstat reports lnk/ as a link and readlink names a share. lnk/ is really a
+    # directory holding inc.xsd, so following the link instead of judging it would validate.
+    (tmp_path / "lnk").mkdir()
+    (tmp_path / "lnk" / "inc.xsd").write_text(_CLEAN, encoding="utf-8")
+    main = _write_path_schema(tmp_path, "lnk/inc.xsd")
+    assert validate_against("<patient>x</patient>", str(main)).valid  # control, before the fake
+    link = os.path.normcase(str(tmp_path / "lnk"))
+    real_lstat, real_readlink = os.lstat, os.readlink
+
+    def fake_lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if os.path.normcase(os.fsdecode(path)) == link:
+            return os.stat_result((stat.S_IFLNK | 0o777, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        return real_lstat(path, *args, **kwargs)
+
+    def fake_readlink(path: Any, *args: Any, **kwargs: Any) -> str:
+        if os.path.normcase(os.fsdecode(path)) == link:
+            return "//nonexist-5537.invalid/share"
+        return real_readlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", fake_lstat)
+    monkeypatch.setattr(os, "readlink", fake_readlink)
+    touched = _spy_on_paths(monkeypatch)
+    with pytest.raises(XmlValidationError) as ei:
+        validate_against("<patient>x</patient>", str(main))
+    assert "XMLResourceBlocked" in _causes(ei.value)
+    assert not [p for p in touched if "nonexist-5537" in p]
+
+
+def test_a_schema_file_that_is_a_link_resolves_includes_beside_its_target(tmp_path: Path) -> None:
+    (tmp_path / "real").mkdir()
+    (tmp_path / "real" / "inc.xsd").write_text(_CLEAN, encoding="utf-8")
+    target = _write_path_schema(tmp_path / "real", "inc.xsd")
+    (tmp_path / "cfg").mkdir()
+    _symlink_or_skip(target, tmp_path / "cfg" / "main.xsd")
+    assert validate_against("<patient>x</patient>", str(tmp_path / "cfg" / "main.xsd")).valid
+
+
+# --- schema_root: a bundle that includes across sibling directories ------------------------------
+
+
+def _write_cda_shaped_bundle(top: Path) -> Path:
+    """The HL7 CDA R2 layout: the entry schema includes ``../../processable/coreschemas/...``."""
+    (top / "infrastructure" / "cda").mkdir(parents=True)
+    (top / "processable" / "coreschemas").mkdir(parents=True)
+    (top / "processable" / "coreschemas" / "datatypes.xsd").write_text(_CLEAN, encoding="utf-8")
+    return _write_path_schema(
+        top / "infrastructure" / "cda", "../../processable/coreschemas/datatypes.xsd"
+    )
+
+
+def test_a_cda_shaped_bundle_needs_schema_root(tmp_path: Path) -> None:
+    main = _write_cda_shaped_bundle(tmp_path / "cda")
+    # Confined to its own directory, the cross-directory include is refused.
+    with pytest.raises(XmlValidationError) as ei:
+        validate_against("<patient>x</patient>", str(main))
+    assert "XMLResourceBlocked" in _causes(ei.value)
+    for root in (tmp_path / "cda", str(tmp_path / "cda")):
+        assert validate_against("<patient>x</patient>", str(main), schema_root=root).valid
+        assert not validate_against("<other>x</other>", str(main), schema_root=root).valid
+
+
+def test_schema_root_still_vets_each_file_under_it(tmp_path: Path) -> None:
+    main = _write_cda_shaped_bundle(tmp_path / "cda")
+    (tmp_path / "cda" / "processable" / "coreschemas" / "datatypes.xsd").write_text(
+        _ENTITY, encoding="utf-8"
+    )
+    with pytest.raises(XmlValidationError) as ei:
+        validate_against("<patient>x</patient>", str(main), schema_root=tmp_path / "cda")
+    assert "XmlSecurityError" in _causes(ei.value)
+
+
+def test_an_include_climbing_above_schema_root_is_refused(tmp_path: Path) -> None:
+    main = _write_cda_shaped_bundle(tmp_path / "cda")
+    # The include reaches cda/processable/, one level above the root named here.
+    with pytest.raises(XmlValidationError) as ei:
+        validate_against(
+            "<patient>x</patient>", str(main), schema_root=tmp_path / "cda" / "infrastructure"
+        )
+    assert "XMLResourceBlocked" in _causes(ei.value)
+
+
+def test_schema_root_must_hold_the_schema(tmp_path: Path) -> None:
+    main = _write_cda_shaped_bundle(tmp_path / "cda")
+    (tmp_path / "elsewhere").mkdir()
+    with pytest.raises(XmlValidationError, match="does not lie under schema_root"):
+        validate_against("<patient>x</patient>", str(main), schema_root=tmp_path / "elsewhere")
+
+
+def test_schema_root_is_refused_for_an_inline_schema(tmp_path: Path) -> None:
+    with pytest.raises(XmlValidationError, match="inline schema"):
+        validate_against("<patient>x</patient>", _CLEAN, schema_root=tmp_path)
+
+
+def test_a_unc_schema_root_is_refused(tmp_path: Path) -> None:
+    main = _write_path_schema(tmp_path, "inc.xsd")
+    with pytest.raises(XmlValidationError, match="UNC or device"):
+        validate_against("<patient>x</patient>", str(main), schema_root="//nonexist-5537.invalid/s")
+
+
+def test_a_schema_at_a_filesystem_root_is_confined_to_itself(tmp_path: Path) -> None:
+    from messagefoundry.parsing.xml.schema import _confinement_root
+
+    top = os.path.abspath(tmp_path.anchor)
+    at_top = os.path.join(top, "main.xsd")
+    assert _confinement_root(at_top, None).path == at_top
+    # Control: one level down, the directory is the root.
+    nested = os.path.join(top, "d", "main.xsd")
+    assert _confinement_root(nested, None).path == os.path.join(top, "d")
+
+
+def test_a_non_file_url_reaching_the_opener_is_a_blocked_resource() -> None:
+    from xmlschema.exceptions import XMLResourceBlocked
+
+    from messagefoundry.parsing.xml.schema import _ConfinedFiles
+
+    opener = urllib.request.OpenerDirector()
+    opener.add_handler(_ConfinedFiles(XMLResourceBlocked, ()))
+    for url in ("http://127.0.0.1:9/x.xsd", "data:text/plain,x"):
+        with pytest.raises(XMLResourceBlocked):
+            opener.open(url)
 
 
 @pytest.mark.parametrize(
@@ -304,9 +534,19 @@ def test_a_network_or_device_location_is_refused_before_it_is_resolved(
 )
 def test_a_non_file_schema_source_is_refused(source: str) -> None:
     # It used to become a path relative to the working directory, which xmlschema then opened.
-    with pytest.raises(XmlValidationError) as ei:
+    with pytest.raises(XmlValidationError, match="not a local path"):
         validate_against("<patient>x</patient>", source)
-    assert _causes(ei.value)[1] == "ValueError"
+
+
+@pytest.mark.parametrize("host", ["localhost", "LOCALHOST", "LocalHost"])
+def test_a_file_url_naming_localhost_in_any_case_is_local(host: str, tmp_path: Path) -> None:
+    (tmp_path / "inc.xsd").write_text(_CLEAN, encoding="utf-8")
+    main = _write_path_schema(tmp_path, "inc.xsd")
+    url = main.as_uri().replace("file://", f"file://{host}", 1)
+    assert validate_against("<patient>x</patient>", url).valid
+    # Control: any other host is refused.
+    with pytest.raises(XmlValidationError, match="naming a host"):
+        validate_against("<patient>x</patient>", url.replace(host, "example.invalid", 1))
 
 
 @pytest.mark.parametrize("codec", ["utf-16-be", "utf-16-le"])

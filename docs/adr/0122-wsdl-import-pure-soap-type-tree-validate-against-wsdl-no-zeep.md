@@ -175,7 +175,7 @@ and `requirements.lock` are untouched.
 - The `[xml]` extra absence → the clear `RuntimeError` from `_deps` (distinct from the `ValueError` data
   errors), unchanged.
 
-## Amendment (2026-11-10) -- any import location is refused, and the XSD build opens nothing (BACKLOG #5537, #5539)
+## Amendment (2026-11-10) -- any import location is refused, and the XSD build reads only inside its root (BACKLOG #5537, #5539)
 
 Two statements above were false in the shipped code, and both are corrected here rather than in place.
 
@@ -184,7 +184,8 @@ Two statements above were false in the shipped code, and both are corrected here
   location passed. On an `xsd:import`, `xsd:include` or `xsd:redefine` inside an embedded schema,
   `xmlschema`, built with `allow="local"` and `base_url=None`, then resolved a relative location against
   the process's working directory and opened it. A `wsdl:import` location was never opened by anything;
-  nothing reads it. `xsd:override` was never inspected at all, even with an `http:` URL. `parse_wsdl` now refuses **any** non-empty `location`/`schemaLocation` on `wsdl:import`,
+  nothing reads it. `xsd:override` was never inspected at all, even with an `http:` URL. `parse_wsdl`
+  now refuses **any** `location`/`schemaLocation`, an empty one included, on `wsdl:import`,
   `xsd:import`, `xsd:include`, `xsd:redefine` and `xsd:override` with `WsdlSecurityError`, naming the
   element and a well-known scheme, or the kind of reference ("a local path", "a network path"), never
   text from the location. An `xsd:import` that names only a `namespace` stays legal: it loads nothing
@@ -193,11 +194,20 @@ Two statements above were false in the shipped code, and both are corrected here
   document.
 - *"`schema.py` builds `xmlschema.XMLSchema(..., allow="local", base_url=None)`."* It still passes
   `allow="local"`, now with `defuse="always"` and an `opener` whose only handler reads `file:` URLs
-  under two roots: `xmlschema`'s bundled schemas, and, for a schema given as a path, that schema's own
-  directory, where each file is first checked by `parse_bytes`. An inline schema, which is how every
-  embedded WSDL schema arrives, has no directory root, so none of its own include, import, redefine or
-  override locations is opened. `xmlschema`'s `allow="sandbox"` was tried and not used: it compares URL
-  string prefixes, narrows to each includer's directory, and blocks the bundled schemas.
+  under two roots: `xmlschema`'s bundled schemas, and, for a schema given as a path, a confinement
+  root, where each file is first checked by `parse_bytes`. The confinement root is the schema's own
+  directory, or the directory the caller passes as `validate_against`'s `schema_root` keyword. That
+  keyword exists for a bundle whose schemas include across sibling directories: the HL7 CDA R2 entry
+  schema includes `../../processable/coreschemas/...`, and IHE XDS bundles do the same, so confining
+  them to the entry schema's directory refused a load that worked before. Below the root, each path is
+  walked one component at a time with `lstat`, and a symlink or junction whose target text is a UNC or
+  device path, or lies outside the root, is refused before it is followed. Nothing in `schema.py` calls
+  `realpath`: on Windows it opens the path, and it rewrites a mapped drive to its UNC path and a long
+  path to its `\\?\` form, which the text check would then refuse. An inline schema, which is how
+  every embedded WSDL schema arrives, has no confinement root, so its own include, import, redefine or
+  override location is opened only when it names a file in `xmlschema`'s bundled schemas. `xmlschema`'s
+  `allow="sandbox"` was tried and not used: it compares URL string prefixes, narrows to each includer's
+  directory, and blocks the bundled schemas.
 
 The backslash UNC form did reach the network on the shipped configuration. Measured 2026-11-10 with
 `xmlschema` 4.3.2 and Python 3.14 on Windows: an inline schema's `xs:include` of
@@ -206,4 +216,5 @@ and opened, and failed with WinError 53, *"The network path was not found"*, so 
 Windows network-path resolution. Whether it would then have completed an SMB session against a live
 host, and with which credentials, was not measured. An earlier reading of a different call shape saw
 the form rewritten to a drive-rooted local path; it does not hold for this one. The guard refuses the
-form, and the opener in `schema.py` refuses a UNC or device location on its text, before resolving it.
+form, and the opener in `schema.py` refuses a UNC or device location on its text, before anything
+touches it.

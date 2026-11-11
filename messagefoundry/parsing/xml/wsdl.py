@@ -18,21 +18,24 @@ consulted to *check* an envelope, never to *drive* one (BACKLOG #70's synchronou
 * The untrusted WSDL is parsed through :func:`~messagefoundry.parsing.xml.harden.parse_bytes`, so it gets
   the identical XXE / entity-expansion / external-DTD lockdown as every other body in the codec.
 * Envelope validation rides :func:`~messagefoundry.parsing.xml.schema.validate_against`. Each embedded
-  schema reaches it as text, so ``xmlschema`` opens no file of its own for it, local or remote, beyond
-  its bundled copies of well-known namespaces (BACKLOG #5537).
+  schema reaches it as text, so ``xmlschema`` opens no file for it, local or remote, beyond its bundled
+  copies of well-known namespaces (BACKLOG #5537).
 * The **distinct** ``wsdl:import`` resolution path is not ``xmlschema``'s to govern, because a
   ``wsdl:import`` is read by *this* code before any schema is built. :func:`parse_wsdl` refuses a
-  non-empty ``location``/``schemaLocation`` on a ``wsdl:import`` / ``xsd:import`` / ``xsd:include`` /
-  ``xsd:redefine`` / ``xsd:override``, local or remote
+  ``location``/``schemaLocation``, even an empty one, on a ``wsdl:import`` / ``xsd:import`` /
+  ``xsd:include`` / ``xsd:redefine`` / ``xsd:override``, local or remote
   (:class:`~messagefoundry.parsing.xml.errors.WsdlSecurityError`, BACKLOG #5539). What the guard let
   through before, and what was opened, is recorded once, in ADR 0122's 2026-11-10 amendment. An
   ``xsd:import`` naming only a ``namespace`` stays legal; a type reachable only through it fails closed
   through ``xmlschema``.
 
-**PHI (CLAUDE.md §9):** every failure names element **QNames** / reason **categories** / URI **schemes**
-only — never element content or a full URL. The PHI-bearing SOAP body goes only to the secured store.
+**PHI (CLAUDE.md §9):** every failure names element **QNames** / reason **categories**, and a refused
+location by its element and a well-known URI **scheme** or the kind of reference (``a local path``,
+``a network path``) — never element content or any other text of the location. The PHI-bearing SOAP
+body goes only to the secured store.
 
-Pure: no engine imports; no disk / network I/O.
+Pure: no engine imports and no network I/O. Parsing reads nothing from disk; validation reads only
+``xmlschema``'s bundled schema files.
 """
 
 from __future__ import annotations
@@ -157,7 +160,7 @@ def parse_wsdl(data: str | bytes) -> WsdlDefinition:
 
     Rides :func:`~messagefoundry.parsing.xml.harden.parse_bytes` (XXE/DTD/no-network lockdown). Refuses a
     ``wsdl:import`` / ``xsd:import`` / ``xsd:include`` / ``xsd:redefine`` / ``xsd:override`` carrying any
-    non-empty location, local or remote
+    location, local, remote or empty
     (:class:`~messagefoundry.parsing.xml.errors.WsdlSecurityError`, BACKLOG #5539). Raises
     :class:`~messagefoundry.parsing.xml.errors.WsdlError` if the document is not a
     ``<wsdl:definitions>`` root, and :class:`RuntimeError` if the ``[xml]`` extra is absent."""
@@ -217,7 +220,8 @@ _LOCATION_ATTRS = (
 
 def _refuse_imports(root: Any) -> None:
     """Refuse any ``wsdl:import`` / ``xsd:import`` / ``xsd:include`` / ``xsd:redefine`` /
-    ``xsd:override`` that carries a non-empty ``location``/``schemaLocation`` (ADR 0122, BACKLOG #5539).
+    ``xsd:override`` that carries a ``location``/``schemaLocation``, even an empty one (ADR 0122,
+    BACKLOG #5539).
 
     Local locations are refused as well as remote ones; ADR 0122's 2026-11-10 amendment says why. An
     ``xsd:import`` that names only a ``namespace`` stays legal; it loads nothing of the author's.
@@ -225,10 +229,10 @@ def _refuse_imports(root: Any) -> None:
     for tag, attr, label in _LOCATION_ATTRS:
         for elem in root.iter(tag):
             location = elem.get(attr)
-            if location:
+            if location is not None:  # an empty one too: it resolves to the base, not to nothing
                 raise WsdlSecurityError(
-                    f"refusing a {label} with a {attr} ({_locator(location)}): a WSDL is read "
-                    "with no network or disk access, so inline the imported document"
+                    f"refusing a {label} with a {attr} ({_locator(location)}): a WSDL's imported "
+                    "documents are never loaded, so inline the imported document"
                 )
 
 
@@ -240,6 +244,8 @@ def _locator(location: str) -> str:
     """A PHI-safe description of a location for an error: a well-known URI scheme, or the kind of
     reference. Never any other text from the location."""
     text = location.strip()
+    if not text:
+        return "an empty location"
     slashed = text.replace("\\", "/")
     if slashed.startswith(("//./", "//?/")):
         return "a device path"

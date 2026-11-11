@@ -219,6 +219,9 @@ _LOCATIONS = {
     "rooted": "/no-such-dir-5539/secret.xsd",
     "unc-backslash": "\\\\localhost\\no-such-share-5539\\secret.xsd",
     "remote": "http://127.0.0.1:9/secret.xsd",
+    # Present but empty: xmlschema resolves it against the base, so it is not "no location".
+    "empty": "",
+    "blank": "   ",
 }
 
 #: (element, location attribute, extra attributes) for each element that names a document to load.
@@ -289,6 +292,7 @@ def test_namespace_only_import_of_a_well_known_namespace_still_validates() -> No
 @pytest.mark.parametrize(
     ("location", "expected"),
     [
+        ("", "an empty location"),
         ("C:\\schemas\\x.xsd", "a local path"),
         ("\\\\fileserver\\share\\x.xsd", "a network path"),
         ("//fileserver/share/x.xsd", "a network path"),
