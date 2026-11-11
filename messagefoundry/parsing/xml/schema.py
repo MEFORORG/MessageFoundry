@@ -33,7 +33,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from messagefoundry.parsing.xml._deps import load_lxml, load_xmlschema
-from messagefoundry.parsing.xml.errors import XmlSecurityError, XmlValidationError
+from messagefoundry.parsing.xml.errors import XmlParseError, XmlSecurityError, XmlValidationError
 from messagefoundry.parsing.xml.harden import parse_bytes
 
 __all__ = ["XmlSchemaResult", "validate_against"]
@@ -95,7 +95,8 @@ def _local(path: str) -> str | None:
     UNC path behind it and a long path to its ``\\\\?\\`` form, both of which this would then refuse. A
     ``\\\\?\\`` prefix on a drive letter is a local long path on Windows and is dropped here, then
     restored by :func:`_native` for a path too long to open without it; ``\\\\?\\UNC\\``, ``\\\\.\\``
-    and any other two-separator drive are not local, nor is any on POSIX."""
+    and any other two-separator drive are not local, nor is any on POSIX. Neither is ``\\\\?\\C:``
+    with nothing rooted after it, the volume device itself."""
     full = os.path.abspath(path)
     drive, rest = ntpath.splitdrive(full)
     if drive[:2] in ("\\\\", "//"):
@@ -105,6 +106,7 @@ def _local(path: str) -> str | None:
             or drive[2:4] not in ("?\\", "?/")
             or len(letter) != 2
             or letter[1] != ":"
+            or rest[:1] not in ("\\", "/")
         ):
             return None
         full = letter + rest
@@ -271,16 +273,21 @@ def _fallback_loader(xmlschema_mod: Any, bundled: tuple[_Root, ...]) -> type:
 class _ConfinedFiles(urllib.request.BaseHandler):
     """The only way xmlschema can open a resource here: ``file:`` URLs under fixed roots (BACKLOG #5537).
 
-    Installed as xmlschema's ``opener``, so it sees every open xmlschema makes, of the schema file the
-    caller named and of each include, import, redefine and override; every other scheme reaches
-    ``unknown_open``. The named file is read as named, a link at it included. One
+    Installed as xmlschema's ``opener``, so it sees every location xmlschema opens as a URL, the schema
+    file the caller named and each include, import, redefine and override location among them; every
+    scheme but ``file:`` reaches ``unknown_open``. It does not see every location a schema names: one
+    xmlschema reads as XML text is parsed, not opened, so :func:`_refuse_text_locations` refuses it
+    first, and ``allow="local"`` refuses a remote URL before it is opened. The named file is read as
+    named, a link at it included. One
     root is xmlschema's bundled ``schemas`` directory, which holds the copies of well-known namespaces
     (SOAP encoding, XML-DSig, xlink and others) a location-free ``xs:import`` resolves to; those are
     library files and are read as they are, links included. For a schema given as a path, the other
     root is its own directory, or the ``schema_root`` the caller named. Each file under it is reached by
     :func:`_resolve_within` and checked by :func:`~messagefoundry.parsing.xml.harden.parse_bytes`
-    first, so a path schema's includes meet the same DOCTYPE refusal as an inline schema. Anything else,
-    and a refused link, a DOCTYPE or a malformed file there, raises :class:`_ResourceRefused`; a
+    first, so a path schema's includes meet the same DOCTYPE refusal as an inline schema. A location
+    outside every root raises :class:`_ResourceRefused`, and so, under a vetted root, does at least a
+    link the walk refuses, a location that cannot be read as a file, such as a directory or one the
+    process may not read, and a file ``parse_bytes`` or :func:`_refuse_text_locations` refuses. A
     missing file raises ``FileNotFoundError``. :func:`_build_schema` says what each does to the build.
 
     The location is judged on its text by :func:`_local`, then compared with each root by whole
@@ -311,21 +318,30 @@ class _ConfinedFiles(urllib.request.BaseHandler):
                     return urllib.response.addinfourl(
                         io.BytesIO(data), email.message.Message(), url
                     )
+                # Each refusal below is _ResourceRefused, not an OSError: xmlschema drops an include
+                # or an import that raises OSError with only a warning. Every reason is fixed text.
                 try:
                     checked = _resolve_within(written, root.path)
                     if checked is None:
-                        break  # a link out of the root, or to a UNC or device path
+                        raise _ResourceRefused(
+                            "a resource reached through a link that leads out of the root, to a UNC"
+                            f" or device path, or through more than {_MAX_LINKS} links",
+                            url,
+                        )
                     data = _read(checked, no_follow=True)
                     _refuse_text_locations(parse_bytes(data))  # the tree is discarded
-                except FileNotFoundError:
-                    raise  # a missing file, as xmlschema has always reported it
-                except (OSError, ValueError) as exc:
-                    # Refused, not an OSError: xmlschema drops an include or an import that raises
-                    # OSError with only a warning. ValueError covers the parse_bytes refusals and a
-                    # reparse point readlink rejects.
+                except (FileNotFoundError, _ResourceRefused):
+                    raise  # a missing file, as xmlschema has always reported it, or the refusal above
+                except OSError as exc:  # a directory, a denied read, or a link it cannot read
+                    raise _ResourceRefused("a location that cannot be read as a file", url) from exc
+                except XmlSecurityError as exc:  # parse_bytes, or _refuse_text_locations
                     raise _ResourceRefused(
-                        "a resource reached through a link out, or a file parse_bytes refuses", url
+                        "a file that declares a DOCTYPE, or names a location that is XML text", url
                     ) from exc
+                except XmlParseError as exc:  # parse_bytes: malformed or empty
+                    raise _ResourceRefused("a file that is not well-formed XML", url) from exc
+                except ValueError as exc:  # chiefly a reparse point readlink rejects
+                    raise _ResourceRefused("a link that cannot be read", url) from exc
                 return urllib.response.addinfourl(io.BytesIO(data), email.message.Message(), url)
         # PHI-safe: names no part of the location.
         raise _ResourceRefused("a resource outside the schema's confinement root", url)
@@ -343,8 +359,14 @@ class _SourceRefused(ValueError):
 
 def _local_path(text: str | bytes | os.PathLike[str], what: str) -> str:
     """The absolute local path ``text`` names: a filesystem path, or a ``file:`` URL with no host. A
-    remote URL, another scheme, or a UNC or device path is refused on its text; ``what`` names the
-    argument in the refusal. Directories are taken as written, so a mapped drive stays a drive letter."""
+    remote URL, another scheme, a path that is not absolute as written, or a UNC or device path is
+    refused on its text; ``what`` names the argument in the refusal. Directories are taken as written,
+    so a mapped drive stays a drive letter.
+
+    A relative path would resolve against the working directory, which under the Windows service is
+    ``System32``, so the confinement root would be a directory nobody named. That includes the
+    drive-relative ``C:``, ``C:.`` and ``file:///C:``: ``abspath`` makes each the working directory
+    when it is on that drive."""
     source = os.fsdecode(text).strip()
     if not source:  # abspath would make it the working directory
         raise _SourceRefused(f"{what} that is empty")
@@ -358,6 +380,8 @@ def _local_path(text: str | bytes | os.PathLike[str], what: str) -> str:
             raise _SourceRefused(f"{what} that is a file URL naming no path")
     elif scheme and not (len(scheme) == 1 and source[1:2] == ":"):  # a drive letter is not a scheme
         raise _SourceRefused(f"{what} that is not a local path")
+    if not os.path.isabs(source):
+        raise _SourceRefused(f"{what} that is not an absolute path")
     local = _local(source)
     if local is None:
         raise _SourceRefused(f"{what} that is a UNC or device path")
@@ -400,12 +424,17 @@ def _build_schema(
     at that name included, and checked by ``parse_bytes``. What it includes is opened only under its
     confinement root, each file checked the same way: its own directory, or ``schema_root`` when the
     caller names one, for a bundle such as HL7 CDA R2 whose schemas include across sibling directories
-    (``../../processable/coreschemas/...``). Its includes resolve beside the name as written.
+    (``../../processable/coreschemas/...``). Its includes resolve beside the name as written. The
+    path and ``schema_root`` are refused on their text when either is not absolute as written, a
+    drive-relative ``C:`` included (:func:`_local_path` says why).
 
-    **A refused location** is a local one outside those bounds, one reached through a link out of the
-    root or to a UNC or device path, a UNC or device path itself, or a file there that ``parse_bytes``
-    refuses (a DOCTYPE, malformed or empty). It fails the build, and the error repeats the refusal's
-    fixed reason. The one exception is an import's own location, when xmlschema bundles a copy of the
+    **A refused location** is at least: a local one outside those bounds; one reached through a link
+    out of the root, to a UNC or device path, or through more than ``_MAX_LINKS`` links; a UNC or
+    device path itself; one that cannot be read as a file, such as a directory or a file the process
+    may not read; a file there that ``parse_bytes`` refuses (a DOCTYPE, malformed or empty); and a
+    location xmlschema would parse as XML text rather than open. It fails the build, and the error
+    repeats the refusal's fixed reason where the refusal has one. The one exception is an import's
+    own location, when xmlschema bundles a copy of the
     imported namespace: the import then falls back to that copy, as the stock W3C XML-DSig schema with
     its DOCTYPE needs. A refusal met further in, inside a file such an import did open, still fails the
     build. A **remote** location never reaches the opener; ``allow="local"`` refuses it first, which
@@ -466,7 +495,8 @@ def validate_against(
 ) -> XmlSchemaResult:
     """Validate ``document`` against the XSD ``schema_source`` (a schema string/bytes or a local path).
 
-    ``schema_root`` (a path or a host-less ``file:`` URL) widens what a schema given as a path may
+    ``schema_root`` (an absolute path or a host-less ``file:`` URL naming one) widens what a schema
+    given as a path, which must also be absolute, may
     include, from its own directory to the whole of ``schema_root``: pass the top of a multi-directory
     bundle such as HL7 CDA R2. :func:`_build_schema` says what each file read must pass. It is refused
     for an inline schema, and for a schema that does not lie under it.

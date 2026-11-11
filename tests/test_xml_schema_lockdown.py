@@ -7,7 +7,8 @@ Three limbs, each pinned against the behaviour it replaces:
 * a schema opening with a byte-order mark is the schema DOCUMENT, not a path, so it goes through the
   hardened pre-parse. A BOM-prefixed ``bytes`` schema used to skip that pre-parse, and xmlschema then
   expanded a DOCTYPE entity in it;
-* every open goes through ``schema._ConfinedFiles``, xmlschema's opener: an inline schema opens none
+* every location xmlschema opens as a URL goes through ``schema._ConfinedFiles``, xmlschema's
+  opener, and one it would parse as XML text is refused before it: an inline schema opens none
   of its own locations outside xmlschema's bundled copies of well-known namespaces, which either kind
   may read, and a path schema opens files only under its own directory or the ``schema_root`` its
   caller names, each checked by ``parse_bytes`` and reached without following a link out of that root
@@ -16,7 +17,7 @@ Three limbs, each pinned against the behaviour it replaces:
   invalid result, and the docstring now says so.
 
 Every file a test writes is under ``tmp_path``; nothing depends on the process's working directory
-except the one test that sets it with ``monkeypatch.chdir``.
+except the tests that set it with ``monkeypatch.chdir`` to show a relative path is refused.
 """
 
 from __future__ import annotations
@@ -160,14 +161,74 @@ def test_path_schema_includes_a_sibling_and_a_subdirectory(tmp_path: Path) -> No
     assert validate_against("<patient>x</patient>", str(nested).encode()).valid
 
 
-def test_relative_path_schema_resolves_its_include_beside_itself(
+def _outside_include_under_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """schemas/main.xsd including ../outside.xsd, with the working directory at ``tmp_path``: a root
+    that resolves to the working directory holds the include, while the schema's own directory does
+    not. Before the fix such a root loaded it."""
+    (tmp_path / "outside.xsd").write_text(_CLEAN, encoding="utf-8")
+    main = _write_path_schema(tmp_path / "schemas", "../outside.xsd")
+    monkeypatch.chdir(tmp_path)
+    return main
+
+
+def test_the_working_directory_named_absolutely_admits_the_include(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    (tmp_path / "schemas").mkdir()
+    # Control for the refusals below: only the relative spelling of this root is refused.
+    main = _outside_include_under_cwd(tmp_path, monkeypatch)
+    assert validate_against("<patient>x</patient>", str(main), schema_root=str(tmp_path)).valid
+
+
+_WINDOWS_ONLY = pytest.mark.skipif(os.name != "nt", reason="a drive-relative path is Windows text")
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        ".",
+        "file:.",
+        "schemas/..",
+        # "C:" and its file URL forms are the working directory when it is on that drive;
+        # ea16ad7941 refused "file:" for the same widening and left these open.
+        *(
+            pytest.param(f, marks=_WINDOWS_ONLY)
+            for f in ("{d}", "{d}.", "file:///{d}", "file:///{d}.", "file:{d}")
+        ),
+    ],
+)
+def test_a_relative_schema_root_is_refused(
+    form: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # It resolves against the working directory, System32 under the Windows service.
+    main = _outside_include_under_cwd(tmp_path, monkeypatch)
+    root = form.format(d=tmp_path.drive)
+    with pytest.raises(XmlValidationError, match="a schema_root that is not an absolute path"):
+        validate_against("<patient>x</patient>", str(main), schema_root=root)
+
+
+def test_a_relative_schema_source_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    main = _write_path_schema(tmp_path / "schemas", "inc.xsd")
     (tmp_path / "schemas" / "inc.xsd").write_text(_CLEAN, encoding="utf-8")
-    _write_path_schema(tmp_path / "schemas", "inc.xsd")
     monkeypatch.chdir(tmp_path)
-    assert validate_against("<patient>x</patient>", "schemas/main.xsd").valid
+    sources: list[str | Path] = [
+        "schemas/main.xsd",
+        "file:schemas/main.xsd",
+        Path("schemas/main.xsd"),
+    ]
+    if os.name == "nt":
+        sources += [
+            tmp_path.drive + "schemas\\main.xsd",
+            f"file:///{tmp_path.drive}schemas/main.xsd",
+        ]
+    for source in sources:
+        with pytest.raises(
+            XmlValidationError, match="a schema location that is not an absolute path"
+        ):
+            validate_against("<patient>x</patient>", source)
+    # Control: the same file named absolutely loads, its include beside it.
+    assert validate_against("<patient>x</patient>", str(main)).valid
 
 
 def test_path_schema_nested_include_may_climb_back_inside_its_directory(tmp_path: Path) -> None:
@@ -267,10 +328,11 @@ def test_path_schema_with_an_empty_doctype_is_refused_like_inline_text(tmp_path:
 def test_path_schema_include_with_a_doctype_entity_is_refused(tmp_path: Path) -> None:
     (tmp_path / "inc.xsd").write_text(_ENTITY, encoding="utf-8")
     main = _write_path_schema(tmp_path, "inc.xsd")
-    with pytest.raises(XmlValidationError) as ei:
+    with pytest.raises(XmlValidationError, match="a file that declares a DOCTYPE") as ei:
         validate_against("<patient>x</patient>", str(main))
     # parse_bytes refused it, not only xmlschema's narrower entity check.
     assert "XmlSecurityError" in _causes(ei.value)
+    assert "inc.xsd" not in str(ei.value)  # PHI-safe: the location is not quoted
 
 
 #: At least these os calls could touch a path for the validator. On Windows each opens a UNC path,
@@ -361,6 +423,7 @@ def test_a_long_path_prefix_on_a_drive_letter_is_a_local_path(tmp_path: Path) ->
         ("//host/share/x.xsd", None),
         ("\\\\?\\UNC\\host\\share\\x.xsd", None),
         ("\\\\.\\C:\\x.xsd", None),
+        ("\\\\?\\C:", None),  # the volume device; _local returned the drive-relative "C:"
         ("\\\\.\\pipe\\x", None),
         ("\\\\?\\GLOBALROOT\\Device\\x", None),
     ],
@@ -430,7 +493,9 @@ def test_a_link_to_a_unc_share_is_refused_before_it_is_followed(
     monkeypatch.setattr(os, "lstat", fake_lstat)
     monkeypatch.setattr(os, "readlink", fake_readlink)
     touched = _spy_on_paths(monkeypatch)
-    with pytest.raises(XmlValidationError) as ei:
+    with pytest.raises(
+        XmlValidationError, match="a link that leads out of the root, to a UNC"
+    ) as ei:
         validate_against("<patient>x</patient>", str(main))
     assert "_ResourceRefused" in _causes(ei.value)
     assert not [p for p in touched if "nonexist-5537" in p]
@@ -473,7 +538,7 @@ def test_an_unreadable_link_under_the_root_fails_the_build(
 
     monkeypatch.setattr(os, "lstat", fake_lstat)
     monkeypatch.setattr(os, "readlink", fake_readlink)
-    with pytest.raises(XmlValidationError) as ei:
+    with pytest.raises(XmlValidationError, match="a location that cannot be read as a file") as ei:
         validate_against("<patient>x</patient>", str(main))
     assert "_ResourceRefused" in _causes(ei.value)
 
@@ -638,6 +703,17 @@ def test_a_refusal_names_its_fixed_reason(tmp_path: Path) -> None:
     assert "o.xsd" not in str(ei.value)  # PHI-safe: the location is not quoted
 
 
+def test_an_include_that_is_a_directory_names_a_true_reason(tmp_path: Path) -> None:
+    # Opening a directory raises an OSError (PermissionError on Windows, IsADirectoryError on read
+    # elsewhere). It used to fail the build as "a link out, or a file parse_bytes refuses", neither of
+    # which happened.
+    (tmp_path / "dir5537.xsd").mkdir()
+    main = _write_path_schema(tmp_path, "dir5537.xsd")
+    with pytest.raises(XmlValidationError, match="a location that cannot be read as a file") as ei:
+        validate_against("<patient>x</patient>", str(main))
+    assert "dir5537" not in str(ei.value)  # PHI-safe: the location is not quoted
+
+
 def test_bytearray_inline_schema_is_read_as_the_schema() -> None:
     # origin/main pre-parsed a bytearray schema as text; 12e253ecb7 sent it to the path branch, where
     # os.fsdecode refused it and the schema failed to load.
@@ -723,7 +799,7 @@ def test_a_reparse_point_readlink_rejects_fails_the_build(
 
     monkeypatch.setattr(os, "lstat", fake_lstat)
     monkeypatch.setattr(os, "readlink", fake_readlink)
-    with pytest.raises(XmlValidationError) as ei:
+    with pytest.raises(XmlValidationError, match="a link that cannot be read") as ei:
         validate_against("<patient>x</patient>", str(main))
     assert "_ResourceRefused" in _causes(ei.value)
 
@@ -814,7 +890,9 @@ def test_a_file_url_naming_no_path_is_refused(url: str, tmp_path: Path) -> None:
     # url2pathname gives "" (or "/"), and abspath("") is the working directory: under the Windows
     # service that can be C:\Windows\System32, so as a schema_root it widened reads to all of it.
     main = _write_path_schema(tmp_path, "inc.xsd")
-    with pytest.raises(XmlValidationError, match="naming no path|filesystem root"):
+    with pytest.raises(
+        XmlValidationError, match="naming no path|filesystem root|not an absolute path"
+    ):
         validate_against("<patient>x</patient>", str(main), schema_root=url)
     with pytest.raises(XmlValidationError):
         validate_against("<patient>x</patient>", url)
