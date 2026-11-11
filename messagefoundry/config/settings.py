@@ -5360,8 +5360,9 @@ class EgressSettings(_Section):
     # gates the loopback sidecar an `ech_egress` REST connection sends every request to, body and
     # credential headers included, and the token-endpoint POST too on a SMART or OAuth2
     # connection. Loopback alone does not bound that hop: without this list a connection could
-    # name any port on this host, and whatever listened there would receive it. Its own list, not `allowed_http`, for the reason
-    # `allowed_proxy` is: the sidecar is an intermediary, not where PHI is meant to end up.
+    # name any port on this host, and whatever listened there would receive it. Its own list, not
+    # `allowed_http`, for the reason `allowed_proxy` is: the sidecar is an intermediary, not where
+    # PHI is meant to end up.
     #
     # DENY-BY-DEFAULT EVEN UNDER THE OPT-OUT, like `allowed_proxy` above: an `ech_egress`
     # connection is refused at config load while this list is empty, whatever

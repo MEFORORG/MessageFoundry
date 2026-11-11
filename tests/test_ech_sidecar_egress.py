@@ -242,6 +242,15 @@ def test_a_sidecar_host_with_a_zone_id_is_refused(build: Any) -> None:
         build("http://[::1%31]:8123")
 
 
+@pytest.mark.parametrize("build", [_gate, _direct], ids=["egress-gate", "direct-build"])
+@pytest.mark.parametrize("sidecar", ["http://127.0.0.1\t:8123", "http://127.0.0.1:81\n23"])
+def test_a_sidecar_with_a_control_character_is_refused(build: Any, sidecar: str) -> None:
+    """urlsplit deletes the tab or newline and urllib keeps it, so the gate admitted port 8123
+    while every dial failed. Refused, on both paths."""
+    with pytest.raises(ValueError, match=r"control character"):
+        build(sidecar)
+
+
 def test_a_sidecar_at_port_0_is_refused_in_its_own_words() -> None:
     """No entry can list port 0, so "not in the allowlist" would send the operator looking for an
     entry to add. Refused in fixed words, before the list is read, empty or not."""

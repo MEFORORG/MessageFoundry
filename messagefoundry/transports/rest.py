@@ -2653,6 +2653,12 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
             "ech_egress is set but ech_sidecar is empty — supply the loopback ECH sidecar URL, "
             "e.g. http://127.0.0.1:8123 (ADR 0139)"
         )
+    # urlsplit deletes a tab, CR or LF inside a URL and urllib does not, so the egress gate would
+    # judge `127.0.0.1\t:8123` as port 8123 while the dial fails on every message (BACKLOG #5528).
+    if any(c.isspace() or not c.isprintable() for c in sidecar):
+        raise ValueError(
+            "ech_sidecar holds a space or a control character; write the URL without one (ADR 0139)"
+        )
     # Never a bare urlsplit, and never the raw value in the message: a URL can carry userinfo
     # (BACKLOG #2686).
     refuse_url_credentials(
