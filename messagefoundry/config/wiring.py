@@ -3256,6 +3256,7 @@ def Http(
     # same reader twice more: its default= here, since the config holds it and `check` loads it,
     # and its environment value by the listener once resolved, at the build `check` and serve run.
     _reject_envref_in_lists("Http", trusted_proxies=trusted_proxies)
+    from_default = isinstance(trusted_proxies, EnvRef)
     written: Any = trusted_proxies
     if isinstance(trusted_proxies, EnvRef):
         written = None if trusted_proxies.default is _UNSET else trusted_proxies.default
@@ -3267,7 +3268,7 @@ def Http(
     except ValueError as exc:
         refusal = str(exc)  # withholds every value; raised below, outside this handler
     if refusal is not None:
-        if written is not trusted_proxies:
+        if from_default:
             refusal = f"Http trusted_proxies env() default= is refused: {refusal}"
         raise WiringError(refusal)
     if trusted_proxies and intake_auth not in _INTAKE_KEY_MODES:
@@ -7319,8 +7320,9 @@ def ech_cleartext_sidecar_hops(
 
 
 #: The note :func:`listener_trusted_proxy_hops` gives a listener whose ``trusted_proxies`` is an
-#: ``env()`` value it could not resolve.
-UNRESOLVED_LISTENER_PROXIES = "possibly: an env() value this reading could not resolve"
+#: ``env()`` value it could not resolve. Short, since the posture entry shows it beside the name and
+#: its text says what a name marked possibly means.
+UNRESOLVED_LISTENER_PROXIES = "possibly"
 
 
 def listener_trusted_proxy_hops(

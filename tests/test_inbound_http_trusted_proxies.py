@@ -281,7 +281,7 @@ def test_a_padded_header_is_read_no_further_than_the_hop_bound() -> None:
 
     def key(hops: list[str]) -> str | None:
         head = HttpRequest("POST", "/", {}, b"", frozenset(), ",".join(hops))
-        found = source._forwarded_client(head, "10.0.0.1")
+        found = source._forwarded_client(head, ipaddress.ip_address("10.0.0.1"))
         return None if found is None else str(found)
 
     listed = ["10.0.0.2"] * (_MAX_FORWARDED_HOPS - 1)
@@ -464,8 +464,10 @@ def test_a_mapped_socket_peer_still_reads_as_a_listed_proxy() -> None:
             settings={"port": 0, "intake_auth": "api_key", "trusted_proxies": ["10.0.0.5"]},
         )
     )
+    from messagefoundry.transports.http_listener import _peer_address
+
     head = HttpRequest("POST", "/", {}, b"", frozenset(), CLIENT_A)
-    assert str(source._forwarded_client(head, "::ffff:10.0.0.5")) == CLIENT_A
+    assert str(source._forwarded_client(head, _peer_address("::ffff:10.0.0.5"))) == CLIENT_A
 
 
 @pytest.mark.parametrize("default", [["*"], ["0.0.0.0/0"], ["10.0.0.0/8"], "10.0.0.5"])
@@ -581,11 +583,9 @@ def test_a_listener_trusted_proxies_is_a_named_loosening() -> None:
 async def test_the_posture_route_names_a_listener_trusted_proxies(tmp_path: Any) -> None:
     """The live graph's listener reaches ``GET /security/posture``, which the start's audit row
     and the ``posture_loosened`` alert read through the same function."""
-    import httpx
-
-    from messagefoundry.api import create_app
     from messagefoundry.config.settings import EgressSettings
     from messagefoundry.pipeline import Engine
+    from tests.test_security_posture_defaults import _posture_body
 
     eng = await Engine.create(
         tmp_path / "posture.db",
@@ -594,13 +594,11 @@ async def test_the_posture_route_names_a_listener_trusted_proxies(tmp_path: Any)
     )
     try:
         eng.add_registry(_http_registry(IB_PROXIED=["10.0.0.0/24"], IB_DIRECT=[]))
-        app = create_app(eng, allow_no_auth=True)
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
-            body = (await client.get("/security/posture")).json()
+        body = await _posture_body(eng)
     finally:
         await eng.stop()
-    entry = next(e for e in body["loosenings"] if e["switch"] == "listener_trusted_proxies")
+    loosenings: list[dict[str, str]] = body["loosenings"]  # type: ignore[assignment]
+    entry = next(e for e in loosenings if e["switch"] == "listener_trusted_proxies")
     assert "IB_PROXIED (range)" in entry["risk"]
     assert "IB_DIRECT" not in entry["risk"]
 

@@ -415,7 +415,6 @@ from messagefoundry.config.wiring import (
     POSSIBLY_GENERIC_DB_HOP,
     UNRESOLVED_DRIVER_REASON,
     UNRESOLVED_ECH_SIDECAR,
-    UNRESOLVED_LISTENER_PROXIES,
     ConfigDirUnlistable,
     EnvRef,
     InboundConnection,
@@ -2133,14 +2132,12 @@ def _posture_loosenings(
         ]
     )
     # BACKLOG #5525: an HTTP listener's trusted_proxies, read against the same values. Its note,
-    # "range" or the unresolved marker, is kept beside the name, since the entry's text keys on it.
+    # "range" or "possibly", is kept beside the name, since the entry's text keys on it.
     listener_proxy_hops = (
         []
         if registry is None
         else [
-            f"{name} ({'possibly' if note == UNRESOLVED_LISTENER_PROXIES else note})"
-            if note
-            else name
+            f"{name} ({note})" if note else name
             for name, note in listener_trusted_proxy_hops(registry, env_values=db_env_values)
             # Narrowed on the bare name, before any marker is added.
             if visible is None or visible(name)

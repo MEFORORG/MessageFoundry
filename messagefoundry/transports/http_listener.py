@@ -857,7 +857,8 @@ def _hop_address(text: str) -> _HopAddress | None:
     to the socket peer. The bracketed form says where the address ends and is always read. The
     address is then read by :func:`_peer_address`."""
     host = text.strip(" \t")
-    if host.startswith("["):
+    bracketed = host.startswith("[")
+    if bracketed:
         inner, closed, rest = host[1:].partition("]")
         if not closed or (rest and not (rest[:1] == ":" and _HOP_PORT_RE.fullmatch(rest[1:]))):
             return None
@@ -866,11 +867,13 @@ def _hop_address(text: str) -> _HopAddress | None:
         host, _, port = host.partition(":")
         if not _HOP_PORT_RE.fullmatch(port):
             return None
-    elif host.count(":") > 1:
+    address = _peer_address(host)
+    if address is not None and not bracketed and host.count(":") > 1:
+        # Checked only once the hop parsed, so the second parse runs for a bare IPv6 hop alone.
         head, _, last = host.partition("%")[0].rpartition(":")
         if _HOP_PORT_RE.fullmatch(last) and _peer_address(head) is not None:
             return None
-    return _peer_address(host)
+    return address
 
 
 def _peer_address(text: str | None) -> _HopAddress | None:
@@ -901,11 +904,13 @@ def _budget_key(address: _HopAddress) -> str:
     return str(address)
 
 
-def _peer_budget_key(peer_host: str | None) -> str:
+def _peer_budget_key(peer_host: str | None, address: _HopAddress | None = None) -> str:
     """The budget key for a socket peer, read as a forwarded client is read: normalised by
     :func:`_peer_address` and keyed by :func:`_budget_key`, so one host never holds two budgets
-    under two spellings. A peer that is not an address keys as it was given, or ``unknown``."""
-    address = _peer_address(peer_host)
+    under two spellings. A peer that is not an address keys as it was given, or ``unknown``.
+    ``address`` is the peer already parsed, where the caller has it."""
+    if address is None:
+        address = _peer_address(peer_host)
     if address is None:
         return peer_host or "unknown"
     return _budget_key(address)
@@ -1622,8 +1627,9 @@ class HttpSource(SourceConnector):
             return
         if head.method in _HEALTH_PROBE_METHODS and self.intake_auth_health == "allow":
             return  # explicit opt-out for a load-balancer probe that cannot carry the credential
-        forwarded = self._forwarded_client(head, peer_host)
-        key = _peer_budget_key(peer_host) if forwarded is None else _budget_key(forwarded)
+        peer = _peer_address(peer_host)
+        forwarded = self._forwarded_client(head, peer)
+        key = _peer_budget_key(peer_host, peer) if forwarded is None else _budget_key(forwarded)
         try:
             self._authorize_credential(head, key)
         except HttpRequestError as exc:
@@ -1632,7 +1638,7 @@ class HttpSource(SourceConnector):
             exc.forwarded_for = None if forwarded is None else str(forwarded)
             raise
 
-    def _forwarded_client(self, head: HttpRequest, peer_host: str | None) -> _HopAddress | None:
+    def _forwarded_client(self, head: HttpRequest, peer: _HopAddress | None) -> _HopAddress | None:
         """The client address a listed proxy forwarded, or ``None`` to key on the socket peer.
 
         uvicorn's walk (BACKLOG #5525): the header counts only when the socket peer is a listed
@@ -1642,9 +1648,8 @@ class HttpSource(SourceConnector):
         uvicorn takes the left-most hop when every hop is listed, and this walk does not: it falls
         back to the socket peer then, as it does for a missing header or a hop that is not an
         address, so no budget is ever keyed on text a client wrote."""
-        if not self._trusted_proxies or not head.forwarded_header or peer_host is None:
+        if not self._trusted_proxies or not head.forwarded_header:
             return None
-        peer = _peer_address(peer_host)
         if peer is None or not self._is_trusted_proxy(peer):
             return None
         # Read hop by hop from the right with rfind, so each hop is scanned once and nothing left of
