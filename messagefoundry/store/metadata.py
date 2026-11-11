@@ -106,14 +106,16 @@ class MetadataTooDeepError(RuntimeError):
 def _load_object(
     text: str | bytes | bytearray | None, *, too_deep_raises: bool = True
 ) -> dict[str, Any]:
-    """The JSON object ``text`` holds, or ``{}`` for ``None``, empty, malformed or non-object text.
+    """The JSON object ``text`` holds, or ``{}`` for ``None``, empty, malformed or non-object text;
+    text nested too deep to decode raises unless ``too_deep_raises`` is false.
 
     It decodes through :func:`~messagefoundry.redaction.json_loads_or_refusal`, so json's depth-limit
     ``RecursionError`` never escapes (BACKLOG #6712): it raises :class:`MetadataTooDeepError`,
     outside any handler so nothing is chained, or reads as malformed where ``too_deep_raises`` is
-    false. Raising is the default because a metadata cell read as ``{}`` changes an outcome. A refusal is logged with json's content-free hint, never the text. ``bytes``/``bytearray``
-    decode as ``json.loads`` decoded them before; any other type reads as ``{}``, as the
-    ``TypeError`` arm this replaced did."""
+    false. Raising is the default because a metadata cell read as ``{}`` changes an outcome. A
+    refusal that reads as empty is logged with json's content-free hint, never the text.
+    ``bytes``/``bytearray`` decode as ``json.loads`` decoded them before; any other type reads as
+    ``{}``, as the ``TypeError`` arm this replaced did."""
     if isinstance(text, bytearray):
         text = bytes(text)
     if not isinstance(text, str | bytes) or not text:

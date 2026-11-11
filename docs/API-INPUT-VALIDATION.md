@@ -230,7 +230,7 @@ list.** How the search ran, and what it could miss, is below the table.
 | API | `content` and `field_path`, on `POST /messages/search` | Send exactly one. | 400 |
 | API | The same pair, on `POST /messages/export` with no `ids` | Send exactly one. With `ids`, the engine reads neither. | 400 |
 | API | The same pair, on `POST /uploads/{file_id}/messages/search` and in the criteria on `POST /search/presets` | Send one or neither. Both together are refused. | 400 |
-| API | `field_value`, beside that pair | The engine reads it only beside `field_path`. Beside `content`, or with neither, it is refused, except on an export by `ids`, which reads none of them. A `field_value` of only spaces counts as not sent, on every route. | 400 |
+| API | `field_value`, beside that pair | The engine reads it only beside `field_path`. Beside `content`, or with neither, it is refused, except on an export by `ids`, which reads none of them. A `field_value` that is empty or only whitespace counts as not sent, on every route. | 400 |
 | API | The presets named in `presets`, on `GET /search/layered` | Exactly one preset carries a content term. | 400 |
 | API | The same presets | Two presets that both set `channel_id`, `status`, `message_type` or `control_id` must set the same value. | 400 |
 | API | `to` and `reroute`, on `POST /messages/{message_id}/edit-resend` | With `to`, the engine delivers to that outbound and ignores `reroute`. Without `to`, `reroute` must be true. | 400 |
@@ -254,8 +254,8 @@ Where each rule lives:
 - Layered search: `_compose_preset_layers`, in
   [`messagefoundry/api/app.py`](../messagefoundry/api/app.py). A content term is a `content` value,
   a `field_path` or a `field_value` saved in a preset. A preset holding a `field_value` with no
-  `field_path` counts as one, and the search refuses it with a 400. A `field_value` of only spaces
-  does not count.
+  `field_path` counts as one, and the search refuses it with a 400. A `field_value` that is empty or
+  only whitespace does not count.
 - Edit and resubmit, and the statistics reset: each route itself, in the same file.
 - Password change: the API rule is in the route, in
   [`messagefoundry/api/auth_routes.py`](../messagefoundry/api/auth_routes.py). The API takes no
