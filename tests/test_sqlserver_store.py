@@ -7661,7 +7661,8 @@ async def _ss_death_row(store, row_id: str) -> tuple[str, int, int]:
 async def test_record_worker_death_counts_then_dead_letters_at_the_cap(store) -> None:
     mid = await store.enqueue_ingress(channel_id="IB", raw=RAW, now=100.0)
     for death in (1, 2, 3):
-        item = await store.claim_next_fifo("IB", now=200.0, stage=Stage.INGRESS.value)
+        # Past the recovery below, which re-pends the row due at its own now (300).
+        item = await store.claim_next_fifo("IB", now=400.0, stage=Stage.INGRESS.value)
         assert item is not None and item.message_id == mid
         counted = await store.record_worker_death(item.id, 3, "router worker killed by _Kill")
         assert (counted.deaths, counted.dead) == (death, death == 3)
