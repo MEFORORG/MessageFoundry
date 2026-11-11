@@ -286,11 +286,11 @@ class _ConfinedFiles(urllib.request.BaseHandler):
     :func:`_resolve_within` and checked by :func:`~messagefoundry.parsing.xml.harden.parse_bytes`
     first, so a path schema's includes meet the same DOCTYPE refusal as an inline schema. A location
     outside every root, or one that is not a local file path, such as a UNC or device path, raises
-    :class:`_ResourceRefused`, and so, under a vetted root, does at least a link the walk refuses, a
-    location that cannot be read as a file, such as a directory, one the process may not read or one
-    reached through a link it cannot read, and a file ``parse_bytes`` or
-    :func:`_refuse_text_locations` refuses. A
-    missing file raises ``FileNotFoundError``. :func:`_build_schema` says what each does to the build.
+    :class:`_ResourceRefused`. So, under any root, the bundled one included, does a location that
+    cannot be read as a file, such as a directory or one the process may not read; and, under a
+    vetted root, does at least a link the walk refuses, one reached through a link it cannot read, and
+    a file ``parse_bytes`` or :func:`_refuse_text_locations` refuses. A missing file raises
+    ``FileNotFoundError``. :func:`_build_schema` says what each does to the build.
 
     The location is judged on its text by :func:`_local`, then compared with each root by whole
     components, so a sibling directory sharing a name prefix (``schemas-old`` beside ``schemas``) is
@@ -315,14 +315,16 @@ class _ConfinedFiles(urllib.request.BaseHandler):
             for root in self._roots:
                 if not _within(written, root.path):
                     continue
-                if not root.vet:
-                    data = _read(written, no_follow=False)
-                    return urllib.response.addinfourl(
-                        io.BytesIO(data), email.message.Message(), url
-                    )
                 # Each refusal below is _ResourceRefused, not an OSError: xmlschema drops an include
-                # or an import that raises OSError with only a warning. Every reason is fixed text.
+                # or an import that raises OSError with only a warning, and a lax wildcard would then
+                # admit that namespace unchecked. That holds for a directory in the bundled root too.
+                # Every reason is fixed text.
                 try:
+                    if not root.vet:  # library files, read as they are, links included
+                        data = _read(written, no_follow=False)
+                        return urllib.response.addinfourl(
+                            io.BytesIO(data), email.message.Message(), url
+                        )
                     checked = _resolve_within(written, root.path)
                     if checked is None:
                         raise _ResourceRefused(
@@ -363,15 +365,17 @@ class _SourceRefused(ValueError):
 
 def _local_path(text: str | bytes | os.PathLike[str], what: str) -> str:
     """The absolute local path ``text`` names: a filesystem path, or a ``file:`` URL with no host. A
-    remote URL, another scheme, a path that is not absolute as written, or a UNC or device path is
-    refused on its text; ``what`` names the argument in the refusal. Directories are taken as written,
-    so a mapped drive stays a drive letter.
+    remote URL, another scheme, a Windows drive-relative path, or a UNC or device path is refused on
+    its text; ``what`` names the argument in the refusal. Directories are taken as written, so a mapped
+    drive stays a drive letter.
 
-    A relative path would resolve against the working directory, which under the shipped Windows
-    service is the engine install root, holding its virtual environment, so the confinement root
-    would be a directory nobody named. That includes the
-    drive-relative ``C:``, ``C:.`` and ``file:///C:``: ``abspath`` makes each the working directory
-    when it is on that drive."""
+    A relative path resolves against the working directory, as xmlschema resolved it before BACKLOG
+    #5537; under the shipped Windows service that is the engine install root. A path rooted with no
+    drive, such as ``/opt/x.xsd``, takes the working directory's drive, as it did then too. A
+    drive-relative path (``C:``, ``C:.``, ``C:foo``, ``file:///C:``, ``file:C:``) is refused: it
+    resolves against that drive's own current directory, which is the working directory only when it
+    is on that drive and otherwise a per-drive setting nobody sees, so its text does not say which
+    directory it names."""
     source = os.fsdecode(text).strip()
     if not source:  # abspath would make it the working directory
         raise _SourceRefused(f"{what} that is empty")
@@ -385,8 +389,10 @@ def _local_path(text: str | bytes | os.PathLike[str], what: str) -> str:
             raise _SourceRefused(f"{what} that is a file URL naming no path")
     elif scheme and not (len(scheme) == 1 and source[1:2] == ":"):  # a drive letter is not a scheme
         raise _SourceRefused(f"{what} that is not a local path")
-    if not os.path.isabs(source):
-        raise _SourceRefused(f"{what} that is not an absolute path")
+    if os.name == "nt":
+        drive, rest = ntpath.splitdrive(source)
+        if len(drive) == 2 and drive[1] == ":" and rest[:1] not in ("\\", "/"):
+            raise _SourceRefused(f"{what} that is a drive-relative path")
     local = _local(source)
     if local is None:
         raise _SourceRefused(f"{what} that is a UNC or device path")
@@ -429,9 +435,10 @@ def _build_schema(
     at that name included, and checked by ``parse_bytes``. What it includes is opened only under its
     confinement root, each file checked the same way: its own directory, or ``schema_root`` when the
     caller names one, for a bundle such as HL7 CDA R2 whose schemas include across sibling directories
-    (``../../processable/coreschemas/...``). Its includes resolve beside the name as written. The
-    path and ``schema_root`` are refused on their text when either is not absolute as written, a
-    drive-relative ``C:`` included (:func:`_local_path` says why).
+    (``../../processable/coreschemas/...``). Its includes resolve beside the name as written. A
+    relative path or ``schema_root`` resolves against the working directory; a Windows
+    drive-relative one, such as ``C:`` or ``C:foo``, is refused on its text (:func:`_local_path` says
+    why).
 
     **A refused location** is at least: a local one outside those bounds; one reached through a link
     out of the root, to a UNC or device path, or through more than ``_MAX_LINKS`` links; a UNC or
@@ -500,10 +507,11 @@ def validate_against(
 ) -> XmlSchemaResult:
     """Validate ``document`` against the XSD ``schema_source`` (a schema string/bytes or a local path).
 
-    ``schema_root`` (an absolute path or a host-less ``file:`` URL naming one) widens what a schema
-    given as a path, which must also be absolute, may include, from its own directory to the whole of
-    ``schema_root``: pass the top of a multi-directory bundle such as HL7 CDA R2. :func:`_build_schema` says what each file read must pass. It is refused
-    for an inline schema, and for a schema that does not lie under it.
+    ``schema_root`` (a path or a host-less ``file:`` URL naming one; a relative one resolves against
+    the working directory, and a Windows drive-relative one is refused) widens what a schema given as
+    a path may include, from its own directory to the whole of ``schema_root``: pass the top of a
+    multi-directory bundle such as HL7 CDA R2. :func:`_build_schema` says what each file read must
+    pass. It is refused for an inline schema, and for a schema that does not lie under it.
 
     Returns an :class:`XmlSchemaResult`; a well-formed document that does not conform is returned as
     data, never raised, so a Handler can route the message and still see why. Raises

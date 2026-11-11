@@ -202,15 +202,17 @@ Two statements above were false in the shipped code, and both are corrected here
   document past the opener, is refused in every schema document read. A location the opener
   refuses, at least a file under the root that declares a DOCTYPE or is malformed, a link the walk
   refuses (out of the root, to a UNC or device path, or through more than 32 links), a location
-  that cannot be read as a file, such as a directory or a file the process may not read, or a file
+  that cannot be read as a file, such as a directory or a file the process may not read, under the
+  root or in the bundled schemas, or a file
   outside the root, fails the build on an include, redefine or override, and on an
   import too, unless the refused file is the one the import names and `xmlschema` bundles a copy of
   that namespace: then the import falls back to that copy, as the stock W3C XML-DSig schema, which
   carries a DOCTYPE, needs. A refusal inside a file such an import did open still fails the build.
-  A `schema_root` that is a filesystem root is refused, and so is a schema path or `schema_root`
-  that is not absolute as written, such as `C:`, `C:.` or `file:///C:`, which would otherwise
-  resolve against the working directory, the engine install root under the shipped Windows
-  service. Skipping any other
+  A `schema_root` that is a filesystem root is refused, and so, on Windows, is a drive-relative
+  schema path or `schema_root`, such as `C:`, `C:.`, `C:foo` or `file:///C:`, which resolves
+  against that drive's own current directory. A plain relative one resolves against the working
+  directory, the engine install root under the shipped Windows service, as it did before. Skipping
+  any other
   refused import would leave its namespace undeclared, and a `lax` or `skip` wildcard would then admit
   that namespace's content unchecked. The confinement root is the schema's own
   directory, or the directory the caller passes as `validate_against`'s `schema_root` keyword. That
