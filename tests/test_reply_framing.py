@@ -1626,12 +1626,14 @@ def _schema_opener_is_confined() -> None:
     """xmlschema's opener in parsing/xml/schema.py, which parsing/ cannot build with
     build_strict_opener from transports/, and which build_opener would fill with urllib's default
     handlers. It holds one _ConfinedFiles, which opens file: and refuses every other scheme in
-    unknown_open; it takes no subclass of that handler, add_handler refuses any other, and open
-    refuses to run with any other in any of its handler tables, however it got there. So no handler in it opens an http or https
-    URL or reads a reply head. That such a URL is refused is
+    unknown_open; it takes no subclass of that handler, add_handler refuses any other, open
+    refuses to run with any other in any of its handler tables, however it got there, and open
+    then refuses any URL whose scheme is not file before a handler runs, so an https_open set on
+    the _ConfinedFiles instance or class is never called. So the opener opens no http or https
+    URL and reads no reply head. That such a URL is refused is
     ``tests/test_xml_schema_lockdown.py::test_a_non_file_url_reaching_the_opener_is_a_refused_resource``.
     """
-    from messagefoundry.parsing.xml.schema import _ConfinedFiles, _ConfinedOpener
+    from messagefoundry.parsing.xml.schema import _ConfinedFiles, _ConfinedOpener, _ResourceRefused
 
     files = _ConfinedFiles(())
     opener = _ConfinedOpener(files)
@@ -1657,6 +1659,13 @@ def _schema_opener_is_confined() -> None:
         vars(tampered)[table].setdefault("https", []).append(urllib.request.HTTPSHandler())
         with pytest.raises(TypeError, match="besides its confined-file handler"):
             tampered.open("https://127.0.0.1:9/x.xsd")
+    # An https_open set on the one handler, which the tables carry in under "https", is never called.
+    injected = _ConfinedFiles(())
+    injected.https_open = urllib.request.HTTPSHandler().https_open  # type: ignore[attr-defined]
+    carrying = _ConfinedOpener(injected)
+    assert vars(carrying)["handle_open"]["https"] == [injected]
+    with pytest.raises(_ResourceRefused, match="not a local file"):
+        carrying.open("https://127.0.0.1:9/x.xsd")
 
 
 #: ``(module under messagefoundry/, origin as _stock_calls reports it) -> the check it rests on``,

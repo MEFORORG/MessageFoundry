@@ -1206,9 +1206,49 @@ def test_a_non_file_url_reaching_the_opener_is_a_refused_resource() -> None:
     from messagefoundry.parsing.xml.schema import _ConfinedFiles, _ConfinedOpener, _ResourceRefused
 
     opener = _ConfinedOpener(_ConfinedFiles(()))
-    for url in ("http://127.0.0.1:9/x.xsd", "https://127.0.0.1:9/x.xsd", "data:text/plain,x"):
-        with pytest.raises(_ResourceRefused):
-            opener.open(url)
+    targets: tuple[str | urllib.request.Request, ...] = (
+        "http://127.0.0.1:9/x.xsd",
+        "https://127.0.0.1:9/x.xsd",
+        "data:text/plain,x",
+        "x.xsd",  # no scheme, which Request cannot type
+        urllib.request.Request("HTTPS://127.0.0.1:9/x.xsd"),
+    )
+    for target in targets:
+        with pytest.raises(_ResourceRefused, match="not a local file") as caught:
+            opener.open(target)
+        assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+
+@pytest.mark.parametrize("where", ["instance", "class"])
+def test_an_https_open_set_on_the_confined_handler_is_never_called(
+    where: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # _ConfinedOpener's handler checks compare handlers, not their methods, so an https_open set on
+    # the _ConfinedFiles instance or class is registered under "https" by the one handler they allow.
+    # open() refuses the scheme before any handler runs; a file: URL still opens.
+    from messagefoundry.parsing.xml.schema import (
+        _ConfinedFiles,
+        _ConfinedOpener,
+        _ResourceRefused,
+        _Root,
+    )
+
+    def https_open(*args: object) -> None:
+        raise AssertionError("an injected https_open ran")  # pytest.raises below would not catch it
+
+    (tmp_path / "main.xsd").write_text(_CLEAN, encoding="utf-8")
+    files = _ConfinedFiles((_Root(str(tmp_path), vet=True),))
+    if where == "instance":
+        files.https_open = https_open  # type: ignore[attr-defined]
+    else:
+        monkeypatch.setattr(_ConfinedFiles, "https_open", https_open, raising=False)
+    opener = _ConfinedOpener(files)
+    assert vars(opener)["handle_open"]["https"] == [files]  # control: the injection registered
+    with pytest.raises(_ResourceRefused, match="not a local file") as caught:
+        opener.open("https://127.0.0.1:9/x.xsd")
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    with opener.open((tmp_path / "main.xsd").as_uri()) as reply:
+        assert b"patient" in reply.read()
 
 
 @pytest.mark.parametrize(
