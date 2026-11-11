@@ -425,6 +425,7 @@ from messagefoundry.config.wiring import (
     ech_cleartext_sidecar_hops,
     expiry_relaxed_hops,
     hostname_unchecked_hops,
+    listener_trusted_proxy_hops,
     load_config,
     path_form_fhir_updates,
     query_credential_hops,
@@ -2130,15 +2131,29 @@ def _posture_loosenings(
             if visible is None or visible(name)
         ]
     )
+    # BACKLOG #5525: an HTTP listener's trusted_proxies, read against the same values. Its note,
+    # "range" or "possibly", is kept beside the name, since the entry's text keys on it.
+    listener_proxy_hops = (
+        []
+        if registry is None
+        else [
+            f"{name} ({note})" if note else name
+            for name, note in listener_trusted_proxy_hops(registry, env_values=db_env_values)
+            # Narrowed on the bare name, before any marker is added.
+            if visible is None or visible(name)
+        ]
+    )
     notes: list[str] = []
     if registry is None:
         notes.append(
             "settings only — no connection graph is loaded on this engine, so the per-connection "
             "cleartext_accepted / tls_allow_expired / tls_check_hostname / url_query_credential / "
             "generic-ODBC-DATABASE-TLS / tls_hop_attested / "
-            "tls_revocation_attested / FHIR update_url_form / http ECH sidecar declarations are "
+            "tls_revocation_attested / FHIR update_url_form / http ECH sidecar / HTTP listener "
+            "trusted_proxies declarations are "
             "NOT included "
-            "(see `messagefoundry check`)"
+            "(see `messagefoundry check`, which reports all but the HTTP listener "
+            "trusted_proxies; those are reported only here, on an engine with a graph)"
         )
     if visible is not None:
         # With no graph too: the [security] opt-outs keyed by connection are still narrowed.
@@ -2185,6 +2200,7 @@ def _posture_loosenings(
             remote_debug=remote_debug,
             startup=startup,
             service_env=service_env,
+            listener_trusted_proxy_hops=listener_proxy_hops,
         )
     )
     # Vault BACKLOG #3062: the open mode is an app opt-in, not a setting, so the registry above

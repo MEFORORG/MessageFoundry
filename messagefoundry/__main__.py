@@ -3188,8 +3188,9 @@ def _serve(args: argparse.Namespace) -> int:
     # the ADR 0173 revocation attestation with its reason, where it suppresses a refusal; at least the
     # bind gates' and raw-TCP guard's tls_hop_attested line, and the database weakened-TLS line that a
     # DatabaseRef source also writes, without the reason),
-    # and all of them completely by `messagefoundry check` and GET /security/posture, which both have
-    # the graph.
+    # and all of them completely by GET /security/posture, which has the graph. `messagefoundry
+    # check` has it too and reports all but an HTTP listener's trusted_proxies (BACKLOG #5525),
+    # whose ranges the listener logs as it is built.
     # The store is NOT open yet either, so the #1008 store-principal privilege OBSERVATION is passed as
     # None for the same reason and with the same discipline: it is reported moments later by the
     # preflight's own log line + audit row once the lifespan opens the store, and completely by
@@ -3235,10 +3236,10 @@ def _serve(args: argparse.Namespace) -> int:
             "url_query_credential, "
             "generic-ODBC "
             "database TLS, tls_hop_attested, tls_revocation_attested (ADR 0173), FHIR update_url_form "
-            "and http ECH sidecar (ADR 0139) declarations are NOT in this list — the graph is not "
-            "loaded yet; they are "
-            "reported by `messagefoundry check` and GET /security/posture, and most also by the "
-            "connector construction gate. Nor is the store-principal privilege observation (#1008) — the "
+            "and http ECH sidecar (ADR 0139) declarations, and an HTTP listener's trusted_proxies, "
+            "are NOT in this list — the graph is not loaded yet; they are "
+            "reported by GET /security/posture, all but the last by `messagefoundry check`, and "
+            "most also by the connector construction gate. Nor is the store-principal privilege observation (#1008) — the "
             "store is not open yet; the startup preflight logs and audits it moments from now.",
             len(_loosenings),
             "; ".join(f"{name} ({risk})" for name, risk in _loosenings),
@@ -12869,7 +12870,8 @@ def _security(args: argparse.Namespace) -> int:
                 "cleartext_accepted, tls_allow_expired, tls_check_hostname, url_query_credential, "
                 "generic-ODBC database TLS, "
                 "tls_hop_attested, "
-                "tls_revocation_attested, FHIR update_url_form and http ECH sidecar declarations are "
+                "tls_revocation_attested, FHIR update_url_form, http ECH sidecar and HTTP listener "
+                "trusted_proxies declarations are "
                 "NOT included, and neither are the store-principal privilege and audit-chain keying "
                 "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
                 "GET /security/posture reports both). Nor are the engine process's remote-debugging "

@@ -259,6 +259,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `tls_revocation_attested` | `false` on every inbound / outbound / `FhirLookup` (*connection-scoped*) |
 | | `ech_sidecar` | no `ech_egress`, or an `https://` sidecar, on every `REST` outbound (*connection-scoped*; an `http://` sidecar is the loosening, named as `ech_sidecar`) |
 | | `update_url_form` | `"transaction"` on every `FHIR()` outbound (*connection-scoped*; `"path"` is the loosening, named as `update_url_form`) |
+| | `trusted_proxies` on an HTTP listener | `[]` on every `Http()` inbound (*connection-scoped*; any non-empty list is the loosening, named as `listener_trusted_proxies`, because each listed proxy, and every host inside a listed range, may key the failed-attempt budget on any address it writes. BACKLOG #5525; [CONNECTIONS.md](CONNECTIONS.md) has the walk and the range floor) |
 | | `url_query_credential` | no credential-like parameter in an outbound or `FhirLookup` `url`'s query string (*connection-scoped*; not a flag, a property of the URL) |
 
 **At least thirty of these do not live in `[security]`.** `[store].aad_bind`,
