@@ -7,8 +7,9 @@ The account scans drop an Unverifiable record, so the self-sufficient-Administra
 not see an Administrator whose seal Vault transit could not verify. The command then cleared the
 earlier holder's factors and sessions and wrote its own credential before the first-administrator
 grant's guard raised on that same row. An Unverifiable record's roles are part of what its seal
-covers, so any one of them may be an Administrator: the command now refuses on one before it writes
-anything. Synthetic data only; severity is conditional (CLAUDE.md section 0).
+covers, so any one of them may be an Administrator: the command now refuses on one and changes no
+account (it writes one integrity.authority_seal_unverifiable audit row per such account). Synthetic
+data only; severity is conditional (CLAUDE.md section 0).
 """
 
 from __future__ import annotations
@@ -164,7 +165,8 @@ async def test_an_unverifiable_administrator_refuses_provision_before_any_write(
         assert _holder_rows(path) == before  # factors, sessions and credential byte-unchanged
         assert command_raised is None
         assert refusal is not None and "could not be verified by Vault transit" in refusal
-        # The write refuses on its own too, whatever the pre-check said, and still writes nothing.
+        # The write refuses on its own too, whatever the pre-check said, and still changes no
+        # account.
         with pytest.raises(FirstAdministratorRefused, match="could not be verified by Vault"):
             await provision()
         assert _holder_rows(path) == before
