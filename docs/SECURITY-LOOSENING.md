@@ -960,8 +960,9 @@ count is above `0` (vault BACKLOG #2613).
   other than `3` changes which failure patterns raise this page, and when. It does not simply
   delay it: a pattern that pages at one value may never page at another. A longer
   `ad_session_recheck_seconds`, or an `ad_session_recheck_max_users` below `200` in an estate
-  larger than the budget, spaces this account's probes further apart, so the page comes later in
-  time. A failure bounded in time can end before it pages at all. The
+  larger than the budget, spaces this account's probes further apart, which changes which failures
+  that vary over time raise this page, and when. A failure bounded in time can end before it pages
+  at all. The
   `ad_reconcile_outage_passes` row of [CONFIGURATION.md](CONFIGURATION.md) states when it comes.
 - **Not named:** fewer strikes, a larger budget, or a higher brake threshold. Each ends sessions
   sooner or ends more of them, and none keeps a session the directory withdrew, though a larger
