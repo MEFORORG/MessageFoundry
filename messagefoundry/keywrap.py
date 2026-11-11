@@ -21,11 +21,12 @@ What is refused, by default and with no setting to turn it off:
 * **PBES2 with scrypt** below Appendix C's floor: ``r >= 8``, and ``N`` at least 2^17, 2^16 or 2^15
   for ``p`` of 1, 2, or 3 and up. Those are the table's three rows, encoded as written.
 * Any other derivation this module does not recognise, an encrypted key it decodes but cannot
-  parse, and a key file it cannot read or that is too large to check. Under the ``ENCRYPTED PRIVATE
-  KEY`` label, bytes that are not DER, BER or cut short, are refused whatever the wrap. Under
-  another label or as raw DER, where OpenSSL decrypts the same bytes, a BER key that names a
-  password-based scheme is judged on its wrap, and refused where its AlgorithmIdentifier is cut
-  short or not DER, inside or out (BACKLOG #5543).
+  parse, and a key file it cannot read or that is too large to check. In an ``ENCRYPTED PRIVATE
+  KEY`` block whose BEGIN is paired with its END, bytes that are not DER, whether BER or cut short,
+  are refused whatever the wrap. Under another label or as raw DER, where OpenSSL decrypts the same
+  bytes, a BER key that names a password-based scheme is judged on its wrap, and refused where its
+  AlgorithmIdentifier is cut short or not DER, inside or out (BACKLOG #5543). So is an ``ENCRYPTED
+  PRIVATE KEY`` block found only behind a stray BEGIN, as :func:`_key_block_problem` says.
 * An encrypted key where the loader has NO passphrase to give, before any library can try it.
 
 ``cryptography``'s ``BestAvailableEncryption`` and the ``openssl`` CLI's own default both write
@@ -52,8 +53,7 @@ to be opened and checked), and any private-key loader this module is not called 
 block under a label other than ``ENCRYPTED PRIVATE KEY`` whose body OpenSSL cleans before it
 decodes: this module decodes the body as strict base64, so it skips one that does not decode and
 reads another as a non-key, and OpenSSL may still decrypt either. That is at least a control or
-high byte at a line end, and a short header line before a blank line. Nor raw DER that holds a
-BEGIN and an END marker anywhere in its bytes: it is read as PEM, not as DER. The inside of
+high byte at a line end, and a short header line before a blank line. The inside of
 a PKCS#12 part that is itself encrypted IS now checked, as above, wherever the caller runs the
 second step (BACKLOG #1352). Read the list of callers as the coverage, and treat it as AT LEAST
 that list.
@@ -502,11 +502,13 @@ def _der_problem(der: bytes, *, known_encrypted: bool) -> tuple[bool, str | None
     ``known_encrypted`` is true for the body of an ``ENCRYPTED PRIVATE KEY`` PEM block, which must
     parse as an EncryptedPrivateKeyInfo. Bare DER need not: if its outer shape is not one, it is an
     unencrypted key or not a key at all, and the loader reports the second itself. Bytes the DER
-    reader cannot walk go to :func:`_ber_problem`. Where the DER reader walks the outer SEQUENCE
-    but not the AlgorithmIdentifier's contents, BER parameters or a BER scheme OID among them, the
-    key gets :data:`_UNREADABLE`, the text for any wrap that does not parse, and the remedy that
-    text gets, never the BER text or its remedy: a re-wrap writes DER, which also cures the
-    encoding."""
+    reader cannot walk go to :func:`_ber_problem`, and so do bytes whose OCTET STRING is not DER
+    (constructed, a high tag or a long length), which :func:`_encrypted_pkcs8_algorithm` raises on.
+    Where the DER reader walks the outer SEQUENCE and both its parts' headers, but not the
+    AlgorithmIdentifier's contents, BER parameters or a BER scheme OID among them, the key gets
+    :data:`_UNREADABLE`, the text for any wrap that does not parse, and the remedy that text gets,
+    not the BER text: a re-wrap writes DER, which also cures the encoding. So which text such a key
+    gets depends on its OCTET STRING too."""
     try:
         found = _encrypted_pkcs8_algorithm(der)
     except _Malformed:
@@ -673,11 +675,13 @@ def _inspect(material: bytes) -> tuple[bool, str | None]:
             "uses legacy OpenSSL PEM encryption (a Proc-Type: 4,ENCRYPTED header), whose key "
             "is derived with MD5 at one iteration (ASVS 11.4.1, 11.4.4)"
         )
+    # The whole input is read as DER first, whatever PEM markers it holds: DER with a BEGIN and an
+    # END marker in or after it is still DER to a loader that reads one object, and a lenient one
+    # ignores bytes after the key. PEM text is not the EncryptedPrivateKeyInfo shape, so it passes.
+    encrypted, problem = _der_problem(material, known_encrypted=False)
     blocks = _pem_blocks(material)
-    if not blocks:
-        # No complete PEM block, which includes DER that happens to contain a BEGIN marker.
-        return _der_problem(material, known_encrypted=False)
-    encrypted = False
+    if problem is not None or not blocks:
+        return encrypted, problem
     # The split reading first, so a weak wrap a stray BEGIN hid is refused with its own text. The
     # paired reading follows, read as it was before the split one existed: what it refuses stays
     # refused, so the split reading can only add refusals.

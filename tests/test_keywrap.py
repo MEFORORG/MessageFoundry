@@ -560,6 +560,21 @@ def test_a_weak_der_wrap_with_a_trailing_byte_is_refused(material: Material) -> 
     assert trailing is not None and "2048 iterations" in trailing
 
 
+@pytest.mark.parametrize("label", [b"X", b"PRIVATE KEY"])
+def test_a_weak_der_wrap_followed_by_pem_markers_is_still_refused(
+    material: Material, label: bytes
+) -> None:
+    # Assembled from parts, as _STRAY_BEGIN below is, so a secret scanner does not read a key here.
+    markers = b"-----" + b"BEGIN " + label + b"-----\nAAAA\n-----" + b"END " + label + b"-----\n"
+    # A BEGIN and an END marker after the DER key used to send the bytes down the PEM path alone,
+    # where the DER key is no block, so the weak wrap passed unchecked. They are bytes after the
+    # key, which a lenient DER reader ignores, as the trailing byte above is.
+    refusal = _check(_der_of(material.wraps["best-available-2048"]) + markers)
+    assert refusal is not None and "2048 iterations" in refusal
+    # The control: the approved wrap in the same shape passes.
+    assert _check(_der_of(material.wraps["approved"]) + markers) is None
+
+
 def _reshape(pem_bytes: bytes, how: str) -> bytes:
     lines = pem_bytes.strip().split(b"\n")
     head, body, tail = lines[0], lines[1:-1], lines[-1]
