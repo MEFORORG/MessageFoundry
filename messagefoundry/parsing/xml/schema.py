@@ -26,7 +26,6 @@ import io
 import ntpath
 import os
 import stat
-import urllib.error
 import urllib.request
 import urllib.response
 from dataclasses import dataclass
@@ -259,16 +258,16 @@ def _bundled_root(module_file: str) -> tuple[_Root, ...]:
 
 
 def _url_path(path: str) -> str | None:
-    """``url2pathname(path)``, or ``None`` where it refuses the path as naming a host.
+    """``url2pathname(path)``, or ``None`` where the path names a host, refused on its text.
 
-    A path that opens with two slashes, as in ``file:////server/share/x.xsd``, names a host the URL's
-    empty authority did not. Windows turns it into a UNC path, which :func:`_local` refuses; POSIX
-    raises ``URLError``, an ``OSError``, so xmlschema met it as a missing include and skipped it with
-    a warning instead of failing the build."""
-    try:
-        return urllib.request.url2pathname(path)
-    except urllib.error.URLError:
+    ``url2pathname`` reads a path that opens with two slashes, as in ``file:////server/share/x.xsd``,
+    as naming a host the URL's empty authority did not. Left to it, that host became a UNC path on
+    Windows, was dropped where it is ``localhost`` or this machine's name, so ``\\\\localhost\\x``
+    read a local file, and on POSIX raised ``URLError``, an ``OSError``, which xmlschema took for a
+    missing include and skipped with a warning instead of failing the build."""
+    if urlsplit("file:" + path).netloc:
         return None
+    return urllib.request.url2pathname(path)
 
 
 def _file_url_path(url: str) -> str | None:
@@ -478,7 +477,7 @@ def _local_path(text: str | bytes | os.PathLike[str], what: str) -> str:
             raise _SourceRefused(f"{what} that is a file URL naming a host")
         named = _url_path(parts.path)
         if named is None:
-            raise _SourceRefused(f"{what} that is a UNC or device path")
+            raise _SourceRefused(f"{what} that is a file URL naming a host")
         source = named.strip()
         if not source:  # "file:" or "file://localhost" names no path, so none is supplied
             raise _SourceRefused(f"{what} that is a file URL naming no path")

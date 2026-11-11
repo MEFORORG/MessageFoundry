@@ -444,31 +444,31 @@ def test_a_network_or_device_location_is_refused_before_anything_touches_it(
         assert not [p for p in touched if "nonexist-5537" in p]
 
 
-def test_a_file_url_path_naming_a_host_is_refused_where_url2pathname_raises(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("host", ["nonexist-5537.invalid", "localhost", "own-name"])
+def test_a_file_url_path_naming_a_host_is_refused_on_its_text(
+    host: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """POSIX ``url2pathname`` raises ``URLError``, an ``OSError``, for a path that opens with two
-    slashes, as in ``file:////server/share/x.xsd``. Raised from the opener, xmlschema took it for a
-    missing include and skipped it with a warning, so the test above went green on Windows and red
-    on POSIX. Simulated here so every platform runs it."""
-    import urllib.error
+    """A path that opens with two slashes, as in ``file:////server/share/x.xsd``, names a host.
+    POSIX ``url2pathname`` raised ``URLError``, an ``OSError``, for a remote one, and xmlschema
+    skipped the include with a warning, so the test above went green on Windows and red on POSIX.
+    For ``localhost`` or this machine's own name it dropped the host and read the local file the
+    rest named. Both are refused on the text now, on every platform."""
+    import ntpath
+    import socket
 
-    real = urllib.request.url2pathname
-
-    def posix_like(path: str, *args: Any, **kwargs: Any) -> str:
-        if path.startswith("//") and "nonexist-5537" in path:
-            raise urllib.error.URLError("file:// scheme is supported only on localhost")
-        return real(path, *args, **kwargs)
-
-    monkeypatch.setattr(urllib.request, "url2pathname", posix_like)
-    location = "file:////nonexist-5537.invalid/share/x.xsd"
+    name = socket.gethostname() if host == "own-name" else host
+    (tmp_path / "inc.xsd").write_text(_CLEAN, encoding="utf-8")
+    # Rooted with no drive: on Windows it takes the working directory's drive, so stand there.
+    monkeypatch.chdir(tmp_path)
+    location = f"file:////{name}{ntpath.splitdrive((tmp_path / 'inc.xsd').as_posix())[1]}"
     main = _write_path_schema(tmp_path, location)
-    for source in (main.read_text(encoding="utf-8"), str(main)):
+    # The path form first: for localhost it read the include before, and an inline schema did not.
+    for source in (str(main), main.read_text(encoding="utf-8")):
         with pytest.raises(XmlValidationError, match="not a local file path") as ei:
             validate_against("<patient>x</patient>", source)
         assert "_ResourceRefused" in _causes(ei.value)
     # The same URL named as the schema itself is refused on its text with a fixed reason.
-    with pytest.raises(XmlValidationError, match="a schema location that is a UNC or device path"):
+    with pytest.raises(XmlValidationError, match="a schema location that is a file URL naming"):
         validate_against("<patient>x</patient>", location)
 
 

@@ -1493,9 +1493,9 @@ def _stock_calls(tree: ast.AST) -> list[tuple[int, str]]:
     At least these pass unseen: a stock class held in a variable first, as in
     ``C = http.client.HTTPConnection`` then ``C(host)``, which a planted control pins; a subclass
     of a stock class built under its own name, which a planted control also pins, as
-    ``parsing/xml/schema.py`` builds ``_ConfinedOpener``, an opener with no http or https handler
-    that its own tests hold to that; and a stock name re-exported under another name by a second module and imported from there, which a scan
-    of one file at a time cannot see and no planted control pins."""
+    ``parsing/xml/schema.py`` builds ``_ConfinedOpener``; and a stock name re-exported under
+    another name by a second module and imported from there, which a scan of one file at a time
+    cannot see and no planted control pins."""
     bindings = _bindings(tree)
     found: list[tuple[int, str]] = []
     for node in ast.walk(tree):

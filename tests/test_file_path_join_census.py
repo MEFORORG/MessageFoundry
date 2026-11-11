@@ -688,9 +688,10 @@ SITES: dict[str, Site] = {
     "messagefoundry/parsing/xml/schema.py::_resolve_within": Site(
         1,
         GUARDED,
-        "One component of a location a schema names, the location and every link target already "
-        "inside the confinement root by the guard, joined onto the part of the walk that lstat "
-        "has checked (BACKLOG #5537).",
+        "One component of a location a schema names, joined onto the part of the walk that lstat "
+        "has checked. The caller, _ConfinedFiles.file_open, holds the location inside the "
+        "confinement root with the guard first, and this unit holds every link target to it "
+        "(BACKLOG #5537).",
         "messagefoundry/parsing/xml/schema.py::_within",
         called=True,
     ),
