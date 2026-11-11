@@ -403,7 +403,8 @@ def test_every_batched_encrypt_burst_charges_the_bound_on_every_backend() -> Non
                 src = inspect.getsource(fn)
             except OSError:  # pragma: no cover — source is always available in-tree
                 continue
-            encrypts = ".encrypt(" in src or "_reencrypt_value(" in src
+            # encrypt_many (vault BACKLOG #6706) seals a batch through the same single-value encrypt.
+            encrypts = ".encrypt(" in src or "encrypt_many(" in src or "_reencrypt_value(" in src
             if "while True" not in src or not encrypts:
                 continue
             checked.append(f"{cls.__name__}.{name}")

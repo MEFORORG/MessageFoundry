@@ -1572,6 +1572,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         {
             "cipher:.decrypt()",
             "cipher:.encrypt()",
+            # Vault BACKLOG #6706: encrypt_many hands a batch cipher several values per call.
+            "cipher:.encrypt_many()",
             "cipher:cryptography.hazmat.primitives.ciphers.aead.AESGCM",
             "csprng:os.urandom",
             "hash:hashlib.sha256",
@@ -1589,6 +1591,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         {
             "cipher:.decrypt_data()",
             "cipher:.encrypt_data()",
+            # Vault BACKLOG #6706: a batch of one goes through the cipher's own single-value encrypt
+            # and decrypt (the latter through store.crypto's decrypt_or_error).
+            "cipher:.encrypt()",
+            "cipher:via messagefoundry.store.crypto",
             "mac:.generate_hmac()",
             # ADR 0217: a row seal's HMAC checked INSIDE Transit (transit/verify), never compared
             # in process. A MAC check, not a signature.
@@ -1645,8 +1651,12 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #2593: opens a queue payload cell (AES-GCM decrypt through the store cipher) under the
     # tag its row's routing fields build.
     "messagefoundry/store/queue_tag.py": frozenset({"cipher:.decrypt()"}),
-    # BACKLOG #1719: read_cipher_cells opens each sealed value through the store cipher it is handed.
-    "messagefoundry/store/cipher_cells.py": frozenset({"cipher:.decrypt()"}),
+    # BACKLOG #1719: read_cipher_cells opens each sealed value through the store cipher it is handed,
+    # several per call to a batch cipher (decrypt_many, vault BACKLOG #6706), else one at a time
+    # through store.crypto's decrypt_or_error.
+    "messagefoundry/store/cipher_cells.py": frozenset(
+        {"cipher:.decrypt_many()", "cipher:via messagefoundry.store.crypto"}
+    ),
     # BACKLOG #2593: opens a message cell or a preset's criteria (AES-GCM decrypt through the store
     # cipher) under the tag its row's id and channel or owner build.
     "messagefoundry/store/cell_tag.py": frozenset({"cipher:.decrypt()"}),

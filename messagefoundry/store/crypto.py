@@ -776,6 +776,60 @@ class Cipher(Protocol):
         ...
 
 
+#: One value, and the AAD its cell binds, for a :class:`BatchCipher`.
+CipherItem = tuple[str, bytes | None]
+
+#: The most values one batch carries (BACKLOG #6706): one Transit ``batch_input`` request, or one
+#: batch a cipher-cell walk opens.
+BATCH_MAX_ITEMS = 128
+#: The most base64 characters, values and associated data together (:func:`batch_chars`), one
+#: batch carries (BACKLOG #6706). Far under Vault's default 32 MiB request bound, so the reply,
+#: which is no larger, stays far under ``strict_requests.MAX_VAULT_REPLY_BYTES``. A value larger
+#: than this on its own is a batch of its own, which Transit sends as a single request.
+BATCH_MAX_CHARS = 4 * 1024 * 1024
+
+
+def b64_chars(n: int) -> int:
+    """The length of the base64 text of ``n`` bytes."""
+    return 4 * ((n + 2) // 3)
+
+
+def batch_chars(stored: str, aad: bytes | None) -> int:
+    """What a sealed value counts against :data:`BATCH_MAX_CHARS`: itself and its AAD as base64."""
+    return len(stored) + (b64_chars(len(aad)) if aad is not None else 0)
+
+
+@runtime_checkable
+class BatchCipher(Protocol):
+    """A cipher that opens and seals several values per call to its key service (BACKLOG #6706).
+    Only :class:`~messagefoundry.store.crypto_transit.TransitCipher` is one. :func:`encrypt_many`
+    and the cipher-cell walk (``store/cipher_cells.py``) use the single-value methods of every
+    other cipher."""
+
+    def decrypt_many(self, items: Sequence[CipherItem]) -> list[str | CipherError]: ...
+
+    def encrypt_many(self, items: Sequence[CipherItem]) -> list[str]: ...
+
+
+def decrypt_or_error(cipher: Cipher, stored: str, aad: bytes | None) -> str | CipherError:
+    """``cipher.decrypt(stored, aad=aad)``, with its :class:`CipherError` returned, not raised."""
+    try:
+        return cipher.decrypt(stored, aad=aad)
+    except CipherError as exc:
+        return exc
+
+
+def encrypt_many(cipher: Cipher, items: Sequence[CipherItem]) -> list[str]:
+    """Each plaintext of ``items`` sealed under its own AAD, in order. Any failure raises, as
+    :meth:`Cipher.encrypt` does, so no value is returned for a batch that did not all seal."""
+    if isinstance(cipher, BatchCipher):
+        sealed = cipher.encrypt_many(items)
+        if len(sealed) != len(items):
+            raise CipherError(f"{type(cipher).__name__} sealed {len(sealed)} of {len(items)}")
+        return sealed
+    return [cipher.encrypt(plaintext, aad=aad) for plaintext, aad in items]
+
+
 def _fingerprint(key: bytes | bytearray) -> str:
     """A stable, self-identifying ``key_id``: first ``_KEY_ID_LEN`` hex of SHA-256(key). One-way
     (preimage-resistant), so embedding it in the stored prefix reveals nothing about the key. Accepts a

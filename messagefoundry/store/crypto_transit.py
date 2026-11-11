@@ -57,14 +57,20 @@ from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.store.crypto import (
     _V3_PREFIX,
     AUDIT_TRANSIT_HASH_ALGO,
+    BATCH_MAX_CHARS,
+    BATCH_MAX_ITEMS,
     MARKER_PREFIX,
     AuditKeyVersionRefusedError,
     AuditKeyVersionUnverifiedError,
     AuditMacFn,
     CipherError,
+    CipherItem,
     CipherUnavailableError,
     TransitSealRefused,
     _UnmarkedPolicy,
+    b64_chars,
+    batch_chars,
+    decrypt_or_error,
 )
 from messagefoundry.store.keyprovider import KeyProviderError
 from messagefoundry.store.keyprovider_vault import (
@@ -174,6 +180,63 @@ def _names_no_version_reason(exc: Exception) -> bool:
     )
 
 
+def _batches(costs: Sequence[int]) -> list[list[int]]:
+    """The item indexes, in order, cut into runs under
+    :data:`~messagefoundry.store.crypto.BATCH_MAX_ITEMS` and
+    :data:`~messagefoundry.store.crypto.BATCH_MAX_CHARS`; an item over the character bound is a
+    run of its own (BACKLOG #6706)."""
+    runs: list[list[int]] = []
+    run: list[int] = []
+    size = 0
+    for index, cost in enumerate(costs):
+        if run and (len(run) >= BATCH_MAX_ITEMS or size + cost > BATCH_MAX_CHARS):
+            runs.append(run)
+            run, size = [], 0
+        run.append(index)
+        size += cost
+    if run:
+        runs.append(run)
+    return runs
+
+
+def _batch_replies(response: Any, sent: int) -> list[Mapping[str, Any]] | None:
+    """Transit's ``batch_results``, when it is a list of ``sent`` objects whose ``reference`` is
+    each one's own place in the request, as sent (BACKLOG #6706); ``None`` otherwise, and the
+    caller then refuses every value of the batch. Vault echoes ``reference`` on every result, so
+    a reply that drops, adds or reorders one is caught here rather than zipped."""
+    data = response.get("data") if isinstance(response, dict) else None
+    replies = data.get("batch_results") if isinstance(data, dict) else None
+    if not isinstance(replies, list) or len(replies) != sent:
+        return None
+    if not all(
+        isinstance(reply, dict) and reply.get("reference") == str(place)
+        for place, reply in enumerate(replies)
+    ):
+        return None
+    return replies
+
+
+def _unasked(failure: CipherUnavailableError, count: int) -> list[str | CipherError]:
+    """``count`` copies of an outage, for values Transit was not asked for once it could not
+    serve one: no verdict on any of them. Each carries ``failure``'s cause, as ``raise ... from``
+    sets it, which is what a reader that tells an outage from a refusal reads."""
+    copies: list[str | CipherError] = []
+    for _ in range(count):
+        error = CipherUnavailableError(str(failure))
+        error.__cause__ = failure.__cause__
+        copies.append(error)
+    return copies
+
+
+def _plaintext(value: object) -> str | None:
+    """Transit's base64 ``plaintext`` as text, or ``None`` when it is not base64 of UTF-8. Never
+    raises, so no error carries the decrypted bytes (BACKLOG #2085)."""
+    # binascii.Error and UnicodeDecodeError are ValueErrors; TypeError is a value that is not text.
+    with contextlib.suppress(ValueError, TypeError):
+        return base64.b64decode(value).decode("utf-8")  # type: ignore[arg-type]
+    return None
+
+
 #: The fixed input of the probe that tells a refused key version from an outage (BACKLOG #2337).
 #: Base64, as Transit takes it. It carries no row data, so no row can decide the probe's answer.
 _VERSION_PROBE_INPUT = base64.b64encode(b"messagefoundry audit key version probe").decode("ascii")
@@ -242,6 +305,10 @@ class TransitCipher(_UnmarkedPolicy):
         except Exception as exc:
             # Type-only message: the plaintext going in is PHI; never surface it or the key material.
             raise _transit_failure("encrypt", self._key, exc) from exc
+        return self._stored(ciphertext)
+
+    def _stored(self, ciphertext: object) -> str:
+        """Transit's ciphertext as the store keeps it, refused when it is not non-empty text."""
         if not isinstance(ciphertext, str) or not ciphertext:
             raise CipherError(f"Transit returned an empty ciphertext (key={self._key!r})")
         return f"{_V3_PREFIX}{ciphertext}"
@@ -276,10 +343,142 @@ class TransitCipher(_UnmarkedPolicy):
             raise _transit_failure("decrypt", self._key, exc) from exc
         # Refused OUTSIDE the handler: a UnicodeDecodeError's .object is the decrypted plaintext, so
         # chaining it would put the PHI this cipher protects on the error (BACKLOG #2085).
-        # binascii.Error and UnicodeDecodeError are ValueErrors; TypeError is a non-str plaintext.
-        with contextlib.suppress(ValueError, TypeError):
-            return base64.b64decode(plaintext_b64).decode("utf-8")
-        raise CipherError(f"Transit returned malformed plaintext (key={self._key!r})")
+        plaintext = _plaintext(plaintext_b64)
+        if plaintext is None:
+            raise self._malformed_plaintext()
+        return plaintext
+
+    def _malformed_plaintext(self) -> CipherError:
+        return CipherError(f"Transit returned malformed plaintext (key={self._key!r})")
+
+    def _batch_input(self, field: str, values: Sequence[CipherItem]) -> list[dict[str, str]]:
+        """Transit's ``batch_input``: each value under ``field``, its AAD as ``associated_data``
+        when it has one, and its place in the request as ``reference`` (BACKLOG #6706)."""
+        batch_input: list[dict[str, str]] = []
+        for place, (value, aad) in enumerate(values):
+            item = {field: value, "reference": str(place)}
+            assoc = self._associated_data(aad)
+            if assoc is not None:
+                item["associated_data"] = assoc
+            batch_input.append(item)
+        return batch_input
+
+    def decrypt_many(self, items: Sequence[CipherItem]) -> list[str | CipherError]:
+        """Each ``(stored, aad)`` of ``items`` opened, in order, in as few Transit ``decrypt``
+        requests as the batch bounds allow (BACKLOG #6706). Each result is the plaintext or the
+        :class:`CipherError` :meth:`decrypt` would raise for that value alone; one value's failure
+        is never another's result.
+
+        A value that is not ``mfenc:v3`` goes to :meth:`decrypt`, which answers it without Transit.
+        Once Transit could not serve a request (:class:`CipherUnavailableError`), every value not
+        yet answered fails with that error and is not asked for. Any other failure of a batch
+        request, Vault's HTTP 400 when one value in it fails among them, sends each value of that
+        batch alone, so each gets its own verdict. A reply :func:`_batch_replies` does not match to
+        the request fails every value of the batch. A batch of one is a single request."""
+        results: dict[int, str | CipherError] = {}
+        sealed: list[int] = []
+        for index, (stored, aad) in enumerate(items):
+            if stored.startswith(_V3_PREFIX):
+                sealed.append(index)
+            else:
+                results[index] = decrypt_or_error(self, stored, aad)
+        down: CipherUnavailableError | None = None
+        for run in _batches([batch_chars(*items[i]) for i in sealed]):
+            picked = [sealed[i] for i in run]
+            if down is not None:
+                opened = _unasked(down, len(picked))
+            else:
+                opened = self._decrypt_batch([items[i] for i in picked])
+            for index, result in zip(picked, opened, strict=True):
+                results[index] = result
+                if down is None and isinstance(result, CipherUnavailableError):
+                    down = result
+        return [results[index] for index in range(len(items))]
+
+    def _decrypt_batch(self, batch: list[CipherItem]) -> list[str | CipherError]:
+        """One run of :meth:`decrypt_many`, every value ``mfenc:v3``, the results in its order."""
+        if len(batch) == 1:
+            return [decrypt_or_error(self, *batch[0])]
+        sent = [(stored[len(_V3_PREFIX) :], aad) for stored, aad in batch]
+        try:
+            response: Any = self._client.secrets.transit.decrypt_data(
+                name=self._key, batch_input=self._batch_input("ciphertext", sent)
+            )
+        except Exception as exc:
+            failure = _transit_failure("decrypt", self._key, exc)
+            if isinstance(failure, CipherUnavailableError):
+                failure.__cause__ = exc
+                return _unasked(failure, len(batch))
+            # Vault answers HTTP 400 to the whole batch when one value fails, so which one is
+            # learnt by asking for each alone, until Transit cannot serve one.
+            alone: list[str | CipherError] = []
+            for stored, aad in batch:
+                result = decrypt_or_error(self, stored, aad)
+                alone.append(result)
+                if isinstance(result, CipherUnavailableError):
+                    alone.extend(_unasked(result, len(batch) - len(alone)))
+                    break
+            return alone
+        replies = _batch_replies(response, len(batch))
+        if replies is None:
+            return [
+                CipherError(
+                    f"Transit's batch decrypt reply does not match the request (key={self._key!r})"
+                )
+                for _ in batch
+            ]
+        opened: list[str | CipherError] = []
+        for reply in replies:
+            if reply.get("error"):
+                # Vault's own text is not quoted: it is a reply this process did not write.
+                opened.append(CipherError(f"Transit refused the value (key={self._key!r})"))
+                continue
+            plaintext = _plaintext(reply.get("plaintext"))
+            opened.append(plaintext if plaintext is not None else self._malformed_plaintext())
+        return opened
+
+    def encrypt_many(self, items: Sequence[CipherItem]) -> list[str]:
+        """Each ``(plaintext, aad)`` of ``items`` sealed, in order, in as few Transit ``encrypt``
+        requests as the batch bounds allow (BACKLOG #6706). Any failure raises as :meth:`encrypt`
+        does, so no value is returned unless all sealed. A reply :func:`_batch_replies` does not
+        match to the request raises :class:`CipherError`. A batch of one is a single request."""
+        costs = [
+            b64_chars(len(plaintext.encode("utf-8"))) + batch_chars("", aad)
+            for plaintext, aad in items
+        ]
+        sealed: list[str] = []
+        for run in _batches(costs):
+            if len(run) == 1:
+                plaintext, aad = items[run[0]]
+                sealed.append(self.encrypt(plaintext, aad=aad))
+            else:
+                sealed.extend(self._encrypt_batch([items[i] for i in run]))
+        return sealed
+
+    def _encrypt_batch(self, batch: list[CipherItem]) -> list[str]:
+        """One run of :meth:`encrypt_many`, the sealed values in its order."""
+        sent = [
+            (base64.b64encode(plaintext.encode("utf-8")).decode("ascii"), aad)
+            for plaintext, aad in batch
+        ]
+        try:
+            response: Any = self._client.secrets.transit.encrypt_data(
+                name=self._key, batch_input=self._batch_input("plaintext", sent)
+            )
+        except Exception as exc:
+            # Type-only message: the plaintext going in is PHI; never surface it or the key material.
+            raise _transit_failure("encrypt", self._key, exc) from exc
+        replies = _batch_replies(response, len(batch))
+        if replies is None:
+            raise CipherError(
+                f"Transit's batch encrypt reply does not match the request (key={self._key!r})"
+            )
+        out: list[str] = []
+        for reply in replies:
+            if reply.get("error"):
+                raise CipherError(f"Transit refused a value (key={self._key!r})")
+            out.append(self._stored(reply.get("ciphertext")))
+        return out
 
     def is_encrypted(self, stored: str) -> bool:
         return stored.startswith(MARKER_PREFIX)
