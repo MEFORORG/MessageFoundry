@@ -9,7 +9,8 @@ reaches the app serving ``POST /ai/chat``, and the endpoint is not loopback
 (docs/SECURITY-LOOSENING.md states it in full). So an off-box endpoint is refused under an
 enforcing or unknown posture unless that CRL is checked or ``[ai].endpoint_revocation_attested``
 is set with its reason. Since BACKLOG #5527 the broker resolves the instance ``[tls]`` policy, so
-``[tls].internal_ca_file`` and ``[tls].crl_file`` reach its opener; the last section pins that.
+``[tls].internal_ca_file`` under ``augment`` or ``pinned`` and ``[tls].crl_file`` reach its
+opener; the last section pins that.
 All endpoints, keys, certificates and CRLs here are synthetic.
 """
 

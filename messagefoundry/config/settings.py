@@ -10743,8 +10743,9 @@ def security_loosenings(
     # is dialled. The reason is in the entry for the same reason as the Vault pairs above.
     # BACKLOG #5527: the CRL clause states the three conditions a CRL check needs, and names the
     # paths that check none, and stays static. Whether the [tls] section reached the app is a fact
-    # of the app (app.state.tls_settings, which create_managed_app sets and an embedder of a direct
-    # create_app may set), not of these arguments. Loopback could be read off ai.endpoint, but the
+    # of the app (app.state.tls_settings, which create_managed_app stashes from its tls_settings
+    # argument, None unless passed, and an embedder of a direct create_app may set), not of these
+    # arguments. Loopback could be read off ai.endpoint, but the
     # app half would still be static, so both stay named.
     if ai.endpoint_revocation_attested:
         out.append(

@@ -5031,8 +5031,9 @@ def create_app(
         # pair is refused under enforce, and a None posture counts as enforcing there. The cleartext-
         # http refusal takes no posture: it refuses in every one (vault BACKLOG #3533 item 5).
         # BACKLOG #5527: the [tls] policy too, the one the alerts test send reads, so the endpoint is
-        # verified against [tls].internal_ca_file and checked against [tls].crl_file as the other
-        # HTTP-family hops are. A direct create_app stashes none, so None goes down.
+        # verified against [tls].internal_ca_file under augment or pinned and checked against
+        # [tls].crl_file as the other HTTP-family hops are. A direct create_app stashes none, so
+        # None goes down.
         # Off the event loop: the constructor builds rest.py's shared opener on first use, a TLS
         # context that reads the system trust store, under a lock a worker thread may hold, or an
         # opener of its own that reads the [tls] CA and CRL files.
