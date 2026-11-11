@@ -1,6 +1,6 @@
 # Proposal: AFK-autonomy mode for the MEFOR fleet
 
-Status: **APPROVED by the owner on 2026-10-21**, as written, through an AskUserQuestion dialog in a Manager session on account 7. Implementation follows section 10. Prepared 2026-10-21 by a Manager session (account 7), revised after two adversarial reviews. Section 3's Class C row, the note on the owner rulings of 2026-11-09 and 2026-11-10 below, and section 12 carry text added after that approval; section 12 records where the Class C row's added text comes from.
+Status: **APPROVED by the owner on 2026-10-21**, as written, through an AskUserQuestion dialog in a Manager session on account 7. Implementation follows section 10. Prepared 2026-10-21 by a Manager session (account 7), revised after two adversarial reviews. Section 3 carries text added after that approval, in at least the changes that section 12 lists under *Section 3 since the approval*; the note on the owner rulings of 2026-11-09 and 2026-11-10 below, and section 12 itself, were also added after it.
 
 **Owner rulings of 2026-10-21 on section 9:**
 1. **Approve:** "Approve as written (Recommended)".
@@ -257,7 +257,11 @@ The section 3 qualifier on new product scope rests on these five records. Words 
 4. **Manager decision d20261110T140603080-869d02**, class B, logged with `scripts/coord/decision.ps1` on 2026-11-10 with `reviewed: no`. It added the provenance clause: the sentences on scope a session wrote and on ADR acceptances a session recorded. Its record cites the owner's standing instruction of 2026-10-22, but it is an ordinary class B decision, not a delegation. Hold 6790483122 on PR 2871 later narrowed the clause's wording.
 5. **Lander decision d20261111T065356263-15d6f1**, class B, logged with `scripts/coord/decision.ps1` on 2026-11-11 as decided under the owner's delegation of 2026-11-11, after an adversarial review that the record reports as split. The question asked which wording of a new direction matches the owner; the answer was *"/driver"*. It set the definition of a new direction and its tiebreak for unclear scope. Its review found that the owner's answers in records 1 and 3 never define the term, so the definition is the drafting seat's reading, not the owner's words.
 
-**What is live:** only the section 3 qualifier, whose wording and limits are the drafting seat's reading of record 3, with the additions of records 4 and 5, not the owner's words. The record 1 exemption from ledger ruling R5 covers it, because it is that same empower widening. T1, T2 and T3 are not live, except as far as that qualifier carries T3's pick-and-split clause.
+**Section 3 since the approval.** The approved text is the plan as commit `18fbca9c2a` (2026-10-21, *"the AFK-autonomy plan, approved by the owner 2026-10-21"*) holds it. At least these changes to section 3 came after it:
+- Commit `1b20affcf0` (2026-10-21, on branch `autonomy-plan`; it reached `main` in engine PR 2498, squashed as `a1e3a4b7dd`). The Class B row gained the clause on a hook, gate or settings edit that only tightens an existing control or follows mechanically from an edit the owner already approved, citing the owner correction of 2026-10-21. The Class C row gained *"except the tightening and follow-on edits that Class B names. An edit that adds an exemption, loosens a check, or adds a new rule stays here."*
+- Engine PR 2871: the Class C row's qualifier on new product scope, which the five records above source.
+
+**What is live:** only the section 3 qualifier, whose wording and limits are the drafting seat's reading of record 3, with the additions of records 4 and 5, not the owner's words. It rests on the owner's R5 exemption for the minimal T4 empower widening, read by the drafting seat as covering the narrowing clauses that bound it (record 1; R5 is ledger ruling R5). That coverage of the narrowing clauses is the drafting seat's reading, not the owner's words. T1, T2 and T3 are not live, except as far as that qualifier carries T3's pick-and-split clause.
 
 ## Appendix: review record
 
