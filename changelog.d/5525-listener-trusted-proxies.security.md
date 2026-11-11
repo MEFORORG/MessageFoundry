@@ -3,6 +3,10 @@
   HTTP reverse proxies in front of the listener. From a listed peer the per-peer budget keys on the
   client address in `X-Forwarded-For`, read right to left as uvicorn reads it, so one client's
   failed attempts no longer `429` every partner behind the same proxy. The default is an empty
-  list, which keys on the socket peer as before. The setting is refused under `none` and
-  `mtls_subject`, with the global budget off, and for `'*'` or any entries that together span a
-  whole address family. See [CONNECTIONS.md](../docs/CONNECTIONS.md). (`BACKLOG #5525`)
+  list, which keys on the socket peer. On every HTTP listener, `mtls_subject` included, an IPv6
+  socket peer now keys on its `/64` and an IPv4-mapped one on its IPv4 address, as a forwarded
+  client does, except in a prefix that carries an IPv4 client, such as NAT64's, where each address
+  keys on itself. At least these are refused at load: the setting under `none` and `mtls_subject`,
+  with either budget off, and for `'*'`, entries that together span a whole address family or more
+  than a `/16` of IPv4 or a `/48` of IPv6, and each form `[api].trusted_proxies` refuses. See
+  [CONNECTIONS.md](../docs/CONNECTIONS.md). (`BACKLOG #5525`)

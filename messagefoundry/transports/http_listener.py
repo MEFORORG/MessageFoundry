@@ -43,6 +43,7 @@ row; any other method is ``405``.
 from __future__ import annotations
 
 import asyncio
+import bisect
 import contextlib
 import ipaddress
 import json
@@ -733,10 +734,19 @@ _MAX_FORWARDED_HOPS = 32
 #: The prefix an IPv6 budget key keeps. A host is usually handed a whole ``/64`` and may pick any
 #: address in it, so keying on the full address would let it mint a fresh budget per address.
 _IPV6_KEY_PREFIX = 64
+#: IPv6 prefixes whose addresses carry an IPv4 client, so one ``/64`` of them holds unrelated
+#: hosts: the NAT64 well-known and local-use prefixes (RFC 6052, RFC 8215), Teredo (RFC 4380) and
+#: the deprecated IPv4-compatible form. An address in one keys on itself, as an IPv4 client does,
+#: and a listed range in one counts its addresses toward the span limit, not its ``/64`` networks.
+_IPV4_EMBEDDING_PREFIXES = tuple(
+    ipaddress.IPv6Network(prefix)
+    for prefix in ("64:ff9b::/96", "64:ff9b:1::/48", "2001::/32", "::/96")
+)
 #: The most budget keys the listed ranges of one family may hold together: addresses for IPv4, and
 #: ``/64`` networks for IPv6, the unit an IPv6 key is. ``2**16`` is one ``/16`` of IPv4 or one
 #: ``/48`` of IPv6. Every host inside a listed range is trusted as a proxy and may write any
-#: ``X-Forwarded-For`` it likes, so this bounds how many hosts may do that. It is a size, not a
+#: ``X-Forwarded-For`` it likes, so this bounds the address space trusted that way, counted in
+#: the unit a key is; an IPv6 ``/64`` may still hold many hosts. It is a size, not a
 #: whole-family test, so a near-whole range such as ``2000::/3``, or ``/1`` to ``/3`` pieces
 #: that leave one gap, is refused as the refused ``'*'`` is (BACKLOG #5525).
 _PROXY_SPAN_LIMIT = 1 << 16
@@ -798,17 +808,11 @@ def trusted_proxy_networks(value: Any) -> tuple[_ProxyNetwork, ...]:
         )
     v4 = [network for network in networks if isinstance(network, ipaddress.IPv4Network)]
     v6 = [network for network in networks if isinstance(network, ipaddress.IPv6Network)]
-    # A key is an IPv4 address or an IPv6 /64, so an IPv6 range counts its /64s, a host as one.
+    # A key is an IPv4 address or an IPv6 /64, so an IPv6 range counts its /64s, a host as one,
+    # except where it overlaps a prefix whose addresses each key on themselves.
     spans = (
         (4, "/16", sum(n.num_addresses for n in ipaddress.collapse_addresses(v4))),
-        (
-            6,
-            "/48",
-            sum(
-                max(1, n.num_addresses >> (128 - _IPV6_KEY_PREFIX))
-                for n in ipaddress.collapse_addresses(v6)
-            ),
-        ),
+        (6, "/48", sum(_v6_key_count(n) for n in ipaddress.collapse_addresses(v6))),
     )
     for version, floor, keys in spans:
         if keys > _PROXY_SPAN_LIMIT:
@@ -819,6 +823,39 @@ def trusted_proxy_networks(value: Any) -> tuple[_ProxyNetwork, ...]:
                 f"ranges that together stay within a {floor} (values withheld)."
             )
     return tuple(networks)
+
+
+def _v6_key_count(network: ipaddress.IPv6Network) -> int:
+    """How many budget keys an IPv6 range holds: its ``/64`` networks, or, where it overlaps an
+    IPv4-embedding prefix whose addresses each key on themselves, its addresses."""
+    if any(network.overlaps(prefix) for prefix in _IPV4_EMBEDDING_PREFIXES):
+        return network.num_addresses
+    return max(1, network.num_addresses >> (128 - _IPV6_KEY_PREFIX))
+
+
+class _ProxyMatcher:
+    """Whether an address falls inside a listed proxy network, by bisecting the collapsed ranges of
+    its family. The span limit allows 65,536 single-host entries, and the walk asks once per hop on
+    the event loop, so a linear scan of the list would cost a padded header millions of checks."""
+
+    __slots__ = ("_ends", "_starts")
+
+    def __init__(self, networks: tuple[_ProxyNetwork, ...]) -> None:
+        v4 = [n for n in networks if isinstance(n, ipaddress.IPv4Network)]
+        v6 = [n for n in networks if isinstance(n, ipaddress.IPv6Network)]
+        # collapse_addresses sorts and merges, so the ranges are disjoint and ascending.
+        families: dict[int, list[_ProxyNetwork]] = {
+            4: list(ipaddress.collapse_addresses(v4)),
+            6: list(ipaddress.collapse_addresses(v6)),
+        }
+        self._starts = {v: [int(n.network_address) for n in c] for v, c in families.items()}
+        self._ends = {v: [int(n.broadcast_address) for n in c] for v, c in families.items()}
+
+    def __contains__(self, address: _HopAddress) -> bool:
+        starts = self._starts[address.version]
+        value = int(address)
+        index = bisect.bisect_right(starts, value) - 1
+        return index >= 0 and value <= self._ends[address.version][index]
 
 
 def _parsed_proxy_or_none(entry: str) -> _HopAddress | _ProxyNetwork | None:
@@ -836,7 +873,7 @@ def _refused_entry_reason(entry: str) -> str:
     the form only; the parse that decided it is ``_parse_trusted_proxy``'s, not this one's."""
     if entry == "*":
         return "is '*', which trusts every peer"
-    if "%" in entry:
+    if "%" in entry and ":" in entry:
         return "is an IPv6 entry with a zone, which no peer address carries"
     try:
         ipaddress.ip_network(entry, strict=False)
@@ -849,12 +886,13 @@ def _hop_address(text: str) -> _HopAddress | None:
     """One ``X-Forwarded-For`` hop as an address; ``None`` when it is not one.
 
     Reads a bare address, ``a.b.c.d:port``, ``[v6]`` and ``[v6]:port``. Anything else, ``unknown``
-    and an empty hop included, is ``None`` and never becomes a budget key. So is an ambiguous bare
-    IPv6 hop: ``2001:db8::1:1234`` is a valid address, and also ``2001:db8::1`` with a port, so a
-    proxy writing the client's port that way would key each connection on its own address. A bare
-    IPv6 hop is ambiguous when its last group is decimal digits and dropping that group still
-    leaves an address. uvicorn reads such a hop as an address; this walk does not, and falls back
-    to the socket peer. The bracketed form says where the address ends and is always read. The
+    and an empty hop included, is ``None`` and never becomes a budget key. A bare IPv6 hop is
+    ambiguous when its last group is decimal digits and dropping that group still leaves an
+    address: ``2001:db8::1:1234`` is an address, and also ``2001:db8::1`` with a port. Where the
+    two readings give one budget key, the usual case since both share the ``/64``, the hop is read
+    as uvicorn reads it, as the whole address. Where they give two, it is ``None`` and the walk
+    falls back to the socket peer, so a client cannot pick between two keys by its choice of
+    interface identifier. The bracketed form says where the address ends and is always read. The
     address is then read by :func:`_peer_address`."""
     host = text.strip(" \t")
     bracketed = host.startswith("[")
@@ -871,8 +909,10 @@ def _hop_address(text: str) -> _HopAddress | None:
     if address is not None and not bracketed and host.count(":") > 1:
         # Checked only once the hop parsed, so the second parse runs for a bare IPv6 hop alone.
         head, _, last = host.partition("%")[0].rpartition(":")
-        if _HOP_PORT_RE.fullmatch(last) and _peer_address(head) is not None:
-            return None
+        if _HOP_PORT_RE.fullmatch(last):
+            other = _peer_address(head)
+            if other is not None and _budget_key(other) != _budget_key(address):
+                return None
     return address
 
 
@@ -898,8 +938,11 @@ def _peer_address(text: str | None) -> _HopAddress | None:
 
 def _budget_key(address: _HopAddress) -> str:
     """The failed-attempt budget key for ``address``: an IPv4 address as written, an IPv6 address
-    as its ``/64``, so rotating addresses inside one ``/64`` mints no budget (BACKLOG #5525)."""
-    if isinstance(address, ipaddress.IPv6Address):
+    as its ``/64``, so rotating addresses inside one ``/64`` mints no budget (BACKLOG #5525). An
+    address in an IPv4-embedding prefix keys on itself, since its ``/64`` holds unrelated clients."""
+    if isinstance(address, ipaddress.IPv6Address) and not any(
+        address in prefix for prefix in _IPV4_EMBEDDING_PREFIXES
+    ):
         return str(ipaddress.IPv6Network((address, _IPV6_KEY_PREFIX), strict=False))
     return str(address)
 
@@ -1094,11 +1137,13 @@ class HttpSource(SourceConnector):
         self.intake_auth_health: str = str(s.get("intake_auth_health") or "require")
         #: The reverse proxies whose ``X-Forwarded-For`` the failed-attempt budget may key on, under
         #: ``api_key`` and ``bearer`` only (BACKLOG #5525). Empty, the default, keys on the socket
-        #: peer as before. At least the allowlist, the connection caps and the audit and event peer
-        #: column stay on the socket peer; a refusal adds the forwarded address beside it.
+        #: peer, read by :func:`_peer_budget_key`. At least the allowlist, the connection caps and
+        #: the audit and event peer column stay on the socket peer; a refusal adds the forwarded
+        #: address beside it.
         self._trusted_proxies: tuple[_ProxyNetwork, ...] = trusted_proxy_networks(
             s.get("trusted_proxies")
         )
+        self._proxy_matcher = _ProxyMatcher(self._trusted_proxies)
         # Synchronous captured-downstream reply (ADR 0154 D4). reply_from's presence is the mode
         # switch; absent, every path below is byte-identical to the shipped 202 slice (AC-8).
         self.reply_from: str | None = s.get("reply_from") or None
@@ -1670,8 +1715,8 @@ class HttpSource(SourceConnector):
         return None
 
     def _is_trusted_proxy(self, address: _HopAddress) -> bool:
-        # A network of the other IP version never contains an address, so no spelling crosses over.
-        return any(address in network for network in self._trusted_proxies)
+        # Matched within the address's own family, so no spelling crosses over.
+        return address in self._proxy_matcher
 
     def _authorize_credential(self, head: HttpRequest, peer: str) -> None:
         """The budget check and the credential comparison, keyed on ``peer``."""

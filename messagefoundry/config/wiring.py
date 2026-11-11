@@ -3280,12 +3280,22 @@ def Http(
             "protection that does not exist"
         )
     if trusted_proxies and not intake_auth_rate_limit_global:
-        # Once each forwarded client keys its own per-peer budget, the global budget is the only
-        # bound on guessing across every client behind the proxy, so it may not be off.
+        # Once each forwarded client keys its own per-peer budget, only the global budget bounds
+        # guessing across the clients behind the proxy, so it may not be off.
         raise WiringError(
             "Http sets trusted_proxies but intake_auth_rate_limit_global is off. Each client "
-            "behind a listed proxy keys its own per-peer budget, so the global budget is the only "
-            "bound on guessing across them. Set intake_auth_rate_limit_global, or remove the setting"
+            "behind a listed proxy keys its own per-peer budget, so without the global budget "
+            "nothing bounds guessing across them. Set intake_auth_rate_limit_global, or remove the "
+            "setting"
+        )
+    if trusted_proxies and not intake_auth_rate_limit:
+        # The global budget exempts a key that authenticated in the window, so a listed proxy that
+        # writes such a partner's address is bounded there by the per-peer budget alone.
+        raise WiringError(
+            "Http sets trusted_proxies but intake_auth_rate_limit is off. The global budget exempts "
+            "an address that authenticated recently, so a request a listed proxy keys on such a "
+            "partner's address is bounded by the per-peer budget alone, and without it nothing "
+            "bounds guessing there. Set intake_auth_rate_limit, or remove the setting"
         )
     settings["trusted_proxies"] = (
         trusted_proxies if isinstance(trusted_proxies, EnvRef) else list(trusted_proxies or ())

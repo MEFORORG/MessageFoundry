@@ -235,6 +235,8 @@ def test_the_setting_is_refused_outside_the_header_modes(mode: str) -> None:
         ("::/80", "whole address family"),
         ("10.0.0.1/24", "host bits set"),
         ("fe80::1%eth0", "zone"),
+        # A '%' on an IPv4 entry is no zone, and is not named as one.
+        ("10.0.0.5%x", "not a valid IP address"),
         ("proxy.example", "not a valid IP address"),
     ],
 )
@@ -289,6 +291,25 @@ def test_a_padded_header_is_read_no_further_than_the_hop_bound() -> None:
     assert key([CLIENT_A, "10.0.0.2", *listed]) is None  # one more listed hop: socket peer
 
 
+def test_the_proxy_match_agrees_with_a_scan_of_the_list() -> None:
+    """The listener bisects the collapsed ranges rather than scan every entry once per hop, since
+    the span limit allows 65,536 single-host entries. It must answer as the scan does."""
+    from messagefoundry.transports.http_listener import _ProxyMatcher
+
+    entries = ["10.0.0.0/24", "10.0.2.5", "10.0.4.0/31", "2001:db8::/64", "2001:db8:0:2::9"]
+    networks = trusted_proxy_networks(entries)
+    matcher = _ProxyMatcher(networks)
+    probes = [
+        "10.0.0.0", "10.0.0.255", "10.0.1.0", "10.0.2.4", "10.0.2.5", "10.0.2.6", "10.0.4.1",
+        "10.0.4.2", "192.0.2.1", "2001:db8::1", "2001:db8:0:1::", "2001:db8:0:2::9",
+        "2001:db8:0:2::8", "::", CLIENT_A,
+    ]  # fmt: skip
+    for probe in probes:
+        address = ipaddress.ip_address(probe)
+        assert (address in matcher) == any(address in n for n in networks), probe
+    assert ipaddress.ip_address("10.0.0.1") not in _ProxyMatcher(())
+
+
 def test_entries_that_together_span_a_family_are_refused() -> None:
     """The two ``/1`` halves are ``0.0.0.0/0`` written as two entries. The upper half is built
     rather than written, since the leak gate reads a literal of it as a routable host."""
@@ -306,8 +327,8 @@ def test_none_reads_as_unset() -> None:
 
 @pytest.mark.parametrize("glob", [0, None])
 def test_the_setting_is_refused_with_the_global_budget_off(glob: int | None) -> None:
-    """Each client behind the proxy keys its own per-peer budget, so the global budget is the only
-    bound on guessing across them."""
+    """Each client behind the proxy keys its own per-peer budget, so without the global budget
+    nothing bounds guessing across them."""
     with pytest.raises(WiringError, match="intake_auth_rate_limit_global is off"):
         Http(
             port=8080,
@@ -316,14 +337,27 @@ def test_the_setting_is_refused_with_the_global_budget_off(glob: int | None) -> 
             trusted_proxies=["10.0.0.5"],
             intake_auth_rate_limit_global=glob,
         )
-    # The per-peer budget alone may be off; the global one still bounds the total.
-    Http(
-        port=8080,
-        intake_auth="api_key",
-        intake_api_key=env("k"),
-        trusted_proxies=["10.0.0.5"],
-        intake_auth_rate_limit=0,
-    )
+
+
+@pytest.mark.parametrize("per_peer", [0, None])
+def test_the_setting_is_refused_with_the_per_peer_budget_off(per_peer: int | None) -> None:
+    """The global budget exempts a key that authenticated in the window. A listed proxy may write
+    such a partner's address, and only the per-peer budget then bounds guessing on that key."""
+    with pytest.raises(WiringError, match="intake_auth_rate_limit is off"):
+        Http(
+            port=8080,
+            intake_auth="api_key",
+            intake_api_key=env("k"),
+            trusted_proxies=["10.0.0.5"],
+            intake_auth_rate_limit=per_peer,
+        )
+    # Its control: the exemption the refusal rests on. A recently authenticated key is never held
+    # to the global budget, so with the per-peer arm off it would be refused by nothing.
+    limiter = _IntakeRateLimiter(per_peer=0, glob=1)
+    limiter.note_success(CLIENT_A)
+    for _ in range(5):
+        limiter.charge_failure(CLIENT_A)
+    assert limiter.check(CLIENT_A)
 
 
 def test_a_bare_string_is_refused_rather_than_read_as_characters() -> None:
@@ -357,6 +391,11 @@ def _v6(first_hextet: int, prefix: int) -> str:
         ["2001:db8::/48", "2001:db8:1::/64"],
         # A mapped entry counts toward IPv4, the family it names.
         ["10.0.0.0/16", "::ffff:10.1.0.0/112"],
+        # A range in an IPv4-embedding prefix counts its addresses, not its /64s: 64:ff9b::/96
+        # is one /64 piece but every IPv4 client behind NAT64.
+        ["64:ff9b::/96"],
+        ["64:ff9b::/64"],
+        ["2001::/32"],
     ],
 )
 def test_a_list_spanning_more_than_the_floor_is_refused(entries: list[str]) -> None:
@@ -377,6 +416,7 @@ def test_a_list_spanning_more_than_the_floor_is_refused(entries: list[str]) -> N
         # One IPv6 host is one of the 65,536 /64 networks a /48 holds, so this is just inside.
         ["2001:db8::/49", "2001:db8:1::5"],
         ["10.0.0.0/16", "2001:db8::/48"],  # each family is bounded on its own
+        ["64:ff9b::c000:200/120"],  # 256 NAT64 addresses
     ],
 )
 def test_a_list_within_the_floor_loads(entries: list[str]) -> None:
@@ -390,12 +430,19 @@ def test_a_list_within_the_floor_loads(entries: list[str]) -> None:
         ("2001:db8::1", "2001:db8::/64"),
         ("[2001:db8::ffff:1]:443", "2001:db8::/64"),
         ("2001:db8:0:1::1", "2001:db8:0:1::/64"),
-        # An unbracketed IPv6 hop with a port is ambiguous and not read: the socket peer keys.
-        ("2001:db8::1:1234", PROXY),
-        ("2001:db8::7:80", PROXY),
+        # A bare hop that also reads as an address and a port, where both readings share a /64:
+        # one key either way, so it is read, and the client cannot fall back by choosing it.
+        ("2001:db8::1:1234", "2001:db8::/64"),
+        ("2001:db8::7:80", "2001:db8::/64"),
+        # Where the two readings key different /64s, it is not read: the socket peer keys.
+        ("2001:db8::1:2:3:4:5", PROXY),
         # Its control: a bare hop whose last group cannot be a port alone is read.
         ("2001:db8::7", "2001:db8::/64"),
         ("2001:db8::a:b", "2001:db8::/64"),
+        # A NAT64 client keys on its whole address: its /64 holds every IPv4 client. So the two
+        # readings of a bare hop there always key apart, and an ambiguous one is not read.
+        ("[64:ff9b::c000:221]:80", "64:ff9b::c000:221"),
+        ("64:ff9b::c000:221", PROXY),
     ],
 )
 async def test_an_ipv6_client_keys_on_its_64_and_an_ambiguous_hop_is_not_read(
@@ -445,6 +492,12 @@ async def test_rotating_ipv6_addresses_inside_one_64_mints_no_budget() -> None:
         ("fe80::1", "fe80::/64"),
         # The socket peer gets the /64 rule a forwarded client gets.
         ("2001:db8::5", "2001:db8::/64"),
+        # Except in a prefix that carries an IPv4 client, where each address is its own key:
+        # NAT64 (well-known and local-use), Teredo and the IPv4-compatible form.
+        ("64:ff9b::c000:221", "64:ff9b::c000:221"),
+        ("64:ff9b:1::c000:221", "64:ff9b:1::c000:221"),
+        ("2001:0:c000:201::1", "2001:0:c000:201::1"),
+        ("::1", "::1"),
         (None, "unknown"),
     ],
 )

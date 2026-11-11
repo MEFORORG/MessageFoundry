@@ -1770,5 +1770,6 @@ address a listed proxy writes in `X-Forwarded-For`. The warning then also carrie
 
 The recorded value is an address the listener parsed and wrote back out, never the header's own
 text, and still no credential crosses the boundary. The budget is keyed on that address, or on
-its `/64` for IPv6, and the socket peer's key follows the same rule. The HTTP listener's
+its `/64` for IPv6 outside the IPv4-carrying prefixes CONNECTIONS.md names, and the socket peer's
+key follows the same rule. The HTTP listener's
 `trusted_proxies` row in [CONNECTIONS.md](../CONNECTIONS.md) says how the header is read.
