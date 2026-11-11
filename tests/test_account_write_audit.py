@@ -25,7 +25,6 @@ from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline.alerts import AlertSink, directory_sign_in_audit_alert
-from messagefoundry.store.base import is_store_shape_error
 from messagefoundry.store.row_seal import RowSealError
 from messagefoundry.store.store import (
     AppendedAuditRow,
@@ -344,36 +343,6 @@ async def test_a_defect_in_the_sign_in_role_row_still_lands_the_roles_and_ends_t
         {"from": [], "to": ["operator"]},
     ], "the row was not tried on its own"
     assert audit_pages == []
-
-
-def _shape_error() -> sqlite3.OperationalError:
-    """A real store-shape error: what SQLite raises for a statement on a table that is not there."""
-    conn = sqlite3.connect(":memory:")
-    try:
-        with pytest.raises(sqlite3.OperationalError) as info:
-            conn.execute("INSERT INTO audit_log VALUES (1)")
-    finally:
-        conn.close()
-    assert is_store_shape_error(info.value), str(info.value)  # control: the classifier names it
-    return info.value
-
-
-async def test_a_shape_error_in_the_sign_in_role_row_raises_as_a_defect_and_pages_nothing(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A store that is not the shape the sign-in's role row needs, in the write's transaction and
-    on its own: re-running fails the same way, so it is held and raised like a defect, as
-    ``_is_revoke_defect`` treats it, and is not paged as a refused row. The directory stays
-    authoritative, so the roles still land with no row, as they do for any defect; this test does
-    not pin that half."""
-    service, first, _grants, audit_pages = await _signed_in(store)
-    await service.set_ad_group_map([("cn=mf-ops,dc=x", "viewer")], actor="admin")
-    raised = _append_fails(monkeypatch, store, _shape_error(), _shape_error())
-    with pytest.raises(sqlite3.OperationalError, match="no such table"):
-        await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)
-    assert raised == ["OperationalError", "OperationalError"], "the row was not tried on its own"
-    assert await service.identity_for_token(first) is None, "a shape error kept a stale session"
-    assert audit_pages == [], "a store-shape error paged as a refused row"
 
 
 @pytest.mark.parametrize(

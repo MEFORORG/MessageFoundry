@@ -261,17 +261,10 @@ _RevocationApplied = Literal["skipped", "quiet", "reported"]
 def _is_held_write_error(exc: BaseException) -> bool:
     """Whether an error from a write with its audit row, or from that row on its own, is held, and
     raised once the write's own steps have run, rather than sorted as a store refusal (BACKLOG
-    #2221, #3018 step 4): a defect (:data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`), a
-    store that is not the shape the statement needs
-    (:func:`~messagefoundry.store.base.is_store_shape_error`), which re-running fails the same way,
-    as :func:`_is_revoke_defect` treats it, or any error
-    :func:`~messagefoundry.store.base.audit_write_errors` does not name, such as a ``TypeError`` or
-    a ``RowSealError``. This is the one statement of the rule."""
-    return (
-        isinstance(exc, AUDIT_WRITE_DEFECTS)
-        or is_store_shape_error(exc)
-        or not isinstance(exc, audit_write_errors())
-    )
+    #2221, #3018 step 4): a defect (:data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`), or
+    any error :func:`~messagefoundry.store.base.audit_write_errors` does not name, such as a
+    ``TypeError`` or a ``RowSealError``. This is the one statement of the rule."""
+    return isinstance(exc, AUDIT_WRITE_DEFECTS) or not isinstance(exc, audit_write_errors())
 
 
 def _hold(held: Exception | None, more: Exception | None) -> Exception | None:

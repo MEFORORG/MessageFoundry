@@ -5,10 +5,7 @@
   written on its own. On a sign-in, a row the store refuses on its own too is lost and pages
   `audit_write_failed`, keyed `directory-sign-in:<action>`. A reconciler pass that ends without
   raising pages it once for each action whose row the store refused during the pass, keyed
-  `directory-reconciler:<action>`; a pass used to only log a refused row. A store that is not the
-  shape the row needs, such as one missing a table, is not taken as a refusal: the write is still
-  applied again without the row, and the error is then raised as a defect's is rather than paged
-  as a refused row. On a directory sign-in,
+  `directory-reconciler:<action>`; a pass used to only log a refused row. On a directory sign-in,
   any error from writing the roles and their row still leaves the engine trying to end the
   account's other sessions and sending the roles-changed notice before the error is raised, and
   when the account's directory groups newly map it to Administrator, `administrator_granted`
