@@ -46,6 +46,7 @@ from messagefoundry.auth.ldap import (
 )
 from messagefoundry.auth.service import AuthService
 from messagefoundry.store.store import MessageStore
+from tests._vault_hop_sockets import _closed_port
 from tests.test_ldap_bind_result_codes import _alice
 from tests.test_ldap_error_mapping import _faulting
 from tests.test_ldap_referrals import _BIND_RESPONSE
@@ -430,15 +431,6 @@ def test_a_service_bind_whose_open_fails_after_the_connect_closes_its_socket(
     assert conn.socket is None
 
 
-def _dead_port() -> int:
-    """A loopback port nothing listens on, so a connect to it is refused."""
-    import socket
-
-    with socket.create_server(("127.0.0.1", 0)) as listener:
-        port: int = listener.getsockname()[1]
-    return port
-
-
 @pytest.mark.parametrize("how", ["wrap-refused", "connect-refused"])
 def test_a_user_or_decoy_bind_whose_open_fails_closes_its_socket(how: str) -> None:
     """The same rule for the second connect, through a real ldap3 stack, on both branches of the
@@ -449,7 +441,7 @@ def test_a_user_or_decoy_bind_whose_open_fails_closes_its_socket(how: str) -> No
     second: dict[str, Any] = {}
     texts: dict[str, str] = {}
     real = ldap3.Connection
-    dead = _dead_port()
+    dead = _closed_port()
 
     def refused_wrap(*_args: Any, **_kwargs: Any) -> None:
         raise ssl.SSLError("synthetic-leak-3017")
@@ -479,11 +471,14 @@ def test_a_user_or_decoy_bind_whose_open_fails_closes_its_socket(how: str) -> No
     for branch, search in (("absent", lambda _raw: [_done(0)]), ("present", _alice)):
         with (
             pytest.MonkeyPatch.context() as mp,
-            _scripted_dc(search) as (_dc, authenticator),
+            _scripted_dc(search) as (dc, authenticator),
         ):
             mp.setattr(ldap3, "Connection", RefusedSecondOpen)
             with pytest.raises(LdapError) as err:
                 authenticator.authenticate("alice", _PASSWORD)
+            # The service account bound and the user search ran, so the refused open was the
+            # second connect, whose release is under test, not the service account's.
+            assert len(dc.searches) == 1, f"the {branch} branch never searched"
         texts[branch] = str(err.value)
     # ldap3 sets conn.socket before the connect, so a failed open still holds one.
     assert sorted(second) == ["absent", "present"], "a branch never reached the second connect"
@@ -510,6 +505,26 @@ def test_a_block_that_raised_on_an_open_connection_is_unbound_and_not_closed_aga
     with pytest.raises(LdapReferralError), ldap_module._released(conn, "user bind"):
         raise LdapReferralError("synthetic")
     assert calls == ["unbind"]
+
+
+def test_an_unbind_defect_still_propagates_and_its_socket_is_closed() -> None:
+    """An unbind error that is not ldap3's is an engine defect and escapes as itself, and the
+    socket the unbind left is closed all the same, which hides nothing (BACKLOG #3017)."""
+    calls: list[str] = []
+    defect = TypeError("synthetic engine defect")
+
+    def unbind() -> None:
+        raise defect
+
+    conn = SimpleNamespace(
+        unbind=unbind,
+        socket=SimpleNamespace(close=lambda: calls.append("socket")),
+        strategy=SimpleNamespace(close=lambda: calls.append("strategy")),
+    )
+    with pytest.raises(TypeError) as raised, ldap_module._released(conn, "user bind") as release:
+        release.answer_stands = True
+    assert raised.value is defect
+    assert calls == ["strategy", "socket"]
 
 
 @pytest.mark.parametrize(

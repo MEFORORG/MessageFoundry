@@ -1148,10 +1148,11 @@ def _close_without_sending(conn: Any, why: str) -> None:
     the service account's here. ``_released`` closes a user or decoy bind's here, after an
     ``unbind`` that does nothing on a closed connection (``_end_release``).
 
-    * Before ``ssl`` takes the socket over, it is the last connected socket on ``conn.socket``, and
-      it is closed here directly, whatever ``close`` did. Read from the ldap3 and ``ssl`` source,
-      that covers at least a TLS context ``NarrowedTls`` could not build, and a receive timeout
-      ``settimeout`` or ``setsockopt`` could not set.
+    * Before ``ssl`` takes the socket over, it is the last socket ldap3 put on ``conn.socket``,
+      connected or not, and it is closed here directly, whatever ``close`` did. Read from the
+      ldap3 and ``ssl`` source, that covers at least a connect the directory refused, a TLS context
+      ``NarrowedTls`` could not build, and a receive timeout ``settimeout`` or ``setsockopt``
+      could not set.
     * Once ``ssl`` has taken it over, ``conn.socket`` holds only the detached socket. A failed
       handshake is closed by ``ssl`` itself. A host name refusal after a completed handshake is
       closed by ``NarrowedTls.wrap_socket`` before it re-raises, for every LDAPS bind.
@@ -1656,9 +1657,10 @@ def _unbind_failed(conn: Any, what: str, failed: BaseException) -> None:
     _close_without_sending(conn, f"after a failed {what} unbind")
 
 
-def _end_release(conn: Any, what: str) -> BaseException | None:
-    """Unbind ``conn``, then close without sending any socket the unbind left on it, and return
-    the ldap3 error the unbind raised, already logged (:func:`_unbind_failed`), or ``None``.
+def _end_release(conn: Any, what: str) -> None:
+    """Unbind ``conn``, then close without sending any socket still on it, however the unbind
+    ended. An ldap3 error from the unbind is logged, the socket closed (:func:`_unbind_failed`),
+    and the error re-raised; any other error propagates once the socket is closed.
 
     BACKLOG #3017. ldap3 2.9.1's ``unbind`` does nothing on a closed connection, and a failed open
     leaves one closed with its socket still held, so without the second step that socket stayed
@@ -1670,11 +1672,10 @@ def _end_release(conn: Any, what: str) -> BaseException | None:
         conn.unbind()
     except ldap3.core.exceptions.LDAPException as failed:
         _unbind_failed(conn, what, failed)
-        error: BaseException = failed  # ldap3 ships no types, so name what this returns
-        return error
-    if getattr(conn, "socket", None) is not None:
-        _close_without_sending(conn, f"left open after the {what} unbind")
-    return None
+        raise
+    finally:
+        if getattr(conn, "socket", None) is not None:
+            _close_without_sending(conn, f"of a socket the {what} unbind left open")
 
 
 @contextlib.contextmanager
@@ -1684,7 +1685,7 @@ def _released(conn: Any, what: str) -> Iterator[_Release]:
     from the unbind is logged at DEBUG, by type only and naming ``what`` connection it was, and
     the socket is closed without sending (:func:`_unbind_failed`). **Everything below holds for
     an ldap3 error only.** Any other error from the unbind propagates, replacing the block's
-    outcome and skipping the close, so an engine defect there does not hide as a log line.
+    outcome, so an engine defect there does not hide as a log line; the socket is still closed.
 
     **An ldap3 unbind error never replaces an exception the block raised (BACKLOG #3010).** The
     block's own exception is the answer both bind branches give, so an unbind failing after an
@@ -1703,15 +1704,20 @@ def _released(conn: Any, what: str) -> Iterator[_Release]:
     raised after it, and the caller fails closed as before. Fail-closed is the default, so a new
     caller that decides a pass inherits it without a check of its own; only a refusal opts out.
     """
+    import ldap3
+
     release = _Release()
     try:
         yield release
     except BaseException:
-        _end_release(conn, what)
+        with contextlib.suppress(ldap3.core.exceptions.LDAPException):
+            _end_release(conn, what)
         raise
-    failed = _end_release(conn, what)
-    if failed is not None and not release.answer_stands:
-        raise failed
+    try:
+        _end_release(conn, what)
+    except ldap3.core.exceptions.LDAPException:
+        if not release.answer_stands:
+            raise
 
 
 class LdapAuthenticator:
@@ -2251,10 +2257,8 @@ class LdapAuthenticator:
                 # the load that matters (ASVS 13.1.3 — resource release).
                 with _released(user_conn, "user bind") as release:
                     # BACKLOG #2566: the bind opens the socket, so only the bind is wrapped. The
-                    # build above does no I/O. The release unbinds an open connection, whose
-                    # socket errors ldap3 raises as its own, and closes a failed open's socket
-                    # with _close_without_sending, which logs a close error rather than raising
-                    # it, so the decoy's outer wrap is not needed here (BACKLOG #3017).
+                    # build above does no I/O. A failed open's socket is closed by the release
+                    # (BACKLOG #3017).
                     with _socket_faults_as_ldap_error(), _ldap3_call("user bind"):
                         bound = user_conn.bind()
                     if not bound:
