@@ -77,12 +77,13 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.tls_policy import HopPosture, StoreTlsRefused, current_hop_posture
 from messagefoundry.connection_events import check_connection_event_kind
+from messagefoundry.odbc_call_gate import UngatedConnectionError
 from messagefoundry.odbc_call_gate import abandon_one_shot as _abandon_one_shot
 from messagefoundry.odbc_call_gate import call_gate as _call_gate
 from messagefoundry.odbc_call_gate import close_one_shot as _close_one_shot
-from messagefoundry.odbc_call_gate import install_call_gate as _install_call_gate
 from messagefoundry.odbc_call_gate import raw_closer as _raw_closer
 from messagefoundry.odbc_call_gate import raw_cursor as _raw_cursor
+from messagefoundry.odbc_call_gate import require_call_gate as _require_call_gate
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
@@ -514,11 +515,24 @@ def _drain_detached_close(fut: asyncio.Future[None]) -> None:
         )
 
 
+def _gate_or_discard(conn: Any) -> None:
+    """Gate a borrowed pooled connection before its first call, or detach it and raise
+    :class:`~messagefoundry.odbc_call_gate.UngatedConnectionError` (BACKLOG #2394). No call is
+    running on it yet, so the detach's close frees nothing under one, and the pool never lends it
+    again. Await-free, like the detach."""
+    try:
+        _require_call_gate(conn)
+    except UngatedConnectionError:
+        _detach_connection(conn)
+        raise
+
+
 def _detach_connection(conn: Any) -> asyncio.Future[None] | None:
     """Take ``conn`` out of the pool for good, and start closing its raw handle off the event loop.
 
     The one detach sequence every discard uses (BACKLOG #1940, engine PR 1722 defect 5), at least:
-    the quarantine of a cancelled call (:meth:`SqlServerStore._release_dirty`, ADR 0159), the
+    the refusal of a borrowed connection the call gate cannot wrap (:func:`_gate_or_discard`), the
+    quarantine of a cancelled call (:meth:`SqlServerStore._release_dirty`, ADR 0159), the
     discard after a rollback that failed or ran past its bound
     (:meth:`SqlServerStore._rollback_or_discard`), whether of an audit append, a lease claim or
     another write, and the discards after a failed schema batch and a failed LOCK_TIMEOUT reset.
@@ -3199,7 +3213,9 @@ async def _assert_autocommit(conn: Any) -> None:
     setter goes through the ODBC driver, so it runs off the event loop, through the connection's
     own ``_execute`` like every other call on it. That is the path the call gate wraps, so a
     cancellation during the set cannot let the connection's close free the handle under it
-    (BACKLOG #2394). A connection with no gate, such as a stand-in, gets a plain thread."""
+    (BACKLOG #2394). A connection with no gate, such as a stand-in, gets a plain thread; the
+    store's own real connections never have none, since it refuses those
+    (:func:`~messagefoundry.odbc_call_gate.require_call_gate`)."""
     raw = getattr(conn, "_conn", None)
     if raw is None:
         return
@@ -3810,7 +3826,9 @@ class SqlServerStore:
         try:
             # BACKLOG #2049: a discard after a cancelled claim closes this cursor and connection;
             # the gate makes both wait for a claim statement still running on an executor thread.
-            _install_call_gate(conn)
+            # BACKLOG #2394: one the gate cannot wrap is refused here, before its first call, and
+            # the except arm below closes it, so no discard ever closes one beside a running call.
+            _require_call_gate(conn)
             raw = getattr(conn, "_conn", None)
             if raw is not None:
                 raw.timeout = self._settings.command_timeout  # seconds; 0 = no limit (STORE-3)
@@ -4631,7 +4649,7 @@ class SqlServerStore:
                     pcur: Any = None
                     abandoned = False
                     try:
-                        _install_call_gate(probe)  # BACKLOG #2394, as on `conn` below
+                        _require_call_gate(probe)  # BACKLOG #2394, as on `conn` below
                         pcur = await probe.cursor()
                         await pcur.execute(
                             "SELECT is_read_committed_snapshot_on FROM sys.databases"
@@ -4645,6 +4663,8 @@ class SqlServerStore:
                     finally:
                         if not abandoned:
                             await _close_one_shot(probe, pcur)
+                except UngatedConnectionError:
+                    raise  # a refusal, not an unreadable state: the open must say why it failed
                 except Exception:  # noqa: BLE001 - an unreadable state is an unverified one
                     log.debug("RCSI re-read on %r failed", db, exc_info=True)
                     continue
@@ -4667,8 +4687,9 @@ class SqlServerStore:
         try:
             # BACKLOG #2394: a cancellation exits through `_abandon_one_shot`, so no handle is freed
             # under a statement still running on its executor thread. The probe connections of
-            # `_rcsi_on_after_a_peer` exit the same way.
-            _install_call_gate(conn)
+            # `_rcsi_on_after_a_peer` exit the same way. One the gate cannot wrap is refused before
+            # its first call, and the `finally` closes it while nothing runs on it.
+            _require_call_gate(conn)
             await _assert_autocommit(conn)
             # Standalone one-shot connection (NOT pooled), so the EF-6 pool-bleed race `_cursor`
             # guards against cannot arise; `_close_one_shot` still closes the cursor first.
@@ -5746,7 +5767,7 @@ class SqlServerStore:
         conn = await acquire_pooled(self._pool, timeout=timeout, backend="sqlserver", retune=retune)
         self._acquire_wait.record((perf_counter() - t0) * 1000.0)
         try:
-            _install_call_gate(conn)  # BACKLOG #2049: one pyodbc call at a time on this connection
+            _gate_or_discard(conn)  # BACKLOG #2049: one pyodbc call at a time on this connection
             raw = getattr(conn, "_conn", None)
             if raw is not None:
                 raw.timeout = self._settings.command_timeout  # seconds; 0 = no limit
@@ -5795,6 +5816,8 @@ class SqlServerStore:
         demotion for as long as the statement runs, which ADR 0159 rejected.
 
         The detach itself is :func:`_detach_connection`, shared with :meth:`_rollback_or_discard`.
+        A real connection here is always gated, because :func:`_gate_or_discard` refused any
+        other before its first call (BACKLOG #2394).
         """
         closer = _detach_connection(conn)  # first: no await may come before the detach
         if closer is None:  # already detached, handed to a running call, or the executor refused
