@@ -9161,12 +9161,9 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       100, inside which a larger value is still looser. ``run - 1`` intervals after the first such
       pass is the least delay, not an estimate (each pass's own run adds to it), and the
       interval's entry says so too. The same value bounds one account the directory keeps failing
-      for, at that many of its last ``ad_reconcile_unreached_window`` probes (BACKLOG #3100, #3709),
-      which widens that window and raises the count it needs. That raises the least delay to that
-      page (that many failing probes in a row), but it does not delay the page in every pattern:
-      an account down for three probes and up for four, in a cycle, pages at 3 and never at 4,
-      and an account that fails twice, answers three times, then keeps failing pages one probe
-      sooner at 4 than at 3.
+      for, at that many of up to its last ``ad_reconcile_unreached_window`` probes (BACKLOG #3100,
+      #3709). A value other than 3 changes which failure patterns raise that page, and when. It
+      does not simply delay it: a pattern that pages at one value may never page at another.
       ``ad_session_revoke_max`` and ``ad_session_revoke_max_fraction`` feed ``breaker_tripped``,
       which aborts a pass that would revoke more than both, and an aborted pass revokes nothing.
       Below the default a smaller wave of genuine revocations aborts, so that is named, as the 0
@@ -9730,7 +9727,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"interval also delays the page about a directory outage, which comes after "
                     f"{floor}, and the page about one account the directory keeps failing for, "
                     f"which comes once {run} of up to that account's last {window} probes "
-                    f"fail, at least {(run - 1) * interval} s after its first such probe",
+                    f"fail, at least {(run - 1) * interval} s after its first such probe. The "
+                    "longer interval spaces that account's probes further apart, so the page "
+                    "comes later in time, and a failure bounded in time can end before it pages "
+                    "at all",
                 )
             )
         if run > _auth_default("ad_reconcile_outage_passes"):
@@ -9743,11 +9743,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     "configured interval. Until it does, a directory account disabled or deleted "
                     "meanwhile keeps its live engine sessions with only a WARNING and an audit row "
                     "per pass to show for it. The same count bounds one account the directory "
-                    f"keeps failing for, at {run} of up to its last {window} probes. A larger "
-                    "value widens that window and raises the count it needs, so it raises the "
-                    "least delay to that page but does not delay it in every pattern: some "
-                    "failure patterns that page at the default never page at this value, and "
-                    "some page sooner",
+                    f"keeps failing for, at {run} of up to its last {window} probes. A value "
+                    "other than the default changes which failure patterns raise that page, and "
+                    "when. It does not simply delay it: a pattern that pages at one value may "
+                    "never page at another",
                 )
             )
         strikes = auth.ad_session_recheck_strikes
@@ -9772,7 +9771,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     "denominator, so a smaller wave of revocations aborts the pass. In an estate "
                     "larger than the sample each account is probed less often, so the page about "
                     "one account the directory keeps failing for, which counts that account's "
-                    "probes, comes more passes later too",
+                    "probes, comes later in time too, and a failure bounded in time can end "
+                    "before it pages at all",
                 )
             )
         brake = (

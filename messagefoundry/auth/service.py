@@ -9063,7 +9063,7 @@ class AuthService:
 
         The latch is set only at the end of the pass, for the accounts whose row was written
         (:meth:`_latch_unreached_accounts`), so a pass that raises, or whose row is refused,
-        leaves the next pass to page."""
+        leaves the account unlatched, and a later failing probe of it can page it."""
         windows, paged = self._reconcile_unreached_windows, self._reconcile_unreached_paged
         threshold = self._settings.ad_reconcile_outage_passes
         span = self._settings.ad_reconcile_unreached_window
@@ -9109,7 +9109,7 @@ class AuthService:
         One ``auth.ad_reconcile_unreached`` row per entry, naming the account as ``actor``, so the
         page the lifespan task raises for it matches a row (ASVS 8.3.2). Through the reconciler's
         soft write, after the revocations, as a paging refusal's row is. A refused row leaves the
-        account unpaged and unlatched, so the next pass writes it again.
+        account unpaged and unlatched, so a later failing probe of it can write the row and page.
 
         Then it decides the rollup (``unreached_rollup``, BACKLOG #3709), once and on the rows
         written: whether the accounts already paged and those just written are more than
