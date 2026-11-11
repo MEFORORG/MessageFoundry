@@ -7126,13 +7126,18 @@ class PostgresStore:
                 # max_attempts None = retry forever; a finite cap dead-letters once exhausted.
                 if retry.max_attempts is not None and attempts >= retry.max_attempts:
                     # ADR 0157 Amendment C (vault BACKLOG #4607 step 6): a row already DONE, DEAD
-                    # or CANCELLED is left as it is. Read under the row lock, on this branch alone,
-                    # so no writer resolves it before the UPDATE and a miss there is still the epoch
-                    # fence alone.
-                    held = await conn.fetchval(
-                        "SELECT status FROM queue WHERE id=$1 FOR UPDATE", outbox_id
+                    # or CANCELLED is left as it is, and so is one a replay reset since the read
+                    # above. Both halves of the decision are read again under the row lock, on this
+                    # branch alone, so no writer moves the row before the UPDATE and a miss there is
+                    # still the epoch fence alone.
+                    held = await conn.fetchrow(
+                        "SELECT status, attempts FROM queue WHERE id=$1 FOR UPDATE", outbox_id
                     )
-                    if held is None or held in _RESOLVED_STATUSES:
+                    if (
+                        held is None
+                        or held["status"] in _RESOLVED_STATUSES
+                        or held["attempts"] < retry.max_attempts
+                    ):
                         return FailOutcome()
                     status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
                 else:

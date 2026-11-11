@@ -240,7 +240,7 @@ _SELECT_ROW: dict[str, tuple[Any, ...]] = {
     ),
     "SELECT message_id, destination_name, attempts FROM queue WHERE id=?": ("m1", "OB1", 3),
     # mark_failed's DEAD branch reads the status under the update lock (vault BACKLOG #4607 step 6).
-    "SELECT status FROM queue WITH (UPDLOCK, ROWLOCK) WHERE id=?": ("inflight",),
+    "SELECT status, attempts FROM queue WITH (UPDLOCK, ROWLOCK) WHERE id=?": ("inflight", 3),
     "SELECT message_id, destination_name FROM queue WHERE id=?": ("m1", "OB1"),
     # ingress_handoff's guard read: a payload that is not a three-part ref takes the corrupt-ref
     # DEAD branch, which is one of the two fenced writes there.

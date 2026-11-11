@@ -1445,9 +1445,9 @@ retry term does. C1 is unchanged: both writes keep the fail-open resolve fence.
 
 **Neither UPDATE carries a status term, so a miss stays the fence's alone.** On Postgres and SQL
 Server a fenced write is told apart by its empty result (C3), so the status must not be a second
-reason for one. `mark_failed`'s DEAD branch, and only that branch, reads the status again under a
-row lock (`FOR UPDATE`, `UPDLOCK`) and returns the empty outcome for a resolved row before its
-UPDATE. `record_worker_death`'s increment matches only an INFLIGHT row and holds its lock until the
+reason for one. `mark_failed`'s DEAD branch, and only that branch, reads the status and attempts
+again under a row lock (`FOR UPDATE`, `UPDLOCK`) and returns the empty outcome before its UPDATE for
+a resolved row, or for one whose attempts a replay reset below the cap since the first read. `record_worker_death`'s increment matches only an INFLIGHT row and holds its lock until the
 commit, so its dead-letter cannot find the row resolved. SQLite does both under its single writer.
 `mark_batch_failed`'s DEAD branch is unchanged.
 

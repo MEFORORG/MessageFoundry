@@ -11620,15 +11620,20 @@ class SqlServerStore:
                 # once exhausted (mirrors the SQLite backend's mark_failed).
                 if retry.max_attempts is not None and attempts >= retry.max_attempts:
                     # ADR 0157 Amendment C (vault BACKLOG #4607 step 6): a row already DONE, DEAD
-                    # or CANCELLED is left as it is. Read under the update lock (a plain read takes
-                    # none under RCSI), on this branch alone, so no writer resolves it before the
-                    # UPDATE and an empty OUTPUT rowset there is still the epoch fence alone.
+                    # or CANCELLED is left as it is, and so is one a replay reset since the read
+                    # above. Both halves of the decision are read again under the update lock (a
+                    # plain read takes none under RCSI), on this branch alone, so no writer moves the
+                    # row before the UPDATE and an empty OUTPUT rowset there is still the fence alone.
                     await cur.execute(
-                        "SELECT status FROM queue WITH (UPDLOCK, ROWLOCK) WHERE id=?",
+                        "SELECT status, attempts FROM queue WITH (UPDLOCK, ROWLOCK) WHERE id=?",
                         (outbox_id,),
                     )
                     held = await cur.fetchone()
-                    if held is None or held[0] in _RESOLVED_STATUSES:
+                    if (
+                        held is None
+                        or held[0] in _RESOLVED_STATUSES
+                        or held[1] < retry.max_attempts
+                    ):
                         await self._commit(conn)
                         return FailOutcome()
                     status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
