@@ -9027,10 +9027,10 @@ class AuthService:
         outage, which pages once it lasts (:meth:`_note_directory_outage`). An account the
         directory fails for while it answers the rest would, without this, have no bound short of
         the absolute session cap and page nobody. A failing probe pages for it once its window
-        holds K or more failures, the account is not latched and no outage page covers it, naming
-        the account, as a paging refusal pages (:meth:`_note_paging_refusals`). The same setting,
-        so one knob says how long a failure lasts before it pages; at the default of 3, three of
-        up to the last five.
+        holds K or more failures, the account is not latched and the outage cover below does not
+        hold, naming the account, as a paging refusal pages (:meth:`_note_paging_refusals`). The
+        same setting, so one knob says how long a failure lasts before it pages; at the default of
+        3, three of up to the last five.
 
         **A window, not a run, so an alternating account pages (#3709 closing step 6).** The
         directory layer has no server pool, but its one host name can stand for several domain
@@ -9038,8 +9038,8 @@ class AuthService:
         another does not, the account's probes alternate, and a run that one answer ends never
         reached K. Fewer than K failures in the window page nothing, so a window of ``2K - 1``
         needs failures to outnumber answers in it before it pages; at the default of 3, two
-        failures in three probes do not. A lone flake pages only when the window already holds
-        K - 1 earlier failures, an outage's or any other.
+        failures in three probes do not. A lone flake pages only when the window already holds at
+        least K - 1 earlier failures, an outage's or any other.
 
         **Every pass that probes the account counts, an outage pass too.** A probe sample can
         hold only unreachable accounts, at a budget of one always, and such a pass reads as an
@@ -9127,8 +9127,8 @@ class AuthService:
 
         def warn(username: str, probes: int) -> None:
             _log.warning(
-                "directory reconcile: %d of up to the last %d probes of %s failed to reach the "
-                "directory, so its sessions are not revoked while this lasts",
+                "directory reconcile: %d of up to the last %d probes of %s, faults aside, failed "
+                "to reach the directory, so its sessions are not revoked while this lasts",
                 probes,
                 plan.unreached_window,
                 scrub_log_argument(username),

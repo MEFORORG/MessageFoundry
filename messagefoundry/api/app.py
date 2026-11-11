@@ -11677,8 +11677,8 @@ _UNREACHED_ALERT_SOURCE = "directory-reconciler-unreached"
 #: What it tells the operator. Short, and the consequence first, for the store's 200 characters.
 _UNREACHED_ALERT_TEXT: Final[str] = (
     "This account's sessions are not revoked: {probes} of up to its last {window} directory "
-    "probes failed to reach the directory. Check its entry, and any outage, referral or "
-    "configuration alert."
+    "probes, faults aside, failed to reach the directory. Check its entry, and any outage, "
+    "referral or configuration alert."
 )
 #: What one page for many such accounts says, on a pass that rolls them up
 #: (``AuthService._record_unreached_accounts`` decides when), so a flapping directory opens one
@@ -11687,11 +11687,11 @@ _UNREACHED_ALERT_TEXT: Final[str] = (
 #: as a total would be replaced by a smaller one while more accounts stood (BACKLOG #3709). No
 #: process can say how many stand: each counts its own, and the instance is shared. ``probes``
 #: is the fewest failures among those entering, of up to each one's last ``window`` probes (its
-#: window can hold fewer), counted in probes, not passes, which differ under a probe budget
-#: smaller than the estate.
+#: window can hold fewer, and a probe fault adds nothing to it, hence "faults aside"), counted in
+#: probes, not passes, which differ under a probe budget smaller than the estate.
 _UNREACHED_ROLLUP_TEXT: Final[str] = (
     "Accounts newly unreachable: {entering}. Their sessions are not revoked; each failed {probes}+ "
-    "of up to its last {window} probes. Check the directory and the path to it. "
+    "of up to its last {window} probes, faults aside. Check the directory. "
     "auth.ad_reconcile_unreached rows name each."
 )
 

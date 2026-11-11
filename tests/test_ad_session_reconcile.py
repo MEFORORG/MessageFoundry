@@ -2781,7 +2781,10 @@ async def test_an_account_the_directory_keeps_failing_for_pages_once_naming_it(
         [(kind, source, payload)] = _unreached_events(sink)
         assert (kind, source) == ("ad_reconcile_aborted", f"{_UNREACHED_PREFIX}alice")
         assert payload["reason"] == reconcile.UNREACHED_ACCOUNT and payload["probed"] == 2
-        assert f"{threshold} of up to its last {span} directory probes failed" in payload["detail"]
+        assert (
+            f"{threshold} of up to its last {span} directory probes, faults aside, failed"
+            in payload["detail"]
+        )
         assert "sessions are not revoked" in payload["detail"][:200]
         assert len(payload["detail"]) <= 200 and "alice" not in payload["detail"]
         assert await _unreached_rows(store) == [("alice", threshold)]
@@ -3079,7 +3082,7 @@ def _unreached_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [
         r.getMessage()
         for r in caplog.records
-        if r.levelno == logging.WARNING and "probes of" in r.getMessage()
+        if r.levelno == logging.WARNING and "of up to the last" in r.getMessage()
     ]
 
 
@@ -3463,7 +3466,9 @@ async def test_an_account_whose_probes_alternate_pages_on_k_of_the_last_2k_minus
             assert plans[pages_on - 1].unreached == ((alice.id, "alice", 3),)
             [(_kind, source, payload)] = _unreached_events(sink)
             assert source == f"{_UNREACHED_PREFIX}alice"
-            assert "3 of up to its last 5 directory probes failed" in payload["detail"]
+            assert (
+                "3 of up to its last 5 directory probes, faults aside, failed" in payload["detail"]
+            )
         assert all(not plan.directory_outage for plan in plans)
         assert await store.list_sessions(alice.id), "the account's sessions were revoked"
     finally:
@@ -3480,6 +3485,8 @@ async def test_an_account_whose_probes_alternate_pages_on_k_of_the_last_2k_minus
         (reconcile.ProbeOutcome.MISCONFIGURED, "synthetic: search noSuchObject", (False,)),
         (reconcile.ProbeOutcome.PRESENT, None, (False,)),
         (reconcile.ProbeOutcome.ABSENT, None, (False,)),
+        (reconcile.ProbeOutcome.DISABLED, None, (False,)),
+        (reconcile.ProbeOutcome.UNDETERMINED, None, (False,)),
         (reconcile.ProbeOutcome.FAULT, "ValueError", ()),
         (reconcile.ProbeOutcome.UNKEYED, None, ()),
     ],

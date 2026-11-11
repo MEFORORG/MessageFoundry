@@ -355,11 +355,14 @@ class ReconcilePlan:
     #: where its probe sample held only unreachable accounts, but none on a pass that raises the
     #: lasting outage page or while that page stands (``AuthService._note_unreached_accounts``).
     unreached: tuple[tuple[str, str, int], ...] = ()
-    #: Set by the auth service on every pass, in the same call that sets :attr:`unreached`, so a
-    #: plan with entries always carries it (BACKLOG #3709 closing step 6): the most probes an
-    #: account's window holds, ``2K - 1`` for K ``[auth].ad_reconcile_outage_passes``. A window
-    #: can hold fewer, an account probed fewer times, so the page and the row say "K of up to the
-    #: last ``2K - 1``" (the row as ``window_up_to``). 0 only on a plan the service has not read.
+    #: Set by the auth service in the same call that sets :attr:`unreached`, so a plan with
+    #: entries always carries it (BACKLOG #3709 closing step 6): the most probes an account's
+    #: window holds, ``2K - 1`` for K ``[auth].ad_reconcile_outage_passes``. A window can hold
+    #: fewer, at least where it is new, was dropped once it held no failure, or its account left
+    #: the record and came back, and a probe fault adds nothing to it, so the page and the row
+    #: say how many failed "of up to the last ``2K - 1``", faults aside (the row as
+    #: ``window_up_to``). 0 on a plan with no entries that never reached that call, such as one
+    #: a pass with no candidates returns.
     unreached_window: int = 0
     #: Set by ``AuthService._record_unreached_accounts`` (BACKLOG #3100, #3709), on the rows it
     #: wrote: True when those entering whose row was written, plus the accounts latched as paged
