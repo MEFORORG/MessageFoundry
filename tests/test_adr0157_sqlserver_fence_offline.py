@@ -99,6 +99,8 @@ _EXPECTED: dict[str, tuple[int, int]] = {
     "mark_failed": (1, 1),
     "mark_batch_failed": (1, 1),
     "dead_letter_batch": (1, 1),
+    # Its dead-letter at the cap (vault BACKLOG #4607 step 6). The increment before it sets no status.
+    "record_worker_death": (1, 1),
     # --- Bring-up sweeps + operator paths: unguarded, allowlisted. ---
     "dead_letter_missing_destinations": (1, 0),
     "dead_letter_missing_handlers": (1, 0),
@@ -118,6 +120,7 @@ _RESOLVE_FENCED = frozenset(
         "mark_failed",
         "mark_batch_failed",
         "dead_letter_batch",
+        "record_worker_death",
     }
 )
 
@@ -236,6 +239,8 @@ _SELECT_ROW: dict[str, tuple[Any, ...]] = {
         1,
     ),
     "SELECT message_id, destination_name, attempts FROM queue WHERE id=?": ("m1", "OB1", 3),
+    # mark_failed's DEAD branch reads the status under the update lock (vault BACKLOG #4607 step 6).
+    "SELECT status FROM queue WITH (UPDLOCK, ROWLOCK) WHERE id=?": ("inflight",),
     "SELECT message_id, destination_name FROM queue WHERE id=?": ("m1", "OB1"),
     # ingress_handoff's guard read: a payload that is not a three-part ref takes the corrupt-ref
     # DEAD branch, which is one of the two fenced writes there.

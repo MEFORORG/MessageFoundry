@@ -42,6 +42,7 @@ from messagefoundry.store.store import (
     SecretRotationMetaStore,
     Stage,
     StreamingAttachmentsUnsupported,
+    WorkerDeathOutcome,
 )
 
 __all__ = [
@@ -72,6 +73,7 @@ __all__ = [
     "StoreNotFoundError",
     "StreamingAttachmentsUnsupported",
     "StripResult",
+    "WorkerDeathOutcome",
     "open_store",
     "provision_store_schema",
     "sqlite_settings",

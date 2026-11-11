@@ -6482,3 +6482,71 @@ async def test_a_keyed_fresh_store_holds_data_until_its_chain_is_gone(store) -> 
     finally:
         # Leave no chain under a key nobody holds for a later module on this database.
         await empty_audit_log()
+
+
+# --- vault BACKLOG #4607 step 6: a row that keeps killing its worker is dead-lettered ------------
+
+
+async def _pg_death_row(store, row_id: str) -> tuple[str, int, int]:
+    async with store._pool.acquire() as conn:
+        r = await conn.fetchrow(
+            "SELECT status, attempts, worker_deaths FROM queue WHERE id=$1", row_id
+        )
+    return str(r["status"]), int(r["attempts"]), int(r["worker_deaths"])
+
+
+async def test_record_worker_death_counts_then_dead_letters_at_the_cap(store) -> None:
+    mid = await store.enqueue_ingress(channel_id="IB", raw=RAW, now=100.0)
+    for death in (1, 2, 3):
+        item = await store.claim_next_fifo("IB", now=200.0, stage=Stage.INGRESS.value)
+        assert item is not None and item.message_id == mid
+        counted = await store.record_worker_death(item.id, 3, "router worker killed by _Kill")
+        assert (counted.deaths, counted.dead) == (death, death == 3)
+        if death < 3:
+            # Below the cap only the count moved; recovery keeps it, and the next claim does not
+            # raise it.
+            assert await _pg_death_row(store, item.id) == ("inflight", death, death)
+            await store.reset_stale_inflight(now=300.0)
+    assert await _pg_death_row(store, item.id) == ("dead", 3, 3)
+    msg = await store.get_message(mid)
+    assert msg is not None and msg["status"] == MessageStatus.ERROR.value
+
+
+async def test_record_worker_death_leaves_a_row_not_in_flight_alone(store) -> None:
+    await store.enqueue_ingress(channel_id="IB", raw=RAW, now=100.0)
+    item = await store.claim_next_fifo("IB", now=200.0, stage=Stage.INGRESS.value)
+    assert item is not None
+    await store.reset_stale_inflight(now=300.0)
+    counted = await store.record_worker_death(item.id, 1, "router worker killed by _Kill")
+    assert (counted.deaths, counted.dead) == (0, False)
+    assert await _pg_death_row(store, item.id) == ("pending", 1, 0)
+
+
+async def test_record_worker_death_fenced_rolls_back_whole_and_re_pends(store) -> None:
+    """ADR 0157 C3: a fenced dead-letter rolls the increment back with it and re-pends the row."""
+    lease_key = "public:mefor_cluster_leader"
+    await _seed_lease_epoch(store, lease_key, 5)
+    store.set_leader_epoch(5, lease_key=lease_key)
+    await store.enqueue_ingress(channel_id="IB", raw=RAW, now=100.0)
+    item = await store.claim_next_fifo("IB", now=200.0, stage=Stage.INGRESS.value)
+    assert item is not None
+    store.set_leader_epoch(3, lease_key=lease_key)  # demoted after the claim
+    counted = await store.record_worker_death(item.id, 1, "router worker killed by _Kill")
+    assert (counted.deaths, counted.dead) == (0, False)
+    # C3 re-pends through release_claimed, which also returns the claim's attempt.
+    assert await _pg_death_row(store, item.id) == ("pending", 0, 0)
+    assert store.fenced_writes == 1
+
+
+async def test_mark_failed_at_its_cap_leaves_a_done_row_done(store) -> None:
+    """A late death after the send was marked done must not turn a delivered row DEAD."""
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
+    )
+    item = await store.claim_next_fifo("OB1", now=200.0)
+    assert item is not None
+    assert await store.mark_done(item.id, now=201.0)
+    outcome = await store.mark_failed(item.id, "late death", RetryPolicy(max_attempts=1))
+    assert outcome == FailOutcome()
+    outbox = await store.outbox_for(mid)
+    assert outbox[0]["status"] == OutboxStatus.DONE.value

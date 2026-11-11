@@ -1,6 +1,6 @@
 # ADR 0157 — Demotion safety: fence scope on post-claim writes, and a bounded graph stop
 
-**Status:** Accepted **Date:** 2026-08-01 **Implemented:** 2026-08-02 (Inc 1, 4, 5), 2026-09-10 (Inc 0), 2026-09-25 (Inc 2), 2026-09-26 (Inc 3), 2026-10-30 (Inc 0 on SQL Server) **Amended:** 2026-09-28 (Amendment A, at the end), 2026-09-29 (Amendment A's term widened), 2026-10-11 (a note under Amendment A's "Not chosen here: a per-claim term", BACKLOG #2415; seat decision under owner delegation 2026-10-08, not an owner ruling), 2026-10-30 (a note under Amendment B's "Not covered" paragraph for the Database source: a writing `poll_statement` is now refused, BACKLOG #2178)
+**Status:** Accepted **Date:** 2026-08-01 **Implemented:** 2026-08-02 (Inc 1, 4, 5), 2026-09-10 (Inc 0), 2026-09-25 (Inc 2), 2026-09-26 (Inc 3), 2026-10-30 (Inc 0 on SQL Server) **Amended:** 2026-09-28 (Amendment A, at the end), 2026-09-29 (Amendment A's term widened), 2026-10-11 (a note under Amendment A's "Not chosen here: a per-claim term", BACKLOG #2415; seat decision under owner delegation 2026-10-08, not an owner ruling), 2026-10-30 (a note under Amendment B's "Not covered" paragraph for the Database source: a writing `poll_statement` is now refused, BACKLOG #2178), 2026-11-11 (Amendment C, at the end: two DEAD writes leave a resolved row as it is, vault BACKLOG #4607 step 6)
 
 > **Amendment A (2026-09-28, BACKLOG #2078, #2348):** `mark_failed`'s retry branch, and
 > `mark_batch_failed`'s, now carry a status term on all three backends, by owner ruling. It was
@@ -199,7 +199,9 @@ firing, and firing is worse.
 
 > *Scoped by Amendment A (2026-09-28).* This paragraph binds the TERMINAL resolves, and they still
 > carry no status conjunct. `mark_failed`'s retry branch, which C1 leaves unfenced, now carries one.
-> The amendment says why the argument above does not reach it.
+> The amendment says why the argument above does not reach it. *Amendment C (2026-11-11)* makes
+> `mark_failed`'s DEAD branch and `record_worker_death`'s dead-letter decline an already-resolved row,
+> never an INFLIGHT or PENDING one, by a locked read rather than a conjunct; it says why.
 
 **C3 — A fenced write is all-or-nothing, and it RE-PENDS the row. It must not leave it INFLIGHT.**
 Zero rows affected ⇒ roll back the enclosing transaction (discarding the `delivered_keys` row, the
@@ -1425,3 +1427,30 @@ for clearing it under a still-live listener.)
 Two findings from review of this amendment are closed in it, not left open: the cleared drain side
 under a still-live listener (fixed above, *Joined is not stopped*), and a third cancel leaving cut
 stops unjoined (it cannot happen, step 4 of *What an outer cancel does now*).
+
+## Amendment C (2026-11-11): two DEAD writes leave a resolved row as it is (vault BACKLOG #4607 step 6)
+
+**What changed.** Two terminal writes now decline a row that is already DONE, DEAD or CANCELLED:
+`mark_failed`'s DEAD branch on all three backends, and the dead-letter in the new
+`record_worker_death`, which counts a row that killed its stage worker and dead-letters it at its
+cap (owner ruling 2026-11-04, "Yes, dead-letter it"). The case is a worker that dies after its row
+was marked DONE: without this, the death's dead-letter at the cap turned a delivered row DEAD and
+its message ERROR.
+
+**Why C2 does not forbid it.** C2 keeps a `status='inflight'` conjunct off the terminal resolves,
+because the owner-blind lease sweep can re-pend the current leader's own row and that row's
+terminal write must still land. Neither write declines an INFLIGHT or PENDING row, so that write
+still lands. Each declines only a row some other writer already resolved, as Amendment A's widened
+retry term does. C1 is unchanged: both writes keep the fail-open resolve fence.
+
+**Neither UPDATE carries a status term, so a miss stays the fence's alone.** On Postgres and SQL
+Server a fenced write is told apart by its empty result (C3), so the status must not be a second
+reason for one. `mark_failed`'s DEAD branch, and only that branch, reads the status again under a
+row lock (`FOR UPDATE`, `UPDLOCK`) and returns the empty outcome for a resolved row before its
+UPDATE. `record_worker_death`'s increment matches only an INFLIGHT row and holds its lock until the
+commit, so its dead-letter cannot find the row resolved. SQLite does both under its single writer.
+`mark_batch_failed`'s DEAD branch is unchanged.
+
+**The increment is not fenced.** It neither resolves the row nor returns it to PENDING. A fenced
+dead-letter rolls it back with the rest of the transaction and re-pends the row (C3), so the death
+is counted again by whichever node claims the row next.
