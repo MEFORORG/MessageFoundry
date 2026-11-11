@@ -877,12 +877,24 @@ def _frontend_alone_in_an_included_mount(app: FastAPI, directory: str) -> None:
     app.include_router(sub, prefix="/inc")
 
 
+def _frontend_in_a_mount_inside_a_mounted_app(app: FastAPI, directory: str) -> None:
+    innermost = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+    innermost.add_api_route("/deep", _ok)
+    innermost.frontend("/", directory=directory, check_dir=False)
+    outer = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+    outer.add_api_route("/outer", _ok)
+    outer.mount("/inner", innermost)
+    app.mount("/outer", outer)
+
+
 @pytest.mark.parametrize(
     "register",
     [
         _frontend_on_the_app,
         _frontend_in_an_include,
         _frontend_in_a_mounted_app,
+        # Two mounts deep: a caller that descends into neither must still be refused.
+        _frontend_in_a_mount_inside_a_mounted_app,
         # A mount whose only content is the group has no routes, so a walk never descends into it.
         _frontend_alone_in_a_mounted_app,
         _frontend_alone_in_a_mounted_router,
@@ -909,7 +921,6 @@ def test_a_frontend_group_fails_the_walk_rather_than_passing_unvisited(
     app = FastAPI(openapi_url=None)
     app.add_api_route("/ordinary", _ok)
     assert ("GET", "/ordinary") in _rows_by_key(app)  # the control: no group, no refusal
-    consume(app)
     register(app, str(tmp_path))
     with pytest.raises(ValueError, match="low-priority route"):
         consume(app)
