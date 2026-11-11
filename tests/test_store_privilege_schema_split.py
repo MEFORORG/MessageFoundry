@@ -71,6 +71,7 @@ from messagefoundry.store.privilege import (
     audit_write_grant,
     postgres_excess,
     sqlserver_excess,
+    view_definition_grant,
 )
 from tests._live_scratch import (
     SqlServerAdmin,
@@ -316,6 +317,85 @@ def test_sqlserver_direct_ddl_grants_are_prescribed_under_auto() -> None:
             alter_schema="dbo",
         )
         == ()
+    )
+
+
+def _ss_excess(**kwargs: Any) -> tuple[str, ...]:
+    """``sqlserver_excess`` for a row-CRUD runtime login under external, with ``kwargs`` on top."""
+    args: dict[str, Any] = {
+        "server_roles": (),
+        "database_roles": ("db_datareader", "db_datawriter"),
+        "control_server": False,
+        "control_database": False,
+        "database": "MessageFoundry",
+        "external": True,
+    }
+    args.update(kwargs)
+    return sqlserver_excess(**args)
+
+
+@pytest.mark.parametrize(
+    ("external", "expected"), [(True, (view_definition_grant("dbo"),)), (False, ())]
+)
+def test_sqlserver_schema_view_definition_is_excess_under_external(
+    external: bool, expected: tuple[str, ...]
+) -> None:
+    """BACKLOG #6714 item 1: only provision-admin needs VIEW DEFINITION on the store's schema, so a
+    runtime login that still holds it is named. A schema listed twice is named once."""
+    assert _ss_excess(external=external, view_definition=("dbo", "dbo")) == expected
+
+
+def test_sqlserver_db_ddladmin_does_not_hide_a_schema_view_definition() -> None:
+    """db_ddladmin is excess itself under external, and it does not carry VIEW DEFINITION."""
+    excess = _ss_excess(
+        database_roles=("db_datareader", "db_datawriter", "db_ddladmin"),
+        view_definition=("app",),
+    )
+    assert excess == ("database role db_ddladmin", view_definition_grant("app"))
+
+
+@pytest.mark.parametrize(
+    ("server_roles", "roles", "control_server", "control_database"),
+    [
+        ((), ("db_owner",), False, False),
+        (("sysadmin",), (), False, False),
+        ((), (), True, False),
+        ((), (), False, True),
+    ],
+    ids=["db_owner", "sysadmin", "control-server", "control-database"],
+)
+def test_sqlserver_schema_rights_are_not_restated_under_a_grant_that_carries_them(
+    server_roles: tuple[str, ...],
+    roles: tuple[str, ...],
+    control_server: bool,
+    control_database: bool,
+) -> None:
+    """BACKLOG #6714: each of these carries CREATE TABLE, ALTER and VIEW DEFINITION on the schema,
+    so it is named and its parts are not. ``CONTROL SERVER`` alone used to restate them."""
+    excess = _ss_excess(
+        server_roles=server_roles,
+        database_roles=roles,
+        control_server=control_server,
+        control_database=control_database,
+        create_table=True,
+        alter_schema="dbo",
+        view_definition=("dbo",),
+    )
+    assert excess, "the carrying grant itself must still be named"
+    assert not [e for e in excess if e.startswith(("create table", "ALTER on schema", "view def"))]
+
+
+def test_sqlserver_a_server_role_with_no_schema_right_does_not_hide_the_direct_ddl() -> None:
+    """BACKLOG #6714 (S01-68): bulkadmin carries no right in the store's database, so the direct
+    CREATE TABLE and ALTER on the schema are named beside it rather than folded into it."""
+    excess = _ss_excess(
+        server_roles=("bulkadmin",), create_table=True, alter_schema="dbo", view_definition=("dbo",)
+    )
+    assert excess == (
+        "server role bulkadmin",
+        "create table on database MessageFoundry",
+        "ALTER on schema dbo",
+        view_definition_grant("dbo"),
     )
 
 
@@ -1634,6 +1714,29 @@ async def test_live_sqlserver_external_refuses_then_provisions_then_runs_row_onl
     assert clean.excess == (), f"a row-only runtime login must be silent, got {clean.excess}"
     rows = f"SELECT COUNT(*) FROM [{db}].dbo.audit_log"
     assert await bounded(sa, "count audit rows", admin.scalar(rows)) >= 1
+
+    # BACKLOG #6714, the positive control for the clean read above: VIEW DEFINITION on the login's
+    # default schema (dbo, for a user made FOR LOGIN) is named once granted, then taken back.
+    await bounded(
+        sa,
+        "grant view definition",
+        admin.run_in(db, f"GRANT VIEW DEFINITION ON SCHEMA::[dbo] TO [{login}]"),
+    )
+    store = await bounded(
+        sa,
+        "reopen with view definition",
+        SqlServerStore.open(runtime, cipher=cipher, audit_mac_key=cipher.audit_mac_key()),
+    )
+    try:
+        viewer = await bounded(sa, "probe with view definition", store.probe_principal_privileges())
+    finally:
+        await store.close()
+    assert viewer.excess == (view_definition_grant("dbo"),), viewer.excess
+    await bounded(
+        sa,
+        "revoke view definition",
+        admin.run_in(db, f"REVOKE VIEW DEFINITION ON SCHEMA::[dbo] FROM [{login}]"),
+    )
 
     await bounded(
         sa, "grant db_ddladmin", admin.run_in(db, f"ALTER ROLE db_ddladmin ADD MEMBER [{login}]")

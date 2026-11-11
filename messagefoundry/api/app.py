@@ -232,7 +232,7 @@ from messagefoundry.api.models import (
 from messagefoundry.api.multipart import (
     MultipartError,
     MultipartTooLargeError,
-    parse_single_file_upload,
+    parse_upload_off_loop,
 )
 from messagefoundry.api.outlive import (
     CANCEL_GRACE_SECONDS,
@@ -425,6 +425,7 @@ from messagefoundry.config.wiring import (
     ech_cleartext_sidecar_hops,
     expiry_relaxed_hops,
     hostname_unchecked_hops,
+    listener_trusted_proxy_hops,
     load_config,
     path_form_fhir_updates,
     query_credential_hops,
@@ -467,6 +468,7 @@ from messagefoundry.pipeline.alerts import (
     LoggingAlertSink,
     administrator_granted_alert,
     authority_seal_alert,
+    authority_seal_page,
     no_enabled_administrator_alert,
     step_up_return_audit_alert,
     store_cipher_refusal_forwarder,
@@ -533,12 +535,13 @@ from messagefoundry.store.content_search import (
 from messagefoundry.store.content_search import (
     ContentSearchError,
     SearchSpec,
-    SearchTarget,
     make_spec,
+    sends_a_needle,
 )
-from messagefoundry.store.crypto import audit_body_digests
+from messagefoundry.store.crypto import CipherError, CipherUnavailableError, audit_body_digests
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.privilege import run_store_privilege_preflight
+from messagefoundry.store.row_seal import probe_row_sealer_at_start
 from messagefoundry.store.store import (
     VIEWED_EVENT,
     AuditAppend,
@@ -2130,15 +2133,29 @@ def _posture_loosenings(
             if visible is None or visible(name)
         ]
     )
+    # BACKLOG #5525: an HTTP listener's trusted_proxies, read against the same values. Its note,
+    # "range" or "possibly", is kept beside the name, since the entry's text keys on it.
+    listener_proxy_hops = (
+        []
+        if registry is None
+        else [
+            f"{name} ({note})" if note else name
+            for name, note in listener_trusted_proxy_hops(registry, env_values=db_env_values)
+            # Narrowed on the bare name, before any marker is added.
+            if visible is None or visible(name)
+        ]
+    )
     notes: list[str] = []
     if registry is None:
         notes.append(
             "settings only — no connection graph is loaded on this engine, so the per-connection "
             "cleartext_accepted / tls_allow_expired / tls_check_hostname / url_query_credential / "
             "generic-ODBC-DATABASE-TLS / tls_hop_attested / "
-            "tls_revocation_attested / FHIR update_url_form / http ECH sidecar declarations are "
+            "tls_revocation_attested / FHIR update_url_form / http ECH sidecar / HTTP listener "
+            "trusted_proxies declarations are "
             "NOT included "
-            "(see `messagefoundry check`)"
+            "(see `messagefoundry check`, which reports all but the HTTP listener "
+            "trusted_proxies; those are reported only here, on an engine with a graph)"
         )
     if visible is not None:
         # With no graph too: the [security] opt-outs keyed by connection are still narrowed.
@@ -2185,6 +2202,7 @@ def _posture_loosenings(
             remote_debug=remote_debug,
             startup=startup,
             service_env=service_env,
+            listener_trusted_proxy_hops=listener_proxy_hops,
         )
     )
     # Vault BACKLOG #3062: the open mode is an app opt-in, not a setting, so the registry above
@@ -3815,7 +3833,11 @@ def _needle_shape(needle: str) -> str:
     An operator's needle may itself be PHI — an MRN, a patient name (ADR 0046 §4/AC-6). The audit must
     record *that a content search ran and roughly what kind of term*, never the term verbatim. We emit
     only a structural class (all-digits / alphanumeric / has-separators / other) — not the characters —
-    so even a 9-digit MRN logs as ``digits`` with a length, never the number itself."""
+    so even a 9-digit MRN logs as ``digits`` with a length, never the number itself.
+
+    The shape is read with the padding removed: ``make_spec`` keeps a needle's spaces (BACKLOG #6700),
+    and a pasted `` 123456789`` is still an MRN-shaped lookup, so it must audit as ``digits``."""
+    needle = needle.strip()
     if needle.isdigit():
         return "digits"
     if needle.isalnum():
@@ -3882,7 +3904,10 @@ def _compose_preset_layers(
     **rejects a conflicting second** (400). **Exactly one** preset may carry a content needle (a
     ``content`` substring or a ``field_path``[+``field_value``]); >1 or 0 → 400. Raises
     :class:`HTTPException` (400) on a conflict / missing-or-duplicate needle; the caller maps the
-    ``ContentSearchError`` from a malformed field path likewise."""
+    ``ContentSearchError`` from a malformed field path likewise.
+
+    A lone ``field_value`` counts as a needle too, so ``make_spec`` refuses it (400) rather than the
+    compose dropping it (BACKLOG #6700)."""
     meta_keys = ("channel_id", "status", "message_type", "control_id")
     meta: dict[str, str | None] = dict.fromkeys(meta_keys)
     needle: dict[str, Any] | None = None
@@ -3896,10 +3921,14 @@ def _compose_preset_layers(
                         400, f"layered presets conflict on {key!r}: {meta[key]!r} vs {value!r}"
                     )
                 meta[key] = value
-        has_needle = bool((crit.get("content") or "").strip()) or bool(
-            (crit.get("field_path") or "").strip()
+        # A lone field_value counts, so make_spec refuses it rather than the compose dropping it.
+        # Counted on stripped values, as before: a blank stored content or field_path on a preset
+        # that is not the needle is not a second needle.
+        content, path = (
+            v.strip() if isinstance(v, str) else v
+            for v in (crit.get("content"), crit.get("field_path"))
         )
-        if has_needle:
+        if sends_a_needle(content, path, crit.get("field_value")):
             if needle is not None:
                 raise HTTPException(
                     400, "layered search allows at most one content predicate across presets"
@@ -3915,7 +3944,7 @@ def _compose_preset_layers(
             content=(needle.get("content") or None),
             field_path=(needle.get("field_path") or None),
             field_value=(needle.get("field_value") or None),
-            target=SearchTarget(needle.get("target") or "both"),
+            target=needle.get("target") or "both",
         )
     except (ContentSearchError, ValueError) as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -5043,10 +5072,21 @@ def create_app(
         # the broker's revocation refusal. An off-box endpoint with no [ai].endpoint_revocation_attested
         # pair is refused under enforce, and a None posture counts as enforcing there. The cleartext-
         # http refusal takes no posture: it refuses in every one (vault BACKLOG #3533 item 5).
+        # BACKLOG #5527: the [tls] policy too, the one the alerts test send reads, so the endpoint is
+        # verified against [tls].internal_ca_file under augment or pinned and checked against
+        # [tls].crl_file as the other HTTP-family hops are. A direct create_app stashes none, so
+        # None goes down.
         # Off the event loop: the constructor builds rest.py's shared opener on first use, a TLS
-        # context that reads the system trust store, under a lock a worker thread may hold.
+        # context that reads the system trust store, under a lock a worker thread may hold, or an
+        # opener of its own that reads the [tls] CA and CRL files.
+        tls_settings = getattr(request.app.state, "tls_settings", None)
         try:
-            broker = await asyncio.to_thread(ai_broker_from_settings, ai, posture=_phi_read_posture)
+            broker = await asyncio.to_thread(
+                ai_broker_from_settings,
+                ai,
+                posture=_phi_read_posture,
+                trust_anchor_policy=tls_settings.policy() if tls_settings is not None else None,
+            )
         except AiBrokerError as exc:
             _log.warning("engine AI broker misconfigured: %s", exc)
             raise HTTPException(503, "engine-brokered AI assistance is not available") from exc
@@ -7562,7 +7602,7 @@ def create_app(
                 content=content,
                 field_path=field_path,
                 field_value=field_value,
-                target=SearchTarget(target),
+                target=target,
                 scan_limit=scan_limit,
             )
         except ContentSearchError as exc:
@@ -7862,7 +7902,7 @@ def create_app(
                 content=content,
                 field_path=field_path,
                 field_value=field_value,
-                target=SearchTarget(target),
+                target=target,
                 scan_limit=scan_limit,
             )
         except ContentSearchError as exc:
@@ -8986,8 +9026,10 @@ def create_app(
         the name while the file exists. A refused file has no id, so its row carries the reason only."""
         us = _require_upload_store(request)
         body = await request.body()
+        # BACKLOG #5522: the parse walks a body of up to [store].max_upload_bytes part by part, so
+        # it runs on the parser's own two-thread executor rather than on the event loop.
         try:
-            part = parse_single_file_upload(
+            part = await parse_upload_off_loop(
                 request.headers.get("content-type"), body, max_file_bytes=us.max_bytes
             )
         except MultipartTooLargeError as exc:
@@ -9189,13 +9231,14 @@ def create_app(
         enforce_phi_read_pacing(request, identity)  # bulk decrypt+split behind a step-up gate
         us = _require_upload_store(request)
         spec: SearchSpec | None = None
-        if content or field_path:
+        # A lone field_value reaches make_spec too, so it is refused rather than dropped (#6700).
+        if sends_a_needle(content, field_path, field_value):
             try:
                 spec = make_spec(
                     content=content,
                     field_path=field_path,
                     field_value=field_value,
-                    target=SearchTarget(target),
+                    target=target,
                 )
             except ContentSearchError as exc:
                 raise HTTPException(400, str(exc)) from exc
@@ -9548,17 +9591,21 @@ def create_app(
         needle is rejected up front (make_spec) so a bad preset can't be saved."""
         crit = body.criteria
         needle_shape: str | None = None
-        if crit.content or crit.field_path:
+        # A lone field_value reaches make_spec too, so it is refused rather than saved unread (#6700).
+        if sends_a_needle(crit.content, crit.field_path, crit.field_value):
             try:
-                make_spec(
+                spec = make_spec(
                     content=crit.content,
                     field_path=crit.field_path,
                     field_value=crit.field_value,
-                    target=SearchTarget(crit.target),
+                    target=crit.target,
                 )
             except ContentSearchError as exc:
                 raise HTTPException(400, str(exc)) from exc
-            needle_shape = _needle_shape(crit.content) if crit.content else "field_path"
+            # From the spec, not the raw criteria: an all-whitespace content is not the needle.
+            needle_shape = (
+                _needle_shape(spec.substring) if spec.substring is not None else "field_path"
+            )
         effective_id, replaced = await engine.store.upsert_search_preset(
             preset_id=uuid4().hex,
             # BACKLOG #1225: the OWNER KEY is the immutable Identity.user_id, never the reassignable
@@ -9630,7 +9677,7 @@ def create_app(
             raise HTTPException(400, f"at most {_MAX_PRESET_LAYERS} presets may be layered")
         criterias: list[dict[str, Any]] = []
         for preset_id in ids:
-            integrity_refused = False
+            refusal: HTTPException | None = None
             try:
                 row = await engine.store.get_search_preset(
                     preset_id=preset_id, owner_user_id=identity.user_id
@@ -9638,20 +9685,59 @@ def create_app(
             except CellTagError:
                 # BACKLOG #2593: the criteria fail their owner tag (alerted and audited) or are
                 # corrupt (logged); the store refused. The caller's own preset exists, so a refusal,
-                # never a 500.
-                integrity_refused = True
-            if integrity_refused:
-                # Raised after the handler, so the 423 chains nothing (BACKLOG #1796): `from None`
-                # would still leave the CellTagError and the cipher's error on __context__.
-                raise HTTPException(
+                # never a 500. Caught before CipherError, which it subclasses.
+                refusal = HTTPException(
                     423, f"preset {preset_id} failed its integrity check and cannot be used"
                 )
+            except CipherUnavailableError as exc:
+                # BACKLOG #5523, as #3734 split the upload routes: the key service gave no verdict,
+                # so a later try may succeed. Its text goes to the log only, as in uploads, and as
+                # a str: the exception's traceback would reach this frame's decrypted `criterias`.
+                _log.warning("layered search answered 503 on preset %s: %s", preset_id, str(exc))
+                refusal = HTTPException(
+                    503,
+                    f"the store's key service could not open preset {preset_id}. Try again shortly",
+                    headers={"Retry-After": str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)},
+                )
+            except CipherError as exc:
+                # BACKLOG #5523: a key or format problem the cipher raises as is, for example an
+                # unmarked value planted in a keyed store, or a value Vault Transit refused. It
+                # answered 500. The type name only: the text is the cipher's, not this route's.
+                # ERROR: under Transit a cell planted across owners lands here, not in the
+                # CellTagError arm, so it is neither audited nor alerted and this is the engine's
+                # only record of it. The outage above is a WARNING: it says nothing about the cell.
+                _log.error("layered search refused preset %s: %s", preset_id, type(exc).__name__)
+                refusal = HTTPException(
+                    423,
+                    f"preset {preset_id} cannot be opened with the store's keys and cannot be used;"
+                    " a retired key that is not supplied, or a value written outside the store,"
+                    " can cause this",
+                )
+            if refusal is not None:
+                # Raised after the handler, so the refusal chains nothing (BACKLOG #1796): `from
+                # None` would still leave the store's and the cipher's errors on __context__.
+                raise refusal
             if row is None:
                 raise HTTPException(404, f"no such preset: {preset_id}")
+            if not row["criteria"]:
+                # BACKLOG #5523: the store never writes blank criteria, and a keyed store passes a
+                # blank cell through unopened, so NULL or "" was written outside the store. Read as
+                # `{}` it would drop out of the compose and widen the search, so refuse it. Logged,
+                # since only the caller would learn of it otherwise.
+                _log.warning(
+                    "layered search refused preset %s: its criteria cell is blank", preset_id
+                )
+                # Its own text: a keyless store has no integrity tag for it to fail.
+                raise HTTPException(
+                    423,
+                    f"preset {preset_id} has blank criteria, written outside the store, and cannot"
+                    " be used",
+                )
             # No chain (BACKLOG #2085): the decode error holds the criteria, which can quote a
             # content needle. json's RecursionError is this 400 too, not a 500. The old TypeError
-            # arm is gone: get_search_preset returns the criteria through the cipher, always a str.
-            criteria, refused = json_loads_or_refusal(row["criteria"] or "{}")
+            # arm is gone: get_search_preset returns the criteria through the cipher as a str, or
+            # None for a NULL cell, and the blank-cell refusal above has already refused None.
+            criteria, refused = json_loads_or_refusal(row["criteria"])
             if refused is not None or not isinstance(criteria, dict):
                 raise HTTPException(400, f"preset {preset_id} has malformed criteria")
             criterias.append(criteria)
@@ -9688,6 +9774,19 @@ def create_app(
             ),
             client=client_ip(request),
         )
+        # BACKLOG #5523: coalesced into summary_access after the route's own row, as
+        # /messages/search does, so a layered recall is no way round the harvest signal (review
+        # M-5). Counted post-redaction.
+        exposed, masked = count_exposed(messages), count_masked(messages)
+        if exposed or masked:
+            await request.app.state.summary_auditor.note(
+                engine.store,
+                identity.username,
+                meta["channel_id"],
+                exposed,
+                time.time(),
+                masked=masked,
+            )
         return MessageSearchResults(
             messages=messages,
             scanned=result.scanned,
@@ -12793,7 +12892,22 @@ def create_managed_app(
         # abandoned in place on a startup failure. engine.stop() ends in store.close(), and
         # aiosqlite's connection worker is NON-DAEMON, so skipping it left the process unable to
         # exit: uvicorn refused correctly, printed 'Exiting.', and then hung forever.
+        disarm_seal_page: Callable[[], None] | None = None
         try:
+            # Decisions d20261109T165402853-83b348 and d20261109T165406730-2505f2 (ADR 0217): a
+            # revoke that goes without an account's epoch raise, or ends its kept session, on a
+            # Vault transit outage pages authority-seal-transit on the authority-seal sink. Armed
+            # on this store's own pager (decision d20261109T200352805-599b24, item 5), first, so
+            # the restore's revoke below pages too; the teardown removes only this registration.
+            seal_pager = getattr(store, "seal_pager", None)
+            if callable(seal_pager):
+                disarm_seal_page = seal_pager().arm(
+                    authority_seal_page(notifier or LoggingAlertSink())
+                )
+            # ADR 0217 slice 1b-iii: the Transit row sealer's start probe, before the restore and
+            # the auth service read or write any authority row. A failed probe refuses the start.
+            # Engine.start runs it again, for an engine started without this lifespan.
+            await probe_row_sealer_at_start(store.row_sealer())
             # BACKLOG #2614: the first start on a restored store ends the archive's sessions and
             # records the restore, before the auth service exists and so before any request.
             await _record_a_restore(store, notifier or LoggingAlertSink())
@@ -13098,6 +13212,10 @@ def create_managed_app(
                     )
             yield
         finally:
+            # This lifespan's own seal page registration, and no other (ADR 0217, decision
+            # d20261109T200352805-599b24 item 5).
+            if disarm_seal_page is not None:
+                disarm_seal_page()
             # BACKLOG #2087, #3191: every step after the yield runs whatever the steps before it
             # did. A step that raises, overruns its bound or is cut by a cancel is logged and the
             # next one runs, so a cancel delivered mid-teardown still drains, stops the engine and

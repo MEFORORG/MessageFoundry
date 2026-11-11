@@ -425,7 +425,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 user_id, body=body, request=request, service=service, identity=identity
             )
         except (ValidationError, HTTPException) as exc:
-            if isinstance(exc, HTTPException) and exc.status_code == status.HTTP_404_NOT_FOUND:
+            # 423: the account's record fails its integrity seal (BACKLOG #5520). Raised as is,
+            # never re-rendered: the detail page would show the unchecked row the engine refused.
+            if isinstance(exc, HTTPException) and exc.status_code in (
+                status.HTTP_404_NOT_FOUND,
+                status.HTTP_423_LOCKED,
+            ):
                 raise
             detail = "invalid input" if isinstance(exc, ValidationError) else str(exc.detail)
             return await _user_detail(user_id, service, identity, error=detail, status_code=400)

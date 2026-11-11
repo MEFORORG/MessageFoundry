@@ -2602,6 +2602,16 @@ def proxy_config_from_settings(
 
 # --- ECH egress route (ADR 0139, ASVS 12.1.5) ---------------------------------------------------------
 
+#: Where a refused ``ech_sidecar`` value is told to put a credential instead (BACKLOG #5528). Not
+#: the connection's ``basic_user`` or ``bearer_token``: the general remedy would send a credential
+#: meant for the sidecar on through it to the partner. The one text for the resolver below and,
+#: through it, the egress gate.
+_ECH_SIDECAR_CREDENTIAL_USE = (
+    "the sidecar's own configuration (the engine has no setting for a credential meant for the "
+    "sidecar; this connection's own Authorization header and any token-endpoint request reach "
+    "the sidecar too, on their way upstream)"
+)
+
 
 def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
     """The loopback ECH-sidecar base URL for this connection (ADR 0139), or ``None`` when ``ech_egress``
@@ -2628,6 +2638,12 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
     this accepts is a host no opener sends through a proxy. That covers the token-endpoint hop too,
     which is re-addressed to the sidecar on the token provider's opener.
 
+    A credential in the URL is refused too, by :func:`refuse_url_credentials` with the remedy
+    :data:`_ECH_SIDECAR_CREDENTIAL_USE` (BACKLOG #5528): urllib would dial ``user:pw@host`` as the
+    host. It is refused here, not only at the egress gate, so a directly built connector refuses it.
+    So, in fixed words that quote no part of the value, are at least a space or control character,
+    a ``?`` or ``#``, a non-ASCII character and a ``%`` in the host; the comments below say why each.
+
     Inert until a destination actually publishes an ECHConfig (as of 2026-07 a DoH probe found no EHR
     endpoint does — demand-gated, ADR 0139)."""
     if not s.get("ech_egress"):
@@ -2639,15 +2655,39 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
             "ech_egress is set but ech_sidecar is empty — supply the loopback ECH sidecar URL, "
             "e.g. http://127.0.0.1:8123 (ADR 0139)"
         )
+    # urlsplit deletes a tab, CR or LF inside a URL and urllib does not, so the egress gate would
+    # judge `127.0.0.1\t:8123` as port 8123 while the dial fails on every message (BACKLOG #5528).
+    if any(c.isspace() or not c.isprintable() for c in sidecar):
+        raise ValueError(
+            "ech_sidecar holds a space or a control character; write the URL without one (ADR 0139)"
+        )
     # Never a bare urlsplit, and never the raw value in the message: a URL can carry userinfo
     # (BACKLOG #2686).
-    parsed = _split_or_refuse(sidecar, "ech_sidecar", use=_URL_CREDENTIAL_USE, error=ValueError)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+    refuse_url_credentials(
+        sidecar, "ech_sidecar", use=_ECH_SIDECAR_CREDENTIAL_USE, error=ValueError
+    )
+    # Each request is this URL with the upstream path appended, so a query would carry the real
+    # path inside it and its own text to the sidecar every time, and a fragment would send every
+    # request to '/' (BACKLOG #5528). Refused anywhere, empty included, as parse_proxy_url does.
+    if "?" in sidecar or "#" in sidecar:
         raise ValueError(
-            f"ech_sidecar must be an http(s):// loopback URL, got {_redact_url(sidecar)!r} "
-            "(ADR 0139)"
+            "ech_sidecar must not hold a query or a fragment ('?' or '#'); write the sidecar's "
+            "base URL alone (ADR 0139)"
         )
-    if not is_never_proxied_host(parsed.hostname):
+    # http.client encodes the request line as ASCII, so a non-ASCII path would fail every send
+    # the gate admitted. After the credential screen, which gives its own remedy for one.
+    if not sidecar.isascii():
+        raise ValueError(
+            "ech_sidecar holds a non-ASCII character; write the URL in ASCII (ADR 0139)"
+        )
+    parsed = _split_or_refuse(
+        sidecar, "ech_sidecar", use=_ECH_SIDECAR_CREDENTIAL_USE, error=ValueError
+    )
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("ech_sidecar must be an http(s):// loopback URL with a host (ADR 0139)")
+    # A '%' in the host is refused with it (BACKLOG #5528): urlsplit keeps an IPv6 zone ID encoded
+    # and urllib decodes it before it dials, so `[::1%31]` reads as loopback here and dials `::11`.
+    if "%" in parsed.hostname or not is_never_proxied_host(parsed.hostname):
         raise ValueError(
             "ech_sidecar must be a loopback address (the ECH sidecar runs beside the engine; a remote "
             "sidecar would leak the SNI on the hop to it, defeating the purpose) (ADR 0139)"
@@ -2663,7 +2703,9 @@ def ech_sidecar_is_cleartext(sidecar: str) -> bool:
     resolver used, never a string prefix, so the two cannot read one value differently. What such
     a hop carries, and why it is listed although it is loopback, is in
     ``docs/SECURITY-LOOSENING.md``."""
-    parsed = _split_or_refuse(sidecar, "ech_sidecar", use=_URL_CREDENTIAL_USE, error=ValueError)
+    parsed = _split_or_refuse(
+        sidecar, "ech_sidecar", use=_ECH_SIDECAR_CREDENTIAL_USE, error=ValueError
+    )
     return parsed.scheme == "http"
 
 
@@ -2770,6 +2812,14 @@ class RestDestination(DestinationConnector):
         accepted, accept_reason = config.cleartext_accepted, config.cleartext_reason
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
+        # BACKLOG #5529: an http_auth this connection cannot honour is refused first, so a connection
+        # that never builds logs no insecure-hop crossing or warning below. Lazy: http_auth imports rest.
+        from messagefoundry.transports.http_auth import (
+            refuse_authorization_signer_beside_digest,
+            refuse_http_digest_conflicts,
+        )
+
+        digest_selected = refuse_http_digest_conflicts(s)
         # ADR 0139 (ASVS 12.1.5): opt-in ECH SNI-hiding. When set, this connection re-addresses each
         # request to a loopback terminating sidecar at send time (see _ech_request); destination TLS +
         # ECH are the sidecar's, so no forward proxy is used. Off (default) → None → byte-identical.
@@ -2789,6 +2839,15 @@ class RestDestination(DestinationConnector):
             raise ValueError(
                 "ech_egress and verify_tls=false are mutually exclusive — the ECH sidecar, not the "
                 "engine, makes this connection's TLS connection to the destination (ADR 0139)"
+            )
+        # BACKLOG #5529 limb 3 (#2707 closing step 1): the ECH branch below replaces the opener the
+        # Digest handler is folded into, so the connection used to build and deliver with no Digest
+        # auth. Keeping the handler on the ECH opener would not work: its password manager is keyed
+        # on self.url, and the ECH request goes to the sidecar URL, so no challenge would match.
+        if self._ech_sidecar is not None and digest_selected:
+            raise HttpAuthError(
+                f"{hop_name_prefix(config.name)}ech_egress and HTTP Digest are mutually exclusive -- "
+                "the Digest handler cannot answer a challenge through the ECH sidecar (ADR 0139)"
             )
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy. None (default, or when
         # ECH is active) → no ProxyHandler and no Proxy-Authorization threaded below → byte-identical.
@@ -2837,6 +2896,11 @@ class RestDestination(DestinationConnector):
         # identical). Built here so a bad key/algorithm fails loud at connector construction (check/
         # dry-run/start), like a bad TLS cert; the per-request signature is minted in _post (off-loop).
         self._signer: MessageSigner | None = signer_from_destination(config)
+        refuse_authorization_signer_beside_digest(
+            None if self._signer is None else self._signer.header_name,
+            digest=digest_selected,
+            connection=config.name,
+        )
         # ASVS 4.2.5: the detached-JWS headers are added after the URL/header gate above.
         # Message-independent, so they are bounded once here rather than on every send.
         enforce_signature_header_limits(self._signer, connector="REST destination")
@@ -2925,11 +2989,7 @@ class RestDestination(DestinationConnector):
 
         digest = digest_handler_from_settings(s, url=self.url)
         if digest is not None:
-            if self._token_provider is not None:
-                raise HttpAuthError(
-                    "a connection cannot use BOTH a bearer-token provider and HTTP Digest auth "
-                    "(mutually exclusive — configure exactly one)"
-                )
+            # A bearer provider beside Digest was refused in refuse_http_digest_conflicts (#5529).
             if _is_shared_no_redirect_opener(self._opener):
                 # Rebuild a per-connection verifying opener so add_handler never touches the shared one.
                 # Through _no_redirect_opener, not a bare build_opener: the bare form lets urllib
@@ -3078,7 +3138,7 @@ class RestDestination(DestinationConnector):
         # credentials), and that token is the one value the construction gate could not see -- the URL
         # and the static headers were already bounded there. Gated here so an operator's "test
         # connection" fails with the real reason rather than an opaque wire error. The SOAP probe
-        # deliberately has no equivalent: it mints nothing, so a gate there could not fire.
+        # mints and gates the same way (BACKLOG #5526).
         try:
             enforce_send_time_length_limits(
                 req.full_url,

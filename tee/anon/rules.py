@@ -47,14 +47,15 @@ _FIELD_PATH_RE = re.compile(r"[A-Z][A-Z0-9]{2}-[1-9][0-9]{0,2}")
 class SurrogateKind(StrEnum):
     """The kind of surrogate a field gets. ``KEEP``/``DROP`` are overlay actions, not surrogates."""
 
-    NAME = "name"  # XPN person name (PID-5/6/9, NK1-2, GT1-3, IN1-16, MRG-4/7)
-    ADDRESS = "address"  # XAD address (PID-11, NK1-4, GT1-5, IN1-19)
-    MRN = "mrn"  # CX medical-record / patient identifier (PID-3, MRG-1/3)
-    SSN = "ssn"  # social-security / national id (PID-19, GT1-12, IN2-2)
-    PHONE = "phone"  # XTN phone/contact (PID-13/14, NK1-5/6/7, GT1-6/7)
+    NAME = "name"  # XPN person name (PID-5/6/9, NK1-2/30, GT1-3, IN1-16, MRG-4/7)
+    ADDRESS = "address"  # XAD address (PID-11, NK1-4/32, GT1-5, IN1-19)
+    MRN = "mrn"  # CX medical-record / patient identifier (PID-2/3/21, MRG-1/3)
+    SSN = "ssn"  # social-security / national id (PID-19, NK1-37, GT1-12, IN2-2)
+    PHONE = "phone"  # XTN phone/contact (PID-13/14, NK1-5/6/7/31, GT1-6/7)
     DOB = "dob"  # DT/TS date of birth (PID-7)
     DATE = "date"  # DTM/TS event date: keep the year, fill the rest (EVN-2, PV1-44, OBR-7, ...)
-    ID = "id"  # a generic identifier (PID-4/18/20, IN1-36/49, PV1-19)
+    ID = "id"  # a generic identifier (PID-4/18, NK1-33, GT1-2, IN1-36/49, PV1-19)
+    DLN = "dln"  # DLN driver's licence: number, issuing state, expiry (PID-20)
     PROVIDER = "provider"  # XCN clinician (PV1-7/8/9/17, PD1-4, ORC-12, OBR-16/32, OBX-16)
     FREETEXT = "freetext"  # narrative that may embed identifiers — blunt full-redact (OBX-5, NTE-3)
     KEEP = "keep"  # leave the field intact (overlay: cancel a default scrub)
@@ -148,8 +149,21 @@ class FieldRule:
 # MRG fields are scrubbed with the SAME kinds as their PID counterparts (MRG-1 with PID-3, MRG-4
 # with PID-5) and keyed on the same value, so an A40 merge's old-to-new linkage is preserved across
 # the surrogate mapping.
+#
+# BACKLOG #5533 mapped fourteen identifier, name, location and contact fields that were unmapped
+# inside segments this map already scrubs: PID-2/21/23, NK1-13/30/31/32/33/37, GT1-2 and
+# PV1-6/11/42/43. The coded fields of those segments stay unmapped ON PURPOSE, because a table code
+# names no one and tests route on it: PID-8 sex, PID-10 race, PID-15 language, PID-16 marital
+# status, PID-17 religion, PID-22 ethnic group, PID-24/25 multiple birth, PID-26 citizenship,
+# PID-27 veteran status, PID-28 nationality, PID-30 death indicator, NK1-3 relationship, NK1-14/15
+# marital status and sex, and PV1-2/4/10 patient class, admission type and hospital service. Any
+# other field of these segments that is neither listed here nor mapped below has no rule yet.
+# At least these do: NK1-12, NK1-26 and NK1-38, GT1-4, GT1-19, GT1-42, GT1-45, GT1-46 and GT1-56,
+# PV1-5, PV1-50 and PV1-52, and MRG-2, MRG-5 and MRG-6. Only the coverage report names such a
+# field, and require_full_coverage refuses it.
 DEFAULT_RULES: tuple[FieldRule, ...] = (
     # PID — patient identity
+    FieldRule("PID-2", SurrogateKind.MRN),  # patient id (external), a CX like PID-3
     FieldRule("PID-3", SurrogateKind.MRN),
     FieldRule("PID-4", SurrogateKind.ID),
     FieldRule("PID-5", SurrogateKind.NAME),
@@ -164,7 +178,9 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("PID-14", SurrogateKind.PHONE),
     FieldRule("PID-18", SurrogateKind.ID),
     FieldRule("PID-19", SurrogateKind.SSN),
-    FieldRule("PID-20", SurrogateKind.ID),
+    FieldRule("PID-20", SurrogateKind.DLN),  # driver's licence, a DLN rather than a CX
+    FieldRule("PID-21", SurrogateKind.MRN),  # mother's identifier, a CX
+    FieldRule("PID-23", SurrogateKind.FREETEXT),  # birth place, free text that names a place
     FieldRule("PID-29", SurrogateKind.DATE),  # death date/time
     # MRG — merge (A40); keep linkage to the PID kinds above
     FieldRule("MRG-1", SurrogateKind.MRN),
@@ -177,8 +193,17 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("NK1-5", SurrogateKind.PHONE),
     FieldRule("NK1-6", SurrogateKind.PHONE),
     FieldRule("NK1-7", SurrogateKind.PHONE),
+    # NK1-13 is an XON. The name kind would write a person's name into it, and XON.3 is numeric,
+    # so the output would fail strict validation; the blunt redact keeps it valid.
+    FieldRule("NK1-13", SurrogateKind.FREETEXT),  # organization name
     FieldRule("NK1-16", SurrogateKind.DOB),  # contact's date of birth
+    FieldRule("NK1-30", SurrogateKind.NAME),  # contact person's name
+    FieldRule("NK1-31", SurrogateKind.PHONE),  # contact person's telephone
+    FieldRule("NK1-32", SurrogateKind.ADDRESS),  # contact person's address
+    FieldRule("NK1-33", SurrogateKind.ID),  # next of kin's identifiers, a CX
+    FieldRule("NK1-37", SurrogateKind.SSN),  # contact person's social security number
     # GT1 — guarantor
+    FieldRule("GT1-2", SurrogateKind.ID),  # guarantor number, a CX
     FieldRule("GT1-3", SurrogateKind.NAME),
     FieldRule("GT1-5", SurrogateKind.ADDRESS),
     FieldRule("GT1-6", SurrogateKind.PHONE),
@@ -207,11 +232,15 @@ DEFAULT_RULES: tuple[FieldRule, ...] = (
     FieldRule("EVN-6", SurrogateKind.DATE),
     # PV1/PD1 — visit + providers
     FieldRule("PV1-3", SurrogateKind.FREETEXT),  # assigned location, see PID-12
+    FieldRule("PV1-6", SurrogateKind.FREETEXT),  # prior patient location, a PL like PV1-3
     FieldRule("PV1-7", SurrogateKind.PROVIDER),
     FieldRule("PV1-8", SurrogateKind.PROVIDER),
     FieldRule("PV1-9", SurrogateKind.PROVIDER),
+    FieldRule("PV1-11", SurrogateKind.FREETEXT),  # temporary location, a PL
     FieldRule("PV1-17", SurrogateKind.PROVIDER),
     FieldRule("PV1-19", SurrogateKind.ID),
+    FieldRule("PV1-42", SurrogateKind.FREETEXT),  # pending location, a PL
+    FieldRule("PV1-43", SurrogateKind.FREETEXT),  # prior temporary location, a PL
     FieldRule("PV1-44", SurrogateKind.DATE),  # admit date/time
     FieldRule("PV1-45", SurrogateKind.DATE),  # discharge date/time
     FieldRule("PD1-4", SurrogateKind.PROVIDER),
@@ -364,9 +393,10 @@ def load_rules(overlay: Path | None = None) -> tuple[FieldRule, ...]:
     An overlay that points a :data:`DEFAULT_RULES` path at a DIFFERENT kind is REFUSED, unless the
     path is also listed under ``[hl7].retarget_acknowledged``. :func:`retargeted_defaults` names
     the retargets this covers. A different kind can leave part of the field as captured: ``id``,
-    ``mrn`` and ``ssn`` rewrite the first component only, so on ``PID-5`` they leave the given
-    name. A retarget to the same kind changes nothing, and ``drop`` and ``freetext`` write a
-    constant, so none of those needs the list. A path on the list that is not such a retarget is
+    ``mrn`` and ``ssn`` rewrite the first component and keep the components a CX names its issuer
+    in, so on ``PID-5`` they leave the middle name, and ``dln`` keeps the second, so it leaves the
+    given name (BACKLOG #5534). A retarget to the same kind changes nothing, and ``drop`` and
+    ``freetext`` write a constant, so none of those needs the list. A path on the list that is not such a retarget is
     refused too, so a misspelt entry cannot sit there doing nothing. Each acknowledged retarget is
     logged at WARNING, by field address, default kind and new kind (BACKLOG #3000).
 
@@ -544,8 +574,9 @@ def retargeted_defaults(rules: tuple[FieldRule, ...]) -> tuple[tuple[FieldRule, 
     The kinds do not rewrite the same parts of a field, so a retarget can leave part of a real
     value behind, and the leak-check scans what is left only for a dashed SSN or a punctuated
     phone (``leak.retarget_residue_hits``). ``id``, ``mrn`` and
-    ``ssn`` rewrite the first component only: on ``PID-5`` that leaves the given name, on
-    ``PID-11`` the city and postal code, on ``PV1-7`` the clinician's name. ``date`` keeps the
+    ``ssn`` rewrite the first component and keep CX components 3 to 6, 9 and 10: on ``PID-5``
+    that leaves the middle name, on ``PID-11`` the city and postal code, on ``PV1-7`` the
+    clinician's given name. ``dln`` keeps the second component (BACKLOG #5534). ``date`` keeps the
     year, so on ``PID-7`` it keeps the birth year. No ordering of the kinds says which retarget is
     safe, because what ``date`` leaves depends on the value. So every change of kind is listed,
     with three exceptions: ``drop`` and ``freetext``, which write a constant in place of the whole

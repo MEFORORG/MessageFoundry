@@ -76,7 +76,9 @@ _ENV_WRAPPED_DEK = "MEFOR_STORE_VAULT_WRAPPED_DEK"
 #: secret — the same status as ``[tls].internal_ca_file`` and ``tls_cert_file``. Env-fed, beside the
 #: address and token it belongs with; ``[tls].internal_ca_file`` cannot reach this hop yet, and
 #: :func:`~messagefoundry.config.tls_policy.vault_client_verify_kwargs` records what that would take.
-#: Unset = hvac's own default, which is ``requests``' PUBLIC certifi bundle.
+#: Unset = hvac and ``requests`` choose the CA from the process environment: at least hvac's
+#: ``VAULT_CACERT`` or ``VAULT_CAPATH``, then ``requests``' ``REQUESTS_CA_BUNDLE`` or
+#: ``CURL_CA_BUNDLE``, and only when none is set ``requests``' PUBLIC certifi bundle.
 _ENV_CA_FILE = "MEFOR_STORE_VAULT_CA_FILE"
 
 #: The refusals for an unset address or token: fixed text naming the variable, never a value. One
@@ -289,6 +291,16 @@ def is_vault_bad_request(exc: BaseException) -> bool:
     return isinstance(exc, InvalidRequest)
 
 
+def is_vault_forbidden(exc: BaseException) -> bool:
+    """Whether ``exc`` is Vault's HTTP 403, which hvac raises as ``Forbidden`` (ADR 0217: a token
+    may hold no capability on a retired Transit key). ``False`` without the ``[vault]`` extra."""
+    try:
+        from hvac.exceptions import Forbidden  # noqa: PLC0415
+    except ImportError:
+        return False
+    return isinstance(exc, Forbidden)
+
+
 #: The ``ssl`` errors that are a TLS session the peer closed, not a refusal of the hop (BACKLOG
 #: #3734). Named rather than imported, so this module adds no ``ssl`` use to the crypto inventory.
 _TLS_SESSION_DROPS = ("SSLEOFError", "SSLZeroReturnError")
@@ -408,6 +420,11 @@ TRANSIT_KEY_TYPES_AUDIT = TRANSIT_KEY_TYPES_DATA | {"hmac"}
 #: generates this KEK themselves so refusing it costs no counterparty anything.
 TRANSIT_KEY_TYPES_KEK = TRANSIT_KEY_TYPES_DATA | {"rsa-3072", "rsa-4096"}
 
+#: Types refused by ruling rather than by the ASVS 11.2.3 floor, which they meet: ``aes128-gcm96``
+#: is a 128-bit AEAD, withdrawn by owner ruling R4 of 2026-09-26 (BACKLOG #2043). The refusal for
+#: one of these must not read as a shortfall against that floor.
+_WITHDRAWN_TRANSIT_KEY_TYPES = frozenset({"aes128-gcm96"})
+
 
 def require_transit_key_type(
     client: Any,
@@ -446,11 +463,19 @@ def require_transit_key_type(
             f"response['data']['type']); refusing to start rather than using a key of unknown type."
         )
     if key_type not in allowed:
+        if key_type in _WITHDRAWN_TRANSIT_KEY_TYPES:
+            why = f"is no longer accepted for {use}, although it meets the 128-bit floor of ASVS 11.2.3"
+            floor = ""
+        else:
+            why = f"cannot be used for {use}"
+            floor = (
+                " (ASVS 11.2.3 -- at least 128 bits of security, and the key must support the "
+                "operation the engine performs on it)"
+            )
         raise KeyProviderError(
             f"Vault transit key {key_name!r} (from {selector}) is of type {key_type!r}, which "
-            f"cannot be used for {use}. Supported types: {', '.join(sorted(allowed))} "
-            f"(ASVS 11.2.3 -- at least 128 bits of security, and the key must support the "
-            f"operation the engine performs on it). Vault cannot change a key's type, and "
+            f"{why}. Supported types: {', '.join(sorted(allowed))}{floor}. "
+            f"Vault cannot change a key's type, and "
             f"rotating the key keeps its type, so create a key of a supported type (for example "
             f"vault write transit/keys/<new-name> type=aes256-gcm96) and set {selector} to its "
             f"name. {after_switch}".rstrip()
@@ -470,6 +495,9 @@ class VaultKeyProvider:
         # The instance posture the caller holds, for the revocation guard on this hop (vault
         # BACKLOG #2983). `None` counts as enforcing.
         self._posture = posture
+        # BACKLOG #6010: a malformed KEK name refuses here, at construction. `active_key` reads the
+        # name again through the same check, as the capability probe does.
+        _kek_name()
 
     def active_key(self) -> str | None:
         transit_key = _kek_name()
@@ -561,6 +589,16 @@ class VaultKeyProvider:
                 f"[store].key_provider={_EXTRA!r} got an empty/non-string plaintext from Vault transit "
                 f"(key {transit_key!r}); expected a base64 32-byte DEK."
             )
+        # BACKLOG #6710: the active_key() contract is base64 of exactly 32 bytes, so a DEK of the
+        # wrong size, or one wrapped as its own base64, refuses here, naming this provider, rather
+        # than wherever a caller first decodes it. Matched as text rather than decoded, so the
+        # check makes no extra copy of the key. Fixed text: no key material.
+        if _B64_32_BYTES.fullmatch(plaintext) is None:
+            raise KeyProviderError(
+                f"[store].key_provider={_EXTRA!r} got a plaintext from Vault transit (key "
+                f"{transit_key!r}) that is not base64 of 32 bytes; {_ENV_WRAPPED_DEK} must wrap "
+                f"exactly the raw 32 DEK bytes, not a key of another length and not its base64."
+            )
         return plaintext
 
     def retired_keys(self) -> Sequence[str]:
@@ -596,10 +634,41 @@ def store_token_setting() -> str | None:
     raise KeyProviderError(refusal)
 
 
+#: A Transit key name in the shape Vault's ``transit/keys/<name>`` route takes
+#: (``framework.GenericNameRegex``): a word character at each end, with word characters, dots and
+#: hyphens between, ASCII as Go's ``\w`` is. No ``/`` and no segment that is ``.`` or ``..``.
+_TRANSIT_KEY_NAME = re.compile(r"[A-Za-z0-9_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?")
+
+
+#: Exactly the strings ``base64.b64decode(..., validate=True)`` decodes to 32 bytes: 43 alphabet
+#: characters and one pad, so the same keys :func:`~messagefoundry.store.crypto._decode_key`
+#: accepts. A pattern rather than that decode, which would leave an unwipeable copy of the key; see
+#: :meth:`VaultKeyProvider.active_key`.
+_B64_32_BYTES = re.compile(r"[A-Za-z0-9+/]{43}=")
+
+
+def checked_transit_key_name(name: str, *, selector: str) -> str:
+    """``name``, refused unless it is a Transit key name (BACKLOG #6010).
+
+    hvac quotes a name into the request path with ``/`` left unescaped, and requests drops ``..``
+    segments, so ``a/../../../sys/x`` would reach ``/v1/sys/x`` with the store token, and the
+    capability probe would ask about a path the request never takes. ``selector`` names the
+    variable the name came from. The refusal is fixed text and does not echo the name."""
+    if _TRANSIT_KEY_NAME.fullmatch(name) is None:
+        raise KeyProviderError(
+            f"{selector} is not a Vault transit key name: use letters, digits and underscores, "
+            f"with dots or hyphens only between them. Any other name could change which Vault "
+            f"path a request reaches, so it is refused."
+        )
+    return name
+
+
 def _kek_name() -> str | None:
-    """The KEK's Transit key name. One read for :meth:`VaultKeyProvider.active_key` and for
-    :func:`kek_required_capabilities`, so the probe asks about the key the provider unwraps under."""
-    return os.environ.get(_ENV_TRANSIT_KEY) or None
+    """The KEK's Transit key name, ``None`` when unset. One read for :meth:`VaultKeyProvider.active_key`
+    and for :func:`kek_required_capabilities`, so the probe asks about the key the provider unwraps
+    under; both go through :func:`checked_transit_key_name`, which refuses a malformed name."""
+    name = os.environ.get(_ENV_TRANSIT_KEY) or None
+    return None if name is None else checked_transit_key_name(name, selector=_ENV_TRANSIT_KEY)
 
 
 def store_vault_token() -> str:
@@ -688,7 +757,7 @@ def kek_required_capabilities() -> dict[str, frozenset[str]]:
 
     Kept beside the calls so the two cannot drift: ``read_key`` is a read of ``transit/keys/<KEK>``
     and ``decrypt_data`` an update of ``transit/decrypt/<KEK>``. Raises :class:`KeyProviderError`
-    when the KEK name is not set, as the provider itself would."""
+    when the KEK name is not set or is malformed, as the provider itself would."""
     kek = _kek_name()
     if not kek:
         raise KeyProviderError(

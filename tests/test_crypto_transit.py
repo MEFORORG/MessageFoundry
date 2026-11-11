@@ -91,6 +91,15 @@ class _FakeTransit:
         digest = self._hmac.new(secret, base64.b64decode(hash_input), self._hashlib.sha256).digest()
         return {"data": {"hmac": "vault:v1:" + base64.b64encode(digest).decode("ascii")}}
 
+    def verify_signed_data(
+        self, *, name: str, hash_input: str, hmac: str, hash_algorithm: str = "sha2-256", **_: Any
+    ) -> dict[str, Any]:
+        # Transit `verify` of an HMAC: the row sealer's start probe and seal checks (ADR 0217).
+        secret = self._hmac_secret[name]
+        digest = self._hmac.new(secret, base64.b64decode(hash_input), self._hashlib.sha256).digest()
+        expected = "vault:v1:" + base64.b64encode(digest).decode("ascii")
+        return {"data": {"valid": self._hmac.compare_digest(expected, hmac)}}
+
     def encrypt_data(
         self, *, name: str, plaintext: str, associated_data: str | None = None, **_: Any
     ) -> dict[str, Any]:
@@ -310,6 +319,43 @@ def test_unreachable_transit_fails_closed_type_only(monkeypatch: pytest.MonkeyPa
         build_transit_cipher(StoreSettings())
     assert "RuntimeError" in str(excinfo.value)
     assert "secret-host" not in str(excinfo.value)  # type-only message, no host/secret leak
+
+
+# --- both key names are checked before they reach a Transit path (BACKLOG #6010) ------------------
+
+_BAD_KEY_NAMES = ["a/../../../sys/x", "..", "mefor/store", "mefor-store/"]
+
+
+@pytest.mark.parametrize("bad", _BAD_KEY_NAMES)
+@pytest.mark.parametrize("selector", ["MEFOR_STORE_TRANSIT_KEY", "MEFOR_STORE_TRANSIT_AUDIT_KEY"])
+def test_a_malformed_key_name_refuses_before_any_client_is_built(
+    monkeypatch: pytest.MonkeyPatch, selector: str, bad: str
+) -> None:
+    _use_fake(monkeypatch)
+
+    def _no_client(addr: str, token: str, **_: Any) -> _FakeClient:
+        raise AssertionError("a client was built for a malformed key name")
+
+    monkeypatch.setattr(crypto_transit, "_build_client", _no_client)
+    monkeypatch.setenv(selector, bad)
+    with pytest.raises(KeyProviderError, match=selector) as excinfo:
+        build_transit_cipher(StoreSettings())
+    assert bad not in str(excinfo.value)  # fixed text: the refusal never echoes the name
+    # The capability probe reads the same names, so it refuses the same way rather than ask about a
+    # path the cipher would never take.
+    with pytest.raises(KeyProviderError, match=selector):
+        crypto_transit.transit_cipher_required_capabilities()
+
+
+def test_a_dotted_hyphenated_key_name_still_builds(monkeypatch: pytest.MonkeyPatch) -> None:
+    transit = _use_fake(monkeypatch)
+    monkeypatch.setenv("MEFOR_STORE_TRANSIT_KEY", "mefor.store-v2")
+    monkeypatch.setenv("MEFOR_STORE_TRANSIT_AUDIT_KEY", "mefor_audit.v1")
+    transit.key_types["mefor_audit.v1"] = "hmac"
+    cipher = build_transit_cipher(StoreSettings())
+    assert cipher.transit_key_name == "mefor.store-v2"
+    assert transit.read_calls == ["mefor.store-v2", "mefor_audit.v1"]
+    assert "transit/hmac/mefor_audit.v1" in crypto_transit.transit_cipher_required_capabilities()
 
 
 # --- the operator-chosen key TYPE is checked at startup (BACKLOG #1166, ASVS 11.2.3) --------------

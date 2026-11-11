@@ -588,7 +588,7 @@ async def test_a_refused_step_up_carries_the_marker_only_when_the_exemption_appl
             ldap: Any = service._ldap
             ldap._principal = replace(ldap._principal, groups=frozenset())
         elif refusal == DIRECTORY_ROLE_MAP_UNSEALED:
-            monkeypatch.setattr(service_module, "ad_map_seal_ok", lambda _sealer, _current: False)
+            monkeypatch.setattr(service_module, "ad_map_seal_ok_async", _map_fails)
         elif refusal == "step_up_subject_mismatch":
             claims["sub"] = "S-1-5-21-someone-else"
         flow_id, _url = await _begin(service, token)
@@ -748,6 +748,9 @@ _KEYWORD_WRITERS = {
     "_directory_reject_audit": "extra",
     "_refuse_directory_row": "extra",
     "_complete_ad_login": "outcome_extra",
+    # ADR 0217 item 3: the step-up's auth.reauth row goes through this helper, which writes the
+    # call site's ``detail`` whole, so the marker is checked where that detail is built.
+    "_write_reauth_row": "detail",
 }
 #: The writers that put a keyword into the row they write, checked by
 #: :func:`test_each_writer_puts_the_marker_keyword_into_its_row`.
@@ -1158,3 +1161,8 @@ async def test_a_too_early_step_up_refused_before_the_exchange_leaves_the_idp_fl
         assert service.oidc_available is False
     finally:
         await store.close()
+
+
+async def _map_fails(*_: object) -> bool:
+    """The service's map seal check, switched to fail (ADR 0217 slice 1b: it is awaitable now)."""
+    return False

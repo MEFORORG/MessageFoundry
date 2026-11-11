@@ -576,11 +576,13 @@ def test_windows_creates_the_drafts_descriptor_without_the_creators_entry(tmp_pa
 
 
 def _is_elevated() -> bool:
+    # The production pre-check, not a second API (vault BACKLOG #6674 item 5).
     if sys.platform != "win32":
         return False
-    import ctypes
-
-    return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    try:
+        return restricted_file.administrators_enabled()
+    except RestrictedFileError:
+        return False  # a token that cannot be read is not elevated; never fail collection
 
 
 @windows_only
@@ -598,6 +600,65 @@ def test_windows_creates_the_file_owned_as_asked_or_not_at_all(tmp_path: Path) -
     write_restricted_file(path, b"k", read_grants=grants, creator_access=False, owner=_ADMINS)
     parsed = store_mod._parse_sddl_dacl(store_mod._read_dacl_sddl(path, owner=True) or "")
     assert parsed is not None and parsed.owner == _ADMINS
+
+
+@windows_only
+def test_windows_an_owner_no_token_may_assign_is_refused_on_every_leg(tmp_path: Path) -> None:
+    # Vault BACKLOG #6674 item 2: the Administrators owner reaches ERROR_INVALID_OWNER only off-admin,
+    # and the hosted legs run elevated. One service's SID is an owner neither an elevated nor a
+    # filtered token may assign without the restore privilege enabled, so this reaches the 1307
+    # branch on every leg. The CI leg runs under Git Bash, whose runtime is believed to enable that
+    # privilege on an elevated token, so it is turned off for the create.
+    from tests.test_worktree_remove_in_use import _privileges_disabled
+
+    path = tmp_path / "handoff.key"
+    with (
+        _privileges_disabled(("SeRestorePrivilege",)),
+        pytest.raises(RestrictedFileError, match="may not make") as caught,
+    ):
+        write_restricted_file(path, b"k", owner=f"*{_SERVICE}")
+    assert isinstance(caught.value, restricted_file.OwnerRefused)
+    assert not path.exists()
+
+
+@windows_only
+@pytest.mark.parametrize(
+    ("owner", "refusal"),
+    [
+        pytest.param("*S-1-1-0", "a group many accounts hold", id="everyone"),
+        pytest.param(f"*{_USERS}", "a group many accounts hold", id="users"),
+        pytest.param("*S-1-15-2-1", "an application package", id="all-app-packages"),
+        pytest.param("*S-1-15-3-1024-1", "an application package", id="capability"),
+    ],
+)
+def test_windows_an_owner_is_screened_as_a_read_grant_is(
+    tmp_path: Path, owner: str, refusal: str
+) -> None:
+    # Vault BACKLOG #6674 item 1: an owner holds READ_CONTROL and WRITE_DAC, so it gets the package
+    # and broad-group screens a read grant gets, before any file is made. The control, an owner of
+    # this process's own account, is test_windows_a_file_that_reads_back_owned_by_another_is_removed.
+    path = tmp_path / "store.key"
+    with pytest.raises(RestrictedFileError, match=refusal) as caught:
+        write_restricted_file(path, b"k", owner=owner)
+    assert "cannot be owned by it" in str(caught.value)
+    assert not isinstance(caught.value, restricted_file.OwnerRefused)  # refused before the create
+    assert not path.exists()
+
+
+@windows_only
+def test_windows_an_owner_named_by_a_group_name_is_refused(tmp_path: Path) -> None:
+    # Vault BACKLOG #6674 item 3, as documented: an alias such as Administrators is refused by
+    # name, with owner advice, and is named as an owner by its SID.
+    import getpass
+
+    path = tmp_path / "store.key"
+    with pytest.raises(RestrictedFileError, match="name an owner .* by its SID"):
+        write_restricted_file(path, b"k", owner="BUILTIN\\Administrators")
+    assert not path.exists()
+    # The control: an owner named by this process's own account name resolves and is accepted.
+    mine = tmp_path / "mine.key"
+    write_restricted_file(mine, b"k", owner=f"{os.environ['USERDOMAIN']}\\{getpass.getuser()}")
+    assert mine.read_bytes() == b"k"
 
 
 @windows_only

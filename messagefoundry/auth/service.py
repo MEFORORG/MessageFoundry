@@ -149,6 +149,7 @@ from messagefoundry.auth.tokens import (
 from messagefoundry.auth.tokens import (
     credential_id_hash as _credential_id_hash,  # locals and parameters here use the bare name
 )
+from messagefoundry.auth.usernames import BLANK_USERNAME_REFUSAL, username_refusal
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.secretprovider import (
     SecretProvider,
@@ -166,6 +167,7 @@ from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.keyed_lock import KeyedLock as _KeyedLock
 from messagefoundry.keyed_lock import hold_keyed_lock as _hold_keyed_lock
+from messagefoundry.logging_setup import redacted_log_field
 from messagefoundry.store.base import (
     AdminStore,
     audit_write_errors,
@@ -179,14 +181,20 @@ from messagefoundry.store.row_seal import (
     ADSET_KIND,
     ROLE_KIND,
     SESSION_KIND,
+    UNVERIFIABLE_SUBJECT_PREFIX,
     USER_KIND,
-    RowSealer,
+    AnyRowSealer,
     RowSealError,
+    RowSealKeyRetiredError,
+    RowSealUnverifiableError,
     SealFailureThrottle,
+    TransitSealUnavailableError,
+    TransitSealUnverifiableError,
 )
 from messagefoundry.store.store import (
     AD_ROLE_MAP,
     AD_SCOPE_MAP,
+    AUTHORITY_SEAL_UNVERIFIABLE_AUDIT_ACTION,
     LOGIN_ADDRESS_RESET_MARKER,
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
@@ -212,7 +220,8 @@ from messagefoundry.store.store import (
     UserRow,
     VerifiedUser,
     WebAuthnCredential,
-    ad_map_seal_ok,
+    ad_map_seal_ok_async,
+    deferred_revoke_reports,
     judge_totp,
     judge_totp_cell,
     passkey_cell_undecodable,
@@ -220,12 +229,12 @@ from messagefoundry.store.store import (
     passkey_is_way_past,
     passkey_is_way_past_under,
     require_notify_email,
-    role_seal_ok,
+    role_seal_ok_async,
     seed_notify_email,
     session_epochs_current,
-    session_seal_ok,
-    session_sealed_by_retired_key,
-    user_seal_ok,
+    session_seal_ok_async,
+    session_sealed_by_retired_key_async,
+    user_seal_ok_async,
 )
 from messagefoundry.store.transit_attestation import utf16_units
 from messagefoundry.transports.email import envelope_address_problem
@@ -281,6 +290,23 @@ _ALWAYS_REPORTED_REASONS: Final = frozenset(
 )
 
 
+def _rotation_store_errors() -> tuple[type[Exception], ...]:
+    """What a session rotation treats as refused, at the lapse check in
+    :meth:`AuthService._elevated_hash` and at the load and re-key in
+    :meth:`AuthService._rotate_session_hash`: every type :func:`_session_write_errors` names, plus a
+    Transit Outage (owner ruling 2026-11-08 on ADR 0217, "Revoke both"). Both sites need it: the
+    lapse check cannot cover the re-key, whose new seal is a Transit call of its own. Not cached, so
+    a test that clears :func:`_session_write_errors`' cache changes this tuple too."""
+    return (*_session_write_errors(), TransitSealUnavailableError)
+
+
+def _rotation_failure_reason(exc: BaseException) -> str:
+    """The ``reason`` an ``auth.session_rotation_failed`` row names for a refused rotation:
+    ``transit_unavailable`` for a Transit Outage, which is no store refusal, else ``store_error``
+    (BACKLOG #3023)."""
+    return "transit_unavailable" if isinstance(exc, TransitSealUnavailableError) else "store_error"
+
+
 @cache
 def _session_write_errors() -> tuple[type[Exception], ...]:
     """What a refused session read or write raises, at least on the store backends named there
@@ -288,9 +314,18 @@ def _session_write_errors() -> tuple[type[Exception], ...]:
     own errors, the acquire timeout, ``OSError`` for a connection lost at the socket, and pyodbc's
     ``Error`` root, which pyodbc raises for an unmapped SQLSTATE such as a deadlock victim. Narrower
     than :func:`~messagefoundry.store.base.audit_write_errors`, which also takes every
-    ``RuntimeError``, ``ValueError``, ``CipherError`` and ``sqlite3.InterfaceError``: a session
-    row's seal is a local HMAC, so no Transit call can refuse it, and an engine ``RuntimeError``
-    other than the acquire timeout still reads as a defect."""
+    ``RuntimeError``, ``ValueError``, ``CipherError`` and ``sqlite3.InterfaceError``: under the
+    local sealer a session row's seal is a local HMAC, so no Transit call can refuse it, and an
+    engine ``RuntimeError`` other than the acquire timeout still reads as a defect. Under the
+    Transit sealer (ADR 0217) that premise is FALSE: an Outage or an Unverifiable seal raises a
+    type this tuple does not take, so it escapes at least every site that catches only this tuple.
+    A session rotation adds the Outage type through :func:`_rotation_store_errors`, at the lapse
+    check in :meth:`AuthService._elevated_hash` and at the load and re-key in
+    :meth:`AuthService._rotate_session_hash` (owner ruling 2026-11-08, "Revoke both"). The slice
+    1b-iv catch census (vault #4739 step 6) read the other such sites and changed none. The
+    rotation's load and re-key also revoke the old hash on an Unverifiable answer, then re-raise
+    (decision d20261110T004916856-814db8 on ADR 0217, Q3); at least the census's other sites still
+    let the Unverifiable type escape."""
     return store_open_errors()
 
 
@@ -320,13 +355,16 @@ def _passkey_read_errors() -> tuple[type[Exception], ...]:
 
 
 class _RotationStoreError(Exception):
-    """A session rotation the store refused (BACKLOG #3023). ``old_revoked`` says whether every
-    best-effort revoke that followed it landed, under the old hash and the new one; the audit row
-    records it as ``revokes_landed``."""
+    """A session rotation the store refused (BACKLOG #3023), or a Transit Outage refused (owner
+    ruling 2026-11-08 on ADR 0217). ``old_revoked`` says whether every best-effort revoke that
+    followed it landed, under the old hash and, when a re-key was attempted, the new one; the audit
+    row records it as ``revokes_landed``. ``reason`` is the audit row's ``reason``, from
+    :func:`_rotation_failure_reason`."""
 
-    def __init__(self, old_revoked: bool) -> None:
-        super().__init__("session rotation refused by the store")
+    def __init__(self, old_revoked: bool, *, reason: str) -> None:
+        super().__init__("session rotation refused")
         self.old_revoked = old_revoked
+        self.reason = reason
 
 
 def _warn_if_corpus_unreadable(path: str | None) -> None:
@@ -531,7 +569,8 @@ _NEW_IP_DEDUP_MAX = 4096
 _NEW_IP_PER_SESSION_MAX = 8
 
 # BACKLOG #3772: the longest client-address text the new-address signal keeps as it is, in its dedupe
-# keys, the seen_ip, known_ip and client of its audit row, its notice and its past-cap log line. Every
+# keys, and the seen_ip, known_ip and client of its audit row and its notice. Its past-cap log line
+# carries a parsed address's canonical form or a digest instead (``_address_log_field``). Every
 # IPv4 or IPv6 address without a zone id fits, the longest being 45 characters; only text that does
 # not parse, or an IPv6 address with a long zone id, is longer. That text is caller-supplied on a
 # proxied hop, and without a bound each session could hold nine copies of it. Longer text keeps a
@@ -540,6 +579,38 @@ _NEW_IP_PER_SESSION_MAX = 8
 # Other sinks of the same text, such as sessions.client and other audit rows, are not bounded here.
 _NEW_IP_TEXT_MAX = 64
 _NEW_IP_TEXT_PREFIX = 24
+# BACKLOG #3770: the longest path value, counted after its escape, that the new-address WARNINGs log
+# (``logging_setup.redacted_log_field``). The path is caller-supplied and bounded only by the HTTP
+# server's request-line limit. The seen address logs as ``_address_log_field``, which is short.
+_NEW_IP_LOG_FIELD_MAX = 256
+# The two new-address WARNINGs up to their first field. The repeat line's head ends "path=" as on
+# main; the past-cap line's head is followed by "path=" on main and by "seen_ip=" here.
+_NEW_IP_REPEAT_HEAD = (
+    "a request from a new client address must re-verify; the address was already flagged since "
+    "the session's last re-verification (audit suppressed): path="
+)
+_NEW_IP_OVER_CAP_HEAD = (
+    "a request from a new client address must re-verify; the address is past the per-session cap "
+    f"of {_NEW_IP_PER_SESSION_MAX} (audit suppressed): "
+)
+
+
+def _new_ip_path_field(path: str, seen_text: str | None = None) -> str:
+    """The path field of a new-address WARNING (BACKLOG #3770): the path as
+    ``logging_setup.redacted_log_field`` reads it in the pre-#3770 repeat line, as the shipped
+    handler filters read it whatever the number of handlers, escaped and bounded; or a
+    placeholder; never seen-address text. With ``seen_text``, the past-cap line's, that reading is
+    also compared with the pre-#3770 past-cap line. When either line logs the placeholder is the
+    rule ``redacted_log_field`` states."""
+    checks = (
+        ()
+        if seen_text is None
+        else ((_NEW_IP_OVER_CAP_HEAD + "path=", " seen_ip=" + scrub_log_argument(seen_text)),)
+    )
+    return redacted_log_field(
+        path, _NEW_IP_LOG_FIELD_MAX, before=_NEW_IP_REPEAT_HEAD, checks=checks
+    )
+
 
 # The first-seen login-address signal (BACKLOG #288, ASVS 8.2.4). Its baseline is the store's
 # per-account ``known_login_addresses`` record (vault BACKLOG #2145), read at every session mint with
@@ -618,6 +689,13 @@ def _client_limiter_key(client: str | None) -> str:
     return _host_key(client) if client else "unknown"
 
 
+#: The per-process key of the digest the past-cap log line gives an address that does not parse
+#: (BACKLOG #3770). Keyed, because that text is caller-supplied and unredacted: a plain digest of a
+#: low-entropy value, a name or a password a client put in a forwarded header, could be recovered
+#: from the general log by hashing guesses. Lines of one process still compare by it.
+_ADDRESS_LOG_KEY = secrets.token_urlsafe(16).encode("ascii")
+
+
 def _bounded_address_text(address: str) -> str:
     """``address`` itself when it is at most ``_NEW_IP_TEXT_MAX`` characters, else a short prefix
     and the SHA-256 of the whole (BACKLOG #3772).
@@ -634,6 +712,32 @@ def _bounded_address_text(address: str) -> str:
     # and the result can be stored. Text within the bound is returned as it is, as on main.
     prefix = address[:_NEW_IP_TEXT_PREFIX].encode("utf-8", "replace").decode("utf-8")
     return f"{prefix}...sha256:{digest}"
+
+
+def _address_log_field(address: str) -> str:
+    """``address`` as a quoted log field value that never carries its raw text (BACKLOG #3770): the
+    canonical form of an IP address, or ``unparsed-sha256-`` and 16 hex digits of a SHA-256 of the
+    whole text, keyed by :data:`_ADDRESS_LOG_KEY`, when it does not parse. A zone id is text, so an
+    address with one logs its canonical address, ``-zone-sha256-`` and that digest.
+
+    The canonical form holds only hex digits, ``.`` and ``:``, and the digest forms only letters,
+    digits, ``.``, ``:`` and ``-``, so the address still reads as an address; the tests read the
+    past-cap line through two shipped handlers and check, for the addresses they name, that this
+    field closes, merges with and erases no other. Its spelling may differ from the raw text the
+    audit rows keep, ``2001:db8::1`` for ``2001:DB8:0:0:0:0:0:1`` for one. The address is
+    caller-supplied on a proxied hop, so this field never carries its text as it is; the audit
+    rows still do."""
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        parsed = None
+    if parsed is not None and not getattr(parsed, "scope_id", None):
+        return f'"{parsed}"'
+    keyed = _ADDRESS_LOG_KEY + address.encode("utf-8", "surrogatepass")
+    digest = hashlib.sha256(keyed).hexdigest()[:16]
+    if parsed is None:
+        return f'"unparsed-sha256-{digest}"'
+    return f'"{ipaddress.IPv6Address(int(parsed))}-zone-sha256-{digest}"'
 
 
 #: The refusals on an IdP step-up's return that draw :meth:`AuthService.allow_step_up_return_audit`
@@ -2025,6 +2129,37 @@ class UsernameTaken(RuntimeError):
     (BACKLOG #1808). ``POST /users`` answers it 409, with its own pre-check's text.
     :meth:`AuthService.create_directory_account` raises it too, when a row already holds the
     directory account's name or id (BACKLOG #2021)."""
+
+
+#: The text :class:`UserSealRefused` carries. Fixed, so it names no field of the record it refuses.
+USER_SEAL_REFUSED: Final = "the user record fails its integrity check, so it was refused"
+
+
+class UserSealRefused(RuntimeError):
+    """:meth:`AuthService.checked_user` found the account's row, and its record fails its integrity
+    seal (BACKLOG #5520). The failure was handed to the seal-failure report, which writes the audit
+    row and raises the alert only for the first failure of the account in each report interval
+    (:data:`~messagefoundry.store.row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS`) of this
+    service's process, so a refusal inside that interval adds no row. Not "no such user": the row is there, and an administrator
+    may still delete it. The admin routes answer it 423. A record Vault transit cannot verify is
+    refused the same way, reported under ``integrity.authority_seal_unverifiable`` (ADR 0217)."""
+
+
+@dataclass(frozen=True)
+class ListedUser:
+    """One account as :meth:`AuthService.list_checked_users` reads it (BACKLOG #5520): ``user`` with
+    its whole record checked against its seal, or ``None`` when that record fails, which was handed
+    to the seal-failure report, as :class:`UserSealRefused` says. ``id`` is all a caller may show of
+    a failing account; every other field of it is unchecked."""
+
+    id: str
+    user: VerifiedUser | None
+
+
+class InvalidUsername(ValueError):
+    """:meth:`AuthService.create_local_user` refused the name a new account was to take (BACKLOG
+    #5521), before anything was generated or written. ``POST /users`` answers it 400. The message
+    is :func:`~messagefoundry.auth.usernames.username_refusal`'s, which never echoes the value."""
 
 
 class DirectoryAccountNotFound(ValueError):
@@ -3495,6 +3630,18 @@ def oidc_client_auth_from_settings(
 
 #: The audit action written when an authority row fails its integrity seal (BACKLOG #2592).
 AUTHORITY_SEAL_FAILED_ACTION: Final = "integrity.authority_seal_failed"
+#: The audit action an Unverifiable authority row writes (ADR 0217, *The four answers*); the
+#: store's own constant, so the two cannot drift.
+AUTHORITY_SEAL_UNVERIFIABLE_ACTION: Final = AUTHORITY_SEAL_UNVERIFIABLE_AUDIT_ACTION
+#: The best-effort audit action a reconcile pass writes when Vault transit was unavailable reading
+#: an AD map (decision d20261110T181645742-b9eccb on ADR 0217). Not ``integrity.*``: an Outage
+#: records no seal failure.
+AD_RECONCILE_MAP_UNAVAILABLE_ACTION: Final = "auth.ad_reconcile_map_unavailable"
+#: The reason an AD map Vault transit could not verify is reported with (ADR 0217 (b)).
+DIRECTORY_MAP_UNVERIFIABLE: Final = "directory_map_unverifiable"
+#: The reason an AD map read during a Vault transit Outage is reported with. Not
+#: ``seal_unavailable``, which ADR 0217 (b) reserves for the Vault-wide abort.
+MAP_SEAL_UNAVAILABLE: Final = "map_seal_unavailable"
 #: How many times :meth:`AuthService.finish_webauthn_assertion` reads the passkey set and then the
 #: holder while the account's passkey digest keeps moving between the two, before it refuses the
 #: factor as unverifiable (BACKLOG #3068).
@@ -3521,9 +3668,20 @@ _ADMINISTRATOR_EXISTS_REFUSAL: Final = (
     " is nothing to provision -- create further accounts from the web console, and use"
     " `admin-unlock` if that administrator is locked out"
 )
+#: ``provision-admin``'s refusal while an account's record reads Unverifiable under Vault transit
+#: (ADR 0217 (a); engine PR 2860 hold, R3-F1). Asked before any account write.
+_UNVERIFIABLE_ACCOUNT_REFUSAL: Final = (
+    "an account's integrity seal could not be verified by Vault transit, so this command cannot"
+    " tell whether a usable Administrator exists, and it changed no account (its scan may write"
+    " integrity.authority_seal_unverifiable audit rows, as the seal-failure throttle allows). The"
+    " seal may be planted:"
+    " check that Vault is healthy and that every node holds the audit key's latest version, then"
+    " retry"
+)
 #: The first refusal of both :meth:`AuthService.provision_first_administrator` and its pre-check
-#: :meth:`AuthService.provision_refusal`, so the two answer a blank name alike (BACKLOG #3391).
-_BLANK_USERNAME_REFUSAL: Final = "a username is required and must not be blank"
+#: :meth:`AuthService.provision_refusal`, so the two answer a blank name alike (BACKLOG #3391), and
+#: the new-username rule's, so `POST /users` answers it alike too (BACKLOG #5521).
+_BLANK_USERNAME_REFUSAL: Final = BLANK_USERNAME_REFUSAL
 
 
 def _lookup_keys(user: UserRecord) -> tuple[str | None, ...]:
@@ -3553,12 +3711,65 @@ class _UserLookup:
         return self.held and self.user is None
 
 
+@dataclass(frozen=True)
+class _SealCheck:
+    """What :meth:`AuthService._verified` established about one account read (BACKLOG #2592,
+    #5520). Three outcomes: ``user`` set, the record passes its seal; ``failed``, it fails, and the
+    failure was handed to :meth:`AuthService._user_seal_failed`; neither, no account, or one whose
+    row was deleted, renamed, rebound or re-keyed between its reads, which is not reported. Only
+    ``failed`` reads as a record that fails its seal. From :meth:`AuthService._verified` it means
+    two reads naming the same account both failed, which two honest role writes committing across
+    both reads can also produce: a false alarm that docs/SECURITY.md, *What an admin user read
+    reports*, states. :meth:`AuthService._checked_by_id` also sets it when it fails closed, and
+    for a record Vault transit cannot verify, which it hands to
+    :meth:`AuthService._user_seal_unverifiable` instead (ADR 0217 (a))."""
+
+    user: VerifiedUser | None = None
+    failed: bool = False
+
+    @property
+    def settled(self) -> bool:
+        """The check established something: the record passes, or it fails."""
+        return self.user is not None or self.failed
+
+
+#: How many times :meth:`AuthService.checked_user` and :meth:`AuthService.list_checked_users` check
+#: an account by id while each check races a write that deletes or re-keys the row (BACKLOG #5520).
+#: What happens once every pass has raced is :meth:`AuthService._checked_by_id`'s to say.
+_CHECKED_READ_PASSES: Final = 3
+
+
 @dataclass
 class _StampOutcome:
     """What :meth:`AuthService._sealed_stamp` saw: ``refused`` when the store would not re-seal the
     row because its seal did not verify, so the stamp was not made (BACKLOG #2592)."""
 
     refused: bool = False
+
+
+@dataclass
+class _StampWindow:
+    """One ceremony's window from its first session stamp to its rotation (decided by the Manager
+    under the Owner's standing instruction of 2026-10-22, ADR 0217, widening "Revoke both"). See
+    :meth:`AuthService._stamp_to_rotation`. ``stamped`` is the hash the first stamp writes to,
+    set before that write runs (decision d20261110T004920629-fb8ff6, Q4), which arms the window;
+    ``closed`` is set once the rotation begins, which owns its
+    own refusals; ``lost`` says the window caught a refusal and answered for the ceremony.
+    ``audit_refused`` is the ``CipherError`` the window's own success audit row raised
+    (:meth:`AuthService._window_audit`), the one ``CipherError`` it answers for.
+    ``rotation_lost`` says :meth:`AuthService._elevated_hash`'s lapse check or re-key answered
+    ``session_lost`` (decision d20261110T004916856-814db8 on ADR 0217, Q1). It is not
+    ``Elevation.session_lost``, which a failed re-proof also sets, and whose row stays hard."""
+
+    stamped: str | None = None
+    closed: bool = False
+    lost: bool = False
+    rotation_lost: bool = False
+    audit_refused: BaseException | None = None
+
+
+#: The open stamp window of the running ceremony, if any (:meth:`AuthService._stamp_to_rotation`).
+_STAMP_WINDOW: ContextVar[_StampWindow | None] = ContextVar("_STAMP_WINDOW", default=None)
 
 
 class AuthService:
@@ -4487,6 +4698,27 @@ class AuthService:
             names.append(user.username)
         return usable, tuple(sorted(names))
 
+    async def _unverifiable_account_held(self) -> bool:
+        """Whether some account's record reads Unverifiable under Vault transit (ADR 0217 (a)), for
+        ``provision-admin`` alone (engine PR 2860 hold, R3-F1).
+
+        :meth:`_administrator_standing` reads through :meth:`_load_users`, which reports such a
+        record and drops it, so the refusal cannot count an Administrator whose seal Vault transit
+        could not verify, while the first-administrator grant's guard raises on that same row. An
+        Unverifiable record's roles are part of what its seal covers, so any one of them may be an
+        Administrator: the command refuses on one before any account write rather than clearing a
+        holder's factors and sessions and then failing at the grant. Each failing account is read
+        again by id, which raises for Unverifiable and returns refused for Forged; Forged stays
+        uncounted, as the grant's guard leaves it. The scans themselves are unchanged."""
+        for listed in await self.list_checked_users():
+            if listed.user is not None:
+                continue
+            try:
+                await self._lookup_user(listed.id)
+            except TransitSealUnverifiableError:
+                return True
+        return False
+
     async def has_self_sufficient_administrator(self) -> bool:
         """True iff some enabled Administrator is a local account with a usable password, so it can
         sign in with no directory or identity provider up.
@@ -4610,6 +4842,9 @@ class AuthService:
         usable, standing_admins = await self._administrator_standing()
         if usable:
             raise FirstAdministratorRefused(_ADMINISTRATOR_EXISTS_REFUSAL)
+        # Before every account write, the repair branch's clears included (R3-F1).
+        if await self._unverifiable_account_held():
+            raise FirstAdministratorRefused(_UNVERIFIABLE_ACCOUNT_REFUSAL)
         violations = self._policy.violations(password, username=username)
         if violations:
             raise FirstAdministratorRefused("; ".join(violations))
@@ -5037,6 +5272,8 @@ class AuthService:
            :func:`provision_notify_email` (BACKLOG #1138, #3391);
         3. an enabled local Administrator with a usable password exists
            (:meth:`has_self_sufficient_administrator`, vault BACKLOG #2711);
+        3a. some account's record reads Unverifiable under Vault transit
+           (:meth:`_unverifiable_account_held`, ADR 0217 (a)), the named one included;
         4. the account with that name fails its integrity seal;
         5. the named row is one this command will not complete: a directory account, a disabled
            one, or one that holds roles (:meth:`_existing_row_refusal`).
@@ -5055,6 +5292,8 @@ class AuthService:
             return str(exc)
         if await self.has_self_sufficient_administrator():
             return _ADMINISTRATOR_EXISTS_REFUSAL
+        if await self._unverifiable_account_held():
+            return _UNVERIFIABLE_ACCOUNT_REFUSAL
         lookup = await self._lookup_by_username(name)
         existing = lookup.user
         if existing is None:
@@ -7252,18 +7491,29 @@ class AuthService:
         # (1) Every stamp against the OLD hash, re-anchoring the session to this client address.
         # The accepted auth_time is written in the same statement (BACKLOG #2143), so the next
         # step-up must show a later one: this answer replayed by the IdP is then refused.
-        async with self._sealed_stamp(token_hash):
-            await self._store.mark_session_reauthed(
-                token_hash, client=client, idp_auth_time=principal_claims.auth_time
+        # The stamp-to-rotation window, as in reauth (_stamp_to_rotation).
+        elevation = Elevation(session_lost=True)
+        grant_refused: bool | None = False
+        grant_checked = False
+        async with self._stamp_to_rotation(
+            ceremony="reauth_oidc", actor=user.username, client=client
+        ) as window:
+            async with self._sealed_stamp(token_hash):
+                await self._store.mark_session_reauthed(
+                    token_hash, client=client, idp_auth_time=principal_claims.auth_time
+                )
+            self._restart_new_ip_dedupe(token_hash)
+            grant_refused = purpose is not None and await self._factor_binding_is_blocked_hash(
+                token_hash, purpose
             )
-        self._restart_new_ip_dedupe(token_hash)
-        grant_refused = purpose is not None and await self._factor_binding_is_blocked_hash(
-            token_hash, purpose
-        )
-        # (2) Rotate. Past this line the staged hash no longer resolves.
-        elevation = await self._elevated_hash(
-            token_hash, ceremony="reauth_oidc", actor=user.username, client=client
-        )
+            grant_checked = True
+            # (2) Rotate. Past this line the staged hash no longer resolves.
+            elevation = await self._elevated_hash(
+                token_hash, ceremony="reauth_oidc", actor=user.username, client=client
+            )
+        if window.lost and not grant_checked:
+            # Decision d20261109T200352805-599b24, item 3: the check never ran, so the row says so.
+            grant_refused = None
         if elevation.ok:
             # vault BACKLOG #2145, as in reauth.
             await self._mark_login_address_known(user.id, client, step_up=True)
@@ -7288,8 +7538,38 @@ class AuthService:
             "session_revoked": False,
             **self._step_up_address_fields(flow, client),
         }
-        await self._audit("auth.reauth", actor=user.username, detail=_json(detail), client=client)
+        await self._write_reauth_row(
+            lost=window.lost or window.rotation_lost,
+            actor=user.username,
+            detail=_json(detail),
+            client=client,
+        )
         return OidcStepUp(elevation=elevation, return_to=return_to)
+
+    async def _write_reauth_row(
+        self, *, lost: bool, actor: str | None, detail: str, client: str | None
+    ) -> None:
+        """Write a step-up's ``auth.reauth`` row. Hard, as before, except when its stamp window
+        answered ``session_lost`` (decision d20261109T200352805-599b24 on ADR 0217, item 3): then
+        softly, through the audit set, since the Transit Outage that ended the session on a
+        ``vault_transit`` store also refuses this row's audit-chain MAC, and the answer is the
+        fail-closed control while the row only records it. ``lost`` is also set when the session
+        was lost at the rotation itself, the lapse check or the re-key (decision
+        d20261110T004916856-814db8, Q1), never for a failed re-proof, whose row stays hard."""
+
+        async def row() -> None:
+            await self._audit("auth.reauth", actor=actor, detail=detail, client=client)
+
+        if not lost:
+            await row()
+            return
+        await write_audit_soft(
+            row,
+            log=_log,
+            message="the auth.reauth row of a step-up that lost its session could not be written",
+            errors=audit_write_errors(),
+            defects=AUDIT_WRITE_DEFECTS,
+        )
 
     async def _step_up_actor(self, flow: PendingFlow) -> str:
         """The account a step-up refusal is filed under: the staged session's user, else ``<oidc>``.
@@ -8979,8 +9259,11 @@ class AuthService:
         scopes: dict[str, channel_scope.ScopeInput] = {}
         # Both directory maps read once for the pass, each through its seal check (BACKLOG #2592),
         # so every account in the pass is judged against one version of each map.
-        role_map = await self._ad_map(AD_ROLE_MAP)
-        scope_map = await self._ad_map(AD_SCOPE_MAP)
+        # A map Vault transit could not verify reads as empty and writes no role (ADR 0217 (b),
+        # owner ruling 2026-11-10): `_reconcile_ad_map`.
+        role_map, role_map_held = await self._reconcile_ad_map(AD_ROLE_MAP)
+        scope_map, scope_map_held = await self._reconcile_ad_map(AD_SCOPE_MAP)
+        maps_held = role_map_held and scope_map_held
         for probe in probes:
             if probe.outcome is not reconcile.ProbeOutcome.PRESENT:
                 continue
@@ -9127,7 +9410,7 @@ class AuthService:
                 self._advance_referral_standing("forfeit")
             # An account with no watermark recorded gets None, which reports.
             outcome = await self._apply_reconcile_revocation(
-                revocation, watermark=watermarks.get(revocation.user_id)
+                revocation, watermark=watermarks.get(revocation.user_id), maps_held=maps_held
             )
             if outcome != "skipped":
                 applied.append(revocation)
@@ -10542,7 +10825,11 @@ class AuthService:
         return isinstance(detail, dict) and detail.get("reason") == revocation.reason
 
     async def _apply_reconcile_revocation(
-        self, revocation: reconcile.SessionRevocation, *, watermark: _AuditWatermark | None
+        self,
+        revocation: reconcile.SessionRevocation,
+        *,
+        watermark: _AuditWatermark | None,
+        maps_held: bool,
     ) -> _RevocationApplied:
         """Apply one planned revocation: persist a role re-diff (when that is why), drop the user's
         live sessions, audit, and notify the affected user out-of-band (ASVS 6.3.7). A scope
@@ -10573,7 +10860,12 @@ class AuthService:
         read, since the compare is on the set, not the record. **Residual, at least:** the second
         can still end a session the first had not yet ended, when its whole apply runs between the
         first's role write and the first's own session revocation. Both then report, the first for
-        the roles and the second for the session."""
+        the roles and the second for the session.
+
+        ``maps_held`` is False only on a pass where an AD map read Unverifiable or Outage
+        (:meth:`_reconcile_ad_map`): no role is written, the sessions still end, and the audit row
+        carries ``map_unverified: true`` and no ``roles``. A Forged map still reads as held, as on
+        ``main``, so its empty targets are written."""
         user = await self._load_user(revocation.user_id)
         if revocation.reason == reconcile.SCOPE_CHANGED and (
             user is None or user.channel_scope != revocation.scope_from
@@ -10596,6 +10888,11 @@ class AuthService:
         # #3085): only the first of them writes and counts a change, and a write that finds the
         # roles moved since this read writes nothing and counts none.
         roles_changed = False
+        # ADR 0217 (b), owner ruling 2026-11-10: on a pass where a map did not verify, the plan's
+        # target roles come from a map read as empty, so no role is written from them; the
+        # sessions below still end.
+        if not maps_held:
+            revocation = replace(revocation, role_ids=None)
         if (
             revocation.role_ids is not None
             and user is not None
@@ -10656,6 +10953,8 @@ class AuthService:
                 {
                     "reason": revocation.reason,
                     "sessions": revoked,
+                    # Only when a map did not verify, so every other row keeps its exact string.
+                    **({} if maps_held else {"map_unverified": True}),
                     **(
                         {"roles": list(revocation.role_ids)}
                         if revocation.role_ids is not None
@@ -11019,7 +11318,9 @@ class AuthService:
         except _RotationStoreError:
             return None
 
-    async def _rotate_session_hash(self, old_hash: str) -> str | None:
+    async def _rotate_session_hash(
+        self, old_hash: str, *, unverifiable: list[bool] | None = None
+    ) -> str | None:
         """:meth:`_rotate_session_token` keyed on the session's HASH, for the one ceremony that holds
         no token: the federated step-up callback, which the SameSite=Strict cookie never reaches
         (BACKLOG #296). Same contract, same lock, same re-key.
@@ -11033,14 +11334,36 @@ class AuthService:
         audit and answer as ``session_lost``. If a revoke is refused too, the session stays live
         until it lapses; the error records which. On Postgres the re-key waits out a pool shortage
         rather than raising. On SQL Server it waits up to a longer, still finite limit, and a
-        ``StoreAcquireTimeout`` at that limit reaches this branch like any other refusal.
+        ``StoreAcquireTimeout`` at that limit reaches this branch like any other refusal. So does a
+        Transit Outage (``TransitSealUnavailableError``), as for a store refusal (owner ruling
+        2026-11-08 on ADR 0217, "Revoke both"): at the load, the old hash is revoked, since no new
+        hash exists yet; at the re-key, both are. Each revoke is best effort, as above, and the
+        audit row names ``transit_unavailable`` rather than ``store_error``. On the elevation path
+        :meth:`_elevated_hash`'s lapse check loads the session first, takes the same Outage, and
+        usually leaves this load a cache hit. An Unverifiable answer, ``TransitSealUnverifiableError``
+        at the load or ``RowSealUnverifiableError`` at the re-key, revokes the old hash, best effort
+        and shielded from a cancel, then propagates (decision d20261110T004916856-814db8 on ADR
+        0217, Q3). Before it propagates, whether that revoke landed is appended to
+        ``unverifiable``, when given, so :meth:`_elevated_hash` can audit it (decision
+        d20261110T042322305-2ffc60). A session under a retired key at the re-key is ended quietly
+        (build ruling 3).
 
         A cancellation is not an ``Exception``, so it skips this branch and propagates with the old
         hash unrotated and unrevoked. The longer post-commit wait widens the window for one."""
         try:
             session = await self._load_session(old_hash)
-        except _session_write_errors() as exc:
-            raise _RotationStoreError(await self._revoke_unrotated(old_hash, None, exc)) from exc
+        except _rotation_store_errors() as exc:
+            raise _RotationStoreError(
+                await self._revoke_unrotated(old_hash, None, exc),
+                reason=_rotation_failure_reason(exc),
+            ) from exc
+        except TransitSealUnverifiableError as exc:
+            # Decision d20261110T004916856-814db8 on ADR 0217, Q3: the stamp is on this hash, so it
+            # is revoked, best effort and shielded, then the Unverifiable answer propagates.
+            landed = await self._revoke_stamped_shielded(old_hash, exc)
+            if unverifiable is not None:
+                unverifiable.append(landed)
+            raise
         if session is None:
             return None
         # Under the account's re-proof lock (BACKLOG #1138), so no rotation lands while a password
@@ -11055,26 +11378,55 @@ class AuthService:
             except RowSealError:  # BACKLOG #2592: the row failed its seal; nothing was written
                 await self._session_seal_failed(old_hash)
                 return None
-            except _session_write_errors() as exc:
+            except RowSealKeyRetiredError:
+                # Owner ruling 2026-11-07 on ADR 0217, "Quiet end at callers": the row changed
+                # between the load and the re-key to one sealed under a retired key. Genuine, so
+                # it is ended as the loader ends one, with nothing reported as a seal failure.
+                await self._session_seal_failed(old_hash, key_changed=True)
+                return None
+            except _rotation_store_errors() as exc:
                 raise _RotationStoreError(
-                    await self._revoke_unrotated(old_hash, hash_token(new_token), exc)
+                    await self._revoke_unrotated(old_hash, hash_token(new_token), exc),
+                    reason=_rotation_failure_reason(exc),
                 ) from exc
+            except RowSealUnverifiableError as exc:
+                # Decision d20261110T004916856-814db8, Q3: the re-key's write check could not
+                # verify the row and wrote nothing, so only the stamped old hash exists to revoke.
+                landed = await self._revoke_stamped_shielded(old_hash, exc)
+                if unverifiable is not None:
+                    unverifiable.append(landed)
+                raise
             if not rotated:
                 return None
             self._rekey_token_state(old_hash, hash_token(new_token))
             return new_token
 
     async def _revoke_unrotated(
-        self, old_hash: str, new_hash: str | None, cause: Exception
+        self,
+        old_hash: str,
+        new_hash: str | None,
+        cause: BaseException,
+        *,
+        stamped: bool = False,
     ) -> bool:
-        """Revoke a session whose rotation the store refused, under ``old_hash`` and, when a re-key
-        was attempted, ``new_hash``; ``True`` when every revoke landed (BACKLOG #3023). Best effort: a
+        """Revoke a session whose rotation the store refused, or a Transit Outage refused (owner
+        ruling 2026-11-08), under ``old_hash`` and, when a re-key was attempted, ``new_hash``;
+        ``True`` when every revoke landed (BACKLOG #3023). Best effort: a
         second refusal is logged, never raised, so the caller still fails closed. The log names the
         error classes only, never a hash.
 
         Each revoke is the ordinary, bounded ``revoke_session``. It has other callers that do not
         follow a committed write, so it is not moved onto a store's longer post-commit borrow
-        here, and at the acquire limit it can be refused while the pool is still short."""
+        here, and at the acquire limit it can be refused while the pool is still short.
+
+        ``stamped`` is :meth:`_revoke_stamped_shielded`'s revoke of a stamped hash, whose callers
+        are the stamp window, for any exception, code defects and cancels included, and the
+        rotation's own load and re-key, for an Unverifiable answer. A cause's message may carry a
+        row value there (CLAUDE.md section 9), so the WARNING names the cause's class and the
+        session's 12-character ref only, with no message and no traceback; the traceback goes at
+        DEBUG. Its wording says the rotation did not complete, which holds for every such caller,
+        and names no window, since the rotation's own revoke happens after the window closed and a
+        ceremony may have none."""
         refused: list[str] = []
         for token_hash in (old_hash, new_hash):
             if token_hash is None:
@@ -11086,8 +11438,24 @@ class AuthService:
         outcome = (
             f"a revoke was refused too ({', '.join(refused)})" if refused else "it was revoked"
         )
+        if stamped:
+            _log.warning(
+                "auth: a stamped session's rotation did not complete, on %s (session %s); %s",
+                type(cause).__name__,
+                old_hash[:_SESSION_REF_LEN],
+                outcome,
+            )
+            _log.debug("auth: the stamped session's revoke cause", exc_info=cause)
+            return not refused
         _log.warning(
-            "auth: a session rotation was refused by the store (%s); %s",
+            "auth: a session rotation, or a step before it, was refused by %s (%s); %s",
+            "the Transit sealer"
+            if isinstance(cause, TransitSealUnavailableError)
+            else "the store"
+            if isinstance(cause, _session_write_errors())
+            else "a cancel"
+            if isinstance(cause, asyncio.CancelledError)
+            else "an error",
             type(cause).__name__,
             outcome,
             exc_info=cause,  # a SQL defect is caught here too, so its traceback must survive
@@ -11120,26 +11488,29 @@ class AuthService:
         loop = asyncio.get_running_loop()
         give_up_at = loop.time() + _POST_COMMIT_REVOKE_BUDGET_SECONDS
         attempt = 0
-        while True:
-            attempt += 1
-            try:
-                return await self._store.revoke_user_sessions(user_id)
-            except _session_write_errors() as exc:
-                if _is_revoke_defect(exc):
+        # A seal refusal the committing attempt met is reported once, by it; one only failed
+        # attempts met is reported by each of them (decision d20261110T063908944-857965, item 4).
+        async with deferred_revoke_reports():
+            while True:
+                attempt += 1
+                try:
+                    return await self._store.revoke_user_sessions(user_id)
+                except _session_write_errors() as exc:
+                    if _is_revoke_defect(exc):
+                        raise
+                    if attempt < _POST_COMMIT_REVOKE_ATTEMPTS and loop.time() < give_up_at:
+                        await asyncio.sleep(_POST_COMMIT_REVOKE_BACKOFF_SECONDS * attempt)
+                        continue
+                    await self._record_revoke_miss(
+                        user_id,
+                        exc,
+                        change=change,
+                        attempts=attempt,
+                        actor=actor,
+                        client=client,
+                        not_attempted=not_attempted,
+                    )
                     raise
-                if attempt < _POST_COMMIT_REVOKE_ATTEMPTS and loop.time() < give_up_at:
-                    await asyncio.sleep(_POST_COMMIT_REVOKE_BACKOFF_SECONDS * attempt)
-                    continue
-                await self._record_revoke_miss(
-                    user_id,
-                    exc,
-                    change=change,
-                    attempts=attempt,
-                    actor=actor,
-                    client=client,
-                    not_attempted=not_attempted,
-                )
-                raise
 
     async def _record_revoke_miss(
         self,
@@ -11252,35 +11623,77 @@ class AuthService:
         a deadline that passes during that wait is not caught.
 
         A store refusal anywhere from the lapse check to the re-key fails closed (BACKLOG #3023):
-        see :meth:`_rotate_session_hash`."""
+        see :meth:`_rotate_session_hash`, which says which Transit answers that covers. The lapse
+        check's own reads take :func:`_rotation_store_errors`, so a Transit Outage there revokes the
+        old hash too (owner ruling 2026-11-08 on ADR 0217, "Revoke both"). This is the site the
+        ruling binds on the elevation path: the lapse check loads the session before the rotation
+        does. It is NOT the only Transit call after the ceremony's stamp: at least ``verify_mfa``,
+        the passkey assertion and ``reauth`` make sealed reads or writes between their stamp and
+        this method. Those are :meth:`_stamp_to_rotation`'s (ADR 0217, decided by the Manager under
+        the Owner's standing instruction of 2026-10-22). This method closes that window once the
+        lapse check has passed, so a refusal from the re-key on is this method's, and an exception
+        from the lapse check that this method's handlers do not take still reaches the window,
+        which revokes the stamped hash (decision d20261109T200352805-599b24, item 1). An
+        Unverifiable answer is the exception to that: at the lapse check this method revokes the
+        stamped hash itself, shielded, and closes the window first so it is not revoked twice; at
+        the rotation's load or re-key the rotation revokes it. Either way the revoke is written as
+        ``auth.session_rotation_failed`` with reason ``transit_unverifiable``, softly, and then the
+        answer propagates (decisions d20261110T042322305-2ffc60 and d20261110T063908944-857965,
+        item 2). The lapse check's reads are the session's
+        and the account's: an Outage on the account record's check revokes the session too, though
+        the session's own seal held."""
+        window = _STAMP_WINDOW.get()
         rotated: str | None = None
         failure: dict[str, object] = {"reason": "session_gone"}
+        unverifiable: list[bool] = []
         try:
             if await self._rotation_lapsed(token_hash, ceremony=ceremony, client=client):
+                if window is not None:
+                    window.rotation_lost = True
                 return Elevation(session_lost=True)
-            rotated = await self._rotate_session_hash(token_hash)
+            if window is not None:
+                # The rotation owns its refusals from here (:meth:`_stamp_to_rotation`). The lapse
+                # check is before it, so an exception there that no handler below takes (at least
+                # Forged or a code defect) still reaches the window, which revokes the stamped hash
+                # and re-raises (decision d20261109T200352805-599b24, item 1). An Unverifiable
+                # answer there is revoked and recorded by the handler below instead.
+                window.closed = True
+            rotated = await self._rotate_session_hash(token_hash, unverifiable=unverifiable)
+        except (TransitSealUnverifiableError, RowSealUnverifiableError) as exc:
+            if unverifiable:
+                # The rotation's load or re-key, which revoked the stamped hash itself.
+                landed = unverifiable[0]
+            else:
+                # The lapse check's (decision d20261110T063908944-857965, item 2): revoked here,
+                # shielded, and the window closed first, so it does not revoke the hash again.
+                if window is not None:
+                    window.closed = True
+                landed = await self._revoke_stamped_shielded(token_hash, exc)
+            # Decisions d20261110T042322305-2ffc60 and d20261110T063908944-857965: the row records
+            # the revoke, softly, before the Unverifiable answer propagates.
+            await self._audit_rotation_failed(
+                ceremony=ceremony,
+                actor=actor,
+                client=client,
+                failure={"reason": "transit_unverifiable", "revokes_landed": landed},
+            )
+            raise
         except _RotationStoreError as refused:
             # BACKLOG #3023: the store refused the re-key. The session was revoked, best effort,
             # and this fails closed exactly as a session gone underneath the ceremony does.
-            failure = {"reason": "store_error", "revokes_landed": refused.old_revoked}
-        except _session_write_errors() as exc:
-            # The lapse check's own reads, refused: the ceremony's stamp is already on this hash.
+            failure = {"reason": refused.reason, "revokes_landed": refused.old_revoked}
+        except _rotation_store_errors() as exc:
+            # The lapse check's own reads, refused by the store or by a Transit Outage: the
+            # ceremony's stamp is already on this hash ("Revoke both", 2026-11-08).
             revoked = await self._revoke_unrotated(token_hash, None, exc)
-            failure = {"reason": "store_error", "revokes_landed": revoked}
+            failure = {"reason": _rotation_failure_reason(exc), "revokes_landed": revoked}
         if rotated is None:
-            # Soft, so a refused audit write still answers session_lost rather than a 500: the
-            # answer is the fail-closed control, and the row only records it.
-            await write_audit_soft(
-                lambda: self._audit(
-                    "auth.session_rotation_failed",
-                    actor=actor,
-                    detail=_json({"ceremony": ceremony, **failure}),
-                    client=client,
-                ),
-                log=_log,
-                message="the auth.session_rotation_failed audit row could not be written",
-                errors=_session_write_errors(),
-                defects=AUDIT_WRITE_DEFECTS,
+            if window is not None:
+                # Decision d20261110T004916856-814db8 on ADR 0217, Q1: the session was lost at the
+                # rotation, so the ceremony's own row is written softly, as for a lost window.
+                window.rotation_lost = True
+            await self._audit_rotation_failed(
+                ceremony=ceremony, actor=actor, client=client, failure=failure
             )
             return Elevation(session_lost=True)
         await self._audit(
@@ -11388,14 +11801,23 @@ class AuthService:
             return None
         return session
 
-    async def _session_row_holds(self, session: SessionRecord, sealer: RowSealer | None) -> bool:
+    async def _session_row_holds(self, session: SessionRecord, sealer: AnyRowSealer | None) -> bool:
         """Whether an unrevoked session row's seal verifies; a row that fails is handed to
-        :meth:`_session_seal_failed`, which ends it (BACKLOG #2592)."""
-        if session_seal_ok(sealer, session):
+        :meth:`_session_seal_failed`, which ends it (BACKLOG #2592).
+
+        Under Transit the retired-key lookup is itself a Transit call. When it raises, the row is
+        still ended first and then reported as an integrity failure (``key_changed=False``) (owner
+        ruling 2026-11-08 on ADR 0217, "Revoke, then report"). The end is best effort, as
+        :meth:`_session_seal_failed` says: a revoke the store refuses is logged, and the row stays
+        live until it lapses. The caught type is not recorded: the report reads as any other seal
+        failure."""
+        if await session_seal_ok_async(sealer, session):
             return True
-        await self._session_seal_failed(
-            session.token_hash, key_changed=session_sealed_by_retired_key(sealer, session)
-        )
+        try:
+            key_changed = await session_sealed_by_retired_key_async(sealer, session)
+        except (TransitSealUnverifiableError, TransitSealUnavailableError):
+            key_changed = False
+        await self._session_seal_failed(session.token_hash, key_changed=key_changed)
         return False
 
     async def _session_seal_failed(self, token_hash: str, *, key_changed: bool = False) -> None:
@@ -11458,31 +11880,151 @@ class AuthService:
         The store refuses the write, writing nothing, when the row it read does not verify. That is
         handled here like a refused read, and the yielded outcome's ``refused`` is set. A caller
         whose next steps record a success must check it and end closed; the others reach a rotation
-        that fails closed on the same row."""
+        that fails closed on the same row.
+
+        The stamp arms the ceremony's open :class:`_StampWindow`, if it has one and the rotation has
+        not begun (:meth:`_stamp_to_rotation`), BEFORE its write (decision
+        d20261110T004920629-fb8ff6 on ADR 0217, Q4): a write whose commit landed and then raised
+        is ambiguous, so it still revokes. The cost is availability only: a write that raised
+        before its commit landed revokes a session whose stamp never landed."""
         outcome = _StampOutcome()
+        window = _STAMP_WINDOW.get()
+        if window is not None and not window.closed and window.stamped is None:
+            window.stamped = token_hash
         try:
             yield outcome
         except RowSealError:
             outcome.refused = True
             await self._session_seal_failed(token_hash)
+        except RowSealKeyRetiredError:
+            # Owner ruling 2026-11-07 on ADR 0217, "Quiet end at callers": refused like a failed
+            # seal, so no success is recorded, but ended quietly, as the loader ends one.
+            outcome.refused = True
+            await self._session_seal_failed(token_hash, key_changed=True)
+
+    @asynccontextmanager
+    async def _stamp_to_rotation(
+        self, *, ceremony: str, actor: str | None, client: str | None
+    ) -> AsyncIterator[_StampWindow]:
+        """Guard a ceremony's window from its session stamp to its rotation (decided by the Manager
+        under the Owner's standing instruction of 2026-10-22, ADR 0217, widening "Revoke both").
+
+        Between the stamp and the rotation a ceremony makes more store calls, sealed under Transit,
+        at least a second stamp, ``record_login_success``, a factor-binding check and an audit row.
+        Once the first stamp's write begins (decision d20261110T004920629-fb8ff6, Q4: armed before
+        the write, so an ambiguous commit still revokes), ANY exception before the rotation
+        revokes the stamped hash, best
+        effort and shielded from a cancel (decision d20261109T200352805-599b24 on ADR 0217, item
+        1). Two kinds are then answered: a refusal :func:`_rotation_store_errors` names, and the
+        ``CipherError`` of the window's own success audit row (:meth:`_window_audit`). For those the
+        ``auth.session_rotation_failed`` row is written as :meth:`_elevated_hash` writes it and the
+        exception is suppressed with ``lost`` set, so the ceremony answers ``session_lost``. Every
+        other exception, at least Forged, Unverifiable, a cancel and a code defect, is re-raised
+        after the revoke. Before the first stamp's write, or once the rotation began, nothing is
+        revoked here and the exception propagates as before."""
+        window = _StampWindow()
+        reset = _STAMP_WINDOW.set(window)
+        try:
+            yield window
+        except (Exception, asyncio.CancelledError) as exc:
+            # Not BaseException: awaiting the revoke while a GeneratorExit closes the coroutine
+            # raises RuntimeError, and an interpreter exit is not the window's to answer.
+            if window.stamped is None or window.closed:
+                raise
+            stamped = window.stamped
+            answered = isinstance(exc, _rotation_store_errors()) or (
+                exc is window.audit_refused and isinstance(exc, CipherError)
+            )
+            revoked = await self._revoke_stamped_shielded(stamped, exc)
+            if not answered:
+                raise
+            window.lost = True
+            reason = (
+                "audit_refused" if exc is window.audit_refused else _rotation_failure_reason(exc)
+            )
+            await self._audit_rotation_failed(
+                ceremony=ceremony,
+                actor=actor,
+                client=client,
+                failure={"reason": reason, "revokes_landed": revoked},
+            )
+        finally:
+            _STAMP_WINDOW.reset(reset)
+
+    async def _revoke_stamped_shielded(self, token_hash: str, cause: BaseException) -> bool:
+        """:meth:`_revoke_unrotated` for a stamped hash, from a stamp window or from the rotation's
+        own Unverifiable branches, run to completion through a cancel the way
+        :func:`_write_through_cancellation` runs a refused sign-in's rows; a cancel that lands
+        meanwhile is re-raised after it, so that cancel then replaces the caller's exception, as it
+        does for :func:`_write_through_cancellation`'s own callers. ``True`` when the revoke
+        landed. A revoke that fails outside the errors :meth:`_revoke_unrotated` takes is logged
+        and reads as not landed, so that failure never replaces the caller's exception."""
+        landed: list[bool] = []
+
+        async def revoke() -> None:
+            try:
+                landed.append(await self._revoke_unrotated(token_hash, None, cause, stamped=True))
+            except Exception:  # noqa: BLE001 -- best effort: the caller's exception stands
+                _log.exception("auth: a stamped session's revoke failed; the original error stands")
+
+        await _write_through_cancellation([revoke])
+        return bool(landed and landed[0])
+
+    async def _window_audit(
+        self, window: _StampWindow, action: str, *, actor: str | None, client: str | None
+    ) -> None:
+        """Write a ceremony's success audit row inside its stamp window, marking a ``CipherError``
+        it raises as the window's to answer (:meth:`_stamp_to_rotation`): on a ``vault_transit``
+        store that is the audit-chain MAC refused by a Transit Outage."""
+        try:
+            await self._audit(action, actor=actor, client=client)
+        except CipherError as exc:
+            window.audit_refused = exc
+            raise
+
+    async def _audit_rotation_failed(
+        self,
+        *,
+        ceremony: str,
+        actor: str | None,
+        client: str | None,
+        failure: dict[str, object],
+    ) -> None:
+        """Write ``auth.session_rotation_failed``, soft, so a refused audit write still answers
+        ``session_lost`` rather than a 500: the answer is the fail-closed control, and the row only
+        records it. The audit set, not the session set: on a vault_transit store a Transit Outage
+        that refused the rotation also refuses the audit-chain MAC, as CipherError (ADR 0217)."""
+        await write_audit_soft(
+            lambda: self._audit(
+                "auth.session_rotation_failed",
+                actor=actor,
+                detail=_json({"ceremony": ceremony, **failure}),
+                client=client,
+            ),
+            log=_log,
+            message="the auth.session_rotation_failed audit row could not be written",
+            errors=audit_write_errors(),
+            defects=AUDIT_WRITE_DEFECTS,
+        )
 
     # --- the user loader (BACKLOG #2592) -----------------------------------------------------------
 
     async def _load_user(self, user_id: str) -> VerifiedUser | None:
         """The account ``user_id`` names, its integrity seal checked, or ``None``. With
         :meth:`_lookup_user`, :meth:`_lookup_by_username`, :meth:`_lookup_by_directory_object_id`,
-        :meth:`_load_user_by_federated_subject`, :meth:`_load_users` and :meth:`_verified`, the
-        ONLY readers of the store's user readers in this service, beside the two existence
-        questions; ``tests/test_user_seal.py`` holds that. See
-        :meth:`_verified` for what ``None`` covers."""
+        :meth:`_load_user_by_federated_subject`, :meth:`list_checked_users`,
+        :meth:`_checked_by_id` and :meth:`_verified`, the ONLY readers of the store's user readers
+        in this service, beside the three existence questions; ``tests/test_user_seal.py`` holds
+        that. See :meth:`_verified` for what ``None`` covers."""
         return (await self._lookup_user(user_id)).user
 
     async def _lookup_user(self, user_id: str) -> _UserLookup:
         """The read behind :meth:`_load_user`, also saying whether the row is there at all, so a
         caller can tell a record that fails its seal from one that is gone (vault BACKLOG #3069).
-        ``refused`` also reads true for a row deleted between the row and role reads."""
+        ``refused`` also reads true for a row deleted or re-keyed between the row and role reads;
+        :meth:`checked_user` tells those apart."""
         raw = await self._store.get_user(user_id)
-        return _UserLookup(await self._verified(raw), raw is not None)
+        return _UserLookup((await self._verified(raw)).user, raw is not None)
 
     async def _load_user_by_username(self, username: str) -> VerifiedUser | None:
         """:meth:`_load_user`, by username."""
@@ -11492,26 +12034,150 @@ class AuthService:
         """:meth:`_load_user_by_username`, also saying whether a row holds the name at all, from
         the same read: a row that fails its seal still holds its name."""
         raw = await self._store.get_user_by_username(username)
-        return _UserLookup(await self._verified(raw), raw is not None)
+        return _UserLookup((await self._verified(raw)).user, raw is not None)
 
     async def _lookup_by_directory_object_id(self, object_id: str) -> _UserLookup:
         """:meth:`_lookup_by_username`, by the directory's immutable id."""
         raw = await self._store.get_user_by_directory_object_id(object_id)
-        return _UserLookup(await self._verified(raw), raw is not None)
+        return _UserLookup((await self._verified(raw)).user, raw is not None)
 
     async def _load_user_by_federated_subject(
         self, issuer: str, subject: str
     ) -> VerifiedUser | None:
         """:meth:`_load_user`, by the federated ``(issuer, sub)`` pair."""
-        return await self._verified(
-            await self._store.get_user_by_federated_subject(issuer, subject)
-        )
+        raw = await self._store.get_user_by_federated_subject(issuer, subject)
+        return (await self._verified(raw)).user
 
     async def _load_users(self) -> list[VerifiedUser]:
-        """Every account whose record passes its seal, in the store's order. An account that fails
-        is reported by :meth:`_verified` and left out, so a scan never counts it."""
-        loaded = [await self._verified(user) for user in await self._store.list_users()]
-        return [user for user in loaded if user is not None]
+        """Every account whose record passes its seal, in the store's order: the accounts
+        :meth:`list_checked_users` reads, so the scans and the admin list agree on every row. An
+        account that fails is reported by :meth:`_verified` and left out, so a scan never counts
+        it."""
+        return [
+            listed.user for listed in await self.list_checked_users() if listed.user is not None
+        ]
+
+    async def checked_user(self, user_id: str) -> VerifiedUser | None:
+        """The account ``user_id`` names, its whole record checked against its seal, for a caller
+        outside this service that SHOWS it (BACKLOG #5520). ``None`` when no row is there. Raises
+        :class:`UserSealRefused` only when :meth:`_verified` established that the record fails,
+        or :meth:`_checked_by_id` failed closed, and handed that to the seal-failure report, so
+        the caller can say so rather than answer "no such user". A record Vault transit cannot
+        verify raises it too, reported under its own cause (ADR 0217 (a)). A Vault transit Outage
+        raises :class:`~messagefoundry.store.row_seal.TransitSealUnavailableError`, paged, which the
+        admin routes answer 503. :meth:`_checked_by_id` says how a row read mid-write is
+        answered."""
+        found = await self._checked_by_id(user_id)
+        if found.failed:
+            raise UserSealRefused(USER_SEAL_REFUSED)
+        return found.user
+
+    async def list_checked_users(self) -> list[ListedUser]:
+        """Every account, in the store's order, each with its record checked (BACKLOG #5520). One
+        that fails stays in the list with ``user=None``, reported, as :meth:`_load_custom_roles`
+        keeps a failing role, so an administrator can still see that it is there and delete it.
+        :meth:`_load_users` drops it instead, for the scans that must not count it.
+
+        Each row is checked by :meth:`_checked_by_id`, which says how a row read mid-write is
+        answered: one it reads as gone is left out, and one renamed meanwhile is listed as it now
+        reads. One Vault transit cannot verify is listed as failing; a Vault transit Outage on any
+        row raises :class:`~messagefoundry.store.row_seal.TransitSealUnavailableError` and lists
+        nothing (ADR 0217)."""
+        out: list[ListedUser] = []
+        for raw in await self._store.list_users():
+            found = await self._checked_by_id(raw.id, raw)
+            if found.settled:
+                out.append(ListedUser(raw.id, found.user))
+        return out
+
+    async def _checked_by_id(self, user_id: str, listed: UserRecord | None = None) -> _SealCheck:
+        """The account ``user_id`` names, checked by :meth:`_verified`, starting from the row a list
+        read already holds where ``listed`` is given (BACKLOG #5520). A check that races a delete or
+        a re-key is unreported and establishes nothing, so the account is read again by id, up to
+        :data:`_CHECKED_READ_PASSES` checks in all. Only a row absent on a re-read is gone. One
+        still there after every check raced fails closed: each of its checks failed its seal, so
+        it is handed to :meth:`_user_seal_failed` and answered ``failed``, rather than read as gone,
+        which would let a writer that keeps re-keying a tampered row hide it from the admin list.
+        One that keeps changing the row's own id still reads as gone under the old id: a re-read
+        by that id finds nothing, as docs/SECURITY.md, *What an admin user read reports*, says."""
+        raw = listed
+        for _ in range(_CHECKED_READ_PASSES):
+            if raw is None:
+                raw = await self._store.get_user(user_id)
+                if raw is None:
+                    return _SealCheck()
+            try:
+                found = await self._verified(raw)
+            except TransitSealUnverifiableError as exc:
+                # ADR 0217 (a): denied as a failed seal is, so the account lists as integrity-failed
+                # and can still be deleted, under its own audit action and page.
+                await self._user_seal_unverifiable(raw.id, exc)
+                return _SealCheck(failed=True)
+            except TransitSealUnavailableError:
+                # ADR 0217, the Outage row: paged, no seal failure recorded, the read refused.
+                self._user_seal_outage()
+                raise
+            if found.settled:
+                return found
+            raw = None
+        still_there = await self._store.get_user(user_id)
+        if still_there is None:
+            return _SealCheck()
+        # Keyed by the stored id, as _verified reports, so a caller's other spelling of the id on a
+        # store that compares ids case-insensitively shares the account's report interval.
+        await self._user_seal_failed(still_there.id)
+        return _SealCheck(failed=True)
+
+    async def _user_seal_unverifiable(
+        self, user_id: str, exc: TransitSealUnverifiableError
+    ) -> None:
+        """Report an account whose record Vault transit could not verify on an admin read (ADR 0217
+        (a)): a page through the store's :class:`~messagefoundry.store.row_seal.SealPager` under the
+        row's capped Unverifiable subject, then a WARNING and a soft
+        :data:`AUTHORITY_SEAL_UNVERIFIABLE_ACTION` row carrying the triage versions. Throttled per
+        account on a key of its own, so it never holds back the account's Forged report."""
+        if not self._seal_failures_reported.due(f"unverifiable:{USER_KIND}:{user_id}"):
+            return
+        reason = (
+            f"a {USER_KIND} record's integrity seal could not be verified by Vault transit and it was"
+            f" refused (account {scrub_log_argument(user_id)}); check that Vault is healthy and that"
+            " every node holds the audit key's latest version, then retry"
+        )
+        pager = getattr(self._store, "seal_pager", None)
+        if callable(pager):
+            pager().unverifiable(USER_KIND, user_id, reason)
+        _log.warning("%s", reason)
+        detail = {
+            "kind": USER_KIND,
+            "user_id": user_id,
+            "stored_version": exc.stored_version,
+            "probe_version": exc.probe_version,
+        }
+        await write_audit_soft(
+            lambda: self._audit(AUTHORITY_SEAL_UNVERIFIABLE_ACTION, detail=_json(detail)),
+            log=_log,
+            message="the %s audit row for an unverified user record could not be written",
+            args=(AUTHORITY_SEAL_UNVERIFIABLE_ACTION,),
+            errors=audit_write_errors(),
+            defects=AUDIT_WRITE_DEFECTS,
+        )
+
+    def _user_seal_outage(self) -> None:
+        """Page a Vault transit Outage met checking an account's record on an admin read under the
+        shared ``authority-seal-transit`` subject (ADR 0217, *The four answers*), with no audit row:
+        an Outage records no seal failure."""
+        pager = getattr(self._store, "seal_pager", None)
+        if callable(pager):
+            pager().outage(
+                f"a {USER_KIND} record's integrity seal could not be made or checked through Vault"
+                " transit; the read was refused"
+            )
+
+    async def identity_for_checked_user(self, user: VerifiedUser) -> Identity:
+        """:meth:`identity_for_user_id` for an account the caller already read through
+        :meth:`checked_user`, so the identity and the caller's record are one read (BACKLOG
+        #5520)."""
+        return await self._build_identity(user)
 
     async def _username_held(self, username: str) -> bool:
         """Whether any row holds ``username``, sealed or not (BACKLOG #2592). A name question, not
@@ -11529,40 +12195,43 @@ class AuthService:
         #3068)."""
         return await self._store.get_user(user_id) is not None
 
-    async def _verified(self, user: UserRecord | None) -> VerifiedUser | None:
+    async def _verified(self, user: UserRecord | None) -> _SealCheck:
         """``user`` with its whole authorization record checked against its seal (BACKLOG #2592):
         the ``users`` row, the account's role rows and its passkey digest. The ONLY place a
         :class:`VerifiedUser` is built.
 
-        ``None`` for no account, and for an account whose record fails its seal, which is handed
-        to :meth:`_user_seal_failed`. A failing account is denied, never written: the store's write
-        helper refuses to re-seal it. On a keyless store there is no seal to check. One statement
-        more than the row read, for the role rows; the identity build reads them from the result
-        instead of reading them again.
+        The result's ``user`` is ``None`` for no account, and for an account whose record fails its
+        seal, which is handed to :meth:`_user_seal_failed` and marked ``failed`` (BACKLOG #5520). A
+        failing account is denied, never written: the store's write helper refuses to re-seal it.
+        On a keyless store there is no seal to check. One statement more than the row read, for
+        the role rows; the identity build reads them from the result instead of reading them
+        again.
 
         The row and the role rows are two reads, so an honest role write committing between them
         can make one pair disagree. A failing pair is therefore read once more, by id, before it is
         reported: a record changed outside the store fails both times, a raced honest write passes
-        the second."""
+        the second. A row deleted or re-keyed by then is neither: this check reports nothing and
+        is not ``failed``. :meth:`_checked_by_id` reads such a row again, and fails closed on one
+        whose every check raced."""
         if user is None:
-            return None
+            return _SealCheck()
         sealer = self._store.row_sealer()
         for attempt in range(2):
             grants = await self._store.get_user_role_grants(user.id)
             record = None if user.row is None else UserAuthzRecord.of(user.row, grants)
-            if sealer is None or (record is not None and user_seal_ok(sealer, record)):
-                return VerifiedUser.of(user, sorted(g.role_id for g in grants))
+            if sealer is None or (record is not None and await user_seal_ok_async(sealer, record)):
+                return _SealCheck(VerifiedUser.of(user, sorted(g.role_id for g in grants)))
             if attempt == 0:
                 reread = await self._store.get_user(user.id)
                 if reread is None:
-                    return None  # deleted meanwhile: nothing to report
+                    return _SealCheck()  # deleted meanwhile: nothing to report
                 if _lookup_keys(reread) != _lookup_keys(user):
                     # The account was renamed, rebound or re-keyed meanwhile, so it may no longer be
                     # the one the caller looked up. Not reported, and the next request reads afresh.
-                    return None
+                    return _SealCheck()
                 user = reread
         await self._user_seal_failed(user.id)
-        return None
+        return _SealCheck(failed=True)
 
     async def _open_totp_cell(self, user: VerifiedUser) -> str | None:
         """``user``'s TOTP cell, the one the checked record's seal covered (BACKLOG #3510), opened
@@ -11674,7 +12343,7 @@ class AuthService:
         if found is None:
             return None
         row = RoleRow.from_mapping(found)
-        if role_seal_ok(self._store.row_sealer(), row):
+        if await role_seal_ok_async(self._store.row_sealer(), row):
             return row
         await self._role_seal_failed(row.id)
         return None
@@ -11689,7 +12358,7 @@ class AuthService:
             row = RoleRow.from_mapping(found)
             if not is_custom_role_id(row.id):
                 continue  # a built-in resolves from code; its row grants nothing
-            holds = role_seal_ok(sealer, row)
+            holds = await role_seal_ok_async(sealer, row)
             if not holds:
                 await self._role_seal_failed(row.id)
             out.append((row, holds))
@@ -11730,7 +12399,7 @@ class AuthService:
         """:meth:`_ad_map`, but ``None`` rather than an empty map when the seal fails, for a caller
         that must tell a failing map from an honestly empty one. The failure is still reported."""
         current = await self._store.get_ad_map(name)
-        if ad_map_seal_ok(self._store.row_sealer(), current):
+        if await ad_map_seal_ok_async(self._store.row_sealer(), current):
             return current
         await self._report_seal_failure(
             f"{ADSET_KIND}:{name}",
@@ -11738,6 +12407,105 @@ class AuthService:
             {"kind": ADSET_KIND, "map": name},
         )
         return None
+
+    async def _reconcile_ad_map(self, name: str) -> tuple[AdMap, bool]:
+        """The AD map ``name`` for one reconcile pass, and whether the pass may write roles from it
+        (ADR 0217 (b), owner ruling 2026-11-10, *"Hold, build AD-map piece"*).
+
+        A map that holds, or one that is Forged, reads as :meth:`_ad_map` reads it, as on ``main``.
+        A map Vault transit cannot verify (Unverifiable) or cannot reach (Outage) used to raise out
+        of the pass, so the reconcile loop logged it and the pass revoked nothing. Now it is
+        reported, by :meth:`_report_unverifiable_reconcile_map` or
+        :meth:`_report_unavailable_reconcile_map`, and read as empty with ``False``: the pass plans
+        as ``main`` plans on a Forged map, under the same breaker, so the accounts the map governs
+        lose their sessions unless the breaker trips or a later user-row Outage aborts the pass,
+        and writes no role from it. Only this map piece of ADR 0217 slice 3 is built; the
+        groups-moved second step and the rest stay filed (vault #8202)."""
+        try:
+            return await self._ad_map(name), True
+        except TransitSealUnverifiableError as exc:
+            await self._report_unverifiable_reconcile_map(name, exc)
+        except TransitSealUnavailableError:
+            await self._report_unavailable_reconcile_map(name)
+        return AdMap(name), False
+
+    async def _report_unverifiable_reconcile_map(
+        self, name: str, exc: TransitSealUnverifiableError
+    ) -> None:
+        """Report an AD map Vault transit could not verify, on every pass that meets it: a page
+        under the map's own fixed subject, ``authority-seal-transit-unverifiable:adset:<map
+        name>``, then a WARNING and a soft :data:`AUTHORITY_SEAL_UNVERIFIABLE_ACTION` row with
+        reason :data:`DIRECTORY_MAP_UNVERIFIABLE`. The store's pager applies no cap or throttle to
+        the page (ADR 0217, *The map page has no latch*); the sink's own per-subject
+        ``integrity_drift`` re-alert throttle still applies. The row carries the triage integers ADR
+        0217 (a) requires; the page and the WARNING carry them and the recovery order. Written
+        before the pass is planned, so neither says what the pass then ended."""
+        reason = (
+            f"the {name} integrity seal could not be verified by Vault transit (stored version"
+            f" {exc.stored_version}, probe version {exc.probe_version}); this directory reconcile"
+            " pass reads it as empty, writes no role from it, and plans to end the sessions it"
+            " governs, under the revocation breaker, unless a later user-row Outage aborts the"
+            " pass. The seal may be planted: check that Vault is healthy and that every node holds"
+            " the audit key's latest version, then retry. Never lower min_decryption_version to"
+            " make it verify: that re-trusts every retired version for every row. A map that"
+            " still does not verify is untrusted and is re-created from its change record, never"
+            " from its stored pairs; re-entering a map that grants Administrator is refused until"
+            " ADR 0217 (d)'s replace_unverifiable is built, which is filed (vault #8202)"
+        )
+        detail: dict[str, object] = {
+            "kind": ADSET_KIND,
+            "map": name,
+            "reason": DIRECTORY_MAP_UNVERIFIABLE,
+            "during": "reconcile",
+            "stored_version": exc.stored_version,
+            "probe_version": exc.probe_version,
+        }
+        # The page first, so an audit write that raises a defect cannot skip it.
+        pager = getattr(self._store, "seal_pager", None)
+        if callable(pager):
+            pager().page(f"{UNVERIFIABLE_SUBJECT_PREFIX}:{ADSET_KIND}:{name}", reason)
+        await self._report_reconcile_map(AUTHORITY_SEAL_UNVERIFIABLE_ACTION, detail, reason)
+
+    async def _report_unavailable_reconcile_map(self, name: str) -> None:
+        """Report an AD map read during a Vault transit Outage, on every pass that meets it: a page
+        under the shared ``authority-seal-transit`` subject, which revoke Outages page under too,
+        so the sink's per-subject ``integrity_drift`` re-alert throttle can hold it behind theirs;
+        then a WARNING and a best-effort :data:`AD_RECONCILE_MAP_UNAVAILABLE_ACTION` row with
+        reason :data:`MAP_SEAL_UNAVAILABLE` (decision d20261110T181645742-b9eccb), which records no
+        seal failure. Written before the pass is planned, so neither says what the pass then
+        ended."""
+        reason = (
+            f"Vault transit was unavailable reading the {name}; this directory reconcile pass"
+            " reads it as empty, writes no role from it, and plans to end the sessions it governs,"
+            " under the revocation breaker, unless a later user-row Outage aborts the pass"
+        )
+        detail: dict[str, object] = {
+            "kind": ADSET_KIND,
+            "map": name,
+            "reason": MAP_SEAL_UNAVAILABLE,
+            "during": "reconcile",
+        }
+        # The page first, so an audit write that raises a defect cannot skip it.
+        pager = getattr(self._store, "seal_pager", None)
+        if callable(pager):
+            pager().outage(reason)
+        await self._report_reconcile_map(AD_RECONCILE_MAP_UNAVAILABLE_ACTION, detail, reason)
+
+    async def _report_reconcile_map(
+        self, action: str, detail: dict[str, object], reason: str
+    ) -> None:
+        """The WARNING and the soft audit row both map reports write, after their page. A refused
+        audit write is logged, not raised; a defect (:data:`AUDIT_WRITE_DEFECTS`) still raises, out
+        of the pass, once the page has gone."""
+        _log.warning("%s", reason)
+        await write_audit_soft(
+            lambda: self._audit(action, detail=_json(detail)),
+            log=_log,
+            message="the %s audit row for an unverified AD map could not be written",
+            args=(action,),
+            errors=audit_write_errors(),
+            defects=AUDIT_WRITE_DEFECTS,
+        )
 
     async def _ad_roles_for_groups(self, groups: Iterable[str]) -> set[str]:
         """The role ids the AD group-to-role map gives ``groups``; none when the map fails its
@@ -12087,7 +12855,9 @@ class AuthService:
         """Resolve a user id directly to its :class:`Identity` (roles + custom-role overlay), or
         ``None`` when no such user exists — WITHOUT a bearer session.
 
-        Used by the effective-permission inspector (BACKLOG #177): an admin resolves the FLATTENED
+        Used by the approval gate. The effective-permission inspector (BACKLOG #177) reads its
+        account through :meth:`checked_user` and builds with :meth:`identity_for_checked_user`
+        instead (BACKLOG #5520). Either way, an admin resolves the FLATTENED
         effective permission set (built-in-role ∪ custom-role ∪ extras) for an arbitrary user via the
         same :meth:`Identity.build` path :meth:`identity_for_token` uses for the caller. Unlike the
         token / username auth paths, a *disabled* user still resolves here — the point is to inspect a
@@ -12584,18 +13354,21 @@ class AuthService:
         the caller's own when it ends it, and that one is taken off (``ended_kept``), and on the
         seal-failure path the handler ends it before the counted sweep.
         :meth:`revoke_every_session` counts it in both cases instead."""
-        try:
-            result = await self._store.revoke_user_sessions(
-                identity.user_id, except_token_hash=current_token_hash
-            )
-        except RowSealError:
-            # BACKLOG #2592: the caller's own session failed its seal, so the store wrote nothing.
-            # The caller asked to end every other session and its own is suspect: end them all,
-            # and audit that scope, since the caller's own session is ended too. The handler ends
-            # it before the sweep, so the count and the reply ("signed out N other sessions") stay
-            # the other sessions only.
-            await self._session_seal_failed(current_token_hash)
-            result = await self._store.revoke_user_sessions(identity.user_id)
+        # A seal refusal the retry below also met is reported once, by the attempt that commits
+        # (decision d20261110T063908944-857965, item 4).
+        async with deferred_revoke_reports():
+            try:
+                result = await self._store.revoke_user_sessions(
+                    identity.user_id, except_token_hash=current_token_hash
+                )
+            except RowSealError:
+                # BACKLOG #2592: the caller's own session failed its seal, so the store wrote
+                # nothing. The caller asked to end every other session and its own is suspect: end
+                # them all, and audit that scope, since the caller's own session is ended too. The
+                # handler ends it before the sweep, so the count and the reply ("signed out N other
+                # sessions") stay the other sessions only.
+                await self._session_seal_failed(current_token_hash)
+                result = await self._store.revoke_user_sessions(identity.user_id)
         others = result.others
         scope = "self_others" if result.kept else "self_all"
         if others or not result.kept:
@@ -12668,17 +13441,21 @@ class AuthService:
         path. The count is the rows this call revoked: where the store or the seal-failure path
         ended the caller's own, that one is in it, which :meth:`revoke_other_sessions` leaves out
         of its count."""
-        try:
-            result = await self._store.revoke_all_sessions(except_token_hash=keep_token_hash)
-        except RowSealError:
-            # The sweep runs first, so the suspect row is counted with the rest: ended first by
-            # the seal-failure handler, the sweep would find it gone and the reply and the audit
-            # row would be one short. The handler still runs if the sweep raises, so the suspect
-            # row is ended either way; its own revoke then matches nothing, and it reports.
+        # A seal refusal the retry below also met is reported once, by the attempt that commits
+        # (decision d20261110T063908944-857965, item 4).
+        async with deferred_revoke_reports():
             try:
-                result = await self._store.revoke_all_sessions()
-            finally:
-                await self._session_seal_failed(keep_token_hash)
+                result = await self._store.revoke_all_sessions(except_token_hash=keep_token_hash)
+            except RowSealError:
+                # The sweep runs first, so the suspect row is counted with the rest: ended first by
+                # the seal-failure handler, the sweep would find it gone and the reply and the
+                # audit row would be one short. The handler still runs if the sweep raises, so the
+                # suspect row is ended either way; its own revoke then matches nothing, and it
+                # reports.
+                try:
+                    result = await self._store.revoke_all_sessions()
+                finally:
+                    await self._session_seal_failed(keep_token_hash)
         await self._audit(
             "auth.session_revoked",
             actor=actor,
@@ -13241,26 +14018,42 @@ class AuthService:
             if proof.directory_unconfirmed
             else None,
         )
-        grant_refused = False
+        grant_refused: bool | None = False
+        grant_checked = False
+        lost = False
         if ok:
             # (1) Every stamp for this elevation, against the OLD hash. The rotation carries these
             # columns forward; a stamp issued after it would silently write nothing.
             # Re-anchor the session to the address it re-verified from, so a forced step-up triggered
             # by a roamed/new client IP (WP-L3-13) clears once the caller re-proves from there.
-            async with self._sealed_stamp(hash_token(token)):
-                await self._store.mark_session_reauthed(hash_token(token), client=client)
-            self._restart_new_ip_dedupe(hash_token(token))
-            # `_factor_binding_is_blocked` resolves the session BY THE OLD TOKEN and fails closed when
-            # it cannot find it, so it is decided here, BEFORE the rotation retires that token --
-            # asking after would refuse every such grant on a session that is perfectly fine. It
-            # covers every action in _PENDING_REFUSED_ACTIONS, session_terminate too (#1951).
-            grant_refused = purpose is not None and await self._factor_binding_is_blocked(
-                token, purpose
-            )
-            # (2) Rotate. Past this line `token` no longer authenticates.
-            elevation = await self._elevated(
-                token, ceremony="reauth", actor=identity.username, client=client
-            )
+            # The stamp-to-rotation window (_stamp_to_rotation): a refusal in it, at least
+            # the factor-binding check, revokes the stamped hash and answers session_lost.
+            async with self._stamp_to_rotation(
+                ceremony="reauth", actor=identity.username, client=client
+            ) as window:
+                async with self._sealed_stamp(hash_token(token)):
+                    await self._store.mark_session_reauthed(hash_token(token), client=client)
+                self._restart_new_ip_dedupe(hash_token(token))
+                # `_factor_binding_is_blocked` resolves the session BY THE OLD TOKEN and fails closed when
+                # it cannot find it, so it is decided here, BEFORE the rotation retires that token --
+                # asking after would refuse every such grant on a session that is perfectly fine. It
+                # covers every action in _PENDING_REFUSED_ACTIONS, session_terminate too (#1951).
+                grant_refused = purpose is not None and await self._factor_binding_is_blocked(
+                    token, purpose
+                )
+                grant_checked = True
+                # (2) Rotate. Past this line `token` no longer authenticates.
+                elevation = await self._elevated(
+                    token, ceremony="reauth", actor=identity.username, client=client
+                )
+            if window.lost:
+                elevation = Elevation(session_lost=True)
+                lost = True
+                if not grant_checked:
+                    # Decision d20261109T200352805-599b24, item 3: the check never ran.
+                    grant_refused = None
+            # Decision d20261110T004916856-814db8, Q1: lost at the rotation is written softly too.
+            lost = lost or window.rotation_lost
             if elevation.ok:
                 # vault BACKLOG #2145: a step-up on an account that owes no factor is how a
                 # first-seen address passes its challenge, so it becomes known.
@@ -13271,8 +14064,8 @@ class AuthService:
                 # Bind THIS fresh proof to the single action named by `purpose` (single-use), so a broad
                 # login-seeded window can never authorize a factor-binding action (ASVS 7.5.1 / 8.2.4).
                 self._grant_action_step_up(hash_token(elevation.token), purpose)
-        await self._audit(
-            "auth.reauth",
+        await self._write_reauth_row(
+            lost=lost,
             actor=identity.username,
             detail=_json(
                 {
@@ -13284,6 +14077,7 @@ class AuthService:
                     "session_lost": elevation.session_lost,
                     # A good password whose purpose grant was refused (a pending session on an
                     # account with a factor). Without it the row reads as a granted re-proof.
+                    # Null when the session was lost before the check ran.
                     "grant_refused": grant_refused,
                     # This failure spent the session's re-proof budget, so it is revoked
                     # (BACKLOG #1138). A session already gone reads session_lost alone.
@@ -13964,29 +14758,33 @@ class AuthService:
         # addresses, so a replayed token cannot amplify the audit log / notifications even when it
         # alternates between addresses (BACKLOG #2159).
         flag = self._first_new_ip_flag(token_hash, seen_key)
+        # BACKLOG #3770: the path logs as an escaped, bounded field holding only its own redacted
+        # text, and the address only as a canonical address or a keyed digest. The tests read
+        # both lines through two shipped handlers and check that no field closes, merges with or
+        # erases another for the vectors they name, and that the second handler changes nothing,
+        # which leaves the line the same for every later handler. The path still comes last, a
+        # second guard.
+        # Only when the line will be written: this branch is the one a replayed token loops on.
         if flag == "repeat":
-            _log.warning(
-                "a request from a new client address must re-verify; the address was already "
-                "flagged since the session's last re-verification (audit suppressed): path=%s",
-                path,
-            )
+            if _log.isEnabledFor(logging.WARNING):
+                _log.warning(_NEW_IP_REPEAT_HEAD + "%s", _new_ip_path_field(path))
             return True
-        # What the row, the notice and the past-cap log line carry. Text within _NEW_IP_TEXT_MAX,
-        # which is every address without a long zone id, is unchanged, so a search by address still
-        # finds the row (vault BACKLOG #3197); longer text is bounded, so this row's client then
-        # differs from the raw text other rows of the request carry. Text that does not parse is its
-        # own host key, so its bounded form is reused rather than hashed twice.
+        # What the row, the notice and the past-cap line's comparison reading carry. Text within
+        # _NEW_IP_TEXT_MAX, which is every address without a long zone id, is unchanged, so a search
+        # by address still finds the row (vault BACKLOG #3197); longer text is bounded, so this
+        # row's client then differs from the raw text other rows of the request carry. Text that
+        # does not parse is its own host key, so its bounded form is reused rather than hashed twice.
         seen_text = seen_key if host_key == client_ip else _bounded_address_text(client_ip)
         if flag == "over_cap":
             # Past the cap no new-address row is written, so this line carries the address. The
-            # address is attacker-supplied text on a proxied hop.
-            _log.warning(
-                "a request from a new client address must re-verify; the address is past the "
-                "per-session cap of %d (audit suppressed): path=%s seen_ip=%s",
-                _NEW_IP_PER_SESSION_MAX,
-                path,
-                scrub_log_argument(seen_text),
-            )
+            # address is attacker-supplied text on a proxied hop, so only its parsed form or a
+            # digest is logged.
+            if _log.isEnabledFor(logging.WARNING):
+                _log.warning(
+                    _NEW_IP_OVER_CAP_HEAD + "seen_ip=%s path=%s",
+                    _address_log_field(client_ip),
+                    _new_ip_path_field(path, seen_text),
+                )
             return True
         known_text = _bounded_address_text(session.client)
         detail: dict[str, object] = {
@@ -14686,16 +15484,21 @@ class AuthService:
         # always a plain one (vault BACKLOG #3113): it needs a code from a later step, since this one
         # is spent, and where the enable matched no row (#2224, below) a reset may have cleared the
         # staged secret, so the user starts the enrolment again.
-        # Stamp against the OLD hash, then rotate — never the other way round.
-        async with self._sealed_stamp(hash_token(token)):
-            await self._store.mark_session_mfa_verified(hash_token(token))
-        elevation = await self._elevated(
-            token,
-            ceremony="mfa_enroll_confirm",
-            actor=identity.username,
-            client=client,
-            recovery_codes=tuple(plain),
-        )
+        # Stamp against the OLD hash, then rotate — never the other way round. Inside the
+        # stamp-to-rotation window (_stamp_to_rotation; decision d20261110T042322305-2ffc60).
+        elevation = Elevation(session_lost=True)
+        async with self._stamp_to_rotation(
+            ceremony="mfa_enroll_confirm", actor=identity.username, client=client
+        ):
+            async with self._sealed_stamp(hash_token(token)):
+                await self._store.mark_session_mfa_verified(hash_token(token))
+            elevation = await self._elevated(
+                token,
+                ceremony="mfa_enroll_confirm",
+                actor=identity.username,
+                client=client,
+                recovery_codes=tuple(plain),
+            )
         if elevation.token is None:  # not ``ok``, spelled so mypy narrows the token below
             return elevation
         spent: EnrolmentCodeOutcome | None = None
@@ -15077,32 +15880,42 @@ class AuthService:
                 # an OIDC one also seed the step-up window (the session has completed password +
                 # MFA). (Initial enrollment has no factor to verify, so this never fires there —
                 # keeping the enrollment step-up gate honest, WP-14.)
-                async with self._sealed_stamp(hash_token(token)) as factor_stamp:
-                    await self._store.mark_session_mfa_verified(hash_token(token))
-                if factor_stamp.refused:
-                    # BACKLOG #2592: the session failed its seal and has been ended. Nothing below
-                    # may record a success for it.
-                    return Elevation(session_lost=True)
-                # BACKLOG #2142 (see the docstring): an OIDC session's window and anchor move only
-                # at the IdP. Seat decision under owner delegation 2026-10-08, not an owner ruling.
-                # Do NOT move the stamp out of this branch: tests/test_oidc_step_up.py pins the
-                # behaviour, and tests/test_docs_security_pathways.py pins the branch itself.
-                if session.auth_mechanism != SessionMechanism.OIDC.value:
-                    # Re-anchor the session to the address that completed the second factor (parity
-                    # with reauth), so an MFA-required admin who roamed clears the WP-L3-13
-                    # new-client-IP signal with one credential proof rather than being forced into a
-                    # separate password step-up.
-                    async with self._sealed_stamp(hash_token(token)) as reauth_stamp:
-                        await self._store.mark_session_reauthed(hash_token(token), client=client)
-                    if reauth_stamp.refused:
-                        # BACKLOG #2592: as above, the session has been ended.
+                # The window from this stamp to the rotation (_stamp_to_rotation) says what an
+                # exception in it does to the stamped hash and to the answer.
+                elevation = Elevation(session_lost=True)
+                async with self._stamp_to_rotation(
+                    ceremony="mfa_verify", actor=user.username, client=client
+                ) as window:
+                    async with self._sealed_stamp(hash_token(token)) as factor_stamp:
+                        await self._store.mark_session_mfa_verified(hash_token(token))
+                    if factor_stamp.refused:
+                        # BACKLOG #2592: the session failed its seal and has been ended. Nothing below
+                        # may record a success for it.
                         return Elevation(session_lost=True)
-                    self._restart_new_ip_dedupe(hash_token(token))
-                await self._store.record_login_success(user.id, now=now)
-                await self._audit("auth.mfa_verified", actor=user.username, client=client)
-                elevation = await self._elevated(
-                    token, ceremony="mfa_verify", actor=user.username, client=client
-                )
+                    # BACKLOG #2142 (see the docstring): an OIDC session's window and anchor move only
+                    # at the IdP. Seat decision under owner delegation 2026-10-08, not an owner ruling.
+                    # Do NOT move the stamp out of this branch: tests/test_oidc_step_up.py pins the
+                    # behaviour, and tests/test_docs_security_pathways.py pins the branch itself.
+                    if session.auth_mechanism != SessionMechanism.OIDC.value:
+                        # Re-anchor the session to the address that completed the second factor (parity
+                        # with reauth), so an MFA-required admin who roamed clears the WP-L3-13
+                        # new-client-IP signal with one credential proof rather than being forced into a
+                        # separate password step-up.
+                        async with self._sealed_stamp(hash_token(token)) as reauth_stamp:
+                            await self._store.mark_session_reauthed(
+                                hash_token(token), client=client
+                            )
+                        if reauth_stamp.refused:
+                            # BACKLOG #2592: as above, the session has been ended.
+                            return Elevation(session_lost=True)
+                        self._restart_new_ip_dedupe(hash_token(token))
+                    await self._store.record_login_success(user.id, now=now)
+                    await self._window_audit(
+                        window, "auth.mfa_verified", actor=user.username, client=client
+                    )
+                    elevation = await self._elevated(
+                        token, ceremony="mfa_verify", actor=user.username, client=client
+                    )
                 if elevation.ok:
                     # vault BACKLOG #2145: the factor is proved from this address. Recorded INSIDE
                     # the account's queue: a local ``login`` classifies under the same queue, so a
@@ -16591,18 +17404,40 @@ class AuthService:
             await self._clear_stale_enrolment_code(user)
         # Parity with confirm_mfa_enrollment: the enrolling session is now MFA-verified (it just
         # proved possession of the freshly-bound authenticator). Stamped against the OLD hash, then
-        # rotated — the reverse order writes nothing and still reports success.
-        async with self._sealed_stamp(hash_token(token)):
-            await self._store.mark_session_mfa_verified(hash_token(token))
-        elevation = await self._elevated(
-            token, ceremony="webauthn_enroll", actor=identity.username, client=client
-        )
-        await self._audit(
-            "auth.webauthn_enrolled",
-            actor=identity.username,
-            detail=_json({"label": label}),
-            client=client,
-        )
+        # rotated — the reverse order writes nothing and still reports success. The stamp-to-
+        # rotation window, as in confirm_mfa_enrollment (decision d20261110T042322305-2ffc60).
+        elevation = Elevation(session_lost=True)
+        async with self._stamp_to_rotation(
+            ceremony="webauthn_enroll", actor=identity.username, client=client
+        ) as window:
+            async with self._sealed_stamp(hash_token(token)):
+                await self._store.mark_session_mfa_verified(hash_token(token))
+            elevation = await self._elevated(
+                token, ceremony="webauthn_enroll", actor=identity.username, client=client
+            )
+
+        async def enrolled_row() -> None:
+            await self._audit(
+                "auth.webauthn_enrolled",
+                actor=identity.username,
+                detail=_json({"label": label}),
+                client=client,
+            )
+
+        if window.lost or window.rotation_lost:
+            # Decision d20261110T063908944-857965, item 1, as Q1 does for auth.reauth: the
+            # session was lost in the window or at the rotation, so this row is written softly.
+            # The answer, session_lost, is the fail-closed control; the row only records it.
+            await write_audit_soft(
+                enrolled_row,
+                log=_log,
+                message="the auth.webauthn_enrolled row of a registration that lost its session"
+                " could not be written",
+                errors=audit_write_errors(),
+                defects=AUDIT_WRITE_DEFECTS,
+            )
+        else:
+            await enrolled_row()
         await self._notify_security(
             MFA_ENABLED, username=user.username, email=user.notify_email, client=client
         )
@@ -16859,25 +17694,32 @@ class AuthService:
             token, user, client=client, factor_checked=True, at="webauthn_assert"
         ):
             return Elevation(session_lost=True)
-        async with self._sealed_stamp(hash_token(token)) as stamp:
-            await self._store.mark_session_mfa_verified(hash_token(token))
-        if stamp.refused:  # BACKLOG #2592: the session failed its seal and has been ended
-            return Elevation(session_lost=True)
-        # BACKLOG #1638. A SUCCESSFUL ASSERTION CLEARS THE FAILURE COUNTER, and that is NOT a reversal
-        # of the ADR 0068 divergence recorded above. That divergence is about not FEEDING
-        # ``_register_failure`` on assertion failure, and it stands. It says nothing about success,
-        # and the counter has to be cleared by whichever leg completes the authentication: since
-        # #1638 the password step no longer clears it, so without this line a passkey-only account's
-        # password failures would shed only by waiting the lockout window out.
-        #
-        # Sited before ``_elevated`` rotates the session for the same reason the group in
-        # ``verify_mfa`` is -- though this write targets the USER row, not the session, so it is
-        # ordering by parity rather than by necessity.
-        await self._store.record_login_success(user.id, now=now)
-        await self._audit("auth.webauthn_verified", actor=user.username, client=client)
-        elevation = await self._elevated(
-            token, ceremony="webauthn_assert", actor=user.username, client=client
-        )
+        # The stamp-to-rotation window, as in verify_mfa (_stamp_to_rotation).
+        elevation = Elevation(session_lost=True)
+        async with self._stamp_to_rotation(
+            ceremony="webauthn_assert", actor=user.username, client=client
+        ) as window:
+            async with self._sealed_stamp(hash_token(token)) as stamp:
+                await self._store.mark_session_mfa_verified(hash_token(token))
+            if stamp.refused:  # BACKLOG #2592: the session failed its seal and has been ended
+                return Elevation(session_lost=True)
+            # BACKLOG #1638. A SUCCESSFUL ASSERTION CLEARS THE FAILURE COUNTER, and that is NOT a reversal
+            # of the ADR 0068 divergence recorded above. That divergence is about not FEEDING
+            # ``_register_failure`` on assertion failure, and it stands. It says nothing about success,
+            # and the counter has to be cleared by whichever leg completes the authentication: since
+            # #1638 the password step no longer clears it, so without this line a passkey-only account's
+            # password failures would shed only by waiting the lockout window out.
+            #
+            # Sited before ``_elevated`` rotates the session for the same reason the group in
+            # ``verify_mfa`` is -- though this write targets the USER row, not the session, so it is
+            # ordering by parity rather than by necessity.
+            await self._store.record_login_success(user.id, now=now)
+            await self._window_audit(
+                window, "auth.webauthn_verified", actor=user.username, client=client
+            )
+            elevation = await self._elevated(
+                token, ceremony="webauthn_assert", actor=user.username, client=client
+            )
         if elevation.ok:
             # vault BACKLOG #2145, as in verify_mfa.
             await self._mark_login_address_known(user.id, client)
@@ -17213,8 +18055,16 @@ class AuthService:
         :class:`InvalidNotifyEmail`. ``None`` is still accepted here, for internal callers: both admin
         surfaces require an address before they reach this method (``UserCreateRequest.email``).
 
+        **``username`` IS CHECKED FIRST (BACKLOG #5521)**, by
+        :func:`~messagefoundry.auth.usernames.username_refusal`, whose module states the rule: a
+        name it refuses raises :class:`InvalidUsername` before any credential is generated or
+        anything is written.
+
         Raises :class:`UsernameTaken` when a concurrent create took ``username`` after the caller's
         own check (BACKLOG #1808)."""
+        refusal = username_refusal(username)
+        if refusal is not None:
+            raise InvalidUsername(refusal)
         if email is not None:
             email = _require_account_email(
                 email, blank="a new account needs a notification address, such as name@example.org"
