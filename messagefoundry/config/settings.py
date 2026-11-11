@@ -9162,9 +9162,11 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       pass is the least delay, not an estimate (each pass's own run adds to it), and the
       interval's entry says so too. The same value bounds one account the directory keeps failing
       for, at that many of its last ``ad_reconcile_unreached_window`` probes (BACKLOG #3100, #3709),
-      so that page waits longer too, and a failure pattern that pages at the default can then
-      never page: an account down for three probes and up for four, in a cycle, pages at 3 and
-      never holds four failures in seven at 4.
+      which widens that window and raises the count it needs. That raises the least delay to that
+      page (that many failing probes in a row), but it does not delay the page in every pattern:
+      an account down for three probes and up for four, in a cycle, pages at 3 and never at 4,
+      and an account that fails twice, answers three times, then keeps failing pages one probe
+      sooner at 4 than at 3.
       ``ad_session_revoke_max`` and ``ad_session_revoke_max_fraction`` feed ``breaker_tripped``,
       which aborts a pass that would revoke more than both, and an aborted pass revokes nothing.
       Below the default a smaller wave of genuine revocations aborts, so that is named, as the 0
@@ -9727,7 +9729,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"default of {_auth_default('ad_session_recheck_seconds')} s, so {late}. The "
                     f"interval also delays the page about a directory outage, which comes after "
                     f"{floor}, and the page about one account the directory keeps failing for, "
-                    f"which comes once {run} of that account's last {window} probes "
+                    f"which comes once {run} of up to that account's last {window} probes "
                     f"fail, at least {(run - 1) * interval} s after its first such probe",
                 )
             )
@@ -9741,9 +9743,11 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     "configured interval. Until it does, a directory account disabled or deleted "
                     "meanwhile keeps its live engine sessions with only a WARNING and an audit row "
                     "per pass to show for it. The same count bounds one account the directory "
-                    f"keeps failing for, at {run} of its last {window} probes, so that page "
-                    "waits longer too, and some failure patterns that page at the default never "
-                    "page at this value",
+                    f"keeps failing for, at {run} of up to its last {window} probes. A larger "
+                    "value widens that window and raises the count it needs, so it raises the "
+                    "least delay to that page but does not delay it in every pattern: some "
+                    "failure patterns that page at the default never page at this value, and "
+                    "some page sooner",
                 )
             )
         strikes = auth.ad_session_recheck_strikes

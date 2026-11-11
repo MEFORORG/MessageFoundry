@@ -3503,7 +3503,8 @@ async def test_only_an_unavailable_probe_with_no_detail_adds_a_failure_to_the_wi
     pages ``account_unreachable`` for a directory that answered."""
     store = await MessageStore.open(":memory:")
     try:
-        service, _ldap = await _outage_service(store)
+        service = AuthService(store, _ad_settings(), ldap=_FakeLdap({}))  # type: ignore[arg-type]
+        await service.initialize()
         seed = reconcile.Probe("u1", "alice", reconcile.ProbeOutcome.UNAVAILABLE)
         probe = reconcile.Probe("u1", "alice", outcome, detail=detail)
         plan = service._note_unreached_accounts(reconcile.ReconcilePlan(), [seed])

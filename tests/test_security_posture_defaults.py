@@ -810,12 +810,14 @@ def test_the_outage_passes_loosening_names_the_unreachable_account_window(
 ) -> None:
     """BACKLOG #3709 closing step 6. The per-account page weighs ``run`` of the account's last
     ``2 * run - 1`` probes, and the entry names that window for the configured value, with no
-    example cycle that holds only at one value.
+    example cycle that holds only at one value, and says a larger value does not delay that page
+    in every pattern.
 
-    RED when: the entry names a window other than ``2 * run - 1``, or a fixed example cycle."""
+    RED when: the entry names a window other than ``2 * run - 1``, a fixed example cycle, or
+    claims the page only waits longer."""
     text = dict(_pairs(auth=_ad(ad_reconcile_outage_passes=run)))["ad_reconcile_outage_passes"]
-    assert f"at {run} of its last {window} probes" in text
-    assert "some failure patterns that page at the default never page at this value" in text
+    assert f"at {run} of up to its last {window} probes" in text
+    assert "never page at this value, and some page sooner" in text
     assert "three probes" not in text
 
 
