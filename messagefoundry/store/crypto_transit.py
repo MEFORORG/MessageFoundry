@@ -32,7 +32,9 @@ mode). The MAC key defaults to the data key and is overridable to a dedicated Tr
 cannot run the operation asked of it (BACKLOG #1166) raises
 :class:`~messagefoundry.store.keyprovider.KeyProviderError` at construction (``open_store`` propagates it
 → ``serve`` refuses to start, never an in-process fallback). A per-operation Transit failure raises :class:`CipherError` — the
-store's existing at-rest error discipline. **No plaintext/PHI is EVER placed in a message** (only the
+store's existing at-rest error discipline. On ``encrypt`` and ``decrypt``, a failure that gave no verdict
+on the value (Transit unreachable, or answering that it cannot serve now) raises its subclass
+:class:`~messagefoundry.store.crypto.CipherUnavailableError` instead (BACKLOG #3734). **No plaintext/PHI is EVER placed in a message** (only the
 exception TYPE): the base64 plaintext handed to Transit is the message body. The one exception is a
 refusal of the Vault hop or its reply, whose text is fixed and is kept whole (BACKLOG #2318; see
 :func:`~messagefoundry.store.keyprovider_vault.vault_failure_text`).
@@ -60,6 +62,7 @@ from messagefoundry.store.crypto import (
     AuditKeyVersionUnverifiedError,
     AuditMacFn,
     CipherError,
+    CipherUnavailableError,
     _UnmarkedPolicy,
 )
 from messagefoundry.store.keyprovider import KeyProviderError
@@ -69,7 +72,9 @@ from messagefoundry.store.keyprovider_vault import (
     TRANSIT_KEY_TYPES_DATA,
     TRANSIT_MOUNT,
     _build_client,
+    checked_transit_key_name,
     is_vault_bad_request,
+    is_vault_unavailable,
     require_transit_key_type,
     store_vault_hop,
     vault_failure_text,
@@ -172,6 +177,26 @@ def _names_no_version_reason(exc: Exception) -> bool:
 _VERSION_PROBE_INPUT = base64.b64encode(b"messagefoundry audit key version probe").decode("ascii")
 
 
+def _transit_failure(op: str, key: str, exc: Exception) -> CipherError:
+    """The error an ``encrypt`` or ``decrypt`` raises for ``exc``: :class:`CipherUnavailableError`
+    where Transit gave no verdict on the value, else plain :class:`CipherError` (BACKLOG #3734).
+    The audit HMAC keeps plain :class:`CipherError`; this split is for the data key alone.
+
+    The outage's text is the key id and ``exc``'s type name only, a reply refusal's fixed text
+    left out, because the upload routes log it; a refusal keeps :func:`vault_failure_text`.
+
+    Runs inside the caller's ``except``, so a classifier fault must not replace the type-only
+    error: anything it raises reads as a refusal, the side the split keeps when it cannot tell."""
+    try:
+        unavailable = is_vault_unavailable(exc)
+    except Exception as fault:  # noqa: BLE001 -- see the docstring; the caller raises CipherError
+        log.warning("Transit failure classifier raised %s; read as a refusal", type(fault).__name__)
+        unavailable = False
+    if unavailable:
+        return CipherUnavailableError(f"Transit {op} failed (key={key!r}): {type(exc).__name__}")
+    return CipherError(f"Transit {op} failed (key={key!r}): {vault_failure_text(exc)}")
+
+
 class TransitCipher(_UnmarkedPolicy):
     """Bulk at-rest cipher whose crypto runs inside Vault/OpenBao Transit — the DEK never enters heap."""
 
@@ -214,9 +239,7 @@ class TransitCipher(_UnmarkedPolicy):
             ciphertext = response["data"]["ciphertext"]  # "vault:v1:…" — no plaintext, no key
         except Exception as exc:
             # Type-only message: the plaintext going in is PHI; never surface it or the key material.
-            raise CipherError(
-                f"Transit encrypt failed (key={self._key!r}): {vault_failure_text(exc)}"
-            ) from exc
+            raise _transit_failure("encrypt", self._key, exc) from exc
         if not isinstance(ciphertext, str) or not ciphertext:
             raise CipherError(f"Transit returned an empty ciphertext (key={self._key!r})")
         return f"{_V3_PREFIX}{ciphertext}"
@@ -246,10 +269,9 @@ class TransitCipher(_UnmarkedPolicy):
             plaintext_b64 = response["data"]["plaintext"]
         except Exception as exc:
             # Covers a failed AEAD tag (wrong cell AAD / corrupt blob) AND transport failure — both fail
-            # closed. Type-only: a Transit error can echo ciphertext, and we never surface key material.
-            raise CipherError(
-                f"Transit decrypt failed (key={self._key!r}): {vault_failure_text(exc)}"
-            ) from exc
+            # closed, and only the second is CipherUnavailableError (BACKLOG #3734). Type-only: a
+            # Transit error can echo ciphertext, and we never surface key material.
+            raise _transit_failure("decrypt", self._key, exc) from exc
         # Refused OUTSIDE the handler: a UnicodeDecodeError's .object is the decrypted plaintext, so
         # chaining it would put the PHI this cipher protects on the error (BACKLOG #2085).
         # binascii.Error and UnicodeDecodeError are ValueErrors; TypeError is a non-str plaintext.
@@ -383,16 +405,21 @@ class TransitCipher(_UnmarkedPolicy):
 def _key_names() -> tuple[str, str]:
     """The Transit data key and audit key from the environment, read in one place for the cipher
     and for :func:`transit_cipher_required_capabilities`. Raises :class:`KeyProviderError` when the
-    data-key name is not set."""
+    data-key name is not set, and when either name is not a Transit key name (BACKLOG #6010): both
+    go into Transit request paths, so each is checked here, before any client is built."""
     key_name = os.environ.get(_ENV_TRANSIT_KEY)
     if not key_name:
         raise KeyProviderError(
             f"[store].cipher_provider={PROVIDER_NAME!r} is selected but {_ENV_TRANSIT_KEY} is not set — "
             f"supply the Transit data-key name via the environment."
         )
+    key_name = checked_transit_key_name(key_name, selector=_ENV_TRANSIT_KEY)
     # Optional dedicated audit-HMAC key; unset ⇒ reuse the data key. Either way the type is checked
     # at build — see the _ENV_AUDIT_KEY comment above for which types each use admits and why.
-    return key_name, os.environ.get(_ENV_AUDIT_KEY) or key_name
+    audit_key = os.environ.get(_ENV_AUDIT_KEY)
+    return key_name, (
+        checked_transit_key_name(audit_key, selector=_ENV_AUDIT_KEY) if audit_key else key_name
+    )
 
 
 def build_transit_cipher(

@@ -160,12 +160,21 @@ it the notifier, or the logging sink when no notifier is configured.
   fires on its refusing arm. The payload is the finding, the count of refusing-class grants (only
   on an over-grant, since an unread token counted nothing) and the hop's detail with control
   characters escaped. Nothing about the token is in it.
-- **A clean read resolves it.** A hop read clean raises `vault_privilege_clean`, which pages nobody
-  and resolves the open warning for the same subject through the ADR 0044 auto-resolve map.
+- **A clean read can resolve it.** A hop read clean raises `vault_privilege_clean`, which pages
+  nobody and can resolve the open warning for the same subject through the ADR 0044 auto-resolve
+  map, fenced as the
+  [ADR 0044 vault BACKLOG #4916 amendment](0044-operator-alert-state.md#amendment-2026-11-09----an-auto-resolve-is-fenced-to-the-raises-it-speaks-for-backlog-4916)
+  states; [SECURITY.md](../SECURITY.md#each-backend-hops-least-privilege-the-engine-probes-the-store-vault-and-ldap),
+  *A warning still open after a clean start*, says what to do with one.
 - **The subject is the hop**, `vault:store` or `vault:secrets`. Keying it by the token's policies
   was rejected: the usual fix is a new token with other policies, and its clean start would never
   resolve the old warning. The cost, stated rather than fixed: engine processes that share one
-  store share each hop's alert, so one process's clean start resolves a warning another raised on
-  a different token. Each start's audit row still records every process's own reading.
+  store share each hop's alert, so one process's clean start can resolve a warning another raised
+  on a different token, under the same conditions; a warning still open after a clean start may
+  be a live finding on another process. Each start's audit row still records its own reading,
+  though not which process wrote it. CORRECTED 2026-11-10: this bullet and the one above said a
+  clean start resolves the warning, with no conditions, which the logging sink made false when
+  they were written; the vault BACKLOG #4916 fence, added 2026-11-09, adds a condition. The
+  audit-row sentence read "records every process's own reading", corrected the same day.
 - **Best effort.** A sink that raises is logged and never masks the finding, the audit row or the
   refusal.

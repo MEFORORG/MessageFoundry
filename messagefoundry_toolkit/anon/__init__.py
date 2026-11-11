@@ -129,10 +129,11 @@ def anonymize_checked(
 
     Use this whenever the output may be persisted/shared — a silently-missed token is worse than no
     anonymization (ADR 0030 §5). The verification is now two-layered (BACKLOG #331): the known-token
-    denylist **and** high-precision structural PHI-shape detectors over the fields no rule matched
-    and over what a retarget of a default field left past its first component, scoped by the same
-    ``rules`` the anonymizer applied. The raised error names token *categories* and
-    field *shapes/addresses* only, never a value, and carries a coverage clause (the count + addresses
+    denylist **and** high-precision structural PHI-shape detectors over the fields no rule
+    matched, over what a retarget of a default field left past its first component, and over the
+    components an ``id``, ``mrn``, ``ssn`` or ``dln`` rule keeps as captured past its first
+    (BACKLOG #5534), scoped by the same ``rules`` the anonymizer applied. The raised error names
+    token *categories* and field *shapes/addresses* only, never a value, and carries a coverage clause (the count + addresses
     of the unmapped fields, whether the denylist tables were live) so a refusal is legible.
 
     A clean return is NOT proof the output is PHI-free. The structural detectors find only a dashed

@@ -86,7 +86,7 @@ from messagefoundry.odbc_call_gate import raw_cursor as _raw_cursor
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
-from messagefoundry.redaction import codec_safe_str, safe_text
+from messagefoundry.redaction import codec_safe_str, safe_exc, safe_text
 from messagefoundry.store import server_schema_verify
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
@@ -167,7 +167,9 @@ from messagefoundry.store.privilege import (
     StorePrivilegeReport,
     audit_write_alias,
     classify_audit_writes,
+    probed_grant,
     sqlserver_excess,
+    view_definition_grant,
 )
 from messagefoundry.store.queue_tag import (
     LIVE_INLINE_ROW,
@@ -220,6 +222,7 @@ from messagefoundry.store.store import (
     AD_MAPS,
     AD_ROLE_MAP,
     AD_SCOPE_MAP,
+    ANY_CLAIM_OWNER,
     AUDIT_KEY_EPOCH_ACTION,
     GLOBAL_SESSION_EPOCH_SQL,
     LOGIN_ADDRESS_RESET_MARKER,
@@ -238,6 +241,7 @@ from messagefoundry.store.store import (
     AdminGrant,
     AdminHolderTest,
     AdminRemoval,
+    AlertGeneration,
     AlertInstance,
     AlertSummary,
     AppendedAuditRow,
@@ -250,6 +254,7 @@ from messagefoundry.store.store import (
     ClaimAbortPhase,
     ClaimedHeads,
     ClaimLockTimeout,
+    ClaimOwnerGuard,
     ClaimProcStatus,
     ConnectionEvent,
     ConnectionEventWrite,
@@ -323,6 +328,7 @@ from messagefoundry.store.store import (
     birth_notify_email,
     build_audit_mac_keys,
     check_caller_event_kind,
+    check_executing_owner_filter,
     check_open_store_pin,
     check_password_generated,
     conditional_way_past,
@@ -1034,9 +1040,18 @@ def _applock_timeout_ms(command_timeout: int) -> int:
     return int(command_timeout * 1000) if command_timeout else -1
 
 
+#: What a clamped borrow's :class:`StoreAcquireTimeout` advises when the clamp, not
+#: ``[store].acquire_timeout``, was the limit (:meth:`SqlServerStore._acquire_clamped`). One fixed
+#: text for every clamped borrow, because no single setting sets every clamp: the
+#: docs/CONFIGURATION.md [cluster] paragraph it points to says which does, and stop()'s writes run
+#: at a fixed bound that none does. It stays short enough that ``safe_exc``'s default limit keeps
+#: the whole rendered message, at any timeout (BACKLOG #5064).
+CLAMPED_BORROW_ADVICE = "its [cluster] clamp's setting, if any (docs/CONFIGURATION.md [cluster])"
+
+
 def _clamped_statement_timeout(clamp_seconds: float, command_timeout: int) -> int:
     """The whole-second pyodbc statement timeout for a statement clamped below ``command_timeout``
-    (ADR 0157 Inc 0: the cluster lease claim/renew).
+    (ADR 0157 Inc 0: the cluster coordinator's maintenance loop and stepdown, BACKLOG #5064).
 
     pyodbc's ``Connection.timeout`` is an integer, so the clamp rounds DOWN, never up: a bound that
     rounded up could land past the detection margin the clamp was checked against. It never drops
@@ -2210,7 +2225,7 @@ _SCHEMA: list[str] = [
         status NVARCHAR(16) NOT NULL, first_seen FLOAT NOT NULL, last_seen FLOAT NOT NULL,
         [count] BIGINT NOT NULL, reason NVARCHAR(MAX) NULL, acked_by NVARCHAR(256) NULL,
         acked_at FLOAT NULL, resolved_at FLOAT NULL, suspended_until FLOAT NULL,
-        escalation_tier INT NOT NULL DEFAULT 0)""",
+        escalation_tier INT NOT NULL DEFAULT 0, raised_by NVARCHAR(64) NULL)""",
     # #143: windowed NOTIFICATION-mute end-epoch (NULL/past = not suspended). COL_LENGTH-gated ADD for a
     # pre-existing (from #56) alert_instance table; a no-op on a fresh DB (the CREATE above already has it).
     """IF COL_LENGTH('alert_instance','suspended_until') IS NULL
@@ -2219,6 +2234,9 @@ _SCHEMA: list[str] = [
     # a pre-existing alert_instance; NOT NULL DEFAULT 0 backfills existing rows. No-op on a fresh DB.
     """IF COL_LENGTH('alert_instance','escalation_tier') IS NULL
         ALTER TABLE alert_instance ADD escalation_tier INT NOT NULL DEFAULT 0""",
+    # #4916: the notifier that wrote the newest raise (a per-process random id); NULL on old rows.
+    """IF COL_LENGTH('alert_instance','raised_by') IS NULL
+        ALTER TABLE alert_instance ADD raised_by NVARCHAR(64) NULL""",
     """IF INDEXPROPERTY(OBJECT_ID('alert_instance'),'ux_alert_instance_open','IndexID') IS NULL
         CREATE UNIQUE INDEX ux_alert_instance_open ON alert_instance(event_type, connection)
         WHERE status <> 'resolved'""",
@@ -3205,16 +3223,35 @@ def _audit_write_probe(table: str, privilege: str) -> str:
     The one-part name resolves as the store's own unqualified statements do, and ``HAS_PERMS_BY_NAME``
     answers NULL for a table this login cannot see, which the probe reads as NOT READ. ``UPDATE`` is
     read column by column: a column-level GRANT outranks a table-level DENY, so the table-level answer
-    alone would miss it. ``OBJECT_ID`` is NULL for a table the login cannot see, so no column row is
-    found and the MAX is NULL too. ``table`` and ``privilege`` come from closed tuples in
-    ``store.privilege``, never from input."""
+    alone would miss it. The per-column answers fold through :func:`_any_grant`, never ``MAX``.
+    ``table`` and ``privilege`` come from closed tuples in ``store.privilege``, never from input."""
     alias = audit_write_alias(table, privilege)
     if privilege == "UPDATE":
-        return (
-            f"(SELECT MAX(HAS_PERMS_BY_NAME('{table}', 'OBJECT', 'UPDATE', c.name, 'COLUMN'))"
-            f" FROM sys.columns c WHERE c.object_id = OBJECT_ID('{table}')) AS {alias}"
+        per_column = (
+            f"SELECT HAS_PERMS_BY_NAME('{table}', 'OBJECT', 'UPDATE', c.name, 'COLUMN') AS p"
+            f" FROM sys.columns c WHERE c.object_id = OBJECT_ID('{table}')"
         )
+        return f"{_any_grant(per_column)} AS {alias}"
     return f"HAS_PERMS_BY_NAME('{table}', 'OBJECT', '{privilege}') AS {alias}"
+
+
+def _any_grant(answers: str) -> str:
+    """A scalar subquery folding the 1 / 0 / NULL answers in column ``p`` of ``answers`` three ways
+    (BACKLOG #6015): 1 when any answer is 1, 0 when every answer is 0, and NULL, NOT READ, when an
+    answer is NULL and none is 1, or when there is no answer at all.
+
+    ``MAX`` skips NULLs, so a NULL column beside a 0 column folded to 0 and read as not held: a
+    false clean from a column that was never read. A 1 still wins over a NULL, since a partial read
+    can only understate a held grant. ``OBJECT_ID`` is NULL for a table the login cannot see, so no
+    column row is found and the fold is NULL. Standard SQL only, so a test can run it on SQLite.
+
+    ``answers`` is interpolated as SQL text, so it must be built from closed constants, as
+    :func:`_audit_write_probe` builds it; never from settings or input."""
+    return (
+        "(SELECT CASE WHEN SUM(CASE WHEN a.p = 1 THEN 1 ELSE 0 END) > 0 THEN 1"
+        " WHEN COUNT(*) > 0 AND COUNT(a.p) = COUNT(*) THEN 0 END"
+        f" FROM ({answers}) AS a)"
+    )
 
 
 def _probed_grant(value: Any) -> bool | None:
@@ -3227,11 +3264,9 @@ def _probed_grant(value: Any) -> bool | None:
     that NULL through ``== 1`` yields ``False``, which reads as *"not a member"* and therefore as
     clean, so a probe that read NOTHING would render as a clean bill of health — the exact false-clean
     :meth:`SqlServerStore.probe_principal_privileges` names catalog enumeration to avoid, arriving by
-    the other door. ``True``/``False`` from a driver that returns booleans still compares equal to
-    ``1``/``0``, so this keeps working on such a driver."""
-    if value is None:
-        return None
-    return bool(value == 1)
+    the other door. ``True``/``False`` from a driver that returns booleans still read as ``1``/``0``;
+    any other value is not read either, by :func:`~messagefoundry.store.privilege.probed_grant`."""
+    return probed_grant(value)
 
 
 class SqlServerStore:
@@ -4682,7 +4717,12 @@ class SqlServerStore:
             # counted only under external, where the runtime login must hold none.
             " HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE TABLE') AS create_table,"
             " SCHEMA_NAME() AS default_schema,"
-            " HAS_PERMS_BY_NAME(SCHEMA_NAME(), 'SCHEMA', 'ALTER') AS alter_schema, "
+            " HAS_PERMS_BY_NAME(SCHEMA_NAME(), 'SCHEMA', 'ALTER') AS alter_schema,"
+            # #6714: VIEW DEFINITION on the two schemas a store's tables resolve through. Only
+            # provision-admin needs it, so under external the runtime login holding it is excess.
+            " HAS_PERMS_BY_NAME(QUOTENAME(SCHEMA_NAME()), N'SCHEMA', N'VIEW DEFINITION')"
+            " AS view_def_default,"
+            " HAS_PERMS_BY_NAME(N'[dbo]', N'SCHEMA', N'VIEW DEFINITION') AS view_def_dbo, "
             + ", ".join(server_cols + db_cols + audit_cols),
             SQLSERVER_FIXED_SERVER_ROLES + SQLSERVER_FIXED_DATABASE_ROLES,
         )
@@ -4717,23 +4757,42 @@ class SqlServerStore:
         if control_database is None:
             unread.append(f"CONTROL on database {database}")
         external = self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
+        # The grants below are findings under external only, so only external needs them READ. An
+        # unread one never turns an over-grant that WAS read into an unobserved report: it is
+        # weighed after the excess, below (#6714), so a read db_owner still refuses under enforce.
+        external_unread: list[str] = []
         create_table = _probed_grant(row["create_table"])
+        if create_table is None:
+            external_unread.append(f"create table on database {database}")
         alter_schema = _probed_grant(row["alter_schema"])
-        if external:
-            # Only external reads these as findings, so only external needs them READ.
-            if create_table is None:
-                unread.append(f"create table on database {database}")
-            if alter_schema is None:
-                unread.append("ALTER on the default schema")
+        if alter_schema is None:
+            external_unread.append("ALTER on the default schema")
+        # #6714: one column per distinct schema; when the default schema is dbo the two name one.
+        default_schema = str(row["default_schema"] or "") or "(unresolved default schema)"
+        view_def_columns = {default_schema: "view_def_default"}
+        view_def_columns.setdefault("dbo", "view_def_dbo")
+        view_definition: list[str] = []
+        for schema, column in view_def_columns.items():
+            grant = _probed_grant(row[column])
+            if grant is None:
+                external_unread.append(view_definition_grant(schema))
+            elif grant:
+                view_definition.append(schema)
         audit_writes, audit_unread = classify_audit_writes(row, SQLSERVER_AUDIT_WRITE_PRIVILEGES)
+        external_unread += audit_unread
         server_roles = tuple(held_server)
         database_roles = tuple(held_database)
         if unread:
             probed = len(SQLSERVER_FIXED_SERVER_ROLES) + len(SQLSERVER_FIXED_DATABASE_ROLES) + 2
             held_labels = [f"server role {r}" for r in server_roles]
             held_labels += [f"database role {r}" for r in database_roles]
-            if external:  # owner ruling R16: a held audit-table right is a finding there
+            also_unread = ""
+            if external:  # owner ruling R16 and #6714: each is a finding there
                 held_labels += list(audit_writes)
+                if view_definition:
+                    held_labels.append(view_definition_grant(*view_definition))
+                if external_unread:
+                    also_unread = f"; also not read: {', '.join(external_unread)}"
             # The catalog enumeration below is skipped deliberately: it is additive only, and widening
             # a report already saying the read was incomplete buys nothing an operator can act on.
             return StorePrivilegeReport(
@@ -4744,11 +4803,12 @@ class SqlServerStore:
                 server_roles=server_roles,
                 database_roles=database_roles,
                 detail=(
-                    f"the privilege query returned NULL for {len(unread)} of {probed} probed grant(s),"
-                    f" so they were not read and must not be reported as absent: {', '.join(unread)}"
+                    f"the privilege query returned NULL, or a value that is not 0 or 1, for"
+                    f" {len(unread)} of {probed} probed grant(s), so they were not read and must not"
+                    f" be reported as absent: {', '.join(unread)}"
                     " (IS_SRVROLEMEMBER / IS_ROLEMEMBER / HAS_PERMS_BY_NAME answer NULL when the name"
                     " does not resolve for this caller); what DID read as held:"
-                    f" {', '.join(held_labels) or 'nothing'}"
+                    f" {', '.join(held_labels) or 'nothing'}{also_unread}"
                 ),
             )
         # #305: `external` (read above) picks which documented grant the login is measured against.
@@ -4783,16 +4843,17 @@ class SqlServerStore:
             create_table=bool(create_table),
             alter_schema=(str(row["default_schema"] or "") if alter_schema else None),
             audit_writes=audit_writes,
+            view_definition=tuple(view_definition),
         )
-        if external and audit_unread:
-            # Owner ruling R16 counts these under external only, so only external needs them READ. A
-            # NULL is a table this login cannot resolve. With nothing else found the read is
-            # unobserved rather than clean; with an over-grant already found it stays OBSERVED, so the
-            # start still refuses on what WAS read.
+        if external and external_unread:
+            # With nothing else found the read is unobserved rather than clean; with an over-grant
+            # already found it stays OBSERVED, so the start still refuses on what WAS read.
             note += (
-                f"; the audit-table grants read NULL for {', '.join(audit_unread)}, so whether this"
-                " login can change audit rows was not read"
+                "; these grants answered NULL, or a value that is not 0 or 1, so they were not"
+                f" read: {', '.join(external_unread)}"
             )
+            if audit_unread:
+                note += ", so whether this login can change audit rows was not read"
             if not excess:
                 return StorePrivilegeReport(
                     backend=self.backend,
@@ -4803,7 +4864,8 @@ class SqlServerStore:
                     database_roles=database_roles,
                     detail=(
                         f"{note}; [store].schema_management is 'external', which requires INSERT and"
-                        " SELECT only on audit_log"
+                        " SELECT only on audit_log, no schema DDL right and no view definition on"
+                        " the store's schemas"
                     ),
                 )
         return StorePrivilegeReport(
@@ -4817,8 +4879,9 @@ class SqlServerStore:
             detail=(
                 f"database user {str(row['db_user'] or '')!r}; {note}; measured against the "
                 + (
-                    "runtime (schema_management=external: no db_ddladmin, and no UPDATE/DELETE/"
-                    "ALTER/CONTROL or take ownership on audit_log)"
+                    "runtime (schema_management=external: no db_ddladmin, no view definition on the"
+                    " default schema or dbo, and no UPDATE/DELETE/ALTER/CONTROL or take ownership"
+                    " on audit_log)"
                     if external
                     else "auto-mode"
                 )
@@ -5567,17 +5630,26 @@ class SqlServerStore:
 
     def _acquire_clamped(self, clamp_seconds: float) -> AbstractAsyncContextManager[Any]:
         """:meth:`_acquire` with a SHORTER acquire limit: the smaller of ``[store].acquire_timeout``
-        and ``clamp_seconds``. Only the cluster lease claim/renew borrows this way
-        (:meth:`_fetchone_clamped` says why)."""
-        return self._borrow(min(self._settings.acquire_timeout, clamp_seconds))
+        and ``clamp_seconds``. Only the cluster coordinator's clamped statements borrow this way
+        (:meth:`_fetchone_clamped` says why). When the clamp is the shorter limit, a borrow that
+        times out advises :data:`CLAMPED_BORROW_ADVICE` rather than ``[store].acquire_timeout``,
+        which would not help; at a tie raising ``[store].acquire_timeout`` would not help either.
+        Otherwise it advises ``[store].acquire_timeout``, as :meth:`_acquire` does (BACKLOG
+        #5064)."""
+        if clamp_seconds <= self._settings.acquire_timeout:
+            return self._borrow(clamp_seconds, retune=CLAMPED_BORROW_ADVICE)
+        return self._borrow(self._settings.acquire_timeout)
 
     @asynccontextmanager
-    async def _borrow(self, timeout: float) -> AsyncIterator[Any]:
+    async def _borrow(
+        self, timeout: float, *, retune: str = "[store].acquire_timeout"
+    ) -> AsyncIterator[Any]:
         """The body of :meth:`_acquire`, :meth:`_acquire_after_commit` and :meth:`_acquire_clamped`,
         and the sole place this store borrows from its pool. ``timeout`` is the acquire limit, never
-        ``None``."""
+        ``None``; ``retune`` is the advice a timed-out borrow's message ends with
+        (:func:`~messagefoundry.store.base.acquire_pooled`)."""
         t0 = perf_counter()
-        conn = await acquire_pooled(self._pool, timeout=timeout, backend="sqlserver")
+        conn = await acquire_pooled(self._pool, timeout=timeout, backend="sqlserver", retune=retune)
         self._acquire_wait.record((perf_counter() - t0) * 1000.0)
         try:
             _install_call_gate(conn)  # BACKLOG #2049: one pyodbc call at a time on this connection
@@ -5664,14 +5736,17 @@ class SqlServerStore:
         duplicate key and 2628 the truncated value.
 
         ``within`` bounds the rollback, in seconds; ``None``, which every caller but
-        :meth:`_fetch_rows` on a clamped read passes, leaves it unbounded and enters no timeout at
-        all. A rollback that runs past the bound is treated as one that failed: the connection is
-        discarded. Where the call gate already marks the rollback as running, the close is handed
+        :meth:`_fetch_rows` and :meth:`_write_rows` on a clamped statement passes, leaves it
+        unbounded and enters no timeout at all. A rollback that runs past the bound is treated as
+        one that failed: the connection is discarded. Where the call gate already marks the rollback as running, the close is handed
         to it and lands as it returns (BACKLOG #2049). A rollback the bound cancelled before it
         entered the gate never runs (BACKLOG #2394), so the separate close that follows takes the
         gate's lock with no rollback left to race it, and the close ends the transaction.
         :meth:`_fetch_rows` passes the lease claim's clamp, so a stalled rollback
-        after a failed claim cannot hold ``_leadership_lock`` past it (BACKLOG #5066).
+        after a failed claim cannot hold ``_leadership_lock`` past it (BACKLOG #5066), and
+        :meth:`_write_rows` passes it for every clamped write (BACKLOG #5064): a stepdown's release
+        write, which holds the same lock, the heartbeat, which runs in series with the renew, and
+        stop()'s two writes at the shutdown bound.
 
         The discard is :func:`_detach_connection`, the same detach :meth:`_release_dirty` uses, and
         unlike that method it does NOT wait for the close.
@@ -5833,49 +5908,71 @@ class SqlServerStore:
     async def _fetchall(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         return await self._fetch_rows(sql, params)
 
+    def _clamp_bounds(
+        self, timeout_clamp: float | None
+    ) -> tuple[AbstractAsyncContextManager[Any], int | None, float | None]:
+        """``(borrow, statement timeout, rollback bound)`` for one statement. ``timeout_clamp`` is
+        ``None`` for every caller outside the SQL Server cluster coordinator, and ``None`` keeps the :meth:`_acquire` borrow and ``[store].command_timeout``. One value sets
+        the borrow, the statement and the rollback bounds, so none can be set without the others; a
+        shorter ``[store].command_timeout`` still ends the statement first, and bounds neither of
+        the other two."""
+        if timeout_clamp is None:
+            return self._acquire(), None, None
+        # The borrow is floored at 1 s like the statement, so a sub-second clamp runs as 1 s on
+        # both, as the coordinator's warning says, and a 0 clamp never refuses every borrow. The
+        # rollback after a failure gets the same floored clamp (BACKLOG #5066).
+        floored_clamp = max(1.0, timeout_clamp)
+        return (
+            self._acquire_clamped(floored_clamp),
+            _clamped_statement_timeout(timeout_clamp, self._settings.command_timeout),
+            floored_clamp,
+        )
+
     async def _fetch_rows(
         self, sql: str, params: tuple[Any, ...], timeout_clamp: float | None = None
     ) -> list[dict[str, Any]]:
-        """The body of :meth:`_fetchall` and :meth:`_fetchone_clamped`. ``timeout_clamp`` is
-        ``None`` for every caller but the cluster lease claim/renew, and ``None`` keeps the
-        :meth:`_acquire` borrow and ``[store].command_timeout``. One value sets the borrow, the
-        statement and the rollback bounds, so none can be set without the others; a shorter
-        ``[store].command_timeout`` still ends the statement first, and bounds neither of the
-        other two."""
-        if timeout_clamp is None:
-            borrow, statement_timeout, floored_clamp = self._acquire(), None, None
-        else:
-            # The borrow is floored at 1 s like the statement, so a sub-second clamp runs as 1 s on
-            # both, as the coordinator's warning says, and a 0 clamp never refuses every borrow. The
-            # rollback after a failure gets the same floored clamp (BACKLOG #5066).
-            floored_clamp = max(1.0, timeout_clamp)
-            borrow = self._acquire_clamped(floored_clamp)
-            statement_timeout = _clamped_statement_timeout(
-                timeout_clamp, self._settings.command_timeout
-            )
-        async with borrow as conn:
-            try:
-                async with (
-                    self._statement_timeout(conn, statement_timeout),
-                    self._cursor(conn) as cur,
-                ):
-                    await cur.execute(sql, params) if params else await cur.execute(sql)
-                    columns = [c[0] for c in cur.description]
-                    rows = await cur.fetchall()
-                    # Read-snapshot release, NOT a durable write — commit without counting (A1). This is
-                    # the single read helper (_fetchall, _fetchone and _fetchone_clamped delegate here);
-                    # routing every read through _commit was what made committed_txns a superset of the
-                    # write cost model on a live SQL Server.
-                    await self._commit_read(conn)
-            except Exception:
-                # autocommit=False: a failed read otherwise leaves the pooled connection mid-txn (and
-                # under RCSI an open snapshot pins the version store / bloats tempdb). Roll back before
-                # it returns to the pool so the next borrower starts clean (M-6). After the cursor has
-                # closed and the timeout is restored, so a discard races neither; _rollback_or_discard
-                # says why it is bounded and discards (BACKLOG #5066).
-                await self._rollback_or_discard(conn, within=floored_clamp)
+        """The body of :meth:`_fetchall` and :meth:`_fetchone_clamped`; :meth:`_clamp_bounds`
+        says what ``timeout_clamp`` sets. A failure of the pool release alone, after the commit,
+        keeps the result, as :meth:`_write_rows` does: the lease claim and the config-version
+        refresh are MERGEs that come through here, so a claim that committed must not read as a
+        failed renew (BACKLOG #5064)."""
+        borrow, statement_timeout, floored_clamp = self._clamp_bounds(timeout_clamp)
+        result: list[dict[str, Any]] | None = None
+        try:
+            async with borrow as conn:
+                try:
+                    async with (
+                        self._statement_timeout(conn, statement_timeout),
+                        self._cursor(conn) as cur,
+                    ):
+                        await cur.execute(sql, params) if params else await cur.execute(sql)
+                        columns = [c[0] for c in cur.description]
+                        rows = await cur.fetchall()
+                        # Read-snapshot release, NOT a durable write — commit without counting (A1).
+                        # This is the single read helper (_fetchall, _fetchone and _fetchone_clamped
+                        # delegate here); routing every read through _commit was what made
+                        # committed_txns a superset of the write cost model on a live SQL Server.
+                        await self._commit_read(conn)
+                except Exception:
+                    # autocommit=False: a failed read otherwise leaves the pooled connection mid-txn
+                    # (and under RCSI an open snapshot pins the version store / bloats tempdb). Roll
+                    # back before it returns to the pool so the next borrower starts clean (M-6).
+                    # After the cursor has closed and the timeout is restored, so a discard races
+                    # neither; _rollback_or_discard says why it is bounded and discards (BACKLOG
+                    # #5066).
+                    await self._rollback_or_discard(conn, within=floored_clamp)
+                    raise
+                # Set only once the body finished cleanly, as in _write_rows.
+                result = [dict(zip(columns, row)) for row in rows]  # noqa: B905
+                return result
+        except Exception as exc:
+            if result is None:
                 raise
-        return [dict(zip(columns, row)) for row in rows]  # noqa: B905
+            log.warning(
+                "sqlserver store: a statement committed, then its pool release failed: %s",
+                safe_exc(exc),
+            )
+            return result
 
     async def _fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
         rows = await self._fetchall(sql, params)
@@ -5885,10 +5982,12 @@ class SqlServerStore:
         self, sql: str, params: tuple[Any, ...], *, timeout_clamp: float
     ) -> dict[str, Any] | None:
         """:meth:`_fetchone` bounded by ``timeout_clamp`` (ADR 0157 Inc 0). The cluster lease
-        claim/renew is its only caller.
+        claim/renew and the config-version refresh are at least its callers (BACKLOG #5064);
+        :meth:`_execute_clamped` is its twin for a write. A borrow that times out at the clamp
+        advises :data:`CLAMPED_BORROW_ADVICE` (:meth:`_acquire_clamped`).
 
         Two windows before the statement returns, each at most the clamp floored at 1 s. The wait
-        for a pooled connection is the smaller of ``max(1.0, clamp)`` and ``[store].acquire_timeout`` (:meth:`_fetch_rows` applies
+        for a pooled connection is the smaller of ``max(1.0, clamp)`` and ``[store].acquire_timeout`` (:meth:`_clamp_bounds` applies
         the floor, :meth:`_acquire_clamped` the minimum): a renew that waited out a saturated pool past the
         fence would otherwise still extend the lease after this node self-fenced. The statement's
         own timeout is :func:`_clamped_statement_timeout`, applied by :meth:`_statement_timeout`.
@@ -5900,7 +5999,9 @@ class SqlServerStore:
         clamp after it is issued, while ``ClusterSettings._renew_fits_the_margin`` compares the
         clamp alone with the margin. The COMMIT after the statement is a call on the connection, not a
         statement, so neither the clamp nor ``[store].command_timeout`` is known to bound it, by a
-        reading of pyodbc's documentation, not a measurement.
+        reading of pyodbc's documentation, not a measurement. Whether msodbcsql bounds
+        ``SQLEndTran`` needs a live SQL Server, and BACKLOG #6621 measures it; until then the COMMIT
+        is outside both windows (BACKLOG #5064 keeps that as a stated reason, not a bound).
 
         **The ROLLBACK after a failure has its own bound (BACKLOG #5066):** the clamp floored at
         1 s, applied on the event loop by :meth:`_rollback_or_discard`. One that fails or runs past
@@ -5917,21 +6018,64 @@ class SqlServerStore:
     async def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:
         """Run a single write statement (or T-SQL batch) in its own committed transaction, and return
         the driver's row count (``-1`` when it reports none). Most callers ignore it; the cluster
-        stepdown reads it to say truthfully whether its owner-scoped release matched a row."""
-        async with self._acquire() as conn:
-            try:
-                async with self._cursor(conn) as cur:
-                    await cur.execute(sql, params)
-                    # getattr: some test cursors model no row count, and -1 is the DB-API 'unknown'.
-                    count = getattr(cur, "rowcount", -1)
-                    rows = count if isinstance(count, int) else -1
-                    await self._commit(conn)
-            except Exception:
-                # A rollback that fails would otherwise recycle a connection still holding the
-                # write's X locks; _rollback_or_discard discards it instead. After the cursor block,
-                # so a detached close cannot race the cursor's own close.
-                await self._rollback_or_discard(conn)
+        stepdown reads it, through :meth:`_execute_clamped`, to say truthfully whether its
+        owner-scoped release matched a row."""
+        return await self._write_rows(sql, params)
+
+    async def _execute_clamped(
+        self, sql: str, params: tuple[Any, ...], *, timeout_clamp: float
+    ) -> int:
+        """:meth:`_execute` bounded by ``timeout_clamp`` exactly as :meth:`_fetchone_clamped` bounds
+        a read, whose docstring says what that leaves unbounded, the COMMIT included, and what a
+        timed-out borrow advises (BACKLOG #5064). The cluster heartbeat and the lease release are
+        at least its callers. The
+        heartbeat runs in series with the renew and a stepdown's release under
+        ``_leadership_lock``, so ``[store].command_timeout`` there would delay the renew (BACKLOG
+        #6472); ``stop()`` passes its own bound instead of the renew clamp."""
+        return await self._write_rows(sql, params, timeout_clamp)
+
+    async def _write_rows(
+        self, sql: str, params: tuple[Any, ...], timeout_clamp: float | None = None
+    ) -> int:
+        """The body of :meth:`_execute` and :meth:`_execute_clamped`; :meth:`_clamp_bounds` says
+        what ``timeout_clamp`` sets.
+
+        A failure of the pool release alone, after the write committed, is logged and the row count
+        returned, as ``cluster._call_within`` does on Postgres: reporting that write as failed would
+        tell the cluster stepdown its release is unconfirmed when it landed (BACKLOG #5064). Before
+        #5064, :meth:`_execute` lost the count the same way."""
+        borrow, statement_timeout, floored_clamp = self._clamp_bounds(timeout_clamp)
+        committed: int | None = None
+        try:
+            async with borrow as conn:
+                try:
+                    async with (
+                        self._statement_timeout(conn, statement_timeout),
+                        self._cursor(conn) as cur,
+                    ):
+                        await cur.execute(sql, params)
+                        # getattr: some test cursors model no row count, and -1 is the DB-API
+                        # 'unknown'.
+                        count = getattr(cur, "rowcount", -1)
+                        rows = count if isinstance(count, int) else -1
+                        await self._commit(conn)
+                except Exception:
+                    # A rollback that fails would otherwise recycle a connection still holding the
+                    # write's X locks; _rollback_or_discard discards it instead. After the cursor
+                    # block, so a detached close cannot race the cursor's own close.
+                    await self._rollback_or_discard(conn, within=floored_clamp)
+                    raise
+                # Set only once the body finished cleanly, so an exception past here is the borrow's
+                # exit, the pool release, and never the write itself.
+                committed = rows
+        except Exception as exc:
+            if committed is None:
                 raise
+            log.warning(
+                "sqlserver store: a write committed, then its pool release failed: %s",
+                safe_exc(exc),
+            )
+            return committed
         return rows
 
     async def _execute_output(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
@@ -8139,6 +8283,7 @@ class SqlServerStore:
         reason: str | None = None,
         escalation_tier: int = 0,
         now: float | None = None,
+        raised_by: str | None = None,
     ) -> None:
         # Pure observer (ADR 0044 D2): no queue row, no finalizer. De-dup grain = ADR 0014's
         # (event_type, connection) key. UPDATE-then-conditional-INSERT in one serializable transaction
@@ -8160,7 +8305,8 @@ class SqlServerStore:
             try:
                 await cur.execute(
                     "UPDATE alert_instance SET last_seen=?, [count]=[count]+1, severity=?, reason=?,"
-                    " escalation_tier=CASE WHEN escalation_tier < ? THEN ? ELSE escalation_tier END"
+                    " escalation_tier=CASE WHEN escalation_tier < ? THEN ? ELSE escalation_tier END,"
+                    " raised_by=?"
                     " WHERE event_type=? AND connection=? AND status<>'resolved'",
                     (
                         now,
@@ -8168,6 +8314,7 @@ class SqlServerStore:
                         reason_enc,
                         escalation_tier,
                         escalation_tier,
+                        raised_by,
                         event_type,
                         connection,
                     ),
@@ -8176,8 +8323,18 @@ class SqlServerStore:
                     await cur.execute(
                         "INSERT INTO alert_instance"
                         " (event_type, connection, severity, status, first_seen, last_seen,"
-                        " [count], reason, escalation_tier) VALUES (?,?,?,'open',?,?,1,?,?)",
-                        (event_type, connection, severity, now, now, reason_enc, escalation_tier),
+                        " [count], reason, escalation_tier, raised_by)"
+                        " VALUES (?,?,?,'open',?,?,1,?,?,?)",
+                        (
+                            event_type,
+                            connection,
+                            severity,
+                            now,
+                            now,
+                            reason_enc,
+                            escalation_tier,
+                            raised_by,
+                        ),
                     )
                 await self._commit(conn)
             except Exception:
@@ -8435,6 +8592,63 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
         return int(changed)
+
+    async def open_alert_generations(
+        self, *, event_type: str, connection: str | None = None
+    ) -> list[AlertGeneration]:
+        # BACKLOG #3269: (id, connection, count) of the live instances of one type. No reason read.
+        # status<>'resolved' is the live predicate spelled as ux_alert_instance_open's filter, so
+        # the read seeks that index.
+        where = ["event_type=?", "status<>'resolved'"]
+        params: list[Any] = [event_type]
+        if connection is not None:
+            where.append("connection=?")
+            params.append(connection)
+        rows = await self._fetchall(
+            "SELECT id, connection, [count] AS count FROM alert_instance WHERE "
+            + " AND ".join(where)
+            + " ORDER BY id",
+            tuple(params),
+        )
+        return [AlertGeneration(int(r["id"]), str(r["connection"]), int(r["count"])) for r in rows]
+
+    async def resolve_alert_instances_fenced(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        raised_by: str,
+        seen: AlertGeneration | None,
+        now: float | None = None,
+    ) -> int:
+        # BACKLOG #4916: close the key's live instance only when its newest raise is one this writer
+        # saw at the clear (seen_id/seen_count) or is this writer's own (raised_by). Clock-free.
+        # OUTPUT, not rowcount: the sink reads a zero as "a newer raise kept it open", and SET
+        # NOCOUNT ON cannot hide an output rowset.
+        now = time.time() if now is None else now
+        seen_id, seen_count = (seen.id, seen.count) if seen is not None else (-1, -1)
+        closed = await self._execute_output(
+            "UPDATE alert_instance SET status='resolved', resolved_at=? OUTPUT inserted.id"
+            " WHERE event_type=? AND connection=? AND status<>'resolved'"
+            " AND (raised_by=? OR (id=? AND [count]<=?))",
+            (now, event_type, connection, raised_by, seen_id, seen_count),
+        )
+        return len(closed)
+
+    async def resolve_alert_generation(
+        self, *, alert_id: int, through_count: int, now: float | None = None
+    ) -> int:
+        # BACKLOG #3269: resolve one live instance only while no raise has folded in past
+        # through_count. Clock-free.
+        # OUTPUT, not rowcount: the caller acts on whether the row closed, and SET NOCOUNT ON
+        # cannot hide an output rowset.
+        now = time.time() if now is None else now
+        closed = await self._execute_output(
+            "UPDATE alert_instance SET status='resolved', resolved_at=? OUTPUT inserted.id"
+            " WHERE id=? AND [count]<=? AND status<>'resolved'",
+            (now, alert_id, through_count),
+        )
+        return len(closed)
 
     async def suspend_alert_instance(
         self, alert_id: int, *, until: float, audit: AuditAppend, now: float | None = None
@@ -13907,7 +14121,7 @@ class SqlServerStore:
         )
 
     async def list_interrupted_approvals(self, *, limit: int = 100) -> list[dict[str, Any]]:
-        """Released requests cut off mid-run, oldest-first (BACKLOG #1562). No expiry filter, and the
+        """Released requests at ``interrupted``, oldest-first (BACKLOG #1562). No expiry filter, and the
         order: the Store protocol says why."""
         return await self._fetchall(
             "SELECT TOP (?) " + _MSSQL_APPROVAL_COLUMNS + " FROM pending_approvals"
@@ -13926,6 +14140,7 @@ class SqlServerStore:
         from_status: str = "pending",
         audit: AuditAppend | None = None,
         claim_owner: str | None = None,
+        from_claim_owner: ClaimOwnerGuard = ANY_CLAIM_OWNER,
     ) -> bool:
         """Atomically move a request in ``from_status`` to ``status``.
         Returns ``True`` iff this call made the transition — guards against a double decision.
@@ -13951,7 +14166,7 @@ class SqlServerStore:
                         current = ApprovalRow.from_mapping(found[0]) if found else None
                         moved = (
                             current is not None
-                            and current.status == from_status
+                            and current.moves_from(from_status, from_claim_owner)
                             and await self._write_approval(
                                 cur,
                                 current.decided(
@@ -14045,12 +14260,26 @@ class SqlServerStore:
         return bool(await cur.fetchall())
 
     async def list_executing_approvals(
-        self, *, claim_owner: str | None = None, limit: int = 1000
+        self,
+        *,
+        claim_owner: str | None = None,
+        not_claimed_by: str | None = None,
+        limit: int = 1000,
     ) -> list[dict[str, Any]]:
         """Released requests still claimed as ``executing``, oldest claim first (BACKLOG #1562).
-        The Store protocol says who reads it, why, and what ``claim_owner`` filters. The owner
-        compares under BIN2, so two owners differing only in case stay two owners. Every column,
-        so the gate can check each row's seal (BACKLOG #2592)."""
+        The Store protocol says who reads it, why, and what ``claim_owner`` and
+        ``not_claimed_by`` filter. The owner compares under BIN2, so two owners differing only in
+        case stay two owners. Every column, so the gate can check each row's seal (BACKLOG
+        #2592)."""
+        check_executing_owner_filter(claim_owner, not_claimed_by)
+        if not_claimed_by is not None:
+            return await self._fetchall(
+                "SELECT TOP (?) " + _MSSQL_APPROVAL_COLUMNS + " FROM pending_approvals"
+                " WHERE status = 'executing' AND claim_owner IS NOT NULL"
+                " AND claim_owner COLLATE Latin1_General_100_BIN2 <> ?"
+                " ORDER BY decided_at ASC",
+                (limit, not_claimed_by),
+            )
         if claim_owner is None:
             return await self._fetchall(
                 "SELECT TOP (?) " + _MSSQL_APPROVAL_COLUMNS + " FROM pending_approvals"

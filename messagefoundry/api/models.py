@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, StrictInt, model_validator
 
 from messagefoundry.api.phi_gate import PhiGatedModel
 from messagefoundry.api.request_model import RequestModel
@@ -140,7 +140,8 @@ class MessageSearchRequest(RequestModel):
     message_type: MessageTypeFilter | None = None
     control_id: ControlIdFilter | None = None
     limit: int = Field(default=50, ge=1, le=500)
-    scan_limit: int | None = Field(default=None, ge=1)
+    # StrictInt: a lax int would take JSON ``true`` as 1 and ``"7"`` as 7 (BACKLOG #6700).
+    scan_limit: StrictInt | None = Field(default=None, ge=1)
 
 
 class MessageExportRequest(MessageSearchRequest):
@@ -535,8 +536,8 @@ ReleaseBlocked = Literal[
 
 class PendingApprovalInfo(BaseModel):
     """One open request in the approver's queue: ``pending`` (awaiting a second approver, unexpired)
-    or ``interrupted`` (released, cut off mid-run, awaiting a resolve; BACKLOG #1562). For an
-    interrupted row, ``approver`` released it and ``decided_at`` is when it was cut off.
+    or ``interrupted`` (released, effects unknown, awaiting a resolve; BACKLOG #1562). For an
+    interrupted row, ``approver`` released it.
 
     ``params`` are the parameters the hold captured, which a release re-runs (BACKLOG #2458), so an
     approver sees what it releases. They are operation metadata, never a message body; ``None``
@@ -1681,7 +1682,9 @@ class SecurityPosture(BaseModel):
     environment: str | None = None  # the active-environment NAME (ADR 0017)
     backend: str  # store backend: "sqlite" | "postgres" | "sqlserver"
     encryption_enabled: bool  # whether the LIVE store cipher encrypts at rest
-    key_source: str  # [store].key_provider name (auto|env|dpapi|aws_kms|...); NOT key material
+    key_source: (
+        str  # [store].key_provider name (store.keyprovider.KNOWN_PROVIDERS); NOT key material
+    )
     key_id: str | None = (
         None  # active key FINGERPRINT only (first 16 hex of SHA-256(key)); never bytes
     )

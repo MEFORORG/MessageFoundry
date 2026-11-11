@@ -23,6 +23,7 @@ from messagefoundry.parsing.x12.delimiters import (
     Delimiters,
     discover_delimiters,
     find_isa_start,
+    iter_segments,
 )
 from messagefoundry.parsing.x12.errors import X12PeekError
 
@@ -30,7 +31,6 @@ __all__ = ["X12Message"]
 
 # SEG-EE[.CC] — segment id (2–3 chars, alpha then alphanumerics), 1-based element, optional component.
 _X12_PATH = re.compile(r"^(?P<seg>[A-Z][A-Z0-9]{1,2})-(?P<elem>\d+)(?:\.(?P<comp>\d+))?$")
-_WHITESPACE = " \t\r\n\x0b\x0c"
 # Segment ids whose addition/removal would corrupt the interchange envelope.
 _ENVELOPE_SEGMENTS = {"ISA", "IEA"}
 
@@ -83,15 +83,7 @@ class X12Message:
             raw = bytes(raw).decode("utf-8", "replace")
         isa = find_isa_start(raw)
         delims = discover_delimiters(raw, isa)
-        segments: list[list[str]] = []
-        for chunk in raw[isa:].split(delims.segment):
-            stripped = chunk.lstrip(_WHITESPACE)
-            if not stripped:
-                continue
-            segments.append(stripped.split(delims.element))
-            if segments[-1][0] == "IEA":
-                break
-        return cls(segments, delims)
+        return cls(list(iter_segments(raw, isa, delims)), delims)
 
     @property
     def delimiters(self) -> Delimiters:

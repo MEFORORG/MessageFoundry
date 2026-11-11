@@ -176,10 +176,13 @@ messagefoundry check-privileges --service-config <instance dir>\messagefoundry.t
 - It **exits 3** when the probe sees a grant beyond that set. Under the `external` default the gMSA
   must never hold `db_ddladmin`, `db_owner` or `sysadmin`, and each one it holds is named. So is
   `UPDATE`, `DELETE`, `ALTER`, `CONTROL` or `TAKE OWNERSHIP` on `audit_log`,
-  and an `UPDATE` granted on one column, which outranks the table-level `DENY`. Remove it and run the check
-  again.
+  and an `UPDATE` granted on one column, which outranks the table-level `DENY`. So is
+  `VIEW DEFINITION` reaching its default schema or `dbo` by any route, at least a grant on the
+  schema, the database or the server, schema ownership, or a role or group membership. Remove it
+  and run the check again.
 - It **exits 4** when the probe could not read the login at all, for example on a failed connection
-  or a permission read that came back NULL. That is not a clean result.
+  or a permission read that came back NULL, or as a value that is not 0 or 1. That is not a clean
+  result.
 - It exits 1 when the service settings do not load.
 
 It also probes each Vault token the engine uses and the AD bind account, when they are
@@ -227,8 +230,8 @@ Vault and LDAP*.
 > the login that runs `provision-admin`, for example
 > `GRANT VIEW DEFINITION ON SCHEMA::[dbo] TO [CORP\some-operator];` when that schema is `dbo`.
 > Under `auth = "integrated"` that login is the Windows account that runs the command, which is
-> not the gMSA unless the command runs as it. The startup probe (§1.3) does not report it as excess,
-> so where that login is the runtime login (`auth = "sql"`), revoke the grant once the mint is done.
+> not the gMSA unless the command runs as it. Where that login is the runtime login (`auth = "sql"`),
+> revoke the grant once the mint is done; §1.3 says when the startup probe reports it as excess.
 >
 > **`[store].schema_management = "auto"` puts the DDL back on the runtime login.** The engine then
 > builds and upgrades its own schema at open, and the gMSA also needs `db_ddladmin` as a standing
@@ -357,7 +360,7 @@ The grants in §1.1 and §1.2 used to be prescriptions the engine could not chec
 
 | Backend | What the probe reads | On SQLite |
 |---|---|---|
-| SQL Server | fixed **server**-role and **database**-role membership by name (`IS_SRVROLEMEMBER` / `IS_ROLEMEMBER` — authoritative and independent of catalog visibility), plus `CONTROL SERVER` / database `CONTROL`, plus any user-defined database role the catalog exposes. Under `schema_management = "external"` (the default) `db_ddladmin` counts as excess, and so does `UPDATE` (on the table or any one column), `DELETE`, `ALTER`, `CONTROL` or `TAKE OWNERSHIP` on `audit_log`; under `auto` `db_ddladmin` is prescribed and the audit-table rights are not counted | n/a |
+| SQL Server | fixed **server**-role and **database**-role membership by name (`IS_SRVROLEMEMBER` / `IS_ROLEMEMBER` — authoritative and independent of catalog visibility), plus `CONTROL SERVER` / database `CONTROL`, plus any user-defined database role the catalog exposes. Under `schema_management = "external"` (the default) `db_ddladmin` counts as excess, and so do `VIEW DEFINITION` on the login's default schema or on `dbo`, and `UPDATE` (on the table or any one column), `DELETE`, `ALTER`, `CONTROL` or `TAKE OWNERSHIP` on `audit_log`; under `auto` `db_ddladmin` is prescribed, and neither the audit-table rights nor `VIEW DEFINITION` is counted | n/a |
 | PostgreSQL | every role the principal may assume and the **attributes** each carries (`SUPERUSER`, `CREATEROLE`, `CREATEDB`, `REPLICATION`, `BYPASSRLS`), plus database ownership and `CREATE` on the database. Under `external` it also counts `CREATE` on the store's schema, ownership of objects in it, and `UPDATE` (on the table or any one column), `DELETE`, `TRUNCATE` or `TRIGGER` on `audit_log` held by any role it may assume, as excess; under `auto` the first two are prescribed and the audit-table rights are not counted | n/a |
 | SQLite | — | reported **not applicable**: a local file has no server principal; access is the filesystem ACL on the `.db` and its `-wal`/`-shm` sidecars |
 
@@ -813,11 +816,13 @@ the programs it starts do not get all of it, as the manual commands run in your 
 [`DANGEROUS-FUNCTIONALITY.md`](DANGEROUS-FUNCTIONALITY.md) section 4, *What each child is
 handed*, states what each one gets.
 
-**It reads the policy only where an ODBC Driver 18 hop is configured.** It needs `pyodbc`
+**It reads the policy only where an ODBC hop on a Microsoft SQL Server driver is configured.** It needs `pyodbc`
 installed in the Python that runs `verify`, found on the import path without being imported. It
 then asks whether the configuration takes such a hop: a `sqlserver` store backend in the service
-settings, or a SQL Server dialect DATABASE connection, a `DatabaseRef` reference set or a
-`DatabaseLookup` in the `--config` graph. A hop found names itself in the row's evidence. The graph
+settings, or a deployed DATABASE connection, a `DatabaseRef` reference set or a
+`DatabaseLookup` in the `--config` graph on a Microsoft SQL Server driver: every entry on the SQL
+Server preset, which builds only on one, and an entry on another dialect whose `odbc_driver` is
+one. A preset entry whose driver the preset refuses is no hop, since the engine never builds it. A hop found names itself in the row's evidence. The graph
 is loaded only when the store is not already a hop, and loading it runs the config modules, as the
 self smoke does, so `--section host` runs them too. With no hop configured the row SKIPs and names
 what it read, so a host that only has `pyodbc` installed does not fail on a policy nothing of it
@@ -825,8 +830,8 @@ uses.
 
 The answer is unknown where at least one of these holds: the graph did not load or there is no
 `--config` directory; the service settings did not load; the shell that runs `verify` does not set
-`MEFOR_STORE_BACKEND`; or every DATABASE connection found uses the generic dialect, whose driver
-brings its own TLS. That variable overrides the service config file, and the service's own
+`MEFOR_STORE_BACKEND`; or no entry found is on a Microsoft driver, and one off the preset names
+its driver by an `env()` reference or uses another vendor's driver, which may bring its own TLS. That variable overrides the service config file, and the service's own
 environment may set it where your shell does not, so a file that says `sqlite` does not show the
 store the service opens, which could be SQL Server. The row then still reads the policy, but
 reports a FAIL or ERROR reading as MANUAL with the reading in its detail. Run `verify` with
@@ -913,7 +918,7 @@ It runs the commands of this step. It differs from them in at least the ways nam
 | FAIL | Any of those does not hold. The row names the suites that are not AEAD. An `Enabled` value that is not set fails too, as on the stock host measured above. On Linux, no OpenSSL file at the path read fails too, because OpenSSL then applies no policy. |
 | ERROR | A reading was attempted and gave no usable answer. At least these: a command ran and failed or timed out; the system TLS module is there but did not import; PowerShell or `openssl` printed a line, or the Group Policy order held an entry, that is not a suite; `openssl version -d` printed other than one `OPENSSLDIR` line; a suite list, enabled or Group Policy, read empty; a registry value could not be read or held the wrong type; the OpenSSL file could not be read. An empty list is a control of 0, so it never reads as healthy. |
 | MANUAL | The row cannot take the reading here. At least these: no Windows PowerShell, no system TLS module folder or no `Get-TlsCipherSuite` cmdlet in it, no `openssl`, an empty `OPENSSL_CONF`, or an OpenSSL file that uses what the row does not follow or holds a line it cannot read (above). Run the commands above by hand. Also a FAIL or ERROR reading on a host whose configuration could not be read, so whether it takes an ODBC hop is not known (above). |
-| SKIP | `pyodbc` is not installed in the Python that runs `verify`, so no ODBC Driver 18 hop can run from it. Or the configuration takes no ODBC hop. Or the host is neither Windows nor Linux. |
+| SKIP | `pyodbc` is not installed in the Python that runs `verify`, so no ODBC hop can run from it. Or the configuration takes no ODBC hop. Or the host is neither Windows nor Linux. |
 
 When readings disagree, the row takes the worst: FAIL, then ERROR, then MANUAL, then PASS. So a
 broken reading never hides a finding. A FAIL or an ERROR makes `verify` exit 1, like any other FAIL

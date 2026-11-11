@@ -245,12 +245,24 @@ this line.**
   503 a later handler change adds is no longer named as the store's refusal. The console now catches
   the engine's `ConfigWriteNotRecorded` and re-raises any other 503. Needs the engine seam that
   carries `api.security.ConfigWriteNotRecorded`. (`BACKLOG #3811`)
+- **An uploaded-log browse, resend or delete that meets a key-service outage says so.** The engine
+  now answers a Vault Transit outage on an uploaded file 503 with `Retry-After`. The console mapped
+  every 503 on those routes to "Uploaded logs are not available on this engine", which tells an
+  administrator to set an uploads directory that is already set. A 503 that carries `Retry-After`
+  now lands on the list page with its own notice, `key_service_busy`, which says nothing was opened,
+  injected or removed and to try again. The no-store 503, which carries no `Retry-After`, keeps its
+  notice. An engine without that change never sends it, so nothing changes there.
+  (`BACKLOG #3734`)
 - **The Approvals page offers no Approve on a held reload that names no config digest.** The
   engine marks it `release_blocked: "params_no_fingerprint"`, and the page offers Reject, or
   Withdraw on the requester's own row, with a note saying why. A held reload's digest parameter
   that is null or not of the form the engine writes is shown as that refusal, never raw.
   Needs the engine seam that carries that value; the same seam drops `PendingApprovalInfo.gated`,
   which the page never read. (vault `BACKLOG #3192`, `#3193`)
+- **The Interrupted releases table heads its time column "Cut off or claimed".** It read "Cut off",
+  but a release a restart or an operator interrupt moved keeps its claim time there, not the time
+  it stopped. Its note no longer says every such release was cut off while it ran: it says the
+  engine cannot tell what the operation did. No seam changes. (`BACKLOG #1562`)
 
 ## [0.5.0] — 2026-10-20 — Early Access
 

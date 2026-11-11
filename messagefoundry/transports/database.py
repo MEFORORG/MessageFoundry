@@ -769,7 +769,7 @@ class _DriverFamily(NamedTuple):
     tls_example: tuple[str, str]
     #: Whether the family is on the escape list: its password is always sent braced, with the ODBC
     #: ``}}`` escape (:func:`_odbc_password`). Its own field, so placing a family for its TLS
-    #: keyword never brings an unmeasured escape with it.
+    #: keyword does not put the family on the escape list.
     brace_escape: bool
 
 
@@ -785,8 +785,13 @@ class _DriverFamily(NamedTuple):
 #
 # The escape list is the families with ``brace_escape`` set, whose password is always sent braced
 # with the ODBC ``}}`` escape (:func:`_odbc_password`, BACKLOG #2705): psqlODBC and MySQL, measured
-# on 2026-10-30 to read that escape, and Microsoft's, not probed then but relied on for the same
-# escape by the SQL Server preset and the store.
+# on 2026-10-30 to read that escape, and Microsoft's, which the SQL Server preset and the store also
+# rely on. A test on the hosted ``sql server (store + connector)`` leg measures Microsoft's for ODBC
+# Driver 18 on Linux (``msodbcsql18`` under unixODBC):
+# tests/test_sqlserver_store.py::test_microsoft_odbc_driver_reads_the_braced_password_escape.
+# That leg installs whichever ``msodbcsql18`` build apt resolves. Unmeasured: at least other Driver
+# 18 builds, Windows ``msodbcsql18.dll``, macOS, every other major the family accepts, and every
+# driver the SQL Server preset accepts outside this family.
 _DRIVER_FAMILIES: dict[str, _DriverFamily] = {
     "psqlodbc": _DriverFamily(
         "sslmode",
@@ -1869,8 +1874,8 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     ``odbc_params`` value refuses a boolean, and ``sslmode`` takes only the spellings
     :func:`_refuse_unread_sslmode` accepts for the driver. ``odbc_driver`` is braced and
     refuses ``;``, ``{`` and ``}``, and must be on the generic driver allowlist. ``password`` is
-    always braced with the ``}}`` escape, as every family on the list reads it
-    (:func:`_odbc_password`).
+    always braced with the ``}}`` escape (:func:`_odbc_password`; the comment above
+    :data:`_DRIVER_FAMILIES` says which drivers were measured to read it).
 
     **TLS is the operator's responsibility on this path.** MessageFoundry cannot introspect an arbitrary
     driver's TLS posture the way it reads SQL Server's ``Encrypt``/``TrustServerCertificate``, so the
@@ -4805,11 +4810,11 @@ class LoginRoleReading:
 def classify_login_roles(row: Sequence[Any]) -> LoginRoleReading:
     """Judge one row of the role probe (BACKLOG #2617). Pure, so every verdict is unit-testable.
 
-    Read three ways, as ``store/sqlserver.py`` ``_probed_grant`` reads the store login: ``1`` held,
-    ``0`` not held, NULL **not read**. Only an int or a bool reads, so any other value, such as the
-    text ``"1"``, ``1.0`` or ``2``, is not read either; ``_probed_grant`` reads ``1.0`` as held and
-    the other two as not held. Not even a ``1`` of another type reads as held, because a held
-    ``db_denydatawriter`` takes a finding away.
+    Read three ways, as ``store/privilege.py`` ``probed_grant`` reads the store login: ``1`` held,
+    ``0`` not held, NULL **not read**. Only an int or a bool that is 0 or 1 reads, so any other
+    value, such as the text ``"1"``, ``1.0`` or ``2``, is not read either, and ``probed_grant``
+    reads all three the same way (BACKLOG #6015). Not even a ``1`` of another type reads as held,
+    because a held ``db_denydatawriter`` takes a finding away.
     ``IS_SRVROLEMEMBER`` and ``IS_ROLEMEMBER`` answer NULL for a name that does not resolve for this
     login, and a NULL folded to "not a member" would be a false clean. A role read as held is still
     reported when another is not read. An unread role can hide an over-grant, and an unread

@@ -1668,6 +1668,19 @@ class AlertInstance:
 
 
 @dataclass(frozen=True)
+class AlertGeneration:
+    """Which raise a live alert instance is at: its ``id`` and its occurrence ``count`` (BACKLOG
+    #3269). ``count`` only grows on a live row and a new row gets a new ``id``, so the pair names one
+    point in the instance's life without reading any clock. A resolve bounded by it
+    (:meth:`~messagefoundry.store.base.QueueStore.resolve_alert_generation`) cannot close a raise
+    that landed after the pair was read. Metadata only, never a reason or a message body."""
+
+    id: int
+    connection: str
+    count: int
+
+
+@dataclass(frozen=True)
 class AlertSummary:
     """The whole-of-scope aggregate over **active** (open + acknowledged) alert instances (BACKLOG
     #1564) — what the nav bell needs, and the one thing a page of rows cannot give it.
@@ -4507,6 +4520,18 @@ def report_role_reseal(resealed: int, refused: int) -> None:
 APPROVAL_SEAL_EXCLUDED: Final[Mapping[str, str]] = MappingProxyType({"seal": "the seal itself"})
 
 
+class _AnyClaimOwner(Enum):
+    ANY = "any"
+
+
+#: ``decide_pending_approval``'s default ``from_claim_owner``: the move does not check the owner.
+ANY_CLAIM_OWNER: Final = _AnyClaimOwner.ANY
+
+#: What ``decide_pending_approval`` guards the row's ``claim_owner`` on: one owner, ``None`` for a
+#: row with no owner, or :data:`ANY_CLAIM_OWNER` for no guard (BACKLOG #1562).
+type ClaimOwnerGuard = str | None | Literal[_AnyClaimOwner.ANY]
+
+
 @dataclass(frozen=True)
 class ApprovalRow:
     """Every column of one ``pending_approvals`` row, each in the one type every backend reads it
@@ -4580,6 +4605,15 @@ class ApprovalRow:
             current.seal,
         )
 
+    def moves_from(self, from_status: str, from_claim_owner: ClaimOwnerGuard) -> bool:
+        """Whether ``decide_pending_approval`` may move this row: it reads ``from_status`` and,
+        unless ``from_claim_owner`` is :data:`ANY_CLAIM_OWNER`, carries exactly that owner, ``None``
+        meaning no owner (BACKLOG #1562). One rule for every backend, which reads the row locked in
+        the write and checks it here."""
+        if self.status != from_status:
+            return False
+        return from_claim_owner is ANY_CLAIM_OWNER or self.claim_owner == from_claim_owner
+
     def decided(
         self, *, status: str, approver: str | None, decided_at: float, claim_owner: str | None
     ) -> ApprovalRow:
@@ -4592,6 +4626,14 @@ class ApprovalRow:
             decided_at=float(decided_at),
             claim_owner=self.claim_owner if claim_owner is None else claim_owner,
         )
+
+
+def check_executing_owner_filter(claim_owner: str | None, not_claimed_by: str | None) -> None:
+    """Refuse ``list_executing_approvals`` both owner filters at once: one keeps an owner's rows
+    and the other drops them, so together they would keep only the unowned ones, which no caller
+    means (BACKLOG #1562)."""
+    if claim_owner is not None and not_claimed_by is not None:
+        raise ValueError("list_executing_approvals takes claim_owner or not_claimed_by, not both")
 
 
 def new_approval_row(
@@ -4850,21 +4892,9 @@ AUDIT_CHAIN_KEYLESS_ROWS = (
 )
 
 
-#: The phrase :func:`audit_prefix_verdict` puts in its failure message, exported so a CALLER can tell a
-#: TRUNCATED/REWRITTEN TAIL from a BROKEN CHAIN without walking the log twice (BACKLOG #328).
-#:
-#: ``verify_audit_chain`` folds both verdicts into one ``(ok, message)`` pair and reports the chain break
-#: FIRST, returning before the prefix comparator runs. So a caller holding only ``ok=False`` cannot say
-#: which fired -- and the two want different handling: a break names a row an operator can go and read,
-#: while a truncation names rows that are no longer there to read. ``Engine._verify_audit_chain_on_start``
-#: routes them to DIFFERENT alert subjects on the strength of this marker, so they throttle and route
-#: independently.
-#:
-#: IT IS A SHARED CONSTANT RATHER THAN A STRING THE CALLER RESTATES, and that is the whole point: a
-#: restated copy drifts silently the day this message is reworded, and the caller then quietly
-#: reclassifies every truncation as a chain break. Substring-matching a message is a weak seam either
-#: way; making the producer and the consumer read the SAME name is what stops the seam rotting
-#: unobserved. Pinned by ``test_prefix_break_marker_appears_in_a_real_prefix_failure``.
+#: The phrase :func:`audit_prefix_verdict` puts in its failure message (BACKLOG #328): the operator-
+#: facing text of a truncated or rewritten tail. A caller classifies on
+#: :attr:`AuditVerdict.prefix_break`, never on this text (vault BACKLOG #3054, item 11).
 AUDIT_PREFIX_BREAK_MARKER = "is not an extension of the recorded prefix"
 
 
@@ -5061,7 +5091,8 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
     producible only from an empty log, so ``5:`` is a head the store can never emit and falls under the
     refusal above. Left accepted it parses to ``(5, "")``, which no intact chain can match — so a line
     truncated while being copied, or an anchor file caught half-written, would be reported as
-    ``truncated or rewritten`` on a chain nobody touched.
+    ``truncated or rewritten`` on a chain nobody touched. The converse holds too: a log with rows has
+    a newest seq of 1 or more, so ``0:<head>`` is refused for the same reason.
 
     IT LIVES HERE, BESIDE THE COMPARATORS AND THE PRODUCER, BECAUSE IT NOW HAS TWO CONSUMERS: the
     ``audit-verify`` CLI and the engine's ``[integrity].audit_anchor_file`` startup check (BACKLOG #328).
@@ -5092,6 +5123,14 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
                 text,
             )
         return count, head
+    if count == 0:
+        # The converse of the pairing above: a log with rows has a newest seq of 1 or more, so a head
+        # beside a zero count is one the store can never emit, and a comparator would report it as
+        # `truncated or rewritten` on an intact chain (vault BACKLOG #5987 item 1).
+        raise AuditAnchorError(
+            "a zero row count is only producible from an EMPTY log, so it cannot carry a head",
+            text,
+        )
     refusal, head = _audit_head_shape(head)
     if refusal is not None:
         raise AuditAnchorError(refusal, text)
@@ -5713,13 +5752,17 @@ class StoreChainNeverStarted(StoreIdPinRefusedBeforeWrite):
 
 
 class StoreCreateBatchFailedBeforeKeyUse(Exception):
-    """A minting open's create batch failed before its commit (PR 2804 hold 17). The batch is one
-    transaction on each server backend, and nothing is sealed under the store key before it commits:
-    the first seal follows ``bind_store_salt``, after the batch and the pin check, which only reads.
-    So nothing was sealed under the key, and a minting command may remove the key
-    it minted, as for :class:`StoreIdPinRefusedBeforeWrite`. ``failure`` is the batch's own error,
-    also the cause. Raised only on a minting open (:func:`minting_open`), so no other caller sees a
-    new class; a failure at or after the commit is never this."""
+    """A minting server open failed before anything was sealed under the store key: its create
+    batch failed before its commit (PR 2804 hold 17), or it failed while building its pool, before
+    the store that holds the cipher existed, with a class only a failed dial raises, at least the
+    hop's TLS settings, a refused address or a refused login (vault BACKLOG #8119 item 2;
+    ``store.base``'s ``_failed_before_connecting`` names them). The batch is one transaction on each server
+    backend, and the first seal follows ``bind_store_salt``, after the batch and after the pin
+    check, which only reads. So nothing was sealed under the key, and a minting command may remove
+    the key it minted, as for :class:`StoreIdPinRefusedBeforeWrite`. ``failure`` is the open's own
+    error, also the cause. Raised only on a minting open (:func:`minting_open`), so no other caller
+    sees a new class; a failure once the pin check has passed is never this, and any other failure
+    before it, a ``RuntimeError`` or a connection lost mid-open among them, keeps the key."""
 
     def __init__(self, failure: Exception) -> None:
         # The failure itself is the one argument, so a copy or an unpickle rebuilds it whole.
@@ -5732,6 +5775,26 @@ class StoreCreateBatchFailedBeforeKeyUse(Exception):
 #: than a parameter of each backend's open, as the hop posture is held during connector
 #: construction; ``None`` for every open that is not under the ``host`` key provider.
 OPEN_STORE_PIN: ContextVar[StorePin | None] = ContextVar("mefor_open_store_pin", default=None)
+
+
+class PinCheck:
+    """Whether the open in progress has passed its store id pin check (:func:`check_open_store_pin`),
+    the last step before its first write under the store key. Under ``auto`` schema management the
+    open may already have committed its schema, and on SQL Server altered the database's options,
+    before it; neither is under the key. A mutable cell rather than a flag in a context variable,
+    so a pass recorded under a copied context still reaches the open that set it (vault BACKLOG
+    #8119 item 2)."""
+
+    __slots__ = ("passed",)
+
+    def __init__(self) -> None:
+        self.passed = False
+
+
+#: The cell ``store.base.open_store`` sets around a minting open's backend open; ``None`` otherwise.
+OPEN_STORE_PIN_CHECK: ContextVar[PinCheck | None] = ContextVar(
+    "mefor_open_store_pin_check", default=None
+)
 
 
 def minting_open() -> bool:
@@ -5862,6 +5925,8 @@ async def check_open_store_pin(host: AuditRangeHost) -> None:
         return
     refusal = await _store_pin_refusal(host, await host._audit_genesis_row(), pin, writable=True)
     if refusal is None:
+        if (check := OPEN_STORE_PIN_CHECK.get()) is not None:
+            check.passed = True  # the open may write under the key from here on
         return
     refused = StoreChainNeverStarted if refusal.never_started else StoreIdPinRefusedBeforeWrite
     raise refused(f"refusing to open the store: {refusal.text}")
@@ -6078,11 +6143,19 @@ class AuditVerdict(tuple[bool, str | None]):
     It is set only with ``ok`` true. A caller whose settings require a key must not report it as a
     pass: ``audit-verify`` exits 5, "not checked", on it (vault BACKLOG #3054).
 
-    ``==`` and ``hash`` are the tuple's and ignore both flags and ``rows``; ``__reduce__`` keeps all three through a
-    copy."""
+    ``prefix_break`` says the ``expected_prefix`` comparator failed: the tail was truncated, or the
+    chain rewritten at or before the anchored row. It is set only with ``ok`` false, and only by that
+    comparator, so a caller that passed ``expected_prefix`` tells that failure from a chain break by
+    this flag, never by matching the message (vault BACKLOG #3054, item 11), since a break's message
+    can quote database values. The ``expected_anchor`` and ``expected_rows`` comparators also catch
+    a truncation and do NOT set it. A chain break outranks it, as :func:`verify_audit_rows` says.
+
+    ``==`` and ``hash`` are the tuple's and ignore the flags and ``rows``; ``__reduce__`` keeps them
+    all through a copy."""
 
     key_unavailable: bool
     keyless_walk: bool
+    prefix_break: bool
     #: How many rows the walk covered, on a clean verdict; -1 where it does not say. Read from the
     #: walk itself, so a caller needs no second query that could fail or see other rows.
     rows: int
@@ -6094,17 +6167,26 @@ class AuditVerdict(tuple[bool, str | None]):
         key_unavailable: bool = False,
         keyless_walk: bool = False,
         rows: int = -1,
+        prefix_break: bool = False,
     ) -> Self:
         verdict = super().__new__(cls, (ok, message))
         verdict.key_unavailable = key_unavailable and not ok
         verdict.keyless_walk = keyless_walk and ok
         verdict.rows = rows
+        verdict.prefix_break = prefix_break and not ok
         return verdict
 
     def __reduce__(self) -> tuple[Any, ...]:
         return (
             type(self),
-            (self[0], self[1], self.key_unavailable, self.keyless_walk, self.rows),
+            (
+                self[0],
+                self[1],
+                self.key_unavailable,
+                self.keyless_walk,
+                self.rows,
+                self.prefix_break,
+            ),
         )
 
 
@@ -6356,6 +6438,7 @@ def verify_audit_rows(
     # returned and each failing one is reported. A break still hides them, as it always hid the
     # prefix: the break is reported first, at its own row.
     failures: list[str] = []
+    prefix_break = False
     if expected_anchor is not None:
         exp_count, exp_head = expected_anchor
         # Evaluate the head compare UNCONDITIONALLY (not behind `or`): the anchor head is a MAC too,
@@ -6369,7 +6452,8 @@ def verify_audit_rows(
             )
     if prefix_pair is not None:
         ok, msg = audit_prefix_verdict(prefix_pair, witness_heads.get(prefix_pair[0]), count)
-        if not ok:  # its own message: the engine routes on its marker (#328)
+        if not ok:  # the engine routes on the flag this sets (#328, vault BACKLOG #3054)
+            prefix_break = True
             failures.append(msg or f"audit log {AUDIT_PREFIX_BREAK_MARKER}")
     missing = 0
     first: tuple[int, str] | None = None
@@ -6393,7 +6477,7 @@ def verify_audit_rows(
             + " — truncated or rewritten"
         )
     if failures:
-        return AuditVerdict(False, "; ".join(failures))
+        return AuditVerdict(False, "; ".join(failures), prefix_break=prefix_break)
     if key_unavailable:
         # Last, after every check that needs no key has passed: a break those checks found is a
         # break, and outranks "could not check".
@@ -9399,7 +9483,8 @@ CREATE TABLE IF NOT EXISTS alert_instance (
     acked_at    REAL,
     resolved_at REAL,                 -- when it resolved (NULL while open/acknowledged)
     suspended_until REAL,             -- #143: windowed NOTIFICATION mute end-epoch (NULL/past = not suspended)
-    escalation_tier INTEGER NOT NULL DEFAULT 0  -- #81: highest occurrence-driven escalation tier reached (0=base)
+    escalation_tier INTEGER NOT NULL DEFAULT 0, -- #81: highest occurrence-driven escalation tier reached (0=base)
+    raised_by   TEXT                  -- #4916: the notifier that wrote the newest raise (a per-process random id)
 );
 -- One LIVE (non-resolved) instance per throttle key; resolved rows leave the index so the key re-opens.
 CREATE UNIQUE INDEX IF NOT EXISTS ux_alert_instance_open
@@ -11722,6 +11807,10 @@ class MessageStore:
             await db.execute(
                 "ALTER TABLE alert_instance ADD COLUMN escalation_tier INTEGER NOT NULL DEFAULT 0"
             )
+        # #4916: NULL on an existing row = no fencing writer raised it, so only its seen count can
+        # close it, which is what an unfenced writer's raise needs.
+        if alert_cols and "raised_by" not in alert_cols:
+            await db.execute("ALTER TABLE alert_instance ADD COLUMN raised_by TEXT")
         # #306: a pre-existing search_presets table (from #151/ADR 0136) predates last_used_at — ALTER
         # it in. NULL on every existing row is CORRECT: those presets were never recall-stamped, so the
         # purge's null-safe MAX falls back to updated_at and their window is byte-identical to before
@@ -16320,6 +16409,7 @@ class MessageStore:
         reason: str | None = None,
         escalation_tier: int = 0,
         now: float | None = None,
+        raised_by: str | None = None,
     ) -> None:
         # Pure observer (ADR 0044 D2): a single short upsert under the write lock — NO queue row, NO
         # finalizer call (alert_instance is invisible to _maybe_finalize_message's `FROM queue` scan), so
@@ -16343,17 +16433,26 @@ class MessageStore:
         async with _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
                 "UPDATE alert_instance SET last_seen=?, count=count+1, severity=?, reason=?,"
-                " escalation_tier=MAX(escalation_tier, ?)"
+                " escalation_tier=MAX(escalation_tier, ?), raised_by=?"
                 " WHERE event_type=? AND connection=? AND status!='resolved'",
-                (now, severity, reason_enc, escalation_tier, event_type, connection),
+                (now, severity, reason_enc, escalation_tier, raised_by, event_type, connection),
             )
             if cur.rowcount == 0:
                 await self._db.execute(
                     "INSERT INTO alert_instance"
                     " (event_type, connection, severity, status, first_seen, last_seen, count, reason,"
-                    " escalation_tier)"
-                    " VALUES (?,?,?,'open',?,?,1,?,?)",
-                    (event_type, connection, severity, now, now, reason_enc, escalation_tier),
+                    " escalation_tier, raised_by)"
+                    " VALUES (?,?,?,'open',?,?,1,?,?,?)",
+                    (
+                        event_type,
+                        connection,
+                        severity,
+                        now,
+                        now,
+                        reason_enc,
+                        escalation_tier,
+                        raised_by,
+                    ),
                 )
             await self._commit()
 
@@ -16530,6 +16629,65 @@ class MessageStore:
                 "UPDATE alert_instance SET status='resolved', resolved_at=?"
                 " WHERE event_type=? AND connection=? AND status!='resolved'",
                 (now, event_type, connection),
+            )
+            await self._commit()
+            return int(cur.rowcount)
+
+    async def open_alert_generations(
+        self, *, event_type: str, connection: str | None = None
+    ) -> list[AlertGeneration]:
+        # BACKLOG #3269: the live instances of one alert type, for one subject or all, as
+        # (id, connection, count) only. Lockfree read; no reason cell is read or decrypted.
+        # status!='resolved' is ux_alert_instance_open's own filter, so the read seeks that index.
+        where = ["event_type=?", "status!='resolved'"]
+        params: list[Any] = [event_type]
+        if connection is not None:
+            where.append("connection=?")
+            params.append(connection)
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT id, connection, count FROM alert_instance WHERE "
+                + " AND ".join(where)
+                + " ORDER BY id",
+                params,
+            )
+            rows = await cur.fetchall()
+        return [AlertGeneration(int(r[0]), str(r[1]), int(r[2])) for r in rows]
+
+    async def resolve_alert_instances_fenced(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        raised_by: str,
+        seen: AlertGeneration | None,
+        now: float | None = None,
+    ) -> int:
+        # BACKLOG #4916: close the key's live instance only when its newest raise is one this writer
+        # saw at the clear (seen_id/seen_count) or is this writer's own (raised_by). Clock-free.
+        now = time.time() if now is None else now
+        seen_id, seen_count = (seen.id, seen.count) if seen is not None else (-1, -1)
+        async with _writer_guard(self._db, self._lock):
+            cur = await self._db.execute(
+                "UPDATE alert_instance SET status='resolved', resolved_at=?"
+                " WHERE event_type=? AND connection=? AND status!='resolved'"
+                " AND (raised_by=? OR (id=? AND count<=?))",
+                (now, event_type, connection, raised_by, seen_id, seen_count),
+            )
+            await self._commit()
+            return int(cur.rowcount)
+
+    async def resolve_alert_generation(
+        self, *, alert_id: int, through_count: int, now: float | None = None
+    ) -> int:
+        # BACKLOG #3269: resolve one live instance only while no raise has folded into it past
+        # through_count. Clock-free, so a later raise from any process keeps the row open.
+        now = time.time() if now is None else now
+        async with _writer_guard(self._db, self._lock):
+            cur = await self._db.execute(
+                "UPDATE alert_instance SET status='resolved', resolved_at=?"
+                " WHERE id=? AND count<=? AND status!='resolved'",
+                (now, alert_id, through_count),
             )
             await self._commit()
             return int(cur.rowcount)
@@ -17043,7 +17201,7 @@ class MessageStore:
             return list(await cur.fetchall())
 
     async def list_interrupted_approvals(self, *, limit: int = 100) -> list[aiosqlite.Row]:
-        """Released requests cut off mid-run, oldest-first (BACKLOG #1562). No expiry filter, and the
+        """Released requests at ``interrupted``, oldest-first (BACKLOG #1562). No expiry filter, and the
         order: the Store protocol says why. Same projection as :meth:`list_pending_approvals`."""
         async with self._read() as db:
             cur = await db.execute(
@@ -17063,6 +17221,7 @@ class MessageStore:
         from_status: str = "pending",
         audit: AuditAppend | None = None,
         claim_owner: str | None = None,
+        from_claim_owner: ClaimOwnerGuard = ANY_CLAIM_OWNER,
     ) -> bool:
         """Atomically move a request in ``from_status`` to ``status``.
         Returns ``True`` iff this call made the transition — guards against a double decision.
@@ -17086,7 +17245,7 @@ class MessageStore:
             current = None if found is None else ApprovalRow.from_mapping(found)
             moved = (
                 current is not None
-                and current.status == from_status
+                and current.moves_from(from_status, from_claim_owner)
                 and await self._write_approval(
                     current.decided(
                         status=status,
@@ -17161,13 +17320,24 @@ class MessageStore:
         return cur.rowcount > 0
 
     async def list_executing_approvals(
-        self, *, claim_owner: str | None = None, limit: int = 1000
+        self,
+        *,
+        claim_owner: str | None = None,
+        not_claimed_by: str | None = None,
+        limit: int = 1000,
     ) -> list[aiosqlite.Row]:
         """Released requests still claimed as ``executing``, oldest claim first (BACKLOG #1562).
-        The Store protocol says who reads it, why, and what ``claim_owner`` filters. Every column,
-        so the gate can check each row's seal (BACKLOG #2592)."""
-        owned = "" if claim_owner is None else " AND (claim_owner = ? OR claim_owner IS NULL)"
-        args = (limit,) if claim_owner is None else (claim_owner, limit)
+        The Store protocol says who reads it, why, and what ``claim_owner`` and
+        ``not_claimed_by`` filter. Every column, so the gate can check each row's seal (BACKLOG
+        #2592)."""
+        check_executing_owner_filter(claim_owner, not_claimed_by)
+        owned = ""
+        args: tuple[object, ...] = (limit,)
+        if claim_owner is not None:
+            owned, args = " AND (claim_owner = ? OR claim_owner IS NULL)", (claim_owner, limit)
+        elif not_claimed_by is not None:
+            owned = " AND claim_owner IS NOT NULL AND claim_owner <> ?"
+            args = (not_claimed_by, limit)
         async with self._read() as db:
             cur = await db.execute(
                 _SQLITE_APPROVAL_SELECT + f" WHERE status = 'executing'{owned}"

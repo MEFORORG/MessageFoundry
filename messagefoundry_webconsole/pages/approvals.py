@@ -8,8 +8,8 @@ each ``pending`` one, through the same engine handlers as ``POST /approvals/{id}
 ``/reject``, so the gate's own refusals (self-approval, too new, expired, requester no longer
 authorized) stay the engine's to make.
 
-**An ``interrupted`` row offers the resolve, never approve or reject** (BACKLOG #2460). Its release
-was cut off while the operation ran, so the engine answers approve and reject with 409. The resolve
+**An ``interrupted`` row offers the resolve, never approve or reject** (BACKLOG #2460). Only a
+``pending`` row can be approved or rejected, so the engine answers both with 409. The resolve
 records whether its effects were applied, through the same handler as
 ``POST /approvals/{id}/resolve``, and its route asks for the same fresh step-up.
 
@@ -89,8 +89,8 @@ _RESOLVE_LABELS: dict[ResolveOutcome, str] = {
 }
 
 _INTERRUPTED_NOTE = (
-    "These releases were cut off while the operation ran, so it may have done none, some or all of "
-    "its work. Nothing re-runs them. Check the operation's own effects, then record what you found. "
+    "For these releases the engine cannot say whether the operation did none, some or all of its "
+    "work. Nothing re-runs them. Check the operation's own effects, then record what you found. "
     "Recording is final, and it may ask you to prove it is you again first; if it does, you come "
     "back here and choose again. The requester cannot record their own."
 )
@@ -125,8 +125,10 @@ _BLOCKED: dict[ReleaseBlocked, str] = {
         "it; if it is still needed, request it again."
     ),
     "requester_not_authorized": (
-        "The requester no longer holds the authority this operation requires, so it cannot be "
-        "approved while that lasts. If their authority is restored, it can be approved then. "
+        "The engine cannot confirm that the requester still holds the authority this operation "
+        "requires: at least, their account is deleted or disabled, lacks the permission or the "
+        "channel scope, or no auth service is bound to check it. It cannot be approved while that "
+        "lasts, and can be approved once it is put right, though never for a deleted account. "
         "Otherwise, {verb} it, and have an authorized user request it again if it is still needed."
     ),
     "seal_failed": (
@@ -214,7 +216,7 @@ _RESOLVE_REFUSALS: dict[int, tuple[str, str]] = {
         "before you request the operation again, because it may already have run.",
     ),
     503: (
-        "Nothing was recorded",
+        "Not confirmed",
         "The engine could not read or record this now, and its message below says why. Reload "
         "the page to see the release's state, and record it again once the cause is fixed.",
     ),
@@ -362,7 +364,7 @@ def approvals_page(listing: ApprovalList, *, notice: str = "") -> Markup:
                     "Parameters",
                     "Requester",
                     "Released by",
-                    "Cut off",
+                    "Cut off or claimed",
                     "Id",
                     "Record",
                 ],

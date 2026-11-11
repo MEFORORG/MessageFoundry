@@ -26,12 +26,14 @@ consumes — ``active_key()`` is the base64 of a 32-byte DEK (or ``None`` → id
 * ``host`` — the key custody host blob the engine minted with the store (vault BACKLOG #3411,
   :mod:`messagefoundry.store.custody_host`). ``open_store`` reads it itself, so it can pin the store
   id; :class:`HostKeyProvider` is what every other caller of this seam gets.
-* ``aws_kms`` | ``azure_kv`` | ``gcp_kms`` | ``vault`` | ``pkcs11`` — external HSM/KMS/Vault providers that
-  **envelope-decrypt** a wrapped DEK inside an isolated security module. These are **lazy, optional
-  extras** that are **not built here** (ADR 0019 §3/§5 — one provider per follow-on PR), so the base
-  install pulls **zero** cloud SDKs. Selecting one before its module ships **fails closed** (ADR 0019
-  §4) — it raises :class:`KeyProviderError` out of ``resolve_active_key``, never a silent degrade to the
-  identity (plaintext) cipher.
+* ``vault`` — the one external provider: it **envelope-decrypts** a wrapped DEK inside HashiCorp Vault
+  Transit (``keyprovider_vault.py``), a **lazy, optional extra**, so the base install pulls no SDK for it.
+
+Any other name **fails closed** (ADR 0019 §4): it raises :class:`KeyProviderError` out of
+``resolve_active_key``, never a silent degrade to the identity (plaintext) cipher. That includes the
+four external names ADR 0019 declared and nobody built, ``aws_kms``, ``azure_kv``, ``gcp_kms`` and
+``pkcs11``, which are no longer accepted (vault BACKLOG #2595 slice D; ADR 0019, *Amendment
+2026-11-05*).
 """
 
 from __future__ import annotations
@@ -49,7 +51,7 @@ if TYPE_CHECKING:
 
 class KeyProviderError(RuntimeError):
     """The configured ``[store].key_provider`` could not provision a key — an unknown provider name, or
-    an external provider that is selected but not built / cannot resolve. Raised out of
+    an external provider that cannot load or resolve. Raised out of
     :func:`resolve_key_provider` (and thus ``resolve_active_key``) so ``open_store`` propagates it and
     ``serve`` **fails to start** rather than degrading to the identity cipher (ADR 0019 §4), mirroring
     the existing fail-closed ``DpapiError``/``DpapiUnavailable`` contract for an unreadable key file."""
@@ -149,8 +151,12 @@ class AutoKeyProvider:
 class HostKeyProvider:
     """``host`` — the store key derived from the key custody host blob (vault BACKLOG #3411). It
     converts a handoff as a store open does, since in the service it may be asked first (the upload
-    cipher is built before the store opens). ``posture`` is the caller's, and ``None`` counts as
-    enforcing for the account check.
+    cipher is built before the store opens). So every command that resolves the key outside a
+    store open converts and deletes a handoff too, when run as the account it was written for,
+    read-only ones such as restore-verify included;
+    :func:`~messagefoundry.store.custody_host.load_host_custody` lists the cases (vault BACKLOG
+    #8119 items 5 and 140). ``posture`` is the caller's, and ``None`` counts as enforcing for the
+    account check.
 
     A custody refusal from here reaches a caller of ``resolve_active_key``,
     ``resolve_decrypt_keys`` or ``build_store_cipher`` as a new ``KeyProviderError`` that keeps its
@@ -187,9 +193,9 @@ _BUILTIN_PROVIDER_CLASSES: dict[
 _BUILTIN_PROVIDERS = tuple(_BUILTIN_PROVIDER_CLASSES)
 
 #: External provider name → optional ``pyproject`` extra that carries its SDK. Each envelope-decrypts
-#: a wrapped DEK inside an isolated security module (ADR 0019 §3). Each lives in its own module, loaded
-#: by :func:`_load_external_provider`: ``vault`` ships (``keyprovider_vault.py``), and the rest are not
-#: built yet and fail closed if selected. The keyless at-rest gate
+#: a wrapped DEK inside an isolated security module (ADR 0019 §3) and lives in its own module, loaded
+#: by :func:`_load_external_provider`. ``vault`` (``keyprovider_vault.py``) is the only one: a name is
+#: added here with its module, never ahead of it (vault BACKLOG #2595 slice D). The keyless at-rest gate
 #: (:func:`provider_reads_a_configured_key`, via ``_store_key_configured`` in ``__main__.py``) counts
 #: every name here as a configured key, before it resolves. That is safe because
 #: ``store.base._checked_active_key`` refuses "no key" from any of them, on both the
@@ -197,11 +203,7 @@ _BUILTIN_PROVIDERS = tuple(_BUILTIN_PROVIDER_CLASSES)
 #: file-secret: it names a provider, not key material, so it must never be added to
 #: ``_FILE_SECRET_KEYS`` (ADR 0019 §2).
 _EXTERNAL_PROVIDERS: dict[str, str] = {
-    "aws_kms": "aws_kms",
-    "azure_kv": "azure_kv",
-    "gcp_kms": "gcp_kms",
     "vault": "vault",
-    "pkcs11": "pkcs11",
 }
 
 #: Every accepted ``[store].key_provider`` value (built-in + external), for validation + error messages.
@@ -240,7 +242,7 @@ def provider_key_file(settings: StoreSettings) -> str | None:
     """The key file ``[store].key_provider`` loads the active key from, or ``None``.
 
     Asked of the built-in provider itself (its ``key_file``), which is what its ``active_key``
-    loads. An external provider loads no local file, and is not built here: building one may need
+    loads. An external provider loads no local file, and is not constructed here: building one may need
     its backend. ``serve`` checks the access of the file this names before it is used (vault
     BACKLOG #2601)."""
     builtin = _BUILTIN_PROVIDER_CLASSES.get(settings.key_provider)
@@ -272,11 +274,11 @@ def _load_external_provider(
 ) -> KeyProvider:
     """Lazy hook for an external HSM/KMS/Vault envelope-decrypt provider (ADR 0019 §3).
 
-    The seam: a future per-provider PR ships ``messagefoundry/store/keyprovider_<name>.py`` exposing
-    ``build_provider(settings, *, posture) -> KeyProvider`` behind the optional ``<extra>`` extra;
-    this dispatch picks it up by import with **no edit here**. Until that module ships the import
-    fails and we **fail closed** — the base install pulls **zero** cloud SDKs (no dependency lands
-    from ADR 0019).
+    The seam: each provider is ``messagefoundry/store/keyprovider_<name>.py`` exposing
+    ``build_provider(settings, *, posture) -> KeyProvider`` behind the optional ``<extra>`` extra,
+    imported only when selected, so the base install pulls no provider SDK. A provider is added by
+    shipping that module and naming it in :data:`_EXTERNAL_PROVIDERS` in the same change. An import
+    that fails **fails closed**.
 
     ``posture`` is handed to every external provider, because each one dials a network hop that
     a posture-keyed guard may judge (vault BACKLOG #2983). It is ``None`` where the caller holds
@@ -287,17 +289,28 @@ def _load_external_provider(
         module = importlib.import_module(module_name)
     except ModuleNotFoundError as exc:
         if exc.name == module_name:
-            # The provider module itself hasn't shipped yet (the common case today).
+            # Every named provider ships its module, so this install is missing a file of its own.
             raise KeyProviderError(
-                f"[store].key_provider={name!r} (external HSM/KMS/Vault envelope decryption, ADR 0019 "
-                f"§3) is designed but not built yet — it lands per-provider under WP-BL3-04 behind the "
-                f"optional {extra!r} extra. Use 'auto' (default), 'env', or 'dpapi' until then."
+                f"[store].key_provider={name!r}: its provider module {module_name} is missing from "
+                "this install. Reinstall MessageFoundry."
             ) from exc
-        # The provider module shipped but a backend it imports (e.g. its cloud SDK) is missing — a
-        # distinct, actionable failure: install the extra rather than "not built yet".
+        # The provider module shipped but a backend it imports (e.g. its SDK) is missing -- a
+        # distinct, actionable failure: install the extra.
         raise KeyProviderError(
             f"[store].key_provider={name!r} could not load its backend ({exc.name!r} is missing) — "
             f"install the optional {extra!r} extra."
+        ) from exc
+    except ImportError as exc:
+        # Present but broken: a C extension that fails to load, or a name its SDK or the provider
+        # module itself no longer has. resolve_active_key and resolve_decrypt_keys already refuse
+        # any provider error as a KeyProviderError with a fixed text, so this changes nothing
+        # there; it keeps this seam's own contract, KeyProviderError, for a provider module whose
+        # import fails. An ImportError raised later, inside build_provider, is the provider's to
+        # wrap, as keyprovider_vault wraps its lazy hvac import (vault BACKLOG #6709).
+        raise KeyProviderError(
+            f"[store].key_provider={name!r} could not load its provider module or backend (an "
+            f"import failed: {type(exc).__name__}, chained below) — reinstall MessageFoundry "
+            f"with the optional {extra!r} extra."
         ) from exc
     # The provider module owns its own construction; annotate the local so mypy keeps the contract.
     provider: KeyProvider = module.build_provider(settings, posture=posture)
@@ -309,8 +322,8 @@ def resolve_key_provider(
 ) -> KeyProvider:
     """Build the :class:`KeyProvider` selected by ``[store].key_provider`` (ADR 0019 §2).
 
-    ``auto`` (default) / ``env`` / ``dpapi`` are the built-ins; the external HSM/KMS/Vault names are
-    lazy optional extras (:func:`_load_external_provider`). An unknown name **fails closed** with
+    ``auto`` (default) / ``env`` / ``dpapi`` are the built-ins; the external ``vault`` is a lazy
+    optional extra (:func:`_load_external_provider`). An unknown name **fails closed** with
     :class:`KeyProviderError` rather than silently falling back to the identity cipher.
 
     ``posture`` reaches an external provider only; the built-ins dial nothing. ``None`` counts as

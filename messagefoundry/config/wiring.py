@@ -58,7 +58,7 @@ from signal import SIGINT, default_int_handler, getsignal
 from types import CodeType, MappingProxyType, ModuleType
 from typing import Any, Final, Literal, NamedTuple, NoReturn, TypeIs
 
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from messagefoundry.author_output import author_code_stdout
 from messagefoundry.config.code_sets import (
@@ -214,6 +214,8 @@ __all__ = [
     "accepted_cleartext_hops",
     "ech_cleartext_sidecar_hops",
     "UNRESOLVED_ECH_SIDECAR",
+    "listener_trusted_proxy_hops",
+    "UNRESOLVED_LISTENER_PROXIES",
     "expiry_relaxed_hops",
     "hostname_unchecked_hops",
     "path_form_fhir_updates",
@@ -221,6 +223,7 @@ __all__ = [
     "path_form_fhir_updates_without_if_match",
     "query_credential_hops",
     "revocation_attested_hops",
+    "odbc_hops",
     "unverified_generic_db_hops",
     "refused_generic_db_drivers",
     "POSSIBLY_GENERIC_DB_HOP",
@@ -1649,7 +1652,8 @@ def resolve_env_settings(
     the failure is loud and actionable, not a raw traceback that names nothing and aborts on the
     first bad value (fail loud, never blank; review M-22). A cast is an arbitrary callable, so
     **every** exception it raises is caught and redacted, not just ``ValueError``/``TypeError``
-    (BACKLOG #1656; see the handler)."""
+    (BACKLOG #1656), and so is a ``SystemExit`` from ``sys.exit()`` in it (vault BACKLOG #5105; see
+    the handler)."""
     resolved: dict[str, Any] = {}
     missing: list[str] = []
     bad: list[str] = []
@@ -1679,7 +1683,7 @@ def resolve_env_settings(
                 if name in bool_defaults:
                     want = "bool"
                     got = _read_bool_setting(got, bool_defaults[name])
-            except Exception as exc:
+            except (Exception, SystemExit) as exc:
                 # BACKLOG #1656 limb 2: `Exception`, not `(ValueError, TypeError)`. A cast is
                 # an arbitrary callable, so it can raise anything -- a `KeyError` from a
                 # lookup-table cast was the measured case -- and a non-(ValueError, TypeError)
@@ -1687,8 +1691,14 @@ def resolve_env_settings(
                 # text. That re-opened, for every other exception type, exactly the leak
                 # BACKLOG #1183 closed for the ValueError arm. The redaction below is the
                 # whole point of catching it, so it has to cover every way a cast can fail.
-                # NEVER `BaseException`: a KeyboardInterrupt or SystemExit is not a cast
-                # failure and must keep propagating.
+                #
+                # `SystemExit` too (vault BACKLOG #5105): a cast that calls `sys.exit()` is a
+                # script habit in a setting reader, not a request to stop. Uncaught, it left a
+                # reload, and `messagefoundry check` ended with the cast's code, 0 included,
+                # which reads as a pass; `sys.exit("...")` can also carry the value it was
+                # handed. It is refused here like any other cast failure, its code and text
+                # withheld. NEVER `BaseException`: a KeyboardInterrupt is an operator stopping
+                # the work, not a cast failure, and must keep propagating.
                 #
                 # NEVER the raw value: a MEFOR_VALUE_* env() setting carries store passwords
                 # and connector keys, and this string is raised at startup into the operator
@@ -1821,8 +1831,7 @@ _SECRET_SETTING_KEYS = frozenset(
         "proxy_password",
         "proxy_user",
         # ADR 0015 — WS-* SOAP outbound: the WS-Security UsernameToken credentials and the mTLS
-        # client-key passphrase. ``ws_password`` back-fills from ``basic_password`` in the connector,
-        # so omitting these disclosed under one name the very credential the other name masks.
+        # client-key passphrase; credentials in their own right (no basic_* fallback since #5526).
         "ws_username",
         "ws_password",
         "client_key_password",
@@ -2082,9 +2091,10 @@ def connector_secret_env_values(
 _URL_SETTING_SUFFIXES = ("url", "uri", "endpoint", "proxy", "urls", "uris", "endpoints", "proxies")
 
 #: Names that end in a URL word and hold no URL: a proxy EXCLUSION host list and an on/off flag
-#: (BACKLOG #2721 shape 6). Matched as the whole name or after a ``_``, so ``proxy_no_proxy`` is one
+#: (BACKLOG #2721 shape 6), and the HTTP listener's list of proxy addresses, which an operator
+#: needs to read in the settings view (BACKLOG #5525). Matched as the whole name or after a ``_``, so ``proxy_no_proxy`` is one
 #: of them and ``proxy_url`` is not. The cost of a miss here is only over-masking.
-_NOT_URL_SETTING_TAILS = ("no_proxy", "use_proxy")
+_NOT_URL_SETTING_TAILS = ("no_proxy", "use_proxy", "trusted_proxies")
 
 
 def _is_url_setting(name: str) -> bool:
@@ -3078,6 +3088,8 @@ def Http(
     | None = INTAKE_AUTH_RATE_LIMIT_DEFAULT,  # FAILED intake-auth attempts per minute per peer (0/None disables)
     intake_auth_rate_limit_global: int
     | None = INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT,  # FAILED intake-auth attempts per minute across all peers
+    trusted_proxies: Sequence[str]
+    | EnvRef = (),  # api_key/bearer: proxies whose X-Forwarded-For is read
     # --- Synchronous captured-downstream reply (ADR 0154 D4) — reply_from's presence is the switch ---
     reply_from: str
     | None = None,  # names the outbound whose CAPTURED reply becomes this request's HTTP body
@@ -3164,6 +3176,17 @@ def Http(
     ``HEAD`` for a load-balancer check, at the cost of an unauthenticated "is MessageFoundry up, and
     where" oracle on a PHI intake socket.
 
+    ``trusted_proxies`` (BACKLOG #5525) names the HTTP reverse proxies in front of the listener
+    that append the client's address to ``X-Forwarded-For``, under ``api_key`` and ``bearer``
+    only. The failed-attempt budget keys on the socket peer, so behind a proxy every partner
+    shares one budget and one client's failures would ``429`` the rest. From a listed peer the
+    budget keys instead on the client address in ``X-Forwarded-For``, walked right to left as
+    uvicorn walks it. Each entry is an address or a network, read by the rules
+    ``[api].trusted_proxies`` follows, but this list is the connection's own. At least the
+    allowlist, the connection caps and the peer recorded in the audit row and the connection event
+    stay the socket peer; a refusal records the forwarded address beside it.
+    ``docs/CONNECTIONS.md`` has the walk and what it does not cover.
+
     **Synchronous captured-downstream reply (ADR 0154 D4).** Naming ``reply_from`` turns this inbound
     from fire-and-forget into a **proxy**: the HTTP turn blocks until the named outbound's reply has
     been captured and **committed**, then returns that reply as the response body. One knob, not two —
@@ -3226,6 +3249,72 @@ def Http(
     }
     _validate_intake_auth(settings)
     _validate_sync_reply(settings)
+    # BACKLOG #5525, owner ruling 2026-11-10 ("Per-connection proxies"). Read by the listener's own
+    # reader, so the factory and the listener cannot disagree on an entry; never [api].trusted_proxies.
+    # The list refusal runs first, as its rule requires. A whole-setting env() is read through the
+    # same reader twice more: its default= here, since the config holds it and `check` loads it,
+    # and its environment value by the listener once resolved, at the build `check` and serve run.
+    _reject_envref_in_lists("Http", trusted_proxies=trusted_proxies)
+    from_default = isinstance(trusted_proxies, EnvRef)
+    written: Any = trusted_proxies
+    if isinstance(trusted_proxies, EnvRef):
+        written = None if trusted_proxies.default is _UNSET else trusted_proxies.default
+    from messagefoundry.transports.http_listener import trusted_proxy_networks
+
+    refusal: str | None = None
+    try:
+        trusted_proxy_networks(written)
+    except ValueError as exc:
+        refusal = str(exc)  # withholds every value; raised below, outside this handler
+    if refusal is not None:
+        if from_default:
+            refusal = f"Http trusted_proxies env() default= is refused: {refusal}"
+        raise WiringError(refusal)
+    if trusted_proxies and intake_auth not in _INTAKE_KEY_MODES:
+        raise WiringError(
+            f"Http sets trusted_proxies but intake_auth={intake_auth!r}; it keys the failed-attempt "
+            "budget only under 'api_key' or 'bearer'. Under 'mtls_subject' the certificate is "
+            "checked at accept, before any header is read, and under 'none' nothing is budgeted. "
+            "Remove the setting; a control that is configured but never consulted reads as "
+            "protection that does not exist"
+        )
+    # Neither budget may be off once trusted_proxies is set. The global one: each forwarded client
+    # keys its own per-peer budget, so only it bounds guessing across the clients behind the
+    # proxy. The per-peer one: the global budget exempts a key that authenticated in the window,
+    # so a listed proxy that writes such a partner's address is bounded there by it alone.
+    budget_reasons = (
+        (
+            "intake_auth_rate_limit_global",
+            intake_auth_rate_limit_global,
+            "Each client behind a listed proxy keys its own per-peer budget, so without the "
+            "global budget nothing bounds guessing across them",
+        ),
+        (
+            "intake_auth_rate_limit",
+            intake_auth_rate_limit,
+            "The global budget exempts an address that authenticated recently, so a request a "
+            "listed proxy keys on such a partner's address is bounded by the per-peer budget "
+            "alone, and without it nothing bounds guessing there",
+        ),
+    )
+    for knob, budget, reason in budget_reasons if trusted_proxies else ():
+        if not budget:
+            raise WiringError(
+                f"Http sets trusted_proxies but {knob} is off. {reason}. Set {knob}, or remove "
+                "the setting"
+            )
+        # The runner reads a budget with int(), so a fraction below 1 would pass the test above
+        # and turn the arm off; a negative, a bool or an env() is no checked budget either.
+        if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+            raise WiringError(
+                f"Http sets trusted_proxies but {knob} is not an integer of at least 1 (value "
+                "withheld). The listener reads it with int(), so a fraction below 1 would turn "
+                "that budget off. Set it to an integer number of failed attempts per minute, or "
+                "remove the setting"
+            )
+    settings["trusted_proxies"] = (
+        trusted_proxies if isinstance(trusted_proxies, EnvRef) else list(trusted_proxies or ())
+    )
     return ConnectionSpec(ConnectorType.HTTP, settings)
 
 
@@ -4831,7 +4920,7 @@ def Soap(
     headers: dict[str, str]
     | None = None,  # static extra headers (no secrets; a nested env() is refused)
     bearer_token: str | EnvRef | None = None,  # Authorization: Bearer … (use env() for the secret)
-    basic_user: str | EnvRef | None = None,
+    basic_user: str | EnvRef | None = None,  # set with basic_password, or neither (#5526)
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared, and in every case with a credential or a static header off the allowlist; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
@@ -4851,8 +4940,8 @@ def Soap(
     client_key_file: str | EnvRef | None = None,  # PEM private key (path or env() text)
     client_key_password: str | EnvRef | None = None,  # key passphrase — secret, use env()
     ws_security: bool = False,  # stamp <wsse:Security> (Timestamp + optional UsernameToken) in send()
-    ws_username: str | EnvRef | None = None,  # UsernameToken username (defaults to basic_user)
-    ws_password: str | EnvRef | None = None,  # UsernameToken password (defaults to basic_password)
+    ws_username: str | EnvRef | None = None,  # UsernameToken user; pairs with ws_password
+    ws_password: str | EnvRef | None = None,  # no basic_password fallback (#5526)
     ws_password_type: Literal["text"] = "text",  # PasswordText; "digest" retired (#1171)
     ws_addressing: bool = False,  # stamp <wsa:Action/To/MessageID> in send(); requires soap_version 1.2
     ws_timestamp_ttl_seconds: int = 300,  # Created→Expires window (must be >= max retry backoff)
@@ -5851,7 +5940,11 @@ def _resolve_port(raw: Any, env_values: Mapping[str, Any]) -> int | None:
         if raw.cast is not None:
             try:
                 value = raw.cast(value)
-            except (ValueError, TypeError):
+            except (Exception, SystemExit):  # noqa: BLE001
+                # Any cast failure, a sys.exit() in it included (vault BACKLOG #5105), is skipped
+                # here unread: its text can carry the value, and resolve_env_settings refuses the
+                # same ref loud and redacted when the connector is built. Not BaseException: a
+                # KeyboardInterrupt is not the cast's failure.
                 return None
         raw = value
     try:
@@ -5981,7 +6074,9 @@ def _resolve_one_env_value(ref: EnvRef, values: Mapping[str, Any]) -> Any:
             return raw
         try:
             return ref.cast(raw)
-        except Exception as exc:  # noqa: BLE001 - BACKLOG #1656: any cast error can quote the value
+        # BACKLOG #1656: any cast error can quote the value; a sys.exit() in the cast is a cast
+        # failure too (vault BACKLOG #5105), as resolve_env_settings treats it.
+        except (Exception, SystemExit) as exc:  # noqa: BLE001
             _logger.debug(
                 "env() value %r: its cast raised %s; skipped by this probe",
                 ref.key,
@@ -6575,7 +6670,7 @@ def accepted_cleartext_hops(registry: Registry) -> list[tuple[str, str]]:
     out = [
         (oc.name, oc.cleartext_reason or "(none recorded)")
         for oc in registry.outbound.values()
-        if oc.cleartext_accepted
+        if _declares(oc.cleartext_accepted)
     ]
     # A lookup's typed fields, not its settings: the read executor trusts only the typed declaration
     # (wiring_runner._fhir_lookup_settings strips a raw key), so this reports exactly what crosses.
@@ -6606,6 +6701,35 @@ class AttestedHop:
 # and a reason that must be a str (or None).
 _LAX_BOOL: Final = TypeAdapter(bool)
 _MODEL_REASON: Final = TypeAdapter(str | None)
+
+
+def read_lax_flag(value: object, where: str, key: str) -> bool:
+    """``value`` read as the typed models read a declaration flag: pydantic's lax ``bool``, so a
+    false spelling such as ``"off"`` or ``b"false"`` is ``False`` (vault BACKLOG #5286).
+
+    A value that lax ``bool`` refuses is a :class:`WiringError` naming ``where`` and ``key``, never
+    the value: pydantic's own error quotes its input, so it is raised after the handler ends,
+    with neither a cause nor a context."""
+    try:
+        return _LAX_BOOL.validate_python(value)
+    except ValidationError:
+        pass
+    raise WiringError(f"{where}: {key} must be a boolean")
+
+
+def _declares(flag: object) -> bool:
+    """Whether a connection's typed declaration flag is set, for a report. A report lists a flag
+    lax ``bool`` reads as true, as :func:`read_lax_flag` reads it and the build and the settings
+    mirror honour it, and does not list one it reads as false, so a falsy string such as ``"no"``
+    is not listed (vault BACKLOG #5286). ``None`` is not listed, as
+    :func:`attested_secure_hop_records` reads it. Every other value lax ``bool`` refuses is listed
+    although the build refuses it, because a report fails toward listing (vault BACKLOG #2232)."""
+    if flag is None:
+        return False
+    try:
+        return _LAX_BOOL.validate_python(flag)
+    except ValidationError:
+        return True
 
 
 def _attested_reason_text(value: object) -> str | None:
@@ -6680,17 +6804,17 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
         # is a lax pydantic bool and each reason a pydantic str. So an int 1 or the string "false"
         # is the flag the typed Source or Destination holds, the build builds it and it is no
         # refusal, and a reason of another type is refused as the model refuses it, never passed to
-        # the pair rule's .strip(). The mark answers only "does the build refuse this hop". It does
-        # not say the build reads one value: _dest_config's settings mirror tests the raw flag by
-        # truthiness, so for a string "false" the settings-driven seams can read the flag set.
+        # the pair rule's .strip(). The mark answers only "does the build refuse this hop". The
+        # flags go through read_lax_flag, the reader _dest_config's settings mirror uses too, so a
+        # string "false" reads unset in both (vault BACKLOG #5286).
         try:
             refuse_raw_hop_attestation(settings, "")
-            accepted_flag = _LAX_BOOL.validate_python(accepted)
+            accepted_flag = read_lax_flag(accepted, "", "cleartext_accepted")
             _check_cleartext_acceptance(
                 accepted_flag, _MODEL_REASON.validate_python(cleartext_reason)
             )
             _check_revocation_attestation(
-                _LAX_BOOL.validate_python(revocation),
+                read_lax_flag(revocation, "", "tls_revocation_attested"),
                 _MODEL_REASON.validate_python(revocation_reason),
             )
         except (WiringError, ValueError):
@@ -7138,12 +7262,12 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = [
         (oc.name, oc.tls_revocation_attested_reason or "(none recorded)")
         for oc in registry.outbound.values()
-        if oc.tls_revocation_attested
+        if _declares(oc.tls_revocation_attested)
     ]
     out.extend(
         (inbound_record_name(ic.name), ic.tls_revocation_attested_reason or "(none recorded)")
         for ic in registry.inbound.values()
-        if ic.tls_revocation_attested
+        if _declares(ic.tls_revocation_attested)
     )
     # Typed fields, as for cleartext_accepted: the executor strips a raw key (BACKLOG #2050).
     out.extend(
@@ -7220,6 +7344,56 @@ def ech_cleartext_sidecar_hops(
     return sorted(out)
 
 
+#: The note :func:`listener_trusted_proxy_hops` gives a listener whose ``trusted_proxies`` is an
+#: ``env()`` value it could not resolve. Short, since the posture entry shows it beside the name and
+#: its text says what a name marked possibly means.
+UNRESOLVED_LISTENER_PROXIES = "possibly"
+
+
+def listener_trusted_proxy_hops(
+    registry: Registry, *, env_values: Mapping[str, Any] | None = None
+) -> list[tuple[str, str]]:
+    """Every inbound ``Http()`` listener that trusts ``X-Forwarded-For`` from a listed proxy, as
+    ``(name, note)`` (BACKLOG #5525).
+
+    The single reader of that set, on the contract of :func:`ech_cleartext_sidecar_hops`:
+    ``GET /security/posture`` reads it for the ``listener_trusted_proxies`` entry of
+    ``security_loosenings()``, which the ``posture_loosened`` alert and the start's audit row read
+    too. Sorted by name.
+
+    Any non-empty list is named, a single proxy address included. A listed proxy may key the
+    failed-attempt budget on any address it writes, so each client behind it holds its own
+    per-peer budget, and the global budget is then the only bound on guessing across them; the
+    ``[api]`` list names only ranges because there a single proxy changes no budget. The note is
+    ``"range"`` where an entry covers more than one address, since every host inside it is trusted
+    as a proxy, and empty otherwise. An ``env()`` value is resolved against ``env_values`` as the
+    build resolves it; one this cannot resolve is named with :data:`UNRESOLVED_LISTENER_PROXIES`,
+    never left off. A ``deployed=False`` listener with an ``env()`` value is skipped, as
+    :func:`ech_cleartext_sidecar_hops` skips one, since its values are never resolved. A value the
+    build would refuse is skipped too: no listener is built from it."""
+    from messagefoundry.transports.http_listener import trusted_proxy_networks
+
+    out: list[tuple[str, str]] = []
+    for ic in registry.inbound.values():
+        if ic.spec.type != ConnectorType.HTTP:
+            continue
+        raw = ic.spec.settings.get("trusted_proxies")
+        if not ic.deployed and isinstance(raw, EnvRef):
+            continue
+        value = _db_setting(ic.spec.settings, "trusted_proxies", None, env_values)
+        if value is _UNRESOLVED:
+            out.append((ic.name, UNRESOLVED_LISTENER_PROXIES))
+            continue
+        try:
+            networks = trusted_proxy_networks(value)
+        except ValueError:
+            continue  # the build refuses this list, so no listener reads it
+        if networks:
+            ranged = any(network.num_addresses > 1 for network in networks)
+            out.append((ic.name, "range" if ranged else ""))
+    return sorted(out)
+
+
 #: Opens the reason :func:`unverified_generic_db_hops` gives for a hop whose ``env()`` dialect it
 #: could not resolve. ``GET /security/posture`` keeps only names, so it marks such a name with this
 #: text rather than state the hop is generic.
@@ -7281,6 +7455,56 @@ def _dark_env_dialect(conn: InboundConnection | OutboundConnection) -> bool:
     unresolved, so neither reader lists a connection that is not built because of a value it never
     reads. A not-deployed connection with a literal dialect resolves nothing and is read as before."""
     return not conn.deployed and isinstance(conn.spec.settings.get("dialect"), EnvRef)
+
+
+def odbc_hops(registry: Registry) -> list[tuple[str, str, str | None, str | None]]:
+    """Entries of the graph that open an ODBC connection, as ``(kind, record name, dialect,
+    driver)``, for ``messagefoundry verify``'s ``host.odbc`` and ``host.ciphers`` rows (BACKLOG
+    #3803 R3).
+
+    Kept beside the factories that write the settings it reads, so the verifier does not re-derive
+    them. The entries are each deployed ``DATABASE`` connection, on either dialect, each
+    database-backed reference set and each database lookup; the last two are always on the
+    ``sqlserver`` preset. ``dialect`` is that preset or ``generic``, in lower case, and ``driver``
+    the ``odbc_driver`` setting as written, the factories' ``ODBC Driver 18 for SQL Server`` when
+    unset; either is ``None`` when it is an ``env()`` reference, read with no values. Which driver
+    a name is, and so which TLS the hop takes, is the caller's to judge. A connection that is not
+    deployed is left out, since the engine never builds it (ADR 0111). A connection is named by its
+    record name, as the other readers here name it, so an inbound and an outbound of one name stay
+    apart. The connections come first, then the reference sets, then the lookups, each by name."""
+
+    # Imported lazily: messagefoundry.transports imports this module at its top level.
+    from messagefoundry.transports.db_endpoint import SQLSERVER_DEFAULT_DRIVER
+
+    def driver(settings: Mapping[str, Any]) -> str | None:
+        value = _db_setting(settings, "odbc_driver", SQLSERVER_DEFAULT_DRIVER, None)
+        return None if value is _UNRESOLVED else str(value)
+
+    connections = [
+        (
+            "DATABASE connection",
+            record_name(conn.name),
+            _db_dialect(conn.spec.settings, None),
+            driver(conn.spec.settings),
+        )
+        for record_name, table in (
+            (_outbound_record_name, registry.outbound),
+            (inbound_record_name, registry.inbound),
+        )
+        for conn in table.values()
+        if conn.spec.type is ConnectorType.DATABASE and conn.deployed
+    ]
+    connections.sort(key=lambda hop: hop[1])
+    references = [
+        ("DatabaseRef reference set", name, "sqlserver", driver(ref.source.settings))
+        for name, ref in sorted(registry.references.items())
+        if ref.source.kind == "database"
+    ]
+    lookups = [
+        ("DatabaseLookup", name, "sqlserver", driver(spec.settings))
+        for name, spec in sorted(registry.lookups.items())
+    ]
+    return [*connections, *references, *lookups]
 
 
 def unverified_generic_db_hops(
@@ -10917,8 +11141,9 @@ def _run_author_code(path: Path, module: ModuleType, helpers: _HelperImporter) -
     leave the loader with its text (vault BACKLOG #3765 item 4).
 
     A module that calls ``sys.exit()`` at import is a bad config, not a request to end the process
-    (vault BACKLOG #3134). The setting cast and the config diagnostics elsewhere in this module leave
-    ``SystemExit`` alone because it is not their kind of failure; this runs the author's module: on a
+    (vault BACKLOG #3134). The config diagnostics elsewhere in this module leave ``SystemExit``
+    alone because it is not their kind of failure, though the ``env()`` cast readers refuse it since
+    vault BACKLOG #5105, a cast being the author's code too; this runs the author's module: on a
     serving engine (at least a reload) it would leave the event loop and stop every connection, and
     at ``check`` it would end the run as if it had passed. So it is refused like any
     failing module, by its real type, because ``isinstance`` would run a ``__class__`` of the

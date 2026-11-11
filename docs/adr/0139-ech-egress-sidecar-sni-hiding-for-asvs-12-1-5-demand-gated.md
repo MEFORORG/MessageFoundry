@@ -16,8 +16,8 @@
   reusing the ADR 0126 opener plumbing) + `egress_route_from_settings`, the single ECH-or-proxy resolver
   (mutually exclusive). Per-connection `ech_egress` / `ech_sidecar` settings. fhir/soap/dicomweb switched to
   the resolver (byte-identical when `ech_egress` is unset; smart/http_auth inherit via the threaded proxy).
-- **Fail-closed:** sidecar down → the hop errors (no direct, SNI-leaking fallback); non-loopback / missing
-  sidecar refused, and, added 2026-11-09 (vault BACKLOG #2977), a `verify_tls = false` beside it. Operator recipe: [`samples/ech-sidecar/`](../../samples/ech-sidecar/README.md).
+- **Fail-closed, at least these:** sidecar down → the hop errors (no direct, SNI-leaking fallback); non-loopback / missing
+  sidecar refused, and, added 2026-11-10 (BACKLOG #5528), a sidecar URL that carries a credential or that urllib would dial differently from how it reads (*Amendment 2026-11-10* below names those refusals); and, added 2026-11-09 (vault BACKLOG #2977), a `verify_tls = false` beside it. Added 2026-11-10 (BACKLOG #5528): a sidecar whose `host:port` is not in `[egress].allowed_ech_sidecar` is refused at config load, by the egress check (*Amendment 2026-11-10* below). Operator recipe: [`samples/ech-sidecar/`](../../samples/ech-sidecar/README.md).
 - **Verified:** ruff + `mypy --strict` clean; 13 tests incl. a **stub-proxy behavioral test** proving egress
   routes THROUGH the sidecar and fails closed when it is down; 309 existing connector tests still pass.
 
@@ -63,6 +63,37 @@ now been **removed by decision** rather than never attempted.
 - **What would reverse it.** The build trigger below — a real partner endpoint begins publishing an
   `ECHConfig`. Reversal starts from the retrieval SHA plus the ownership costs listed above, taken
   deliberately.
+
+## Amendment 2026-11-10 — the sidecar address gets its own egress list (BACKLOG #5528)
+
+Increment 1 refused a sidecar off this host, and nothing bounded which loopback port it named. The
+egress check (`check_egress_allowed`, `transports/egress.py`) read the upstream `url` against
+`[egress].allowed_http` and never read `ech_sidecar`. Every request of an `ech_egress` connection goes
+to the sidecar first, body and credential headers included, and so does the token-endpoint POST on a
+SMART or OAuth2 connection. So a deploying site's connection could have sent PHI and credentials to
+any listener on this host whose port the connection's author named.
+
+- **Decision.** A dedicated `[egress].allowed_ech_sidecar` list of `host:port` entries, checked by
+  `_check_ech_sidecar_egress` for a REST outbound with `ech_egress` set, before the destination
+  lists. It is modelled on `[egress].allowed_proxy` ([ADR 0126](0126-outbound-forward-egress-web-proxy-for-the-stdlib-http-family.md)):
+  the sidecar is an intermediary, not where PHI is meant to end up, so it is not folded into
+  `allowed_http`.
+- **Deny-by-default on its own terms.** An empty list refuses an `ech_egress` connection even under
+  `[security].block_unlisted_outbound = false`. An instance with no ECH connection is never refused for an empty list, though a malformed entry is refused at load either way.
+- **No entry stands for any port.** The port is required, and an entry with none is refused at load.
+  The `host[:port]` lists, such as `allowed_http`, read a host-only entry as any port; on this list
+  that would re-open the hole the list closes.
+- **The gate judges the dialled address.** It reads the sidecar through
+  `ech_sidecar_url_from_settings`, the resolver the connector dials from, and compares the host and
+  the port urllib dials (80 or 443 where the URL names none). The resolver refuses a user or a
+  password in the URL, so a directly built connector refuses it too, and tells the operator to put
+  a credential meant for the sidecar in the sidecar's own configuration: the engine has no setting
+  for one, and the connection's own `Authorization` header reaches the sidecar on every request.
+  The resolver also refuses, at least, a `%` in the host, a space or control character, a `?` or
+  `#` anywhere, and a non-ASCII character, each a value urllib would dial differently from how
+  the gate reads it, or fail to dial. None of these refusals quotes the value; the reason for each
+  is stated once, in the comments of `ech_sidecar_url_from_settings`. The gate refuses port 0 in
+  its own words, since no entry can list it.
 
 ## Context
 
@@ -133,5 +164,5 @@ native path (revisit when OpenSSL 4.0 + CPython PR #135435 GA); 13.3.3 ([ADR 013
 
 - [ ] **Re-run the DoH type-65 probe** of the deployment's actual egress allowlist — build only if a real partner now publishes ECH.
 - [x] **Decide the sidecar and its packaging/signing** — resolved 2026-08-10 (#1011): the sidecar is **operator-supplied and not shipped**, so there is no wheel/installer packaging or signing question left to answer. sing-box and the retired reference implementation (*Disposition*) each satisfy the published contract.
-- [x] **Define the per-connection opt-in config and fail-closed routing for non-ECH endpoints** — built in Increment 1 (`ech_egress` / `ech_sidecar`; a missing, non-loopback or `proxy_url`-paired sidecar is refused at construction, and a down sidecar errors rather than falling back). *(Corrected 2026-11-09, vault BACKLOG #2977 item 8: that list of refusals is not closed. Since #2977, `RestDestination.__init__` also refuses `verify_tls = false` beside `ech_egress`, whatever is attested.)* The **DoH resolver is the sidecar's**, by design — it is part of the contract, not engine code.
+- [x] **Define the per-connection opt-in config and fail-closed routing for non-ECH endpoints** — built in Increment 1 (`ech_egress` / `ech_sidecar`; a missing, non-loopback or `proxy_url`-paired sidecar is refused at construction, and a down sidecar errors rather than falling back). *(Corrected 2026-11-09, vault BACKLOG #2977 item 8: that list of refusals is not closed. Since #2977, `RestDestination.__init__` also refuses `verify_tls = false` beside `ech_egress`, whatever is attested.)* *(Corrected again 2026-11-10, BACKLOG #5528: the egress check also refuses a sidecar whose `host:port` is not in the deny-by-default `[egress].allowed_ech_sidecar`; see the amendment above.)* The **DoH resolver is the sidecar's**, by design — it is part of the contract, not engine code.
 - [ ] Reassess against the native CPython path once OpenSSL 4.0 GA + PR #135435 land (may supersede the sidecar).

@@ -43,6 +43,7 @@ import sys
 import uuid
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -95,21 +96,34 @@ def _extract(path: Path, names: list[str], body: str) -> str:
     return "\n".join(lines)
 
 
-def _run(script: str, tmp_path: Path) -> subprocess.CompletedProcess[str]:
-    if shutil.which("pwsh") is None:
-        pytest.skip("SKIP (nothing run): pwsh not on PATH")
+def _run(script: str, tmp_path: Path, host: str = "pwsh") -> subprocess.CompletedProcess[str]:
+    """Run ``script`` on PowerShell 7, or on ``host="powershell"``, Windows PowerShell 5.1, the host
+    CI runs the installer on."""
+    if shutil.which(host) is None:
+        pytest.skip(f"SKIP (nothing run): {host} not on PATH")
     f = tmp_path / f"harness-{uuid.uuid4().hex}.ps1"
-    f.write_text(script, encoding="utf-8")
+    env = None
+    if host == "powershell":
+        # 5.1 reads a BOM-less file as the ANSI code page. A PSModulePath inherited from PowerShell 7
+        # points 5.1 at 7's modules, and Get-Acl then fails to load; 5.1 rebuilds its own path when
+        # the variable is absent.
+        f.write_text(script, encoding="utf-8-sig")
+        env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
+        cmd = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass"]
+    else:
+        f.write_text(script, encoding="utf-8")
+        cmd = ["pwsh", "-NoProfile", "-NonInteractive"]
     return subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(f)],
+        [*cmd, "-File", str(f)],
+        env=env,
         capture_output=True,
         text=True,
         timeout=180,
     )
 
 
-def _ok(script: str, tmp_path: Path) -> str:
-    r = _run(script, tmp_path)
+def _ok(script: str, tmp_path: Path, host: str = "pwsh") -> str:
+    r = _run(script, tmp_path, host)
     assert r.returncode == 0, f"harness failed:\n{(r.stderr + r.stdout)[:2000]}"
     return r.stdout
 
@@ -1038,6 +1052,7 @@ _PATH_PARAMS = [
     "ServiceConfig",
     "ProjectRoot",
     "DbPath",
+    "SecretsDir",
     # -EngineWheel's inputs (vault BACKLOG #2626), read before the build acts.
     "EngineWheel",
     "RequirementsLock",
@@ -1242,7 +1257,7 @@ _BROAD = {
     "S-1-5-32-546": "Guests",
 }
 
-_ACL_FNS = ["Set-SecureDataDirAcl", "Get-BroadAclResidue"]
+_ACL_FNS = ["Set-SecureDataDirAcl", "Get-WellKnownBroadSids", "Get-BroadAclResidue"]
 
 _windows_only = pytest.mark.skipif(
     not sys.platform.startswith("win"), reason="icacls / Windows DACLs"
@@ -1663,7 +1678,12 @@ def test_the_smoke_dacl_step_refuses_an_account_leg_it_does_not_know(tmp_path: P
 # The fix is an ORDERING-FREE one: write ObjectName unconditionally, so the assumption about what NSSM
 # defaults to at create time stops mattering. The guards are therefore about which branches write it.
 
-_ACL_CALLS = ["Set-SecureDataDirAcl", "Set-SecureConfigAcl", "Set-ConfigReadAcl"]
+_ACL_CALLS = [
+    "Set-SecureDataDirAcl",
+    "Set-SecureConfigAcl",
+    "Set-ConfigReadAcl",
+    "Set-SecretsDirAcl",
+]
 
 
 def _objectname_calls(facts: dict) -> list[dict]:
@@ -2076,6 +2096,7 @@ _FULL_FACTS: dict[str, object] = {
     "ServiceAccount": r"NT SERVICE\MessageFoundry",
     "ServiceAccountSid": "S-1-5-80-4001",
     "ConfigDir": r"D:\mefor\config",
+    "SecretsDir": r"C:\ProgramData\MessageFoundry-secrets",
     "ConfigInheritanceStripped": True,
     "CachedNssm": r"C:\ProgramData\MessageFoundry\bin\nssm.exe",
     "WerImages": ["messagefoundry.exe", "python.exe"],
@@ -2088,6 +2109,8 @@ _NEEDLE = {
     "cached_nssm": r"bin\nssm.exe",
     "data_ace": "Data dir entry",
     "config_ace": "Config dir entry",
+    "secrets_dir": "Secrets dir ",
+    "secrets_ace": "Secrets entry",
     "logon_right": "Log on as a service",
     "config_inheritance": "/inheritance:e",
     "wer": "Windows Error Reporting",
@@ -2153,8 +2176,8 @@ def test_the_notice_names_every_residue_the_installer_leaves(tmp_path: Path) -> 
         # account residues go -- and nothing else may go with them.
         (
             {"ServiceAccount": "LocalSystem", "ServiceAccountSid": ""},
-            ["data_ace", "config_ace", "logon_right"],
-            ["data_dir", "cached_nssm", "config_inheritance", "wer"],
+            ["data_ace", "config_ace", "secrets_ace", "logon_right"],
+            ["data_dir", "cached_nssm", "config_inheritance", "wer", "secrets_dir"],
         ),
         # No config dir could be read off the registration: its two lines go, the data dir's stay.
         (
@@ -2167,6 +2190,12 @@ def test_the_notice_names_every_residue_the_installer_leaves(tmp_path: Path) -> 
             {"ConfigInheritanceStripped": False},
             ["config_inheritance"],
             ["config_ace", "data_ace", "logon_right"],
+        ),
+        # No secrets directory was registered: its two lines go, the rest stay.
+        (
+            {"SecretsDir": ""},
+            ["secrets_dir", "secrets_ace"],
+            ["data_dir", "data_ace", "config_ace"],
         ),
         # No image is excluded, so this host never ran -SuppressCrashDumps.
         ({"WerImages": []}, ["wer"], ["data_dir", "data_ace", "config_ace"]),
@@ -2233,9 +2262,16 @@ def test_a_cleared_residue_is_reported_as_cleared_not_as_remaining(tmp_path: Pat
     run it is the same defect pointing the other way.
     """
     facts = dict(_FULL_FACTS)
-    facts.update({"LogonRightRemoved": True, "DataAceRemoved": True, "ConfigAceRemoved": True})
+    facts.update(
+        {
+            "LogonRightRemoved": True,
+            "DataAceRemoved": True,
+            "ConfigAceRemoved": True,
+            "SecretsAceRemoved": True,
+        }
+    )
     text = _notice(tmp_path, facts)
-    assert text.count("REMOVED") >= 3, (
+    assert text.count("REMOVED") >= 4, (
         f"the notice must report what this run actually took back:\n{text}"
     )
     assert "/remove:g" not in text, (
@@ -2552,13 +2588,20 @@ def test_both_switches_are_declared_and_wired(tmp_path: Path) -> None:
     assert names.count(_SECEDIT_FN) == 1, (
         f"expected one {_SECEDIT_FN} call, found {names.count(_SECEDIT_FN)}"
     )
-    assert names.count(_ACE_FN) == 2, (
-        "the account's entry is written on BOTH the data dir and the config dir, so both must be "
-        f"removable; found {names.count(_ACE_FN)} {_ACE_FN} calls"
+    assert names.count(_ACE_FN) == 3, (
+        "the account's entry is written on the data dir, the config dir and the secrets dir, so "
+        f"each must be removable; found {names.count(_ACE_FN)} {_ACE_FN} calls"
     )
     notice = [c for c in cmds if c["name"] == "Get-UninstallResidueNotice"]
     assert len(notice) == 1, f"expected one Get-UninstallResidueNotice call, found {len(notice)}"
-    for fact in ("-DataDir", "-ServiceAccount", "-ConfigDir", "-CachedNssm", "-WerImages"):
+    for fact in (
+        "-DataDir",
+        "-ServiceAccount",
+        "-ConfigDir",
+        "-SecretsDir",
+        "-CachedNssm",
+        "-WerImages",
+    ):
         assert fact in notice[0]["text"], (
             f"the notice is called without {fact}, so that residue can never be reported: "
             f"{notice[0]['text']}"
@@ -2691,3 +2734,462 @@ def test_the_notice_names_localdumps_separately_from_the_exclusion_list(tmp_path
     assert "ExcludedApplications" in plain, (
         f"the exclusion-list surface stopped being named:\n{plain}"
     )
+
+
+# --------------------------------------------- the secrets directory (vault BACKLOG #2595 slice C)
+
+
+def test_the_environment_merge_replaces_only_the_secrets_directory(tmp_path: Path) -> None:
+    """`nssm set AppEnvironmentExtra` replaces the whole list, so the installer merges instead: a
+    rerun keeps every entry an operator set and leaves exactly one MEFOR_SECRETS_DIRECTORY, whatever
+    case the old entry was spelled in. The control: the old value is in the input."""
+    assert _SCRIPT is not None
+    body = r"""
+  $old = @('MEFOR_LOG_LEVEL=INFO', 'mefor_secrets_directory=C:\old', 'MEFOR_X=a=b')
+  $merged = Get-MergedEnvironmentList -Existing $old -Name 'MEFOR_SECRETS_DIRECTORY' -Value 'C:\new'
+  $fresh = Get-MergedEnvironmentList -Existing $null -Name 'MEFOR_SECRETS_DIRECTORY' -Value 'C:\new'
+  [pscustomobject]@{ old = $old; merged = @($merged); fresh = @($fresh) } | ConvertTo-Json -Compress
+"""
+    got = json.loads(
+        _ok(
+            _extract(_SCRIPT, ["Get-MergedEnvironmentList", "Test-EnvironmentEntryNames"], body),
+            tmp_path,
+        )
+        .strip()
+        .splitlines()[-1]
+    )
+    assert r"mefor_secrets_directory=C:\old" in got["old"]  # the control
+    assert got["merged"] == [
+        "MEFOR_LOG_LEVEL=INFO",
+        "MEFOR_X=a=b",
+        r"MEFOR_SECRETS_DIRECTORY=C:\new",
+    ]
+    assert got["fresh"] == [r"MEFOR_SECRETS_DIRECTORY=C:\new"]
+
+
+@_windows_only
+def test_the_secrets_directory_lockdown_passes_the_engines_own_check(tmp_path: Path) -> None:
+    """Set-SecretsDirAcl on a directory that inherits Users read and the account's Modify, the shape
+    a fresh secrets directory would have under an unlocked parent. Measured with the engine's own
+    check, broad_access_problem(directory=True): it refuses the directory before and accepts it
+    after. The account keeps read and loses the inherited Modify. Unelevated, the owner change is
+    refused, and the function refuses for that alone: the read-back finds no other problem."""
+    from messagefoundry.restricted_file import broad_access_problem
+
+    assert _SCRIPT is not None
+    parent = tmp_path / f"sd-{uuid.uuid4().hex[:8]}"
+    secrets = parent / "secrets"
+    secrets.mkdir(parents=True)
+    # Two phases, so the engine's check reads the directory in the state the lockdown starts from.
+    pre = rf"""
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  & icacls {_psq(str(parent))} /grant '*S-1-5-32-545:(OI)(CI)RX' "${{me}}:(OI)(CI)M" | Out-Null
+"""
+    _ok(_extract(_SCRIPT, [], pre), tmp_path)
+    before = broad_access_problem(secrets, directory=True)
+    assert before is not None, (
+        "CONTROL FAILED: the engine accepted the directory before the lockdown"
+    )
+    lock = rf"""
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  $mySid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  $dir = {_psq(str(secrets))}
+  $refusal = ''
+  try {{ Set-SecretsDirAcl -Path $dir -Account $me }} catch {{ $refusal = $_.Exception.Message }}
+  $acl = Get-Acl $dir
+  $mine = @($acl.Access | Where-Object {{
+    try {{ $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq $mySid }}
+    catch {{ $false }} }})
+  [pscustomobject]@{{
+    refusal = $refusal
+    inherited = @($acl.Access | Where-Object {{ $_.IsInherited }}).Count
+    protected = $acl.AreAccessRulesProtected
+    mine = @($mine | ForEach-Object {{ "$($_.FileSystemRights)" }})
+    text = (& icacls $dir | Out-String)
+  }} | ConvertTo-Json -Depth 4 -Compress
+"""
+    try:
+        got = json.loads(
+            _ok(
+                _extract(
+                    _SCRIPT,
+                    [
+                        "Set-SecretsDirAcl",
+                        "Get-WellKnownBroadSids",
+                        "Get-BroadAclResidue",
+                        "Get-ReparsePointAncestor",
+                    ],
+                    lock,
+                ),
+                tmp_path,
+            )
+            .strip()
+            .splitlines()[-1]
+        )
+        after = broad_access_problem(secrets, directory=True)
+    finally:
+        restore = rf"""
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  & icacls {_psq(str(secrets))} /inheritance:e /grant "${{me}}:(OI)(CI)F" | Out-Null
+"""
+        _run(_extract(_SCRIPT, [], restore), tmp_path)
+    assert after is None, f"the engine still refuses the locked directory: {after}\n{got['text']}"
+    assert got["protected"] and got["inherited"] == 0, got["text"]
+    assert got["mine"], f"the service account lost its read:\n{got['text']}"
+    assert all("Modify" not in r and "Write" not in r for r in got["mine"]), (
+        f"the account kept the Modify it inherited:\n{got['text']}"
+    )
+    # Elevated, nothing is refused. Unelevated, the owner change is, and only that.
+    refusal = got["refusal"]
+    assert not refusal or (
+        "owner" in refusal and "grants access" not in refusal and "inherits" not in refusal
+    ), f"a clean lockdown must find no residue; got {refusal}"
+
+
+def test_the_installer_creates_and_names_the_secrets_directory(tmp_path: Path) -> None:
+    """CALL-SITE guard: the functions above prove nothing if the script stops calling them. The
+    directory is restricted after the data directory, whose inheritable grants would reach it, and
+    is named to the service through the merging writer, never `nssm set AppEnvironmentExtra`."""
+    facts = _preflight_facts(tmp_path)
+    data = _sole_call(facts, "Set-SecureDataDirAcl")
+    locks = [c for c in facts["commands"] if c["name"] == "Set-SecretsDirAcl"]
+    assert all("-Path $SecretsDir" in c["text"] for c in locks), locks
+    lock = _sole_call(facts, "Set-SecretsDirAcl")
+    assert "-Account $ServiceAccount" in lock["text"], lock["text"]
+    assert lock["start"] > data["start"], "the secrets directory is restricted before the data dir"
+    named = _sole_call(facts, "Set-ServiceEnvironmentValue")
+    assert "MEFOR_SECRETS_DIRECTORY" in named["text"] and "$SecretsDir" in named["text"]
+    assert "AppEnvironmentExtra" not in " ".join(
+        c["text"] for c in facts["commands"] if c["name"] == "Invoke-Nssm"
+    ), "an `nssm set AppEnvironmentExtra` would replace the operator's whole list"
+    # The lockdown replaces the directory's list, so -SecretsDir is judged by the -LockConfigDir
+    # rule, and the directory is made, before anything acts on the service.
+    check = next(
+        c
+        for c in facts["commands"]
+        if c["name"] == "Get-LockPathProblem" and "-Path $SecretsDir" in c["text"]
+    )
+    assert "-AllowMissing" in check["text"] and "-OnlyFolders @()" in check["text"], check["text"]
+    # Made in one step with its owner and list (New-RestrictedDirectory), never New-Item then icacls,
+    # which leaves a window where the folder inherits Users' create right.
+    creates = _sole_call(facts, "New-RestrictedDirectory")
+    assert "-Path $SecretsDir" in creates["text"], creates["text"]
+    assert not [
+        c
+        for c in facts["commands"]
+        if c["name"] in ("New-AdminOnlyFolder", "New-Item") and "-Path $SecretsDir" in c["text"]
+    ], "the secrets directory itself must not be made by New-Item"
+    junction = next(
+        c
+        for c in facts["commands"]
+        if c["name"] == "Get-ReparsePointAncestor" and "-Path $SecretsDir" in c["text"]
+    )
+    sharers = _sole_call(facts, "Get-OtherServiceNamingPath")
+    empty = _sole_call(facts, "Get-SecretsDirHeldProblem")
+    registered = min(
+        c["start"]
+        for c in facts["commands"]
+        if c["name"] == "Invoke-Nssm" and "install" in c["text"]
+    )
+    assert check["start"] < junction["start"] < sharers["start"] < creates["start"] < registered, (
+        "the secrets directory must be judged and made before the service registration changes"
+    )
+    # The empty check follows the restricted create, both before the registration.
+    assert creates["start"] < empty["start"] < registered, (
+        "the made directory must be found empty before the registration changes"
+    )
+    # An existing directory the service does not name is refused, never adopted: the preflight
+    # says so, and no lockdown runs before the account's.
+    assert "it already exists and the service does not name it" in _script_text()
+    holds = next(a for a in facts["assignments"] if a["lhs"] == "SecretsHolds")["rhsText"]
+    for other in ("$DataDir", "$LogDir", "$DbPath", "$Config", "$NssmDir", "$AppDirectory"):
+        assert other in holds, other
+    assert "environments" in holds and "$ServiceConfig" in holds, holds
+
+
+@_windows_only
+def test_the_secrets_directory_path_rule(tmp_path: Path) -> None:
+    """Get-LockPathProblem with -AllowMissing, as the installer calls it for -SecretsDir: a path
+    that does not exist yet passes; a volume root, a folder holding a folder, and a path inside a
+    refused folder do not. The control: the same call without -AllowMissing refuses the absent
+    path, so the switch is what lets it through."""
+    assert _SCRIPT is not None
+    existing = tmp_path / "sec"
+    (existing / "sub").mkdir(parents=True)
+    absent = tmp_path / "absent"
+    body = rf"""
+  $absent = {_psq(str(absent))}
+  $existing = {_psq(str(existing))}
+  $outer = {_psq(str(tmp_path))}
+  [pscustomobject]@{{
+    absent = (Get-LockPathProblem -Path $absent -OnlyFolders @() -AllowMissing)
+    absentStrict = (Get-LockPathProblem -Path $absent -OnlyFolders @())
+    root = (Get-LockPathProblem -Path ([System.IO.Path]::GetPathRoot($outer)) -OnlyFolders @() -AllowMissing)
+    folder = (Get-LockPathProblem -Path $existing -OnlyFolders @() -AllowMissing)
+    within = (Get-LockPathProblem -Path $absent -NotWithin @($outer) -OnlyFolders @() -AllowMissing)
+    holds = (Get-LockPathProblem -Path $absent -Holds @((Join-Path $absent 'x')) -OnlyFolders @() -AllowMissing)
+  }} | ConvertTo-Json -Compress
+"""
+    got = json.loads(
+        _ok(_extract(_SCRIPT, ["Get-LockPathProblem"], body), tmp_path).strip().splitlines()[-1]
+    )
+    assert got["absent"] == "", got
+    assert got["absentStrict"], "CONTROL FAILED: without -AllowMissing an absent path passed"
+    assert "root of a volume" in got["root"], got
+    assert "other folders" in got["folder"], got
+    assert "inside" in got["within"], got
+    assert "holds" in got["holds"], got
+
+
+@_windows_only
+@pytest.mark.parametrize("host", ["pwsh", "powershell"])
+def test_the_secrets_directory_is_made_restricted_in_one_step(tmp_path: Path, host: str) -> None:
+    """New-RestrictedDirectory makes the folder with its owner and protected list at once, so it
+    never inherits the parent's grants, and the engine's own check accepts it as made. Run on both
+    hosts: 5.1 takes the CreateDirectory overload, 7 the extension method. The test owns the folder
+    (-OwnerSid of its own SID), since an unelevated process cannot name Administrators.
+
+    The control: a folder that was already there, made by mkdir under the same open parent, is
+    refused, because CreateDirectory would otherwise hand it back as if it had made it."""
+    from messagefoundry.restricted_file import broad_access_problem
+
+    assert _SCRIPT is not None
+    parent = tmp_path / f"rd-{uuid.uuid4().hex[:8]}"
+    parent.mkdir()
+    made = parent / "secrets"
+    squatted = parent / "squatted"
+    squatted.mkdir()
+    body = rf"""
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  & icacls {_psq(str(parent))} /grant '*S-1-5-32-545:(OI)(CI)M' | Out-Null
+  New-RestrictedDirectory -Path {_psq(str(made))} -OwnerSid $me
+  $acl = Get-Acl -LiteralPath {_psq(str(made))}
+  $squat = ''
+  try {{ New-RestrictedDirectory -Path {_psq(str(squatted))} -OwnerSid $me }}
+  catch {{ $squat = $_.Exception.Message }}
+  [pscustomobject]@{{
+    owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    me = $me
+    protected = $acl.AreAccessRulesProtected
+    inherited = @($acl.Access | Where-Object {{ $_.IsInherited }}).Count
+    sids = @($acl.Access | ForEach-Object {{
+      $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }})
+    squat = $squat
+  }} | ConvertTo-Json -Compress
+"""
+    script = _extract(_SCRIPT, ["New-RestrictedDirectory", "Get-ReparsePointAncestor"], body)
+    got = json.loads(_ok(script, tmp_path, host).strip().splitlines()[-1])
+    assert got["owner"] == got["me"] and got["protected"] and got["inherited"] == 0, got
+    assert sorted(set(got["sids"])) == ["S-1-5-18", "S-1-5-32-544"], got
+    # The parent grants Users Modify; none of it reached the folder.
+    assert broad_access_problem(made, directory=True) is None
+    assert "was there before" in got["squat"], f"CONTROL FAILED: the squatted folder passed: {got}"
+
+
+@_windows_only
+def test_a_junction_above_the_secrets_directory_is_named(tmp_path: Path) -> None:
+    """Get-ReparsePointAncestor names a junction anywhere above the path, skips folders not made
+    yet, and finds nothing above a plain path. The control: the same tail below a plain folder."""
+    assert _SCRIPT is not None
+    target = tmp_path / "target"
+    target.mkdir()
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    link = tmp_path / "link"
+    made = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True
+    )
+    assert made.returncode == 0, made.stderr
+    body = rf"""
+  [pscustomobject]@{{
+    under = (Get-ReparsePointAncestor -Path {_psq(str(link / "absent" / "secrets"))})
+    plain = (Get-ReparsePointAncestor -Path {_psq(str(plain / "absent" / "secrets"))})
+  }} | ConvertTo-Json -Compress
+"""
+    got = json.loads(
+        _ok(_extract(_SCRIPT, ["Get-ReparsePointAncestor"], body), tmp_path)
+        .strip()
+        .splitlines()[-1]
+    )
+    assert "junction" in got["under"] and str(link) in got["under"], got
+    assert got["plain"] == "", f"CONTROL FAILED: a plain path was named: {got}"
+
+
+_SHARER_FUNCTIONS = [
+    "Get-OtherServiceNamingPath",
+    "ConvertTo-EngineStripped",
+    "ConvertTo-NormalPath",
+    "Get-EnvironmentListValue",
+    "Test-EnvironmentEntryNames",
+]
+
+
+def _sharer_hits(
+    tmp_path: Path, services: list[tuple[str, str]], host: str = "pwsh", extra: str = ""
+) -> dict[str, Any]:
+    """Get-OtherServiceNamingPath for 'Mine' at C:\\PD\\MF-secrets, against a services key built
+    under HKCU holding ``services`` as (name, MEFOR_SECRETS_DIRECTORY value) pairs, plus a service
+    with no Parameters key. ``extra`` is PowerShell whose value is returned as ``extra``."""
+    assert _SCRIPT is not None
+    root = f"HKCU:\\Software\\MeforTest-{uuid.uuid4().hex[:8]}"
+    # One row per line, each with a unary comma, so a single row stays one pair rather than
+    # flattening into its two strings.
+    rows = "\n".join(
+        f"      ,@({_psq(name)}, {_psq('MEFOR_SECRETS_DIRECTORY=' + value)})"
+        for name, value in services
+    )
+    body = rf"""
+  $root = {_psq(root)}
+  try {{
+    $services = @(
+{rows}
+    )
+    foreach ($s in $services) {{
+      $k = New-Item -Path (Join-Path $root "$($s[0])\Parameters") -Force
+      Set-ItemProperty -LiteralPath $k.PSPath -Name AppEnvironmentExtra -Type MultiString `
+        -Value @('MEFOR_X=1', $s[1])
+    }}
+    New-Item -Path (Join-Path $root 'NoParams') -Force | Out-Null
+    $hits = @(Get-OtherServiceNamingPath -ServiceName 'Mine' -Name 'MEFOR_SECRETS_DIRECTORY' `
+      -Path 'C:\PD\MF-secrets' -ServicesKey $root)
+    [pscustomobject]@{{ hits = $hits; extra = $({extra or "$null"}) }} | ConvertTo-Json -Compress
+  }} finally {{ Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }}
+"""
+    out = _ok(_extract(_SCRIPT, _SHARER_FUNCTIONS, body), tmp_path, host)
+    got: dict[str, Any] = json.loads(out.strip().splitlines()[-1])
+    return got
+
+
+@_windows_only
+def test_a_secrets_directory_another_service_names_is_found(tmp_path: Path) -> None:
+    """Get-OtherServiceNamingPath, against a services key built under HKCU: a second service whose
+    NSSM environment names the same directory (another case, a trailing backslash), the same one
+    through '..' and forward slashes, a folder inside it, or a folder around it is returned; the
+    installing service itself, a sibling whose name only starts the same, and a service naming
+    another directory are not."""
+    got = _sharer_hits(
+        tmp_path,
+        [
+            ("First", "C:\\PD\\MF-SECRETS\\"),
+            ("Mine", "C:\\PD\\MF-secrets"),
+            ("Dots", "C:/PD/x/../MF-secrets"),
+            ("Inside", "C:\\PD\\MF-secrets\\sub"),
+            ("Around", "C:\\PD"),
+            ("Sibling", "C:\\PD\\MF-secrets-two"),
+            ("Other", "C:\\PD\\elsewhere"),
+        ],
+    )
+    assert sorted(got["hits"]) == ["Around", "Dots", "First", "Inside"], got
+
+
+@_windows_only
+def test_a_secrets_directory_value_that_cannot_be_compared_counts_as_a_sharer(
+    tmp_path: Path,
+) -> None:
+    """An absolute value ConvertTo-NormalPath cannot read is returned, not skipped: on Windows
+    PowerShell 5.1 a path over 260 characters, which the engine may still read. It names no folder
+    that overlaps C:\\PD\\MF-secrets as written, so only the fail-closed rule reports it. A host
+    that can read it measures nothing here, so it skips. The control: a readable value naming
+    another directory is still not returned."""
+    long_value = "C:\\PD\\other\\" + "a" * 300
+    got = _sharer_hits(
+        tmp_path,
+        [("Long", long_value), ("Other", "C:\\PD\\elsewhere")],
+        host="powershell",
+        extra=f"$null -eq (ConvertTo-NormalPath {_psq(long_value)})",
+    )
+    if got["extra"] is not True:
+        pytest.skip(f"SKIP (nothing measured): this host reads the long path: {got}")
+    assert sorted(got["hits"]) == ["Long"], got
+
+
+@_windows_only
+def test_a_secrets_directory_value_with_a_leading_space_is_a_sharer(tmp_path: Path) -> None:
+    """The engine strips MEFOR_SECRETS_DIRECTORY with str.strip() before reading it, so a value
+    with a leading space, or a leading U+001C that String.Trim() would keep, names the same
+    directory and is returned. A run with one service checks a single row is not flattened. The
+    control: a leading-space value naming another directory is not returned."""
+    got = _sharer_hits(
+        tmp_path,
+        [
+            ("Spaced", " C:\\PD\\MF-secrets"),
+            ("Sep", "\x1cC:\\PD\\MF-secrets"),
+            ("Other", " C:\\PD\\elsewhere"),
+        ],
+    )
+    assert sorted(got["hits"]) == ["Sep", "Spaced"], got
+    single = _sharer_hits(tmp_path, [("Only", " C:\\PD\\MF-secrets")])
+    assert single["hits"] == ["Only"], single
+
+
+@_windows_only
+def test_the_secrets_directory_refuses_residue_and_held_files(tmp_path: Path) -> None:
+    """Refusals where a warning used to be. Set-SecretsDirAcl throws when an entry for another
+    account is left after the removals: icacls is shadowed so /remove:g does nothing, the way a
+    removal that fails would. It throws too when the account's read is missing at the end: the
+    shadow drops the account's /grant. Get-SecretsDirHeldProblem names a file the directory holds.
+    The controls: the same directory with nothing in it reads clean, and the
+    residue named is the one the setup granted."""
+    assert _SCRIPT is not None
+    held = tmp_path / "held"
+    held.mkdir()
+    (held / "MEFOR_PLANTED").write_text("x", encoding="utf-8")
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    residue = tmp_path / "residue"
+    residue.mkdir()
+    noread = tmp_path / "noread"
+    noread.mkdir()
+    body = rf"""
+  & icacls.exe {_psq(str(residue))} /grant '*S-1-5-32-551:(OI)RX' | Out-Null
+  function icacls {{
+    if ($global:dropRemove -and $args -contains '/remove:g') {{ $global:LASTEXITCODE = 0; return }}
+    if ($global:dropGrant -and $args -contains '/grant') {{ $global:LASTEXITCODE = 0; return }}
+    & icacls.exe @args
+  }}
+  $global:dropRemove = $true
+  $res = ''
+  try {{ Set-SecretsDirAcl -Path {_psq(str(residue))} }} catch {{ $res = $_.Exception.Message }}
+  $global:dropRemove = $false
+  $global:dropGrant = $true
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  $noread = ''
+  try {{ Set-SecretsDirAcl -Path {_psq(str(noread))} -Account $me }} catch {{ $noread = $_.Exception.Message }}
+  $heldMsg = Get-SecretsDirHeldProblem -Path {_psq(str(held))}
+  $emptyMsg = Get-SecretsDirHeldProblem -Path {_psq(str(empty))}
+  [pscustomobject]@{{ res = $res; noread = $noread; held = $heldMsg; empty = $emptyMsg }} |
+    ConvertTo-Json -Compress
+"""
+    try:
+        got = json.loads(
+            _ok(
+                _extract(
+                    _SCRIPT,
+                    [
+                        "Set-SecretsDirAcl",
+                        "Get-WellKnownBroadSids",
+                        "Get-BroadAclResidue",
+                        "Get-ReparsePointAncestor",
+                        "Get-SecretsDirHeldProblem",
+                    ],
+                    body,
+                ),
+                tmp_path,
+            )
+            .strip()
+            .splitlines()[-1]
+        )
+    finally:
+        me = subprocess.run(["whoami"], capture_output=True, text=True).stdout.strip()
+        for locked in (residue, noread):
+            subprocess.run(
+                ["icacls", str(locked), "/inheritance:e", "/grant", f"{me}:(OI)(CI)F"],
+                capture_output=True,
+            )
+    assert "still grants access" in got["res"] and "Backup Operators" in got["res"], got
+    assert "holds no read" in got["noread"], got
+    assert "holds no read" not in got["res"], (
+        f"CONTROL FAILED: no -Account, yet a read check: {got}"
+    )
+    assert "MEFOR_PLANTED" in got["held"], got
+    assert got["empty"] == "", f"CONTROL FAILED: an empty directory was refused: {got}"

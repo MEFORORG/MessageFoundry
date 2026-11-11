@@ -34,10 +34,11 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from email.message import EmailMessage
-from typing import Any, Generic, Protocol, TypeVar
+from typing import Any, Generic, Protocol, TypeVar, cast
 
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import (
@@ -134,6 +135,152 @@ class _AlertStateStore(Protocol):
     ) -> Sequence[Any]: ...
 
 
+class _Generation(Protocol):
+    """A live instance's generation (``store.AlertGeneration``)."""
+
+    @property
+    def id(self) -> int: ...
+    @property
+    def count(self) -> int: ...
+
+
+class _FencedStore(_AlertStateStore, Protocol):
+    """The read and the write a fenced resolve needs (BACKLOG #4916). Every shipped store has
+    them; a store without them resolves unfenced, as before."""
+
+    async def upsert_alert_instance(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        severity: str,
+        reason: str | None = ...,
+        escalation_tier: int = ...,
+        now: float | None = ...,
+        raised_by: str | None = ...,
+    ) -> None: ...
+
+    async def open_alert_generations(
+        self, *, event_type: str, connection: str | None = ...
+    ) -> Sequence[_Generation]: ...
+
+    async def resolve_alert_instances_fenced(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        raised_by: str,
+        seen: Any,
+        now: float | None = ...,
+    ) -> int: ...
+
+
+def _fences(store: object) -> bool:
+    return hasattr(store, "open_alert_generations") and hasattr(
+        store, "resolve_alert_instances_fenced"
+    )
+
+
+class _ResolveFence:
+    """Bound an auto-resolve to the raises it speaks for, with no clock (BACKLOG #4916).
+
+    A resolve waits behind its key's FIFO lock, and its retries wait too, while another engine
+    shard or node on the same store may raise the same key. Unfenced, the resolve then closes that
+    newer raise. A ``last_seen <= now`` guard was refuted (decision d20261030T211551515-1de84e):
+    under cross-node clock skew it leaves an alert open for good. The fence compares no clock.
+
+    Each raise stamps the instance with its writer's random id (``raised_by``), and the resolve
+    closes only what that id and a snapshot of the key allow. ``docs/adr/0044-operator-alert-state.md``,
+    the BACKLOG #4916 amendment, states the rule. Only a store without the fence methods resolves
+    unfenced."""
+
+    def __init__(
+        self,
+        store: _FencedStore,
+        *,
+        event_type: str,
+        connection: str,
+        writer_id: str,
+        verdict: bool,
+    ) -> None:
+        self._store = store
+        self._verdict = verdict
+        self._event_type = event_type
+        self._connection = connection
+        self._writer_id = writer_id
+        self._snapshot: asyncio.Future[Sequence[_Generation]] | None = None
+        self.superseded = False
+
+    def begin(self) -> None:
+        self._snapshot = self._read()
+
+    def _read(self) -> asyncio.Future[Sequence[_Generation]]:
+        return asyncio.ensure_future(
+            self._store.open_alert_generations(
+                event_type=self._event_type, connection=self._connection
+            )
+        )
+
+    def end(self) -> None:
+        snapshot = self._snapshot
+        if snapshot is None:
+            return
+        if not snapshot.done():
+            snapshot.cancel()
+        elif not snapshot.cancelled():
+            snapshot.exception()  # retrieved, so asyncio does not report a failed read again
+
+    async def resolve(self, now: float) -> int:
+        assert self._snapshot is not None  # begin ran
+        self.superseded = False
+        try:
+            seen = await self._snapshot
+        except Exception:
+            # The attempt fails, so the retry loop logs it and tries again, and the next attempt
+            # reads afresh: re-awaiting this failed read would fail every retry, and closing only
+            # this writer's own raise would miss one an earlier run of this process left
+            # (BACKLOG #4916, review round-c69a5607).
+            self._snapshot = self._read()
+            raise
+        closed = await self._store.resolve_alert_instances_fenced(
+            event_type=self._event_type,
+            connection=self._connection,
+            raised_by=self._writer_id,
+            seen=seen[0] if seen else None,
+            now=now,
+        )
+        if not closed and self._verdict:
+            # The UPDATE has committed, so a fault here must not reach the retry loop: a retry
+            # would run the resolve again and end in a false "gave up" ERROR. Not knowing, keep
+            # what the clear dropped (superseded), which is the safe side.
+            try:
+                live = bool(
+                    await self._store.open_alert_generations(
+                        event_type=self._event_type, connection=self._connection
+                    )
+                )
+            except Exception as exc:
+                # Assumed, not observed: its own line, so the log never states a cause it did not see.
+                self.superseded = True
+                log.warning(
+                    "alert-instance resolve for %s %r closed nothing and the re-read failed (%s); "
+                    "assuming the instance is still open and keeping its in-memory alert state",
+                    self._event_type,
+                    self._connection,
+                    type(exc).__name__,
+                )
+                return closed
+            if live:
+                self.superseded = True
+                log.info(
+                    "alert-instance resolve for %s %r closed nothing: a live instance remains "
+                    "whose newest raise this clear does not speak for, so it stays open",
+                    self._event_type,
+                    self._connection,
+                )
+        return closed
+
+
 #: Auto-resolution map (ADR 0044 D2): an inverse lifecycle event type resolves the matching open
 #: instance(s) of the failure event type it cancels. ``connection_restored`` cancels the
 #: ``connection_error`` raised on ``connection_lost``; ``connection_started``, which the runner emits
@@ -148,8 +295,8 @@ _AUTO_RESOLVE: dict[str, str] = {
     "dr_released": "dr_activated",
     # #305: a start that OBSERVED a clean store principal resolves the open over-grant warning.
     "store_privilege_clean": "store_privilege_warning",
-    # #2903 (ADR 0216): a start that read a Vault token and found it clean resolves the open
-    # warning for the same hop.
+    # #2903 (ADR 0216): a start that read a Vault token and found it clean can resolve the open
+    # warning for the same hop, fenced as the ADR 0044 BACKLOG #4916 amendment states.
     "vault_privilege_clean": "vault_privilege_warning",
     # #290: a bound that cleared its resume line resolves the open intake pause for the same bound.
     "intake_resumed": "intake_paused",
@@ -1105,8 +1252,9 @@ class AlertRuleSet:
 
 @dataclass
 class _ClearedState:
-    """The in-memory alert state one ``connection_started`` cleared for a key, held until its
-    durable resolve settles (BACKLOG #1741, :meth:`NotifierAlertSink._resolve_settled`)."""
+    """The in-memory alert state one clear dropped for a key, held until its durable resolve
+    settles (:meth:`NotifierAlertSink._resolve_settled`): a ``connection_started``'s (BACKLOG
+    #1741), or any other auto-resolving inverse's (BACKLOG #4916), whose ``last`` is always None."""
 
     last: float | None
     occurrences: int | None
@@ -1159,6 +1307,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # holds its key's lock, so a raise and its clear land in emit order; writes for different keys
         # stay concurrent. An entry is dropped once no write holds or awaits it.
         self._state_locks: dict[str, KeyedLock] = {}
+        # BACKLOG #4916: this sink's raises carry this random id, so its own clears can close them
+        # and no other process's clear can close a newer one (_ResolveFence). Per process.
+        self._writer_id = uuid.uuid4().hex
         # #143 (ADR 0044 amendment): windowed NOTIFICATION-mute cache — (type:connection) → until-epoch.
         # The synchronous suspend gate _emit consults; in-memory + per-node (the same advisory posture as
         # the _last_sent throttle above). The DURABLE record is alert_instance.suspended_until; this cache
@@ -1963,8 +2114,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             raise
 
     def _resolve_settled(self, key: str, cleared: _ClearedState, *, landed: bool) -> None:
-        """Settle the in-memory state :meth:`connection_started` cleared, once its durable resolve
-        has landed or failed (BACKLOG #1741). A landed resolve closed the row, so the state stays
+        """Settle the in-memory state a clear dropped, once its durable resolve has landed or
+        failed: :meth:`connection_started`'s (BACKLOG #1741), or any other inverse's (BACKLOG
+        #4916). A landed resolve closed the row, so the state stays
         cleared, every earlier clear still waiting is settled with it, and a suspend set while it was
         in flight muted the row it closed and goes too. A failed one left the row open: a later
         start's resolve still queued behind it then takes the state over and decides in its turn, or,
@@ -2141,30 +2293,73 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             # suspend cache entry AND the escalation occurrence counter for the resolved key, so a later
             # re-open of the SAME key starts un-suspended at the base tier (the durable suspended_until /
             # escalation_tier were on the now-resolved row and never return via list_active).
-            self._suspended.pop(key, None)
-            self._occurrences.pop(key, None)
+            # BACKLOG #4916: the drop is provisional, as connection_started's is (BACKLOG #1741). A
+            # fenced resolve can leave the row open on purpose, so what it dropped goes back if it
+            # does not land (_resolve_settled). connection_started passes its own on_settled and
+            # has already taken both entries, so nothing is queued for it here.
+            suspended = self._suspended.pop(key, None)
+            occurrences = self._occurrences.pop(key, None)
+            # Queued even when it dropped nothing: a later clear's entry is what takes an earlier
+            # failed one's state over in _resolve_settled, rather than that state going back.
+            if on_settled is None:
+                cleared = _ClearedState(None, occurrences, suspended)
+                self._pending_clears.setdefault(key, []).append(cleared)
+
+                def settle_cleared(landed: bool) -> None:
+                    self._resolve_settled(key, cleared, landed=landed)
+
+                on_settled = settle_cleared
+
+            # Only a settle callback reads the superseded verdict, so only then is it paid for.
+            fence = (
+                _ResolveFence(
+                    cast(_FencedStore, store),
+                    event_type=inverse_of,
+                    connection=connection,
+                    writer_id=self._writer_id,
+                    verdict=on_settled is not None,
+                )
+                if _fences(store)
+                else None
+            )
 
             # A factory, not a built coroutine: a coroutine can be awaited only once, and a retry
             # needs a fresh one. Nothing is built until the background task runs.
             def write() -> Awaitable[Any]:
+                if fence is not None:
+                    return fence.resolve(now)
                 return store.resolve_alert_instances_for(
                     event_type=inverse_of, connection=connection, now=now
                 )
 
         else:
+            fence = None
             # reason: the diagnostic the event carries. _detail is a reason kept off the wire
             # (connection_error, BACKLOG #5021); the stored copy is masked until revealed (#2443).
             raw_reason = event.get("_detail") or event.get("detail") or event.get("reason")
             reason = str(raw_reason) if raw_reason is not None else None
 
+            # Only a store that fences takes the writer id; a test double without it still works.
+            raised_by = self._writer_id if _fences(store) else None
+
             def write() -> Awaitable[Any]:
-                return store.upsert_alert_instance(
+                if raised_by is None:
+                    return store.upsert_alert_instance(
+                        event_type=etype,
+                        connection=connection,
+                        severity=severity,
+                        reason=reason,
+                        escalation_tier=escalation_tier,
+                        now=now,
+                    )
+                return cast(_FencedStore, store).upsert_alert_instance(
                     event_type=etype,
                     connection=connection,
                     severity=severity,
                     reason=reason,
                     escalation_tier=escalation_tier,
                     now=now,
+                    raised_by=raised_by,
                 )
 
         settle: Callable[[bool], None] | None = None
@@ -2180,7 +2375,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                     except Exception:
                         log.exception("alert-instance settle callback failed")
 
-        wrapper = self._run_state(write, key, settle, resolves=inverse_of, connection=connection)
+        wrapper = self._run_state(
+            write, key, settle, resolves=inverse_of, connection=connection, fence=fence
+        )
         try:
             task = asyncio.ensure_future(wrapper)
         except RuntimeError:
@@ -2210,9 +2407,13 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         *,
         resolves: str | None = None,
         connection: str = "",
+        fence: _ResolveFence | None = None,
     ) -> None:
         """Run one alert-instance write under its key's lock. ``resolves`` names the alert type an
-        inverse's write resolves; such a write is retried (BACKLOG #3756), an upsert is not."""
+        inverse's write resolves; such a write is retried (BACKLOG #3756), an upsert is not.
+        ``fence`` bounds a resolve to the raises it speaks for (BACKLOG #4916); it begins here,
+        at the task's first step, before the task queues on the lock. A fenced resolve another
+        process's newer raise superseded settles as not landed, with no retry."""
         # BACKLOG #2272 defect 8: each write was its own task, so a slow upsert could land after the
         # resolve emitted behind it and leave a cleared condition open (or the reverse). Each write now
         # holds its key's FIFO lock. Tasks take their first step in the order they were created, so
@@ -2225,6 +2426,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         tried = 0
         task = asyncio.current_task()
         try:
+            if fence is not None:
+                fence.begin()
             async with hold_keyed_lock(self._state_locks, key):
                 for tried in range(1, attempts + 1):
                     try:
@@ -2249,9 +2452,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                         finally:
                             self._retrying.discard(task)
                     else:
-                        landed = True
+                        landed = fence is None or not fence.superseded
                         break
-            if resolves is not None and not landed:
+            if resolves is not None and not landed and not (fence and fence.superseded):
                 log.error(
                     "alert-instance resolve gave up after %d attempt(s): any open %s alert for %r "
                     "stays open",
@@ -2272,6 +2475,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             # Outside the write itself (the key lock's bookkeeping): still never raise.
             log.warning("alert-instance state write failed", exc_info=True)
         finally:
+            if fence is not None:
+                fence.end()
             # A cancel, too, is settled as not landed: the row is most likely still open.
             if on_settled is not None:
                 on_settled(landed)

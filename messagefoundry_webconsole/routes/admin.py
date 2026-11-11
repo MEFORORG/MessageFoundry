@@ -263,12 +263,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         return HTMLResponse(
             pages.user_detail_page(
                 # BACKLOG #1141: a must-change account's page states when its credential dies.
-                admin.user_summary(
+                admin.user_summary_scoped(
                     user,
                     role_ids,
                     credential_expires_at=pending_credential_deadline(service, user),
                     # BACKLOG #1131 (ASVS 6.1.1): this page is users:manage, so it shows the locks.
                     lock_state_at=time.time(),
+                    # And the channel scope, which the summary withholds unless asked (vault
+                    # BACKLOG #3748 item 5).
+                    show_scope=True,
                 ),
                 all_roles,
                 error=error,
@@ -422,7 +425,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 user_id, body=body, request=request, service=service, identity=identity
             )
         except (ValidationError, HTTPException) as exc:
-            if isinstance(exc, HTTPException) and exc.status_code == status.HTTP_404_NOT_FOUND:
+            # 423: the account's record fails its integrity seal (BACKLOG #5520). Raised as is,
+            # never re-rendered: the detail page would show the unchecked row the engine refused.
+            if isinstance(exc, HTTPException) and exc.status_code in (
+                status.HTTP_404_NOT_FOUND,
+                status.HTTP_423_LOCKED,
+            ):
                 raise
             detail = "invalid input" if isinstance(exc, ValidationError) else str(exc.detail)
             return await _user_detail(user_id, service, identity, error=detail, status_code=400)
@@ -551,7 +559,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # Read through the summary, not the record: the console never reads a UserRecord attribute
         # itself, so the seam snapshot covers the field. The role list is not read. A missing user
         # falls through to the handler's own 404. The record is the one read before the guard.
-        summary = None if user is None else admin.user_summary(user, [])
+        summary = None if user is None else admin.user_summary_scoped(user, [], show_scope=True)
         ticked = form.get(CONFIRM_MANUAL_SCOPE_FIELD) == CONFIRM_MANUAL_SCOPE_VALUE
         if not ticked and summary is not None and needs_manual_scope_confirm(summary):
             return await _user_detail(

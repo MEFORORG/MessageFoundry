@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.childenv import python_module_argv
+from messagefoundry.security import audit_all_platforms as audit_module
 from messagefoundry.security.audit_all_platforms import (
     _URL_SCHEMES,
     PUBLISHED_DISTRIBUTIONS,
@@ -1005,22 +1006,269 @@ def test_a_failed_install_check_stops_before_the_audit(tmp_path: Path) -> None:
     assert len(ran) == 1
 
 
-#: Exits 3 when the engine secret arrived, 4 when the control variable did not, 0 otherwise.
+#: Exits 3 when the engine secret arrived, 4 or 5 when a setting pip reads did not, 6 when a
+#: variable nobody listed did, 0 otherwise.
 _ENV_PROBE = (
     "import os, sys; "
     "sys.exit(3 if 'MEFOR_TEST_AUDIT_SECRET' in os.environ "
-    "else 4 if os.environ.get('PIP_TEST_AUDIT_SETTING') != 'kept' else 0)"
+    "else 4 if os.environ.get('PIP_TEST_AUDIT_SETTING') != 'kept' "
+    "else 5 if os.environ.get('HTTPS_PROXY') != 'http://proxy.invalid:3128' "
+    "else 6 if 'ORDINARY_RUNNER_VARIABLE' in os.environ else 0)"
 )
 
 
-def test_an_engine_secret_does_not_reach_pip_or_pip_audit(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The real runner hands its children childenv.non_engine_environment, not the whole environment.
+def test_only_what_pip_reads_reaches_pip_or_pip_audit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The real runner hands its children ``childenv.auditor_environment``, an allowlist, not the
+    whole environment (vault BACKLOG #2587).
 
-    The control, a pip-style setting, must still arrive: pip reads its index and proxy from there.
+    An engine secret does not arrive, and neither does a variable nobody listed, which the old
+    deny-list let through. The controls, a pip setting and a proxy, must still arrive: pip reads
+    its index and proxy from there.
     """
     monkeypatch.setenv("MEFOR_TEST_AUDIT_SECRET", "marker-not-a-secret")
     monkeypatch.setenv("PIP_TEST_AUDIT_SETTING", "kept")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setenv("ORDINARY_RUNNER_VARIABLE", "marker-not-a-secret")
     assert _run([sys.executable, "-c", _ENV_PROBE]) == 0
+
+
+def test_a_name_the_caller_passes_reaches_pip_and_pip_audit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--pass-environment`` is how a keyring backend's variable reaches them. The control is the
+    same run without it, where the same variable does not arrive."""
+    monkeypatch.setenv("ORDINARY_RUNNER_VARIABLE", "marker-not-a-secret")
+    probe = "import os, sys; sys.exit('ORDINARY_RUNNER_VARIABLE' not in os.environ)"
+    assert _run([sys.executable, "-c", probe], pass_environment=("ORDINARY_RUNNER_VARIABLE",)) == 0
+    assert _run([sys.executable, "-c", probe]) == 1
+
+
+def test_main_hands_each_pass_environment_name_to_both_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no runner given, ``main`` starts the install check and the audit with the names."""
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    seen: list[tuple[str, ...]] = []
+
+    def fake_run(cmd: list[str], *, pass_environment: tuple[str, ...] = ()) -> int:
+        seen.append(pass_environment)
+        return 0
+
+    monkeypatch.setattr(audit_module, "_run", fake_run)
+    names = ["--pass-environment", "KEYRING_A", "--pass-environment", "KEYRING_B"]
+    assert main([*names, str(src)]) == 0
+    assert seen == [("KEYRING_A", "KEYRING_B")] * 2
+
+
+@pytest.mark.parametrize("name", ["MEFOR_STORE_KEY", "mefor_store_password", "VAULT_TOKEN"])
+def test_a_pass_environment_naming_an_engine_variable_is_refused(
+    name: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    ran, run = _recorder(0)
+    assert main(["--pass-environment", name, str(src)], run=run) == 2
+    assert not ran
+    assert name in capsys.readouterr().err
+
+
+def test_a_pass_environment_entry_that_is_not_a_name_is_refused_without_its_value(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``NAME=value`` typed by mistake would put the value in the job log (vault BACKLOG #2600)."""
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    ran, run = _recorder(0)
+    for entry in ("MEFOR_STORE_KEY=marker-not-a-key", "KEYRING_A=marker-not-a-key", " KEYRING_A"):
+        assert main(["--pass-environment", entry, str(src)], run=run) == 2
+        err = capsys.readouterr().err
+        assert "not an environment variable name" in err
+        assert "marker-not-a-key" not in err
+    assert not ran
+
+
+def test_a_pass_environment_naming_a_console_variable_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A child started with ``PYTHONINSPECT`` waits at a prompt, so the audit would hang."""
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    ran, run = _recorder(0)
+    assert main(["--pass-environment", "PYTHONINSPECT", str(src)], run=run) == 2
+    assert not ran
+    assert "to a console" in capsys.readouterr().err
+
+
+def test_a_pass_environment_after_the_lock_is_refused_by_name(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    ran, run = _recorder(0)
+    assert main([str(src), "--pass-environment", "KEYRING_A"], run=run) == 2
+    assert not ran
+    assert "goes before the lock" in capsys.readouterr().err
+
+
+#: The value each case below types, asserted absent from everything the auditor prints.
+_SECRET = "marker-not-a-key"
+
+
+@pytest.mark.parametrize(
+    ("after", "position", "reason"),
+    [
+        ([f"--pass-environment=KEYRING_A={_SECRET}"], 1, "own option"),
+        ([f"--pass-env=KEYRING_A={_SECRET}"], 1, "own option"),
+        ([f"--skip-private=idna={_SECRET}"], 1, "own option"),
+        (["--pass-env", f"KEYRING_A={_SECRET}"], 1, "own option"),
+        (["--pas", "KEYRING_A"], 1, "own option"),
+        (["--skip-p", "idna"], 1, "own option"),
+        ([f"--p=KEYRING_A={_SECRET}"], 1, "holds '='"),
+        ([f"--pa=KEYRING_A={_SECRET}"], 1, "holds '='"),
+        ([f"--PASS-ENVIRONMENT=KEYRING_A={_SECRET}"], 1, "holds '='"),
+        ([f"-pass-environment=KEYRING_A={_SECRET}"], 1, "holds '='"),
+        ([f"--env=KEYRING_A={_SECRET}"], 1, "holds '='"),
+        (["--desc", f"KEYRING_A={_SECRET}"], 2, "holds '='"),
+        # An abbreviation in the = form is refused rather than resolved.
+        ([f"--out=KEYRING_A={_SECRET}"], 1, "holds '='"),
+        # A flag in the = form: argparse's "ignored explicit argument" error quotes the value.
+        ([f"--strict={_SECRET}"], 1, "holds '='"),
+        ([f"--help={_SECRET}"], 1, "is not passed on"),
+        ([f"-S={_SECRET}"], 1, "holds '='"),
+        # A fixed-form value holding "=": its "invalid choice" error quotes the value.
+        ([f"--format=json={_SECRET}"], 1, "holds '='"),
+        ([f"-f=json={_SECRET}"], 1, "holds '='"),
+    ],
+)
+def test_a_word_after_the_lock_that_pip_audit_would_quote_is_refused_unquoted(
+    after: list[str],
+    position: int,
+    reason: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """After the lock, argparse hands every word to pip-audit, whose usage error quotes a word it
+    does not take, or its value, whole, so ``NAME=value`` typed there in any spelling would carry
+    the value into a CI log. This auditor's own options go before the lock, and any other word
+    holding ``=`` must be a pip-audit option that takes a value, named in full: pip-audit never
+    starts, and the refusal names the word's position, not the word."""
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    ran, run = _recorder(0)
+    assert main([str(src), *after], run=run) == 2
+    assert not ran
+    out, err = capsys.readouterr()
+    assert f"word {position} after the lock" in err
+    assert reason in err
+    assert _SECRET not in out + err
+
+
+@pytest.mark.parametrize(
+    "word",
+    [
+        "--dry-run",
+        "--dry",
+        "--d",
+        "-d",
+        "-vd",
+        "--fix",
+        "--fi",
+        "--help",
+        "--he",
+        "-h",
+        "--version",
+        "--vers",
+        "-V",
+        "-lV",
+        "--dry-run=yes",
+    ],
+)
+def test_a_dry_run_fix_help_or_version_word_is_refused_after_the_lock(
+    word: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Each word listed here, put third after the lock, is refused with exit 2 and a refusal that
+    names word 3 after the lock, and pip-audit never starts."""
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    ran, run = _recorder(0)
+    assert main([str(src), "--desc", "on", word], run=run) == 2
+    assert not ran
+    err = capsys.readouterr().err
+    assert "word 3 after the lock is not passed on" in err
+
+
+def test_pip_audits_own_options_still_pass_through_after_the_lock(tmp_path: Path) -> None:
+    """The control for the refusal above, with an invocation pip-audit 2.10.1 accepts beside the
+    ``-r``, ``--desc``, ``--disable-pip`` and ``--strict`` the auditor gives it: options in the
+    ``=`` form, long and short, a free-text value that holds ``=``, and ``--skip``, pip-audit's
+    own abbreviation of ``--skip-editable``."""
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    ran, run = _recorder(0)
+    passed = [
+        "--progress-spinner=off",
+        "--timeout=30",
+        "-f=json",
+        "-o=report.json",
+        "--index-url=https://index.invalid/simple?a=b",
+        "--skip",
+        "--ignore-vuln",
+        "GHSA-0000-0000-0000",
+    ]
+    assert main([str(src), *passed], run=run) == 0
+    assert ran[-1][-len(passed) :] == passed
+
+
+@pytest.mark.parametrize(
+    "words",
+    [
+        # argparse's own "unrecognized arguments" line.
+        [f"--pass-enviroment=KEYRING_A={_SECRET}", "LOCK"],
+        [f"--Pass-Environment=KEYRING_A={_SECRET}", "LOCK"],
+        ["--pass-enviroment=K=marker", f"--pass-enviroment=K=marker{_SECRET}", "LOCK"],
+        # argparse's "ignored explicit argument" error quotes only the value, as a repr.
+        [f"--help=K={_SECRET}", "LOCK"],
+        # A word with a space is read as the lock.
+        [f"--pass-enviroment=K={_SECRET} b", "LOCK"],
+        # The flag forgotten: NAME=value is read as the lock, a "/" in it included, which a path
+        # normalises past anything a substring match could find.
+        [f"KEYRING_A={_SECRET}", "LOCK"],
+        [f"PIP_INDEX_URL=https://user:{_SECRET}@host.invalid/simple/", "LOCK"],
+        [f"PIP_INDEX_URL=https://user:{_SECRET}@host.invalid//simple/"],
+        # A package name canonical_name would rewrite.
+        [f"--skip-private=idna=KEY_{_SECRET}", "LOCK"],
+    ],
+)
+def test_nothing_the_auditor_prints_holds_a_value_typed_before_the_lock(
+    words: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A word holding ``=`` before the lock is refused unquoted wherever it lands: argparse's own
+    usage error quotes nothing once such a word is given, and a lock path or ``--skip-private``
+    entry holding ``=`` is refused before any line prints it (vault BACKLOG #2600)."""
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    ran, run = _recorder(0)
+    argv = [str(src) if word == "LOCK" else word for word in words]
+    status: int | str | None
+    try:
+        status = main(argv, run=run)
+    except SystemExit as stopped:
+        status = stopped.code
+    assert status == 2
+    assert not ran
+    out, err = capsys.readouterr()
+    assert err
+    assert _SECRET not in out + err
+
+
+def test_an_unreadable_lock_is_named_through_safe_exc(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The ``OSError`` is printed with ``safe_exc``, which names its type, not the raw text."""
+    assert main([str(tmp_path / "missing.lock")], run=_recorder(0)[1]) == 2
+    err = capsys.readouterr().err
+    assert "not readable: FileNotFoundError" in err
 
 
 def test_a_relative_pythonpath_entry_does_not_reach_pip_or_pip_audit(

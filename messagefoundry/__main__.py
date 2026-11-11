@@ -3188,8 +3188,9 @@ def _serve(args: argparse.Namespace) -> int:
     # the ADR 0173 revocation attestation with its reason, where it suppresses a refusal; at least the
     # bind gates' and raw-TCP guard's tls_hop_attested line, and the database weakened-TLS line that a
     # DatabaseRef source also writes, without the reason),
-    # and all of them completely by `messagefoundry check` and GET /security/posture, which both have
-    # the graph.
+    # and all of them completely by GET /security/posture, which has the graph. `messagefoundry
+    # check` has it too and reports all but an HTTP listener's trusted_proxies (BACKLOG #5525),
+    # whose ranges the listener logs as it is built.
     # The store is NOT open yet either, so the #1008 store-principal privilege OBSERVATION is passed as
     # None for the same reason and with the same discipline: it is reported moments later by the
     # preflight's own log line + audit row once the lifespan opens the store, and completely by
@@ -3235,10 +3236,10 @@ def _serve(args: argparse.Namespace) -> int:
             "url_query_credential, "
             "generic-ODBC "
             "database TLS, tls_hop_attested, tls_revocation_attested (ADR 0173), FHIR update_url_form "
-            "and http ECH sidecar (ADR 0139) declarations are NOT in this list — the graph is not "
-            "loaded yet; they are "
-            "reported by `messagefoundry check` and GET /security/posture, and most also by the "
-            "connector construction gate. Nor is the store-principal privilege observation (#1008) — the "
+            "and http ECH sidecar (ADR 0139) declarations, and an HTTP listener's trusted_proxies, "
+            "are NOT in this list — the graph is not loaded yet; they are "
+            "reported by GET /security/posture, all but the last by `messagefoundry check`, and "
+            "most also by the connector construction gate. Nor is the store-principal privilege observation (#1008) — the "
             "store is not open yet; the startup preflight logs and audits it moments from now.",
             len(_loosenings),
             "; ".join(f"{name} ({risk})" for name, risk in _loosenings),
@@ -5561,6 +5562,8 @@ def _supervise(args: argparse.Namespace) -> int:
             env=args.env,
             service_config=args.service_config,
             project_root=args.project_root,
+            # BACKLOG #3314: the cap for the supervisor's own CRL reload, as an engine shard's.
+            crl_max_reloads=settings.cert_monitor.crl_max_reloads,
             registry_guard=_chain_registry_guards(
                 refuse_keep_forever_overrides,
                 _fleet_connection_key_file_refusal(
@@ -7334,8 +7337,10 @@ def _discard_minted_custody(
     open wrote nothing under it: the store id pin refused before the open's first write
     (:class:`~messagefoundry.store.store.StoreIdPinRefusedBeforeWrite`; a pin refusal raised later,
     once the salt bind may have run, does not count), a server create batch that failed before its
-    commit (:class:`~messagefoundry.store.store.StoreCreateBatchFailedBeforeKeyUse`, PR 2804 hold
-    17), or a SQLite store whose file was never made.
+    commit, or a server open that failed building its pool with a class only a failed dial raises
+    (:class:`~messagefoundry.store.store.StoreCreateBatchFailedBeforeKeyUse`, PR 2804 hold 17 and
+    vault BACKLOG #8119 item 2; any other failure before the pin check, a ``RuntimeError``
+    included, keeps the key), or a SQLite store whose file was never made.
 
     Otherwise the file is kept, and the warning names it and says to keep it and the recovery key
     shown, deleting neither: the store may hold data sealed under it, and no check this run or an
@@ -8948,9 +8953,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
     if settings is None:
         return _emit_error(detail or "could not load the service settings", as_json=args.json)
 
-    # AC-15: the argument checks, before the prompt and before any open. The limits are the web
-    # console's (`UserCreateRequest`), so this offline surface admits nothing the console refuses,
-    # and the address limit is the one `admin-set-notify-email` applies.
+    # AC-15: the argument checks, before the prompt and before any open. The length limits are the
+    # web console's (`UserCreateRequest`), and the address limit is the one `admin-set-notify-email`
+    # applies. The new-username rule (BACKLOG #5521, `auth/usernames.py`) is NOT applied here: this
+    # trims the name rather than refusing white space at either end, and admits a control character
+    # and the audit trail's synthetic actor forms, which `POST /users` refuses. `POST
+    # /users/directory` and an AD sign-in that creates its mirror row do not apply it either.
     username = args.username.strip()
     if not username:
         return _emit_error(_BLANK_USERNAME_REFUSAL, as_json=args.json)
@@ -9018,7 +9026,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # before any store is opened; `_build_provision_auth_service` says why.
     from messagefoundry.auth.policy import _common_passwords
     from messagefoundry.auth.trust_anchors import TrustAnchorError
-    from messagefoundry.config.settings import StoreBackend, hop_posture_from_ai
+    from messagefoundry.config.settings import SchemaManagement, StoreBackend, hop_posture_from_ai
     from messagefoundry.config.tls_policy import InsecureHopRefused
     from messagefoundry.store.base import StoreNotFoundError, build_store_cipher
     from messagefoundry.store.crypto import CipherError, StoreKeylessError
@@ -9065,13 +9073,15 @@ def _provision_admin(args: argparse.Namespace) -> int:
         the prompts, as the ordinary pre-check's do."""
         return await server_store_found() != "held"
 
-    async def no_store_anywhere() -> Literal["none"]:
+    async def no_store_anywhere(missing: StoreNotFoundError) -> Literal["none"]:
         """``none`` once the server database's catalog shows no table under a store table name in
         the schemas the open resolves (PR 2804 fourteenth and fifteenth holds). An open's "no
         store" is only what its login may see there, so a store it cannot see reads the same.
-        Raises :class:`HostCustodyRefused` for such a table there, whoever made it, and for a
-        catalog it cannot show, a search_path it cannot
-        read included: neither is minted over. What the catalog read cannot see, at least, is in
+        Raises :class:`HostCustodyRefused` for at least such a table there, whoever made it, a
+        catalog it cannot show, a search_path it cannot read included, and, after those, no store
+        schema this login resolves under external schema management, which the create would not
+        build, quoting ``missing``, the read-only open's refusal (vault BACKLOG #8119 item 1): none
+        is minted over. What the catalog read cannot see, at least, is in
         :func:`~messagefoundry.store.base.server_store_schema_found_anywhere`."""
         from messagefoundry.store import base as store_base
         from messagefoundry.store.base import store_connect_errors, store_driver_errors
@@ -9115,6 +9125,19 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 "grant this login the store's schema if they are a store it cannot reach, then "
                 "run the command again"
             )
+        if settings.store.resolved_schema_management() is SchemaManagement.EXTERNAL:
+            # The create open runs no DDL under external schema management, so over a database
+            # with no store schema it would refuse only after the recovery key was shown and
+            # proved (vault BACKLOG #8119 item 1). Refused here instead, before the prompts.
+            # The read-only open's own refusal is kept whole: it names the schema setting and the
+            # grant that hide a store provisioned elsewhere, which provision-schema cannot fix.
+            raise HostCustodyRefused(
+                "this login resolves no store schema, and [store].schema_management is 'external' "
+                "(the default on a server store), under which this command builds none, so no key "
+                f"was minted. {_sentence(missing)} Under the host key provider, serve does not "
+                "build a store before its key exists: under 'auto' this command builds it as it "
+                "mints. Then run the command again"
+            )
         return "none"
 
     async def server_store_found() -> Literal["none", "empty", "held"]:
@@ -9143,8 +9166,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
                 custody=throwaway,
             )
-        except StoreNotFoundError:
-            return await no_store_anywhere()
+        except StoreNotFoundError as missing:
+            return await no_store_anywhere(missing)
         except (StoreIdPinRefused, CipherError):
             return "held"
         try:
@@ -9515,6 +9538,24 @@ def _provision_admin(args: argparse.Namespace) -> int:
         print(
             "The recovery key was entered back and opens the store key. Keep that copy off this "
             "host: this engine never shows it again.",
+            file=sys.stderr,
+        )
+        # Vault BACKLOG #8119 item 9: this shell's environment chose the custody directory, and
+        # the service reads its own, so the line names what the service must see. The variable is
+        # named as a literal: this text reaches stderr (keep_the_key_step says why).
+        import os
+
+        from messagefoundry.engine_secrets import SECRETS_DIRECTORY_VARIABLE
+
+        where = (
+            f"MEFOR_SECRETS_DIRECTORY set to {minted.path.parent}"
+            if os.environ.get(SECRETS_DIRECTORY_VARIABLE, "").strip()
+            else "MEFOR_SECRETS_DIRECTORY unset, so that it looks beside the SQLite store file"
+        )
+        print(
+            f"The store key was written to {minted.path}. The service looks for it in the custody "
+            f"directory its own environment names; here that came from {where}. A service whose "
+            "environment names another custody directory does not find it, and refuses to start.",
             file=sys.stderr,
         )
 
@@ -11078,8 +11119,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
     try:
         active_key = resolve_active_key(settings.store, posture=posture)
     except _key_unresolved() + (ValueError,) as exc:
-        # KeyProviderError: a non-default [store].key_provider that is unknown or not-yet-built (an
-        # external HSM/KMS/Vault provider) — fail closed with a clean exit-2, not a traceback (ADR 0019).
+        # KeyProviderError: a non-default [store].key_provider that is unknown, or an external
+        # provider that cannot load or resolve — fail closed with a clean exit-2, not a traceback
+        # (ADR 0019).
         #
         # ValueError (vault BACKLOG #3247): under key_provider=vault the Vault client build can
         # refuse with a bare one, which reached the dispatch floor and exited 1, an aborted
@@ -12863,7 +12905,8 @@ def _security(args: argparse.Namespace) -> int:
                 "cleartext_accepted, tls_allow_expired, tls_check_hostname, url_query_credential, "
                 "generic-ODBC database TLS, "
                 "tls_hop_attested, "
-                "tls_revocation_attested, FHIR update_url_form and http ECH sidecar declarations are "
+                "tls_revocation_attested, FHIR update_url_form, http ECH sidecar and HTTP listener "
+                "trusted_proxies declarations are "
                 "NOT included, and neither are the store-principal privilege and audit-chain keying "
                 "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
                 "GET /security/posture reports both). Nor are the engine process's remote-debugging "

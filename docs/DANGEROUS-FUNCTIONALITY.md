@@ -407,8 +407,8 @@ and the builders, and a test checks that each module named calls each builder na
   through either.
   No other variable reaches these starts.
 - The sandbox worker, in `pipeline/sandbox.py`, gets an allowlist (`worker_environment`): the
-  platform's start-up names, the interpreter's own variables, the engine switches its own code
-  reads, and the names `[sandbox].pass_environment` lists. No other inherited variable crosses. On
+  platform's start-up names, the interpreter's own variables, and the names
+  `[sandbox].pass_environment` lists. No other inherited variable crosses, and no `MEFOR_*` one. On
   Linux with `[sandbox].mem_mb` set, the engine also sets `MALLOC_ARENA_MAX=2` where the operator
   passed none.
 - The disaster-recovery hook, in `pipeline/dr.py`, gets an allowlist (`hook_environment`), which
@@ -424,11 +424,12 @@ and the builders, and a test checks that each module named calls each builder na
   `OPENSSL_ENGINES`. No other
   variable reaches them, and no Python variable, since `openssl` is not Python. Both start
   through one call, so they find the same `openssl` on the same `PATH`.
-- The `pip` and `pip-audit` starts in `security/audit_all_platforms.py` get everything outside
-  the engine's `MEFOR_*` namespace, less the few secret names the module lists outside it and any
-  empty or relative `PYTHONPATH` entry (`non_engine_environment` over `engine_environment`). So
-  they keep the index, proxy and certificate settings they read from the environment, and any
-  other variable the runner set, a CI token among them, reaches them too.
+- The `pip` and `pip-audit` starts in `security/audit_all_platforms.py` get an allowlist
+  (`auditor_environment`): what a Python child needs to start, as the sandbox worker gets it, less
+  any empty or relative `PYTHONPATH` entry; pip's own `PIP_*` variables; and the proxy,
+  certificate, `NETRC` and XDG folder variables that pip and pip-audit read to reach an index;
+  and each name the auditor's `--pass-environment` lists, which refuses an engine variable. No
+  other variable is in their environment, a CI token or an engine secret among them.
 
 At least these pass on the environment they run with, on purpose: `checks.py`, which adds one
 variable, and the tray's opens, where starting VS Code drops the two variables VS Code's own
@@ -537,13 +538,11 @@ pure-Python equivalent:
   `consume_handoff_file` opens it with DELETE as well, and once the service has converted it,
   deletes it through that same handle with `kernel32`'s `SetFileInformationByHandle`, POSIX
   semantics first and the classic disposition where the volume has none
-  (`restricted_file.delete_through_handle`), so the file deleted is the file read. Nothing calls
-  these yet. On Linux it opens the file with
-  `O_NOFOLLOW` and reads its mode, owner, group and POSIX access control list from the open
-  descriptor. It asks for that descriptor's file system through
-  `restricted_file.linux_file_system_type` (`fstatfs64`, or `fstatfs` where the C library has no
-  `fstatfs64`), and refuses any file system not on the allowlist for that kind of file. Any other
-  POSIX host opens none of these files
+  (`restricted_file.delete_through_handle`), so the file deleted is the file read. On Linux it
+  opens the file with `O_NOFOLLOW` and reads its mode, owner, group and POSIX access control list
+  from the open descriptor. It asks for that descriptor's file system through
+  `restricted_file.linux_file_system_type` (below), and refuses any file system not on the
+  allowlist for that kind of file. Any other POSIX host opens none of these files
 - Path checks: `tray/actions.py`, which asks `kernel32`'s `GetDriveTypeW` whether the drive letter
   of `log_path` or `repo_path` is a mapped network drive. It asks each time the tray menu is built,
   and again before View Log opens the file, so it can refuse one before touching it. And
@@ -551,7 +550,8 @@ pure-Python equivalent:
   best-effort remote-path check on a generic ODBC file keyword (BACKLOG #2705)
 - Process and job control: `proctree.py`, which kills a child together with every process it
   started. Where it cannot set up the job or signal the group, its callers fall back to killing
-  only the child, and a failed job setup or group signal logs a WARNING. The sandbox worker and the disaster-recovery takeover hook use it. On Windows it puts
+  only the child, and a failed job setup or group signal logs a WARNING. The sandbox worker and
+  the disaster-recovery takeover hook use it. On Windows it puts
   the child in a `kernel32` job object that ends the whole tree. The takeover hook starts
   suspended, so it joins the job before it can start anything, and `ntdll`'s `NtResumeProcess`
   then lets it run (vault BACKLOG #2622). POSIX needs no `ctypes` for this; the child leads its
@@ -561,8 +561,8 @@ pure-Python equivalent:
   link or junction, `GetFileInformationByHandleEx` to refuse a part that is one, and
   `GetFinalPathNameByHandleW` to confirm where the file it opened really is (BACKLOG #2507, #2535).
   It then moves and deletes the file through that handle with `SetFileInformationByHandle`, so the
-  act cannot be redirected after the check. POSIX needs no `ctypes` for this; it opens each path part
-  with `O_NOFOLLOW` and acts relative to the opened directory. The disaster-recovery backup's
+  act cannot be redirected after the check. POSIX needs no `ctypes` for this; it opens each path
+  part with `O_NOFOLLOW` and acts relative to the opened directory. The disaster-recovery backup's
   staging fail-safe, which empties the files a failed backup left in its staging directory, calls
   these same helpers on Windows rather than `ctypes` of its own. It holds each directory, opens each
   file as itself, and refuses a link or junction. It confirms that file lies under the staging
@@ -753,7 +753,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 
 | Why it is left out | Modules |
 |---|---|
-| It reads rows or files the engine wrote itself: its store, the key custody host blob and the recovery wrap kept in its store (no command reads a wrap from an archive yet), audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches | `store/metadata.py`, `store/crypto.py`, `store/custody.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py`, `pipeline/security_signals.py` |
+| It reads rows or files the engine wrote itself: its store, the key custody host blob and the recovery wrap kept in its store (no command reads a wrap from an archive yet), audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches | `store/metadata.py`, `store/crypto.py`, `store/custody.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/audit_visibility.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py`, `pipeline/security_signals.py` |
 | It reads the responses the engine's own HTTP server writes | `api/protocol_headers.py`, `api/protocol_floor_selftest.py` |
 | It reads what an operator supplies: service settings, the code sets in the config directory and edits to them, private key files, command-line JSON, the install's package metadata, a restore token file, the trust anchor files it chooses to trust, a systemd credential and a recovery key a person types | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `cli_common.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py`, `store/custody.py` |
 | It reads a hashed requirements lock from the repository being checked, never a received message: the engine's own locks in `security.yml`, a released line's lock at the tag a release names, an adopter's `requirements.lock` in the `audit-pin` job `messagefoundry-toolkit init` generates, or a lock a person names when running it by hand. On a pull request run the lock comes from whoever opened the pull request, and so do the workflow and the script that read it. It decodes the file as pip does, so a coding declaration in the lock picks the codec, which can be any text codec this Python knows; a declaration naming a codec that is not a text codec, such as `zlib`, `hex` or `rot13`, is refused. It splits each requirement line into its pin, marker, options and comment, to write a copy with the markers removed for `pip-audit`. It is a command run in CI or by hand; the engine never calls it. | `security/audit_all_platforms.py` |
@@ -853,8 +853,10 @@ or compression library:
   connector's ceiling, `max_decompressed_bytes`, defaults to 64 MiB; setting it to `0` turns it off.
   A connection with `decompress=` set and that ceiling off logs one warning when it is built.
   Its gzip member cap, `max_decompressed_members`, defaults to 1024 and cannot be turned off.
-  A zip is refused whole for too many members, duplicate or overlapped members, or bytes before or
-  after the archive. Each member's name must be a safe relative path, and its bytes must match the
+  A zip is refused whole for at least too many members, duplicate or overlapped members, bytes
+  before or after the archive, or an entry compressed with any method but STORED or DEFLATED. The
+  ceiling holds as it goes only for those two methods, because stdlib `zipfile` does not bound one
+  read's output for the others (BACKLOG #5535). Each member's name must be a safe relative path, and its bytes must match the
   type its extension names. Members come back as bytes in memory; this module writes no file.
 - `parsing/dicom/_inflate.py` bounds a deflated DICOM object's inflate before `pydicom` reads it,
   because `pydicom` would otherwise inflate the whole stream with no limit.

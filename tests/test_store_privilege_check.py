@@ -198,6 +198,37 @@ async def test_a_clean_login_raises_no_alert() -> None:
     assert sink.cleared == ["store:CORP\\mefor-svc$@MessageFoundry"]
 
 
+@pytest.mark.parametrize(
+    "report",
+    [
+        _unobservable_report(),
+        _sysadmin_report(),
+        # An unread grant with the principal named: still not a clean read, so nothing is cleared.
+        StorePrivilegeReport(
+            backend=StoreBackend.SQLSERVER,
+            status=StorePrivilegeStatus.UNOBSERVABLE,
+            principal="CORP\\mefor-svc$",
+            database="MessageFoundry",
+            detail="the privilege query returned NULL for 1 of 19 probed grant(s)",
+        ),
+    ],
+    ids=["unobservable-bare", "over-granted", "unobservable-named"],
+)
+async def test_only_a_clean_observed_start_clears_any_warning(
+    report: StorePrivilegeReport,
+) -> None:
+    """Only a clean OBSERVED read resolves a warning: a start that did not observe a clean principal
+    clears nothing."""
+    sink = _RecordingSink()
+    await run_store_privilege_preflight(
+        _store(report),
+        require_least_privilege=False,
+        enforcing=False,
+        alert_sink=sink,
+    )
+    assert sink.cleared == []
+
+
 async def test_sqlite_raises_no_alert() -> None:
     sink = _RecordingSink()
     report = StorePrivilegeReport(

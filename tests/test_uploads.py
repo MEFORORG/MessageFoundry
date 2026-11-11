@@ -350,8 +350,10 @@ async def test_concurrent_uploads_cannot_double_book_the_quota(
 
     real_scan = store._scan_metas_sync
 
-    def _slow_scan(held: list[Any] | None = None) -> list[UploadedFileMeta]:
-        out = real_scan(held)
+    def _slow_scan(
+        held: list[Any] | None = None, *, outage_raises: bool = False
+    ) -> list[UploadedFileMeta]:
+        out = real_scan(held, outage_raises=outage_raises)
         time.sleep(0.05)  # widen the window so an unlocked check-then-write WOULD lose the race
         return out
 
@@ -692,11 +694,13 @@ async def test_a_stuck_sweep_that_deleted_nothing_logs_no_audit_gap(
     paused, release, scanned = threading.Event(), threading.Event(), threading.Event()
     real_scan = store._scan_metas_sync
 
-    def _stuck_scan(held: list[Any] | None = None) -> list[UploadedFileMeta]:
+    def _stuck_scan(
+        held: list[Any] | None = None, *, outage_raises: bool = False
+    ) -> list[UploadedFileMeta]:
         paused.set()
         release.wait(timeout=10)
         try:
-            return real_scan(held)
+            return real_scan(held, outage_raises=outage_raises)
         finally:
             scanned.set()
 
@@ -814,7 +818,7 @@ async def test_a_pair_another_pass_already_removed_is_not_reported_twice(tmp_pat
     await store.save(data=b"aging\n", filename="a.txt", uploader="op", uploader_id="u-op")
     seen = store._scan_metas_sync()
     first = await store.prune_expired(now=time.time() + 31 * 86_400)
-    store._scan_metas_sync = lambda held=None: seen  # type: ignore[method-assign]
+    store._scan_metas_sync = lambda held=None, *, outage_raises=False: seen  # type: ignore[method-assign]
     second = await store.prune_expired(now=time.time() + 31 * 86_400)
 
     assert len(first.pruned) == 1

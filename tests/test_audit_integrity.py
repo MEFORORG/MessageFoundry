@@ -41,6 +41,7 @@ from messagefoundry.store.store import (
     AUDIT_KEY_EPOCH_ACTION,
     AUDIT_PREFIX_BREAK_MARKER,
     AuditAnchorError,
+    AuditVerdict,
     audit_prefix_verdict,
     audit_row_hash,
     parse_audit_anchor,
@@ -1486,14 +1487,21 @@ class _EngineLogCapture:
 
 
 async def _verify_on_start(
-    db: Path, anchor_file: Path | None
+    db: Path, anchor_file: Path | None, verdict: AuditVerdict | None = None
 ) -> tuple[_AnchorRecordingSink, _EngineLogCapture]:
     """Run ONLY the startup audit check against `db`, returning the sink and the log lines.
 
     The method rather than `start()`: `start()` also brings up recovery, the coordinator and the
     graph, none of which this behaviour depends on. The `start()`-level gating is pinned separately.
+    A ``verdict`` stubs the walk out, so the check classifies exactly that verdict.
     """
     store = await MessageStore.open(db)
+    if verdict is not None:
+
+        async def fake_verify(**_kwargs: object) -> AuditVerdict:
+            return verdict
+
+        store.verify_audit_chain = fake_verify  # type: ignore[method-assign]
     sink = _AnchorRecordingSink()
     eng = Engine(
         store,
@@ -1512,19 +1520,16 @@ async def _verify_on_start(
 
 
 def test_prefix_break_marker_appears_in_a_real_prefix_failure() -> None:
-    """The marker the engine classifies on must be what the comparator actually emits.
+    """The marker is the phrase the comparator actually emits, and no break's own text.
 
-    `verify_audit_chain` folds a chain break and a prefix failure into one `(ok, message)` pair and
-    returns on the break FIRST, so a caller holding only `ok=False` cannot say which fired. The engine
-    separates them by substring. That seam is weak by nature -- this test is what stops it rotting
-    unobserved, by failing the day the message is reworded rather than the day an operator gets a
-    truncation filed as a chain break.
+    The engine no longer classifies on it (vault BACKLOG #3054, item 11): it reads
+    `AuditVerdict.prefix_break`, pinned by the tests below, because a break's message can quote a
+    database value that carries the phrase. The phrase stays the operator-facing text of a
+    truncation, so it is still held to that.
     """
     ok, msg = audit_prefix_verdict((3, "a" * 64), None, 2)
     assert ok is False
     assert msg is not None and AUDIT_PREFIX_BREAK_MARKER in msg
-    # And it must NOT match the other verdict, or the discriminator calls everything a truncation.
-    assert AUDIT_PREFIX_BREAK_MARKER not in "audit chain broken at row id=4"
 
 
 async def test_startup_anchor_passes_when_the_log_only_grew(tmp_path: Path) -> None:
@@ -1597,6 +1602,113 @@ async def test_startup_chain_break_keeps_its_own_alert_subject(tmp_path: Path) -
     assert subject == "audit-chain", "a chain break was filed under the truncation subject"
     assert "broken at seq=2, row id=2" in reason
     assert "chain break" in cap.text, cap.records
+
+
+async def _averify_with_prefix(db: Path, prefix: str) -> AuditVerdict:
+    """``verify_audit_chain`` over ``db`` with ``prefix`` (an anchor's ``COUNT:HEAD``) as the prefix."""
+    store = await MessageStore.open(db)
+    try:
+        return await store.verify_audit_chain(expected_prefix=parse_audit_anchor(prefix))
+    finally:
+        await store.close()
+
+
+async def test_the_walk_sets_prefix_break_on_a_cut_tail_and_never_on_a_break(
+    tmp_path: Path,
+) -> None:
+    """The flag the engine classifies on comes from the comparator, not from the message (vault
+    BACKLOG #3054, item 11). A cut tail sets it; the exact seal over the same cut does not; an
+    edited row WITH a cut tail does not either, because a break outranks it."""
+    db = tmp_path / "flag.db"
+    await _aseed_audit_rows(db, 5)
+    anchor = await _aread_anchor(db)
+    assert (await _averify_with_prefix(db, anchor))[0]  # precondition: the anchor fits
+
+    await _atruncate_audit_tail(db, keep=2)
+    cut = await _averify_with_prefix(db, anchor)
+    assert not cut[0] and cut.prefix_break, cut
+    # Control: the exact seal sees the same cut, and it is not the prefix comparator.
+    store = await MessageStore.open(db)
+    try:
+        sealed = await store.verify_audit_chain(expected_anchor=parse_audit_anchor(anchor))
+    finally:
+        await store.close()
+    assert not sealed[0] and not sealed.prefix_break, sealed
+
+    edited = tmp_path / "edited.db"
+    await _aseed_audit_rows(edited, 4)
+    anchor = await _aread_anchor(edited)
+    with contextlib.closing(sqlite3.connect(edited)) as conn:
+        conn.execute("UPDATE audit_log SET actor='HACKED' WHERE id=2")
+        conn.commit()
+    await _atruncate_audit_tail(edited, keep=3)  # alone, this would fail the comparator
+    broken = await _averify_with_prefix(edited, anchor)
+    assert not broken[0] and "broken at seq=2" in (broken[1] or ""), broken
+    assert not broken.prefix_break, broken
+
+
+async def _subject_for_verdict(tmp_path: Path, verdict: AuditVerdict) -> str:
+    """The alert subject the startup check files ``verdict`` under, with the walk stubbed out."""
+    sink, _cap = await _verify_on_start(tmp_path / "stub.db", None, verdict)
+    assert len(sink.events) == 1, sink.events
+    return sink.events[0][0]
+
+
+async def test_startup_check_classifies_truncation_by_the_flag_not_the_text(
+    tmp_path: Path,
+) -> None:
+    """Vault BACKLOG #3054, item 11: the subject follows ``prefix_break``, never a substring.
+
+    Both halves fail on the substring classifier: a chain-break reason that quotes the prefix phrase
+    was filed as a truncation, and a truncation whose text lacks the phrase as a chain break. The
+    control is a verdict whose flag and text agree, which both classifiers file the same way.
+    """
+    quoting = AuditVerdict(
+        False, f"audit chain broken at seq=2, row id=2 (a row says it {AUDIT_PREFIX_BREAK_MARKER})"
+    )
+    assert await _subject_for_verdict(tmp_path, quoting) == "audit-chain"
+
+    reworded = AuditVerdict(False, "audit log tail was cut", prefix_break=True)
+    assert await _subject_for_verdict(tmp_path, reworded) == "audit-chain-truncated"
+
+    agreed = AuditVerdict(False, f"audit log {AUDIT_PREFIX_BREAK_MARKER}", prefix_break=True)
+    assert await _subject_for_verdict(tmp_path, agreed) == "audit-chain-truncated"
+
+
+async def test_a_plain_tuple_verdict_files_a_chain_break_and_never_fails_start(
+    tmp_path: Path,
+) -> None:
+    """A store returning a plain ``(ok, message)`` pair, with no ``prefix_break``, must not fail the
+    alert-only start check: it files the ordinary ``audit-chain`` alert, even when its text quotes
+    the prefix phrase (vault BACKLOG #3054, item 11). Control: the flag-carrying twin is filed as a
+    truncation."""
+    plain = (False, f"audit log {AUDIT_PREFIX_BREAK_MARKER}")
+    assert await _subject_for_verdict(tmp_path, plain) == "audit-chain"  # type: ignore[arg-type]
+    flagged = AuditVerdict(*plain, prefix_break=True)
+    assert await _subject_for_verdict(tmp_path, flagged) == "audit-chain-truncated"
+
+
+async def test_a_planted_row_quoting_the_prefix_phrase_is_still_a_chain_break(
+    tmp_path: Path,
+) -> None:
+    """The real path of vault BACKLOG #3054, item 11: a database writer plants the prefix phrase as a
+    row's text ``seq``, the walk quotes it in its break reason, and the substring classifier filed
+    that break as a truncation. The flag keeps it under the chain-break subject."""
+    db = tmp_path / "planted.db"
+    await _aseed_audit_rows(db, 3)
+    anchor = await _aread_anchor(db)
+    with contextlib.closing(sqlite3.connect(db)) as conn:
+        # The newest row: a text seq sorts after every integer, so the walk meets it last.
+        conn.execute("UPDATE audit_log SET seq=? WHERE id=3", (AUDIT_PREFIX_BREAK_MARKER,))
+        conn.commit()
+    anchor_file = tmp_path / "anchor.txt"
+    anchor_file.write_text(anchor, encoding="utf-8")
+    sink, _cap = await _verify_on_start(db, anchor_file)
+
+    assert len(sink.events) == 1, sink.events
+    subject, reason, _ = sink.events[0]
+    assert AUDIT_PREFIX_BREAK_MARKER in reason and "broken at seq=3" in reason, reason
+    assert subject == "audit-chain", "a planted phrase turned a chain break into a truncation"
 
 
 async def test_startup_check_with_no_key_still_alerts_on_a_chain_that_names_a_key(
@@ -1832,6 +1944,33 @@ def test_parse_audit_anchor_refuses_an_empty_head_with_a_nonzero_count() -> None
     assert parse_audit_anchor("0:") == (0, "")  # the legal pairing still round-trips
     with pytest.raises(ValueError, match="only producible from an EMPTY log"):
         parse_audit_anchor("5:")
+
+
+@pytest.mark.parametrize(
+    "head", ["a" * 64, "vault:v1:c3ludGhldGlj"], ids=["hex-digest", "isolated-module-mac"]
+)
+def test_parse_audit_anchor_refuses_a_head_with_a_zero_count(head: str) -> None:
+    """The converse of the pairing above (vault BACKLOG #5987 item 1). A log with rows has a newest
+    seq of 1 or more on every backend, so `0:<head>` is an anchor the store can never emit, and
+    `audit-verify --expected-anchor` would report an intact chain as `truncated or rewritten`."""
+    with pytest.raises(AuditAnchorError) as caught:
+        parse_audit_anchor(f"0:{head}")
+    assert caught.value.reason == (
+        "a zero row count is only producible from an EMPTY log, so it cannot carry a head"
+    )
+    assert parse_audit_anchor(f"1:{head}") == (1, head)  # the control: the head itself is legal
+
+
+@pytest.mark.parametrize(
+    "text", ["-98765:" + "a" * 64, "98765:", "98765:" + "a" * 12, "98765:zz", "0:" + "a" * 64]
+)
+def test_no_anchor_refusal_reason_carries_the_parsed_count(text: str) -> None:
+    """vault BACKLOG #5987: the engine logs `.reason` to the persistent service log, and the count is
+    the mis-pointed file's content, so no reason may carry it. Pinned per refusal that parses one."""
+    with pytest.raises(AuditAnchorError) as caught:
+        parse_audit_anchor(text)
+    assert "98765" not in caught.value.reason
+    assert "a" * 12 not in caught.value.reason
 
 
 def test_anchor_file_reader_refuses_an_oversized_file(tmp_path: Path) -> None:

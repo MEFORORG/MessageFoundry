@@ -6,10 +6,18 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Sequence
+import re
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from messagefoundry.config.settings import ServiceSettings, StoreBackend
+from messagefoundry.redaction import codec_safe_str
+from messagefoundry.transports.db_endpoint import (
+    SQLSERVER_DEFAULT_DRIVER,
+    _preset_driver,  # the preset's own driver test, so the census cannot drift from the build
+    generic_driver_family,
+)
 from messagefoundry.verify.checks import (
     OdbcHops,
     check_credential_generation,
@@ -22,6 +30,9 @@ from messagefoundry.verify.smoke import (
     smoke_self,
     synthetic_message,
 )
+
+if TYPE_CHECKING:
+    from messagefoundry.config.wiring import Registry
 
 _log = logging.getLogger(__name__)
 
@@ -94,80 +105,260 @@ def _writable_dir(settings: ServiceSettings | None) -> Path:
     return Path.cwd()
 
 
-def _odbc_hops(
-    settings: ServiceSettings | None, service_config: str | None, config_dir: str
-) -> OdbcHops:
-    """Which ODBC Driver 18 hops this deployment takes, for the ``host.ciphers`` row (BACKLOG #3277).
+def _microsoft_driver(driver: str) -> bool:
+    """Whether ``driver``, an ``odbc_driver`` as written, is a Microsoft SQL Server driver: one the
+    SQL Server preset accepts, or the generic dialect's Microsoft family."""
+    return _preset_driver(driver) or generic_driver_family(driver) == "msodbc"
 
-    The SQL Server store is read from the service settings. A DATABASE connection on the SQL Server
-    dialect, a ``DatabaseRef`` reference set and a ``DatabaseLookup`` are read from the config graph,
-    which this loads the way the self smoke does, so it runs only when the store has not already
-    shown a hop. A hop found either way is enough.
 
-    Anything not read leaves the answer unknown rather than "no hop", because a hop could sit in it:
-    a graph that does not load, settings that did not load, or a shell with no
-    ``MEFOR_STORE_BACKEND``. That variable overrides the settings file, and an operator's shell
-    need not carry the service's own environment, so without it even a file that says sqlite does
-    not show the service's store (BACKLOG #3803 R1). A generic-dialect DATABASE connection is
-    unknown too: its driver, not Driver 18, decides its TLS."""
-    if settings is not None and settings.store.backend is StoreBackend.SQLSERVER:
-        return OdbcHops(found=("the [store] backend is sqlserver",))
-    from messagefoundry.config.models import ConnectorType
-    from messagefoundry.config.settings import settings_file_path
-    from messagefoundry.config.wiring import WiringError, load_config
+#: The two dialects the build accepts; another is refused at build (``transports.database``).
+_DIALECTS = ("sqlserver", "generic")
+
+
+def _builds_on(dialect: str, driver: str) -> bool:
+    """Whether the build accepts ``driver``, an ``odbc_driver`` as written, on ``dialect``: the
+    preset's own driver test, or the generic dialect's allowlist."""
+    if dialect == "sqlserver":
+        return _preset_driver(driver)
+    return generic_driver_family(driver) is not None
+
+
+#: The file name, in lower case, of a Microsoft ODBC Driver library: ``libmsodbcsql-18.3.so.3.1``,
+#: ``libmsodbcsql.18.dylib`` or ``msodbcsql18.dll``. Read only after :func:`_preset_driver` accepts
+#: the whole ``odbc_driver``, so it tells a library from a registered name and nothing else: no
+#: registered name the preset accepts starts this way.
+_DRIVER_LIBRARY = re.compile(r"(?:lib)?msodbcsql.*")
+
+
+class _Graph:
+    """The ``--config`` graph, loaded at most once per verify run (BACKLOG #3803 R2).
+
+    The hop census and the self smoke both read it, and a load runs every config module, so a
+    second load ran them twice. The first load's outcome, the graph or what the load raised, is
+    what every caller gets. It allows an empty graph, which the census reads as one with no hop,
+    an answer rather than an unknown; :func:`~messagefoundry.verify.smoke.smoke_self` applies the
+    empty-graph rule itself."""
+
+    def __init__(self, config_dir: str) -> None:
+        self.config_dir = config_dir
+        self._outcome: Registry | BaseException | None = None
+
+    def __call__(self) -> Registry:
+        if self._outcome is None:
+            from messagefoundry.config.wiring import load_config
+
+            try:
+                self._outcome = load_config(self.config_dir, allow_empty=True)
+            except (Exception, SystemExit) as exc:  # each caller maps what was raised its own way
+                self._outcome = _without_tracebacks(exc)
+        if isinstance(self._outcome, BaseException):
+            # Cleared again here, since each raise adds the raiser's frames to the one instance.
+            raise self._outcome.with_traceback(None)
+        return self._outcome
+
+
+def _without_tracebacks(exc: BaseException) -> BaseException:
+    """``exc`` with its traceback, and those of its cause and context chain, cleared, so a kept
+    failure does not hold the failed load's frames, a config module's among them, for the run."""
+    seen: set[int] = set()
+    pending: list[BaseException] = [exc]
+    while pending:
+        link = pending.pop()
+        if id(link) in seen:
+            continue
+        seen.add(id(link))
+        link.__traceback__ = None
+        pending += [e for e in (link.__cause__, link.__context__) if e is not None]
+        if isinstance(link, BaseExceptionGroup):
+            pending += list(link.exceptions)
+    return exc
+
+
+def _buildable_entries(
+    config_dir: str, graph: Callable[[], Registry]
+) -> tuple[list[tuple[str, str | None, str | None]], str | None]:
+    """``(label, dialect, driver)`` for each graph entry the build accepts, read by
+    :func:`~messagefoundry.config.wiring.odbc_hops` from ``graph``, the run's one load of
+    ``config_dir``, and why the graph was not read, or ``None`` when it was.
+
+    An entry the build refuses, on a dialect other than the two, or on a driver no dialect it can
+    take accepts, is left out, since the engine never dials it."""
+    from messagefoundry.config.wiring import WiringError, odbc_hops
     from messagefoundry.redaction import codec_safe_str
 
     if Path(config_dir) == Path(_DEFAULT_CONFIG_DIR):
         # The CLI fills this in when --config is left out, so it is not the deployment's graph.
-        return OdbcHops(unknown=f"--config was left at {_DEFAULT_CONFIG_DIR!r}; pass --config")
+        return [], f"--config was left at {_DEFAULT_CONFIG_DIR!r}; pass --config"
     if not Path(config_dir).is_dir():
-        return OdbcHops(unknown=f"no config dir at {config_dir!r}; pass --config")
+        return [], f"no config dir at {config_dir!r}; pass --config"
     try:
-        # allow_empty: an empty graph takes no hop, which is an answer, not an unknown.
-        reg = load_config(config_dir, allow_empty=True)
+        reg = graph()
     except (WiringError, OSError, ImportError, SyntaxError, ValueError, SystemExit) as exc:
         # SystemExit: a config module that exits at import must not end the verify run.
-        reason = codec_safe_str(exc)[:200]
-        return OdbcHops(unknown=f"the config dir {config_dir!r} did not load: {reason}")
-    database = sorted(
-        (str(conn.spec.settings.get("dialect", "sqlserver")).lower(), name)
-        for table in (reg.inbound, reg.outbound)
-        for name, conn in table.items()
-        if conn.spec.type is ConnectorType.DATABASE
-    )
-    found = (
-        *(f"DATABASE connection {name}" for dialect, name in database if dialect == "sqlserver"),
-        *(
-            f"DatabaseRef reference set {name}"
-            for name, ref in sorted(reg.references.items())
-            if ref.source.kind == "database"
-        ),
-        *(f"DatabaseLookup {name}" for name in sorted(reg.lookups)),
-    )
-    if found:
-        return OdbcHops(found=found)
-    generic = [name for dialect, name in database if dialect != "sqlserver"]
-    if generic:
-        return OdbcHops(
-            unknown=f"DATABASE connection {generic[0]} uses a generic ODBC driver, whose TLS "
-            "this row does not read"
-        )
+        return [], f"the config dir {config_dir!r} did not load: {codec_safe_str(exc)[:200]}"
+    entries: list[tuple[str, str | None, str | None]] = []
+    for kind, name, dialect, driver in odbc_hops(reg):
+        if dialect is not None and dialect not in _DIALECTS:
+            continue  # the build refuses another dialect, so nothing dials the entry
+        # An env() dialect may take either arm, so its driver is refused only where both refuse it.
+        arms = _DIALECTS if dialect is None else (dialect,)
+        if driver is not None and not any(_builds_on(arm, driver) for arm in arms):
+            continue  # the build refuses this driver on every arm the entry can take
+        entries.append((f"{kind} {name}", dialect, driver))
+    return entries, None
+
+
+def _store_unknown(settings: ServiceSettings | None, service_config: str | None) -> str | None:
+    """Why the store backend the service opens is not known from this shell, or ``None``.
+
+    ``MEFOR_STORE_BACKEND`` overrides the settings file, and an operator's shell need not carry the
+    service's own environment, so without it even a file that says sqlite does not show the
+    service's store (BACKLOG #3803 R1)."""
+    from messagefoundry.config.settings import settings_file_path
+
     if settings is None:
-        return OdbcHops(unknown="service settings did not load, so the store backend is not known")
+        return "service settings did not load, so the store backend is not known"
     # Spelled as load_settings reads it: the prefix exactly, the rest in any case.
-    if not any(n.startswith("MEFOR_") and n[6:].lower() == "store_backend" for n in os.environ):
-        if service_config is None and not settings_file_path(None).exists():
-            return OdbcHops(
-                unknown="no service config was read, so the store may be SQL Server; pass "
-                "--service-config, and set MEFOR_STORE_BACKEND as the service sets it"
-            )
-        return OdbcHops(
-            unknown=f"the store backend reads {settings.store.backend.value} from the service "
-            "config or its defaults, but MEFOR_STORE_BACKEND, which overrides both, is not set in "
-            "this shell, and the service's own environment may set it to sqlserver; set it here "
-            "as the service sets it"
+    if any(n.startswith("MEFOR_") and n[6:].lower() == "store_backend" for n in os.environ):
+        return None
+    if service_config is None and not settings_file_path(None).exists():
+        return (
+            "no service config was read, so the store may be SQL Server; pass "
+            "--service-config, and set MEFOR_STORE_BACKEND as the service sets it"
         )
+    return (
+        f"the store backend reads {settings.store.backend.value} from the service "
+        "config or its defaults, but MEFOR_STORE_BACKEND, which overrides both, is not set in "
+        "this shell, and the service's own environment may set it to sqlserver; set it here "
+        "as the service sets it"
+    )
+
+
+def _odbc_hops(
+    settings: ServiceSettings | None,
+    service_config: str | None,
+    config_dir: str,
+    graph: Callable[[], Registry],
+) -> OdbcHops:
+    """Which ODBC hops this deployment takes on a Microsoft SQL Server driver, whose TLS the host
+    policy decides, for the ``host.ciphers`` row (BACKLOG #3277).
+
+    The SQL Server store is read from the service settings, and the graph's entries by
+    :func:`_buildable_entries`, only when the store has not already shown a hop. A hop found
+    either way is enough. Every preset entry the engine builds is on a Microsoft driver, an
+    ``env()`` driver included; an entry on another dialect is a hop where its driver is one.
+
+    Anything not read leaves the answer unknown rather than "no hop", because a hop could sit in it:
+    a graph that does not load, settings that did not load, or a shell with no
+    ``MEFOR_STORE_BACKEND`` (:func:`_store_unknown`). An entry off the preset whose driver is an
+    ``env()`` reference, or another vendor's, which may bring its own TLS, is unknown too."""
+    if settings is not None and settings.store.backend is StoreBackend.SQLSERVER:
+        return OdbcHops(found=("the [store] backend is sqlserver",))
+    entries, unread = _buildable_entries(config_dir, graph)
+    if unread is not None:
+        return OdbcHops(unknown=unread)
+    found: list[str] = []
+    undecided: list[str] = []
+    for label, dialect, driver in entries:
+        if dialect == "sqlserver" or (driver is not None and _microsoft_driver(driver)):
+            found.append(label)
+        elif driver is None:
+            undecided.append(f"{label} names its odbc_driver by an env() reference")
+        else:
+            # ascii(): printable on any console code page, and cut as the other reasons here are.
+            undecided.append(
+                f"{label} uses the driver {ascii(driver[:200])}, which may bring its own TLS, "
+                "and this row does not read it"
+            )
+    if found:
+        return OdbcHops(found=tuple(found))
+    if undecided:
+        return OdbcHops(unknown=undecided[0])
+    store = _store_unknown(settings, service_config)
+    if store is not None:
+        return OdbcHops(unknown=store)
     return OdbcHops(judged=f"the service settings and the graph in {config_dir!r}")
+
+
+def _driver_hops(
+    settings: ServiceSettings | None,
+    service_config: str | None,
+    config_dir: str,
+    graph: Callable[[], Registry],
+) -> OdbcHops:
+    """Every ODBC hop this deployment takes, with the SQL Server driver each needs, for the
+    ``host.odbc`` row (BACKLOG #3803 R6).
+
+    Unlike :func:`_odbc_hops`, the whole configuration is read even once a hop is found, since
+    each hop's driver is checked. ``needs`` holds each hop that names a registered Microsoft
+    driver, as the build sends it (the generic dialect trims it), which pyodbc must list: the SQL
+    Server store names Driver 18. ``paths`` holds each preset hop that names the Microsoft library
+    by a path, which the driver manager loads from that path, not from pyodbc's list. A hop on
+    another vendor's driver is in ``found`` alone: it is an ODBC hop, but this row checks no driver
+    of it, as is a hop whose driver is not told. ``unknown`` joins every reason a graph hop could
+    be missed or its driver not told: a ``--config`` that did not load, an ``env()`` driver, and a
+    library named other than by an absolute path. ``unless_18`` holds the reasons a listed Driver
+    18 answers, apart: the store backend not known, which would need Driver 18, and no
+    ``--config`` given at all, the fast host check."""
+    store = settings is not None and settings.store.backend is StoreBackend.SQLSERVER
+    needs = [("the [store] backend is sqlserver", SQLSERVER_DEFAULT_DRIVER)] if store else []
+    paths: list[tuple[str, str]] = []
+    others: list[str] = []
+    unknowns: list[str] = []
+    try:
+        entries, unread = _buildable_entries(config_dir, graph)
+    except Exception as exc:  # a read failure not foreseen: the store's need must survive it
+        _log.warning("host.odbc: the graph read raised %s", type(exc).__name__)
+        entries, unread = (
+            [],
+            f"the graph read raised {type(exc).__name__}: {codec_safe_str(exc)[:200]}",
+        )
+    # Reasons a listed Driver 18 answers: the store's backend, and with no --config given the
+    # graph, so the fast host check on a host with Driver 18 reads PASS as before.
+    unless_18: list[str] = []
+    if unread is not None:
+        default = Path(config_dir) == Path(_DEFAULT_CONFIG_DIR)
+        (unless_18 if default else unknowns).append(unread)
+    # Entries whose driver is not told are still ODBC hops, so an unreadable list is ERROR on them.
+    undecided: list[str] = []
+    for label, dialect, driver in entries:
+        if driver is None:
+            undecided.append(label)
+            unknowns.append(f"{label} names its odbc_driver by an env() reference")
+        # Only the preset takes a library, so an env() dialect naming one is on the preset.
+        elif dialect != "generic" and _DRIVER_LIBRARY.fullmatch(
+            re.split(r"[\\/]", driver.lower())[-1]
+        ):
+            if Path(driver).is_absolute():
+                paths.append((label, driver))
+            else:
+                # A bare name is searched for, and a relative one is read from the service's
+                # working directory, which need not be this shell's.
+                undecided.append(label)
+                unknowns.append(
+                    f"{label} names the library {ascii(driver[:200])} by a name that is not an "
+                    "absolute path, which the service resolves where this shell cannot see"
+                )
+        elif _microsoft_driver(driver):
+            needs.append((label, driver.strip()))
+        else:
+            others.append(label)
+    store_unknown = None if store else _store_unknown(settings, service_config)
+    if store_unknown is not None:
+        unless_18.append(store_unknown)
+    return OdbcHops(
+        found=(
+            *(label for label, _ in needs),
+            *(label for label, _ in paths),
+            *others,
+            *undecided,
+        ),
+        unknown="; ".join(unknowns) or None,
+        judged=f"the service settings and the graph in {config_dir!r}",
+        needs=tuple(needs),
+        paths=tuple(paths),
+        unless_18="; ".join(unless_18) or None,
+    )
 
 
 def _manual_rows() -> list[CheckResult]:
@@ -293,6 +484,7 @@ def run_verify(
     """
     selected = set(sections) if sections else set(ALL_SECTIONS)
     settings, settings_error = _load_settings(service_config)
+    graph = _Graph(config_dir)
     results: list[CheckResult] = []
     if settings_error is not None:
         # Emitted ONLY on a real load failure, so a box with no config (which resolves to
@@ -312,7 +504,8 @@ def run_verify(
         results += run_host_checks(
             ports=ports,
             writable_dir=_writable_dir(settings),
-            odbc_hops=lambda: _odbc_hops(settings, service_config, config_dir),
+            odbc_hops=lambda: _odbc_hops(settings, service_config, config_dir, graph),
+            driver_hops=lambda: _driver_hops(settings, service_config, config_dir, graph),
         )
 
     if "store" in selected:
@@ -347,7 +540,9 @@ def run_verify(
             # default when no service settings resolve (#241 F3, #230 CLI parity).
             snapshot_on_send = settings.pipeline.snapshot_on_send if settings is not None else False
             results.append(
-                smoke_self(config_dir, inbound=inbound, snapshot_on_send=snapshot_on_send)
+                smoke_self(
+                    config_dir, inbound=inbound, snapshot_on_send=snapshot_on_send, graph=graph
+                )
             )
         elif smoke_mode == "live":
             # synthetic_message() is a module constant since #1192, so there is no generator step

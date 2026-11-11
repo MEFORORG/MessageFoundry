@@ -22,14 +22,24 @@ from pathlib import Path
 from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
-from messagefoundry.config.settings import BLOCK_UNLISTED_OUTBOUND_IN_FORCE, EgressSettings
+from messagefoundry.config.settings import (
+    BLOCK_UNLISTED_OUTBOUND_IN_FORCE,
+    EgressSettings,
+    pinned_host_port,
+)
 from messagefoundry.config.wiring import WiringError, resolve_env_settings
 from messagefoundry.secretscrub import credential_query_params
+from messagefoundry.transports.base import _ECH_ROUTING_DESTINATIONS
 from messagefoundry.transports.db_endpoint import database_dial_endpoint, port_or_zero
 from messagefoundry.transports.email import envelope_address_problem, envelope_recipients
-from messagefoundry.transports.proxy_address import ProxyAddress, parse_proxy_url
+from messagefoundry.transports.proxy_address import (
+    _UNCACHED_URLSPLIT,
+    ProxyAddress,
+    parse_proxy_url,
+)
 from messagefoundry.transports.rest import (
     PROXY_DEFAULT,
+    ech_sidecar_url_from_settings,
     refuse_url_credentials,
     url_host_label,
     url_scheme,
@@ -302,6 +312,113 @@ def _check_forward_proxy_egress(
         )
 
 
+#: The port urllib dials for an ``http`` or ``https`` URL that names none.
+_HTTP_DEFAULT_PORTS: Mapping[str, int] = {"http": 80, "https": 443}
+
+
+def http_dial_port(scheme: str, port: int | None) -> int:
+    """The port urllib dials for an ``http`` or ``https`` URL: ``port`` when the URL names one,
+    else the scheme's default. The ``[egress].allowed_ech_sidecar`` gate judges the sidecar at it
+    (BACKLOG #5528).
+
+    Raises ``ValueError`` for any other scheme, whether or not ``port`` is set: it knows only what
+    urllib dials for these two. The message does not quote ``scheme``."""
+    default = _HTTP_DEFAULT_PORTS.get(scheme.lower())
+    if default is None:
+        raise ValueError("http_dial_port reads only an http or https URL")
+    return default if port is None else port
+
+
+def _check_ech_sidecar_egress(
+    label: str, settings: Mapping[str, Any], allowed_ech_sidecar: list[str]
+) -> None:
+    """Gate an ``ech_egress`` connection's loopback sidecar (ADR 0139) against
+    ``[egress].allowed_ech_sidecar`` (BACKLOG #5528).
+
+    The sidecar is where the connection's bytes go first: every request, body and credential
+    headers included, and on a SMART or OAuth2 connection the token-endpoint POST, which
+    ``http_auth`` re-addresses to the same sidecar. The resolver refuses a host off this machine,
+    but nothing bounded the port, so without this gate a deploying site's connection could name any
+    loopback listener and it would receive all of that.
+
+    **Its own list, deny-by-default on its own terms**, for the reasons
+    :func:`_check_forward_proxy_egress` gives for ``allowed_proxy``: the sidecar is an intermediary
+    rather than a PHI destination, so folding it into ``allowed_http`` would let one list entry
+    stand for two different hops, and an empty list that allowed any port under the
+    ``[security].block_unlisted_outbound = false`` opt-out would leave the hop ungated there.
+
+    **It judges the address that is dialled.** The sidecar is read by
+    :func:`~messagefoundry.transports.rest.ech_sidecar_url_from_settings`, the resolver the
+    connector dials from, so a value the build refuses is refused here first, in that resolver's
+    words, which name no credential. That includes a URL credential, which urllib would dial as
+    part of the host rather than the host this gate reads. A port that cannot be read, or port 0,
+    which no entry can list, is refused next in fixed words. The port is the URL's, or 80 for
+    ``http`` and 443 for ``https`` where it names none, as urllib dials. That host and port, and
+    each entry, are read by :func:`~messagefoundry.config.settings.pinned_host_port`, the parse the
+    list is validated with at load, so an IP literal compares in one spelling and an entry it
+    cannot read never matches: no entry stands for any port. An unset ``ech_egress`` is a no-op."""
+    refusal: str | None = None
+    try:
+        sidecar = ech_sidecar_url_from_settings(settings)
+    except ValueError as exc:
+        sidecar, refusal = None, str(exc)
+    # Raised after the handler ends, so the refusal carries no exception context.
+    if refusal is not None:
+        log.warning(
+            "egress denied: %s ECH sidecar refused before [egress].allowed_ech_sidecar", label
+        )
+        raise WiringError(f"{label}: {refusal}")
+    if sidecar is None:
+        return
+    # Uncached, as the resolver's own split is (vault BACKLOG #5287).
+    parts = _UNCACHED_URLSPLIT(sidecar)
+    try:
+        url_port = parts.port
+        unreadable = False
+    except ValueError:
+        # A port of more than 4300 digits, leading zeros and all, passes the resolver's credential
+        # screen and breaks int(). urlsplit's own text is not let out.
+        url_port, unreadable = None, True
+    if unreadable:
+        log.warning("egress denied: %s ECH sidecar port cannot be read", label)
+        raise WiringError(f"{label}: ech_sidecar names a port that cannot be read as a number")
+    if url_port == 0:
+        # Not "not in the allowlist": no entry can list port 0, so that would send the operator
+        # looking for an entry to add.
+        log.warning("egress denied: %s ECH sidecar names port 0", label)
+        raise WiringError(
+            f"{label}: ech_sidecar names port 0, which is not a port a sidecar can listen on and "
+            "no [egress].allowed_ech_sidecar entry can list; name the sidecar's own port"
+        )
+    if not allowed_ech_sidecar:
+        log.warning(
+            "egress denied: %s ECH sidecar set with an empty [egress].allowed_ech_sidecar", label
+        )
+        raise WiringError(
+            f"{label}: ech_egress is set but [egress].allowed_ech_sidecar is empty — list the "
+            "sidecar's host:port to permit it (the sidecar receives every request and its "
+            "credentials, so this list is deny-by-default even under "
+            "[security].block_unlisted_outbound = false)"
+        )
+    port = http_dial_port(parts.scheme, url_port)
+    hostname = parts.hostname or ""
+    # Read back through the entries' own parse, so a host is compared in one spelling on both
+    # sides: `0:0:0:0:0:0:0:1` matches a `[::1]` entry.
+    dialled = pinned_host_port(f"[{hostname}]:{port}" if ":" in hostname else f"{hostname}:{port}")
+    if dialled is None or not any(pinned_host_port(e) == dialled for e in allowed_ech_sidecar):
+        host = url_host_label(sidecar)
+        log.warning(
+            "egress denied: %s ECH sidecar host %r port %s not in [egress].allowed_ech_sidecar",
+            label,
+            host,
+            port,
+        )
+        raise WiringError(
+            f"{label}: ECH sidecar host {host!r} at port {port} is not in the "
+            "[egress].allowed_ech_sidecar allowlist"
+        )
+
+
 def check_fhir_lookup_allowed(
     name: str,
     settings: Mapping[str, Any],
@@ -442,10 +559,10 @@ def check_egress_allowed(
     allowlist (WP-11c — ASVS 13.2.4/13.2.5/14.2.3), so a fat-fingered or hostile destination can't
     exfiltrate PHI. ``build_destination`` runs it on every build (vault BACKLOG #2605). Under the
     default ``deny_by_default`` an empty list refuses; only the audited opt-out makes an empty list
-    unrestricted, and ``allowed_proxy`` and ``allowed_recipient_domains`` stay deny-by-default on
-    their own terms either way. Checked against the resolved
-    (``env()``-substituted) destination at config load/reload/start. Webhook/SMTP alert sinks carry no
-    PHI bodies and keep their own ``[alerts]`` host allowlists.
+    unrestricted, and at least ``allowed_proxy``, ``allowed_ech_sidecar`` and
+    ``allowed_recipient_domains`` stay deny-by-default on their own terms either way. Checked
+    against the resolved (``env()``-substituted) destination at config load/reload/start.
+    Webhook/SMTP alert sinks carry no PHI bodies and keep their own ``[alerts]`` host allowlists.
 
     Under ``[egress].deny_by_default`` a destination whose transport has no allowlist is refused
     outright (fail-closed); with the list set, the per-list matching below is unchanged.
@@ -465,6 +582,14 @@ def check_egress_allowed(
     # nothing about whether the proxy is permitted (BACKLOG #1659).
     if dest.type in _HTTP_FAMILY_DEST_TYPES:
         _check_forward_proxy_egress(f"outbound {dest.name!r}", dest.settings, egress.allowed_proxy)
+    # ADR 0139 ECH sidecar: the loopback hop every request of an ech_egress connection takes, gated
+    # by its OWN deny-by-default [egress].allowed_ech_sidecar list for the same reason (BACKLOG
+    # #5528). Keyed off the set build_destination admits ech_egress on, so a connector added to it
+    # is gated here too.
+    if dest.type in _ECH_ROUTING_DESTINATIONS:
+        _check_ech_sidecar_egress(
+            f"outbound {dest.name!r}", dest.settings, egress.allowed_ech_sidecar
+        )
     if egress.deny_by_default and not _allowlist_for(dest.type, egress):
         # Names the switch the way the raise below does, not the internal field. NSSM captures stderr
         # to files, so this log line is a forensic surface an operator reads -- and "under

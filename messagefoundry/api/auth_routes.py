@@ -48,6 +48,7 @@ from messagefoundry.api.auth_models import (
     ExpectedFederatedPair,
     FederatedIdentityRequest,
     FederatedIdentityView,
+    IntegrityFailedUser,
     LoginRequest,
     LoginResponse,
     MfaConfirmRequest,
@@ -71,6 +72,7 @@ from messagefoundry.api.auth_models import (
     SimpleMessage,
     UserCreatedResponse,
     UserCreateRequest,
+    UserListEntry,
     UserLockState,
     UserPermissions,
     UserSummary,
@@ -125,7 +127,10 @@ from messagefoundry.auth import (
 )
 from messagefoundry.auth.audit_visibility import (
     AUDIT_WITHHELD_HEADER,
+    CHANNEL_LIST_ACTIONS,
+    audit_detail_for,
     audit_exclusion_for,
+    narrows_scope_rows_for,
     withholds_rows_from,
 )
 from messagefoundry.auth.ldap import LdapError, canonical_group_dn
@@ -157,17 +162,19 @@ from messagefoundry.auth.service import (
     FederatedBindingChanged,
     FederatedSubjectHeld,
     InvalidNotifyEmail,
+    InvalidUsername,
     LastAdministratorRefused,
     NotifyEmailAlreadySet,
     SelfTargetOp,
     TemporaryPasswordUnavailable,
     UsernameTaken,
+    UserSealRefused,
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
 from messagefoundry.store.row_seal import RowSealError
-from messagefoundry.store.store import SessionRecord, UserRecord
+from messagefoundry.store.store import SessionRecord, UserRecord, VerifiedUser
 
 _VALID_ROLE_IDS = {role.value for role in Role}
 
@@ -335,6 +342,21 @@ async def _refuse_if_self(
     raise HTTPException(status.HTTP_400_BAD_REQUEST, detail)
 
 
+async def _checked_user(service: AuthService, user_id: str) -> VerifiedUser:
+    """The account an admin route reads, its record checked against its seal (BACKLOG #5520), or
+    the route's refusal: 404 when no row is there, 423 when the row's record fails its check, with
+    nothing of the row answered. What the 423 reports, rate-limited per account, is
+    :class:`~messagefoundry.auth.service.UserSealRefused`'s to say; docs/SECURITY.md, *What an
+    admin user read reports*, is the operator's statement of it."""
+    try:
+        user = await service.checked_user(user_id)
+    except UserSealRefused as exc:
+        raise HTTPException(status.HTTP_423_LOCKED, str(exc)) from exc
+    if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+    return user
+
+
 async def _refuse_own_channel_scope(
     request: Request,
     service: AuthService,
@@ -452,16 +474,18 @@ def _lock_state(user: UserRecord, now: float) -> UserLockState:
 
 def _user_summary(
     user: UserRecord,
-    role_ids: list[str],
+    role_ids: Sequence[str],
     *,
     credential_expires_at: float | None = None,
     lock_state_at: float | None = None,
-    show_scope: bool = True,
+    show_scope: bool = False,
 ) -> UserSummary:
     """``lock_state_at`` is the instant to evaluate the account's locks at, and passing it is what
     DISCLOSES them: pass it only on a ``users:manage`` surface (BACKLOG #1131). Left ``None``, the
     summary carries ``lock_state=None``, which reads as "not shown", never as "not locked".
-    ``show_scope=False`` withholds the channel scope and its source the same way (BACKLOG #3189)."""
+    The channel scope and its source are withheld the same way unless ``show_scope=True`` is
+    passed, again only on a ``users:manage`` surface (BACKLOG #3189). Withholding is the default,
+    so a new caller that forgets the argument discloses nothing (vault BACKLOG #3748 item 5)."""
     return UserSummary(
         id=user.id,
         username=user.username,
@@ -476,6 +500,29 @@ def _user_summary(
         channel_scope_withheld=not show_scope,
         credential_expires_at=credential_expires_at,
         lock_state=None if lock_state_at is None else _lock_state(user, lock_state_at),
+    )
+
+
+def _console_user_summary(
+    user: UserRecord,
+    role_ids: list[str],
+    *,
+    show_scope: bool,
+    credential_expires_at: float | None = None,
+    lock_state_at: float | None = None,
+) -> UserSummary:
+    """:func:`_user_summary` as the console seam hands it on, with ``show_scope`` REQUIRED (vault
+    BACKLOG #3748 item 5). Each console page decides, and one that forgets raises rather than
+    discloses, where a withholding default would read a real scope as deny-all and offer to save
+    that over it. The seam field is named ``user_summary_scoped`` so the rename moves the seam
+    digest: a console from before the keyword refuses to mount, rather than mounting and failing on
+    its user pages (``_ui_seam.py`` history)."""
+    return _user_summary(
+        user,
+        role_ids,
+        credential_expires_at=credential_expires_at,
+        lock_state_at=lock_state_at,
+        show_scope=show_scope,
     )
 
 
@@ -1319,11 +1366,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
         return SimpleMessage(detail="custom role deleted")
 
-    @app.get("/users", response_model=list[UserSummary])
+    @app.get("/users", response_model=list[UserListEntry])
     async def list_users(
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require(Permission.USERS_READ)),
-    ) -> list[UserSummary]:
+    ) -> list[UserListEntry]:
         # BACKLOG #1131 (ASVS 6.1.1): lock state goes only to a users:manage holder, which no custom
         # role can grant (ADR 0045 D1). A users:read-only caller gets lock_state=None on every row.
         # No step-up, like GET /users/{id}/channel-scope: every users:manage holder is an
@@ -1340,9 +1387,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # One instant for the whole list, so every row answers "locked now?" for the same now.
         manager = identity.has(Permission.USERS_MANAGE)
         lock_state_at = time.time() if manager else None
-        summaries: list[UserSummary] = []
-        for user in await service.store.list_users():
-            role_ids = await service.store.get_user_role_ids(user.id)
+        summaries: list[UserListEntry] = []
+        # BACKLOG #5520: through the service's checked reader, roles included, which the seal
+        # covers. An account whose record fails stays listed by id alone (IntegrityFailedUser).
+        for listed in await service.list_checked_users():
+            user = listed.user
+            if user is None:
+                summaries.append(IntegrityFailedUser(id=listed.id, integrity_failed=True))
+                continue
             # No credential_expires_at here, deliberately (BACKLOG #1141). This route needs only
             # users:read, and which accounts hold a live admin-issued temporary password, and until
             # when, is a target list. The users:manage surfaces state it.
@@ -1351,7 +1403,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             # be minted into a custom role, which can be channel-scoped, and the list would
             # otherwise name every other account's channels to it.
             summaries.append(
-                _user_summary(user, role_ids, lock_state_at=lock_state_at, show_scope=manager)
+                _user_summary(user, user.role_ids, lock_state_at=lock_state_at, show_scope=manager)
             )
         return summaries
 
@@ -1364,14 +1416,15 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         """Effective-permission inspector (BACKLOG #177): resolve the FLATTENED effective permission
         set — built-in-role ∪ custom-role ∪ extras — for an arbitrary user id, for RBAC
         troubleshooting. Reuses the same ``Identity.build`` flattening path ``/auth/me`` uses for the
-        caller (via :meth:`AuthService.identity_for_user_id`) rather than re-deriving the union.
-        Gated like ``/users`` (``USERS_READ``, deny-by-default); a non-existent user id 404s."""
-        resolved = await service.identity_for_user_id(user_id)
-        if resolved is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+        caller (via :meth:`AuthService.identity_for_checked_user`) rather than re-deriving the union.
+        Gated like ``/users`` (``USERS_READ``, deny-by-default); a non-existent user id 404s, and
+        one whose record fails its integrity seal 423s (BACKLOG #5520)."""
+        checked = await _checked_user(service, user_id)
+        resolved = await service.identity_for_checked_user(checked)
         # The flattened Identity carries only built-in Roles; list the actual held role ids (built-in +
-        # custom:) so an operator can see WHERE a grant came from, mirroring _user_summary.
-        role_ids = await service.store.get_user_role_ids(user_id)
+        # custom:) so an operator can see WHERE a grant came from, mirroring _user_summary. From the
+        # checked record, whose seal covers them (BACKLOG #5520), never a bare store read.
+        role_ids = checked.role_ids
         return UserPermissions(
             user_id=resolved.user_id,
             username=resolved.username,
@@ -1407,9 +1460,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
         except UsernameTaken as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-        except InvalidNotifyEmail as exc:
-            # BACKLOG #2018: raised before any write, as on PATCH /users/{id}. The message names the
-            # rule and never echoes the value.
+        except (InvalidNotifyEmail, InvalidUsername) as exc:
+            # BACKLOG #2018, #5521: raised before any write, as on PATCH /users/{id}. The message
+            # names the rule and never echoes the value. The request model refuses the same
+            # username first; this is the service's own check, for every other caller.
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         except TemporaryPasswordUnavailable as exc:
             # ADR 0197 Amendment A: the credential is generated now, so the reset's 503 applies here
@@ -1431,6 +1485,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             sorted(body.roles),
             credential_expires_at=pending_credential_deadline(service, user),
             lock_state_at=time.time(),
+            show_scope=True,  # users:manage, under step-up
         )
         return UserCreatedResponse(
             **summary.model_dump(), temp_password=created.credential.password
@@ -1473,7 +1528,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         user = await service.store.get_user(user_id)
         assert user is not None
-        return _user_summary(user, [], lock_state_at=time.time())
+        return _user_summary(user, [], lock_state_at=time.time(), show_scope=True)
 
     @app.patch("/users/{user_id}", response_model=SimpleMessage)
     async def update_user(
@@ -1488,9 +1543,15 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             require_step_up_action(STEP_UP_ACTION_ADMIN_USER_UPDATE, Permission.USERS_MANAGE)
         ),
     ) -> SimpleMessage:
-        current = await service.store.get_user(user_id)
-        if current is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+        # BACKLOG #5520: the checked record, so a row whose record fails its seal answers 423, as
+        # GET /users shows it, rather than the store's refused write. Its profile fields fill an
+        # omitted PATCH field below, so an unchecked value is never written back.
+        # The read follows the gate above, so wherever the gate spends a single-use grant, this 423
+        # and the 404 cost it; docs/SECURITY.md states when that is. Checking first would need the
+        # proof moved into this route, and the console calls this function after its own gate, so
+        # that move would need the console path reworked too; admin_user_update is not a refundable
+        # action (_REFUNDABLE_ACTIONS, ADR 0197).
+        current = await _checked_user(service, user_id)
         if body.disabled:
             await _refuse_if_self(
                 request,
@@ -1913,11 +1974,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         :func:`require`, whose ``auth.permission_granted`` row is the read's only audit row, and no
         step-up, so it spends no grant. The console's page of the same pair asks for the step-up
         window (``require_ui_step_up``) because it offers the link and unlink forms; this read
-        offers neither. 404 for an unknown user."""
-        user = await service.store.get_user(user_id)
-        if user is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
-        return _federated_identity_view(user, service)
+        offers neither. 404 for an unknown user, 423 for one whose record fails its integrity seal,
+        whose pair is then unchecked and not shown (BACKLOG #5520)."""
+        return _federated_identity_view(await _checked_user(service, user_id), service)
 
     @app.put("/users/{user_id}/federated-identity", response_model=SimpleMessage)
     async def bind_user_federated_identity(
@@ -2016,9 +2075,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         _: Identity = Depends(require(Permission.USERS_MANAGE)),
     ) -> ChannelScope:
-        user = await service.store.get_user(user_id)
-        if user is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+        """The account's stored channel scope. 404 for an unknown user, 423 for one whose record
+        fails its integrity seal, which covers the scope (BACKLOG #5520)."""
+        user = await _checked_user(service, user_id)
         return ChannelScope(channels=_parse_channel_scope(user.channel_scope))
 
     @app.put("/users/{user_id}/channel-scope", response_model=SimpleMessage)
@@ -2174,8 +2233,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         ``offset`` is the numbered pager's position (BACKLOG #2438).
 
         Every filter value is passed as a keyword to the store, which binds it as a SQL parameter
-        across all three backends (BACKLOG #170) -- never string-interpolated into the query."""
-        return await service.store.list_audit(
+        across all three backends (BACKLOG #170) -- never string-interpolated into the query.
+
+        Each row's ``detail`` is the one ``identity`` may read (:func:`audit_detail_for`), so the
+        channel lists and scope sources of the rows ``CHANNEL_LIST_ACTIONS`` names are withheld
+        here, for every caller without ``users:manage``, on all three reads (vault BACKLOG #3748)."""
+        rows = await service.store.list_audit(
             limit=limit,
             actor=actor,
             action=action,
@@ -2185,6 +2248,16 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             before_id=before_id,
             offset=offset,
         )
+        if not narrows_scope_rows_for(identity):
+            return rows
+        # A row of a CHANNEL_LIST_ACTIONS action is copied with its narrowed detail, whether or not
+        # the narrowing changed it; every other row is returned as stored, uncopied.
+        return [
+            {**row, "detail": audit_detail_for(identity, row["action"], row["detail"])}
+            if row["action"] in CHANNEL_LIST_ACTIONS
+            else row
+            for row in rows
+        ]
 
     async def _count_audit(
         service: AuthService,
@@ -2576,7 +2649,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         list_audit=_audit_ui_list,
         export_audit=export_audit,
         my_security_events=my_security_events,
-        user_summary=_user_summary,
+        user_summary_scoped=_console_user_summary,
         federated_identity_view=_federated_identity_view,
         current_user=_current_user,
     )

@@ -76,8 +76,9 @@ def alert_sink_for(state: Any) -> AlertSink:
 
 #: ``granted_by`` on the ``administrator_granted`` alert a directory sign-in raises (vault BACKLOG
 #: #2610): no administrator acted, the directory's group membership did. It is a fixed marker, styled
-#: like the ``<kerberos>`` audit actor. No username check reserves it, so an account literally named
-#: ``<directory>`` would read the same in this field; the alert's ``via`` names the route either way.
+#: like the ``<kerberos>`` audit actor. ``POST /users`` refuses the name (``auth/usernames.py``), but
+#: provision-admin and the directory create paths do not, so an account literally named
+#: ``<directory>`` could read the same in this field; the alert's ``via`` names the route either way.
 DIRECTORY_GRANTED_BY = "<directory>"
 
 
@@ -547,8 +548,9 @@ def client_ip(conn: HTTPConnection) -> str | None:
 
     **It parses no forwarding header, ever, and must not start.** The
     ``[security].allowed_client_networks`` gate decides on this value (``api/client_networks.py``),
-    so a header read here would let any caller spoof its way past that gate. uvicorn is the one
-    ``X-Forwarded-For`` trust point (ADR 0151, D-1).
+    so a header read here would let any caller spoof its way past that gate. uvicorn is the API's one
+    ``X-Forwarded-For`` trust point (ADR 0151, D-1); the inbound HTTP listener's own, for its
+    failed-attempt budget only, never reaches this value (BACKLOG #5525).
 
     It reads ``scope["client"][0]`` itself, the item the gate judged before BACKLOG #2289, rather
     than starlette's ``conn.client``: that builds ``Address(*scope["client"])`` and raises

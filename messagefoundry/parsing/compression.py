@@ -52,6 +52,10 @@ Two invariants shape the surface:
   zip member count is read from the central directory before either pass, and the gzip member cap
   cannot be turned off, so :func:`gzip_decompress` always runs it.
 
+  A bounded read holds only where the reader takes at most a chunk per read. Stdlib :mod:`zipfile`
+  does that for STORED and DEFLATED members alone, so :func:`zip_decompress` refuses an entry with
+  any other compression method before either pass reads a byte (BACKLOG #5535).
+
   Why a required keyword rather than a safer default (BACKLOG #1237): a default is a value the author
   never had to think about. A parameter with **no default** is a gate that refuses when the
   precondition is absent, which is a different construct from a stricter default and the reason this
@@ -344,25 +348,6 @@ def zip_compress(entries: Mapping[str, bytes], *, level: int | None = None) -> b
     return buf.getvalue()
 
 
-def _member_codec_errors() -> tuple[type[Exception], ...]:
-    # zipfile reads LZMA and Zstandard members through modules a Python build may omit, and neither
-    # module's error is an OSError, so each is named when its module is present.
-    errors: list[type[Exception]] = []
-    try:
-        import lzma
-
-        errors.append(lzma.LZMAError)
-    except ImportError:
-        pass
-    try:
-        from compression import zstd
-
-        errors.append(zstd.ZstdError)
-    except ImportError:
-        pass
-    return tuple(errors)
-
-
 # What a corrupt archive or member raises. ValueError covers a member name flagged UTF-8 that is not
 # (UnicodeDecodeError). A corrupt offset that would make zipfile seek to a negative position is a
 # ValueError too, though _zip_layout_reason refuses that archive before any member is opened.
@@ -377,8 +362,15 @@ _ZIP_CORRUPT_ERRORS: tuple[type[Exception], ...] = (
     zlib.error,
     ValueError,
     OverflowError,
-    *_member_codec_errors(),
 )
+
+# The only member methods zip_decompress reads (BACKLOG #5535). zipfile hands every other method's
+# decompressor a whole compressed chunk with no output bound, so a BZIP2, LZMA or Zstandard member
+# expands in full before a single bounded read returns, and the byte ceiling is checked too late.
+# DEFLATED alone gets a max_length from zipfile, and STORED copies at most what is asked for. ADR
+# 0123's 2026-11-10 amendment records the measurement.
+_ZIP_BOUNDED_METHODS = frozenset({zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED})
+_UNSUPPORTED_FEATURE = "uses a zip feature this reader does not support"
 
 
 def zip_decompress(
@@ -398,11 +390,21 @@ def zip_decompress(
     see the module docstring. Every member name is checked before either pass reads a byte. Content
     is checked only in the real pass. So an archive over the ceiling is refused for the ceiling,
     even when a member's content would be refused too. An archive refused for its content costs
-    one trial inflate first, which the byte ceiling bounds. A corrupt
-    archive, too many members, an over-ceiling total, or a member that uses a zip feature ``zipfile`` cannot read (encryption, a
-    compression method, a format version) raises :class:`CompressionError`, which names a member by
-    its position and never by its filename. Duplicate file member names also refuse the whole
-    archive, since the returned mapping cannot preserve repeated names. So do two members that share
+    one trial inflate first, which the byte ceiling bounds. A corrupt archive, too many members,
+    an over-ceiling total, or a member that uses a zip feature ``zipfile`` cannot read (encryption,
+    a flag, a format version) raises :class:`CompressionError`, which names a member by its
+    position and never by its filename.
+
+    Only STORED and DEFLATED entries are read (BACKLOG #5535). An entry with any other compression
+    method, BZIP2, LZMA and Zstandard included, refuses the whole archive before any member is
+    read, directory entries too. ``zipfile`` reads those three methods without bounding one read's
+    output, so the ceiling would be checked only after the expansion; see
+    ``_ZIP_BOUNDED_METHODS``. This refusal does not depend on ``max_output_bytes``: an
+    archive it refuses is refused under any ceiling, and under none. :func:`zip_compress` writes
+    only DEFLATED members.
+
+    Duplicate file member names also refuse the whole archive, since the returned mapping cannot
+    preserve repeated names. So do two members that share
     one local header, the overlapped-entries zip-bomb shape (BACKLOG #1598).
 
     Each member is also **admitted or refused** (ASVS 5.2.2 / 5.3.2, BACKLOG #1128) — its name must be a
@@ -449,12 +451,22 @@ def zip_decompress(
             ]
             if len({info.filename for _, info in members}) != len(members):
                 raise CompressionError("zip archive contains duplicate member names")
-            # Names, BEFORE a single byte is read: a traversal name is refused for what it is, not
-            # for what it expands to, and refusing early spends nothing on a hostile archive.
+            # Names, then methods, BEFORE a single byte is read: a traversal name is refused for
+            # what it is, not for what it expands to, and refusing early spends nothing on a
+            # hostile archive. Names go first, so a hostile name is the reason an operator sees.
             for position, info in members:
                 name_reason = archive_member_name_reason(info.filename)
                 if name_reason is not None:
                     raise CompressionError(f"zip archive member {position} refused: {name_reason}")
+            # _read_zip_member is bounded only for the methods let through here (BACKLOG #5535).
+            # Every entry is checked, a directory entry too, so no entry with an unbounded method
+            # is admitted in any form.
+            for position, info in enumerate(zf.infolist(), start=1):
+                if info.compress_type not in _ZIP_BOUNDED_METHODS:
+                    raise CompressionError(
+                        f"zip archive member {position} {_UNSUPPORTED_FEATURE} (compression method "
+                        f"{info.compress_type}; only stored and deflated members are read)"
+                    )
             # With a ceiling, a trial pass reads every member and keeps nothing, so an archive
             # over it is refused before any member is kept (BACKLOG #1129). The member count was
             # read from the central directory above, so with no ceiling there is nothing to try.
@@ -486,12 +498,10 @@ def zip_decompress(
         failure = "could not be read (the interpreter recursion limit was reached)"
     except RuntimeError:
         # NotImplementedError is a RuntimeError. zipfile raises RuntimeError for a member flagged as
-        # encrypted and NotImplementedError for a compression method, a flag or a format version it
-        # lacks (BACKLOG #1598).
-        failure = (
-            "uses a zip feature this reader does not support "
-            "(encryption, a compression method, or a format version)"
-        )
+        # encrypted and NotImplementedError for a flag or a format version it lacks (BACKLOG #1598).
+        # A compression method other than stored or deflated never reaches it: the loop above
+        # refuses that member before any member opens (BACKLOG #5535).
+        failure = f"{_UNSUPPORTED_FEATURE} (encryption, a flag, or a format version)"
     # zipfile's messages embed the archive-chosen member filename, which can be PHI: the encrypted
     # RuntimeError carries the ZipInfo repr, and BadZipFile says "Bad CRC-32 for file '<name>'". So
     # the typed error names the member position only, and it is raised OUTSIDE the handler, with no
@@ -513,7 +523,9 @@ def _read_zip_member(
 ) -> tuple[bytes, int]:
     """Read one member in bounded chunks. Returns its bytes, or ``b""`` when ``keep_output`` is
     false, and the archive's running output total after it. Raises :class:`CompressionError` the
-    moment the total passes ``max_output_bytes``, and before that chunk is kept."""
+    moment the total passes ``max_output_bytes``, and before that chunk is kept. The chunks are
+    bounded only for a method in ``_ZIP_BOUNDED_METHODS``, which :func:`zip_decompress` checks
+    before it calls this."""
     # A list joined once builds the member's bytes in one copy; a bytearray would need a second.
     kept: list[bytes] = []
     total = produced_before

@@ -14,11 +14,15 @@ are no-ops (the request and the session share one address).
 from __future__ import annotations
 
 import ast
+import hashlib
 import inspect
+import io
 import json
 import logging
+import random
+import re
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
 import httpx
@@ -38,16 +42,27 @@ from messagefoundry.auth import Role, totp
 from messagefoundry.auth.identity import ALL_CHANNELS, Identity
 from messagefoundry.auth.notifications import NEW_ADDRESS_REVERIFY, SecurityEvent
 from messagefoundry.auth.service import (
+    _NEW_IP_LOG_FIELD_MAX,
     _NEW_IP_PER_SESSION_MAX,
     _NEW_IP_TEXT_MAX,
+    _NEW_IP_TEXT_PREFIX,
     STEP_UP_ACTION_ADMIN_USER_UPDATE,
     STEP_UP_ACTION_SESSION_TERMINATE,
     AuthService,
+    _address_log_field,
     _bounded_address_text,
+    _new_ip_path_field,
 )
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.controlchars import scrub_log_argument
+from messagefoundry.logging_setup import (
+    LOG_FIELD_READ_MAX,
+    UNREADABLE_LOG_VALUE,
+    _install_phi_filters,
+    redact_log_value,
+    redacted_log_field,
+)
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_admin, create_local_user_chosen
@@ -267,9 +282,10 @@ async def test_each_refused_request_writes_its_own_warning(
         assert len(warnings) == repeats + len(past_cap)
         assert sum("already flagged" in line for line in warnings) == repeats
         over = [line for line in warnings if "past the per-session" in line]
-        assert [line.rsplit("seen_ip=", 1)[1] for line in over] == [
-            scrub_log_argument(seen) for seen in past_cap
-        ]
+        assert [line.split("seen_ip=", 1)[1].split(" path=", 1)[0] for line in over] == [
+            f'"{seen}"' for seen in past_cap[:-1]
+        ] + [_address_log_field(forged)]
+        assert _address_log_field(forged).startswith('"unparsed-sha256-')
         assert not any("\n" in line for line in over)
         assert await _new_ip_rows(store) == reported
         assert sum(1 for e in notifier.events if e.event_type == NEW_ADDRESS_REVERIFY) == len(
@@ -277,6 +293,229 @@ async def test_each_refused_request_writes_its_own_warning(
         )
     finally:
         await store.close()
+
+
+#: One ``key="value"`` field; neither field writer puts a quote inside a value.
+_FIELD = r'([a-z_]+)="([^"]*)"'
+
+
+def _logged_fields(line: str) -> list[tuple[str, str]]:
+    """The ``key="value"`` fields after the colon of a new-address WARNING, in order, read as a
+    log reader would. Refuses a line that is anything but such fields joined by single spaces, so
+    a field a filter erased, merged or ran past fails here."""
+    rest = line.split(": ", 1)[1]
+    assert re.fullmatch(f"{_FIELD}(?: {_FIELD})*", rest), line
+    return re.findall(_FIELD, rest)
+
+
+#: Paths that tried to write a field of their own (BACKLOG #3770). The second is the one the review
+#: measured against ``quote_log_text``. See quote_log_text's docstring for where it may be used. The
+#: rest end on a label a credential scrub reads as the start of a quoted value, open a quoted value,
+#: or start a PHI or credential pattern that runs to the end of the line (an HL7 segment, an XML
+#: element, an ODBC brace, a ``MEFOR_`` name), or hold an HL7 separator on each side of a space,
+#: which the ``%XX`` escape joined into one run the HL7 pass erased, key and all. One is a plain
+#: path, which must log unchanged.
+_FORGING_PATHS = (
+    '/users seen_ip=10.6.6.6 held_back=99 "x\\',
+    '/users token=a" seen_ip=10.6.6.6 z="',
+    "/x token=",
+    "/x password:",
+    "/x/password:",
+    "/api/auth/bearer",
+    "/x password='a seen_ip=10.6.6.6 '",
+    "/x code=a&state=b seen_ip=10.6.6.6",
+    "/x code=SECRETVALUE",
+    "/PID|x",
+    "/a|b|c",
+    "/x<given>abc",
+    "/x;pwd={abc",
+    "/x/password={a",
+    "/MEFOR_X=abc",
+    "/plain/path-with.dots-and-hyphens",
+    "/x:colon",
+    "/x%20password:",
+    "/a&" + "b" * 300,
+    "/a~b c~d",
+    "/a|b c|d",
+    "/a%7Cb c%7Cd",
+    "/x 19-01-01",
+    "/é12-34-5678",
+    "/ꄣ-45-6789",
+    "/" + "19800101é/" * 30,
+    "/" + "x" * 230 + "/19800505" + "9" * 50,
+    "/x\x01DOE%5EJANE%5EQ",
+    "/u" + "\U0001f600" * 300,
+    "/u" + "x" * 5000,
+)
+
+#: A seen text over ``_NEW_IP_TEXT_MAX`` that holds a tab. The shipped handlers leave its bounded
+#: text unchanged; at 9dc628aa47 the extra tab-to-space round rewrote it in the past-cap context,
+#: so its prefix and its plain digest reached the path field.
+_LONG_SEEN = "hunter2\tpw" + "x" * 70
+
+#: Seen texts that do not parse: one with a tab, which only that tab round rewrites; a name, which
+#: the PHI pass rewrites; and ``_LONG_SEEN``.
+_HOSTILE_SEEN = ("hunter2\tpw", "DOE JANE hunter2", _LONG_SEEN)
+
+#: Seen addresses a forwarded header could carry, each with what the past-cap line must log for
+#: it: an address in its canonical form, or a fixed token and a digest, never the text (BACKLOG
+#: #3770). The first two are the review's: ``%20`` read as a label start by the credential scrub,
+#: which took the closing quote and the ``path=`` key, and ``a|b c|d``, which the ``%XX`` escape
+#: joined into one HL7 run that erased ``seen_ip=`` with its value.
+_FORGING_SEEN = (
+    ("x%20password=<redacted>/users", None),
+    ("a|b c|d", None),
+    ("x password:", None),
+    ('10.6.6.6" path="/forged', None),
+    ("10.6.6.6 held_back=99", None),
+    ("fe80::1%eth0 path=x", "fe80::1-zone-sha256-"),
+    ("2001:DB8:0:0:0:0:0:1", "2001:db8::1"),
+    ("10.7.7.7", "10.7.7.7"),
+    *((seen, None) for seen in _HOSTILE_SEEN),
+)
+
+#: Paths the forge test logs with every seen address above, so it can check that a path has one
+#: spelling, the repeat line's, wherever the past-cap line does not log the unreadable placeholder.
+_PATHS_FOR_EVERY_SEEN = ("/users", "/a b", "/x/password:", "/x code=SECRETVALUE")
+
+#: What a path field may hold: the escape's kept characters and ``_uXXXX_`` units, the two
+#: placeholders, and a cut mark with its checksum. Written from the escape's contract, not from the
+#: code under test.
+_PATH_FIELD = r"(?:[A-Za-z0-9./-]|_u[0-9A-F]{4}_|<redacted>|\[redacted\])*(?:_%crc32x[0-9a-f]{8})?"
+
+
+#: The path field's value when it cannot be read apart from its context, unquoted.
+_UNREADABLE = UNREADABLE_LOG_VALUE
+_UNREADABLE_FIELD = f'"{UNREADABLE_LOG_VALUE}"'
+
+
+def _unescaped(text: str) -> str:
+    return re.sub(r"_u([0-9A-F]{4})_", lambda m: chr(int(m.group(1), 16)), text)
+
+
+def _seen_leaks(seen: str, path: str, field: str) -> list[str]:
+    """What of ``seen`` the path ``field`` holds that ``path`` does not: a word of three or more
+    letters or digits, the ``seen_ip`` key, or a plain SHA-256 prefix of the text. The placeholders
+    are the field's own spelling, so their words do not count."""
+    if field == _UNREADABLE:
+        return []
+    decoded = _unescaped(field).replace("<redacted>", " ").replace("[redacted]", " ")
+    words = set(re.findall(r"[A-Za-z0-9]{3,}", seen)) - set(re.findall(r"[A-Za-z0-9]+", path))
+    leaks = [word for word in sorted(words) if word in decoded]
+    if "seen_ip" in decoded and "seen_ip" not in path:
+        leaks.append("seen_ip")
+    digest = hashlib.sha256(seen.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    if digest in decoded:
+        leaks.append(digest)
+    return leaks
+
+
+def _shipped_handlers(count: int = 2) -> tuple[list[io.StringIO], list[logging.Handler]]:
+    """``count`` handlers, two unless named, each with the shipped filter chain, so each reads what
+    the one before it rewrote: the filters rewrite the record in place. ``configure_logging`` with a
+    log file and a forwarder installs three."""
+    streams = [io.StringIO() for _ in range(count)]
+    handlers: list[logging.Handler] = []
+    for stream in streams:
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        _install_phi_filters(handler)
+        handlers.append(handler)
+    return streams, handlers
+
+
+def test_a_bounded_address_is_always_longer_than_its_bound() -> None:
+    """RED when: the bound and its prefix are edited so the replacement fits under the bound, so a
+    short address text spelled like ``<prefix>...sha256:<hex>`` could read as the bounded form of a
+    longer one (BACKLOG #3772)."""
+    assert _NEW_IP_TEXT_PREFIX + len("...sha256:") + 64 > _NEW_IP_TEXT_MAX
+
+
+async def test_a_path_cannot_forge_a_field_of_the_new_address_warnings() -> None:
+    """RED when: the request path or the seen address can close its field on the line a shipped
+    handler writes, so a path holding a space, a quote or a credential label writes a field of its
+    own; or the seen address carries its own text into the line, so it can merge with or erase the
+    path; or a field is longer than its bound after its escape; or a redaction placeholder is
+    escaped out of its searchable spelling (BACKLOG #3770). The lines are read through two handlers,
+    each carrying the shipped filter chain (``_install_phi_filters``), not from the record."""
+    streams, handlers = _shipped_handlers()
+    logger = logging.getLogger("messagefoundry.auth.service")
+    level = logger.level
+    for handler in handlers:
+        logger.addHandler(handler)
+    logger.setLevel(logging.WARNING)
+    store = await MessageStore.open(":memory:")
+    cases: list[tuple[str, str | None, str]] = [
+        (f"10.9.9.{i}", f"10.9.9.{i}", path) for i, path in enumerate(_FORGING_PATHS)
+    ]
+    cases += [(seen, want, path) for seen, want in _FORGING_SEEN for path in _PATHS_FOR_EVERY_SEEN]
+    try:
+        service = AuthService(store, AuthSettings(admin_new_ip_step_up=True))
+        await service.initialize()
+        token, _ = await _enabled_admin(service, client="10.1.1.1")
+        for i in range(_NEW_IP_PER_SESSION_MAX + 1):
+            assert await service.flag_new_client_ip(token, f"10.3.3.{i}", path="/users") is True
+        for stream in streams:
+            stream.truncate(0)
+            stream.seek(0)
+        for seen, _, path in cases:
+            assert await service.flag_new_client_ip(token, "10.3.3.0", path=path) is True
+            assert await service.flag_new_client_ip(token, seen, path=path) is True
+    finally:
+        for handler in handlers:
+            logger.removeHandler(handler)
+            handler.close()
+        logger.setLevel(level)
+        await store.close()
+    first, second = ([ln for ln in s.getvalue().splitlines() if ln] for s in streams)
+    # The second handler re-filters what the first wrote, and changes nothing.
+    assert first == second
+    lines = first
+    # The control: every case wrote both of its lines.
+    assert len(lines) == 2 * len(cases)
+    fields: dict[str, set[str]] = {}
+    for i, (seen, want, path) in enumerate(cases):
+        repeat, over = (_logged_fields(line) for line in lines[2 * i : 2 * i + 2])
+        assert [key for key, _ in over] == ["seen_ip", "path"], lines[2 * i + 1]
+        assert [key for key, _ in repeat] == ["path"], lines[2 * i]
+        # The past-cap line logs the repeat line's path field or the unreadable placeholder, in
+        # the escape's alphabet, and the seen address reaches no part of it.
+        assert over[1][1] in (repeat[0][1], _UNREADABLE), (lines[2 * i], lines[2 * i + 1])
+        for field in (repeat[0][1], over[1][1]):
+            assert re.fullmatch(_PATH_FIELD, field) or field == _UNREADABLE, field
+            assert not _seen_leaks(seen, path, field), lines[2 * i + 1]
+            if field != _UNREADABLE:
+                fields.setdefault(path, set()).add(field)
+        logged_ip = over[0][1]
+        if want is None:
+            assert re.fullmatch("unparsed-sha256-[0-9a-f]{16}", logged_ip), lines[2 * i + 1]
+        else:
+            assert logged_ip.startswith(want), lines[2 * i + 1]
+        assert len(over[1][1]) <= _NEW_IP_LOG_FIELD_MAX
+    # One path has one spelling, whatever the seen address and the line.
+    assert all(len(spellings) == 1 for spellings in fields.values()), fields
+    bearer = _FORGING_PATHS.index("/api/auth/bearer")
+    # The repeat line logs it; on the past-cap line a bearer label takes ``seen_ip=`` as its
+    # value, so the seen text is rewritten and the boundary is unknown.
+    assert [_logged_fields(line)[-1][1] for line in lines[2 * bearer : 2 * bearer + 2]] == [
+        "/api/auth/bearer",
+        _UNREADABLE,
+    ]
+    assert "SECRETVALUE" not in "\n".join(lines)
+    assert "JANE" not in "\n".join(lines)
+    plain = _FORGING_PATHS.index("/plain/path-with.dots-and-hyphens")
+    assert _logged_fields(lines[2 * plain + 1]) == [
+        ("seen_ip", f"10.9.9.{plain}"),
+        ("path", _FORGING_PATHS[plain]),
+    ]
+    # Placeholders keep their spelling, so a search for them finds the line.
+    token_line = lines[2 * _FORGING_PATHS.index("/x code=SECRETVALUE") + 1]
+    assert _logged_fields(token_line)[1][1] == "/x_u0020_code_u003D_<redacted>"
+    # The HL7 pass takes ``path=`` with the path, so the boundary is unknown.
+    hl7_line = lines[2 * _FORGING_PATHS.index("/a|b|c") + 1]
+    assert _logged_fields(hl7_line)[1][1] == _UNREADABLE
+    longest = _FORGING_PATHS.index("/u" + "x" * 5000)
+    assert "_%crc32x" in _logged_fields(lines[2 * longest + 1])[1][1]
 
 
 async def test_alternating_new_addresses_audit_once_each() -> None:
@@ -556,8 +795,8 @@ async def test_long_address_text_is_bounded_in_the_dedupe_and_the_past_cap_recor
             for r in caplog.records
             if r.levelno == logging.WARNING and "past the per-session" in r.getMessage()
         ]
-        assert [line.rsplit("seen_ip=", 1)[1] for line in over] == [
-            _bounded_address_text(texts[-1])
+        assert [line.split("seen_ip=", 1)[1].split(" path=", 1)[0] for line in over] == [
+            _address_log_field(texts[-1])
         ]
     finally:
         await store.close()
@@ -1131,3 +1370,696 @@ async def test_each_step_up_factory_refuses_a_new_address_holding_a_fresh_proof(
         assert r.headers.get("X-Step-Up-Action") == action, name
     assert isinstance(engine.store, MessageStore)
     assert await _new_ip_rows(engine.store) == ["10.9.9.9"], name
+
+
+def test_a_redaction_that_raises_logs_a_placeholder_not_an_exception(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """RED when: a redaction pass that raises escapes ``redacted_log_field``, so a log argument
+    built inside the new-address gate fails the request it was only describing; or the failure is
+    swallowed with no record, or its record carries the value."""
+    import messagefoundry.logging_setup as logging_setup
+
+    def _boom(text: str, **_: str) -> str:
+        raise RuntimeError(text)
+
+    monkeypatch.setattr(logging_setup, "redact_log_value", _boom)
+    monkeypatch.setattr(logging_setup, "_UNLOGGABLE_REPORTED", set())
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.logging_setup"):
+        got = redacted_log_field("/users/SECRETVALUE", _NEW_IP_LOG_FIELD_MAX)
+    assert got == '"unloggable-RuntimeError"'
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert errors and all("RuntimeError" in m and "SECRETVALUE" not in m for m in errors)
+
+
+#: Every C0 control and DEL, each before a percent-encoded HL7 name: the PHI pass skips the encoded
+#: run in text that is not printable, so on main only a second handler, reading the first one's
+#: escaped text, hid the name, and with a tab, which that escape keeps, no handler did (BACKLOG
+#: #3770).
+_CONTROL_HL7_PATHS = tuple(
+    f"/x{chr(c)}DOE{sep}JANE{sep}Q"
+    for c in [*range(0x20), 0x7F]
+    for sep in ("%5E", "%7C", "%7E", "%26")
+)
+
+# What these tests check of ``_new_ip_path_field`` (BACKLOG #3770), kept here rather than in its
+# docstring, which states only the guarantee.
+#
+# - No path word main hid prints in the path field more often than in main's path span, as the
+#   strict baseline ``_hides_no_less_than_main`` counts it. Its words are ASCII letter and digit
+#   runs of three or more, so a shorter or non-ASCII token is not counted. It can report a false
+#   red for a path whose word main printed, paired with a seen text whose tail main wrote a third
+#   way; ``_KNOWN_FALSE_RED`` pins two such paths, not the whole class. It runs over the paths main
+#   hid, each with every ``_BASELINE_SEEN`` text; the quote-closing, control-character and
+#   raw-in-line vectors, each with one seen text; and a seeded corpus, each path with one. Only the
+#   raw-in-line vectors reach the check's raw-tail form. The paths main hid, the third-handler
+#   vectors and a seeded quote-closing corpus also run with three handlers.
+# - An ordinary path stays readable with each ``_REWRITTEN_SEEN`` text, and the two raw-in-line
+#   paths stay readable with the encoded HL7 seen text their line leaves raw.
+# - Over a seeded corpus, a path the repeat line reads blanks on the past-cap line only where main's
+#   own past-cap line was not the repeat value or main's repeat-line span, then the seen text raw
+#   or as written alone. Its seen texts hold no encoded run beside a tab, which blanks a path
+#   while main wrote that form; so it bounds the blanking only for the seen texts it reads.
+# - Not tested, at least: the blanking bound below with three handlers; a Unicode space separator before an encoded HL7 name,
+#   which the pre-#3770 lines printed too; a seen text no vector names; and a pass that, in the
+#   past-cap line, hides the end of the path and writes that end back, followed by exactly
+#   ``seen_ip=`` and the seen text, as it was or as the passes write it alone.
+
+#: Paths whose words main's last shipped handler hid on at least one of main's two WARNING lines.
+#: The first five put a label, a date or a name after a tab, with a value split by an escaped line
+#: break. The next three are the review's: a tab before a credential label glued on by a ``%XX``
+#: code, which a tab-to-space round in place of main's second round unhid; and two whose value main
+#: hid only because ``seen_ip=`` followed the path on its past-cap line. The rest glue a bearer
+#: label to an encoded HL7 run with another ``%XX`` code, after a tab.
+_MAIN_HID_PATHS = (
+    "/x\tpassword:\tabc\nSECRETVALUE",
+    "/x Bearer\tabc\nSECRETVALUE",
+    "/\tcode=\x0b.1234567/",
+    "/\tcode=-\r1980-01-01secret:",
+    "/DOB:\tpassword=Bearer|\nJane",
+    "/\ta%7Cb%7Cc%2Cbearer abc\nSECRET",
+    '/~:Authorization: "name": JANE678919800101bearer ',
+    '/mrn "name": DOEa%7Cb%7Ccsession=bearer \xa0',
+    "/\ta%7Cb%7Cc%3BBearer tok98765\nSECRET",
+    "/\tx%5Ey%5Ez%20bearer abc\rSECRET",
+    "/\ta%7Cb%7Cc%2FBearer tok98765\rSECRET",
+    "/\tx%5Ey%5Ez%3Abearer abc\nSECRET",
+)
+
+_REPEAT_HEAD = (
+    "a request from a new client address must re-verify; the address was already flagged since "
+    "the session's last re-verification (audit suppressed): path="
+)
+_OVER_HEAD = (
+    "a request from a new client address must re-verify; the address is past the per-session cap "
+    f"of {_NEW_IP_PER_SESSION_MAX} (audit suppressed): "
+)
+
+
+#: Seen addresses the baseline reads main's past-cap line with: two addresses and
+#: ``_HOSTILE_SEEN``.
+_BASELINE_SEEN = ("10.0.0.1", *_HOSTILE_SEEN, "2001:DB8:0:0:0:0:0:1")
+
+#: A path that opens a quoted credential value and a seen text that closes it: main's past-cap
+#: line hid the rest of the path as that value, which a reading of the path alone does not. The
+#: last three are the review's (round-ea896ecc): the seen text writes the path's own tail back
+#: after the quote, which a check of the value's prefix alone let through.
+_QUOTE_CLOSING_SEEN = (
+    ("/x password='hunter2 more words", "x'"),
+    ('/x token="abc def ghi', 'q"'),
+    ("/x password='hunter2 more", "x' hunter2 more"),
+    ("/x password='hunter2 SECRETTAIL", "x' SECRETTAIL 1"),
+    ("/x password='hunter2 more", "x' more junk"),
+    ("/x password='hunter2 SECRETTAIL", "x' SECRETTAIL seen_ip=1"),
+)
+
+
+def _sink_lines(fmt: str, *args: object, count: int = 2) -> list[str]:
+    """What each of ``count`` shipped handlers, two unless named, writes for one WARNING."""
+    streams, handlers = _shipped_handlers(count)
+    logger = logging.getLogger("tests.control_hl7")
+    logger.propagate = False
+    for handler in handlers:
+        logger.addHandler(handler)
+    try:
+        logger.warning(fmt, *args)
+    finally:
+        for handler in handlers:
+            logger.removeHandler(handler)
+            handler.close()
+        logger.propagate = True
+    written = [s.getvalue() for s in streams]
+    # The control: each sink wrote the one line.
+    assert all(text.count("\n") == 1 and text.endswith("\n") for text in written), written
+    return written
+
+
+def _last_sink_line(fmt: str, *args: object, count: int = 2) -> str:
+    """What the last of ``count`` shipped handlers, two unless named, writes for one WARNING,
+    without its line break."""
+    return _sink_lines(fmt, *args, count=count)[-1].rstrip("\n")
+
+
+def _seen_tail(seen_text: str) -> str:
+    """The pre-#3770 past-cap line's tail after the path, with the seen text as main logged it."""
+    return " seen_ip=" + scrub_log_argument(seen_text)
+
+
+def _hides_no_less_than_main(path: str, seen: str = "10.0.0.1", count: int = 2) -> list[str]:
+    """With ``count`` shipped handlers, two unless named: the words of ``path`` that a sink of this
+    branch's matching line prints in its path field, escapes decoded, more often than main's last
+    handler printed them in its path span, on one of main's two WARNING lines. Main's lines are its
+    own two formats, with the seen address as main logged it. Main's path span is its line after
+    its head and, on the past-cap line, before ``seen_ip=`` and the seen text, as main logged it or
+    as the same handlers write it alone. Where
+    neither tail is found whole, the span runs to the end of the line and the larger of the two
+    tails' counts of the word is taken off, uncapped. The subtraction is strict: it guesses no
+    boundary, so a word only main's tail printed is not credited to main, but a path word main
+    printed can be taken off when its tail, written a third way, did not print it, a false red
+    that ``_KNOWN_FALSE_RED`` pins. Not covered, at least: a path word a pass's placeholder or
+    escape spells, which a tail rewritten more in the line than alone could add."""
+    seen_text = _bounded_address_text(seen)
+    repeat = _new_ip_path_field(path)
+    over = _new_ip_path_field(path, seen_text)
+    main_tail = _seen_tail(seen_text)
+    pairs = (
+        (
+            _sink_lines(_REPEAT_HEAD + "%s", path, count=count),
+            _sink_lines(_REPEAT_HEAD + "%s", repeat, count=count),
+        ),
+        (
+            _sink_lines(_OVER_HEAD + "path=%s%s", path, main_tail, count=count),
+            _sink_lines(
+                _OVER_HEAD + "seen_ip=%s path=%s", _address_log_field(seen), over, count=count
+            ),
+        ),
+    )
+    # The control: every sink wrote the WARNING. Its opening words, since main's own line can lose
+    # ``path=`` to a run of the path.
+    opening = "a request from a new client address must re-verify; the address "
+    assert all(line.startswith(opening) for pair in pairs for side in pair for line in side)
+    words = set(re.findall(r"[A-Za-z0-9]{3,}", path))
+    tails = (main_tail, _last_sink_line("%s", main_tail, count=count))
+    shown = []
+    for (main, ours), head, after in zip(
+        pairs, (_REPEAT_HEAD, _OVER_HEAD + "path="), (("",), tails), strict=True
+    ):
+        span, taken_off = _main_span(main[-1], head, opening, after)
+        # The unreadable placeholder is a constant that carries no path text, so its own words,
+        # such as ``redacted``, are not words the field printed of the path.
+        values = (_path_value(line) for line in ours)
+        fields = ["" if value == _UNREADABLE else _unescaped(value) for value in values]
+        for word in sorted(words):
+            in_main_span = max(0, span.count(word) - taken_off(word))
+            if any(field.count(word) > in_main_span for field in fields):
+                shown.append(word)
+    return shown
+
+
+def _main_span(
+    line: str, head: str, opening: str, tails: tuple[str, ...]
+) -> tuple[str, Callable[[str], int]]:
+    """Main's path span in ``line``, and how many of a word in it the caller takes off: the rest
+    of ``head`` where a pass took part of it; and, where no tail of ``tails`` is found whole at the
+    line's end, the larger of the tails' counts, uncapped: the strict rule
+    ``_hides_no_less_than_main`` states."""
+    line = line.rstrip("\n")
+    extra = ""
+    if line.startswith(head):
+        line = line[len(head) :]
+    else:
+        line, extra = line[len(opening) :], head[len(opening) :]
+    for tail in tails:
+        if line.endswith(tail):
+            return line[: len(line) - len(tail)], extra.count
+    return line, lambda word: extra.count(word) + max(tail.count(word) for tail in tails)
+
+
+def _path_value(line: str) -> str:
+    """The value of a line's ``path`` field, read by ``_logged_fields``. Only that field is read:
+    the seen address field of an unparsed address is a digest under a key drawn per process, and
+    could hold a path word."""
+    return dict(_logged_fields(line.rstrip("\n")))["path"]
+
+
+#: Known false reds of the strict baseline (round-5aa03c4b): main wrote the past-cap tail a third
+#: way, the encoded run raw and the date redacted, while the path's own date printed, so taking
+#: off the raw tail's date takes off the path's. The field prints the date no more often than main.
+_KNOWN_FALSE_RED = (
+    "//codemrn/1980-01-01SECRET\t|",
+    "/'.:\t1980-01-01Authorization: 123-45-6789",
+)
+
+
+@pytest.mark.parametrize("path", _KNOWN_FALSE_RED)
+def test_the_strict_baseline_reports_a_known_false_red(path: str) -> None:
+    """RED when: the baseline stops flagging a named false red, so its subtraction is no longer the
+    strict one its docstring states, or the field prints the date more often than main's line did
+    (BACKLOG #3770). Either change needs this vector re-read rather than dropped."""
+    seen = "a%7Cb%7Cc 1980-01-01"
+    seen_text = _bounded_address_text(seen)
+    line = _last_sink_line(_OVER_HEAD + "path=%s%s", path, _seen_tail(seen_text))
+    # The controls: main's tail is neither raw nor as written alone, main printed the path's date
+    # once, and the field prints it once.
+    assert line.endswith(" seen_ip=a%7Cb%7Cc [redacted]") and line.count("1980") == 1, ascii(line)
+    assert _unescaped(_new_ip_path_field(path, seen_text)).count("1980") == 1
+    assert _hides_no_less_than_main(path, seen) == ["1980"], ascii(path)
+
+
+@pytest.mark.parametrize(("path", "seen"), _QUOTE_CLOSING_SEEN)
+def test_a_seen_address_that_closes_a_quote_hides_the_path(path: str, seen: str) -> None:
+    """RED when: the past-cap line's path field prints words of the path that main's past-cap line
+    hid only because the seen text after the path closed a quote the path opened; or such a path
+    stops logging the placeholder, a case ``redacted_log_field`` lists (BACKLOG #3770)."""
+    assert _new_ip_path_field(path, _bounded_address_text(seen)) == _UNREADABLE_FIELD, (path, seen)
+    assert not _hides_no_less_than_main(path, seen), (path, seen)
+
+
+@pytest.mark.parametrize("path", _CONTROL_HL7_PATHS)
+def test_a_control_character_does_not_unhide_an_encoded_hl7_name(path: str) -> None:
+    """RED when: the path field prints a percent-encoded HL7 name that follows a control
+    character, on any sink of either line (BACKLOG #3770)."""
+    for line in _sink_lines("path=%s", _new_ip_path_field(path)):
+        assert "DOE" not in _unescaped(line) and "JANE" not in _unescaped(line), ascii(line)
+    assert not _hides_no_less_than_main(path)
+
+
+#: Paths whose words main's third shipped handler hid and its second printed, so a reading taken
+#: at two handlers printed them (review round-f0aa430e and its fuzz). With a log file and a
+#: forwarder, ``configure_logging`` installs three handlers on one shared record.
+_THIRD_HANDLER_HID = (
+    "/MEFOR_X=session:';\"DOE",
+    "/MEFOR_X=%7C\":'[redacted]token=",
+    "/MEFOR_X=WORDAcode=SECRETVALUE';\"MEFOR_X",
+    '/MEFOR_X=/token="1980-01-01"DOE:',
+    "/MEFOR_X=password=password='token=\"session:'name",
+    '/MEFOR_X=x\'"token="\xa0',
+)
+
+
+@pytest.mark.parametrize("count", (2, 3))
+@pytest.mark.parametrize("path", (*_MAIN_HID_PATHS, *_THIRD_HANDLER_HID))
+def test_the_path_field_hides_no_less_than_main(path: str, count: int) -> None:
+    """RED when: a word of the path that main's last shipped handler hid on main's repeat or
+    past-cap line prints on a sink of this branch's matching line (BACKLOG #3770), with two
+    handlers or with three, as ``configure_logging`` installs with a log file and a forwarder.
+    Main logged the raw path in ``path=%s`` and ``path=%s seen_ip=%s``; this branch logs an
+    escaped field the handlers cannot read into, so the field must already carry what they would
+    have hidden."""
+    for seen in _BASELINE_SEEN:
+        assert not _hides_no_less_than_main(path, seen, count), (ascii(path), seen, count)
+
+
+def test_a_third_handler_does_not_unhide_the_path() -> None:
+    """RED when: the path field carries a word that main's third shipped handler hid, so a
+    forwarder behind a log file would write it on a first deployment (BACKLOG #3770). The
+    reviewer's vector: main's forwarder wrote ``path=/MEFOR_X=<redacted> seen_ip=10.0.0.1``."""
+    path, seen = _THIRD_HANDLER_HID[0], "10.0.0.1"
+    seen_text = _bounded_address_text(seen)
+    main = _sink_lines(_OVER_HEAD + "path=%s%s", path, _seen_tail(seen_text), count=3)
+    # The control: main's second sink printed the name and its third hid it.
+    assert "DOE" in main[1] and "DOE" not in main[2], [ascii(line) for line in main]
+    ours = _sink_lines(_REPEAT_HEAD + "%s", _new_ip_path_field(path), count=3)
+    ours += _sink_lines(
+        _OVER_HEAD + "seen_ip=%s path=%s",
+        _address_log_field(seen),
+        _new_ip_path_field(path, seen_text),
+        count=3,
+    )
+    for line in ours:
+        assert "DOE" not in _unescaped(line), ascii(line)
+
+
+#: What the three-handler corpus builds paths from, after ``/MEFOR_X=``: credential labels, quotes
+#: that open and close a value, names, encoded separators and the shapes that turn a pass off.
+_QUOTE_PIECES = (
+    "\xa0",
+    "code=SECRETVALUE",
+    "password='",
+    'token="',
+    "password=",
+    "SECRET",
+    "hunter2",
+    " ",
+    " seen_ip=",
+    "x'",
+    "'",
+    '"',
+    "DOE",
+    "JANE",
+    "a%7Cb%7Cc",
+    "%5E",
+    "/",
+    "Bearer ",
+    "1980-01-01",
+    "\t",
+    "more",
+    ":",
+    "=",
+    "session:",
+    "MEFOR_X=",
+    ";",
+    "|",
+    "name",
+    "token",
+)
+
+
+def test_the_path_field_hides_no_less_than_main_with_three_handlers_over_quote_vectors() -> None:
+    """RED when: over a seeded corpus of quote-closing paths, a word that main's last of three
+    shipped handlers hid prints on a sink of this branch's matching line (BACKLOG #3770)."""
+    rng = random.Random(3)
+    third_hid = 0
+    for _ in range(300):
+        path = _corpus_path(rng, _QUOTE_PIECES, prefix="/MEFOR_X=", most=7)
+        assert not _hides_no_less_than_main(path, "10.0.0.1", count=3), ascii(path)
+        main = _sink_lines(_REPEAT_HEAD + "%s", path, count=3)
+        third_hid += main[1] != main[2]
+    # The control: the corpus holds paths that main's third handler wrote differently from its
+    # second, so a reading taken at two handlers is tested here.
+    assert third_hid >= 10, third_hid
+
+
+def test_a_reading_still_changing_at_the_cap_logs_the_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: a line that the shipped handlers are still rewriting when the reading stops is
+    logged from that last pass rather than as the placeholder, or the cap stops being read
+    (BACKLOG #3770). The reviewer's path changes on main's third handler pass."""
+    import messagefoundry.logging_setup as logging_setup
+
+    path = _THIRD_HANDLER_HID[0]
+    # The control: with the shipped cap the path reads, and its name is hidden.
+    assert _new_ip_path_field(path) == '"/MEFOR_u005F_X_u003D_<redacted>"'
+    # The path changes on three passes and the fourth confirms it: a cap of exactly four reads it,
+    # and a cap of three, one short, does not.
+    monkeypatch.setattr(logging_setup, "_SHIPPED_READING_MAX_PASSES", 4)
+    assert _new_ip_path_field(path) == '"/MEFOR_u005F_X_u003D_<redacted>"'
+    monkeypatch.setattr(logging_setup, "_SHIPPED_READING_MAX_PASSES", 3)
+    assert _new_ip_path_field(path) == _UNREADABLE_FIELD
+    assert _new_ip_path_field(path, "10.0.0.1") == _UNREADABLE_FIELD
+
+
+def test_a_path_past_the_read_bound_logs_the_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: a path longer than ``LOG_FIELD_READ_MAX`` is read through the filters, whose
+    passes run on the event loop in the branch a replayed token loops on, or is logged as anything
+    but the placeholder (BACKLOG #3770)."""
+    import messagefoundry.logging_setup as logging_setup
+
+    path = "/" + "a" * (LOG_FIELD_READ_MAX - 1)
+    # The control: a path at the bound reads, cut by the field bound.
+    assert _new_ip_path_field(path) != _UNREADABLE_FIELD
+
+    def _no_reading() -> tuple[logging.Filter, ...]:
+        raise AssertionError("an over-bound path was read")
+
+    # A reading of the over-bound path would raise here and log ``unloggable-AssertionError``.
+    monkeypatch.setattr(logging_setup, "_shipped_filters", _no_reading)
+    monkeypatch.setattr(logging_setup, "_UNLOGGABLE_REPORTED", set())
+    assert _new_ip_path_field(path + "a") == _UNREADABLE_FIELD
+    assert _new_ip_path_field(path + "a", "10.0.0.1") == _UNREADABLE_FIELD
+    # The control: the patch is live, so a path at the bound now fails to read.
+    assert _new_ip_path_field(path) == '"unloggable-AssertionError"'
+
+
+@pytest.mark.parametrize("label", ("token", "password", "secret", "id_token", "access_token"))
+def test_a_credential_matrix_parameter_blanks_the_past_cap_line_for_the_named_seen_texts(
+    label: str,
+) -> None:
+    """RED when: a path holding a credential matrix parameter stops logging the placeholder on the
+    past-cap line with a ``_BASELINE_SEEN`` text, or stops logging the repeat field with ``||`` or
+    ``a^b^c``, the cases ``redacted_log_field`` lists; or either line stops hiding the value
+    (BACKLOG #3770)."""
+    path = f"/x;{label}=abc"
+    repeat = _new_ip_path_field(path)
+    assert "abc" not in repeat and repeat.endswith('_u003D_<redacted>"'), repeat
+    for seen in _BASELINE_SEEN:
+        assert _new_ip_path_field(path, _bounded_address_text(seen)) == _UNREADABLE_FIELD, seen
+    for seen in ("||", "a^b^c"):
+        assert _new_ip_path_field(path, _bounded_address_text(seen)) == repeat, seen
+
+
+#: What the seeded corpora build paths from: labels, separators, encoded separators, controls,
+#: words, a no-break space and a credential shape. The last two turn a pass off for a whole line.
+_CORPUS_PIECES = (
+    "password",
+    "Bearer",
+    "bearer ",
+    "token",
+    "session",
+    "code",
+    "MEFOR_X",
+    "mrn",
+    "MRN",
+    '"name": ',
+    "Authorization: ",
+    "|",
+    "^",
+    "&",
+    "~",
+    "%7C",
+    "%5E",
+    "%26",
+    "%2C",
+    "%3B",
+    "%20",
+    "=",
+    ":",
+    " ",
+    "\t",
+    "\n",
+    "\r",
+    "\x01",
+    "\x0b",
+    "DOE",
+    "JANE",
+    "Jane Doe",
+    "1980-01-01",
+    "19800101",
+    "123-45-6789",
+    "abc",
+    "SECRET",
+    "hunter2",
+    "/",
+    "-",
+    ".",
+    "\xa0",
+    "code=SECRETVALUE",
+)
+
+
+def _corpus_path(
+    rng: random.Random,
+    pieces: tuple[str, ...] = _CORPUS_PIECES,
+    *,
+    prefix: str = "/",
+    most: int = 9,
+) -> str:
+    """One path of a seeded corpus: one to ``most`` of ``pieces`` after ``prefix``, by default
+    one to nine of ``_CORPUS_PIECES`` after a slash."""
+    return prefix + "".join(rng.choice(pieces) for _ in range(rng.randrange(1, most + 1)))
+
+
+def test_the_path_field_hides_no_less_than_main_over_a_seeded_corpus() -> None:
+    """The same, over paths built from labels, separators, encoded separators, controls and
+    words (BACKLOG #3770)."""
+    rng = random.Random(3770)
+    for n in range(300):
+        path = _corpus_path(rng)
+        seen = _BASELINE_SEEN[n % len(_BASELINE_SEEN)]
+        assert not _hides_no_less_than_main(path, seen), (ascii(path), seen)
+
+
+def test_an_unparsed_address_logs_a_keyed_digest() -> None:
+    """RED when: the past-cap line logs a plain digest of an unparsed address, so a low-entropy
+    name or password a client put in a forwarded header is recovered by hashing guesses (BACKLOG
+    #3770)."""
+    import hashlib
+
+    for text in ("DOE JANE", "password=hunter2", "fe80::1%eth0"):
+        field = _address_log_field(text)
+        plain = hashlib.sha256(text.encode()).hexdigest()[:16]
+        assert plain not in field, text
+        assert re.fullmatch(r'"(?:unparsed|fe80::1-zone)-sha256-[0-9a-f]{16}"', field), field
+        assert field == _address_log_field(text)
+
+
+def test_redact_log_value_follows_the_shipped_filter_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: ``redact_log_value`` stops reading the filters ``_install_phi_filters`` installs,
+    so a filter added there never reaches a new-address WARNING's path, whose escape hides its text
+    from every handler filter (BACKLOG #3770)."""
+    import messagefoundry.logging_setup as logging_setup
+
+    assert redact_log_value("/x code=a password=b DOE JANE") == (
+        "/x code=<redacted> password=<redacted> [redacted]"
+    )
+
+    class _Marker(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            record.msg, record.args = record.getMessage().replace("MARKER", "[gone]"), None
+            return True
+
+    installed = logging_setup._install_phi_filters
+
+    def _with_marker(handler: logging.Handler) -> None:
+        installed(handler)
+        handler.addFilter(_Marker())
+
+    monkeypatch.setattr(logging_setup, "_install_phi_filters", _with_marker)
+    assert redact_log_value("/a/MARKER/b") == "/a/[gone]/b"
+
+
+def test_a_rewritten_context_logs_a_placeholder() -> None:
+    """RED when: a pass that rewrites the line's fixed context around the value leaves that context
+    in the value; or a seen text a pass takes into the path is not caught; or a path ending in a
+    credential label is unreadable on the repeat line, or ``/x/password:`` is readable on the
+    past-cap line, where its label takes ``seen_ip=`` as its value; or the placeholder passes its
+    bound (BACKLOG #3770).
+    ``/x/password:`` before ``seen_ip=`` reads as a label whose value is the next field."""
+    assert _UNREADABLE not in ("<redacted>", "[redacted]")
+    assert redact_log_value("/x/password:", after=" seen_ip=0.0.0.0") is None
+    after = " seen_ip=0.0.0.0"
+    assert redacted_log_field("/x/password:", 64, after=after) == _UNREADABLE_FIELD
+    assert redacted_log_field("/a", 64) == '"/a"'
+    # The placeholder is bounded like any value.
+    for limit in range(16, 24):
+        assert len(redacted_log_field("/x/password:", limit, after=after)) <= limit + 2
+    assert _new_ip_path_field("/x/password:", "10.0.0.1") == _UNREADABLE_FIELD
+    assert _new_ip_path_field("/x/password=", "10.0.0.1") == _UNREADABLE_FIELD
+    assert _new_ip_path_field("/x/password:") == '"/x/password_u003A_"'
+    assert _new_ip_path_field("/plain/path", "10.0.0.1") == '"/plain/path"'
+    assert _new_ip_path_field("/api/auth/bearer") == '"/api/auth/bearer"'
+    # The bearer label takes ``seen_ip=`` as its value in the past-cap line, a case
+    # ``redacted_log_field`` lists.
+    for seen in ("10.0.0.1", "DOE JANE hunter2"):
+        assert _new_ip_path_field("/api/auth/bearer", seen) == _UNREADABLE_FIELD, seen
+
+
+#: Seen texts the past-cap reading rewrites on their own: a date, a name, an MRN or an HL7 run a
+#: shipped filter rewrites, or a tab, which the shipped filters keep and only that reading's tab
+#: round writes as a space. Each must leave an ordinary path readable.
+_REWRITTEN_SEEN = (*_HOSTILE_SEEN, "1980-01-01", "MRN 12345", "Smith John", "a^b^c")
+
+
+@pytest.mark.parametrize("seen", _REWRITTEN_SEEN)
+@pytest.mark.parametrize("path", ["/plain", "/users", "/a b", "/api/admin/users/42"])
+def test_a_rewritten_seen_address_leaves_an_ordinary_path_readable(path: str, seen: str) -> None:
+    """RED when: a seen text that the past-cap reading rewrites alike in the line and on its own
+    (``_REWRITTEN_SEEN``) makes an ordinary path unreadable on that line, so a caller's forwarded
+    header blanks the only log of which path it reached (BACKLOG #3770)."""
+    seen_text = _bounded_address_text(seen)
+    tail = _seen_tail(seen_text)
+    # The control: a shipped handler rewrites this seen text read alone, or it holds a tab, which
+    # only the reading's tab round rewrites; so the case is the one named.
+    assert "\t" in tail or _last_sink_line("%s", tail) != tail, seen
+    field = _new_ip_path_field(path, seen_text)
+    assert field == _new_ip_path_field(path) != _UNREADABLE_FIELD, (path, seen, field)
+
+
+#: A path that switches a pass off for its whole line, a no-break space or a credential shape,
+#: with an encoded HL7 seen text: the past-cap line leaves that text raw, while the text read
+#: alone is rewritten (round-46f84b99).
+_RAW_IN_LINE_SEEN = (
+    ("/api/connections/IB_ACME\xa0/stop", "a%7Cb%7Cc"),
+    ("/x code=SECRETVALUE", "DOE%5EJANE%5EQ"),
+)
+
+
+@pytest.mark.parametrize(("path", "seen"), _RAW_IN_LINE_SEEN)
+def test_a_seen_text_left_raw_in_the_line_leaves_the_path_readable(path: str, seen: str) -> None:
+    """RED when: a seen text the past-cap line leaves raw, though a pass rewrites it alone, makes
+    a path readable on the repeat line unreadable on the past-cap line (BACKLOG #3770)."""
+    seen_text = _bounded_address_text(seen)
+    tail = _seen_tail(seen_text)
+    line = _last_sink_line(_OVER_HEAD + "path=%s%s", path, tail)
+    # The controls: the line kept the tail raw, and the tail read alone is rewritten.
+    assert line.endswith(tail), ascii(line)
+    assert _last_sink_line("%s", tail) != tail, seen
+    field = _new_ip_path_field(path, seen_text)
+    assert field == _new_ip_path_field(path) != _UNREADABLE_FIELD, (ascii(path), seen, field)
+    assert not _hides_no_less_than_main(path, seen), (ascii(path), seen)
+
+
+@pytest.mark.parametrize("seen", ["code=SECRETVALUE", "10.0.0.1\xa0"])
+def test_a_seen_text_that_turns_a_pass_off_blanks_a_path_that_pass_rewrote(seen: str) -> None:
+    """RED when: the case ``redacted_log_field`` names, a seen text that turns a pass off for the
+    whole line so the line hides less of the path than the repeat line did, stops logging the
+    placeholder (BACKLOG #3770). It fails closed; a change that makes it readable must also change
+    that docstring, and still pass the hides-no-less tests."""
+    path = "/api/x a%7Cb%7Cc"
+    assert _new_ip_path_field(path) == '"/api/x_u0020_[redacted]"'
+    assert _new_ip_path_field(path, _bounded_address_text(seen)) == _UNREADABLE_FIELD
+
+
+@pytest.mark.parametrize("seen", ["a%7Cb%7Cc\tx", "a%7Cb%7Cc 1980-01-01", "a%7Cb%7Cc DOE JANE"])
+@pytest.mark.parametrize("path", [path for path, _ in _RAW_IN_LINE_SEEN])
+def test_a_raw_run_beside_another_rewritten_shape_blanks_a_switch_off_path(
+    path: str, seen: str
+) -> None:
+    """RED when: a path that turns a pass off for its whole line, with a seen text holding a raw
+    encoded run beside a tab, a date or a name, stops logging the placeholder (BACKLOG #3770).
+    ``redacted_log_field`` lists the tab form as an example; the date and name forms are measured
+    here only. It fails closed; a change that makes the tab form readable must also change that
+    docstring, and still pass the hides-no-less tests."""
+    assert _new_ip_path_field(path, _bounded_address_text(seen)) == _UNREADABLE_FIELD
+    assert _new_ip_path_field(path) != _UNREADABLE_FIELD
+
+
+def _unexplained_blanks(field: Callable[[str, str], str]) -> tuple[int, list[str]]:
+    """Over the seeded corpus, how many paths ``field`` blanks on the past-cap line though the
+    repeat line reads them, and those of them main's own past-cap line, written by two shipped
+    handlers, printed readably: as the repeat value, or main's own repeat-line path span, followed
+    by the seen text raw or as the passes write it alone."""
+    rng = random.Random(46)
+    head = _OVER_HEAD + "path="
+    seens = (*_BASELINE_SEEN, *(seen for _, seen in _RAW_IN_LINE_SEEN))
+    blanked, readable_in_main = 0, []
+    for n in range(300):
+        path = _corpus_path(rng)
+        seen_text = _bounded_address_text(seens[n % len(seens)])
+        if field(path, seen_text) != _UNREADABLE_FIELD:
+            continue
+        value = redact_log_value(path, before=_REPEAT_HEAD)
+        if value is None:
+            continue
+        blanked += 1
+        # Main's own repeat span keeps a tab the repeat value, read with the tab round, respells.
+        repeat = _last_sink_line(_REPEAT_HEAD + "%s", path)
+        spans = {value}
+        if repeat.startswith(_REPEAT_HEAD):
+            spans.add(repeat[len(_REPEAT_HEAD) :])
+        tail = _seen_tail(seen_text)
+        tails = (tail, _last_sink_line("%s", tail))
+        line = _last_sink_line(head + "%s%s", path, tail)
+        if any(line == head + span + end for span in spans for end in tails):
+            readable_in_main.append(ascii(path))
+    return blanked, readable_in_main
+
+
+def test_the_past_cap_line_blanks_a_path_only_where_main_wrote_neither_tail_form() -> None:
+    """RED when: over the seeded corpus, the past-cap line logs the placeholder for a path the
+    repeat line reads, though main's own past-cap line, written by two shipped handlers, printed
+    it readably: the repeat value or main's own repeat-line path span, followed by the seen text
+    raw or as the passes write it alone (BACKLOG #3770). Main's line is read through the real
+    handlers here, not the reading the field's check uses. It does not catch a blank where main
+    printed the path with the tail written a third way."""
+    blanked, unexplained = _unexplained_blanks(_new_ip_path_field)
+    # The control: the corpus reaches the placeholder at all.
+    assert blanked, "no corpus path was blanked, so this measured nothing"
+    assert not unexplained, unexplained
+    # The control: a field that blanks every path holding a tab is caught, which a comparison
+    # with the repeat value alone, a tab respelled, could not catch.
+    # Only the paths it blanks are read further, so any other spelling serves the rest.
+    _, caught = _unexplained_blanks(
+        lambda path, seen_text: _UNREADABLE_FIELD if "\t" in path else '"readable"'
+    )
+    assert any("\\t" in path for path in caught), caught
+
+
+def test_a_cut_checksum_is_never_read_as_a_date() -> None:
+    """RED when: the cut mark ends where a word boundary falls before the checksum, so a checksum
+    of eight decimal digits starting 19 or 20 logs as ``[redacted]`` (BACKLOG #3770)."""
+    streams, handlers = _shipped_handlers()
+    logger = logging.getLogger("tests.cut_checksum")
+    logger.propagate = False
+    for handler in handlers:
+        logger.addHandler(handler)
+    try:
+        hits = 0
+        for n in range(20000):
+            token = redacted_log_field(f"/users/{'a' * 300}{n}", _NEW_IP_LOG_FIELD_MAX)
+            if not re.search(r"_%crc32x(?:19|20)[0-9]{6}\"", token):
+                continue
+            hits += 1
+            logger.warning("path=%s", token)
+            assert all(s.getvalue().splitlines()[-1] == f"path={token}" for s in streams)
+        assert hits  # the control: such a checksum occurred in the range
+    finally:
+        for handler in handlers:
+            logger.removeHandler(handler)
+            handler.close()
+        logger.propagate = True

@@ -57,6 +57,7 @@ from messagefoundry.store import MessageStore
 from tests.test_dr_outlive_deadline import _admin_client, _coordinator, _rows, _seed
 from tests.test_dr_passive_followups import _PASSIVE_UNCHECKED, _runner
 from tests.test_outbound_ca_anchors import (
+    _LANE_REFUSED,
     _at,
     _ca,
     _CountingSink,
@@ -439,13 +440,19 @@ async def test_a_reload_with_a_typo_in_a_literal_pin_is_an_invalid_config(
 # --- item 5: the advice a refused setting gets, and a kept failure that stops resolving --------
 
 
+class _Switch:
+    """A lane check that raises whatever ``exc`` holds now, for every lane."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+
+    async def __call__(self, _direction: str, _name: str, _settings: object) -> None:
+        raise self.exc
+
+
 def _raising(exc: BaseException) -> Any:
     """A lane check that raises ``exc`` for every lane."""
-
-    async def check(_direction: str, _name: str, _settings: object) -> None:
-        raise exc
-
-    return check
+    return _Switch(exc)
 
 
 _FIX_THE_FILE = "Fix the file"
@@ -925,10 +932,14 @@ async def test_a_refused_row_cannot_read_as_a_completed_action(
         await engine.stop()
 
 
+def _store_down() -> AnchorStoreUnavailable:
+    return AnchorStoreUnavailable("the store refused the trust-anchor audit read")
+
+
 def _store_fault_line() -> TrustAnchorError:
     """What a start raises for a check the store stopped: the lane's fixed line, from the fault."""
     line = TrustAnchorError("inbound connection: its tls_ca_file could not be checked")
-    line.__cause__ = AnchorStoreUnavailable("the store refused the trust-anchor audit read")
+    line.__cause__ = _store_down()
     return line
 
 
@@ -1219,5 +1230,187 @@ async def test_flipping_a_flag_back_ends_a_kept_ca_failure(
         assert runner.inbound_failed(_IB) is not None  # still recorded, so only the flag differs
         with pytest.raises(WiringError, match=_PIN_MISMATCH):
             await runner.reload(_poller_graph(ca, _WRONG_PIN))
+    finally:
+        await runner.stop()
+
+
+# --- vault BACKLOG #5146: the once-only guards key on the line's class -----------------------
+
+
+def _refused() -> TrustAnchorError:
+    return TrustAnchorError("the CA does not match its configured SHA-256 pin")
+
+
+_UNCHECKED_LINE = "could not be checked, because the store refused"
+
+
+async def test_an_outbound_line_follows_its_class_in_both_directions(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """A store fault, then the store back and the CA refused, reads as refused, with one alert;
+    then a store fault again reads as one, with one alert. A repeat of either class stays silent.
+    Red under: ``_repeats_failed_class`` reverted to a bare membership test, which keeps the
+    first line and raises no second alert."""
+    ca = _ca(tmp_path)
+    switch = _Switch(_store_down())
+    sink = _CountingSink()
+    runner = _runner(
+        store, _outbound_registry(ca, _sha(ca)), lane_anchor_check=switch, alert_sink=sink
+    )
+    await runner.start()
+    try:
+        assert _UNCHECKED_LINE in (runner.outbound_failed("OUT") or "")
+        assert runner.failed_on_store_fault("outbound", "OUT")
+        assert sink.stopped == ["OUT"]
+        await runner.start_outbound("OUT")  # the same class again: silent
+        assert sink.stopped == ["OUT"]
+
+        switch.exc = _refused()
+        await runner.start_outbound("OUT")
+        assert _LANE_REFUSED in (runner.outbound_failed("OUT") or "")
+        assert not runner.failed_on_store_fault("outbound", "OUT")
+        assert ("outbound", "OUT") in runner._anchor_refused
+        assert sink.stopped == ["OUT", "OUT"]
+        await runner.start_outbound("OUT")  # the declined #3224 item 3: no second page
+        assert sink.stopped == ["OUT", "OUT"]
+
+        switch.exc = _store_down()
+        await runner.start_outbound("OUT")
+        assert _UNCHECKED_LINE in (runner.outbound_failed("OUT") or "")
+        assert runner.failed_on_store_fault("outbound", "OUT")
+        # The refusal's mark went with its line, so a reload reads the CA again.
+        assert ("outbound", "OUT") not in runner._anchor_refused
+        assert sink.stopped == ["OUT", "OUT", "OUT"]
+    finally:
+        await runner.stop()
+
+
+async def test_a_store_fault_after_a_refusal_ends_the_kept_ca_failure(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """A refused outbound is kept failed across a reload that changes nothing, so the reload does
+    not read its CA. Once a store fault replaces its line, the next reload reads the CA again,
+    and a CA still refused refuses that reload. Red under: ``_record_failed`` keeping the
+    refusal's mark beside a store fault's line, where the reload keeps the lane unread."""
+    ca = _ca(tmp_path)
+    switch = _Switch(_refused())
+    runner = _runner(store, _outbound_registry(ca, _sha(ca)), lane_anchor_check=switch)
+    await runner.start()
+    try:
+        assert ("outbound", "OUT") in runner._anchor_refused
+        await runner.reload(_outbound_registry(ca, _sha(ca)))  # the control: kept, not read
+        switch.exc = _store_down()
+        await runner.start_outbound("OUT")
+        assert runner.failed_on_store_fault("outbound", "OUT")
+        switch.exc = _refused()
+        with pytest.raises(WiringError):
+            await runner.reload(_outbound_registry(ca, _sha(ca)))
+    finally:
+        await runner.stop()
+
+
+async def test_an_inbound_start_line_follows_its_class_in_both_directions(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """The inbound twin, through the start door, which records before either retrying door
+    looks. Red under: ``_checked_inbound_start`` keyed on membership again."""
+    switch = _Switch(_store_down())
+    sink = _CountingSink()
+    runner = _runner(
+        store, _poller_graph(_ca(tmp_path), _WRONG_PIN), lane_anchor_check=switch, alert_sink=sink
+    )
+    await runner.start()
+    try:
+        assert runner.failed_on_store_fault("inbound", _IB)
+        assert sink.stopped == [_IB]
+
+        switch.exc = _refused()
+        for _ in range(2):
+            with pytest.raises(TrustAnchorError):
+                await runner.start_inbound(_IB)
+        assert _LANE_REFUSED in (runner.inbound_failed(_IB) or "")
+        assert not runner.failed_on_store_fault("inbound", _IB)
+        assert sink.stopped == [_IB, _IB]
+
+        switch.exc = _store_down()
+        for _ in range(2):
+            with pytest.raises(TrustAnchorError):
+                await runner.start_inbound(_IB)
+        assert _UNCHECKED_LINE in (runner.inbound_failed(_IB) or "")
+        assert runner.failed_on_store_fault("inbound", _IB)
+        assert sink.stopped == [_IB, _IB, _IB]
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize("door", ["window_open", "engine_restart"])
+async def test_each_retrying_inbound_door_records_a_class_change_once(
+    store: MessageStore,
+    tmp_path: Path,
+    judged: None,
+    door: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The scheduler's window open and an engine restart each guard on the class themselves, for
+    a failure the start door left unrecorded. The start is stubbed so it records nothing, which
+    is what isolates the door. Red under: that door's guard keyed on membership again, one door
+    per case."""
+    sink = _CountingSink()
+    runner = _runner(
+        store,
+        _poller_graph(_ca(tmp_path), _WRONG_PIN),
+        lane_anchor_check=_Switch(_store_down()),
+        alert_sink=sink,
+    )
+    await runner.start()
+    try:
+        assert runner.failed_on_store_fault("inbound", _IB)
+        failure: list[Exception] = [_store_fault_line()]
+
+        async def unrecorded_start(_name: str, *, resolve: bool) -> None:
+            raise failure[0]
+
+        async def fail_once() -> None:
+            if door == "window_open":
+                runner._record_window_open_failure(_IB, failure[0])
+                return
+            with pytest.raises(TrustAnchorError):
+                await runner.restart_inbound(_IB)
+
+        monkeypatch.setattr(runner, "_resolving_start", unrecorded_start)
+        await fail_once()  # the same class: silent
+        assert sink.stopped == [_IB]
+
+        failure[0] = _refused()
+        await fail_once()
+        await fail_once()
+        assert not runner.failed_on_store_fault("inbound", _IB)
+        assert sink.stopped == [_IB, _IB]
+
+        failure[0] = _store_fault_line()
+        await fail_once()
+        await fail_once()
+        assert runner.failed_on_store_fault("inbound", _IB)
+        assert sink.stopped == [_IB, _IB, _IB]
+    finally:
+        await runner.stop()
+
+
+async def test_a_passive_line_keeps_its_store_fault_class(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """The passive start builds its fixed line rather than raise it, with no cause linked, so it
+    names the line's class itself. Red under: ``_preflight_passive_lanes`` not passing
+    ``store_fault`` to ``_record_failed``."""
+    runner = _runner(
+        store,
+        _poller_graph(_ca(tmp_path), _WRONG_PIN),
+        lane_anchor_check=_Switch(_store_down()),
+        dr_standby=Priority.CRITICAL,
+    )
+    await runner.start()
+    try:
+        assert runner.inbound_failed(_IB) is not None
+        assert runner.failed_on_store_fault("inbound", _IB)
     finally:
         await runner.stop()

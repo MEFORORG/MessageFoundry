@@ -6,6 +6,22 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **The Windows service installer creates the secrets directory.** `install-service.ps1` makes
+  `<DataDir>-secrets` (or `-SecretsDir`), restricted to SYSTEM, Administrators and the service
+  account, and adds `MEFOR_SECRETS_DIRECTORY` to the service's NSSM environment, keeping the
+  entries already there. It refuses a directory it cannot restrict, one below a junction, one
+  another service names, and an existing directory the service does not already name. The directory starts empty; the
+  engine reads it as before, refusing it
+  when a broad group can reach it. `uninstall-service.ps1` names it and leaves it. See the secrets
+  directory bullet in [SERVICE.md](docs/SERVICE.md). (`BACKLOG #2595`)
+
+### Removed
+- **`[store].key_provider` no longer accepts `aws_kms`, `azure_kv`, `gcp_kms` or `pkcs11`.** None
+  was ever built, and each already failed closed at store open. Each is now refused as an unknown
+  name, and the keyless-store gate no longer counts one as a configured key. `vault` is the one
+  external provider. (`BACKLOG #2595`)
+
 ### Changed
 - **A `[dr]` takeover or release hook now gets an allowlisted environment.** It used to get the
   engine's whole environment less the engine's own `MEFOR_*` names, so a secret kept under any
@@ -17,6 +33,19 @@ All notable changes to MessageFoundry are documented here. The format follows
 - On Windows, a generic DATABASE file keyword is now also refused when a best-effort check finds
   its path leads to another host, or cannot finish reading the path; see the Generic ODBC section of
   [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #2705`)
+
+### Fixed
+- **The `supervise` process's own TLS log forwarder now picks up a replaced CRL without a
+  restart.** An engine process applied a replaced `[logging].forward_tls_crl_file` to its running
+  forwarder, but the supervisor builds no engine, so nothing in it did. On a first deployment a
+  collector certificate revoked after the start would have been accepted by every later handshake
+  of the supervisor's forwarder until a restart. `supervise` now runs the same CRL reload while its
+  engine shards run, capped by `[cert_monitor].crl_max_reloads`. The revocation is refused at the
+  forwarder's next handshake; a connection it already holds is not cut, and keeps sending until it
+  fails and the forwarder reconnects. The supervisor raises no `[alerts]` alert for a refused
+  reload: it is a WARNING line in the supervisor's own log. A shutdown signal sent while a reload
+  pass is stuck cuts the supervisor's wait on that pass; the process can still wait at exit for
+  the stuck read's worker thread to return. (`BACKLOG #3314`)
 
 ## [0.5.2] — 2026-10-20 — Early Access
 

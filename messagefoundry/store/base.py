@@ -79,12 +79,15 @@ from messagefoundry.store.privilege import (
 )
 from messagefoundry.store.row_seal import RowSealer
 from messagefoundry.store.store import (
+    ANY_CLAIM_OWNER,
     OPEN_STORE_PIN,
+    OPEN_STORE_PIN_CHECK,
     UPLOAD_RESERVATION_STALE_AFTER,
     AdMap,
     AdminGrant,
     AdminHolderTest,
     AdminRemoval,
+    AlertGeneration,
     AlertInstance,
     AlertSummary,
     AuditAppend,
@@ -92,6 +95,7 @@ from messagefoundry.store.store import (
     CapturedResponse,
     ChannelScopeSource,
     ClaimedHeads,
+    ClaimOwnerGuard,
     ClaimProcStatus,
     ConnectionEvent,
     ConnectionEventWrite,
@@ -112,6 +116,7 @@ from messagefoundry.store.store import (
     OutboxItem,
     OwnedLanes,
     PasskeyCounts,
+    PinCheck,
     ReingressOriginMissing,
     ReingressOutcome,
     ReplyWaitState,
@@ -128,11 +133,13 @@ from messagefoundry.store.store import (
     SessionRecord,
     SignCountAnswer,
     Stage,
+    StoreCreateBatchFailedBeforeKeyUse,
     StorePin,
     StreamingAttachmentsUnsupported,
     TotpUsable,
     UserRecord,
     WebAuthnCredential,
+    minting_open,
     note_audit_chain_read,
 )
 
@@ -1448,6 +1455,7 @@ class QueueStore(StoreLifecycle, Protocol):
         reason: str | None = None,
         escalation_tier: int = 0,
         now: float | None = None,
+        raised_by: str | None = None,
     ) -> None:
         """Record/fold one operator-alert occurrence into a resolvable ``alert_instance`` (ADR 0044),
         de-duped on ADR 0014's ``(event_type, connection)`` throttle key: if a live (``open`` or
@@ -1460,7 +1468,11 @@ class QueueStore(StoreLifecycle, Protocol):
         transaction, touching no ``queue`` row and calling no finalizer, so it can never pin a message's
         disposition. ``reason`` is ``safe_text``-scrubbed (#120) and encrypted at rest on every backend;
         no message body is ever passed here. The caller (the ``_emit`` chokepoint) wraps it fail-soft, so
-        a store error here can never wedge a delivery worker."""
+        a store error here can never wedge a delivery worker.
+
+        ``raised_by`` names the writer of this raise, stored on the instance as its newest raiser
+        (BACKLOG #4916): the notifier passes its per-process random id, and
+        :meth:`resolve_alert_instances_fenced` reads it."""
         ...
 
     async def list_active_alert_instances(
@@ -1547,6 +1559,39 @@ class QueueStore(StoreLifecycle, Protocol):
     ) -> int:
         """Auto-resolve the live instance(s) for a ``(event_type, connection)`` key on the inverse
         lifecycle signal (e.g. ``connection_restored``). Returns the count resolved."""
+        ...
+
+    async def open_alert_generations(
+        self, *, event_type: str, connection: str | None = None
+    ) -> list[AlertGeneration]:
+        """The live (``open`` or ``acknowledged``) instances of ``event_type``, for one
+        ``connection`` or for every one, as :class:`AlertGeneration` pairs (BACKLOG #3269). Lockfree
+        read; no reason cell is read."""
+        ...
+
+    async def resolve_alert_instances_fenced(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        raised_by: str,
+        seen: AlertGeneration | None,
+        now: float | None = None,
+    ) -> int:
+        """Auto-resolve the key's live instance only when its newest raise is one the resolving
+        writer had seen or wrote itself (BACKLOG #4916): it is the instance ``seen`` names, at most
+        ``seen.count`` raises in, or its newest raise carries ``raised_by``. A raise another writer
+        wrote after ``seen`` was read keeps it open. Returns the count resolved. No clock is
+        compared."""
+        ...
+
+    async def resolve_alert_generation(
+        self, *, alert_id: int, through_count: int, now: float | None = None
+    ) -> int:
+        """Resolve instance ``alert_id`` only while it is live and its ``count`` is at most
+        ``through_count`` (BACKLOG #3269). Returns 1 when it resolved, 0 when the row was already
+        resolved, unknown, or has taken a raise since its generation was read. No clock is compared,
+        so a raise from another process that lands first keeps the row open whatever its clock."""
         ...
 
     async def suspend_alert_instance(
@@ -2094,7 +2139,7 @@ class AuditStore(Protocol):
         ...
 
     async def list_interrupted_approvals(self, *, limit: int = 100) -> Sequence[Row]:
-        """Released requests whose operation was cut off mid-run (status ``interrupted``), OLDEST
+        """Released requests at status ``interrupted``, OLDEST
         first (BACKLOG #1562). Kept apart from :meth:`list_pending_approvals` so "pending" keeps its
         one meaning: awaiting a second approver. An interrupted row is awaiting an operator's record
         of what happened, so no expiry applies to it; it stays listed until it is resolved.
@@ -2103,8 +2148,7 @@ class AuditStore(Protocol):
         hide the rows that have waited longest, and nothing would ever bring them back. Oldest first,
         a row past the cap appears as the ones before it are resolved.
 
-        Projects the same columns as the pending queue, so ``approver`` and ``decided_at`` say who
-        released it and when it was cut off."""
+        Projects the same columns as the pending queue."""
         ...
 
     async def decide_pending_approval(
@@ -2117,6 +2161,7 @@ class AuditStore(Protocol):
         from_status: str = "pending",
         audit: AuditAppend | None = None,
         claim_owner: str | None = None,
+        from_claim_owner: ClaimOwnerGuard = ANY_CLAIM_OWNER,
     ) -> bool:
         """Move a request from ``from_status`` to ``status`` in one guarded UPDATE. ``True`` iff
         this call moved it, which is what guards a double decision.
@@ -2133,6 +2178,11 @@ class AuditStore(Protocol):
         operation, so that process can recognise its own claims after a restart
         (``ApprovalGate.reconcile_after_restart``). Engine shards and cluster nodes share one store,
         and the owner is what keeps one process from settling a sibling's live release.
+
+        ``from_claim_owner``, when not :data:`~messagefoundry.store.store.ANY_CLAIM_OWNER`, also
+        guards the move on the row's ``claim_owner`` reading exactly that value, ``None`` meaning
+        no owner, checked on the row read in the write (BACKLOG #1562). An operator's settle of a
+        stranded release passes the owner it judged, so the move lands only on the row it judged.
 
         **The move checks the row's seal first (BACKLOG #2592).** It reads the row, and raises
         :class:`~messagefoundry.store.row_seal.RowSealError`, writing nothing, when the seal does
@@ -2171,12 +2221,19 @@ class AuditStore(Protocol):
         ...
 
     async def list_executing_approvals(
-        self, *, claim_owner: str | None = None, limit: int = 1000
+        self,
+        *,
+        claim_owner: str | None = None,
+        not_claimed_by: str | None = None,
+        limit: int = 1000,
     ) -> Sequence[Row]:
         """Released requests still claimed as ``executing``, OLDEST claim first (BACKLOG #1562).
 
         ``claim_owner``, when given, keeps only the rows that owner claimed and the rows with no
         owner, filtered in SQL so other owners' rows cannot push them past ``limit``.
+        ``not_claimed_by`` is its complement for a sibling scan: only rows some OTHER owner
+        claimed, never an unowned row, so the caller's own rows cannot push a sibling's past
+        ``limit`` either. Passing both raises :class:`ValueError`.
 
         Projects every column, as :meth:`list_pending_approvals` does; ``decided_at`` is when it
         was claimed. Read at startup by ``ApprovalGate.reconcile_after_restart``,
@@ -4492,6 +4549,56 @@ def _absent_sqlite_store(settings: StoreSettings) -> Path | None:
     return None
 
 
+#: SQLSTATEs a server driver reports for a connection it could not establish: 08001 (unable to
+#: establish one) and 08004 (the server rejected it). The invalid-authorization class, 28, a
+#: refused login, is matched by its prefix. Each names a failed dial, not that no earlier dial in
+#: the same open succeeded, so :func:`_failed_before_connecting` asks where it was raised too.
+_CONNECT_ONLY_SQLSTATES: Final = frozenset({"08001", "08004"})
+#: The modules whose ``_create_pool`` builds a server store's pool. Each backend's open calls it
+#: once, first among the calls that can reach the database, and hands the cipher to the store only
+#: after it returns.
+_POOL_CREATION_MODULES: Final = frozenset(
+    {"messagefoundry.store.postgres", "messagefoundry.store.sqlserver"}
+)
+
+
+def _raised_creating_the_pool(exc: BaseException) -> bool:
+    """Whether ``exc``'s traceback passes through a server backend's ``_create_pool``, so it was
+    raised before the store that holds the cipher was built. A backend that catches such an error
+    and raises another outside that call answers ``False``, which keeps the key."""
+    tb = exc.__traceback__
+    while tb is not None:
+        frame = tb.tb_frame
+        if (
+            frame.f_code.co_name == "_create_pool"
+            and frame.f_globals.get("__name__") in _POOL_CREATION_MODULES
+        ):
+            return True
+        tb = tb.tb_next
+    return False
+
+
+def _failed_before_connecting(exc: Exception) -> bool:
+    """Whether a minting server open's ``exc`` proves it wrote nothing under its key (vault BACKLOG
+    #8119 item 2, the Manager's ruling of 2026-11-10): raised while the backend built its pool,
+    before the store that holds the cipher existed (:func:`_raised_creating_the_pool`), AND of a
+    class only a failed dial raises: the hop's own TLS settings refused (``InsecureHopRefused``), a
+    refused or unresolvable address (``ConnectionRefusedError``, ``socket.gaierror``), or a
+    driver's connection or login refusal named by its SQLSTATE (:data:`_CONNECT_ONLY_SQLSTATES`,
+    class 28). Anything else answers ``False``, and the minting command keeps the key: at least
+    any failure after the pool was built, a timeout, a ``RuntimeError``, and a dial failure a
+    backend wraps in another class, such as SQL Server's database-options connection under
+    ``auto``, or asyncio's combined error for several addresses."""
+    import socket
+
+    if not _raised_creating_the_pool(exc):
+        return False
+    if isinstance(exc, (InsecureHopRefused, ConnectionRefusedError, socket.gaierror)):
+        return True
+    state = driver_sqlstate(exc)
+    return state is not None and (state in _CONNECT_ONLY_SQLSTATES or state.startswith("28"))
+
+
 async def open_store(
     settings: StoreSettings,
     *,
@@ -4630,6 +4737,12 @@ async def open_store(
     # The pin rides a context variable to the genesis read every backend shares (vault BACKLOG
     # #3411); reset at once, so no later open in this context inherits it.
     pinned = OPEN_STORE_PIN.set(pin)
+    # A minting server open's failure is typed as one that sealed nothing under the minted key, so
+    # the minting command removes it, only where _failed_before_connecting proves it, and only
+    # before the pin check passed; every other failure keeps the key (vault BACKLOG #8119 item 2).
+    # The batch failures a backend typed itself, and the pin refusals, are re-raised as they are.
+    check = PinCheck() if minting_open() and settings.backend is not StoreBackend.SQLITE else None
+    checking = OPEN_STORE_PIN_CHECK.set(check)
     try:
         store = await _open_backend(
             settings,
@@ -4641,7 +4754,12 @@ async def open_store(
             create=create,
             read_only=read_only,
         )
+    except Exception as exc:
+        if check is None or check.passed or not _failed_before_connecting(exc):
+            raise
+        raise StoreCreateBatchFailedBeforeKeyUse(exc) from exc
     finally:
+        OPEN_STORE_PIN_CHECK.reset(checking)
         OPEN_STORE_PIN.reset(pinned)
     if keyless_chain_refusal is not None and audit_mac_key is None and audit_mac_fn is None:
         await _refuse_to_start_a_keyless_chain(
@@ -4998,7 +5116,13 @@ DEFAULT_STORE_ACQUIRE_TIMEOUT = 30.0
 
 
 class StoreAcquireTimeout(RuntimeError):
-    """A store pooled-connection borrow exceeded ``[store].acquire_timeout``.
+    """A store pooled-connection borrow exceeded its limit: at least ``[store].acquire_timeout``,
+    a shorter cluster clamp, or the longer post-commit limit. The message ends with the advice its
+    caller passed, ``[store].acquire_timeout`` unless the caller says otherwise. A SQL Server
+    cluster coordinator's clamped borrow whose clamp, floored at 1 s, is no longer than
+    ``[store].acquire_timeout`` advises one fixed text that points to the docs/CONFIGURATION.md
+    [cluster] paragraph instead
+    (``SqlServerStore._acquire_clamped``, BACKLOG #5064).
 
     An ordinary ``Exception`` on purpose, so it lands in the store callers' existing ``except
     Exception`` handling and is treated as a transient stage failure (retry / dead-letter) — never a
@@ -5040,8 +5164,12 @@ def _salvage_late_borrow(pool: Any, backend: str, borrow: asyncio.Future[Any]) -
 _LATE_RELEASES: set[asyncio.Future[None]] = set()
 
 
-async def acquire_pooled(pool: Any, *, timeout: float, backend: str) -> Any:
+async def acquire_pooled(
+    pool: Any, *, timeout: float, backend: str, retune: str = "[store].acquire_timeout"
+) -> Any:
     """Borrow a pooled connection within ``timeout`` seconds, or raise :class:`StoreAcquireTimeout`.
+    ``retune`` is the advice the error ends with, after "retune with": a setting name, or for a
+    caller whose limit is not ``[store].acquire_timeout`` alone, the text that caller passes.
 
     The single bounded chokepoint both server backends' ``_acquire`` helpers go through, so there is
     one place that decides what happens at the limit and the two cannot drift. The caller releases the
@@ -5064,7 +5192,7 @@ async def acquire_pooled(pool: Any, *, timeout: float, backend: str) -> Any:
         borrow.add_done_callback(partial(_salvage_late_borrow, pool, backend))
         raise StoreAcquireTimeout(
             f"{backend}: store pool acquire timed out after {timeout:g}s "
-            f"(pool exhausted or database unresponsive); retune with [store].acquire_timeout"
+            f"(pool exhausted or database unresponsive); retune with {retune}"
         ) from exc
     except asyncio.CancelledError:
         borrow.cancel()

@@ -15,7 +15,7 @@ import logging
 import os
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -110,7 +110,6 @@ from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
 from messagefoundry.store.crypto import Cipher
 from messagefoundry.store.store import (
-    AUDIT_PREFIX_BREAK_MARKER,
     REINGRESS_TARGET_PREFIX,
     AuditAnchorError,
     AuditAppend,
@@ -433,6 +432,11 @@ class ReloadOutcome:
     config_version: int | None = None
     initiator_digest: Mapping[str, object] | None = None
     restart_required: tuple[str, ...] | None = None
+    #: The ``env()`` values an applied reload swapped in with ``registry``, so an audit row reads
+    #: that graph's loosenings against the values it builds with, whatever the runner holds by then
+    #: (vault BACKLOG #3814). ``None`` for a dry run. They include secret values, so they are kept
+    #: out of the repr and of equality.
+    env_values: Mapping[str, Any] | None = field(default=None, repr=False, compare=False)
 
     @property
     def degraded(self) -> bool:
@@ -1907,9 +1911,9 @@ class Engine:
         **THEY ARE NOT INDEPENDENT, AND A ``"audit-chain"`` ALERT DOES NOT MEAN THE TAIL IS INTACT.**
         ``verify_audit_chain`` returns on the chain break BEFORE the prefix comparator runs, so when a
         row is edited AND the tail is cut — the likeliest real shape, an edit plus its cover-up — only
-        the break is reported and the truncation is never named. Lifting that needs the store to return a
-        structured verdict carrying both instead of one ``(ok, message)`` pair, across all three
-        backends; it is not done here. Read a break as *"at least* a break"."""
+        the break is reported and the truncation is never named. The verdict's ``prefix_break`` flag
+        separates the two, but lifting this needs the walk to run the comparator past a break too;
+        it is not done here. Read a break as *"at least* a break"."""
         expected_prefix = await self._load_audit_anchor()
         try:
             verdict = await self.store.verify_audit_chain(expected_prefix=expected_prefix)
@@ -1941,9 +1945,9 @@ class Engine:
                 "An engine runs with no key only under the audited keyless opt-out, where a chain "
                 "never names one: either the chain was altered, or the engine lost its key"
             )
-        # verify_audit_chain folds both verdicts into one (ok, message) and reports a chain break FIRST,
-        # so the marker is the only thing that separates them without walking the log a second time.
-        truncated = AUDIT_PREFIX_BREAK_MARKER in reason
+        # The flag, never the message text (vault BACKLOG #3054, item 11). Read as `key_unavailable`
+        # is, so a store returning a plain (ok, message) pair files a chain break, never fails start.
+        truncated = bool(getattr(verdict, "prefix_break", False))
         subject = "audit-chain-truncated" if truncated else "audit-chain"
         log.warning(
             "startup audit-chain verification FAILED (alert-only, %s): %s",
@@ -2077,8 +2081,8 @@ class Engine:
         # reloads, and NOT leader-gated: whichever node runs the graph pauses its own listeners
         # against the one shared backlog. Built and measured ONCE here, BEFORE the graph comes up, so
         # a restart onto a backlog already over the bound binds its listeners paused rather than
-        # reading until the first tick. A no-op (no task) when the depth bound is off and the disk
-        # floor does not apply.
+        # reading until the first tick. With the depth bound off and no disk floor, its task only
+        # sweeps stale intake alerts, and only when a sink is wired (BACKLOG #3269).
         if self._intake_monitor is None:
             self._intake_monitor = IntakeBoundMonitor(
                 self.store,
@@ -3676,6 +3680,10 @@ class Engine:
             fingerprint=fingerprint,
             config_version=config_version,
             restart_required=restart_required,
+            # The values this reload applied, not copied again. On a first load, or with no
+            # provider, this is the engine's own dict, which nothing changes in place: a reload
+            # rebinds it.
+            env_values=env_values,
         )
 
     def _resolve_reload_target(self, config_dir: str | Path | None) -> Path:
@@ -3999,59 +4007,98 @@ class Engine:
             await self._registry_runner.stop()
         # After the graph, so the listeners are already closed when the monitor opens the gate on its
         # way out; stopping it first would let a paused listener read again during shutdown.
+        # A count, not a flag, as in IntakeBoundMonitor.stop: a cancel of this stop from any step
+        # below is held until the store has closed, then raised in place of any error.
+        me = asyncio.current_task()
+        baseline = me.cancelling() if me is not None else 0
+        monitor_cancelled = False
         if self._intake_monitor is not None:
-            await self._intake_monitor.stop()
-            self._intake_monitor = None
-        # Vault BACKLOG #2613: after the graph, so a clear raised here does not say a graph that is
-        # still serving has gone, and ahead of the alert-state drain, which gives its write a chance.
-        if self.on_graph_stopped is not None:
+            monitor, self._intake_monitor = self._intake_monitor, None
             try:
-                self.on_graph_stopped()
-            except Exception as exc:  # noqa: BLE001 - a stop must go on to close the store
-                log.warning("a graph-stopped callback failed: %s", type(exc).__name__)
-        # Vault BACKLOG #2742: after the graph, so a script refused during the drain is still
-        # reported by the watch's last pass. That pass may write an audit row and raise an alert,
-        # so it runs while the store is open, and ahead of the alert-state drain at the end.
-        if self._remote_debug_watch is not None:
-            await self._remote_debug_watch.stop()
-            self._remote_debug_watch = None
-        # Settle the GCM invocation bound only AFTER the message graph has quiesced. stop() spends the
-        # unused remainder of this process's reserved block and unhooks the refill signal, so anything
-        # that encrypts after it runs is charged against no reservation with no checkpointer left to
-        # refill one. The registry runner is what drives those encrypts, so settling ahead of it would
-        # silently under-count every write performed during the shutdown drain.
-        if self._gcm_invocation_runner is not None:
-            await self._gcm_invocation_runner.stop()
-            self._gcm_invocation_runner = None
-        self._disarm_cipher_refusal_alert()
-        # Deregister cluster membership after the runner has quiesced but before the store closes (the
-        # coordinator marks its node left over the same pool). stop() is idempotent and safe even if
-        # start() raised (then there's just nothing to cancel). NullCoordinator is a no-op.
-        # ADR 0157 Inc 5: drop the edge-trigger BEFORE stopping the coordinator, so a clean
-        # step-down cannot fire a wake into a supervisor that is already gone.
-        if isinstance(self._coordinator, _SupportsDemoteHook):
-            self._coordinator.set_on_demote(None)
-        await self._coordinator.stop()
-        # Cancel the background pool warm-up if still running (best-effort; the store is about to close).
-        # It releases any connections it holds in its own finally, but at shutdown the pool closes anyway.
-        if self._warm_pool_task is not None:
-            self._warm_pool_task.cancel()
-            await asyncio.gather(self._warm_pool_task, return_exceptions=True)
-            self._warm_pool_task = None
-        # A config write whose caller was cancelled is still running, and its row needs the store
-        # (BACKLOG #2623). Under the managed API lifespan a drain has already run, bounded by its
-        # shutdown budget (BACKLOG #3191), and closed the gate. A write it left running gets only
-        # the short late wait here, inside this step's reserve; with none running it costs nothing.
-        # A caller whose shutdown ran no drain gets the fixed bound.
-        await self.drain_config_writes(
-            _CONFIG_WRITE_LATE_DRAIN_SECONDS
-            if self._config_writes_closed
-            else _CONFIG_WRITE_DRAIN_SECONDS
-        )
-        # Clears raised on the way out are background writes: an unpinned cluster node's intake
-        # alerts (BACKLOG #2272) and the coordinator's leadership release. Give them a bounded chance
-        # to land before the store closes. Last, so it covers every stop step above.
-        drain = getattr(self._alert_sink, "drain_state", None)
-        if drain is not None:
-            await drain(_ALERT_STATE_DRAIN_SECONDS)
-        await self.store.close()
+                await monitor.stop()
+            except asyncio.CancelledError:
+                # The monitor passes a cancel of this stop on once its gate is open (BACKLOG
+                # #3269). Finish the teardown below first, so the store still drains and closes.
+                monitor_cancelled = True
+        # The rest of the teardown is guarded (BACKLOG #3269): the store closes even if a later step
+        # raises or is cancelled. A pending cancel is raised last, in place of any error a step or the
+        # close raised, which is then logged. A SystemExit or KeyboardInterrupt is never replaced.
+        cancelled = monitor_cancelled
+        failure: BaseException | None = None
+        try:
+            # Vault BACKLOG #2613: after the graph, so a clear raised here does not say a graph that is
+            # still serving has gone, and ahead of the alert-state drain, which gives its write a chance.
+            if self.on_graph_stopped is not None:
+                try:
+                    self.on_graph_stopped()
+                except Exception as exc:  # noqa: BLE001 - a stop must go on to close the store
+                    log.warning("a graph-stopped callback failed: %s", type(exc).__name__)
+            # Vault BACKLOG #2742: after the graph, so a script refused during the drain is still
+            # reported by the watch's last pass. That pass may write an audit row and raise an alert,
+            # so it runs while the store is open, and ahead of the alert-state drain at the end.
+            if self._remote_debug_watch is not None:
+                await self._remote_debug_watch.stop()
+                self._remote_debug_watch = None
+            # Settle the GCM invocation bound only AFTER the message graph has quiesced. stop() spends the
+            # unused remainder of this process's reserved block and unhooks the refill signal, so anything
+            # that encrypts after it runs is charged against no reservation with no checkpointer left to
+            # refill one. The registry runner is what drives those encrypts, so settling ahead of it would
+            # silently under-count every write performed during the shutdown drain.
+            if self._gcm_invocation_runner is not None:
+                await self._gcm_invocation_runner.stop()
+                self._gcm_invocation_runner = None
+            self._disarm_cipher_refusal_alert()
+            # Deregister cluster membership after the runner has quiesced but before the store closes (the
+            # coordinator marks its node left over the same pool). stop() is idempotent and safe even if
+            # start() raised (then there's just nothing to cancel). NullCoordinator is a no-op.
+            # ADR 0157 Inc 5: drop the edge-trigger BEFORE stopping the coordinator, so a clean
+            # step-down cannot fire a wake into a supervisor that is already gone.
+            if isinstance(self._coordinator, _SupportsDemoteHook):
+                self._coordinator.set_on_demote(None)
+            await self._coordinator.stop()
+            # Cancel the background pool warm-up if still running (best-effort; the store is about to close).
+            # It releases any connections it holds in its own finally, but at shutdown the pool closes anyway.
+            if self._warm_pool_task is not None:
+                self._warm_pool_task.cancel()
+                await asyncio.gather(self._warm_pool_task, return_exceptions=True)
+                self._warm_pool_task = None
+            # A config write whose caller was cancelled is still running, and its row needs the store
+            # (BACKLOG #2623). Under the managed API lifespan a drain has already run, bounded by its
+            # shutdown budget (BACKLOG #3191), and closed the gate. A write it left running gets only
+            # the short late wait here, inside this step's reserve; with none running it costs nothing.
+            # A caller whose shutdown ran no drain gets the fixed bound.
+            await self.drain_config_writes(
+                _CONFIG_WRITE_LATE_DRAIN_SECONDS
+                if self._config_writes_closed
+                else _CONFIG_WRITE_DRAIN_SECONDS
+            )
+            # Clears raised on the way out are background writes: an unpinned cluster node's intake
+            # alerts (BACKLOG #2272) and the coordinator's leadership release. Give them a bounded chance
+            # to land before the store closes. Last, so it covers every stop step above.
+            drain = getattr(self._alert_sink, "drain_state", None)
+            if drain is not None:
+                await drain(_ALERT_STATE_DRAIN_SECONDS)
+        except asyncio.CancelledError:
+            cancelled = True
+        except BaseException as exc:  # noqa: BLE001 - held until the store closes, then re-raised
+            failure = exc
+        try:
+            await self.store.close()
+        except Exception as exc:
+            if failure is None:
+                failure = exc
+            else:
+                log.exception("the store close failed after an engine stop step failed")
+        cancelled = cancelled or (me is not None and me.cancelling() > baseline)
+        if failure is not None and not isinstance(failure, Exception):
+            raise failure  # SystemExit, KeyboardInterrupt: never swallowed by a cancel
+        if cancelled:
+            if failure is not None:
+                # The cancel replaces this error, so it is logged here or not at all.
+                log.error(
+                    "an engine stop step or the store close failed after the stop was cancelled",
+                    exc_info=failure,
+                )
+            raise asyncio.CancelledError
+        if failure is not None:
+            raise failure

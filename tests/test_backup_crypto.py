@@ -386,3 +386,198 @@ def test_writer_header_stays_far_under_the_cap() -> None:
     (hdrlen,) = _U32.unpack(enc.getvalue()[off : off + _U32.size])
     assert hdrlen < 160  # the "well under 160 bytes" the MAX_HEADER_BYTES note cites
     assert hdrlen * 8 < bc.MAX_HEADER_BYTES  # and the cap keeps room for future additive fields
+
+
+# --- BACKLOG #6686: chunk_size is validated as given, never coerced by truthiness ------------------
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, False, 1024.0])
+def test_writer_refuses_a_chunk_size_that_is_not_a_positive_int(bad: int) -> None:
+    # `chunk_size or DEFAULT_CHUNK_SIZE` turned 0 (and False) into 1 MiB, so the documented 1..MAX
+    # guard never saw it; True passed it as a 1-byte chunk, and a float reached the header. Only
+    # None selects the default.
+    with pytest.raises(bc.BackupCodecError, match="chunk_size"):
+        bc.encrypt_stream(io.BytesIO(b"x"), io.BytesIO(), os.urandom(32), chunk_size=bad)
+
+
+def test_writer_none_chunk_size_selects_the_default() -> None:
+    enc = io.BytesIO()
+    bc.encrypt_stream(io.BytesIO(b"x"), enc, os.urandom(32), chunk_size=None)
+    assert bc.read_header(io.BytesIO(enc.getvalue())).chunk_size == bc.DEFAULT_CHUNK_SIZE
+
+
+# --- BACKLOG #6687: a short read that is not EOF is not a truncation -------------------------------
+
+
+class _Trickle(io.BytesIO):
+    """A source that serves at most ``step`` bytes per read, as a raw pipe or socket may.
+
+    A short read from such a source is legal and is NOT end of stream; only an empty read is. Once
+    ``block_after`` bytes have been served, every read reports "no data yet" as ``None``, as a
+    non-blocking raw stream does."""
+
+    def __init__(self, data: bytes, *, step: int = 1, block_after: int | None = None) -> None:
+        super().__init__(data)
+        self._step = step
+        self._block_after = block_after
+
+    def read(self, size: int | None = -1, /) -> bytes:
+        if self._block_after is not None and self.tell() >= self._block_after:
+            return None  # type: ignore[return-value]  # what a non-blocking raw stream returns
+        if size is None or size < 0:
+            size = self._step
+        return super().read(min(size, self._step))
+
+
+class _Gush(io.BytesIO):
+    """A source that breaks the read contract by returning more than it was asked for, after
+    ``honest`` well-behaved short reads of one byte each."""
+
+    def __init__(self, data: bytes, *, honest: int = 0) -> None:
+        super().__init__(data)
+        self._honest = honest
+
+    def read(self, size: int | None = -1, /) -> bytes:
+        if self._honest > 0:
+            self._honest -= 1
+            return super().read(1)
+        return super().read()
+
+
+def _archive(payload: bytes, key: bytes) -> tuple[bytes, int, int]:
+    """A real 1024-byte-chunk archive, the offset its first frame starts at, and one frame's length."""
+    enc = io.BytesIO()
+    bc.encrypt_stream(io.BytesIO(payload), enc, key, chunk_size=1024)
+    blob = enc.getvalue()
+    off = len(bc.MAGIC) + 1
+    (hdrlen,) = _U32.unpack(blob[off : off + _U32.size])
+    return blob, off + _U32.size + hdrlen, _NONCE_BYTES + _U32.size + 1024 + bc._TAG_BYTES
+
+
+def test_the_trickle_source_actually_short_reads() -> None:
+    # Positive control: without it, every test below could pass on a source that never short-reads.
+    src = _Trickle(b"abcdef", step=2)
+    assert src.read(5) == b"ab"
+
+
+@pytest.mark.parametrize("step", [1, 7, 1000])
+def test_decrypt_and_read_header_fill_short_reads(step: int) -> None:
+    key = os.urandom(32)
+    payload = os.urandom(5000)
+    enc = io.BytesIO()
+    bc.encrypt_stream(io.BytesIO(payload), enc, key, chunk_size=1024)
+    blob = enc.getvalue()
+    assert bc.read_header(_Trickle(blob, step=step)).chunk_size == 1024
+    out = io.BytesIO()
+    bc.decrypt_stream(_Trickle(blob, step=step), out, key)
+    assert out.getvalue() == payload
+
+
+@pytest.mark.parametrize(
+    "where", ["magic", "header", "before frame 0", "after frame 0", "inside frame 1", "last byte"]
+)
+def test_a_truncated_archive_still_fails_through_short_reads(where: str) -> None:
+    # Looping to fill must stop at true EOF: a cut archive is still refused, as a truncation,
+    # whether the cut lands in the prefix, on a frame boundary, or inside a frame.
+    key = os.urandom(32)
+    blob, first, frame = _archive(os.urandom(3000), key)
+    cut = {
+        "magic": 3,
+        "header": first - 5,
+        "before frame 0": first,
+        "after frame 0": first + frame,
+        "inside frame 1": first + frame + 30,
+        "last byte": len(blob) - 1,
+    }[where]
+    with pytest.raises(bc.BackupCodecError, match="truncated"):
+        bc.decrypt_stream(_Trickle(blob[:cut], step=5), io.BytesIO(), key)
+
+
+def test_encrypt_fills_each_frame_from_a_short_reading_source() -> None:
+    # Every frame but the last carries a full chunk_size of plaintext, so the declared header
+    # chunk_size describes the archive whatever the source's read granularity.
+    key = os.urandom(32)
+    payload = os.urandom(5000)
+    enc = io.BytesIO()
+    bc.encrypt_stream(_Trickle(payload, step=100), enc, key, chunk_size=1024)
+    src = io.BytesIO(enc.getvalue())
+    bc.read_header(src)
+    lengths = []
+    while nonce := src.read(_NONCE_BYTES):
+        assert len(nonce) == _NONCE_BYTES
+        (ctlen,) = _U32.unpack(src.read(_U32.size))
+        src.read(ctlen)
+        lengths.append(ctlen - bc._TAG_BYTES)
+    assert lengths == [1024, 1024, 1024, 1024, 5000 - 4 * 1024]
+    out = io.BytesIO()
+    bc.decrypt_stream(io.BytesIO(enc.getvalue()), out, key)
+    assert out.getvalue() == payload
+
+
+def test_a_writer_source_with_no_data_ready_is_refused_not_read_as_eof() -> None:
+    # A non-blocking raw stream returns None for "nothing yet". Reading that as EOF after two full
+    # chunks would let the writer seal a silently truncated backup as a complete, authentic archive.
+    for block_after in (0, 1024, 2048, 2500):
+        with pytest.raises(bc.BackupCodecError, match="no data"):
+            bc.encrypt_stream(
+                _Trickle(b"x" * 5000, step=300, block_after=block_after),
+                io.BytesIO(),
+                os.urandom(32),
+                chunk_size=1024,
+            )
+
+
+@pytest.mark.parametrize("where", ["prefix", "between frames", "inside a frame", "after final"])
+def test_a_reader_source_with_no_data_ready_is_refused_not_read_as_eof(where: str) -> None:
+    # On the read side, None after the final frame must not pass the trailing-byte check as EOF.
+    key = os.urandom(32)
+    blob, first, frame = _archive(os.urandom(3000), key)
+    block_after = {
+        "prefix": 4,
+        "between frames": first + frame,
+        "inside a frame": first + frame + 30,
+        "after final": len(blob),
+    }[where]
+    with pytest.raises(bc.BackupCodecError, match="no data"):
+        bc.decrypt_stream(_Trickle(blob, step=7, block_after=block_after), io.BytesIO(), key)
+
+
+def test_a_source_that_returns_more_than_asked_is_refused() -> None:
+    # An over-long read would let the writer seal a frame past its declared chunk_size, which this
+    # build's own reader then rejects at restore time.
+    # Both on the first read and inside the fill loop, after a short read.
+    key = os.urandom(32)
+    blob, _, _ = _archive(b"x" * 3000, key)
+    for honest in (0, 1):
+        with pytest.raises(bc.BackupCodecError, match="returned"):
+            bc.encrypt_stream(_Gush(b"x" * 3000, honest=honest), io.BytesIO(), key, chunk_size=1024)
+        with pytest.raises(bc.BackupCodecError, match="returned"):
+            bc.decrypt_stream(_Gush(blob, honest=honest), io.BytesIO(), key)
+
+
+class _OneEof(io.BytesIO):
+    """A source that refuses to be read again once it has returned end of stream."""
+
+    def __init__(self, data: bytes) -> None:
+        super().__init__(data)
+        self.eofs = 0
+
+    def read(self, size: int | None = -1, /) -> bytes:
+        if self.eofs:
+            raise AssertionError("read again past an end of stream already returned")
+        data = super().read(size)
+        if not data:
+            self.eofs += 1
+        return data
+
+
+@pytest.mark.parametrize("length", [0, 1000, 1024, 5000])
+def test_encrypt_reads_the_source_past_eof_at_most_once(length: int) -> None:
+    # A TTY or similar source may block, or raise, when read again after it reported EOF.
+    key = os.urandom(32)
+    payload = os.urandom(length)
+    enc = io.BytesIO()
+    bc.encrypt_stream(_OneEof(payload), enc, key, chunk_size=1024)
+    out = io.BytesIO()
+    bc.decrypt_stream(io.BytesIO(enc.getvalue()), out, key)
+    assert out.getvalue() == payload

@@ -7,6 +7,9 @@
 // multi-line block, such as the output of `messagefoundry check`, is split first so that no line is
 // left without one.
 //
+// engineLog.ts writes the "MessageFoundry Engine" channel through `writeStamped` too, one line per
+// record (vault BACKLOG #2349).
+//
 // No `vscode` import: the unit tests drive this with a fixed clock and no Extension Host.
 
 /** Write `text` to `sink`, each line prefixed with the clock's instant as ISO 8601 UTC
