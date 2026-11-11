@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import codecs
 import email.message
+import errno
 import functools
 import io
 import ntpath
@@ -135,9 +136,29 @@ def _is_link(st: os.stat_result) -> bool:
     return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_reparse_tag", 0) & _NAME_SURROGATE)
 
 
+def _runs_through_a_file(path: str, root: str) -> bool:
+    """Whether the deepest existing parent of ``path`` at or below ``root`` is not a directory, links
+    followed. Windows reports a path that runs on through a file as missing, where POSIX raises
+    ``NotADirectoryError``; this tells the two apart on Windows. Used only for xmlschema's bundled
+    root, whose links are library files; a vetted root is walked by :func:`_resolve_within`."""
+    parent = os.path.dirname(path)
+    while _within(parent, root):
+        try:
+            return not stat.S_ISDIR(os.stat(_native(parent)).st_mode)
+        except FileNotFoundError:
+            if os.path.dirname(parent) == parent:  # a filesystem root; never a bundled root
+                return False
+            parent = os.path.dirname(parent)
+    return False
+
+
 def _link_target(link: str) -> str | None:
     """Where ``link`` points, as :func:`_local` judges the target text, without following it."""
     return _local(os.path.join(os.path.dirname(link), os.readlink(_native(link))))
+
+
+def _not_a_directory() -> NotADirectoryError:
+    return NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR))
 
 
 def _resolve_within(path: str, root: str) -> str | None:
@@ -145,15 +166,24 @@ def _resolve_within(path: str, root: str) -> str | None:
 
     Walks the components below ``root`` one at a time with ``lstat``, so no link is followed before its
     target text is judged: one pointing at a UNC or device path, or outside ``root``, refuses the whole
-    path before anything opens it. ``root`` itself is not walked; it is the operator's choice."""
+    path before anything opens it. ``root`` itself is not walked for links; it is the operator's choice.
+
+    A path that runs on through an existing file that is not a directory, ``root`` included, raises
+    ``NotADirectoryError``. POSIX raises that itself, while Windows reports such a path as missing, and
+    xmlschema skips a missing include or import with only a warning."""
     pending = os.path.relpath(path, root).split(os.sep)
+    if pending != [os.curdir] and not stat.S_ISDIR(os.stat(_native(root)).st_mode):
+        raise _not_a_directory()  # a schema at a filesystem root is confined to itself, a file
     current, hops = root, 0
     while pending:
         part = pending.pop(0)
         if part in ("", os.curdir):
             continue
         candidate = os.path.join(current, part)
-        if not _is_link(os.lstat(_native(candidate))):  # a missing file raises, as an open would
+        st = os.lstat(_native(candidate))  # a missing file raises, as an open would
+        if not _is_link(st):
+            if pending and not stat.S_ISDIR(st.st_mode):
+                raise _not_a_directory()
             current = candidate
             continue
         hops += 1
@@ -166,12 +196,26 @@ def _resolve_within(path: str, root: str) -> str | None:
 
 
 def _read(path: str, *, no_follow: bool) -> bytes:
+    """The bytes of the regular file at ``path``; anything else raises an ``OSError``.
+
+    On POSIX ``os.open`` succeeds on a directory, a FIFO or a device, and ``os.fdopen`` then raised
+    without closing the descriptor it was handed, so each such location leaked one. ``O_NONBLOCK``
+    (POSIX only) keeps a FIFO with no writer from blocking the open, and ``fstat`` refuses every
+    non-regular file before a read, so a device such as ``/dev/zero`` is never read without end."""
     # O_NOFOLLOW (POSIX only) refuses a final component swapped for a link after the walk checked it.
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
     if no_follow:
         flags |= getattr(os, "O_NOFOLLOW", 0)
-    with os.fdopen(os.open(_native(path), flags), "rb") as fh:
-        return fh.read()
+    fd = os.open(_native(path), flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file")
+        chunks = []
+        while chunk := os.read(fd, 1 << 16):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
 
 
 #: The XSD elements that name another document to load. A location on one that holds a newline or
@@ -287,7 +331,8 @@ class _ConfinedFiles(urllib.request.BaseHandler):
     first, so a path schema's includes meet the same DOCTYPE refusal as an inline schema. A location
     outside every root, or one that is not a local file path, such as a UNC or device path, raises
     :class:`_ResourceRefused`. So, under any root, the bundled one included, does a location that
-    cannot be read as a file, such as a directory or one the process may not read; and, under a
+    cannot be read as a file, such as a directory, a FIFO or device, a path that runs on through a
+    file, or one the process may not read; and, under a
     vetted root, does at least a link the walk refuses, one reached through a link it cannot read, and
     a file ``parse_bytes`` or :func:`_refuse_text_locations` refuses. A missing file raises
     ``FileNotFoundError``. :func:`_build_schema` says what each does to the build.
@@ -321,7 +366,12 @@ class _ConfinedFiles(urllib.request.BaseHandler):
                 # Every reason is fixed text.
                 try:
                     if not root.vet:  # library files, read as they are, links included
-                        data = _read(written, no_follow=False)
+                        try:
+                            data = _read(written, no_follow=False)
+                        except FileNotFoundError:
+                            if _runs_through_a_file(written, root.path):
+                                raise _not_a_directory() from None
+                            raise
                         return urllib.response.addinfourl(
                             io.BytesIO(data), email.message.Message(), url
                         )
@@ -343,8 +393,9 @@ class _ConfinedFiles(urllib.request.BaseHandler):
                 except XmlParseError as exc:  # parse_bytes: malformed or empty
                     raise _ResourceRefused("a file that is not well-formed XML", url) from exc
                 except (OSError, ValueError) as exc:  # after the two above, which are ValueErrors
-                    # A directory, a denied read, a link lstat or readlink cannot read (readlink
-                    # raises ValueError for a reparse point it rejects), or a NUL in the path.
+                    # A directory, a FIFO or device, a path that runs on through a file, a denied
+                    # read, a link lstat or readlink cannot read (readlink raises ValueError for a
+                    # reparse point it rejects), or a NUL in the path.
                     raise _ResourceRefused("a location that cannot be read as a file", url) from exc
                 return urllib.response.addinfourl(io.BytesIO(data), email.message.Message(), url)
         # PHI-safe: names no part of the location.
@@ -442,7 +493,8 @@ def _build_schema(
 
     **A refused location** is at least: a local one outside those bounds; one reached through a link
     out of the root, to a UNC or device path, or through more than ``_MAX_LINKS`` links; a UNC or
-    device path itself; one that cannot be read as a file, such as a directory or a file the process
+    device path itself; one that cannot be read as a file, such as a directory, a FIFO or device, a
+    path that runs on through a file (on every platform), or a file the process
     may not read; a file there that ``parse_bytes`` refuses (a DOCTYPE, malformed or empty); and a
     location xmlschema would parse as XML text rather than open. It fails the build, and the error
     repeats the refusal's fixed reason where the refusal has one. The one exception is an import's

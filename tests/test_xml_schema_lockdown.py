@@ -786,6 +786,82 @@ def test_a_refused_include_names_a_true_reason(location: str, reason: str, tmp_p
     assert "dir5537" not in str(ei.value)  # PHI-safe: the location is not quoted
 
 
+def _open_fds() -> int | None:
+    """How many descriptors this process holds, or ``None`` where no listing exists (Windows)."""
+    for listing in ("/proc/self/fd", "/dev/fd"):
+        if os.path.isdir(listing):
+            return len(os.listdir(listing))
+    return None
+
+
+def test_a_directory_location_is_refused_and_leaks_no_descriptor(tmp_path: Path) -> None:
+    # On POSIX os.open succeeds on a directory and os.fdopen then raised IsADirectoryError without
+    # closing the descriptor, so every build that met one leaked it. Windows refuses the open itself.
+    (tmp_path / "dir5537.xsd").mkdir()
+    main = _write_path_schema(tmp_path, "dir5537.xsd")
+
+    def refuse_both() -> None:
+        with pytest.raises(XmlValidationError, match="a location that cannot be read as a file"):
+            validate_against("<patient>x</patient>", str(main))
+        # The named schema itself being a directory takes the same read, and fails the build.
+        with pytest.raises(XmlValidationError, match="could not load XSD schema"):
+            validate_against("<patient>x</patient>", str(tmp_path / "dir5537.xsd"))
+
+    refuse_both()  # warm-up, so anything opened once and kept is not counted
+    before = _open_fds()
+    if before is None:  # Windows: no listing to count, and the refusal is asserted above
+        return
+    for _ in range(5):
+        refuse_both()
+    assert _open_fds() == before  # 10 refusals, so a leak shows as 10 more descriptors
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="a FIFO is POSIX")
+@pytest.mark.timeout(60)
+def test_a_fifo_location_is_refused_without_blocking(tmp_path: Path) -> None:
+    # With no O_NONBLOCK the open waited for a writer that never comes, and the build hung.
+    os.mkfifo(tmp_path / "fifo5537.xsd")
+    main = _write_path_schema(tmp_path, "fifo5537.xsd")
+    with pytest.raises(XmlValidationError, match="a location that cannot be read as a file") as ei:
+        validate_against("<patient>x</patient>", str(main))
+    assert "fifo5537" not in str(ei.value)  # PHI-safe: the location is not quoted
+
+
+def test_a_path_that_runs_on_through_a_file_is_refused(tmp_path: Path) -> None:
+    # POSIX refused this as NotADirectoryError, while Windows reported it missing and xmlschema skipped
+    # the include with a warning, so the schema loaded without it. Both refuse it now.
+    (tmp_path / "inc.xsd").write_text(_CLEAN, encoding="utf-8")
+    for location in ("inc.xsd/b.xsd", "inc.xsd/sub/b.xsd"):
+        main = _write_path_schema(tmp_path / "schemas", f"../{location}")
+        with pytest.raises(XmlValidationError, match="a location that cannot be read as a file"):
+            validate_against("<patient>x</patient>", str(main), schema_root=str(tmp_path))
+    # Control: a missing file under a real directory is still skipped, as xmlschema always did.
+    main = _write_path_schema(tmp_path / "schemas", "../absent/b.xsd")
+    with pytest.warns(Warning, match="Include schema failed"):
+        assert not validate_against(
+            "<patient>x</patient>", str(main), schema_root=str(tmp_path)
+        ).valid
+
+
+def test_a_root_that_is_a_file_refuses_a_path_below_it(tmp_path: Path) -> None:
+    # A schema at a filesystem root is confined to itself, a file; nothing lies below it.
+    from messagefoundry.parsing.xml.schema import _resolve_within
+
+    root = tmp_path / "top.xsd"
+    root.write_text(_CLEAN, encoding="utf-8")
+    with pytest.raises(NotADirectoryError):
+        _resolve_within(str(root / "b.xsd"), str(root))
+    assert _resolve_within(str(root), str(root)) == str(root)  # control: the file itself
+
+
+def test_a_path_through_a_bundled_file_is_refused() -> None:
+    # The bundled root is read without the walk, so it takes its own check on Windows.
+    through = _bundled_directory() / "xmldsig-core-schema.xsd" / "x.xsd"
+    schema = f'<xs:schema {_XS}><xs:include schemaLocation="{through.as_uri()}"/></xs:schema>'
+    with pytest.raises(XmlValidationError, match="a location that cannot be read as a file"):
+        validate_against("<patient>x</patient>", schema)
+
+
 def test_bytearray_inline_schema_is_read_as_the_schema() -> None:
     # origin/main pre-parsed a bytearray schema as text; 12e253ecb7 sent it to the path branch, where
     # os.fsdecode refused it and the schema failed to load.
