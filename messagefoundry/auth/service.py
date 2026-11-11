@@ -9033,7 +9033,7 @@ class AuthService:
 
         **A window, not a run, so an alternating account pages (#3709 closing step 6).** The
         directory layer has no server pool, but its one host name can stand for several domain
-        controllers behind DNS round-robin, a VIP or a referral. Where one of them answers and
+        controllers behind at least DNS round-robin or a VIP. Where one of them answers and
         another does not, the account's probes alternate, and a run that one answer ends never
         reached K. Fewer than K failures in the window page nothing, so a window of ``2K - 1``
         needs failures to outnumber answers in it before it pages; at the default of 3, two
@@ -9082,8 +9082,13 @@ class AuthService:
                         "%d probes, so its unreachable page has ended",
                         scrub_log_argument(probe.username),
                         # A group search refused for its bound is an answer whose outcome reads
-                        # "unavailable"; its cause says what answered.
-                        probe.detail or probe.outcome.value,
+                        # "unavailable"; its cause slug says what answered. Other details, such
+                        # as a referral's hosts, stay out of this line.
+                        (
+                            probe.detail
+                            if probe.outcome is reconcile.ProbeOutcome.UNAVAILABLE and probe.detail
+                            else probe.outcome.value
+                        ),
                         len(window),
                     )
                 continue

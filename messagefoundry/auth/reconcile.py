@@ -235,10 +235,10 @@ PAGING_CAP = "group_search_cap"
 #: The reason slug of an account whose own probe failed to reach the directory, read
 #: :attr:`ProbeOutcome.UNAVAILABLE` with no paging cause, on K of its last ``2K - 1`` probes, K
 #: being ``[auth].ad_reconcile_outage_passes`` (BACKLOG #3100 closing step 2, #3709 closing step
-#: 6). The whole-directory outage has its own
-#: page (:data:`OUTAGE_ABORT`); this is the bound on one account the directory keeps failing to
-#: answer for, which is never struck or revoked while that lasts. It pages once per account as it
-#: enters that state (``AuthService._note_unreached_accounts``).
+#: 6). The whole-directory outage has its own page (:data:`OUTAGE_ABORT`); this is the bound on
+#: one account the directory keeps failing to answer for, which is never struck or revoked while
+#: that lasts. It pages once per account as it enters that state
+#: (``AuthService._note_unreached_accounts``).
 UNREACHED_ACCOUNT = "account_unreachable"
 
 #: The outcomes that judge nothing about the account: no strike, no recorded outcome (rule item 4).
@@ -351,8 +351,8 @@ class ReconcilePlan:
     #: step 2): ``(user_id, username, probes)`` of each account that has just ENTERED the state
     #: :data:`UNREACHED_ACCOUNT` names, ``probes`` being how many of its last
     #: :attr:`unreached_window` probes read it unreachable. An account already in that state is
-    #: not here, so each pages once per state
-    #: change. An outage-shaped pass can carry entries, where its probe sample held only
+    #: not here, so each pages once per state change. An outage-shaped pass can carry entries,
+    #: where its probe sample held only
     #: unreachable accounts, but none on a pass that raises the lasting outage page or while that
     #: page stands (``AuthService._note_unreached_accounts``).
     unreached: tuple[tuple[str, str, int], ...] = ()
@@ -364,8 +364,8 @@ class ReconcilePlan:
     #: Set by ``AuthService._record_unreached_accounts`` (BACKLOG #3100, #3709), on the rows it
     #: wrote: True when those entering whose row was written, plus the accounts latched as paged
     #: that still hold a live session and a directory key and whose window has not since held
-    #: only answers, are
-    #: more than ``AuthService``'s fixed rollup bound, so the lifespan task pages once for those
+    #: only answers, are more than ``AuthService``'s fixed rollup bound, so the lifespan task
+    #: pages once for those
     #: entering rather than once per account. A directory that answers only a few probes
     #: in each pass would otherwise open an instance per signed-in account.
     unreached_rollup: bool = False

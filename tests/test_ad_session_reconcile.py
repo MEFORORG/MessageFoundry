@@ -3411,7 +3411,7 @@ async def test_a_fault_neither_counts_nor_ends_a_run_and_an_answer_says_so(
 # --- BACKLOG #3709 closing step 6: an account whose probes alternate pages ----------------------
 #
 # The directory layer has no server pool, but one host name can stand for several domain
-# controllers behind DNS round-robin, a VIP or a referral, so one account's probes can alternate
+# controllers behind at least DNS round-robin or a VIP, so one account's probes can alternate
 # between a controller that answers and one that does not. A run that one answer ends never reached
 # K; a window of the last 2K - 1 probes does.
 
@@ -3438,7 +3438,7 @@ async def _drive(
         ("FAFA", None),  # two of four: the control one probe short
         ("FAAFAAFAAFAAFAA", None),  # a one-in-three flake never reaches three of five
         ("FFF", 3),  # in a row still pages on the third probe
-        ("FAAAAF", None),  # the window slid past the first failure
+        ("FFAAAF", None),  # three in six: a window one wider would page
     ],
 )
 async def test_an_account_whose_probes_alternate_pages_on_k_of_the_last_2k_minus_1(
@@ -3449,7 +3449,7 @@ async def test_an_account_whose_probes_alternate_pages_on_k_of_the_last_2k_minus
     answers, and never otherwise.
 
     RED when: an answer ends the count (FAFAF never pages), the window is wider than ``2K - 1``
-    (the one-in-three flake or FAAAAF pages), or a run no longer pages on its K-th probe."""
+    (the one-in-three flake or FFAAAF pages), or a run no longer pages on its K-th probe."""
     store = await MessageStore.open(":memory:")
     try:
         service, ldap = await _outage_service(store)

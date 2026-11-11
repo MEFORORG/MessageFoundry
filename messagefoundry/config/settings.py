@@ -9742,8 +9742,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     "meanwhile keeps its live engine sessions with only a WARNING and an audit row "
                     "per pass to show for it. The same count bounds one account the directory "
                     f"keeps failing for, at {run} of its last {window} probes, so that page "
-                    "waits longer too, and some patterns that page at the default never page, "
-                    "such as an account down for three probes and up for four, in a cycle",
+                    "waits longer too, and some failure patterns that page at the default never "
+                    "page at this value",
                 )
             )
         strikes = auth.ad_session_recheck_strikes

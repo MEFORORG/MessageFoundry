@@ -11903,10 +11903,10 @@ def _alert_unreached_accounts(plan: ReconcilePlan, sink: AlertSink) -> None:
     """Page each account that has just entered the lasting unreachable state (BACKLOG #3100
     closing step 2, #3709 closing step 6; ``AuthService._note_unreached_accounts`` says when one
     enters). That many of its last ``plan.unreached_window`` probes failed to reach the directory,
-    so the reconciler has neither struck nor revoked it. Once per entry, like a paging refusal, and with
-    no inverse: an operator resolves it. The account name is in the source only, as for a paging
-    refusal. On a rolled-up pass (``plan.unreached_rollup``), one page under the bare source covers
-    those entering, naming none, and counting only them."""
+    so the reconciler has neither struck nor revoked it. Once per entry, like a paging refusal,
+    and with no inverse: an operator resolves it. The account name is in the source only, as for
+    a paging refusal. On a rolled-up pass (``plan.unreached_rollup``), one page under the bare
+    source covers those entering, naming none, and counting only them."""
     if plan.unreached_rollup:
         sink.ad_reconcile_aborted(
             _UNREACHED_ALERT_SOURCE,

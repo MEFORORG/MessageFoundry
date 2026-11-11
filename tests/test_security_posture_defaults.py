@@ -804,6 +804,21 @@ def test_a_reconciler_loosening_names_the_delay_to_the_unreachable_account_page(
     assert words in dict(_pairs(auth=_ad(**{field: value})))[field]
 
 
+@pytest.mark.parametrize(("run", "window"), [(4, 7), (5, 9), (100, 199)])
+def test_the_outage_passes_loosening_names_the_unreachable_account_window(
+    run: int, window: int
+) -> None:
+    """BACKLOG #3709 closing step 6. The per-account page weighs ``run`` of the account's last
+    ``2 * run - 1`` probes, and the entry names that window for the configured value, with no
+    example cycle that holds only at one value.
+
+    RED when: the entry names a window other than ``2 * run - 1``, or a fixed example cycle."""
+    text = dict(_pairs(auth=_ad(ad_reconcile_outage_passes=run)))["ad_reconcile_outage_passes"]
+    assert f"at {run} of its last {window} probes" in text
+    assert "some failure patterns that page at the default never page at this value" in text
+    assert "three probes" not in text
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
