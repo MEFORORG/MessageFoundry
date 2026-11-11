@@ -310,6 +310,36 @@ async def test_a_failing_row_whose_keys_flip_on_every_read_fails_closed(
     assert any(victim in alert for alert in alerts)
 
 
+async def test_a_fail_closed_refusal_is_reported_under_the_stored_id(
+    keyed: tuple[Engine, Path],
+) -> None:
+    """On a store that finds an id case-insensitively, as SQL Server's default collation does, the
+    fail-closed report is keyed by the id the row holds, not the caller's spelling of it, so a
+    second spelling inside the interval adds no second row."""
+    engine, path = keyed
+    service, _alerts, _intact, victim = await _setup(engine)
+    await _tamper(path, victim)
+    store = engine.store
+    real_get_user = store.get_user
+    reads = itertools.count(1)
+
+    async def any_case_rekeyed(uid: str) -> UserRecord | None:
+        row = await real_get_user(uid.lower())
+        if row is None or row.id != victim:
+            return row
+        read = next(reads)
+        return dataclasses.replace(row, username=f"{row.username}-{read}")
+
+    store.get_user = any_case_rekeyed  # type: ignore[method-assign,assignment]
+    for spelling in (victim.upper(), victim.swapcase(), victim):
+        with pytest.raises(UserSealRefused):
+            await service.checked_user(spelling)
+    assert victim.upper() != victim
+    rows = await engine.store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION, limit=10_000)
+    named = [str(row["detail"]) for row in rows if victim in str(row["detail"]).lower()]
+    assert len(named) == 1 and victim in named[0], named
+
+
 async def test_a_row_deleted_after_every_pass_raced_is_still_gone(
     keyed: tuple[Engine, Path],
 ) -> None:

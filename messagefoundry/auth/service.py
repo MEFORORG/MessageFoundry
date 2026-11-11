@@ -11620,9 +11620,12 @@ class AuthService:
             if found.settled:
                 return found
             raw = None
-        if not await self._user_id_held(user_id):
+        still_there = await self._store.get_user(user_id)
+        if still_there is None:
             return _SealCheck()
-        await self._user_seal_failed(user_id)
+        # Keyed by the stored id, as _verified reports, so a caller's other spelling of the id on a
+        # store that compares ids case-insensitively shares the account's report interval.
+        await self._user_seal_failed(still_there.id)
         return _SealCheck(failed=True)
 
     async def identity_for_checked_user(self, user: VerifiedUser) -> Identity:
