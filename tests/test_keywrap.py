@@ -386,13 +386,10 @@ def test_the_direct_loader_refuses_a_weak_wrap(
 def test_the_direct_loader_refuses_a_weak_der_wrap_and_loads_the_approved_one(
     tmp_path: Path, material: Material
 ) -> None:
-    def der_of(pem: bytes) -> bytes:
-        return base64.b64decode(b"".join(pem.splitlines()[1:-1]))
-
-    weak = _write(tmp_path, "weak.der", der_of(_best_available_pkcs8(material.key)))
+    weak = _write(tmp_path, "weak.der", _der_of(_best_available_pkcs8(material.key)))
     with pytest.raises(ValueError, match="2048 iterations"):
         _direct(weak, _PASSPHRASE)
-    good_der = _write(tmp_path, "good.der", der_of(material.wraps["approved"]))
+    good_der = _write(tmp_path, "good.der", _der_of(material.wraps["approved"]))
     assert _direct(good_der, _PASSPHRASE) is not None
     good_pem = _write(tmp_path, "good.pem", material.wraps["approved"])
     assert _direct(good_pem, _PASSPHRASE) is not None
@@ -537,6 +534,11 @@ def test_garbled_pem_is_checked_in_linear_time() -> None:
         started = time.monotonic()
         _check(material)
         assert time.monotonic() - started < 20.0
+    # The check stops at 1 MiB, where a rescan of the rest per BEGIN still ends in seconds, so the
+    # scanner is driven directly at sixteen times that: a rescan per BEGIN is then minutes.
+    started = time.monotonic()
+    assert keywrap._pem_blocks(stacked * 16)
+    assert time.monotonic() - started < 20.0
 
 
 def test_a_crafted_wrap_is_refused_not_raised() -> None:
@@ -622,6 +624,12 @@ _OPENSSL_LOADS_STRAY: dict[str, Callable[[bytes], bytes]] = {
     "own-line-inside": lambda p: _before_end(p, _STRAY_BEGIN + b"NOTE-----\n"),
     "no-dashes-inside": lambda p: _before_end(p, _STRAY_BEGIN + b"NOTE\n"),
     "key-label-inside": lambda p: _before_end(p, _STRAY_BEGIN + b"PRIVATE KEY-----\n"),
+    "encrypted-label-inside": lambda p: _before_end(
+        p, _STRAY_BEGIN + b"ENCRYPTED PRIVATE KEY-----\n"
+    ),
+    "encrypted-label-same-line": lambda p: _onto_last_line(
+        p, _STRAY_BEGIN + b"ENCRYPTED PRIVATE KEY-----"
+    ),
     "same-line-inside": lambda p: _onto_last_line(p, _STRAY_BEGIN + b"X-----"),
     "dash-text-inside": lambda p: _before_end(p, b"-x\n"),
     "dash-text-inside-plain-label": lambda p: _before_end(
@@ -679,6 +687,22 @@ def test_an_ssl_loader_refuses_a_weak_key_with_a_stray_begin_marker(
     assert _api(cert, approved, _PASSPHRASE) is not None
 
 
+@pytest.mark.parametrize("shape", ["encrypted-label-inside", "encrypted-label-same-line"])
+def test_an_unencrypted_key_with_a_stray_encrypted_begin_line_still_passes_and_loads(
+    tmp_path: Path, material: Material, shape: str
+) -> None:
+    # The stray line opens a block with no key bytes. Read as an encrypted key, it would refuse a
+    # plain key that OpenSSL loads.
+    plain = material.key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+    )
+    key_bytes = _OPENSSL_LOADS_STRAY[shape](plain)
+    assert _check(key_bytes, given=False) is None
+    cert = _write(tmp_path, "cert.pem", material.cert_pem)
+    key = _write(tmp_path, "key.pem", key_bytes)
+    assert _api(cert, key, None) is not None
+
+
 # --- BER forms of an EncryptedPrivateKeyInfo (BACKLOG #5543) ------------------------------------
 #
 # OpenSSL's decoder takes BER, so it decrypts an EncryptedPrivateKeyInfo in forms DER forbids,
@@ -711,12 +735,15 @@ def _to_ber(der: bytes, form: str) -> bytes:
         return b"\x3f\x80\x80\x80\x10" + seq(content)[1:]
     if form == "both":
         return _to_ber(_to_ber(der, "constructed-octets"), "indefinite-outer")
-    if form == "indefinite-algorithm-and-outer":
-        return _to_ber(_to_ber(der, "indefinite-algorithm"), "indefinite-outer")
+    if form.endswith("-and-outer"):
+        return _to_ber(_to_ber(der, form.removesuffix("-and-outer")), "indefinite-outer")
     first, second = keywrap.der_children(der, outer)
     algorithm, algorithm_body = der[outer.start : first.end], der[first.start : first.end]
     ciphertext = der[second.start : second.end]
     chunks = octets(ciphertext[:16]) + octets(ciphertext[16:])
+    scheme, *params = keywrap.der_children(der, first)
+    scheme_tlv = der[first.start : scheme.end]
+    params_body = b"".join(der[t.start : t.end] for t in params)
     shapes = {
         "constructed-octets": seq(algorithm, b"\x24\x80" + chunks + b"\x00\x00"),
         "definite-constructed-octets": seq(algorithm, tlv(0x24, chunks)),
@@ -727,6 +754,12 @@ def _to_ber(der: bytes, form: str) -> bytes:
         ),
         "high-tag-octets": seq(algorithm, b"\x1f\x04" + octets(ciphertext)[1:]),
         "indefinite-algorithm": seq(b"\x30\x80" + algorithm_body + b"\x00\x00", octets(ciphertext)),
+        "indefinite-params": seq(
+            seq(scheme_tlv + b"\x30\x80" + params_body + b"\x00\x00"), octets(ciphertext)
+        ),
+        "high-tag-scheme": seq(
+            seq(b"\x1f\x06" + scheme_tlv[1:] + der[scheme.end : first.end]), octets(ciphertext)
+        ),
     }
     return shapes[form]
 
@@ -744,14 +777,21 @@ _JUDGED_BER_FORMS = [
     "padded-high-tag-outer",
     "high-tag-octets",
 ]
-#: Forms whose AlgorithmIdentifier is itself BER, which the check does not walk. Each is refused as
-#: unreadable, the approved wrap with the weak.
+#: Forms whose AlgorithmIdentifier, or something inside it, is BER, which the check does not walk.
+#: Each is refused as unreadable, the approved wrap with the weak.
 _UNWALKED_BER_FORMS = [
     "high-tag-algorithm",
     "padded-high-tag-algorithm",
     "indefinite-algorithm",
     "indefinite-algorithm-and-outer",
+    "indefinite-params-and-outer",
+    "high-tag-scheme-and-outer",
 ]
+
+#: What the refusal of an unwalked form says, and the remedy it gives a loader that takes a
+#: passphrase: the encoding is unread, not the wrap weak.
+_UNWALKED_TEXT = "BER that is not DER, or bytes cut short"
+_UNWALKED_REMEDY = "Supply the whole key DER-encoded"
 
 
 @pytest.mark.parametrize("form", _JUDGED_BER_FORMS)
@@ -779,14 +819,20 @@ def test_a_ber_wrap_the_check_cannot_walk_is_refused_not_passed(
         ber = _to_ber(_der_of(material.wraps[wrap]), form)
         for shaped in (ber, pem(ber, "PRIVATE KEY"), pem(ber)):
             refusal = _check(shaped)
-            assert refusal is not None and "BER encoding this engine cannot read" in refusal
-            assert "Supply it DER-encoded" in refusal and "Re-wrap" not in refusal
+            assert refusal is not None and _UNWALKED_TEXT in refusal
+            assert _UNWALKED_REMEDY in refusal and "Re-wrap" not in refusal
+            # A loader that takes no passphrase gets its own remedy: an unencrypted key.
+            no_pass = key_wrap_refusal(
+                shaped, setting="the key", unlock_setting=None, passphrase_given=False
+            )
+            assert no_pass is not None and _UNWALKED_TEXT in no_pass
+            assert "supply the key unencrypted" in no_pass and _UNWALKED_REMEDY not in no_pass
 
 
 @pytest.mark.parametrize(
     ("form", "why"),
     [(form, "2048 iterations") for form in _JUDGED_BER_FORMS]
-    + [(form, "cannot read") for form in _UNWALKED_BER_FORMS],
+    + [(form, _UNWALKED_TEXT) for form in _UNWALKED_BER_FORMS],
 )
 def test_an_ssl_loader_refuses_a_weak_ber_wrap_under_a_plain_label(
     tmp_path: Path, material: Material, form: str, why: str
@@ -823,6 +869,10 @@ def test_an_unencrypted_ber_key_still_passes_and_loads(
     assert _check(pem(ber, "PRIVATE KEY"), given=False) is None
     cert = _write(tmp_path, "cert.pem", material.cert_pem)
     key = _write(tmp_path, "key.pem", pem(ber, "PRIVATE KEY"))
+    try:
+        ssl.create_default_context(ssl.Purpose.CLIENT_AUTH).load_cert_chain(cert, key)
+    except ssl.SSLError:
+        pytest.skip(f"{ssl.OPENSSL_VERSION} does not load this form")
     assert _api(cert, key, None) is not None
 
 

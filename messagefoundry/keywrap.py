@@ -20,9 +20,10 @@ What is refused, by default and with no setting to turn it off:
   by RFC 8018's default, so it is refused like an explicit SHA-1 one.
 * **PBES2 with scrypt** below Appendix C's floor: ``r >= 8``, and ``N`` at least 2^17, 2^16 or 2^15
   for ``p`` of 1, 2, or 3 and up. Those are the table's three rows, encoded as written.
-* Any other derivation this module does not recognise, an encrypted key it cannot parse (among
-  them a BER encoding of one that names a password-based scheme, where the scheme's own
-  AlgorithmIdentifier is not DER), and a key file it cannot read or that is too large to check.
+* Any other derivation this module does not recognise, an encrypted key it decodes but cannot
+  parse (among them a BER encoding of one that names a password-based scheme, where its
+  AlgorithmIdentifier or anything inside it is not DER), and a key file it cannot read or that is
+  too large to check.
 * An encrypted key where the loader has NO passphrase to give, before any library can try it.
 
 ``cryptography``'s ``BestAvailableEncryption`` and the ``openssl`` CLI's own default both write
@@ -45,7 +46,10 @@ checked, which on psqlODBC is every client key (BACKLOG #2423).
 
 What this does NOT check, so a reader does not assume it: the content cipher inside PBES2 (that is a
 cipher question, not a derivation one; the AES-CBC limit above is only what a PKCS#12 part must use
-to be opened and checked), and any private-key loader this module is not called from. The inside of
+to be opened and checked), and any private-key loader this module is not called from. Nor a key
+block under a label other than ``ENCRYPTED PRIVATE KEY`` whose body is not strict base64: it is
+skipped, and OpenSSL may still decrypt such a body, at least where it drops a control or high byte
+at a line end, or a short header line, before it decodes. The inside of
 a PKCS#12 part that is itself encrypted IS now checked, as above, wherever the caller runs the
 second step (BACKLOG #1352). Read the list of callers as the coverage, and treat it as AT LEAST
 that list.
@@ -338,10 +342,10 @@ def _ber_encrypted_pkcs8_algorithm(der: bytes) -> _Tlv | None:
     before this reader existed: a BER certificate, CSR or public key opens with another OID or with
     no OID at all there, and an unencrypted key opens with an INTEGER.
 
-    In that shape, the AlgorithmIdentifier is returned to be judged on its wrap when it is DER
-    :func:`_read_tlv` can walk, whatever BER the bytes around it use; the wrap is decided by the
-    AlgorithmIdentifier alone. Otherwise this raises :class:`_Malformed`, and the caller refuses it
-    as unreadable. :func:`_read_tlv` and :func:`_children` stay DER readers, because
+    In that shape, the AlgorithmIdentifier is returned to be judged on its wrap when its own header
+    is one :func:`_read_tlv` can walk, whatever BER the bytes around it use; the wrap is decided by
+    the AlgorithmIdentifier alone, and the caller refuses it as unreadable where its contents do not
+    parse. Otherwise this raises :class:`_Malformed`, and the caller refuses it as unreadable. :func:`_read_tlv` and :func:`_children` stay DER readers, because
     :mod:`messagefoundry.pki` shares them."""
     outer = _ber_header(der, 0)
     if outer is None or outer[0] != 0x30:
@@ -479,10 +483,11 @@ _UNREADABLE: Final = "is an encrypted private key this engine cannot read to che
 #: The refusal for a BER EncryptedPrivateKeyInfo whose wrap this module cannot read. Its remedy is
 #: :data:`_REENCODE`, not a re-wrap: the wrap may be approved, and only its encoding is unread.
 _UNREADABLE_BER: Final = (
-    "is an encrypted private key in a BER encoding this engine cannot read to check its wrap"
+    "is an encrypted private key in an encoding this engine cannot read to check its wrap: BER "
+    "that is not DER, or bytes cut short"
 )
 _REENCODE: Final = (
-    "Supply it DER-encoded, as the openssl CLI and the cryptography library write a key"
+    "Supply the whole key DER-encoded, as the openssl CLI and the cryptography library write one"
 )
 
 
@@ -495,18 +500,22 @@ def _der_problem(der: bytes, *, known_encrypted: bool) -> tuple[bool, str | None
     reader cannot walk go to :func:`_ber_encrypted_pkcs8_algorithm`: one that names a
     password-based scheme is judged on its wrap where that function can read it, and refused as
     unreadable BER where it cannot; any other is treated as the DER reader would treat a non-key."""
+    # Bytes the DER reader could not walk are not DER somewhere, so an algorithm found in them that
+    # does not parse gets the BER text too: its parameters may be BER that OpenSSL reads.
+    unreadable = _UNREADABLE
     try:
         found = _encrypted_pkcs8_algorithm(der)
     except _Malformed:
+        unreadable = _UNREADABLE_BER
         try:
             found = _ber_encrypted_pkcs8_algorithm(der)
         except _Malformed:
-            return True, _UNREADABLE_BER
+            return True, unreadable
     if found is None:
         return (True, _UNREADABLE) if known_encrypted else (False, None)
     # The shape said encrypted; an algorithm or parameters that do not parse are refused, failing
     # closed.
-    problem: str | None = _UNREADABLE
+    problem: str | None = unreadable
     with contextlib.suppress(_Malformed):
         problem = _wrap_problem(der, *_algorithm(der, found))
     return True, problem
@@ -618,6 +627,10 @@ def _inspect(material: bytes) -> tuple[bool, str | None]:
                 return True, _UNREADABLE
             # Not base64, so skipped. OpenSSL may still load some such bodies: it drops a control
             # or high byte at a line end, and a short header line, before it decodes.
+            continue
+        if not der:
+            # No key bytes, so nothing for a loader to open: a stray BEGIN line just before the
+            # key's END makes such a block, whatever its label.
             continue
         # Every key block is read for the EncryptedPrivateKeyInfo shape, whatever its label:
         # OpenSSL decrypts that shape under a plain PRIVATE KEY label too.
@@ -1121,11 +1134,13 @@ def key_wrap_refusal(
     encrypted, problem = _inspect(material)
     if problem is not None:
         # _inspect hands _der_problem's constant through unchanged, so this match holds; the BER
-        # refusal test pins it.
-        if problem == _UNREADABLE_BER:
+        # refusal tests pin it.
+        if unlock_setting is None:
+            fix = _DECRYPT
+        elif problem == _UNREADABLE_BER:
             fix = _REENCODE
         else:
-            fix = _DECRYPT if unlock_setting is None else _REWRAP
+            fix = _REWRAP
         return f"{setting}: the private key {problem}. It is refused. {fix}"
     if encrypted and not passphrase_given:
         fix = _DECRYPT if unlock_setting is None else f"Set {unlock_setting}"
