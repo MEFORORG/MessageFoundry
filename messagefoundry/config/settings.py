@@ -10758,8 +10758,9 @@ def security_loosenings(
                 "none unless the embedder sets it), and the endpoint is not loopback. So at least "
                 "a loopback endpoint, and an app the [tls] section never reached, check no CRL "
                 "whatever [tls].crl_file says. The "
-                "attestation adds no check. Wherever the revocation refusal would apply to that "
-                "hop it is lifted, so a revoked certificate is caught only if what the reason "
+                "attestation adds no check. Where no CRL is checked, the revocation refusal is "
+                "lifted wherever it would apply to that hop, so a revoked certificate is caught "
+                "there only if what the reason "
                 "names really covers it. It never lifts a cleartext refusal",
             )
         )

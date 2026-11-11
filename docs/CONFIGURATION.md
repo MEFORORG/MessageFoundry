@@ -446,7 +446,7 @@ way across its revocation refusal, beside `[ai].endpoint_revocation_attested`; a
 issuer has no CRL in that file then fails its handshake. A loopback endpoint takes neither file.
 An app this section never reached checks the endpoint against the OS trust store and no CRL,
 whatever the instance's `[tls]` says. Which apps that covers, and where the CRL is and is not
-checked on this hop, is stated once, in the `[ai].endpoint_revocation_attested` entry of
+checked on this hop, is stated in full in the `[ai].endpoint_revocation_attested` entry of
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md).
 
 ### `[inbound]` — inbound listener defaults

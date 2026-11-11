@@ -1615,7 +1615,8 @@ count is above `0` (vault BACKLOG #2613).
   checks no OCSP. **It checks no CRL unless all three of these hold** (BACKLOG #5527):
   `[tls].crl_file` is set; the `[tls]` section reaches the app serving `POST /ai/chat`; and the
   endpoint is not loopback. `messagefoundry serve` hands its app that section. A direct
-  `create_app` (the embedded path) holds none unless its embedder sets `app.state.tls_settings`.
+  `create_app` (the embedded path) holds none unless its embedder sets `app.state.tls_settings`
+  to a `TlsSettings`.
   So at least these check no CRL, whatever `[tls].crl_file` says: a loopback endpoint, and an app
   the `[tls]` section never reached, such as a direct `create_app` whose embedder did not set it.
   Without such a CRL, an `[ai].endpoint` whose host is not loopback is refused under

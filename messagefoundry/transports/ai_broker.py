@@ -112,7 +112,8 @@ _AI_HOP_CELL = "[ai] engine AI broker (verified TLS, no revocation check)"
 #: ``[tls].crl_file`` reaches this hop since BACKLOG #5527, the later CRL lever ADR 0173 section 12
 #: foresaw when the owner ruling of 2026-10-27 built the attestation pair alone. It is offered only
 #: to a broker that was handed a ``[tls]`` policy: on a build with none, such as a direct
-#: ``create_app`` whose embedder set no ``app.state.tls_settings``, setting it would change nothing. No connection's attestation is offered either:
+#: ``create_app`` whose embedder set no ``app.state.tls_settings``, setting it would change
+#: nothing. No connection's attestation is offered either:
 #: the endpoint is not a connection. Naming either would be a remedy the operator cannot perform.
 _AI_CRL_LEVER = (
     "Set [tls].crl_file to a CRL file that covers the issuer of the AI endpoint's certificate (it "
