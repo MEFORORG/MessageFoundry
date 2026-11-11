@@ -355,12 +355,13 @@ class _ConfinedFiles(urllib.request.BaseHandler):
     """The only way xmlschema can open a resource here: ``file:`` URLs under fixed roots (BACKLOG #5537).
 
     The only handler inside :class:`_ConfinedOpener`, the ``opener`` :func:`_build_schema` hands
-    xmlschema, so it sees every ``file:`` location xmlschema opens as a URL while building a schema
-    for :func:`validate_against`, the schema file the caller named and each include, import,
-    redefine and override location among them; :meth:`_ConfinedOpener.open` refuses any other
-    scheme before this handler runs. It never sees the meta-schema files xmlschema reads from its
-    bundled directory when it is imported, which go through Python's stock URL opener. Nor does it
-    see every location a schema names: one xmlschema reads as XML text is parsed, not opened, so
+    xmlschema, so it sees every ``file:`` location xmlschema opens as a URL for a schema
+    :func:`validate_against` builds, while building it or validating against it, the schema file
+    the caller named and each include, import, redefine and override location among them;
+    :meth:`_ConfinedOpener.open` refuses any other scheme before this handler runs. It never sees
+    the meta-schema files xmlschema reads from its bundled directory when it is imported, which go
+    through Python's stock URL opener. Nor does it see every location a schema names: one
+    xmlschema reads as XML text is parsed, not opened, so
     :func:`_refuse_text_locations` refuses it first in the inline schema, the named file and each
     file under a vetted root, though not in the bundled copies, and ``allow="local"`` refuses a
     remote URL before it is opened. The named file is read as named, a link at it included. One
