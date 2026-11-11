@@ -24,7 +24,7 @@ import logging
 import sqlite3
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, cast, get_args
@@ -2757,15 +2757,16 @@ async def test_an_account_the_directory_keeps_failing_for_pages_once_naming_it(
     """BACKLOG #3100 closing step 2. An ``LdapError`` on one account's probe, while the directory
     answers the other, reads UNAVAILABLE: no strike, no revocation. Without a bound the account's
     sessions would run to the absolute cap and nobody would be told. So
-    ``ad_reconcile_outage_passes`` of its probes running page once, naming the account in the
-    source, with one audit row. The next failing pass pages nothing more; an answer ends the run
-    and re-arms the page. It is still fail-open throughout, and the whole-directory outage page
-    never fires.
+    ``ad_reconcile_outage_passes`` of its last ``2K - 1`` probes page once, naming the account in
+    the source, with one audit row. The next failing pass pages nothing more; one answer does not
+    re-arm the page (#3709 closing step 6), and a window of answers does. It is still fail-open
+    throughout, and the whole-directory outage page never fires.
 
     RED when: the arm pages nobody, pages on every pass, or never re-arms."""
     store = await MessageStore.open(":memory:")
     try:
         service, ldap = await _outage_service(store, ad_reconcile_outage_passes=threshold)
+        span = 2 * threshold - 1
         alice = await store.get_user_by_username("alice")
         assert alice is not None
         sink = _InverseSink()
@@ -2773,24 +2774,36 @@ async def test_an_account_the_directory_keeps_failing_for_pages_once_naming_it(
         for n in range(1, threshold):
             plan = await _pass(service, sink)
             assert not plan.directory_outage and plan.unavailable == 1 and plan.unreached == ()
-            assert service._reconcile_unreached_runs == {alice.id: n}
+            assert service._reconcile_unreached_windows == {alice.id: (True,) * n}
         assert _unreached_events(sink) == []  # the N-1 control
         plan = await _pass(service, sink)
         assert plan.unreached == ((alice.id, "alice", threshold),)
         [(kind, source, payload)] = _unreached_events(sink)
         assert (kind, source) == ("ad_reconcile_aborted", f"{_UNREACHED_PREFIX}alice")
         assert payload["reason"] == reconcile.UNREACHED_ACCOUNT and payload["probed"] == 2
-        assert f"{threshold} of its directory probes running failed" in payload["detail"]
+        assert (
+            f"{threshold} of up to its last {span} directory probes, faults aside, failed"
+            in payload["detail"]
+        )
         assert "sessions are not revoked" in payload["detail"][:200]
         assert len(payload["detail"]) <= 200 and "alice" not in payload["detail"]
         assert await _unreached_rows(store) == [("alice", threshold)]
+        [row] = [dict(r) for r in await store.list_audit(action="auth.ad_reconcile_unreached")]
+        assert json.loads(str(row["detail"]))["window_up_to"] == span
 
         assert (await _pass(service, sink)).unreached == ()  # latched: no second page
         assert len(_unreached_events(sink)) == 1 and len(await _unreached_rows(store)) == 1
 
-        ldap.unreachable = set()  # the account answers once
+        ldap.unreachable = set()  # the account answers once: the window still holds failures
         assert (await _pass(service, sink)).unreached == ()
-        assert service._reconcile_unreached_runs == {}
+        assert alice.id in service._reconcile_unreached_paged
+        ldap.unreachable = {"alice"}
+        assert (await _pass(service, sink)).unreached == (), "one answer re-armed the page"
+        ldap.unreachable = set()
+        for _ in range(span):  # a window of answers re-arms it
+            assert (await _pass(service, sink)).unreached == ()
+        assert service._reconcile_unreached_windows == {}
+        assert service._reconcile_unreached_paged == set()
         ldap.unreachable = {"alice"}
         for _ in range(threshold):
             plan = await _pass(service, sink)
@@ -2980,7 +2993,7 @@ async def test_a_later_rollup_says_it_counts_only_the_accounts_entering() -> Non
             "Accounts newly unreachable: 7",
             "Accounts newly unreachable: 1",
         ]
-        assert "each failed 3+ directory probes running" in rollups[1]["detail"]
+        assert "each failed 3+ of up to its last 5 probes" in rollups[1]["detail"]
         assert all("sessions are not revoked;" in p["detail"] for p in rollups)
     finally:
         await store.close()
@@ -3069,7 +3082,7 @@ def _unreached_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [
         r.getMessage()
         for r in caplog.records
-        if r.levelno == logging.WARNING and "probes running of" in r.getMessage()
+        if r.levelno == logging.WARNING and "of up to the last" in r.getMessage()
     ]
 
 
@@ -3219,7 +3232,7 @@ async def test_a_raise_outside_an_unreached_row_write_warns_only_the_accounts_wr
                 return real_json(obj)
 
             monkeypatch.setattr(service_module, "_json", raise_second)
-        plan = replace(reconcile.ReconcilePlan(), unreached=entries)
+        plan = replace(reconcile.ReconcilePlan(), unreached=entries, unreached_window=5)
         raises: dict[str, tuple[type[Exception], str]] = {
             "first-entry": (RuntimeError, "entries gone"),
             "second-detail": (RuntimeError, "detail gone"),
@@ -3363,11 +3376,13 @@ async def test_a_fault_neither_counts_nor_ends_a_run_and_an_answer_says_so(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """BACKLOG #3100 closing step 2, round-one review. A probe fault says nothing about whether
-    the directory was reached, on any pass, so it leaves the account's run as it stands. An
-    answer for a paged account ends its run with a WARNING, so an operator can tell when to
-    resolve the instance.
+    the directory was reached, on any pass, so it leaves the account's window as it stands. A
+    window of answers for a paged account ends its page with a WARNING, so an operator can tell
+    when to resolve the instance; fewer answers than the window say nothing (#3709 closing step
+    6).
 
-    RED when: a fault resets the run on a pass that reached the directory, or the end is silent."""
+    RED when: a fault resets the window on a pass that reached the directory, an answer short of
+    a window re-arms, or the end is silent."""
     store = await MessageStore.open(":memory:")
     try:
         service, ldap = await _outage_service(store)  # the default threshold, 3
@@ -3380,15 +3395,244 @@ async def test_a_fault_neither_counts_nor_ends_a_run_and_an_answer_says_so(
         ldap.unreachable = set()
         ldap.broken = {"alice": ValueError("synthetic: unreadable entry")}
         assert (await _pass(service, sink)).faulted == (alice.id,)  # bob answered
-        assert service._reconcile_unreached_runs == {alice.id: 2}
+        assert service._reconcile_unreached_windows == {alice.id: (True, True)}
         ldap.broken = {}
         ldap.unreachable = {"alice"}
         assert (await _pass(service, sink)).unreached == ((alice.id, "alice", 3),)
         ldap.unreachable = set()
         with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
-            await _pass(service, sink)
+            for _ in range(4):
+                await _pass(service, sink)
+            assert not [r for r in caplog.records if "answered for again" in r.getMessage()]
+            await _pass(service, sink)  # the fifth answer leaves no failure in the window
         said = [r.getMessage() for r in caplog.records if "answered for again" in r.getMessage()]
-        assert len(said) == 1 and "after 3 unreachable probes" in said[0]
+        assert len(said) == 1 and "on each of its last 5 probes" in said[0]
+    finally:
+        await store.close()
+
+
+# --- BACKLOG #3709 closing step 6: an account whose probes alternate pages ----------------------
+#
+# The directory layer has no server pool, but one host name can stand for several domain
+# controllers behind at least DNS round-robin or a VIP, so one account's probes can alternate
+# between a controller that answers and one that does not. A run that one answer ends never reached
+# K; a window of the last 2K - 1 probes does.
+
+
+async def _drive(
+    service: AuthService,
+    ldap: _FakeLdap,
+    sink: _InverseSink,
+    pattern: str,
+    who: Iterable[str] = ("alice",),
+) -> list[reconcile.ReconcilePlan]:
+    """One pass per letter: ``F`` makes ``who`` unreachable, ``A`` lets the directory answer."""
+    plans: list[reconcile.ReconcilePlan] = []
+    for letter in pattern:
+        ldap.unreachable = set(who) if letter == "F" else set()
+        plans.append(await _pass(service, sink))
+    return plans
+
+
+@pytest.mark.parametrize(
+    ("pattern", "pages_on"),
+    [
+        ("FAFAF", 5),  # three of the last five
+        ("FAFA", None),  # two of four: the control one probe short
+        ("FAAFAAFAAFAAFAA", None),  # a one-in-three flake never reaches three of five
+        ("FFF", 3),  # in a row still pages on the third probe
+        ("FFAAAF", None),  # three in six: a window one wider would page
+    ],
+)
+async def test_an_account_whose_probes_alternate_pages_on_k_of_the_last_2k_minus_1(
+    pattern: str, pages_on: int | None
+) -> None:
+    """BACKLOG #3709 closing step 6, at the default K of 3. The account pages on the failing probe
+    that makes three failures among its last five, whether those failures ran or alternated with
+    answers, and never otherwise.
+
+    RED when: an answer ends the count (FAFAF never pages), the window is wider than ``2K - 1``
+    (the one-in-three flake or FFAAAF pages), or a run no longer pages on its K-th probe."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store)
+        alice = await store.get_user_by_username("alice")
+        assert alice is not None
+        sink = _InverseSink()
+        plans = await _drive(service, ldap, sink, pattern)
+        paged = [n for n, plan in enumerate(plans, 1) if plan.unreached]
+        assert paged == ([] if pages_on is None else [pages_on])
+        if pages_on is not None:
+            assert plans[pages_on - 1].unreached == ((alice.id, "alice", 3),)
+            [(_kind, source, payload)] = _unreached_events(sink)
+            assert source == f"{_UNREACHED_PREFIX}alice"
+            assert (
+                "3 of up to its last 5 directory probes, faults aside, failed" in payload["detail"]
+            )
+        assert all(not plan.directory_outage for plan in plans)
+        assert await store.list_sessions(alice.id), "the account's sessions were revoked"
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "detail", "adds"),
+    [
+        (reconcile.ProbeOutcome.UNAVAILABLE, None, (True,)),
+        (reconcile.ProbeOutcome.UNAVAILABLE, reconcile.PAGING_DEADLINE, (False,)),
+        (reconcile.ProbeOutcome.UNAVAILABLE, reconcile.PAGING_CAP, (False,)),
+        (reconcile.ProbeOutcome.REFERRED, "synthetic: referred to dc2", (False,)),
+        (reconcile.ProbeOutcome.MISCONFIGURED, "synthetic: search noSuchObject", (False,)),
+        (reconcile.ProbeOutcome.PRESENT, None, (False,)),
+        (reconcile.ProbeOutcome.ABSENT, None, (False,)),
+        (reconcile.ProbeOutcome.DISABLED, None, (False,)),
+        (reconcile.ProbeOutcome.UNDETERMINED, None, (False,)),
+        (reconcile.ProbeOutcome.FAULT, "ValueError", ()),
+        (reconcile.ProbeOutcome.UNKEYED, None, ()),
+    ],
+)
+async def test_only_an_unavailable_probe_with_no_detail_adds_a_failure_to_the_window(
+    outcome: reconcile.ProbeOutcome, detail: str | None, adds: tuple[bool, ...]
+) -> None:
+    """BACKLOG #3709 closing step 6. Only UNAVAILABLE with no detail failed to reach the
+    directory. A group search refused for its bound, a referral and a configuration refusal are
+    answers, each paging on its own; a fault or an unkeyed row adds nothing. The window starts
+    with one failure, so an answer shows as an appended False and nothing as no change.
+
+    RED when: a paging refusal, a referral or a configuration refusal counts as a failure, so it
+    pages ``account_unreachable`` for a directory that answered."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, _ad_settings(), ldap=_FakeLdap({}))  # type: ignore[arg-type]
+        await service.initialize()
+        seed = reconcile.Probe("u1", "alice", reconcile.ProbeOutcome.UNAVAILABLE)
+        probe = reconcile.Probe("u1", "alice", outcome, detail=detail)
+        plan = service._note_unreached_accounts(reconcile.ReconcilePlan(), [seed])
+        assert plan.unreached_window == 5
+        service._note_unreached_accounts(plan, [probe])
+        assert service._reconcile_unreached_windows == {"u1": (True, *adds)}
+    finally:
+        await store.close()
+
+
+async def test_an_alternating_account_re_arms_only_on_a_window_of_answers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3709 closing step 6. Once paged, the account stays latched while any failure is in
+    its window, so an alternating account does not page again on each third failure, and four
+    answers then one failure neither re-arm nor re-page. Five answers in a row re-arm it, with the
+    WARNING, and it can page again.
+
+    RED when: the latch ends on an answer that leaves a failure in the window."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store)
+        alice = await store.get_user_by_username("alice")
+        assert alice is not None
+        sink = _InverseSink()
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            await _drive(service, ldap, sink, "FAFAFAFAFAAAAF")
+            assert len(_unreached_events(sink)) == 1
+            assert alice.id in service._reconcile_unreached_paged
+            assert not [r for r in caplog.records if "answered for again" in r.getMessage()]
+            await _drive(service, ldap, sink, "AAAAA")
+        assert service._reconcile_unreached_paged == set()
+        assert service._reconcile_unreached_windows == {}
+        said = [r.getMessage() for r in caplog.records if "answered for again" in r.getMessage()]
+        assert len(said) == 1 and "on each of its last 5 probes" in said[0]
+        plans = await _drive(service, ldap, sink, "FAFAF")
+        assert [bool(plan.unreached) for plan in plans] == [False] * 4 + [True]
+        assert len(_unreached_events(sink)) == 2
+    finally:
+        await store.close()
+
+
+async def test_a_window_met_under_the_outage_cover_pages_on_the_first_failure_after() -> None:
+    """BACKLOG #3709 closing step 6, the documented quirk. No account pages while the lasting
+    outage page covers it, but its window still fills. Once a pass reaches the directory and ends
+    the cover, an account whose window already holds K failures pages on its first failing probe,
+    even after an answer in between, and an answer alone pages nothing.
+
+    RED when: the account pages under the cover, pages on an answer, or the window is reset by
+    the outage."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store)
+        alice = await store.get_user_by_username("alice")
+        assert alice is not None
+        sink = _InverseSink()
+        outage = await _drive(service, ldap, sink, "FFFF", who=("alice", "bob"))
+        assert [plan.outage_page for plan in outage] == [False, False, True, False]
+        assert all(plan.unreached == () for plan in outage)
+        assert service._reconcile_unreached_windows[alice.id] == (True,) * 4
+        ldap.unreachable = set()
+        back = await _pass(service, sink)  # the directory answers both: the cover ends
+        assert back.outage_clear and back.unreached == ()
+        blip = await _drive(service, ldap, sink, "F")
+        assert blip[0].unreached == ((alice.id, "alice", 4),)
+        assert len(_unreached_events(sink)) == 1
+        assert [k for k, _s, _p in _outage_events(sink) if k == "ad_reconcile_aborted"] == [
+            "ad_reconcile_aborted"
+        ]
+    finally:
+        await store.close()
+
+
+async def test_alternating_accounts_past_the_rollup_bound_page_as_one() -> None:
+    """BACKLOG #3709 closing step 6. Seven accounts alternating on the same passes enter together
+    and, past ``_UNREACHED_ROLLUP_ABOVE``, page once under the bare source, each with its own row.
+
+    RED when: alternating accounts never page, or page one instance each past the bound."""
+    store = await MessageStore.open(":memory:")
+    try:
+        names = ["ok"] + [f"flap{i}" for i in range(7)]
+        ldap = _FakeLdap({n: _principal(n) for n in names})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for n in names:
+            assert await _signed_in_ad_user(service, store, n) is not None
+        sink = _InverseSink()
+        plans = await _drive(service, ldap, sink, "FAFAF", who=names[1:])
+        assert [bool(plan.unreached) for plan in plans] == [False] * 4 + [True]
+        assert plans[-1].unreached_rollup and len(plans[-1].unreached) == 7
+        rollups = [p for _k, s, p in sink.events if s == _UNREACHED_ALERT_SOURCE]
+        assert len(rollups) == 1 and _unreached_events(sink) == []
+        assert rollups[0]["detail"].startswith("Accounts newly unreachable: 7.")
+        assert "each failed 3+ of up to its last 5 probes" in rollups[0]["detail"]
+        assert len(rollups[0]["detail"]) <= 200
+        assert sorted(a for a, _n in await _unreached_rows(store)) == sorted(names[1:])
+    finally:
+        await store.close()
+
+
+async def test_a_refused_row_leaves_an_alternating_account_unlatched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3709 closing step 6. A refused ``auth.ad_reconcile_unreached`` row leaves the
+    account unpaged and unlatched, so its next failing probe that still leaves K failures in the
+    window writes the row and pages.
+
+    RED when: a refused row latches the account, so it never pages."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store)
+        sink = _InverseSink()
+        real = service._audit_reconciler_row
+
+        async def refusing(action: str, **kwargs: Any) -> bool:
+            if action == "auth.ad_reconcile_unreached":
+                return False
+            return await real(action, **kwargs)
+
+        monkeypatch.setattr(service, "_audit_reconciler_row", refusing)
+        refused = await _drive(service, ldap, sink, "FAFAF")
+        assert all(plan.unreached == () for plan in refused)
+        assert service._reconcile_unreached_paged == set() and _unreached_events(sink) == []
+        monkeypatch.setattr(service, "_audit_reconciler_row", real)
+        [plan] = await _drive(service, ldap, sink, "F")  # A F A F F: still three of five
+        assert [name for _uid, name, _n in plan.unreached] == ["alice"]
+        assert await _unreached_rows(store) == [("alice", 3)]
+        assert len(_unreached_events(sink)) == 1
     finally:
         await store.close()
 
