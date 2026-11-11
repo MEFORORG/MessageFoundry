@@ -246,6 +246,9 @@ def test_a_rest_destination_passes_its_sidecar_to_the_token_hop_guard(
         trust_anchor_policy=TrustAnchorPolicy(crl_file=bare_crl),
     )
     with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation") as exc:
-        build_destination(cfg, egress=EgressSettings(deny_by_default=False))
+        build_destination(
+            cfg,
+            egress=EgressSettings(deny_by_default=False, allowed_ech_sidecar=["127.0.0.1:8123"]),
+        )
     assert "OAuth2 token endpoint" in str(exc.value)
     assert "REST destination" not in str(exc.value)

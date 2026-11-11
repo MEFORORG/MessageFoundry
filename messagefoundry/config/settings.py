@@ -5234,6 +5234,40 @@ def _bare_domain_entries(
     return cleaned
 
 
+def pinned_host_port(entry: str) -> tuple[str, int] | None:
+    """``entry`` read as a loopback ``host:port``, or ``None`` when it is not one.
+
+    The one parse ``[egress].allowed_ech_sidecar`` is validated with at load and matched with at
+    the gate, which reads the sidecar it dials back through it, so the two cannot read a host or a
+    port differently (BACKLOG #5528). It splits at the LAST ``:``, so ``[::1]:8123`` reads as a
+    host and a port; ``transports.egress.host_port_allowed`` splits at the first. ``None`` for at
+    least: no port; a port that is not 1 to 65535 in at most five ASCII digits; a host holding a
+    ``:`` outside brackets, or none inside them; and a host the
+    sidecar resolver would refuse, because :func:`is_loopback_hop_host` does not read it as this
+    machine. An IP literal is returned in :mod:`ipaddress`'s compressed form, so ``::1`` and
+    ``0:0:0:0:0:0:0:1`` are one host; a name is returned lowercased."""
+    host, _, port = entry.strip().rpartition(":")
+    host = host.strip()
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+        if ":" not in host:
+            return None
+    elif ":" in host:
+        return None
+    # The length cap first: int() refuses a string of more than 4300 digits with its own error.
+    if not (port.isascii() and port.isdigit()) or len(port) > 5:
+        return None
+    number = int(port)
+    # A '%' is refused: urlsplit keeps an IPv6 zone ID still encoded, and urllib decodes it before
+    # it dials, so `[::1%31]` would compare as one host here and be dialled as `::11`.
+    if not host or "%" in host or not 1 <= number <= 65535 or not is_loopback_hop_host(host):
+        return None
+    try:
+        return ipaddress.ip_address(host).compressed, number
+    except ValueError:
+        return host.lower(), number
+
+
 class EgressSettings(_Section):
     """``[egress]`` — fail-closed outbound destination allowlist (WP-11c; ASVS 13.2.4/13.2.5/14.2.3).
 
@@ -5321,6 +5355,25 @@ class EgressSettings(_Section):
     # to combine it with proxy credentials, so that path mints no `Proxy-Authorization`.
     # Env (comma-separated): MEFOR_EGRESS_ALLOWED_PROXY.
     allowed_proxy: list[str] = []
+    # The ECH-SIDECAR address allowlist (BACKLOG #5528, ADR 0139). Each entry is "host:port", and
+    # the port is REQUIRED: an entry with none is refused at load rather than read as any port, as
+    # the `host[:port]` lists such as `allowed_http` read it. The host must be one the sidecar
+    # resolver reads as this machine, or the entry could never match. NOT a destination list: it
+    # gates the loopback sidecar an `ech_egress` REST connection sends every request to, body and
+    # credential headers included, and the token-endpoint POST too on a SMART or OAuth2
+    # connection. Loopback alone does not bound that hop: without this list a connection could
+    # name any port on this host, and whatever listened there would receive it. Its own list, not
+    # `allowed_http`, for the reason `allowed_proxy` is: the sidecar is an intermediary, not where
+    # PHI is meant to end up.
+    #
+    # DENY-BY-DEFAULT EVEN UNDER THE OPT-OUT, like `allowed_proxy` above: an `ech_egress`
+    # connection is refused at config load while this list is empty, whatever
+    # `[security].block_unlisted_outbound` says. An instance with no ECH connection is never refused
+    # for an empty list, though a malformed entry is refused at load either way.
+    # The gate is `_check_ech_sidecar_egress` in messagefoundry/transports/egress.py, and it
+    # parses each entry with `pinned_host_port`, defined above this class. Env (comma-separated):
+    # MEFOR_EGRESS_ALLOWED_ECH_SIDECAR.
+    allowed_ech_sidecar: list[str] = []
     # Allowed SYSLOG collectors for the off-box log forwarder (``[logging].forward_host`` and
     # ``forward_port``; BACKLOG #2356): each entry is "host" (any port) or "host:port". The forwarder
     # is not a connection, so no graph check sees it; ``serve`` and ``supervise`` check it at start,
@@ -5356,6 +5409,7 @@ class EgressSettings(_Section):
         "allowed_recipient_domains",
         "proxy_no_proxy",
         "allowed_proxy",
+        "allowed_ech_sidecar",
         "allowed_syslog",
         mode="before",
     )
@@ -5448,6 +5502,30 @@ class EgressSettings(_Section):
             "'hospital.example', not an address, URL, port, wildcard or suffix; list each "
             "subdomain as its own entry",
         )
+
+    @field_validator("allowed_ech_sidecar", mode="after")
+    @classmethod
+    def _ech_sidecar_entries_pin_a_port(cls, value: list[str]) -> list[str]:
+        """Refuse at load an entry :func:`pinned_host_port` cannot read, so one with no port is
+        never taken for any port (BACKLOG #5528). Whitespace is stripped and a blank entry skipped.
+        The refusal names the entry by position among the non-blank ones, not by text: an operator
+        who pasted the sidecar's URL, credential and all, would otherwise find it in the error. The
+        env form drops blank items before this runs, so the position skips blanks in both forms."""
+        cleaned: list[str] = []
+        for raw in value:
+            item = raw.strip()
+            if not item:
+                continue
+            if pinned_host_port(item) is None:
+                raise ValueError(
+                    f"[egress].allowed_ech_sidecar entry {len(cleaned) + 1} (counting non-blank "
+                    "entries) is not a loopback 'host:port'. "
+                    "Write the sidecar's loopback host and its port, such as '127.0.0.1:8123', "
+                    "'localhost:8123' or '[::1]:8123'; an entry with no port is refused rather "
+                    "than read as any port"
+                )
+            cleaned.append(item)
+        return cleaned
 
 
 #: How an operator-facing refusal says ``EgressSettings.deny_by_default`` is on (BACKLOG #1361).
