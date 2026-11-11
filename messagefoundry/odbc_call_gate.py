@@ -12,7 +12,8 @@ leaf beside :mod:`messagefoundry.odbc_env`, where the store and a transport can 
 without one importing the other.
 
 The SQL Server store installs it on every pooled connection, every claim holder and its open-time
-probe connections. The DATABASE connector installs it on every pooled connection it borrows, and
+probe connections, through :func:`require_call_gate`, which refuses a real one it cannot wrap. The
+DATABASE connector installs it on every pooled connection it borrows, and
 hands a cursor close to a running call with :meth:`CallGate.run_after_running_call`. The detach that quarantines a cancelled pooled connection stays in the store,
 because it is the pool's rule, not the gate's. The exits of an unpooled one-shot connection,
 :func:`close_one_shot` and :func:`abandon_one_shot`, live here: they need no pool, so a transport
@@ -40,6 +41,7 @@ from typing import Any
 
 __all__ = [
     "CallGate",
+    "UngatedConnectionError",
     "abandon_one_shot",
     "call_gate",
     "close_one_shot",
@@ -48,6 +50,7 @@ __all__ = [
     "raw_closer",
     "raw_cursor",
     "report_once",
+    "require_call_gate",
 ]
 
 log = logging.getLogger(__name__)
@@ -281,8 +284,9 @@ class CallGate:
             )
 
 
-def install_call_gate(conn: Any) -> None:
-    """Route every pyodbc call an aioodbc connection makes through a :class:`CallGate`. Idempotent.
+def install_call_gate(conn: Any) -> CallGate | None:
+    """Route every pyodbc call an aioodbc connection makes through a :class:`CallGate`, and return
+    that gate, or ``None`` when the connection cannot be gated. Idempotent.
 
     aioodbc 0.5.0 sends every call through ``Connection._execute(func, *args, **kwargs)``: cursor
     operations reach it through ``Cursor._run_operation``, and the connection's own ``cursor``,
@@ -294,14 +298,15 @@ def install_call_gate(conn: Any) -> None:
     double) is left alone and keeps the pre-gate behaviour. A real aioodbc connection that cannot
     be gated is logged at ERROR, because it brings the native crash back. That is logged once per
     process for its type, not on every borrow (BACKLOG #5005); every later borrow of such a
-    connection goes ungated just the same. The store's live suite also pins that a pooled
-    connection is gated.
+    connection goes ungated just the same, unless its caller refuses it through
+    :func:`require_call_gate`. The store's live suite also pins that a pooled connection is gated.
     """
-    if call_gate(conn) is not None:
-        return
+    gate = call_gate(conn)
+    if gate is not None:
+        return gate
     execute = getattr(conn, "_execute", None)
     if not inspect.ismethod(execute):
-        if type(conn).__module__.startswith("aioodbc"):
+        if _is_aioodbc(conn):
             report_once(
                 "_execute",
                 conn,
@@ -309,10 +314,41 @@ def install_call_gate(conn: Any) -> None:
                 " handles under a running statement (BACKLOG #2049), and no connection of this"
                 " type is gated",
             )
-        return
+        return None
     gate = CallGate()
     conn._execute = partial(gate.submit, execute)
     conn._mefor_call_gate = gate
+    return gate
+
+
+class UngatedConnectionError(RuntimeError):
+    """A real aioodbc connection :func:`install_call_gate` could not wrap, refused by
+    :func:`require_call_gate` (BACKLOG #2394)."""
+
+
+def require_call_gate(conn: Any) -> None:
+    """:func:`install_call_gate`, then refuse a real aioodbc connection it could not wrap
+    (BACKLOG #2394). Raises :class:`UngatedConnectionError`.
+
+    Call it before the first pyodbc call on ``conn``: right after a connect, or on a borrow before
+    its first statement. The caller then discards the connection, and that close is safe because no
+    call is running on it. Every later exit may then take a real connection as gated. An ungated one
+    has no safe cancellation exit: with no gate, nothing can wait for a running call, so its close
+    frees the handles under that call (BACKLOG #2049), and leaving the handles unclosed frees them
+    wherever the last reference drops instead. A stand-in with no bound ``_execute`` is not refused,
+    as :func:`install_call_gate` leaves it alone."""
+    if install_call_gate(conn) is None and _is_aioodbc(conn):
+        raise UngatedConnectionError(
+            f"odbc: aioodbc {type(conn).__qualname__} cannot be wrapped by the call gate, so a"
+            " cancelled call could free its handles under a running statement (BACKLOG #2049);"
+            " refusing the connection. Install the aioodbc release pyproject.toml pins"
+            " (BACKLOG #5005)"
+        )
+
+
+def _is_aioodbc(obj: Any) -> bool:
+    """Whether ``obj`` is a real aioodbc object rather than a stand-in."""
+    return type(obj).__module__.startswith("aioodbc")
 
 
 def call_gate(conn: Any) -> CallGate | None:
@@ -393,7 +429,7 @@ def raw_cursor(cur: Any) -> Any:
     ungateable connection is: aioodbc renamed what this reads, so every such cursor takes the
     fallback."""
     raw_cur = getattr(cur, "_impl", None)
-    if raw_cur is None and cur is not None and type(cur).__module__.startswith("aioodbc"):
+    if raw_cur is None and cur is not None and _is_aioodbc(cur):
         report_once(
             "_impl",
             cur,
