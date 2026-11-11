@@ -73,8 +73,9 @@ both halves are set, a WS-Security UsernameToken only with ``ws_security`` on, a
   listed: the first fails the connector's build, and the second meets the send-time proxy rule. A
   ``proxy_user``/``proxy_password`` pair beside an ``env()`` URL is still listed.
 
-Pure apart from :func:`apply_static_credential_gate`, which also logs: every function reads its
-arguments and touches nothing else.
+Pure apart from :func:`apply_static_credential_gate`, which also logs, and ``_digest``, which logs
+at debug the ``http_auth`` refusal it absorbs (BACKLOG #5529): every function reads its arguments
+and touches nothing else.
 
 **A detail cannot carry a secret, by construction.** Every detail is fixed text chosen from a closed
 set, plus at most one peer label. The peer label (:func:`~messagefoundry.config.wiring._peer_label`) is built from parsed parts, so it holds

@@ -163,6 +163,18 @@ def test_a_minted_bearer_also_owns_the_authorization_header() -> None:
     assert _auth_keys(d) == []
 
 
+def test_the_minted_bearer_purge_runs_before_the_construction_gates() -> None:
+    """Round 1 of the repair review: the purge used to run after the header length gate had
+    judged the table, so a static header the minted bearer would replace could refuse the build."""
+    spec = with_oauth2_client_credentials(
+        Soap(url=URL, headers={"Authorization": "x" * 20_000}),
+        token_url="https://auth.example.com/token",
+        client_id="cid",
+        client_secret="cs-synthetic",  # noqa: S106 -- a synthetic test credential
+    )
+    assert _auth_keys(_build(spec.settings)) == []
+
+
 def test_control_a_static_authorization_header_alone_is_kept() -> None:
     d = _dest(headers={"authorization": "Basic STATIC"})
     assert _auth_keys(d) == ["authorization"]

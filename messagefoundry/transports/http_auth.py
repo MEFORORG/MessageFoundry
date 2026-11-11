@@ -78,6 +78,7 @@ __all__ = [
     "digest_handler_from_settings",
     "http_digest_selected",
     "is_authorization_header_name",
+    "refuse_authorization_signer_beside_digest",
     "refuse_http_digest_conflicts",
     "oauth2_auth_configured",
     "oauth2_cc_provider_from_settings",
@@ -380,13 +381,14 @@ def refuse_http_digest_conflicts(s: Mapping[str, Any]) -> bool:
     The connectors call this at the top of construction, so a connection that will not build logs
     no insecure-hop crossing or warning first; :func:`digest_handler_from_settings` calls it again.
     Refuses an unrecognised ``http_auth`` (:func:`http_digest_selected`), and with Digest selected,
-    a static ``bearer_token``, ``basic_user``, ``basic_password``, ``Authorization`` entry in
-    ``headers`` or signing header named ``Authorization``: a connection configures exactly one HTTP
-    credential. Where such a credential is sent it would replace the Digest response on the wire,
-    because urllib lets a request header override the one the Digest handler adds; a lone Basic
-    half sends nothing, and is refused under the same rule. Also refuses, here rather than late, a
-    SMART or OAuth2 bearer provider beside Digest and a missing Digest user or password. Names
-    settings, never a value."""
+    a static ``bearer_token``, ``basic_user``, ``basic_password`` or ``Authorization`` entry in
+    ``headers``: beside Digest, a connection configures exactly one HTTP credential. Where such a
+    credential is sent it would replace the Digest response on the wire, because urllib lets a
+    request header override the one the Digest handler adds; a lone Basic half sends nothing, and
+    is refused under the same rule. Also refuses, here rather than late, a SMART or OAuth2 bearer
+    provider beside Digest and a missing Digest user or password. Names settings, never a value.
+    A signing header named ``Authorization`` is refused later, once the signer is built, by
+    :func:`refuse_authorization_signer_beside_digest`."""
     if not http_digest_selected(s):
         return False
     # Read strictly: a non-bool flag raises HttpAuthError naming the connection (#2232).
@@ -396,11 +398,6 @@ def refuse_http_digest_conflicts(s: Mapping[str, Any]) -> bool:
     extra = s.get("headers")
     if isinstance(extra, Mapping) and any(is_authorization_header_name(str(k)) for k in extra):
         static.append("an Authorization entry in headers")
-    # A detached JWS written under the Authorization name (with_signing's header_name) is a header
-    # _post sets per request, so it would replace the Digest response the same way.
-    signing = s.get("sign_private_key") and s.get("sign_enabled", True)
-    if signing and is_authorization_header_name(str(s.get("sign_header") or "")):
-        static.append("a signing header named Authorization")
     if static:
         raise HttpAuthError(
             f"{prefix}HTTP Digest cannot be configured beside a static credential "
@@ -417,6 +414,22 @@ def refuse_http_digest_conflicts(s: Mapping[str, Any]) -> bool:
             "(password via env())"
         )
     return True
+
+
+def refuse_authorization_signer_beside_digest(
+    sign_header: str | None, *, digest: bool, connection: str | None
+) -> None:
+    """Refuse a detached-JWS signing header named ``Authorization``, however spelled, beside HTTP
+    Digest (BACKLOG #5529). ``_post`` writes the signature per request after the static headers,
+    so under that name it would replace the Digest response on the wire. ``sign_header`` is the
+    built signer's ``header_name``, or ``None`` when signing is off, so the typed
+    ``Destination.sign`` and the flat ``sign_*`` settings are read by the one rule that builds the
+    signer. Called by REST and SOAP, the two connectors that sign."""
+    if digest and sign_header is not None and is_authorization_header_name(sign_header):
+        raise HttpAuthError(
+            f"{hop_name_prefix(connection)}HTTP Digest cannot be configured beside a signing "
+            "header named Authorization; configure exactly one"
+        )
 
 
 def digest_handler_from_settings(

@@ -403,7 +403,8 @@ def _drop_authorization(headers: dict[str, str]) -> None:
     table held two keys. A name ending in a space or a tab, or with a NUL or a DEL at either end,
     is not merged, so the static value crossed too, as a second header a peer may read as
     ``Authorization``. A leading space or tab made ``http.client`` refuse the request instead. The
-    REST, FHIR and DICOMweb header builders do not purge."""
+    REST, FHIR and DICOMweb header builders do not purge. A signing header named ``Authorization``
+    is not in this table: ``_post`` writes it per request, and only beside Digest is it refused."""
     from messagefoundry.transports.http_auth import is_authorization_header_name
 
     for key in [k for k in headers if is_authorization_header_name(k)]:
@@ -487,11 +488,15 @@ class SoapDestination(DestinationConnector):
         self._connection_name = config.name
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
-        self._refuse_half_credential_pairs(s)
-        # BACKLOG #5529: refused before any hop gate logs a crossing for a connection that never builds.
-        from messagefoundry.transports.http_auth import refuse_http_digest_conflicts
+        # BACKLOG #5529: refused before any hop gate logs a crossing for a connection that never builds,
+        # and before the half-pair check, so a lone basic_user beside Digest hears the Digest rule.
+        from messagefoundry.transports.http_auth import (
+            refuse_authorization_signer_beside_digest,
+            refuse_http_digest_conflicts,
+        )
 
-        refuse_http_digest_conflicts(s)
+        digest_selected = refuse_http_digest_conflicts(s)
+        self._refuse_half_credential_pairs(s)
         self._validate_ws(scheme, s)
 
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy (None → byte-identical).
@@ -536,6 +541,11 @@ class SoapDestination(DestinationConnector):
         # (byte-identical). Built here so a bad key/algorithm fails loud at connector construction; the
         # signature is minted in _post over the FINAL wire bytes (the WS-* wrapped envelope, ADR 0015).
         self._signer: MessageSigner | None = signer_from_destination(config)
+        refuse_authorization_signer_beside_digest(
+            None if self._signer is None else self._signer.header_name,
+            digest=digest_selected,
+            connection=config.name,
+        )
         # ASVS 4.2.5: the detached-JWS headers are added after the URL/header gate above.
         # Message-independent, so they are bounded once here rather than on every send.
         enforce_signature_header_limits(self._signer, connector="SOAP destination")
@@ -605,8 +615,6 @@ class SoapDestination(DestinationConnector):
             s, proxy=self._proxy, trust_anchor_policy=config.trust_anchor_policy
         )
         if self._token_provider is not None:
-            # The minted bearer owns the Authorization header _post writes per request (#5526).
-            _drop_authorization(self._headers)
             refuse_cleartext_credentials(
                 scheme,
                 {**self._headers, "Authorization": "Bearer"},
@@ -838,8 +846,14 @@ class SoapDestination(DestinationConnector):
             auth = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
         elif token:
             auth = f"Bearer {token}"
-        if auth is not None:
+        from messagefoundry.transports.http_auth import oauth2_auth_configured
+        from messagefoundry.transports.smart import smart_auth_configured
+
+        # A minted bearer owns the header too: _post and _probe write it per request (#5526). Purged
+        # here, before the construction gates judge the table, so none counts a header never sent.
+        if auth is not None or oauth2_auth_configured(s) or smart_auth_configured(s):
             _drop_authorization(headers)
+        if auth is not None:
             headers["Authorization"] = auth
         return headers
 
@@ -969,8 +983,7 @@ class SoapDestination(DestinationConnector):
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
                 # ASVS 15.2.2: the HEAD probe body is discarded, but an unbounded drain would let a
-                # reachability check be turned into a memory exhaustion. Unlike the length gate this
-                # method deliberately omits, this bound CAN fire: the peer chooses the body.
+                # reachability check be turned into a memory exhaustion. The peer chooses the body.
                 drain_bounded(resp, connector=f"{self._hop} probe")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):

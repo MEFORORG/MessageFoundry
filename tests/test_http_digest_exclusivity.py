@@ -8,10 +8,10 @@ posture reader agreed. It is refused now, through one predicate the reader share
 Limb 2: a static ``bearer_token``, Basic pair or ``Authorization`` header rode beside Digest on
 REST, SOAP and FHIR. urllib lets a request header override the Digest handler's own, so where the
 static credential was sent it is what would have crossed; a lone Basic half sent nothing. All are
-refused under one rule, a connection configures exactly one HTTP credential, by
+refused under one rule, beside Digest a connection configures exactly one HTTP credential, by
 ``refuse_http_digest_conflicts``. REST, SOAP and FHIR call it at the top of construction, and
 ``digest_handler_from_settings`` calls it again. A signing header named ``Authorization`` is
-refused the same way.
+refused once REST or SOAP has built the signer, by ``refuse_authorization_signer_beside_digest``.
 
 Limb 3 (also #2707 closing step 1): ``ech_egress`` replaced the opener that held the Digest
 handler, so a REST connection built with no Digest auth. The pair is refused at construction; the
@@ -24,8 +24,15 @@ import logging
 import urllib.request
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 
-from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.models import (
+    ConnectorType,
+    Destination,
+    OutboundSigning,
+    SignatureAlgorithm,
+)
 from messagefoundry.config.static_credentials import _http_static
 from messagefoundry.config.tls_policy import MIRRORED_CONNECTION_SETTING
 from messagefoundry.config.wiring import FHIR, Rest, Soap
@@ -109,10 +116,9 @@ def _digest_spec(ctype: ConnectorType, **extra: object) -> dict[str, object]:
 @pytest.mark.parametrize("static", list(_STATIC), ids=list(_STATIC))
 @pytest.mark.parametrize("ctype", list(_FACTORIES), ids=[c.value for c in _FACTORIES])
 def test_a_static_credential_beside_digest_is_refused(ctype: ConnectorType, static: str) -> None:
-    # SOAP refuses a half Basic pair before it reads Digest (#5526), with that refusal's own words.
-    half_soap = ctype is ConnectorType.SOAP and static == "basic-user-only"
-    expected = "must be set together" if half_soap else "beside a static credential"
-    with pytest.raises(HttpAuthError, match=expected) as ei:
+    # SOAP reads Digest before its half-pair rule (#5526), so a lone basic_user hears the Digest
+    # rule on every connector, rather than being told to complete a pair Digest would then refuse.
+    with pytest.raises(HttpAuthError, match="beside a static credential") as ei:
         _build(ctype, _digest_spec(ctype, **_STATIC[static]))
     assert _PW not in str(ei.value)
 
@@ -128,29 +134,57 @@ def test_control_basic_without_digest_builds(ctype: ConnectorType) -> None:
     assert not _has_digest(_build(ctype, settings))
 
 
-@pytest.mark.parametrize("name", ["Authorization", "authorization", "Authorization	"])
+def _ec_pem() -> str:
+    key = ec.generate_private_key(ec.SECP256R1())
+    return key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode("ascii")
+
+
+def _signed(ctype: ConnectorType, header: str, **over: object) -> dict[str, object]:
+    settings = _digest_spec(ctype)
+    settings.update(
+        {"sign_private_key": _ec_pem(), "sign_algorithm": "ES256", "sign_header": header, **over}
+    )
+    return settings
+
+
+@pytest.mark.parametrize("name", ["Authorization", "authorization", "Authorization\t"])
 @pytest.mark.parametrize("ctype", [ConnectorType.REST, ConnectorType.SOAP])
 def test_a_signing_header_named_authorization_is_refused_beside_digest(
     ctype: ConnectorType, name: str
 ) -> None:
     """``_post`` writes the detached JWS under ``sign_header`` per request, so under the
-    Authorization name it would replace the Digest response. The refusal runs before the signing
-    key is read, so a placeholder key is enough here."""
-    settings = _digest_spec(ctype)
-    settings.update({"sign_private_key": "placeholder", "sign_header": name})
+    Authorization name it would replace the Digest response."""
     with pytest.raises(HttpAuthError, match="signing header named Authorization") as ei:
-        _build(ctype, settings)
+        _build(ctype, _signed(ctype, name))
     assert _PW not in str(ei.value)
 
 
-def test_control_the_default_signing_header_beside_digest_passes_the_screen() -> None:
-    settings = {**_digest_spec(ConnectorType.REST), "sign_private_key": "placeholder"}
-    assert refuse_http_digest_conflicts(settings)
-    settings["sign_header"] = "X-JWS-Signature"
-    assert refuse_http_digest_conflicts(settings)
-    # Signing switched off writes no header, so the Authorization name is not a conflict then.
-    settings.update({"sign_header": "Authorization", "sign_enabled": False})
-    assert refuse_http_digest_conflicts(settings)
+def test_the_typed_signing_config_is_read_by_the_same_rule() -> None:
+    """The runner assembles ``Destination.sign``; the refusal reads the built signer, so the typed
+    form is refused as the flat ``sign_*`` settings are."""
+    sign = OutboundSigning(
+        algorithm=SignatureAlgorithm.ES256, private_key=_ec_pem(), header_name="authorization"
+    )
+    dest = Destination(
+        name="OB_HTTP",
+        type=ConnectorType.REST,
+        settings=_digest_spec(ConnectorType.REST),
+        sign=sign,
+    )
+    with pytest.raises(HttpAuthError, match="signing header named Authorization"):
+        build_destination(dest, egress=permitting(dest.settings))
+
+
+def test_control_signing_beside_digest_builds_unless_it_writes_authorization() -> None:
+    assert _has_digest(_build(ConnectorType.REST, _signed(ConnectorType.REST, "X-JWS-Signature")))
+    # Signing switched off writes no header, so the Authorization name is no conflict then.
+    off = _signed(ConnectorType.REST, "Authorization", sign_enabled=False)
+    assert _has_digest(_build(ConnectorType.REST, off))
+    assert refuse_http_digest_conflicts(off)
 
 
 def test_control_a_non_auth_static_header_beside_digest_builds() -> None:
