@@ -3284,10 +3284,11 @@ class Engine:
         digest is of the snapshot that load ran, as a reload's is, so an edit or a file lock after
         the load's read cannot reach it (vault BACKLOG #2944, #3765). Off a snapshot, only a file
         the load does not read, in ``environments/``, can be left out of it, and it holds that
-        folder as the load read it. Where the start's own value file sits in that folder, the start
-        parsed its values from those bytes (:meth:`apply_start_env_values`), so the digest names
-        the value-file bytes the start applied; the folder's other files are folded and not
-        parsed. A value file outside the config directory is in no start digest. The directory is
+        folder as the load read it. Where the start's own value file sits in that folder and the
+        load read it, the managed app's start parsed its values from those bytes
+        (:meth:`apply_start_env_values`), so the digest names the value-file bytes the start
+        applied; one the load could not read is left out, and the folder's other files are folded
+        and not parsed. A value file outside the config directory is in no start digest. The directory is
         read for the advisory VCS head alone.
 
         A running graph that carries no snapshot gets none of that: the digest is of the directory
@@ -3321,9 +3322,10 @@ class Engine:
 
         The managed app's start calls it after the load and before :meth:`guard_registry`, so the
         guard, the preflight and the runner judge and run the values the digest names, and only
-        before the graph is added: a runner holds its own values. Raises ``WiringError`` when the
-        snapshot's value file cannot be parsed, or was created or removed since the build read
-        it."""
+        before the graph is added: a runner holds its own values. Raises ``WiringError`` where a
+        reload of the same snapshot would refuse its values, at least a value file that cannot be
+        parsed, one created or removed since the load read it, and a vet of the file or its folder
+        that refuses."""
         if self._registry_runner is not None:
             raise RuntimeError("a start's environment values are applied before its graph runs")
         provider = self._env_values_provider

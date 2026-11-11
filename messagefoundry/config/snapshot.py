@@ -305,7 +305,7 @@ class ConfigSnapshot:
         where the bytes cannot stand for the file now: the snapshot could not read it or its
         folder (for ``environments/``, the config directory too), read a file that is gone now,
         or read no file by its name while one is there now, created since. The caller refuses
-        then; the values are read again on the next reload."""
+        then, a reload or a start alike; a reload reads the values again on the next one."""
         value_file = Path(path)
         folder = self._folder_of(value_file)
         if folder is None:

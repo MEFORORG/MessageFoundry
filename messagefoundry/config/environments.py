@@ -72,8 +72,8 @@ class SnapshotEnvValuesProvider(ABC):
         """The values, with a value file ``snapshot`` covers parsed from its bytes, or ``None``
         when the value file this provider reads is outside the snapshot
         (:meth:`~messagefoundry.config.snapshot.ConfigSnapshot.covers_environment_file`). On
-        ``None`` the engine calls the provider plainly and, on a released reload, checks the digest
-        again."""
+        ``None`` a reload calls the provider plainly and, when released, checks the digest again;
+        a start keeps the values it read when the engine was built."""
 
     @property
     def value_file(self) -> Path | None:

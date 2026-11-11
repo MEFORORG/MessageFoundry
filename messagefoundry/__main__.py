@@ -2499,9 +2499,9 @@ def _environment_values_reader(
 ) -> EnvironmentValuesReader:
     """``serve``'s ``env_values_provider``: :func:`_read_environment_values` over one value file.
 
-    The Engine calls it with no arguments at start, and with a reload's config snapshot on a
-    reload that read one, so a value file the snapshot covers is parsed from the bytes the reload's
-    digest names (vault BACKLOG #2596). ``supervise`` builds the same reader."""
+    The Engine calls it with no arguments when it is built, and with a config snapshot at a start
+    and on a reload that read one, so a value file the snapshot covers is parsed from the bytes
+    that load's digest names (vault BACKLOG #2596). ``supervise`` builds the same reader."""
     from messagefoundry.config.environments import EnvironmentValuesReader
 
     return EnvironmentValuesReader(

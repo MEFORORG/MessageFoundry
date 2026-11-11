@@ -927,6 +927,7 @@ def _managed_start(
     edit: str | None = _UNREVIEWED,
     during_load: Callable[[], Any] | None = None,
     registry_guard: Callable[[Any], None] | None = None,
+    registry_preflight: Callable[[Any, Mapping[str, Any]], Any] | None = None,
 ) -> Any:
     """A managed app whose value file is rewritten to ``edit`` after the engine is built and
     before its load reads the directory, with ``during_load`` (a context manager) around the
@@ -955,6 +956,7 @@ def _managed_start(
         egress_settings=EgressSettings(deny_by_default=False),
         env_values_provider=provider,
         registry_guard=registry_guard,
+        registry_preflight=registry_preflight,
     )
 
 
@@ -995,6 +997,11 @@ async def test_a_start_applies_the_environments_value_file_its_digest_names(
     cfg, value_file = _in_config_layout(tmp_path)
     built = config_fingerprint(cfg)
     guarded: list[Mapping[str, Any] | None] = []
+    preflighted: list[Mapping[str, Any]] = []
+
+    async def _preflight(_registry: Any, values: Mapping[str, Any]) -> None:
+        preflighted.append(values)
+
     values, loaded, rows, _snapshot = await _start_with_edit(
         tmp_path,
         cfg,
@@ -1002,6 +1009,7 @@ async def test_a_start_applies_the_environments_value_file_its_digest_names(
         cfg,
         monkeypatch,
         registry_guard=lambda _registry: guarded.append(guarded_env_values()),
+        registry_preflight=_preflight,
     )
     applied = config_fingerprint(cfg)
     assert applied != built, "control: the digest folds the value file in environments/"
@@ -1009,6 +1017,21 @@ async def test_a_start_applies_the_environments_value_file_its_digest_names(
     assert [row["fingerprint"] for row in rows] == [applied]
     assert values == {"host": "unreviewed.example.invalid"}, "the values are the bytes it names"
     assert [dict(g or {}) for g in guarded] == [values], "the guard judged them"
+    assert [dict(p) for p in preflighted] == [values], "and so did the preflight"
+
+
+async def test_a_value_file_created_between_the_build_and_the_load_is_applied_and_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The build read no file. The load's snapshot holds the one created since, so the start
+    applies it and its digest names it, rather than refusing."""
+    cfg, value_file = _in_config_layout(tmp_path)
+    value_file.unlink()
+    values, loaded, _rows, _snapshot = await _start_with_edit(
+        tmp_path, cfg, value_file, cfg, monkeypatch
+    )
+    assert values == {"host": "unreviewed.example.invalid"}
+    assert loaded is not None and loaded["fingerprint"] == config_fingerprint(cfg)
 
 
 async def test_a_value_file_malformed_between_the_build_and_the_load_refuses_the_start(
