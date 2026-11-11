@@ -11264,6 +11264,7 @@ class PostgresStore:
         :meth:`_after_commit_txn`'s, for the reason it gives. ``audit``'s row is appended last,
         in this transaction, so the audit advisory lock follows the account and session rows
         (BACKLOG #3018 step 4)."""
+        require_operator_audit(audit, "store.revoke_user_sessions")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._after_commit_txn() as conn:
             raised = await self._bump_session_epoch(conn, user_id)

@@ -16152,6 +16152,7 @@ class SqlServerStore:
         ``audit``'s row is appended last, before the one commit, as an operator mutation's is
         (:meth:`_append_operator_audit` says why the in-process ``_audit_lock`` is not taken), so
         a failed append rolls the revokes back (BACKLOG #3018 step 4)."""
+        require_operator_audit(audit, "store.revoke_user_sessions")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._acquire_after_commit() as conn:
             try:

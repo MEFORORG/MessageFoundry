@@ -19501,6 +19501,7 @@ class MessageStore:
         own seal does not verify, that raises :class:`RowSealError` and the whole transaction,
         revokes included, rolls back. ``audit``'s row is appended before the one commit, so a
         failed append rolls the revokes back too (BACKLOG #3018 step 4)."""
+        require_operator_audit(audit, "store.revoke_user_sessions")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock):
             raised = await self._bump_session_epoch(user_id)

@@ -7798,8 +7798,15 @@ class AuthService:
                 await self._revoke_after_commit(
                     user.id, change="ad_roles_resynced", actor=user.username, client=client
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 -- logged here, raised below
                 # Raised below, after the notice and the grant's page, since the roles committed.
+                # Logged here, since a role-write error already held is the one raised.
+                _log.error(
+                    "auth: the session revoke after %s's directory role sync raised %s",
+                    scrub_log_argument(user.username),
+                    type(exc).__name__,
+                    exc_info=exc,
+                )
                 held = _hold(held, exc)
             # A directory-pushed privilege change is the same privilege change to the same user as
             # a local one, so notify the affected user out-of-band too (ASVS 6.3.7), matching
