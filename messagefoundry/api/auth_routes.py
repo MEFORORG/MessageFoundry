@@ -1546,11 +1546,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # BACKLOG #5520: the checked record, so a row whose record fails its seal answers 423, as
         # GET /users shows it, rather than the store's refused write. Its profile fields fill an
         # omitted PATCH field below, so an unchecked value is never written back.
-        # The gate above has already spent the single-use admin_user_update grant, so this 423 and
-        # the 404 cost the proof. Checking first would need the proof moved into this route, and
-        # the console calls this function after its own gate has spent its grant, so that move
-        # would need the console path reworked too; admin_user_update is not a refundable action
-        # (_REFUNDABLE_ACTIONS, ADR 0197). docs/SECURITY.md states the cost.
+        # The read follows the gate above, so wherever the gate spends a single-use grant, this 423
+        # and the 404 cost it; docs/SECURITY.md states when that is. Checking first would need the
+        # proof moved into this route, and the console calls this function after its own gate, so
+        # that move would need the console path reworked too; admin_user_update is not a refundable
+        # action (_REFUNDABLE_ACTIONS, ADR 0197).
         current = await _checked_user(service, user_id)
         if body.disabled:
             await _refuse_if_self(

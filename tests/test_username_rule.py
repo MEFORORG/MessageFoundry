@@ -71,6 +71,13 @@ REFUSED = [
     "\u3164",
     "\uffa0bob",
     "bob\U000e0100",
+    # Blank glyphs from no control or ignorable class, alone and at an edge, where the white-space
+    # check does not see them: the Braille pattern blank, the null notehead, the Khitan filler.
+    "⠀",
+    "bob⠀",
+    "⠀bob",
+    "\U0001d159",
+    "bob\U00016fe4",
 ]
 
 #: The controls: names beside each refused form that the rule must leave alone.

@@ -3591,9 +3591,10 @@ class _SealCheck:
     #5520). Three outcomes: ``user`` set, the record passes its seal; ``failed``, it fails, and the
     failure was handed to :meth:`AuthService._user_seal_failed`; neither, no account, or one whose
     row was deleted, renamed, rebound or re-keyed between its reads, which is not reported. Only
-    ``failed`` reads as a record that fails its seal. It means two reads naming the same account
-    both failed, which two honest role writes committing across both reads can also produce: a
-    false alarm that docs/SECURITY.md, *What an admin user read reports*, states."""
+    ``failed`` reads as a record that fails its seal. From :meth:`AuthService._verified` it means
+    two reads naming the same account both failed, which two honest role writes committing across
+    both reads can also produce: a false alarm that docs/SECURITY.md, *What an admin user read
+    reports*, states. :meth:`AuthService._checked_by_id` also sets it when it fails closed."""
 
     user: VerifiedUser | None = None
     failed: bool = False
@@ -3605,9 +3606,8 @@ class _SealCheck:
 
 
 #: How many times :meth:`AuthService.checked_user` and :meth:`AuthService.list_checked_users` check
-#: an account by id while each check races a write that deletes or re-keys the row (BACKLOG #5520),
-#: before they read it as gone. Every pass that races is unreported, so only a failure
-#: :meth:`AuthService._verified` established can answer as a record that fails its seal.
+#: an account by id while each check races a write that deletes or re-keys the row (BACKLOG #5520).
+#: What happens once every pass has raced is :meth:`AuthService._checked_by_id`'s to say.
 _CHECKED_READ_PASSES: Final = 3
 
 
@@ -11578,9 +11578,9 @@ class AuthService:
         """The account ``user_id`` names, its whole record checked against its seal, for a caller
         outside this service that SHOWS it (BACKLOG #5520). ``None`` when no row is there. Raises
         :class:`UserSealRefused` only when :meth:`_verified` established that the record fails,
-        and handed that to the seal-failure report, so the caller can say so rather than answer
-        "no such user". A row deleted or re-keyed while it is read is read again by id, as
-        :meth:`_checked_by_id` says, and never refused for that."""
+        or :meth:`_checked_by_id` failed closed, and handed that to the seal-failure report, so
+        the caller can say so rather than answer "no such user". :meth:`_checked_by_id` says how a
+        row read mid-write is answered."""
         found = await self._checked_by_id(user_id)
         if found.failed:
             raise UserSealRefused(USER_SEAL_REFUSED)
@@ -11592,9 +11592,9 @@ class AuthService:
         keeps a failing role, so an administrator can still see that it is there and delete it.
         :meth:`_load_users` drops it instead, for the scans that must not count it.
 
-        A row deleted or re-keyed while it is checked is read again by id, as
-        :meth:`_checked_by_id` says: one deleted meanwhile is left out, one renamed meanwhile is
-        listed as it now reads, and a race is never listed as a failing record."""
+        Each row is checked by :meth:`_checked_by_id`, which says how a row read mid-write is
+        answered: one it reads as gone is left out, and one renamed meanwhile is listed as it now
+        reads."""
         out: list[ListedUser] = []
         for raw in await self._store.list_users():
             found = await self._checked_by_id(raw.id, raw)
@@ -11606,8 +11606,10 @@ class AuthService:
         """The account ``user_id`` names, checked by :meth:`_verified`, starting from the row a list
         read already holds where ``listed`` is given (BACKLOG #5520). A check that races a delete or
         a re-key is unreported and establishes nothing, so the account is read again by id, up to
-        :data:`_CHECKED_READ_PASSES` checks in all. A row deleted meanwhile reads as gone; so does
-        one that raced every pass, the only answer that claims nothing about its record."""
+        :data:`_CHECKED_READ_PASSES` checks in all. Only a row absent on a re-read is gone. One
+        still there after every check raced fails closed: each of its checks failed its seal, so
+        it is handed to :meth:`_user_seal_failed` and answered ``failed``, rather than read as gone,
+        which would let a writer that keeps re-keying a tampered row hide it from the admin list."""
         raw = listed
         for _ in range(_CHECKED_READ_PASSES):
             if raw is None:
@@ -11618,7 +11620,10 @@ class AuthService:
             if found.settled:
                 return found
             raw = None
-        return _SealCheck()
+        if not await self._user_id_held(user_id):
+            return _SealCheck()
+        await self._user_seal_failed(user_id)
+        return _SealCheck(failed=True)
 
     async def identity_for_checked_user(self, user: VerifiedUser) -> Identity:
         """:meth:`identity_for_user_id` for an account the caller already read through
@@ -11657,8 +11662,9 @@ class AuthService:
         The row and the role rows are two reads, so an honest role write committing between them
         can make one pair disagree. A failing pair is therefore read once more, by id, before it is
         reported: a record changed outside the store fails both times, a raced honest write passes
-        the second. A row deleted or re-keyed by then is neither: it is not reported and not
-        ``failed``, so no caller may answer it as a record that fails its seal."""
+        the second. A row deleted or re-keyed by then is neither: this check reports nothing and
+        is not ``failed``. :meth:`_checked_by_id` reads such a row again, and fails closed on one
+        whose every check raced."""
         if user is None:
             return _SealCheck()
         sealer = self._store.row_sealer()
