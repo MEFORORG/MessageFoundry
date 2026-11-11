@@ -2641,8 +2641,8 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
     A credential in the URL is refused too, by :func:`refuse_url_credentials` with the remedy
     :data:`_ECH_SIDECAR_CREDENTIAL_USE` (BACKLOG #5528): urllib would dial ``user:pw@host`` as the
     host. It is refused here, not only at the egress gate, so a directly built connector refuses it.
-    So, at least, are a value urllib would dial differently from how urlsplit reads it and a ``?`` or
-    ``#``, in fixed words that quote no part of the value; the comments below say why each.
+    So, in fixed words that quote no part of the value, are at least a space or control character,
+    a ``?`` or ``#``, a non-ASCII character and a ``%`` in the host; the comments below say why each.
 
     Inert until a destination actually publishes an ECHConfig (as of 2026-07 a DoH probe found no EHR
     endpoint does — demand-gated, ADR 0139)."""
@@ -2673,6 +2673,12 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
         raise ValueError(
             "ech_sidecar must not hold a query or a fragment ('?' or '#'); write the sidecar's "
             "base URL alone (ADR 0139)"
+        )
+    # http.client encodes the request line as ASCII, so a non-ASCII path would fail every send
+    # the gate admitted. After the credential screen, which gives its own remedy for one.
+    if not sidecar.isascii():
+        raise ValueError(
+            "ech_sidecar holds a non-ASCII character; write the URL in ASCII (ADR 0139)"
         )
     parsed = _split_or_refuse(
         sidecar, "ech_sidecar", use=_ECH_SIDECAR_CREDENTIAL_USE, error=ValueError

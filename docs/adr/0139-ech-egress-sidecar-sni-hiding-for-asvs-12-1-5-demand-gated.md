@@ -89,12 +89,11 @@ any listener on this host whose port the connection's author named.
   password in the URL, so a directly built connector refuses it too, and tells the operator to put
   a credential meant for the sidecar in the sidecar's own configuration: the engine has no setting
   for one, and the connection's own `Authorization` header reaches the sidecar on every request.
-  The resolver also refuses, at least, a `%` in the host (urllib decodes an IPv6 zone ID before it
-  dials), a space or control character (urlsplit deletes a tab or newline, urllib keeps it), and a
-  `?` or `#` anywhere (each request is the sidecar URL with the upstream path appended, so a query
-  would carry the real path and its own text to the sidecar, and a fragment would send every
-  request to `/`). None of these refusals quotes the value. `ech_sidecar_url_from_settings` holds
-  the reasons in its comments. The gate refuses port 0 in its own words, since no entry can list it.
+  The resolver also refuses, at least, a `%` in the host, a space or control character, a `?` or
+  `#` anywhere, and a non-ASCII character, each a value urllib would dial differently from how
+  the gate reads it, or fail to dial. None of these refusals quotes the value; the reason for each
+  is stated once, in the comments of `ech_sidecar_url_from_settings`. The gate refuses port 0 in
+  its own words, since no entry can list it.
 
 ## Context
 

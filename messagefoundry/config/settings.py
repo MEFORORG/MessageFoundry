@@ -5240,7 +5240,7 @@ def pinned_host_port(entry: str) -> tuple[str, int] | None:
     port differently (BACKLOG #5528). It splits at the LAST ``:``, so ``[::1]:8123`` reads as a
     host and a port; ``transports.egress.host_port_allowed`` splits at the first. ``None`` for at
     least: no port; a port that is not 1 to 65535 in at most five ASCII digits; a host holding a
-    ``:`` outside brackets, or none inside them, which urlsplit refuses in a URL; and a host the
+    ``:`` outside brackets, or none inside them; and a host the
     sidecar resolver would refuse, because :func:`is_loopback_hop_host` does not read it as this
     machine. An IP literal is returned in :mod:`ipaddress`'s compressed form, so ``::1`` and
     ``0:0:0:0:0:0:0:1`` are one host; a name is returned lowercased."""

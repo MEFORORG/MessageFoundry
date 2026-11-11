@@ -273,6 +273,15 @@ def test_a_sidecar_with_a_query_or_fragment_is_refused(build: Any, sidecar: str)
 
 
 @pytest.mark.parametrize("build", [_gate, _direct], ids=["egress-gate", "direct-build"])
+def test_a_sidecar_with_a_non_ascii_character_is_refused(build: Any) -> None:
+    """http.client encodes the request line as ASCII, so a non-ASCII sidecar path would fail every
+    send of a connection the gate admitted. Refused, on both paths, quoting nothing."""
+    with pytest.raises(ValueError, match=r"non-ASCII") as caught:
+        build("http://127.0.0.1:8123/svc-é")
+    assert "svc-" not in str(caught.value)
+
+
+@pytest.mark.parametrize("build", [_gate, _direct], ids=["egress-gate", "direct-build"])
 def test_a_sidecar_with_a_bad_scheme_is_refused_without_its_path(build: Any) -> None:
     """The scheme refusal quotes no part of the value: a sidecar path can carry a token."""
     with pytest.raises(ValueError, match=r"http\(s\)://") as caught:
