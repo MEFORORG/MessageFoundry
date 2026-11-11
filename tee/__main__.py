@@ -51,10 +51,9 @@ from tee.anon.keying import Keyer
 from tee.anon.leak import (
     MALFORMED_LINE_ADVICE,
     MALFORMED_LINE_HIT,
-    RETARGET_ADVICE,
     CoverageTally,
     LeakReport,
-    has_retarget_residue,
+    mapped_field_advice,
 )
 from tee.anon.rules import (
     RETARGET_ACKNOWLEDGED,
@@ -775,15 +774,19 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
     lines: list[str] = []
     coverage = CoverageTally(full_coverage=args.require_full_coverage)
     failed = 0
-    # Reports with a shape a retarget left (BACKLOG #3493). A keep is the wrong advice for one:
-    # it would leave the whole field. The row's own refusal text is never printed, so the run
-    # line below is the only place to say so.
+    # Reports with a shape in a mapped field: one a retarget left (BACKLOG #3493), or one an
+    # identifier rule kept (BACKLOG #5533, #5534). A keep is the wrong advice for one: it would
+    # leave the whole field. The row's own refusal text is never printed, so the run line below
+    # is the only place to say so.
     residue_reports = 0
+    residue_advice: dict[str, None] = {}
 
     def _tally(report: LeakReport) -> None:
         nonlocal residue_reports
         coverage.add(report)
-        residue_reports += has_retarget_residue(report)
+        advice = mapped_field_advice(report)
+        residue_reports += bool(advice)
+        residue_advice.update(dict.fromkeys(advice))
 
     for row in rows:
         text = row.raw.decode("latin-1")  # lossless byte<->char, matches the capture sink
@@ -842,9 +845,9 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         if residue_reports:
             # A keep is the wrong advice here: it would leave the whole field.
             steps = [
-                f"{residue_reports} of them carried a PHI shape that a retarget of a default field "
-                f"left past its first component. {RETARGET_ADVICE} A keep would leave the whole "
-                "field.",
+                f"{residue_reports} of them carried a PHI shape in a field a rule maps, past its "
+                "first component, where a retarget or an identifier rule left it as captured. "
+                f"{' '.join(residue_advice)} A keep would leave the whole field.",
                 *(["For the others:", *steps] if residue_reports < failed else ["Then retry."]),
             ]
         print(

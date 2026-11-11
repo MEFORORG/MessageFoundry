@@ -442,8 +442,8 @@ def unmapped_field_values(
     itself, which may be a wrapped name, is never printed.
 
     ``named_by`` is the rule paths whose segment ids count as named, ``mapped_paths`` when left
-    out. :func:`retarget_residue_hits` walks with fewer paths mapped than the rules name, and
-    passes every rule's path here so a segment only a retarget names keeps its address.
+    out. :func:`past_first_component_hits` walks with fewer paths mapped than the rules name,
+    and passes every rule's path here so a segment only those rules name keeps its address.
     """
     return _walk(text, mapped_paths, version, split=False, named_by=named_by)[0]
 
@@ -907,8 +907,7 @@ RETARGET_ADVICE = "Point each retargeted field back at its default kind, or at d
 #: What to do about a hit in a component an identifier rule kept. The field is already mapped, so
 #: extending the rule map does not help, and a keep would leave the whole field instead.
 KEPT_COMPONENT_ADVICE = (
-    "Point each field whose kept identifier components carry it at drop or freetext in an "
-    "overlay; a keep would leave the whole field."
+    "Point each field whose kept identifier components carry it at drop or freetext in an overlay."
 )
 #: The advice for each kind of hit in a mapped field (:func:`past_first_component_hits`), by the
 #: label its hits carry. Such a hit is no reason to extend the rule map: the field is mapped.
@@ -921,6 +920,17 @@ _MAPPED_FIELD_ADVICE: tuple[tuple[str, str], ...] = (
 def has_retarget_residue(report: LeakReport) -> bool:
     """True if ``report`` holds a hit from :func:`retarget_residue_hits`."""
     return any(RETARGET_RESIDUE in hit for hit in report.structural_hits)
+
+
+def mapped_field_advice(report: LeakReport) -> list[str]:
+    """The advice for each kind of hit in a mapped field that ``report`` holds
+    (:func:`past_first_component_hits`), in a fixed order. Empty when it holds none. A keep is
+    the wrong advice for every one of them: it would leave the whole field."""
+    return [
+        advice
+        for label, advice in _MAPPED_FIELD_ADVICE
+        if any(label in hit for hit in report.structural_hits)
+    ]
 
 
 def refusal_advice(
@@ -937,11 +947,7 @@ def refusal_advice(
     )
     if token_hit or shape_hit:
         steps.append("Extend the rule map so the field that carries it is scrubbed.")
-    steps.extend(
-        advice
-        for label, advice in _MAPPED_FIELD_ADVICE
-        if any(label in hit for hit in report.structural_hits)
-    )
+    steps.extend(mapped_field_advice(report))
     if coverage_refused:
         steps.append("Add a rule for each field named, or a keep for one you reviewed.")
         if any(_is_bare_line(address) for address in report.undecided_fields):

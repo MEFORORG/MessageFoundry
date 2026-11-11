@@ -260,16 +260,14 @@ def surrogate_dln(rep: str, keyer: Keyer, seps: Seps) -> str:
     return _surrogate_identifier("dln", rep, keyer, seps, _DLN_KEPT_COMPONENTS)
 
 
-#: The kinds whose surrogate keeps components past the first as captured: the three that call
-#: :func:`_surrogate_identifier` and ``ssn``. The leak-check scans what they keep
-#: (``leak.kept_component_hits``), so a kind that starts keeping a component belongs here. A
-#: tuple, not a set: a rule may carry the other package's member, which compares equal by value
-#: but does not hash like this package's.
-COMPONENT_KEEPING_KINDS: tuple[SurrogateKind, ...] = (
-    SurrogateKind.ID,
-    SurrogateKind.MRN,
-    SurrogateKind.SSN,
-    SurrogateKind.DLN,
+#: The identifier kinds, whose surrogate keeps sender components past the first as captured:
+#: the three that call :func:`_surrogate_identifier`, and ``ssn``. The leak-check scans what they
+#: keep (``leak.kept_component_hits``), so an identifier kind that starts keeping a component
+#: belongs here. They are not every kind that keeps captured text in a field it maps: at least
+#: ``date`` keeps a TS.2 precision code, and ``freetext`` on ``OBX-5`` keeps some values whole,
+#: and neither is scanned there.
+COMPONENT_KEEPING_KINDS: frozenset[SurrogateKind] = frozenset(
+    {SurrogateKind.ID, SurrogateKind.MRN, SurrogateKind.SSN, SurrogateKind.DLN}
 )
 
 

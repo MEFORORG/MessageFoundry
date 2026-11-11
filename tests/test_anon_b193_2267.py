@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+import tee.anon.leak
 import tee.anon.rules
 from tee.__main__ import main as tee_main
 from tee.store import RelayStore
@@ -274,6 +275,39 @@ def test_a_residue_refusal_is_not_told_to_add_a_keep(
     assert ("For the others: Extend" in error) is (residue and general)
     assert ("Then retry." in error) is (residue and not general)
     assert "555-0199" not in error
+
+
+def test_a_kept_component_refusal_is_not_told_to_add_a_keep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # PID-21 takes the mrn kind by default and keeps CX.4 as captured, so a dashed SSN there is
+    # refused (BACKLOG #5533, #5534). The field is mapped, so the run line names the kept-component
+    # fix, and neither the old advice nor the retarget advice.
+    path = str(tmp_path / "kept.db")
+    row = "PID|1||999^^^H^MR||DOE^JOHN" + "|" * 16 + "M77^^^123-45-6789^MR"
+    raw = f"MSH|^~\\&|SAPP|SFAC|RAPP|RFAC|20260101||ADT^A01|K0|P|2.5.1\r{row}"
+
+    async def seed() -> None:
+        store = await RelayStore.open(path)
+        try:
+            await store.record_capture(
+                direction="corepoint_copy", control_id="K0", raw=raw.encode("latin-1")
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    monkeypatch.setenv("MEFOR_ANON_SALT", _SALT)
+
+    assert _run(path, tmp_path / "ds.jsonl") == 1
+
+    (error,) = [line for line in capsys.readouterr().err.splitlines() if line.startswith("error:")]
+    assert tee.anon.leak.KEPT_COMPONENT_ADVICE in error
+    assert "A keep would leave the whole field." in error
+    assert "Then retry." in error
+    assert _GENERAL not in error
+    assert _TOLD.capitalize() not in error
+    assert "123-45-6789" not in error
 
 
 def test_a_keep_and_a_retarget_each_get_a_line(
