@@ -156,11 +156,12 @@ def merge_user_metadata(existing_json: str | None, meta_ops: Sequence[tuple[str,
 
     Any non-``user`` keys already present (ADR 0013 correlation lineage) are preserved untouched. Within
     one message the same key is last-writer-wins. ``existing_json`` may be ``None``/empty (no metadata
-    yet) or a non-object (defensively treated as empty), and so may a non-object ``"user"`` bag. An
-    existing object that decodes but is too deep to re-encode raises :class:`MetadataTooDeepError`
-    rather than being written back as the ops alone, which would erase the engine-internal keys.
-    Caller passes decrypted JSON in and encrypts the result out — this function does neither."""
-    parsed = _load_object(existing_json)
+    yet) or a non-object (defensively treated as empty), and so may a non-object ``"user"`` bag. A
+    cell too deep to decode, or one that decodes but is too deep to re-encode, raises
+    :class:`MetadataTooDeepError` rather than being written back as the ops alone, which would erase
+    the engine-internal keys. Caller passes decrypted JSON in and encrypts the result out — this
+    function does neither."""
+    parsed = _load_object(existing_json, too_deep_raises=True)
     existing_user = parsed.get("user")
     user: dict[str, Any] = dict(existing_user) if isinstance(existing_user, dict) else {}
     for key, value in meta_ops:

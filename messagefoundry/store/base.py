@@ -4574,7 +4574,7 @@ def _failed_before_connecting(exc: Exception) -> bool:
     class 28). Anything else answers ``False``, and the minting command keeps the key: at least
     any failure after the pool was built, a timeout, a ``RuntimeError``, and a dial failure a
     backend wraps in another class, such as SQL Server's database-options connection under
-    ``auto``, a TLS verification error, or asyncio's combined error for several addresses."""
+    ``auto``, or asyncio's combined error for several addresses."""
     import socket
 
     if not _raised_creating_the_pool(exc):

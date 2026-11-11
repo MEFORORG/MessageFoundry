@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``store/metadata.py`` JSON hardening: no bare NaN/Infinity token from the reference sink (BACKLOG
-#6711), and deeply nested JSON reads as malformed in the three decoders (BACKLOG #6712)."""
+#6711), and deeply nested JSON never escapes the three decoders as json's ``RecursionError`` (BACKLOG
+#6712): the header decoder reads it as malformed, while ``merge_user_metadata`` and ``user_metadata``
+raise ``MetadataTooDeepError``."""
 
 from __future__ import annotations
 
@@ -18,6 +20,7 @@ from messagefoundry.config.wiring import FileRef, ReferenceSpec
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import metadata as metadata_module
+from messagefoundry.store.cell_tag import message_cell_aad
 from messagefoundry.store.metadata import (
     MetadataTooDeepError,
     decode_response_headers,
@@ -27,6 +30,7 @@ from messagefoundry.store.metadata import (
     user_metadata,
 )
 from messagefoundry.store.store import MessageStore
+from tests.test_metadata_bag import _to_routed
 
 # Deep enough to exhaust json's C scanner on every supported platform (measured: 100_000 overflows).
 _DEEP = "[" * 200_000
@@ -118,7 +122,7 @@ async def test_a_toml_nan_fails_the_sync_and_writes_no_snapshot(
         await store.close()
 
 
-# --- #6712: the three decoders ----------------------------------------------------------------
+# --- #6712: the three decoders; only the header decoder reads deep nesting as empty ----------
 
 
 def test_the_deep_input_really_reaches_the_recursion_limit() -> None:
@@ -128,10 +132,55 @@ def test_the_deep_input_really_reaches_the_recursion_limit() -> None:
 
 
 @pytest.mark.parametrize("bad", [_DEEP, "{not json"], ids=["deep-nesting", "plain-malformed"])
-def test_header_and_merge_decoders_read_malformed_input_as_empty(bad: str) -> None:
+def test_the_header_decoder_reads_malformed_input_as_empty(bad: str) -> None:
     """Deep nesting raises json's ``RecursionError``; here it reads like any other malformed cell."""
     assert decode_response_headers(bad) == {}
-    assert json.loads(merge_user_metadata(bad, [("k", "v")])) == {"user": {"k": "v"}}
+
+
+def test_merge_user_metadata_reads_plain_malformed_input_as_empty() -> None:
+    """Unchanged from main: an unparseable cell is "no metadata", so the merge writes the ops alone."""
+    assert json.loads(merge_user_metadata("{not json", [("k", "v")])) == {"user": {"k": "v"}}
+
+
+# A well-formed cell holding the correlation lineage beside a value too deep to decode.
+_DEEP_CELL = '{"corr": "x", "user": {"old": "y"}, "z": ' + "[" * 200_000 + "]" * 200_000 + "}"
+
+
+def test_merge_user_metadata_raises_on_a_cell_too_deep_to_decode() -> None:
+    """Read as ``{}``, the merge would write back the ops alone and erase the cell's other keys, the
+    correlation lineage among them; on main json's ``RecursionError`` escaped instead. Raised
+    unchained, content-free, and not a ``ValueError``."""
+    with pytest.raises(MetadataTooDeepError, match="decode") as info:
+        merge_user_metadata(_DEEP_CELL, [("k", "v")])
+    assert info.value.__cause__ is None
+    assert info.value.__context__ is None
+    assert not isinstance(info.value, ValueError)
+
+
+async def test_a_setmeta_handoff_leaves_a_too_deep_stored_cell_unchanged(tmp_path: Path) -> None:
+    """End to end on the store: the handoff aborts, and the stored cell, ``corr`` included, is the
+    same text afterwards, so no lineage is erased."""
+    store = await MessageStore.open(tmp_path / "deep.db")
+    try:
+        mid, rtd = await _to_routed(store)
+        aad = message_cell_aad("metadata", message_id=mid, channel_id="IB")
+        await store._db.execute(
+            "UPDATE messages SET metadata=? WHERE id=?", (store._enc(_DEEP_CELL, aad=aad), mid)
+        )
+        await store._db.commit()
+        with pytest.raises(MetadataTooDeepError):
+            await store.transform_handoff(
+                routed_id=rtd.id,
+                message_id=mid,
+                channel_id="IB",
+                deliveries=[("OB1", "OUTBODY")],
+                meta_ops=[("k", "v")],
+            )
+        msg = await store.get_message(mid)
+        assert msg is not None
+        assert msg["metadata"] == _DEEP_CELL
+    finally:
+        await store.close()
 
 
 def test_user_metadata_reads_plain_malformed_input_as_none() -> None:
