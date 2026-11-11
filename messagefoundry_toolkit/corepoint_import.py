@@ -786,9 +786,15 @@ def parse_roles(data: str) -> tuple[RoleToken, ...]:
         cls = stack[-1] if stack else ""
         tokens.append(RoleToken(_ROLE_BY_CLASS.get(cls, "text") if cls else "text", run, cls))
 
+    # Each search runs again only once its match is consumed. Searching for both on every pass
+    # rescanned the input to its end each time, so a run of one tag kind cost O(n^2) (#4036).
+    opening = _SPAN_OPEN.search(data)
+    closing = _SPAN_CLOSE.search(data)
     while pos < len(data):
-        opening = _SPAN_OPEN.search(data, pos)
-        closing = _SPAN_CLOSE.search(data, pos)
+        if opening is not None and opening.start() < pos:
+            opening = _SPAN_OPEN.search(data, pos)
+        if closing is not None and closing.start() < pos:
+            closing = _SPAN_CLOSE.search(data, pos)
         if opening is None and closing is None:
             break
         if closing is None or (opening is not None and opening.start() < closing.start()):
