@@ -1613,8 +1613,8 @@ count is above `0` (vault BACKLOG #2613).
 - **What the engine refuses without it:** the engine AI broker sends `[ai].api_key` and the code
   sent for assistance over https that verifies the endpoint's certificate, and its handshake
   checks no OCSP. It checks `[tls].crl_file` only where the engine's `[tls]` policy reaches the
-  hop: an engine `messagefoundry serve` started, for an endpoint that is not loopback (BACKLOG
-  #5527). A loopback endpoint, and an app built without the `[tls]` settings, such as a direct
+  hop: an engine started by `messagefoundry serve`, for an endpoint that is not loopback (BACKLOG
+  #5527). A loopback endpoint, and an app not handed the `[tls]` section, such as a direct
   `create_app` (the embedded path), check no CRL whatever `[tls].crl_file` says. So without that
   CRL an `[ai].endpoint` whose host is not loopback is refused under
   `[security].enforcement = enforce`, and wherever a broker is built without a known posture,
@@ -1624,10 +1624,10 @@ count is above `0` (vault BACKLOG #2613).
   unexpired endpoint certificate is then accepted unless something outside the engine stops it, and the API key
   crosses to whoever holds it. **Setting the flag adds no check on the wire.**
 - **What the attestation can truthfully rest on:** not on the engine. Since BACKLOG #5527
-  `[tls].crl_file` reaches this hop on an engine `serve` started, and there it is the other way
-  across under `enforce`, so prefer it where you hold the CRL of the endpoint certificate's
-  issuer. It is instance-wide: once set, an endpoint
-  whose issuer has no CRL in that file fails its handshake, and this flag does not change that.
+  `[tls].crl_file` reaches this hop on an engine started by `serve`, and there it is the other
+  way across under `enforce`, so prefer it where you hold the CRL of the endpoint certificate's
+  issuer. It is instance-wide: once set, an off-box endpoint it reaches whose issuer has no CRL
+  in that file fails its handshake, and this flag does not change that.
   For an endpoint under a public CA you hold no CRL for, a short-lived endpoint certificate is the
   main honest basis; put its lifetime in the reason. A gateway on this machine that checks the
   upstream's revocation itself needs no attestation at all: a loopback endpoint is not refused.

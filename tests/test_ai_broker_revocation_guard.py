@@ -706,6 +706,7 @@ async def test_the_route_hands_the_broker_the_instance_tls_policy(
         ("direct-create-app", "a direct create_app (the embedded path)"),
         ("loopback", "A loopback endpoint"),
     ],
+    ids=["direct-create-app", "loopback"],
 )
 async def test_the_posture_entry_claims_no_crl_check_where_crl_file_does_not_reach(
     engine: Engine, monkeypatch: pytest.MonkeyPatch, pki: _Pki, path: str, names_the_path: str

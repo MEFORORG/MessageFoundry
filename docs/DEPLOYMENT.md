@@ -1157,7 +1157,7 @@ bind-guard ladder above:
 
   **The AI-broker endpoint is gated the same way** (BACKLOG #2193, owner ruling 2026-10-27). An
   off-box `[ai].endpoint` is refused under `enforce` unless a `[tls].crl_file` reaches it, as it
-  can since BACKLOG #5527 on an engine `messagefoundry serve` started, or
+  can since BACKLOG #5527 on an engine started by `messagefoundry serve`, or
   `[ai].endpoint_revocation_attested = true` is set with an
   `[ai].endpoint_revocation_attested_reason`. On that engine the broker also verifies the endpoint
   against `[tls].internal_ca_file` under `augment` or `pinned`. An app built by a direct

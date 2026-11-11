@@ -436,14 +436,13 @@ byte-identical SSL context.
 | `internal_ca_file` | path | — | PEM path to the org's internal CA. **Not a secret** — a path, like `tls_cert_file` / `forward_tls_ca_file`. Unset (default) = no internal anchor; every hop uses the OS trust store. |
 | `trust_anchor_mode` | enum | `system` | how `internal_ca_file` composes with the OS default roots on a non-loopback internal hop. `system` (default) = **OS trust store only**, `internal_ca_file` ignored (byte-identical). `augment` = OS roots **and** the internal CA (a mixed public + private estate). `pinned` = **only** the internal CA, not the public bundle (a fully-private estate; strictest). `pinned` **without** `internal_ca_file` is **refused at load** — with nothing to pin it would silently fall back to the full OS trust store, i.e. the operator excludes public roots and gets all of them. |
 
-**The engine AI broker reads this block too** (BACKLOG #5527). On an engine `messagefoundry serve`
-started, `POST /ai/chat` verifies an
-`[ai].endpoint` whose host is not loopback against `internal_ca_file` under `augment` or `pinned`,
-and checks it against `crl_file` in any mode, as the HTTP-family connections do. A loopback
-endpoint takes neither file, and an app built without this block, such as a direct `create_app`
-(the embedded path), checks the endpoint against the OS trust store and no CRL, whatever this
-block says. Its TLS context is
-built on the first assist call and kept, so a replaced `crl_file` reaches it as it reaches any
+**The engine AI broker reads this block too** (BACKLOG #5527). On an engine started by
+`messagefoundry serve`, `POST /ai/chat` verifies an `[ai].endpoint` whose host is not loopback
+against `internal_ca_file` under `augment` or `pinned`, and checks it against `crl_file` in any
+mode, as the HTTP-family connections do. A loopback endpoint takes neither file. An app that is
+not handed the `[tls]` section at all, as a direct `create_app` (the embedded path) is not, checks
+the endpoint against the OS trust store and no CRL, whatever the instance's `[tls]` says. Its TLS
+context is built on the first assist call and kept, so a replaced `crl_file` reaches it as it reaches any
 connection's, and an `internal_ca_file` changed in place takes a restart. A `crl_file` that reaches the endpoint
 is a way across its revocation refusal, beside `[ai].endpoint_revocation_attested`; an endpoint
 whose issuer has no CRL in that file then fails its handshake.
