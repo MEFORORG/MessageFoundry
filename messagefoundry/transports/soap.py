@@ -959,8 +959,10 @@ class SoapDestination(DestinationConnector):
         headers = self._headers
         if self._token_provider is not None:
             # BACKLOG #5526: the probe presents the credential a send presents. Construction purges a
-            # static Authorization header once a provider exists, so a probe that did not mint would
-            # carry no credential at all. A token-endpoint failure raises DeliveryError.
+            # static `headers` Authorization once a provider exists, but keeps a configured
+            # bearer_token or Basic pair, so a probe that did not mint would carry either no
+            # credential or that static one, never the minted bearer a send presents. A
+            # token-endpoint failure raises DeliveryError.
             headers = {
                 **self._headers,
                 "Authorization": f"Bearer {self._token_provider.access_token()}",
