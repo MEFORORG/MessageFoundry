@@ -2396,9 +2396,10 @@ Properties of the anonymizer:
   CX components that name who issued it: CX.3 to CX.6, CX.9 and CX.10. It blanks CX.2, the check digit, the CX.7 and
   CX.8 dates, and anything past CX.10. `PID-20`, a driver's licence, takes the `dln` kind: the
   number is fabricated, the issuing state kept and the expiry blanked (BACKLOG #5534). A kept
-  component is not leak-scanned, because a rule maps the field, so text a sender puts in one
-  passes. The kept positions are CX positions whatever the field's type, so an overlay that points
-  an EI field such as `OBR-3` at `id` blanks EI.2, the namespace id.
+  component is still leak-scanned for a dashed SSN and a punctuated phone number, as written and
+  decoded, though a rule maps the field, so either one refuses there as it would in a field no
+  rule maps. Any other text a sender puts in one, such as a name, passes. The kept positions are
+  CX positions whatever the field's type, so an overlay that points an EI field such as `OBR-3` at `id` blanks EI.2, the namespace id.
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
   loose string search. With no site prefix loaded it matches nothing, and
   `python -m tee anonymize-captures` prints a warning saying so (vault BACKLOG #3516).
@@ -2423,8 +2424,8 @@ both are described below:
 | The message has no parseable MSH, or its structure cannot be parsed (`AnonError`) | The whole message |
 | A known partner, vendor or site token, or a routable IP address, survives | The whole message |
 | The header's `MSH-12` version is made of digits and dots, and one run of digits is longer than 32 (`AnonError`, raised by the anonymizer before the leak-check runs) | The header |
-| A dashed SSN (`NNN-NN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, and what a retarget of a default field leaves past its first component. A cut shape counts when at least one of its fields is one no rule maps |
-| A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, and what a retarget of a default field leaves past its first component. A cut shape counts when at least one of its fields is one no rule maps |
+| A dashed SSN (`NNN-NN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
+| A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
 | A CX identifier typed `MR` or `MRN` appears | Fields no rule maps |
 | A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule rewriting a field of that segment names. A wrapped `LEE` or `ZOE` is such a line, and with no readable version in MSH-12 the version defines no id. Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields, the header included. Or it is an `MSH` line ahead of the header. | Every line but a header of three or more split fields whose first field is `MSH`, in capitals or not. The header is the one line the separators are read from. It is the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
 | The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |

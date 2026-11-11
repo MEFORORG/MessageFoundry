@@ -137,7 +137,9 @@
   `PID-20`, a driver's licence rather than a CX: it fabricates the number, keeps the issuing state
   and blanks the expiry. **This changes one §3 choice:** `PID-20` moves from `ID` to `DLN`. An
   overlay that points `PID-20` back at `id` is now a retarget and must list it. Nothing else in
-  the `KEEP` set or the field list moves.
+  the `KEEP` set or the field list moves. The leak-check scans the components these kinds keep
+  for a dashed SSN and a punctuated phone, as written and decoded, though a rule maps the field,
+  so the fields #5533 mapped refuse those shapes as they did unmapped.
 - **Decision in one line:** ship a **pure-stdlib, dependency-free `anon` package** that turns real,
   messy HL7 v2 into structurally-faithful **PHI-free** datasets via a **two-layer rule model — a
   declarative field-*selection* map (data) over a code registry of pure surrogate *functions* (logic)** —

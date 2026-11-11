@@ -260,6 +260,19 @@ def surrogate_dln(rep: str, keyer: Keyer, seps: Seps) -> str:
     return _surrogate_identifier("dln", rep, keyer, seps, _DLN_KEPT_COMPONENTS)
 
 
+#: The kinds whose surrogate keeps components past the first as captured: the three that call
+#: :func:`_surrogate_identifier` and ``ssn``. The leak-check scans what they keep
+#: (``leak.kept_component_hits``), so a kind that starts keeping a component belongs here. A
+#: tuple, not a set: a rule may carry the other package's member, which compares equal by value
+#: but does not hash like this package's.
+COMPONENT_KEEPING_KINDS: tuple[SurrogateKind, ...] = (
+    SurrogateKind.ID,
+    SurrogateKind.MRN,
+    SurrogateKind.SSN,
+    SurrogateKind.DLN,
+)
+
+
 def surrogate_ssn(rep: str, keyer: Keyer, seps: Seps) -> str:
     """A fabricated SSN/national id — preserves a dashed ``NNN-NN-NNNN`` shape if present, and keeps
     the CX authority components a CX-shaped national id carries, blanking the rest as

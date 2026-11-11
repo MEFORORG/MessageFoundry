@@ -26,7 +26,9 @@ already-pseudonymized field is never re-flagged:
   §5). A name, an undashed number or a date in an unmapped field
   is NOT detected; the coverage report is the only record of it (BACKLOG #1710). The dashed SSN
   and punctuated phone detectors also scan what a retarget of a default field left past its
-  first component (:func:`retarget_residue_hits`, BACKLOG #3493). The shape detectors that read
+  first component (:func:`retarget_residue_hits`, BACKLOG #3493), and the components an ``id``,
+  ``mrn``, ``ssn`` or ``dln`` rule keeps as captured past its first (:func:`kept_component_hits`,
+  BACKLOG #5533, #5534). The shape detectors that read
   one field, and the token scan, read a value decoded from its HL7 escape sequences as well as as
   written, so a shape or token written ``\\X2D\\`` for a dash is found too (BACKLOG #5532).
   docs/PHI.md section 9 names the checks that do not decode.
@@ -54,6 +56,7 @@ from types import ModuleType
 
 from .rules import HEADER_SEGMENTS, AnonError, FieldRule, SurrogateKind, retargeted_defaults
 from .surrogates import (
+    COMPONENT_KEEPING_KINDS,
     Seps,
     message_has_site_code,
     read_message_seps,
@@ -660,46 +663,75 @@ def structural_phi_hits(
 
 #: What a hit in the part of a field a retarget left reads as, after its shape label.
 RETARGET_RESIDUE = "left by a retarget"
+#: What a hit in a component an identifier rule kept reads as, after its shape label.
+KEPT_COMPONENT = "in a component an identifier rule keeps"
 
 
-def retarget_residue_hits(
+def past_first_component_hits(
     text: str, rules: tuple[FieldRule, ...], *, version: str | None = None
 ) -> list[str]:
-    """Structural PHI-shape hits in what a retarget of a default field left in ``text``
-    (BACKLOG #3493). Reasons name the shape and the field address only, never a value.
+    """Structural PHI-shape hits in the part past component 1 of a mapped field that a rule can
+    leave as captured. Reasons name the shape and the field address only, never a value.
 
-    A rule that points a default field at a different kind (:func:`.rules.retargeted_defaults`)
-    maps the field, so :func:`structural_phi_hits` never scans it. ``id``, ``mrn``, ``ssn`` and
-    ``dln`` rewrite component 1 and keep some components after it as captured (BACKLOG #5534).
-    So each repetition of such a field is scanned here with its component 1 left out, for the dashed SSN and the
-    punctuated phone. The MRN-typed shape needs a component 1, so it never fires here, which is
-    right: the id there is the surrogate. The other kinds add no hit: ``name``, ``address`` and
-    ``provider`` write values from fixed pools, and ``tests/test_anon_overlay_retarget_warning.py``
-    pins that no pool value has one of these shapes; ``phone`` and ``dob`` write one component;
-    ``date`` writes component 1 and keeps after it only a known TS.2 precision code.
+    A rule maps its field, so :func:`structural_phi_hits` never scans it. Two kinds of field
+    are scanned here, each repetition with its component 1 left out, for the dashed SSN and the
+    punctuated phone, as written and decoded as :func:`_structural_reasons` reads a value:
 
-    The walk names a segment by every rule's path, so a segment only the retarget names keeps
-    its address in a message whose HL7 version does not define it."""
+    * a default field a retarget points at a different kind (:func:`.rules.retargeted_defaults`,
+      BACKLOG #3493). Its hits read :data:`RETARGET_RESIDUE`.
+    * any other field an ``id``, ``mrn``, ``ssn`` or ``dln`` rule rewrites
+      (:data:`.surrogates.COMPONENT_KEEPING_KINDS`), whose surrogate keeps the issuer components
+      as the sender wrote them (BACKLOG #5533, #5534). Its hits read :data:`KEPT_COMPONENT`.
+
+    The MRN-typed shape needs a component 1, so it never fires here, which is right: the id
+    there is the surrogate. The other kinds add no hit on a retargeted field: ``name``,
+    ``address`` and ``provider`` write values from fixed pools, and
+    ``tests/test_anon_overlay_retarget_warning.py`` pins that no pool value has one of these
+    shapes; ``phone`` and ``dob`` write one component; ``date`` writes component 1 and keeps after
+    it only a known TS.2 precision code.
+
+    The walk names a segment by every rule's path, so a segment only these rules name keeps its
+    address in a message whose HL7 version does not define it."""
     retargeted = {default.path for default, _ in retargeted_defaults(rules)}
+    paths = retargeted | {r.path for r in rules if r.kind in COMPONENT_KEEPING_KINDS}
     parsed = read_message_seps(text)
-    if not retargeted or parsed is None:
+    if not paths or parsed is None:
         return []
     seps, field_sep = parsed
     rewritten = {r.path for r in rules if r.kind != SurrogateKind.KEEP}
     hits: list[str] = []
-    walk = unmapped_field_values(text, rewritten - retargeted, version=version, named_by=rewritten)
+    walk = unmapped_field_values(text, rewritten - paths, version=version, named_by=rewritten)
     for address, value in walk:
-        if address not in retargeted:
+        if address not in paths:
             continue
+        label = RETARGET_RESIDUE if address in retargeted else KEPT_COMPONENT
         rest = seps.repetition.join(
             seps.component.join(["", *rep.split(seps.component)[1:]])
             for rep in value.split(seps.repetition)
         )
         hits.extend(
-            f"{reason.removeprefix('unmapped ')} {RETARGET_RESIDUE} in {address}"
+            f"{reason.removeprefix('unmapped ')} {label} in {address}"
             for reason in _structural_reasons(rest, seps, field_sep)
         )
     return hits
+
+
+def retarget_residue_hits(
+    text: str, rules: tuple[FieldRule, ...], *, version: str | None = None
+) -> list[str]:
+    """The hits of :func:`past_first_component_hits` in what a retarget of a default field left
+    (BACKLOG #3493)."""
+    hits = past_first_component_hits(text, rules, version=version)
+    return [hit for hit in hits if RETARGET_RESIDUE in hit]
+
+
+def kept_component_hits(
+    text: str, rules: tuple[FieldRule, ...], *, version: str | None = None
+) -> list[str]:
+    """The hits of :func:`past_first_component_hits` in the components an ``id``, ``mrn``,
+    ``ssn`` or ``dln`` rule kept, on a field no retarget names (BACKLOG #5533, #5534)."""
+    hits = past_first_component_hits(text, rules, version=version)
+    return [hit for hit in hits if KEPT_COMPONENT in hit]
 
 
 def has_unreachable_line(text: str, mapped_paths: Iterable[str] = ()) -> bool:
@@ -780,8 +812,9 @@ def leak_report(
     Token hits use the guard's substring + estate-token mode (ADR 0030 §5) plus a field-anchored
     site-code check. Structural detection engages **only when ``rules`` is supplied** — the address
     of every unmapped field is derived from ``{r.path for r in rules}`` and the high-precision
-    detectors run over those fields, and over what a retarget of a default field left past its
-    first component (:func:`retarget_residue_hits`). With ``rules is None`` (a direct/legacy
+    detectors run over those fields, over what a retarget of a default field left past its
+    first component (:func:`retarget_residue_hits`), and over the components an identifier rule
+    keeps past its first (:func:`kept_component_hits`). With ``rules is None`` (a direct/legacy
     call over a bare string) structural detection is skipped and the result is byte-for-byte the legacy token-only behaviour.
 
     ``version`` is the HL7 version a bare line is judged by. A caller that checks the OUTPUT of
@@ -808,7 +841,7 @@ def leak_report(
         walked = unmapped_field_values(text, mapped_paths, version=version)
         unmapped = tuple(sorted({addr for addr, _ in walked}))
         structural = structural_phi_hits(text, mapped_paths, version=version)
-        structural += retarget_residue_hits(text, rules, version=version)
+        structural += past_first_component_hits(text, rules, version=version)
         decided = {r.path for r in rules}
         # A bare line has no field a rule could name, so a rule or a keep on ANY field of its
         # segment decides it (BACKLOG #3001).
@@ -844,9 +877,9 @@ def leak_check(
 ) -> list[str]:
     """Forbidden-token + structural PHI hits in ``text`` (empty list = clean) — a thin wrapper over
     :func:`leak_report`. ``rules`` scopes the structural PHI-shape detectors to the fields no rule
-    matched and to what a retarget left; omitting it (a bare-string call) runs the legacy
-    token-only check. A caller that
-    ran ``anonymize`` itself passes ``version=message_version(raw)``, as :func:`leak_report` says.
+    matched, to what a retarget left and to the components an identifier rule keeps; omitting it
+    (a bare-string call) runs the legacy token-only check. A caller that ran ``anonymize`` itself
+    passes ``version=message_version(raw)``, as :func:`leak_report` says.
     """
     return leak_report(text, rules=rules, version=version).hits
 
@@ -871,6 +904,18 @@ def denylist_is_live(report: LeakReport) -> bool:
 
 #: What to do about a hit in what a retarget left. A keep would leave the whole field instead.
 RETARGET_ADVICE = "Point each retargeted field back at its default kind, or at drop or freetext."
+#: What to do about a hit in a component an identifier rule kept. The field is already mapped, so
+#: extending the rule map does not help, and a keep would leave the whole field instead.
+KEPT_COMPONENT_ADVICE = (
+    "Point each field whose kept identifier components carry it at drop or freetext in an "
+    "overlay; a keep would leave the whole field."
+)
+#: The advice for each kind of hit in a mapped field (:func:`past_first_component_hits`), by the
+#: label its hits carry. Such a hit is no reason to extend the rule map: the field is mapped.
+_MAPPED_FIELD_ADVICE: tuple[tuple[str, str], ...] = (
+    (RETARGET_RESIDUE, RETARGET_ADVICE),
+    (KEPT_COMPONENT, KEPT_COMPONENT_ADVICE),
+)
 
 
 def has_retarget_residue(report: LeakReport) -> bool:
@@ -887,12 +932,16 @@ def refusal_advice(
     steps: list[str] = []
     token_hit = len(report.hits) > len(report.structural_hits)
     shape_hit = any(
-        hit != MALFORMED_LINE_HIT and RETARGET_RESIDUE not in hit for hit in report.structural_hits
+        hit != MALFORMED_LINE_HIT and not any(label in hit for label, _ in _MAPPED_FIELD_ADVICE)
+        for hit in report.structural_hits
     )
     if token_hit or shape_hit:
         steps.append("Extend the rule map so the field that carries it is scrubbed.")
-    if has_retarget_residue(report):
-        steps.append(RETARGET_ADVICE)
+    steps.extend(
+        advice
+        for label, advice in _MAPPED_FIELD_ADVICE
+        if any(label in hit for hit in report.structural_hits)
+    )
     if coverage_refused:
         steps.append("Add a rule for each field named, or a keep for one you reviewed.")
         if any(_is_bare_line(address) for address in report.undecided_fields):

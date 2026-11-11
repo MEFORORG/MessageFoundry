@@ -7,7 +7,9 @@ they kept a non-ASCII letter of the id as it was. So a check digit, the CX.7 and
 driver's licence state and expiry survived inside a field the rule map reported as scrubbed, and
 nothing scans a mapped field. Now a CX keeps only the components that name its issuer (CX.3 to
 CX.6, CX.9 and CX.10), a driver's licence keeps only its state, and every letter of the id is
-fabricated as ASCII. A mapped field is not leak-scanned, so these tests are the only check.
+fabricated as ASCII. The leak-check scans a kept component only for a dashed SSN and a punctuated
+phone (``tests/test_anon_b214_kept_components.py``), so for every other residue these tests are
+the only check.
 
 Every value here is synthetic.
 """

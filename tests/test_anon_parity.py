@@ -186,6 +186,9 @@ _LEAK_PARITY_INPUTS = [
     "MSH-^~\\&-A-B-C-D-20260101--ADT^A01-M1-P-2.5.1\rPID-1--1^^^H^MR--X^Y"
     "\rZZZ-1-123-45-6789\rZZZ-1-555-555-0100\rOBX-1-NM-8480^S^LN--000-12-3456\rzz-123-45-6789",
     "MSH ^~\\& A B C D 20260101  ADT^A01 M1 P 2.5.1\rPID 1  1^^^H^MR  X^Y\rZZZ 1 (555) 555-0100",
+    # BACKLOG #5533/#5534: shapes in the components an identifier rule keeps, as written and escaped.
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1|M7^^^H^MR^202-555-0188|1^^^H^MR||X^Y"
+    "\rGT1|1|G8^^123\\X2D\\45\\X2D\\6789^H^GN",
 ]
 
 
