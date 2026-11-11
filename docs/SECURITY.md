@@ -5598,28 +5598,27 @@ session took no part in is not evidence about the session. (The retired PySide6 
 OS-keyring token cache is an accepted retirement loss — BACKLOG #103. That retired one *instance* of
 durable token storage, not the shape: the extension's SecretStorage cache is a live one.)
 
-**At least these systems create, hold or manage a session that reaches the engine.** The three
-federated sign-in legs ship off: `[auth].ad_enabled`, `[auth].kerberos_enabled` and
+**At least these systems create, hold or manage a session that reaches the engine.** The directory
+and federated legs below ship off: `[auth].ad_enabled`, `[auth].kerberos_enabled` and
 `[auth].oidc_enabled` all default to false.
 
 - **The engine** mints every session at one site, `AuthService._issue_session` in
   `messagefoundry/auth/service.py`, the engine's only caller of `Store.create_session`. It keeps
-  only the token's hash, and stamps the absolute lifetime at mint from `[auth].session_absolute_hours`.
-- **The web console, `apiclient` and the VS Code extension** hold the token, as the table above
-  says. The extension signs in through `POST /auth/login`, and offers the user `provider: "ad"`
-  when `/auth/providers` reports the directory available (`ide/src/auth.ts`).
-- **LDAP (Active Directory)** authenticates a directory sign-in on `POST /auth/login` when
-  `ad_enabled` is set. The directory session reconciler re-asks the directory about each directory
-  account that holds a live session, and may revoke the sessions of one the directory reports
-  disabled or no longer finds, under the strike, hold and breaker rules of ADR 0079 and ADR 0195. It
-  runs every `[auth].ad_session_recheck_seconds`, default 300, and only with `ad_enabled` set and an
-  LDAP client wired; `0` turns it off.
+  only the token's hash, and stamps the absolute lifetime at mint from `[security].max_session_hours`.
+- **The web console, `apiclient` and the VS Code extension** hold the token (table above). The
+  extension signs in through `POST /auth/login` with a local account: `/auth/providers` reports
+  `ad` as false, and the engine refuses `provider: "ad"` (BACKLOG #1137).
+- **LDAP (Active Directory)**, under `ad_enabled`, is the directory the Kerberos and OIDC legs
+  resolve a principal against, and the bind the directory session reconciler uses. It accepts no
+  directory-password sign-in; that pathway is retired (BACKLOG #1137). The reconciler can revoke a
+  directory account's live sessions, and *Directory session reconciliation* below states when.
 - **Kerberos (Windows SSO)** creates a directory session through `POST /auth/negotiate` and the
   console's `GET /ui/sso` when `kerberos_enabled` is set. The engine reads no ticket lifetime, so such
   a session's absolute lifetime is the engine's own flat cap, not the directory's (ADR 0079).
 - **OIDC** creates a federated session when `oidc_enabled` is set. Its absolute lifetime is the
-  earliest of the engine's cap, the signature-verified `id_token` `exp`, and
-  `[auth].oidc_session_max_hours` when that is set (ADR 0142).
+  earliest of the engine's cap, the signature-verified `id_token` `exp`, the IdP `auth_time` plus
+  `[auth].oidc_max_age_seconds`, and `[auth].oidc_session_max_hours` when that is set (ADR 0142,
+  BACKLOG #1150).
 
 ### A revoked privilege reaches the next request, with exceptions (ASVS 8.3.2)
 
