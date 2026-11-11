@@ -994,6 +994,12 @@ def _walk_scan_prefix(
             # require one, and a branch nobody walked is a branch nobody checked.
             required = [step(option, seen=seen) for option in arg[1]]
             seen = bool(required) and all(required)
+        elif op == sre_constants.GROUPREF_EXISTS:
+            # A conditional, ``(?(name)yes|no)``, as BACKLOG #5545's narrowed value classes are: either
+            # branch can run, so both are walked, and an absent "no" requires nothing.
+            _group, yes, no = arg
+            required = [step(option, seen=seen) for option in (yes, no if no is not None else [])]
+            seen = all(required)
         elif op in (sre_constants.ASSERT, sre_constants.ASSERT_NOT):
             step(arg[1], seen=seen)
     return seen
@@ -1017,7 +1023,16 @@ def _unbounded_scan_repeats(source: str) -> tuple[str, ...]:
     text. A class that cannot span a word boundary holds no "%", so a run of it reaches past at most
     the two hex digits of the escape before it: each run is entered from a constant number of start
     positions, which is the word-boundary route's own argument with one more start per run. Any other
-    lookbehind in that place is not read as an anchor, so it is flagged."""
+    lookbehind in that place is not read as an anchor, so it is flagged.
+
+    SO DOES THE CAMELCASE START, ``secretscrub._LABEL_OR_CAMEL_START``, and again only spelled
+    exactly as the shipped constant (BACKLOG #5545). Its camelCase half fires at a capital after a
+    lower-case letter or a digit, inside a word run, but only where a label word starts there and
+    ENDS the run. So a run offers at most one such start per label word that can end it, a constant,
+    and the walk from it is that word, since the label patterns' start also needs the separator right
+    after it. The pattern opens its label group in front of the start, ``(`` then the start, which is
+    the same position. The same capital start without that lookahead is flagged, which is the control
+    below."""
     parsed = sre_parser.parse(source)
     head = parsed[0] if len(parsed) else (None, None)
     anchored = head[0] == sre_constants.AT and head[1] in (
@@ -1025,7 +1040,13 @@ def _unbounded_scan_repeats(source: str) -> tuple[str, ...]:
         sre_constants.AT_BEGINNING,
         sre_constants.AT_BEGINNING_STRING,
     )
-    anchored = anchored or source.removeprefix("(?i)").startswith(scrub_mod._LABEL_START)
+    anchored = anchored or source.removeprefix("(?i)").startswith(
+        (
+            scrub_mod._LABEL_START,
+            scrub_mod._LABEL_OR_CAMEL_START,
+            "(" + scrub_mod._LABEL_OR_CAMEL_START,
+        )
+    )
     found: list[str] = []
     _walk_scan_prefix(
         parsed,
@@ -1096,6 +1117,32 @@ def test_every_applied_credential_pattern_has_a_contained_scan_prefix() -> None:
     assert _unbounded_scan_repeats(r"(?i)(?:\b|(?<=[0-9A-Fa-f]{2}))[A-Za-z0-9]+[:=]"), (
         "a lookbehind that fires inside a word run is not the label start, and is not containment"
     )
+    # THE CAMELCASE START (BACKLOG #5545), both ways: shipped, it is contained; the same capital
+    # start without the lookahead that makes the label word end the run is flagged. The exemption is
+    # by spelling, so the shipped constant is held to carrying that lookahead here, or an edit that
+    # dropped it would carry the exemption with it.
+    assert scrub_mod._CAMEL_START.endswith(
+        r"(?=(?i:" + scrub_mod._alternation(scrub_mod._CAMEL_WORDS) + r")\b)"
+    )
+    # The label patterns' start: the same, with the separator and the value's first character after
+    # the word, which still opens on ``\b``.
+    assert scrub_mod._SAME_LINE_VALUE.startswith(r"\b")
+    assert scrub_mod._CAMEL_LABEL_START.endswith(
+        r"(?=(?i:"
+        + scrub_mod._alternation(scrub_mod._CAMEL_WORDS)
+        + r")"
+        + scrub_mod._SAME_LINE_VALUE
+        + r")"
+    )
+    assert scrub_mod._LABEL_OR_CAMEL_START.endswith(
+        r"|(?P<camel>)" + scrub_mod._CAMEL_LABEL_START + r")"
+    )
+    assert not _unbounded_scan_repeats(
+        r"(?i)" + scrub_mod._LABEL_OR_CAMEL_START + r"[A-Za-z0-9]+[:=]"
+    )
+    assert _unbounded_scan_repeats(
+        r"(?i)(?:" + scrub_mod._LABEL_START + r"|(?-i:(?<=[a-z0-9])(?=[A-Z])))[A-Za-z0-9]+[:=]"
+    ), "a capital start with no label-word lookahead fires all through a word run"
 
     checked: list[str] = []
     excused: set[str] = set()
@@ -1626,10 +1673,10 @@ def test_the_dsn_scan_grows_linearly_in_line_length() -> None:
     )
 
     # THE GATE-REJECT PATH IS A SUBJECT IN ITS OWN RIGHT, and it is the one that runs on nearly every
-    # record: a line naming no credential word at all. It reaches `_ANY_HINT`'s 15 substring sweeps and
-    # then returns, so nothing below it is exercised -- which is exactly why it needs its own timed row
-    # rather than being inferred from the marked one. Without it a regression that made that sweep
-    # pathological would have no timed coverage anywhere in this file.
+    # record: a line naming no credential word at all. It reaches `_ANY_HINT`'s substring sweeps (23
+    # since BACKLOG #5545) and then returns, so nothing below it is exercised -- which is exactly why
+    # it needs its own timed row rather than being inferred from the marked one. Without it a
+    # regression that made that sweep pathological would have no timed coverage anywhere in this file.
     subjects: tuple[tuple[str, Callable[[str], object], bool], ...] = (
         (
             "support.redact._DSN_PASSWORD",
@@ -3544,7 +3591,13 @@ def test_both_copies_of_each_stopped_pattern_agree() -> None:
     They differ on purpose in spelling -- a scoped fold here, a derived alternation there -- so the
     check is on what they MATCH, over an ASCII corpus where those spellings are equivalent. The quoted
     values, the review shapes and the structured lines are in it because they are what reach the
-    braced and quoted alternates; the swallow family alone never does."""
+    braced and quoted alternates; the swallow family alone never does.
+
+    Since BACKLOG #5545 this module's patterns also read camelCase and compound key labels, which
+    the copy does not, so the copy is compared with ``secretscrub._pre_camel`` of each: the reading
+    without them, which ``scrub_credentials`` keeps beside the shipped one. The camelCase lines
+    below are there so that comparison meets the shapes the two readings differ on (found by code
+    review)."""
     corpus = [
         *_swallow_family(),
         *(line for line, _values, _labels in SWALLOW_EXAMPLES),
@@ -3555,10 +3608,15 @@ def test_both_copies_of_each_stopped_pattern_agree() -> None:
         *_structured_lines(2000),
         # Every fifth nested line: the braced MEFOR_ value's trailing quote is spelled in both copies.
         *_nested_label_lines()[::5],
+        "accessToken=zq1",
+        'token=zq1;accessToken="zq2 zq3"',
+        "AccountKey=zq1;x=1",
+        "storageAccountKey=zq1,region=x",
+        "clientSecret:\npassword: zq1",
     ]
     compared = 0
     for name in _STOPPED_PATTERNS:
-        ours, theirs = getattr(redact_mod, name), getattr(scrub_mod, name)
+        ours, theirs = getattr(redact_mod, name), scrub_mod._pre_camel(getattr(scrub_mod, name))
         for line in corpus:
             spans = [m.span() for m in ours.finditer(line)]
             assert spans == [m.span() for m in theirs.finditer(line)], f"{name} differs on {line!r}"

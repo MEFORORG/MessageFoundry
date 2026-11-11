@@ -18,6 +18,7 @@ import re
 import struct
 import threading
 import time
+import tracemalloc
 import warnings
 import zipfile
 import zlib
@@ -890,14 +891,16 @@ def test_zip_multi_round_member_with_trailing_bytes_ends() -> None:  # #1964
 _PHI_NAME = "SMITH_JOHN_MRN123.txt"
 
 
-def _two_member_zip_with_second_patched(*, flag: int = 0, method: int | None = None) -> bytes:
-    """A stored two-member archive whose SECOND member has ``flag`` OR-ed into its 16-bit
+def _two_member_zip_with_second_patched(
+    *, flag: int = 0, method: int | None = None, second_name: str = _PHI_NAME
+) -> bytes:
+    """A stored two-member archive whose SECOND member, named ``second_name``, has ``flag`` OR-ed into its 16-bit
     general-purpose flags and, if given, ``method`` as its compression method, in both the local header and the
     central directory. Stored bodies contain no ``PK`` signature, so the header search is exact."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
         zf.writestr("ok.txt", b"first")
-        zf.writestr(_PHI_NAME, b"second")
+        zf.writestr(second_name, b"second")
     blob = bytearray(buf.getvalue())
     # (signature, offset of the flags field, offset of the method field) for each header kind.
     for signature, flag_at, method_at in ((b"PK\x03\x04", 6, 8), (b"PK\x01\x02", 8, 10)):
@@ -945,32 +948,15 @@ def _central_directory_offset_too_large() -> bytes:
     return bytes(blob)
 
 
-def _second_member_codec_corrupted(compress_type: int) -> bytes:
-    # A compressed member whose first stream bytes are garbage. Neither lzma.LZMAError nor
-    # compression.zstd.ZstdError is an OSError.
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as zf:
-        zf.writestr("ok.txt", b"first")
-        zf.writestr(zipfile.ZipInfo(_PHI_NAME), b"second" * 50, compress_type=compress_type)
-    blob = bytearray(buf.getvalue())
-    local = blob.index(b"PK\x03\x04", blob.index(b"PK\x03\x04") + 1)
-    name_len, extra_len = (
-        int.from_bytes(blob[local + 26 : local + 28], "little"),
-        int.from_bytes(blob[local + 28 : local + 30], "little"),
-    )
-    data_at = local + 30 + name_len + extra_len
-    # LZMA: the properties after zipfile's 4-byte version/size prefix. Zstandard: the frame magic.
-    start = 4 if compress_type == zipfile.ZIP_LZMA else 0
-    blob[data_at + start : data_at + start + 5] = b"\xff" * 5
-    return bytes(blob)
-
-
-def _second_member_zstd_corrupted() -> bytes:
-    pytest.importorskip("compression.zstd", reason="this Python build has no Zstandard support")
-    return _second_member_codec_corrupted(zipfile.ZIP_ZSTANDARD)
-
-
 _UNSUPPORTED = "member 2 uses a zip feature this reader does not support"
+
+
+def _refusal(method: int, position: int = 2) -> str:
+    """The #5535 refusal of the entry at ``position`` for its compression ``method``."""
+    return (
+        rf"^zip archive member {position} uses a zip feature this reader does not support "
+        rf"\(compression method {method}; only stored and deflated members are read\)$"
+    )
 
 
 @pytest.mark.parametrize(
@@ -982,18 +968,22 @@ _UNSUPPORTED = "member 2 uses a zip feature this reader does not support"
             id="encrypted-flag",
         ),
         pytest.param(
-            lambda: _two_member_zip_with_second_patched(method=98), _UNSUPPORTED, id="method-98"
+            lambda: _two_member_zip_with_second_patched(method=98), _refusal(98), id="method-98"
+        ),
+        # Method 98 is now refused by the #5535 method check before any member opens. These two
+        # flags still reach zipfile's NotImplementedError, so the RuntimeError arm stays pinned.
+        pytest.param(
+            lambda: _two_member_zip_with_second_patched(flag=0x20),
+            rf"^zip archive {_UNSUPPORTED} \(encryption, a flag, or a format version\)$",
+            id="compressed-patched-flag",
+        ),
+        pytest.param(
+            lambda: _two_member_zip_with_second_patched(flag=0x40),
+            rf"^zip archive {_UNSUPPORTED} \(encryption, a flag, or a format version\)$",
+            id="strong-encryption-flag",
         ),
         pytest.param(
             _second_member_body_corrupted, r"member 2 is corrupt.*\(BadZipFile\)", id="bad-crc"
-        ),
-        pytest.param(
-            lambda: _second_member_codec_corrupted(zipfile.ZIP_LZMA),
-            r"member 2 is corrupt.*\(LZMAError\)",
-            id="lzma-corrupt",
-        ),
-        pytest.param(
-            _second_member_zstd_corrupted, r"member 2 is corrupt.*\(ZstdError\)", id="zstd-corrupt"
         ),
         pytest.param(
             _second_member_name_not_utf8,
@@ -1184,6 +1174,111 @@ def test_zip_recursion_error_is_labelled_as_recursion(
     assert "does not support" not in str(exc.value)
     assert exc.value.__cause__ is None
     assert exc.value.__context__ is None
+
+
+# --- #5535: only STORED and DEFLATED entries are read --------------------------------------------
+
+# zipfile reads a BZIP2, LZMA or Zstandard chunk with no bound on its output, so these three are
+# refused before any member opens. The refusal reads the method number only, so the refusal tests
+# patch it into a stored archive and need no codec module.
+_UNBOUNDED_METHODS = [
+    pytest.param(zipfile.ZIP_BZIP2, id="bzip2"),
+    pytest.param(zipfile.ZIP_LZMA, id="lzma"),
+    pytest.param(zipfile.ZIP_ZSTANDARD, id="zstandard"),
+]
+# The module each method's real encoder needs, for the one test that builds a real bomb.
+_CODEC_MODULES = {
+    zipfile.ZIP_BZIP2: "bz2",
+    zipfile.ZIP_LZMA: "lzma",
+    zipfile.ZIP_ZSTANDARD: "compression.zstd",
+}
+
+
+def _record_opens(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Patch ``ZipFile.open`` to record the name of each entry opened, and return that record."""
+    opened: list[str] = []
+    real_open = zipfile.ZipFile.open
+
+    def _recording_open(self: zipfile.ZipFile, name: Any, *args: Any, **kwargs: Any) -> Any:
+        opened.append(getattr(name, "filename", name))
+        return real_open(self, name, *args, **kwargs)
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", _recording_open)
+    return opened
+
+
+@pytest.mark.parametrize("ceiling", [1024 * 1024, None], ids=["ceiling", "no-ceiling"])
+@pytest.mark.parametrize("method", _UNBOUNDED_METHODS)
+def test_zip_member_with_an_unbounded_method_is_refused_before_any_member_opens(
+    monkeypatch: pytest.MonkeyPatch, method: int, ceiling: int | None
+) -> None:  # #5535
+    archive = _two_member_zip_with_second_patched(method=method)
+    opened = _record_opens(monkeypatch)
+    with pytest.raises(CompressionError, match=_refusal(method)) as exc:
+        zip_decompress(archive, max_output_bytes=ceiling)
+    # Refused before the trial pass, so not even the admissible first member was opened.
+    assert opened == []
+    _assert_names_no_member(exc)
+
+
+def test_zip_directory_entry_with_an_unbounded_method_is_refused() -> None:  # #5535
+    # A directory entry is never read, but the method check covers every entry, so no entry with
+    # an unbounded method is admitted in any form.
+    blob = _two_member_zip_with_second_patched(method=zipfile.ZIP_BZIP2, second_name="data/")
+    with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+        assert zf.infolist()[1].is_dir()
+    with pytest.raises(CompressionError, match=_refusal(zipfile.ZIP_BZIP2)):
+        zip_decompress(blob, max_output_bytes=None)
+
+
+@pytest.mark.parametrize("method", _UNBOUNDED_METHODS)
+def test_zip_bomb_in_an_unbounded_method_never_expands_in_memory(method: int) -> None:  # #5535
+    # 16 MiB of one byte packs into a few kilobytes at most. On a reader that opened the member,
+    # the first read would expand all of it before the 1 MiB ceiling is checked; ADR 0123's
+    # 2026-11-10 amendment records the full-size measurement.
+    pytest.importorskip(_CODEC_MODULES[method], reason="this Python build lacks the codec")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("ok.txt", b"first")
+        zf.writestr(_PHI_NAME, b"A" * (16 * 1024 * 1024), compress_type=method)
+    archive = buf.getvalue()
+    assert len(archive) < 64 * 1024
+    was_tracing = tracemalloc.is_tracing()
+    if not was_tracing:
+        tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        before, _ = tracemalloc.get_traced_memory()
+        # Any refusal is caught here, so the growth below is read whichever check fired.
+        with pytest.raises(CompressionError) as exc:
+            zip_decompress(archive, max_output_bytes=1024 * 1024)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        if not was_tracing:
+            tracemalloc.stop()
+    assert peak - before < 4 * 1024 * 1024
+    assert re.match(_refusal(method), str(exc.value))
+
+
+@pytest.mark.parametrize("ceiling", [1024 * 1024, None], ids=["ceiling", "no-ceiling"])
+@pytest.mark.parametrize(
+    "method", [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED], ids=["stored", "deflated"]
+)
+def test_zip_stored_and_deflated_members_are_still_read(
+    monkeypatch: pytest.MonkeyPatch, method: int, ceiling: int | None
+) -> None:  # #5535
+    # Control: the two bounded methods still read under either ceiling setting, and the open
+    # recorder the refusal test relies on does see both members open.
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=method) as zf:
+        zf.writestr("ok.txt", b"first")
+        zf.writestr(_PHI_NAME, b"second" * 50)
+    opened = _record_opens(monkeypatch)
+    assert zip_decompress(buf.getvalue(), max_output_bytes=ceiling) == {
+        "ok.txt": b"first",
+        _PHI_NAME: b"second" * 50,
+    }
+    assert set(opened) == {"ok.txt", _PHI_NAME}
 
 
 # --- #1977: one bounded-inflate primitive, two trailing rules ------------------------------------
