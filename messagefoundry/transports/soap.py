@@ -849,8 +849,12 @@ class SoapDestination(DestinationConnector):
         from messagefoundry.transports.http_auth import oauth2_auth_configured
         from messagefoundry.transports.smart import smart_auth_configured
 
-        # A minted bearer owns the header too: _post and _probe write it per request (#5526). Purged
-        # here, before the length gate judges this table, so it does not refuse a header never sent.
+        # A minted bearer owns the header too: _post and _probe write it per request (#5526). A static
+        # `headers` Authorization is purged here, before the length gate judges this table, so the
+        # gate does not refuse that header, which is never sent. One case the purge does not cover:
+        # with OAuth2 or SMART configured, a configured bearer_token or Basic pair is still written
+        # back below and judged by the length gate, although the minted bearer replaces it on every
+        # request, so an over-long bearer_token beside OAuth2 is refused at construction.
         # The cleartext and verify-off refusals read the settings (http_credentials_sent), not this.
         if auth is not None or oauth2_auth_configured(s) or smart_auth_configured(s):
             _drop_authorization(headers)
