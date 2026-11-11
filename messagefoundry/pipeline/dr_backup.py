@@ -1755,13 +1755,15 @@ def _verify_archive_blocking(
     Steps (ADR 0049): (1) key-fingerprint precheck — a mismatch is a clean ``KEY_MISMATCH`` BEFORE any
     decrypt; (2) decrypt the archive; (3) extract + open ``store.db`` read-only, run
     ``PRAGMA integrity_check``; (4) compare per-table row counts to the manifest. ``full`` additionally
-    decrypts + authenticates the cipher-covered cells the snapshot holds as archived, then re-opens it
-    through the real ``open_store`` path (cipher + migrations) — heavier. The walk runs before the open,
-    so it reads the archive's own schema and reads a cell only where that schema holds the cell's
-    table and every column its tag binds. A cell that only a later migration adds or renames is not
-    read, by the walk or after the open: at least ``queue.payload`` on a schema without ``body_ref``,
-    ``search_presets.criteria`` on one without ``owner_user_id``, and a value the outbox fold moves into
-    ``queue``. The full leg returns its own
+    decrypts + authenticates the cipher-covered cells the snapshot holds as archived, re-opens it
+    through the real ``open_store`` path (cipher + migrations), then decrypts + authenticates the
+    cells of the opened copy — heavier. The first walk reads the archive's own schema, before the
+    open's at-open sweep can seal a value it would judge; it reads a cell only where that schema holds
+    the cell's table and every column its tag binds. The second walk reads the migrated schema, so it
+    also reads a cell that only a migration adds or renames, at least ``queue.payload`` on a schema
+    without ``body_ref``, ``search_presets.criteria`` on one without ``owner_user_id``, and a value the
+    outbox fold moves into ``queue``. The first walk's verdict leads the second's, and the cell count
+    is the first walk's. The full leg returns its own
     ``KEY_MISMATCH`` when the settings resolve no key for a snapshot that holds sealed cells or is
     recorded as keyed (see :func:`_full_open_check`), so an archive that is fine and a key
     configuration that is not are not both reported as ``FAIL``.
@@ -3936,24 +3938,29 @@ def _full_open_check(
         # from one says nothing about an encrypted archive — which is the archive worth verifying.
         return "FAIL", "no live store settings were supplied for the full restore-verify", 0
     snap_settings = settings.model_copy(update={"path": str(snap), "backend": StoreBackend.SQLITE})
+
+    def _walk() -> tuple[str, str, int]:
+        try:
+            return _decrypt_check(snap, snap_settings, posture=posture)
+        except (RuntimeError, ValueError, OSError, sqlite3.Error) as exc:
+            # Its cipher build and its read-only connect are the open's own, so a failure there (a
+            # key provider or DPAPI, a cipher config or a refused hop, a file the connect cannot
+            # read) is the FAIL the open's handler gave it when the open ran first. Still a verdict,
+            # and still behind an incompatible snapshot's, so the open runs and the order decides.
+            return "FAIL", safe_exc(exc), 0
+
     # The cells are read FIRST, from the snapshot as the archive holds it (BACKLOG #1719). The open
     # below is a keyed open, and its at-open sweep seals what it reads as legacy plaintext: under
     # the opt-out, or on a surface no keyed open recorded, that includes a value whose marker is
     # damaged, which would then open cleanly and PASS. Read first, the walk judges that value as
-    # it was archived, and the verdict matches `cipher-audit`'s on the same store.
-    try:
-        walked = _decrypt_check(snap, snap_settings, posture=posture)
-    except (RuntimeError, ValueError, OSError, sqlite3.Error) as exc:
-        # Its cipher build and its read-only connect are the open's own, so a failure there (a key
-        # provider or DPAPI, a cipher config or a refused hop, a file the connect cannot read) is the
-        # FAIL the open's handler below gave it when the open ran first. Still a verdict, and still
-        # behind an incompatible snapshot's, so the open below runs and the order there decides.
-        walked = ("FAIL", safe_exc(exc), 0)
+    # it was archived, and the verdict matches `cipher-audit`'s on the same store. A second walk
+    # after the open reads the cells a migration adds or renames, which this one cannot see.
+    walked = _walk()
     # ADR 0196 AC-8: the snapshot is a copy of the LIVE store and carries its salt. Opened as it is,
     # anything the open seals (the at-open sweep) would land under the live store's data sub-key and
     # be counted only in this throwaway copy's row. Dropping the salt makes the open mint a new one,
     # so whatever it seals is under a key nothing else uses. Every existing value names its own salt,
-    # and the decrypt pass above has read them. The copy is discarded afterwards either way.
+    # so neither walk is affected. The copy is discarded afterwards either way.
     from messagefoundry.store.store import forget_store_salt
 
     try:
@@ -3981,17 +3988,17 @@ def _full_open_check(
 
     # Verdict order: an incompatible snapshot first, since its cells may read wrongly only because
     # this build reads them differently, and the remedy is the version that wrote it; then the
-    # walk's verdict, which read the archive before the open could change it; then the open's.
+    # walk's verdict, which read the archive before the open could change it; then the open's; then
+    # the second walk's, over the migrated copy.
     try:
         ok, msg = run_guarded(_open())
     except SchemaMismatchError as exc:
         return "FAIL", _incompatible_snapshot(exc, engine_version), 0
     except StoreKeylessError as exc:
         # The store's own eager `state`/`reference` warm-ups fail closed on a keyless open of an
-        # encrypted store. Same cause, same verdict — an absent keyring, not a bad archive. Its
-        # text names the setting to fix, so it leads; a walk that found the same keeps its line.
-        if walked[0] == "FAIL":
-            return walked
+        # encrypted store. Same cause, same verdict — an absent keyring, not a bad archive — as
+        # before the walk ran first, whatever the walk found. Its text names the setting to fix, so
+        # it leads, and a walk that found anything keeps its line after it.
         reason = safe_exc(exc) if walked[0] == "PASS" else f"{safe_exc(exc)}; {walked[1]}"
         return "KEY_MISMATCH", reason, 0
     except Exception as exc:  # a restore that won't even open is the thing we're trying to catch
@@ -4000,6 +4007,13 @@ def _full_open_check(
         return walked
     if not ok:
         return "FAIL", msg, 0
+    # The open ran the migrations on this copy, so this walk also reads a cell they add or rename.
+    # It decides a verdict only. Its count would include a value the open's own sweep sealed, which
+    # the archive did not hold sealed, so the count reported is the first walk's: the archive's
+    # cells that decrypted as it holds them.
+    rewalked = _walk()
+    if rewalked[0] != "PASS":
+        return rewalked
     return walked
 
 
@@ -4064,7 +4078,8 @@ def _decrypt_check(
     first value that does not open. With no key it reads on past a BLOB, which fails under any
     cipher, so a sealed value later in the walk still decides KEY_MISMATCH, as ``cipher-audit``
     decides it, whichever row comes first. A full verify runs this pass before the store's own
-    open (:func:`_full_open_check`), so the open cannot decide first or change a cell this reads.
+    open (:func:`_full_open_check`), so the open cannot decide first or change a cell this reads,
+    and again after it, over the migrated copy.
 
     It also reads the non-blank values with no marker, as ``cipher-audit`` does: one on a surface
     the keyed store has sealed fails, unless ``allow_unmarked_ciphertext`` is set, because the

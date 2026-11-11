@@ -1868,3 +1868,89 @@ def test_the_full_walk_failing_still_yields_to_an_incompatible_snapshot(
     monkeypatch.setattr(dr_backup, "run_guarded", incompatible)
     status, reason, _cells = dr_backup._full_open_check(db, settings, engine_version="0.0.1")
     assert status == "FAIL" and "0.0.1" in reason and "key service" not in reason, reason
+
+
+def _drop_queue_body_ref(db: Path) -> None:
+    """Take ``queue`` back to the shape before store-once-deliver-many, with no ``body_ref``
+    column, which the store's open migrates back in. The queue payload's tag binds ``body_ref``,
+    so a walk of this schema cannot read the cell until that migration runs. A store-once row
+    could not exist before the column did, and its tag binds a non-NULL ``body_ref``, so it goes."""
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("DELETE FROM queue WHERE body_ref IS NOT NULL")
+        conn.execute("DROP INDEX IF EXISTS ix_queue_body_ref")
+        conn.execute("ALTER TABLE queue DROP COLUMN body_ref")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _damage_one_queue_payload(db: Path) -> None:
+    """Flip one character inside a sealed ``queue.payload`` value, after its marker."""
+    conn = sqlite3.connect(db)
+    try:
+        rowid, value = conn.execute(
+            "SELECT rowid, payload FROM queue WHERE payload LIKE ? ORDER BY rowid LIMIT 1",
+            (f"{MARKER_PREFIX}%",),
+        ).fetchone()
+        cut = len(value) - 8
+        flipped = "A" if value[cut] != "A" else "B"
+        conn.execute(
+            "UPDATE queue SET payload = ? WHERE rowid = ?",
+            (value[:cut] + flipped + value[cut + 1 :], rowid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_the_full_verify_reads_a_cell_only_a_migration_makes_readable(
+    tmp_path: Path, _template: tuple[Path, StoreSettings]
+) -> None:
+    """The walk before the open reads the archive's own schema, so it cannot read ``queue.payload``
+    on a schema without ``body_ref``. The full verify's second walk, after the open's migrations,
+    reads it, as the full verify did when its only walk ran after the open (BACKLOG #1719)."""
+    db, settings = _copy(_template, tmp_path)
+    _drop_queue_body_ref(db)
+    _damage_one_queue_payload(db)
+    # Control: the walk of the archive as it is does not reach the damaged cell.
+    assert dr_backup._decrypt_check(db, settings)[0] == "PASS"
+    status, reason, _cells = dr_backup._full_open_check(db, settings)
+    assert status == "FAIL" and "queue.payload" in reason, reason
+    assert _SYNTH not in reason
+
+
+def test_the_full_verify_passes_a_good_cell_only_a_migration_makes_readable(
+    tmp_path: Path, _template: tuple[Path, StoreSettings]
+) -> None:
+    """The same migrated schema with every payload intact passes, and the cells it counts are the
+    ones the archive held readable as it was, before the open."""
+    db, settings = _copy(_template, tmp_path)
+    _drop_queue_body_ref(db)
+    first = dr_backup._decrypt_check(db, settings)
+    assert first[0] == "PASS", first
+    status, reason, cells = dr_backup._full_open_check(db, settings)
+    assert (status, cells) == ("PASS", first[2]), reason
+
+
+def test_a_keyless_open_after_a_failed_walk_is_still_a_key_mismatch(
+    tmp_path: Path, _template: tuple[Path, StoreSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An open refused as keyless blames the keyring, as it did before the walk ran first, even
+    when the walk found a FAIL. The open's line leads and the walk's follows it."""
+    from messagefoundry.store.crypto import StoreKeylessError
+
+    db, settings = _copy(_template, tmp_path)
+    monkeypatch.setattr(
+        dr_backup, "_decrypt_check", lambda *_a, **_kw: ("FAIL", "synthetic walk line", 0)
+    )
+
+    def keyless(coro: Any) -> Any:
+        coro.close()
+        raise StoreKeylessError("synthetic: the store is keyed and no key resolved")
+
+    monkeypatch.setattr(dr_backup, "run_guarded", keyless)
+    status, reason, cells = dr_backup._full_open_check(db, settings)
+    assert (status, cells) == ("KEY_MISMATCH", 0), reason
+    head, _, tail = reason.partition("; ")
+    assert "no key resolved" in head and tail == "synthetic walk line", reason

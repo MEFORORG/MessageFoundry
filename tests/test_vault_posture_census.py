@@ -364,7 +364,7 @@ _CENSUS: list[Row] = sorted(
             "self._hop_posture",
         ),
         ("pipeline/dr_backup.py", "_decrypt_check", "build_store_cipher", "posture"),
-        ("pipeline/dr_backup.py", "_full_open_check", "_decrypt_check", "posture"),
+        ("pipeline/dr_backup.py", "_full_open_check._walk", "_decrypt_check", "posture"),
         ("pipeline/dr_backup.py", "_full_open_check._open", "open_store", "posture"),
         ("pipeline/dr_backup.py", "_verify_archive_blocking", "_verify_in_staging", "posture"),
         ("pipeline/dr_backup.py", "_verify_in_staging", "_full_open_check", "posture"),

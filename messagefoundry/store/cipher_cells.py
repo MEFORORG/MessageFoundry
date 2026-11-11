@@ -92,8 +92,10 @@ class CipherCell:
 
     ``order`` is the columns a server-store walk pages by, the table's primary key (a server table
     has no ``rowid``); the SQLite walk pages by ``rowid`` and does not read it. On a server cell
-    the ``"position"`` locator stands where SQLite's ``rowid`` does: the value's 1-based place
-    among the cell's non-NULL values in ``order``, which a later write may shift.
+    the ``"position"`` locator stands where SQLite's ``rowid`` does: the value's 1-based place, in
+    ``order``, among the values the walk fetched for the cell. A walk that reads unmarked values
+    fetches every non-NULL value; a ``sealed_only`` walk fetches only the values that start with
+    the marker, so one row can hold a different position in each. A later write may shift it.
 
     ``chunk_cap`` bounds a server walk's chunk for a cell whose rows are large, since a server
     driver fetches a whole chunk at once where SQLite reads it one row at a time."""
