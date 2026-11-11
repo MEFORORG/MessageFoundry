@@ -20,9 +20,13 @@ from __future__ import annotations
 
 import base64
 import importlib
+import importlib.abc
+import importlib.machinery
+import importlib.util
 import re
 import sys
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -327,42 +331,113 @@ def test_a_ca_path_holding_a_nul_is_one_that_cannot_be_opened(nul_path: str | by
     assert_chain_severed(caught.value)
 
 
-@pytest.fixture
-def _broken_pyopenssl_on_the_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A stub ``OpenSSL`` package whose import raises :class:`AttributeError`, as a pyOpenSSL that
-    does not match the installed ``cryptography`` can, with no pyOpenSSL loaded."""
-    package = tmp_path / "stub" / "OpenSSL"
+def test_a_real_pyopenssl_pin_that_cannot_convert_is_an_anchor_fault() -> None:
+    """An empty pyOpenSSL certificate raises pyOpenSSL's own error from ``to_cryptography()``, and
+    is refused as the documented anchor ``ValueError`` with nothing chained."""
+    crypto = pytest.importorskip("OpenSSL.crypto")
+    with pytest.raises(ValueError) as caught:
+        verify(_sign(_BODY), x509_cert=crypto.X509())
+    assert not isinstance(caught.value, XmlError)
+    assert str(caught.value) == "x509_cert cannot be read: Error"
+    assert_chain_severed(caught.value)
+
+
+def _drop_every_openssl_module(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remove ``OpenSSL`` and every ``OpenSSL.*`` entry from :data:`sys.modules` for the test, so no
+    pyOpenSSL module is loaded; monkeypatch puts them back afterwards."""
+    for name in [n for n in sys.modules if n == "OpenSSL" or n.startswith("OpenSSL.")]:
+        monkeypatch.delitem(sys.modules, name)
+
+
+def _stub_openssl_package(root: Path, init: str, crypto: str | None = None) -> None:
+    """Write a stub ``OpenSSL`` package under ``root``, with an optional ``crypto`` submodule."""
+    package = root / "OpenSSL"
     package.mkdir(parents=True)
-    (package / "__init__.py").write_text("raise AttributeError('stub pyOpenSSL')\n")
-    monkeypatch.syspath_prepend(str(package.parent))
-    for name in ("OpenSSL", "OpenSSL.crypto"):
-        monkeypatch.delitem(sys.modules, name, raising=False)
+    (package / "__init__.py").write_text(init)
+    if crypto is not None:
+        (package / "crypto.py").write_text(crypto)
 
 
-def _assert_the_stub_is_live() -> None:
-    """Positive control, run after the call under test: an import of pyOpenSSL would have met the
-    stub. Run first, it would only show the stub; after, it shows the call never imported it."""
+@pytest.mark.parametrize("subclass", [False, True], ids=["the error", "a subclass of it"])
+def test_a_pin_that_loads_pyopenssl_while_converting_is_an_anchor_fault(
+    subclass: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pin whose ``to_cryptography()`` first loads ``OpenSSL.crypto`` and then raises its ``Error``,
+    or a subclass of it, is refused as the anchor ``ValueError``. The module was not loaded when the
+    read started, so a fault set built from what was loaded then would let the error escape raw."""
+    _stub_openssl_package(tmp_path / "stub", "", f"class Error(Exception):\n    {_PLANTED!r}\n")
+    monkeypatch.syspath_prepend(str(tmp_path / "stub"))
+    _drop_every_openssl_module(monkeypatch)
+
+    class _LazyPin:
+        def to_cryptography(self) -> object:
+            error: type[Exception] = importlib.import_module("OpenSSL.crypto").Error
+            if subclass:
+                error = type("_LazyStubError", (error,), {})
+            raise error(_PLANTED)
+
+    with pytest.raises(ValueError) as caught:
+        verify(_sign(_BODY), x509_cert=_LazyPin())  # type: ignore[arg-type]
+    assert not isinstance(caught.value, XmlError)
+    expected = "_LazyStubError" if subclass else "Error"
+    assert str(caught.value) == f"x509_cert cannot be read: {expected}"
+    assert_chain_severed(caught.value)
+
+
+def test_an_error_named_like_pyopenssls_elsewhere_is_not_an_anchor_fault() -> None:
+    """Only a class named ``Error`` in an ``OpenSSL.`` module counts: an ``Error`` from any other
+    module escapes as raised, as any fault of a type the read does not turn does."""
+    error = type("Error", (Exception,), {"__module__": "notopenssl.crypto"})
+
+    class _Pin:
+        def to_cryptography(self) -> object:
+            raise error(_PLANTED)
+
+    with pytest.raises(error):
+        verify(_sign(_BODY), x509_cert=_Pin())  # type: ignore[arg-type]
+
+
+@pytest.fixture
+def _sentinel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A stub ``OpenSSL`` package whose import writes the returned sentinel file and then raises
+    :class:`AttributeError`, as a pyOpenSSL that does not match the installed ``cryptography``
+    can. Every ``OpenSSL`` module is removed from :data:`sys.modules` first, so none is loaded."""
+    sentinel = tmp_path / "pyopenssl-imported"
+    _stub_openssl_package(
+        tmp_path / "stub",
+        f"open({str(sentinel)!r}, 'w').close()\nraise AttributeError('stub pyOpenSSL')\n",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path / "stub"))
+    _drop_every_openssl_module(monkeypatch)
+    return sentinel
+
+
+def _assert_never_imported(sentinel: Path) -> None:
+    """The call under test never imported pyOpenSSL; then the negative control, that importing the
+    stub directly does write the sentinel, so its absence before was not a dead instrument."""
+    assert not sentinel.exists(), "verify() imported pyOpenSSL"
     with pytest.raises(AttributeError, match="stub pyOpenSSL"):
         importlib.import_module("OpenSSL.crypto")
+    assert sentinel.exists()
 
 
-@pytest.mark.usefixtures("_broken_pyopenssl_on_the_path")
 def test_a_broken_pyopenssl_neither_replaces_nor_chains_onto_an_anchor_fault(
-    tmp_path: Path,
+    _sentinel: Path, tmp_path: Path
 ) -> None:
     """A missing CA file raises the documented :class:`OSError`, with nothing on ``__cause__`` or
     ``__context__``, when importing pyOpenSSL would fail with something other than
-    :class:`ImportError`. Building the set of anchor faults must not import it: done where the
-    fault is caught, an import error would replace the fault and carry it on ``__context__``."""
+    :class:`ImportError`. Classifying the fault must not import it: done in the handler, an import
+    error would replace the fault and carry it on ``__context__``."""
     with pytest.raises(OSError) as caught:
         verify(_sign(_BODY), ca_pem_file=str(tmp_path / "missing.pem"))
     assert isinstance(caught.value, FileNotFoundError)
     assert_chain_severed(caught.value)
-    _assert_the_stub_is_live()
+    _assert_never_imported(_sentinel)
 
 
-@pytest.mark.usefixtures("_broken_pyopenssl_on_the_path")
-def test_a_broken_pyopenssl_still_lets_an_unreadable_ca_file_be_refused(tmp_path: Path) -> None:
+def test_a_broken_pyopenssl_still_lets_an_unreadable_ca_file_be_refused(
+    _sentinel: Path, tmp_path: Path
+) -> None:
     """The faults that do not need pyOpenSSL are still refused as the anchor ``ValueError``."""
     doc, kwargs = _signed_and_anchor(_key(), "ca_pem_file", tmp_path)
     Path(kwargs["ca_pem_file"]).write_bytes(b"not a certificate")
@@ -371,7 +446,51 @@ def test_a_broken_pyopenssl_still_lets_an_unreadable_ca_file_be_refused(tmp_path
     assert not isinstance(caught.value, XmlError)
     assert str(caught.value) == "ca_pem_file cannot be read: ValueError"
     assert_chain_severed(caught.value)
-    _assert_the_stub_is_live()
+    _assert_never_imported(_sentinel)
+
+
+class _FailingLoader(importlib.abc.Loader):
+    """A loader whose module cannot execute, as a broken pyOpenSSL behind a lazy import would be."""
+
+    def create_module(self, spec: importlib.machinery.ModuleSpec) -> None:
+        return None
+
+    def exec_module(self, module: ModuleType) -> None:
+        raise RuntimeError("stub lazy pyOpenSSL")
+
+
+@pytest.mark.parametrize("anchor", ["valid", "unreadable"])
+def test_a_lazy_pyopenssl_entry_that_fails_on_access_does_not_break_the_read(
+    anchor: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ``OpenSSL.crypto`` entry in :data:`sys.modules` made by :class:`importlib.util.LazyLoader`
+    runs pyOpenSSL on its first attribute access. The read must not touch it, so a valid pin still
+    verifies and an unreadable one is still the anchor ``ValueError``."""
+    spec = importlib.util.spec_from_loader(
+        "OpenSSL.crypto", importlib.util.LazyLoader(_FailingLoader())
+    )
+    assert spec is not None and spec.loader is not None
+    lazy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(lazy)
+    monkeypatch.setitem(sys.modules, "OpenSSL.crypto", lazy)
+    if anchor == "valid":
+        assert verify(_sign(_BODY), x509_cert=_cert_pem()).verified
+    else:
+        with pytest.raises(ValueError) as caught:
+            verify(_sign(_BODY), x509_cert=b"not a certificate")
+        assert str(caught.value) == "x509_cert cannot be read: ValueError"
+        assert_chain_severed(caught.value)
+    # Positive control: the entry does fail on access, so the read above never touched it.
+    with pytest.raises(RuntimeError, match="stub lazy pyOpenSSL"):
+        _ = lazy.Error
+
+
+def test_the_docstring_names_every_fault_the_read_turns() -> None:
+    """``verify()``'s docstring names every fault type the anchor read turns into its
+    ``ValueError``, read from the tuple the read itself uses."""
+    doc = verify.__doc__ or ""
+    for fault in sigmod._anchor_fault_types():
+        assert fault.__name__ in doc, fault
 
 
 def test_a_pin_of_no_readable_type_is_an_anchor_fault() -> None:
