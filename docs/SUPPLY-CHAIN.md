@@ -150,18 +150,25 @@ Facts the labels leave out:
 - **The draft.** The engine's GitHub release stays a draft until the harness wheel is on it
   too, and until every upload `publish-pypi` runs has succeeded. With `PUBLISH_HARNESS` unset,
   that is the toolkit and the engine only. A separate job publishes it last, so no
-  job adds an asset to a published release. The console's release is a draft too, until its
-  `publish-pypi-webconsole` job has succeeded. With `PUBLISH_WEBCONSOLE` set, that job uploads the
-  wheel first. Unset, the console upload is skipped and the console's release is still published
-  once the `pypi` approval is given, as the engine's is with `PUBLISH_HARNESS` unset. With either
-  variable set, its draft publisher reads it again when it runs and refuses to publish the release
-  while that run skipped the upload. A re-run that reused an earlier reading of the variable can
-  still skip the upload, and on an engine tag the toolkit and engine are on PyPI by then. The
-  release stays a draft until its build job is re-run (`release-harness` on an engine tag,
-  `release-webconsole` on a console tag), which re-runs the jobs after it, or the variable is unset
-  and the publisher re-run. If the refusal is from a copy of the variable on the `pypi`
-  environment, remove the copy, then re-run the build job. GitHub allows a re-run only within 30
-  days of a run's first attempt, so past that no re-run finishes the release.
+  job adds an asset to a published release. The console's release is a draft too, at least until
+  its `publish-pypi-webconsole` job has succeeded. With `PUBLISH_WEBCONSOLE` set, that job uploads
+  the wheel first. Unset, the console upload is skipped and the console's release is still
+  published once the `pypi` approval is given, as the engine's is with `PUBLISH_HARNESS` unset.
+  With either variable set, its draft publisher reads it again when it runs and refuses to publish
+  the release while that run skipped the upload. On an engine tag the toolkit and engine are on
+  PyPI by then. The refusal's own text omits part of the remedy and can name the wrong cause, so
+  use these instead:
+  - The variable was set after the build job read it, or unset while the upload waited for its
+    approval and set again before the publisher ran: re-run the build job (`release-harness` on an
+    engine tag, `release-webconsole` on a console tag), which re-runs the jobs after it. A "Re-run
+    failed jobs" reuses the upload's skipped outcome and is refused again.
+  - The `pypi` environment holds its own copy of the variable: remove the copy, then re-run the
+    upload job (`publish-pypi` or `publish-pypi-webconsole`), which re-runs the publisher after it.
+  - Or unset the variable and re-run the publisher; the release then goes public without that
+    upload.
+
+  GitHub allows a re-run only within 30 days of a run's first attempt, so past that no re-run
+  finishes the release. Publishing that draft by hand would skip the upload the gate requires.
 - **The provenance gate.** The tagged commit must be on `main`, and each required check's latest
   run on it must have passed. A red run after the merge blocks the tag even if the merge-queue run
   passed. To clear it, re-run the failed job on that commit, then re-run the release. A check

@@ -407,19 +407,6 @@ def _despace(text: str) -> str:
     return re.sub(r"\s+", "", text)
 
 
-#: A job-level `if:` a variable can turn false. It reads the `vars` context, in any spelling
-#: (`vars.X`, `vars['X']`, `toJSON(vars)`), or another job's outputs, in any spelling
-#: (`needs.<job>.outputs.<name>`, `needs['<job>']['outputs']`), which is how a build job hands a
-#: variable on. Matching the bare words is deliberately wide: a false hit reddens a test, a miss
-#: lets a skipped job leave every release a draft. Case is ignored, which only widens it.
-#: Declared above its first use, for the reason the guards above give.
-_VARIABLE_GATE = re.compile(r"\b(?:vars|outputs)\b", flags=re.IGNORECASE)
-
-
-def _is_variable_gated(job: dict) -> bool:
-    return _VARIABLE_GATE.search(str(job.get("if") or "")) is not None
-
-
 # --- (4) the irreversible PyPI upload runs LAST and only on a tag ------------------------------------
 
 
@@ -3960,6 +3947,18 @@ def test_every_job_that_can_publish_waits_on_the_provenance_gate() -> None:
 _PUBLISH_JOB = "publish-github-release"
 _CONSOLE_PUBLISH_JOB = "publish-github-release-webconsole"
 
+#: A job-level `if:` a variable can turn false. It reads the `vars` context, or the `needs` context,
+#: which is how a build job hands a variable on as an output. At least these spellings are seen:
+#: `vars.X`, `vars['X']`, `toJSON(vars)`, `needs.<job>.outputs.<name>`,
+#: `needs['<job>']['outputs']`, `toJSON(needs)`. Matching the bare context names is deliberately
+#: wide, so `needs.<job>.result` counts too: a false hit reddens a test, while a miss lets a
+#: skipped job leave every release a draft. Case is ignored, which only widens it.
+_VARIABLE_GATE = re.compile(r"\b(?:vars|needs)\b", flags=re.IGNORECASE)
+
+
+def _is_variable_gated(job: dict) -> bool:
+    return _VARIABLE_GATE.search(str(job.get("if") or "")) is not None
+
 
 def _gh_release_jobs(verbs: str) -> set[str]:
     """Jobs whose EXECUTED shell runs `gh release <verb>` for any verb in ``verbs``."""
@@ -4590,8 +4589,10 @@ def _variable_gated_jobs(jobs: dict, publisher: str) -> list[str]:
         ("needs['release-harness']['outputs']['publish-harness'] == 'true'", True),
         ("needs.release-harness['outputs'].publish-harness == 'true'", True),
         ("contains(needs.*.outputs.publish-harness, 'true')", True),
+        ("contains(toJSON(needs.release-harness), 'true')", True),
+        ("contains(toJSON(needs), 'publish-harness')", True),
         ("github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')", False),
-        ("needs.release.result == 'success'", False),
+        ("!startsWith(github.ref_name, 'webconsole-')", False),
     ],
 )
 def test_the_variable_gate_pattern_sees_direct_and_indirect_spellings(
@@ -4620,7 +4621,8 @@ def test_the_variable_gate_scan_reaches_upstream_jobs_and_the_publisher(
     publisher: str, target: str, gate: str
 ) -> None:
     """Positive control for `_variable_gated_jobs`: a gate added to a job the publisher waits on, or
-    to the publisher itself, is found by the walk; unplanted, the same walk finds none."""
+    to the publisher itself, is absent from the walk's result before it is planted and found
+    after."""
     jobs = copy.deepcopy(_jobs())
     assert target not in _variable_gated_jobs(jobs, publisher), target
     jobs[target]["if"] = f"{jobs[target].get('if') or 'true'} && {gate}"
