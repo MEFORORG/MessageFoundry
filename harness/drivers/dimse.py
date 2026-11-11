@@ -10,7 +10,8 @@ for Out of Resources, ``b"C000"`` for Cannot Understand). A status is an answer,
 the same way an MLLP ``AE`` is; ``error`` is set only when no status came back at all.
 
 ``pynetdicom`` and ``pydicom`` are the ``[dicom]`` extra and are imported inside :meth:`inject`, so
-harness discovery never fails without them; without them every payload reports an error.
+harness discovery never fails without them; without them, or with a ``pydicom`` that lacks the
+header readers the deflate guard replays, every payload reports an error and none is sent.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from typing import Any
 
 from harness.drivers import Driver, Injection
 from harness.endpoints import Endpoints
+from messagefoundry.parsing.dicom._deps import load_header_readers, parse_error_types
 from messagefoundry.parsing.dicom._inflate import guard_part10_deflate
 from messagefoundry.parsing.dicom.errors import DicomBombError
 
@@ -43,12 +45,18 @@ MAX_ASSOCIATION_READ_BYTES = 1 << 20
 
 
 def dicom_extra_missing() -> str | None:
-    """None when pydicom and pynetdicom both import, else why not (a reason to report, not a pass)."""
+    """None when pydicom and pynetdicom both import and pydicom still has the header readers the
+    deflate guard replays, else why not (a reason to report, not a pass)."""
     try:
         import pydicom  # noqa: F401
         import pynetdicom  # noqa: F401
     except ImportError as exc:
         return f"the [dicom] extra (pydicom + pynetdicom) is not installed: {exc}"
+    try:
+        # Without them the guard refuses every payload, and dcmread alone would inflate unbounded.
+        load_header_readers()
+    except RuntimeError as exc:
+        return str(exc)
     return None
 
 
@@ -137,14 +145,6 @@ class DimseDriver(Driver):
             return [Injection(error=missing) for _ in payloads]
         from pydicom import dcmread
 
-        from messagefoundry.parsing.dicom._deps import load_header_readers, parse_error_types
-
-        try:
-            # A pydicom without the readers the guard replays fails every payload, so say so once,
-            # here, rather than raise from inject() (the Driver contract) or send unguarded.
-            load_header_readers()
-        except RuntimeError as exc:
-            return [Injection(error=str(exc)) for _ in payloads]
         capped_ae = _capped_ae_class()
 
         unreadable = parse_error_types()
@@ -152,15 +152,16 @@ class DimseDriver(Driver):
         for payload in payloads:
             try:
                 # ASVS 5.2.3: dcmread inflates a Deflated Explicit VR LE Data Set unbounded, so bound
-                # it first with the engine's own Part-10 guard and its cap (BACKLOG #4808). The guard
-                # replays dcmread's header read, so it sits inside the same handler, with dcmread's force.
+                # it first with the engine's own Part-10 guard and its cap (vault BACKLOG #4808).
+                # The guard replays dcmread's header read, so it sits inside the same handler, and
+                # it takes dcmread's force: change one and you must change the other.
                 guard_part10_deflate(payload, force=False)
                 dataset = dcmread(BytesIO(payload))
                 sop_class = dataset.SOPClassUID
                 transfer_syntax = dataset.file_meta.TransferSyntaxUID
                 dataset.SOPInstanceUID  # noqa: B018  (send_c_store needs it; refuse here, not there)
             except DicomBombError as exc:  # a ValueError, so it must come before `unreadable`
-                outcomes.append(Injection(error=f"refused before decode: {exc}"))
+                outcomes.append(Injection(error=f"not sent: {exc}"))
                 continue
             except unreadable as exc:
                 outcomes.append(

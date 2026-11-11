@@ -246,10 +246,11 @@ def test_the_driver_refuses_a_pdu_past_its_read_cap_without_reading_it() -> None
 def test_the_driver_refuses_a_deflated_payload_that_inflates_past_the_cap_before_dcmread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ASVS 5.2.3 (BACKLOG #4808): the driver bounds a Deflated Part-10 payload's inflate with the
-    engine's ``guard_part10_deflate`` before ``dcmread``, so one that inflates past the guard's cap is
-    refused, never read and never sent. The cap is lowered so the bomb stays small; the guard reads
-    it at call time. The deflated object under the cap is the positive control, stored by the sink."""
+    """ASVS 5.2.3 (vault BACKLOG #4808): the driver bounds a Deflated Part-10 payload's inflate with
+    the engine's ``guard_part10_deflate`` before ``dcmread``, so one that inflates past the guard's
+    cap is refused and not sent, and ``dcmread`` never runs on it (the guard's own inflate is bounded
+    and discarded). The cap is lowered so the bomb stays small; the guard reads it at call time. The
+    deflated object under the cap is the positive control, stored by the sink."""
     from io import BytesIO
 
     import pydicom
@@ -277,13 +278,27 @@ def test_the_driver_refuses_a_deflated_payload_that_inflates_past_the_cap_before
         records = sink.wait_for(lambda rs: len(rs) == 1, 10.0)
     assert status_of(out[0]) == 0 and records[0].payload
     assert under in read, "the spy saw the driver's read of the control"
-    assert out[1].error == (
-        "refused before decode: deflated DICOM object exceeds the maximum uncompressed size "
-        f"({mib} bytes); refusing to decode (possible decompression bomb)"
-    )
+    assert out[1].error.startswith("not sent: ") and f"({mib} bytes)" in out[1].error, out[1]
     assert status_of(out[1]) is None
     assert bomb not in read, "dcmread ran on the bomb"
     assert len(sink.records()) == 1
+
+
+def test_the_driver_sends_nothing_when_pydicom_lacks_the_guards_header_readers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the readers the deflate guard replays, the guard cannot bound dcmread's inflate, so
+    every payload reports why and none is sent; inject() still does not raise (the Driver contract)."""
+    from pydicom import filereader
+
+    payloads, _ = make_datasets(2)
+    monkeypatch.delattr(filereader, "_read_file_meta_info")
+    reason = dicom_extra_missing()
+    assert reason and "_read_file_meta_info" in reason
+    with DimseSink() as sink:
+        out = _driver_for(sink).inject(payloads)
+        assert sink.records() == []
+    assert [o.error for o in out] == [reason, reason]
 
 
 def test_the_driver_reports_an_unreachable_port_and_a_non_dicom_payload() -> None:
