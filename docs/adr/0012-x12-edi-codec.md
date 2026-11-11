@@ -159,17 +159,22 @@ gate**: every element-separator position implied by the fixed ISA element widths
 `6, 17, 20, 31, 34, 50, 53, 69, 76, 81, 83, 89, 99, 101, 103` (all element-separator offsets except the
 defining one at `+3`) — must equal the element separator. (Derive these in code from the ISA width table,
 not a hand-typed list.) No ISA element's data may hold the element separator or the segment terminator
-(either character of a `CR+LF` one), and every codec tokenizer (`X12Peek`, `X12Message`, `split`,
-`check_integrity` and `X12FrameReader`) starts the body past the ISA, so the fixed-width header is never
-read as more than one segment (BACKLOG #5536). The strict `validate()` in `parsing/x12/validate.py` uses
-none of them: it hands the raw text to pyx12, whose own reader splits the whole buffer, ISA included, on
-the segment terminator. pyx12 refused each forged header measured against a conformant 004010 270 (a
-forged `ST`, `GS` or `IEA` in ISA06, an element separator in ISA08) with `X12ValidationError`, but that
-is pyx12's behaviour, not a guarantee this codec makes. On a delimiter collision, a sanity-gate
-failure or such a delimiter in ISA element data, the codec raises
+(either character of a `CR+LF` one). On a delimiter collision, a sanity-gate failure or such a delimiter
+in ISA element data, the codec's delimiter discovery (`discover_delimiters`, which `X12Peek`,
+`X12Message`, `split` and `check_integrity` run) raises
 **`X12PeekError`** — the Router routes the message to the **error/dead-letter** path (status `ERROR`) rather
 than guessing, honouring the count-and-log invariant (never accept-and-drop). Hardcoding `*~:^` is **wrong** —
 trading partners legitimately vary all four.
+
+Every codec tokenizer, at least `iter_segments` (which `X12Peek`, `X12Message` and `check_integrity`
+read through), `split` and `X12FrameReader`, starts the body past the ISA, so the fixed-width header is
+never read as more than one segment (BACKLOG #5536). `X12FrameReader` runs none of the ISA checks above:
+it frames such an ISA whole, and the refusal comes where a Router or Handler peeks or parses it. The
+strict `validate()` in `parsing/x12/validate.py` runs neither the delimiter discovery nor these
+tokenizers. It hands the raw text to pyx12, which reads its delimiters from the fixed-width ISA but then
+splits from the start of the ISA on the one character at `+105`, so a segment forged in ISA element data
+can reach that split. pyx12 refuses some such headers on its own ISA element count, but not all: a
+measured forgery that kept the count came back `valid=False` with an acknowledgment, not refused.
 
 ### 5. Tolerant peek + structural integrity for MVP; strict guide-driven validation deferred
 
