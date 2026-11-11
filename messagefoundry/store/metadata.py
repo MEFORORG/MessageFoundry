@@ -104,14 +104,14 @@ class MetadataTooDeepError(RuntimeError):
 
 
 def _load_object(
-    text: str | bytes | bytearray | None, *, too_deep_raises: bool = False
+    text: str | bytes | bytearray | None, *, too_deep_raises: bool = True
 ) -> dict[str, Any]:
     """The JSON object ``text`` holds, or ``{}`` for ``None``, empty, malformed or non-object text.
 
     It decodes through :func:`~messagefoundry.redaction.json_loads_or_refusal`, so json's depth-limit
-    ``RecursionError`` never escapes (BACKLOG #6712): it reads as malformed, or with
-    ``too_deep_raises`` it raises :class:`MetadataTooDeepError`, outside any handler so nothing is
-    chained. A refusal is logged with json's content-free hint, never the text. ``bytes``/``bytearray``
+    ``RecursionError`` never escapes (BACKLOG #6712): it raises :class:`MetadataTooDeepError`,
+    outside any handler so nothing is chained, or reads as malformed where ``too_deep_raises`` is
+    false. Raising is the default because a metadata cell read as ``{}`` changes an outcome. A refusal is logged with json's content-free hint, never the text. ``bytes``/``bytearray``
     decode as ``json.loads`` decoded them before; any other type reads as ``{}``, as the
     ``TypeError`` arm this replaced did."""
     if isinstance(text, bytearray):
@@ -147,7 +147,8 @@ def decode_response_headers(headers_json: str | None) -> dict[str, str]:
     retention nulls the column) or a legacy row reads as "no captured headers". Only ``str``→``str``
     entries survive, as :func:`encode_response_headers` writes nothing else. Pure: the caller decrypts
     before calling."""
-    return {k: v for k, v in _load_object(headers_json).items() if isinstance(v, str)}
+    loaded = _load_object(headers_json, too_deep_raises=False)
+    return {k: v for k, v in loaded.items() if isinstance(v, str)}
 
 
 def merge_user_metadata(existing_json: str | None, meta_ops: Sequence[tuple[str, str]]) -> str:
@@ -161,7 +162,7 @@ def merge_user_metadata(existing_json: str | None, meta_ops: Sequence[tuple[str,
     :class:`MetadataTooDeepError` rather than being written back as the ops alone, which would erase
     the engine-internal keys. Caller passes decrypted JSON in and encrypts the result out — this
     function does neither."""
-    parsed = _load_object(existing_json, too_deep_raises=True)
+    parsed = _load_object(existing_json)
     existing_user = parsed.get("user")
     user: dict[str, Any] = dict(existing_user) if isinstance(existing_user, dict) else {}
     for key, value in meta_ops:
@@ -188,7 +189,7 @@ def user_metadata(metadata_json: str | None) -> str | None:
     the default ``InternalErrorPolicy.CONTINUE`` it dead-letters the row, and under ``STOP`` it
     re-pends the row on the retry policy's backoff (dead-lettering it once a finite attempt cap is
     reached) and halts the lane until an operator reloads or restarts."""
-    user = _load_object(metadata_json, too_deep_raises=True).get("user")
+    user = _load_object(metadata_json).get("user")
     if not isinstance(user, dict) or not user:
         return None
     return _dumps_or_raise(user)

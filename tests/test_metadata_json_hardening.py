@@ -19,6 +19,7 @@ from messagefoundry.config.settings import EgressSettings, ReferenceSettings
 from messagefoundry.config.wiring import FileRef, ReferenceSpec
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.store import Stage
 from messagefoundry.store import metadata as metadata_module
 from messagefoundry.store.cell_tag import message_cell_aad
 from messagefoundry.store.metadata import (
@@ -179,6 +180,9 @@ async def test_a_setmeta_handoff_leaves_a_too_deep_stored_cell_unchanged(tmp_pat
         msg = await store.get_message(mid)
         assert msg is not None
         assert msg["metadata"] == _DEEP_CELL
+        # Aborted whole: the routed row survives and no outbound row was produced.
+        cur = await store._db.execute("SELECT stage FROM queue WHERE message_id=?", (mid,))
+        assert [row["stage"] for row in await cur.fetchall()] == [Stage.ROUTED.value]
     finally:
         await store.close()
 

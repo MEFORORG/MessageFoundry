@@ -538,9 +538,8 @@ pure-Python equivalent:
   deletes it through that same handle with `kernel32`'s `SetFileInformationByHandle`, POSIX
   semantics first and the classic disposition where the volume has none
   (`restricted_file.delete_through_handle`), so the file deleted is the file read. On Linux it
-  opens the file with
-  `O_NOFOLLOW` and reads its mode, owner, group and POSIX access control list from the open
-  descriptor. It asks for that descriptor's file system through
+  opens the file with `O_NOFOLLOW` and reads its mode, owner, group and POSIX access control list
+  from the open descriptor. It asks for that descriptor's file system through
   `restricted_file.linux_file_system_type` (below), and refuses any file system not on the
   allowlist for that kind of file. Any other POSIX host opens none of these files
 - Path checks: `tray/actions.py`, which asks `kernel32`'s `GetDriveTypeW` whether the drive letter
