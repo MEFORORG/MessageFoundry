@@ -58,12 +58,12 @@ REFUSED = [
     "cli:Administrator",
     "CLI:root",
     # Format, separator and surrogate characters, and a fullwidth spelling of a reserved name.
-    "sys​tem",
-    "﻿system",
-    "‮system",
-    "a b",
+    "sys\u200btem",
+    "\ufeffsystem",
+    "\u202esystem",
+    "a\u2028b",
     "a\ud800b",
-    "ｓｙｓｔｅｍ",
+    "\uff53\uff59\uff53\uff54\uff45\uff4d",
 ]
 
 #: The controls: names beside each refused form that the rule must leave alone.
