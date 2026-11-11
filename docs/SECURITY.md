@@ -2914,8 +2914,9 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   at release unless the edit is reverted, and then it can be released;
 - in a cluster, the release compares the digest with the disk of the node that handles the approve,
   which may not be the node that took it;
-- a value file outside the config directory is in no start digest, so a start records nothing
-  about the values it applied from it. With `serve`'s value provider, a value file in the
+- a value file anywhere but the config directory's `environments/` folder is in no start digest,
+  one inside the config directory under another `[environments].dir` included, so a start records
+  nothing about the values it applied from it. With `serve`'s value provider, a value file in the
   `environments/` folder is parsed from the load's snapshot, the one the start's `config_loaded`
   digest folds, so that digest names the value-file bytes the start applied (vault BACKLOG
   #2596). Where the load could not read that file, the start applies the values read when the

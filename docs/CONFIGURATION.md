@@ -1987,8 +1987,9 @@ started together, can each raise it; the alert list folds them into one instance
   `environments/` out of those bytes too, so the fingerprint names the value-file bytes the start
   applied, though not a `MEFOR_VALUE_*` variable or the secrets directory. Where the load could not
   read the value file, the start applies the values read when the engine was built, and the
-  fingerprint leaves the file out. A value file outside the config directory is in no
-  fingerprint. Just after the load it fingerprints
+  fingerprint leaves the file out. A value file anywhere but the config directory's
+  `environments/` folder is in no fingerprint, one inside the config directory under another
+  `[environments].dir` included. Just after the load, the start fingerprints
   the directory once more, and compares both with the baseline, so `config_changed` fires when
   either differs. When the two cover the same files and differ, an edit landed after the load read
   that file, and the comparison is `changed_during_load`. The alert then names the directory's

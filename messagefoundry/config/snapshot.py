@@ -280,6 +280,16 @@ class ConfigSnapshot:
         folder = self._folder_of(value_file)
         return folder is not None and self._left_out(folder, value_file.name)
 
+    def holds_value_file_now(self, path: str | Path) -> bool:
+        """Whether the value file ``path`` holds now the bytes this snapshot read for it, read
+        again from disk; :meth:`environment_file` raises as it does for a file it cannot stand
+        for. A start that vets the file after its load calls it after that vet, so the bytes it
+        applies are those of the vetted file (vault BACKLOG #2596)."""
+        value_file = Path(path)
+        held = self.environment_file(value_file)
+        now = _read(value_file) if is_regular_file(value_file) else None
+        return held == now
+
     def _left_out(self, folder: str, name: str) -> bool:
         """Whether the value file ``<folder>/<name>``, or a folder holding it, is unreadable here."""
         want = os.path.normcase(f"{folder}/{name}")
@@ -304,8 +314,10 @@ class ConfigSnapshot:
         Raises :class:`NotInSnapshot` for a path the snapshot does not cover. Raises ``OSError``
         where the bytes cannot stand for the file now: the snapshot could not read it or its
         folder (for ``environments/``, the config directory too), read a file that is gone now,
-        or read no file by its name while one is there now, created since. The caller refuses
-        then, a reload or a start alike; a reload reads the values again on the next one."""
+        or read no file by its name while one is there now, created since. A reload refuses then
+        and reads the values again on the next one. A start refuses on the last two; one its
+        snapshot could not read it does not ask about, and keeps the values read when the engine
+        was built (:meth:`left_out_environment_file`)."""
         value_file = Path(path)
         folder = self._folder_of(value_file)
         if folder is None:

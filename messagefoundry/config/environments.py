@@ -57,15 +57,17 @@ _log = logging.getLogger(__name__)
 
 
 class SnapshotEnvValuesProvider(ABC):
-    """An engine ``env_values_provider`` that can also read a reload's values from that reload's
-    config snapshot (vault BACKLOG #2596). A provider opts in by subclassing, never by having a
-    method of the right name. ``serve``'s provider is one."""
+    """An engine ``env_values_provider`` that can also read a load's values from that load's
+    config snapshot, a reload's and the managed app's start's alike (vault BACKLOG #2596). A
+    provider opts in by subclassing, never by having a method of the right name. ``serve``'s
+    provider is one."""
 
     __slots__ = ()
 
     @abstractmethod
     def __call__(self) -> Mapping[str, Any]:
-        """The values, read from disk: at start, and on a reload that read no snapshot."""
+        """The values, read from disk: when the engine is built, and on a reload that read no
+        snapshot."""
 
     @abstractmethod
     def from_snapshot(self, snapshot: ConfigSnapshot) -> Mapping[str, Any] | None:

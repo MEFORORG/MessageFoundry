@@ -1120,3 +1120,123 @@ async def test_a_reload_whose_snapshot_lacks_the_value_file_still_warns(
     finally:
         await engine.stop()
     assert f"environment value file {value_file} is outside the config snapshot" in caplog.text
+
+
+def _after_load(act: Callable[[], None]) -> Callable[[], Any]:
+    """A ``during_load`` context that runs ``act`` once the load has read the directory."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _context() -> Any:
+        yield
+        act()
+
+    return _context
+
+
+async def _refused_start(app: Any) -> WiringError:
+    with pytest.raises(WiringError) as caught:
+        async with app.router.lifespan_context(app):
+            pass
+    return caught.value
+
+
+@pytest.mark.parametrize("change", ["edit", "remove"])
+async def test_a_value_file_changed_between_the_load_and_the_apply_refuses_the_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """The bytes the start applies must be those of the file its vet passed, read after it. An
+    edit after the load leaves the snapshot holding bytes the file no longer holds, so they are
+    refused rather than applied unvetted; a removal is refused as a reload refuses it."""
+    cfg, value_file = _in_config_layout(tmp_path)
+
+    def _change() -> None:
+        if change == "edit":
+            value_file.write_text(_UNREVIEWED, encoding="utf-8")
+        else:
+            value_file.unlink()
+
+    app = _managed_start(
+        tmp_path, cfg, value_file, cfg, monkeypatch, edit=None, during_load=_after_load(_change)
+    )
+    refusal = str(await _refused_start(app))
+    expected = "changed after the start's config load" if change == "edit" else "is gone"
+    assert expected in refusal, refusal
+
+
+async def test_the_start_vets_the_value_file_before_the_read_it_applies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The load reads environments/ before any vet, so the start vets the file and its folder and
+    only then reads the file the bytes it applies must match."""
+    from messagefoundry.config import wiring
+
+    cfg, value_file = _in_config_layout(tmp_path)
+    events: list[str] = []
+    real_vet = wiring.assert_trusted_start_paths
+    real_read = Path.read_bytes
+
+    def _vet(files: Any, *, lead: str = "", folders: Any = ()) -> None:
+        if value_file in list(files):
+            events.append("vet+folder" if list(folders) else "vet")
+        real_vet(files, lead=lead, folders=folders)
+
+    def _read(self: Path) -> bytes:
+        if self == value_file:
+            events.append("read")
+        return real_read(self)
+
+    monkeypatch.setattr(wiring, "assert_trusted_start_paths", _vet)
+    monkeypatch.setattr(Path, "read_bytes", _read)
+    values, *_ = await _start_with_edit(
+        tmp_path,
+        cfg,
+        value_file,
+        cfg,
+        monkeypatch,
+        edit=None,
+        during_load=_after_load(lambda: events.append("loaded")),
+        registry_guard=lambda _registry: events.append("guard"),
+    )
+    # Between the load and the guard, which judges the values the start applies.
+    assert events[events.index("loaded") + 1 : events.index("guard")] == ["vet+folder", "read"]
+    assert values == {"host": "approved.example.invalid"}
+
+
+async def test_a_start_whose_vet_refuses_the_folder_refuses_even_with_no_value_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The start vets the value file's folder as a reload does, so a folder the vet refuses
+    refuses the start even where no value file is there. The build's read vets no folder: the
+    control is that the same app starts with that vet passing."""
+    from messagefoundry.config import wiring
+
+    cfg, value_file = _in_config_layout(tmp_path)
+    value_file.unlink()
+    real_vet = wiring.assert_trusted_start_paths
+
+    def _vet(files: Any, *, lead: str = "", folders: Any = ()) -> None:
+        if value_file.parent in list(folders):
+            raise WiringError("refusing the folder for the test")
+        real_vet(files, lead=lead, folders=folders)
+
+    monkeypatch.setattr(wiring, "assert_trusted_start_paths", _vet)
+    app = _managed_start(tmp_path, cfg, value_file, cfg, monkeypatch, edit=None)
+    assert "refusing the folder for the test" in str(await _refused_start(app))
+    monkeypatch.setattr(wiring, "assert_trusted_start_paths", real_vet)
+    values, *_ = await _start_with_edit(tmp_path, cfg, value_file, cfg, monkeypatch, edit=None)
+    assert values == {}, "control: the same start, with the vet passing, serves"
+
+
+async def test_start_values_are_not_applied_once_a_runner_holds_the_graph(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A runner holds its own values, so a later call would split the engine's from the graph's."""
+    cfg, value_file = _in_config_layout(tmp_path)
+    app = _managed_start(tmp_path, cfg, value_file, cfg, monkeypatch, edit=None)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        rr = engine.registry_runner
+        assert rr is not None
+        with pytest.raises(RuntimeError, match="before its graph runs"):
+            await engine.apply_start_env_values(rr.registry)

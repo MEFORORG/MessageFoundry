@@ -5593,7 +5593,9 @@ def _fleet_connection_key_file_refusal(
     (BACKLOG #3402). The supervisor judges the whole graph, before the engine-shard filter, and each
     engine shard then judges its own inbound connections and every outbound one at each load.
     Refusal only, so ``None`` under ``warn``, where each engine shard writes its own warning.
-    ``env_values`` reads the values as each engine shard reads them. It reads files, so the
+    ``env_values`` reads the values from disk, as each engine shard reads them when its engine is
+    built; a shard's start then applies a value file in ``environments/`` from its own load's
+    snapshot, so an edit in between is judged here on the earlier bytes. It reads files, so the
     supervisor calls it in a worker thread, as it does the rest of shard discovery."""
     if not enforcing:
         return None
