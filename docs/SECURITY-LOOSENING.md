@@ -959,12 +959,14 @@ count is above `0` (vault BACKLOG #2613).
   window and asks for more failures in it, so the page is not ordered by the value: some cyclic
   patterns that page at `3` never page at a larger value, for example an account down for three
   probes and up for four never holds four failures in seven at `4`, and some that never page at
-  `3` page at a larger one, for example down for two and up for three at `4`. So a value above `3`
-  can leave a pattern unpaged, not only page it later. Its least delay runs from that account's
-  first failing probe, not from the first outage pass. An
-  `ad_reconcile_outage_passes` above `3`, a longer
-  `ad_session_recheck_seconds`, or an `ad_session_recheck_max_users` below `200` in an estate larger
-  than the budget delays it. The `ad_reconcile_outage_passes` row of
+  `3` page at a larger one, for example down for two and up for three at `4`. Nor does a larger
+  value delay the page in every pattern: an account that fails twice, answers three times, then
+  keeps failing pages one probe sooner at `4` than at `3`. So a value above `3` can leave a pattern
+  unpaged, page it later, or page it sooner. What it does raise is the least delay, which runs from
+  that account's first failing probe, not from the first outage pass, and needs that many failing
+  probes in a row. A longer `ad_session_recheck_seconds`, or an `ad_session_recheck_max_users`
+  below `200` in an estate larger than the budget, delays the page in every pattern, since each
+  stretches the time between one account's probes. The `ad_reconcile_outage_passes` row of
   [CONFIGURATION.md](CONFIGURATION.md) states when it comes.
 - **Not named:** fewer strikes, a larger budget, or a higher brake threshold. Each ends sessions
   sooner or ends more of them, and none keeps a session the directory withdrew, though a larger
