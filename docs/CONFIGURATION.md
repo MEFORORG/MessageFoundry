@@ -436,6 +436,19 @@ byte-identical SSL context.
 | `internal_ca_file` | path | — | PEM path to the org's internal CA. **Not a secret** — a path, like `tls_cert_file` / `forward_tls_ca_file`. Unset (default) = no internal anchor; every hop uses the OS trust store. |
 | `trust_anchor_mode` | enum | `system` | how `internal_ca_file` composes with the OS default roots on a non-loopback internal hop. `system` (default) = **OS trust store only**, `internal_ca_file` ignored (byte-identical). `augment` = OS roots **and** the internal CA (a mixed public + private estate). `pinned` = **only** the internal CA, not the public bundle (a fully-private estate; strictest). `pinned` **without** `internal_ca_file` is **refused at load** — with nothing to pin it would silently fall back to the full OS trust store, i.e. the operator excludes public roots and gets all of them. |
 
+**The engine AI broker reads this block too** (BACKLOG #5527). On an app this section reaches,
+as `messagefoundry serve` hands it, `POST /ai/chat` verifies an `[ai].endpoint` whose host is not
+loopback against `internal_ca_file` under `augment` or `pinned`, and, where `crl_file` is set,
+checks it against that CRL in any mode, as the HTTP-family connections do. That anchored TLS context is built on the first
+assist call and kept, so a replaced `crl_file` reaches it as it reaches any connection's, and an
+`internal_ca_file` changed in place takes a restart. A `crl_file` that reaches the endpoint is a
+way across its revocation refusal, beside `[ai].endpoint_revocation_attested`; an endpoint whose
+issuer has no CRL in that file then fails its handshake. A loopback endpoint takes neither file.
+An app this section never reached checks the endpoint against the OS trust store and no CRL,
+whatever the instance's `[tls]` says. Which apps that covers, and where the CRL is and is not
+checked on this hop, is stated in full in the `[ai].endpoint_revocation_attested` entry of
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md).
+
 ### `[inbound]` — inbound listener defaults
 | Key | Type | Default | Notes |
 |---|---|---|---|
@@ -1009,7 +1022,7 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 | `endpoint` | str | — | the customer-managed LLM URL. **Required** for `mode = managed_endpoint`; `http`/`https` only, and a cleartext `http` endpoint is **refused** (it would expose `api_key`) |
 | `api_key` | secret | — | the LLM credential — **env only** (`MEFOR_AI_API_KEY`), never the file. **Required** for `mode = managed_endpoint` |
 | `allowed_endpoints` | list | `[]` | fail-closed SSRF allow-list for `endpoint`'s host; each entry is `host` (any port) or `host:port`. **An empty list permits nothing** — deliberately independent of `[egress].allowed_http`, which an empty list leaves allow-any under the `[security].block_unlisted_outbound = false` opt-out ([`[egress]`](#egress) states the rule), so it can't gate this surface |
-| `endpoint_revocation_attested` | bool | `false` | attests that revocation of the `endpoint`'s server certificate is covered outside the engine (BACKLOG #2193, owner ruling 2026-10-27). The broker verifies that certificate and checks no CRL and no OCSP, so under `[security].enforcement = enforce` an `endpoint` whose host is not loopback is **refused** at `POST /ai/chat` (503) unless this is set; no CRL lever is built, so `[tls].crl_file` does not reach this hop. Adds no check on the wire. A **loosening**: `security_loosenings()` names it with the reason. What it can rest on: [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). Env: `MEFOR_AI_ENDPOINT_REVOCATION_ATTESTED` |
+| `endpoint_revocation_attested` | bool | `false` | attests that revocation of the `endpoint`'s server certificate is covered outside the engine (BACKLOG #2193, owner ruling 2026-10-27). The broker verifies that certificate against the [`[tls]`](#tls--outbound-client-trust-anchors) anchor where that section reaches the app, and checks no OCSP. It checks no CRL unless `[tls].crl_file` is set and reaches the endpoint, on the three conditions [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) states (BACKLOG #5527). So under `[security].enforcement = enforce` an `endpoint` whose host is not loopback is **refused** at `POST /ai/chat` (503) unless that CRL is checked or this is set. `[tls].crl_file`, where it is checked, adds a check on the wire and this does not, but it is instance-wide, and the `[tls]` paragraph on the AI broker says what that costs this hop; an endpoint under a public CA you hold no CRL for is a case for this flag with `[tls].crl_file` unset. A **loosening**: `security_loosenings()` names it with the reason. What it can rest on: [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). Env: `MEFOR_AI_ENDPOINT_REVOCATION_ATTESTED` |
 | `endpoint_revocation_attested_reason` | str | — | **required** with `endpoint_revocation_attested = true`: what covers revocation of the endpoint's certificate, for example its short lifetime. Put no secret in it: it is printed in the serve-time warning and `GET /security/posture`. The load rules are the `[store].vault_revocation_attested_reason` row's. Env: `MEFOR_AI_ENDPOINT_REVOCATION_ATTESTED_REASON` |
 
 > Only `code_only` context is ever sent in the MVP (graph names + active editor code) — **never

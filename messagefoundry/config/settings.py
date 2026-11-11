@@ -4723,8 +4723,10 @@ class AiSettings(_Section):
     allowed_endpoints: list[str] = []
     # Attest that revocation of the AI endpoint's server certificate is covered outside the engine
     # (BACKLOG #2193 slice (e), on the ADR 0173 section 12 pattern). The broker verifies that
-    # certificate and checks no CRL and no OCSP, so an off-box endpoint is REFUSED under
-    # [security].enforcement = enforce unless this is set; no CRL lever is built for this hop. What
+    # certificate and checks no OCSP, and no CRL unless [tls].crl_file is set, the [tls] section
+    # reaches the app serving POST /ai/chat, and the endpoint is not loopback (BACKLOG #5527;
+    # docs/SECURITY-LOOSENING.md states it in full). So without that CRL an
+    # off-box endpoint is REFUSED under [security].enforcement = enforce unless this is set. What
     # the refusal keys on is stated once, on transports.ai_broker._refuse_an_unrevoked_ai_hop.
     # Setting it adds no check on the wire. The reason is MANDATORY; at least a flag without one, a
     # blank one, a reason without the flag, or a control character in the reason refuses at load.
@@ -10734,17 +10736,28 @@ def security_loosenings(
     # BACKLOG #2193 slice (e), on the ADR 0173 section 12 pattern: the AI endpoint's revocation
     # attestation. Named whenever the flag is set, whatever [ai].mode is, so the text claims no hop
     # is dialled. The reason is in the entry for the same reason as the Vault pairs above.
+    # BACKLOG #5527: the CRL clause states the three conditions a CRL check needs, and names the
+    # paths that check none, and stays static. Whether the [tls] section reached the app is a fact
+    # of the app (app.state.tls_settings, which create_managed_app stashes from its tls_settings
+    # argument, None unless passed, and an embedder of a direct create_app may set), not of these
+    # arguments. Loopback could be read off ai.endpoint, but the
+    # app half would still be static, so both stay named.
     if ai.endpoint_revocation_attested:
         out.append(
             (
                 "ai.endpoint_revocation_attested",
                 "revocation of the [ai].endpoint server certificate is attested as covered outside "
                 f"the engine (reason: {ai.endpoint_revocation_attested_reason}) -- the AI broker "
-                "verifies that certificate but its own handshake checks no CRL and no OCSP, and the "
-                "attestation adds no check. Wherever the revocation refusal would apply to that hop "
-                "it is lifted, so a revoked certificate is caught only if what the reason names "
-                "really covers it. No CRL lever is built for this hop. It never lifts a cleartext "
-                "refusal",
+                "verifies that certificate but its own handshake checks no OCSP, and checks no CRL "
+                "unless all three hold: [tls].crl_file is set, the [tls] section reaches the app "
+                "serving POST /ai/chat (`messagefoundry serve` hands it; a direct create_app holds "
+                "none unless the embedder sets it), and the endpoint is not loopback. So at least "
+                "a loopback endpoint, and an app the [tls] section never reached, check no CRL "
+                "whatever [tls].crl_file says. The "
+                "attestation adds no check. Where no CRL is checked, the revocation refusal is "
+                "lifted wherever it would apply to that hop, so a revoked certificate is caught "
+                "there only if what the reason "
+                "names really covers it. It never lifts a cleartext refusal",
             )
         )
     # --- the [alerts] SMTP hop (#323 layer 3). Two SEPARATE entries, deliberately: the deviation and the

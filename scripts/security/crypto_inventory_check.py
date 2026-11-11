@@ -1723,8 +1723,11 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     # Vault BACKLOG #2484: the broker dials through rest.py's shared verifying opener, which it now
     # obtains by calling rest._shared_no_redirect_opener() rather than reading a module constant, so
-    # the operation arm sees the hop. Before this it was IMPORT_ONLY; the opener is rest.py's, built
-    # through tls_policy, and the broker builds no context of its own.
+    # the operation arm sees the hop. Before this it was IMPORT_ONLY. BACKLOG #5527: where the [tls]
+    # anchor narrows, the broker holds an anchored opener from rest._no_redirect_opener, whose
+    # context loads [tls].internal_ca_file under augment or pinned and [tls].crl_file where set.
+    # Either way the context is built in rest.py through tls_policy, so the arms below are
+    # unchanged.
     "messagefoundry/transports/ai_broker.py": frozenset(
         {
             "key_cert:via messagefoundry.transports.rest",
