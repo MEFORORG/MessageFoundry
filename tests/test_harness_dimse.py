@@ -243,6 +243,49 @@ def test_the_driver_refuses_a_pdu_past_its_read_cap_without_reading_it() -> None
     assert status_of(out) is None
 
 
+def test_the_driver_refuses_a_deflated_payload_that_inflates_past_the_cap_before_dcmread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ASVS 5.2.3 (BACKLOG #4808): the driver bounds a Deflated Part-10 payload's inflate with the
+    engine's ``guard_part10_deflate`` before ``dcmread``, so one that inflates past the guard's cap is
+    refused, never read and never sent. The cap is lowered so the bomb stays small; the guard reads
+    it at call time. The deflated object under the cap is the positive control, stored by the sink."""
+    from io import BytesIO
+
+    import pydicom
+
+    import messagefoundry.parsing.dicom._inflate as inflate
+
+    mib = 1024 * 1024
+    (base,), _ = make_datasets(1)
+    bomb = _grown(base, 2 * mib, deflated=True)
+    under = _grown(base, mib // 2, deflated=True)
+    assert len(bomb) < mib, "only its inflate is large"
+
+    read: list[bytes] = []
+    real_dcmread = pydicom.dcmread
+
+    def spy(fp: object, *args: object, **kwargs: object) -> object:
+        if isinstance(fp, BytesIO):
+            read.append(fp.getvalue())
+        return real_dcmread(fp, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pydicom, "dcmread", spy)
+    monkeypatch.setattr(inflate, "DEFAULT_MAX_INFLATED_BYTES", mib)
+    with DimseSink() as sink:
+        out = _driver_for(sink).inject([under, bomb])
+        records = sink.wait_for(lambda rs: len(rs) == 1, 10.0)
+    assert status_of(out[0]) == 0 and records[0].payload
+    assert under in read, "the spy saw the driver's read of the control"
+    assert out[1].error == (
+        "refused before decode: deflated DICOM object exceeds the maximum uncompressed size "
+        f"({mib} bytes); refusing to decode (possible decompression bomb)"
+    )
+    assert status_of(out[1]) is None
+    assert bomb not in read, "dcmread ran on the bomb"
+    assert len(sink.records()) == 1
+
+
 def test_the_driver_reports_an_unreachable_port_and_a_non_dicom_payload() -> None:
     with DimseSink() as sink:
         pass

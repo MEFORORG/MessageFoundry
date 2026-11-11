@@ -22,6 +22,8 @@ from typing import Any
 
 from harness.drivers import Driver, Injection
 from harness.endpoints import Endpoints
+from messagefoundry.parsing.dicom._inflate import guard_part10_deflate
+from messagefoundry.parsing.dicom.errors import DicomBombError
 
 KIND = "dimse"
 
@@ -135,18 +137,31 @@ class DimseDriver(Driver):
             return [Injection(error=missing) for _ in payloads]
         from pydicom import dcmread
 
-        from messagefoundry.parsing.dicom._deps import parse_error_types
+        from messagefoundry.parsing.dicom._deps import load_header_readers, parse_error_types
 
+        try:
+            # A pydicom without the readers the guard replays fails every payload, so say so once,
+            # here, rather than raise from inject() (the Driver contract) or send unguarded.
+            load_header_readers()
+        except RuntimeError as exc:
+            return [Injection(error=str(exc)) for _ in payloads]
         capped_ae = _capped_ae_class()
 
         unreadable = parse_error_types()
         outcomes: list[Injection] = []
         for payload in payloads:
             try:
+                # ASVS 5.2.3: dcmread inflates a Deflated Explicit VR LE Data Set unbounded, so bound
+                # it first with the engine's own Part-10 guard and its cap (BACKLOG #4808). The guard
+                # replays dcmread's header read, so it sits inside the same handler, with dcmread's force.
+                guard_part10_deflate(payload, force=False)
                 dataset = dcmread(BytesIO(payload))
                 sop_class = dataset.SOPClassUID
                 transfer_syntax = dataset.file_meta.TransferSyntaxUID
                 dataset.SOPInstanceUID  # noqa: B018  (send_c_store needs it; refuse here, not there)
+            except DicomBombError as exc:  # a ValueError, so it must come before `unreadable`
+                outcomes.append(Injection(error=f"refused before decode: {exc}"))
+                continue
             except unreadable as exc:
                 outcomes.append(
                     Injection(error=f"not a DICOM Part-10 object ({type(exc).__name__})")
