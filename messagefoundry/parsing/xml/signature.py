@@ -323,8 +323,31 @@ def _coverage_refusal(root: Any, result: Any, location: str) -> str | None:
     def c14n(element: Any) -> bytes:
         return bytes(etree.tostring(element, method="c14n", exclusive=True, with_comments=True))
 
-    if c14n(root) != c14n(result.signed_xml):
+    # Content outside the signed element can make the document impossible to canonicalize, such as
+    # an element in a namespace with a relative URI. Coverage is then unshown, so refuse (BACKLOG #2816).
+    try:
+        if c14n(root) != c14n(result.signed_xml):
+            return UNSIGNED_CONTENT
+    except etree.C14NError:
         return UNSIGNED_CONTENT
+    return None
+
+
+def _read_anchor(
+    signxml: Any, x509_cert: str | bytes | None, ca_pem_file: str | bytes | None
+) -> Any:
+    """Fail on an unreadable anchor before signxml's call, whose errors :func:`verify` blames on the
+    document. Returns the pinned certificate, or ``None``. Like signxml, it skips ``ca_pem_file``
+    when a certificate is pinned.
+    """
+    # Imported here, not at module top, as in _signing_key_refusal.
+    from cryptography import x509
+
+    if x509_cert is not None:
+        return x509.load_pem_x509_certificate(signxml.util.add_pem_header(x509_cert))
+    if ca_pem_file is not None:
+        with open(ca_pem_file, "rb") as pems:
+            x509.load_pem_x509_certificates(pems.read())
     return None
 
 
@@ -357,7 +380,8 @@ def verify(
     instruction is admitted anywhere, and neither is any element, attribute or text that
     :func:`_signature_holds_unsigned_content` does not admit. Each of those is refused: with
     :data:`UNSIGNED_CONTENT` unless an earlier check refuses it first, such as the key floor, the
-    cryptography, or signxml's own schema check, which raises rather than returning a result.
+    cryptography, or signxml's own schema check, which raises :class:`XmlError` rather than
+    returning a result.
 
     **``verified=True`` vouches for ``signed_content`` and nothing else, so read the message from
     ``signed_content``, never from your own parse of ``document``** (vault BACKLOG #5538, reviewed
@@ -382,12 +406,14 @@ def verify(
     not take the signer's identity from ``ds:KeyInfo`` either, and do not treat a
     ``ds:X509Certificate`` there as checked: the anchor you pass is what checks the signer.
 
-    Raises :class:`ValueError` if no anchor is supplied,
-    :class:`~messagefoundry.parsing.xml.errors.XmlError` if the input is unparseable, and
-    :class:`RuntimeError` if the ``[xml]`` extra is absent. Malformed content inside ``ds:Signature``
-    can also raise from signxml or ``cryptography`` unwrapped, at least
-    :class:`lxml.etree.DocumentInvalid` from the schema check and :class:`ValueError` from key or
-    certificate parsing; such a message may quote document text, so do not log it."""
+    Raises :class:`ValueError` if no anchor is supplied or the anchor cannot be read, such as a
+    pinned certificate that is not one or a CA file holding none, and :class:`OSError` if
+    ``ca_pem_file`` cannot be opened. Raises :class:`~messagefoundry.parsing.xml.errors.XmlError`
+    if the input is unparseable, or if signxml or a library under it cannot process the signature,
+    such as a schema-invalid or empty ``ds:SignatureValue`` or key data it cannot read (vault BACKLOG
+    #2816, #5372). That message names only the library's exception type, and the library's
+    exception is on neither ``__cause__`` nor ``__context__``, because several quote the document.
+    Raises :class:`RuntimeError` if the ``[xml]`` extra is absent."""
     if x509_cert is None and ca_pem_file is None:
         # Refuse origin-blind verification. Require the caller to pin the expected signer or a partner
         # CA rather than fall back to signxml's "trust anything the OS trusts" default (DELTA-03).
@@ -396,24 +422,39 @@ def verify(
             "ca_pem_file (a trusted CA). Refusing to trust any system-CA-trusted certificate."
         )
     signxml = load_signxml()
+    pinned = _read_anchor(signxml, x509_cert, ca_pem_file)
     root = parse_bytes(document)
     verifier = signxml.XMLVerifier()
     config = _approved_signature_config(signxml)
+    # What signxml and the libraries under it raise on a signature they cannot process, measured on
+    # signxml 5.2.0; several quote the document (BACKLOG #2816, #5372). Caught only around this call.
+    from cryptography.exceptions import UnsupportedAlgorithm
+
+    unprocessable = (
+        signxml.exceptions.SignXMLException,
+        load_lxml().LxmlError,
+        ValueError,
+        TypeError,
+        KeyError,
+        NotImplementedError,
+        UnsupportedAlgorithm,
+    )
     try:
         result = verifier.verify(
             root,
-            x509_cert=x509_cert,
+            x509_cert=pinned,
             ca_pem_file=ca_pem_file,
             expect_config=config,
         )
     except signxml.exceptions.InvalidSignature as exc:
         return XmlSignatureResult(verified=False, reason=type(exc).__name__)
-    except signxml.exceptions.InvalidInput as exc:
-        # No signature present / structurally unprocessable as DSig — a data error, route it.
-        raise XmlError(
-            f"document is not a verifiable XML-DSig payload: {type(exc).__name__}"
-        ) from exc
-    refusal = _signing_key_refusal(result) or _coverage_refusal(root, result, config.location)
-    if refusal is not None:
-        return XmlSignatureResult(verified=False, reason=refusal)
-    return XmlSignatureResult(verified=True, signed_content=bytes(result.signed_data))
+    except unprocessable as exc:
+        # A data error, routed by type name only. Raised after the handler ends, so the library's
+        # exception is on neither __cause__ nor __context__ (BACKLOG #1796).
+        fault = type(exc).__name__
+    else:
+        refusal = _signing_key_refusal(result) or _coverage_refusal(root, result, config.location)
+        if refusal is not None:
+            return XmlSignatureResult(verified=False, reason=refusal)
+        return XmlSignatureResult(verified=True, signed_content=bytes(result.signed_data))
+    raise XmlError(f"document is not a verifiable XML-DSig payload: {fault}")

@@ -114,7 +114,7 @@ def _pem(cert: x509.Certificate) -> bytes:
     return cert.public_bytes(serialization.Encoding.PEM)
 
 
-def _sign(key: _SignerKey, cert: x509.Certificate) -> bytes:
+def _sign(key: _SignerKey, cert: x509.Certificate, *, always_add_key_value: bool = False) -> bytes:
     from lxml import etree
     from signxml.signer import XMLSigner
 
@@ -131,7 +131,9 @@ def _sign(key: _SignerKey, cert: x509.Certificate) -> bytes:
     )
     # A test-only signer over a synthetic body parsed from a literal, never untrusted input.
     root = etree.fromstring(_BODY)  # noqa: S320
-    signed = XMLSigner(signature_algorithm=alg).sign(root, key=key_pem, cert=[_pem(cert).decode()])
+    signed = XMLSigner(signature_algorithm=alg).sign(
+        root, key=key_pem, cert=[_pem(cert).decode()], always_add_key_value=always_add_key_value
+    )
     return bytes(etree.tostring(signed))
 
 
@@ -259,6 +261,13 @@ def test_a_weak_ca_key_is_refused_by_the_chain_check(tmp_path: Path) -> None:
     assert result.reason == "InvalidCertificate"
 
 
+def _readable_anchor() -> bytes:
+    """A real certificate: ``verify`` parses the anchor before it calls signxml (BACKLOG #5372), so
+    the stubbed verifier below is reached only past a readable one."""
+    key = _rsa(2048)
+    return _pem(_cert(key, key, "partner-signer", "partner-signer", ca=False))
+
+
 def test_an_unreadable_signing_key_is_refused_not_passed(monkeypatch: pytest.MonkeyPatch) -> None:
     """Fail closed: a floor that cannot read the key must not return ``verified=True``."""
     from signxml.verifier import XMLVerifier
@@ -267,7 +276,7 @@ def test_an_unreadable_signing_key_is_refused_not_passed(monkeypatch: pytest.Mon
         signature_key = b"not a public key"
 
     monkeypatch.setattr(XMLVerifier, "verify", lambda self, *a, **k: _Result())
-    result = verify(b"<root/>", x509_cert=b"unit-test-anchor-sentinel")
+    result = verify(b"<root/>", x509_cert=_readable_anchor())
     assert result.verified is False
     assert result.reason == sigmod.UNREADABLE_SIGNING_KEY
 
@@ -285,7 +294,7 @@ def test_a_list_result_is_checked_whole(shape: str, monkeypatch: pytest.MonkeyPa
     )
     expected = sigmod.UNREADABLE_SIGNING_KEY if shape == "empty" else sigmod.WEAK_SIGNING_KEY
     monkeypatch.setattr(XMLVerifier, "verify", lambda self, *a, **k: listed)
-    result = verify(b"<root/>", x509_cert=b"unit-test-anchor-sentinel")
+    result = verify(b"<root/>", x509_cert=_readable_anchor())
     assert result.verified is False
     assert result.reason == expected
 
