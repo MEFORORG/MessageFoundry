@@ -12709,8 +12709,8 @@ def create_managed_app(
             # BACKLOG #1142, slice 3: the audited preflight for every inbound CA that requires a
             # peer certificate (MLLP, the HTTP listener, the DICOM SCP), at the first load and at
             # every real reload. Each listener's own build then enforces again and loads the bytes
-            # it read. Since vault BACKLOG #2371 it also checks each FhirLookup's CA; the lane
-            # CAs are the runner's, below. Module item 9 of auth/trust_anchors.py says when.
+            # it read. The lane CAs and, since vault BACKLOG #3582, the FhirLookup CAs are the
+            # runner's, below. Module item 9 of auth/trust_anchors.py says when.
             # Dormant when no connection names a CA: no store call, no audit row.
             # BACKLOG #3402: the caller's own preflight runs first, beside it and never in its
             # place, so a graph it refuses writes no anchor audit row.
@@ -12720,7 +12720,8 @@ def create_managed_app(
             ),
             # vault BACKLOG #2371: the same check, per lane, as the runner builds an outbound or
             # binds an Ftp poller, so a refused CA fails that lane only (ADR 0031), and before a
-            # reload for each lane that reload builds or keeps running.
+            # reload for each lane that reload builds or keeps running. Since vault BACKLOG #3582
+            # it checks each FhirLookup the same way, so a refused one isolates that lookup.
             lane_anchor_check=make_lane_anchor_check(store, enforcing=trust_anchors_enforcing),
             # BACKLOG #2034: the settings anchors (OIDC / AD / api-mTLS client CA, and since vault
             # BACKLOG #3188 the dialling settings CAs), re-verified by
