@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""``validate_against`` reads no resource beyond the schema it is given (BACKLOG #5537).
+"""``validate_against`` reads no resource outside the roots it confines a schema to (BACKLOG #5537).
 
 Three limbs, each pinned against the behaviour it replaces:
 
 * a schema opening with a byte-order mark is the schema DOCUMENT, not a path, so it goes through the
   hardened pre-parse. A BOM-prefixed ``bytes`` schema used to skip that pre-parse, and xmlschema then
   expanded a DOCTYPE entity in it;
-* every location xmlschema opens as a URL goes through ``schema._ConfinedFiles``, xmlschema's
-  opener, and one it would parse as XML text is refused before it: an inline schema opens none
+* every location xmlschema opens as a URL goes through ``schema._ConfinedFiles``, the only handler
+  in xmlschema's opener, and one it would parse as XML text is refused before it in the inline
+  schema, the named file and each file under the root, though not in a bundled copy: an inline schema opens none
   of its own locations outside xmlschema's bundled copies of well-known namespaces, which either kind
   may read, and a path schema opens files only under its own directory or the ``schema_root`` its
   caller names, each checked by ``parse_bytes`` and reached without following a link out of that root
@@ -1053,7 +1054,8 @@ def test_a_long_drive_path_gets_its_prefix_back_for_the_os(tmp_path: Path) -> No
 
 
 def _write_cda_shaped_bundle(top: Path) -> Path:
-    """The HL7 CDA R2 layout: the entry schema includes ``../../processable/coreschemas/...``."""
+    """The HL7 CDA R2 layout, one level flattened: there ``POCD_MT000040.xsd``, beside the entry
+    schema, includes ``../../processable/coreschemas/...``; here the entry schema does."""
     (top / "infrastructure" / "cda").mkdir(parents=True)
     (top / "processable" / "coreschemas").mkdir(parents=True)
     (top / "processable" / "coreschemas" / "datatypes.xsd").write_text(_CLEAN, encoding="utf-8")

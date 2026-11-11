@@ -177,7 +177,8 @@ and `requirements.lock` are untouched.
 
 ## Amendment (2026-11-10) -- any import location is refused, and the XSD build reads only inside its root (BACKLOG #5537, #5539)
 
-Two statements above were false in the shipped code, and both are corrected here rather than in place.
+At least three statements above were false in the shipped code, and each is corrected here rather
+than in place.
 
 - *"A relative/local location is not fetched either."* For a schema location it was. The guard refused
   only a location with a scheme or a `//host` authority, so a relative, rooted or Windows backslash UNC
@@ -218,8 +219,9 @@ Two statements above were false in the shipped code, and both are corrected here
   refused import would leave its namespace undeclared, and a `lax` or `skip` wildcard would then admit
   that namespace's content unchecked. The confinement root is the schema's own
   directory, or the directory the caller passes as `validate_against`'s `schema_root` keyword. That
-  keyword exists for a bundle whose schemas include across sibling directories: the HL7 CDA R2 entry
-  schema includes `../../processable/coreschemas/...`, and IHE XDS bundles do the same, so confining
+  keyword exists for a bundle whose schemas include across sibling directories: in HL7 CDA R2,
+  `POCD_MT000040.xsd`, which the entry schema includes beside itself, includes
+  `../../processable/coreschemas/...`, and IHE XDS bundles do the same, so confining
   them to the entry schema's directory refused a load that worked before. Below the root, each path is
   walked one component at a time with `lstat`, and a symlink or junction whose target text is a UNC or
   device path, or lies outside the root, is refused before it is followed. Nothing in `schema.py` calls
@@ -229,6 +231,11 @@ Two statements above were false in the shipped code, and both are corrected here
   override location is opened only when it names a file in `xmlschema`'s bundled schemas. `xmlschema`'s
   `allow="sandbox"` was tried and not used: it compares URL string prefixes, narrows to each includer's
   directory, and blocks the bundled schemas.
+- *"A PHI-safe message naming the scheme only."* The shipped refusal named whatever `urlsplit` read
+  as a scheme, which is any word before a colon, so a location such as `JohnSmith:MRN12345` was
+  refused with `scheme 'johnsmith'`, text taken from the location. The refusal now names only a
+  well-known scheme (`http`, `https`, `ftp`, `ftps`, `file`), and any other as "an unrecognised
+  scheme" (`test_wsdl_import.py`).
 
 The backslash UNC form did reach the network on the shipped configuration. Measured 2026-11-10 with
 `xmlschema` 4.3.2 and Python 3.14 on Windows: an inline schema's `xs:include` of

@@ -353,7 +353,8 @@ class _ConfinedFiles(urllib.request.BaseHandler):
     location xmlschema opens as a URL, the schema file the caller named and each include, import,
     redefine and override location among them; every scheme but ``file:`` reaches
     ``unknown_open``. It does not see every location a schema names: one xmlschema reads as XML
-    text is parsed, not opened, so :func:`_refuse_text_locations` refuses it first, and
+    text is parsed, not opened, so :func:`_refuse_text_locations` refuses it first in the inline
+    schema, the named file and each file under a vetted root, though not in the bundled copies, and
     ``allow="local"`` refuses a remote URL before it is opened. The named file is read as named, a
     link at it included. One root is xmlschema's bundled ``schemas`` directory, which holds
     the copies of well-known namespaces (SOAP encoding, XML-DSig, xlink and others) a location-free
@@ -453,16 +454,29 @@ class _ConfinedOpener(urllib.request.OpenerDirector):
     ``FileHandler``, ``FTPHandler`` and ``DataHandler`` among them, each able to open what
     ``_ConfinedFiles`` refuses; and ``parsing/`` may not import ``transports/``. This opener has no
     handler that opens an ``http`` or ``https`` URL, so it reads no reply head, the hazard that
-    function exists for, and :meth:`add_handler` refuses any handler after the first. The
-    stock-opener scan in ``tests/test_reply_framing.py`` sanctions this class by name, and checks
-    both."""
+    function exists for. It takes a :class:`_ConfinedFiles` and no subclass, which could add an
+    ``https_open``; :meth:`add_handler` refuses any handler after the first; and :meth:`open`
+    refuses to run if any other handler got in another way, such as through ``super`` or the
+    handler list itself. The stock-opener scan in ``tests/test_reply_framing.py`` sanctions this
+    class by name, and checks all three."""
 
     def __init__(self, files: _ConfinedFiles) -> None:
+        if type(files) is not _ConfinedFiles:
+            raise TypeError("the schema opener takes a _ConfinedFiles and no subclass")
         super().__init__()
         super().add_handler(files)
+        self._files = files
 
     def add_handler(self, handler: urllib.request.BaseHandler) -> None:
         raise TypeError("the schema opener holds its confined-file handler and no other")
+
+    def open(self, *args: Any, **kwargs: Any) -> Any:
+        state = vars(self)  # handlers and handle_open are instance attributes typeshed omits
+        if state["handlers"] != [self._files] or any(
+            chain != [self._files] for chain in state["handle_open"].values()
+        ):
+            raise TypeError("the schema opener holds a handler besides its confined-file handler")
+        return super().open(*args, **kwargs)
 
 
 class _SourceRefused(ValueError):

@@ -26,8 +26,9 @@ consulted to *check* an envelope, never to *drive* one (BACKLOG #70's synchronou
   ``xsd:include`` / ``xsd:redefine`` / ``xsd:override``, local or remote
   (:class:`~messagefoundry.parsing.xml.errors.WsdlSecurityError`, BACKLOG #5539). What the guard let
   through before, and what was opened, is recorded once, in ADR 0122's 2026-11-10 amendment. An
-  ``xsd:import`` naming only a ``namespace`` stays legal; a type reachable only through it fails closed
-  through ``xmlschema``.
+  ``xsd:import`` naming only a ``namespace`` stays legal. A type reachable only through it resolves
+  to ``xmlschema``'s bundled copy where it bundles that namespace (XML-DSig, for one), and otherwise
+  fails closed through ``xmlschema``.
 
 **PHI (CLAUDE.md §9):** every failure names element **QNames** / reason **categories**, and a refused
 location by its element and a well-known URI **scheme** or the kind of reference (``a local path``,
