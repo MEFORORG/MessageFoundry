@@ -425,6 +425,7 @@ from messagefoundry.config.wiring import (
     ech_cleartext_sidecar_hops,
     expiry_relaxed_hops,
     hostname_unchecked_hops,
+    listener_trusted_proxy_hops,
     load_config,
     path_form_fhir_updates,
     query_credential_hops,
@@ -534,8 +535,8 @@ from messagefoundry.store.content_search import (
 from messagefoundry.store.content_search import (
     ContentSearchError,
     SearchSpec,
-    SearchTarget,
     make_spec,
+    sends_a_needle,
 )
 from messagefoundry.store.crypto import CipherError, CipherUnavailableError, audit_body_digests
 from messagefoundry.store.metadata import user_metadata
@@ -2132,15 +2133,29 @@ def _posture_loosenings(
             if visible is None or visible(name)
         ]
     )
+    # BACKLOG #5525: an HTTP listener's trusted_proxies, read against the same values. Its note,
+    # "range" or "possibly", is kept beside the name, since the entry's text keys on it.
+    listener_proxy_hops = (
+        []
+        if registry is None
+        else [
+            f"{name} ({note})" if note else name
+            for name, note in listener_trusted_proxy_hops(registry, env_values=db_env_values)
+            # Narrowed on the bare name, before any marker is added.
+            if visible is None or visible(name)
+        ]
+    )
     notes: list[str] = []
     if registry is None:
         notes.append(
             "settings only — no connection graph is loaded on this engine, so the per-connection "
             "cleartext_accepted / tls_allow_expired / tls_check_hostname / url_query_credential / "
             "generic-ODBC-DATABASE-TLS / tls_hop_attested / "
-            "tls_revocation_attested / FHIR update_url_form / http ECH sidecar declarations are "
+            "tls_revocation_attested / FHIR update_url_form / http ECH sidecar / HTTP listener "
+            "trusted_proxies declarations are "
             "NOT included "
-            "(see `messagefoundry check`)"
+            "(see `messagefoundry check`, which reports all but the HTTP listener "
+            "trusted_proxies; those are reported only here, on an engine with a graph)"
         )
     if visible is not None:
         # With no graph too: the [security] opt-outs keyed by connection are still narrowed.
@@ -2187,6 +2202,7 @@ def _posture_loosenings(
             remote_debug=remote_debug,
             startup=startup,
             service_env=service_env,
+            listener_trusted_proxy_hops=listener_proxy_hops,
         )
     )
     # Vault BACKLOG #3062: the open mode is an app opt-in, not a setting, so the registry above
@@ -3817,7 +3833,11 @@ def _needle_shape(needle: str) -> str:
     An operator's needle may itself be PHI — an MRN, a patient name (ADR 0046 §4/AC-6). The audit must
     record *that a content search ran and roughly what kind of term*, never the term verbatim. We emit
     only a structural class (all-digits / alphanumeric / has-separators / other) — not the characters —
-    so even a 9-digit MRN logs as ``digits`` with a length, never the number itself."""
+    so even a 9-digit MRN logs as ``digits`` with a length, never the number itself.
+
+    The shape is read with the padding removed: ``make_spec`` keeps a needle's spaces (BACKLOG #6700),
+    and a pasted `` 123456789`` is still an MRN-shaped lookup, so it must audit as ``digits``."""
+    needle = needle.strip()
     if needle.isdigit():
         return "digits"
     if needle.isalnum():
@@ -3884,7 +3904,10 @@ def _compose_preset_layers(
     **rejects a conflicting second** (400). **Exactly one** preset may carry a content needle (a
     ``content`` substring or a ``field_path``[+``field_value``]); >1 or 0 → 400. Raises
     :class:`HTTPException` (400) on a conflict / missing-or-duplicate needle; the caller maps the
-    ``ContentSearchError`` from a malformed field path likewise."""
+    ``ContentSearchError`` from a malformed field path likewise.
+
+    A lone ``field_value`` counts as a needle too, so ``make_spec`` refuses it (400) rather than the
+    compose dropping it (BACKLOG #6700)."""
     meta_keys = ("channel_id", "status", "message_type", "control_id")
     meta: dict[str, str | None] = dict.fromkeys(meta_keys)
     needle: dict[str, Any] | None = None
@@ -3898,10 +3921,14 @@ def _compose_preset_layers(
                         400, f"layered presets conflict on {key!r}: {meta[key]!r} vs {value!r}"
                     )
                 meta[key] = value
-        has_needle = bool((crit.get("content") or "").strip()) or bool(
-            (crit.get("field_path") or "").strip()
+        # A lone field_value counts, so make_spec refuses it rather than the compose dropping it.
+        # Counted on stripped values, as before: a blank stored content or field_path on a preset
+        # that is not the needle is not a second needle.
+        content, path = (
+            v.strip() if isinstance(v, str) else v
+            for v in (crit.get("content"), crit.get("field_path"))
         )
-        if has_needle:
+        if sends_a_needle(content, path, crit.get("field_value")):
             if needle is not None:
                 raise HTTPException(
                     400, "layered search allows at most one content predicate across presets"
@@ -3917,7 +3944,7 @@ def _compose_preset_layers(
             content=(needle.get("content") or None),
             field_path=(needle.get("field_path") or None),
             field_value=(needle.get("field_value") or None),
-            target=SearchTarget(needle.get("target") or "both"),
+            target=needle.get("target") or "both",
         )
     except (ContentSearchError, ValueError) as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -5045,10 +5072,21 @@ def create_app(
         # the broker's revocation refusal. An off-box endpoint with no [ai].endpoint_revocation_attested
         # pair is refused under enforce, and a None posture counts as enforcing there. The cleartext-
         # http refusal takes no posture: it refuses in every one (vault BACKLOG #3533 item 5).
+        # BACKLOG #5527: the [tls] policy too, the one the alerts test send reads, so the endpoint is
+        # verified against [tls].internal_ca_file under augment or pinned and checked against
+        # [tls].crl_file as the other HTTP-family hops are. A direct create_app stashes none, so
+        # None goes down.
         # Off the event loop: the constructor builds rest.py's shared opener on first use, a TLS
-        # context that reads the system trust store, under a lock a worker thread may hold.
+        # context that reads the system trust store, under a lock a worker thread may hold, or an
+        # opener of its own that reads the [tls] CA and CRL files.
+        tls_settings = getattr(request.app.state, "tls_settings", None)
         try:
-            broker = await asyncio.to_thread(ai_broker_from_settings, ai, posture=_phi_read_posture)
+            broker = await asyncio.to_thread(
+                ai_broker_from_settings,
+                ai,
+                posture=_phi_read_posture,
+                trust_anchor_policy=tls_settings.policy() if tls_settings is not None else None,
+            )
         except AiBrokerError as exc:
             _log.warning("engine AI broker misconfigured: %s", exc)
             raise HTTPException(503, "engine-brokered AI assistance is not available") from exc
@@ -7564,7 +7602,7 @@ def create_app(
                 content=content,
                 field_path=field_path,
                 field_value=field_value,
-                target=SearchTarget(target),
+                target=target,
                 scan_limit=scan_limit,
             )
         except ContentSearchError as exc:
@@ -7864,7 +7902,7 @@ def create_app(
                 content=content,
                 field_path=field_path,
                 field_value=field_value,
-                target=SearchTarget(target),
+                target=target,
                 scan_limit=scan_limit,
             )
         except ContentSearchError as exc:
@@ -9193,13 +9231,14 @@ def create_app(
         enforce_phi_read_pacing(request, identity)  # bulk decrypt+split behind a step-up gate
         us = _require_upload_store(request)
         spec: SearchSpec | None = None
-        if content or field_path:
+        # A lone field_value reaches make_spec too, so it is refused rather than dropped (#6700).
+        if sends_a_needle(content, field_path, field_value):
             try:
                 spec = make_spec(
                     content=content,
                     field_path=field_path,
                     field_value=field_value,
-                    target=SearchTarget(target),
+                    target=target,
                 )
             except ContentSearchError as exc:
                 raise HTTPException(400, str(exc)) from exc
@@ -9552,17 +9591,21 @@ def create_app(
         needle is rejected up front (make_spec) so a bad preset can't be saved."""
         crit = body.criteria
         needle_shape: str | None = None
-        if crit.content or crit.field_path:
+        # A lone field_value reaches make_spec too, so it is refused rather than saved unread (#6700).
+        if sends_a_needle(crit.content, crit.field_path, crit.field_value):
             try:
-                make_spec(
+                spec = make_spec(
                     content=crit.content,
                     field_path=crit.field_path,
                     field_value=crit.field_value,
-                    target=SearchTarget(crit.target),
+                    target=crit.target,
                 )
             except ContentSearchError as exc:
                 raise HTTPException(400, str(exc)) from exc
-            needle_shape = _needle_shape(crit.content) if crit.content else "field_path"
+            # From the spec, not the raw criteria: an all-whitespace content is not the needle.
+            needle_shape = (
+                _needle_shape(spec.substring) if spec.substring is not None else "field_path"
+            )
         effective_id, replaced = await engine.store.upsert_search_preset(
             preset_id=uuid4().hex,
             # BACKLOG #1225: the OWNER KEY is the immutable Identity.user_id, never the reassignable

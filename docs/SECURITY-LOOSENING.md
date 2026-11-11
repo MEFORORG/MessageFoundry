@@ -259,6 +259,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `tls_revocation_attested` | `false` on every inbound / outbound / `FhirLookup` (*connection-scoped*) |
 | | `ech_sidecar` | no `ech_egress`, or an `https://` sidecar, on every `REST` outbound (*connection-scoped*; an `http://` sidecar is the loosening, named as `ech_sidecar`) |
 | | `update_url_form` | `"transaction"` on every `FHIR()` outbound (*connection-scoped*; `"path"` is the loosening, named as `update_url_form`) |
+| | `trusted_proxies` on an HTTP listener | `[]` on every `Http()` inbound (*connection-scoped*; any non-empty list is the loosening, named as `listener_trusted_proxies`, because each listed proxy, and every host inside a listed range, may key the failed-attempt budget on any address it writes. BACKLOG #5525; [CONNECTIONS.md](CONNECTIONS.md) has the walk and the range floor) |
 | | `url_query_credential` | no credential-like parameter in an outbound or `FhirLookup` `url`'s query string (*connection-scoped*; not a flag, a property of the URL) |
 
 **At least thirty of these do not live in `[security]`.** `[store].aad_bind`,
@@ -532,6 +533,9 @@ false premise.
 - **Still refused:** a **PHI** instance with fully-open egress refuses to start under **strict enforcement**
   (`enforcement = enforce`, the default; warns at `enforcement = warn`). Leaving this unset keeps
   deny-by-default **on**; [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress) says what that does.
+- **Not opened by it:** at least `[egress].allowed_proxy`, `allowed_ech_sidecar` and
+  `allowed_recipient_domains` stay deny-by-default under this opt-out, so an empty one still refuses
+  the forward proxy, the ECH sidecar or the `Email()` destination it gates.
 
 ### `delete_message_bodies_after_days = 0` / `allow_keeping_phi_indefinitely = true` — unbounded PHI retention
 - **What you lose:** PHI message bodies accumulate at rest without bound (data-minimization failure).
@@ -1612,18 +1616,29 @@ count is above `0` (vault BACKLOG #2613).
 > above). It needs its `[ai].endpoint_revocation_attested_reason`.
 - **What the engine refuses without it:** the engine AI broker sends `[ai].api_key` and the code
   sent for assistance over https that verifies the endpoint's certificate, and its handshake
-  checks no CRL and no OCSP. So an `[ai].endpoint` whose host is not loopback is refused under
+  checks no OCSP. **It checks no CRL unless all three of these hold** (BACKLOG #5527):
+  `[tls].crl_file` is set; the `[tls]` section reaches the app serving `POST /ai/chat`; and the
+  endpoint is not loopback. `messagefoundry serve` hands its app that section. A direct
+  `create_app` (the embedded path) holds none unless its embedder sets `app.state.tls_settings`
+  to a `TlsSettings`.
+  So at least these check no CRL, whatever `[tls].crl_file` says: a loopback endpoint, and an app
+  the `[tls]` section never reached, such as a direct `create_app` whose embedder did not set it.
+  Without such a CRL, an `[ai].endpoint` whose host is not loopback is refused under
   `[security].enforcement = enforce`, and wherever a broker is built without a known posture,
   which counts as enforcing. The broker is built for each `POST /ai/chat` request, so the refusal
   comes there, answered 503; `serve` starts, and `messagefoundry check` does not report it.
-- **What you lose:** that refusal. A revoked but unexpired endpoint certificate is then accepted
-  unless something outside the engine stops it, and the API key crosses to whoever holds it.
-  **Setting the flag adds no check on the wire.**
-- **What the attestation can truthfully rest on:** not on the engine. No CRL lever is built for
-  this hop, so `[tls].crl_file` does not reach it and the flag is the only way across under
-  `enforce`. A short-lived endpoint certificate is the main honest basis; put its lifetime in the
-  reason. A gateway on this machine that checks the upstream's revocation itself needs no
-  attestation at all: a loopback endpoint is not refused.
+- **What you lose:** that refusal. Where no CRL is checked on the hop, a revoked but
+  unexpired endpoint certificate is then accepted unless something outside the engine stops it, and the API key
+  crosses to whoever holds it. **Setting the flag adds no check on the wire.**
+- **What the attestation can truthfully rest on:** not on the engine. Since BACKLOG #5527 a set
+  `[tls].crl_file` is checked on this hop where the first bullet says, for example an off-box
+  endpoint on an engine started by `serve`, and there it is the other way across under
+  `enforce`, so prefer it where you hold the CRL of the endpoint certificate's
+  issuer. It is instance-wide: once set, an off-box endpoint it reaches whose issuer has no CRL
+  in that file fails its handshake, and this flag does not change that.
+  For an endpoint under a public CA you hold no CRL for, a short-lived endpoint certificate is the
+  main honest basis; put its lifetime in the reason. A gateway on this machine that checks the
+  upstream's revocation itself needs no attestation at all: a loopback endpoint is not refused.
 - **What it cannot do:** it never lifts the broker's other refusals, at least an `http` endpoint,
   an endpoint missing from `[ai].allowed_endpoints`, and credentials in the URL. The process-wide
   `MEFOR_TLS_REVOCATION_ATTESTED` does **not** cross this hop under an enforcing or unknown
@@ -1638,7 +1653,9 @@ count is above `0` (vault BACKLOG #2613).
   whatever `[ai].mode` is.
 - **At load:** the flag without a reason, a blank reason, a reason without the flag, or a reason
   holding a control character or a lone surrogate is refused when the settings load.
-- **Reversible:** yes. Delete both lines and restart. An off-box endpoint then refuses again.
+- **Reversible:** yes. Delete both lines and restart. An off-box endpoint then refuses again,
+  unless a set `[tls].crl_file` is checked on it, where the first bullet says (BACKLOG #5527):
+  that hop crosses on its CRL, with or without this pair.
 
 ### `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1` **with `MEFOR_SECURITY_ENFORCEMENT=warn`** — config Python loads from a place others can write
 > **An environment variable, not a setting, and refused under `[security].enforcement = enforce`**
@@ -1973,6 +1990,11 @@ count is above `0` (vault BACKLOG #2613).
   build, `http` or `https`, and no declaration lifts that refusal: neither `cleartext_accepted` nor
   `tls_hop_attested`. So this hop never leaves the host, which is why no cleartext-hop gate refuses
   it.
+- **What else you keep, whatever the scheme:** the sidecar's `host:port` must be on
+  `[egress].allowed_ech_sidecar` (BACKLOG #5528), a deny-by-default list rather than a loosening;
+  [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress) states its rules. Loopback alone would not
+  bound the hop: without the list a deploying site's connection could send this traffic to whatever
+  listened on a port its author named.
 - **Why it is listed when a loopback `http://` `url` is not:** an ECH connection's `url` is
   normally `https://`, so its config reads as TLS while the first leg under it is cleartext. A plain
   `http://127.0.0.1` `url` shows what it is. The list names every `http://` sidecar, whatever the

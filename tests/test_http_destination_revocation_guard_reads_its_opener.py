@@ -181,8 +181,13 @@ def _build(
             if revocation_attested
             else None,
         ),
-        # The proxy is listed so the forward-proxy arms build; no other arm sets a proxy.
-        egress=EgressSettings(deny_by_default=False, allowed_proxy=[_PROXY_HOST]),
+        # The proxy is listed so the forward-proxy arms build; no other arm sets a proxy. The ECH
+        # sidecar is listed so the ECH arms build (BACKLOG #5528); no other arm sets ech_egress.
+        egress=EgressSettings(
+            deny_by_default=False,
+            allowed_proxy=[_PROXY_HOST],
+            allowed_ech_sidecar=[f"{LOOPBACK}:8123"],
+        ),
     )
 
 

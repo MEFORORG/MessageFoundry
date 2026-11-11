@@ -538,13 +538,11 @@ pure-Python equivalent:
   `consume_handoff_file` opens it with DELETE as well, and once the service has converted it,
   deletes it through that same handle with `kernel32`'s `SetFileInformationByHandle`, POSIX
   semantics first and the classic disposition where the volume has none
-  (`restricted_file.delete_through_handle`), so the file deleted is the file read. Nothing calls
-  these yet. On Linux it opens the file with
-  `O_NOFOLLOW` and reads its mode, owner, group and POSIX access control list from the open
-  descriptor. It asks for that descriptor's file system through
-  `restricted_file.linux_file_system_type` (`fstatfs64`, or `fstatfs` where the C library has no
-  `fstatfs64`), and refuses any file system not on the allowlist for that kind of file. Any other
-  POSIX host opens none of these files
+  (`restricted_file.delete_through_handle`), so the file deleted is the file read. On Linux it
+  opens the file with `O_NOFOLLOW` and reads its mode, owner, group and POSIX access control list
+  from the open descriptor. It asks for that descriptor's file system through
+  `restricted_file.linux_file_system_type` (below), and refuses any file system not on the
+  allowlist for that kind of file. Any other POSIX host opens none of these files
 - Path checks: `tray/actions.py`, which asks `kernel32`'s `GetDriveTypeW` whether the drive letter
   of `log_path` or `repo_path` is a mapped network drive. It asks each time the tray menu is built,
   and again before View Log opens the file, so it can refuse one before touching it. And
@@ -552,7 +550,8 @@ pure-Python equivalent:
   best-effort remote-path check on a generic ODBC file keyword (BACKLOG #2705)
 - Process and job control: `proctree.py`, which kills a child together with every process it
   started. Where it cannot set up the job or signal the group, its callers fall back to killing
-  only the child, and a failed job setup or group signal logs a WARNING. The sandbox worker and the disaster-recovery takeover hook use it. On Windows it puts
+  only the child, and a failed job setup or group signal logs a WARNING. The sandbox worker and
+  the disaster-recovery takeover hook use it. On Windows it puts
   the child in a `kernel32` job object that ends the whole tree. The takeover hook starts
   suspended, so it joins the job before it can start anything, and `ntdll`'s `NtResumeProcess`
   then lets it run (vault BACKLOG #2622). POSIX needs no `ctypes` for this; the child leads its
@@ -562,8 +561,8 @@ pure-Python equivalent:
   link or junction, `GetFileInformationByHandleEx` to refuse a part that is one, and
   `GetFinalPathNameByHandleW` to confirm where the file it opened really is (BACKLOG #2507, #2535).
   It then moves and deletes the file through that handle with `SetFileInformationByHandle`, so the
-  act cannot be redirected after the check. POSIX needs no `ctypes` for this; it opens each path part
-  with `O_NOFOLLOW` and acts relative to the opened directory. The disaster-recovery backup's
+  act cannot be redirected after the check. POSIX needs no `ctypes` for this; it opens each path
+  part with `O_NOFOLLOW` and acts relative to the opened directory. The disaster-recovery backup's
   staging fail-safe, which empties the files a failed backup left in its staging directory, calls
   these same helpers on Windows rather than `ctypes` of its own. It holds each directory, opens each
   file as itself, and refuses a link or junction. It confirms that file lies under the staging
@@ -853,8 +852,10 @@ or compression library:
   connector's ceiling, `max_decompressed_bytes`, defaults to 64 MiB; setting it to `0` turns it off.
   A connection with `decompress=` set and that ceiling off logs one warning when it is built.
   Its gzip member cap, `max_decompressed_members`, defaults to 1024 and cannot be turned off.
-  A zip is refused whole for too many members, duplicate or overlapped members, or bytes before or
-  after the archive. Each member's name must be a safe relative path, and its bytes must match the
+  A zip is refused whole for at least too many members, duplicate or overlapped members, bytes
+  before or after the archive, or an entry compressed with any method but STORED or DEFLATED. The
+  ceiling holds as it goes only for those two methods, because stdlib `zipfile` does not bound one
+  read's output for the others (BACKLOG #5535). Each member's name must be a safe relative path, and its bytes must match the
   type its extension names. Members come back as bytes in memory; this module writes no file.
 - `parsing/dicom/_inflate.py` bounds a deflated DICOM object's inflate before `pydicom` reads it,
   because `pydicom` would otherwise inflate the whole stream with no limit.

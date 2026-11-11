@@ -98,7 +98,8 @@ def parse_bytes(data: bytes | str) -> Any:
     try:
         root = etree.fromstring(payload, parser=parser)
     except etree.XMLSyntaxError as exc:
-        # PHI-safe: lxml's message names a line/column + syntax category, not the element content.
+        # NOT content-free: lxml's message can quote element and entity names and the bytes at the
+        # fault, and the chain keeps lxml's error. Callers must not log it as body-free.
         raise XmlParseError(f"not well-formed XML: {exc}") from exc
     # Defense in depth: refuse any DOCTYPE so entity *definitions* can't ride along (references are
     # already not resolved). getroottree().docinfo exposes the parsed DOCTYPE, if any.

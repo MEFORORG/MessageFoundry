@@ -2547,8 +2547,10 @@ class SandboxSettings(_Section):
     zero overhead** — the isolation seam is invisible. ``mode="subprocess"`` runs each inbound's
     Router/Handler in a **persistent per-inbound worker child** (never a per-message fork), enforcing
     a forbidden-import guard (socket/store/crypto), the resource caps below, and a fail-closed refusal
-    of the live ``db_lookup``/``fhir_lookup`` bridges. An isolation denial routes the message to
-    ``ERROR``/dead-letter **post-ACK** (no NAK), never dropping it.
+    of the live ``db_lookup``/``fhir_lookup`` bridges. An isolation denial fails the message's call
+    **post-ACK** (no NAK), never dropping it, and the ``[delivery] internal_error`` policy handles
+    it: ``ERROR``/dead-letter under the default ``continue``; under ``stop`` the inbound's routing
+    or transform halts.
 
     **What turning it on costs, all of it measured in ADR 0087 (do not re-derive):**
 
@@ -2562,9 +2564,12 @@ class SandboxSettings(_Section):
       sandbox field, so ``mode="off"`` set for one Handler runs **every** Router and Handler in the
       process in-process, not just that one.
     * **``wall_seconds`` starts being enforced.** At ``mode="off"`` there is no timeout at all; at
-      ``mode="subprocess"`` or ``mode="isolated"`` the parent kills a worker that overruns and dead-letters that message
-      post-ACK. A busy-loop can no longer wedge intake, **and** a legitimately slow Handler that used
-      to finish now dead-letters. ``startup_seconds`` and the POSIX ``mem_mb`` arm with it.
+      ``mode="subprocess"`` or ``mode="isolated"`` the parent kills a worker that overruns and fails
+      that message's call post-ACK, for the ``[delivery] internal_error`` policy to handle
+      (``ERROR``/dead-letter under the default ``continue``; under ``stop`` the inbound's routing
+      or transform halts). A busy-loop can no longer wedge intake, **and** a legitimately slow
+      Handler that used to finish now fails. ``startup_seconds`` and the POSIX ``mem_mb`` arm with
+      it.
     * **Throughput** ~0.19 ms per dispatch with no reference view; a 20k-entry crosswalk ~4.5 ms
       marshalling and ~6.2 ms end-to-end, ~1.4x a pickle round-trip — inside the pipeline's existing
       per-interface bound. **One message is not one dispatch:** a message routed to one handler with
@@ -2592,8 +2597,10 @@ class SandboxSettings(_Section):
     # POSIX-only memory cap (MiB) inside the child (no-op on Windows). None disables it. On Linux it is
     # HEADROOM above the loaded graph: RLIMIT_DATA at the worker's VmData after load_config, plus this,
     # with MALLOC_ARENA_MAX=2 so thread arenas cannot keep spending it.
-    # Elsewhere on POSIX it is an absolute RLIMIT_AS cap. A call that hits it dead-letters and its
-    # worker is recycled (ADR 0087, amendment of 2026-10-11).
+    # Elsewhere on POSIX it is an absolute RLIMIT_AS cap. A call that hits it fails, for the
+    # [delivery] internal_error policy to handle (dead-letter under the default continue; under stop
+    # the inbound's routing or transform halts), and its worker is recycled (ADR 0087, amendment
+    # of 2026-10-11).
     mem_mb: int | None = Field(default=512, ge=1)
     # Bound (seconds) on the one-time child bootstrap (config load + guard install) before start fails.
     startup_seconds: float = Field(default=30.0, gt=0)
@@ -4723,8 +4730,10 @@ class AiSettings(_Section):
     allowed_endpoints: list[str] = []
     # Attest that revocation of the AI endpoint's server certificate is covered outside the engine
     # (BACKLOG #2193 slice (e), on the ADR 0173 section 12 pattern). The broker verifies that
-    # certificate and checks no CRL and no OCSP, so an off-box endpoint is REFUSED under
-    # [security].enforcement = enforce unless this is set; no CRL lever is built for this hop. What
+    # certificate and checks no OCSP, and no CRL unless [tls].crl_file is set, the [tls] section
+    # reaches the app serving POST /ai/chat, and the endpoint is not loopback (BACKLOG #5527;
+    # docs/SECURITY-LOOSENING.md states it in full). So without that CRL an
+    # off-box endpoint is REFUSED under [security].enforcement = enforce unless this is set. What
     # the refusal keys on is stated once, on transports.ai_broker._refuse_an_unrevoked_ai_hop.
     # Setting it adds no check on the wire. The reason is MANDATORY; at least a flag without one, a
     # blank one, a reason without the flag, or a control character in the reason refuses at load.
@@ -5232,6 +5241,40 @@ def _bare_domain_entries(
     return cleaned
 
 
+def pinned_host_port(entry: str) -> tuple[str, int] | None:
+    """``entry`` read as a loopback ``host:port``, or ``None`` when it is not one.
+
+    The one parse ``[egress].allowed_ech_sidecar`` is validated with at load and matched with at
+    the gate, which reads the sidecar it dials back through it, so the two cannot read a host or a
+    port differently (BACKLOG #5528). It splits at the LAST ``:``, so ``[::1]:8123`` reads as a
+    host and a port; ``transports.egress.host_port_allowed`` splits at the first. ``None`` for at
+    least: no port; a port that is not 1 to 65535 in at most five ASCII digits; a host holding a
+    ``:`` outside brackets, or none inside them; and a host the
+    sidecar resolver would refuse, because :func:`is_loopback_hop_host` does not read it as this
+    machine. An IP literal is returned in :mod:`ipaddress`'s compressed form, so ``::1`` and
+    ``0:0:0:0:0:0:0:1`` are one host; a name is returned lowercased."""
+    host, _, port = entry.strip().rpartition(":")
+    host = host.strip()
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+        if ":" not in host:
+            return None
+    elif ":" in host:
+        return None
+    # The length cap first: int() refuses a string of more than 4300 digits with its own error.
+    if not (port.isascii() and port.isdigit()) or len(port) > 5:
+        return None
+    number = int(port)
+    # A '%' is refused: urlsplit keeps an IPv6 zone ID still encoded, and urllib decodes it before
+    # it dials, so `[::1%31]` would compare as one host here and be dialled as `::11`.
+    if not host or "%" in host or not 1 <= number <= 65535 or not is_loopback_hop_host(host):
+        return None
+    try:
+        return ipaddress.ip_address(host).compressed, number
+    except ValueError:
+        return host.lower(), number
+
+
 class EgressSettings(_Section):
     """``[egress]`` — fail-closed outbound destination allowlist (WP-11c; ASVS 13.2.4/13.2.5/14.2.3).
 
@@ -5319,6 +5362,25 @@ class EgressSettings(_Section):
     # to combine it with proxy credentials, so that path mints no `Proxy-Authorization`.
     # Env (comma-separated): MEFOR_EGRESS_ALLOWED_PROXY.
     allowed_proxy: list[str] = []
+    # The ECH-SIDECAR address allowlist (BACKLOG #5528, ADR 0139). Each entry is "host:port", and
+    # the port is REQUIRED: an entry with none is refused at load rather than read as any port, as
+    # the `host[:port]` lists such as `allowed_http` read it. The host must be one the sidecar
+    # resolver reads as this machine, or the entry could never match. NOT a destination list: it
+    # gates the loopback sidecar an `ech_egress` REST connection sends every request to, body and
+    # credential headers included, and the token-endpoint POST too on a SMART or OAuth2
+    # connection. Loopback alone does not bound that hop: without this list a connection could
+    # name any port on this host, and whatever listened there would receive it. Its own list, not
+    # `allowed_http`, for the reason `allowed_proxy` is: the sidecar is an intermediary, not where
+    # PHI is meant to end up.
+    #
+    # DENY-BY-DEFAULT EVEN UNDER THE OPT-OUT, like `allowed_proxy` above: an `ech_egress`
+    # connection is refused at config load while this list is empty, whatever
+    # `[security].block_unlisted_outbound` says. An instance with no ECH connection is never refused
+    # for an empty list, though a malformed entry is refused at load either way.
+    # The gate is `_check_ech_sidecar_egress` in messagefoundry/transports/egress.py, and it
+    # parses each entry with `pinned_host_port`, defined above this class. Env (comma-separated):
+    # MEFOR_EGRESS_ALLOWED_ECH_SIDECAR.
+    allowed_ech_sidecar: list[str] = []
     # Allowed SYSLOG collectors for the off-box log forwarder (``[logging].forward_host`` and
     # ``forward_port``; BACKLOG #2356): each entry is "host" (any port) or "host:port". The forwarder
     # is not a connection, so no graph check sees it; ``serve`` and ``supervise`` check it at start,
@@ -5354,6 +5416,7 @@ class EgressSettings(_Section):
         "allowed_recipient_domains",
         "proxy_no_proxy",
         "allowed_proxy",
+        "allowed_ech_sidecar",
         "allowed_syslog",
         mode="before",
     )
@@ -5446,6 +5509,30 @@ class EgressSettings(_Section):
             "'hospital.example', not an address, URL, port, wildcard or suffix; list each "
             "subdomain as its own entry",
         )
+
+    @field_validator("allowed_ech_sidecar", mode="after")
+    @classmethod
+    def _ech_sidecar_entries_pin_a_port(cls, value: list[str]) -> list[str]:
+        """Refuse at load an entry :func:`pinned_host_port` cannot read, so one with no port is
+        never taken for any port (BACKLOG #5528). Whitespace is stripped and a blank entry skipped.
+        The refusal names the entry by position among the non-blank ones, not by text: an operator
+        who pasted the sidecar's URL, credential and all, would otherwise find it in the error. The
+        env form drops blank items before this runs, so the position skips blanks in both forms."""
+        cleaned: list[str] = []
+        for raw in value:
+            item = raw.strip()
+            if not item:
+                continue
+            if pinned_host_port(item) is None:
+                raise ValueError(
+                    f"[egress].allowed_ech_sidecar entry {len(cleaned) + 1} (counting non-blank "
+                    "entries) is not a loopback 'host:port'. "
+                    "Write the sidecar's loopback host and its port, such as '127.0.0.1:8123', "
+                    "'localhost:8123' or '[::1]:8123'; an entry with no port is refused rather "
+                    "than read as any port"
+                )
+            cleaned.append(item)
+        return cleaned
 
 
 #: How an operator-facing refusal says ``EgressSettings.deny_by_default`` is on (BACKLOG #1361).
@@ -10109,6 +10196,7 @@ def security_loosenings(
     remote_debug: RemoteDebugPosture | None,
     startup: StartupPosture | None,
     service_env: ServiceEnvPosture | None,
+    listener_trusted_proxy_hops: Sequence[str] = (),
 ) -> list[tuple[str, str]]:
     """The ``[security]`` switches at their INSECURE value, plus the enumerated deviations outside that
     section, as ``(switch, plain-language risk)``.
@@ -10276,7 +10364,10 @@ def security_loosenings(
     ``path_form_fhir_hops`` is an outbound ``FHIR()`` connection that sets
     ``update_url_form="path"``, or may through an ``env()`` value (vault BACKLOG #2571), and
     ``ech_cleartext_sidecar_hops`` is a ``REST`` outbound whose ECH sidecar is an ``http://`` URL
-    (ADR 0139). They arrive as plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
+    (ADR 0139), and ``listener_trusted_proxy_hops`` is an inbound ``Http()`` listener with a
+    non-empty ``trusted_proxies`` (BACKLOG #5525), read by ``listener_trusted_proxy_hops``, which
+    walks the ``HTTP`` inbounds. That one alone has a default, empty, so the callers that have no
+    graph need not name it; every caller with a graph passes it. They arrive as plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
     caller resolves them through the shared readers in ``config.wiring``
     (``accepted_cleartext_hops``, which walks both outbound connections and ``FhirLookup`` read
     connections; ``expiry_relaxed_hops``, which walks outbound and the inbound REMOTEFILE pollers;
@@ -10734,17 +10825,28 @@ def security_loosenings(
     # BACKLOG #2193 slice (e), on the ADR 0173 section 12 pattern: the AI endpoint's revocation
     # attestation. Named whenever the flag is set, whatever [ai].mode is, so the text claims no hop
     # is dialled. The reason is in the entry for the same reason as the Vault pairs above.
+    # BACKLOG #5527: the CRL clause states the three conditions a CRL check needs, and names the
+    # paths that check none, and stays static. Whether the [tls] section reached the app is a fact
+    # of the app (app.state.tls_settings, which create_managed_app stashes from its tls_settings
+    # argument, None unless passed, and an embedder of a direct create_app may set), not of these
+    # arguments. Loopback could be read off ai.endpoint, but the
+    # app half would still be static, so both stay named.
     if ai.endpoint_revocation_attested:
         out.append(
             (
                 "ai.endpoint_revocation_attested",
                 "revocation of the [ai].endpoint server certificate is attested as covered outside "
                 f"the engine (reason: {ai.endpoint_revocation_attested_reason}) -- the AI broker "
-                "verifies that certificate but its own handshake checks no CRL and no OCSP, and the "
-                "attestation adds no check. Wherever the revocation refusal would apply to that hop "
-                "it is lifted, so a revoked certificate is caught only if what the reason names "
-                "really covers it. No CRL lever is built for this hop. It never lifts a cleartext "
-                "refusal",
+                "verifies that certificate but its own handshake checks no OCSP, and checks no CRL "
+                "unless all three hold: [tls].crl_file is set, the [tls] section reaches the app "
+                "serving POST /ai/chat (`messagefoundry serve` hands it; a direct create_app holds "
+                "none unless the embedder sets it), and the endpoint is not loopback. So at least "
+                "a loopback endpoint, and an app the [tls] section never reached, check no CRL "
+                "whatever [tls].crl_file says. The "
+                "attestation adds no check. Where no CRL is checked, the revocation refusal is "
+                "lifted wherever it would apply to that hop, so a revoked certificate is caught "
+                "there only if what the reason "
+                "names really covers it. It never lifts a cleartext refusal",
             )
         )
     # --- the [alerts] SMTP hop (#323 layer 3). Two SEPARATE entries, deliberately: the deviation and the
@@ -10963,6 +11065,25 @@ def security_loosenings(
                 "sidecar listener encrypts the hop. A name marked possibly has an env() value this "
                 "reading could not resolve, and the above holds of it only if it resolves to an "
                 "http:// sidecar with ech_egress on",
+            )
+        )
+    # BACKLOG #5525, owner ruling 2026-11-10: an HTTP listener that keys its failed-attempt budget
+    # on the client a listed proxy forwards. Reported for any non-empty list, as [api] ranges are
+    # for theirs: each listed proxy may key the budget on any address it writes.
+    if listener_trusted_proxy_hops:
+        named = ", ".join(sorted(listener_trusted_proxy_hops))
+        out.append(
+            (
+                "listener_trusted_proxies",
+                f"{len(listener_trusted_proxy_hops)} HTTP listener(s) key the failed-attempt budget "
+                f"on the client address a listed proxy writes in X-Forwarded-For ({named}) -- "
+                "each listed proxy, and every host inside a listed range, may write any address "
+                "there and so hold a fresh per-peer budget per address (for most IPv6, per /64). Guessing "
+                "through it is then bounded by the global budget, plus the per-peer budget of each "
+                "address it writes that authenticated recently, which the global budget exempts; "
+                "writing a partner's address also spends that partner's budget. A name marked "
+                "range lists a "
+                "range; a name marked possibly has an env() value this reading could not resolve",
             )
         )
     # --- the STORE PRINCIPAL's observed privilege posture (#1008, ASVS 13.2.2). An OBSERVATION, like
