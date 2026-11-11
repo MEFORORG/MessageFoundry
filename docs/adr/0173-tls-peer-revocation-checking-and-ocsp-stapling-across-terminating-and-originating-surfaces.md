@@ -1224,7 +1224,8 @@ of the list above:
 | Vault Transit cipher: `store/crypto_transit.py`, which calls the key provider's `_build_client` | the Vault token, and message bodies sent to Vault to encrypt and decrypt | The key provider's row applies: it is the same client build (*code*) | None, as the key provider's row | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits. Its `https://` proxy leg is guarded too, since 2026-10-26 (vault BACKLOG #3561) |
 | Vault secret provider: `config/secretprovider_vault.py`, its own `_build_client`. `secrets_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, connector credentials back | The same shape as the key provider, proxy leg included, with `MEFOR_SECRETS_VAULT_CA_FILE` as its anchor (*code*) | None, as the key provider's row | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits. Its `https://` proxy leg is guarded too, since 2026-10-26 (vault BACKLOG #3561) |
 
-**The ODBC hops are a named gap by owner ruling, and the driver test is still owed.** BACKLOG #2194
+**The ODBC hops are a named gap by owner ruling, and the driver test has run on one machine.**
+*(Until 2026-11-11 this lead-in ended "and the driver test is still owed.")* BACKLOG #2194
 names three outcomes for a hop: a guard, a documented driver control, or an accepted gap. The owner
 ruled on 2026-10-05, in an AskUserQuestion answer to the batch 191 Manager. The record is R6 of the
 vault's `docs/security/ASVS-OWNER-RULINGS-2026-10-05.md`. The answer, verbatim, is
@@ -1240,10 +1241,9 @@ ruling:
 - **The ruling rests on Microsoft's driver.** The question cited Microsoft's driver documentation,
   and the test names ODBC Driver 18 only. Another driver can serve these hops, as the second
   bullet of the 2026-10-04 reading below says. No owner answer and no planned test covers one.
-- **The drivers' own revocation behaviour is measured for one driver build on one operating
-  system only.** The ruling's "then test it" half has run for ODBC Driver 18 on Windows, with a
-  control certificate that is not revoked. The amendment of 2026-11-11 below holds what was
-  measured and its limits. No other driver and no other operating system was measured. *(Until
+- **The drivers' own revocation behaviour is measured only in part.** The ruling's "then test it"
+  half has run once, with a control certificate that is not revoked. The amendment of 2026-11-11
+  below states what was measured and the limits of that measurement. *(Until
   2026-11-11 this bullet read: "**The drivers' own revocation behaviour is still unmeasured.** The
   ruling's "then test it" half is owed. It needs a SQL Server whose certificate can be revoked. A
   control connection to a certificate that is not revoked shows that a refusal comes from the
@@ -1291,40 +1291,54 @@ public summary of two private test records in the vault, one per run of the vaul
 revocation runbook. Their contents beyond this summary are not repeated here. It changes no grade
 and no code.
 
-- **Where it ran.** Two runs, on 2026-10-16 and 2026-10-17, on one disposable virtual machine
-  built for the test, not on a SQL Server test box. The client ran on the same machine as SQL
-  Server.
+- **Where it ran.** Two runs, on 2026-10-16 and 2026-10-17. The first run's record says it ran on
+  a disposable virtual machine built for the test, not on the SQL Server test box. The second run's
+  record says it started from a checkpoint of that machine dated 2026-10-16. The runbook names the SQL Server
+  test box for its next run, and no run there is recorded. In both runs the client ran on the
+  same machine as SQL Server, so no off-box hop was exercised.
 - **Versions.** ODBC Driver 18 for SQL Server, 64-bit, the 18.7 build, which reported itself as
   `18.07.0001`. Windows Server 2022 Datacenter, build 20348. SQL Server 2022 RTM,
-  16.0.1000.6. pyodbc 5.3.0, the only part of the engine's Python environment the test used.
+  16.0.1000.6. The engine's Python environment supplied only pyodbc 5.3.0. The records do not
+  give the interpreter's version.
 - **How the revocation was published.** A throwaway test root, with no intermediate CA, issued two
-  server certificates. It revoked one, and served a signed CRL listing it over HTTP. The other
-  was the control. SQL Server ran on each in turn. Before the legs, Windows' own chain check
-  reported the revoked certificate as revoked, fetching the list to do so, and passed the
-  control. No OCSP responder was offered.
-- **Which shapes were tried.** Connection strings carried by the runbook, copied from the engine's
-  code: the store and the DATABASE SQL Server preset (one string), `db_lookup`, the generic
-  dialect naming Driver 18, and the store with a matching `ServerCertificate` pin under
-  `Encrypt=yes`. Each ran on both certificates with the CRL cache cleared, and again with the list
-  already cached. The second run added the pinned string with `Encrypt=strict` in place of
-  `Encrypt=yes`, which the runbook's strings did not carry, on a cleared cache only.
-- **What the driver did.** Every leg of the four runbook shapes connected, on the revoked
-  certificate as on the control, with the cache cleared and with the list cached. The list's
-  server logged no request during any leg. Read by the runbook's own table, the driver did not use
-  this list for those shapes, fetched or cached. The strict pinned leg on the revoked certificate
-  also connected, with no list request.
+  server certificates and revoked one. An HTTP listener on the same machine served a signed CRL
+  listing it. The other certificate was the control. SQL Server ran on each in turn. Before the
+  legs, Windows' own chain check reported the revoked certificate as revoked, fetching the list
+  to do so, and passed the control. No OCSP responder was offered.
+- **Which shapes were tried.** At least these, as connection strings the runbook carries, copied
+  from the engine's code before the amendment of 2026-10-17 below:
+  - the store and the DATABASE SQL Server preset, one string, which the runbook says the
+    reference-sync source also builds with default settings;
+  - `db_lookup`;
+  - the generic dialect naming Driver 18;
+  - the store with a matching `ServerCertificate` pin under `Encrypt=yes`;
+  - the store with the other certificate pinned under `Encrypt=yes`.
+
+  The first four ran on both certificates, with the CRL cache cleared and again with the list
+  cached; the fifth ran with the cache cleared only. The second run added the two pinned strings
+  with `Encrypt=strict` in place of `Encrypt=yes`, with the cache cleared only. Since that
+  amendment, the store's pinned string carries `Encrypt=strict` (`odbc_connection_string`,
+  `messagefoundry/odbc_dsn.py`, *code*). So the pinned shape the store sends today is the
+  second run's strict string with a matching pin, which ran once on each certificate, with the
+  cache cleared.
+- **What the driver did.** Every leg of the five `Encrypt=yes` strings connected, on the revoked
+  certificate as on the control. The list's listener logged no request during any leg of either
+  run. Read by the runbook's own table, for the first four strings the driver did not use this
+  list, fetched or cached. The strict string with a matching pin connected on both certificates.
   No strict leg ran without a pin or with the list cached, so this does not show that the pin is
-  the reason.
+  the reason no list was fetched. The strict string with the other certificate pinned was
+  refused on both certificates. That refusal, like the fifth string's connections, is the pin's
+  result, which the amendment of 2026-10-17 below records.
 - **The limits.** At least these. Only that driver build, and only Windows Server 2022. Linux,
   macOS, other Driver 18 builds, and other drivers, which the generic dialect and the
   `odbc_driver` setting can name, were not measured. Only a CRL over HTTP: OCSP was not offered,
-  so this does not show that the driver never checks revocation. The strings were the runbook's,
-  so the result says nothing directly about how the engine builds or sends its own strings. One
-  machine, one throwaway root.
+  so this does not show that the driver never checks revocation. Only a same-machine connection.
+  The strings were the runbook's, so the result says nothing directly about how the engine builds
+  or sends its own strings. One machine, one throwaway root.
 
-The same runs' pin legs are the record behind the amendment of 2026-10-17 below, and are not
-repeated here. **What the result means for the five rows' grade is not decided here.** The limits
-bullet above says it is not ruled, and the owner has not ruled on it.
+**What the result means for the five rows' grade is not decided here.** The fourth limit under
+the ruling, above, *What a result would mean for the grade is not ruled*, says why, and the owner
+has not ruled on it.
 
 **What is open on the three Vault hops.** *(Built on 2026-10-13, under vault BACKLOG #2983;
 §12 is the record. This paragraph and its two facts are kept as written. Fact 1 no longer holds:
@@ -1409,9 +1423,8 @@ DIRECT; §11 lists the edit.)* Add these rows to it:
   read "Five more rows wait on an owner answer, beside DIRECT.")*
 - Three more hops could take a guard, beside the seven BACKLOG #2193 tracks. *(Since 2026-10-13
   those three, the Vault hops, are guarded by attestation; §12.)*
-- Whether the ODBC drivers check revocation is still not established in general. BACKLOG #3009's
-  test measured one driver build on one operating system; the amendment of 2026-11-11 above holds
-  what it found and its limits. *(Until 2026-11-11 this read: "The ODBC drivers' own revocation
+- Whether the ODBC drivers check revocation is still not established in general. The amendment of
+  2026-11-11 above states what BACKLOG #3009's test measured, and its limits. *(Until 2026-11-11 this read: "The ODBC drivers' own revocation
   behaviour is still not established. BACKLOG #3009 is the test.")*
 
 The heading in section 7, "SOME HOPS ARE STILL UNGRADED", now holds only in this sense: **read the
