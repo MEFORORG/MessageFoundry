@@ -378,6 +378,17 @@ which a database writer chooses, so it is scrubbed of control characters and bou
 `main`'s one rule for shortening an alert subject (`shorten_with_checksum`) before it reaches a
 subject, a reason or an exception. No other field of a row ever does.
 
+A correction, added 2026-11-11: "bounded with `main`'s one rule for shortening an alert subject
+(`shorten_with_checksum`) before it reaches a subject, a reason or an exception" does not hold for
+the reasons of at least two reporters this build adds, `AuthService._user_seal_unverifiable` in
+`auth/service.py` and `ApprovalGate._approval_seal_unverifiable` in `api/approvals.py`. Each embeds
+the stored id through `scrub_log_argument`, which escapes control characters and bounds nothing,
+so its reason, and the WARNING line that logs that reason, carries the id at whatever length a
+database writer stored it. Their page subjects are bounded: `SealPager.unverifiable` builds each
+through `unverifiable_subject`, and so through `seal_row_ref`. Both reasons are open on vault
+BACKLOG #8202. The claim holds for at least the revoke report: `_RevokeCarry._entry` in
+`store/store.py` names a row in its reason by `seal_row_ref`.
+
 **A ref is for reading, never a key.** A 12-character prefix and a shortened id both collide, and a
 database writer who can read a genuine row can plant one that shares its ref. So every throttle and
 the unverifiable-row cap are keyed by the SHA-256 of the kind and the **whole** stored id, held in
@@ -419,6 +430,22 @@ call per refused check stays (see item 3).
   503 that ends nothing and records nothing" does not hold on at least the approve claim and
   `_decide_or_503`, gaps (2) and (6) of *Open audit gaps, a correction added 2026-11-11*, and its
   extension, in (c).
+- **A correction, added 2026-11-11:** "the audit row and the page carry `stored_version` [...] and
+  `probe_version`" and "The recovery text tells the operator, in this order" do not hold for the
+  pages of at least two reporters this build adds. `AuthService._user_seal_unverifiable` in
+  `auth/service.py`, which an admin user read reaches through `_checked_by_id`, and
+  `ApprovalGate._approval_seal_unverifiable` in `api/approvals.py` each write both integers into
+  their `integrity.authority_seal_unverifiable` audit detail, but their page reason, which is also
+  their WARNING line, carries neither. Neither reason states the recovery order. The user
+  reporter's gives only its middle step, to check that Vault is healthy and that every node holds
+  the audit key's latest version and then retry. It does not say the seal may be planted, or that a
+  row that still does not verify is re-created from an authoritative source. The approval
+  reporter's gives none of the order. (c) item 4's "gives the recovery text from (a)" does not hold
+  for these two pages either. Both are open on vault BACKLOG #8202. The revoke report's
+  Unverifiable page, built by `_RevokeCarry._entry` in `store/store.py`, carries neither integer
+  and no recovery order either; it is named here for filing on vault BACKLOG #8202. The claim holds
+  for at least `AuthService._report_unverifiable_reconcile_map`, whose page and WARNING carry both
+  integers and the recovery order.
 - **Failure accepted:** a genuine seal checked against a node that lags a key rotation is denied
   for the length of the lag: a session so checked is ended, and its user signs in again (on a node
   that has caught up); a write so refused is retried by its caller; an approval is denied, never
@@ -755,12 +782,20 @@ it supersedes, and only where it disagrees; the earlier text is kept as it was.
   (`integrity.authority_seal_failed`, `key_changed=False`).
 - **What that ruling leaves unbuilt, filed under vault #8202.** At least: step 2 (the groups-moved
   set and its sealed group digest); the Forged map's change from `main`; the sealed empty map; a
-  failing user row's probing for revocation, and an Unverifiable user row read by `_load_user` or
-  `_load_users`, which still raises out of the pass; the Vault-wide `seal_unavailable` abort and its
+  failing user row's probing for revocation, and an Unverifiable user row read by `_load_user`,
+  which still raises out of the pass; the Vault-wide `seal_unavailable` abort and its
   `seal_clear`; and a pass where a map did not hold still confirming accounts. An Outage on a map row
   takes step 1 here, where (b) gives it step 2 alone. (b) says a single timed-out call must not sign
   out every role holder, and below the brake's thresholds this build lets one do that. With no
   step 2 built, the only alternative was the old behaviour, which revoked nothing.
+  **A correction, added 2026-11-11:** this bullet read "an Unverifiable user row read by
+  `_load_user` or `_load_users`, which still raises out of the pass". Since 67c274348b,
+  `_load_users` reads every account through `list_checked_users`, whose `_checked_by_id` reports an
+  Unverifiable row with `_user_seal_unverifiable` and lists it as failed, and `_load_users` drops
+  it. The pass then goes on without that account: it neither probes it nor revokes its sessions on
+  that pass. A Vault transit Outage on any account's row still raises out of `_load_users`, and so
+  out of the pass. `_load_user`, the pass's re-read of each account its probe found present, still
+  raises on an Unverifiable row.
 - **The held `refused()` log.** `RevokeSealOutcome.refused` no longer logs at refusal time, inside
   the writer transaction. Its line is held and written once the outcome is known, with the
   committed or the failed wording, as the skipped-raise count is, which is logged after a commit
@@ -977,7 +1012,16 @@ session, approval, on SQLite, PostgreSQL and SQL Server):
   `AuthService._verified`, at least local sign-in and the bearer identity, can let a Transit
   refusal escape as a 500 with no row. (7) `provision-admin` reaches gap (1) through
   `grant_first_admin_unless_admin_exists`, where it is the CLI's top-level defect report rather
-  than a 500, with no audit row and no page. Beneath all of these, (c) item 2's catch census test,
+  than a 500. **A correction, added 2026-11-11:** (7) read "rather than a 500, with no audit row
+  and no page". Since 67c274348b the command's first account read, `_administrator_standing` in
+  `provision_first_administrator`, goes through `_load_users`, which reports an Unverifiable
+  account with `_user_seal_unverifiable`: a WARNING and a soft `integrity.authority_seal_unverifiable`
+  row. Its page reaches no sink on this path, since the command arms no `SealPager`. The account is
+  then dropped, so an Unverifiable Administrator is not counted, the self-sufficient-Administrator
+  refusal can pass, and the command creates or takes over the named local account and writes its
+  password, any TOTP enrolment and its notice address before its grant reaches gap (1). The
+  defect report then leaves that local account roleless. A Vault transit Outage on that first read raises before any write, with no audit row,
+  and its page reaches no sink either. Beneath all of these, (c) item 2's catch census test,
   (c) item 3's API backstop for both refusal types, and *The four answers*' "The API answers an
   Outage with HTTP 503 and `Retry-After`" are not yet built on every path: a refusal no caller maps
   reaches the engine's generic handler as a 500. The sign-in audit actions this ADR names,
