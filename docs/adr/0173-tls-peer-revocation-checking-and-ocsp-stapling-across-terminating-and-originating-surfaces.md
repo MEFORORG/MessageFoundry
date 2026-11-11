@@ -1242,12 +1242,11 @@ ruling:
 - **The ruling rests on Microsoft's driver.** The question cited Microsoft's driver documentation,
   and the test names ODBC Driver 18 only. Another driver can serve these hops, as the second
   bullet of the 2026-10-04 reading below says. No owner answer and no planned test covers one.
-- **Driver 18 was tested on one build on Windows, and other drivers were not tested.** The
-  ruling's "then test it" half has two recorded results. The test needs a SQL Server whose
-  certificate can be revoked. A control connection to a certificate that is not revoked shows
-  that a refusal comes from the revocation. The amendment of 2026-11-11 below states what the
-  runs measured. *(Until
-  2026-11-11 this bullet read: "**The drivers' own revocation behaviour is still unmeasured.** The
+- **Driver 18 was tested on one build on Windows Server 2022, and other drivers were not
+  tested.** The ruling's "then test it" half has two recorded results. The test needs a SQL
+  Server whose certificate can be revoked. A control connection to a certificate that is not
+  revoked shows that a refusal comes from the revocation. The amendment of 2026-11-11 below
+  states what the runs measured. *(Until 2026-11-11 this bullet read: "**The drivers' own revocation behaviour is still unmeasured.** The
   ruling's "then test it" half is owed. It needs a SQL Server whose certificate can be revoked. A
   control connection to a certificate that is not revoked shows that a refusal comes from the
   revocation. Until #3009 runs, nothing here says whether Driver 18 checks revocation.")*
@@ -1296,25 +1295,26 @@ ODBC revocation runbook that reached a result. Their contents beyond this summar
 here. It changes no code. For the grade, the limit *What a result would mean for the grade is not
 ruled*, under the ruling above, holds.
 
-- **Where it ran.** Two runs with results, dated 2026-10-16 and 2026-10-17 in Central time. In UTC, the
-  first run's legs ran from 02:22 to 02:25 and the second's from 05:18 to 05:19, both on
+- **Where it ran.** Two runs with results, dated 2026-10-16 and 2026-10-17 in Central time. In
+  UTC, the first run's legs ran from 02:22 to 02:25 and the second's from 05:18 to 05:19, both on
   2026-10-17. The first run's record says it ran on a disposable virtual machine built for the
   test, not on the SQL Server test box, and that the runbook puts the next run there. The second
   run's record says it ran inside a virtual machine, after a revert to checkpoint
   `post-3009-clean-2026-10-16`, a tightening of folder permissions and a new checkpoint,
-  `post-3009-acl-2026-10-17`. An earlier scripted run stopped at Step 2, as designed, and changed
-  nothing. No run on the SQL Server test box is recorded.
-- **Versions.** ODBC Driver 18 for SQL Server, 64-bit: `msodbcsql18.dll` ProductVersion 18.7
-  build 1.1, reporting driver version `18.07.0001`. Windows Server 2022 Datacenter, build 20348,
-  update revision 5256. SQL Server 2022 RTM, 16.0.1000.6. messagefoundry 0.3.2. The engine's
-  Python environment supplied only pyodbc 5.3.0. The records do not give the interpreter's version.
+  `post-3009-acl-2026-10-17`, and does not say which machine that is. An earlier scripted run
+  stopped at Step 2, as designed, and changed nothing.
+- **Versions.** ODBC Driver 18 for SQL Server, 64-bit: `msodbcsql18.dll` ProductVersion 18.7,
+  build 1, revision 1, reporting driver version `18.07.0001`. Windows Server 2022 Datacenter,
+  build 20348, update revision 5256. SQL Server 2022 RTM, 16.0.1000.6. messagefoundry 0.3.2. The
+  engine's Python environment supplied only pyodbc 5.3.0.
 - **How the revocation was published.** In each run, a throwaway test root issued two server
   certificates and revoked one. An HTTP listener on the same machine served a signed CRL listing
   it. The other certificate was the control. SQL Server ran on each in turn. Before the legs,
   Windows' own chain check reported the revoked certificate as revoked, fetching the list to do
   so, and passed the control.
-- **Which shapes were tried.** At least these, as connection strings the runbook carries, copied
-  from engine commit `c818a16d5b`, before the amendment of 2026-10-17 below:
+- **Which shapes were tried.** At least these, as connection strings the runbook carries. The
+  first record says they were copied from engine commit `c818a16d5b`, which predates the
+  amendment of 2026-10-17 below:
   - the store and the DATABASE SQL Server preset, one string;
   - `db_lookup`;
   - the generic dialect naming Driver 18;
@@ -1324,19 +1324,18 @@ ruled*, under the ruling above, holds.
   The first four ran on both certificates, with the CRL cache cleared and again with the list
   cached; the fifth ran with the cache cleared only. The second run's script added two strings of
   its own, the two pinned strings with `Encrypt=strict` in place of `Encrypt=yes`, run with the
-  cache cleared only. No leg ran any engine builder or pool. The store has not sent the two
-  `Encrypt=yes` pinned strings since that amendment (`odbc_connection_string`,
-  `messagefoundry/odbc_dsn.py`, *code*), and neither record compares its current string with a
-  tested one.
+  cache cleared only. The store has not sent the two `Encrypt=yes` pinned strings since that
+  amendment (`odbc_connection_string`, `messagefoundry/odbc_dsn.py`, *code*), and neither record
+  compares its current string with a tested one.
 - **What the driver did.** Every leg of the five `Encrypt=yes` strings connected, on the revoked
   certificate as on the control. The list's listener logged no request during any leg of either
   run. Read by the runbook's own table, for the first four strings the driver did not use this
   list, fetched or cached. The strict string with a matching pin connected on both certificates.
   No strict leg ran without a pin or with the list cached, so this does not show that the pin is
   the reason no list was fetched. The strict string with the other certificate pinned was
-  refused on both certificates, with an error that names certificate usage, not the pin. What the pin legs mean for the pin is the amendment of 2026-10-17 below. For the
-  strict legs that reading is the second record's own, because the runbook's table has no row
-  for them.
+  refused on both certificates, with an error that names certificate usage, not the pin. What
+  the pin legs mean for the pin is the amendment of 2026-10-17 below. For the strict legs that
+  reading is the second record's own, because the runbook's table has no row for them.
 - **The limits.** At least these.
   - Only that driver build, only Windows Server 2022, and only SQL Server 2022 RTM. Linux, macOS,
     other Driver 18 builds, and other drivers, which the generic dialect and the `odbc_driver`
@@ -1346,9 +1345,9 @@ ruled*, under the ruling above, holds.
   - Only a same-machine connection: the client ran on the machine SQL Server ran on, so no
     off-box hop was exercised. The server's name resolved to an IPv6 address of that machine,
     link-local in the first record, so both records say the legs probably connected over IPv6.
-  - Only strings written out in the runbook and the script, so the result says nothing about how
-    the engine builds or sends its own strings.
-  - Only a single-level chain from a throwaway root, with no intermediate CA.
+  - Only strings written out in the runbook and the script. No leg ran any engine builder or
+    pool, so the result says nothing about how the engine builds or sends its own strings.
+  - Only a throwaway root, with no intermediate CA.
 
 *(End of the amendment of 2026-11-11. The next paragraph continues the 2026-10-04 note.)*
 
@@ -1544,7 +1543,7 @@ ruling's limits and what the test must show. Other places name the ruling and po
 BACKLOG #3009 has a result, it goes in that paragraph. *(Note 2026-11-11: the result is in §7.1's
 amendment of that date, after the 2026-10-04 reading that follows that paragraph. What the test
 must show is still stated in that paragraph's limit *Driver 18 was tested on one build on
-Windows, and other drivers were not tested*.)*
+Windows Server 2022, and other drivers were not tested*.)*
 
 **What this amendment does not do.** It builds no guard, changes no code and measures nothing.
 
