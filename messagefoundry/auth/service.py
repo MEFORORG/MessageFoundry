@@ -273,7 +273,7 @@ def _is_held_write_error(exc: BaseException) -> bool:
 _ROLE_WRITE_REFUSED_UNWRITTEN: Final = (UnknownRoleError, RowSealError)
 
 #: The note :func:`_mark_unwritten` adds to an error raised before a role write could commit.
-_UNWRITTEN_NOTE: Final = "nothing was written: no role changed, so nobody is told or paged"
+_UNWRITTEN_NOTE: Final = "nothing was written: no role changed, so nobody is told of a change"
 
 #: The attribute :func:`_mark_unwritten` keeps the error that wrote nothing under, when the error
 #: raised is a held one it was named on.
@@ -7800,8 +7800,9 @@ class AuthService:
             # error, a row refused twice, which pages, and an error from the retry fail the
             # sign-in only once the revoke has been tried, the user is told and an Administrator
             # grant has paged: the change may have committed, so this fails closed. A write marked
-            # unwritten (``_mark_unwritten``) changed nothing, so it tells and pages nobody, but
-            # the other sessions still end before it raises: the directory's roles may remove one.
+            # unwritten (``_mark_unwritten``) changed nothing, so nobody is told of a change or
+            # paged for a grant, but the other sessions still end before it raises: the
+            # directory's roles may remove one.
             try:
                 synced = await self._write_with_row(
                     write,
@@ -7813,13 +7814,11 @@ class AuthService:
                 )
             except Exception as exc:  # noqa: BLE001 -- raised below; see the comment above
                 if _wrote_nothing(exc):
+                    # Not ``_revoke_after_commit``: no change committed, so its miss row, which
+                    # records a committed change, would be false. A refused revoke is named on
+                    # the error raised, and so is a failed report, so neither replaces it.
                     try:
-                        await self._revoke_after_commit(
-                            user.id,
-                            change="ad_roles_resync_refused",
-                            actor=user.username,
-                            client=client,
-                        )
+                        await self._store.revoke_user_sessions(user.id, audit=no_audit_row)
                     except Exception as revoke_exc:  # noqa: BLE001 -- named on the error raised
                         _log.error(
                             "auth: the session revoke after %s's unwritten role write raised %s",
@@ -7828,12 +7827,21 @@ class AuthService:
                             exc_info=revoke_exc,
                         )
                         _hold(exc, revoke_exc)
-                    await self._report_unwritten_role_write(
-                        exc,
-                        user_id=user.id,
-                        username=user.username,
-                        where="auth: the directory sign-in's role sync",
-                    )
+                    try:
+                        await self._report_unwritten_role_write(
+                            exc,
+                            user_id=user.id,
+                            username=user.username,
+                            where="auth: the directory sign-in's role sync",
+                        )
+                    except Exception as report_exc:  # noqa: BLE001 -- named on the error raised
+                        _log.error(
+                            "auth: reporting %s's unwritten role write raised %s",
+                            scrub_log_argument(user.username),
+                            type(report_exc).__name__,
+                            exc_info=report_exc,
+                        )
+                        _hold(exc, report_exc)
                     raise
                 _log.error(
                     "auth: the directory sign-in's role write for %s raised %s after its retry; "
@@ -10886,11 +10894,11 @@ class AuthService:
         (BACKLOG #2221). The roles stand as stored; each caller ends the account's sessions."""
         cause = _unwritten_cause(exc)
         _log.error(
-            "%s: the role write for %s wrote nothing (%s); the roles stand as stored",
+            "%s: the role write for %s wrote nothing (%s, logged where it was raised); the roles "
+            "stand as stored",
             where,
             scrub_log_argument(username),
             type(cause).__name__,
-            exc_info=exc,
         )
         if isinstance(cause, RowSealError):
             await self._user_seal_failed(user_id)
@@ -11077,7 +11085,7 @@ class AuthService:
 
         Returns ``"skipped"`` when it applied nothing, ``"reported"`` when it applied and must
         alert, and ``"quiet"`` when it applied but must not alert. A quiet revocation ended no
-        session and changed no role, and either has a reason outside
+        session, changed no role and had no role write that wrote nothing, and either has a reason outside
         :data:`_ALWAYS_REPORTED_REASONS` or is a verified repeat, below (BACKLOG #3085, owner
         rulings 2026-10-16 and 2026-10-17, B258-R7). It still writes its
         ``auth.ad_session_revoked`` row, with ``sessions: 0`` ("audit always"), and sends no
@@ -11102,9 +11110,11 @@ class AuthService:
         counts the change too (:meth:`_write_reconciled_roles`), and so does any error raised out
         of that write, which may have committed: it is raised once the revoke has been tried and
         the user told, so it fails closed. Except an error marked unwritten
-        (:func:`_mark_unwritten`), which changed nothing: it is logged, the sessions still end,
-        nothing is told or paged for the roles, the revocation reports, and it is not raised, so
-        the pass goes on to its later accounts. A write whose
+        (:func:`_mark_unwritten`), which changed nothing: the sessions still end, with a revoke row
+        naming no roles, it is then logged, nothing is told or paged for the roles, the revocation
+        reports, and it is not raised, so the pass goes on to its later accounts. A held first
+        error raised in its place, other than one of :data:`_ROLE_WRITE_REFUSED_UNWRITTEN`, is
+        raised once the revoke has run, as any held error is. A write whose
         roles another writer moved to a different set after this call's read writes nothing. **Not
         closed, at least:** a sign-in that wrote between the pass's plan and this call's read, since
         the plan's roles are not carried to compare on; and a newer write of the same set this call
@@ -11134,7 +11144,7 @@ class AuthService:
         # #3085): only the first of them writes and counts a change, and a write that finds the
         # roles moved since this read writes nothing and counts none.
         roles_changed = False
-        unwritten = False
+        unwritten: Exception | None = None
         pending: Exception | None = None
         if (
             revocation.role_ids is not None
@@ -11153,16 +11163,17 @@ class AuthService:
             except Exception as exc:  # noqa: BLE001 -- held and raised below; see the comment
                 # The retry or its read-back raised, and the role change may have committed. Fail
                 # closed: count it as changed, so the revoke is still tried and the user told,
-                # then raise it. An error marked unwritten changed nothing: logged, not counted,
-                # not raised, and the revoke below still ends the sessions.
+                # then raise it. An error marked unwritten changed nothing: not counted, and the
+                # revoke below still ends the sessions, then it is reported. It is not raised, so
+                # the pass goes on, unless the first try's held error, such as a defect, was raised
+                # in its place: that one is raised once the revoke has run, as any held error is.
+                # A first try refused the same way as the retry is no defect.
                 if _wrote_nothing(exc):
-                    await self._report_unwritten_role_write(
-                        exc,
-                        user_id=revocation.user_id,
-                        username=revocation.username,
-                        where="directory reconcile",
-                    )
-                    unwritten = True
+                    unwritten = exc
+                    if _unwritten_cause(exc) is not exc and not isinstance(
+                        exc, _ROLE_WRITE_REFUSED_UNWRITTEN
+                    ):
+                        pending = exc
                 else:
                     _log.error(
                         "directory reconcile: the role write for %s raised %s after its retry; it "
@@ -11175,10 +11186,7 @@ class AuthService:
                     roles_changed, pending = True, exc
             else:
                 roles_changed, pending = roles.result, roles.held
-            if unwritten:
-                # Logged above. The roles stand as stored, so there is no loss or grant to report.
-                pass
-            elif not roles_changed:
+            if not roles_changed and unwritten is None:
                 # The roles moved after the read above, or the row went. The writer that moved
                 # them, a second reconciler or a directory sign-in, owns that change and its report;
                 # a stale plan must not write over a newer write either. The next pass plans from
@@ -11188,7 +11196,7 @@ class AuthService:
                     "the account went, so this revocation wrote no role (BACKLOG #3085)",
                     scrub_log_argument(revocation.username),
                 )
-            else:
+            elif roles_changed:
                 # Owner ruling 2026-10-13 (#3229): the directory stays authoritative, so a
                 # demotion of the last enabled Administrator is applied, never refused. It alerts
                 # and audits instead, right after the write, so no later step's failure can skip
@@ -11218,9 +11226,31 @@ class AuthService:
         )
         revoke_error: Exception | None = None
         try:
-            ended = await self._revoke_with_row(revocation)
+            # A role write that wrote nothing leaves the stored roles, so its revoke row must not
+            # name the planned ones as if they were written.
+            ended = await self._revoke_with_row(
+                revocation if unwritten is None else replace(revocation, role_ids=None)
+            )
         except Exception as exc:  # noqa: BLE001 -- raised below, after the notice
             revoke_error = exc
+        if unwritten is not None:
+            # After the revoke, so a failed report cannot keep the sessions. Its error is held and
+            # raised as the role write's would be.
+            try:
+                await self._report_unwritten_role_write(
+                    unwritten,
+                    user_id=revocation.user_id,
+                    username=revocation.username,
+                    where="directory reconcile",
+                )
+            except Exception as report_exc:  # noqa: BLE001 -- held and raised below
+                _log.error(
+                    "directory reconcile: reporting %s's unwritten role write raised %s",
+                    scrub_log_argument(revocation.username),
+                    type(report_exc).__name__,
+                    exc_info=report_exc,
+                )
+                pending = _hold(pending, report_exc)
         if revoke_error is not None:
             # A failed revoke without its row raises, as a failed revoke always did. A committed
             # role change is still told to its user first, as the sign-in does. The role write's
@@ -11246,7 +11276,7 @@ class AuthService:
         quiet = (
             not revoked
             and not roles_changed
-            and not unwritten
+            and unwritten is None
             and (revocation.reason not in _ALWAYS_REPORTED_REASONS or elsewhere)
         )
         _log.info(
@@ -11285,7 +11315,7 @@ class AuthService:
         else:
             kind = DIRECTORY_SESSIONS_ENDED
         # A role write that wrote nothing changed no role, so a ROLES_CHANGED notice would be false.
-        if user is not None and revocation.reason != reconcile.SCOPE_CHANGED and not unwritten:
+        if user is not None and revocation.reason != reconcile.SCOPE_CHANGED and unwritten is None:
             await self._notify_security(
                 kind,
                 username=user.username,

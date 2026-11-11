@@ -5669,7 +5669,8 @@ who holds no audit key cannot silence the alert with a forged row. That method n
 residuals, at least a holder of the active audit key and a writer who lowers the watermark close
 to a genuine revocation of the same account. On a keyless audit chain no repeat is quiet.
 Any other revocation that ends nothing and changes no role, such as a scope, role, undetermined or
-unkeyed one, is quiet too. Two reconcilers that both read the audit chain before either writes its
+unkeyed one, is quiet too, except a role revocation whose role write is taken as writing nothing
+(below). Two reconcilers that both read the audit chain before either writes its
 row both report. Two that both read the old roles do not, because the role write is a
 compare-and-set on the roles it read (vault BACKLOG #3085): only the first counts the change, and
 the second, ending no session, is quiet. The exception is a write that raises and is applied
@@ -5681,8 +5682,11 @@ the revoke is still tried and the user told, and then the error is raised, which
 with no `ad_session_revoked` alert for that account. A retry whose record write raises before it
 writes, and an error building the role row, are taken as writing nothing, as *A directory grant*
 under [Dual-control approval](#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235)
-states. Here the revocation still revokes the session, raises `ad_session_revoked`, and does not
-end the pass, so later accounts are still reached. The roles stay as stored, so the next pass
+states. Here the session is still revoked, with an `auth.ad_session_revoked` row that names no
+roles, `ad_session_revoked` is raised even when no session ended, and the pass goes on, so later
+accounts are still reached. When the write's first try raised some other error that is not a
+store refusal, such as a defect, that error is raised once the revoke has run, and ends the pass
+as above. The roles stay as stored, so the next pass
 plans the change again. Of the sign-in's race, only the seal half applies here: a role deleted
 before the retry also leaves the account's roles, so the compare-and-set declines before it
 writes. A write that finds the roles moved to another set since

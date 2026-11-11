@@ -7662,6 +7662,9 @@ async def test_a_reconciled_role_retry_refused_before_it_wrote_tells_nobody_but_
             assert service._reconcile_refused_rows == []
             assert await service.identity_for_token(tokens["jdoe"]) is None
             assert len(drift) == (1 if isinstance(retry_error, RowSealError) else 0)
+            # The revoke row names no roles: none were written.
+            rows = await store.list_audit(action="auth.ad_session_revoked")
+            assert "roles" not in json.loads(rows[0]["detail"])
         else:
             assert [e.event_type for e in notifier.sent] == [ROLES_CHANGED]
             assert grants == [("jdoe", "directory_reconcile")]
