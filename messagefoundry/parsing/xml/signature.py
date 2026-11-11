@@ -361,10 +361,13 @@ def _read_anchor(
     from cryptography import x509
     from cryptography.exceptions import UnsupportedAlgorithm
 
+    if x509_cert is None and ca_pem_file is None:
+        # verify() refuses this first; kept closed so signxml never falls back to the system store.
+        raise ValueError("a trust anchor is required")
     name = "x509_cert" if x509_cert is not None else "ca_pem_file"
-    # Reached only with no anchor at all, which verify() refuses first. Raising keeps this closed
-    # rather than letting signxml fall back to the system CA store.
-    fault = f"{name} is required"
+    # Looked up outside the try, so a signxml without them is not blamed on the anchor.
+    add_pem_header = signxml.util.add_pem_header
+    chain_verifier = signxml.util.X509CertChainVerifier
     try:
         if x509_cert is not None:
             cert: Any = x509_cert
@@ -373,12 +376,13 @@ def _read_anchor(
                 if callable(to_cryptography):
                     cert = to_cryptography()
                 else:
-                    cert = x509.load_pem_x509_certificate(signxml.util.add_pem_header(cert))
+                    cert = x509.load_pem_x509_certificate(add_pem_header(cert))
+            if not isinstance(cert, x509.Certificate):
+                raise TypeError("not a certificate")
             # signxml reads the key inside its call, where a fault would be blamed on the document.
             cert.public_key()
             return cert, None
-        if ca_pem_file is not None:
-            return None, signxml.util.X509CertChainVerifier(ca_pem_file=ca_pem_file).store
+        return None, chain_verifier(ca_pem_file=ca_pem_file).store
     except (ValueError, TypeError, AttributeError, UnsupportedAlgorithm) as exc:
         fault = f"{name} cannot be read: {type(exc).__name__}"
     raise ValueError(fault)

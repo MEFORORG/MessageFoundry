@@ -283,6 +283,21 @@ def test_a_pinned_pyopenssl_certificate_still_verifies() -> None:
     assert result.verified, result.reason
 
 
+def test_a_pin_that_converts_to_something_else_is_an_anchor_fault() -> None:
+    """A ``to_cryptography`` that returns no certificate is refused at the anchor read, not inside
+    signxml's call, where it would be blamed on the document."""
+    from cryptography import x509
+
+    class _NotACertificate:
+        def to_cryptography(self) -> object:
+            return x509.load_pem_x509_certificate(_cert_pem()).public_key()
+
+    with pytest.raises(ValueError) as caught:
+        verify(_sign(_BODY), x509_cert=_NotACertificate())  # type: ignore[arg-type]
+    assert not isinstance(caught.value, XmlError)
+    assert str(caught.value) == "x509_cert cannot be read: TypeError"
+
+
 def test_a_pin_of_no_readable_type_is_an_anchor_fault() -> None:
     with pytest.raises(ValueError) as caught:
         verify(_sign(_BODY), x509_cert=memoryview(_cert_pem()))  # type: ignore[arg-type]
