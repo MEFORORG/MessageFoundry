@@ -295,6 +295,10 @@ audit append still works" does not hold for a request the approval gate refuses 
 writes no row; that path and two others are named in *Open audit gaps, a correction added
 2026-11-11*, in (c).
 
+A correction, added 2026-11-11: the Unverifiable row's audit action and page do not hold on at
+least gaps (1), (2), (5) and (6) of *Open audit gaps, a correction added 2026-11-11*, and its
+extension, in (c).
+
 **The seal input is a fixed-length digest.** The sealer sends Transit not the row's encoding but its
 SHA-256: `seal = Transit hmac(SHA-256(label || store id || seal_bytes(kind, fields)))`, each part
 length-prefixed as today. So every `hmac` and `verify` call carries 32 bytes whatever the row
@@ -411,6 +415,10 @@ call per refused check stays (see item 3).
 - **A correction, added 2026-11-11:** "always audited and paged" does not hold on at least three
   open paths, each failing closed; *Open audit gaps, a correction added 2026-11-11*, in (c), names
   them.
+- **A correction, added 2026-11-11:** "A planted unheld version is never downgraded to a retryable
+  503 that ends nothing and records nothing" does not hold on at least the approve claim and
+  `_decide_or_503`, gaps (2) and (6) of *Open audit gaps, a correction added 2026-11-11*, and its
+  extension, in (c).
 - **Failure accepted:** a genuine seal checked against a node that lags a key rotation is denied
   for the length of the lag: a session so checked is ended, and its user signs in again (on a node
   that has caught up); a write so refused is retried by its caller; an approval is denied, never
@@ -952,6 +960,31 @@ session, approval, on SQLite, PostgreSQL and SQL Server):
   writes no row. The owner ruled on 2026-11-11, in the Lander's session, that this ADR names them
   as open and the build merges with them filed: "do it"
   (https://github.com/MEFORORG/MessageFoundry/pull/2860#issuecomment-6785384065).
+- **Open audit gaps, extended 2026-11-11.** The three paths above are not the whole list. At least
+  these are open too, named here for filing on vault BACKLOG #8202, and each fails closed. (4) A
+  disable reads every account: `update_user` asks `is_last_enabled_admin`, which reads every
+  account through `_load_users`, so an Outage on any account's row, not only another
+  administrator's, refuses the disable with a 500 and no audit row, though the Outage is paged; an
+  Unverifiable row there counts as no enabled administrator, which can refuse a disable as the last
+  administrator's but never allow one. (5) Rejecting an Unverifiable pending approval takes the
+  Forged path, `_reject_seal_failed`, whose store write meets the Unverifiable answer again: it
+  answers 503, pages `audit_write_failed`, writes the Forged action
+  `integrity.authority_seal_failed`, and leaves the request pending, against the four answers'
+  Reject rule. (6) `ApprovalGate._requester_authority` at approve, and
+  `ApprovalGate._decide_or_503` behind reject, `resolve_interrupted` and `interrupt_stranded`, can
+  turn a Transit refusal into a 500, or into a `_store_fault` 503 that pages `audit_write_failed`
+  and writes no integrity row; and outside the admin user reads, a request-path caller of
+  `AuthService._verified`, at least local sign-in and the bearer identity, can let a Transit
+  refusal escape as a 500 with no row. (7) `provision-admin` reaches gap (1) through
+  `grant_first_admin_unless_admin_exists`, where it is the CLI's top-level defect report rather
+  than a 500, with no audit row and no page. Beneath all of these, (c) item 2's catch census test,
+  (c) item 3's API backstop for both refusal types, and *The four answers*' "The API answers an
+  Outage with HTTP 503 and `Retry-After`" are not yet built on every path: a refusal no caller maps
+  reaches the engine's generic handler as a 500. The sign-in audit actions this ADR names,
+  `auth.login_refused_unavailable` in the Outage row and in (e), `auth.login_refused_unverifiable`
+  in (e), and the audit rows (e)'s *Control kept* and *The refusal cache* promise a sign-in refusal
+  writes, are slice 2's sign-in refusals, which the 2026-11-08 build status line lists as not
+  built; neither action is in the code yet.
 - **Failure accepted:** an unverifiable row pages under the cap with other rows. Past five
   distinct rows in a window a row's page goes to the shared `:*` subject, which the sink's
   re-alert throttle may already hold, and a database writer who keeps more than five planted rows
@@ -1292,6 +1325,9 @@ session end rolls back on a Transit fault. Each refusal is audited under its tru
 A correction, added 2026-11-11: "Each refusal is audited under its true cause" does not hold on at
 least three open paths, each failing closed; *Open audit gaps, a correction added 2026-11-11*, in
 (c), names them.
+
+A correction, added 2026-11-11: "it denies, audits and pages" does not hold on at least the paths
+*Open audit gaps, a correction added 2026-11-11*, and its extension, in (c), names.
 
 **Negative.** Offboarding still freezes when step 2 of (b) trips, which a mass change to unmapped
 groups can cause, and when Vault is down everywhere (when no request is served either). Below the
