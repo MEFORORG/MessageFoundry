@@ -43,14 +43,17 @@ class XmlSignatureResult:
     """The outcome of an XML-DSig verification.
 
     ``verified`` is True iff the signature is valid against the supplied certificate/CA, its key
-    clears the strength floor, it covers the whole document outside the ``ds:Signature`` element,
-    AND that element holds nothing :func:`verify` refuses there, though it may hold unsigned content
-    verify admits (vault BACKLOG #2315, #5538). ``reason`` is a PHI-safe failure category when not
-    (``None`` on success).
+    clears the strength floor, it covers the document outside the ``ds:Signature`` element as
+    exclusive C14N with comments reads it, AND that element holds only ``ds:SignedInfo``,
+    ``ds:SignatureValue`` and ``ds:KeyInfo``, with no comment or processing instruction and only the
+    key data :func:`verify` admits (vault BACKLOG #2315, #5538). ``reason`` is a PHI-safe failure
+    category when not (``None`` on success).
 
     ``signed_content`` is the content the signature covers, as the signer canonicalized it: the
-    document without its ``ds:Signature`` element. It is ``None`` unless ``verified``. These bytes
-    are what the cryptography actually checked; :func:`verify` says why a Handler reads only them.
+    document without its ``ds:Signature`` element, and under an exclusive-C14N signer without any
+    namespace declaration no element or attribute name uses. It is ``None`` unless ``verified``.
+    These bytes are what the cryptography actually checked; :func:`verify` says why a Handler reads
+    only them.
     """
 
     verified: bool
@@ -244,7 +247,7 @@ def _drop_signature(signature: Any) -> None:
 
 
 def _signature_holds_unsigned_content(signature: Any) -> bool:
-    """True if the ``ds:Signature`` element carries anything a Handler could mistake for payload.
+    """True if the ``ds:Signature`` element carries unsigned content outside the admitted key data.
 
     The enveloped transform removes the whole element before digesting, so nothing inside it is
     signed except ``ds:SignedInfo``, which the signature value covers. The schema signxml enforces
@@ -255,7 +258,7 @@ def _signature_holds_unsigned_content(signature: Any) -> bool:
     name. It refuses a comment or processing instruction anywhere in the element, because no
     signature covers one there.
 
-    Admitted leaf text is still unsigned; see :func:`verify`.
+    What it admits, leaf text included, is still unsigned; see :func:`verify`.
     """
 
     def blank(text: str | None) -> bool:
@@ -279,7 +282,7 @@ def _signature_holds_unsigned_content(signature: Any) -> bool:
 
 
 def _coverage_refusal(root: Any, result: Any, location: str) -> str | None:
-    """Return :data:`UNSIGNED_CONTENT` unless the signature covers the whole document (BACKLOG #2315).
+    """Return :data:`UNSIGNED_CONTENT` unless the signature covers the document (BACKLOG #2315).
 
     signxml checks that the REFERENCED content is intact, wherever it sits, and returns that content.
     It does not check that the reference is the document. A Handler that reads its own parse of the
@@ -345,9 +348,12 @@ def verify(
     whose key cannot be read fails with :data:`UNREADABLE_SIGNING_KEY` (BACKLOG #1166).
 
     **Only a signature over everything outside its own ``ds:Signature`` element verifies** (vault
-    BACKLOG #2315). A document holding content the signature does not cover outside that element
-    fails with :data:`UNSIGNED_CONTENT`: for example a signed element under a new document element,
-    or a comment the signature excluded. Inside ``ds:Signature``, no comment or processing
+    BACKLOG #2315), as exclusive C14N with comments reads that content. A document holding content
+    the signature does not cover outside that element fails with :data:`UNSIGNED_CONTENT`: for
+    example a signed element under a new document element, or a comment the signature excluded.
+    Exclusive C14N drops a namespace declaration that no element or attribute name uses, so under
+    an exclusive-C14N signer such a declaration is unsigned anywhere in the document, including a
+    prefix only a QName in content, such as an ``xsi:type`` value, resolves through. Inside ``ds:Signature``, no comment or processing
     instruction is admitted anywhere, and neither is any element, attribute or text that
     :func:`_signature_holds_unsigned_content` does not admit. Each of those is refused: with
     :data:`UNSIGNED_CONTENT` unless an earlier check refuses it first, such as the key floor, the
@@ -358,10 +364,11 @@ def verify(
     not-a-bug). Inside ``ds:Signature``, only ``ds:SignedInfo`` is signed, and a verified document
     may still carry unsigned content there. That includes at least:
 
-    - free text in a ``ds:KeyInfo`` leaf, such as ``ds:KeyName``, ``ds:MgmtData``,
-      ``ds:X509SubjectName`` or ``ds:X509Certificate``;
+    - free text in a ``ds:KeyInfo`` leaf, such as ``ds:KeyName``, ``ds:MgmtData`` or
+      ``ds:X509SubjectName``, and on the pinned ``x509_cert`` path ``ds:X509Certificate``;
     - attributes the schema allows on ``ds:Signature`` and ``ds:SignatureValue``, which are not
-      checked here: at least an ``Id``, and an ``xsi:`` attribute such as ``xsi:schemaLocation``;
+      checked here: at least an ``Id`` on either, and an ``xsi:`` attribute such as
+      ``xsi:schemaLocation`` on ``ds:SignatureValue``;
     - the ``Id``, ``URI`` and ``Algorithm`` attributes :data:`_KEY_INFO_ATTRIBUTES` admits on
       ``ds:KeyInfo`` and its descendants, wherever the schema defines one, such as the ``Id`` of
       ``ds:KeyInfo``, the ``URI`` of ``dsig11:KeyInfoReference`` or the ``Algorithm`` of
@@ -377,7 +384,10 @@ def verify(
 
     Raises :class:`ValueError` if no anchor is supplied,
     :class:`~messagefoundry.parsing.xml.errors.XmlError` if the input is unparseable, and
-    :class:`RuntimeError` if the ``[xml]`` extra is absent."""
+    :class:`RuntimeError` if the ``[xml]`` extra is absent. Malformed content inside ``ds:Signature``
+    can also raise from signxml or ``cryptography`` unwrapped, at least
+    :class:`lxml.etree.DocumentInvalid` from the schema check and :class:`ValueError` from key or
+    certificate parsing; such a message may quote document text, so do not log it."""
     if x509_cert is None and ca_pem_file is None:
         # Refuse origin-blind verification. Require the caller to pin the expected signer or a partner
         # CA rather than fall back to signxml's "trust anything the OS trusts" default (DELTA-03).
