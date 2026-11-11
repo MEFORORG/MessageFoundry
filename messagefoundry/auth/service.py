@@ -3668,6 +3668,14 @@ _ADMINISTRATOR_EXISTS_REFUSAL: Final = (
     " is nothing to provision -- create further accounts from the web console, and use"
     " `admin-unlock` if that administrator is locked out"
 )
+#: ``provision-admin``'s refusal while an account's record reads Unverifiable under Vault transit
+#: (ADR 0217 (a); engine PR 2860 hold, R3-F1). Asked before any account write.
+_UNVERIFIABLE_ACCOUNT_REFUSAL: Final = (
+    "an account's integrity seal could not be verified by Vault transit, so this command cannot"
+    " tell whether a usable Administrator exists, and it wrote nothing. The seal may be planted:"
+    " check that Vault is healthy and that every node holds the audit key's latest version, then"
+    " retry"
+)
 #: The first refusal of both :meth:`AuthService.provision_first_administrator` and its pre-check
 #: :meth:`AuthService.provision_refusal`, so the two answer a blank name alike (BACKLOG #3391), and
 #: the new-username rule's, so `POST /users` answers it alike too (BACKLOG #5521).
@@ -4688,6 +4696,27 @@ class AuthService:
             names.append(user.username)
         return usable, tuple(sorted(names))
 
+    async def _unverifiable_account_held(self) -> bool:
+        """Whether some account's record reads Unverifiable under Vault transit (ADR 0217 (a)), for
+        ``provision-admin`` alone (engine PR 2860 hold, R3-F1).
+
+        :meth:`_administrator_standing` reads through :meth:`_load_users`, which reports such a
+        record and drops it, so the refusal cannot count an Administrator whose seal Vault transit
+        could not verify, while the first-administrator grant's guard raises on that same row. An
+        Unverifiable record's roles are part of what its seal covers, so any one of them may be an
+        Administrator: the command refuses on one before any account write rather than clearing a
+        holder's factors and sessions and then failing at the grant. Each failing account is read
+        again by id, which raises for Unverifiable and returns refused for Forged; Forged stays
+        uncounted, as the grant's guard leaves it. The scans themselves are unchanged."""
+        for listed in await self.list_checked_users():
+            if listed.user is not None:
+                continue
+            try:
+                await self._lookup_user(listed.id)
+            except TransitSealUnverifiableError:
+                return True
+        return False
+
     async def has_self_sufficient_administrator(self) -> bool:
         """True iff some enabled Administrator is a local account with a usable password, so it can
         sign in with no directory or identity provider up.
@@ -4811,6 +4840,9 @@ class AuthService:
         usable, standing_admins = await self._administrator_standing()
         if usable:
             raise FirstAdministratorRefused(_ADMINISTRATOR_EXISTS_REFUSAL)
+        # Before every account write, the repair branch's clears included (R3-F1).
+        if await self._unverifiable_account_held():
+            raise FirstAdministratorRefused(_UNVERIFIABLE_ACCOUNT_REFUSAL)
         violations = self._policy.violations(password, username=username)
         if violations:
             raise FirstAdministratorRefused("; ".join(violations))
@@ -5238,6 +5270,8 @@ class AuthService:
            :func:`provision_notify_email` (BACKLOG #1138, #3391);
         3. an enabled local Administrator with a usable password exists
            (:meth:`has_self_sufficient_administrator`, vault BACKLOG #2711);
+        3a. some account's record reads Unverifiable under Vault transit
+           (:meth:`_unverifiable_account_held`, ADR 0217 (a)), the named one included;
         4. the account with that name fails its integrity seal;
         5. the named row is one this command will not complete: a directory account, a disabled
            one, or one that holds roles (:meth:`_existing_row_refusal`).
@@ -5256,6 +5290,8 @@ class AuthService:
             return str(exc)
         if await self.has_self_sufficient_administrator():
             return _ADMINISTRATOR_EXISTS_REFUSAL
+        if await self._unverifiable_account_held():
+            return _UNVERIFIABLE_ACCOUNT_REFUSAL
         lookup = await self._lookup_by_username(name)
         existing = lookup.user
         if existing is None:
