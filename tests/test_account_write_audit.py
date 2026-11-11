@@ -584,3 +584,33 @@ async def test_a_sign_in_role_retry_refused_before_it_wrote_tells_nobody_and_end
         assert grants == [("jdoe", "directory_sign_in")]
         assert audit_pages == ["auth.ad_roles_resynced"]
         assert len(revokes) == 1
+
+
+async def test_a_held_first_role_error_is_raised_when_the_retry_wrote_nothing(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #2221. A held first error, then a retry refused before it wrote: the held error is
+    the one raised, with the retry's named on it, and nobody is told, paged or signed out."""
+    service, _first, grants, audit_pages = await _signed_in(store, "viewer")
+    await service.set_ad_group_map([("cn=mf-ops,dc=x", ADMIN)], actor="admin")
+    service._security_notifier.sent.clear()
+    calls: list[int] = []
+
+    async def failing(*_args: object, **_kwargs: object) -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            raise NotImplementedError("synthetic first")
+        raise UnknownRoleError([ADMIN])
+
+    revokes: list[str] = []
+
+    async def revoke(user_id: str, **_kwargs: Any) -> None:
+        revokes.append(user_id)
+
+    monkeypatch.setattr(store, "set_user_roles", failing)
+    monkeypatch.setattr(service, "_revoke_after_commit", revoke)
+    with pytest.raises(NotImplementedError) as raised:
+        await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)
+    assert any("UnknownRoleError" in note for note in raised.value.__notes__)
+    assert service._security_notifier.sent == []
+    assert grants == [] and audit_pages == [] and revokes == []
