@@ -669,11 +669,30 @@ def _render_connector(spec: dict[str, Any], channel: str, *, inbound: bool) -> t
 # The real export is XML (see the module docstring). Everything below turns a ``<Package>`` into the
 # SAME intermediate model the JSON layer produces, so the code generator is shared verbatim.
 
+
 # Rich-text markup wrapper on ``@Data``. A Corepoint export stores each statement as *styled* text —
 # syntax-colouring tags plus HTML entities, escaped again for the XML attribute. Strip the tags, then
 # unescape the entities. Without this the leading token is a tag, not a verb, and the overwhelming
 # majority of statements fail to classify: the single biggest schema surprise of the #105 validation.
-_MARKUP_TAG = re.compile(r"<[^>]+>")
+#
+# The tag strip is a split on ``>``, not ``re.sub(r"<[^>]+>", "", data)``. The two give the same
+# output, but the regex retries from every ``<`` and scans to the end of the input each time when no
+# ``>`` closes it, so an attribute of n ``<`` characters costs O(n^2). The attribute comes from an
+# untrusted export, so that cost is the import's to bound.
+def _strip_tags(data: str) -> str:
+    """Remove every ``<`` + one-or-more non-``>`` + ``>`` tag, leftmost first, in linear time.
+
+    Each ``>``-terminated piece holds at most one tag, the one opening at its first ``<``: a later
+    ``<`` in the piece sits inside that tag. A piece whose first ``<`` is its last character is a bare
+    ``<>``, which is not a tag, so it is kept with its ``>``. The piece after the last ``>`` has no
+    closing ``>`` and is kept whole."""
+    *closed, tail = data.split(">")
+    kept: list[str] = []
+    for piece in closed:
+        start = piece.find("<")
+        kept.append(piece[:start] if 0 <= start < len(piece) - 1 else piece + ">")
+    kept.append(tail)
+    return "".join(kept)
 
 
 def strip_markup(data: str) -> str:
@@ -683,7 +702,7 @@ def strip_markup(data: str) -> str:
     double-escapes: an ``&amp;quot;`` in the file is a ``&quot;`` after the XML parse and a ``"`` only
     after the unescape. Unescaping first would resurrect ``<`` characters that the tag-strip would then
     eat out of the *statement*."""
-    return html.unescape(_MARKUP_TAG.sub("", data)).strip()
+    return html.unescape(_strip_tags(data)).strip()
 
 
 # --- the ROLE layer: @Data markup is semantic, not decorative -----------------

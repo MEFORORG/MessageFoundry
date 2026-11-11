@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+from itertools import product
 from pathlib import Path
 
 import pytest
@@ -35,6 +36,7 @@ from messagefoundry_toolkit.corepoint_import import (
     _operands_from_roles,
     _role_prose,
     _role_verb,
+    _strip_tags,
     _understood_list,
     generate_module,
     import_corepoint,
@@ -45,6 +47,7 @@ from messagefoundry_toolkit.corepoint_import import (
     strip_markup,
     tokenize_statement,
 )
+from tests._growth import _growth_between
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = REPO_ROOT / "tests" / "fixtures" / "corepoint"
@@ -754,6 +757,39 @@ def test_strip_markup_recovers_the_verb() -> None:
     # a ``<`` that the tag-strip then eats out of the statement itself.
     assert strip_markup("<b>ItemCopy</b> &amp;lt;kept&amp;gt;") == "ItemCopy &lt;kept&gt;"
     assert strip_markup("   <i></i>  ") == ""
+
+
+# The pattern ``strip_markup`` used before #4036, kept here as the reference its output must match.
+_OLD_MARKUP_TAG = re.compile(r"<[^>]+>")
+
+
+def test_the_tag_strip_matches_the_old_regex_on_every_short_string() -> None:
+    """Exhaustive over ``<``, ``>``, a letter and a newline up to length 8: same output as the regex."""
+    for length in range(9):
+        for chars in product("<>a\n", repeat=length):
+            data = "".join(chars)
+            assert _strip_tags(data) == _OLD_MARKUP_TAG.sub("", data), repr(data)
+
+
+# 8x the input: a linear strip grows about 8x per call, the old regex about 64x (#4036).
+_GROWTH_LENGTHS = (2048, 16384)
+_MAX_GROWTH = 24.0
+
+
+@pytest.mark.parametrize("unit", ["<", "<a", "<\n"])
+def test_the_markup_strip_is_linear_on_unclosed_tags(unit: str) -> None:
+    """#4036: a run of ``<`` with no closing ``>`` made the regex retry from every ``<``.
+
+    The old pattern runs first as the positive control, so a box that cannot see the difference reds
+    the test instead of passing it."""
+    short, long = (unit * n for n in _GROWTH_LENGTHS)
+    control = _growth_between(lambda text: _OLD_MARKUP_TAG.sub("", text), short, long, rounds=3)
+    assert control > _MAX_GROWTH, (
+        f"the old pattern grew only {control:.1f}x across {_GROWTH_LENGTHS}, under "
+        f"{_MAX_GROWTH}x, so this box or probe cannot tell; fix the fixture, do not raise the bar"
+    )
+    growth = _growth_between(strip_markup, short, long, rounds=7)
+    assert growth < _MAX_GROWTH, f"strip_markup grew {growth:.1f}x across {_GROWTH_LENGTHS}"
 
 
 def test_markup_stripped_statements_classify_in_the_fixture() -> None:
