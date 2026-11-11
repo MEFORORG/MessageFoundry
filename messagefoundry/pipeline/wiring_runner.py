@@ -33,7 +33,6 @@ import math
 import threading
 import time
 from collections.abc import (
-    AsyncIterator,
     Awaitable,
     Callable,
     Collection,
@@ -43,7 +42,7 @@ from collections.abc import (
 )
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, asynccontextmanager, suppress
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, StrEnum, auto
@@ -1498,26 +1497,11 @@ def _kills_the_worker(exc: BaseException) -> bool:
     )
 
 
-@asynccontextmanager
-async def _counting_worker_death(
-    runner: RegistryRunner, worker: str, name: str, item: OutboxItem
-) -> AsyncIterator[None]:
-    """Count a death that ends the block against ``item`` before the exception goes on (vault
-    BACKLOG #4607 step 6). The one place the rule lives: the body wrapper below and the concurrent
-    transform run both enter it."""
-    try:
-        yield
-    except BaseException as exc:
-        if _kills_the_worker(exc):
-            await runner._record_worker_death(worker, name, item, exc)
-        raise
-
-
 def _records_worker_death(worker: str) -> Callable[[_ItemBody], _ItemBody]:
     """Wrap one ``_process_*_item`` body so a row that kills its worker is counted against that row
     before the exception goes on (vault BACKLOG #4607 step 6). Both claim modes reach these bodies,
     the per_lane loops directly and the pooled dispatcher through its ``_dispatch_*`` adapters. The
-    concurrent transform run counts in its own code instead, since it does not come through
+    concurrent transform run counts where a death leaves its loop, since it does not come through
     :meth:`RegistryRunner._process_routed_item`. The exception is always re-raised: respawning a
     dead worker and recovering its other held rows is #4607 steps 1, 2 and 5."""
 
@@ -1526,8 +1510,12 @@ def _records_worker_death(worker: str) -> Callable[[_ItemBody], _ItemBody]:
         async def guarded(
             self: RegistryRunner, name: str, item: OutboxItem
         ) -> tuple[_ItemOutcome, float | None]:
-            async with _counting_worker_death(self, worker, name, item):
+            try:
                 return await body(self, name, item)
+            except BaseException as exc:
+                if _kills_the_worker(exc):
+                    await self._record_worker_death(worker, name, item, exc)
+                raise
 
         return guarded
 
@@ -11355,9 +11343,7 @@ class RegistryRunner:
                 _ic: InboundConnection = ic,
                 _snap: Mapping[tuple[str, str], Any] = state_snapshot,
             ) -> _RoutedPrep:
-                # A death is counted here, in the sibling's own task (#4607 step 6): only this
-                # row caused it, and gather hands the exception back after every sibling ran.
-                async with _sem, _counting_worker_death(self, "transform", name, it):
+                async with _sem:
                     return await self._prepare_routed(name, _ic, it, state_snapshot=_snap)
 
             preps = await asyncio.gather(*(_compute(it) for it in run), return_exceptions=True)
@@ -11367,11 +11353,19 @@ class RegistryRunner:
                     # captured as data). Mirror the sequential path: propagate to the worker's backoff.
                     # Lower-claim siblings already handed off (committed, in order); this row + any
                     # higher un-applied rows stay INFLIGHT and recover in claim order via
-                    # reset_stale_inflight (ADR 0058 INV-3 / ADR 0001 at-least-once). A death was
-                    # already counted in _compute.
+                    # reset_stale_inflight (ADR 0058 INV-3 / ADR 0001 at-least-once). A death is
+                    # counted here, where it leaves the worker, never in the sibling's task: an
+                    # earlier sibling's STOP or fault ends the run before a later death is raised
+                    # (#4607 step 6).
+                    if _kills_the_worker(prep):
+                        await self._record_worker_death("transform", name, it, prep)
                     raise prep
-                async with _counting_worker_death(self, "transform", name, it):
+                try:
                     applied = await self._apply_routed(name, it, prep)
+                except BaseException as exc:
+                    if _kills_the_worker(exc):
+                        await self._record_worker_death("transform", name, it, exc)
+                    raise
                 if applied[0] is _ItemOutcome.STOPPED:
                     return True
         return False
@@ -12480,7 +12474,8 @@ class RegistryRunner:
                 if cap is None or item.attempts < cap:
                     log.error(
                         "%s worker %r: row %s (message %s) killed the worker with %s on attempt %d "
-                        "of %s; nothing written, so the row stays in flight until the next start",
+                        "of %s; nothing written, so a row still in flight comes back at the next "
+                        "start",
                         worker,
                         name,
                         item.id,
@@ -12490,7 +12485,21 @@ class RegistryRunner:
                         "unlimited" if cap is None else cap,
                     )
                     return
-                dead = (await self.store.mark_failed(item.id, error, retry)).dead > 0
+                failed = await self.store.mark_failed(item.id, error, retry)
+                if failed.retry_at is not None:
+                    # The store's attempts were below the cap the claim's copy reached: something
+                    # in the body already returned an attempt. mark_failed re-pended the row.
+                    log.error(
+                        "%s worker %r: row %s (message %s) killed the worker with %s; the store "
+                        "counted fewer attempts than the claim, so the row was re-pended to retry",
+                        worker,
+                        name,
+                        item.id,
+                        item.message_id,
+                        kind,
+                    )
+                    return
+                dead = failed.dead > 0
                 deaths = item.attempts if dead else 0
             else:
                 counted = await self.store.record_worker_death(item.id, _WORKER_DEATH_LIMIT, error)
@@ -12538,8 +12547,8 @@ class RegistryRunner:
             f"death {deaths} of {_WORKER_DEATH_LIMIT}, so the row stays in flight until the next "
             "start"
             if deaths
-            else "nothing written: the row was no longer in flight or no longer held, or the "
-            "store's leader fence refused the write",
+            else "nothing written: the row was no longer in flight, or the store's leader fence "
+            "refused the write",
         )
 
     def _drained_by_dispatcher(self, stage: Stage, lane: str) -> bool:

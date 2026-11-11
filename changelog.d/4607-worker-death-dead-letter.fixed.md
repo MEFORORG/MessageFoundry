@@ -8,7 +8,8 @@
   paged by the in-flight watch, until the next start. "Every time" means across passes that each
   claim the row anew, after a restart or a Postgres lease reclaim: a dead worker's row is not yet
   re-claimed in the same process. An outbound row counts a death as a failed send under its lane's
-  retry policy, so a lane set to retry forever never dead-letters on a death. A death on a lane a
+  retry policy, so a lane set to retry forever never dead-letters on a death; a batching outbound
+  lane does not count deaths yet. A death on a lane a
   pooled dispatcher drains fires `connection_stopped`. `KeyboardInterrupt`, `SystemExit`,
   `CancelledError` and `GeneratorExit` are never counted, and the worker still dies. A replay resets
   the count with `attempts`. `mark_failed` at its cap now leaves a row already DONE, DEAD or
