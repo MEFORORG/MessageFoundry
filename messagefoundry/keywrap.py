@@ -47,9 +47,11 @@ checked, which on psqlODBC is every client key (BACKLOG #2423).
 What this does NOT check, so a reader does not assume it: the content cipher inside PBES2 (that is a
 cipher question, not a derivation one; the AES-CBC limit above is only what a PKCS#12 part must use
 to be opened and checked), and any private-key loader this module is not called from. Nor a key
-block under a label other than ``ENCRYPTED PRIVATE KEY`` whose body is not strict base64: it is
-skipped, and OpenSSL may still decrypt such a body, at least where it drops a control or high byte
-at a line end, or a short header line, before it decodes. The inside of
+block under a label other than ``ENCRYPTED PRIVATE KEY`` whose body OpenSSL cleans before it
+decodes: this module decodes the body as strict base64, so it skips one that does not decode and
+reads another as a non-key, and OpenSSL may still decrypt either. That is at least a control or
+high byte at a line end, and a short header line before a blank line. Nor raw DER that holds a
+BEGIN and an END marker anywhere in its bytes: it is read as PEM, not as DER. The inside of
 a PKCS#12 part that is itself encrypted IS now checked, as above, wherever the caller runs the
 second step (BACKLOG #1352). Read the list of callers as the coverage, and treat it as AT LEAST
 that list.
@@ -534,8 +536,11 @@ def _pem_blocks(material: bytes) -> list[tuple[bytes, bytes]]:
     its BEGIN marker to the next END, or to the next BEGIN when one comes first.
 
     Markers are found ANYWHERE, not only alone on a line: ``cryptography``'s PEM reader and
-    OpenSSL both accept a key that is all on one line, has text before BEGIN, or has base64 on the
-    BEGIN or END line, so a checker stricter than the loaders would wave those through unchecked.
+    OpenSSL both accept a key that is all on one line or has base64 on the BEGIN or END line, and a
+    lenient reader may take one with text before BEGIN, so a checker stricter than the loaders would
+    wave those through unchecked. OpenSSL itself skips a BEGIN that does not start a line, as
+    ``messagefoundry.pki``'s ``_crl_blocks`` records; a block such a BEGIN opens is read here too,
+    which can only refuse more.
     A label ends at its line, as OpenSSL reads it, so a label that runs across a line end is not one.
 
     A BEGIN with another BEGIN before its END is read BOTH ways, because which one opens the key
@@ -1102,6 +1107,8 @@ def ssh_key_encrypted(material: bytes) -> bool:
             raw = base64.b64decode(b"".join(body.split()), validate=True)
         except (binascii.Error, ValueError):
             return True
+        if not raw:
+            continue  # no key bytes: a stray BEGIN line before the key's own makes such a block
         if not raw.startswith(_OPENSSH_MAGIC):
             return True
         pos = len(_OPENSSH_MAGIC)

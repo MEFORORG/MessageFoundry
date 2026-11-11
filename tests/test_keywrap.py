@@ -645,7 +645,7 @@ _OPENSSL_LOADS_STRAY: dict[str, Callable[[bytes], bytes]] = {
         + b"NOTE-----\n"
     ),
 }
-#: Shapes no loader was seen to load. They are refused all the same.
+#: Every shape above, plus four no loader was seen to load, which are refused all the same.
 _STRAY_SHAPES: dict[str, Callable[[bytes], bytes]] = {
     **_OPENSSL_LOADS_STRAY,
     "own-line-before": lambda p: _STRAY_BEGIN + b"NOTE-----\n" + p,
@@ -1571,6 +1571,8 @@ _PARAMIKO_LOADS_BEHIND: dict[str, str] = {
     "comment-no-dashes": "# " + _STRAY_BEGIN.decode() + "NOTE\n",
     "no-dashes": _STRAY_BEGIN.decode() + "NOTE\n",
     "own-line": _STRAY_BEGIN.decode() + "NOTE-----\n",
+    # A stray line with the key's own label opens a block with no key bytes, which is skipped.
+    "comment-key-label": "# " + _STRAY_BEGIN.decode() + "OPENSSH PRIVATE KEY-----\n",
 }
 
 
