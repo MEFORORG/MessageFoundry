@@ -3341,8 +3341,8 @@ class Engine:
         named. A value file anywhere but that folder, one inside the config directory under another
         ``[environments].dir`` included, is in no start snapshot and no published digest, so the
         values read at the build stand. So do they where the load's snapshot could not read the
-        value file, as under an antivirus lock: the digest then leaves the file out and names it
-        as such. A no-op with no snapshot or no
+        value file, as under an antivirus lock: the digest then leaves the file out, or the folder
+        holding it, and names it as such. A no-op with no snapshot or no
         :class:`~messagefoundry.config.environments.SnapshotEnvValuesProvider`; another provider's
         values stay the build's, a limit docs/SECURITY.md records.
 
@@ -3357,7 +3357,9 @@ class Engine:
         before the graph is added: a runner holds its own values. Raises ``WiringError`` for at
         least a value file that cannot be parsed, one created, removed or edited since the load
         read it, and a vet of the file or its folder that refuses, the folder's even where the
-        value file is absent."""
+        value file is absent, but not where the load could not read the value file or list its
+        folder: the snapshot then leaves the value file out
+        (:meth:`ConfigSnapshot.left_out_environment_file`), and the start returns before any vet."""
         if self._registry_runner is not None:
             raise RuntimeError("a start's environment values are applied before its graph runs")
         provider = self._env_values_provider
