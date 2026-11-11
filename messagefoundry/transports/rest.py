@@ -2641,6 +2641,8 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
     A credential in the URL is refused too, by :func:`refuse_url_credentials` with the remedy
     :data:`_ECH_SIDECAR_CREDENTIAL_USE` (BACKLOG #5528): urllib would dial ``user:pw@host`` as the
     host. It is refused here, not only at the egress gate, so a directly built connector refuses it.
+    So, at least, are a value urllib would dial differently from how urlsplit reads it and a ``?`` or
+    ``#``, in fixed words that quote no part of the value; the comments below say why each.
 
     Inert until a destination actually publishes an ECHConfig (as of 2026-07 a DoH probe found no EHR
     endpoint does — demand-gated, ADR 0139)."""
@@ -2664,14 +2666,19 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
     refuse_url_credentials(
         sidecar, "ech_sidecar", use=_ECH_SIDECAR_CREDENTIAL_USE, error=ValueError
     )
+    # Each request is this URL with the upstream path appended, so a query would carry the real
+    # path inside it and its own text to the sidecar every time, and a fragment would send every
+    # request to '/' (BACKLOG #5528). Refused anywhere, empty included, as parse_proxy_url does.
+    if "?" in sidecar or "#" in sidecar:
+        raise ValueError(
+            "ech_sidecar must not hold a query or a fragment ('?' or '#'); write the sidecar's "
+            "base URL alone (ADR 0139)"
+        )
     parsed = _split_or_refuse(
         sidecar, "ech_sidecar", use=_ECH_SIDECAR_CREDENTIAL_USE, error=ValueError
     )
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise ValueError(
-            f"ech_sidecar must be an http(s):// loopback URL, got {_redact_url(sidecar)!r} "
-            "(ADR 0139)"
-        )
+        raise ValueError("ech_sidecar must be an http(s):// loopback URL with a host (ADR 0139)")
     # A '%' in the host is refused with it (BACKLOG #5528): urlsplit keeps an IPv6 zone ID encoded
     # and urllib decodes it before it dials, so `[::1%31]` reads as loopback here and dials `::11`.
     if "%" in parsed.hostname or not is_never_proxied_host(parsed.hostname):

@@ -16,8 +16,8 @@
   reusing the ADR 0126 opener plumbing) + `egress_route_from_settings`, the single ECH-or-proxy resolver
   (mutually exclusive). Per-connection `ech_egress` / `ech_sidecar` settings. fhir/soap/dicomweb switched to
   the resolver (byte-identical when `ech_egress` is unset; smart/http_auth inherit via the threaded proxy).
-- **Fail-closed:** sidecar down → the hop errors (no direct, SNI-leaking fallback); non-loopback / missing
-  sidecar refused, and, added 2026-11-09 (vault BACKLOG #2977), a `verify_tls = false` beside it. Added 2026-11-10 (BACKLOG #5528): a sidecar whose `host:port` is not in `[egress].allowed_ech_sidecar` is refused at config load, by the egress check (*Amendment 2026-11-10* below). Operator recipe: [`samples/ech-sidecar/`](../../samples/ech-sidecar/README.md).
+- **Fail-closed, at least these:** sidecar down → the hop errors (no direct, SNI-leaking fallback); non-loopback / missing
+  sidecar refused, and, added 2026-11-10 (BACKLOG #5528), a sidecar URL that carries a credential or that urllib would dial differently from how it reads (*Amendment 2026-11-10* below names those refusals); and, added 2026-11-09 (vault BACKLOG #2977), a `verify_tls = false` beside it. Added 2026-11-10 (BACKLOG #5528): a sidecar whose `host:port` is not in `[egress].allowed_ech_sidecar` is refused at config load, by the egress check (*Amendment 2026-11-10* below). Operator recipe: [`samples/ech-sidecar/`](../../samples/ech-sidecar/README.md).
 - **Verified:** ruff + `mypy --strict` clean; 13 tests incl. a **stub-proxy behavioral test** proving egress
   routes THROUGH the sidecar and fails closed when it is down; 309 existing connector tests still pass.
 
@@ -89,7 +89,12 @@ any listener on this host whose port the connection's author named.
   password in the URL, so a directly built connector refuses it too, and tells the operator to put
   a credential meant for the sidecar in the sidecar's own configuration: the engine has no setting
   for one, and the connection's own `Authorization` header reaches the sidecar on every request.
-  The gate refuses port 0 in its own words, since no entry can list it.
+  The resolver also refuses, at least, a `%` in the host (urllib decodes an IPv6 zone ID before it
+  dials), a space or control character (urlsplit deletes a tab or newline, urllib keeps it), and a
+  `?` or `#` anywhere (each request is the sidecar URL with the upstream path appended, so a query
+  would carry the real path and its own text to the sidecar, and a fragment would send every
+  request to `/`). None of these refusals quotes the value. `ech_sidecar_url_from_settings` holds
+  the reasons in its comments. The gate refuses port 0 in its own words, since no entry can list it.
 
 ## Context
 

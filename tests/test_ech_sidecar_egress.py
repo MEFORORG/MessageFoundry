@@ -251,6 +251,35 @@ def test_a_sidecar_with_a_control_character_is_refused(build: Any, sidecar: str)
         build(sidecar)
 
 
+@pytest.mark.parametrize("build", [_gate, _direct], ids=["egress-gate", "direct-build"])
+@pytest.mark.parametrize(
+    "sidecar",
+    [
+        "http://127.0.0.1:8123?access_token=abc-tok",
+        "http://127.0.0.1:8123/svc?access_token=abc-tok",
+        "http://127.0.0.1:8123#abc-tok",
+        "http://127.0.0.1:8123/?",
+        "http://127.0.0.1:8123#",
+    ],
+)
+def test_a_sidecar_with_a_query_or_fragment_is_refused(build: Any, sidecar: str) -> None:
+    """Each request is the sidecar URL with the upstream path appended, so a query put the real
+    path inside it and sent the query's token to the sidecar on every request, and a fragment
+    sent every request to ``/``. The gate admitted both. Refused anywhere, as ``parse_proxy_url``
+    refuses them for a forward proxy, in fixed words that quote no part of the value."""
+    with pytest.raises(ValueError, match=r"query or a fragment") as caught:
+        build(sidecar)
+    assert "abc-tok" not in str(caught.value)
+
+
+@pytest.mark.parametrize("build", [_gate, _direct], ids=["egress-gate", "direct-build"])
+def test_a_sidecar_with_a_bad_scheme_is_refused_without_its_path(build: Any) -> None:
+    """The scheme refusal quotes no part of the value: a sidecar path can carry a token."""
+    with pytest.raises(ValueError, match=r"http\(s\)://") as caught:
+        build("ftp://127.0.0.1/svc-token-abc123")
+    assert "svc-token" not in str(caught.value)
+
+
 def test_a_sidecar_at_port_0_is_refused_in_its_own_words() -> None:
     """No entry can list port 0, so "not in the allowlist" would send the operator looking for an
     entry to add. Refused in fixed words, before the list is read, empty or not."""

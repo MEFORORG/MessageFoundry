@@ -4,5 +4,6 @@
   could have been named as the sidecar. The new list takes `host:port` entries, port required, and
   is deny-by-default even under `[security].block_unlisted_outbound = false`: an `ech_egress`
   connection whose sidecar is not on it is refused at config load. List the sidecar, for example
-  `allowed_ech_sidecar = ["127.0.0.1:8123"]`. See the key's row under `[egress]` in
+  `allowed_ech_sidecar = ["127.0.0.1:8123"]`. The sidecar URL itself is refused at least when it
+  carries a user, a password, a query or a fragment. See the key's row under `[egress]` in
   [CONFIGURATION.md](../docs/CONFIGURATION.md#egress).
