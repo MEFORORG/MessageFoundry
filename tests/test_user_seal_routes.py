@@ -472,6 +472,8 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
         "adds no row and no alert",
         "one absent on a re-read reads as gone",
         "A row still there after every check raced fails closed",
+        "One that keeps changing the row's own `id` still can",
+        "`SEAL_FAILURE_TRACK_MAX`",
         "Two honest role writes to the account that commit across both of those reads",
         "Each engine process sharing the store keeps its own interval",
         "Where `[auth].require_action_step_up` is on, the default",

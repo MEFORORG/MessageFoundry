@@ -11609,7 +11609,9 @@ class AuthService:
         :data:`_CHECKED_READ_PASSES` checks in all. Only a row absent on a re-read is gone. One
         still there after every check raced fails closed: each of its checks failed its seal, so
         it is handed to :meth:`_user_seal_failed` and answered ``failed``, rather than read as gone,
-        which would let a writer that keeps re-keying a tampered row hide it from the admin list."""
+        which would let a writer that keeps re-keying a tampered row hide it from the admin list.
+        One that keeps changing the row's own id still reads as gone under the old id: a re-read
+        by that id finds nothing, as docs/SECURITY.md, *What an admin user read reports*, says."""
         raw = listed
         for _ in range(_CHECKED_READ_PASSES):
             if raw is None:

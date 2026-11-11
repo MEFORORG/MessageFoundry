@@ -1660,15 +1660,20 @@ each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs 
 the `integrity.authority_seal_failed` audit row and raises the `integrity_drift` alert. A refusal
 inside that interval, from any of these routes or any other reader of the same account in that
 process, answers 423 or lists the account as failed and adds no row and no alert. Each engine
-process sharing the store keeps its own interval, so each may report the same account once. A
+process sharing the store keeps its own interval, so each may report the same account once. The
+interval holds only while the process still remembers the account: it remembers at most
+`SEAL_FAILURE_TRACK_MAX` failing rows of every kind together, and past that it forgets the oldest,
+so an account it forgot is reported again on its next refusal. A
 record is refused only after two failing reads that name the same account, or when it fails
 closed as this paragraph says below. A check whose row is
 deleted, renamed, rebound or re-keyed while it is read is unreported and read again by id, up to
 three checks: one that then passes is served, or listed as it now reads, and one absent on a
 re-read reads as gone, a 404 or left out of the list. **A row still there after every check raced
 fails closed**: each of its checks failed, so it is reported and answered as a failing record, and
-a writer with direct database access that keeps re-keying a tampered row cannot make it vanish
-from these reads. Honest writes that race all three checks the same way would be a false alarm
+a writer with direct database access that keeps changing a tampered row's username, directory id
+or federated pair cannot make it vanish from these reads. One that keeps changing the row's own
+`id` still can: a re-read by the old id finds nothing, so the row reads as gone under that id,
+unreported. Honest writes that race all three checks the same way would be a false alarm
 too. **Two honest role writes to the account that commit across both of those reads
 are still answered as a failing record and reported**, a false alarm the reads cannot tell from
 tampering, because the role rows are read apart from the account's row. Where
