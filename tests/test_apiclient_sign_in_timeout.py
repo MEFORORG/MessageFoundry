@@ -141,8 +141,8 @@ def test_the_sign_in_read_outlasts_the_engines_request_deadline() -> None:
     deadline (vault BACKLOG #2950 step 1). At or below it, a sign-in still waiting in the
     per-account queue outlasts the client while the engine goes on to finish; a hair above it, the
     engine's 503 can still arrive after the read expires. 30 s is the margin ``cluster_stepdown``
-    takes over the same deadline. The client cannot import the engine's constant
-    (``tests/test_dependency_boundaries.py``), so the order is pinned here."""
+    takes over the same deadline. The client duplicates the deadline rather than importing it, as
+    ``cluster_stepdown`` does (ADR 0088); no test enforces that, so the order is pinned here."""
     assert SIGN_IN_TIMEOUT_SECONDS - DEFAULT_REQUEST_TIMEOUT_SECONDS >= 30.0
 
 

@@ -1246,7 +1246,8 @@ class EngineClient:
         It is sent only when given.
 
         Refused before anything is sent on a cleartext non-loopback hop, like :meth:`verify_mfa`:
-        the body carries a second factor whether or not a token is held."""
+        the body carries a second factor, and any ``enrolment_code``, whether or not a token is
+        held."""
         self._refuse_credential_on_cleartext("a second factor")
         body: dict[str, str] = {"code": code}
         if enrolment_code is not None:
