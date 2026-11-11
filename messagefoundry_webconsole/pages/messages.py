@@ -22,7 +22,7 @@ from messagefoundry.api.models import (
 from messagefoundry.parsing.tree import TreeNode
 
 from .._html import Markup, el, page, rows_table, text
-from ._common import _pager, _reveal_cell, _seg
+from ._common import _pager, _refilled_field_value, _reveal_cell, _seg
 from .approvals import approvals_link
 
 __all__ = [
@@ -329,6 +329,7 @@ def message_search(
             el("input", name="field_path", value=field_path or None, placeholder="PID-3"),
         ),
         el("label", "Field value", el("input", name="field_value", value=field_value or None)),
+        _refilled_field_value(field_path, field_value),
         el("label", "Substring", el("input", name="content", value=content or None)),
         el("label", "Target", el("select", *target_options, name="target")),
         el("input", name="channel_id", value=channel_id or None, placeholder="channel (optional)"),

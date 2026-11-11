@@ -16,8 +16,9 @@ import pytest
 
 from messagefoundry.parsing.xml.signature import verify
 
-# Any non-None value clears the anchor guard (it is never parsed as a certificate on this code path),
-# so a plain sentinel is used instead of a certificate-shaped blob — the latter compiles into the
+# Any non-None value clears the anchor guard, which reads only whether an anchor was passed. Past the
+# guard the anchor read refuses this value (BACKLOG #5372), and these tests stop there, so a plain
+# sentinel is used instead of a certificate-shaped blob — the latter compiles into the
 # .pyc and trips antivirus "embedded certificate" heuristics (Gen:Heur.PHS.1), a false positive.
 _DUMMY_ANCHOR = b"unit-test-anchor-sentinel"
 
@@ -34,12 +35,15 @@ def test_verify_without_anchor_is_refused(kwargs: dict[str, object]) -> None:
 )
 def test_verify_with_an_anchor_gets_past_the_guard(kwargs: dict[str, object]) -> None:
     # Supplying either anchor must clear the no-anchor guard. The call then fails downstream (extra
-    # absent -> RuntimeError, or extra present -> XmlError / crypto error on the dummy doc/cert) — but
-    # never with the anchor-required ValueError.
+    # absent -> RuntimeError, or extra present -> the anchor read refuses the dummy before the
+    # document is parsed: ValueError for the certificate, OSError for the CA path, BACKLOG #5372) —
+    # but never with the anchor-required ValueError.
     try:
         verify(b"<root/>", **kwargs)  # type: ignore[arg-type]
-    except ValueError as exc:  # pragma: no cover - only asserts the guard did not misfire
-        assert "anchor" not in str(exc).lower(), "anchor supplied but no-anchor guard still fired"
+    except ValueError as exc:  # with the extra, the anchor read refuses the sentinel here
+        assert "requires a trust anchor" not in str(exc), (
+            "anchor supplied but no-anchor guard still fired"
+        )
     except Exception:  # noqa: BLE001 - any non-anchor failure means the guard let the call through
         pass
 

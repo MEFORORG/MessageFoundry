@@ -20,8 +20,16 @@ What is refused, by default and with no setting to turn it off:
   by RFC 8018's default, so it is refused like an explicit SHA-1 one.
 * **PBES2 with scrypt** below Appendix C's floor: ``r >= 8``, and ``N`` at least 2^17, 2^16 or 2^15
   for ``p`` of 1, 2, or 3 and up. Those are the table's three rows, encoded as written.
-* Any other derivation this module does not recognise, an encrypted key it cannot parse, and a key
-  file it cannot read or that is too large to check.
+* Any other derivation this module does not recognise, an encrypted key it decodes but cannot
+  parse, and a key file it cannot read or that is too large to check. The DER reader also takes
+  some BER: a long length of up to four bytes with leading zeros, and bytes after the key, which
+  are judged on the wrap like DER. In an ``ENCRYPTED PRIVATE KEY`` block whose BEGIN is paired with
+  its END, bytes it cannot walk, other BER or bytes cut short, are refused whatever the wrap. Under
+  another label or as raw DER, where OpenSSL decrypts the same bytes, such a key that names a
+  password-based scheme is judged on its wrap, and refused where its AlgorithmIdentifier is cut
+  short or in a form the DER reader does not take, inside or out (BACKLOG #5543). So is an
+  ``ENCRYPTED PRIVATE KEY`` block found only behind a stray BEGIN, as :func:`_key_block_problem`
+  says.
 * An encrypted key where the loader has NO passphrase to give, before any library can try it.
 
 ``cryptography``'s ``BestAvailableEncryption`` and the ``openssl`` CLI's own default both write
@@ -44,7 +52,11 @@ checked, which on psqlODBC is every client key (BACKLOG #2423).
 
 What this does NOT check, so a reader does not assume it: the content cipher inside PBES2 (that is a
 cipher question, not a derivation one; the AES-CBC limit above is only what a PKCS#12 part must use
-to be opened and checked), and any private-key loader this module is not called from. The inside of
+to be opened and checked), and any private-key loader this module is not called from. Nor a key
+block under a label other than ``ENCRYPTED PRIVATE KEY`` whose body OpenSSL cleans before it
+decodes: this module decodes the body as strict base64, so it skips one that does not decode and
+reads another as a non-key, and OpenSSL may still decrypt either. That is at least a control or
+high byte at a line end, and a short header line before a blank line. The inside of
 a PKCS#12 part that is itself encrypted IS now checked, as above, wherever the caller runs the
 second step (BACKLOG #1352). Read the list of callers as the coverage, and treat it as AT LEAST
 that list.
@@ -142,8 +154,10 @@ _PBES2: Final = "1.2.840.113549.1.5.13"
 _PBKDF2: Final = "1.2.840.113549.1.5.12"
 _SCRYPT: Final = "1.3.6.1.4.1.11591.4.11"
 _HMAC_SHA1: Final = "1.2.840.113549.2.7"
-_PBES1: Final = frozenset(f"1.2.840.113549.1.5.{n}" for n in (1, 3, 4, 6, 10, 11))
-_PKCS12_PBE: Final = frozenset(f"1.2.840.113549.1.12.1.{n}" for n in range(1, 7))
+_PKCS5_ARC: Final = "1.2.840.113549.1.5."
+_PKCS12_PBE_ARC: Final = "1.2.840.113549.1.12.1."
+_PBES1: Final = frozenset(f"{_PKCS5_ARC}{n}" for n in (1, 3, 4, 6, 10, 11))
+_PKCS12_PBE: Final = frozenset(f"{_PKCS12_PBE_ARC}{n}" for n in range(1, 7))
 
 _ENCRYPTED_LABEL: Final = b"ENCRYPTED PRIVATE KEY"
 
@@ -259,16 +273,107 @@ def _encrypted_pkcs8_algorithm(der: bytes) -> _Tlv | None:
     whose shape says encrypted and whose algorithm does not parse is refused rather than passed.
 
     The shape is ``SEQUENCE { AlgorithmIdentifier, OCTET STRING }``. An unencrypted PKCS#8 or a
-    traditional key opens with an INTEGER instead, so it returns ``None``. Bytes after the outer
-    SEQUENCE are ignored HERE, on purpose: a lenient loader may ignore them too, so a weak wrap with
-    a byte appended must still be seen and refused."""
+    traditional key opens with an INTEGER instead, so it returns ``None``. A constructed OCTET
+    STRING is BER, which DER forbids, so it raises :class:`_Malformed` and is left to
+    :func:`_ber_problem`, as other bytes the DER reader cannot walk are.
+    Bytes after the outer SEQUENCE are ignored HERE, on purpose: a lenient loader may ignore them
+    too, so a weak wrap with a byte appended must still be seen and refused."""
     outer = _read_tlv(der, 0, len(der))
     if outer.tag != 0x30:
         raise _Malformed
     parts = _children(der, outer)
-    if len(parts) != 2 or parts[0].tag != 0x30 or parts[1].tag != 0x04:
+    if len(parts) != 2 or parts[0].tag != 0x30:
         return None
-    return parts[0]
+    if parts[1].tag == 0x24:
+        raise _Malformed  # BER: left to _ber_encrypted_pkcs8_algorithm
+    return parts[0] if parts[1].tag == 0x04 else None
+
+
+#: What :func:`_ber_header` gives for a tag number it cannot fold to one byte. No element of a key
+#: uses one.
+_HIGH_TAG: Final = -1
+
+
+def _ber_header(buf: bytes, pos: int) -> tuple[int, int, int | None] | None:
+    """``(tag, contents start, length)`` for the BER header at ``pos``, the length ``None`` when it
+    is indefinite, or ``None`` when the bytes end before the header does. A long length is read
+    whatever its width, leading zeros and all. A tag in the high-tag-number form is folded to its
+    one-byte form, however many 0x80 bytes pad its number, as OpenSSL reads it; a number of 31 or
+    more gives :data:`_HIGH_TAG`."""
+    end = len(buf)
+    if pos >= end:
+        return None
+    tag = buf[pos]
+    pos += 1
+    if tag & 0x1F == 0x1F:
+        number = 0
+        while True:
+            if pos >= end:
+                return None
+            byte = buf[pos]
+            pos += 1
+            number = min((number << 7) | (byte & 0x7F), 1 << 32)  # bounded; only < 31 matters
+            if not byte & 0x80:
+                break
+        tag = (tag & 0xE0) | number if number < 0x1F else _HIGH_TAG
+    if pos >= end:
+        return None
+    first = buf[pos]
+    pos += 1
+    if first == 0x80:
+        return tag, pos, None
+    if not first & 0x80:
+        return tag, pos, first
+    count = first & 0x7F  # at most 127 bytes, so the int below stays small to build
+    if pos + count > end:
+        return None
+    return tag, pos + count, int.from_bytes(buf[pos : pos + count], "big")
+
+
+#: The OID arcs of the password-based schemes an EncryptedPrivateKeyInfo names: PKCS#5 (PBES1,
+#: PBES2 and their kin) and the PKCS#12 PBE schemes. A certificate, a CSR, a public key and an
+#: unencrypted key never open with an AlgorithmIdentifier under either.
+_PBE_ARCS: Final = (_PKCS5_ARC, _PKCS12_PBE_ARC)
+
+
+def _ber_encrypted_pkcs8_algorithm(der: bytes) -> _Tlv | None:
+    """For bytes the DER reader could not walk: the AlgorithmIdentifier of an
+    EncryptedPrivateKeyInfo in a BER form, or ``None`` when ``der`` is not that shape (BACKLOG
+    #5543).
+
+    OpenSSL's decoder takes BER, so it decrypts an EncryptedPrivateKeyInfo in forms DER forbids, at
+    least: an indefinite length, a constructed OCTET STRING, a long length padded with leading
+    zeros, and a tag in the high-tag-number form, padded or not. Under a plain ``PRIVATE KEY``
+    label or as raw DER such a key would pass as unencrypted. So the shape is read leniently, as
+    far as the scheme OID: a SEQUENCE whose first element is a SEQUENCE whose first element is an
+    OID under :data:`_PBE_ARCS`. Anything else returns ``None`` and is left to the loader, as
+    before this reader existed: a BER certificate, CSR or public key opens with another OID or with
+    no OID at all there, and an unencrypted key opens with an INTEGER.
+
+    In that shape, the AlgorithmIdentifier is returned to be judged on its wrap when its own header
+    is one :func:`_read_tlv` can walk, whatever BER the bytes around it use. Otherwise this raises
+    :class:`_Malformed`. :func:`_ber_problem` says what each outcome is refused or passed as.
+    :func:`_read_tlv` and :func:`_children` stay DER readers, because :mod:`messagefoundry.pki`
+    shares them."""
+    outer = _ber_header(der, 0)
+    if outer is None or outer[0] != 0x30:
+        return None
+    inner = _ber_header(der, outer[1])
+    if inner is None or inner[0] != 0x30:
+        return None
+    named = _ber_header(der, inner[1])
+    if named is None:
+        return None
+    tag, start, length = named
+    if tag != 0x06 or length is None or start + length > len(der):
+        return None
+    try:
+        scheme = _oid(der, _Tlv(0x06, start, start + length))
+    except _Malformed:
+        return None
+    if not scheme.startswith(_PBE_ARCS):
+        return None
+    return _read_tlv(der, outer[1], len(der))  # raises where the DER reader cannot walk it
 
 
 def _pbes2_problem(buf: bytes, params: _Tlv | None) -> str | None:
@@ -383,25 +488,78 @@ def _wrap_problem(der: bytes, algorithm: str, params: _Tlv | None) -> str | None
 
 _UNREADABLE: Final = "is an encrypted private key this engine cannot read to check its wrap"
 
+#: The refusal for an EncryptedPrivateKeyInfo the DER reader cannot walk, from
+#: :func:`_ber_problem`. Its remedy is :data:`_REENCODE`, not a re-wrap: the wrap may be approved,
+#: and only the encoding is not accepted.
+_UNREADABLE_BER: Final = (
+    "is an encrypted private key in an encoding this engine does not accept: BER that is not "
+    "DER, or bytes cut short"
+)
+_REENCODE: Final = (
+    "Supply the whole key DER-encoded, as the openssl CLI and the cryptography library write one"
+)
+
 
 def _der_problem(der: bytes, *, known_encrypted: bool) -> tuple[bool, str | None]:
     """``(encrypted, problem)`` for one DER key.
 
     ``known_encrypted`` is true for the body of an ``ENCRYPTED PRIVATE KEY`` PEM block, which must
     parse as an EncryptedPrivateKeyInfo. Bare DER need not: if its outer shape is not one, it is an
-    unencrypted key or not a key at all, and the loader reports the second itself."""
+    unencrypted key or not a key at all, and the loader reports the second itself. Bytes the DER
+    reader cannot walk go to :func:`_ber_problem`, among them bytes whose OCTET STRING is
+    constructed, has a high tag or has a length of more than four bytes. A long length of up to
+    four bytes with leading zeros is BER the DER reader takes, so such a key is judged here.
+    Where the DER reader walks the outer SEQUENCE and both its parts' headers, but not the
+    AlgorithmIdentifier's contents, BER parameters or a BER scheme OID among them, the key gets
+    :data:`_UNREADABLE`, the text for any wrap that does not parse, and the remedy that text gets,
+    not the BER text: a re-wrap writes DER, which also cures the encoding. So which text such a key
+    gets depends on its OCTET STRING too."""
     try:
         found = _encrypted_pkcs8_algorithm(der)
     except _Malformed:
-        found = None
+        return _ber_problem(der, known_encrypted=known_encrypted)
+    return _judge(der, found, known_encrypted=known_encrypted, unparsed=_UNREADABLE)
+
+
+def _judge(
+    der: bytes, found: _Tlv | None, *, known_encrypted: bool, unparsed: str
+) -> tuple[bool, str | None]:
+    """``(encrypted, problem)`` once a reader has looked for the AlgorithmIdentifier: ``found`` is
+    it, or ``None`` where ``der`` is not the EncryptedPrivateKeyInfo shape. The shape said
+    encrypted, so an algorithm or parameters that do not parse are refused with ``unparsed``,
+    failing closed."""
     if found is None:
         return (True, _UNREADABLE) if known_encrypted else (False, None)
-    # The shape said encrypted; an algorithm or parameters that do not parse are refused, failing
-    # closed.
-    problem: str | None = _UNREADABLE
+    problem: str | None = unparsed
     with contextlib.suppress(_Malformed):
         problem = _wrap_problem(der, *_algorithm(der, found))
     return True, problem
+
+
+def _ber_problem(der: bytes, *, known_encrypted: bool) -> tuple[bool, str | None]:
+    """``(encrypted, problem)`` for bytes the DER reader cannot walk: BER it does not take, or bytes
+    cut short (BACKLOG #5543).
+
+    Under the ``ENCRYPTED PRIVATE KEY`` label they are refused whatever they hold, as they were
+    before the BER reader existed: with the wrap's own text where
+    :func:`_ber_encrypted_pkcs8_algorithm` finds a wrap that is not approved, with
+    :data:`_UNREADABLE_BER` where it finds an approved one or cannot read the AlgorithmIdentifier,
+    and with :data:`_UNREADABLE` where they name no password-based scheme. Under another label or as
+    raw DER, where OpenSSL decrypts the same bytes, a password-based scheme is judged on its wrap:
+    one not approved is refused, an approved one passes even when the bytes after its
+    AlgorithmIdentifier are cut short (OpenSSL refuses those itself), and an AlgorithmIdentifier
+    that is cut short or the DER reader cannot walk, inside or out, gets :data:`_UNREADABLE_BER`.
+    Bytes that name no password-based scheme pass there, as the DER reader passes a non-key."""
+    try:
+        found = _ber_encrypted_pkcs8_algorithm(der)
+    except _Malformed:
+        return True, _UNREADABLE_BER
+    encrypted, problem = _judge(
+        der, found, known_encrypted=known_encrypted, unparsed=_UNREADABLE_BER
+    )
+    if problem is None and known_encrypted:
+        problem = _UNREADABLE_BER
+    return encrypted, problem
 
 
 _BEGIN: Final = b"-----BEGIN "
@@ -416,9 +574,12 @@ def _pem_blocks(material: bytes) -> list[tuple[bytes, bytes]]:
     """``(label, body)`` for every BEGIN/END pair in ``material``, in one linear pass.
 
     Markers are found ANYWHERE, not only alone on a line: ``cryptography``'s PEM reader and
-    OpenSSL both accept a key that is all on one line, has text before BEGIN, or has base64 on the
-    BEGIN or END line, so a checker stricter than the loaders would wave those through unchecked.
-    Every search starts where the last one stopped, so a garbled file costs one pass."""
+    OpenSSL both accept a key that is all on one line, or has base64 on the BEGIN or END line, so a
+    checker stricter than the loaders would wave those through unchecked. Each BEGIN is paired with
+    the next END, so a BEGIN between them is part of the body. This is the reading every check here
+    keeps; :func:`_split_pem_blocks` adds a second one, so a key may be refused for what either
+    shows and is never passed for what this one refuses (BACKLOG #5544). Every search starts where
+    the last one stopped, so a garbled file costs one pass."""
     blocks: list[tuple[bytes, bytes]] = []
     pos = 0
     while True:
@@ -436,6 +597,59 @@ def _pem_blocks(material: bytes) -> list[tuple[bytes, bytes]]:
             return blocks
         blocks.append((material[label_start:label_end].strip(), material[body_start:end]))
         pos = end + len(_END)
+
+
+def _split_pem_blocks(material: bytes) -> list[tuple[bytes, bytes]]:
+    """``(label, body)`` for every PEM block in ``material`` when a BEGIN also ends the body before
+    it, in one linear pass. A body runs from its BEGIN marker to the next END, or to the next BEGIN
+    when one comes first (BACKLOG #5544).
+
+    :func:`_pem_blocks` pairs a stray BEGIN with the key's END, so the key reads as a block with
+    another label, or as one whose body is not base64, and a check on that reading alone skips it.
+    OpenSSL skips a BEGIN that does not start a line, as ``messagefoundry.pki``'s ``_crl_blocks``
+    records, so it skips a ``# -----BEGIN NOTE-----`` comment line, or a BEGIN line with no closing
+    dashes, and loads the key after it: the scan restarts at the inner BEGIN. OpenSSL also loads a
+    key from a proper BEGIN line with a stray BEGIN line between its base64 and its END: the outer
+    block is kept too, its body cut at the inner BEGIN. OpenSSL's base64 reader stops at the first
+    ``-``, so it decodes nothing past that point. An OpenSSH reader such as paramiko may decode past
+    it, but the cipher name it reads is at the start of the body, which the cut keeps. The cut also
+    holds each body to the stretch between two BEGINs, which keeps the pass linear. A label ends at
+    its line, as OpenSSL reads it, so a label that runs across a line end is not one here.
+
+    A block this reading finds may be one no loader opens, such as a stray BEGIN line inside a key
+    whose own BEGIN line is proper, so a caller reads these blocks more leniently than the paired
+    ones: see :func:`_inspect`.
+
+    Every search starts where the last one stopped, and the END found is kept until the scan
+    passes it, so a garbled file costs one pass."""
+    blocks: list[tuple[bytes, bytes]] = []
+    pos = 0
+    end = -1
+    while True:
+        begin = material.find(_BEGIN, pos)
+        if begin < 0:
+            return blocks
+        label_start = begin + len(_BEGIN)
+        label_end = material.find(_DASHES, label_start, label_start + _MAX_LABEL + 1)
+        label = material[label_start:label_end] if label_end >= 0 else b""
+        if label_end < 0 or b"\n" in label or b"\r" in label:
+            pos = label_start
+            continue
+        body_start = label_end + len(_DASHES)
+        if end < body_start:
+            end = material.find(_END, body_start)
+            if end < 0:
+                return blocks
+        # Searched from the label, not the body: an inner BEGIN can start inside the dashes this
+        # BEGIN's label was closed by, as in ``-----BEGIN X--------BEGIN ...``.
+        inner = material.find(_BEGIN, label_start, end)
+        if inner < 0:
+            blocks.append((label.strip(), material[body_start:end]))
+            pos = end + len(_END)
+            continue
+        if inner > body_start:  # else the inner BEGIN starts in this one's own closing dashes
+            blocks.append((label.strip(), material[body_start:inner]))
+        pos = inner
 
 
 def _legacy_encrypted(material: bytes) -> bool:
@@ -466,29 +680,52 @@ def _inspect(material: bytes) -> tuple[bool, str | None]:
             "uses legacy OpenSSL PEM encryption (a Proc-Type: 4,ENCRYPTED header), whose key "
             "is derived with MD5 at one iteration (ASVS 11.4.1, 11.4.4)"
         )
+    # The whole input is read as DER first, whatever PEM markers it holds: DER with a BEGIN and an
+    # END marker in or after it is still DER to a loader that reads one object, and a lenient one
+    # ignores bytes after the key. PEM text is not the EncryptedPrivateKeyInfo shape, so it passes.
+    encrypted, problem = _der_problem(material, known_encrypted=False)
     blocks = _pem_blocks(material)
-    if not blocks:
-        # No complete PEM block, which includes DER that happens to contain a BEGIN marker.
-        return _der_problem(material, known_encrypted=False)
-    encrypted = False
-    for label, body in blocks:
-        known = label == _ENCRYPTED_LABEL
-        if not known and not label.endswith(b"PRIVATE KEY"):
-            continue  # a certificate or other non-key block
-        der = b""
-        try:
-            der = base64.b64decode(b"".join(body.split()), validate=True)
-        except (binascii.Error, ValueError):
-            if known:
-                return True, _UNREADABLE
-            continue  # not base64: the loader rejects it itself
-        # Every key block is read for the EncryptedPrivateKeyInfo shape, whatever its label:
-        # OpenSSL decrypts that shape under a plain PRIVATE KEY label too.
-        block_encrypted, problem = _der_problem(der, known_encrypted=known)
-        encrypted = encrypted or block_encrypted
-        if problem is not None:
-            return True, problem
+    if problem is not None or not blocks:
+        return encrypted, problem
+    # The split reading first, so a weak wrap a stray BEGIN hid is refused with its own text. The
+    # paired reading follows, read as it was before the split one existed: what it refuses stays
+    # refused, so the split reading can only add refusals.
+    for split, readings in ((True, _split_pem_blocks(material)), (False, blocks)):
+        for label, body in readings:
+            block_encrypted, problem = _key_block_problem(label, body, split=split)
+            encrypted = encrypted or block_encrypted
+            if problem is not None:
+                return True, problem
     return encrypted, None
+
+
+def _key_block_problem(label: bytes, body: bytes, *, split: bool) -> tuple[bool, str | None]:
+    """``(encrypted, problem)`` for one PEM block, from :func:`_split_pem_blocks` when ``split``
+    is true and from :func:`_pem_blocks` when it is false."""
+    known = label == _ENCRYPTED_LABEL
+    if not known and not label.endswith(b"PRIVATE KEY"):
+        return False, None  # a certificate or other non-key block
+    if split:
+        # Cut at the first "-", where OpenSSL's base64 reader stops, so text after the base64
+        # does not hide the key from this check.
+        body = body.split(b"-", 1)[0]
+    try:
+        der = base64.b64decode(b"".join(body.split()), validate=True)
+    except (binascii.Error, ValueError):
+        # Refused under the ENCRYPTED label in either reading. In the split one this block may be
+        # a stray, but OpenSSL cleans some bodies before it decodes them, so a skip there would let
+        # a stray BEGIN in front widen that gap from the plain labels to this one. Under another
+        # label the block is skipped: OpenSSL may still load some such bodies, as it drops a
+        # control or high byte at a line end, and a short header line, before it decodes.
+        return (True, _UNREADABLE) if known else (False, None)
+    if split and not der:
+        return False, None  # no key bytes: a stray BEGIN line just before an END makes one
+    # Every key block is read for the EncryptedPrivateKeyInfo shape, whatever its label: OpenSSL
+    # decrypts that shape under a plain PRIVATE KEY label too. A split block is read as a plain
+    # label is, whatever its label: it may be a stray no loader opens, such as an ENCRYPTED BEGIN
+    # line inside an unencrypted key, which OpenSSL loads. The paired reading keeps the stricter
+    # rule for the ENCRYPTED label.
+    return _der_problem(der, known_encrypted=known and not split)
 
 
 def _too_large(material: bytes) -> bool:
@@ -941,25 +1178,37 @@ def ssh_key_encrypted(material: bytes) -> bool:
 
     Neither format can reach an approved derivation: legacy PEM derives with MD5, and OpenSSH
     format with bcrypt_pbkdf, which ASVS Appendix C lists only for password storage. An OpenSSH
-    key that cannot be read is treated as encrypted, so it is refused rather than passed."""
+    key that cannot be read is treated as encrypted, so it is refused rather than passed: an
+    OpenSSH block whose body is empty or not base64 among them, as :func:`_pem_blocks` pairs it.
+    The blocks :func:`_split_pem_blocks` adds are read too, so a stray BEGIN line in front of an
+    encrypted key does not hide it (BACKLOG #5544); one of those with no key bytes is skipped, since
+    a stray BEGIN line just before a key's own makes such a block."""
     if _legacy_encrypted(material):
         return True
-    for label, body in _pem_blocks(material):
-        if label != b"OPENSSH PRIVATE KEY":
-            continue
-        raw = b""
-        try:
-            raw = base64.b64decode(b"".join(body.split()), validate=True)
-        except (binascii.Error, ValueError):
-            return True
-        if not raw.startswith(_OPENSSH_MAGIC):
-            return True
-        pos = len(_OPENSSH_MAGIC)
-        length = int.from_bytes(raw[pos : pos + 4], "big")
-        cipher = raw[pos + 4 : pos + 4 + length]
-        if cipher != b"none":
-            return True
-    return False
+    # A paired block with no key bytes (None) reads as encrypted; a split one is skipped.
+    return any(
+        label == b"OPENSSH PRIVATE KEY" and _openssh_body_encrypted(body) is not False
+        for label, body in _pem_blocks(material)
+    ) or any(
+        label == b"OPENSSH PRIVATE KEY" and _openssh_body_encrypted(body) is True
+        for label, body in _split_pem_blocks(material)
+    )
+
+
+def _openssh_body_encrypted(body: bytes) -> bool | None:
+    """Whether one OpenSSH block's body is encrypted, ``None`` when it decodes to no bytes. A body
+    that is not strict base64, or not an ``openssh-key-v1`` key, reads as encrypted."""
+    try:
+        raw = base64.b64decode(b"".join(body.split()), validate=True)
+    except (binascii.Error, ValueError):
+        return True
+    if not raw:
+        return None
+    if not raw.startswith(_OPENSSH_MAGIC):
+        return True
+    pos = len(_OPENSSH_MAGIC)
+    length = int.from_bytes(raw[pos : pos + 4], "big")
+    return raw[pos + 4 : pos + 4 + length] != b"none"
 
 
 def key_wrap_refusal(
@@ -983,7 +1232,14 @@ def key_wrap_refusal(
         )
     encrypted, problem = _inspect(material)
     if problem is not None:
-        fix = _DECRYPT if unlock_setting is None else _REWRAP
+        # _inspect hands _ber_problem's constant through unchanged, so this match holds; the BER
+        # refusal tests pin it.
+        if unlock_setting is None:
+            fix = _DECRYPT
+        elif problem == _UNREADABLE_BER:
+            fix = _REENCODE
+        else:
+            fix = _REWRAP
         return f"{setting}: the private key {problem}. It is refused. {fix}"
     if encrypted and not passphrase_given:
         fix = _DECRYPT if unlock_setting is None else f"Set {unlock_setting}"

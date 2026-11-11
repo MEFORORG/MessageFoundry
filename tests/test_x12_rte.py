@@ -31,6 +31,7 @@ from messagefoundry.config.wiring import (
     build_inbound_connection,
     build_outbound_connection,
 )
+from messagefoundry.parsing.x12.errors import X12PeekError
 from messagefoundry.parsing.x12.peek import X12Peek
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.transports import build_destination
@@ -305,6 +306,23 @@ def test_ta1_for_a_payload_with_no_isa_skips_correlation() -> None:
     # Nothing to correlate against (as MLLP does for an unreadable MSH-10): classified on TA1-04.
     with pytest.raises(NegativeAckError):
         _dest(capture_response=False)._check_ta1(_ta1("R"), payload="NOT-AN-INTERCHANGE~")
+
+
+def test_a_sent_isa_the_codec_refuses_still_correlates_by_its_isa13() -> None:
+    # BACKLOG #5536: the codec refuses an ISA whose element data holds a delimiter, but its ISA13
+    # still reads at the fixed offset. Before the fallback a "~" in ISA06 switched correlation off,
+    # so a TA1*R naming another interchange dead-lettered this one.
+    forged = EDI.replace("SENDERID".ljust(15), "A~IEA*1".ljust(15), 1)
+    with pytest.raises(X12PeekError, match="ISA-06 holds a delimiter character"):
+        X12Peek.parse(forged)
+    assert _sent_isa13(forged) == "000000001"
+    with pytest.raises(DeliveryError) as ei:
+        _dest(capture_response=False)._check_ta1(_ta1_for("R", "000000777"), payload=forged)
+    assert not isinstance(ei.value, NegativeAckError)
+    with pytest.raises(NegativeAckError):
+        _dest(capture_response=False)._check_ta1(_ta1_for("R", "000000001"), payload=forged)
+    # Control: an ISA whose separators are not where the layout fixes them still has no ISA13.
+    assert _sent_isa13(EDI.replace("*", "|", 2)) is None
 
 
 def test_the_ta1_naming_the_sent_interchange_is_the_one_acted_on() -> None:

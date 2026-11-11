@@ -97,7 +97,10 @@ Two consequences follow, and both cut toward pooling:
 dispatch at a time**. Inside that body, every isolation fault ends in `self._kill(proc)` — a marshal
 rejection, a `wall_seconds` timeout, an EOF from a crashed child, a codec rejection, and a frame no
 outstanding request asked for. There is no wire-level cancel: killing the process *is* how a runaway
-call is stopped, and `_kill` reaps the whole tree.
+call is stopped, and `_kill` reaps the whole tree. (*Amendment B* records that the first item, a
+marshal rejection of the engine's own request, which is refused before a byte is written, no longer
+kills the worker. The codec rejection of the worker's answer in the same list still does, recorded
+as an invalid frame. *Amendment B* also records that every kill records its cause.)
 
 Against one inbound, the blast radius of a kill is that inbound. Against a shared worker it is every
 lane that worker serves, and that is the design work this memo exists to price.
@@ -343,6 +346,40 @@ for the build, open to the build's own review.
 5. The N=1500 two-arm comparison runs against **the pool**, the shape that would ship, on both
    Windows and Linux, with N=750 recorded beside it (BACKLOG #3132).
 
+## Amendment B (2026-11-09) -- a refused request keeps its worker, and a kill records its cause
+
+The Context section above describes `main` before vault BACKLOG #3135, and is kept as written apart
+from one added pointer to this amendment, at the end of its paragraph on what a fault kills. Since
+#3135:
+
+- **A request the engine cannot encode, or one over the frame cap, no longer kills the worker.**
+  This is the engine's own request, refused before a byte is written, so the worker is still in
+  step; only that message fails. A failure while writing the request still kills the worker, since
+  it may hold part of a frame. The worker's answer is a different case: a codec rejection of an
+  answer still kills the worker, recorded as an invalid frame.
+- **A frame waiting before a request kills the worker and retries the message once on a fresh one**
+  (owner ruling 2026-11-09, #3135 step 4). The message never reached the worker. Its
+  call fails, which the `[delivery] internal_error` policy then handles, in at least these cases:
+  the fresh worker has a stray frame waiting too; a respawn
+  fails; the workers spawned for it keep exiting, or closing their pipe, before its request is
+  written; and any fault the request itself meets on the fresh worker, as for any other message,
+  such as a worker that exits as its request is written. A frame left after an answer can still
+  fail the call of the message it follows. [ADR 0087](0087-sandbox-subprocess-isolation.md) AC-10's
+  2026-11-09 amendment says when each check runs, what a frame arriving later costs, and how the
+  handling of a length header over the frame cap changed.
+- **Every kill records a cause from a closed set**, `KillCause` in `messagefoundry/pipeline/sandbox.py`,
+  and writes one `WARNING` naming the inbound, the phase and the cause token, never message content.
+  A graph refusal writes none, and a shutdown logs at `INFO`. The runner alerts on a graph refusal
+  only when it is against the graph the engine serves; one against a graph a reload has replaced
+  gets neither the alert nor the runner's line. This
+  is the kill-cause record design point 1 of *Amendment A* puts ahead of any kill budget; the budget
+  itself is still unbuilt. The reap after a kill, a graph refusal's included, can add lines of its
+  own, at least those [`docs/CONFIGURATION.md`](../CONFIGURATION.md) `[sandbox]` lists for a worker
+  already reaped or a process group that could not be signalled, so one kill is not always one line.
+
+The kill is still the only cancellation primitive for a running dispatch, so the blast-radius
+argument above stands for every fault that does kill.
+
 ## Acceptance Criteria
 
 > **Amended 2026-10-07 for option 1.** AC-1, AC-2 and AC-5 stand as written. AC-3 and AC-4 are
@@ -377,6 +414,13 @@ for the build, open to the build's own review.
   the closed codec grammar, a desynchronized or forged frame, an unsolicited frame, and a
   `wall_seconds` overrun SHALL each still raise rather than degrade.
   → the existing ADR 0087 sandbox suites, which must continue to pass unchanged
+  > **Amended 2026-11-09 (vault BACKLOG #3135 step 4, owner ruling 2026-11-09).** One refusal
+  > changed by ruling, not by degradation: an unsolicited frame found **before** a request still
+  > kills the worker and is never consumed, but its message is retried once on a fresh worker, and
+  > raises in at least the cases *Amendment B* lists. `test_a_frame_staged_between_dispatches_can_never_answer_the_next_one`
+  > was changed to pin that. A request outside the codec grammar still raises, and keeps the worker.
+  >
+  > *Added 2026-11-10, not part of the ruling:* at least two forged frames that carry the request's id can fail to raise: a forged `ok` answer, and at `mode=isolated` a forged lookup. See [ADR 0087](0087-sandbox-subprocess-isolation.md) AC-10's 2026-11-09 amendment and `dispatch` in `messagefoundry/pipeline/sandbox.py`, with `_await_answer` for the lookup. No owner record cited there names this AC. A fix is to be added as a step on vault BACKLOG #3135.
 
 ## Consequences
 

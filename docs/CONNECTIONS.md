@@ -1202,7 +1202,10 @@ ceiling to what the IDE row feeds it. The second covers content from any row:
   Each takes `max_output_bytes` as a required keyword with no default, so the Handler author must
   choose the ceiling. Passing `None` removes it, and has to be written out. `zip_decompress` also caps
   the member count at `max_entries`, default 1024, and refuses the whole archive when one member's
-  name or content fails the checks in `parsing/sniff.py`. `gzip_decompress` caps the number of gzip
+  name or content fails the checks in `parsing/sniff.py`. It reads only STORED and DEFLATED members,
+  and refuses an archive with any other member method, such as BZIP2, LZMA or Zstandard, before it
+  reads a byte, because the stdlib reader expands those past the ceiling before the ceiling is
+  checked (BACKLOG #5535). `gzip_decompress` caps the number of gzip
   members at `max_members`, default 1024 (BACKLOG #1129). A gzip stream has no member list to read
   first. So the codec counts each member as it starts, and refuses the one past the cap before it
   inflates. Each decompressor checks its caps in a trial pass before the real one (BACKLOG #1129).

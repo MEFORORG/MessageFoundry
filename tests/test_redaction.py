@@ -2849,11 +2849,19 @@ def test_the_credential_pattern_is_held_to_its_sources() -> None:
 
 
 def _start_labels_at_a_word_boundary_alone(patched: pytest.MonkeyPatch) -> None:
-    """Give ``secretscrub``'s label patterns back the ``\\b`` start ``_CREDENTIAL_AHEAD`` keeps."""
+    """Give ``secretscrub``'s label patterns back the ``\\b`` start ``_CREDENTIAL_AHEAD`` keeps.
+
+    Three of them open with ``_LABEL_OR_CAMEL_START`` since BACKLOG #5545, which holds
+    ``_LABEL_START``; the whole start is swapped there, or the camelCase half would stay. Its empty
+    ``camel`` group stays, never taking part, since the narrowed value class reads it."""
     for name in PCT_STARTED:
         pattern: re.Pattern[str] = getattr(secretscrub, name)
         assert pattern.pattern.count(secretscrub._LABEL_START) == 1, name
-        old = pattern.pattern.replace(secretscrub._LABEL_START, r"\b")
+        if secretscrub._LABEL_OR_CAMEL_START in pattern.pattern:
+            start, word_start = secretscrub._LABEL_OR_CAMEL_START, r"(?:\b|(?P<camel>)(?!))"
+        else:
+            start, word_start = secretscrub._LABEL_START, r"\b"
+        old = pattern.pattern.replace(start, word_start)
         patched.setattr(secretscrub, name, re.compile(old, pattern.flags))
 
 

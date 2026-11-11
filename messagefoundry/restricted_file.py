@@ -52,7 +52,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from messagefoundry.auth.anchor_path import (
     _GRANTING_ACE_TYPES,
@@ -71,7 +71,9 @@ __all__ = [
     "LINUX_HOST_FILE_SYSTEMS",
     "WINERROR_ACCESS_DENIED",
     "WINERROR_SHARING_VIOLATION",
+    "OwnerRefused",
     "RestrictedFileError",
+    "administrators_enabled",
     "broad_access_problem",
     "can_add_a_file",
     "custody_account_problem",
@@ -163,8 +165,8 @@ def custody_account_problem(sid: str | None) -> str | None:
     if sid in _CUSTODY_REFUSED_SIDS:
         return (
             f"{describe_sid(sid)} is an account many services share or the operating system's "
-            "own, and a key custody file is kept for an account the engine alone runs as (a "
-            "virtual service account, S-1-5-80-...)"
+            "own, and a key custody file is kept for an account the engine alone runs as, such "
+            "as a virtual service account (S-1-5-80-...)"
         )
     return None
 
@@ -215,8 +217,8 @@ def handoff_grantee_problem(sid: str, kind_of: Callable[[str], int | None]) -> s
     what = "no account" if kind is None else _SID_TYPE_NAMES.get(kind, f"an account of kind {kind}")
     return (
         f"Windows maps {describe_sid(sid)} to {what}, not to one account, and a handoff is granted "
-        "to the one account the service runs as: a user account, or a virtual service account "
-        "(S-1-5-80-...)"
+        "to the one account the service runs as, such as a user account or a virtual service "
+        "account (S-1-5-80-...)"
     )
 
 
@@ -229,23 +231,7 @@ def _lookup_sid_kind(sid: str) -> int | None:
     import ctypes
     from ctypes import wintypes
 
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    advapi32.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
-    advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
-    advapi32.LookupAccountSidW.argtypes = [
-        wintypes.LPCWSTR,  # lpSystemName (NULL = this machine)
-        ctypes.c_void_p,  # Sid
-        wintypes.LPWSTR,  # Name
-        ctypes.POINTER(wintypes.DWORD),  # cchName
-        wintypes.LPWSTR,  # ReferencedDomainName
-        ctypes.POINTER(wintypes.DWORD),  # cchReferencedDomainName
-        ctypes.POINTER(ctypes.c_int),  # peUse
-    ]
-    advapi32.LookupAccountSidW.restype = wintypes.BOOL
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.LocalFree.restype = ctypes.c_void_p
-
+    advapi32, kernel32 = _sid_libraries()
     pointer = ctypes.c_void_p()
     if not advapi32.ConvertStringSidToSidW(sid, ctypes.byref(pointer)):
         raise RestrictedFileError(f"the account {sid} could not be read as a SID")
@@ -425,6 +411,19 @@ def _is_package_sid(sid: str) -> bool:
     (vault BACKLOG #3411; the key custody ADR draft, rule 3). Refused as a grant when a file is
     created, and reported by the check before a key file is used, like a broad group."""
     return sid.upper().startswith(_PACKAGE_SID_PREFIX)
+
+
+def _screened_principal(sid: str) -> str | None:
+    """What ``sid`` is, when a key file may name it neither as a read grant nor as its owner: an
+    application package, or a broad group. ``None`` when it may be named. One screen for both on
+    the create, so a later screen reaches grants and owners alike there. The check before a key file
+    is used, :func:`_windows_access_problem`, calls the two predicates itself and judges entries,
+    not the owner."""
+    if _is_package_sid(sid):
+        return "an application package"
+    if _is_broad_group(sid):
+        return f"{describe_sid(sid)}, a group many accounts hold"
+    return None
 
 
 def _windows_access_problem(security: _WinPathSecurity, mask: int = _REACH_MASK) -> str | None:
@@ -1240,8 +1239,46 @@ def replace_generated(staged: Path, live: Path) -> None:
 # --- creating the file ----------------------------------------------------------------------------
 
 
-class _OwnerRefused(RestrictedFileError):
+class OwnerRefused(RestrictedFileError):
     """The file could not be created owned by the account asked for, so nothing was written to it."""
+
+
+@functools.cache
+def _sid_libraries() -> tuple[Any, Any]:
+    """``advapi32`` and ``kernel32``, loaded once, with the prototypes of the SID calls this
+    module's account helpers share declared once: converting a SID to and from its string form,
+    looking up a SID's account, checking a token's membership, and freeing what those return. At
+    least the name lookup and the create still declare their own. Windows only."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise RestrictedFileError("a SID is converted on Windows only")
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+    advapi32.CheckTokenMembership.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    advapi32.CheckTokenMembership.restype = wintypes.BOOL
+    advapi32.LookupAccountSidW.argtypes = [
+        wintypes.LPCWSTR,  # lpSystemName (NULL = this machine)
+        ctypes.c_void_p,  # Sid
+        wintypes.LPWSTR,  # Name
+        ctypes.POINTER(wintypes.DWORD),  # cchName
+        wintypes.LPWSTR,  # ReferencedDomainName
+        ctypes.POINTER(wintypes.DWORD),  # cchReferencedDomainName
+        ctypes.POINTER(ctypes.c_int),  # peUse
+    ]
+    advapi32.LookupAccountSidW.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    return advapi32, kernel32
 
 
 #: ERROR_INVALID_OWNER: the creating token may not make the SID asked for a new object's owner.
@@ -1249,7 +1286,7 @@ _WINERROR_INVALID_OWNER = 1307
 _READ_CONTROL = 0x00020000
 
 
-def _administrators_enabled() -> bool:
+def administrators_enabled() -> bool:
     """Whether this process's token holds Administrators as an enabled group: at least an elevated
     administrator's and SYSTEM's do, and a filtered token's (an administrator not elevated, where
     the group is deny-only) does not.
@@ -1263,19 +1300,7 @@ def _administrators_enabled() -> bool:
     import ctypes
     from ctypes import wintypes
 
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    advapi32.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
-    advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
-    advapi32.CheckTokenMembership.argtypes = [
-        wintypes.HANDLE,
-        ctypes.c_void_p,
-        ctypes.POINTER(wintypes.BOOL),
-    ]
-    advapi32.CheckTokenMembership.restype = wintypes.BOOL
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.LocalFree.restype = ctypes.c_void_p
-
+    advapi32, kernel32 = _sid_libraries()
     sid = ctypes.c_void_p()
     if not advapi32.ConvertStringSidToSidW(ADMINISTRATORS_SID, ctypes.byref(sid)):
         raise RestrictedFileError(
@@ -1309,10 +1334,15 @@ def write_restricted_file(
     ``NT SERVICE\\MessageFoundry``, or a SID, with or without a leading ``*``.
 
     ``owner`` (Windows only) is the account the file is created owned by, in the call that creates
-    it, named as ``read_grants`` are, and read back through the creating handle before a byte is
-    written. A token that may not make that account an owner, or a file that reads back owned by
-    anyone else, raises :class:`RestrictedFileError`. Left out, the owner is the creating token's
-    default.
+    it, and read back through the creating handle before a byte is written. It is a SID, with or
+    without a leading ``*``, or a name: a name Windows reports as a group, an alias or a domain is
+    refused, as for a read grant, so a group such as Administrators is named by its SID. A name it
+    reports as a well-known group (SID_NAME_USE 5, as SYSTEM, a service's virtual account and
+    Everyone all report) passes that gate, and a SID is taken as given. Then an
+    application package, and at least the broad groups :func:`_is_broad_group` knows, are refused
+    as an owner, as they are as a read grant; other groups are not screened here. A token that may
+    not make that account an owner, or a file that reads back owned by anyone else, raises
+    :class:`RestrictedFileError`. Left out, the owner is the creating token's default.
 
     ``creator_access`` (Windows only to turn off) gives the creating account full control. With it
     off the list is SYSTEM and Administrators with full control and each read grant with read, and
@@ -1427,7 +1457,11 @@ def _create_restricted(
     if not creator_access:
         raise RestrictedFileError("a file without its creator's access is made on Windows only")
     if owner is not None:
-        raise RestrictedFileError("a file owned by another account is made on Windows only")
+        # Refused even when it names this account: POSIX takes no owner at create (vault BACKLOG #6674).
+        raise RestrictedFileError(
+            "an owner is named for a new file on Windows only; on POSIX the account that creates "
+            "a file owns it"
+        )
     if local_volume_only and sys.platform != "linux":
         raise RestrictedFileError(
             "a file system is checked before a key file is written on Linux and Windows only"
@@ -1520,20 +1554,21 @@ def _create_restricted_windows(
     read_sids = [_resolve_sid(name) for name in read_grants]
     # Resolved as a grant is, so only a SID Windows itself rendered reaches the descriptor, and the
     # read-back compares like with like.
-    owner_sid = None if owner is None else _resolve_sid(owner)
+    owner_sid = None if owner is None else _resolve_sid(owner, as_owner=True)
     for name, sid in zip(read_grants, read_sids, strict=True):
-        if _is_package_sid(sid):
+        # A grant that would make the file broadly readable is not a restricted create.
+        if (what := _screened_principal(sid)) is not None:
             raise RestrictedFileError(
-                f"{path} was not created: {name!r} is an application package, and a key file is "
-                "granted to the account the engine runs as, never to a package"
+                f"{path} was not created: {name!r} is {what}, and a key file cannot be granted "
+                "to it. Name the one account the engine runs as"
             )
-        if _is_broad_group(sid):
-            # A grant that would make the file broadly readable is not a restricted create.
-            raise RestrictedFileError(
-                f"{path} was not created: {name!r} is {describe_sid(sid)}, a group many accounts "
-                "hold, and a key file cannot be granted to it. Name the one account the engine "
-                "runs as"
-            )
+    # An owner holds READ_CONTROL and WRITE_DAC whatever the list says, so it could grant itself
+    # read: the owner gets the screens a read grant gets (vault BACKLOG #6674 item 1).
+    if owner_sid is not None and (what := _screened_principal(owner_sid)) is not None:
+        raise RestrictedFileError(
+            f"{path} was not created: {owner!r} is {what}, and a key file cannot be owned by it, "
+            "because a file's owner may rewrite its access list"
+        )
     expected = _expected_access(
         probes.self_sid, read_sids, creator_access=creator_access, read_delete=read_delete
     )
@@ -1605,7 +1640,7 @@ def _create_restricted_windows(
         if handle is None or handle == invalid_handle:
             error = ctypes.get_last_error()
             if owner_sid is not None and error == _WINERROR_INVALID_OWNER:
-                raise _OwnerRefused(
+                raise OwnerRefused(
                     f"{path} was not created: this process may not make {describe_sid(owner_sid)} "
                     "the owner of a new file"
                 )
@@ -1624,12 +1659,12 @@ def _create_restricted_windows(
         security = _read_handle_security(handle)
         if owner_sid is not None:
             if security.error is not None or security.owner_sid is None:
-                raise _OwnerRefused(
+                raise OwnerRefused(
                     f"{path} could not be created owned by {describe_sid(owner_sid)}: its owner "
                     f"could not be read back ({security.error or 'none was returned'})"
                 )
             if security.owner_sid != owner_sid:
-                raise _OwnerRefused(
+                raise OwnerRefused(
                     f"{path} could not be created owned by {describe_sid(owner_sid)}: it reads back "
                     f"owned by {_who(security.owner_sid)}"
                 )
@@ -1645,7 +1680,7 @@ def _create_restricted_windows(
         raise
 
 
-def _resolve_sid(principal: str) -> str:
+def _resolve_sid(principal: str, *, as_owner: bool = False) -> str:
     """The string SID of ``principal``: an account name, or a SID with or without a leading ``*``.
 
     A NAME must resolve to one account: a group, an alias or a domain is refused. A SID literal is
@@ -1658,15 +1693,8 @@ def _resolve_sid(principal: str) -> str:
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise RestrictedFileError("an account name resolves to a SID on Windows only")
     import ctypes
-    from ctypes import wintypes
 
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    advapi32.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
-    advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.LocalFree.restype = ctypes.c_void_p
-
+    advapi32, kernel32 = _sid_libraries()
     refusal = RestrictedFileError(f"the account {principal!r} could not be resolved")
     literal = principal.removeprefix("*")
     if literal.upper().startswith("S-1-"):
@@ -1689,6 +1717,9 @@ def _resolve_sid(principal: str) -> str:
             raise RestrictedFileError(
                 f"{principal!r} names a group or a domain, not one account, so a key file cannot "
                 "be granted to it. Name the one account the engine runs as"
+                if not as_owner
+                else f"{principal!r} is not a user or well-known account by name; name an owner "
+                "that is a group, a computer or any other kind by its SID"
             )
     if rendered is None:
         raise refusal
@@ -1703,12 +1734,7 @@ def _render_sid(sid_pointer: object) -> str | None:
     import ctypes
     from ctypes import wintypes
 
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
-    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.LocalFree.restype = ctypes.c_void_p
+    advapi32, kernel32 = _sid_libraries()
     text = wintypes.LPWSTR()
     if not advapi32.ConvertSidToStringSidW(sid_pointer, ctypes.byref(text)):
         return None
