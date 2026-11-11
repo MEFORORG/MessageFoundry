@@ -25,6 +25,7 @@ from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline.alerts import AlertSink, directory_sign_in_audit_alert
+from messagefoundry.store.row_seal import RowSealError
 from messagefoundry.store.store import AppendedAuditRow, AuditAppend, MessageStore
 from tests._account_write_audit_contract import assert_account_write_audit_contract, sign_in
 from tests._last_admin_store_contract import ADMIN, VIEWER, seed
@@ -464,3 +465,57 @@ def test_the_sign_in_audit_alert_pages_keyed_by_the_action() -> None:
             raise RuntimeError("synthetic: the sink broke its contract")
 
     directory_sign_in_audit_alert(cast(AlertSink, _Broken()))("auth.ad_roles_resynced")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [TypeError("synthetic"), KeyError("synthetic"), RowSealError("synthetic")],
+    ids=["TypeError", "KeyError", "RowSealError"],
+)
+async def test_an_unclassified_error_in_the_sign_in_role_row_still_ends_the_sessions(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    """BACKLOG #2221. An error outside ``audit_write_errors()`` in the sign-in's in-transaction
+    row: the write may have committed, so the roles are written again without it, the stale
+    sessions end and the user is told, and only then does the sign-in fail with the error."""
+    service, first, _grants, _audit_pages = await _signed_in(store)
+    await service.set_ad_group_map([("cn=mf-ops,dc=x", "viewer")], actor="admin")
+    service._security_notifier.sent.clear()
+    raised = _append_fails(monkeypatch, store, error)
+    with pytest.raises(type(error)):
+        await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)
+    assert raised == [type(error).__name__]
+    user = await store.get_user_by_username("jdoe")
+    assert user is not None and await store.get_user_role_ids(user.id) == ["viewer"]
+    assert await service.identity_for_token(first) is None, "the error kept a stale session"
+    assert [e.username for e in service._security_notifier.sent] == ["jdoe"]
+
+
+@pytest.mark.parametrize(
+    "retry_error",
+    [sqlite3.OperationalError("synthetic retry"), TypeError("synthetic retry")],
+    ids=["refused", "unclassified"],
+)
+async def test_a_sign_in_whose_role_retry_raises_still_ends_the_sessions_and_tells_the_user(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, retry_error: Exception
+) -> None:
+    """BACKLOG #2221. The role write raises with its row and again without it. Either may have
+    committed, so the account's other sessions still end and the user is still told before the
+    sign-in fails with the retry's error."""
+    service, first, _grants, _audit_pages = await _signed_in(store)
+    await service.set_ad_group_map([("cn=mf-ops,dc=x", "viewer")], actor="admin")
+    service._security_notifier.sent.clear()
+    calls: list[int] = []
+
+    async def failing(*_args: object, **_kwargs: object) -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("synthetic first")
+        raise retry_error
+
+    monkeypatch.setattr(store, "set_user_roles", failing)
+    with pytest.raises(type(retry_error)):
+        await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)
+    assert len(calls) == 2
+    assert await service.identity_for_token(first) is None, "a raising retry kept a stale session"
+    assert [e.username for e in service._security_notifier.sent] == ["jdoe"]
