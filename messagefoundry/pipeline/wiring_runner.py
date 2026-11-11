@@ -244,7 +244,6 @@ from messagefoundry.store import (
     FailOutcome,
     MessageStatus,
     OutboxItem,
-    OutboxStatus,
     QueueStore,
     Stage,
     StreamingAttachmentsUnsupported,
@@ -12453,8 +12452,9 @@ class RegistryRunner:
         its failed sends, and which a FIFO batch claim raises on every row it takes, so a batch tail
         carries the count too. At the lane's ``max_attempts`` the row goes through ``mark_failed``,
         whose DEAD branch leaves a row already DONE, DEAD or CANCELLED as it is; below it nothing is
-        written. A lane that retries forever (``max_attempts = None``) never dead-letters on a
-        death.
+        written. Where the store counted fewer attempts than the claim, ``mark_failed`` takes its
+        retry branch instead, and its retry wake is armed. A lane that retries forever
+        (``max_attempts = None``) never dead-letters on a death.
 
         **A pooled lane's serializer is not respawned** (#4607 step 2), so its lane claims nothing
         until a restart, and every death there fires ``connection_stopped``.
@@ -12493,26 +12493,23 @@ class RegistryRunner:
                         "unlimited" if cap is None else cap,
                     )
                     return
-                failed = await self.store.mark_failed(item.id, error, retry)
+                # Through _mark_failed_and_arm, so a re-pend (the store's attempts lower than the
+                # claim's copy) arms the lane's retry wake.
+                failed = await self._mark_failed_and_arm(name, item.id, error, retry)
                 if failed.retry_at is not None:
-                    # The store's attempts were below the cap the claim's copy reached, so
                     # mark_failed took its retry branch. Its retry_at comes back even when the
-                    # status term skipped a row already resolved (ADR 0157 Amendment A), so read
-                    # the row before calling it a re-pend or arming the lane's retry wake.
-                    repended = await self._outbound_row_pending(item)
-                    if repended:
-                        self._arm_retry(name, failed)
+                    # status term skipped a row already resolved (ADR 0157 Amendment A), so it
+                    # does not prove a re-pend, and the log does not claim one. The wake it arms
+                    # then claims nothing, as for the other _mark_failed_and_arm callers.
                     log.error(
                         "%s worker %r: row %s (message %s) killed the worker with %s; the store "
-                        "counted fewer attempts than the claim, %s",
+                        "counted fewer attempts than the claim, so mark_failed took its retry "
+                        "branch, which re-pends the row unless it was already resolved",
                         worker,
                         name,
                         item.id,
                         item.message_id,
                         kind,
-                        "so the row was re-pended to retry"
-                        if repended
-                        else "and the row was not left pending, so no retry was armed",
                     )
                     return
                 dead = failed.dead > 0
@@ -12575,14 +12572,6 @@ class RegistryRunner:
         if stage is Stage.OUTBOUND:
             return not self._per_lane_delivery(lane)
         return self._claim_mode == "pooled"
-
-    async def _outbound_row_pending(self, item: OutboxItem) -> bool:
-        """Whether ``item``'s outbound row reads PENDING now. Only the worker-death path asks, after
-        a ``mark_failed`` retry branch whose ``retry_at`` cannot say whether it re-pended anything
-        (vault BACKLOG #4607 step 6). A row re-pended and claimed again before this read reads not
-        pending, which costs only the wake its own claim no longer needs."""
-        rows = await self.store.outbox_for(item.message_id)
-        return any(r["id"] == item.id and r["status"] == OutboxStatus.PENDING.value for r in rows)
 
     async def _mark_failed_and_arm(
         self, lane: str, outbox_id: str, error: str, retry: RetryPolicy

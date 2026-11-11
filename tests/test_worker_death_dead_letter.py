@@ -386,34 +386,40 @@ async def test_a_death_after_the_send_was_marked_done_leaves_it_done(
     assert await _dead_rows(store) == 0
 
 
-@pytest.mark.parametrize("done", [False, True])
-async def test_a_retry_branch_miss_on_a_resolved_row_arms_no_wake(
-    tmp_path: Path, store: MessageStore, monkeypatch: pytest.MonkeyPatch, done: bool
+@pytest.mark.parametrize(
+    "resolved",
+    [None, OutboxStatus.DONE.value, OutboxStatus.DEAD.value, OutboxStatus.CANCELLED.value],
+)
+async def test_a_retry_branch_miss_leaves_a_resolved_row_and_claims_no_re_pend(
+    tmp_path: Path,
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    resolved: str | None,
 ) -> None:
     """The store counted fewer attempts than the claim, so ``mark_failed`` takes its retry branch,
     whose ``retry_at`` comes back even when its status term skipped the row (ADR 0157 Amendment
-    A). A DONE row is left DONE and arms no wake; the control arm, a row still in flight, is
-    re-pended and armed, so the test can tell the two apart."""
+    A). A resolved row is left as it is, and the log does not call it re-pended. The control arm,
+    a row still in flight, is re-pended, so the test can tell the two apart."""
     runner = _runner(_registry(tmp_path), store, "per_lane")
     runner._retry["OB"] = RetryPolicy(max_attempts=1, backoff_seconds=0.01)
-    armed: list[str] = []
-    monkeypatch.setattr(runner, "_arm_retry", lambda lane, failed: armed.append(lane))
+    monkeypatch.setattr(runner, "_arm_retry", lambda lane, failed: failed)
     mid = await store.enqueue_message(channel_id="IB", raw=_hl7("MISS"), deliveries=[("OB", "p")])
     item = await _claim(store, "OB", Stage.OUTBOUND)
     assert item.attempts == 1
-    if done:
-        assert await store.mark_done(item.id)
-    await store._db.execute("UPDATE queue SET attempts=0 WHERE id=?", (item.id,))
+    await store._db.execute(
+        "UPDATE queue SET attempts=0, status=? WHERE id=?",
+        (resolved or OutboxStatus.INFLIGHT.value, item.id),
+    )
     await store._db.commit()
-    await runner._record_worker_death("delivery", "OB", item, _Kill())
+    with caplog.at_level("ERROR", logger=wiring_runner.log.name):
+        await runner._record_worker_death("delivery", "OB", item, _Kill())
     status = (await _row(store, mid, Stage.OUTBOUND))[0]
-    if done:
-        assert status == OutboxStatus.DONE.value
-        assert armed == []
-    else:
-        assert status == OutboxStatus.PENDING.value
-        assert armed == ["OB"]
-    assert await _dead_rows(store) == 0
+    assert status == (resolved or OutboxStatus.PENDING.value)
+    said = [r.getMessage() for r in caplog.records if str(item.id) in r.getMessage()]
+    assert len(said) == 1
+    assert "unless it was already resolved" in said[0]
+    assert "re-pended to retry" not in said[0]
 
 
 @pytest.mark.parametrize(
