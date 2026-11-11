@@ -386,9 +386,11 @@ def _custody_errors() -> tuple[type[BaseException], ...]:
 def _settle_left_handoff(handoff: Path, blob: HostBlob) -> None:
     """The crash rule (draft rule 3 step 3): a handoff found beside a host file that opens is
     deleted when it names the host file's store id, through the handle that read it, and refused
-    when it names another. The refusal is raised with the blob dropped from this frame, which its
-    traceback keeps, and with no cycle through it, so it never holds the master key; a caller that
-    holds the blob drops it too before the refusal leaves (BACKLOG #4882)."""
+    when it names another. Reached only on a converting read, and on a POSIX host, which reads no
+    handoff, it refuses; :func:`load_host_custody` lists who converts. The refusal is raised with
+    the blob dropped from this frame, which its traceback keeps, and with no cycle through it, so
+    it never holds the master key; a caller that holds the blob drops it too before the refusal
+    leaves (BACKLOG #4882)."""
     refusal = _left_handoff_refusal(handoff, blob)
     if refusal is None:
         return
@@ -621,10 +623,45 @@ def load_host_custody(
     Refuses, with :class:`HostCustodyRefused`: what :func:`check_host_custody_settings` refuses, an
     account the custody rules refuse (and one not local to this host under ``enforcing``), a host
     file or handoff the custody reads refuse, and a handoff the crash rule refuses.
-    :class:`HostCustodyMissing` when neither file is there. ``convert`` lets a handoff be
-    converted; a read-only open passes ``False``. ``observe`` records what was found as this
-    process's custody observation; only a store open passes it, so a key read for another purpose
-    (a backup, the upload cipher) never overwrites what the open found.
+    :class:`HostCustodyMissing` when neither file is there. ``observe`` records what was found as
+    this process's custody observation; only a store open passes it, so a key read for another
+    purpose (a backup, the upload cipher) never overwrites what the open found.
+
+    **What it does with the files it finds** (vault BACKLOG #8119 item 140). The files and their
+    primitives are in :mod:`messagefoundry.store.custody`. At least these cases:
+
+    * Neither file: :class:`HostCustodyMissing`, before the account is judged.
+    * A host file alone: read as it is, and nothing is written or deleted.
+    * A host file and a handoff, with ``convert``: the crash rule (:func:`_settle_left_handoff`)
+      deletes the handoff through the handle that read it when it names the host file's store id
+      and key, refuses and keeps it when it names another, and passes when another start deleted
+      it first. Without ``convert`` the handoff is left as it is. On a POSIX host, which uses no
+      handoff, a handoff beside the host file refuses every converting read, and a handoff
+      alone refuses every read.
+    * A handoff alone, with ``convert``: converted (:func:`_convert_handoff`). This account re-wraps
+      the key in its own user scope as the host file, reads it back, and deletes the handoff
+      through the handle that read it; a host file that does not read back is removed, and the
+      handoff kept, so the next start converts again. An engine shard converting it at the same
+      moment is ridden out by reading the host file it leaves. A handoff it could not show deleted
+      refuses, with the host file kept.
+    * A handoff alone, without ``convert``: refused as not yet converted, changing nothing.
+
+    **Who converts.** ``convert`` defaults to ``True``. At least every writable store open passes it
+    (:func:`~messagefoundry.store.base.open_store` passes ``convert=not read_only``), and so does
+    :class:`~messagefoundry.store.keyprovider.HostKeyProvider`, which every key resolution outside
+    an open goes through: ``resolve_active_key``, ``resolve_decrypt_keys`` and ``build_store_cipher``
+    without a ``host_key``. So at least ``serve``'s upload cipher, a backup, restore-verify and
+    ``rotate-key``, and ``provision-admin``'s pre-check open, convert and delete a handoff when run
+    as the account it was written for, read-only commands included, before the service's first
+    start does. Run as another account, at least one without Administrators enabled is refused
+    at the open of the file, which asks for access the handoff's list does not grant it, and an
+    elevated one gets past that open and is refused by the exact-list check, unless it relists the
+    file first; :func:`~messagefoundry.store.custody.read_handoff_file` names what else those
+    checks do not keep out.
+
+    **The record.** With ``observe``, a read that succeeds records the observation; a read that
+    refuses records nothing, so an earlier open's record stays, and an open that refuses after
+    this read leaves the record this read made.
 
     Each refusal's text is fixed: it names the paths and settings, and the remedy where there is
     one, and reads no text from an error it replaced (BACKLOG #4882). An ``Exception`` from the

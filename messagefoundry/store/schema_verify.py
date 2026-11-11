@@ -81,28 +81,37 @@ _KEYED_DETAIL = (
     " you set [secret_rotation].store_key_last_rotated, update it."
 )
 
+# Every read skips virtual tables: a pragma on one whose module is not loaded here raises "no such
+# module" (BACKLOG #6719). The store builds none, and a test pins that, so an expected name held by a
+# virtual table reads as a missing table and is refused rather than skipped.
+_ORDINARY_TABLE = "m.type = 'table' AND m.sql NOT LIKE 'CREATE VIRTUAL TABLE%'"
 # Each pragma is read through its table-valued form, so one statement reads every table, and the
 # table names travel as bound parameters rather than being spliced into SQL. Only tables the EXPECTED
 # shape names are read for columns. The placeholder list is built from a count, never from a name.
 _COLUMNS_SQL = (
     "SELECT m.name AS tbl, c.name AS col, c.type AS type, c.pk AS pk"
     " FROM sqlite_master AS m, pragma_table_info(m.name) AS c"
-    " WHERE m.type = 'table' AND lower(m.name) IN ({marks})"
+    " WHERE " + _ORDINARY_TABLE + " AND lower(m.name) IN ({marks})"
 )
 # Indexes are read from EVERY ordinary table, not just the expected ones, so an index whose expected
 # name was taken on some other table is reported as living there instead of as merely missing. Driven
 # from pragma_index_list rather than from sqlite_master's index rows, because a WITHOUT ROWID table's
-# key index has no sqlite_master row. Virtual tables are skipped: a module not loaded here would make
-# the pragma raise. index_xinfo rather than index_info: it carries each key column's collation and
-# direction; key = 0 rows are the row id or auxiliary columns, not part of what the index enforces.
+# key index has no sqlite_master row. index_xinfo rather than index_info: it carries each key column's
+# collation and direction; key = 0 rows are the row id or auxiliary columns, not part of what the index
+# enforces.
 _INDEXES_SQL = (
     "SELECT m.name AS tbl, il.name AS idx, il.[unique] AS uniq, il.origin AS origin,"
     " il.partial AS partial, ix.seqno AS seqno, ix.name AS col, ix.[desc] AS dsc, ix.coll AS coll"
     " FROM sqlite_master AS m, pragma_index_list(m.name) AS il, pragma_index_xinfo(il.name) AS ix"
-    " WHERE m.type = 'table' AND m.sql NOT LIKE 'CREATE VIRTUAL TABLE%' AND ix.key = 1"
+    f" WHERE {_ORDINARY_TABLE} AND ix.key = 1"
+)
+_SALT_TABLE_SQL = (
+    "SELECT EXISTS (SELECT 1 FROM sqlite_master AS m"
+    " WHERE " + _ORDINARY_TABLE + " AND lower(m.name) = 'store_salt')"
 )
 _TABLES_SQL = (
-    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
+    "SELECT m.name FROM sqlite_master AS m"
+    f" WHERE {_ORDINARY_TABLE} AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
 )
 
 
@@ -339,13 +348,26 @@ async def verify_live_schema(
 
 #: The SQLite messages that name an existing object's shape. A syntax error in this build's own
 #: DDL, or a statement the local SQLite is too old for, is also SQLITE_ERROR, and it is not fixed
-#: by recreating the store, so the code alone is not enough.
+#: by recreating the store, so the code alone is not enough. An expected name held by an object of
+#: another kind is not "already exists": SQLite names the kind, or refuses the index or ALTER the
+#: script or a migration then runs on it (BACKLOG #6720; the texts are measured in
+#: tests/test_schema_verify_6719_6720.py). "no such module" names a virtual table in the file:
+#: this build creates none, which that test file pins, so the module is never this build's own.
 _SHAPE_MESSAGES = (
     "no such column",
     "no such table",
     "has no column named",
     "duplicate column name",
     "already exists",
+    "there is already an index named",
+    "there is already a table named",
+    "views may not be indexed",
+    "virtual tables may not be indexed",
+    "Cannot add a column to a view",
+    "virtual tables may not be altered",
+    "because it is a view",
+    "use DROP VIEW to delete view",
+    "no such module",
 )
 
 
@@ -354,9 +376,11 @@ def is_schema_step_error(exc: BaseException) -> bool:
 
     Two tests, both needed. The code must be SQLite's generic ``SQLITE_ERROR``: a busy or locked
     file, a read-only file, an I/O error, a full disk and a corrupt file each carry their own primary
-    code. And the message must name a missing or clashing table, column or index, because a syntax
-    error is ``SQLITE_ERROR`` too. None of the others is fixed by recreating the store, so each
-    keeps its own error rather than getting this remedy (BACKLOG #2101)."""
+    code. And the message must name a missing or clashing table, column or index, or a virtual
+    table's module, because a syntax error is ``SQLITE_ERROR`` too. This build creates no virtual
+    table, so a missing module is always an object some other tool left in the file (BACKLOG
+    #6719). None of the others is fixed by recreating the store, so each keeps its own error rather
+    than getting this remedy (BACKLOG #2101)."""
     code = getattr(exc, "sqlite_errorcode", None)
     return (
         isinstance(exc, sqlite3.OperationalError)
@@ -400,7 +424,9 @@ async def _counts_under_a_dek(db: aiosqlite.Connection) -> bool:
     row on its first keyed open, so a counted file without one never had its data key derived.
 
     The two tables are read separately. When the schema script itself failed (BACKLOG #2101), an
-    older file may have no ``store_salt`` table at all, and that too means no salt was ever minted."""
+    older file may have no ``store_salt`` table at all, and that too means no salt was ever minted.
+    So does a view or a virtual table under its name (BACKLOG #6719): this build creates neither,
+    so only an ordinary table can hold a salt this build minted."""
     try:
         async with db.execute("SELECT EXISTS (SELECT 1 FROM cipher_meta)") as cur:
             row = await cur.fetchone()
@@ -409,13 +435,15 @@ async def _counts_under_a_dek(db: aiosqlite.Connection) -> bool:
     if not (row and row[0]):
         return False
     try:
+        async with db.execute(_SALT_TABLE_SQL) as cur:
+            ordinary = await cur.fetchone()
+        if not (ordinary and ordinary[0]):
+            return True  # no ordinary salt table: this file never had a salt minted
         async with db.execute("SELECT EXISTS (SELECT 1 FROM store_salt)") as cur:
             salted = await cur.fetchone()
     except sqlite3.OperationalError as exc:
-        if "no such table" in str(exc):
-            return True  # no salt table: this file never had a salt minted
-        # Anything else (a busy or unreadable file) answers nothing about the salt: say so, and
-        # fall back to the plain remedy, as an unreadable count does above.
+        # A busy or unreadable file answers nothing about the salt: say so, and fall back to the
+        # plain remedy, as an unreadable count does above.
         log.warning("could not read store_salt to pick the schema remedy: %s", exc)
         return False
     return not (salted and salted[0])

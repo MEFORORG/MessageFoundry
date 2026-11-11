@@ -1074,6 +1074,11 @@ def test_provision_admin_mints_the_key_and_creates_the_store_pinned_to_it(
     blob = custody.read_host_file(tmp_path / "master.key")
     recovery = consoles[0].shown_key()
     assert not _leaks(captured.out + captured.err, blob, recovery)
+    # Vault BACKLOG #8119 item 9: the custody directory this shell chose is named, with the
+    # setting the service's own environment must agree on.
+    err = " ".join(captured.err.split())
+    assert f"The store key was written to {tmp_path / 'master.key'}." in err, err
+    assert "MEFOR_SECRETS_DIRECTORY unset" in err, err
     settings = _settings(tmp_path).model_copy(update={"path": str(db)})
     assert asyncio.run(_genesis_store_id(settings, blob)) == blob.store_id.value
     # The store exists, so a second run mints nothing and asks no recovery key.
@@ -2478,12 +2483,14 @@ def test_the_add_file_check_reads_a_junctions_target_not_the_link(tmp_path: Path
 @host_file_platforms
 @pytest.mark.parametrize("backend", [StoreBackend.POSTGRES, StoreBackend.SQLSERVER])
 @pytest.mark.parametrize("anywhere", [None, True, False])
+@pytest.mark.parametrize("schema", ["auto", "external"])
 def test_a_server_no_store_read_mints_only_when_the_whole_catalog_shows_none(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     anywhere: bool | None,
     backend: StoreBackend,
+    schema: str,
 ) -> None:
     # PR 2804 fourteenth hold, item 4: the pre-check read a server open's "no store" as absent and
     # minted. That open sees only what its login resolves (a search_path, a default schema, the
@@ -2521,19 +2528,34 @@ def test_a_server_no_store_read_mints_only_when_the_whole_catalog_shows_none(
     (tmp_path / "messagefoundry.toml").write_text(
         f'[store]\nbackend = "{backend.value}"\nkey_provider = "host"\n'
         'server = "db.invalid"\ndatabase = "mefor"\nusername = "mefor"\n'
-        "[security]\nrequire_mfa = false\n"
+        # Under external, the server default, the create builds no schema, so a database with no
+        # store schema refuses before the mint (vault BACKLOG #8119 item 1); the catalog's own
+        # refusals still come first.
+        + ('schema_management = "auto"\n' if schema == "auto" else "")
+        + "[security]\nrequire_mfa = false\n"
     )
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
     argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
     code = main([*argv, "--no-totp"])
     err = " ".join(capsys.readouterr().err.split())
     assert code == 2, err
-    if anywhere is False:  # the control: the whole catalog shows no store, so the mint runs
+    provision = base.PROVISION_SCHEMA_COMMAND
+    if anywhere is False and schema == "auto":  # the control: no store anywhere, so it mints
         assert shown == ["recovery key shown"], err
         return
     assert shown == [], err  # refused before any recovery key was shown
     assert "no key was minted" in err.lower(), err
     assert not (secrets / custody_host.HOST_FILE_NAME).exists()
+    assert not _advises_changing(err), err
+    if anywhere is False:  # external: no store schema, and none is built here
+        assert provision in err and "'external'" in err, err
+        # It claims only what this login resolves, and keeps the open's own hint at the setting
+        # and grant that hide a store provisioned elsewhere (round 2 of the #8119 review).
+        assert "this login resolves no store schema" in err, err
+        hint = "[store].db_schema" if backend is StoreBackend.POSTGRES else "default schema"
+        assert hint in err and "the database holds no store schema" not in err, err
+        return
+    assert provision not in err, err  # the catalog's own refusal, not the external one
     # Fifteenth hold, review round 1: the text names only this backend's cause, and a found
     # store is not said to be unreachable. Hold 17: nor partly created, which invites dropping
     # tables another application may own. Neither advises changing what exists.
@@ -2714,11 +2736,13 @@ class _PresentTablesConn(_CatalogConn):
 
 @host_file_platforms
 @pytest.mark.parametrize("present", [{"users"}, {"messages"}, set()])
+@pytest.mark.parametrize("schema", ["auto", "external"])
 def test_a_schema_holding_one_store_table_without_schema_meta_refuses_and_mints_nothing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     present: set[str],
+    schema: str,
 ) -> None:
     # PR 2804 sixteenth hold, item 2 (F1): a table under one of the store's own names, with no
     # schema_meta, passed the pre-check, so the run minted and the create then failed over that
@@ -2766,7 +2790,9 @@ def test_a_schema_holding_one_store_table_without_schema_meta_refuses_and_mints_
     (tmp_path / "messagefoundry.toml").write_text(
         '[store]\nbackend = "postgres"\nkey_provider = "host"\n'
         'server = "db.invalid"\ndatabase = "mefor"\nusername = "mefor"\n'
-        "[security]\nrequire_mfa = false\n"
+        # The default, external, refuses the empty schema too, after the catalog's refusals.
+        + ('schema_management = "auto"\n' if schema == "auto" else "")
+        + "[security]\nrequire_mfa = false\n"
     )
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
     argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
@@ -2774,9 +2800,12 @@ def test_a_schema_holding_one_store_table_without_schema_meta_refuses_and_mints_
     err = " ".join(capsys.readouterr().err.split())
     assert code == 2, err
     assert len(conn.calls) == 2, conn.calls  # the catalog was asked
-    if not present:
+    if not present and schema == "auto":
         assert shown == ["recovery key shown"], err
         return
+    # A found table gets the catalog's refusal under either mode; only an empty schema under
+    # external gets the provisioning one.
+    assert (base.PROVISION_SCHEMA_COMMAND in err) is (not present), err
     assert shown == [], err  # refused before any recovery key was shown
     assert "no key was minted" in err.lower(), err
     assert not (secrets / custody_host.HOST_FILE_NAME).exists()
@@ -3254,6 +3283,7 @@ def test_a_create_that_fails_in_its_batch_removes_the_key_and_one_after_it_keeps
     (tmp_path / "messagefoundry.toml").write_text(
         f'[store]\nbackend = "{backend.value}"\nkey_provider = "host"\n'
         'server = "db.invalid"\ndatabase = "mefor"\nusername = "mefor"\n'
+        'schema_management = "auto"\n'  # a create batch runs only under auto
         "[security]\nrequire_mfa = false\n"
     )
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
@@ -3348,6 +3378,7 @@ def test_a_failed_server_create_keeps_the_minted_key_and_names_it_to_the_end(
     (tmp_path / "messagefoundry.toml").write_text(
         '[store]\nbackend = "postgres"\nkey_provider = "host"\n'
         'server = "db.invalid"\ndatabase = "mefor"\nusername = "mefor"\n'
+        'schema_management = "auto"\n'  # the default, external, refuses before the mint here
         "[security]\nrequire_mfa = false\n"
     )
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
@@ -3383,3 +3414,282 @@ def test_a_failed_server_create_keeps_the_minted_key_and_names_it_to_the_end(
     # It stops at the kept file, or at the store's never-started chain, as the warning says.
     stop = "already exists" if shape == "no store" else "the store's audit chain was never started"
     assert stop in rerun, rerun
+
+
+# --- vault BACKLOG #8119: a server mint that fails before the key is used -------------------------
+
+
+class _EmptyProvisionedStore:
+    """A read-only server store whose schema is provisioned, with every table empty."""
+
+    async def table_occupancy(self) -> dict[str, int]:
+        return dict.fromkeys(("messages", "message_events", "audit_log", "users", "schema_meta"), 0)
+
+    async def close(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize("module", ["postgres", "sqlserver", "store"])
+def test_every_writable_open_checks_the_pin_before_its_first_keyed_write(module: str) -> None:
+    # Vault BACKLOG #8119 item 2 rests on this order: a minting open's failure before the pin
+    # check passed is typed as one that sealed nothing, and its key is removed. So each backend's
+    # open must call check_open_store_pin before bind_store_salt, the first step under the key.
+    import importlib
+    import inspect
+
+    target = importlib.import_module(f"messagefoundry.store.{module}")
+    cls = {
+        "postgres": "PostgresStore",
+        "sqlserver": "SqlServerStore",
+        "store": "MessageStore",
+    }[module]
+    source = inspect.getsource(getattr(target, cls).open)
+    pin = source.index("await check_open_store_pin(store)")
+    assert pin < source.index("bind_store_salt("), module
+    assert pin < source.index("checkpoint_cipher_invocations"), module
+
+
+class _EmptyChain:
+    """An audit chain with no row, as :func:`check_open_store_pin` reads one."""
+
+    async def _audit_genesis_row(self) -> None:
+        return None
+
+    async def _audit_rows(self, *, limit: int) -> list[object]:
+        return []
+
+
+class _Pool:
+    """An asyncpg pool stand-in that the open closes on its way out."""
+
+    async def close(self) -> None:
+        return None
+
+
+@pytest.fixture
+def fake_postgres(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
+    """Run the real ``PostgresStore.open`` against a stand-in ``asyncpg``, failing where asked:
+    ``pool`` inside the real ``_create_pool``, ``schema`` in the schema step once the pool and the
+    store exist, and ``after the pin`` once the pin check has passed. Where the real driver is
+    installed only its ``create_pool`` is replaced, so no cached tuple of driver errors can hold a
+    stand-in class; the cached tuples are cleared before and after all the same."""
+    import importlib.util
+
+    from messagefoundry.auth import service
+    from messagefoundry.store import base, postgres
+    from messagefoundry.store.store import check_open_store_pin
+
+    def clear_cached_errors() -> None:
+        for cached in (
+            base.store_call_errors,
+            base.audit_write_errors,
+            service._session_write_errors,
+            service._passkey_read_errors,
+        ):
+            cached.cache_clear()
+
+    def arm(failure: Exception, where: str) -> None:
+        async def create_pool(**_kwargs: object) -> _Pool:
+            if where == "pool":
+                raise failure
+            return _Pool()
+
+        if importlib.util.find_spec("asyncpg") is not None:
+            import asyncpg
+
+            monkeypatch.setattr(asyncpg, "create_pool", create_pool)
+        else:
+            driver = types.ModuleType("asyncpg")
+            driver.create_pool = create_pool  # type: ignore[attr-defined]
+            for name in ("PostgresError", "InterfaceError", "InternalClientError"):
+                setattr(driver, name, type(name, (Exception,), {}))
+            monkeypatch.setitem(sys.modules, "asyncpg", driver)
+        monkeypatch.setattr(postgres, "_build_ssl", lambda _settings, posture=None: None)
+
+        async def ensure_schema(_store: object, **_kwargs: object) -> None:
+            if where == "schema":
+                raise failure
+
+        async def pin(_store: object) -> None:
+            await check_open_store_pin(_EmptyChain())  # type: ignore[arg-type]
+            raise failure
+
+        monkeypatch.setattr(postgres.PostgresStore, "_ensure_schema", ensure_schema)
+        monkeypatch.setattr(postgres, "check_open_store_pin", pin)
+
+    clear_cached_errors()
+    yield arm
+    clear_cached_errors()
+
+
+class _DriverError(Exception):
+    """A server driver's error as ``driver_sqlstate`` reads one: a ``sqlstate`` attribute."""
+
+    def __init__(self, sqlstate: str) -> None:
+        super().__init__(f"driver error {sqlstate} (stand-in)")
+        self.sqlstate = sqlstate
+
+
+def _open_failure(case: str) -> Exception:
+    """The error each case's backend open raises."""
+    import socket
+
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+    from messagefoundry.store.store import (
+        StoreCreateBatchFailedBeforeKeyUse,
+        StoreIdPinRefusedBeforeWrite,
+    )
+
+    return {
+        "refused address": ConnectionRefusedError("the server did not answer (stand-in)"),
+        "unresolved name": socket.gaierror("no such host (stand-in)"),
+        "hop refused": InsecureHopRefused("the store hop was refused (stand-in)"),
+        "login refused": _DriverError("28P01"),
+        "not established": _DriverError("08001"),
+        "lost mid-open": _DriverError("08006"),
+        "connection reset": ConnectionResetError("reset (stand-in)"),
+        "runtime": RuntimeError("an engine refusal (stand-in)"),
+        "pin refusal": StoreIdPinRefusedBeforeWrite("refusing to open the store (stand-in)"),
+        "batch": StoreCreateBatchFailedBeforeKeyUse(_collision()),
+    }.get(case, ConnectionRefusedError("the server did not answer (stand-in)"))
+
+
+#: The failures only a connection's establishment raises: typed on a minting server open.
+_BEFORE_CONNECTING = (
+    "refused address",
+    "unresolved name",
+    "hop refused",
+    "login refused",
+    "not established",
+)
+
+
+@pytest.mark.parametrize(
+    ("case", "where"),
+    [
+        *((case, "pool") for case in _BEFORE_CONNECTING),
+        ("lost mid-open", "pool"),
+        ("connection reset", "pool"),
+        ("runtime", "pool"),
+        ("runtime", "schema"),
+        ("refused address", "schema"),  # a later dial in the same open, once the pool was built
+        ("login refused", "schema"),
+        ("refused address", "after the pin"),
+        ("not minting", "pool"),
+        ("sqlite", "pool"),
+        ("pin refusal", "schema"),
+        ("batch", "schema"),
+    ],
+)
+def test_only_a_failure_before_connecting_is_typed_on_a_minting_server_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_postgres: Any, case: str, where: str
+) -> None:
+    # Vault BACKLOG #8119 item 2, under the Manager's ruling of 2026-11-10: removing a minted key
+    # rests on where and how the open failed, never on an ordering nothing enforces end to end.
+    # Only a failure raised while the backend built its pool, before the store that holds the
+    # cipher existed, and of a class only a failed dial raises, is typed as one that sealed
+    # nothing, so provision-admin removes the void key. Every other failure keeps the error, and
+    # the key, as it was: a RuntimeError, a connection lost or reset, the same dial classes once
+    # the pool was built, every other open, and every failure once the pin check passed.
+    import asyncio
+
+    from messagefoundry.store import base
+    from messagefoundry.store.store import StoreCreateBatchFailedBeforeKeyUse
+
+    monkeypatch.setenv("MEFOR_SECRETS_DIRECTORY", str(tmp_path))
+    failure = _open_failure(case)
+    fake_postgres(failure, where)
+    backend = StoreBackend.SQLITE if case == "sqlite" else StoreBackend.POSTGRES
+    settings = _settings(tmp_path, backend=backend, server="db.invalid", database="mefor")
+    if case == "sqlite":
+
+        async def _sqlite_open(_settings: StoreSettings, **_kwargs: object) -> Store:
+            raise failure
+
+        monkeypatch.setattr(base, "_open_backend", _sqlite_open)
+    blob = HostBlob(MasterKey.mint(), StoreId.mint())
+    wrap = b"" if case == "not minting" else b"wrap"
+    with pytest.raises(Exception) as raised:
+        asyncio.run(open_store(settings, create=True, custody=blob, recovery_wrap=wrap))
+    if case in _BEFORE_CONNECTING and where == "pool":
+        assert isinstance(raised.value, StoreCreateBatchFailedBeforeKeyUse), raised.value
+        assert raised.value.failure is failure and raised.value.__cause__ is failure
+    else:
+        assert raised.value is failure
+
+
+@host_file_platforms
+@pytest.mark.parametrize("after_the_pin", [False, True])
+@pytest.mark.parametrize("schema", ["auto", "external"])
+@pytest.mark.parametrize("failure", ["hop refused", "runtime"])
+def test_a_server_create_that_fails_before_connecting_removes_the_minted_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    fake_postgres: Any,
+    after_the_pin: bool,
+    schema: str,
+    failure: str,
+) -> None:
+    # Vault BACKLOG #8119 item 2, through provision-admin and the real open down to the real
+    # PostgresStore._create_pool: a hop refusal while the pool is built, before the store that
+    # holds the cipher exists, wrote nothing under the minted key, so the key is removed and the
+    # next run mints a new one rather than stop at the file. Kept, as before: an arbitrary
+    # RuntimeError there, whose class proves nothing (the Manager's ruling of 2026-11-10), and a
+    # failure after the pin check passed, where the open may have written. Under auto the probe
+    # finds no store schema; under external, the server default, it finds a provisioned schema
+    # with an empty chain and no data, the default's one way to a mint.
+    from messagefoundry import __main__ as cli
+    from messagefoundry.__main__ import main
+    from messagefoundry.store import base
+    from messagefoundry.store.custody_host import MintedCustody
+
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    if sys.platform != "win32":
+        secrets.chmod(0o700)
+    monkeypatch.setenv("MEFOR_SECRETS_DIRECTORY", str(secrets))
+    host_file = secrets / custody_host.HOST_FILE_NAME
+    fake_postgres(_open_failure(failure), "after the pin" if after_the_pin else "pool")
+    real_open_backend = base._open_backend
+
+    async def _open_backend(settings: StoreSettings, **kwargs: Any) -> Any:
+        if kwargs.get("read_only"):  # the pre-check's probe
+            if schema == "external":
+                return _EmptyProvisionedStore()
+            raise base.StoreNotFoundError.server_schema(StoreBackend.POSTGRES, "mefor")
+        return await real_open_backend(settings, **kwargs)
+
+    def _ceremony(*_args: object, **_kwargs: object) -> MintedCustody:
+        host_file.write_bytes(b"minted (stand-in)")
+        return MintedCustody(HostBlob(MasterKey.mint(), StoreId.mint()), host_file, b"wrap")
+
+    async def _none_anywhere(*_args: object, **_kwargs: object) -> bool:
+        return False
+
+    monkeypatch.setattr(base, "_open_backend", _open_backend)
+    monkeypatch.setattr(base, "server_store_schema_found_anywhere", _none_anywhere)
+    monkeypatch.setattr(custody_host, "mint_host_custody", _ceremony)
+    monkeypatch.setattr(cli, "_read_new_password", lambda _prompt: "correct horse battery")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "messagefoundry.toml").write_text(
+        '[store]\nbackend = "postgres"\nkey_provider = "host"\n'
+        'server = "db.invalid"\ndatabase = "mefor"\nusername = "mefor"\n'
+        f'schema_management = "{schema}"\n'
+        "[security]\nrequire_mfa = false\n"
+    )
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
+    code = main([*argv, "--no-totp"])
+    err = " ".join(capsys.readouterr().err.split())
+    if failure == "hop refused":
+        assert code == 2, err
+        assert "the store hop was refused (stand-in)" in err, err  # the open's own refusal
+    else:
+        assert code != 0, err  # the dispatch floor, as any unrecognised open failure ends
+    if after_the_pin or failure == "runtime":
+        assert host_file.read_bytes() == b"minted (stand-in)", err
+        assert "Keep both, and do not delete either" in err, err
+    else:
+        assert not host_file.exists(), err
+        assert "was removed from" in err and "Keep both" not in err, err

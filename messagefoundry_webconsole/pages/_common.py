@@ -27,6 +27,21 @@ from messagefoundry.api.models import LogForwarderInfo
 
 from .._html import Markup, el, text
 
+REFILLED_FIELD_VALUE = "field_value_refilled"
+"""The hidden input that carries the Field value a needle form was refilled with (BACKLOG #6700).
+:func:`messagefoundry_webconsole.routes._common.posted_field_value` reads it back."""
+
+
+def _refilled_field_value(field_path: str, field_value: str) -> Markup:
+    """A needle form's record of the Field value it was rendered with BESIDE a Field path, so the
+    POST can tell a value the operator left in place from one they typed (BACKLOG #6700). Written
+    only with a path: a page re-rendered from a refused value-without-path holds no marker, so
+    resubmitting that refusal sends the value again rather than dropping it. It holds the same value
+    as the visible box beside it and travels in the POST body, as the box does."""
+    # Blank as posted_field_value and the engine read it: a path of only spaces is no path.
+    value = field_value if field_path.strip() else ""
+    return el("input", type="hidden", name=REFILLED_FIELD_VALUE, value=value or None)
+
 
 def _reveal_cell(value: str | None, href: str | None, *, revealed: bool) -> object:
     """A masked cell: the value as the engine sent it, plus a "Reveal" link to ``href`` while it is

@@ -7337,8 +7337,10 @@ def _discard_minted_custody(
     open wrote nothing under it: the store id pin refused before the open's first write
     (:class:`~messagefoundry.store.store.StoreIdPinRefusedBeforeWrite`; a pin refusal raised later,
     once the salt bind may have run, does not count), a server create batch that failed before its
-    commit (:class:`~messagefoundry.store.store.StoreCreateBatchFailedBeforeKeyUse`, PR 2804 hold
-    17), or a SQLite store whose file was never made.
+    commit, or a server open that failed building its pool with a class only a failed dial raises
+    (:class:`~messagefoundry.store.store.StoreCreateBatchFailedBeforeKeyUse`, PR 2804 hold 17 and
+    vault BACKLOG #8119 item 2; any other failure before the pin check, a ``RuntimeError``
+    included, keeps the key), or a SQLite store whose file was never made.
 
     Otherwise the file is kept, and the warning names it and says to keep it and the recovery key
     shown, deleting neither: the store may hold data sealed under it, and no check this run or an
@@ -9024,7 +9026,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # before any store is opened; `_build_provision_auth_service` says why.
     from messagefoundry.auth.policy import _common_passwords
     from messagefoundry.auth.trust_anchors import TrustAnchorError
-    from messagefoundry.config.settings import StoreBackend, hop_posture_from_ai
+    from messagefoundry.config.settings import SchemaManagement, StoreBackend, hop_posture_from_ai
     from messagefoundry.config.tls_policy import InsecureHopRefused
     from messagefoundry.store.base import StoreNotFoundError, build_store_cipher
     from messagefoundry.store.crypto import CipherError, StoreKeylessError
@@ -9071,13 +9073,15 @@ def _provision_admin(args: argparse.Namespace) -> int:
         the prompts, as the ordinary pre-check's do."""
         return await server_store_found() != "held"
 
-    async def no_store_anywhere() -> Literal["none"]:
+    async def no_store_anywhere(missing: StoreNotFoundError) -> Literal["none"]:
         """``none`` once the server database's catalog shows no table under a store table name in
         the schemas the open resolves (PR 2804 fourteenth and fifteenth holds). An open's "no
         store" is only what its login may see there, so a store it cannot see reads the same.
-        Raises :class:`HostCustodyRefused` for such a table there, whoever made it, and for a
-        catalog it cannot show, a search_path it cannot
-        read included: neither is minted over. What the catalog read cannot see, at least, is in
+        Raises :class:`HostCustodyRefused` for at least such a table there, whoever made it, a
+        catalog it cannot show, a search_path it cannot read included, and, after those, no store
+        schema this login resolves under external schema management, which the create would not
+        build, quoting ``missing``, the read-only open's refusal (vault BACKLOG #8119 item 1): none
+        is minted over. What the catalog read cannot see, at least, is in
         :func:`~messagefoundry.store.base.server_store_schema_found_anywhere`."""
         from messagefoundry.store import base as store_base
         from messagefoundry.store.base import store_connect_errors, store_driver_errors
@@ -9121,6 +9125,19 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 "grant this login the store's schema if they are a store it cannot reach, then "
                 "run the command again"
             )
+        if settings.store.resolved_schema_management() is SchemaManagement.EXTERNAL:
+            # The create open runs no DDL under external schema management, so over a database
+            # with no store schema it would refuse only after the recovery key was shown and
+            # proved (vault BACKLOG #8119 item 1). Refused here instead, before the prompts.
+            # The read-only open's own refusal is kept whole: it names the schema setting and the
+            # grant that hide a store provisioned elsewhere, which provision-schema cannot fix.
+            raise HostCustodyRefused(
+                "this login resolves no store schema, and [store].schema_management is 'external' "
+                "(the default on a server store), under which this command builds none, so no key "
+                f"was minted. {_sentence(missing)} Under the host key provider, serve does not "
+                "build a store before its key exists: under 'auto' this command builds it as it "
+                "mints. Then run the command again"
+            )
         return "none"
 
     async def server_store_found() -> Literal["none", "empty", "held"]:
@@ -9149,8 +9166,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
                 custody=throwaway,
             )
-        except StoreNotFoundError:
-            return await no_store_anywhere()
+        except StoreNotFoundError as missing:
+            return await no_store_anywhere(missing)
         except (StoreIdPinRefused, CipherError):
             return "held"
         try:
@@ -9521,6 +9538,24 @@ def _provision_admin(args: argparse.Namespace) -> int:
         print(
             "The recovery key was entered back and opens the store key. Keep that copy off this "
             "host: this engine never shows it again.",
+            file=sys.stderr,
+        )
+        # Vault BACKLOG #8119 item 9: this shell's environment chose the custody directory, and
+        # the service reads its own, so the line names what the service must see. The variable is
+        # named as a literal: this text reaches stderr (keep_the_key_step says why).
+        import os
+
+        from messagefoundry.engine_secrets import SECRETS_DIRECTORY_VARIABLE
+
+        where = (
+            f"MEFOR_SECRETS_DIRECTORY set to {minted.path.parent}"
+            if os.environ.get(SECRETS_DIRECTORY_VARIABLE, "").strip()
+            else "MEFOR_SECRETS_DIRECTORY unset, so that it looks beside the SQLite store file"
+        )
+        print(
+            f"The store key was written to {minted.path}. The service looks for it in the custody "
+            f"directory its own environment names; here that came from {where}. A service whose "
+            "environment names another custody directory does not find it, and refuses to start.",
             file=sys.stderr,
         )
 

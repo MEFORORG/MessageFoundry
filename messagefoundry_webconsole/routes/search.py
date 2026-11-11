@@ -23,7 +23,14 @@ from .._auth import (
     require_ui,
     require_ui_step_up,
 )
-from ._common import UI_BODY_FILTER_RULES, _form_pairs, blank_to_none, check_filters, for_echo
+from ._common import (
+    UI_BODY_FILTER_RULES,
+    _form_pairs,
+    blank_to_none,
+    check_filters,
+    for_echo,
+    posted_field_value,
+)
 
 # content-search (ADR 0046 #51): the search PAGE is step-up-gated (bulk-PHI decrypt), so register
 # it as an UNLOCK form — a stale step-up 303s to /ui/reauth and GET-redirects back to the fresh
@@ -233,7 +240,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             criteria = SearchPresetCriteria(
                 content=form.get("content") or None,
                 field_path=form.get("field_path") or None,
-                field_value=form.get("field_value") or None,
+                field_value=posted_field_value(form),
                 target=form.get("target")  # type: ignore[arg-type]
                 if form.get("target") in ("raw", "summary", "both")
                 else "both",

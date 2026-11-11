@@ -215,6 +215,33 @@ def test_an_external_provider_that_returns_no_key_fails_closed(
 
 
 @pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(ImportError("DLL load failed"), id="broken-c-extension"),
+        pytest.param(ImportError("cannot import name 'Client' from 'sdk'"), id="missing-symbol"),
+    ],
+)
+def test_an_external_provider_whose_backend_import_breaks_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, error: ImportError
+) -> None:
+    # Vault BACKLOG #6709: an SDK that is installed but broken raises a plain ImportError, not
+    # ModuleNotFoundError. The seam itself must raise the KeyProviderError its contract names,
+    # chained to the original, never a raw ImportError. The resolve_active_key half is a control:
+    # it already refused any provider error as a KeyProviderError before this fix.
+    def _import(_name: str) -> ModuleType:
+        raise error
+
+    monkeypatch.setattr("messagefoundry.store.keyprovider.importlib.import_module", _import)
+    with pytest.raises(
+        KeyProviderError, match="could not load its provider module or backend"
+    ) as caught:
+        resolve_key_provider(StoreSettings(key_provider="vault"))
+    assert caught.value.__cause__ is error
+    with pytest.raises(KeyProviderError):
+        resolve_active_key(StoreSettings(key_provider="vault"))
+
+
+@pytest.mark.parametrize(
     "settings",
     [
         pytest.param(
@@ -292,6 +319,38 @@ def test_resolve_active_key_propagates_unknown_provider() -> None:
     # Fail-closed propagates out of resolve_active_key → open_store → serve refuses to start.
     with pytest.raises(KeyProviderError):
         resolve_active_key(StoreSettings(key_provider="bogus"))
+
+
+@pytest.mark.parametrize("provider", ["auto", "env"])
+@pytest.mark.parametrize(
+    "value",
+    [f"{KEY_A}\n", f" {KEY_A}", "   "],
+    ids=["trailing-newline", "leading-space", "whitespace-only"],
+)
+def test_a_whitespace_bearing_env_key_fails_closed_and_is_not_stripped(
+    monkeypatch: pytest.MonkeyPatch, provider: str, value: str
+) -> None:
+    # Vault BACKLOG #6708, read as not a defect: the active key is passed through unstripped, so a
+    # padded or blank MEFOR_STORE_ENCRYPTION_KEY refuses at the cipher, naming the setting, and the
+    # engine does not start. Stripping it would accept a key this refuses, and a blank value would
+    # fall through to the key file, so neither is done. The keyless gate counts the value as a
+    # configured key, so it reaches this refusal rather than the audited keyless opt-out.
+    def _boom(_path: object) -> str:
+        raise AssertionError("a set environment key must not fall through to the key file")
+
+    monkeypatch.setattr("messagefoundry.secrets_dpapi.load_protected_key", _boom)
+    settings = StoreSettings(
+        key_provider=provider, encryption_key=value, encryption_key_file="C:/x/k.dpapi"
+    )
+    # Without the key file, so the gate answers on the environment key alone under auto too.
+    assert provider_reads_a_configured_key(
+        StoreSettings(key_provider=provider, encryption_key=value)
+    )
+    assert resolve_active_key(settings) == value
+    with pytest.raises(ValueError, match="MEFOR_STORE_ENCRYPTION_KEY.*must be valid base64"):
+        make_cipher(resolve_active_key(settings))
+    # The control: the same key without the whitespace builds a cipher.
+    assert make_cipher(KEY_A) is not None
 
 
 def test_resolve_active_key_propagates_dpapi_failure(monkeypatch: pytest.MonkeyPatch) -> None:
