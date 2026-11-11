@@ -2770,6 +2770,14 @@ class RestDestination(DestinationConnector):
         accepted, accept_reason = config.cleartext_accepted, config.cleartext_reason
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
+        # BACKLOG #5529: an http_auth this connection cannot honour is refused first, so a connection
+        # that never builds logs no insecure-hop crossing or warning below. Lazy: http_auth imports rest.
+        from messagefoundry.transports.http_auth import (
+            refuse_authorization_signer_beside_digest,
+            refuse_http_digest_conflicts,
+        )
+
+        digest_selected = refuse_http_digest_conflicts(s)
         # ADR 0139 (ASVS 12.1.5): opt-in ECH SNI-hiding. When set, this connection re-addresses each
         # request to a loopback terminating sidecar at send time (see _ech_request); destination TLS +
         # ECH are the sidecar's, so no forward proxy is used. Off (default) → None → byte-identical.
@@ -2789,6 +2797,15 @@ class RestDestination(DestinationConnector):
             raise ValueError(
                 "ech_egress and verify_tls=false are mutually exclusive — the ECH sidecar, not the "
                 "engine, makes this connection's TLS connection to the destination (ADR 0139)"
+            )
+        # BACKLOG #5529 limb 3 (#2707 closing step 1): the ECH branch below replaces the opener the
+        # Digest handler is folded into, so the connection used to build and deliver with no Digest
+        # auth. Keeping the handler on the ECH opener would not work: its password manager is keyed
+        # on self.url, and the ECH request goes to the sidecar URL, so no challenge would match.
+        if self._ech_sidecar is not None and digest_selected:
+            raise HttpAuthError(
+                f"{hop_name_prefix(config.name)}ech_egress and HTTP Digest are mutually exclusive -- "
+                "the Digest handler cannot answer a challenge through the ECH sidecar (ADR 0139)"
             )
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy. None (default, or when
         # ECH is active) → no ProxyHandler and no Proxy-Authorization threaded below → byte-identical.
@@ -2837,6 +2854,11 @@ class RestDestination(DestinationConnector):
         # identical). Built here so a bad key/algorithm fails loud at connector construction (check/
         # dry-run/start), like a bad TLS cert; the per-request signature is minted in _post (off-loop).
         self._signer: MessageSigner | None = signer_from_destination(config)
+        refuse_authorization_signer_beside_digest(
+            None if self._signer is None else self._signer.header_name,
+            digest=digest_selected,
+            connection=config.name,
+        )
         # ASVS 4.2.5: the detached-JWS headers are added after the URL/header gate above.
         # Message-independent, so they are bounded once here rather than on every send.
         enforce_signature_header_limits(self._signer, connector="REST destination")
@@ -2925,11 +2947,7 @@ class RestDestination(DestinationConnector):
 
         digest = digest_handler_from_settings(s, url=self.url)
         if digest is not None:
-            if self._token_provider is not None:
-                raise HttpAuthError(
-                    "a connection cannot use BOTH a bearer-token provider and HTTP Digest auth "
-                    "(mutually exclusive — configure exactly one)"
-                )
+            # A bearer provider beside Digest was refused in refuse_http_digest_conflicts (#5529).
             if _is_shared_no_redirect_opener(self._opener):
                 # Rebuild a per-connection verifying opener so add_handler never touches the shared one.
                 # Through _no_redirect_opener, not a bare build_opener: the bare form lets urllib
@@ -3078,7 +3096,7 @@ class RestDestination(DestinationConnector):
         # credentials), and that token is the one value the construction gate could not see -- the URL
         # and the static headers were already bounded there. Gated here so an operator's "test
         # connection" fails with the real reason rather than an opaque wire error. The SOAP probe
-        # deliberately has no equivalent: it mints nothing, so a gate there could not fire.
+        # mints and gates the same way (BACKLOG #5526).
         try:
             enforce_send_time_length_limits(
                 req.full_url,

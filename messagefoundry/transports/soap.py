@@ -69,6 +69,7 @@ from messagefoundry.config.tls_policy import (
     TrustAnchor,
     build_verifying_client_context,
     harden_cipher_suites,
+    hop_name_prefix,
     narrow_to_approved_suites,
     relax_verify_expiry,
 )
@@ -395,6 +396,21 @@ _XML_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 _SCRUB_MIN_LEN = 8
 
 
+def _drop_authorization(headers: dict[str, str]) -> None:
+    """Remove every spelling of ``Authorization`` from a static header table, so the credential the
+    connection configures owns the one header (BACKLOG #5526). For a name in plain letters urllib
+    capitalises it and the last write wins, so the configured value already crossed, though the
+    table held two keys. A name ending in a space or a tab, or with a NUL or a DEL at either end,
+    is not merged, so the static value crossed too, as a second header a peer may read as
+    ``Authorization``. A leading space or tab made ``http.client`` refuse the request instead. The
+    REST, FHIR and DICOMweb header builders do not purge. A signing header named ``Authorization``
+    is not in this table: ``_post`` writes it per request, and it is refused only beside Digest."""
+    from messagefoundry.transports.http_auth import is_authorization_header_name
+
+    for key in [k for k in headers if is_authorization_header_name(k)]:
+        del headers[key]
+
+
 def _iso(t: float) -> str:
     """An XSD ``dateTime`` in UTC, e.g. ``2026-06-15T05:30:00Z`` (WS-Security Created/Expires)."""
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
@@ -445,8 +461,10 @@ class SoapDestination(DestinationConnector):
         self.client_key_password: str | None = s.get("client_key_password") or None
         self.ws_addressing: bool = bool(s.get("ws_addressing", False))
         self.ws_security: bool = bool(s.get("ws_security", False))
-        self.ws_username: str | None = s.get("ws_username") or s.get("basic_user") or None
-        self.ws_password: str | None = s.get("ws_password") or s.get("basic_password") or None
+        # BACKLOG #5526 (ADR 0015 amendment 2026-11-10): no fallback to basic_user/basic_password.
+        # Borrowing the Basic pair sent one password twice, in the Authorization header and the token.
+        self.ws_username: str | None = s.get("ws_username") or None
+        self.ws_password: str | None = s.get("ws_password") or None
         self.ws_password_type: str = str(s.get("ws_password_type", "text"))
         self.ws_timestamp_ttl_seconds: int = count_setting(
             s.get("ws_timestamp_ttl_seconds", 300),
@@ -470,6 +488,15 @@ class SoapDestination(DestinationConnector):
         self._connection_name = config.name
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
+        # BACKLOG #5529: refused before any hop gate logs a crossing for a connection that never builds,
+        # and before the half-pair check, so a lone basic_user beside Digest hears the Digest rule.
+        from messagefoundry.transports.http_auth import (
+            refuse_authorization_signer_beside_digest,
+            refuse_http_digest_conflicts,
+        )
+
+        digest_selected = refuse_http_digest_conflicts(s)
+        self._refuse_half_credential_pairs(s)
         self._validate_ws(scheme, s)
 
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy (None → byte-identical).
@@ -514,6 +541,11 @@ class SoapDestination(DestinationConnector):
         # (byte-identical). Built here so a bad key/algorithm fails loud at connector construction; the
         # signature is minted in _post over the FINAL wire bytes (the WS-* wrapped envelope, ADR 0015).
         self._signer: MessageSigner | None = signer_from_destination(config)
+        refuse_authorization_signer_beside_digest(
+            None if self._signer is None else self._signer.header_name,
+            digest=digest_selected,
+            connection=config.name,
+        )
         # ASVS 4.2.5: the detached-JWS headers are added after the URL/header gate above.
         # Message-independent, so they are bounded once here rather than on every send.
         enforce_signature_header_limits(self._signer, connector="SOAP destination")
@@ -592,11 +624,7 @@ class SoapDestination(DestinationConnector):
             )
         digest = digest_handler_from_settings(s, url=self.url)
         if digest is not None:
-            if self._token_provider is not None:
-                raise HttpAuthError(
-                    "a connection cannot use BOTH a bearer-token provider and HTTP Digest auth "
-                    "(mutually exclusive — configure exactly one)"
-                )
+            # A bearer provider beside Digest was refused in refuse_http_digest_conflicts (#5529).
             if _is_shared_no_redirect_opener(self._opener):
                 # _no_redirect_opener, not a bare build_opener: the bare form lets urllib fill in an
                 # HTTPSHandler whose context the engine never names, so the forward-secrecy assertion
@@ -733,6 +761,26 @@ class SoapDestination(DestinationConnector):
                     text = text.replace(form, "***")
         return text
 
+    def _refuse_half_credential_pairs(self, s: dict[str, Any]) -> None:
+        """A credential pair is both halves or neither (BACKLOG #5526). Read here, on the resolved
+        settings, because the ``Soap()`` factory sees ``env()`` references and cannot tell one that
+        resolves empty from a set value. One Basic half alone would send no HTTP Basic header; a
+        token user alone would stamp a UsernameToken with an empty password, and a token password
+        alone would stamp none. The message names keys, never a value."""
+        prefix = hop_name_prefix(self._connection_name)
+        if bool(s.get("basic_user")) != bool(s.get("basic_password")):
+            raise HttpAuthError(
+                f"{prefix}SOAP destination basic_user and basic_password must be set together; "
+                "one without the other would send no HTTP Basic credential"
+            )
+        # The token is stamped only with ws_security on, so the pair binds only then. With neither
+        # half, ws_security stamps the Timestamp alone, a profile a mutual-TLS service may ask for.
+        if self.ws_security and bool(self.ws_username) != bool(self.ws_password):
+            raise HttpAuthError(
+                f"{prefix}SOAP destination ws_username and ws_password must be set together with "
+                "ws_security on; the UsernameToken does not use basic_user/basic_password"
+            )
+
     def _validate_ws(self, scheme: str, s: dict[str, Any]) -> None:
         """Runtime validation of the WS-* / mTLS settings (also enforced at wiring time by
         ``build_outbound_connection`` so ``check``/dry-run catches it without a store; the url-scheme
@@ -766,8 +814,8 @@ class SoapDestination(DestinationConnector):
             raise ValueError("SOAP ws_addressing/ws_security require soap_version='1.2' (ADR 0015)")
         # A UsernameToken password over cleartext http is a credential on the wire, refused like the
         # header credentials: only a loopback host lets it cross, never a declaration or the escape
-        # (vault BACKLOG #3533 item 4). Only with ws_security on: without it no token is stamped,
-        # and a basic_user that ws_username falls back to is judged as HTTP Basic instead.
+        # (vault BACKLOG #3533 item 4). Only with ws_security on: without it no token is stamped.
+        # ws_username no longer falls back to basic_user (#5526), which is judged as HTTP Basic.
         if self.ws_security and self.ws_username:
             refuse_cleartext_credential_hop(
                 scheme,
@@ -792,12 +840,26 @@ class SoapDestination(DestinationConnector):
         if isinstance(extra, dict):
             headers.update({str(k): str(v) for k, v in extra.items()})
         token = s.get("bearer_token")
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
         user, password = s.get("basic_user"), s.get("basic_password")
-        if user and password:
-            raw = f"{user}:{password}".encode()
-            headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
+        auth: str | None = None
+        if user and password:  # Basic wins over a static bearer_token, as it always has
+            auth = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
+        elif token:
+            auth = f"Bearer {token}"
+        from messagefoundry.transports.http_auth import oauth2_auth_configured
+        from messagefoundry.transports.smart import smart_auth_configured
+
+        # A minted bearer owns the header too: _post and _probe write it per request (#5526). A static
+        # `headers` Authorization is purged here, before the length gate judges this table, so the
+        # gate does not refuse that header, which is never sent. One case the purge does not cover:
+        # with OAuth2 or SMART configured, a configured bearer_token or Basic pair is still written
+        # back below and judged by the length gate, although the minted bearer replaces it on every
+        # request, so an over-long bearer_token beside OAuth2 is refused at construction.
+        # The cleartext and verify-off refusals read the settings (http_credentials_sent), not this.
+        if auth is not None or oauth2_auth_configured(s) or smart_auth_configured(s):
+            _drop_authorization(headers)
+        if auth is not None:
+            headers["Authorization"] = auth
         return headers
 
     # --- WS-* envelope assembly (all non-deterministic values minted here, in send()) -------------
@@ -892,20 +954,41 @@ class SoapDestination(DestinationConnector):
         # Reachability only: a HEAD reaches the endpoint without POSTing an envelope. An HTTP response
         # means the host answered (a 405 is still a pass), but a 401/403 means the configured
         # credentials would be rejected — surface that as a failure. Connection/DNS/TLS/timeout fails.
-        # ASVS 4.2.5: deliberately NO send-time length gate here. Unlike the REST and FHIR probes,
-        # this one does not mint a bearer -- it ships ``self.url`` and ``self._headers`` verbatim, and
-        # both were bounded at construction. A gate here could not fire on any input, and a guard that
-        # cannot fail reads as coverage without being it.
-        # BACKLOG #2196: the hop re-check _post runs, before a byte crosses.
+        # BACKLOG #2196: the hop re-check _post runs, before the bearer is minted below.
         assert_probe_hop(self._hop_guard, self.url, connector="SOAP")
+        headers = self._headers
+        if self._token_provider is not None:
+            # BACKLOG #5526: the probe presents the credential a send presents. Construction purges a
+            # static Authorization header once a provider exists, so a probe that did not mint would
+            # carry no credential at all. A token-endpoint failure raises DeliveryError.
+            headers = {
+                **self._headers,
+                "Authorization": f"Bearer {self._token_provider.access_token()}",
+            }
         req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
-            self.url, headers=self._headers, method="HEAD"
+            self.url, headers=headers, method="HEAD"
         )
+        # ASVS 4.2.5: the minted bearer is the one value the construction gate could not see; the URL
+        # and the static headers were bounded there. As in the REST and FHIR probes.
+        try:
+            enforce_send_time_length_limits(
+                req.full_url,
+                headers,
+                connector=f"SOAP {_redact_url(self.url)} probe",
+                minted_credential_names=(
+                    frozenset({"Authorization"})
+                    if self._token_provider is not None
+                    else frozenset()
+                ),
+            )
+        except NegativeAckError as exc:
+            if exc.credential_fault and self._token_provider is not None:
+                self._token_provider.invalidate()
+            raise
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
                 # ASVS 15.2.2: the HEAD probe body is discarded, but an unbounded drain would let a
-                # reachability check be turned into a memory exhaustion. Unlike the length gate this
-                # method deliberately omits, this bound CAN fire: the peer chooses the body.
+                # reachability check be turned into a memory exhaustion. The peer chooses the body.
                 drain_bounded(resp, connector=f"{self._hop} probe")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):

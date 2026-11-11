@@ -1829,8 +1829,7 @@ _SECRET_SETTING_KEYS = frozenset(
         "proxy_password",
         "proxy_user",
         # ADR 0015 — WS-* SOAP outbound: the WS-Security UsernameToken credentials and the mTLS
-        # client-key passphrase. ``ws_password`` back-fills from ``basic_password`` in the connector,
-        # so omitting these disclosed under one name the very credential the other name masks.
+        # client-key passphrase; credentials in their own right (no basic_* fallback since #5526).
         "ws_username",
         "ws_password",
         "client_key_password",
@@ -4839,7 +4838,7 @@ def Soap(
     headers: dict[str, str]
     | None = None,  # static extra headers (no secrets; a nested env() is refused)
     bearer_token: str | EnvRef | None = None,  # Authorization: Bearer … (use env() for the secret)
-    basic_user: str | EnvRef | None = None,
+    basic_user: str | EnvRef | None = None,  # set with basic_password, or neither (#5526)
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared, and in every case with a credential or a static header off the allowlist; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
@@ -4859,8 +4858,8 @@ def Soap(
     client_key_file: str | EnvRef | None = None,  # PEM private key (path or env() text)
     client_key_password: str | EnvRef | None = None,  # key passphrase — secret, use env()
     ws_security: bool = False,  # stamp <wsse:Security> (Timestamp + optional UsernameToken) in send()
-    ws_username: str | EnvRef | None = None,  # UsernameToken username (defaults to basic_user)
-    ws_password: str | EnvRef | None = None,  # UsernameToken password (defaults to basic_password)
+    ws_username: str | EnvRef | None = None,  # UsernameToken user; pairs with ws_password
+    ws_password: str | EnvRef | None = None,  # no basic_password fallback (#5526)
     ws_password_type: Literal["text"] = "text",  # PasswordText; "digest" retired (#1171)
     ws_addressing: bool = False,  # stamp <wsa:Action/To/MessageID> in send(); requires soap_version 1.2
     ws_timestamp_ttl_seconds: int = 300,  # Created→Expires window (must be >= max retry backoff)
