@@ -76,6 +76,7 @@ self-test failure (an instrument that cannot see is not a content hit; the two n
 
 from __future__ import annotations
 
+import bisect
 import json
 import os
 import re
@@ -572,11 +573,12 @@ _PR_CELL_GOES_ON = (
 _PR_CELL_VERDICT_LEAD = re.compile(
     rf"(?i)(?:(?P<prefix>unchanged(?:[,;:]|{_PR_CELL_DASH})?|{_PR_STATE_VERB}){_PR_SEP})?"
     rf"{_PR_QUALIFIER}{_PR_VERDICT}{_PR_FMT}(?:[.;,:](?:\s|$)|\s*\(|{_PR_CELL_DASH}(?:\s|$)"
-    rf"|\s+(?:{_PR_CELL_GOES_ON})\b|$)"
+    rf"|(?P<goes_on>\s+(?:{_PR_CELL_GOES_ON})\b)|$)"
 )
 #: The markup a table cell wraps around a value, and the separators of a cell that lists identifiers.
 _PR_CELL_MARKUP = re.compile(_PR_MARKUP)
-#: The characters _PR_MARKUP matches plus a space, as str.strip takes them, to trim only a cell's ends.
+#: The characters _PR_MARKUP matches plus every space character (a tab and a no-break space included),
+#: as str.strip takes them, to trim only a cell's ends.
 _PR_CELL_EDGE = "".join(c for c in map(chr, range(0x3001)) if c.isspace()) + "*`_\"'"
 #: No "\s*" around a separator: on a long run of spaces it backtracks quadratically, so whitespace is a
 #: separator of its own and the empty parts are dropped.
@@ -799,7 +801,7 @@ def _pr_table_verdict(row: str, ids: set[str], marked: bool) -> bool:
     goes on binds only a row whose identifier is marked (_PR_CELL_VERDICT_LEAD).
 
     Every cell, identifier or verdict, is read twice, and either reading may match. Trimmed at its
-    ends only, as engine PR 2448 read it, the markup inside it stays where the cell patterns expect
+    ends only (markup and spaces), as engine PR 2448 read it, the markup inside it stays where the cell patterns expect
     it ("stays`partial`" through _PR_SEP, "isn't met" as a contraction). With all its markup deleted,
     a lead or a verdict reads beside its neighbour ("ASVS `<id>`", "unchanged, `partial`.")."""
     if not ids:
@@ -816,7 +818,13 @@ def _pr_table_verdict(row: str, ids: set[str], marked: bool) -> bool:
 
     def opens_with_verdict(cell: str) -> bool:
         lead = _PR_CELL_VERDICT_LEAD.match(cell)
-        return lead is not None and (marked or lead.group("prefix") is not None)
+        if lead is None:
+            return False
+        # A cell that goes on in words ("is passing for the nightly") is CI prose as often as a record,
+        # so it binds only a row whose identifier is marked.
+        if lead.group("goes_on") is not None:
+            return marked
+        return marked or lead.group("prefix") is not None
 
     return any(lists_ids(c) for c in cells) and any(
         _PR_CELL_VERDICT.fullmatch(c) or opens_with_verdict(c) for c in cells
@@ -866,7 +874,11 @@ def scan_pr_body(body: str) -> list[str]:
     for index, (marks, unit, is_row) in enumerate(units):
         if not is_row:
             asvs_columns = set()
-        elif index + 1 < len(units) and _pr_is_delimiter(units[index + 1][1]):
+        elif (
+            not _pr_is_delimiter(unit)
+            and index + 1 < len(units)
+            and _pr_is_delimiter(units[index + 1][1])
+        ):
             asvs_columns = _pr_asvs_columns(unit)
         for start, sentence in _pr_sentences(unit, is_row):
             found: dict[str, int] = {}
@@ -884,6 +896,8 @@ def scan_pr_body(body: str) -> list[str]:
             evidence: _PrEvidence | None = None
             row_marked = False
             previous: tuple[int, bool] | None = None
+            # Where the cell edges sit, found once for the row; an identifier's column is then a lookup.
+            pipes = [i for i, ch in enumerate(sentence) if ch == "|"] if asvs_columns else []
             for m, version in ids:
                 window = (
                     sentence
@@ -897,7 +911,10 @@ def scan_pr_body(body: str) -> list[str]:
                         and previous[1]
                         and _pr_in_list(sentence, previous[0], m)
                     )
-                    or (bool(asvs_columns) and sentence[: m.start()].count("|") - 1 in asvs_columns)
+                    or (
+                        bool(asvs_columns)
+                        and bisect.bisect_left(pipes, m.start()) - 1 in asvs_columns
+                    )
                 )
                 previous = (m.end(), marked)
                 row_marked = row_marked or marked

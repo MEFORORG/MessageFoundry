@@ -944,6 +944,9 @@ _PR_STEP4_MUST_FIRE: list[tuple[str, str, str]] = [
     ("e", "verdict", f"ASVS {_REQ} has still been {_MET}."),
     ("e", "verdict", f"ASVS {_REQ} has now been {_MET}."),
     ("e", "verdict", f"ASVS {_REQ} has never been {_MET}."),
+    ("e", "verdict", f"ASVS {_REQ} has not yet been {_MET}."),
+    ("e", "verdict", f"ASVS {_REQ} has already been {_MET}."),
+    ("e", "verdict", f"ASVS {_REQ} will probably remain {_PARTIAL}."),
     # (f) The written-out negation.
     ("f", "verdict", f"ASVS {_REQ} is not {_PARTIAL}."),
     ("f", "verdict", f"ASVS {_REQ} was not {_PARTIAL}."),
@@ -953,6 +956,8 @@ _PR_STEP4_MUST_FIRE: list[tuple[str, str, str]] = [
     # (h) A cell that opens with a verdict and goes on in words.
     ("h", "verdict", f"| ASVS {_REQ} | the outbound limb | stays {_PARTIAL} until #1 |"),
     ("h", "verdict", f"| ASVS {_REQ} | the outbound limb | {_PARTIAL} pending the follow-up |"),
+    ("h", "verdict", f"| ASVS {_REQ} | the outbound limb | {_PARTIAL} because of #1 |"),
+    ("h", "verdict", f"| ASVS {_REQ} | the outbound limb | is {_PARTIAL} for now |"),
     # (i) A comma before "which stays partial": the case the _PR_STRONG_VERB comment names.
     ("i", "verdict", f"Applies to {_REQ}, which stays {_PARTIAL}."),
     ("i", "verdict", f"ASVS {_REQ}, which is {_PARTIAL} today."),
@@ -984,6 +989,10 @@ _PR_STEP4_MUST_STAY_QUIET: list[tuple[str, str]] = [
     ("g", "_Updates_ 2.9.1 to pass Z-segments through unchanged."),
     ("h", f"| 2.5.1 | ADT^A01 | {_PASS.title()} for 12 messages |"),
     ("h", f"| 2.5.1 | the parser | is {_PARTIAL} frames until EOF |"),
+    # A cell that goes on in words after a state verb is CI prose beside an unmarked HL7 version.
+    ("h", "| 2.5.1 | ADT^A01 | is passing for the nightly |"),
+    ("h", "| 2.5.1 | the strict suite | was failing since the last merge |"),
+    ("h", f"| 3.2.1 | lxml | stays {_PARTIAL} for now |"),
     ("i", "Updates 2.9.1, which is pass-through for Z segments."),
     ("i", "Bumps lxml to 5.1.2, which passes the strict suite."),
     (
@@ -1031,6 +1040,9 @@ def test_a_header_row_marks_only_its_own_table_and_column(sf) -> None:
     assert sf.scan_pr_body(one), "the control must fire, or the next two assert nothing"
     two = one + "\n\n| Version | Note | Result |\n| --- | --- | --- |\n" + row
     assert sf.scan_pr_body(two) == [f"pr-body:3: {sf.PR_BODY_REASONS['verdict']}"]
+    # A placeholder row of dashes is data, not a delimiter, and must not wipe the marked column.
+    placeholder = f"| ASVS | Note | Result |\n|---|---|---|\n| - | - | - |\n{row}"
+    assert sf.scan_pr_body(placeholder) == [f"pr-body:4: {sf.PR_BODY_REASONS['verdict']}"]
     wrong_column = (
         f"| ASVS | Note |\n| --- | --- |\n| the limb | {_REQ} | x | {_PASS.title()} (12 messages) |"
     )
@@ -1057,6 +1069,8 @@ def test_the_residue_rules_leave_versions_and_plain_numbers_alone(sf, line: str)
         # Step 4: a header that marks a column, a run of dashes in a delimiter row, and a long list.
         "| ASVS | x |\n|---|---|\n| " + ", ".join([_REQ] * 8000) + " | the outbound limb |",
         "| ASVS | x |\n|" + "-" * 80000 + "x|\n| 1 | 2 |",
+        # Identifiers split by a word, so each one takes the column lookup.
+        "| ASVS | x |\n|---|---|\n| " + " x ".join([_REQ] * 16000) + " |",
         "ASVS " + " and ".join([_REQ] * 8000) + " cannot pass",
     ],
 )
