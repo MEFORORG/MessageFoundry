@@ -518,10 +518,10 @@ async def _layered_with_decrypt_raising(
         def _raise(stored: str, **_kw: object) -> str:
             raise exc
 
-        monkeypatch.setattr(cipher, "decrypt", _raise)
         caplog.set_level(logging.WARNING, logger="messagefoundry.api.app")
-        r = await c.get("/search/layered", params={"presets": pid}, headers=h)
-        monkeypatch.undo()
+        with monkeypatch.context() as patched:  # undoes the decrypt patch alone
+            patched.setattr(cipher, "decrypt", _raise)
+            r = await c.get("/search/layered", params={"presets": pid}, headers=h)
     return r, raised, pid
 
 
@@ -541,12 +541,13 @@ async def test_a_key_service_outage_on_the_criteria_answers_503_with_retry_after
     assert "Transit" not in r.text and "mf-store-secret" not in r.text
     assert raised[-1].__context__ is None and raised[-1].__cause__ is None
     assert "mf-store-secret" not in repr(raised[-1].args)
-    assert any(
-        rec.getMessage()
-        == f"layered search answered 503 on preset {pid}: Transit unreachable for key"
-        " mf-store-secret"
-        for rec in _layered_refusal_log(caplog)
-    )
+    assert [(rec.levelno, rec.getMessage()) for rec in _layered_refusal_log(caplog)] == [
+        (
+            logging.WARNING,
+            f"layered search answered 503 on preset {pid}: Transit unreachable for key"
+            " mf-store-secret",
+        )
+    ]
 
 
 async def test_a_transit_refusal_on_the_criteria_is_logged_at_error(
@@ -554,13 +555,16 @@ async def test_a_transit_refusal_on_the_criteria_is_logged_at_error(
 ) -> None:
     """BACKLOG #5523: under Vault Transit a criteria cell planted across owners is refused as a
     plain ``CipherError``, not a ``CellTagError``, so it writes no integrity audit row and raises
-    no alert, and its log record is its only signal. It is a 423, logged at ERROR with the type
-    name alone: no exception object, cipher text or criteria."""
+    no alert, and its log record is the engine's only record of it. It is a 423, logged at ERROR
+    with the type name alone: no exception object, cipher text or criteria. The cipher raises the
+    error by hand, so this pins the route's arm, not how ``TransitCipher`` classifies a refusal."""
     refusal = CipherError("Transit decrypt refused (key='mf-store-secret'): MRN999")
     r, raised, pid = await _layered_with_decrypt_raising(engine, monkeypatch, caplog, refusal)
     assert r.status_code == 423, r.text
     assert "mf-store-secret" not in r.text and "MRN999" not in r.text
+    assert r.json()["detail"].startswith(f"preset {pid} cannot be opened with the store's keys")
     assert raised[-1].__context__ is None and raised[-1].__cause__ is None
+    assert "mf-store-secret" not in repr(raised[-1].args) and "MRN999" not in repr(raised[-1].args)
     # _layered_refusal_log also checks no record carries exc_info or a non-str arg.
     assert [(rec.levelno, rec.getMessage()) for rec in _layered_refusal_log(caplog)] == [
         (logging.ERROR, f"layered search refused preset {pid}: CipherError")

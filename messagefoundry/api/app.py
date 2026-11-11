@@ -9599,8 +9599,8 @@ def create_app(
                 # unmarked value planted in a keyed store, or a value Vault Transit refused. It
                 # answered 500. The type name only: the text is the cipher's, not this route's.
                 # ERROR: under Transit a cell planted across owners lands here, not in the
-                # CellTagError arm, so it is neither audited nor alerted and this is its only
-                # signal. The outage above stays a WARNING: it says nothing about the cell.
+                # CellTagError arm, so it is neither audited nor alerted and this is the engine's
+                # only record of it. The outage above is a WARNING: it says nothing about the cell.
                 _log.error("layered search refused preset %s: %s", preset_id, type(exc).__name__)
                 refusal = HTTPException(
                     423,
