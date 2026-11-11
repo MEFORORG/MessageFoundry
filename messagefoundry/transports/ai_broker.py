@@ -27,7 +27,8 @@ the vetted network call.
   for an opener of its own. The API route runs the build and :meth:`AiBroker.chat` each through
   :func:`asyncio.to_thread`.
 * **Revocation (BACKLOG #2193 slice (e), BACKLOG #5527).** The endpoint's certificate is verified,
-  and stdlib ssl checks no OCSP. It checks a CRL only when ``[tls].crl_file`` reaches the hop. So an
+  and stdlib ssl checks no OCSP. It checks no CRL unless ``[tls].crl_file`` is set, the ``[tls]``
+  policy is handed in, and the endpoint is not loopback. So an
   off-box endpoint is refused under an enforcing or unknown posture unless that CRL is checked or
   ``[ai].endpoint_revocation_attested`` is set with its reason: :func:`_refuse_an_unrevoked_ai_hop`.
 * **Secrets / PHI.** The prompt, the reply, and the provider ``api_key`` are NEVER logged. A failure names
@@ -111,7 +112,7 @@ _AI_HOP_CELL = "[ai] engine AI broker (verified TLS, no revocation check)"
 #: ``[tls].crl_file`` reaches this hop since BACKLOG #5527, the later CRL lever ADR 0173 section 12
 #: foresaw when the owner ruling of 2026-10-27 built the attestation pair alone. It is offered only
 #: to a broker that was handed a ``[tls]`` policy: on a build with none, such as a direct
-#: ``create_app``, setting it would change nothing. No connection's attestation is offered either:
+#: ``create_app`` whose embedder set no ``app.state.tls_settings``, setting it would change nothing. No connection's attestation is offered either:
 #: the endpoint is not a connection. Naming either would be a remedy the operator cannot perform.
 _AI_CRL_LEVER = (
     "Set [tls].crl_file to a CRL file that covers the issuer of the AI endpoint's certificate (it "

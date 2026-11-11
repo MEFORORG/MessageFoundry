@@ -4,9 +4,11 @@
 (BACKLOG #2193 slice (e), owner ruling 2026-10-27, on the ADR 0173 section 12 pattern).
 
 Every call sends ``[ai].api_key`` over https that verifies the endpoint's certificate, and stdlib
-ssl checks no OCSP. So an off-box endpoint is refused under an enforcing or unknown posture unless
-``[tls].crl_file`` reaches the hop or ``[ai].endpoint_revocation_attested`` is set with its
-reason. Since BACKLOG #5527 the broker resolves the instance ``[tls]`` policy, so
+ssl checks no OCSP. It checks no CRL unless ``[tls].crl_file`` is set, the ``[tls]`` section
+reaches the app serving ``POST /ai/chat``, and the endpoint is not loopback
+(docs/SECURITY-LOOSENING.md states it in full). So an off-box endpoint is refused under an
+enforcing or unknown posture unless that CRL is checked or ``[ai].endpoint_revocation_attested``
+is set with its reason. Since BACKLOG #5527 the broker resolves the instance ``[tls]`` policy, so
 ``[tls].internal_ca_file`` and ``[tls].crl_file`` reach its opener; the last section pins that.
 All endpoints, keys, certificates and CRLs here are synthetic.
 """
@@ -374,7 +376,7 @@ def test_the_attestation_is_a_named_loosening_that_carries_its_reason() -> None:
     assert switch in named
     assert _REASON in named[switch]
     # BACKLOG #5527: a CRL reaches this hop on some paths now, so the entry says which.
-    assert "only where the engine's [tls] policy reaches the hop" in named[switch]
+    assert "checks no CRL unless all three hold: [tls].crl_file is set" in named[switch]
     assert "No CRL lever is built" not in named[switch]
 
 
@@ -703,8 +705,8 @@ async def test_the_route_hands_the_broker_the_instance_tls_policy(
 @pytest.mark.parametrize(
     ("path", "names_the_path"),
     [
-        ("direct-create-app", "a direct create_app (the embedded path)"),
-        ("loopback", "A loopback endpoint"),
+        ("direct-create-app", "a direct create_app holds none unless the embedder sets it"),
+        ("loopback", "a loopback endpoint"),
     ],
     ids=["direct-create-app", "loopback"],
 )
@@ -712,16 +714,19 @@ async def test_the_posture_entry_claims_no_crl_check_where_crl_file_does_not_rea
     engine: Engine, monkeypatch: pytest.MonkeyPatch, pki: _Pki, path: str, names_the_path: str
 ) -> None:
     """The ``GET /security/posture`` entry must not say a CRL is checked on a path where none is,
-    whatever ``[tls].crl_file`` the instance names. Two such paths: a direct ``create_app``, which
-    takes no ``[tls]`` section, so no ``crl_file`` can reach its route; and a loopback endpoint on
-    an app that holds a ``[tls]`` section with a ``crl_file``, as ``serve`` stashes it, which
-    ``resolve_trust_anchor`` exempts from the CRL. Each arm checks the context the route really
-    dials with, then reads the entry. Red on 547561b4da: the entry said "no CRL unless
-    [tls].crl_file is set", a CRL check on both paths."""
-    seen: list[ssl.SSLContext] = []
+    whatever ``[tls].crl_file`` the instance names. Two such paths: a direct ``create_app`` whose
+    embedder set no ``app.state.tls_settings``, so no ``crl_file`` reaches its route; and a
+    loopback endpoint on an app that holds a ``[tls]`` section with a ``crl_file``, as ``serve``
+    stashes it, which ``resolve_trust_anchor`` exempts from the CRL. In both arms a ``crl_file``
+    is configured where it would matter if reached: the loopback app holds it, and for the direct
+    ``create_app`` the process environment names it and the process already holds the anchored
+    opener that CRL builds, as a ``serve``-hosted broker in the same process would. Each arm checks
+    the context the route really dials with, then reads the entry. Red on 547561b4da: the entry
+    said "no CRL unless [tls].crl_file is set", a CRL check on both paths."""
+    dialled: list[AiBroker] = []
 
     def fake_chat(self: AiBroker, prompt: str) -> str:
-        seen.append(_context(self))
+        dialled.append(self)
         return "synthetic reply"
 
     monkeypatch.setattr(ai_broker_mod.AiBroker, "chat", fake_chat)
@@ -729,6 +734,14 @@ async def test_the_posture_entry_claims_no_crl_check_where_crl_file_does_not_rea
         # The fact the entry's clause rests on: create_app has no [tls] parameter, so whatever
         # crl_file the instance's [tls] names has no way into this app.
         assert "tls_settings" not in inspect.signature(create_app).parameters
+        # The instance's [tls] does name a CRL: the process environment carries it.
+        monkeypatch.setenv("MEFOR_TLS_CRL_FILE", pki.crl_file)
+        # And the process already holds the CRL-checking opener that policy builds for this very
+        # endpoint, so a route that fell back to the environment or reused the held slot would
+        # dial a CRL here.
+        primed = _broker(posture=_ENFORCING, policy=TlsSettings(crl_file=pki.crl_file).policy())
+        assert _context(primed).verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+        assert ai_broker_mod._anchored_opener is not None
         ai = _managed_ai(
             endpoint_revocation_attested=True, endpoint_revocation_attested_reason=_REASON
         )
@@ -747,8 +760,11 @@ async def test_the_posture_entry_claims_no_crl_check_where_crl_file_does_not_rea
         chat = await c.post("/ai/chat", json={"prompt": "synthetic prompt"})
         posture = await c.get("/security/posture")
     assert chat.status_code == 200
-    assert len(seen) == 1
-    assert not seen[0].verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+    assert len(dialled) == 1
+    assert not _context(dialled[0]).verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+    if path == "direct-create-app":
+        # Not the held anchored opener: the route dialled the shared one, on the OS trust store.
+        assert dialled[0]._opener is _shared_no_redirect_opener()
     assert posture.status_code == 200
     risk = {e["switch"]: e["risk"] for e in posture.json()["loosenings"]}[_SWITCH]
     assert "unless [tls].crl_file is set" not in risk
