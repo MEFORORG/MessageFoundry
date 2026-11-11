@@ -384,10 +384,13 @@ the reasons of at least two reporters this build adds, `AuthService._user_seal_u
 `auth/service.py` and `ApprovalGate._approval_seal_unverifiable` in `api/approvals.py`. Each embeds
 the stored id through `scrub_log_argument`, which escapes control characters and bounds nothing,
 so its reason, and the WARNING line that logs that reason, carries the id at whatever length a
-database writer stored it. Their page subjects are bounded: `SealPager.unverifiable` builds each
-through `unverifiable_subject`, and so through `seal_row_ref`. Both reasons are open on vault
-BACKLOG #8202. The claim holds for at least the revoke report: `_RevokeCarry._entry` in
-`store/store.py` names a row in its reason by `seal_row_ref`.
+database writer stored it. Their Unverifiable page subjects are bounded: `SealPager.unverifiable`
+builds each through `unverifiable_subject`, and so through `seal_row_ref`. The approval reporter
+reaches at least one subject that is not: it hands the same unbounded id to `_record_audit_soft`,
+so a failed audit write pages `audit_write_failed` under `approval:<id>` and logs the id in its
+ERROR line. Both reporters are named here for filing on vault BACKLOG #8202. The claim holds for
+at least the revoke report: `RevokeSealOutcome._entry` in `store/store.py` names a row in its
+reason by `seal_row_ref`.
 
 **A ref is for reading, never a key.** A 12-character prefix and a shortened id both collide, and a
 database writer who can read a genuine row can plant one that shares its ref. So every throttle and
@@ -433,19 +436,20 @@ call per refused check stays (see item 3).
 - **A correction, added 2026-11-11:** "the audit row and the page carry `stored_version` [...] and
   `probe_version`" and "The recovery text tells the operator, in this order" do not hold for the
   pages of at least two reporters this build adds. `AuthService._user_seal_unverifiable` in
-  `auth/service.py`, which an admin user read reaches through `_checked_by_id`, and
-  `ApprovalGate._approval_seal_unverifiable` in `api/approvals.py` each write both integers into
-  their `integrity.authority_seal_unverifiable` audit detail, but their page reason, which is also
-  their WARNING line, carries neither. Neither reason states the recovery order. The user
-  reporter's gives only its middle step, to check that Vault is healthy and that every node holds
-  the audit key's latest version and then retry. It does not say the seal may be planted, or that a
-  row that still does not verify is re-created from an authoritative source. The approval
-  reporter's gives none of the order. (c) item 4's "gives the recovery text from (a)" does not hold
-  for these two pages either. Both are open on vault BACKLOG #8202. The revoke report's
-  Unverifiable page, built by `_RevokeCarry._entry` in `store/store.py`, carries neither integer
-  and no recovery order either; it is named here for filing on vault BACKLOG #8202. The claim holds
-  for at least `AuthService._report_unverifiable_reconcile_map`, whose page and WARNING carry both
-  integers and the recovery order.
+  `auth/service.py`, which every read through `_checked_by_id` reaches (at least the admin user
+  reads and every `_load_users` scan, start-up's passkey rehash and the directory reconcile pass
+  among them), and `ApprovalGate._approval_seal_unverifiable` in `api/approvals.py` each write
+  both integers into their `integrity.authority_seal_unverifiable` audit detail, but their page
+  reason, which is also their WARNING line, carries neither. Neither reason states the recovery
+  order. The user reporter's gives only its middle step, to check that Vault is healthy and that
+  every node holds the audit key's latest version and then retry. It does not say the seal may be
+  planted, or that a row that still does not verify is re-created from an authoritative source.
+  The approval reporter's gives none of the order. (c) item 4's "gives the recovery text from (a)"
+  does not hold for these two pages either. The revoke report's Unverifiable page, built by
+  `RevokeSealOutcome._entry` in `store/store.py`, carries neither integer and no recovery order
+  either. All three are named here for filing on vault BACKLOG #8202. The claim holds for at least
+  `AuthService._report_unverifiable_reconcile_map`, whose page and WARNING carry both integers and
+  the recovery order.
 - **Failure accepted:** a genuine seal checked against a node that lags a key rotation is denied
   for the length of the lag: a session so checked is ended, and its user signs in again (on a node
   that has caught up); a write so refused is retried by its caller; an approval is denied, never
@@ -789,13 +793,18 @@ it supersedes, and only where it disagrees; the earlier text is kept as it was.
   out every role holder, and below the brake's thresholds this build lets one do that. With no
   step 2 built, the only alternative was the old behaviour, which revoked nothing.
   **A correction, added 2026-11-11:** this bullet read "an Unverifiable user row read by
-  `_load_user` or `_load_users`, which still raises out of the pass". Since 67c274348b,
-  `_load_users` reads every account through `list_checked_users`, whose `_checked_by_id` reports an
-  Unverifiable row with `_user_seal_unverifiable` and lists it as failed, and `_load_users` drops
-  it. The pass then goes on without that account: it neither probes it nor revokes its sessions on
-  that pass. A Vault transit Outage on any account's row still raises out of `_load_users`, and so
-  out of the pass. `_load_user`, the pass's re-read of each account its probe found present, still
-  raises on an Unverifiable row.
+  `_load_user` or `_load_users`, which still raises out of the pass". `_load_users` reads every
+  account through `list_checked_users` and `_checked_by_id`, and since this build's admin user read
+  change (commit 67c274348b on PR 2860) `_checked_by_id` catches an Unverifiable answer, reports it
+  with `_user_seal_unverifiable` and lists the row as failed, which `_load_users` drops. The pass
+  then reads that account as one that left its candidates: it neither probes it nor revokes its
+  sessions, and the attrition step and the ledger prunes discard its reconcile state, its strikes
+  among it, so an account that reads Unverifiable on a pass loses its progress toward a revocation.
+  A Vault transit Outage on any account's row still raises out of `_load_users`, and so out of the
+  pass. At least two later reads still raise on an Unverifiable row: `_load_user`, in the re-read
+  of each account its probe found present and in `_apply_reconcile_revocation`, and
+  `_load_user_by_username` in the rename step, which runs after the revocations are applied. The
+  rename step's read, and the lost reconcile state, are named here for filing on vault #8202.
 - **The held `refused()` log.** `RevokeSealOutcome.refused` no longer logs at refusal time, inside
   the writer transaction. Its line is held and written once the outcome is known, with the
   committed or the failed wording, as the skipped-raise count is, which is logged after a commit
@@ -1013,15 +1022,24 @@ session, approval, on SQLite, PostgreSQL and SQL Server):
   refusal escape as a 500 with no row. (7) `provision-admin` reaches gap (1) through
   `grant_first_admin_unless_admin_exists`, where it is the CLI's top-level defect report rather
   than a 500. **A correction, added 2026-11-11:** (7) read "rather than a 500, with no audit row
-  and no page". Since 67c274348b the command's first account read, `_administrator_standing` in
-  `provision_first_administrator`, goes through `_load_users`, which reports an Unverifiable
-  account with `_user_seal_unverifiable`: a WARNING and a soft `integrity.authority_seal_unverifiable`
-  row. Its page reaches no sink on this path, since the command arms no `SealPager`. The account is
-  then dropped, so an Unverifiable Administrator is not counted, the self-sufficient-Administrator
-  refusal can pass, and the command creates or takes over the named local account and writes its
-  password, any TOTP enrolment and its notice address before its grant reaches gap (1). The
-  defect report then leaves that local account roleless. A Vault transit Outage on that first read raises before any write, with no audit row,
-  and its page reaches no sink either. Beneath all of these, (c) item 2's catch census test,
+  and no page". The command reads the accounts through `_administrator_standing` twice: first in
+  its pre-check, `AuthService.provision_refusal` by way of `has_self_sufficient_administrator`,
+  before any prompt, and again in `provision_first_administrator`. Each read goes through
+  `_load_users`, and since this build's admin user read change (commit 67c274348b on PR 2860) an
+  Unverifiable account is reported there with `_user_seal_unverifiable`: a WARNING and a soft
+  `integrity.authority_seal_unverifiable` row, written at the pre-check. One service runs both
+  reads, so its per-account report throttle normally keeps the second from reporting again. The
+  page reaches no sink on this path, since the command arms no `SealPager`. The account is then
+  dropped, so an Unverifiable Administrator is not counted and the self-sufficient-Administrator
+  refusal can pass. The command then does at least this before its grant reaches gap (1): it
+  creates or takes over the named local account, on the takeover branch clearing the earlier
+  holder's TOTP, passkeys and sessions and telling the address that row held, if any, and it
+  writes the password, any TOTP enrolment and the notice address. The defect report then leaves
+  that local account roleless. Where the named account's own row is the Unverifiable one, the
+  pre-check's `_lookup_by_username` raises instead, before any prompt, with no report of its own:
+  it calls `_verified`, which has no Transit catch. A Vault transit Outage on the first read
+  raises before any write, with no audit row, and its page reaches no sink either. Beneath all of
+  these, (c) item 2's catch census test,
   (c) item 3's API backstop for both refusal types, and *The four answers*' "The API answers an
   Outage with HTTP 503 and `Retry-After`" are not yet built on every path: a refusal no caller maps
   reaches the engine's generic handler as a 500. The sign-in audit actions this ADR names,
