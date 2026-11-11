@@ -11676,8 +11676,9 @@ _PAGING_REFUSAL_TEXT: Final[Mapping[str, str]] = {
 _UNREACHED_ALERT_SOURCE = "directory-reconciler-unreached"
 #: What it tells the operator. Short, and the consequence first, for the store's 200 characters.
 _UNREACHED_ALERT_TEXT: Final[str] = (
-    "This account's sessions are not revoked: {probes} of its directory probes running failed to "
-    "reach the directory. Check its entry, and any outage, referral or configuration alert."
+    "This account's sessions are not revoked: {probes} of its last {window} directory probes "
+    "failed to reach the directory. Check its entry, and any outage, referral or configuration "
+    "alert."
 )
 #: What one page for many such accounts says, on a pass that rolls them up
 #: (``AuthService._record_unreached_accounts`` decides when), so a flapping directory opens one
@@ -11685,11 +11686,11 @@ _UNREACHED_ALERT_TEXT: Final[str] = (
 #: pass, and says so: a later rollup updates the same open instance's text, so a count that read
 #: as a total would be replaced by a smaller one while more accounts stood (BACKLOG #3709). No
 #: process can say how many stand: each counts its own, and the instance is shared. ``probes``
-#: is the shortest run among those entering, in probes, not passes, which differ under a probe
-#: budget smaller than the estate.
+#: is the fewest failures among those entering, of each one's last ``window`` probes, counted in
+#: probes, not passes, which differ under a probe budget smaller than the estate.
 _UNREACHED_ROLLUP_TEXT: Final[str] = (
     "Accounts newly unreachable: {entering}. Their sessions are not revoked; each failed {probes}+ "
-    "directory probes running. Check the directory and the path to it. "
+    "of its last {window} directory probes. Check the directory and the path to it. "
     "auth.ad_reconcile_unreached rows name each."
 )
 
@@ -11900,9 +11901,9 @@ def _alert_paging_refusals(plan: ReconcilePlan, sink: AlertSink) -> None:
 
 def _alert_unreached_accounts(plan: ReconcilePlan, sink: AlertSink) -> None:
     """Page each account that has just entered the lasting unreachable state (BACKLOG #3100
-    closing step 2; ``AuthService._note_unreached_accounts`` says when one enters). That many of
-    its probes running failed to reach the directory, so the
-    reconciler has neither struck nor revoked it. Once per entry, like a paging refusal, and with
+    closing step 2, #3709 closing step 6; ``AuthService._note_unreached_accounts`` says when one
+    enters). That many of its last ``plan.unreached_window`` probes failed to reach the directory,
+    so the reconciler has neither struck nor revoked it. Once per entry, like a paging refusal, and with
     no inverse: an operator resolves it. The account name is in the source only, as for a paging
     refusal. On a rolled-up pass (``plan.unreached_rollup``), one page under the bare source covers
     those entering, naming none, and counting only them."""
@@ -11912,7 +11913,9 @@ def _alert_unreached_accounts(plan: ReconcilePlan, sink: AlertSink) -> None:
             reason=UNREACHED_ACCOUNT,
             probed=plan.asked,
             detail=_UNREACHED_ROLLUP_TEXT.format(
-                entering=len(plan.unreached), probes=min(n for _u, _n, n in plan.unreached)
+                entering=len(plan.unreached),
+                probes=min(n for _u, _n, n in plan.unreached),
+                window=plan.unreached_window,
             ),
         )
         return
@@ -11921,7 +11924,7 @@ def _alert_unreached_accounts(plan: ReconcilePlan, sink: AlertSink) -> None:
             f"{_UNREACHED_ALERT_SOURCE}:{username}",
             reason=UNREACHED_ACCOUNT,
             probed=plan.asked,
-            detail=_UNREACHED_ALERT_TEXT.format(probes=probes),
+            detail=_UNREACHED_ALERT_TEXT.format(probes=probes, window=plan.unreached_window),
         )
 
 

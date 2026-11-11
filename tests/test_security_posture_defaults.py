@@ -790,7 +790,7 @@ def test_a_reconciler_knob_is_named_only_in_its_looser_direction(
         (
             "ad_session_recheck_seconds",
             600,
-            "probes running fail, at least 1200 s after its first such probe",
+            "last 5 probes fail, at least 1200 s after its first such probe",
         ),
         ("ad_session_recheck_max_users", 6, "the page about one account the directory keeps"),
     ],

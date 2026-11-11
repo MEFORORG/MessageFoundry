@@ -827,8 +827,8 @@ _FORFEIT_NOBODY_ELSE: Final[str] = (
     "an engine of more than one engine shard resolves none itself"
 )
 #: Where those whose row this pass wrote, plus the accounts latched as paged unreachable that still
-#: hold a live session and a directory key and were not since answered for, are more than this,
-#: those entering page as one (BACKLOG #3100 closing step 2, #3709;
+#: hold a live session and a directory key and whose window has not since held only answers, are
+#: more than this, those entering page as one (BACKLOG #3100 closing step 2, #3709;
 #: `AuthService._record_unreached_accounts`). A fixed number, not a setting, so tuning the
 #: mass-revoke breaker does not change how these page.
 _UNREACHED_ROLLUP_ABOVE: Final[int] = 5
@@ -4189,12 +4189,14 @@ class AuthService:
         #: #3018 step 2). Emptied as a pass starts and copied onto the plan it returns, as
         #: ``ReconcilePlan.audit_refused``, so the lifespan task pages ``audit_write_failed``.
         self._reconcile_refused_rows: list[str] = []
-        #: user_id -> how many of that account's probes running read it unreachable, on any pass
-        #: that probed it, an outage pass included (BACKLOG #3100 closing step 2), and the user_ids
-        #: whose page for it is raised. In memory, like the strikes: a restart counts again and
-        #: pages a standing one once more. `_note_unreached_accounts` keeps the counts, and
+        #: user_id -> that account's last ``2K - 1`` probes, oldest first, True where one read it
+        #: unreachable, K being ``[auth].ad_reconcile_outage_passes``, on any pass that probed it,
+        #: an outage pass included (BACKLOG #3100 closing step 2, #3709 closing step 6); an account
+        #: whose window holds no failure has no entry. Then the user_ids whose page for it is
+        #: raised. In memory, like the strikes: a restart counts again and pages a standing one
+        #: once more. `_note_unreached_accounts` keeps the windows, and
         #: `_latch_unreached_accounts` sets the latch last in the pass.
-        self._reconcile_unreached_runs: dict[str, int] = {}
+        self._reconcile_unreached_windows: dict[str, tuple[bool, ...]] = {}
         self._reconcile_unreached_paged: set[str] = set()
         #: The undetermined-wave hold's operator message (ADR 0195). Its own latch, because a held
         #: pass is not an aborted one and so clears `_reconcile_alert`. Set on a pass that holds,
@@ -9016,28 +9018,39 @@ class AuthService:
     def _note_unreached_accounts(
         self, plan: reconcile.ReconcilePlan, probes: Iterable[reconcile.Probe]
     ) -> reconcile.ReconcilePlan:
-        """Count each account's probes running that failed to reach the directory, and say on the
-        plan which accounts enter the lasting state (BACKLOG #3100 closing step 2).
+        """Keep each account's window of its last ``2K - 1`` probes, K being
+        ``[auth].ad_reconcile_outage_passes``, and say on the plan which accounts enter the lasting
+        unreachable state (BACKLOG #3100 closing step 2, #3709 closing step 6).
 
         An ``LdapError`` probe reads :attr:`~reconcile.ProbeOutcome.UNAVAILABLE`, fail-open: no
         strike and no revocation. On a pass where every probe fails that is a whole-directory
         outage, which pages once it lasts (:meth:`_note_directory_outage`). An account the
-        directory fails for on every probe while it answers the rest would, without this, have
-        no bound short of the absolute session cap and page nobody. Once
-        ``[auth].ad_reconcile_outage_passes`` of its probes running read it so, the pass pages for
-        it once, naming the account, as a paging refusal pages (:meth:`_note_paging_refusals`).
-        The same setting, so one knob says how long a failure lasts before it pages.
+        directory fails for while it answers the rest would, without this, have no bound short of
+        the absolute session cap and page nobody. Once K of its last ``2K - 1`` probes read it so,
+        the failing probe that makes it K pages for it once, naming the account, as a paging
+        refusal pages (:meth:`_note_paging_refusals`). The same setting, so one knob says how long
+        a failure lasts before it pages; at the default of 3, three of the last five.
+
+        **A window, not a run, so an alternating account pages (#3709 closing step 6).** The
+        directory layer has no server pool, but its one host name can stand for several domain
+        controllers behind DNS round-robin, a VIP or a referral. Where one of them answers and
+        another does not, the account's probes alternate, and a run that one answer ends never
+        reached K. Two failures in three probes still page nothing: a window of ``2K - 1`` needs
+        failures to outnumber answers in it before it pages, so a lone flake does not.
 
         **Every pass that probes the account counts, an outage pass too.** A probe sample can
         hold only unreachable accounts, at a budget of one always, and such a pass reads as an
         outage whose run the next sample ends, so neither page would come. What the outage page
         covers is left to it: no account enters on a pass that raises the outage page, or while
-        that page stands in this run, and one still unreachable enters once a pass reaches the
-        directory. An unreachable probe adds one, and any other answer ends the account's run and
-        re-arms its page, with a WARNING where it had paged. A probe fault neither adds nor ends:
-        it says nothing about whether the directory was reached, and it pages on its own. A group
+        that page stands in this run, and one still unreachable enters on its first failing probe
+        once a pass reaches the directory, if its window still holds K failures. An unreachable
+        probe adds a failure and any other answer adds an answer; the page re-arms only once the
+        window holds no failure, with a WARNING where it had paged. A probe fault adds nothing: it
+        says nothing about whether the directory was reached, and it pages on its own. A group
         search refused for its bound is an answer: the user search answered, and it pages on its
-        own (vault BACKLOG #3696). An account the pass did not probe keeps its count.
+        own (vault BACKLOG #3696). An account the pass did not probe keeps its window. An account
+        whose window holds no failure keeps no window, which reads the same as one of answers
+        only, since an answer adds nothing to the count.
 
         **A flapping directory must not page every account.** Whether the lifespan task pages
         once for those entering (``unreached_rollup``) is decided by
@@ -9048,29 +9061,33 @@ class AuthService:
         The latch is set only at the end of the pass, for the accounts whose row was written
         (:meth:`_latch_unreached_accounts`), so a pass that raises, or whose row is refused,
         leaves the next pass to page."""
-        runs, paged = self._reconcile_unreached_runs, self._reconcile_unreached_paged
+        windows, paged = self._reconcile_unreached_windows, self._reconcile_unreached_paged
         threshold = self._settings.ad_reconcile_outage_passes
+        span = self._settings.ad_reconcile_unreached_window
         covered = plan.outage_page or self._reconcile_outage_run_paged
         entered: list[tuple[str, str, int]] = []
         for probe in probes:
             if probe.outcome in (reconcile.ProbeOutcome.UNKEYED, reconcile.ProbeOutcome.FAULT):
                 continue  # never asked, or an answer the engine could not read
-            if probe.outcome is not reconcile.ProbeOutcome.UNAVAILABLE or probe.detail is not None:
-                run = runs.pop(probe.user_id, 0)
+            failed = probe.outcome is reconcile.ProbeOutcome.UNAVAILABLE and probe.detail is None
+            window = (*windows.get(probe.user_id, ()), failed)[-span:]
+            failures = sum(window)
+            if not failures:
+                windows.pop(probe.user_id, None)
                 if probe.user_id in paged:
                     paged.discard(probe.user_id)
                     _log.warning(
-                        "directory reconcile: %s was answered for again (%s) after %d "
-                        "unreachable probes, so its unreachable page has ended",
+                        "directory reconcile: %s was answered for again (%s) on each of its last "
+                        "%d probes, so its unreachable page has ended",
                         scrub_log_argument(probe.username),
                         probe.outcome.value,
-                        run,
+                        len(window),
                     )
                 continue
-            runs[probe.user_id] = count = runs.get(probe.user_id, 0) + 1
-            if count >= threshold and probe.user_id not in paged and not covered:
-                entered.append((probe.user_id, probe.username, count))
-        return replace(plan, unreached=tuple(entered))
+            windows[probe.user_id] = window
+            if failed and failures >= threshold and probe.user_id not in paged and not covered:
+                entered.append((probe.user_id, probe.username, failures))
+        return replace(plan, unreached=tuple(entered), unreached_window=span)
 
     async def _record_unreached_accounts(
         self, plan: reconcile.ReconcilePlan
@@ -9100,9 +9117,10 @@ class AuthService:
 
         def warn(username: str, probes: int) -> None:
             _log.warning(
-                "directory reconcile: %d probes running of %s failed to reach the directory, so "
-                "its sessions are not revoked while this lasts",
+                "directory reconcile: %d of the last %d probes of %s failed to reach the "
+                "directory, so its sessions are not revoked while this lasts",
                 probes,
+                plan.unreached_window,
                 scrub_log_argument(username),
             )
 
@@ -9118,6 +9136,7 @@ class AuthService:
                     {
                         "reason": reconcile.UNREACHED_ACCOUNT,
                         "probes": probes,
+                        "window": plan.unreached_window,
                         "asked": plan.asked,
                         "aborted": plan.aborted,
                     }
@@ -9140,7 +9159,7 @@ class AuthService:
             )
             if rollup:
                 _log.warning(
-                    "directory reconcile: %d accounts entered a run of unreachable probes, so "
+                    "directory reconcile: %d accounts entered the unreachable state, so "
                     "their sessions are not revoked while this lasts; an "
                     "auth.ad_reconcile_unreached row names each",
                     len(written),
@@ -9338,9 +9357,12 @@ class AuthService:
         reconcile.prune_ledger(self._reconcile_last_probed, users, rank=float)
         reconcile.prune_ledger(self._reconcile_outcomes, users, rank=reconcile.outcome_rank)
         reconcile.prune_ledger(self._reconcile_paging_refused, users, rank=lambda _cause: 0.0)
-        reconcile.prune_ledger(self._reconcile_unreached_runs, users, rank=float)
-        # Every latched account has a run, so the runs' prune, cap included, bounds the latch.
-        self._reconcile_unreached_paged &= self._reconcile_unreached_runs.keys()
+        reconcile.prune_ledger(
+            self._reconcile_unreached_windows, users, rank=lambda window: float(sum(window))
+        )
+        # A latched account's window holds a failure until its latch ends, so it has a window, and
+        # the windows' prune, cap included, bounds the latch.
+        self._reconcile_unreached_paged &= self._reconcile_unreached_windows.keys()
         if reconcile.ProbeOutcome.UNDETERMINED not in self._reconcile_outcomes.values():
             # u is 0: every held account has left the record, so the hysteresis has nothing to hold.
             self._reconcile_hold_latched = False

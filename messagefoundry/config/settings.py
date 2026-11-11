@@ -4316,6 +4316,14 @@ class AuthSettings(_Section):
         cannot see."""
         return self.ad_enabled and self.ad_session_recheck_seconds > 0
 
+    @property
+    def ad_reconcile_unreached_window(self) -> int:
+        """How many of one account's last probes the unreachable-account page weighs (BACKLOG
+        #3100, #3709 closing step 6): ``2K - 1`` for K ``ad_reconcile_outage_passes``, so K
+        failures in it outnumber the answers. Said once here, for the service and the loosening
+        text alike."""
+        return 2 * self.ad_reconcile_outage_passes - 1
+
     @model_validator(mode="after")
     def _refuse_a_dead_breaker_fraction(self) -> AuthSettings:
         """BACKLOG #3085. Refuse a fraction under which the mass-revoke breaker never trips.
@@ -9152,7 +9160,9 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       revokes nothing, so the page about a revocation gap arrives later. The load bounds it to 2 to
       100, inside which a larger value is still looser. ``run - 1`` intervals after the first such
       pass is the least delay, not an estimate (each pass's own run adds to it), and the
-      interval's entry says so too.
+      interval's entry says so too. The same value bounds one account the directory keeps failing
+      for, at that many of its last ``ad_reconcile_unreached_window`` probes (BACKLOG #3100, #3709),
+      so that page waits longer too.
       ``ad_session_revoke_max`` and ``ad_session_revoke_max_fraction`` feed ``breaker_tripped``,
       which aborts a pass that would revoke more than both, and an aborted pass revokes nothing.
       Below the default a smaller wave of genuine revocations aborts, so that is named, as the 0
@@ -9702,6 +9712,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
         # (run - 1) intervals after the first such pass is the least time to the page, never its
         # estimate.
         run = auth.ad_reconcile_outage_passes
+        window = auth.ad_reconcile_unreached_window
         floor = (
             f"at least {run} passes that read it unreachable, no sooner than "
             f"{(run - 1) * interval} s after the first of them"
@@ -9714,7 +9725,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"default of {_auth_default('ad_session_recheck_seconds')} s, so {late}. The "
                     f"interval also delays the page about a directory outage, which comes after "
                     f"{floor}, and the page about one account the directory keeps failing for, "
-                    f"which comes after at least {run} of that account's own probes running "
+                    f"which comes once {run} of that account's last {window} probes "
                     f"fail, at least {(run - 1) * interval} s after its first such probe",
                 )
             )
@@ -9728,7 +9739,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     "configured interval. Until it does, a directory account disabled or deleted "
                     "meanwhile keeps its live engine sessions with only a WARNING and an audit row "
                     "per pass to show for it. The same count bounds one account the directory "
-                    "keeps failing for, so that page waits longer too",
+                    f"keeps failing for, at {run} of its last {window} probes, so that page "
+                    "waits longer too",
                 )
             )
         strikes = auth.ad_session_recheck_strikes
