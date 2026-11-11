@@ -877,20 +877,44 @@ def _frontend_alone_in_an_included_mount(app: FastAPI, directory: str) -> None:
     app.include_router(sub, prefix="/inc")
 
 
+def _frontend_in_a_mount_inside_a_mounted_app(app: FastAPI, directory: str) -> None:
+    innermost = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+    innermost.add_api_route("/deep", _ok)
+    innermost.frontend("/", directory=directory, check_dir=False)
+    outer = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+    outer.add_api_route("/outer", _ok)
+    outer.mount("/inner", innermost)
+    app.mount("/outer", outer)
+
+
 @pytest.mark.parametrize(
     "register",
     [
         _frontend_on_the_app,
         _frontend_in_an_include,
         _frontend_in_a_mounted_app,
+        # Two mounts deep: a caller that descends into neither must still be refused.
+        _frontend_in_a_mount_inside_a_mounted_app,
         # A mount whose only content is the group has no routes, so a walk never descends into it.
         _frontend_alone_in_a_mounted_app,
         _frontend_alone_in_a_mounted_router,
         _frontend_alone_in_an_included_mount,
     ],
 )
+@pytest.mark.parametrize(
+    "consume",
+    [
+        route_gates.route_rows,
+        # BACKLOG #3177. A caller that does not descend into a mount must be refused too: the
+        # refusal of a mount with routes once ran only when ``_walk`` descended into it.
+        lambda app: list(route_gates._effective_routes(app)),
+    ],
+    ids=["route_rows", "effective_routes_without_a_descent"],
+)
 def test_a_frontend_group_fails_the_walk_rather_than_passing_unvisited(
-    register: Callable[[FastAPI, str], None], tmp_path: Path
+    register: Callable[[FastAPI, str], None],
+    consume: Callable[[FastAPI], object],
+    tmp_path: Path,
 ) -> None:
     """FastAPI keeps a ``frontend`` group in a list ``iter_route_contexts`` never yields, so the walk
     would serve it unseen. None is registered today; one that is reds every consumer of the walk."""
@@ -899,7 +923,21 @@ def test_a_frontend_group_fails_the_walk_rather_than_passing_unvisited(
     assert ("GET", "/ordinary") in _rows_by_key(app)  # the control: no group, no refusal
     register(app, str(tmp_path))
     with pytest.raises(ValueError, match="low-priority route"):
-        route_gates.route_rows(app)
+        consume(app)
+
+
+def test_a_mount_inside_a_mounted_app_with_no_frontend_group_passes_without_a_descent() -> None:
+    """The control for the two-mounts-deep shape: checking every mount beneath a yielded mount
+    refuses only a low-priority route, never the nesting itself."""
+    innermost = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+    innermost.add_api_route("/deep", _ok)
+    outer = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+    outer.add_api_route("/outer", _ok)
+    outer.mount("/inner", innermost)
+    app = FastAPI(openapi_url=None)
+    app.mount("/outer", outer)
+    assert len(list(route_gates._effective_routes(app))) == 1
+    assert ("GET", "/outer/inner/deep") in _rows_by_key(app)
 
 
 def test_a_renamed_low_priority_list_fails_the_walk_by_name(
