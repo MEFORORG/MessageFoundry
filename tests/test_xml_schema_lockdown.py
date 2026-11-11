@@ -207,7 +207,7 @@ def test_a_relative_schema_root_resolves_against_the_working_directory(
     form: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A Handler may name a bundle relative to the engine's working directory, as xmlschema resolved
-    # a relative schema before BACKLOG #5537; b53eabad0a refused every one of these.
+    # a relative schema before BACKLOG #5537; an earlier round of that fix refused the relative ones.
     main = _outside_include_under_cwd(tmp_path, monkeypatch)
     root = str(tmp_path) if form == "absolute" else form
     assert validate_against("<patient>x</patient>", str(main), schema_root=root).valid
@@ -959,8 +959,8 @@ def test_schema_root_is_refused_for_an_inline_schema(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("url", ["file:", "file://", "file://localhost", "file:///"])
 def test_a_file_url_naming_no_path_is_refused(url: str, tmp_path: Path) -> None:
-    # url2pathname gives "" (or "/"), and abspath("") is the working directory: under the Windows
-    # service that is the engine install root, so as a schema_root it widened reads to all of it.
+    # url2pathname gives "" (or "/"). abspath("") is the working directory, which such a URL does
+    # not name ("file:." does), and "/" is a filesystem root.
     main = _write_path_schema(tmp_path, "inc.xsd")
     with pytest.raises(XmlValidationError, match="naming no path|filesystem root"):
         validate_against("<patient>x</patient>", str(main), schema_root=url)
@@ -990,7 +990,7 @@ def test_a_refusal_while_validating_is_a_schema_load_error(
 
 @pytest.mark.parametrize("root", ["", "   "])
 def test_an_empty_schema_root_is_refused(root: str, tmp_path: Path) -> None:
-    # abspath("") is the working directory, which would widen the root past the schema's own.
+    # abspath("") is the working directory, which an empty value does not name ("." does).
     main = _write_path_schema(tmp_path, "inc.xsd")
     with pytest.raises(XmlValidationError, match="empty"):
         validate_against("<patient>x</patient>", str(main), schema_root=root)

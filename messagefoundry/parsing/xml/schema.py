@@ -370,14 +370,14 @@ def _local_path(text: str | bytes | os.PathLike[str], what: str) -> str:
     drive stays a drive letter.
 
     A relative path resolves against the working directory, as xmlschema resolved it before BACKLOG
-    #5537; under the shipped Windows service that is the engine install root. A path rooted with no
-    drive, such as ``/opt/x.xsd``, takes the working directory's drive, as it did then too. A
-    drive-relative path (``C:``, ``C:.``, ``C:foo``, ``file:///C:``, ``file:C:``) is refused: it
-    resolves against that drive's own current directory, which is the working directory only when it
-    is on that drive and otherwise a per-drive setting nobody sees, so its text does not say which
-    directory it names."""
+    #5537; under the shipped Windows service that is the engine install root. On Windows, a path
+    rooted with no drive, such as ``/opt/x.xsd``, takes the working directory's drive, as it did then
+    too, and a drive-relative path (``C:``, ``C:.``, ``C:foo``, ``file:///C:``, ``file:C:``) is
+    refused: it resolves against that drive's own current directory, which is the working directory
+    only when it is on that drive and otherwise a per-drive setting nobody sees, so its text does not
+    say which directory it names. On POSIX, ``C:foo`` is an ordinary relative file name."""
     source = os.fsdecode(text).strip()
-    if not source:  # abspath would make it the working directory
+    if not source:  # names no path; abspath would supply the working directory, which "." names
         raise _SourceRefused(f"{what} that is empty")
     parts = urlsplit(source)
     scheme = parts.scheme.lower()
@@ -385,7 +385,7 @@ def _local_path(text: str | bytes | os.PathLike[str], what: str) -> str:
         if parts.netloc.lower() not in ("", "localhost"):
             raise _SourceRefused(f"{what} that is a file URL naming a host")
         source = urllib.request.url2pathname(parts.path).strip()
-        if not source:  # "file:" or "file://localhost" names no path; abspath would supply one
+        if not source:  # "file:" or "file://localhost" names no path, so none is supplied
             raise _SourceRefused(f"{what} that is a file URL naming no path")
     elif scheme and not (len(scheme) == 1 and source[1:2] == ":"):  # a drive letter is not a scheme
         raise _SourceRefused(f"{what} that is not a local path")
