@@ -18,7 +18,7 @@
   as of 2026-10-02. §7.1 says which rows each covers. The five ODBC rows are a named gap by owner
   ruling since 2026-10-05, and their driver test is BACKLOG #3009. The paragraph below §7.1's ODBC
   table holds the ruling's limits. §7.1's amendment of 2026-11-11 summarises the test's two
-  recorded runs.
+  recorded results.
   **The three Vault hops §7.1 graded *a guard is possible* are guarded as of 2026-10-13, by owner
   ruling of that date (vault BACKLOG #2983).** Each refuses unless its own settings pair attests,
   and no CRL lever is built. §12 holds the ruling and its limits.
@@ -1225,7 +1225,7 @@ of the list above:
 | Vault Transit cipher: `store/crypto_transit.py`, which calls the key provider's `_build_client` | the Vault token, and message bodies sent to Vault to encrypt and decrypt | The key provider's row applies: it is the same client build (*code*) | None, as the key provider's row | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits. Its `https://` proxy leg is guarded too, since 2026-10-26 (vault BACKLOG #3561) |
 | Vault secret provider: `config/secretprovider_vault.py`, its own `_build_client`. `secrets_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, connector credentials back | The same shape as the key provider, proxy leg included, with `MEFOR_SECRETS_VAULT_CA_FILE` as its anchor (*code*) | None, as the key provider's row | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits. Its `https://` proxy leg is guarded too, since 2026-10-26 (vault BACKLOG #3561) |
 
-**The ODBC hops are a named gap by owner ruling, and the driver test has two recorded runs.**
+**The ODBC hops are a named gap by owner ruling, and the driver test has two recorded results.**
 *(Until 2026-11-11 this lead-in ended "and the driver test is still owed.")* BACKLOG #2194
 names three outcomes for a hop: a guard, a documented driver control, or an accepted gap. The owner
 ruled on 2026-10-05, in an AskUserQuestion answer to the batch 191 Manager. The record is R6 of the
@@ -1242,11 +1242,11 @@ ruling:
 - **The ruling rests on Microsoft's driver.** The question cited Microsoft's driver documentation,
   and the test names ODBC Driver 18 only. Another driver can serve these hops, as the second
   bullet of the 2026-10-04 reading below says. No owner answer and no planned test covers one.
-- **Driver 18's revocation behaviour is measured on one build on Windows, and other drivers' is
-  unmeasured.** The ruling's "then test it" half has two recorded runs, and neither record says
-  its run was on the SQL Server test box. The test needs a SQL Server whose certificate can be
-  revoked. A control connection to a certificate that is not revoked shows that a refusal comes
-  from the revocation. The amendment of 2026-11-11 below states what the runs measured. *(Until
+- **Driver 18 was tested on one build on Windows, and other drivers were not tested.** The
+  ruling's "then test it" half has two recorded results. The test needs a SQL Server whose
+  certificate can be revoked. A control connection to a certificate that is not revoked shows
+  that a refusal comes from the revocation. The amendment of 2026-11-11 below states what the
+  runs measured. *(Until
   2026-11-11 this bullet read: "**The drivers' own revocation behaviour is still unmeasured.** The
   ruling's "then test it" half is owed. It needs a SQL Server whose certificate can be revoked. A
   control connection to a certificate that is not revoked shows that a refusal comes from the
@@ -1291,28 +1291,30 @@ chosen option gives for building no guard:
   terminator exists for these hops either.
 
 **Amendment 2026-11-11 -- what the ODBC Driver 18 test measured (vault BACKLOG #3009).** This is a
-public summary of two private test records in the vault, one per run of the vault's ODBC
-revocation runbook. Their contents beyond this summary are not repeated here. It changes no code.
-For the grade, the fourth limit under the ruling above holds.
+public summary of two private test records in the vault, each recording one run of the vault's
+ODBC revocation runbook that reached a result. Their contents beyond this summary are not repeated
+here. It changes no code. For the grade, the limit *What a result would mean for the grade is not
+ruled*, under the ruling above, holds.
 
-- **Where it ran.** Two runs, dated 2026-10-16 and 2026-10-17 in Central time. In UTC, the
+- **Where it ran.** Two runs with results, dated 2026-10-16 and 2026-10-17 in Central time. In UTC, the
   first run's legs ran from 02:22 to 02:25 and the second's from 05:18 to 05:19, both on
   2026-10-17. The first run's record says it ran on a disposable virtual machine built for the
   test, not on the SQL Server test box, and that the runbook puts the next run there. The second
-  run's record does not name its machine. It says the run followed a revert to checkpoint
+  run's record says it ran inside a virtual machine, after a revert to checkpoint
   `post-3009-clean-2026-10-16`, a tightening of folder permissions and a new checkpoint,
-  `post-3009-acl-2026-10-17`. No run on the SQL Server test box is recorded.
+  `post-3009-acl-2026-10-17`. An earlier scripted run stopped at Step 2, as designed, and changed
+  nothing. No run on the SQL Server test box is recorded.
 - **Versions.** ODBC Driver 18 for SQL Server, 64-bit: `msodbcsql18.dll` ProductVersion 18.7
   build 1.1, reporting driver version `18.07.0001`. Windows Server 2022 Datacenter, build 20348,
-  update revision 5256. SQL Server 2022 RTM, 16.0.1000.6. The engine's Python environment
-  supplied only pyodbc 5.3.0. The records do not give the interpreter's version.
+  update revision 5256. SQL Server 2022 RTM, 16.0.1000.6. messagefoundry 0.3.2. The engine's
+  Python environment supplied only pyodbc 5.3.0. The records do not give the interpreter's version.
 - **How the revocation was published.** In each run, a throwaway test root issued two server
   certificates and revoked one. An HTTP listener on the same machine served a signed CRL listing
   it. The other certificate was the control. SQL Server ran on each in turn. Before the legs,
   Windows' own chain check reported the revoked certificate as revoked, fetching the list to do
   so, and passed the control.
-- **Which shapes were tried.** These five connection strings, which the runbook carries, copied
-  from the engine's code before the amendment of 2026-10-17 below:
+- **Which shapes were tried.** At least these, as connection strings the runbook carries, copied
+  from engine commit `c818a16d5b`, before the amendment of 2026-10-17 below:
   - the store and the DATABASE SQL Server preset, one string;
   - `db_lookup`;
   - the generic dialect naming Driver 18;
@@ -1332,8 +1334,7 @@ For the grade, the fourth limit under the ruling above holds.
   list, fetched or cached. The strict string with a matching pin connected on both certificates.
   No strict leg ran without a pin or with the list cached, so this does not show that the pin is
   the reason no list was fetched. The strict string with the other certificate pinned was
-  refused on both certificates, with an error that names certificate usage, not the pin or
-  revocation. What the pin legs mean for the pin is the amendment of 2026-10-17 below. For the
+  refused on both certificates, with an error that names certificate usage, not the pin. What the pin legs mean for the pin is the amendment of 2026-10-17 below. For the
   strict legs that reading is the second record's own, because the runbook's table has no row
   for them.
 - **The limits.** At least these.
@@ -1345,8 +1346,8 @@ For the grade, the fourth limit under the ruling above holds.
   - Only a same-machine connection: the client ran on the machine SQL Server ran on, so no
     off-box hop was exercised. The server's name resolved to an IPv6 address of that machine,
     link-local in the first record, so both records say the legs probably connected over IPv6.
-  - Only strings written out in the runbook and the script, so the result says nothing directly
-    about how the engine builds or sends its own strings.
+  - Only strings written out in the runbook and the script, so the result says nothing about how
+    the engine builds or sends its own strings.
   - Only a single-level chain from a throwaway root, with no intermediate CA.
 
 *(End of the amendment of 2026-11-11. The next paragraph continues the 2026-10-04 note.)*
@@ -1542,7 +1543,8 @@ cells, whose old grade is quoted once, in the grades bullet:
 ruling's limits and what the test must show. Other places name the ruling and point there. When
 BACKLOG #3009 has a result, it goes in that paragraph. *(Note 2026-11-11: the result is in §7.1's
 amendment of that date, after the 2026-10-04 reading that follows that paragraph. What the test
-must show is still stated in that paragraph's third limit.)*
+must show is still stated in that paragraph's limit *Driver 18 was tested on one build on
+Windows, and other drivers were not tested*.)*
 
 **What this amendment does not do.** It builds no guard, changes no code and measures nothing.
 
