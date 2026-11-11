@@ -127,7 +127,9 @@ def test_a_store_run_only_by_directory_administrators_answers_with_the_no_termin
                 audits=(),
             )
             await AuthService(store, AuthSettings()).initialize()
-            await store.set_user_roles("dir-a", [Role.ADMINISTRATOR.value], assigned_by="test")
+            await store.set_user_roles(
+                "dir-a", [Role.ADMINISTRATOR.value], assigned_by="test", audits=()
+            )
         finally:
             await store.close()
 

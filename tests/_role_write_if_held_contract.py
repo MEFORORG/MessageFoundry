@@ -42,7 +42,7 @@ async def seed(store: Any, user_id: str, roles: tuple[str, ...]) -> None:
         password_generated=False,
         audits=(),
     )
-    await store.set_user_roles(user_id, list(roles), assigned_by="seed", now=2.0)
+    await store.set_user_roles(user_id, list(roles), assigned_by="seed", now=2.0, audits=())
 
 
 async def _grants(store: Any, user_id: str) -> list[tuple[str, float, str | None]]:
@@ -56,32 +56,39 @@ async def assert_role_write_if_held_contract(store: Any) -> None:
     write = store.set_user_roles_if_held
     await seed(store, "u1", (VIEWER,))
     assert await write(
-        "u1", [OPERATOR, VIEWER], expected_role_ids=[VIEWER], assigned_by="ad-reconcile", now=3.0
+        "u1",
+        [OPERATOR, VIEWER],
+        expected_role_ids=[VIEWER],
+        assigned_by="ad-reconcile",
+        now=3.0,
+        audits=(),
     )
     assert await _grants(store, "u1") == [
         (OPERATOR, 3.0, "ad-reconcile"),
         (VIEWER, 3.0, "ad-reconcile"),
     ]
     # The record moved off the expected set, so nothing is written and the grants keep their stamp.
-    assert not await write("u1", [ADMIN], expected_role_ids=[VIEWER], now=4.0)
+    assert not await write("u1", [ADMIN], expected_role_ids=[VIEWER], now=4.0, audits=())
     assert await _grants(store, "u1") == [
         (OPERATOR, 3.0, "ad-reconcile"),
         (VIEWER, 3.0, "ad-reconcile"),
     ]
     # Compared as sets: order and a duplicate in the expectation do not matter.
-    assert await write("u1", [VIEWER], expected_role_ids=[VIEWER, OPERATOR, VIEWER], now=5.0)
+    assert await write(
+        "u1", [VIEWER], expected_role_ids=[VIEWER, OPERATOR, VIEWER], now=5.0, audits=()
+    )
     assert await store.get_user_role_ids("u1") == [VIEWER]
     # The empty set is a set like any other, on both sides.
-    assert await write("u1", [], expected_role_ids=[VIEWER], now=6.0)
+    assert await write("u1", [], expected_role_ids=[VIEWER], now=6.0, audits=())
     assert await store.get_user_role_ids("u1") == []
-    assert not await write("u1", [ADMIN], expected_role_ids=[VIEWER], now=7.0)
-    assert await write("u1", [ADMIN], expected_role_ids=[], now=8.0)
+    assert not await write("u1", [ADMIN], expected_role_ids=[VIEWER], now=7.0, audits=())
+    assert await write("u1", [ADMIN], expected_role_ids=[], now=8.0, audits=())
     assert await store.get_user_role_ids("u1") == [ADMIN]
     # A gone row writes nothing.
-    assert not await write("nobody", [VIEWER], expected_role_ids=[], now=9.0)
+    assert not await write("nobody", [VIEWER], expected_role_ids=[], now=9.0, audits=())
     # An unknown role is refused, writing nothing, as set_user_roles refuses it.
     with pytest.raises(UnknownRoleError):
-        await write("u1", ["no-such-role"], expected_role_ids=[ADMIN], now=10.0)
+        await write("u1", ["no-such-role"], expected_role_ids=[ADMIN], now=10.0, audits=())
     assert await store.get_user_role_ids("u1") == [ADMIN]
 
 
@@ -89,8 +96,8 @@ async def assert_concurrent_role_writes_write_once(store: Any) -> None:
     """Two writers that read one set, started at once: exactly one writes."""
     await seed(store, "u2", (ADMIN,))
     results = await asyncio.gather(
-        store.set_user_roles_if_held("u2", [OPERATOR], expected_role_ids=[ADMIN]),
-        store.set_user_roles_if_held("u2", [VIEWER], expected_role_ids=[ADMIN]),
+        store.set_user_roles_if_held("u2", [OPERATOR], expected_role_ids=[ADMIN], audits=()),
+        store.set_user_roles_if_held("u2", [VIEWER], expected_role_ids=[ADMIN], audits=()),
     )
     assert sorted(results) == [False, True], results
     assert await store.get_user_role_ids("u2") == [OPERATOR if results[0] else VIEWER]

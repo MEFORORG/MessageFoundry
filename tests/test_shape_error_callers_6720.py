@@ -81,7 +81,7 @@ async def _account(store: MessageStore) -> AuthService:
         password_generated=False,
         audits=(),
     )
-    await store.set_user_roles("u1", ["viewer"], assigned_by="test")
+    await store.set_user_roles("u1", ["viewer"], assigned_by="test", audits=())
     out = await service.login("bob", _PASSWORD)
     assert out.ok
     return service

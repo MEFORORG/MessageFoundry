@@ -42,7 +42,7 @@ from messagefoundry.auth.service import (
     AuthService,
 )
 from messagefoundry.config.settings import AuthSettings, _auth_limit_loosenings
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import MessageStore, no_audit_row
 from tests._ast_sites import parse_source
 from tests.test_auth_oidc_service import (
     AUTH_CODE,
@@ -594,7 +594,9 @@ async def test_a_refused_step_up_carries_the_marker_only_when_the_exemption_appl
         flow_id, _url = await _begin(service, token)
         if refusal == "session_gone":
             # After the start leg staged the session, so the callback finds it gone.
-            await store.revoke_user_sessions(_staged(service, flow_id).step_up_user_id or "")
+            await store.revoke_user_sessions(
+                _staged(service, flow_id).step_up_user_id or "", audit=no_audit_row
+            )
         clock[0] += elapsed
         out = await _return_from_idp(service, monkeypatch, rsa_key, flow_id, **claims)
         assert not out.elevation.ok and out.reason == refusal, out

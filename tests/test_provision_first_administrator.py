@@ -244,7 +244,7 @@ async def test_it_refuses_to_take_over_an_account_somebody_is_using() -> None:
             password_generated=False,
             audits=(),
         )
-        await store.set_user_roles("roled", [Role.OPERATOR.value], assigned_by="test")
+        await store.set_user_roles("roled", [Role.OPERATOR.value], assigned_by="test", audits=())
         with pytest.raises(FirstAdministratorRefused, match="holds roles"):
             await service.provision_first_administrator(
                 username="bob",
@@ -2097,7 +2097,9 @@ def _keyed_store_with_directory_administrator(db: Path, key: str) -> None:
                 audits=(),
             )
             await AuthService(store, AuthSettings()).initialize()
-            await store.set_user_roles("dir-a", [Role.ADMINISTRATOR.value], assigned_by="test")
+            await store.set_user_roles(
+                "dir-a", [Role.ADMINISTRATOR.value], assigned_by="test", audits=()
+            )
         finally:
             await store.close()
 
@@ -3705,7 +3707,7 @@ def test_the_cli_refuses_a_username_it_would_not_complete_before_any_prompt(
                 password_generated=False,
                 audits=(),
             )
-            await store.set_user_roles("bob", [Role.VIEWER.value], assigned_by="test")
+            await store.set_user_roles("bob", [Role.VIEWER.value], assigned_by="test", audits=())
         finally:
             await store.close()
 
