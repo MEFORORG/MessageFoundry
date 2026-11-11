@@ -29,10 +29,10 @@ The forcing constraints on any fix:
   reuse a long-lived worker.
 - **Reliability / purity (CLAUDE.md §2).** At-least-once re-runs a router/transform and *"relies on
   a re-run re-deriving identical output"*; isolation must not change the result or the disposition,
-  and any isolation fault must fail the message's call **post-ACK**, for the `[delivery]
-  internal_error` policy to handle (`ERROR`/dead-letter under the default `continue`, a stopped
-  inbound under `stop`) — *"never accept-and-drop, never crash the connection"* (count-and-log
-  invariant).
+  and any isolation fault must fail the message's call **post-ACK**, for the
+  `[delivery] internal_error` policy to handle (`ERROR`/dead-letter under the default `continue`;
+  under `stop` the router or transform worker halts) — *"never accept-and-drop, never crash the
+  connection"* (count-and-log invariant).
 - **Layering (CLAUDE.md §4).** Isolation is a `pipeline/` concern — *no `api/`/`console/` imports*.
 - **No new dependency without cause (CLAUDE.md §5).** Prefer stdlib.
 
@@ -85,21 +85,21 @@ in-process, byte-identically and with zero overhead.
   validation ran long after `pickle.loads` had already executed whatever the child sent.
 - **`db_lookup`/`fhir_lookup` in the sandbox = FORBIDDEN, fail-closed (this PR).** They bridge back
   onto the engine event loop via `run_coroutine_threadsafe`, which a subprocess boundary breaks. A
-  sandboxed Handler that calls one gets a clear `SandboxError`, which the `[delivery] internal_error`
-  policy handles as the next bullet says (`ERROR`/dead-letter under the default). A Handler that
-  needs live enrichment runs with `mode=off` (per-policy). Forward-over-IPC is a documented
-  next-phase residual.
+  sandboxed Handler that calls one gets a clear `SandboxError`, which the
+  `[delivery] internal_error` policy handles as the next bullet says. A Handler that needs live
+  enrichment runs with `mode=off` (per-policy). Forward-over-IPC is a documented next-phase
+  residual.
 - **Isolation denial routing.** A forbidden import/op, a resource-cap overrun, a worker crash, or an
   unmarshallable payload/run-context raises `SandboxError`, which the router/transform worker hands,
   **post-ACK**, to the engine-wide `[delivery] internal_error` policy via the existing
   `_apply_router_internal_error` / `_apply_transform_internal_error` paths. Under the default,
-  `continue`, the message goes to `ERROR`/dead-letter and the inbound carries on. Under `stop` the
-  inbound stops with an `ERROR` log line and a `connection_stopped` alert, held for the operator,
-  and its head row is re-pended, or dead-lettered once its attempts reach the retry cap
-  ([CONFIGURATION.md, `[delivery]`](../CONFIGURATION.md#delivery), `internal_error`). Either way no
-  NAK and never accept-and-drop. *Corrected 2026-11-11:* this bullet said the worker routes the
-  error to `ERROR`/dead-letter post-ACK, naming no policy, and ended *"never a crashed
-  connection"*; that was false under `internal_error = "stop"`.
+  `continue`, the message goes to `ERROR`/dead-letter and the worker carries on. Under `stop` the
+  router or transform worker halts instead, with at least an `ERROR` log line and a
+  `connection_stopped` alert, and its head row is re-pended, or dead-lettered once its attempts
+  reach the retry cap; [CONFIGURATION.md, `[delivery]`](../CONFIGURATION.md#delivery), row
+  `internal_error`, says the rest. Either way: no NAK, never accept-and-drop, never a crashed
+  connection. *Corrected 2026-11-11:* this bullet said the worker routes the error to
+  `ERROR`/dead-letter post-ACK and named no policy, which was false under `internal_error = "stop"`.
 - **Load-time top-level exec is NOT sandboxed** in this PR. `_exec_module` runs admin config under
   the unchanged `_assert_safe_config_source` DACL gate (ADR 0036); sandboxing import-time exec is a
   chicken-and-egg (the worker itself must load the graph) and out of scope. `_assert_safe_config_source`
@@ -115,12 +115,12 @@ section 0).
 **Why.** `RLIMIT_CPU` counts the CPU a process spends over its whole life. The worker is persistent
 and serves many calls, so the limit was a lifetime budget rather than a per-call one. Once many
 short, innocent calls added up past it, the kernel killed the worker in whichever call came next,
-and that message failed (dead-lettered under the default `[delivery] internal_error`). Engine PR
-2084 measured it: a reused worker died on its tenth
-0.15 s call. That PR stopped the bootstrap's own CPU counting against the budget, and named a CPU
-kill as one, but the lifetime shape stayed. The wall cap already bounds every call on every
-platform, a CPU-bound runaway included, so for the case the backstop was there for it added only a
-way to fail. Vault BACKLOG #3133 listed a per-dispatch CPU cap as the alternative to dropping it.
+and, under the default `[delivery] internal_error`, that message dead-lettered. Engine PR 2084
+measured it: a reused worker died on its tenth 0.15 s call. That PR stopped the bootstrap's own CPU
+counting against the budget, and named a CPU kill as one, but the lifetime shape stayed. The wall
+cap already bounds every call on every platform, a CPU-bound runaway included, so for the case the
+backstop was there for it added only a way to fail. Vault BACKLOG #3133 listed a per-dispatch CPU
+cap as the alternative to dropping it.
 
 **What this gives up.** The limit counted the whole process, and a child inherits it, so it also
 bounded CPU the wall cap never sees. That CPU now has no bound; it is recorded under "Out of scope /
@@ -221,11 +221,12 @@ target, no `pickle` import left to mis-suppress:
 - **Wire.** Outer `>I length || body` (64 MiB cap, unchanged). The body is *segmented*:
   `>I header_len || header_json || ( >I blob_len || blob_bytes )*`, so a large message payload never
   round-trips through JSON string escaping. Bounds: header ≤ 64 MiB, ≤ 65536 segments, value nesting
-  ≤ 256 — each an independent fail-closed rejection. The header bound is deliberately the frame bound
-  and nothing tighter: a request header carries the whole `reference_view`, so a 16 MiB header cap was
-  in practice a ~700k-entry ceiling on reference tables that failed **every** message on a bigger
-  graph (dead-lettered under the default `[delivery] internal_error`) while `mode=off` served it,
-  and the outer framing already refuses an over-cap frame before a byte is parsed. A fail-closed cap must be sized against real traffic or it is an outage.
+  ≤ 256 — each an independent fail-closed rejection. The header bound is deliberately the frame
+  bound and nothing tighter: a request header carries the whole `reference_view`, so a 16 MiB header
+  cap was in practice a ~700k-entry ceiling on reference tables that, under the default
+  `[delivery] internal_error`, dead-lettered **every** message on a bigger graph while `mode=off`
+  served it, and the outer framing already refuses an over-cap frame before a byte is parsed. A
+  fail-closed cap must be sized against real traffic or it is an outage.
 - **Closed grammar.** Containers are tagged (`{"l":…}` list, `{"p":…}` tuple, `{"d":[[k,v],…]}` dict,
   `{"b":…}` bytes, `{"f":…}` non-finite float, `{"D"/"E"/"T":…}` datetime/date/time), so a bare array
   is illegal at value level and nothing needs escaping. Decoding is `json.loads` + `bytes.decode` +
@@ -292,15 +293,14 @@ target, no `pickle` import left to mis-suppress:
 - **`Send` carries encoded text, never a live `Message`.** The sole parent-side consumer already
   reduces it to a `str`, so the parent's `Send(...)` rebuild is a provable no-op for ADR 0104's
   copy-on-Send choke point instead of taking a second snapshot.
-- **`code_sets` are hoisted off the per-dispatch frame** (they were ~430 KB / ~4.6 ms per message on a
-  realistic crosswalk) and travel **once per spawn in the `boot` frame** instead. The engine's tables
-  are the source of truth on both sides, so the child cannot diverge from `mode=off`. A first attempt
-  let the child re-read `codesets/` itself and pinned a SHA-256 digest to *detect* the divergence —
-  which converted a fail-open hazard into a worse fail-closed one: after any routine respawn (a
-  wall-cap kill, a crash) following an unreloaded `codesets/` edit, every message on that inbound
-  failed permanently (dead-lettered under the default `[delivery] internal_error`), burning a full
-  config load per attempt. Sending the tables removes the
-  hazard rather than detecting it.
+- **`code_sets` are hoisted off the per-dispatch frame** (they were ~430 KB / ~4.6 ms per message on
+  a realistic crosswalk) and travel **once per spawn in the `boot` frame** instead. The engine's
+  tables are the source of truth on both sides, so the child cannot diverge from `mode=off`. A first
+  attempt let the child re-read `codesets/` itself and pinned a SHA-256 digest to *detect* the
+  divergence — which converted a fail-open hazard into a worse fail-closed one: after any routine
+  respawn (a wall-cap kill, a crash) following an unreloaded `codesets/` edit, every message on that
+  inbound dead-lettered permanently under the default `[delivery] internal_error`, burning a full
+  config load per attempt. Sending the tables removes the hazard rather than detecting it.
 - **A lookup table travels in one of two forms, and they decode identically.** A crosswalk is
   overwhelmingly `str -> short str`; those tables ride as a single plain JSON object so the C
   encoder/decoder does the walk, and anything else falls back to the tagged per-entry form. The
@@ -469,22 +469,22 @@ target, no `pickle` import left to mis-suppress:
   `tests/test_sandbox.py::test_request_ids_are_unpredictable_and_never_reused`,
   `tests/test_sandbox_codec.py::test_hostile_frames_fail_closed[name_mismatch]`
 - **AC-11** — WHERE `[sandbox].mode=subprocess`, THE SYSTEM SHALL route a **generator** Router
-  identically to `mode=off` (it previously failed every message, dead-lettered under the default
-  `[delivery] internal_error`), and SHALL preserve
-  `_partition` parity for **every** return shape — where, since the 2026-08-04 amendment, a
-  tuple/set/generator of `Send`s **delivers** in both modes (BACKLOG #341) and a `Send` subclass still
-  delivers. Parity is over the **multiset** of items in each of the three partitions, plus their
-  **order for an ordered container**; a `set` return has no defined iteration order in either mode, so
-  its fan-out order is explicitly **not** covered by this SHALL (see the Result-parity bullet).
-  **Amended 2026-09-14 (BACKLOG #1687).** This criterion read *"and a non-iterable unrecognized value
-  (a bare `int`, a `__reduce__` gadget) still drops"*. It no longer drops in either mode: both sides
-  now test admissibility against the one shared rule (`wiring.handler_item_fault`) and **raise** — the
-  parent a `ValueError` from `_partition`, the child a codec rejection its parent re-raises as
-  `SandboxError` — so the transform stage fails the message under the `[delivery] internal_error`
-  policy (`ERROR`/dead-letter under the default `continue`, a stopped inbound under `stop`) instead
-  of recording a `FILTERED` that reads as a deliberate decline. The SHALL itself is unchanged: parity is still over every shape, and
-  the shapes that moved moved in BOTH modes together, which is the property this criterion exists to
-  hold.
+  identically to `mode=off` (under the default `[delivery] internal_error` it previously
+  dead-lettered every message), and SHALL preserve `_partition` parity for **every** return shape —
+  where, since the 2026-08-04 amendment, a tuple/set/generator of `Send`s **delivers** in both modes
+  (BACKLOG #341) and a `Send` subclass still delivers. Parity is over the **multiset** of items in
+  each of the three partitions, plus their **order for an ordered container**; a `set` return has no
+  defined iteration order in either mode, so its fan-out order is explicitly **not** covered by this
+  SHALL (see the Result-parity bullet).
+  **Amended 2026-09-14 (BACKLOG #1687).** This criterion read *"and a non-iterable unrecognized
+  value (a bare `int`, a `__reduce__` gadget) still drops"*. It no longer drops in either mode: both
+  sides now test admissibility against the one shared rule (`wiring.handler_item_fault`) and
+  **raise** — the parent a `ValueError` from `_partition`, the child a codec rejection its parent
+  re-raises as `SandboxError` — so the transform stage hands the `[delivery] internal_error` policy
+  a fault (`ERROR`/dead-letter under the default `continue`; under `stop` the router or transform
+  worker halts) instead of a `FILTERED` that reads as a deliberate decline. The SHALL itself is
+  unchanged: parity is still over every shape, and the shapes that moved moved in BOTH modes
+  together, which is the property this criterion exists to hold.
   WHERE the Handler is a **generator**, its body SHALL execute inside the child's run context, so a
   run-scoped accessor within it resolves as it does under `mode=off` rather than raising.
   → `tests/test_sandbox.py::test_generator_router_routes_under_mode_subprocess`,
@@ -507,9 +507,9 @@ target, no `pickle` import left to mis-suppress:
   `messagefoundry.store` import, making the feature combination non-functional).
   → `tests/test_sandbox.py::test_response_view_reaches_a_sandboxed_handler`
 - **AC-14** — WHERE a value crosses the boundary that `mode=off` accepts — a large `reference_view`,
-  a deeply nested `SetState` value — THE SYSTEM SHALL marshal it rather than fail the message's call,
-  which under the default `[delivery] internal_error` dead-letters it, so no
-  codec bound is a mode-dependent behaviour change.
+  a deeply nested `SetState` value — THE SYSTEM SHALL marshal it rather than fail the message's call
+  (a dead-letter under the default `[delivery] internal_error`), so no codec bound is a
+  mode-dependent behaviour change.
   → `tests/test_sandbox_codec.py::test_the_header_cap_is_the_frame_cap_and_nothing_tighter`,
   `tests/test_sandbox_codec.py::test_a_large_reference_view_round_trips`,
   `tests/test_sandbox_codec.py::test_a_deeply_nested_value_is_not_a_mode_dependent_dead_letter`
@@ -729,12 +729,12 @@ it is the constraint any proposal to make `subprocess` a *default* has to clear 
   from every router/predicate dispatch, roughly doubling the wire cost of the routing stage to
   reproduce a documented authoring hazard. Pinned by AC-15 so it cannot drift silently. If a graph
   needs a Router-derived fact at the predicate, pass it through the message, not through mutation.
-- **A Handler's own exception reaches the operator wrapped.** In-process a Handler raise propagates as
-  itself; under `mode=subprocess` it is reported across the pipe and re-raised as `SandboxError`
-  carrying `"<Type>: <message>"`. The **disposition is identical** (both land in the router/transform
-  worker's `except Exception` → the `[delivery] internal_error` policy: `ERROR`/dead-letter under
-  the default `continue`, a stopped inbound under `stop`); only the `last_error` text differs, and no
-  traceback crosses.
+- **A Handler's own exception reaches the operator wrapped.** In-process a Handler raise propagates
+  as itself; under `mode=subprocess` it is reported across the pipe and re-raised as `SandboxError`
+  carrying `"<Type>: <message>"`. The **disposition is identical** (both land in the
+  router/transform worker's `except Exception` → the `[delivery] internal_error` policy:
+  `ERROR`/dead-letter under the default `continue`; under `stop` the router or transform worker
+  halts); only the `last_error` text differs, and no traceback crosses.
 - **Run-scoped sinks do not cross back.** The `#162` unmapped-capture buffer drains inside the child
   against a sink the child never installs. No production sink exists today, so nothing is lost — but
   any future run-scoped sink (capture, metrics, audit) will silently no-op under `mode=subprocess`

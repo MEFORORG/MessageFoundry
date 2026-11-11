@@ -77,9 +77,9 @@ address-space boundary and the codec are the load-bearing controls.
 crash, a rejected frame, or an unmarshallable payload/run-context — raises :class:`SandboxError`. The
 caller (the router/transform worker) hands it, **post-ACK**, to the ``[delivery] internal_error``
 policy via the existing ``_apply_router_internal_error`` / ``_apply_transform_internal_error`` paths:
-``ERROR``/dead-letter under the default ``continue``; under ``stop`` the inbound stops with a
-``connection_stopped`` alert and its head row is re-pended, or dead-lettered once its attempts reach
-the retry cap. Never a NAK, never an accept-and-drop.
+``ERROR``/dead-letter under the default ``continue``; under ``stop`` the router or transform worker
+halts with a ``connection_stopped`` alert, and its head row is re-pended, or dead-lettered once its
+attempts reach the retry cap. Never a NAK, never an accept-and-drop, never a crashed connection.
 
 **Engine-side validation stays engine-side.** The worker describes only the *shape* of the
 Router/Handler return value; the fail-closed handler-name / outbound-name validation (see
@@ -854,8 +854,7 @@ class SandboxSessionClosed(SandboxError):
     on the same session may have run (``route_only`` runs the Router, then each ``accepts=``
     predicate), which is safe to repeat because Routers are pure. The runner retries on a fresh
     session or re-pends the row, and never hands it to the ``[delivery] internal_error`` policy as
-    a Router or Handler fault (vault
-    BACKLOG #2772)."""
+    a Router or Handler fault (vault BACKLOG #2772)."""
 
 
 class SandboxWorkerRefused(SandboxError):
@@ -1309,10 +1308,10 @@ class SandboxSession:
 
         :data:`_EOF` is the opposite case and must NOT be treated the same way. It is a parent-private
         singleton with no wire form (see :class:`_Eof`), so a worker cannot manufacture one — it
-        carries no trust information at all, only "the peer is gone". Failing a call on it would fail
-        closed against a signal that proves nothing: a child that crashes in the instant *after*
-        writing a correct, correlation-proven answer would lose a message it had already answered, and
-        a child that died between dispatches would lose the next one instead of respawning
+        carries no trust information at all, only "the peer is gone". Failing the call on it would be
+        failing closed on a signal that proves nothing: a child that crashes in the instant *after*
+        writing a correct, correlation-proven answer would fail a message it had already answered, and
+        a child that died between dispatches would fail the next one instead of respawning
         transparently. Reap it and let the caller carry on.
 
         ``announced_exit`` is :meth:`_drop_unsolicited`'s."""
