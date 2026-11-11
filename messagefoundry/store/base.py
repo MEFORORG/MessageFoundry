@@ -972,14 +972,16 @@ class QueueStore(StoreLifecycle, Protocol):
         the death), and reads the count that increment left. Nothing else writes that column but a
         replay, which resets it with ``attempts``: no claim raises it, and no release, reschedule or
         ``reset_stale_inflight`` lowers it. So a batch tail claimed beside a dying row is never
-        counted, and the count survives a restart. Below ``cap`` that is the whole write: the row stays
-        in flight, as a death leaves it, and ``updated_at`` is untouched. At ``cap`` or above the same
-        transaction dead-letters the row as :meth:`dead_letter_now` does, a ``dead`` event written and
-        its message finalized. A row already DONE, DEAD or CANCELLED is never changed: the increment
-        matches only an unresolved row and holds it locked until the commit (ADR 0157 Amendment C). On
-        Postgres and SQL Server that dead-letter takes the fail-open resolve fence (ADR 0157 C1, C2);
-        a fenced rejection rolls the whole transaction back, increment included, and re-pends the row
-        (C3), so the successor counts that death again.
+        counted, and the count survives a restart. Below ``cap`` that is the whole write: the row
+        stays as a death leaves it, and ``updated_at`` is untouched. At ``cap`` or above the same
+        transaction dead-letters the row as :meth:`dead_letter_now` does, a ``dead`` event
+        written and its message finalized. A row already DONE, DEAD or CANCELLED is never
+        changed: the increment matches only an unresolved row and holds it locked until the
+        commit (ADR 0157 Amendment C). On Postgres and SQL Server that dead-letter takes the
+        fail-open resolve fence (ADR 0157 C1, C2); a fenced rejection rolls the whole transaction
+        back, increment included, and re-pends the row (C3). That death is lost: nothing records
+        it again, so a row whose dead-letter is fenced needs more deaths than ``cap`` before one
+        lands.
 
         "Every time" therefore means across passes that each claimed the row anew: after a restart,
         or a Postgres lease reclaim. A per_lane worker is respawned, but its dying row stays in

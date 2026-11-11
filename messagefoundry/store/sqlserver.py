@@ -11625,8 +11625,9 @@ class SqlServerStore:
                 if retry.max_attempts is not None and attempts >= retry.max_attempts:
                     if row[3] in _RESOLVED_STATUSES:
                         # ADR 0157 Amendment C (vault BACKLOG #4607 step 6): a row already DONE,
-                        # DEAD or CANCELLED is left as it is. Read under the lock and kept out of the
-                        # UPDATE, so an empty OUTPUT rowset there is still the epoch fence alone.
+                        # DEAD or CANCELLED is left as it is. Read under the lock and kept out of
+                        # the UPDATE, so an empty OUTPUT rowset there is still the epoch fence
+                        # alone.
                         await self._commit(conn)
                         return FailOutcome()
                     status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
@@ -12278,9 +12279,10 @@ class SqlServerStore:
     ) -> WorkerDeathOutcome:
         """See the base contract (vault BACKLOG #4607 step 6). The increment is neither terminal nor
         a re-pend, so it carries no fence (ADR 0157 C1). It matches only an INFLIGHT or PENDING row
-        and takes its lock, so the dead-letter that follows at the cap cannot find the row resolved and needs
-        no status term (Amendment C); a miss there is the resolve fence alone, handled as C3 says. Both statements read
-        their match from an ``OUTPUT`` rowset, never ``cursor.rowcount`` (Inc 3, as built)."""
+        and takes its lock, so the dead-letter that follows at the cap cannot find the row resolved
+        and needs no status term (Amendment C); a miss there is the resolve fence alone, handled as
+        C3 says. Both statements read their match from an ``OUTPUT`` rowset, never
+        ``cursor.rowcount`` (Inc 3, as built)."""
         error = safe_text(error)  # PHI chokepoint (#120): scrub first, then cipher last_error (H4)
         now = time.time() if now is None else now
         output, guard, guard_params = self._resolve_guard()  # ADR 0157 C1 — TERMINAL
@@ -12473,8 +12475,9 @@ class SqlServerStore:
                         )
                     placeholders = ",".join("?" * len(replay_from))
                     await cur.execute(
-                        f"UPDATE queue SET status=?, attempts=0, worker_deaths=0, next_attempt_at=?, last_error=NULL,"
-                        f" updated_at=? WHERE message_id=? AND status IN ({placeholders})"
+                        "UPDATE queue SET status=?, attempts=0, worker_deaths=0, next_attempt_at=?,"
+                        " last_error=NULL, updated_at=? WHERE message_id=?"
+                        f" AND status IN ({placeholders})"
                         f" AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER}",
                         (OutboxStatus.PENDING.value, now, now, message_id, *replay_from),
                     )
@@ -13046,8 +13049,8 @@ class SqlServerStore:
                         await self._commit(conn)
                         return 0
                     await cur.execute(
-                        f"UPDATE queue SET status=?, attempts=0, worker_deaths=0, next_attempt_at=?, last_error=NULL,"
-                        f" updated_at=? WHERE {clause}",
+                        "UPDATE queue SET status=?, attempts=0, worker_deaths=0, next_attempt_at=?,"
+                        f" last_error=NULL, updated_at=? WHERE {clause}",
                         (OutboxStatus.PENDING.value, now, now, *params),
                     )
                     count = cur.rowcount

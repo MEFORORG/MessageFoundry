@@ -1360,8 +1360,8 @@ _SCHEMA.append(
 # only thing that sends a store marked by an earlier build through both once.
 # 9 (BACKLOG #1720): the same function builds ux_users_federated_subject, moved out of _SCHEMA. The
 # _SCHEMA edit moves the hash too; the bump is what the contract above ties the body to.
-# 10 (vault BACKLOG #4607 step 6): the same function ADDs queue.worker_deaths. The queue CREATE TABLE
-# moved too; the bump is what ties the migration body to the hash.
+# 10 (vault BACKLOG #4607 step 6): the same function ADDs queue.worker_deaths. The queue CREATE
+# TABLE moved too; the bump is what ties the migration body to the hash.
 _MIGRATION_REV = 10
 
 # BACKLOG #1726: for the tracking view's newest-first page and its received_at filter. SQLite's plan
@@ -5745,8 +5745,9 @@ class PostgresStore:
     ) -> WorkerDeathOutcome:
         """See the base contract (vault BACKLOG #4607 step 6). The increment is neither terminal nor
         a re-pend, so it carries no fence (ADR 0157 C1). It matches only an INFLIGHT or PENDING row
-        (a lease sweep may have re-pended the row before the death) and takes its lock, so the dead-letter that follows at the cap cannot find the row resolved and needs
-        no status term (Amendment C); a miss there is the resolve fence alone, handled as C3 says."""
+        (a lease sweep may have re-pended the row before the death) and takes its lock, so the
+        dead-letter that follows at the cap cannot find the row resolved and needs no status term
+        (Amendment C); a miss there is the resolve fence alone, handled as C3 says."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         guard, guard_args = self._resolve_guard(6)  # ADR 0157 C1 — TERMINAL
@@ -7131,8 +7132,8 @@ class PostgresStore:
                 if retry.max_attempts is not None and attempts >= retry.max_attempts:
                     if row["status"] in _RESOLVED_STATUSES:
                         # ADR 0157 Amendment C (vault BACKLOG #4607 step 6): a row already DONE,
-                        # DEAD or CANCELLED is left as it is. Read under the lock and kept out of the
-                        # UPDATE, so a miss there is still the epoch fence alone.
+                        # DEAD or CANCELLED is left as it is. Read under the lock and kept out of
+                        # the UPDATE, so a miss there is still the epoch fence alone.
                         return FailOutcome()
                     status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
                 else:
@@ -8007,8 +8008,8 @@ class PostgresStore:
                     OutboxStatus.DONE.value,
                 )
             result = await conn.execute(
-                "UPDATE queue SET status=$1, attempts=0, worker_deaths=0, next_attempt_at=$2, last_error=NULL,"
-                f" updated_at=$2 WHERE message_id=$3 AND status = ANY($4::text[])"
+                "UPDATE queue SET status=$1, attempts=0, worker_deaths=0, next_attempt_at=$2,"
+                f" last_error=NULL, updated_at=$2 WHERE message_id=$3 AND status = ANY($4::text[])"
                 f" AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER}",
                 OutboxStatus.PENDING.value,
                 now,
@@ -8466,8 +8467,8 @@ class PostgresStore:
                 await self._append_operator_audit(conn, written, audit, 0)
                 return 0
             result = await conn.execute(
-                "UPDATE queue SET status=$1, attempts=0, worker_deaths=0, next_attempt_at=$2, last_error=NULL,"
-                " updated_at=$2 WHERE stage=$3 AND status=$4"
+                "UPDATE queue SET status=$1, attempts=0, worker_deaths=0, next_attempt_at=$2,"
+                " last_error=NULL, updated_at=$2 WHERE stage=$3 AND status=$4"
                 " AND ($5::text IS NULL OR channel_id=$5)"
                 f" AND ($6::text IS NULL OR destination_name=$6) AND ({_REPLAYABLE_BODY})"
                 f" AND {_NOT_PT_MARKER}",

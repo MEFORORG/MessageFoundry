@@ -1233,10 +1233,10 @@ class WorkerDeathOutcome:
     """What one ``record_worker_death`` call did (vault BACKLOG #4607 step 6).
 
     ``deaths`` is the row's ``worker_deaths`` as this call's own increment left it, read inside the
-    same write, never the value a claim returned. It is 0 when the row was already resolved, so nothing
-    was counted. ``dead`` is True when this call dead-lettered the row at its cap. On Postgres and
-    SQL Server both are reset to the empty outcome when the H1 epoch fence rolled the dead-letter
-    back, increment included (ADR 0157 C3)."""
+    same write, never the value a claim returned. It is 0 when the row was already resolved, so
+    nothing was counted. ``dead`` is True when this call dead-lettered the row at its cap. On
+    Postgres and SQL Server both are reset to the empty outcome when the H1 epoch fence rolled the
+    dead-letter back, increment included (ADR 0157 C3)."""
 
     deaths: int = 0
     dead: bool = False
@@ -12471,8 +12471,8 @@ class MessageStore:
         # the CREATE TABLE IF NOT EXISTS in _SCHEMA, so a reopened DB gains it without a separate step.
         if "body_ref" not in queue_cols:
             await db.execute("ALTER TABLE queue ADD COLUMN body_ref TEXT")
-        # Vault BACKLOG #4607 step 6: the per-row count of passes that killed their stage worker. 0 on
-        # an existing row is right: no death was counted before the column existed.
+        # Vault BACKLOG #4607 step 6: the per-row count of passes that killed their stage worker.
+        # 0 on an existing row is right: no death was counted before the column existed.
         if "worker_deaths" not in queue_cols:
             await db.execute(
                 "ALTER TABLE queue ADD COLUMN worker_deaths INTEGER NOT NULL DEFAULT 0"
@@ -14563,7 +14563,8 @@ class MessageStore:
         async def _body() -> WorkerDeathOutcome:
             # Not updated_at: the in-flight watch measures a held row's age from its claim.
             cur = await self._db.execute(
-                "UPDATE queue SET worker_deaths = worker_deaths + 1 WHERE id=? AND status IN (?, ?)",
+                "UPDATE queue SET worker_deaths = worker_deaths + 1"
+                " WHERE id=? AND status IN (?, ?)",
                 (outbox_id, OutboxStatus.INFLIGHT.value, OutboxStatus.PENDING.value),
             )
             if cur.rowcount == 0:
@@ -14579,7 +14580,8 @@ class MessageStore:
                 return WorkerDeathOutcome(deaths=deaths)
             # No status term: the increment matched this row unresolved, under the writer lock.
             await self._db.execute(
-                "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=? WHERE id=?",
+                "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
+                " WHERE id=?",
                 (
                     OutboxStatus.DEAD.value,
                     now,
@@ -16597,8 +16599,8 @@ class MessageStore:
                 return 0
             # All-or-nothing, matching the SQL Server backend's atomicity.
             upd = await self._db.execute(
-                f"UPDATE queue SET status=?, attempts=0, worker_deaths=0, next_attempt_at=?, last_error=NULL,"
-                f" updated_at=? WHERE {clause}",
+                "UPDATE queue SET status=?, attempts=0, worker_deaths=0, next_attempt_at=?,"
+                f" last_error=NULL, updated_at=? WHERE {clause}",
                 (OutboxStatus.PENDING.value, now, now, *params),
             )
             for message_id in message_ids:

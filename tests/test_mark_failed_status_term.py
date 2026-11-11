@@ -256,9 +256,9 @@ async def test_a_zero_multiplier_on_a_reset_row_does_not_raise(store: MessageSto
 
 async def test_the_dead_branch_still_lands_on_a_pending_row(store: MessageStore) -> None:
     """C2 keeps a status conjunct off terminal resolves, so Amendment A's term does not reach the
-    DEAD branch, and Amendment C's decline (vault BACKLOG #4607 step 6) spares an INFLIGHT or PENDING
-    row. Pinned so a later edit that spreads the retry term to both branches has to change this test
-    on purpose."""
+    DEAD branch, and Amendment C's decline (vault BACKLOG #4607 step 6) spares an INFLIGHT or
+    PENDING row. Pinned so a later edit that spreads the retry term to both branches has to change
+    this test on purpose."""
     mid, (oid,) = await _claimed(store, "OB1")
     await store.mark_failed(oid, "boom", _RETRY, now=100.0)  # PENDING, not INFLIGHT, attempts 1
 

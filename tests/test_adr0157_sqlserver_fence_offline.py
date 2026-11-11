@@ -99,7 +99,7 @@ _EXPECTED: dict[str, tuple[int, int]] = {
     "mark_failed": (1, 1),
     "mark_batch_failed": (1, 1),
     "dead_letter_batch": (1, 1),
-    # Its dead-letter at the cap (vault BACKLOG #4607 step 6). The increment before it sets no status.
+    # Its dead-letter at the cap (vault BACKLOG #4607 step 6). Its increment sets no status.
     "record_worker_death": (1, 1),
     # --- Bring-up sweeps + operator paths: unguarded, allowlisted. ---
     "dead_letter_missing_destinations": (1, 0),
