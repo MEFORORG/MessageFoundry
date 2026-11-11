@@ -3273,8 +3273,9 @@ with no page.
 - **A directory grant.** An account can get Administrator because the *directory* added it to a
   group already mapped to Administrator. The engine sees that grant in one of the two places below,
   whichever comes first. Either one raises `administrator_granted`, but at least these cases raise
-  none. A sign-in that sees it first and fails with a server error in a step after the role sync,
-  such as the session mint, loses it; the retry then gains nothing. A reconciler pass the mass-revoke breaker aborts writes no roles.
+  none. A sign-in that sees it first and fails with a server error after the revoke and the
+  notice, for example in the session mint, loses it; the retry then gains nothing. A reconciler
+  pass the mass-revoke breaker aborts writes no roles.
   An account that never signs in again raises nothing when no pass reaches it: it holds no live
   session, or `[auth].ad_session_recheck_seconds` is 0. So watch membership of the mapped group in
   the directory itself.

@@ -4470,7 +4470,7 @@ def test_the_changelog_states_the_directory_grant_limits() -> None:
     cases is pinned elsewhere, if at all (see ``_REVIEWED_TEXT_CHECKS``)."""
     cases = (
         "at least these cases raise none",
-        "fails with a server error in a step after the role sync",
+        "a server error after the revoke and the notice",
         "mass-revoke breaker aborts writes no roles",
         "holds no live session",
         "`[auth].ad_session_recheck_seconds` is 0",
