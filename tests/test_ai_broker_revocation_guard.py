@@ -711,13 +711,13 @@ async def test_the_route_hands_the_broker_the_instance_tls_policy(
 async def test_the_posture_entry_claims_no_crl_check_where_crl_file_does_not_reach(
     engine: Engine, monkeypatch: pytest.MonkeyPatch, pki: _Pki, path: str, names_the_path: str
 ) -> None:
-    """With ``[tls].crl_file`` set, the ``GET /security/posture`` entry must not say a CRL is
-    checked on a path where none is. Two such paths: a direct ``create_app``, which takes no
-    ``[tls]`` section, so the instance's ``crl_file`` cannot reach its route; and a loopback
-    endpoint on an app that holds the ``[tls]`` section, as ``serve`` stashes it, which
-    ``resolve_trust_anchor`` exempts from the CRL. Each arm first proves, on the context the route
-    really dials with, that no CRL is checked, then reads the entry. Red on 547561b4da: the entry
-    said "no CRL unless [tls].crl_file is set", a CRL check on both paths."""
+    """The ``GET /security/posture`` entry must not say a CRL is checked on a path where none is,
+    whatever ``[tls].crl_file`` the instance names. Two such paths: a direct ``create_app``, which
+    takes no ``[tls]`` section, so no ``crl_file`` can reach its route; and a loopback endpoint on
+    an app that holds a ``[tls]`` section with a ``crl_file``, as ``serve`` stashes it, which
+    ``resolve_trust_anchor`` exempts from the CRL. Each arm checks the context the route really
+    dials with, then reads the entry. Red on 547561b4da: the entry said "no CRL unless
+    [tls].crl_file is set", a CRL check on both paths."""
     seen: list[ssl.SSLContext] = []
 
     def fake_chat(self: AiBroker, prompt: str) -> str:

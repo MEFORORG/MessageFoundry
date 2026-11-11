@@ -1613,9 +1613,10 @@ count is above `0` (vault BACKLOG #2613).
 - **What the engine refuses without it:** the engine AI broker sends `[ai].api_key` and the code
   sent for assistance over https that verifies the endpoint's certificate, and its handshake
   checks no OCSP. It checks `[tls].crl_file` only where the engine's `[tls]` policy reaches the
-  hop: an engine started by `messagefoundry serve`, for an endpoint that is not loopback (BACKLOG
-  #5527). A loopback endpoint, and an app not handed the `[tls]` section, such as a direct
-  `create_app` (the embedded path), check no CRL whatever `[tls].crl_file` says. So without that
+  hop: an app handed the `[tls]` section, as `messagefoundry serve` hands it, for an endpoint
+  that is not loopback (BACKLOG #5527). A loopback endpoint, and an app not handed that section,
+  such as a direct `create_app` (the embedded path), check no CRL whatever `[tls].crl_file`
+  says. So without that
   CRL an `[ai].endpoint` whose host is not loopback is refused under
   `[security].enforcement = enforce`, and wherever a broker is built without a known posture,
   which counts as enforcing. The broker is built for each `POST /ai/chat` request, so the refusal

@@ -4,9 +4,9 @@
   revoked endpoint certificate with no refusal and no record. On an instance at `[security].enforcement = enforce`,
   an `[ai].endpoint` whose host is not loopback is now refused at `POST /ai/chat`, answered 503,
   unless `[ai].endpoint_revocation_attested = true` is set with an
-  `[ai].endpoint_revocation_attested_reason`. No CRL lever is built for this hop, so
-  `[tls].crl_file` does not reach it, and `MEFOR_TLS_REVOCATION_ATTESTED` does not cross it under
-  `enforce`. A broker built with no instance posture is judged as enforcing. A non-enforcing
+  `[ai].endpoint_revocation_attested_reason`, or, since BACKLOG #5527, on a `[tls].crl_file`
+  that reaches the hop (its own entry says where). `MEFOR_TLS_REVOCATION_ATTESTED` does not cross
+  it under `enforce`. A broker built with no instance posture is judged as enforcing. A non-enforcing
   instance warns, once per process for each endpoint host. The pair is a loosening that
   `security show`, `GET /security/posture` and the serve-time warning name, with the reason. See
   [DEPLOYMENT.md](../docs/DEPLOYMENT.md#revocation-guard-behavior). (`BACKLOG #2193`)
