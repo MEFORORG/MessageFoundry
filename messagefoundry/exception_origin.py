@@ -41,6 +41,7 @@ from typing import Any, Final
 __all__ = [
     "ExceptionChainTooLong",
     "exception_chain",
+    "is_ssl_error",
     "raise_statement_file",
     "raised_by_the_engine",
     "raised_only_by_the_engine",
@@ -67,6 +68,13 @@ _CHAIN_LIMIT: Final = 1024
 
 class ExceptionChainTooLong(Exception):
     """:func:`exception_chain` passed :data:`_CHAIN_LIMIT` links, so what it read is not all there is."""
+
+
+def is_ssl_error(exc: BaseException, name: str) -> bool:
+    """Whether ``exc`` is the stdlib ``ssl`` module's class ``name`` or a subclass of it. Read off
+    the class's MRO, so a caller reads an exception's type without importing ``ssl``, which the
+    crypto inventory gate counts as a crypto use (``scripts/security/crypto_inventory_check.py``)."""
+    return any(c.__module__ == "ssl" and c.__name__ == name for c in type(exc).__mro__)
 
 
 def exception_chain(exc: BaseException) -> Iterator[BaseException]:

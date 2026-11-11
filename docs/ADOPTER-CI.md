@@ -298,6 +298,16 @@ that package's build code may run in CI:
     index that serves it. It refuses the engine's own name, and the name of each other MessageFoundry
     package your engine release records as published: at least `messagefoundry-webconsole`,
     `messagefoundry-harness` and `messagefoundry-toolkit`.
+  - From the first engine release after 0.5.2, pip and pip-audit get an allowlist environment, not
+    the job's whole one: what Python needs to start, pip's own `PIP_*` variables, and the proxy,
+    certificate, `NETRC` and XDG folder variables. A CI token the job sets is then not in their
+    environment. That is not isolation: they run as the job's account and can still read the
+    auditor's process, so keep the job's token permissions minimal. 0.5.2 and earlier hand them
+    every variable outside the engine's `MEFOR_*` names. If your index authenticates through a
+    keyring backend or a cloud credential helper that reads another variable, name it with
+    `--pass-environment <name>` before `requirements.lock`, once per variable. It refuses at least
+    an entry that is not a name, an engine variable, `VAULT_TOKEN` and `PGPASSWORD` among them, and
+    `PYTHONINSPECT`.
   - It refuses a lock with pip option lines, such as an index URL, `--trusted-host` or `--find-links`.
     `uv pip compile --python-platform windows --python-version 3.14 --generate-hashes
     requirements.txt -o requirements.lock` writes none by default and locks Windows alone.
@@ -354,6 +364,32 @@ failed** — advisory checks and skips never block.
 **Per-feed fixture mapping (#11):** a fixture placed under `messages/sets/<inbound_name>/` is
 dry-run **only** against that feed; a fixture not under such a subdir is cross-producted against
 **every** inbound. This lets you assert "this message belongs to this feed and only this feed."
+
+**Declaring the expected disposition (`.expect`).** A fixture `a.hl7` may have a sibling
+`a.hl7.expect` holding one disposition name, case-insensitive: `RECEIVED`, `UNROUTED`, `FILTERED`,
+`NOT_DEPLOYED` or `ERROR` (`PROCESSED`, `ROUTED`, `DELIVERED` and `DELIVERS` alias `RECEIVED`). The
+fixture then passes only when its dry run lands in that disposition, instead of only when it does
+not error. To pin *why* a fixture errors, write `ERROR <reason>`: `ERROR`, one space, then the
+rest of the line. The run must then be `ERROR`, and its error text, or the strict validator's
+content refusal, must contain the reason, matched case-sensitively. A strict-validation refusal is
+the validator's errors joined and cut at 200 characters, the text the MLLP listener's `AR` NAK
+carries. It is not what the listener stores: the stored error is `strict-validation failed: `
+followed by a scrubbed, uncut copy of those errors. So a reason that quotes text from past the
+200-character cut can never match a strict-validation refusal. On a mismatch the gate says the reason did not match and
+prints neither text, since both can quote the message.
+
+A strict-validation timeout on its own needs a reason to pass; the exception, a late content
+refusal, is at the end of this paragraph. Past `validation.strict_timeout_s` the run's
+error is the timeout text, `strict-validation timed out after <N>s`, which the live listener
+records as a final `AR` ([`HL7-VALIDATION.md`](HL7-VALIDATION.md)). A fixture that pins that DoS
+backstop writes a reason holding `timed out`, such as `ERROR strict-validation timed out`; the
+timeout text satisfies no other reason, so a reason written for a content refusal, such as
+`ERROR strict-validation`, cannot pass on a slow runner. Such a fixture still measures the
+runner: its body must take longer than the inbound's timeout on every machine the gate runs on,
+or a fast runner fails it with the run's real disposition. A plain `ERROR` accepts any other
+error, but never a timeout alone, because a timeout measures the runner, not the message. It does
+accept a timed-out run whose validator, though late, still returned a content refusal, and the
+reason form is then matched against that refusal too.
 
 ---
 

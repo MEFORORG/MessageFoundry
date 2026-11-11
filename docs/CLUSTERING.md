@@ -538,10 +538,11 @@ longer one can miss it. A clean stop needs no pause, because a stopped node does
 **A slow store during the pause does not block a retried stepdown.** While paused, each tick reads
 who owns the lease, and it reads while holding the lock a stepdown waits on. A stepdown waits for
 that lock only up to `leader_fence_timeout_seconds`, and the retry after a `release-unconfirmed` is
-the call most likely to arrive then. So the read gets its own limit: the smaller of the store's
-statement timeout and three quarters of the fence timeout. At the shipped settings that is 15
-seconds on SQL Server, where `[store].command_timeout` (30) is longer than the fence (20), and the
-4.5 second renew timeout on Postgres. A read that misses the limit fails, the node logs it and stays
+the call most likely to arrive then. So the read gets its own limit: three quarters of the fence
+timeout, 15 seconds at the shipped settings. Inside it the read's statement runs under the smaller
+of the renew timeout and half that limit, 4.5 seconds at the shipped settings (4 on SQL Server,
+which counts whole seconds), rather than the 30 second `[store].command_timeout`, which is longer
+than the 20 second fence; [BACKLOG #5064](BACKLOG.md) brought SQL Server's read under it. A read that misses the limit fails, the node logs it and stays
 paused, and the stepdown gets the lock in time ([BACKLOG #2540](BACKLOG.md)).
 
 The limit is on the read, and cleaning up after a stalled read takes a little longer. On Postgres the

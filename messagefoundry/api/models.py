@@ -535,8 +535,8 @@ ReleaseBlocked = Literal[
 
 class PendingApprovalInfo(BaseModel):
     """One open request in the approver's queue: ``pending`` (awaiting a second approver, unexpired)
-    or ``interrupted`` (released, cut off mid-run, awaiting a resolve; BACKLOG #1562). For an
-    interrupted row, ``approver`` released it and ``decided_at`` is when it was cut off.
+    or ``interrupted`` (released, effects unknown, awaiting a resolve; BACKLOG #1562). For an
+    interrupted row, ``approver`` released it.
 
     ``params`` are the parameters the hold captured, which a release re-runs (BACKLOG #2458), so an
     approver sees what it releases. They are operation metadata, never a message body; ``None``
@@ -1681,7 +1681,9 @@ class SecurityPosture(BaseModel):
     environment: str | None = None  # the active-environment NAME (ADR 0017)
     backend: str  # store backend: "sqlite" | "postgres" | "sqlserver"
     encryption_enabled: bool  # whether the LIVE store cipher encrypts at rest
-    key_source: str  # [store].key_provider name (auto|env|dpapi|aws_kms|...); NOT key material
+    key_source: (
+        str  # [store].key_provider name (store.keyprovider.KNOWN_PROVIDERS); NOT key material
+    )
     key_id: str | None = (
         None  # active key FINGERPRINT only (first 16 hex of SHA-256(key)); never bytes
     )

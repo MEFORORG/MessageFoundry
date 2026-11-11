@@ -32,7 +32,9 @@ mode). The MAC key defaults to the data key and is overridable to a dedicated Tr
 cannot run the operation asked of it (BACKLOG #1166) raises
 :class:`~messagefoundry.store.keyprovider.KeyProviderError` at construction (``open_store`` propagates it
 → ``serve`` refuses to start, never an in-process fallback). A per-operation Transit failure raises :class:`CipherError` — the
-store's existing at-rest error discipline. **No plaintext/PHI is EVER placed in a message** (only the
+store's existing at-rest error discipline. On ``encrypt`` and ``decrypt``, a failure that gave no verdict
+on the value (Transit unreachable, or answering that it cannot serve now) raises its subclass
+:class:`~messagefoundry.store.crypto.CipherUnavailableError` instead (BACKLOG #3734). **No plaintext/PHI is EVER placed in a message** (only the
 exception TYPE): the base64 plaintext handed to Transit is the message body. The one exception is a
 refusal of the Vault hop or its reply, whose text is fixed and is kept whole (BACKLOG #2318; see
 :func:`~messagefoundry.store.keyprovider_vault.vault_failure_text`).
@@ -58,6 +60,7 @@ from messagefoundry.store.crypto import (
     AuditKeyVersionRefusedError,
     AuditMacFn,
     CipherError,
+    CipherUnavailableError,
     _UnmarkedPolicy,
 )
 from messagefoundry.store.keyprovider import KeyProviderError
@@ -68,6 +71,7 @@ from messagefoundry.store.keyprovider_vault import (
     TRANSIT_MOUNT,
     _build_client,
     is_vault_bad_request,
+    is_vault_unavailable,
     require_transit_key_type,
     store_vault_hop,
     vault_failure_text,
@@ -100,6 +104,26 @@ _ENV_AUDIT_KEY = "MEFOR_STORE_TRANSIT_AUDIT_KEY"
 #: The fixed input of the probe that tells a refused key version from an outage (BACKLOG #2337).
 #: Base64, as Transit takes it. It carries no row data, so no row can decide the probe's answer.
 _VERSION_PROBE_INPUT = base64.b64encode(b"messagefoundry audit key version probe").decode("ascii")
+
+
+def _transit_failure(op: str, key: str, exc: Exception) -> CipherError:
+    """The error an ``encrypt`` or ``decrypt`` raises for ``exc``: :class:`CipherUnavailableError`
+    where Transit gave no verdict on the value, else plain :class:`CipherError` (BACKLOG #3734).
+    The audit HMAC keeps plain :class:`CipherError`; this split is for the data key alone.
+
+    The outage's text is the key id and ``exc``'s type name only, a reply refusal's fixed text
+    left out, because the upload routes log it; a refusal keeps :func:`vault_failure_text`.
+
+    Runs inside the caller's ``except``, so a classifier fault must not replace the type-only
+    error: anything it raises reads as a refusal, the side the split keeps when it cannot tell."""
+    try:
+        unavailable = is_vault_unavailable(exc)
+    except Exception as fault:  # noqa: BLE001 -- see the docstring; the caller raises CipherError
+        log.warning("Transit failure classifier raised %s; read as a refusal", type(fault).__name__)
+        unavailable = False
+    if unavailable:
+        return CipherUnavailableError(f"Transit {op} failed (key={key!r}): {type(exc).__name__}")
+    return CipherError(f"Transit {op} failed (key={key!r}): {vault_failure_text(exc)}")
 
 
 class TransitCipher(_UnmarkedPolicy):
@@ -144,9 +168,7 @@ class TransitCipher(_UnmarkedPolicy):
             ciphertext = response["data"]["ciphertext"]  # "vault:v1:…" — no plaintext, no key
         except Exception as exc:
             # Type-only message: the plaintext going in is PHI; never surface it or the key material.
-            raise CipherError(
-                f"Transit encrypt failed (key={self._key!r}): {vault_failure_text(exc)}"
-            ) from exc
+            raise _transit_failure("encrypt", self._key, exc) from exc
         if not isinstance(ciphertext, str) or not ciphertext:
             raise CipherError(f"Transit returned an empty ciphertext (key={self._key!r})")
         return f"{_V3_PREFIX}{ciphertext}"
@@ -176,10 +198,9 @@ class TransitCipher(_UnmarkedPolicy):
             plaintext_b64 = response["data"]["plaintext"]
         except Exception as exc:
             # Covers a failed AEAD tag (wrong cell AAD / corrupt blob) AND transport failure — both fail
-            # closed. Type-only: a Transit error can echo ciphertext, and we never surface key material.
-            raise CipherError(
-                f"Transit decrypt failed (key={self._key!r}): {vault_failure_text(exc)}"
-            ) from exc
+            # closed, and only the second is CipherUnavailableError (BACKLOG #3734). Type-only: a
+            # Transit error can echo ciphertext, and we never surface key material.
+            raise _transit_failure("decrypt", self._key, exc) from exc
         # Refused OUTSIDE the handler: a UnicodeDecodeError's .object is the decrypted plaintext, so
         # chaining it would put the PHI this cipher protects on the error (BACKLOG #2085).
         # binascii.Error and UnicodeDecodeError are ValueErrors; TypeError is a non-str plaintext.

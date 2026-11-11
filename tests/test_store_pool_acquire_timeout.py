@@ -39,6 +39,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.settings import StoreSettings
+from messagefoundry.redaction import safe_exc
 from messagefoundry.store.base import (
     DEFAULT_STORE_ACQUIRE_TIMEOUT,
     StoreAcquireTimeout,
@@ -404,6 +405,69 @@ async def test_sqlserver_store_acquire_is_bounded() -> None:
     with pytest.raises(StoreAcquireTimeout):
         async with store._acquire():
             pytest.fail("the body must never run on a wedged pool")
+
+
+async def test_sqlserver_clamped_borrow_points_to_the_cluster_paragraph() -> None:
+    """BACKLOG #5064: a borrow cut at the cluster clamp advises one fixed text, pointing to the
+    docs/CONFIGURATION.md [cluster] paragraph that says which setting sets each clamp, since
+    raising ``[store].acquire_timeout`` would not lengthen it and no one setting sets every clamp.
+    Driven through a real clamped statement, so the store's 1 s floor sets the rendered limit."""
+    from messagefoundry.store.sqlserver import CLAMPED_BORROW_ADVICE
+
+    store = _sqlserver_store(_HangingPool(), timeout=30.0)
+    with pytest.raises(StoreAcquireTimeout) as clamped:
+        await store._execute_clamped("UPDATE nodes SET status = ?", ("x",), timeout_clamp=0.2)
+    message = str(clamped.value)
+    assert " after 1s " in message, message
+    assert message.endswith(f"; retune with {CLAMPED_BORROW_ADVICE}"), message
+    assert "[store].acquire_timeout" not in message
+    assert "docs/CONFIGURATION.md [cluster]" in CLAMPED_BORROW_ADVICE
+    # A logged error passes through safe_exc, whose default limit must keep the whole message. The
+    # worst case renders the limit in the most characters ``:g`` uses for a finite value of at least
+    # the 1 s floor, 12 for a three-digit exponent, so render the message at that limit too.
+    worst = StoreAcquireTimeout(message.replace(" after 1s ", f" after {1.23456789e100:g}s "))
+    assert len(str(worst)) == len(message) + len(f"{1.23456789e100:g}") - 1
+    assert safe_exc(worst) == f"StoreAcquireTimeout: {worst}", safe_exc(worst)
+    assert safe_exc(clamped.value) == f"StoreAcquireTimeout: {message}", safe_exc(clamped.value)
+    # A tie advises the same text: raising [store].acquire_timeout alone would not lengthen it.
+    store = _sqlserver_store(_HangingPool(), timeout=FAST)
+    with pytest.raises(StoreAcquireTimeout) as tie:
+        async with store._acquire_clamped(FAST):
+            pytest.fail("the body must never run on a wedged pool")
+    assert str(tie.value).endswith(CLAMPED_BORROW_ADVICE), str(tie.value)
+    store = _sqlserver_store(_HangingPool(), timeout=FAST)
+    with pytest.raises(StoreAcquireTimeout, match=r"retune with \[store\]\.acquire_timeout$"):
+        async with store._acquire_clamped(5.0):
+            pytest.fail("the body must never run on a wedged pool")
+
+
+def test_the_clamped_borrow_advice_points_to_a_paragraph_that_exists() -> None:
+    """BACKLOG #5064: the paragraph the advice points to is under [cluster] in
+    docs/CONFIGURATION.md, and names each bound a clamped borrow can be cut at."""
+    from messagefoundry.store.sqlserver import CLAMPED_BORROW_ADVICE
+
+    doc = (Path(__file__).resolve().parent.parent / "docs" / "CONFIGURATION.md").read_text(
+        encoding="utf-8"
+    )
+    start = doc.index("### `[cluster]`")
+    section = doc[start : doc.index("\n### ", start + 1)]
+    heading = "**Which setting sets a clamped SQL Server borrow's bound.**"
+    assert heading in section
+    paragraph = section[section.index(heading) : section.index("#### `[cluster.vip]`")]
+    for term in (
+        "lease_renew_timeout_seconds",
+        "leader_fence_timeout_seconds",
+        "half the paused-read budget",
+        "1 s floor",
+        "fixed 2 s",
+    ):
+        assert term in paragraph, term
+    # The paragraph quotes the message's ending exactly.
+    assert f"`retune with {CLAMPED_BORROW_ADVICE}`" in paragraph
+    # The paragraph's "fixed 2 s" is stop()'s bound, which no setting changes.
+    from messagefoundry.pipeline.cluster import STOP_WRITE_TIMEOUT_SECONDS
+
+    assert STOP_WRITE_TIMEOUT_SECONDS == 2.0
 
 
 async def test_postgres_store_acquire_is_bounded() -> None:
@@ -882,8 +946,9 @@ def test_sqlserver_longer_post_commit_borrow_has_exactly_its_two_writes() -> Non
     """BACKLOG #3023: the SQL Server counterpart of the Postgres pin above. The longer post-commit
     borrow is reached from ``revoke_user_sessions`` directly and from ``rotate_session`` through
     ``_write_session_txn(after_commit=True)``, the only call passing that keyword; nothing else.
-    ``_borrow`` is called only by ``_acquire``, ``_acquire_after_commit`` and, for the cluster lease
-    claim's SHORTER limit (BACKLOG #1497), ``_acquire_clamped``; strict mypy keeps
+    ``_borrow`` is called only by ``_acquire``, ``_acquire_after_commit`` and, for the SHORTER limit
+    of the cluster coordinator's clamped statements (the lease claim since BACKLOG #1497, the
+    loop's other statements and the release writes since #5064), ``_acquire_clamped``; strict mypy keeps
     ``None`` out of its ``float`` limit. A third write moved onto the longer limit would pass every offline test, so
     its callers are pinned by name."""
     assert _sqlserver_functions_referencing("_acquire_after_commit") == [
@@ -894,13 +959,16 @@ def test_sqlserver_longer_post_commit_borrow_has_exactly_its_two_writes() -> Non
         " it too follows a committed write nothing retries, then update this pin"
     )
     assert _sqlserver_functions_referencing("after_commit") == ["rotate_session"]
-    # BACKLOG #1497 added a SHORTER borrow for the cluster lease claim alone; pinned the same way.
+    # BACKLOG #1497 added a SHORTER borrow for the cluster lease claim, which #5064 widened to the
+    # coordinator's other clamped statements; pinned the same way.
     assert _sqlserver_functions_referencing("_borrow") == [
         "_acquire",
         "_acquire_after_commit",
         "_acquire_clamped",
     ]
-    assert _sqlserver_functions_referencing("_acquire_clamped") == ["_fetch_rows"]
+    # BACKLOG #5064 moved it behind _clamp_bounds, shared by the clamped read and the clamped write.
+    assert _sqlserver_functions_referencing("_acquire_clamped") == ["_clamp_bounds"]
+    assert _sqlserver_functions_referencing("_clamp_bounds") == ["_fetch_rows", "_write_rows"]
 
 
 # --- the setting -------------------------------------------------------------

@@ -147,7 +147,7 @@ def _apply_resource_caps(mem_mb: int | None) -> str:
     Where ``/proc/self/status`` gives a ``VmData`` (Linux), ``mem_mb`` is HEADROOM above what the
     worker holds once its graph is loaded: the cap is ``RLIMIT_DATA`` at that ``VmData`` plus
     ``mem_mb`` (vault BACKLOG #3133 part 2, owner ruling 2026-10-11). Called right after
-    ``load_config``, so a graph larger than ``mem_mb`` does not start the worker over its cap.
+    ``load_snapshot``, so a graph larger than ``mem_mb`` does not start the worker over its cap.
     ``RLIMIT_DATA`` counts writable private memory and not address space that is only reserved. A
     thread's glibc malloc arena reserves about 64 MiB and keeps it mapped after the thread exits, so
     an ``RLIMIT_AS`` cap became a lifetime budget that innocent threads used up. An arena's peak
@@ -440,7 +440,7 @@ def _run_one(
         raise  # not a plain handler error: main() answers it and recycles the worker
     except SystemExit as exc:
         # Caught deliberately: sys.exit() in user code is a content fault, reported in mode=off's words
-        # (vault BACKLOG #3134; UserCodeCalledSysExit says why config code differs). Uncaught, it ended
+        # (vault BACKLOG #3134; UserCodeCalledSysExit says why it is converted). Uncaught, it ended
         # the worker, so the message read as a crash and the next paid a respawn. No shutdown of this
         # worker raises here: the parent closes the pipe (EOF in main()) or kills it. KeyboardInterrupt
         # and every other BaseException are not converted, as at mode=off.
@@ -506,7 +506,7 @@ def main() -> int:
     stdout = sys.stdout.buffer
     # Sequenced deliberately: AFTER the frame writer captures its raw handle (at module scope the
     # capture above would resolve to fd 2 and send every frame to the wrong pipe) and BEFORE the boot
-    # frame read below, whose reply path runs ``load_config()`` -- the earliest untrusted code.
+    # frame read below, whose reply path runs ``load_snapshot()`` -- the earliest untrusted code.
     _redirect_stdout_to_stderr()
 
     frame = _read_frame_bytes(stdin)

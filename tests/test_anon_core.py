@@ -501,18 +501,22 @@ def test_leak_check_catches_unmapped_phone() -> None:
 
 @_NO_SCANNER
 def test_leak_check_catches_unmapped_mrn() -> None:
-    """A CX id typed `MR` in an unmapped field (PID-2, absent from DEFAULT_RULES) is caught by HL7
-    structure, and the raw id never surfaces in the reason or the LeakError (PHI-safe).
+    """A CX id typed `MR` in an unmapped field (ZPI-2, a Z-segment no default rule names) is caught
+    by HL7 structure, and the raw id never surfaces in the reason or the LeakError (PHI-safe).
+
+    It used PID-2 until BACKLOG #5533 mapped that field; a Z-segment stays unmapped by design.
 
     Falsified: removing the MR/MRN component detector let the unmapped MRN pass clean (RED), then
     restored — confirming the CX id-type signal, not a digit heuristic, is doing the work.
     """
     msg = _msg(
         r"MSH|^~\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1",
-        "PID|1|98765^^^HOSP^MR||X^Y",  # PID-2: unmapped CX, id-typed MR
+        "PID|1||X^^^HOSP^MR||X^Y",
+        "ZPI|1|98765^^^HOSP^MR",  # ZPI-2: unmapped CX, id-typed MR
     )
+    assert not any(rule.path.startswith("ZPI-") for rule in DEFAULT_RULES)
     hits = leak_check(msg, rules=DEFAULT_RULES)
-    assert any("MRN" in h and "PID-2" in h for h in hits), hits
+    assert any("MRN" in h and "ZPI-2" in h for h in hits), hits
     assert all("98765" not in h for h in hits)  # names the shape + address, never the id
     with pytest.raises(LeakError) as exc:
         anonymize_checked(msg, salt=_SALT)

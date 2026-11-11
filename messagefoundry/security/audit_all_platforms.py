@@ -55,6 +55,13 @@ downloadable from the index pip is configured with. Past refusing the engine and
 packages this release knows to be published, nothing checks that the named package is in fact
 private: like ``--ignore-vuln``, it is the adopter's recorded decision.
 
+``--pass-environment <name>``, also given BEFORE the lock and repeatable, hands pip and pip-audit
+one more environment variable than their allowlist holds, such as one a keyring backend or a cloud
+credential helper reads to reach a private index (vault BACKLOG #2587). It refuses at least an
+entry that is not a variable name, an engine variable, and an interpreter variable that starts a
+console (``childenv.pass_environment_refusal``). A caller that passes its own ``run``
+to :func:`main` gets the names checked but not forwarded: they reach only the default runner.
+
 WHY STRIPPING IS SOUND HERE. Every pin in a uv export is a version that uv resolved for some
 environment the lock covers. The engine's ``[tool.uv] environments`` limits that to CPython 3.14 on
 Windows and Linux, so every engine pin is one a supported host can install, and each exported line
@@ -79,9 +86,14 @@ covers; and a copy holding a requirement in which that parser could still find a
 marker, as ``_pip_audit_may_see_marker`` reads it, which pip-audit would skip unaudited where the
 host fails the marker (the ``;`` the strip leaves inside a bare URL's ``#egg=`` fragment, say); and
 a ``--skip-private`` that names the engine or another published
-MessageFoundry package, a package the lock does not pin, or every pin, or that comes after the lock
-as a word of its own (the ``=`` form or an abbreviation there reaches pip-audit, which fails on it
-as an unknown option). It does not judge
+MessageFoundry package, a package the lock does not pin, or every pin, or that holds ``=``; and a
+``--pass-environment`` entry the paragraph above says it refuses; and either flag after the lock,
+or an abbreviation of it that is no abbreviation of a pip-audit option, in the ``=`` form or not;
+and any other word after the lock that holds ``=`` and is not ``--option=value`` for a pip-audit
+option that takes a value, named in full (``_after_lock_refusal``), since pip-audit's usage error
+would print a ``NAME=value`` typed there; and a lock path that holds ``=``. No refusal quotes a
+word that holds ``=``, and the module's own usage error quotes nothing once a word holds one. A free-text value after the lock that holds ``=``, as in ``--index-url=URL``, still
+reaches pip-audit, which can print it in its own output. It does not judge
 whether a non-empty lock is complete; released-line-audit carries its own floor for that.
 
 It reads lines as pip does: a requirement or option is any line that does not continue the one
@@ -98,7 +110,11 @@ or character it failed on.
 
 Both subprocesses start through ``messagefoundry.childenv.python_module_argv``, so with ``-P``
 (the checked-out tree, the current directory, is not on their ``sys.path`` and cannot shadow a
-module the auditor imports) and the engine's other child-interpreter flags.
+module the auditor imports) and the engine's other child-interpreter flags. Their environment is
+``messagefoundry.childenv.auditor_environment``, an allowlist, plus the ``--pass-environment``
+names: a variable neither names, a CI token or an engine secret among them, is not in their
+environment. That is not isolation: they run as the auditor's own account, which can still read
+the auditor process.
 
 WHAT IT DOES NOT HANDLE, stated rather than papered over. If a lock ever pins ONE name at two
 versions under two markers (a resolver fork), the copy carries both and pip-audit refuses it with
@@ -110,6 +126,7 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import functools
 import io
 import locale
 import os
@@ -120,8 +137,13 @@ import tempfile
 import urllib.parse
 from collections.abc import Callable, Collection, Sequence
 from pathlib import Path
+from typing import NoReturn
 
-from messagefoundry.childenv import engine_environment, non_engine_environment, python_module_argv
+from messagefoundry.childenv import (
+    auditor_environment,
+    pass_environment_refusal,
+    python_module_argv,
+)
 from messagefoundry.redaction import safe_exc
 
 
@@ -506,11 +528,8 @@ _NEVER_PRIVATE = frozenset(canonical_name(n) for n in {"messagefoundry", *PUBLIS
 
 
 def _skip_private_refusal(private: Collection[str], pip_audit_args: Sequence[str]) -> str | None:
-    """Why a ``--skip-private`` request is refused, or ``None``."""
-    if "--skip-private" in pip_audit_args:
-        # After the lock, argparse hands it to pip-audit, which fails with a usage error that
-        # names neither the flag's position nor this module.
-        return "--skip-private goes before the lock, not after it"
+    """Why a ``--skip-private`` request is refused, or ``None``. The flag after the lock is
+    :func:`_after_lock_refusal`'s."""
     named = sorted(_NEVER_PRIVATE.intersection(private))
     return (
         f"--skip-private may not name the engine or a published MessageFoundry package: {named}"
@@ -519,13 +538,168 @@ def _skip_private_refusal(private: Collection[str], pip_audit_args: Sequence[str
     )
 
 
-def _run(cmd: list[str]) -> int:
-    # non_engine_environment: everything outside the engine's MEFOR_* namespace and its named
-    # secrets, so pip and pip-audit keep the index, proxy and certificate settings they read from
-    # the environment, and an engine secret set on the same runner does not reach them. Built over
-    # engine_environment, which drops an empty or relative PYTHONPATH entry: that would put the
-    # working directory back on the children's sys.path, which -P keeps off it.
-    env = non_engine_environment(engine_environment())
+#: pip-audit's long options, as the pinned pip-audit (2.10.1, in ``requirements-audit.lock``)
+#: declares them, with argparse's own ``--help``. These take no value.
+_PIP_AUDIT_FLAGS = frozenset(
+    {
+        "--help",
+        "--version",
+        "--local",
+        "--locked",
+        "--dry-run",
+        "--strict",
+        "--verbose",
+        "--fix",
+        "--require-hashes",
+        "--skip-editable",
+        "--no-deps",
+        "--disable-pip",
+    }
+)
+#: Those that take a value of a fixed form, a choice or a number: argparse's error for a bad one
+#: quotes the value, so one holding ``=`` is refused.
+_PIP_AUDIT_FIXED_VALUE_OPTIONS = frozenset(
+    {
+        "--format",
+        "--vulnerability-service",
+        "--desc",
+        "--aliases",
+        "--progress-spinner",
+        "--timeout",
+    }
+)
+#: Those that take free text, a path, a URL or an ID, which may hold ``=``.
+_PIP_AUDIT_TEXT_OPTIONS = frozenset(
+    {
+        "--requirement",
+        "--osv-url",
+        "--cache-dir",
+        "--path",
+        "--index-url",
+        "--extra-index-url",
+        "--output",
+        "--ignore-vuln",
+    }
+)
+_PIP_AUDIT_OPTIONS = _PIP_AUDIT_FLAGS | _PIP_AUDIT_FIXED_VALUE_OPTIONS | _PIP_AUDIT_TEXT_OPTIONS
+
+
+#: The short forms of those that take a value, with the long form each stands for.
+_PIP_AUDIT_SHORT_VALUE_OPTIONS = {
+    "-r": "--requirement",
+    "-o": "--output",
+    "-f": "--format",
+    "-s": "--vulnerability-service",
+}
+
+#: This module's own options, which argparse hands to pip-audit when they come after the lock.
+_OWN_OPTIONS = ("--skip-private", "--pass-environment")
+
+#: pip-audit options refused after the lock. A dry run without
+#: ``--fix``, help and version audit nothing and exit 0. ``--fix`` audits, then rewrites every
+#: requirements file pip-audit was given, the copy included, to fixed versions; it can exit 0 on a
+#: vulnerable lock.
+_FAIL_OPEN_LONG = ("--dry-run", "--fix", "--help", "--version")
+_FAIL_OPEN_SHORT = frozenset("dhV")
+
+
+def _opens_the_gate(head: str) -> bool:
+    """Whether ``head``, a word up to any ``=``, is one of :data:`_FAIL_OPEN_LONG` or an
+    abbreviation of one, or a cluster of short flags that holds one of :data:`_FAIL_OPEN_SHORT`
+    before any short option that takes a value."""
+    if head.startswith("--"):
+        return len(head) > 2 and any(option.startswith(head) for option in _FAIL_OPEN_LONG)
+    if not head.startswith("-"):
+        return False
+    for letter in head[1:]:
+        if letter in _FAIL_OPEN_SHORT:
+            return True
+        if f"-{letter}" in _PIP_AUDIT_SHORT_VALUE_OPTIONS:
+            return False
+    return False
+
+
+def _names_own_option(head: str) -> bool:
+    """Whether ``head`` is one of :data:`_OWN_OPTIONS` or an abbreviation of it that is no
+    abbreviation of a pip-audit option: ``--pas`` and ``--skip-p`` are this module's, while ``--pa``
+    is pip-audit's ``--path`` and ``--skip`` its ``--skip-editable``."""
+    return (
+        len(head) > 2
+        and any(option.startswith(head) for option in _OWN_OPTIONS)
+        and not any(option.startswith(head) for option in _PIP_AUDIT_OPTIONS)
+    )
+
+
+def _after_lock_refusal(pip_audit_args: Sequence[str]) -> str | None:
+    """Why a word after the lock is not passed to pip-audit, or ``None``. The refusal names the
+    word's position, never the word.
+
+    One of this module's own options there, abbreviated or in the ``=`` form, goes before the lock.
+    Any other word holding ``=`` must be ``--option=value`` for a pip-audit option that takes a
+    value, named exactly, long or short (``--format=json``, ``-o=out.json``): pip-audit's usage
+    error quotes a word it does not take, or its value, whole, so ``NAME=value`` typed there would
+    carry the value into a CI log. A fixed-form value, a choice or a number, may not itself hold
+    ``=``, since argparse's error for a bad one quotes it. An abbreviation in the ``=`` form is
+    refused rather than resolved, since the pip-audit that runs may read it as another option or
+    as ambiguous. A free-text value that holds ``=`` still reaches pip-audit, which can print it
+    in its own output, at least its ``--verbose`` debug line of the arguments it parsed."""
+    for position, word in enumerate(pip_audit_args, 1):
+        head, equals, value = word.partition("=")
+        if _names_own_option(head):
+            return (
+                f"word {position} after the lock is this auditor's own option; it goes before "
+                "the lock"
+            )
+        if _opens_the_gate(head):
+            return f"word {position} after the lock is not passed on"
+        if not equals:
+            continue
+        option = _PIP_AUDIT_SHORT_VALUE_OPTIONS.get(head, head)
+        if option in _PIP_AUDIT_TEXT_OPTIONS or (
+            option in _PIP_AUDIT_FIXED_VALUE_OPTIONS and "=" not in value
+        ):
+            continue
+        return (
+            f"word {position} after the lock holds '=' and is not a pip-audit option that takes "
+            "a value, named in full and given as --option=value with a value of its form; it is "
+            "not passed on"
+        )
+    return None
+
+
+class _UnquotingParser(argparse.ArgumentParser):
+    """A parser whose usage error quotes nothing it was given once any word holds ``=``: argparse
+    quotes an unrecognized word whole, and the value of an ``--option=value`` it cannot take, so a
+    misspelled ``--pass-enviroment=NAME=value`` would carry the value into a CI log (vault BACKLOG
+    #2600)."""
+
+    def __init__(self, words: Sequence[str], *, description: str | None) -> None:
+        super().__init__(description=description)
+        self._quotes_a_value = any("=" in word for word in words)
+
+    def error(self, message: str) -> NoReturn:
+        if self._quotes_a_value:
+            message = (
+                "the arguments could not be read; with a word holding '=' given, the reason is "
+                "not printed, since it can quote that word. Check the spelling of each option"
+            )
+        super().error(message)
+
+
+def _pass_environment_refusal(names: Sequence[str], pip_audit_args: Sequence[str]) -> str | None:
+    """Why a ``--pass-environment`` request is refused, or ``None``.
+
+    The flag after the lock is :func:`_after_lock_refusal`'s. The text echoes no entry that is not
+    a name."""
+    refusals = (pass_environment_refusal(name) for name in names)
+    first = next((refusal for refusal in refusals if refusal), None)
+    return f"--pass-environment: {first}" if first else None
+
+
+def _run(cmd: list[str], *, pass_environment: Sequence[str] = ()) -> int:
+    # An allowlist (vault BACKLOG #2587), plus what the caller named; its docstring says what
+    # crosses.
+    env = auditor_environment(extra_names=pass_environment)
     # The argv is a list and no shell reads it, but it is not all fixed. Written in this module:
     # the module name (pip or pip_audit) and each flag main() writes. From python_module_argv: the
     # interpreter and its child flags, some fixed and some repeated from this process's own flags
@@ -537,8 +711,9 @@ def _run(cmd: list[str]) -> int:
     return subprocess.run(cmd, check=False, env=env).returncode  # nosec B603 - argv list, no shell
 
 
-def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _run) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
+def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | None = None) -> int:
+    words = list(sys.argv[1:] if argv is None else argv)
+    parser = _UnquotingParser(words, description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument(
         "--skip-private",
         action="append",
@@ -547,18 +722,43 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
         help="leave this pin out of the audit, for a package no advisory database can look up; "
         "repeatable, and given before the lock",
     )
+    parser.add_argument(
+        "--pass-environment",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="also hand pip and pip-audit this environment variable, such as one a keyring "
+        "backend reads; repeatable, and given before the lock",
+    )
     parser.add_argument("lock", type=Path, help="the hashed lock to audit")
     parser.add_argument(
         "pip_audit_args",
         nargs=argparse.REMAINDER,
         help="passed through to pip-audit, e.g. --ignore-vuln <ID>",
     )
-    args = parser.parse_args(argv)
+    args = parser.parse_args(words)
+    # Nothing typed that holds "=" is printed below (vault BACKLOG #2600): a lock word or a
+    # --skip-private entry holding one is refused here unquoted, a word after the lock by its
+    # position, and a --pass-environment entry by pass_environment_refusal, which never echoes it.
+    if "=" in str(args.lock):
+        print(
+            "::error::the lock path holds '='; it is not quoted, since a NAME=value typed without "
+            "its flag is read as the lock. Name the lock first, or check the option before it",
+            file=sys.stderr,
+        )
+        return 2
+    lock = str(args.lock)
+    refusal = _after_lock_refusal(args.pip_audit_args)
+    if any("=" in name for name in args.skip_private):
+        refusal = "a --skip-private entry is not a package name; name packages only"
+    if refusal:
+        print(f"::error::{lock}: {refusal}", file=sys.stderr)
+        return 2
 
     try:
         raw = args.lock.read_bytes()
     except OSError as exc:
-        print(f"::error::{args.lock}: not readable: {exc}", file=sys.stderr)
+        print(f"::error::{lock}: not readable: {safe_exc(exc, file_name=lock)}", file=sys.stderr)
         return 2
     try:
         source, copy_encoding = _decode_lock(raw)
@@ -567,7 +767,7 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
         # safe_exc names it by type, codec and position; a LookupError keeps its type and a
         # bounded text, since the codec name it quotes is the lock's own, of any length.
         print(
-            f"::error::{args.lock}: not decodable the way pip decodes a requirements file: "
+            f"::error::{lock}: not decodable the way pip decodes a requirements file: "
             f"{safe_exc(exc)}",
             file=sys.stderr,
         )
@@ -576,18 +776,18 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
     stripped_lines, stripped, requirements = _strip(lines, kinds)
     if requirements == 0:
         print(
-            f"::error::{args.lock}: no requirement lines -- refusing an empty audit",
+            f"::error::{lock}: no requirement lines -- refusing an empty audit",
             file=sys.stderr,
         )
         return 2
     options = _lines_of(lines, kinds, "option")
     if options:
-        print(f"::error::{args.lock}: pip option lines are not audited: {options}", file=sys.stderr)
+        print(f"::error::{lock}: pip option lines are not audited: {options}", file=sys.stderr)
         return 2
     continued = _lines_of(lines, kinds, "continued")
     if continued:
         print(
-            f"::error::{args.lock}: a requirement continues onto a line whose marker would not be "
+            f"::error::{lock}: a requirement continues onto a line whose marker would not be "
             f"removed: {continued}",
             file=sys.stderr,
         )
@@ -596,12 +796,14 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
     # pip-audit's parser reads (see _pip_audit_requirement_count). Checked here, before _drop reads
     # the stripped lines by the lock's kinds, and again on the copy _drop leaves.
     if _pip_audit_requirement_count("".join(stripped_lines)) != requirements:
-        print(f"::error::{args.lock}: {_COUNT_REFUSAL}", file=sys.stderr)
+        print(f"::error::{lock}: {_COUNT_REFUSAL}", file=sys.stderr)
         return 2
     private = {canonical_name(name) for name in args.skip_private}
-    refusal = _skip_private_refusal(private, args.pip_audit_args)
+    refusal = _skip_private_refusal(private, args.pip_audit_args) or _pass_environment_refusal(
+        args.pass_environment, args.pip_audit_args
+    )
     if refusal:
-        print(f"::error::{args.lock}: {refusal}", file=sys.stderr)
+        print(f"::error::{lock}: {refusal}", file=sys.stderr)
         return 2
     # _strip rewrote lines one for one and kept each one's continuation, so their kinds stand: the
     # check above refuses a copy where they do not.
@@ -609,29 +811,29 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
     unmatched = private - {name for name, _ in skipped}
     if unmatched:
         print(
-            f"::error::{args.lock}: --skip-private names a package the lock does not pin: "
+            f"::error::{lock}: --skip-private names a package the lock does not pin: "
             f"{sorted(unmatched)}",
             file=sys.stderr,
         )
         return 2
     if len(skipped) == requirements:
-        print(f"::error::{args.lock}: --skip-private leaves no pin to audit", file=sys.stderr)
+        print(f"::error::{lock}: --skip-private leaves no pin to audit", file=sys.stderr)
         return 2
     counted = requirements - len(skipped)
     audited = "".join(kept)
     read = _pip_audit_requirements(audited)
     if read is None or len(read) != counted:
-        print(f"::error::{args.lock}: {_COUNT_REFUSAL}", file=sys.stderr)
+        print(f"::error::{lock}: {_COUNT_REFUSAL}", file=sys.stderr)
         return 2
     if any(map(_pip_audit_may_see_marker, read)):
-        print(f"::error::{args.lock}: {_MARKER_REFUSAL}", file=sys.stderr)
+        print(f"::error::{lock}: {_MARKER_REFUSAL}", file=sys.stderr)
         return 2
     # A skipped pin is neither counted nor listed as audited.
     stripped = [
         e for e in stripped if not (m := _NAME.match(e)) or canonical_name(m[0]) not in private
     ]
     print(
-        f"{args.lock}: {counted} pinned requirements audited, {len(stripped)} "
+        f"{lock}: {counted} pinned requirements audited, {len(stripped)} "
         "un-gated from a marker the host would have evaluated:"
     )
     for entry in stripped:
@@ -639,6 +841,8 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
     for _, entry in skipped:
         print(f"  not audited, named by --skip-private: {entry}")
     sys.stdout.flush()
+    if run is None:
+        run = functools.partial(_run, pass_environment=tuple(args.pass_environment))
     pip_check = [*python_module_argv("pip"), "install", "--dry-run", "--ignore-installed"]
     status = run(
         [*pip_check, "--require-hashes", "--only-binary", ":all:", "--quiet", "-r", str(args.lock)]
@@ -655,8 +859,7 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
             copy.write_bytes(audited.encode(copy_encoding))
         except UnicodeError as exc:
             print(
-                f"::error::{args.lock}: its copy is not writable as {copy_encoding}: "
-                f"{safe_exc(exc)}",
+                f"::error::{lock}: its copy is not writable as {copy_encoding}: {safe_exc(exc)}",
                 file=sys.stderr,
             )
             return 2
@@ -674,7 +877,7 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
             faithful = False
         if not faithful:
             print(
-                f"::error::{args.lock}: its copy does not read back, the way pip-audit reads it, "
+                f"::error::{lock}: its copy does not read back, the way pip-audit reads it, "
                 "as the text whose pins were counted",
                 file=sys.stderr,
             )

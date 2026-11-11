@@ -282,6 +282,9 @@ A `<wsse:UsernameToken>` may carry the password two ways; the ADR supports both,
 The token credentials are dedicated `ws_username` / `ws_password` settings (falling back to
 `basic_user`/`basic_password` if unset), resolved via `env()`/DPAPI — never source.
 
+*(Amended 2026-11-10, BACKLOG #5526: the fallback to `basic_user`/`basic_password` is removed, and a
+half pair is refused. See the amendment at the end of this ADR.)*
+
 ### 5. Response / error capture + classification (Q5) — reuse ADR 0013, extend the fault map
 
 Capture is **already built** and stays regex-based (no XML parser; §2a) *(corrected 2026-11-04: see the
@@ -366,6 +369,7 @@ path** (including via the `connections.toml` desugar, ADR 0007) — never source
   `UsernameToken`).
 - `ws_username: str | EnvRef | None`, `ws_password: str | EnvRef | None` — UsernameToken credentials
   (default to `basic_user`/`basic_password` if unset); secrets via `env()`/DPAPI.
+  *(Amended 2026-11-10, BACKLOG #5526: no default any more; see the amendment at the end of this ADR.)*
 - `ws_password_type: str = "text"` — `"text"` (PasswordText; recommended over mTLS) | `"digest"`
   (PasswordDigest computed in `send()`; §4a).
 - `ws_addressing: bool = False` — stamp `<wsa:Action>` (from `soap_action`), `<wsa:To>` (from `url`),
@@ -519,3 +523,28 @@ WS-Security carries credentials in the `<Header>` (`_build_username_token`, [`so
 | **Nested `body_secrets={token: env()}` reaching the connector unresolved** | `resolve_env_settings` is top-level only; the connector would splice `EnvRef` *reprs* onto the wire. Hence the flat-key hoist. |
 | **`connections.toml` / GUI support** | The nested table has no lossless flat round-trip (the writer emits the hoisted keys, which the factory would then reject), and the VS Code connection editor renders a nested map as `[object Object]`. Refused loudly instead of corrupting silently — code-first only. |
 | **No-token "compose the credential elements" design** | Needs a SOAP 1.1 envelope generator the engine does not have, cannot express a `<Credentials>` wrapper / interleaved `xs:sequence`, and removes plain mode. Not buildable against an unread WSDL. |
+
+## Amendment (2026-11-10) — no fallback from `ws_*` to `basic_*`; half credential pairs refused (BACKLOG #5526)
+
+§4 and the settings list above said the UsernameToken credentials fall back to `basic_user`/`basic_password`
+when `ws_username`/`ws_password` are unset. That fallback is **removed**. With `ws_security` on and only the
+Basic pair configured, the connector sent the same password twice: once as an HTTP `Authorization: Basic`
+header and once in the `<wsse:UsernameToken>`. The two are different credentials securing different layers
+(this ADR's §4 versus the HTTP hop), and a partner that wants both can configure both explicitly.
+
+**What the connector does now** (`SoapDestination.__init__`, on the `env()`-resolved settings, so an
+`env()` that resolves to an empty string counts as unset):
+
+- `basic_user` without `basic_password`, or the reverse, is refused. One half used to build and then send
+  no HTTP Basic header.
+- With `ws_security` on, `ws_username` without `ws_password`, or the reverse, is refused. A user alone used
+  to stamp a UsernameToken with an empty password; a password alone stamped nothing.
+- With `ws_security` on and **neither** half set, the connector stamps the `<wsu:Timestamp>` alone. That is
+  a recognised WS-Security profile, for example beside mutual TLS, so it builds rather than refuses.
+- With `ws_security` off, `ws_username`/`ws_password` are not read for the wire, as before.
+
+**Why there is no migration step.** MessageFoundry has no deployed instance (CLAUDE.md §0), so no
+configuration relies on the fallback, and the simple end state costs nothing to reach. The static-credential
+census (`config/static_credentials.py`, `_http_static`) and `docs/CONNECTIONS.md` changed in the same commit.
+
+`tests/test_soap_credential_pairs.py` pins each case above.
