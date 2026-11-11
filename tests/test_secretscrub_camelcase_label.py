@@ -69,6 +69,7 @@ _SURFACES = (
 
 @pytest.mark.parametrize(("line", "label"), _CAMEL_LINES, ids=[line for line, _ in _CAMEL_LINES])
 def test_a_camelcase_label_loses_its_value_on_every_surface(line: str, label: str) -> None:
+    assert len(_SURFACES) >= 3
     printed = [name for name, apply in _SURFACES if _VALUE in apply(line)]
     assert not printed, (line, printed)
     out = scrub_credentials(line)
@@ -208,6 +209,7 @@ _COMPOUND_KEY_LINES = (
 
 @pytest.mark.parametrize("line", _COMPOUND_KEY_LINES)
 def test_a_compound_key_label_loses_its_value_on_every_surface(line: str) -> None:
+    assert len(_SURFACES) >= 3
     printed = [name for name, apply in _SURFACES if _VALUE in apply(line)]
     assert not printed, (line, printed)
 
@@ -394,6 +396,7 @@ _REVIEW_REGRESSIONS = (
 def test_a_value_the_reading_before_hid_stays_hidden_on_every_surface(
     line: str, value: str
 ) -> None:
+    assert len(_SURFACES) >= 3
     printed = [name for name, apply in _SURFACES if value in apply(line)]
     assert not printed, (line, printed)
 
