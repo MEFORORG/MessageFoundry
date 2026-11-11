@@ -149,6 +149,8 @@ def _runs_through_a_file(path: str, root: str) -> bool:
             if os.path.dirname(parent) == parent:  # a filesystem root; never a bundled root
                 return False
             parent = os.path.dirname(parent)
+        except (OSError, ValueError):  # unreadable: not shown to be a file, so the miss stands
+            return False
     return False
 
 
@@ -196,12 +198,15 @@ def _resolve_within(path: str, root: str) -> str | None:
 
 
 def _read(path: str, *, no_follow: bool) -> bytes:
-    """The bytes of the regular file at ``path``; anything else raises an ``OSError``.
+    """The bytes of the regular file at ``path``. Any other file that opens raises an ``OSError``
+    once open; a path that cannot be opened raises what ``os.open`` raises, which is a ``ValueError``
+    for a NUL in it.
 
-    On POSIX ``os.open`` succeeds on a directory, a FIFO or a device, and ``os.fdopen`` then raised
-    without closing the descriptor it was handed, so each such location leaked one. ``O_NONBLOCK``
-    (POSIX only) keeps a FIFO with no writer from blocking the open, and ``fstat`` refuses every
-    non-regular file before a read, so a device such as ``/dev/zero`` is never read without end."""
+    On POSIX ``os.open`` succeeds on a directory or a device, and ``os.fdopen`` then raised without
+    closing the descriptor it was handed, so each such location leaked one. A FIFO with no writer
+    blocked the open itself; ``O_NONBLOCK`` (POSIX only) lets that open return. ``fstat`` then refuses
+    every non-regular file before any read, so a device such as ``/dev/zero`` is never read without
+    end, and the descriptor is closed on every path."""
     # O_NOFOLLOW (POSIX only) refuses a final component swapped for a link after the walk checked it.
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
     if no_follow:
@@ -366,12 +371,15 @@ class _ConfinedFiles(urllib.request.BaseHandler):
                 # Every reason is fixed text.
                 try:
                     if not root.vet:  # library files, read as they are, links included
+                        through_a_file = False
                         try:
                             data = _read(written, no_follow=False)
                         except FileNotFoundError:
-                            if _runs_through_a_file(written, root.path):
-                                raise _not_a_directory() from None
-                            raise
+                            if not _runs_through_a_file(written, root.path):
+                                raise  # a missing file, as xmlschema has always reported it
+                            through_a_file = True
+                        if through_a_file:  # raised outside the handler, so nothing is chained
+                            raise _not_a_directory()
                         return urllib.response.addinfourl(
                             io.BytesIO(data), email.message.Message(), url
                         )

@@ -24,6 +24,7 @@ rooted paths with no drive.
 from __future__ import annotations
 
 import codecs
+import gc
 import os
 import stat
 import sys
@@ -808,12 +809,15 @@ def test_a_directory_location_is_refused_and_leaks_no_descriptor(tmp_path: Path)
             validate_against("<patient>x</patient>", str(tmp_path / "dir5537.xsd"))
 
     refuse_both()  # warm-up, so anything opened once and kept is not counted
+    gc.collect()  # so a collection mid-loop cannot close an earlier test's descriptor and mask one
     before = _open_fds()
     if before is None:  # Windows: no listing to count, and the refusal is asserted above
         return
     for _ in range(5):
         refuse_both()
-    assert _open_fds() == before  # 10 refusals, so a leak shows as 10 more descriptors
+    after = _open_fds()
+    assert after is not None
+    assert after <= before  # 10 refusals, so a leak shows as 10 more descriptors
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="a FIFO is POSIX")
