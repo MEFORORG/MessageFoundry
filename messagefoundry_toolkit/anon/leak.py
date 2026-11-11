@@ -7,7 +7,7 @@ customer/partner/site tokens — and that token set must be the SINGLE source of
 copy that drifts (the very drift that already bit ``tests/test_load_config.py``). So the toolkit-side
 leak-check delegates to ``scripts/security/scan_forbidden.py`` — the owner-managed guard — via
 its importable :func:`scan_text`. The standalone ``tee/anon/leak.py`` loads the same guard by
-path and reads its tables at each scan, so it holds no copy of them.
+path and reads its name and estate tables at each scan, so it holds no copy of them.
 
 The token denylist alone is a **backstop that only catches known *strings***: a real MRN in a field
 the rule map never mapped is not a denylisted token, so it would sail through clean. Two structural
@@ -823,7 +823,8 @@ def leak_report(
     keeps past its first (:func:`kept_component_hits`). With ``rules is None`` (a direct/legacy
     call over a bare string) structural detection is skipped and the check is token-only, as the
     legacy one was, except that the token scan also reads the text decoded from its HL7 escape
-    sequences (BACKLOG #5532), so it can name a token the legacy check missed.
+    sequences when it has a parseable MSH (BACKLOG #5532), so it can name a token the legacy check
+    missed.
 
     ``version`` is the HL7 version a bare line is judged by. A caller that checks the OUTPUT of
     ``anonymize`` passes the version of the INPUT (:func:`message_version`), because a rule may
@@ -886,7 +887,8 @@ def leak_check(
     """Forbidden-token + structural PHI hits in ``text`` (empty list = clean) — a thin wrapper over
     :func:`leak_report`. ``rules`` scopes the structural PHI-shape detectors to the fields no rule
     matched, to what a retarget left and to the components an identifier rule keeps; omitting it
-    (a bare-string call) runs the legacy token-only check. A caller that ran ``anonymize`` itself
+    (a bare-string call) runs the token-only check :func:`leak_report` describes. A caller that ran
+    ``anonymize`` itself
     passes ``version=message_version(raw)``, as :func:`leak_report` says.
     """
     return leak_report(text, rules=rules, version=version).hits

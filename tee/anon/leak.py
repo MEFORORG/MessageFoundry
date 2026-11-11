@@ -8,7 +8,8 @@ same way ``messagefoundry_toolkit/anon/leak.py`` does) rather than vendoring a c
 literal or fragmented customer/vendor token appears in this tracked, published file**, and there is nothing to
 drift (``test_anon_parity`` still pins the two equal). Loading by path keeps the tee ``messagefoundry``-free.
 The name and estate tables are read from the guard at each scan, not copied at import, so a
-``reload_tokens()`` on the guard reaches those tables and the liveness flag together (BACKLOG
+``reload_tokens()`` on this module's own guard instance, ``_GUARD``, reaches those tables and the
+liveness flag together (BACKLOG
 #5541). It does not reach the site-code check: ``surrogates.message_has_site_code`` keeps the
 prefixes ``surrogates.py`` loaded at import until ``surrogates.reload_site_prefixes()`` runs, so
 after a guard reload alone a report can call the denylist live while that check uses the old
@@ -866,7 +867,8 @@ def leak_report(
     rather than the toolkit's ``_scanner()`` delegate, but the structural walk, coverage report, and
     token-floor signal are the byte-identical shared logic above. Structural detection engages **only
     when ``rules`` is supplied**; a bare-string call is token-only, as the legacy one was, except
-    that the token scan also reads the text decoded from its HL7 escape sequences (BACKLOG #5532).
+    that the token scan also reads the text decoded from its HL7 escape sequences when it has a
+    parseable MSH (BACKLOG #5532).
 
     ``version`` is the HL7 version a bare line is judged by. A caller that checks the OUTPUT of
     ``anonymize`` passes the version of the INPUT (:func:`message_version`), because a rule may
@@ -939,7 +941,8 @@ def leak_check(
     """Forbidden-token + structural PHI hits in ``text`` (empty list = clean) — a thin wrapper over
     :func:`leak_report`. ``rules`` scopes the structural PHI-shape detectors to the fields no rule
     matched, to what a retarget left and to the components an identifier rule keeps; omitting it
-    (a bare-string call) runs the legacy token-only check. A caller that ran ``anonymize`` itself
+    (a bare-string call) runs the token-only check :func:`leak_report` describes. A caller that ran
+    ``anonymize`` itself
     passes ``version=message_version(raw)``, as :func:`leak_report` says.
     """
     return leak_report(text, rules=rules, version=version).hits
