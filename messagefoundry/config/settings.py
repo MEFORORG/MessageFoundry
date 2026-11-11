@@ -2567,8 +2567,9 @@ class SandboxSettings(_Section):
       ``mode="subprocess"`` or ``mode="isolated"`` the parent kills a worker that overruns and fails
       that message's call post-ACK, for the ``[delivery] internal_error`` policy to handle
       (``ERROR``/dead-letter under the default ``continue``; under ``stop`` the inbound's routing
-      or transform halts). A busy-loop can no longer wedge intake, **and** a legitimately slow Handler that
-      used to finish now fails. ``startup_seconds`` and the POSIX ``mem_mb`` arm with it.
+      or transform halts). A busy-loop can no longer wedge intake, **and** a legitimately slow
+      Handler that used to finish now fails. ``startup_seconds`` and the POSIX ``mem_mb`` arm with
+      it.
     * **Throughput** ~0.19 ms per dispatch with no reference view; a 20k-entry crosswalk ~4.5 ms
       marshalling and ~6.2 ms end-to-end, ~1.4x a pickle round-trip — inside the pipeline's existing
       per-interface bound. **One message is not one dispatch:** a message routed to one handler with
