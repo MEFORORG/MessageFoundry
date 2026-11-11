@@ -3188,8 +3188,9 @@ def _serve(args: argparse.Namespace) -> int:
     # the ADR 0173 revocation attestation with its reason, where it suppresses a refusal; at least the
     # bind gates' and raw-TCP guard's tls_hop_attested line, and the database weakened-TLS line that a
     # DatabaseRef source also writes, without the reason),
-    # and all of them completely by `messagefoundry check` and GET /security/posture, which both have
-    # the graph.
+    # and all of them completely by GET /security/posture, which has the graph. `messagefoundry
+    # check` has it too and reports all but an HTTP listener's trusted_proxies (BACKLOG #5525),
+    # whose ranges the listener logs as it is built.
     # The store is NOT open yet either, so the #1008 store-principal privilege OBSERVATION is passed as
     # None for the same reason and with the same discipline: it is reported moments later by the
     # preflight's own log line + audit row once the lifespan opens the store, and completely by
@@ -3235,10 +3236,10 @@ def _serve(args: argparse.Namespace) -> int:
             "url_query_credential, "
             "generic-ODBC "
             "database TLS, tls_hop_attested, tls_revocation_attested (ADR 0173), FHIR update_url_form "
-            "and http ECH sidecar (ADR 0139) declarations are NOT in this list — the graph is not "
-            "loaded yet; they are "
-            "reported by `messagefoundry check` and GET /security/posture, and most also by the "
-            "connector construction gate. Nor is the store-principal privilege observation (#1008) — the "
+            "and http ECH sidecar (ADR 0139) declarations, and an HTTP listener's trusted_proxies, "
+            "are NOT in this list — the graph is not loaded yet; they are "
+            "reported by GET /security/posture, all but the last by `messagefoundry check`, and "
+            "most also by the connector construction gate. Nor is the store-principal privilege observation (#1008) — the "
             "store is not open yet; the startup preflight logs and audits it moments from now.",
             len(_loosenings),
             "; ".join(f"{name} ({risk})" for name, risk in _loosenings),
@@ -8950,9 +8951,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
     if settings is None:
         return _emit_error(detail or "could not load the service settings", as_json=args.json)
 
-    # AC-15: the argument checks, before the prompt and before any open. The limits are the web
-    # console's (`UserCreateRequest`), so this offline surface admits nothing the console refuses,
-    # and the address limit is the one `admin-set-notify-email` applies.
+    # AC-15: the argument checks, before the prompt and before any open. The length limits are the
+    # web console's (`UserCreateRequest`), and the address limit is the one `admin-set-notify-email`
+    # applies. The new-username rule (BACKLOG #5521, `auth/usernames.py`) is NOT applied here: this
+    # trims the name rather than refusing white space at either end, and admits a control character
+    # and the audit trail's synthetic actor forms, which `POST /users` refuses. `POST
+    # /users/directory` and an AD sign-in that creates its mirror row do not apply it either.
     username = args.username.strip()
     if not username:
         return _emit_error(_BLANK_USERNAME_REFUSAL, as_json=args.json)
@@ -11080,8 +11084,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
     try:
         active_key = resolve_active_key(settings.store, posture=posture)
     except _key_unresolved() + (ValueError,) as exc:
-        # KeyProviderError: a non-default [store].key_provider that is unknown or not-yet-built (an
-        # external HSM/KMS/Vault provider) — fail closed with a clean exit-2, not a traceback (ADR 0019).
+        # KeyProviderError: a non-default [store].key_provider that is unknown, or an external
+        # provider that cannot load or resolve — fail closed with a clean exit-2, not a traceback
+        # (ADR 0019).
         #
         # ValueError (vault BACKLOG #3247): under key_provider=vault the Vault client build can
         # refuse with a bare one, which reached the dispatch floor and exited 1, an aborted
@@ -12865,7 +12870,8 @@ def _security(args: argparse.Namespace) -> int:
                 "cleartext_accepted, tls_allow_expired, tls_check_hostname, url_query_credential, "
                 "generic-ODBC database TLS, "
                 "tls_hop_attested, "
-                "tls_revocation_attested, FHIR update_url_form and http ECH sidecar declarations are "
+                "tls_revocation_attested, FHIR update_url_form, http ECH sidecar and HTTP listener "
+                "trusted_proxies declarations are "
                 "NOT included, and neither are the store-principal privilege and audit-chain keying "
                 "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
                 "GET /security/posture reports both). Nor are the engine process's remote-debugging "

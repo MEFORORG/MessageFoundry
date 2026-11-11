@@ -13,12 +13,16 @@ loopback SSH server on 127.0.0.1 and handshake with it. They skip where it is no
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime
 import ftplib
+import inspect
 import ipaddress
 import logging
 import posixpath
+import socket
 import ssl
+import threading
 import traceback
 from collections.abc import Sequence
 from pathlib import Path
@@ -38,6 +42,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.x509.oid import NameOID
 
+from messagefoundry import pki
 from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Ftp, Sftp, WiringError
@@ -1319,7 +1324,8 @@ def test_ftps_insecure_allowed_with_escape(
 
 
 def test_ftps_connect_passes_context(monkeypatch: pytest.MonkeyPatch) -> None:
-    # FTP_TLS is constructed with the built verifying context= kwarg (not the no-verify default).
+    # The FTPS session class is constructed with the built verifying context= kwarg (not the
+    # no-verify default).
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     recorded: dict[str, Any] = {}
 
@@ -1346,14 +1352,260 @@ def test_ftps_connect_passes_context(monkeypatch: pytest.MonkeyPatch) -> None:
         def close(self) -> None:
             pass
 
-    import ftplib as _ftplib
-
-    monkeypatch.setattr(_ftplib, "FTP_TLS", _RecordingFTPTLS)
+    monkeypatch.setattr(remotefile, "_SessionReusingFtpTls", _RecordingFTPTLS)
     client = _FtpClient({"host": "ftp.example.com", "remote_dir": "/in"}, tls=True)
     ftp = client._connect()
     assert isinstance(ftp, _RecordingFTPTLS)
     assert isinstance(recorded["context"], ssl.SSLContext)
     assert recorded["context"].verify_mode == ssl.CERT_REQUIRED
+
+
+# --- BACKLOG #5530: a PROT P data connection resumes the control channel's TLS session -------------
+#
+# These run real TLS over loopback. Only ftplib's plain ``FTP.ntransfercmd`` (the PASV and RETR
+# exchange) and ``FTP.voidcmd`` (the PBSZ and PROT replies) are replaced; the TLS wrap is the code
+# under test.
+
+
+class _LoopbackTlsServer:
+    """Accepts ``count`` connections on loopback, completes a TLS handshake on each (on a fresh
+    self-signed ``localhost`` pair written to ``directory``), records whether it resumed a session,
+    and sends one byte, which carries any TLS 1.3 ticket to the client first. With ``garbage``, it
+    answers each connection with bytes that are not TLS instead. It then reads each connection until
+    the client closes it, so it never resets one with unread data.
+
+    Used as a context manager. Leaving it closes every client socket the test appended to
+    ``clients``, so a failing assert does not leave the thread waiting. ``error`` holds whatever the
+    serving thread raised, and ``finished`` whether it ended."""
+
+    def __init__(
+        self,
+        directory: Path,
+        *,
+        count: int,
+        version: ssl.TLSVersion,
+        garbage: bool = False,
+        num_tickets: int = 2,
+    ) -> None:
+        self._context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.ca_file = directory / "srv-c.pem"
+        if not garbage:  # a server that never handshakes needs no certificate
+            cert_pem, key_pem = pki.make_self_signed("localhost", [], 1)
+            directory.mkdir()
+            key_file = directory / "srv-k.pem"
+            self.ca_file.write_bytes(cert_pem)
+            key_file.write_bytes(key_pem)
+            self._context.load_cert_chain(self.ca_file, key_file)
+            self._context.minimum_version = self._context.maximum_version = version
+            self._context.num_tickets = num_tickets
+        self._count = count
+        self._garbage = garbage
+        self.reused: list[bool] = []
+        self.clients: list[socket.socket] = []
+        self.error: Exception | None = None
+        self.finished = False
+        self._listener = socket.create_server(("127.0.0.1", 0))
+        self._listener.settimeout(5)
+        self.address = self._listener.getsockname()[:2]
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    def __enter__(self) -> _LoopbackTlsServer:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        for sock in self.clients:
+            sock.close()
+        self._listener.close()
+        self._thread.join(5)
+        self.finished = not self._thread.is_alive()
+
+    def _serve(self) -> None:
+        held: list[socket.socket] = []
+        try:
+            for _ in range(self._count):
+                raw, _peer = self._listener.accept()
+                raw.settimeout(5)
+                held.append(raw)
+                if self._garbage:
+                    raw.sendall(b"421 not a TLS server\r\n" * 4)
+                    continue
+                conn = self._context.wrap_socket(raw, server_side=True)
+                held[-1] = conn
+                self.reused.append(bool(conn.session_reused))
+                conn.sendall(b"x")
+        except Exception as exc:  # recorded for the test to assert on, never dropped
+            self.error = exc
+        finally:
+            for sock in held:
+                # A client that closes with a ticket or garbage unread resets the connection here.
+                with contextlib.suppress(OSError):
+                    while sock.recv(4096):
+                        pass
+                sock.close()
+
+
+def _ftps_over_loopback(
+    cls: type[ftplib.FTP_TLS],
+    server: _LoopbackTlsServer,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    data_address: tuple[str, int] | None = None,
+) -> tuple[ftplib.FTP_TLS, ssl.SSLSocket]:
+    """A session object of ``cls`` whose control channel is a real TLS connection to ``server``,
+    built from the connector's own verifying context and secured with the real ``prot_p``, and whose
+    data connections are raw loopback connects to ``data_address`` (default: ``server``), appended
+    to ``server.clients``."""
+    context = _ftps_ssl_context({"host": "localhost", "tls_ca_file": str(server.ca_file)})
+    control = context.wrap_socket(
+        socket.create_connection(server.address, timeout=5), server_hostname="localhost"
+    )
+    server.clients.append(control)
+    assert control.recv(1) == b"x"  # a reply on the control channel, as the login's would be
+
+    def _raw_transfer(
+        self: ftplib.FTP, cmd: str, rest: int | str | None = None
+    ) -> tuple[Any, None]:
+        server.clients.append(socket.create_connection(data_address or server.address, timeout=5))
+        return server.clients[-1], None
+
+    monkeypatch.setattr(ftplib.FTP, "voidcmd", lambda self, cmd: "200 ok")
+    monkeypatch.setattr(ftplib.FTP, "ntransfercmd", _raw_transfer)
+    ftp = cls(context=context, timeout=5)
+    ftp.sock = control
+    ftp.host = "localhost"
+    ftp.prot_p()
+    return ftp, control
+
+
+@pytest.mark.parametrize(
+    ("stock", "version", "num_tickets", "resumes"),
+    [
+        (False, ssl.TLSVersion.TLSv1_2, 2, True),
+        (False, ssl.TLSVersion.TLSv1_3, 2, True),
+        # A TLS 1.3 server that issues no ticket leaves a session that cannot be resumed: the data
+        # handshake falls back to a full one rather than failing.
+        (False, ssl.TLSVersion.TLSv1_3, 0, False),
+        # Positive control: over the same harness the stdlib class does a full handshake on the data
+        # connection, so the instrument can tell the two apart.
+        (True, ssl.TLSVersion.TLSv1_3, 2, False),
+    ],
+)
+def test_ftps_data_channel_resumes_the_control_session(
+    stock: bool,
+    version: ssl.TLSVersion,
+    num_tickets: int,
+    resumes: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A server that requires session reuse (vsftpd require_ssl_reuse=YES) refuses a data connection
+    # that does a fresh handshake, so every transfer would fail. Both TLS versions the context allows.
+    cls = ftplib.FTP_TLS if stock else remotefile._SessionReusingFtpTls
+    with _LoopbackTlsServer(
+        tmp_path / "srv", count=2, version=version, num_tickets=num_tickets
+    ) as server:
+        ftp, control = _ftps_over_loopback(cls, server, monkeypatch)
+        data, size = ftp.ntransfercmd("RETR a.hl7")
+        server.clients.append(data)
+        assert size is None
+        assert isinstance(data, ssl.SSLSocket)
+        assert data.recv(1) == b"x"
+        assert data.version() == control.version()
+        assert data.session_reused is resumes
+    assert server.finished and server.error is None
+    assert server.reused == [False, resumes]  # the control handshake is always a full one
+
+
+@pytest.mark.parametrize("prot_p", [True, False])
+def test_ftps_data_channel_wrap_without_a_tls_control_socket(
+    prot_p: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A control socket that is not TLS has no session: under PROT P the wrap gets session=None, a
+    # full handshake, rather than an error. Under PROT C the data channel stays clear, as the
+    # stdlib's: no wrap at all. The real prot_p and prot_c set the flag the override reads.
+    calls: list[dict[str, Any]] = []
+    raw = object()
+
+    class _Context:
+        def wrap_socket(self, sock: object, **kwargs: Any) -> str:
+            assert sock is raw
+            calls.append(kwargs)
+            return "wrapped"
+
+    monkeypatch.setattr(ftplib.FTP, "voidcmd", lambda self, cmd: "200 ok")
+    monkeypatch.setattr(ftplib.FTP, "ntransfercmd", lambda self, cmd, rest=None: (raw, 7))
+    ftp = remotefile._SessionReusingFtpTls(context=_Context())  # type: ignore[arg-type]
+    ftp.host = "ftp.example.com"
+    if prot_p:
+        ftp.prot_p()
+    else:
+        ftp.prot_c()
+    result: Any = ftp.ntransfercmd("RETR a.hl7")  # the fake context returns a str
+    if prot_p:
+        assert result == ("wrapped", 7)
+        assert calls == [{"server_hostname": "ftp.example.com", "session": None}]
+    else:
+        assert result == (raw, 7)
+        assert calls == []
+
+
+def test_a_failed_data_handshake_closes_the_raw_socket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Pins the reading in _SessionReusingFtpTls's docstring that a failed data handshake leaks no
+    # socket, so a CPython change to it fails here.
+    closed: list[bool] = []
+
+    class _RecordingSslSocket(ssl.SSLSocket):
+        def close(self) -> None:
+            closed.append(True)
+            super().close()
+
+    with (
+        _LoopbackTlsServer(tmp_path / "tls", count=1, version=ssl.TLSVersion.TLSv1_3) as tls,
+        _LoopbackTlsServer(
+            tmp_path / "junk", count=1, version=ssl.TLSVersion.TLSv1_3, garbage=True
+        ) as junk,
+    ):
+        ftp, _control = _ftps_over_loopback(
+            remotefile._SessionReusingFtpTls, tls, monkeypatch, data_address=junk.address
+        )
+        ftp.context.sslsocket_class = _RecordingSslSocket
+        with pytest.raises(ssl.SSLError):
+            ftp.ntransfercmd("RETR a.hl7")
+        assert tls.clients[-1].fileno() == -1  # detached: the SSLSocket owned the descriptor
+        assert closed == [True]  # and closed it when the handshake failed
+    assert tls.finished and tls.error is None
+    assert junk.finished and junk.error is None
+
+
+def test_stdlib_ftp_tls_ntransfercmd_is_the_body_the_override_replaces() -> None:
+    # Tripwire: _SessionReusingFtpTls calls ftplib.FTP.ntransfercmd directly and repeats the stdlib
+    # FTP_TLS wrap with a session added. A CPython change to that method (native reuse, a close on a
+    # failed wrap, a check after it) would be skipped by the override, so it fails here instead.
+    body = inspect.getsource(ftplib.FTP_TLS.ntransfercmd)
+    assert [line.strip() for line in body.splitlines()] == [
+        "def ntransfercmd(self, cmd, rest=None):",
+        "conn, size = super().ntransfercmd(cmd, rest)",
+        "if self._prot_p:",
+        "conn = self.context.wrap_socket(conn,",
+        "server_hostname=self.host)",
+        "return conn, size",
+    ]
+
+
+def test_ftps_connect_builds_the_session_reusing_class(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The connector's FTPS session is the reusing class, not the stock FTP_TLS.
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    cls = remotefile._SessionReusingFtpTls
+    monkeypatch.setattr(cls, "connect", lambda self, host, port: "220 ready")
+    monkeypatch.setattr(cls, "auth", lambda self: "234 ok")
+    monkeypatch.setattr(cls, "login", lambda self, user, passwd: "230 ok")
+    monkeypatch.setattr(cls, "prot_p", lambda self: "200 ok")
+    ftp = _FtpClient({"host": "ftp.example.com", "remote_dir": "/in"}, tls=True)._connect()
+    assert type(ftp) is cls
+    assert ftp.context.verify_mode == ssl.CERT_REQUIRED
 
 
 def test_sftp_with_credentials_is_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3245,9 +3497,7 @@ class _ScriptedFtp:
 
 
 def _scripted_ftps(monkeypatch: pytest.MonkeyPatch, *, refuse_at: str, reply: str) -> None:
-    """Make ``ftplib.FTP_TLS`` a :class:`_ScriptedFtp` refusing ``refuse_at`` with ``reply``."""
-    import ftplib as _ftplib
-
+    """Make the FTPS session class a :class:`_ScriptedFtp` refusing ``refuse_at`` with ``reply``."""
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     _ScriptedFtp.instances = []
 
@@ -3255,7 +3505,7 @@ def _scripted_ftps(monkeypatch: pytest.MonkeyPatch, *, refuse_at: str, reply: st
         def __init__(self, *, context: Any = None, timeout: float | None = None) -> None:
             super().__init__(refuse_at=refuse_at, reply=reply)
 
-    monkeypatch.setattr(_ftplib, "FTP_TLS", _Ftps)
+    monkeypatch.setattr(remotefile, "_SessionReusingFtpTls", _Ftps)
 
 
 def _ftps_client() -> _FtpClient:
@@ -3925,12 +4175,10 @@ class _DropBoxFtp:
 def _drop_box(
     monkeypatch: pytest.MonkeyPatch, entries: list[tuple[str, dict[str, str]]]
 ) -> type[_DropBoxFtp]:
-    import ftplib as _ftplib
-
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     _DropBoxFtp.connections = []
     _DropBoxFtp.entries = entries
-    monkeypatch.setattr(_ftplib, "FTP_TLS", _DropBoxFtp)
+    monkeypatch.setattr(remotefile, "_SessionReusingFtpTls", _DropBoxFtp)
     return _DropBoxFtp
 
 

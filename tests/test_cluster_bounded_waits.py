@@ -196,6 +196,11 @@ class _SqlStore:
         assert isinstance(result, int)
         return result
 
+    async def _execute_clamped(
+        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
+    ) -> int:
+        return await self._execute(sql, params)  # heartbeat and release; no driver timeout here
+
 
 @pytest.fixture
 def server() -> Iterator[_Server]:

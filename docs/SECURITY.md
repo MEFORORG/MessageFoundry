@@ -134,7 +134,7 @@ Four more facts:
 ## Enforcement model
 
 Authentication is **required** for the running service. The engine `serve` command always attaches an
-auth layer, and no setting turns it off (vault BACKLOG #2719). Of the **117** engine route objects, **98 demand a
+auth layer, and no setting turns it off (vault BACKLOG #2719). Of the **121** engine route objects, **102 demand a
 specific permission** and 19 do not — 3 are deliberately unauthenticated (`GET /auth/providers`, an
 unbounded capability advertisement that carries no account state and charges **no** limiter;
 `POST /auth/login` and `POST /auth/negotiate`, bounded by the per-IP **and** global login sliding
@@ -1412,10 +1412,10 @@ apply. What each **adds** over plain `require()`:
 
 | Gate wrapper | Routes | What it adds over `require()` |
 |---|---|---|
-| `require` | 41 | nothing — the ladder itself |
+| `require` | 42 | nothing — the ladder itself |
 | `require_paced` | 17 | the **new-client-IP** refusal (403 + `X-Step-Up-Required: 1`, vault BACKLOG #2620), then per-actor anti-automation pacing on **non-GET** requests (`allow_admin_write`), 429 + a `Retry-After` naming the actor's wait |
 | `require_phi_read` | 8 | the ADR 0092 PHI-read hop refusal (`enforce_phi_read_hop`) **before** any identity work, then the **new-client-IP** refusal (403 + `X-Step-Up-Required: 1`, vault BACKLOG #2620), then the per-actor PHI-read budget, 429 + a `Retry-After` naming the actor's wait (the whole window while the global count is spent) |
-| `require_step_up` | 22 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
+| `require_step_up` | 23 | the same non-GET pacing, then the **MFA gate** (403 + `X-MFA-Required: 1`), the **new-client-IP** signal, and the credential-recency window (403 + `X-Step-Up-Required: 1`) |
 | `require_step_up_action` | 20 | the same non-GET pacing (BACKLOG #1148), the **MFA gate**, then a **single-use, action-bound** step-up grant, minted on this plane only by `POST /me/reauth` (403 + `X-Step-Up-Action: <action>`; the password leg of `POST /ui/reauth` and the IdP leg mint it for a cookie session). Promoting a route here no longer drops the pacing floor. Since vault BACKLOG #2625 it also gates the injection and bulk-export set (see [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)) |
 | `require_reauth_only_action` | 4 | password step-up **without** the MFA gate — deadlock avoidance on the MFA-enrollment lanes, and on session terminate (ASVS 7.5.2), where the grant is action-bound so a login-seeded window does not unlock it. `require_reauth_only` still exists and still backs the `/ui` twin, but BACKLOG #1149 moved the last JSON route off it, so it no longer appears in this walk |
 | `require_service_cert` | 1 | cert-only authentication (a bearer token gets 401), and a **PHI fence** that raises at *app construction* if asked to gate `messages:view_summary` / `messages:view_raw` |
@@ -1450,7 +1450,7 @@ The two gates audit differently. Under the default audit setting, `authorize_ws`
 
 The catalogue is `Permission` in [`auth/permissions.py`](../messagefoundry/auth/permissions.py); the
 enum value **is** the wire/storage string. "Routes" counts engine route objects gated on that permission
-under `create_app()` (they sum to 102, not 98, because BOTH `/messages/export` routes,
+under `create_app()` (they sum to 106, not 102, because BOTH `/messages/export` routes,
 `/messages/{id}/outbound` and `POST /uploads/{id}/resend` require two).
 
 | Constant | Permission | PHI | Routes | Gates |
@@ -1483,7 +1483,7 @@ under `create_app()` (they sum to 102, not 98, because BOTH `/messages/export` r
 | `FILES_BROWSE` | `files:browse` | **PHI** | 4 | `GET /uploads` (metadata), `GET /uploads/{id}/messages` (bulk decrypt+split), `POST /uploads/{id}/resend` (with `messages:edit` since vault BACKLOG #2625; a browse-only role reads and cannot inject) |
 | `FILES_DELETE` | `files:delete` | | 1 | `DELETE /uploads/{id}` — destructive, audited cleanup |
 | `FILES_ACCESS_ANY` | `files:access_any` | **PHI** | 0 | no route — an **object-level** override (ASVS 8.2.2), enforced in the uploaded-files handler bodies rather than at a gate (the console calls those handlers directly over the seam, so a gate would not cover it). Uploaded files are **owner-only**: without this, `files:browse`/`files:delete` reach only what the caller uploaded; with it, every uploader's. It is not a capability of its own — the holder still needs `files:browse` / `files:delete` for the route. Never assignable to a custom role |
-| `APPROVALS_APPROVE` | `approvals:approve` | | 4 | `GET /approvals`, `POST /approvals/{id}/approve`, `/reject`, `/resolve` (dual control, ASVS 2.3.5). The console's Approvals page, `/ui/approvals`, reaches all four (BACKLOG #1982, #2460). Never assignable to a custom role |
+| `APPROVALS_APPROVE` | `approvals:approve` | | 6 | `GET /approvals`, `POST /approvals/{id}/approve`, `/reject`, `/resolve` (dual control, ASVS 2.3.5). The console's Approvals page, `/ui/approvals`, reaches all four (BACKLOG #1982, #2460). Also `GET /approvals/executing` and `POST /approvals/{id}/interrupt`, which no console page reaches (BACKLOG #1562). Never assignable to a custom role |
 
 `config:validate` and `code:edit` have **no API endpoint yet**; they are defined so
 the Deployment/Coding roles are complete and those endpoints can be gated the moment they land, without
@@ -1576,12 +1576,12 @@ Managed at `GET /roles/custom` (`users:read`) and `POST` / `PUT` / `DELETE /role
 
 ### Route → permission map (engine API)
 
-**Counting basis.** `create_app()` with no arguments builds **119 route objects** — 73 declared in
-[`api/app.py`](../messagefoundry/api/app.py) (72 HTTP + 1 WebSocket) and 46 declared in
+**Counting basis.** `create_app()` with no arguments builds **121 route objects** — 75 declared in
+[`api/app.py`](../messagefoundry/api/app.py) (74 HTTP + 1 WebSocket) and 46 declared in
 [`api/auth_routes.py`](../messagefoundry/api/auth_routes.py). No other module in `api/` declares routes
-and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 123 (`/openapi.json`,
-`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 249
-(119 + the 129 console routes + the `/ui/static` mount). Of the 119: **100 are permission-gated**, 19 are
+and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 125 (`/openapi.json`,
+`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 251
+(121 + the 129 console routes + the `/ui/static` mount). Of the 121: **102 are permission-gated**, 19 are
 not. Every one is listed below — none is collapsed away.
 
 #### Functions requiring no authorization
@@ -1629,28 +1629,59 @@ tuple: they act only on the caller's own account.
 | `POST` | `/roles/custom` | `users:manage` | `require_step_up` |
 | `PUT` | `/roles/custom/{role_id}` | `users:manage` | `require_step_up_action` (action `save_ends_own_sessions`) **only when the save would end the caller's own sessions**, else the session window (BACKLOG #3401) |
 | `DELETE` | `/roles/custom/{role_id}` | `users:manage` | `require_step_up_action` (action `save_ends_own_sessions`) **only when the save would end the caller's own sessions**, else the session window (BACKLOG #3401) |
-| `GET` | `/users` | `users:read` | `require` |
-| `GET` | `/users/{user_id}/permissions` | `users:read` | `require` — the effective-permission inspector |
-| `POST` | `/users` | `users:manage` | `require_step_up` |
+| `GET` | `/users` | `users:read` | `require`. Each account's record is checked against its integrity seal (BACKLOG #5520); one that fails is listed by its `id` alone, with `integrity_failed: true` (`IntegrityFailedUser`). What that reports: *What an admin user read reports* below this table |
+| `GET` | `/users/{user_id}/permissions` | `users:read` | `require` — the effective-permission inspector. The account is read with its record checked against its integrity seal (BACKLOG #5520): 423 when the record fails it, with nothing of the row answered. What the 423 reports, and when a row read mid-write is not refused: *What an admin user read reports* below this table; 404 for an unknown user |
+| `POST` | `/users` | `users:manage` | `require_step_up`. Refuses (422) a `username` the new-username rule refuses, before anything is generated or written (BACKLOG #5521). The rule, and what it admits, is stated once, in the docstring of `messagefoundry/auth/usernames.py`; the service refuses the same name 400 for a caller that skips the request model. `provision-admin`, `POST /users/directory` and an AD sign-in that creates its account do not apply this rule |
 | `POST` | `/users/directory` | `users:manage` | `require_step_up`. Creates a directory (AD) account's mirror row by name, without a sign-in (BACKLOG #2021). The row's `objectGUID`, display name and `mail` come from a service-account directory lookup, never from the request: the body carries `username` and an optional `notify_email`, and an unknown key is refused 422. The row is never born without a notification address: the directory's `mail` is it when BACKLOG #2014's rule adopts it, and `notify_email` is then refused; otherwise `notify_email` is required and checked as `POST /users` checks `email` (400). 404 when the directory has no enabled account by that name, 400 when it returns no readable `objectGUID`, 409 when a row already holds the name or id, 503 when the directory cannot be reached. No roles: they come from the AD-group map at sign-in |
-| `PATCH` | `/users/{user_id}` | `users:manage` | `require_step_up_action` (action `admin_user_update`) |
+| `PATCH` | `/users/{user_id}` | `users:manage` | `require_step_up_action` (action `admin_user_update`). The account is read with its record checked against its integrity seal (BACKLOG #5520): 423 when the record fails it, with nothing of the row answered. What the 423 reports, and when a row read mid-write is not refused: *What an admin user read reports* below this table; 404 for an unknown user |
 | `DELETE` | `/users/{user_id}` | `users:manage` | `require_step_up` |
 | `DELETE` | `/users/{user_id}/sessions` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) -- end your own from `DELETE /me/sessions` and sign-out instead |
 | `DELETE` | `/sessions` | `users:manage` | `require_step_up_action` (action `revoke_all_sessions`). Ends the sessions it finds and keeps the caller's current session, except at least when that session's seal fails, when it is ended too, and when the revoke declines to re-stamp it, because an earlier revoke's sweep missed it or its account's record fails its seal, when the revoke ends it in the same transaction (BACKLOG #4975 and its follow-up). Whether it kept that session, in the reply and in the audit row's scope, is the store's answer from the revoke's own transaction, not a read made after it (BACKLOG #4975). Writes one `auth.session_revoked` row with the count, even a zero (BACKLOG #2614); the count includes the caller's own session wherever the call ended it. What it may miss: *Limits of the session sweep* under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142). `messagefoundry admin-revoke-sessions` is the same act from the host, for when the API is not trusted |
 | `PUT` | `/users/{user_id}/roles` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) |
 | `POST` | `/users/{user_id}/reset-password` | `users:manage` | `require_step_up_action` (action `admin_reset_password`) |
-| `GET` | `/users/{user_id}/federated-identity` | `users:manage` | `require` (a read on the `users:manage` tier, like `GET /users/{user_id}/channel-scope`). The account's stored `issuer`/`subject`, the issuer a bind would use, and whether the account carries its directory id: the pair the console's federated-identity screen shows, for a JSON caller to send back as `expected_issuer`/`expected_subject` (BACKLOG #2331). No step-up, so it spends no grant. Audited as every satisfied route is, by its `auth.permission_granted` row, as the channel-scope read is. The console page of the same pair asks for the step-up window, because it also offers the link and unlink forms. 404 for an unknown user |
+| `GET` | `/users/{user_id}/federated-identity` | `users:manage` | `require` (a read on the `users:manage` tier, like `GET /users/{user_id}/channel-scope`). The account's stored `issuer`/`subject`, the issuer a bind would use, and whether the account carries its directory id: the pair the console's federated-identity screen shows, for a JSON caller to send back as `expected_issuer`/`expected_subject` (BACKLOG #2331). No step-up, so it spends no grant. Audited as every satisfied route is, by its `auth.permission_granted` row, as the channel-scope read is. The console page of the same pair asks for the step-up window, because it also offers the link and unlink forms. 404 for an unknown user. The account is read with its record checked against its integrity seal (BACKLOG #5520): 423 when the record fails it, with nothing of the row answered. What the 423 reports, and when a row read mid-write is not refused: *What an admin user read reports* below this table |
 | `PUT` | `/users/{user_id}/federated-identity` | `users:manage` | `require_step_up_action` (action `admin_federated_identity`). Binds the account to an IdP `sub` under the configured `[auth].oidc_issuer`, or rebinds it; either one revokes every live session of the account, in the same transaction as the write (vault BACKLOG #2609). **The only path that creates a federated binding** (ADR 0184, BACKLOG #1143): a federated login never binds, and an unbound one is refused. Directory (AD) accounts only, and only one that carries its immutable directory id (`users.directory_object_id`, the `objectGUID`): 400 `directory_object_id_missing` otherwise, audited as `auth.federated_bind_refused` (BACKLOG #1143 slice C). A local account is refused 400 too, audited with reason `not_a_directory_account` (BACKLOG #3174). 409 when another account holds the identity, audited with reason `federated_subject_held` (BACKLOG #3174), and 409 `federated_binding_changed` when the account no longer holds the body's required `expected_issuer`/`expected_subject`, the pair the caller saw (BACKLOG #2026), also audited as `auth.federated_bind_refused`, with reason `federated_binding_changed`, the expected pair (BACKLOG #2331), and the pair the row held as `held_issuer`/`held_subject` wherever the refusal read it (BACKLOG #3174). 404 for an unknown user, including one deleted while the bind ran (BACKLOG #2331). A rebind is still a clear then a separate set: if another bind lands between them the rebind is refused 409 without that code, and its clear has already removed the old binding, audited as `auth.federated_subject_unbound`. The refusal itself is audited as `auth.federated_bind_refused` with reason `account_bound_concurrently`; that row and the `federated_subject_held` one carry `previous_binding_removed`, which says whether this request's clear had removed a binding first (BACKLOG #3174). **A bound account is refused Windows SSO from then on**, whether or not `oidc_enabled` is on (vault BACKLOG #2609; [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) has the limits) |
 | `DELETE` | `/users/{user_id}/federated-identity` | `users:manage` | `require_step_up_action` (action `admin_federated_identity`). Removes the binding and revokes the account's sessions (BACKLOG #1474's service method); its next federated login is refused until it is bound again. The body's required `expected_issuer`/`expected_subject` is the pair the caller saw: a stored pair that differs is refused 409 `federated_binding_changed` with nothing changed, compared under the clear's row lock (BACKLOG #2026). That refusal writes an `auth.federated_unbind_refused` audit row naming the actor, with reason `federated_binding_changed` and the expected pair (BACKLOG #2331) |
 | `POST` | `/users/{user_id}/reset-mfa` | `users:manage` | `require_step_up_action` (action `admin_reset_mfa`); **refuses (400) when `user_id` is the caller's own** — use the self-service MFA settings instead. Targeting yourself here was a third route to zero factors that skipped the last-factor refusal both self-service paths make (BACKLOG #1022). Cross-user reset is untouched: it is the always-available recovery for a locked-out passkey user (ADR 0068 §2) |
 | `POST` | `/users/{user_id}/enrolment-code` | `users:manage` | `require_step_up_action` (action `admin_enrolment_code_issue`). Issues a directory account's single-use enrolment code, returned once and `no-store` ([Directory-account enrolment codes](#directory-account-enrolment-codes-adr-0207), ADR 0207). **Refuses (400) the caller's own account**, a local account, an account holding a factor and a disabled account; 404 for an unknown one |
 | `DELETE` | `/users/{user_id}/enrolment-code` | `users:manage` | `require_step_up_action` (action `admin_enrolment_code_revoke`). Clears an outstanding code; `revoked` says whether one was. Refuses (400) the caller's own account; 404 for an unknown one |
-| `GET` | `/users/{user_id}/channel-scope` | `users:manage` | `require` (a read on the `users:manage` tier, not `users:read`) |
+| `GET` | `/users/{user_id}/channel-scope` | `users:manage` | `require` (a read on the `users:manage` tier, not `users:read`). The account is read with its record checked against its integrity seal (BACKLOG #5520): 423 when the record fails it, with nothing of the row answered. What the 423 reports, and when a row read mid-write is not refused: *What an admin user read reports* below this table; 404 for an unknown user |
 | `PUT` | `/users/{user_id}/channel-scope` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) |
 | `GET` | `/ad-group-map` | `users:manage` | `require` |
 | `PUT` | `/ad-group-map` | `users:manage` | `require_step_up_action` (action `save_ends_own_sessions`) **only when the save would end the caller's own sessions**, else the session window (BACKLOG #3401) |
 | `GET` | `/ad-group-scope-map` | `users:manage` | `require` |
 | `PUT` | `/ad-group-scope-map` | `users:manage` | `require_step_up_action` (action `save_ends_own_sessions`) **only when the save would end the caller's own sessions**, else the session window (BACKLOG #3401) |
+
+**What an admin user read reports (BACKLOG #5520).** `GET /users`, `GET /users/{user_id}/permissions`,
+`PATCH /users/{user_id}`, `GET /users/{user_id}/federated-identity` and `GET /users/{user_id}/channel-scope`
+read each account with its whole record checked against its integrity seal. A failure is reported
+per account and rate-limited, in each engine process: only the first refusal of an account in
+each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs a WARNING, writes
+the `integrity.authority_seal_failed` audit row and raises the `integrity_drift` alert. A refusal
+inside that interval, from any of these routes or any other reader of the same account in that
+process, answers 423 or lists the account as failed and adds no row and no alert. Each engine
+process sharing the store keeps its own interval, so each may report the same account once. The
+interval holds only while the process still remembers the account: it remembers at most
+`SEAL_FAILURE_TRACK_MAX` failing rows of every kind together, and past that it forgets the oldest,
+so an account it forgot is reported again on its next refusal. A
+record is refused only after two failing reads that name the same account, or when it fails
+closed as this paragraph says below. A check whose row is
+deleted, renamed, rebound or re-keyed while it is read is unreported and read again by id, up to
+three checks: one that then passes is served, or listed as it now reads, and one absent on a
+re-read reads as gone, a 404 or left out of the list. **A row still there after every check raced
+fails closed**: each of its checks failed, so it is reported and answered as a failing record, and
+a writer with direct database access that keeps changing a tampered row's username, directory id
+or federated pair cannot make it vanish from these reads. One that keeps changing the row's own
+`id` still can: a re-read by the old id finds nothing, so the row reads as gone under that id,
+unreported. Honest writes that race all three checks the same way would be a false alarm
+too. **Two honest role writes to the account that commit across both of those reads
+are still answered as a failing record and reported**, a false alarm the reads cannot tell from
+tampering, because the role rows are read apart from the account's row. Where
+`[auth].require_action_step_up` is on, the default, `PATCH /users/{user_id}` reads the account
+after its gate has spent the single-use `admin_user_update` grant, so its 423 and its 404 cost that
+proof, as the console's `POST /ui/users/{user_id}/update` does after its own gate. Where it is
+off, the gate checks the step-up session window instead and spends nothing, so neither answer
+costs a proof.
 
 #### Audit
 
@@ -1709,6 +1740,8 @@ tuple: they act only on the caller's own account.
 | `POST` | `/approvals/{approval_id}/approve` | `approvals:approve` | `require_step_up` — a fresh step-up, as the resolve asks (owner ruling 2026-10-13, #3241 R4); the requester can never approve their own request; data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `POST` | `/approvals/{approval_id}/reject` | `approvals:approve` | `require_paced` |
 | `POST` | `/approvals/{approval_id}/resolve` | `approvals:approve` | `require_step_up` — records an `interrupted` release as `effects_applied` or `effects_not_applied`; never re-runs it, and the requester can never resolve their own request (BACKLOG #1562) |
+| `GET` | `/approvals/executing` | `approvals:approve` | `require` — releases still claimed as `executing`, up to the store read's cap, with their claim owner and what an interrupt would judge of that owner now; params are not listed (BACKLOG #1562) |
+| `POST` | `/approvals/{approval_id}/interrupt` | `approvals:approve` | `require_step_up` — moves a stranded `executing` release to `interrupted`, refused while its owner may be live; an owner with no heartbeat to read needs `attest_owner_stopped`; never runs the operation (BACKLOG #1562) |
 | `POST` | `/cluster/stepdown` | `cluster:control` | `require_step_up` |
 | `POST` | `/dr/activate` | `dr:operate` | `require_step_up` |
 | `POST` | `/dr/release` | `dr:operate` | `require_step_up` |
@@ -1818,7 +1851,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/logs/tail` | `logs:view` | `require_phi_read` | best-effort-redacted; writes a `logs_view` audit row |
 | `POST` | `/ai/chat` | `ai:assist` | `require` | **not** paced; bounded by the central AI policy |
 
-**PHI-egress route set.** Of the 119 route objects a default `create_app()` serves, **at least twenty-one**
+**PHI-egress route set.** Of the 121 route objects a default `create_app()` serves, **at least twenty-one**
 can put PHI on the wire: the thirteen message/search rows above marked PHI (`/messages`, `/messages/{id}`,
 `/messages/{id}/raw`, `/responses`, `/outbound`, `/attachments/{id}`, `/messages/search`, `/messages/export`,
 `/search/layered`, the three `/search/presets` rows, `/dead-letters`), plus
@@ -2606,7 +2639,7 @@ itself still needs no step-up.
 
 This row records what that listing disclosed, and only that. It does not record every route to the
 fact. The same audience can learn much of it elsewhere: an Administrator holds `approvals:approve`,
-and `GET /users` shows an Administrator each account's disabled flag, roles and channel scope. The
+and `GET /users` shows an Administrator each account's disabled flag, roles and channel scope, for every account whose record passes its integrity seal. The
 console's user pages write no grant row. So a missing `approval.standing_shown` row does not show
 that a caller never learned a requester's standing.
 
@@ -2688,11 +2721,25 @@ test (vault BACKLOG #3746).** A start or restart whose CA check the store stoppe
 **503**, not the **409** a refused CA answers on an inbound, and its `connection_control` row would
 carry `reason` `store_unavailable`. A restart would have stopped the lane before the check ran, so
 its 503 would say the connection is left stopped until the next start. The lane would read
-`failed`, and a lane with no earlier failure on record would show a line saying the CA could not be
-checked. An outbound checks its CA at a start only when it has no connector. An operator start of
-such a lane that was paused would leave it paused with its rows pending, because a resumed lane
-with no connector charges each row it claims an attempt, and a finite `max_attempts` would
-dead-letter it with nothing known against the CA.
+`failed`, with a line saying the CA could not be checked. That line would replace one recorded
+earlier for any other reason, with one alert. It is written only for a CA its file checks did not
+refuse (the `store_unavailable` reason for a reload, vault BACKLOG #3091, says why), so it does
+not hide a refusal: a later start failure that is not a store fault, a CA refused once the file
+changed included, replaces it in turn, with one alert. The class compared is only whether the line
+is a store fault (vault BACKLOG #5146). A later failure in the class the line already records keeps
+the line and alerts no more. So a refused CA after an unrelated line, such as a failed bind or
+build, keeps that line, and the lane's line does not name the refusal. The refusal shows at least
+in the server log and, on an operator start of an inbound, in the 409's fixed detail `trust anchor
+refused; see the server log`. Where the CA check wrote one, it shows in the `auth.trust_anchor`
+rows too; a CA setting refused before any audit row is written has none. The lane is still held
+failed across a reload that leaves its config unchanged. On an inbound the rule holds for any start
+failure. On an outbound it holds for a failure raised as a `TrustAnchorError`, as a refused or
+store-stopped CA check is; any other outbound start failure records its line and alerts each time. A
+refused-CA lane whose line a store fault replaced is no longer kept failed across a reload, so the
+next reload reads its CA again. An outbound checks its CA at a start only when it has no connector.
+An operator start of such a lane that was paused would leave it paused with its rows pending,
+because a resumed lane with no connector charges each row it claims an attempt, and a finite
+`max_attempts` would dead-letter it with nothing known against the CA.
 
 **That hold covers the operator control route only, and it ends at the lane's next start**, which
 at least an operator, a schedule or a rule can make. While a lane is held it sits in the paused
@@ -2927,8 +2974,7 @@ than to one request.
   another caller moved the row, and `unknown` where the read-back cannot tell.
 
 For some failed writes the gate logs at ERROR and pages nothing. At least this one: a restart
-cannot move a leftover `executing` row to `interrupted`. The row stays `executing`, and the next
-start tries again.
+cannot move a leftover `executing` row to `interrupted`.
 
 An outcome's combined write can fail while the status write that follows finds the row already
 moved. The gate then writes no row alone, and reads the row back (vault BACKLOG #3193 N1). If it
@@ -3006,7 +3052,7 @@ the row to one of three outcomes. Each move carries its own audit row, after the
 |---|---|---|
 | `approved` | The operation ran and returned | `approval.approved` |
 | `failed` | The operation raised, or the release was cancelled before it started. It did not complete | `approval.failed` |
-| `interrupted` | The release was cancelled while the operation ran, for example by the request timeout. Or the engine process that claimed it restarted before it recorded an outcome. It may have done none, some or all of its work | `approval.interrupted` (against `system`, with `reason` `engine_restart`, when a restart finds it) |
+| `interrupted` | The release was cancelled while the operation ran, for example by the request timeout. Or the engine process that claimed it restarted before it recorded an outcome. Or an operator interrupted a release stranded in `executing`. It may have done none, some or all of its work | `approval.interrupted` (against `system`, with `reason` `engine_restart`, when a restart finds it; against the operator, with `reason` `operator_interrupt`, when an operator interrupts it) |
 | `resolved_applied` | An operator checked an `interrupted` release and recorded that its effects were applied | `approval.resolved` (against the resolver) |
 | `resolved_not_applied` | An operator checked an `interrupted` release and recorded that its effects were not applied | `approval.resolved` (against the resolver) |
 
@@ -3020,7 +3066,7 @@ already moved. The gate then writes no row alone and pages, as above.
 Nothing retries an `interrupted` request. Re-running an operation that may already have run would be
 worse than a stuck row, so an operator has to check the operation's own effects. `GET /approvals`
 lists `interrupted` rows after the pending ones, each with its `status`, the approver who released it,
-and when it was cut off. Once the operator has checked, `POST /approvals/{id}/resolve` with
+and its `decided_at`. Once the operator has checked, `POST /approvals/{id}/resolve` with
 `{"outcome": "effects_applied"}` or `{"outcome": "effects_not_applied"}` records the finding and moves
 the row to the matching `resolved_*` status (owner ruling 2026-09-26). The resolve:
 
@@ -3034,14 +3080,15 @@ the row to the matching `resolved_*` status (owner ruling 2026-09-26). The resol
   the operation afresh, through dual control;
 - answers **409** for a row that is not `interrupted`, including one another operator resolved first;
 - writes `approval.resolved` against the resolver in the same write as the move, naming the
-  requester, the releasing approver, the outcome, the new status and the cut-off time. If that write
-  fails, the resolve answers **503** and the row stays `interrupted`. A resolver who loses a race
+  requester, the releasing approver, the outcome, the new status and the row's earlier `decided_at`
+  as `interrupted_at`. If that write raises anything but a seal refusal, the resolve answers **503**
+  and pages `audit_write_failed`. A resolver who loses a race
   moves nothing and writes no row. The row keeps the releasing approver;
 - flags a resolver whose account changed after the request, and still resolves (BACKLOG #2125). It
   runs the approver check below on the resolver, against the request time. Once the row has moved,
   it writes `approval.approver_provenance` with `act` `resolve` and raises the same alert, keyed
   `approval:<id>:resolve`. A resolve that answers 409 or 503 is not flagged, even where its COMMIT
-  landed despite the error. The check compares against the request time, not the cut-off time,
+  landed despite the error. The check compares against the request time, not `decided_at`,
   so a row left `interrupted` for a long time also flags a routine password change or TOTP
   enrolment made while it waited. This is a seat decision under owner delegation
   2026-10-08, not an owner ruling.
@@ -3054,15 +3101,17 @@ row at `executing`. A process can die mid-operation. A release's outcome write c
 the operation ran but the move from `executing` to `approved` fails even when written alone, the
 error is logged and the release still succeeds, because an error would invite a new request that
 runs it twice. The gate still tries to write the `approval.approved` audit row. And a claim can
-commit after its reply was lost, so nothing ran. The status cannot tell these apart; the audit
-trail sometimes can, so read it before resolving.
+commit after its reply was lost, so nothing ran. The status cannot tell these apart, so the
+restart claims no outcome for any of them.
 
 The claim records which engine process owns the release, in the row's `claim_owner` column. At its
 next start, before the API serves an approval, that process moves each `executing` row it owns to
-`interrupted`, with an `approval.interrupted` row in the same write. That row is written against
-`system` and carries `reason` `engine_restart`, the claim owner and the claim time. Nothing
-re-runs. The operator checks the effects and resolves the row as above. A move that fails is logged
-and the row stays `executing` for the next start to try again.
+`interrupted`, with an `approval.interrupted` row; so does the catch-up an embedded engine shard
+runs once its name is known. Each row is in the same write as its move, written against `system`,
+and carries `reason` `engine_restart`, the claim owner and the claim time. The move keeps the row's `decided_at` as the
+claim time, so an `interrupted` row a restart settled shows when it was claimed, not when the
+engine restarted. Nothing re-runs. The operator checks the effects of an `interrupted` row and
+resolves it as above. A move that fails is logged.
 
 Engine shards and cluster nodes share one store, so a process touches only its own rows: a
 sibling's `executing` row may be a live release. The owner is:
@@ -3074,10 +3123,46 @@ sibling's `executing` row may be a live release. The owner is:
 | A `[cluster]` node | `node:<node_id>` | Only when `[cluster].node_id` is pinned |
 
 A row owned by another process is left alone and logged at WARNING at each start, with its owner and
-claim time. If that owner never returns, as with an unpinned cluster node, the row stays
-`executing`. Nothing settles it on a timer, because no check here can tell a dead owner from a slow
-one. `GET /approvals` does not list `executing` rows, so that WARNING is the place to find one. A
-row claimed before the column existed has no owner, and the first process to start treats it as its
+claim time. The start reads other owners' rows apart from its own, so its own rows never fill that
+read and hide a sibling's. If that owner never returns, as with an unpinned cluster node, the row
+stays `executing`. Nothing settles it on a timer, because no check here can tell a dead owner from
+a slow one. An operator settles it instead, through two routes (owner-delegated decision of
+2026-10-29, `d20261029T205247402-81159c`):
+
+- `GET /approvals/executing` lists `executing` rows, up to the store read's cap and leaving out
+  any that fail their seal, with its claim owner, its claim time,
+  whether this process owns it, and what an interrupt would judge of its owner now. It needs
+  `approvals:approve`. `GET /approvals` does not list `executing` rows.
+- `POST /approvals/{id}/interrupt` moves one to `interrupted`, so it takes the resolve above. It
+  needs `approvals:approve` and a fresh step-up, and it refuses the original requester, **403**, as
+  the resolve does, comparing user ids; a row with no recorded requester id is refused, **409**. It
+  never runs the operation and never records an outcome. It judges the owner in three tiers:
+
+| Owner | The interrupt |
+|---|---|
+| This process is running the release, or still writing its outcome | refused, **409** |
+| `node:<id>`, and that node's heartbeat is fresh | refused, **409** |
+| `node:<id>`, and the heartbeats cannot be read | refused, **503**; try again |
+| `node:<id>`, on an engine that is not a cluster node and reads no heartbeats | refused, **409**; interrupt from a cluster node |
+| `node:<id>`, and the heartbeat has lapsed or the node is gone | moves the row |
+| `shard:<id>`, `engine`, no owner, or any other name | moves the row only with `{"attest_owner_stopped": true}`, a JSON `true` and nothing a parser could coerce to one (any other value is **422**), the operator's word that no process under that name is running; otherwise **409** |
+
+A cluster node whose `[cluster].node_id` is not pinned comes back under a new id, so its old claims
+read as a lapsed heartbeat here and can be interrupted without an attestation. The heartbeat is the
+`fresh` reading `/cluster/nodes` shows. A fresh heartbeat on this process's own node id refuses too,
+even for a row this process is not running.
+
+The move is guarded on `executing` and on the claim owner it judged, so a row that moved or changed
+owner since answers **409** and moves nothing. Its `approval.interrupted` row is in the same write,
+against the operator, with `reason` `operator_interrupt`, the claim owner, the tier as `liveness`,
+and `owner_stopped_attested`. If that write raises anything but a seal refusal, the call answers
+**503** and pages `audit_write_failed`. The move keeps `decided_at` as the claim time.
+An attestation is the operator's word, and nothing checks it. A row interrupted while its owner was
+in fact still running it is recorded when that owner writes its outcome: the outcome write finds
+the row moved and logs it, and the outcome row is written alone. If that outcome write raised
+instead, no outcome row is written alone, and it pages `audit_write_failed`, as the list above says.
+
+A row claimed before the column existed has no owner, and the first process to start treats it as its
 own. Two plain `serve` processes over one store would share the `engine` owner; that layout is
 unsupported anyway. For the same reason, build one app per engine: a second app over the same
 engine runs the reconcile again and would take the first one's live releases for leftovers.
@@ -3738,6 +3823,8 @@ The complete set, as enumerated in the [route map](#route--permission-map-engine
   hook and unbinds every inbound. Each asks for the same fresh proof as the planned failover above.
 - **Dual control** -- `POST /approvals/{id}/resolve` (BACKLOG #1562). Approve and reject are not
   step-up gated; this one is, because it closes an approval record on the resolver's word alone.
+  So is `POST /approvals/{id}/interrupt`, the step before a resolve for a release stranded in
+  `executing`, which can rest on the operator's word that its owner is stopped (BACKLOG #1562).
 - **Bulk-PHI reads** — `GET /messages/search`, `GET /messages/export`, `GET /search/layered`,
   `GET /uploads/{file_id}/messages`, and the body-carrying twins `POST /messages/search`,
   `POST /messages/export` and `POST /uploads/{file_id}/messages/search` (BACKLOG #1184). The two
@@ -4442,22 +4529,23 @@ each nested `OutboxInfo` / `EventInfo` individually, because the redactor keys o
 dashboard `GET /connections`, and `GET /connections/{name}/metadata` (all BACKLOG #2443). Its `/ws/stats` push redacts the same rows. The four
 alert-mutation replies (`ack`, `resolve`, `suspend`, `resume`) redact their `AlertInstanceInfo` too.
 
-**Audit.** Four of those additionally feed the **coalesced per-actor/hour PHI-summary exposure
-census** (`/dead-letters`, `/messages`, `/messages/search`, `/messages/{id}`), so a scripted bulk read
-cannot harvest the patient census unaudited. The rest do **not** call the coalescer — they write
-their own dedicated audit rows instead (`response.read` for `GET /messages/{id}/responses`,
-`preset.layered_search` for `GET /search/layered`, a `connection_event_reveal` or `alert_reveal`
+**Audit.** At least five of those additionally feed the **coalesced per-actor/hour PHI-summary exposure
+census** (`/dead-letters`, `/messages`, `/messages/search`, `/messages/{id}`, and
+`/search/layered` since BACKLOG #5523), so a scripted bulk read cannot harvest the patient census
+unaudited. The rest do **not** call the coalescer — they write their own dedicated audit rows
+instead (`response.read` for `GET /messages/{id}/responses`, a `connection_event_reveal` or `alert_reveal`
 row for each per-item reveal on the three monitoring reads, and a `connection_error_reveal` row for
 each per-connection reveal on `GET /connections` and `GET /connections/{name}/metadata`; those
-five write nothing on a masked load). The four census surfaces are audited **only when a
-gated property is actually returned** — `count_exposed()` is computed *post*-redaction and the
-coalescer is called under `if exposed:` — so a fully-redacted list read by a caller without
+five write nothing on a masked load). The census surfaces are audited **only when a
+gated property is actually returned** — `count_exposed()` and `count_masked()` are computed
+*post*-redaction and the coalescer is called under `if exposed or masked:`, so a display-masked row
+counts (vault BACKLOG #1187) — so a fully-redacted list read by a caller without
 `messages:view_summary` (a Viewer paging `GET /messages` or `GET /dead-letters`) writes **no audit row
 at all**. That is accepted: those reads carry no PHI, and auditing them would let an unprivileged
 caller amplify into unbounded `audit_log` growth. `GET /messages/{id}` and `GET /messages/search` write
 unconditional dedicated rows (`message_view`, `message_search`) regardless, and so does the body fetch
-`GET /messages/{id}/raw` (`message_body_view`, whose detail names the `surface` that asked), as do the other two
-(`response.read`, `preset.layered_search`).
+`GET /messages/{id}/raw` (`message_body_view`, whose detail names the `surface` that asked), as do
+`GET /messages/{id}/responses` (`response.read`) and `GET /search/layered` (`preset.layered_search`).
 
 **Roles and visibility.** `messages:view_raw` is **not** a superset of `messages:view_summary` —
 `Identity.has()` is a flat membership check. The built-in roles happen to grant them nested
@@ -4635,7 +4723,7 @@ slack.
 
 | Attribute | Source of the value | Predicate / threshold | Action | Default | Knob |
 |---|---|---|---|---|---|
-| Client source network | ASGI `scope["client"][0]` (uvicorn's `ProxyHeadersMiddleware` is the single `X-Forwarded-For` trust point) | outside every listed CIDR/host; loopback always allowed; unresolvable address → fail closed | **DENY** 403 (`X-MessageFoundry-Denied: client-network`) / WS close `1008`, pre-routing; rate-limited WARNING; counted on `GET /security/posture`. `GET /health` is the sole exempt path and echoes `observed_client` when the allow-list is in use, so a locked-out operator can self-diagnose the address the engine actually sees | `[]` = no restriction | `[security].allowed_client_networks` |
+| Client source network | ASGI `scope["client"][0]` (uvicorn's `ProxyHeadersMiddleware` is the API's single `X-Forwarded-For` trust point; the inbound HTTP listener's own `trusted_proxies`, BACKLOG #5525, keys only that listener's failed-attempt budget) | outside every listed CIDR/host; loopback always allowed; unresolvable address → fail closed | **DENY** 403 (`X-MessageFoundry-Denied: client-network`) / WS close `1008`, pre-routing; rate-limited WARNING; counted on `GET /security/posture`. `GET /health` is the sole exempt path and echoes `observed_client` when the allow-list is in use, so a locked-out operator can self-diagnose the address the engine actually sees | `[]` = no restriction | `[security].allowed_client_networks` |
 | Client-address monoculture | the set of distinct observed client addresses | allow-list in use **and** no trusted proxy declared **and** ≥ 50 observations **and** all resolved to the same loopback address | **LOG** — one-shot WARNING + `client_address_monoculture` on `GET /security/posture` | n/a | (derived; no knob) |
 | Login attempt rate, per client IP **and** globally | `api.security.client_ip`, which returns the ASGI `scope["client"][0]` the *Client source network* row evaluates; an attempt with no address is counted under the literal `"unknown"` | > 10 attempts per IP (`login_rate_limit_per_ip`), or > 60 across all clients (`login_rate_limit_global`), in a rolling 60 s window (`login_rate_limit_window_seconds`); a refused attempt is not itself counted | **THROTTLE** — 429 `too many attempts` with **no** `Retry-After` on the three JSON routes; 429 + a `Retry-After` of the whole sign-in window on `POST /ui/login` and on `POST /ui/login/passkey`, the passkey sign-in's begin leg; a **303** redirect to `/ui/login?e=rate_limited` (no 429, no `Retry-After`) on `GET /ui/sso`, `POST /ui/oidc/start` and `GET /ui/oidc/callback` (a sign-in return; a step-up return draws the ceremony budget, BACKLOG #3374), and on `GET /ui/oidc/start` only when its interstitial is skipped (see the [Route → limiter map](#route--limiter-map)). WARNING-logged, deliberately **not** audited | on, 10 / 60 / 60 s | `[auth].login_rate_limit_enabled` |
 | Credential-ceremony rate, per **actor** | `identity.user_id` (**not** an IP); on an IdP step-up's return, which has no session, the user id its staged flow names | > `login_rate_limit_per_ip` (10) ceremonies per actor per 60 s, on each of the actor's keys (the *Credential ceremonies* row of [Business-logic limits](#business-logic-limits-asvs-213) names them); **no** global dimension (`glob=0`, deliberately) | **THROTTLE** 429, logged | on with the row above | *gated by the same* `[auth].login_rate_limit_enabled` |
@@ -4724,7 +4812,7 @@ listen source. The refusal action differs materially per listener, so each has i
 | **MLLP / HTTP / DICOM** — peer client certificate | the TLS peer certificate presented at handshake | `tls = true` **and** `tls_ca_file` set → `ssl.CERT_REQUIRED` plus strict RFC 5280 verify flags; no client certificate, or one not issued by that CA | **DENY** — the TLS handshake fails. On MLLP and HTTP, on every loop, the allow-list and both connection caps run BEFORE the handshake (BACKLOG #1606, #2479), and on HTTP so does the per-address handshake budget `max_handshakes_per_host`, which counts the socket until its handshake ends (vault BACKLOG #4888). MLLP has no handshake budget. The failed handshake opens no session, so the only connection event is a throttled `tls_handshake_failed`, which [PHI.md section 7, row 7](PHI.md#7-logging--phi-redaction) describes (vault BACKLOG #2613, #3302). The DICOM SCP accepts the connection first, checks its allow-list, and only then runs the handshake, so a peer outside the list is refused before any handshake; a failed handshake writes **no** connection event there either. The SCP counts it and logs a throttled WARNING naming the peer instead, as [PHI.md section 7, row 7](PHI.md#7-logging--phi-redaction) states (vault BACKLOG #3784). `tls_ca_file` unset → server-only TLS and no peer-certificate decision. TCP and X12 have no inbound TLS at this release |
 | **MLLP** — expected sender (`tls_client_subjects`, BACKLOG #4907) | the verified client certificate's qualified `SAN:<type>:` / `CN:` names, read after the handshake | `tls_client_subjects` is set and none of the certificate's names is listed under the loaded `tls_ca_file` CA whose key signed the leaf; matched exactly and case-sensitively, through the matcher the HTTP row below uses, so a second CA in `tls_ca_file` issuing a listed name is refused. With `tls_client_subjects` set, the issuer map's start checks in the HTTP intake row below apply to `tls_ca_file`, so the start is refused when the CA certificates the map reads are not the ones the TLS library loaded, which that row matches by identity, while certificates that are not CAs are compared only by count. That row's rules for a loaded certificate that is not a CA apply too. Unset by default, and then a verified certificate from any loaded CA is admitted as any sender | **DENY** — each message the connection's first read completes is recorded as an `ERROR` row, then answered `AR` with MSA-3 `sender not permitted` on an HL7 v2 inbound that acknowledges, and the connection closes; on any other inbound it closes with nothing written. If a row cannot be written no `AR` is sent: an HL7 inbound that replies sends the handler-fault `AE`, and any other inbound closes with nothing written and no row. The row's reason, the reply and the WARNING log line (throttled per address) carry no certificate field. Each refusal is audited `intake.auth_subject_denied` with an `auth_subject_denied` connection event, and charged to the HTTP listener's failed-attempt budget at the `Http()` defaults, with no setting of its own; an address that has spent its own budget is closed unread before its certificate is compared, and the global budget closes only a sender whose certificate the compare has refused, never a listed one; each close is audited `intake.auth_rate_limited`. TLS renegotiation is refused on this listener. [CONNECTIONS.md](CONNECTIONS.md#expected-senders-tls_client_subjects) states the design |
 | **HTTP** — intake authentication (`intake_auth`, ADR 0154 D6) | the credential a peer presents: the `intake_api_key_header` header (default `x-api-key`) under `api_key`, `Authorization: Bearer` under `bearer`, or the verified client certificate's `CN:` / `SAN:` names under `mtls_subject` | `intake_auth` is not `none` and the key or token is missing or wrong, or the certificate's names are not in `intake_client_subjects` under the loaded `tls_ca_file` CA whose key signed it (vault BACKLOG #2287; the refusals include at least these, and the list is not complete: a listed name is refused when the loaded CA that signed the leaf is not the one the name is listed under, and a leaf signed by an intermediate the client sends is refused unless that intermediate is itself loaded in `tls_ca_file` and the name is listed under it; no certificate is admitted under a DN that `tls_ca_file` holds under two different keys, each on a CA or on a self-signed certificate that is not a CA, as during a key rollover, and the listener warns about that at start. **The issuer map's start checks.** They run only where an identity map is configured, at least here under `intake_auth = "mtls_subject"`, on an MLLP inbound with `tls_client_subjects`, and on the API with `[api].tls_client_ca_file` and `[api].tls_client_cert_identities` both set. A certificate block that cannot be parsed refuses the start. The CA certificates the map reads are compared, by identity, with the set the TLS library loaded, and any mismatch refuses the start. Every other certificate the map reads must load as no CA in a scratch context holding only those, or the start is refused. Those are compared with what the TLS library loaded only by count, which must lie between the distinct ones read and every copy read, or the start is refused. A certificate that is not a CA names as issuer only a leaf identical to it, and only when it signs itself. One that does not sign itself is named for no leaf and makes no DN ambiguous; the start warns when any certificate the map reads that is not a CA has a loaded CA's subject, ASCII case and white space folded, since OpenSSL may take it as the issuer of a client that CA issued and then refuse that client. When that certificate has no key identifier, or the CA's own, the warning says every client of that CA may be refused. It says the same when `cryptography` cannot read the CA's extensions, and adds that the map then cannot tell whether the CA itself is the cause, as a CA strict verification refuses would be, and, for a certificate with a key identifier, which clients carry an authority key identifier that rules it out, and says to check the CA too. When the CA's own version and extensions show a fault for which strict verification refuses it as a CA, the warning names the CA and each fault found as the cause instead, whatever key identifier the namesake has, in one warning per CA. The faults it reads include at least a version-1 CA, with or without extensions, and a version-3 CA with no basic constraints, basic constraints that are not critical, no key usage, no subject key identifier, a critical subject or authority key identifier, or, when it is not self-signed, no authority key identifier or one carrying no key identifier, which strict verification requires once the CA's issuer is loaded; whether it is self-signed is read by name, by a model of OpenSSL's name comparison: ASCII case and ASCII white space folded, a one-byte text type such as a T61String read as Latin-1, and the string type ignored only for text types. Each of those was measured against OpenSSL 3.5.7 for at least one pair of names, at least including a T61String holding UTF-8 bytes against a UTF8String of the same letters, which OpenSSL reads as two names (error 2). It is a model, not OpenSSL's own comparison, so it may still differ from OpenSSL in ways not measured. It reads names only, and OpenSSL's own self-signed read does not stop there: at least a root whose names match but whose authority key identifier names another serial number reads as self-signed here, with no fault named, while strict verification refuses a version-3 and a version-1 client through it (measured on OpenSSL 3.5.7, `test_a_root_whose_authority_key_identifier_names_another_serial_is_measured` in `tests/test_inbound_http_intake_issuer.py`). For a CA whose issuer name `cryptography` cannot read, only those two authority key identifier faults go unread; when no other fault is found, the warning, in whichever wording the namesake's key identifier gives, adds that the issuer name cannot be read, so the map cannot tell whether the CA is self-signed, that strict verification refuses every client through it if it is not, with its issuer loaded or not (without it no chain is found, and with it the CA needs an authority key identifier carrying a key identifier, which it lacks), and to check the CA too (measured on OpenSSL 3.5.7, for a version-3 and a version-1 client; the cases measured are listed once, in `test_what_a_ca_whose_issuer_cannot_be_read_does_to_its_clients_is_measured` in `tests/test_inbound_http_intake_issuer.py`). Where an engine defect, such as an installed `cryptography` that no longer exposes a name's string types, stops the names being compared, it says the engine cannot compare them instead. With no basic constraints it names only that fault, since OpenSSL then refuses the CA as invalid before its other checks. The list is not complete, and the warning says "at least". At least the API, HTTP and MLLP contexts that build the map verify strictly, and strict verification refuses every client whose chain runs through such a CA, with or without the namesake (each fault measured on OpenSSL 3.5.7, for a version-3 and a version-1 client, with the CA alone or, for one that is not self-signed, beside its issuer; the warning says it was measured there). So the warning says to re-issue the CA with the same subject and key as a version-3 CA with at least critical basic constraints `CA:TRUE`, key usage `keyCertSign`, and `cRLSign` too where the hop checks a CRL that CA signs, a subject key identifier equal to the key identifier its client certificates' authority key identifiers carry and, unless it is self-signed, an authority key identifier carrying its issuer's subject key identifier, neither critical, and that a client certificate whose authority key identifier names the CA's issuer and serial number, or another key identifier, must then be re-issued too; or to remove the CA if it is not needed; and, while the CA stays loaded, to remove the namesake or re-issue it under another subject. A CA strict verification refuses for a reason the check does not read, such as a missing issuer, gets the namesake wording instead. Where none of those faults is found, one with a key identifier other than the CA's is ruled out for a client whose authority key identifier names the CA's key, but not for a client with no authority key identifier, and strict verification accepts such a client when it is version 1, which has no extensions: on OpenSSL 3.5.7 a listener refused one in at least one listing order. Its warning names those clients. A warning changes no allow, deny or refusal). **The default is `intake_auth = "none"`, which checks no credential: a default HTTP inbound admits any peer the rows above admit.** Under `api_key` / `bearer`, `GET`/`HEAD` probes are inside the check unless `intake_auth_health = "allow"`. Under `mtls_subject` the certificate is checked at accept, before the method is known, so no probe is exempt. A peer with no certificate from `tls_ca_file` never reaches this row: it fails the handshake in the peer-client-certificate row above | **DENY** — `401` for a missing or wrong key or token (read before any body byte), `400` for a credential header sent more than once, even with identical copies, and with `_` read as `-` in the header name, since the engine would keep the last copy while a front end may read the first (BACKLOG #2051; refused before any comparison, charged to the failed-attempt budget and audited `intake.auth_failed`), `403` for a verified certificate whose subject is not listed under the loaded CA that signed it; nothing is committed. Audited `intake.auth_failed` / `intake.auth_subject_denied`, plus a connection event |
-| **HTTP** — intake failed-attempt budget (ADR 0154 D6) | the peer address, and the listener's failed-attempt count across all peers | the peer has spent `intake_auth_rate_limit` failed attempts in the window, or all peers together have spent `intake_auth_rate_limit_global` (defaults and the `0`/`None` off switch in [CONNECTIONS.md](CONNECTIONS.md)). A peer that authenticated inside the window is exempt from the global budget, so a flood cannot lock out a working partner. Counted in-process, so each engine shard keeps its own count | **THROTTLE** — `429` + `Retry-After: 60` before any credential is compared; audited `intake.auth_rate_limited`. A successful authentication never spends budget |
+| **HTTP** — intake failed-attempt budget (ADR 0154 D6) | the peer address (an IPv6 peer by its `/64`, with the exceptions [CONNECTIONS.md](CONNECTIONS.md) names), or under `api_key` and `bearer` behind a proxy listed in `trusted_proxies` the client address that proxy forwards (BACKLOG #5525; [CONNECTIONS.md](CONNECTIONS.md) has the walk), and the listener's failed-attempt count across all peers | the peer has spent `intake_auth_rate_limit` failed attempts in the window, or all peers together have spent `intake_auth_rate_limit_global` (defaults and the `0`/`None` off switch in [CONNECTIONS.md](CONNECTIONS.md)). A peer that authenticated inside the window is exempt from the global budget, so a flood cannot lock out a working partner. Counted in-process, so each engine shard keeps its own count | **THROTTLE** — `429` + `Retry-After: 60` before any credential is compared; audited `intake.auth_rate_limited`. A successful authentication never spends budget |
 | **HTTP** — peer-control start gate (ADR 0154 D7) | the listener's bind host × the presence of an **effective** peer control | non-loopback bind, `[security].enforcement = enforce` (the default), and **no** effective peer control: `intake_auth` is `none`, and `source_ip_allowlist` is unset or has an entry wider than a /8 (IPv4) or a /32 (IPv6), so `0.0.0.0/0` does not count. `tls` + `tls_ca_file` alone does not count either, because it binds no subject | **DENY at start** (`WiringError`); the connection degrades per ADR 0031 startup fault isolation. Loopback binds are exempt |
 | **HTTP** — peer-control start gate, not enforcing | as the row above | the same listener shape, with `[security].enforcement` at any level other than `enforce` | **LOG** — the listener starts and a WARNING names the missing control |
 | **DICOM** — calling AE | the requesting AE's Calling AE Title, at **association negotiation** | `calling_ae_allowlist` set and the title is not in it | **DENY** — the association is rejected by pynetdicom before any C-STORE callback runs (`ae.require_calling_aet`). `None` = any AE the peer-IP allow-list admits |
@@ -5518,8 +5606,17 @@ check and its directory gap.
 
 Three long responses ask again while they run (BACKLOG #1154). Each asks at least: a live session,
 the route's permissions, no pending password change, a met second factor and a notification address
-on file. None asks again for a fresh step-up, the client-network check or the new-address check;
-those ran at the gate. Each resolves the token it started with, so a session rotation (a step-up
+on file. None asks again for a fresh step-up, the client-network check or the new-address check,
+and what ran at the start differs by response (BACKLOG #3469). The client-network check
+(`[security].allowed_client_networks`) is middleware, so it ran once on each response's request or
+handshake. The bulk message export's gate, `require_step_up_action` with the export's action, also
+ran the new-address check, and the route spends a fresh step-up bound to the export before it
+streams. With `[auth].require_action_step_up = false` that spend reads the session's step-up window
+instead; [Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)
+says what opens that window. The `/ws/stats` gate
+(`authorize_ws`, or the console's cookie twin) and the audit export's gate
+(`require(Permission.AUDIT_EXPORT)`, or the console's `require_ui(Permission.AUDIT_EXPORT)`) run
+no step-up and no new-address check, so neither response is step-up gated at any point. Each of the three responses resolves the token it started with, so a session rotation (a step-up
 on that session, for example) ends it as a revocation would.
 
 - The `/ws/stats` live feed asks before every frame, about one a second. A refusal closes the socket
@@ -5583,11 +5680,17 @@ on that session, for example) ends it as a revocation would.
   read and one chunk, so a withdrawn grant reaches it within one page. A refusal stops it as the
   bulk export bullet above says, with the reason `standing_changed`. The pages are read with the
   identity the export started with. A caller that may now read fewer rows, as after losing
-  `users:manage`, would still receive the lock rows. So that stops it too, with the reason
-  `scope_changed`. A stop records `audit.export.stopped` with the counted and streamed rows and
+  `users:manage`, would still receive the lock rows. A role change through the API revokes the
+  session, so that loss stops the export with the reason `standing_changed`. Only when the session
+  survives the loss, as after a direct store write or on a page checked before the revoke lands,
+  does it stop with the reason `scope_changed`. A stop records `audit.export.stopped` with the counted and streamed rows and
   the reason, then raises to abort the transfer, which reaches the client as a failed download,
-  as the bulk export bullet above says. The idle clock moves as the bulk export's does, at most
-  every quarter of the window.
+  as the bulk export bullet above says. The idle clock moves at most every quarter of the window,
+  as the bulk export's does, but the quarter is counted from when the stream starts sending, not
+  from the gate's own move. The row count, the first page's read and the `audit.export` row run
+  between the two, so on a large trail the first move can come more than a quarter window after
+  the gate's. The first page moves it only if sending the CSV header stalled for a quarter window,
+  where the bulk export's first row always does.
 
 **At least these paths do not see a change on the next request.** The table is not a complete list.
 On a first deployment, each would let a caller keep acting on a withdrawn grant for the time shown.
@@ -7844,8 +7947,9 @@ BACKLOG #190 bundled three integrity residuals; #190 closes with **one built** a
   against a real ECH endpoint. So "infeasible" is **not** the reason and must not be offered as one.
   The reason is that it would hide nothing: a 2026-07-20 DoH probe found **no** partner endpoint
   publishing an `ECHConfig`. The engine therefore ships only the opt-in, fail-closed **routing** half
-  (per-connection `ech_egress` / `ech_sidecar`, refused when the sidecar is non-loopback or paired
-  with `proxy_url` or `verify_tls = false`), and the re-originator was retired from the tree on 2026-08-10 rather than carried
+  (per-connection `ech_egress` / `ech_sidecar`, refused at least when the sidecar is non-loopback,
+  carries a credential in its URL, is not listed in `[egress].allowed_ech_sidecar` (BACKLOG #5528),
+  or is paired with `proxy_url` or `verify_tls = false`), and the re-originator was retired from the tree on 2026-08-10 rather than carried
   as a second language nothing builds, tests or pins. Evidence, the retrieval SHA and the re-score
   trigger: [ADR 0139](adr/0139-ech-egress-sidecar-sni-hiding-for-asvs-12-1-5-demand-gated.md);
   operator contract: [`samples/ech-sidecar/`](../samples/ech-sidecar/README.md). The residual is

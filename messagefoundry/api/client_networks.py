@@ -9,7 +9,9 @@ the ``/ws/stats`` WebSocket and the ``/ui/static`` mount as well as the JSON rou
 **Which address is evaluated, and why it is the right one.** This reads ``scope["client"][0]`` — the
 address the SERVER reports, read through ``api.security.client_ip`` like every other client-address
 read (BACKLOG #2289) — and parses **no forwarding header, ever**. uvicorn's
-``ProxyHeadersMiddleware`` is the single X-Forwarded-For trust point in the process: it rewrites
+``ProxyHeadersMiddleware`` is the single X-Forwarded-For trust point for the API (the inbound HTTP
+listener has its own, per connection, for its failed-attempt budget only: ``Http(trusted_proxies=)``,
+BACKLOG #5525, which never reaches ``scope["client"]``): it rewrites
 ``scope["client"]`` from XFF when, and only when, the socket peer matches ``forwarded_allow_ips``,
 which ``__main__`` builds from ``[api].trusted_proxies`` with ``uvicorn_trusted_hosts`` (it says
 what it adds, BACKLOG #3042). So:

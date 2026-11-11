@@ -169,6 +169,7 @@ Defaults:
 | Data dir | `C:\ProgramData\MessageFoundry` |
 | Message store | `<DataDir>\messagefoundry.db` |
 | Logs | `<DataDir>\logs\service.out.log`, `service.err.log` |
+| Secrets directory (`-SecretsDir`) | the one the service already names, else `<DataDir>-secrets`; named to the service as `MEFOR_SECRETS_DIRECTORY` |
 | Bind | `127.0.0.1:8765` |
 | Log level | `INFO` |
 
@@ -322,6 +323,9 @@ Restart-Service MessageFoundry   # the running engine keeps its old settings unt
 
 **`set AppEnvironmentExtra` replaces the service's whole list of extra variables.** Pass every
 variable the service needs in one call, or the ones you leave out are gone at the next start.
+That includes the `MEFOR_SECRETS_DIRECTORY` entry the installer wrote: without it the engine reads
+no file in the secrets directory, and every secret moved there is missing, with no error naming
+the directory. Read the list first with `nssm get MessageFoundry AppEnvironmentExtra`.
 **The store key does not go in that list:** the engine refuses to start with it there, because any
 local user can read the list. Use the DPAPI key file (see
 [Protect the store encryption key at rest](#protect-the-store-encryption-key-at-rest-wp-11d)).
@@ -656,12 +660,29 @@ environment.
   settings other than the store key, among them the database password, and every `MEFOR_VALUE_*`
   value can each come from a file instead of the service's NSSM list. A variable an operator names
   as a `[secrets].provider = "env"` reference, and one a library reads for itself, are not read
-  from it. Point `MEFOR_SECRETS_DIRECTORY` at a directory only
-  SYSTEM, Administrators and the service account can reach, with one file per setting, named as
-  its variable. A path in the NSSM list is not a secret. The engine refuses a directory or file a
-  broad group can read or change. The files are plain, protected by their access list alone, and
-  nothing creates the directory yet, so you create it. Which settings it supplies, and the rules,
-  are stated once, in
+  from it. **The installer creates it**, restricted, and adds `MEFOR_SECRETS_DIRECTORY=<its path>`
+  to the service's NSSM list, keeping the entries already there; a path in the NSSM list is not a
+  secret. The path is `-SecretsDir`, else the one the service already names, else
+  `<DataDir>-secrets`, beside the data directory and not in it, so a backup of the data directory
+  does not copy the plain files. The installer refuses a path that is a volume root, a junction, a
+  file or a folder holding a folder, that sits below a junction, or that is, holds or sits inside
+  at least the data, log, store, config, value-file and settings-file folders, NSSM's folder, the
+  engine install, the checkout, the Windows folder and Program Files. It refuses a path another
+  service already names as its `MEFOR_SECRETS_DIRECTORY`, or a folder inside or around one, so a second service on the same
+  `-DataDir` needs its own `-SecretsDir`. The installer makes the directory with its owner and
+  access list in one step. The directory starts empty: as an administrator, create or copy in one
+  file per setting, named as its variable, and restart the service. Do not move a file in: a
+  moved file keeps its old access list. Each run makes Administrators the
+  owner and removes every grant there but SYSTEM's, Administrators' and the service account's,
+  whose own grant it keeps, and refuses when any is left or the account holds no read. It refuses
+  an existing directory the service does not already name, since restricting a folder someone else
+  made does not shut them out, and one the service names whose owner is no longer Administrators
+  or SYSTEM. A refusal
+  after the service is registered sets the service to Disabled. A folder above the directory that the installer
+  creates is administrator-only; one that already existed is yours to restrict, since the engine
+  does not read it. `uninstall-service.ps1` leaves the directory and its files, names them, and
+  with `-RemoveAccountAces` removes the account's entry there too. Which settings it supplies, the
+  access list it needs, and the rest of the rules are stated once, in
   [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). This is the
   first part of the protected channel vault BACKLOG #2595 asks for, not the whole of it: a secret
   left in the NSSM list is still named, not refused.
@@ -676,8 +697,7 @@ environment.
 >
 > Each one's settings and preconditions are in [CONFIGURATION.md](CONFIGURATION.md), under
 > [`[store]`](CONFIGURATION.md#store--message-store--db) and
-> [`[secrets]`](CONFIGURATION.md#secrets--connector-secretprovider-selection); the `[store]` row also
-> says which other key providers are not built. For any other source, fetch the secret in your
+> [`[secrets]`](CONFIGURATION.md#secrets--connector-secretprovider-selection). For any other source, fetch the secret in your
 > service-start wrapper and export it as the corresponding `MEFOR_*` variable, or place the DPAPI key
 > file via your provisioning tool. That covers Windows Credential Manager, Azure Key Vault via a
 > **managed identity**, and any credential with no reference field. An AD **gMSA** has no

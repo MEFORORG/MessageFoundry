@@ -15,7 +15,14 @@ cases known to differ (a header not in capitals among them). A ``BHS`` or ``FHS`
 the same field on both sides, and both refuse a short later header line (BACKLOG #2998).
 
 Never string-slices in the forbidden sense: it splits only on the message's *actual* field separator
-(read from MSH) and replaces whole fields — surrogate values never contain a field separator.
+(read from MSH) and replaces whole fields. A surrogate value CAN hold the field separator under a
+custom MSH-1. At least: the date fill writes ``+``, the free-text redaction writes ``[`` and ``]``,
+every street in the address pool holds a space, and the surrogate kinds write letters and digits.
+Joined back, such a value would add fields and renumber every later field for any reader of the
+output. So :func:`_whole_field` refuses the values a RULE writes that the engine adapter's
+whole-field ``Message.set`` refuses (BACKLOG #5540). Neither adapter checks what the shared
+site-code pass writes after the rules, or a surrogate holding a component, repetition, subcomponent
+or escape character.
 """
 
 from __future__ import annotations
@@ -52,8 +59,10 @@ def anonymize_message(
 ) -> str:
     """De-identify one HL7 v2 message: apply ``rules`` field-by-field, then the site-code pass.
 
-    Pure + deterministic for a given ``keyer``. Raises :class:`AnonError` (carrying no body) when the
-    message has no parseable MSH / encoding characters — fail closed, matching the engine adapter.
+    Pure + deterministic for a given ``keyer``. Raises :class:`AnonError` (carrying no body) when it
+    cannot safely anonymize the message — fail closed, matching the engine adapter. The causes
+    include at least a message with no parseable MSH / encoding characters, and a surrogate that
+    would hold the field separator (see :func:`_whole_field`).
 
     ``blanked``, when given, collects the address of every field the ``DATE`` kind scrubbed to empty
     (``surrogate_field_recorded``), as the engine adapter does.
@@ -87,11 +96,28 @@ def anonymize_message(
             if _skip_obx5(rule, fields, seps):
                 continue
             if index < len(fields):
-                fields[index] = surrogate_field_recorded(
+                value = surrogate_field_recorded(
                     rule.path, _kind_for(rule, fields), fields[index], keyer, seps, blanked
                 )
+                fields[index] = _whole_field(rule.path, value, field_sep)
     encoded = "\r".join(field_sep.join(fields) for fields in segments)
     return scrub_message_site_codes(encoded, keyer, rules)
+
+
+#: Beside the field separator, what the engine's whole-field ``Message.set`` refuses: CR, LF, then
+#: its ``_STRUCTURE_REFUSED``, which the tee cannot import. A test pins the two refusing alike.
+_REFUSED_IN_FIELD = ("\r", "\n", "\x0b", "\x1c", "\x00")
+
+
+def _whole_field(path: str, value: str, field_sep: str) -> str:
+    """``value``, unless it holds the field separator or a character in ``_REFUSED_IN_FIELD``; then a
+    body-free :class:`AnonError` naming the rule, never the value."""
+    if field_sep in value or any(char in value for char in _REFUSED_IN_FIELD):
+        raise AnonError(
+            f"the surrogate for {path} would hold the field separator, a segment separator, an MLLP "
+            "frame byte or NUL — refusing to emit"
+        )
+    return value
 
 
 def _skip_obx5(rule: FieldRule, fields: list[str], seps: Seps) -> bool:

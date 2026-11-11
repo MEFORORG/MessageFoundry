@@ -24,8 +24,9 @@ predicate, which the escape widens. (This paragraph replaced a "shares the predi
 action" thesis that its own module had already outgrown: a reader taking that literally puts the next neutraliser elsewhere,
 which is how the escape table came to live in ``logging_setup``.)
 
-THE TWO NEUTRALISERS ARE DIFFERENT AND ONE MUST NEVER BE "SIMPLIFIED" INTO THE OTHER. Beside the
-refusals, that makes three actions built on one predicate:
+THE NEUTRALISERS ARE DIFFERENT AND ONE MUST NEVER BE "SIMPLIFIED" INTO ANOTHER. Beside the
+refusals, that makes three actions built on one predicate. QUOTE, a fourth, escapes by an
+allowlist rather than by the predicate; its bullet below gives the encoding. The actions:
 
   * REJECT -- six sites. A control character in a value that reaches a URL path, a header, a
     filename or a config field is refused outright.
@@ -45,6 +46,18 @@ refusals, that makes three actions built on one predicate:
     document from ``json.dumps`` without ``indent`` still parses after it (vault BACKLOG #3012):
     that output holds no character of the alphabet outside a string. A document with a CR or LF
     between tokens, an indented one for example, does not, because ``\\n`` is not JSON there.
+  * QUOTE -- one ``key=value`` field of a log line, through
+    :func:`messagefoundry.logging_setup.redacted_log_field`, whose docstring says where it is
+    tested. ESCAPE keeps a value on one line but leaves its spaces, quotes and ``=`` alone, so a
+    value logged before another field can still write a field of its own. QUOTE writes everything
+    but a safe alphabet as ``_uXXXX_`` and wraps the result in quotes, so the value holds no space,
+    quote, ``:`` or ``=`` with which to end its field or write another, nor any separator a handler
+    filter's match needs to reach past its quotes (BACKLOG #3770). A filter may still rewrite a run
+    of kept characters inside the field, a date for example. :func:`quote_log_text` is a separate
+    JSON-quoted form for text printed to a terminal, such as a check line, which no handler filter
+    reads; a credential scrub can close it early, so it is not for any text a handler filter reads,
+    a last field or a whole message included. QUOTE changes the value's spelling, so it does not
+    replace ESCAPE on a whole line.
 
 WHY ESCAPE LIVES HERE, WHICH IS THE ONE FACT WORTH STATING ONCE (BACKLOG #1591). It was defined in
 ``logging_setup`` until ``logging_guard`` needed it, and ``logging_setup`` imports
@@ -312,3 +325,136 @@ def scrub_log_argument(text: str) -> str:
     return scrub_control_chars(
         text.replace("\r", _CTRL_TRANSLATION[0x0D]).replace("\n", _CTRL_TRANSLATION[0x0A])
     )
+
+
+def quote_log_text(text: str) -> str:
+    """``text`` as one double-quoted token that its own content cannot close or extend, in text no
+    handler filter reads.
+
+    JSON string quoting escapes every double quote and backslash, writes ``\\n``, ``\\r``, ``\\t``,
+    ``\\b`` and ``\\f`` for those controls, and every other character outside printable ASCII, DEL
+    included, as ``\\uXXXX``, a character past U+FFFF as a surrogate pair of them. So, in text no
+    handler filter reads, a value cannot end its token and write a separator, a second entry or a
+    mark after it, and a lookalike quote such as U+02BA or U+FF02, or a right-to-left letter, cannot
+    fake that end for a human reader (vault BACKLOG #3139). The output is printable ASCII, and
+    :func:`scrub_log_argument` changes nothing in it. It stays as a guard should the ``json.dumps``
+    call ever drop ``ensure_ascii``, and because CodeQL's ``py/log-injection`` accepts its
+    line-break ``replace`` as the neutraliser and does not see ``json.dumps``.
+
+    NOT FOR ANY TEXT A CONFIGURED HANDLER'S FILTERS READ, WHEREVER IT SITS IN THE LINE. At least the
+    credential scrub and the redaction filters can close the token early or erase its closing quote,
+    and the text after it then reads as fields of its own (BACKLOG #3770). For a logged field, use
+    :func:`messagefoundry.logging_setup.redacted_log_field`, whose docstring says where it is
+    tested."""
+    # Imported here, not at the top: the remote-debug guard imports this module before its hook
+    # goes in, and json, with re and enum under it, would lengthen that window.
+    import json
+
+    return scrub_log_argument(json.dumps(text))
+
+
+#: The characters :func:`log_field_token` writes as they are: letters, digits and ``-./``
+#: (BACKLOG #3770). Every other character is escaped, at least the space and every other
+#: whitespace, both quotes, the backslash, ``_``, ``:``, ``=``, ``;``, ``,``, ``#``, ``%``, ``|``,
+#: ``^``, ``&``, ``~``, ``<``, ``{``, ``(`` and ``[``. So the value holds nothing with which to end its
+#: field or start one, and no separator a shipped handler filter's match needs to run past the
+#: closing quote: no credential label can reach its ``:`` or ``=``, no HL7 run its separator, no
+#: name run its space. A filter can still match a run of kept characters, a date of digits, ``-``
+#: and ``/`` for one, and rewrite it as ``[redacted]`` inside the field. ``:`` goes too, because a
+#: kept ``password:`` let the credential scrub take the closing quote and the next key; ``_`` goes
+#: because it starts and ends every escape.
+_LOG_FIELD_KEPT = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-./")
+
+#: What :func:`log_field_token` puts in place of the cut tail of a token over its bound. It starts
+#: with "_%", which neither the escape nor a kept run writes, so a bounded token cannot read as a
+#: kept one, and it holds no HL7 separator, so a cut head cannot gain one. Both its ends are word
+#: characters, so it gives the date pass no word boundary: not after a cut head's digits, and not
+#: before the checksum's.
+_LOG_FIELD_CUT_MARK = "_%crc32x"
+_LOG_FIELD_CUT_LENGTH = len(_LOG_FIELD_CUT_MARK) + 8
+
+#: What a literal :func:`log_field_token` keeps whole may hold: the kept alphabet and the
+#: placeholder brackets. Nothing in it closes a field or completes a filter's match.
+_LOG_FIELD_LITERAL = _LOG_FIELD_KEPT | frozenset("<>[]")
+
+
+def _unit_escape(ch: str) -> str:
+    """``ch`` itself when kept, else one ``_uXXXX_`` per UTF-16 code unit, four upper-case hex
+    digits between ``_u`` and ``_``. Not ``%XX``: a ``%`` and two hex digits is where the credential
+    scrub starts a label (``secretscrub._LABEL_START``) and how the HL7 pass spells an encoded
+    separator (``redaction._ENCODED_SEPARATOR``), so ``%20password`` read as a label and ``%7C`` as
+    a separator. An escape starts and ends in ``_``, a word character that is not a digit, so it
+    gives the date and SSN passes no word boundary and no digit to join to a kept one: ``%u00E9``
+    before ``12-34-5678`` read as an SSN, and ``%`` after a kept date as its end."""
+    if ch in _LOG_FIELD_KEPT:
+        return ch
+    units = ch.encode("utf-16-be", "surrogatepass")
+    return "".join(f"_u{units[i]:02X}{units[i + 1]:02X}_" for i in range(0, len(units), 2))
+
+
+def log_field_token(text: str, limit: int, *, literals: tuple[str, ...] = ()) -> str:
+    """``text`` as one double-quoted ``key=value`` field value of a log line, which no part of
+    ``text`` can close, extend or join to another field, before or after the shipped handler
+    filters, however many handlers run them in turn (BACKLOG #3770).
+
+    Every character outside :data:`_LOG_FIELD_KEPT` is written by :func:`_unit_escape`, so the token
+    holds no space, quote, backslash or separator, and an ``_uXXXX_`` decode gives ``text`` back,
+    except that two lone surrogates that spell a pair decode to its character. Each
+    occurrence of a string in ``literals`` is kept whole instead, which is how the redaction
+    placeholders stay searchable as themselves; a literal may hold only :data:`_LOG_FIELD_LITERAL`.
+    A text that already holds a placeholder's spelling therefore logs it as it is, so a value can
+    claim of itself that something was redacted, though never of another field. The handler filters
+    still read the token, and one may rewrite a run inside it, a date for example, as
+    ``[redacted]``, which holds no space or quote. They anchor on less than they would in raw text,
+    so a caller does not call this directly: a caller calls
+    :func:`messagefoundry.logging_setup.redacted_log_field` instead, whose docstring says where it
+    is tested.
+
+    The escaped text is at most ``limit`` characters, counted after the escape, so the field is at
+    most ``limit`` plus its two quotes whatever ``text`` holds. That is the token's bound; a handler
+    filter's rewrite inside it can lengthen the logged field, at least by up to two characters for
+    each date of eight characters it reads as ``[redacted]``. Longer text keeps whole leading
+    pieces, a character's escapes or a literal, and :data:`_LOG_FIELD_CUT_MARK` with the CRC-32 of
+    all of ``text``, so two honest long texts that share the head almost never read alike. A
+    checksum, not a digest, as in ``pipeline.intake_bound.shorten_with_checksum``: the field is read
+    by a person and is never a key, so it has no forged collision to resist, and this leaf module
+    stays out of the crypto inventory. ``limit`` must leave room for the mark, 16 characters."""
+    if limit < _LOG_FIELD_CUT_LENGTH:
+        raise ValueError(
+            f"limit {limit} leaves no room for the {_LOG_FIELD_CUT_LENGTH}-character cut mark"
+        )
+    for literal in literals:
+        if not literal or not set(literal) <= _LOG_FIELD_LITERAL:
+            raise ValueError(f"literal {literal!r} holds a character a field must not")
+    # Each piece is at least one character, so pieces past `limit + 1` characters are never needed,
+    # and the head is built a whole piece at a time, so a cut never splits an escape or a literal.
+    starts = {literal[0] for literal in literals}
+    pieces: list[str] = []
+    length = 0
+    i = 0
+    while i < len(text) and length <= limit:
+        piece = None
+        if text[i] in starts:
+            piece = next((lit for lit in literals if text.startswith(lit, i)), None)
+        if piece is None:
+            piece = _unit_escape(text[i])
+            i += 1
+        else:
+            i += len(piece)
+        length += len(piece)
+        pieces.append(piece)
+    if length <= limit:
+        return scrub_log_argument(f'"{"".join(pieces)}"')
+    import binascii  # lazily, for the reason quote_log_text imports json lazily
+
+    budget = limit - _LOG_FIELD_CUT_LENGTH
+    head: list[str] = []
+    for piece in pieces:
+        budget -= len(piece)
+        if budget < 0:
+            break
+        head.append(piece)
+    checksum = binascii.crc32(text.encode("utf-8", "surrogatepass"))
+    # Printable ASCII already, so the scrub changes nothing; it is here for CodeQL, as in
+    # quote_log_text.
+    return scrub_log_argument(f'"{"".join(head)}{_LOG_FIELD_CUT_MARK}{checksum:08x}"')
