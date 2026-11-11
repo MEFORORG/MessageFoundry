@@ -469,18 +469,6 @@ def test_a_file_url_path_naming_a_host_is_refused_on_its_text(
         validate_against("<patient>x</patient>", location)
 
 
-def test_the_schema_opener_holds_one_handler_and_takes_no_other() -> None:
-    """It is not made by ``build_strict_opener``, so it must hold no handler that reads an HTTP
-    reply. ``test_a_non_file_url_reaching_the_opener_is_a_refused_resource`` pins that an http or
-    https URL reaching it is refused."""
-    from messagefoundry.parsing.xml.schema import _ConfinedFiles, _ConfinedOpener
-
-    opener = _ConfinedOpener(_ConfinedFiles(()))
-    assert [type(h) for h in vars(opener)["handlers"]] == [_ConfinedFiles]
-    with pytest.raises(TypeError, match="no other"):
-        opener.add_handler(urllib.request.HTTPHandler())
-
-
 # --- a mapped drive, a long path, and links (BACKLOG #5537 repair) ---------------------------------
 
 
@@ -510,6 +498,44 @@ def test_a_long_path_prefix_on_a_drive_letter_is_a_local_path(tmp_path: Path) ->
     long_inc = _write_path_schema(tmp_path / "sub", "\\\\?\\" + str(tmp_path / "inc.xsd"))
     assert validate_against("<patient>x</patient>", str(long_inc), schema_root=tmp_path).valid
     assert validate_against("<patient>x</patient>", "file:////%3F/" + main.as_posix()).valid
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a drive letter is Windows path text")
+def test_a_file_url_with_a_drive_in_the_authority_position_is_a_local_path(tmp_path: Path) -> None:
+    # As a source or a schema_root, file:////C:/... loaded before BACKLOG #5537, and was then
+    # refused as a UNC path (\\C:\...). On an include, xmlschema refuses it as an invalid URI
+    # before the opener sees it.
+    (tmp_path / "inc.xsd").write_text(_CLEAN, encoding="utf-8")
+    main = _write_path_schema(tmp_path, "inc.xsd")
+    assert validate_against("<patient>x</patient>", "file:////" + main.as_posix()).valid
+    assert validate_against(
+        "<patient>x</patient>", str(main), schema_root="file:////" + tmp_path.as_posix()
+    ).valid
+
+
+def test_only_a_windows_drive_authority_goes_to_url2pathname(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``schema._url_path``'s classification, measured on every platform: on Windows an authority
+    whose second character is ``:`` is a drive and goes to ``url2pathname``; a host is kept as
+    written, and so is a drive on POSIX."""
+    from messagefoundry.parsing.xml.schema import _local, _url_path
+
+    def spy(path: str) -> str:
+        return f"url2pathname({path})"
+
+    for name in ("nt", "posix"):
+        with monkeypatch.context() as m:
+            m.setattr(urllib.request, "url2pathname", spy)
+            m.setattr(os, "name", name)
+            drive = _url_path("//C:/schemas/main.xsd")
+            host = _url_path("//server/share/x.xsd")
+            empty = _url_path("/C:/schemas/main.xsd")
+        assert (drive == "url2pathname(//C:/schemas/main.xsd)") is (name == "nt"), (name, drive)
+        assert host == f"{os.sep}{os.sep}server{os.sep}share{os.sep}x.xsd", (name, host)
+        assert empty == "url2pathname(/C:/schemas/main.xsd)", (name, empty)
+    if os.name != "nt":  # kept as written, a drive authority is a UNC path here, and is refused
+        assert _local(_url_path("//C:/schemas/main.xsd")) is None
 
 
 @pytest.mark.skipif(os.name != "nt", reason="drive and UNC syntax is Windows path text")

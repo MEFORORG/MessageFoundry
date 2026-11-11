@@ -267,8 +267,14 @@ def _url_path(path: str) -> str:
     (``localhost``, this machine's name), so ``\\\\localhost\\x`` read a local file, and on POSIX
     raised ``URLError``, an ``OSError``, for any other, which xmlschema took for a missing include
     and skipped with a warning. Kept, as ``url2pathname`` keeps any other on Windows, it is a UNC
-    or device path, or on Windows a ``\\\\?\\C:`` long path, each judged on its text."""
-    if not urlsplit("file:" + path).netloc:
+    or device path, or on Windows a ``\\\\?\\C:`` long path, each judged on its text.
+
+    On Windows an authority whose second character is ``:`` is a drive, not a host, as in
+    ``file:////C:/schemas/main.xsd``, and ``url2pathname`` reads it as ``C:\\schemas\\main.xsd``,
+    as it did before BACKLOG #5537; kept, it read as ``\\\\C:\\...``, a UNC path, and was refused.
+    On POSIX it is a name like any other, so the path stays a UNC path there and is refused."""
+    authority = urlsplit("file:" + path).netloc
+    if not authority or (os.name == "nt" and authority[1:2] == ":"):
         return urllib.request.url2pathname(path)
     return unquote(
         path.replace("/", os.sep),
@@ -342,12 +348,13 @@ def _fallback_loader(xmlschema_mod: Any, bundled: tuple[_Root, ...]) -> type:
 class _ConfinedFiles(urllib.request.BaseHandler):
     """The only way xmlschema can open a resource here: ``file:`` URLs under fixed roots (BACKLOG #5537).
 
-    Installed as xmlschema's ``opener``, so it sees every location xmlschema opens as a URL, the schema
-    file the caller named and each include, import, redefine and override location among them; every
-    scheme but ``file:`` reaches ``unknown_open``. It does not see every location a schema names: one
-    xmlschema reads as XML text is parsed, not opened, so :func:`_refuse_text_locations` refuses it
-    first, and ``allow="local"`` refuses a remote URL before it is opened. The named file is read as
-    named, a link at it included. One root is xmlschema's bundled ``schemas`` directory, which holds
+    The only handler inside :class:`_ConfinedOpener`, xmlschema's ``opener``, so it sees every
+    location xmlschema opens as a URL, the schema file the caller named and each include, import,
+    redefine and override location among them; every scheme but ``file:`` reaches
+    ``unknown_open``. It does not see every location a schema names: one xmlschema reads as XML
+    text is parsed, not opened, so :func:`_refuse_text_locations` refuses it first, and
+    ``allow="local"`` refuses a remote URL before it is opened. The named file is read as named, a
+    link at it included. One root is xmlschema's bundled ``schemas`` directory, which holds
     the copies of well-known namespaces (SOAP encoding, XML-DSig, xlink and others) a location-free
     ``xs:import`` resolves to; those are library files and are read as they are, links included. For
     a schema given as a path, the other root is its own directory, or the ``schema_root`` the caller
@@ -445,7 +452,9 @@ class _ConfinedOpener(urllib.request.OpenerDirector):
     ``FileHandler``, ``FTPHandler`` and ``DataHandler`` among them, each able to open what
     ``_ConfinedFiles`` refuses; and ``parsing/`` may not import ``transports/``. This opener has no
     handler that opens an ``http`` or ``https`` URL, so it reads no reply head, the hazard that
-    function exists for, and :meth:`add_handler` refuses any handler after the first."""
+    function exists for, and :meth:`add_handler` refuses any handler after the first. The
+    stock-opener scan in ``tests/test_reply_framing.py`` sanctions this class by name, and checks
+    both."""
 
     def __init__(self, files: _ConfinedFiles) -> None:
         super().__init__()
@@ -555,13 +564,14 @@ def _build_schema(
     leaves its namespace undeclared: a reference to one of its types fails the build, but a ``lax`` or
     ``skip`` wildcard admits that namespace's elements unchecked.
 
-    Both rely on :class:`_ConfinedFiles` as xmlschema's opener, with ``allow="local"`` so xmlschema
-    refuses a remote URL before it reaches the opener, and ``defuse="always"`` so its own entity check
-    runs on every file as well. Before BACKLOG #5537 this was ``allow="local"`` with no opener and the
-    default ``defuse="remote"``, and an inline schema's ``xs:include`` of a ``file:`` URL read that local
-    file and expanded a DOCTYPE entity inside it. xmlschema's ``allow="sandbox"`` is not used: it
-    compares URL string prefixes, and it narrows to each includer's own directory, so a nested include
-    that climbs back inside the top-level directory was refused.
+    Both rely on :class:`_ConfinedOpener` as xmlschema's opener, holding :class:`_ConfinedFiles` as
+    its only handler, with ``allow="local"`` so xmlschema refuses a remote URL before it reaches the
+    opener, and ``defuse="always"`` so its own entity check runs on every file as well. Before
+    BACKLOG #5537 this was ``allow="local"`` with no opener and the default ``defuse="remote"``, and
+    an inline schema's ``xs:include`` of a ``file:`` URL read that local file and expanded a DOCTYPE
+    entity inside it. xmlschema's ``allow="sandbox"`` is not used: it compares URL string prefixes,
+    and it narrows to each includer's own directory, so a nested include that climbs back inside
+    the top-level directory was refused.
     """
     bundled = _bundled_root(xmlschema_mod.__file__)
     roots = bundled
