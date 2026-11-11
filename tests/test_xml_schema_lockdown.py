@@ -444,6 +444,46 @@ def test_a_network_or_device_location_is_refused_before_anything_touches_it(
         assert not [p for p in touched if "nonexist-5537" in p]
 
 
+def test_a_file_url_path_naming_a_host_is_refused_where_url2pathname_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POSIX ``url2pathname`` raises ``URLError``, an ``OSError``, for a path that opens with two
+    slashes, as in ``file:////server/share/x.xsd``. Raised from the opener, xmlschema took it for a
+    missing include and skipped it with a warning, so the test above went green on Windows and red
+    on POSIX. Simulated here so every platform runs it."""
+    import urllib.error
+
+    real = urllib.request.url2pathname
+
+    def posix_like(path: str, *args: Any, **kwargs: Any) -> str:
+        if path.startswith("//") and "nonexist-5537" in path:
+            raise urllib.error.URLError("file:// scheme is supported only on localhost")
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(urllib.request, "url2pathname", posix_like)
+    location = "file:////nonexist-5537.invalid/share/x.xsd"
+    main = _write_path_schema(tmp_path, location)
+    for source in (main.read_text(encoding="utf-8"), str(main)):
+        with pytest.raises(XmlValidationError, match="not a local file path") as ei:
+            validate_against("<patient>x</patient>", source)
+        assert "_ResourceRefused" in _causes(ei.value)
+    # The same URL named as the schema itself is refused on its text with a fixed reason.
+    with pytest.raises(XmlValidationError, match="a schema location that is a UNC or device path"):
+        validate_against("<patient>x</patient>", location)
+
+
+def test_the_schema_opener_holds_one_handler_and_takes_no_other() -> None:
+    """It is not made by ``build_strict_opener``, so it must hold no handler that reads an HTTP
+    reply. ``test_a_non_file_url_reaching_the_opener_is_a_refused_resource`` pins that an http or
+    https URL reaching it is refused."""
+    from messagefoundry.parsing.xml.schema import _ConfinedFiles, _ConfinedOpener
+
+    opener = _ConfinedOpener(_ConfinedFiles(()))
+    assert [type(h) for h in vars(opener)["handlers"]] == [_ConfinedFiles]
+    with pytest.raises(TypeError, match="no other"):
+        opener.add_handler(urllib.request.HTTPHandler())
+
+
 # --- a mapped drive, a long path, and links (BACKLOG #5537 repair) ---------------------------------
 
 
@@ -1104,15 +1144,19 @@ def test_only_the_exact_named_file_skips_the_link_walk(tmp_path: Path) -> None:
     # The named file may be a link out of its directory and is read as named. A name differing from it
     # only in case is another file in a case-sensitive Windows directory, so it takes the walk; it used
     # to match on normcase and be read through the link unwalked.
-    from messagefoundry.parsing.xml.schema import _ConfinedFiles, _ResourceRefused, _Root
+    from messagefoundry.parsing.xml.schema import (
+        _ConfinedFiles,
+        _ConfinedOpener,
+        _ResourceRefused,
+        _Root,
+    )
 
     (tmp_path / "real").mkdir()
     (tmp_path / "real" / "main.xsd").write_text(_CLEAN, encoding="utf-8")
     (tmp_path / "cfg").mkdir()
     entry = tmp_path / "cfg" / "main.xsd"
     _symlink_or_skip(tmp_path / "real" / "main.xsd", entry)
-    opener = urllib.request.OpenerDirector()
-    opener.add_handler(_ConfinedFiles((_Root(str(tmp_path / "cfg"), vet=True),), str(entry)))
+    opener = _ConfinedOpener(_ConfinedFiles((_Root(str(tmp_path / "cfg"), vet=True),), str(entry)))
     assert b"patient" in opener.open(entry.as_uri()).read()  # control: the named file itself
     variant = (tmp_path / "cfg" / "MAIN.xsd").as_uri()
     # Case-insensitive here: the walk finds the link and refuses its target. Case-sensitive: no file.
@@ -1121,11 +1165,10 @@ def test_only_the_exact_named_file_skips_the_link_walk(tmp_path: Path) -> None:
 
 
 def test_a_non_file_url_reaching_the_opener_is_a_refused_resource() -> None:
-    from messagefoundry.parsing.xml.schema import _ConfinedFiles, _ResourceRefused
+    from messagefoundry.parsing.xml.schema import _ConfinedFiles, _ConfinedOpener, _ResourceRefused
 
-    opener = urllib.request.OpenerDirector()
-    opener.add_handler(_ConfinedFiles(()))
-    for url in ("http://127.0.0.1:9/x.xsd", "data:text/plain,x"):
+    opener = _ConfinedOpener(_ConfinedFiles(()))
+    for url in ("http://127.0.0.1:9/x.xsd", "https://127.0.0.1:9/x.xsd", "data:text/plain,x"):
         with pytest.raises(_ResourceRefused):
             opener.open(url)
 

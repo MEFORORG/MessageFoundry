@@ -672,6 +672,28 @@ SITES: dict[str, Site] = {
     "messagefoundry/log_spool.py::LogSpool.open": Site(
         1, INTERNAL, "A fixed lock name in the spool directory."
     ),
+    "messagefoundry/parsing/xml/schema.py::_bundled_root": Site(
+        1, INTERNAL, "A fixed name, schemas, beside the installed xmlschema package's own file."
+    ),
+    "messagefoundry/parsing/xml/schema.py::_link_target": Site(
+        1,
+        GUARDED,
+        "A link's target text, read from a link the walk met under a schema's confinement root, "
+        "joined onto the link's directory. The guard refuses a UNC or device result on its text, "
+        "and the caller, _resolve_within, refuses one outside the root before anything follows "
+        "it (BACKLOG #5537).",
+        "messagefoundry/parsing/xml/schema.py::_local",
+        called=True,
+    ),
+    "messagefoundry/parsing/xml/schema.py::_resolve_within": Site(
+        1,
+        GUARDED,
+        "One component of a location a schema names, the location and every link target already "
+        "inside the confinement root by the guard, joined onto the part of the walk that lstat "
+        "has checked (BACKLOG #5537).",
+        "messagefoundry/parsing/xml/schema.py::_within",
+        called=True,
+    ),
     "messagefoundry/pipeline/dr_backup.py::BackupRunner._add_config_dir": Site(
         2,
         OPERATOR,

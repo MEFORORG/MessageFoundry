@@ -26,6 +26,7 @@ import io
 import ntpath
 import os
 import stat
+import urllib.error
 import urllib.request
 import urllib.response
 from dataclasses import dataclass
@@ -257,12 +258,26 @@ def _bundled_root(module_file: str) -> tuple[_Root, ...]:
     return () if directory is None else (_Root(directory, vet=False),)
 
 
+def _url_path(path: str) -> str | None:
+    """``url2pathname(path)``, or ``None`` where it refuses the path as naming a host.
+
+    A path that opens with two slashes, as in ``file:////server/share/x.xsd``, names a host the URL's
+    empty authority did not. Windows turns it into a UNC path, which :func:`_local` refuses; POSIX
+    raises ``URLError``, an ``OSError``, so xmlschema met it as a missing include and skipped it with
+    a warning instead of failing the build."""
+    try:
+        return urllib.request.url2pathname(path)
+    except urllib.error.URLError:
+        return None
+
+
 def _file_url_path(url: str) -> str | None:
     """The local path a host-less ``file:`` URL names, in :func:`_local` form, else ``None``."""
     parts = urlsplit(url)
     if parts.scheme.lower() != "file" or parts.netloc.lower() not in ("", "localhost"):
         return None
-    return _local(urllib.request.url2pathname(parts.path))
+    path = _url_path(parts.path)
+    return None if path is None else _local(path)
 
 
 class _ResourceRefused(ValueError):
@@ -417,6 +432,24 @@ class _ConfinedFiles(urllib.request.BaseHandler):
         raise _ResourceRefused("a resource that is not a local file", req.full_url)
 
 
+class _ConfinedOpener(urllib.request.OpenerDirector):
+    """xmlschema's opener, holding one :class:`_ConfinedFiles` and no other handler.
+
+    Not made by ``build_strict_opener`` (``transports/bounded_read.py``), which builds the openers
+    that read an HTTP reply. That one goes through ``build_opener``, which adds urllib's defaults,
+    ``FileHandler``, ``FTPHandler`` and ``DataHandler`` among them, each able to open what
+    ``_ConfinedFiles`` refuses; and ``parsing/`` may not import ``transports/``. This opener has no
+    handler that opens an ``http`` or ``https`` URL, so it reads no reply head, the hazard that
+    function exists for, and :meth:`add_handler` refuses any handler after the first."""
+
+    def __init__(self, files: _ConfinedFiles) -> None:
+        super().__init__()
+        super().add_handler(files)
+
+    def add_handler(self, handler: urllib.request.BaseHandler) -> None:
+        raise TypeError("the schema opener holds its confined-file handler and no other")
+
+
 class _SourceRefused(ValueError):
     """A schema source or ``schema_root`` this module refuses. Its message is fixed text, never the
     path, so :func:`_build_schema` may repeat it."""
@@ -443,7 +476,10 @@ def _local_path(text: str | bytes | os.PathLike[str], what: str) -> str:
     if scheme == "file":
         if parts.netloc.lower() not in ("", "localhost"):
             raise _SourceRefused(f"{what} that is a file URL naming a host")
-        source = urllib.request.url2pathname(parts.path).strip()
+        named = _url_path(parts.path)
+        if named is None:
+            raise _SourceRefused(f"{what} that is a UNC or device path")
+        source = named.strip()
         if not source:  # "file:" or "file://localhost" names no path, so none is supplied
             raise _SourceRefused(f"{what} that is a file URL naming no path")
     elif scheme and not (len(scheme) == 1 and source[1:2] == ":"):  # a drive letter is not a scheme
@@ -541,13 +577,11 @@ def _build_schema(
             # A file URL, not the bare path: xmlschema decodes a path's %XX a second time, and keeps
             # a URL's identity, so an include that includes the entry back is not loaded twice.
             source = Path(entry).as_uri()
-        opener = urllib.request.OpenerDirector()
-        opener.add_handler(_ConfinedFiles(roots, entry))
         return xmlschema_mod.XMLSchema(
             source,
             allow="local",
             defuse="always",
-            opener=opener,
+            opener=_ConfinedOpener(_ConfinedFiles(roots, entry)),
             loader_class=_fallback_loader(xmlschema_mod, bundled),
         )
     except (_SourceRefused, _ResourceRefused) as exc:
