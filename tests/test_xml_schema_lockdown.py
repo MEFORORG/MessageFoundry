@@ -514,6 +514,14 @@ def test_a_file_url_with_a_drive_in_the_authority_position_is_a_local_path(tmp_p
     ).valid
 
 
+@pytest.mark.parametrize("url", ["file:", "file://", "file:////?/C:/x.xsd"])
+def test_a_file_url_naming_no_path_is_not_a_local_path(url: str) -> None:
+    # Its path is empty, and abspath read it as the working directory.
+    from messagefoundry.parsing.xml.schema import _file_url_path
+
+    assert _file_url_path(url) is None
+
+
 def test_only_a_windows_drive_authority_goes_to_url2pathname(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

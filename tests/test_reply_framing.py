@@ -1390,7 +1390,14 @@ def test_a_proxy_handler_may_sit_on_a_strict_opener() -> None:
 
 #: Names of the calls that make an opener or a connection with the stock response class.
 _STOCK_OPENER_CALLS = frozenset(
-    {"build_opener", "urlopen", "OpenerDirector", "HTTPConnection", "HTTPSConnection"}
+    {
+        "build_opener",
+        "urlopen",
+        "urlretrieve",
+        "OpenerDirector",
+        "HTTPConnection",
+        "HTTPSConnection",
+    }
 )
 
 #: Import origins that share a name above but build no urllib opener or ``http.client``
@@ -1491,10 +1498,26 @@ def _is_stock(origin: str, imported: bool, names: frozenset[str] = _STOCK_OPENER
     return not names.isdisjoint(origin.split("."))
 
 
-def _stock_calls(tree: ast.AST) -> list[tuple[int, str]]:
+def _name_chain(node: ast.expr) -> Iterator[ast.expr]:
+    """The ``Name``/``Attribute``/``getattr`` nodes :func:`_call_origins` reads to resolve ``node``,
+    and nothing under them, so a call inside a receiver, as in ``urlopen(u).read``, is still
+    judged on its own."""
+    while True:
+        yield node
+        if isinstance(node, ast.Attribute):
+            node = node.value
+        elif target := _getattr_target(node):
+            node = target[0]
+        else:
+            return
+
+
+def _stock_calls(tree: ast.AST, module: str | None = None) -> list[tuple[int, str]]:
     """``(line, origin)`` for each call, and each other use of a name as a value, whose origin
     names a stock name in any part, and for each class with such a base, or with a base naming a
     class ``_SANCTIONED_STOCK_SITES`` lets stand, whose origin reads ``class Name(base origin)``.
+    A value naming a sanctioned class counts too, outside ``module``, the file under
+    ``messagefoundry/`` that defines that class.
 
     The import decides, not the spelling: ``from http.client import HTTPConnection as C`` then
     ``C(host)`` is a stock call, and starlette's ``HTTPConnection`` under its own name is not. An
@@ -1504,40 +1527,49 @@ def _stock_calls(tree: ast.AST) -> list[tuple[int, str]]:
     spelling. Any part counts, so ``urllib.request.OpenerDirector.add_handler(opener, handler)``,
     which skips a subclass's own ``add_handler``, is an offence too. A value counts, so a stock
     class held in a variable, handed to ``do_open``, set as a pool's ``ConnectionCls`` or put in
-    the bases ``type`` is called with is an offence; an annotation is not. A base is resolved the
-    way a call's target is, so a subclass of ``urllib.request.OpenerDirector`` is found under any
-    alias or dotted spelling. So is a class built on a sanctioned class, from whatever module,
-    which that sanction's check never sees.
+    the bases ``type`` is called with is an offence; a name in an annotation is not, though a call
+    inside one is. A base is resolved the way a call's target is, so a subclass of
+    ``urllib.request.OpenerDirector`` is found under any alias or dotted spelling. So is a class
+    statement built on a sanctioned class, and outside the module that defines it, a value naming
+    one, such as a ``type`` call's bases, since that sanction's check sees only the class itself.
 
     At least these pass unseen: a stock class reached by ``getattr`` with a name that is not a
     constant; a stock name re-exported under another name by a second module and imported from
     there, which a scan of one file at a time cannot see; a urllib3 or requests constructor, such
     as ``urllib3.PoolManager`` or ``requests.Session``, that builds a stock connection inside the
-    library; and a handler added to a sanctioned opener by ``super`` or by editing its handler
-    list, which ``_ConfinedOpener`` itself refuses when it opens. No planted control pins these."""
+    library; a stock handler driven directly, as in ``urllib.request.HTTPSHandler().https_open``,
+    since engine code builds stock handlers to hand to build_strict_opener; a value naming a
+    sanctioned class inside the module that defines it; and a handler added to a sanctioned opener
+    by ``super`` or by editing its handler tables, which ``_ConfinedOpener`` itself refuses when it
+    opens. No planted control pins these."""
     bindings = _bindings(tree)
+    elsewhere = frozenset(name for name, home in _SANCTIONED_CLASSES.items() if home != module)
     found: list[tuple[int, str]] = []
-    judged: set[int] = set()  # nodes a call, a base or an annotation already accounts for
+    judged: set[int] = set()  # names a call, a base or an annotation already accounts for
     for node in ast.walk(tree):
         annotations: list[ast.expr | None] = []
         if isinstance(node, (ast.arg, ast.AnnAssign)):
             annotations.append(node.annotation)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             annotations.append(node.returns)
-        judged.update(id(n) for a in annotations if a is not None for n in ast.walk(a))
-    # ast.walk is breadth-first, so an outer name is judged before the parts inside it. A set, so
+        judged.update(
+            id(n)
+            for a in annotations
+            if a is not None
+            for n in ast.walk(a)
+            if isinstance(n, (ast.Name, ast.Attribute))
+        )
+    # ast.walk is breadth-first, so an outer name is judged before the names inside it. A set, so
     # one use whose root resolves two ways is reported once per origin; sorted only so a failure
     # lists them in a stable order.
     for node in ast.walk(tree):
-        if id(node) in judged:
-            continue
         if isinstance(node, ast.Call):
-            judged.update(id(n) for n in ast.walk(node.func))
+            judged.update(id(n) for n in _name_chain(node.func))
             calls = {o for o, i in _call_origins(node.func, bindings) if _is_stock(o, i)}
             found.extend((node.lineno, origin) for origin in sorted(calls))
         elif isinstance(node, ast.ClassDef):
-            judged.update(id(n) for base in node.bases for n in ast.walk(base))
-            names = _STOCK_OPENER_CALLS | _SANCTIONED_CLASSES
+            judged.update(id(n) for base in node.bases for n in _name_chain(base))
+            names = _STOCK_OPENER_CALLS | frozenset(_SANCTIONED_CLASSES)
             bases = {
                 origin
                 for base in node.bases
@@ -1545,9 +1577,14 @@ def _stock_calls(tree: ast.AST) -> list[tuple[int, str]]:
                 if _is_stock(origin, imported, names)
             }
             found.extend((node.lineno, f"class {node.name}({origin})") for origin in sorted(bases))
-        elif isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load):
-            judged.update(id(n) for n in ast.walk(node))
-            values = {o for o, i in _call_origins(node, bindings) if _is_stock(o, i)}
+        elif (
+            isinstance(node, (ast.Name, ast.Attribute))
+            and isinstance(node.ctx, ast.Load)
+            and id(node) not in judged
+        ):
+            judged.update(id(n) for n in _name_chain(node))
+            names = _STOCK_OPENER_CALLS | elsewhere
+            values = {o for o, i in _call_origins(node, bindings) if _is_stock(o, i, names)}
             found.extend((node.lineno, origin) for origin in sorted(values))
     return found
 
@@ -1590,7 +1627,7 @@ def _schema_opener_is_confined() -> None:
     build_strict_opener from transports/, and which build_opener would fill with urllib's default
     handlers. It holds one _ConfinedFiles, which opens file: and refuses every other scheme in
     unknown_open; it takes no subclass of that handler, add_handler refuses any other, and open
-    refuses to run with any other however it got in. So no handler in it opens an http or https
+    refuses to run with any other in any of its handler tables, however it got there. So no handler in it opens an http or https
     URL or reads a reply head. That such a URL is refused is
     ``tests/test_xml_schema_lockdown.py::test_a_non_file_url_reaching_the_opener_is_a_refused_resource``.
     """
@@ -1614,6 +1651,12 @@ def _schema_opener_is_confined() -> None:
     urllib.request.OpenerDirector.add_handler(opener, urllib.request.HTTPSHandler())
     with pytest.raises(TypeError, match="besides its confined-file handler"):
         opener.open("https://127.0.0.1:9/x.xsd")
+    # Or one placed straight in a handler table add_handler fills.
+    for table in ("handle_error", "process_request", "process_response"):
+        tampered = _ConfinedOpener(_ConfinedFiles(()))
+        vars(tampered)[table].setdefault("https", []).append(urllib.request.HTTPSHandler())
+        with pytest.raises(TypeError, match="besides its confined-file handler"):
+            tampered.open("https://127.0.0.1:9/x.xsd")
 
 
 #: ``(module under messagefoundry/, origin as _stock_calls reports it) -> the check it rests on``,
@@ -1647,12 +1690,13 @@ _SANCTIONED_STOCK_SITES: dict[tuple[str, str], Callable[[], None]] = {
     ): _schema_opener_is_confined,
 }
 
-#: The class each sanctioned ``class Name(...)`` site defines. A base naming one is reported.
-_SANCTIONED_CLASSES = frozenset(
-    origin.removeprefix("class ").partition("(")[0]
-    for _, origin in _SANCTIONED_STOCK_SITES
+#: ``class -> the module defining it`` for each sanctioned ``class Name(...)`` site. A base naming
+#: one is reported, and so is a value naming one outside that module.
+_SANCTIONED_CLASSES = {
+    origin.removeprefix("class ").partition("(")[0]: module
+    for module, origin in _SANCTIONED_STOCK_SITES
     if origin.startswith("class ")
-)
+}
 
 
 def test_no_engine_module_builds_a_stock_opener() -> None:
@@ -1677,10 +1721,10 @@ def test_no_engine_module_builds_a_stock_opener() -> None:
         # import still spells the stock name in the import itself. NFKC is how the parser reads
         # an identifier, so a look-alike spelling is not skipped either.
         normalized = unicodedata.normalize("NFKC", text)
-        if not any(name in normalized for name in _STOCK_OPENER_CALLS | _SANCTIONED_CLASSES):
+        if not any(name in normalized for name in _STOCK_OPENER_CALLS | set(_SANCTIONED_CLASSES)):
             continue
         rel = path.relative_to(root).as_posix()
-        for lineno, origin in _stock_calls(ast.parse(text)):
+        for lineno, origin in _stock_calls(ast.parse(text), rel):
             if (rel, origin) in _SANCTIONED_STOCK_SITES:
                 sanctioned[rel, origin] += 1
             else:
@@ -1848,6 +1892,47 @@ def test_no_engine_module_builds_a_stock_opener() -> None:
             id="stock-connection-as-a-pool-class",
         ),
         pytest.param(
+            "import urllib.request\ndata = urllib.request.urlopen(u).read()",
+            True,
+            id="chained-call-on-a-stock-call",
+        ),
+        pytest.param(
+            "import urllib.request\nurllib.request.build_opener(h).open(r)",
+            True,
+            id="chained-open-on-a-stock-opener",
+        ),
+        pytest.param(
+            "import urllib.request\nstatus = urllib.request.urlopen(u).status",
+            True,
+            id="attribute-of-a-stock-call",
+        ),
+        pytest.param(
+            "import urllib.request\nfrom typing import Annotated\n"
+            "def f(x: Annotated[int, urllib.request.build_opener()]): ...",
+            True,
+            id="call-inside-an-annotation",
+        ),
+        pytest.param(
+            "import http.client, six\n"
+            "class X(six.with_metaclass(M, http.client.HTTPConnection)): ...",
+            True,
+            id="stock-class-inside-a-base-call",
+        ),
+        pytest.param(
+            "import urllib.request\nurllib.request.urlretrieve(u, f)", True, id="urlretrieve"
+        ),
+        pytest.param(
+            "from messagefoundry.parsing.xml.schema import _ConfinedOpener\nQ = _ConfinedOpener",
+            True,
+            id="sanctioned-class-held-in-a-variable",
+        ),
+        pytest.param(
+            "from messagefoundry.transports import bounded_read as b\n"
+            "L = type('L', (b._StrictHTTPSConnection,), {})",
+            True,
+            id="type-call-with-a-sanctioned-base",
+        ),
+        pytest.param(
             "import http.client\nx: http.client.HTTPConnection | None = None",
             False,
             id="variable-annotation-not-a-value",
@@ -1879,3 +1964,11 @@ def test_a_site_whose_root_resolves_two_ways_is_reported_once() -> None:
         (2, "class O(urllib.request.OpenerDirector)"),
         (4, "urllib.request.urlopen"),
     ]
+
+
+def test_a_sanctioned_class_is_a_value_only_inside_its_own_module() -> None:
+    """Its own module hands it to do_open or a pool, which is how it is used; anywhere else a value
+    naming it can build a subclass its sanction's check never sees."""
+    tree = ast.parse("class _ConfinedOpener: ...\nQ = _ConfinedOpener\n")
+    assert _stock_calls(tree, "parsing/xml/schema.py") == []
+    assert _stock_calls(tree, "parsing/xml/other.py") == [(2, "_ConfinedOpener")]

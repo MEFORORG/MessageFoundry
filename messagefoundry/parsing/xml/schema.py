@@ -289,7 +289,9 @@ def _file_url_path(url: str) -> str | None:
     parts = urlsplit(url)
     if parts.scheme.lower() != "file" or parts.netloc.lower() not in ("", "localhost"):
         return None
-    return _local(_url_path(parts.path))
+    path = _url_path(parts.path)
+    # An empty path names no file; abspath would supply the working directory.
+    return _local(path) if path.strip() else None
 
 
 class _ResourceRefused(ValueError):
@@ -368,12 +370,14 @@ class _ConfinedFiles(urllib.request.BaseHandler):
     cannot be read as a file, such as a directory, a FIFO or device, a path that runs on through a
     file, or one the process may not read; and, under a
     vetted root, does at least a link the walk refuses, one reached through a link it cannot read, and
-    a file ``parse_bytes`` or :func:`_refuse_text_locations` refuses. A missing file raises
-    ``FileNotFoundError``. :func:`_build_schema` says what each does to the build.
+    a file ``parse_bytes`` or :func:`_refuse_text_locations` refuses. A missing file under a root
+    raises ``FileNotFoundError``; one outside every root is refused like any other location there.
+    :func:`_build_schema` says what each does to the build.
 
     The location is judged on its text by :func:`_local`, then compared with each root by whole
     components, so a sibling directory sharing a name prefix (``schemas-old`` beside ``schemas``) is
-    outside. Only then is any of it touched, by the ``lstat`` walk."""
+    outside. Only then is any of it touched: under a vetted root by the ``lstat`` walk, and the
+    named file and a bundled one by a read that follows a link."""
 
     def __init__(self, roots: tuple[_Root, ...], entry: str | None = None) -> None:
         self._roots = roots
@@ -471,9 +475,12 @@ class _ConfinedOpener(urllib.request.OpenerDirector):
         raise TypeError("the schema opener holds its confined-file handler and no other")
 
     def open(self, *args: Any, **kwargs: Any) -> Any:
-        state = vars(self)  # handlers and handle_open are instance attributes typeshed omits
-        if state["handlers"] != [self._files] or any(
-            chain != [self._files] for chain in state["handle_open"].values()
+        state = vars(self)  # the handler tables are instance attributes typeshed omits
+        tables = ("handle_error", "process_request", "process_response")
+        if (
+            state["handlers"] != [self._files]
+            or any(chain != [self._files] for chain in state["handle_open"].values())
+            or any(state[table] for table in tables)  # _ConfinedFiles puts nothing in these
         ):
             raise TypeError("the schema opener holds a handler besides its confined-file handler")
         return super().open(*args, **kwargs)
@@ -573,9 +580,10 @@ def _build_schema(
     its DOCTYPE needs. A refusal met further in, inside a file such an import did open, still fails the
     build. A **remote** location never reaches the opener; ``allow="local"`` refuses it first, which
     fails the build on an include, redefine or override, and on an import makes xmlschema skip that
-    location with a warning and try the next, as it did before BACKLOG #5537. A **missing** file is
-    handled by xmlschema as it always was: an include or an import of one is skipped with a warning,
-    and a redefine or override that carries components fails. A skipped import with no location left
+    location with a warning and try the next, as it did before BACKLOG #5537. A **missing** file
+    under a root is handled by xmlschema as it always was: an include or an import of one is skipped
+    with a warning, and a redefine or override that carries components fails. A missing file outside
+    every root is refused like any other location there, so it fails the build. A skipped import with no location left
     leaves its namespace undeclared: a reference to one of its types fails the build, but a ``lax`` or
     ``skip`` wildcard admits that namespace's elements unchecked.
 
