@@ -267,6 +267,29 @@ def test_a_pinned_certificate_object_still_verifies() -> None:
     assert result.verified, result.reason
 
 
+def test_a_pinned_certificate_as_a_bytearray_still_verifies() -> None:
+    """signxml reads any text-like PEM it can decode, so the anchor read does too."""
+    result = verify(_sign(_BODY), x509_cert=bytearray(_cert_pem()))  # type: ignore[arg-type]
+    assert result.verified, result.reason
+
+
+def test_a_pinned_pyopenssl_certificate_still_verifies() -> None:
+    """signxml converts a pyOpenSSL certificate to a ``cryptography`` one; the anchor read too."""
+    crypto = pytest.importorskip("OpenSSL.crypto")
+    from cryptography import x509
+
+    pin = crypto.X509.from_cryptography(x509.load_pem_x509_certificate(_cert_pem()))
+    result = verify(_sign(_BODY), x509_cert=pin)
+    assert result.verified, result.reason
+
+
+def test_a_pin_of_no_readable_type_is_an_anchor_fault() -> None:
+    with pytest.raises(ValueError) as caught:
+        verify(_sign(_BODY), x509_cert=memoryview(_cert_pem()))  # type: ignore[arg-type]
+    assert not isinstance(caught.value, XmlError)
+    assert str(caught.value) == "x509_cert cannot be read: AttributeError"
+
+
 def _break_the_ca_file_after_the_anchor_read(
     monkeypatch: pytest.MonkeyPatch, ca_file: Path, replacement: bytes | None
 ) -> None:

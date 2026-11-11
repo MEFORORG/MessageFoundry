@@ -40,8 +40,10 @@ def test_verify_with_an_anchor_gets_past_the_guard(kwargs: dict[str, object]) ->
     # but never with the anchor-required ValueError.
     try:
         verify(b"<root/>", **kwargs)  # type: ignore[arg-type]
-    except ValueError as exc:  # pragma: no cover - only asserts the guard did not misfire
-        assert "anchor" not in str(exc).lower(), "anchor supplied but no-anchor guard still fired"
+    except ValueError as exc:  # with the extra, the anchor read refuses the sentinel here
+        assert "requires a trust anchor" not in str(exc), (
+            "anchor supplied but no-anchor guard still fired"
+        )
     except Exception:  # noqa: BLE001 - any non-anchor failure means the guard let the call through
         pass
 
