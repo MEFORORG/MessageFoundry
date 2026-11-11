@@ -3672,8 +3672,9 @@ _ADMINISTRATOR_EXISTS_REFUSAL: Final = (
 #: (ADR 0217 (a); engine PR 2860 hold, R3-F1). Asked before any account write.
 _UNVERIFIABLE_ACCOUNT_REFUSAL: Final = (
     "an account's integrity seal could not be verified by Vault transit, so this command cannot"
-    " tell whether a usable Administrator exists, and it changed no account (it writes one"
-    " integrity.authority_seal_unverifiable audit row per such account). The seal may be planted:"
+    " tell whether a usable Administrator exists, and it changed no account (its scan may write"
+    " integrity.authority_seal_unverifiable audit rows, as the seal-failure throttle allows). The"
+    " seal may be planted:"
     " check that Vault is healthy and that every node holds the audit key's latest version, then"
     " retry"
 )

@@ -8,8 +8,8 @@ not see an Administrator whose seal Vault transit could not verify. The command 
 earlier holder's factors and sessions and wrote its own credential before the first-administrator
 grant's guard raised on that same row. An Unverifiable record's roles are part of what its seal
 covers, so any one of them may be an Administrator: the command now refuses on one and changes no
-account (it writes one integrity.authority_seal_unverifiable audit row per such account). Synthetic
-data only; severity is conditional (CLAUDE.md section 0).
+account (its scan may write ``integrity.authority_seal_unverifiable`` audit rows, as the
+seal-failure throttle allows). Synthetic data only; severity is conditional (CLAUDE.md section 0).
 """
 
 from __future__ import annotations

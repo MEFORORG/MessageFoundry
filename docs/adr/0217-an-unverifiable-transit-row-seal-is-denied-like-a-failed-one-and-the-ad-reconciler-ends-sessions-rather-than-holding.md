@@ -999,8 +999,8 @@ session, approval, on SQLite, PostgreSQL and SQL Server):
    `provision_refusal` and `provision_first_administrator` before any account write, refuses
    while any account reads Unverifiable, the named one included, since such a record's roles are
    part of what its seal covers. The command then ends in its own refusal text and exit code,
-   having changed no account (it writes one `integrity.authority_seal_unverifiable` audit row
-   per such account);
+   having changed no account (its scan may write `integrity.authority_seal_unverifiable` audit
+   rows, as the seal-failure throttle allows);
    `tests/test_provision_admin_unverifiable_administrator.py::test_an_unverifiable_administrator_refuses_provision_before_any_write`
    pins that. At least two cases still reach the CLI's defect report: a Vault transit Outage on any
    account, and an account that first reads Unverifiable after that check, at the grant's guard
