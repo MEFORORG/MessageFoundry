@@ -351,11 +351,12 @@ def _read_anchor(
     document. Returns ``(pinned certificate, None)`` or ``(None, CA store)``. Like signxml, it skips
     ``ca_pem_file`` when a certificate is pinned, and it reads that file through signxml's own
     loader; :func:`_verifier_type` hands the store to signxml's chain check. A pinned
-    ``cryptography`` certificate object is passed through, a pyOpenSSL one is converted as signxml
-    converts it, and anything else is read as PEM text, as signxml reads it.
+    ``cryptography`` certificate object is passed through, any object with ``to_cryptography()``,
+    such as a pyOpenSSL one, is converted through it, and anything else is read as PEM text.
 
-    A certificate, a key or a CA file that cannot be read raises :class:`ValueError` naming the
-    anchor and the type of the fault; a CA file that cannot be opened raises :class:`OSError`.
+    A pinned certificate or its key, or a CA file, that cannot be read raises :class:`ValueError`
+    naming the anchor and the type of the fault; a CA file that cannot be opened raises
+    :class:`OSError`.
     """
     # Imported here, not at module top, as in _signing_key_refusal.
     from cryptography import x509
@@ -482,7 +483,10 @@ def verify(
     Raises :class:`ValueError` if no anchor is supplied or the anchor cannot be read, such as a
     pinned certificate that is not one or whose key cannot be loaded, or a CA file holding none,
     and :class:`OSError` if ``ca_pem_file`` cannot be opened. Both are raised before the document
-    is read. Raises :class:`~messagefoundry.parsing.xml.errors.XmlError` if signxml or a library
+    is read. Only reading is checked there: a pin whose key type signxml cannot verify with, such
+    as Ed25519, or a CA certificate in the file whose key cannot be loaded, fails per document
+    instead, as an ``XmlError`` or an ``InvalidCertificate`` result.
+    Raises :class:`~messagefoundry.parsing.xml.errors.XmlError` if signxml or a library
     under it cannot process the signature, such as a schema-invalid or empty ``ds:SignatureValue``
     or key data it cannot read (vault BACKLOG #2816, #5372). That message names only the library's
     exception type, and the library's exception is on neither ``__cause__`` nor ``__context__``,
