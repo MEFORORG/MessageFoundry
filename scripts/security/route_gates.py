@@ -593,9 +593,10 @@ def _effective_routes(owner: Starlette | APIRouter | Mount) -> Iterator[tuple[Ba
                     f"with no rebuilt route ({served!r}), so the walk cannot read its path"
                 )
             served = original
-        if isinstance(served, Mount) and not served.routes:
-            # A walk descends only into a mount with routes, which refuses there; a mount holding
-            # nothing but a frontend group has none, so it is refused here.
+        if isinstance(served, Mount):
+            # Every mount is refused here, before it is yielded, so the refusal does not depend on
+            # a caller descending into it; a mount holding only a frontend group has no routes and
+            # is never descended into at all (vault BACKLOG #3177).
             _refuse_low_priority_routes(served)
         yield original, served
 

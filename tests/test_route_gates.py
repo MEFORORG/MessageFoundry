@@ -889,17 +889,30 @@ def _frontend_alone_in_an_included_mount(app: FastAPI, directory: str) -> None:
         _frontend_alone_in_an_included_mount,
     ],
 )
+@pytest.mark.parametrize(
+    "consume",
+    [
+        route_gates.route_rows,
+        # BACKLOG #3177. A caller that does not descend into a mount must be refused too: the
+        # refusal of a mount with routes once ran only when ``_walk`` descended into it.
+        lambda app: list(route_gates._effective_routes(app)),
+    ],
+    ids=["route_rows", "effective_routes_without_a_descent"],
+)
 def test_a_frontend_group_fails_the_walk_rather_than_passing_unvisited(
-    register: Callable[[FastAPI, str], None], tmp_path: Path
+    register: Callable[[FastAPI, str], None],
+    consume: Callable[[FastAPI], object],
+    tmp_path: Path,
 ) -> None:
     """FastAPI keeps a ``frontend`` group in a list ``iter_route_contexts`` never yields, so the walk
     would serve it unseen. None is registered today; one that is reds every consumer of the walk."""
     app = FastAPI(openapi_url=None)
     app.add_api_route("/ordinary", _ok)
     assert ("GET", "/ordinary") in _rows_by_key(app)  # the control: no group, no refusal
+    consume(app)
     register(app, str(tmp_path))
     with pytest.raises(ValueError, match="low-priority route"):
-        route_gates.route_rows(app)
+        consume(app)
 
 
 def test_a_renamed_low_priority_list_fails_the_walk_by_name(
