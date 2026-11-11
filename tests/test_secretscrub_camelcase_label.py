@@ -406,6 +406,35 @@ def test_a_camelcase_label_with_its_value_on_the_next_line_is_left_alone() -> No
         assert scrub_credentials(line) == line
 
 
+def test_a_scheme_word_or_brace_ending_a_camelcase_line_is_left_alone() -> None:
+    """A camelCase label whose same-line value is only a scheme word, or opens a "{", is no label
+    either: ``_BEARER``'s scheme word and a braced value both run over the line break (found by code
+    review: ``refreshToken: Bearer`` then a traceback line lost that line's head)."""
+    for line in (
+        "refreshToken: Bearer\n  at module.fn (line 3)",
+        "sessionToken = Digest\nnext line here",
+        "clientSecret: {\n  name: str\n}",
+    ):
+        assert scrub_credentials(line) == line
+
+
+def test_the_union_keeps_only_what_the_reading_before_printed() -> None:
+    """Where the reading before hid a braced value whole, the camelCase reading's masked tail of it
+    does not show through as "x" letters, and a hidden stretch is one placeholder (found by code
+    review: ``<redacted>xx<redacted>`` showed the masked word's length)."""
+    for line in ("accessToken=a|PWD={pp ww}", "accessToken=a.PWD={pp wx}"):
+        assert scrub_credentials(line) == f"accessToken={CREDENTIAL_PLACEHOLDER}", line
+
+
+def test_a_member_key_the_reading_before_printed_survives_for_the_bundle() -> None:
+    """The support bundle masks a ``;<key>=`` member after this module, over the joined line. A
+    camelCase value that took such a ";" hid the key, and the bundle printed the value it masked on
+    ``origin/main`` (found by code review), so that line keeps the reading before."""
+    line = "login refused userPwd={hunter;sslpassword=Bearer abcd2 efgh3"
+    assert "efgh3" not in redact_log_line(line)
+    assert "efgh3" not in scrub_credentials(line)
+
+
 def test_a_camelcase_or_compound_value_ends_at_a_field_separator() -> None:
     """The narrowed value class: ";", "," and "&" end it, so the fields after it survive, and the
     value itself is still hidden."""
@@ -424,8 +453,12 @@ _DENSE_LABELS = (
     "Authorization", "private_key", "encryption_key", "MEFOR_A", "Bearer",
     "accessToken", "clientSecret", "userPassword", "refreshToken", "bindPwd", "xToken",
     "aSession", "dbPass", "AccountKey", "SharedAccessKey", "storageAccountKey", "secretKey",
+    ";sslpassword", ";PWD", ";AccessToken", "userPwd",
 )  # fmt: skip
-_DENSE_ASSIGNMENTS = ("=", ": ", " = ", "'=", "=Bearer ", ":\n", ": ")
+#: ":\n" and "=Bearer\n" put a value on the next line. The ";"-led labels above are the
+#: connection-string member keys the support bundle masks after this module, which a review found
+#: missing from this corpus.
+_DENSE_ASSIGNMENTS = ("=", ": ", " = ", "'=", "=Bearer ", ":\n", ": ", ": Bearer\n", "={")
 _DENSE_SEPARATORS = (";", "&", ",", "|", " ", ".", "=", ":", "-", "_", "", "x", "\n")
 
 
@@ -560,6 +593,16 @@ def test_the_reading_before_holds_none_of_the_camelcase_fragments() -> None:
         assert before != shipped.pattern, name
         for marker in ("(?P<camel>)", "(?P<compound>)", secretscrub._RUN_UNIT, "sharedaccesskey"):
             assert marker not in before, (name, marker)
+        assert "(?(camel)" not in before and "(?(compound)" not in before, name
+
+
+def test_no_camelcase_fragment_sits_inside_a_later_one() -> None:
+    """``_CAMEL_FRAGMENTS`` is replaced in order, which is safe only while no fragment sits inside
+    one replaced after it: replacing it first would leave the later one half rewritten, unmatched."""
+    fragments = [fragment for fragment, _before in secretscrub._CAMEL_FRAGMENTS]
+    for i, fragment in enumerate(fragments):
+        for later in fragments[i + 1 :]:
+            assert fragment not in later, (fragment[:40], later[:40])
 
 
 def test_an_untraceable_replacement_falls_back_to_the_reading_before(
@@ -580,10 +623,11 @@ def test_the_chain_twice_residual_is_a_value_the_first_pass_already_printed(
     record two handlers filter in turn can lose more on the second. Here the reading before printed
     "vq3" on the first pass and hid it on the second, where the PHI pass read its rewrite as a field
     run; the camelCase reading changes the first pass, so the second prints it. The first handler
-    printed it under both readings. Measured 2026-11-10 against ``origin/main``'s module, on two
-    seeded 40,000-line corpora dense with camelCase labels: 156 and 5 lines on this surface and on a
-    chain line the bundle reads back, each an atom the first pass already printed under
-    ``origin/main``, and none otherwise; on the credential scrub, the chain and the bundle, none."""
+    printed it under both readings. Measured 2026-11-10 against ``origin/main``'s module, on three
+    seeded 40,000-line corpora dense with camelCase labels, this file's among them: 102, 2 and 148
+    lines on this surface, and about as many on a chain line the bundle reads back, each an atom the
+    first pass already printed under ``origin/main``, and none otherwise; on the credential scrub,
+    the chain and the bundle, none."""
     line = "dbPass = vq0_vq1|client_secret: vq2&vq3"
     assert _prints("vq3", _through_the_chain(_through_the_chain(line)))
     with monkeypatch.context() as patch:

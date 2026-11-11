@@ -139,19 +139,19 @@ and masks with one ``str.translate``; it was not measured again.
 
 WHAT THE CAMELCASE READING COSTS (BACKLOG #5545), measured 2026-11-10 the third paragraph's way: one
 whole ``scrub_credentials`` call against the module at ``82ddcd03bc``, minimum over interleaved
-rounds, on a shared and noisy box whose absolute figures sit above the table's. The table above is
-left as measured, because it is a different instrument. A line holding no camelCase or compound
-label takes one reading and a probe for one (:func:`_reads_camel`). The plain line costs 1.3
-against 1.0 us, because the admission gate's substring sweep grew from 15 words to 23. A credential
-line is level within this box's noise, 7.8 against 8.3 us. A 6 KB base64url run naming one word
-costs 0.24 against 0.12 ms, the probe and the split walk. The 6 KB hyphen-and-dot run naming every
-family, the adversarial ceiling above, costs 6.0 against 4.2 ms. A 6 KB value of alternating
+rounds, on a shared box whose absolute figures sit above the table's. The table above is left as
+measured, because it is a different instrument. A line holding no camelCase or compound label takes
+one reading and a probe for one (:func:`_reads_camel`). The plain line costs 0.80 against 0.60 us,
+because the admission gate's substring sweep grew from 15 words to 23. A credential line costs 7.7
+against 5.7 us, the probe and every start position also trying the camelCase start. A 6 KB
+base64url run naming one word costs 0.13 against 0.070 ms. The 6 KB hyphen-and-dot run naming every
+family, the adversarial ceiling above, costs 5.9 against 4.2 ms. A 6 KB value of alternating
 lower-case and capital letters ending on a quote, which forces the value walk to check before every
-unit, costs 1.4 against 0.12 ms. A line that does hold one pays for both readings and the trace
+unit, costs 1.4 against 0.084 ms. A line that does hold one pays for both readings and the trace
 that joins them (:func:`_union`), and these are stated rather than hidden: a camelCase credential
-line 15 against 5.5 us, a 6 KB run of alternating letters naming every family and a compound key
-word 3.1 against 0.52 ms, the quote-ended value above under ``accessToken=`` 1.2 against 0.18 ms, and
-6 KB of nothing but ``aToken=b;`` labels, one traced match each, 4.8 against 1.5 ms. Each grows
+line 13 against 5.2 us, a 6 KB run of alternating letters naming every family and a compound key
+word 3.1 against 0.51 ms, the quote-ended value above under ``accessToken=`` 1.1 against 0.19 ms,
+and 6 KB of nothing but ``aToken=b;`` labels, one traced match each, 6.0 against 1.7 ms. Each grows
 linearly, as ``tests/test_secretscrub_camelcase_label.py`` times, and each sits under the ceiling.
 """
 
@@ -373,12 +373,15 @@ _CAMEL_INITIALS = "".join(sorted({word[0].upper() for word in _CAMEL_WORDS}))
 # the passes run one after another, and a label read now can end an earlier value where it used to
 # run on, or take a later label into its own plain value. In ``^accessToken=secret: Jane DoexToken=``
 # the newly read token value took "secret:", and "Jane", which ``secret:`` hid, printed. Measured
-# 2026-11-10 over 40,000 seeded lines dense with camelCase labels: 1,590 lines printed a value atom the
-# patterns without this start hid. So :func:`scrub_credentials` no longer applies it alone. A line
-# where this start or a compound key word could read anything is scrubbed twice, with these patterns
-# and with :func:`_pre_camel` of them, and :func:`_union` keeps a character only where BOTH readings
-# kept it. The reading without the start is the one ``origin/main`` shipped, so no value it hid can
-# print; ``tests/test_secretscrub_camelcase_label.py`` holds both halves.
+# 2026-11-10 against ``origin/main``'s module over 40,000 seeded lines dense with camelCase labels:
+# 1,437 lines printed a value atom it hid. So :func:`scrub_credentials` no longer applies it alone.
+# A line where this start or a compound key word could read anything is scrubbed twice, with these
+# patterns and with :func:`_pre_camel` of them, and :func:`_union` keeps a character only where the
+# second reading, the one ``origin/main`` shipped, printed it too. THAT HOLDS FOR THIS FUNCTION'S OWN
+# OUTPUT, by construction. A pass that reads that output AFTERWARDS can still differ: :func:`_union`
+# keeps the reading before whole where the bundle's member mask would lose a ";" key, and a record
+# filtered twice is a pinned residual. ``tests/test_secretscrub_camelcase_label.py`` measures the
+# chain and the bundle and holds the residual.
 #: One lower-case letter or digit as the ENCLOSING pattern's case rule reads it: an ASCII one, case-
 #: sensitively, or a non-ASCII character the pattern's own ``[a-z]`` takes. Under ``(?i)`` that is
 #: the :data:`_GATE_FOLDS` letters, which ``(?i)[A-Za-z0-9]`` took; under ``_MEFOR_SECRET``, compiled
@@ -406,7 +409,13 @@ def _camel_start(after: str) -> str:
 _CAMEL_START = _camel_start(r"\b")
 #: After a label word: an optional quote, the ":" or "=", and the value's first character, all on
 #: one line. The comment on :data:`_CAMEL_START` says why a camelCase or compound label needs it.
-_SAME_LINE_VALUE = r"\b['\"]?[^\S\r\n]*+[:=][^\S\r\n]*+\S"
+#: The value may not open with "{", since a braced value runs over line breaks, nor be a bare scheme
+#: word at the end of its line, since ``_BEARER`` takes the next line as the credential after one
+#: (found by code review: ``refreshToken: Bearer`` then a traceback line lost that line's head).
+_SAME_LINE_VALUE = (
+    r"\b['\"]?[^\S\r\n]*+[:=][^\S\r\n]*+"
+    r"(?!(?i:bearer|basic|digest)[^\S\r\n]*+(?:[\r\n{]|\Z))[^\s{]"
+)
 #: :data:`_CAMEL_START`'s position, where a label pattern may start: the label word is the keyword
 #: and :data:`_SAME_LINE_VALUE` follows it. :data:`_CAMEL_START` itself is what a value walk's
 #: :data:`_RUN_UNIT` splits at, and what :func:`scrub_credentials` probes for.
@@ -973,9 +982,12 @@ _PLAIN_SCHEME_VALUE = (
 )
 
 
-def _narrowed_value(value: str, terminators: str, *groups: str) -> str:
+def _narrowed_value(
+    value: str, terminators: str, *groups: str
+) -> tuple[str, tuple[tuple[str, str], ...]]:
     """``value``, a plain value class built on ``terminators``, that also ends at ";", "," and "&"
-    when any of ``groups`` took part in the match (BACKLOG #5545).
+    when any of ``groups`` took part in the match (BACKLOG #5545); and each class it wrote, with the
+    class it replaced, for :data:`_CAMEL_FRAGMENTS`.
 
     A camelCase or compound key label is read where no label was read before, so its value must not
     run over what an earlier reading left for a later pass. ";" in particular opens a
@@ -984,6 +996,7 @@ def _narrowed_value(value: str, terminators: str, *groups: str) -> str:
     member mask, which hid "d" on ``origin/main``, found no key (found by code review). It also ends
     ``accessKey=X,region=y`` at the comma rather than taking the rest of the line."""
     wider = terminators + "".join(c for c in ";,&" if c not in terminators)
+    written: list[tuple[str, str]] = []
     for plain, narrow in (
         (f"[^{terminators}{{]++", f"[^{wider}{{]++"),
         (f"[^A-Za-z0-9{terminators}]", f"[^A-Za-z0-9{wider}]"),
@@ -991,21 +1004,22 @@ def _narrowed_value(value: str, terminators: str, *groups: str) -> str:
         chosen = plain
         for group in reversed(groups):
             chosen = f"(?({group}){narrow}|{chosen})"
-        assert plain in value, plain
+        if plain not in value:
+            raise ValueError(f"no {plain} to narrow")
         value = value.replace(plain, chosen)
-        _NARROWED_CLASSES.append((chosen, plain))
-    return value
-
-
-#: Each class :func:`_narrowed_value` wrote, with the class it replaced, for :data:`_CAMEL_FRAGMENTS`.
-_NARROWED_CLASSES: list[tuple[str, str]] = []
+        written.append((chosen, plain))
+    return value, tuple(written)
 
 
 #: ``_BEARER``'s and ``_KEY_MATERIAL``'s plain values, narrowed under a camelCase start (the
 #: ``camel`` group of :data:`_LABEL_OR_CAMEL_START`) or a compound key word (the ``compound`` group
 #: of :data:`_KEY_LABEL_ALTERNATION`). ``_CREDENTIAL_KV``'s class already ends at all three.
-_CAMEL_PLAIN_VALUE = _narrowed_value(_PLAIN_VALUE, _PLAIN_TERMINATORS, "camel")
-_CAMEL_PLAIN_KEY_VALUE = _narrowed_value(_PLAIN_KEY_VALUE, _KEY_TERMINATORS, "camel", "compound")
+_CAMEL_PLAIN_VALUE, _CAMEL_VALUE_CLASSES = _narrowed_value(
+    _PLAIN_VALUE, _PLAIN_TERMINATORS, "camel"
+)
+_CAMEL_PLAIN_KEY_VALUE, _CAMEL_KEY_VALUE_CLASSES = _narrowed_value(
+    _PLAIN_KEY_VALUE, _KEY_TERMINATORS, "camel", "compound"
+)
 
 # A bearer/authorization token or an opaque session token in a header-ish or "token=" shape.
 #
@@ -1765,7 +1779,8 @@ def scrub_credentials(text: str, *, placeholder: str = CREDENTIAL_PLACEHOLDER) -
     pointer-identity fast path.
 
     A line a camelCase or compound key label could be read on takes :func:`_union`, so the reading
-    BACKLOG #5545 added can hide more of a line but never print what the reading before it hid."""
+    BACKLOG #5545 added can hide more of this function's output but never print what the reading
+    before it hid there. The comment on :data:`_CAMEL_START` says what a later pass still sees."""
     folded = _gate_fold(text)
     if not _admits(folded, _ANY_HINT):
         return text
@@ -2050,15 +2065,21 @@ def _run(text: str, placeholder: str, folded: str | None, sub: _Sub | None = Non
 #: The group :func:`_keep_label` and ``_AUTH_SCHEME``'s replacement write back masked at their end.
 _BRACED = "braced_tail"
 
+#: What the reading before did with a character of the line, in :func:`_union`.
+_HIDDEN = b"\x00"
+_PRINTED = b"\x01"
+_MASKED = b"\x02"
+
 type _Repl = Callable[[re.Match[str]], str]
 type _Sub = Callable[[re.Pattern[str], _Repl, str, str | int | None], str]
 
 #: The camelCase reading, as fragments of a shipped pattern's source, each with what the pattern
-#: before BACKLOG #5545 held in its place. Longest first, so a fragment holding another is replaced
-#: before the one it holds.
+#: before BACKLOG #5545 held in its place. Replaced in this order; no fragment sits inside a later one,
+#: which ``tests/test_secretscrub_camelcase_label.py`` checks.
 _CAMEL_FRAGMENTS = (
     ("(" + _LABEL_OR_CAMEL_START, _LABEL_START + "("),
-    *sorted(_NARROWED_CLASSES, key=lambda pair: len(pair[0]), reverse=True),
+    *_CAMEL_VALUE_CLASSES,
+    *_CAMEL_KEY_VALUE_CLASSES,
     (
         _alternation(_CREDENTIAL_WORDS + _KEY_LABEL_WORDS),
         _alternation(_CREDENTIAL_WORDS + _KEY_MATERIAL_WORDS),
@@ -2112,12 +2133,13 @@ class _Untraceable(Exception):
 
 class _Trace:
     """Where each character of the text :func:`_run` is rewriting came from in the line it started
-    with: ``runs`` holds ``(start, end, origin)`` for each span copied from the line, in order, and a
-    character no run covers was written by a replacement. ``read`` maps each pattern :func:`_run`
-    applies to the one this trace runs."""
+    with: ``runs`` holds ``(start, end, origin, masked)`` for each span carried over from the line,
+    in order. ``masked`` marks a span a replacement wrote back masked, character for character, so
+    it is not the line's own text. A character no run covers was written by a replacement. ``read``
+    maps each pattern :func:`_run` applies to the one this trace runs."""
 
     def __init__(self, length: int, read: Callable[[re.Pattern[str]], re.Pattern[str]]) -> None:
-        self.runs: list[tuple[int, int, int]] = [(0, length, 0)] if length else []
+        self.runs: list[tuple[int, int, int, bool]] = [(0, length, 0, False)] if length else []
         self.read = read
 
     def sub(self, pattern: re.Pattern[str], repl: _Repl, text: str, tail: str | int | None) -> str:
@@ -2125,7 +2147,7 @@ class _Trace:
         if tail == _BRACED and _BRACED not in pattern.groupindex:
             tail = None
         out: list[str] = []
-        runs: list[tuple[int, int, int]] = []
+        runs: list[tuple[int, int, int, bool]] = []
         cursor = pos = length = 0
         for m in pattern.finditer(text):
             start, end = m.span()
@@ -2138,36 +2160,45 @@ class _Trace:
                 tail_start = tail_end = 0
             if len(replacement) < head_end - start + tail_end - tail_start:
                 raise _Untraceable(pattern.pattern[:40])
-            cursor = self._copy(pos, head_end, length, runs, cursor)
+            cursor = self._copy(pos, head_end, length, runs, cursor, False)
             length += start - pos
             if tail_end > tail_start:
                 at = length + len(replacement) - (tail_end - tail_start)
-                cursor = self._copy(tail_start, tail_end, at, runs, cursor)
+                cursor = self._copy(tail_start, tail_end, at, runs, cursor, True)
             out.append(text[pos:start])
             out.append(replacement)
             length += len(replacement)
             pos = end
         if not out:
             return text  # most passes match nothing, and the runs still describe ``text``
-        self._copy(pos, len(text), length, runs, cursor)
+        self._copy(pos, len(text), length, runs, cursor, False)
         out.append(text[pos:])
         self.runs = runs
         return "".join(out)
 
     def _copy(
-        self, start: int, end: int, at: int, runs: list[tuple[int, int, int]], cursor: int
+        self,
+        start: int,
+        end: int,
+        at: int,
+        runs: list[tuple[int, int, int, bool]],
+        cursor: int,
+        masked: bool,
     ) -> int:
         """Record in ``runs`` that ``text[start:end]`` of the current text lands at ``at`` in the next
-        one, reading :attr:`runs` from index ``cursor``, and return where the next call may start.
-        Calls come in increasing ``start`` order within one pass, so the cursor only moves forward."""
+        one, masked if ``masked`` or if it already was, reading :attr:`runs` from index ``cursor``,
+        and return where the next call may start. Calls come in increasing ``start`` order within one
+        pass, so the cursor only moves forward."""
         previous = self.runs
         while cursor < len(previous) and previous[cursor][1] <= start:
             cursor += 1
         i = cursor
         while i < len(previous) and previous[i][0] < end:
-            run_start, run_end, origin = previous[i]
+            run_start, run_end, origin, was_masked = previous[i]
             lo, hi = max(run_start, start), min(run_end, end)
-            runs.append((at + lo - start, at + hi - start, origin + lo - run_start))
+            runs.append(
+                (at + lo - start, at + hi - start, origin + lo - run_start, masked or was_masked)
+            )
             i += 1
         return cursor
 
@@ -2182,8 +2213,10 @@ def _reads_camel(text: str, folded: str | None, placeholder: str) -> bool:
 
 
 def _union(text: str, placeholder: str, folded: str | None) -> str:
-    """``text`` scrubbed with the shipped patterns, then each character those printed and
-    :func:`_pre_camel` of them hid replaced, a run of them by one ``placeholder``."""
+    """``text`` scrubbed with the shipped patterns, keeping a character of the line only where
+    :func:`_pre_camel` of them printed it too: where that reading masked it, its mask, and where it
+    hid it, one ``placeholder`` for the run. That reading's own output instead where the shipped one
+    would hide a ";" it printed."""
     before = _Trace(len(text), _pre_camel)
     shipped = _Trace(len(text), lambda pattern: pattern)
     try:
@@ -2194,28 +2227,61 @@ def _union(text: str, placeholder: str, folded: str | None) -> str:
         new = _run(text, placeholder, folded, shipped.sub)
     except _Untraceable:
         return _run(text, placeholder, folded, _pre_camel_sub)
-    # Where the pre-camelCase reading printed the line's own character.
-    printed = bytearray(len(text))
-    for start, end, origin in before.runs:
-        if old[start:end] == text[origin : origin + end - start]:
-            printed[origin : origin + end - start] = b"\x01" * (end - start)
-            continue
-        for k in range(end - start):
-            if old[start + k] == text[origin + k]:
-                printed[origin + k] = 1
+    # What the reading before did with each character of the line: printed it, masked it, or hid it.
+    state = bytearray(len(text))  # _HIDDEN
+    old_masks: dict[int, str] = {}
+    for start, end, origin, masked in before.runs:
+        if masked:
+            state[origin : origin + end - start] = _MASKED * (end - start)
+            for k in range(end - start):
+                old_masks[origin + k] = old[start + k]
+        else:
+            state[origin : origin + end - start] = _PRINTED * (end - start)
+    if ";" in text:
+        # A ";" opens a connection-string member, whose key a pass AFTER this module reads: the
+        # support bundle's member mask runs over the joined line. Where the shipped reading hid a
+        # ";" the reading before printed, that pass would lose the key and print the value it masked
+        # on origin/main (found by code review), so the line keeps the reading before.
+        carried = bytearray(len(text))
+        for start, end, origin, _masked in shipped.runs:
+            carried[origin : origin + end - start] = b"\x01" * (end - start)
+        at = text.find(";")
+        while at != -1:
+            if state[at] == _PRINTED[0] and not carried[at]:
+                return old
+            at = text.find(";", at + 1)
     out: list[str] = []
     pos = 0
-    for start, end, origin in shipped.runs:
-        if printed.find(0, origin, origin + end - start) == -1:
+    hiding = False
+    for start, end, origin, _masked in shipped.runs:
+        stop = origin + end - start
+        if state.find(_HIDDEN, origin, stop) == -1 and state.find(_MASKED, origin, stop) == -1:
             continue
-        out.append(new[pos:start])
-        for k in range(end - start):
-            char = new[start + k]
-            # A masked character is not the line's own, so it may stay where the old reading hid it.
-            if printed[origin + k] or char != text[origin + k]:
-                out.append(char)
-            elif not out or not out[-1].endswith(placeholder):
+        if start > pos:
+            out.append(new[pos:start])
+            hiding = new[pos:start].endswith(placeholder)
+        at = origin
+        while at < stop:
+            kind = state[at]
+            # Where this stretch of one kind ends.
+            ends = [
+                found
+                for other in (_PRINTED, _MASKED, _HIDDEN)
+                if other[0] != kind and (found := state.find(other, at, stop)) != -1
+            ]
+            until = min(ends, default=stop)
+            if kind == _PRINTED[0]:
+                out.append(new[start + at - origin : start + until - origin])
+                hiding = False
+            elif kind == _MASKED[0]:
+                # The reading before's own mask, so the line keeps the length and the character
+                # classes later passes read, as origin/main wrote them.
+                out.append("".join(old_masks[k] for k in range(at, until)))
+                hiding = False
+            elif not hiding:
                 out.append(placeholder)
+                hiding = True
+            at = until
         pos = end
     if not out:
         return new
