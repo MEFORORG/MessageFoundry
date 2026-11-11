@@ -739,8 +739,9 @@ it is the constraint any proposal to make `subprocess` a *default* has to clear 
   `ERROR`/dead-letter under the default `continue`; under `stop` the inbound's routing or transform
   halts). What differs is at least the exception type the operator sees: the policy's log line and,
   under `stop`, the `connection_stopped` alert's detail name `SandboxError` where `mode=off` names
-  the Handler's own type, and the `last_error` text carries that type only inside the `SandboxError`
-  message. No traceback crosses.
+  the Handler's own type, or `UserCodeCalledSysExit` for a Handler that calls `sys.exit()`, which
+  `_off_loop_sandboxed` converts before the policy sees it. The `last_error` text carries that type
+  only inside the `SandboxError` message. No traceback crosses.
 - **Run-scoped sinks do not cross back.** The `#162` unmapped-capture buffer drains inside the child
   against a sink the child never installs. No production sink exists today, so nothing is lost — but
   any future run-scoped sink (capture, metrics, audit) will silently no-op under `mode=subprocess`
