@@ -77,9 +77,10 @@ address-space boundary and the codec are the load-bearing controls.
 crash, a rejected frame, or an unmarshallable payload/run-context — raises :class:`SandboxError`. The
 caller (the router/transform worker) hands it, **post-ACK**, to the ``[delivery] internal_error``
 policy via the existing ``_apply_router_internal_error`` / ``_apply_transform_internal_error`` paths:
-``ERROR``/dead-letter under the default ``continue``; under ``stop`` the router or transform worker
-halts with a ``connection_stopped`` alert, and its head row is re-pended, or dead-lettered once its
-attempts reach the retry cap. Never a NAK, never an accept-and-drop, never a crashed connection.
+``ERROR``/dead-letter under the default ``continue``; under ``stop`` the inbound's routing or
+transform halts with a ``connection_stopped`` alert, and the head row is re-pended, or
+dead-lettered once its attempts reach the retry cap. Never a NAK, never an accept-and-drop, never
+a crashed connection.
 
 **Engine-side validation stays engine-side.** The worker describes only the *shape* of the
 Router/Handler return value; the fail-closed handler-name / outbound-name validation (see
