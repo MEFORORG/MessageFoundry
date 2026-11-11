@@ -20,6 +20,7 @@ Nothing here needs a server or aioodbc.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import gc
 import sys
@@ -28,10 +29,12 @@ import types
 from collections.abc import AsyncIterator, Callable, Coroutine
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+import messagefoundry.store.sqlserver as sqlserver
 from messagefoundry import odbc_call_gate
 from messagefoundry.config.settings import SchemaManagement, StoreBackend, StoreSettings
 from messagefoundry.odbc_call_gate import UngatedConnectionError, call_gate, require_call_gate
@@ -183,8 +186,45 @@ async def test_a_cancel_during_a_refused_borrows_release_still_never_lends_it(
     await asyncio.wait_for(pool.in_release.wait(), 1.0)
     task.cancel()
     await cancelled_at_once(task)
-    assert conn.closed and pool.free == [], "the refused connection is lendable again"
+    # The cancel landed before the fake release read `closed`, so `free` alone proves nothing
+    # here; `closed` is what that read, aioodbc's own rule, would have found.
+    assert conn.closed, "the refused connection was not detached before its release"
     await _closed_once_and_never_used(rig)
+
+
+class _RenamedHandleConn(_RealAioConn):
+    """A real connection from an aioodbc that renamed ``_conn`` as well as ``_execute``."""
+
+    __module__ = "aioodbc.connection"  # a class's own: a subclass never inherits it
+
+    def __init__(self, raw: RawConn, executor: ThreadPoolExecutor) -> None:
+        super().__init__(raw, executor, gateable=False)
+        self._handle: RawConn | None = self._conn
+        self._conn = None
+
+    @property
+    def closed(self) -> bool:
+        return self._handle is None
+
+    async def close(self) -> None:
+        raw, self._handle = self._handle, None
+        if raw is not None:
+            await self._loop.run_in_executor(self._executor, raw.close)
+
+
+async def test_a_refused_borrow_with_a_renamed_handle_is_closed_through_its_own_close(
+    rig: _Rig,
+) -> None:
+    """Round 1 of this step's review: the detach reads ``_conn``, so a connection without one was
+    put back on the free list open, refused again on every borrow."""
+    raw = rig.raw()
+    conn = _RenamedHandleConn(raw, rig.executor)
+    pool = Pool(conn)
+    with pytest.raises(UngatedConnectionError):
+        async with bare_store(pool)._acquire():
+            raise AssertionError("the body ran on an ungated connection")
+    assert conn.closed and pool.free == [], "the refused connection is lendable again"
+    assert raw.closed and not raw.cursors, rig.log
 
 
 # --- the claim connection ------------------------------------------------------------------------
@@ -308,3 +348,50 @@ async def test_a_cancel_during_the_refused_probes_close_does_not_wait(
     _aioodbc_serving(monkeypatch, [_gated_main(rig), rig.ungated("probe", block_conn_close=True)])
     await _cancel_mid_close(rig, _open(), "probe:conn.close")
     await wait_for_entry(rig.log, "main:conn.close")
+
+
+# --- the source pin ------------------------------------------------------------------------------
+
+
+def _direct_calls(func: ast.AST) -> list[str]:
+    """The dotted names ``func`` calls in its own body, not in a function nested inside it."""
+    names: list[str] = []
+    pending = list(ast.iter_child_nodes(func))
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        if isinstance(node, ast.Call):
+            target = node.func
+            if isinstance(target, ast.Attribute):
+                names.append(target.attr)  # `self._connect_claim_conn()` reads as its method
+                if isinstance(target.value, ast.Name):
+                    names.append(f"{target.value.id}.{target.attr}")
+            elif isinstance(target, ast.Name):
+                names.append(target.id)
+        pending.extend(ast.iter_child_nodes(node))
+    return names
+
+
+def test_every_store_connect_requires_the_gate() -> None:
+    """The refusal holds only while every way a real connection enters the store requires the
+    gate. A new ``aioodbc.connect`` in a function that does not, or a second pooled borrow beside
+    ``_borrow``, fails here rather than run ungated."""
+    tree = ast.parse(Path(sqlserver.__file__).read_text(encoding="utf-8"))
+    funcs = {
+        node.name: _direct_calls(node)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    connects = sorted(name for name, calls in funcs.items() if "aioodbc.connect" in calls)
+    # The control: the pin sees the three connect sites this step gated, so it is not vacuous.
+    assert connects == ["_connect_claim_conn", "_ensure_database_options", "_rcsi_on_after_a_peer"]
+    for name in connects:
+        if name == "_connect_claim_conn":  # a seam the tests replace; its one caller gates
+            continue
+        assert "_require_call_gate" in funcs[name], name
+    claim_openers = [n for n, calls in funcs.items() if "_connect_claim_conn" in calls]
+    assert claim_openers == ["_open_claim_holder"]
+    assert "_require_call_gate" in funcs["_open_claim_holder"]
+    assert [n for n, calls in funcs.items() if "acquire_pooled" in calls] == ["_borrow"]
+    assert "_gate_or_discard" in funcs["_borrow"]

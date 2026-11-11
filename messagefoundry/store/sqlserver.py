@@ -515,15 +515,26 @@ def _drain_detached_close(fut: asyncio.Future[None]) -> None:
         )
 
 
-def _gate_or_discard(conn: Any) -> None:
-    """Gate a borrowed pooled connection before its first call, or detach it and raise
+async def _gate_or_discard(conn: Any) -> None:
+    """Gate a borrowed pooled connection before its first call, or discard it and raise
     :class:`~messagefoundry.odbc_call_gate.UngatedConnectionError` (BACKLOG #2394). No call is
-    running on it yet, so the detach's close frees nothing under one, and the pool never lends it
-    again. Await-free, like the detach."""
+    running on it yet, so the discard's close frees nothing under one, and the pool never lends it
+    again.
+
+    The discard is :func:`_detach_connection`, with no await in front of it. A connection with no
+    ``_conn`` cannot be detached that way: an aioodbc that renamed ``_execute`` may have renamed
+    that too. It is closed through its own ``close`` instead, best effort, so the pool's
+    ``closed`` check drops it."""
     try:
         _require_call_gate(conn)
     except UngatedConnectionError:
-        _detach_connection(conn)
+        if getattr(conn, "_conn", None) is not None:
+            _detach_connection(conn)
+        else:
+            try:
+                await conn.close()
+            except Exception:  # noqa: BLE001 - the refusal is the outcome that must propagate
+                log.warning("sqlserver: closing a refused connection failed", exc_info=True)
         raise
 
 
@@ -4638,7 +4649,8 @@ class SqlServerStore:
 
         async def _rcsi_on_after_a_peer() -> bool:
             """Re-read RCSI on FRESH connections after our ALTER failed: a concurrent opener's ALTER
-            may have killed our session yet turned RCSI on. Any failure to read counts as OFF."""
+            may have killed our session yet turned RCSI on. Any failure to read counts as OFF,
+            except a refused connection (BACKLOG #2394), which propagates."""
             for attempt in range(_RCSI_REREADS):
                 if attempt:
                     await asyncio.sleep(_RCSI_REREAD_DELAY_S)
@@ -5767,7 +5779,9 @@ class SqlServerStore:
         conn = await acquire_pooled(self._pool, timeout=timeout, backend="sqlserver", retune=retune)
         self._acquire_wait.record((perf_counter() - t0) * 1000.0)
         try:
-            _gate_or_discard(conn)  # BACKLOG #2049: one pyodbc call at a time on this connection
+            await _gate_or_discard(
+                conn
+            )  # BACKLOG #2049: one pyodbc call at a time on this connection
             raw = getattr(conn, "_conn", None)
             if raw is not None:
                 raw.timeout = self._settings.command_timeout  # seconds; 0 = no limit
@@ -5816,8 +5830,8 @@ class SqlServerStore:
         demotion for as long as the statement runs, which ADR 0159 rejected.
 
         The detach itself is :func:`_detach_connection`, shared with :meth:`_rollback_or_discard`.
-        A real connection here is always gated, because :func:`_gate_or_discard` refused any
-        other before its first call (BACKLOG #2394).
+        A real connection that came through :meth:`_borrow` is gated here, because
+        :func:`_gate_or_discard` refused any other before its first call (BACKLOG #2394).
         """
         closer = _detach_connection(conn)  # first: no await may come before the detach
         if closer is None:  # already detached, handed to a running call, or the executor refused

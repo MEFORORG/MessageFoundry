@@ -312,7 +312,7 @@ def install_call_gate(conn: Any) -> CallGate | None:
                 conn,
                 "odbc: aioodbc %s has no bound _execute to gate; a cancelled call can free ODBC"
                 " handles under a running statement (BACKLOG #2049), and no connection of this"
-                " type is gated",
+                " type is gated; a caller that requires the gate refuses it",
             )
         return None
     gate = CallGate()
@@ -326,9 +326,9 @@ class UngatedConnectionError(RuntimeError):
     :func:`require_call_gate` (BACKLOG #2394)."""
 
 
-def require_call_gate(conn: Any) -> None:
+def require_call_gate(conn: Any) -> CallGate | None:
     """:func:`install_call_gate`, then refuse a real aioodbc connection it could not wrap
-    (BACKLOG #2394). Raises :class:`UngatedConnectionError`.
+    (BACKLOG #2394), and return the gate, or ``None`` for a stand-in. Raises :class:`UngatedConnectionError`.
 
     Call it before the first pyodbc call on ``conn``: right after a connect, or on a borrow before
     its first statement. The caller then discards the connection, and that close is safe because no
@@ -337,17 +337,20 @@ def require_call_gate(conn: Any) -> None:
     frees the handles under that call (BACKLOG #2049), and leaving the handles unclosed frees them
     wherever the last reference drops instead. A stand-in with no bound ``_execute`` is not refused,
     as :func:`install_call_gate` leaves it alone."""
-    if install_call_gate(conn) is None and _is_aioodbc(conn):
+    gate = install_call_gate(conn)
+    if gate is None and _is_aioodbc(conn):
         raise UngatedConnectionError(
             f"odbc: aioodbc {type(conn).__qualname__} cannot be wrapped by the call gate, so a"
             " cancelled call could free its handles under a running statement (BACKLOG #2049);"
             " refusing the connection. Install the aioodbc release pyproject.toml pins"
             " (BACKLOG #5005)"
         )
+    return gate
 
 
 def _is_aioodbc(obj: Any) -> bool:
-    """Whether ``obj`` is a real aioodbc object rather than a stand-in."""
+    """Whether ``obj`` is a real aioodbc object rather than a stand-in, read from its own type's
+    module. A subclass defined elsewhere reads as a stand-in, as the tests' stand-ins rely on."""
     return type(obj).__module__.startswith("aioodbc")
 
 

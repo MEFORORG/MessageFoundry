@@ -660,16 +660,18 @@ the next reader does not re-derive the wrong precedent from the same comment.
   runs before the discard. **Still open, at least:** a cancellation that lands after a `cursor()` call returned on its thread but before the
   loop delivered the result leaves that cursor for the collector; and the store's pooled
   quarantine, its `_cursor` helper and the one-shot exits still close an ungated connection beside a
-  running call. Under the `aioodbc==0.5.0` pin (BACKLOG #5005) no real connection is ungated.
+  running call (**SUPERSEDED for the SQL Server store by the 2026-11-11 note below**). Under the `aioodbc==0.5.0` pin (BACKLOG #5005) no real connection is ungated.
   Pinned offline by `tests/test_backlog2394_cancel_exits.py` and
   `tests/test_backlog2394_database_gate.py`.
 
   **NOTE 2026-11-11 (BACKLOG #2394 step 2): the SQL Server store's ungated residual above is
   closed by refusal.** The store's pooled borrow, its claim connection and its two open-time
   connections each run `require_call_gate` before the first pyodbc call, and discard a real
-  aioodbc connection the gate cannot wrap while nothing runs on it. So no store exit, the
-  quarantine and `_cursor` included, meets a real ungated connection; only a stand-in reaches
-  the ungated branches. The DATABASE connector's ungated borrow is unchanged. Pinned offline by
+  aioodbc connection the gate cannot wrap while nothing runs on it. So a real connection that
+  enters the store through those four sites reaches its exits, the quarantine and `_cursor`
+  included, gated. That holds only while they are the store's only ways in: a source pin fails
+  when an `aioodbc.connect` appears in a function that does not require the gate. The DATABASE
+  connector's ungated borrow is unchanged. Pinned offline by
   `tests/test_backlog2394_store_refuses_ungated.py`.
 
 ## Acceptance Criteria
