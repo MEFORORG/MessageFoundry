@@ -187,6 +187,23 @@ async def test_a_refusal_records_the_socket_peer_and_the_forwarded_address() -> 
     ) in events
 
 
+async def test_a_refusal_records_the_reading_it_keyed_not_a_dropped_one() -> None:
+    """The whole-address reading of 64:ff9b::c000:221:80 is no client's and is dropped, so the
+    record names the reading that was charged."""
+    audit = _Audit()
+    src = await _proxied(trusted_proxies=[PROXY])
+    src.on_intake_audit = audit
+    try:
+        await _request(
+            src.sockport, headers={"x-api-key": "wrong", "X-Forwarded-For": "64:ff9b::c000:221:80"}
+        )
+    finally:
+        await src.stop()
+    assert audit.rows == [
+        ("intake.auth_failed", PROXY, "mode=api_key; forwarded_for=64:ff9b::c000:221")
+    ]
+
+
 async def test_a_refusal_with_no_forwarded_address_is_unchanged() -> None:
     audit = _Audit()
     src = await _proxied(trusted_proxies=[PROXY])
@@ -364,14 +381,14 @@ def test_the_setting_is_refused_with_the_per_peer_budget_off(per_peer: int | Non
 
 
 @pytest.mark.parametrize("knob", ["intake_auth_rate_limit", "intake_auth_rate_limit_global"])
-@pytest.mark.parametrize("budget", [0.5, 1.5, -1, True, "10", env("budget", default=10)])
+@pytest.mark.parametrize("budget", [0.5, 1.5, 10.0, -1, True, "10", env("budget", default=10)])
 def test_a_budget_that_is_not_a_whole_number_of_at_least_1_is_refused(
     knob: str, budget: object
 ) -> None:
     """The runner reads each budget with ``int()``, so 0.5 passed the truthiness test and turned
     that arm off. Red on b6ed93ab18, which tested only truthiness."""
     knobs: dict[str, Any] = {knob: budget}
-    with pytest.raises(WiringError, match=f"{knob} is not a whole number of at least 1") as exc:
+    with pytest.raises(WiringError, match=f"{knob} is not an integer of at least 1") as exc:
         Http(
             port=8080,
             intake_auth="api_key",
@@ -494,6 +511,10 @@ def test_a_list_within_the_floor_loads(entries: list[str]) -> None:
         # Its control: NAT64's local-use prefix carries the client at a place the operator chose,
         # so neither reading can be told for a misreading, and both are keyed.
         ("64:ff9b:1::c000:221", ["64:ff9b:1::c000:221", "64:ff9b:1::c000"]),
+        # A full address and a port is one group too many to be an address, so it is read as
+        # that address alone, never left to fall back to the proxy's key.
+        ("2001:db8:0:1:2:3:4:5:443", ["2001:db8:0:1::/64"]),
+        ("::1:2:3:4:5:6:7:80", ["0:1:2:3::/64"]),
         # A 6to4 client keys as the IPv4 holder of its /48, never on one of its 65,536 /64s.
         ("[2002:c000:221::1]:80", ["192.0.2.33"]),
         ("[2002:c000:221:ffff::9]", ["192.0.2.33"]),

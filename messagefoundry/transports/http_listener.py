@@ -59,9 +59,9 @@ from typing import TYPE_CHECKING, Any, ClassVar, assert_never, cast
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.settings import (
     _IPV4_MAPPED_BASE,
-    _THIS_NETWORK,
     _classify_proxy_entries,
     _ipv4_meaning,
+    _not_a_host_address,
     _parse_trusted_proxy,
 )
 from messagefoundry.credential import (
@@ -757,8 +757,9 @@ _IPV4_EMBEDDING_PREFIXES = (
 #: Where no client holds an address (:func:`_is_phantom`): the IETF-reserved ``::/8``, outside the
 #: parts of it that are assigned, which are the IPv4-compatible ``::/96``, the IPv4-mapped
 #: ``::ffff:0:0/96`` (read as IPv4 before this is asked), NAT64's well-known ``/96`` and its
-#: local-use ``/48``; and, inside an embedding, IPv4 that is no host's (``_THIS_NETWORK``,
-#: multicast and the reserved class E block, the rule ``_not_a_host_address`` applies).
+#: local-use ``/48``; and, inside an embedding, IPv4 that is no host's, by the rule
+#: ``config.settings._not_a_host_address`` applies (at least "this network", multicast and the
+#: reserved class E block).
 _IETF_RESERVED = ipaddress.IPv6Network("::/8")
 #: The most budget keys the listed ranges of one family may hold together: addresses for IPv4, and
 #: ``/64`` networks for IPv6, the unit an IPv6 key is. ``2**16`` is one ``/16`` of IPv4 or one
@@ -937,6 +938,12 @@ def _hop_readings(text: str) -> tuple[_HopAddress, ...]:
         if not _HOP_PORT_RE.fullmatch(port):
             return ()
     address = _peer_address(host)
+    if address is None and not bracketed and host.count(":") > 1:
+        # One group too many to be an address, such as a full eight-group address and a port:
+        # unambiguous, so read as that address alone rather than fall back to the socket peer.
+        head, _, last = host.rpartition(":")
+        if _HOP_PORT_RE.fullmatch(last):
+            return () if (only := _peer_address(head)) is None else (only,)
     if address is None:
         return ()
     if not bracketed and host.count(":") > 1:
@@ -1007,8 +1014,8 @@ def _embedded_client(address: ipaddress.IPv6Address) -> ipaddress.IPv4Address | 
 
 
 def _is_client_ipv4(address: ipaddress.IPv4Address) -> bool:
-    # The rule config.settings._not_a_host_address applies to an entry, read on a parsed address.
-    return not (address in _THIS_NETWORK or address.is_multicast or address.is_reserved)
+    # One rule with the [api] entry reader's, so a change to it reaches both.
+    return not _not_a_host_address(str(address))
 
 
 def _is_phantom(address: _HopAddress) -> bool:
@@ -1787,9 +1794,9 @@ class HttpSource(SourceConnector):
         if head.method in _HEALTH_PROBE_METHODS and self.intake_auth_health == "allow":
             return  # explicit opt-out for a load-balancer probe that cannot carry the credential
         peer = _peer_address(peer_host)
-        forwarded = self._forwarded_client(head, peer)
+        forwarded = _client_readings(self._forwarded_client(head, peer))
         keys = (
-            tuple(dict.fromkeys(_budget_key(reading) for reading in _client_readings(forwarded)))
+            tuple(dict.fromkeys(_budget_key(reading) for reading in forwarded))
             if forwarded
             else (_peer_budget_key(peer_host, peer),)
         )
@@ -1798,7 +1805,7 @@ class HttpSource(SourceConnector):
         except HttpRequestError as exc:
             # Recorded beside the socket peer, never instead of it, and as the address itself: the
             # key may be its /64, which says less about who sent the request. An ambiguous hop is
-            # recorded as its whole-address reading, uvicorn's.
+            # recorded as its whole-address reading, uvicorn's, unless that one was dropped.
             exc.forwarded_for = str(forwarded[0]) if forwarded else None
             raise
 

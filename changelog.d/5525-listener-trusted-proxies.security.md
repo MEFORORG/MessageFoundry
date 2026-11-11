@@ -9,6 +9,6 @@
   that IPv4 client or on the whole address. Hosts that share a `/64` therefore share one budget,
   among them link-local peers and the clients of a network-specific NAT64 gateway. At least these
   are refused at load: the setting under `none` and `mtls_subject`, with either budget off or not
-  a whole number of at least 1, and for `'*'`, entries that together span a whole address family
+  an integer of at least 1, and for `'*'`, entries that together span a whole address family
   or more than a `/16` of IPv4 or a `/48` of IPv6, and each form `[api].trusted_proxies` refuses.
   See [CONNECTIONS.md](../docs/CONNECTIONS.md). (`BACKLOG #5525`)
