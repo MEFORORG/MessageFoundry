@@ -78,7 +78,13 @@ async def keyed() -> AsyncIterator[tuple[Any, str]]:
     try:
         await _clear(janitor)
         key = generate_key()
-        store = await SqlServerStore.open(settings, cipher=make_cipher(key, write_v2=True))
+        cipher = make_cipher(key, write_v2=True)
+        # With its audit MAC key, as a keyed service open holds it, so this open writes the chain's
+        # genesis row. Without it the log stays empty, and a keyless `cipher-audit` is then refused
+        # for starting a keyless chain (BACKLOG #1916) before it can report KEY_MISMATCH.
+        store = await SqlServerStore.open(
+            settings, cipher=cipher, audit_mac_key=cipher.audit_mac_key()
+        )
         try:
             await write_every_cell(store)
             yield store, key
@@ -122,6 +128,8 @@ async def test_cipher_audit_opens_every_written_cell(
 
     store, _key = keyed
     columns = await store.cipher_walk_columns(server_walk_tables(SQLSERVER_CIPHER_CELLS))
+    # Positive controls: neither absence check below may pass over an empty walk.
+    assert len(SQLSERVER_CIPHER_CELLS) > 0
     absent = [c for c in SQLSERVER_CIPHER_CELLS if not server_cell_present(c, columns)]
     assert not absent, f"the inventory names columns this schema lacks: {absent}"
 
@@ -133,6 +141,8 @@ async def test_cipher_audit_opens_every_written_cell(
     for tally in audit.tallies:
         assert tally.opened == await _sealed(store, tally.table, tally.column), tally
     written = {f"{t}.{c}" for t, c in cells_in_scope("sqlserver.py")}
+    assert len(audit.tallies) > 0
+    assert len(written & {t.name for t in audit.tallies}) > 0, written
     unread = sorted(t.name for t in audit.tallies if t.name in written and t.opened == 0)
     assert not unread, f"written cells the audit opened nothing in: {unread}"
 
