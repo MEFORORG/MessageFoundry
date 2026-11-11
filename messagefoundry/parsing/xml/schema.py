@@ -255,7 +255,9 @@ class _Root:
 @functools.cache
 def _bundled_root(module_file: str) -> tuple[_Root, ...]:
     """xmlschema's own ``schemas`` directory, which holds its copies of well-known namespaces. Empty
-    when xmlschema is installed on a UNC path, which no root may be."""
+    when xmlschema is installed on a UNC or device path, which no root may be, as :func:`_local`
+    judges it. A mapped drive, and on Windows a ``\\\\?\\C:\\`` long path on a drive letter, is a
+    local path there, so an install on either keeps the root."""
     directory = _local(os.path.join(os.path.dirname(module_file), "schemas"))
     return () if directory is None else (_Root(directory, vet=False),)
 
@@ -352,21 +354,24 @@ def _fallback_loader(xmlschema_mod: Any, bundled: tuple[_Root, ...]) -> type:
 class _ConfinedFiles(urllib.request.BaseHandler):
     """The only way xmlschema can open a resource here: ``file:`` URLs under fixed roots (BACKLOG #5537).
 
-    The only handler inside :class:`_ConfinedOpener`, xmlschema's ``opener``, so it sees every
-    ``file:`` location xmlschema opens as a URL, the schema file the caller named and each include,
-    import, redefine and override location among them; :meth:`_ConfinedOpener.open` refuses any
-    other scheme before this handler runs. It does not see every location a schema names: one
-    xmlschema reads as XML text is parsed, not opened, so :func:`_refuse_text_locations` refuses it
-    first in the inline schema, the named file and each file under a vetted root, though not in the
-    bundled copies, and ``allow="local"`` refuses a remote URL before it is opened. The named file
-    is read as named, a link at it included. One root is xmlschema's bundled ``schemas`` directory, which holds
-    the copies of well-known namespaces (SOAP encoding, XML-DSig, xlink and others) a location-free
-    ``xs:import`` resolves to; those are library files and are read as they are, links included. For
-    a schema given as a path, the other root is its own directory, or the ``schema_root`` the caller
-    named. Each file under it is reached by
-    :func:`_resolve_within` and checked by :func:`~messagefoundry.parsing.xml.harden.parse_bytes`
-    first, so a path schema's includes meet the same DOCTYPE refusal as an inline schema. A location
-    outside every root, or one that is not a local file path, such as a UNC or device path, raises
+    The only handler inside :class:`_ConfinedOpener`, the ``opener`` :func:`_build_schema` hands
+    xmlschema, so it sees every ``file:`` location xmlschema opens as a URL while building a schema
+    for :func:`validate_against`, the schema file the caller named and each include, import,
+    redefine and override location among them; :meth:`_ConfinedOpener.open` refuses any other
+    scheme before this handler runs. It never sees the meta-schema files xmlschema reads from its
+    bundled directory when it is imported, which go through Python's stock URL opener. Nor does it
+    see every location a schema names: one xmlschema reads as XML text is parsed, not opened, so
+    :func:`_refuse_text_locations` refuses it first in the inline schema, the named file and each
+    file under a vetted root, though not in the bundled copies, and ``allow="local"`` refuses a
+    remote URL before it is opened. The named file is read as named, a link at it included. One
+    root is xmlschema's bundled ``schemas`` directory, which holds the copies of well-known
+    namespaces (SOAP encoding, XML-DSig, xlink and others) a location-free ``xs:import`` resolves
+    to; those are library files and are read as they are, links included. For a schema given as a
+    path, the other root is its own directory, or the ``schema_root`` the caller named. Each file
+    under it is reached by :func:`_resolve_within` and checked by
+    :func:`~messagefoundry.parsing.xml.harden.parse_bytes` first, so a path schema's includes meet
+    the same DOCTYPE refusal as an inline schema. A location outside every root, or one that is not
+    a local file path, such as a UNC or device path, raises
     :class:`_ResourceRefused`. So, under any root, the bundled one included, does a location that
     cannot be read as a file, such as a directory, a FIFO or device, a path that runs on through a
     file, or one the process may not read; and, under a

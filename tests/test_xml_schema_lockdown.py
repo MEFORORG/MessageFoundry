@@ -1224,7 +1224,7 @@ def test_a_non_file_url_reaching_the_opener_is_a_refused_resource() -> None:
 
 @pytest.mark.parametrize("name", ["https_open", "default_open"])
 @pytest.mark.parametrize("where", ["instance", "class"])
-def test_an_open_method_set_on_the_confined_handler_is_never_called(
+def test_an_open_method_set_on_the_confined_handler_is_refused_before_it_runs(
     name: str, where: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # _ConfinedOpener's handler checks compare handlers, not their methods, so an open method set on
