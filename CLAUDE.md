@@ -708,8 +708,8 @@ Manager's watch reached the cloud session 29 seconds after its question.
   change. Without it, the Lander sends the change to code review. The proof must cover the change
   being merged, so a conflict resolution the Lander wrote itself needs its own review. The Lander
   reads what the review found. **The Lander may merge when none of the open findings changes
-  behaviour or weakens a control (owner ruling 2026-10-12, in session, its order corrected
-  2026-11-11 below).** A finding
+  behaviour or weakens a control (owner ruling 2026-10-12, in session, with the order set by the
+  2026-11-11 decision below).** A finding
   that does either still goes to the owner for a ruling. **CORRECTED 2026-10-12:** this read *"a
   finding that names a defect the merge would ship goes back to the owner for a ruling."* The
   ruling does not let the Lander skip the review proof, or choose between two authors' deliberate
@@ -717,16 +717,6 @@ Manager's watch reached the cloud session 29 seconds after its question.
   Korus `roles/LANDER.md` *4a-quinquies* holds the rest. Where korus still carries the earlier
   rule, this ruling is the newer one. The full text and the owner's words are in
   [`docs/METHOD.md`](docs/METHOD.md), *CLAUDE.md text moved in wave 3*.
-  **Filing a finding as a row never holds the merge.** Before the merge, the Lander names each open
-  finding on the PR in one line, with its row or "queued". It files them in its next ledger pass,
-  under the sweep in korus `roles/LANDER.md`, *An item left in a PR comment is yours to carry*, and
-  by R2's mechanics below. **CORRECTED 2026-11-11:** this bullet read *"The Lander may merge when
-  the open findings are filed as rows and none changes behaviour or weakens a control"*, and its R2
-  paragraph read *"changes how the findings are filed, and nothing else in this bullet"* and *"The
-  merge permission, and what goes to the owner, are unchanged."* Decision
-  d20261111T061703900-432f31, decided by the Lander under the owner's delegation of 2026-11-11,
-  reads R2's signed text as setting this order. The review proof, and which findings go to the
-  owner, are unchanged.
   **A delegated decision counts as that ruling (owner ruling 2026-10-22).** In the owner's words:
   *"when I answer a specific question with /driver or /empower, that delegates that question to the
   seat that asked it, including questions the empower rules reserve to me. The seat decides after
@@ -741,9 +731,20 @@ Manager's watch reached the cloud session 29 seconds after its question.
   that weakens a control, so it goes to the owner under the 2026-10-12 ruling, and the PR waits
   for that ruling. A finding the Lander cannot classify goes to the owner (decision
   d20261029T165623191-578690).
+  **Filing a finding as a row never holds the merge.** Before the merge, the Lander names each open
+  finding's subject on the PR in one line, with its row or "queued". It files them in its next
+  ledger pass, under the sweep in korus `roles/LANDER.md`, *An item left in a PR comment is yours to
+  carry*, and by ledger ruling R2's mechanics below. **CORRECTED 2026-11-11:** this bullet read
+  *"The Lander may merge when the open findings are filed as rows and none changes behaviour or
+  weakens a control"*, and its R2 paragraph read *"changes how the findings are filed, and nothing
+  else in this bullet"* and *"The merge permission, and what goes to the owner, are unchanged."*
+  Decision d20261111T061703900-432f31, decided by the Lander under the owner's delegation of
+  2026-11-11, reads R2's signed text as setting this order. The review proof, and which findings go
+  to the owner, are unchanged.
   **Ledger ruling R2 (owner-signed 2026-11-04, in session: *"Sign R1-R9"*) changes how the findings
   are filed.** Its *"The merge still never waits on an open finding"* is the text the decision
-  above reads as setting the order. A merged PR files at most one row, holding its open findings
+  above reads as setting the order of filing and merging, not as lifting the wait on a finding that
+  goes to the owner. A merged PR files at most one row, holding its open findings
   as numbered items. Its deferred scope becomes steps on the row it cites, or is briefed to that
   row's next Builder, and goes into a new row only when the PR cites none. A finding about code the
   PR did not touch goes instead into the one open row for that module, as an item. What goes to
