@@ -223,6 +223,8 @@ METHOD_RULES: dict[str, str] = {
     "rewrap_data": "cipher",  # hvac Vault Transit
     "sign": "sign_verify",
     "verify": "sign_verify",
+    # ADR 0217: the row sealers' awaitable verify, served by the local and Transit sealers.
+    "verify_async": "sign_verify",
     "sign_data": "sign_verify",  # hvac Vault Transit
     "verify_signed_data": "sign_verify",  # hvac Vault Transit
     "generate_hmac": "mac",  # hvac Vault Transit

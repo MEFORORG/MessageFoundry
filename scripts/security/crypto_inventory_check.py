@@ -1590,6 +1590,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:.decrypt_data()",
             "cipher:.encrypt_data()",
             "mac:.generate_hmac()",
+            # ADR 0217: a row seal's HMAC checked INSIDE Transit (transit/verify), never compared
+            # in process. A MAC check, not a signature.
+            "sign_verify:.verify_signed_data()",
             "tls_context:via messagefoundry.store.keyprovider_vault",
         }
     ),
@@ -1626,9 +1629,17 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/store/row_seal.py": frozenset(
         {
             "compare:hmac.compare_digest",
+            # ADR 0217: the Transit sealer's fixed-length input, its cache key and its key id are
+            # SHA-256 digests with no key. The input is load-bearing: Transit MACs that digest, not
+            # the row, so a seal also rests on SHA-256's collision resistance.
+            "hash:hashlib.sha256",
             "hash:via messagefoundry.store.crypto",
             "kdf:via messagefoundry.store.crypto",
             "mac:hmac.new[sha256]",
+            # ADR 0217: RowSealer.verify_async awaits nothing and calls its own self.verify, the
+            # local constant-time HMAC check above, so a store's await reaches every backend; a
+            # MAC check, not a signature.
+            "sign_verify:.verify()",
         }
     ),
     # BACKLOG #2593: opens a queue payload cell (AES-GCM decrypt through the store cipher) under the
@@ -1721,7 +1732,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:hashlib.sha256",
             "hash:via messagefoundry.store.crypto",
             "mac:hmac.new[sha256]",
-            # BACKLOG #2592: session_seal_ok checks a session row's seal (RowSealer.verify).
+            # BACKLOG #2592: session_seal_ok checks a session row's seal (RowSealer.verify), and
+            # session_seal_ok_async the same through either sealer's verify_async (ADR 0217).
+            "sign_verify:.verify_async()",
             "sign_verify:.verify()",
         }
     ),

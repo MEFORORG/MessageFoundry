@@ -12081,6 +12081,7 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
     from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
     from messagefoundry.config.settings import keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
+    from messagefoundry.pipeline.alerts import LoggingAlertSink, authority_seal_page
     from messagefoundry.redaction import safe_exc
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
@@ -12103,6 +12104,11 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
                 keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
             )
         )
+        # Decision d20261109T200352805-599b24 on ADR 0217, item 5: this revoke pages through the
+        # store's own pager, on the logging sink, serve's fallback, since the CLI holds no notifier.
+        seal_pager = getattr(store, "seal_pager", None)
+        if callable(seal_pager):
+            seal_pager().arm(authority_seal_page(LoggingAlertSink()))
         try:
             _refuse_an_unauditable_write(store)
             try:

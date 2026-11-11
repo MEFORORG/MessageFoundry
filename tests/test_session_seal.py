@@ -71,6 +71,11 @@ def _raw_for(path: Path) -> Any:
     return raw
 
 
+async def _holds(*_: object) -> bool:
+    """A seal check switched off: every row holds."""
+    return True
+
+
 async def test_the_session_seal_contract_holds_on_sqlite(
     keyed: tuple[MessageStore, Path],
 ) -> None:
@@ -86,7 +91,7 @@ async def test_the_contract_fails_when_the_service_checks_no_seal(
     import messagefoundry.auth.service as service_module
 
     store, path = keyed
-    monkeypatch.setattr(service_module, "session_seal_ok", lambda sealer, record: True)
+    monkeypatch.setattr(service_module, "session_seal_ok_async", _holds)
     with pytest.raises(AssertionError):
         await assert_session_seal_contract(store, _raw_for(path))
 

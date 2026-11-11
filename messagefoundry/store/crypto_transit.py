@@ -63,6 +63,7 @@ from messagefoundry.store.crypto import (
     AuditMacFn,
     CipherError,
     CipherUnavailableError,
+    TransitSealRefused,
     _UnmarkedPolicy,
 )
 from messagefoundry.store.keyprovider import KeyProviderError
@@ -74,6 +75,7 @@ from messagefoundry.store.keyprovider_vault import (
     _build_client,
     checked_transit_key_name,
     is_vault_bad_request,
+    is_vault_forbidden,
     is_vault_unavailable,
     require_transit_key_type,
     store_vault_hop,
@@ -294,9 +296,16 @@ class TransitCipher(_UnmarkedPolicy):
 
     def authz_root(self) -> None:
         """No in-heap DEK, so no in-process authorization root (BACKLOG #2592). Row seals under this
-        provider are Transit's own HMAC, a separate piece of work; until it lands this cipher writes
-        and checks no row seals."""
+        provider are Transit's own HMAC under the audit key: the store's
+        :class:`~messagefoundry.store.row_seal.TransitRowSealer` (ADR 0217 slice 1b-iii), which
+        ``row_sealer_for_cipher`` builds for this cipher, not a sealer keyed from this root."""
         return None
+
+    def row_seal_backend(self) -> TransitCipher:
+        """This cipher: it makes the Transit ``hmac`` and ``verify`` calls the store's
+        :class:`~messagefoundry.store.row_seal.TransitRowSealer` seals authority rows through, under
+        the audit key (ADR 0217 slice 1b-iii, item 3.7)."""
+        return self
 
     def retired_authz_roots(self) -> Sequence[bytes]:
         """No in-heap DEK, so no retired roots either (BACKLOG #2592)."""
@@ -404,6 +413,73 @@ class TransitCipher(_UnmarkedPolicy):
             )
             return False
         return isinstance(answered, str) and not answered.startswith(f"vault:v{key_version}:")
+
+    # --- The row seal backend (ADR 0217; TransitSealBackend in store/row_seal.py) -----------------
+
+    @property
+    def seal_key_name(self) -> str:
+        """The Transit key row seals are made under: the audit key, which is the data key when no
+        audit key is set. Transit receives only a 32-byte digest per seal, so a seal stays apart from
+        the key's other MACs only while no other caller MACs a bare 32-byte value under it; the
+        seal's label sits inside the digest's preimage and plays no part in that (ADR 0217)."""
+        return self._audit_key
+
+    @property
+    def seal_mount(self) -> str:
+        """The Transit mount every call here reaches (hvac's default)."""
+        return TRANSIT_MOUNT
+
+    def _seal_generate(self, hash_input: str, what: str) -> object:
+        """One Transit ``hmac`` under the active audit key's latest version, for a row seal or its
+        probe. Returns Transit's raw value; the sealer checks its shape. Any failure raises
+        :class:`CipherError` naming the key and Vault's failure text, never the input."""
+        try:
+            response: Any = self._client.secrets.transit.generate_hmac(
+                name=self._audit_key, hash_input=hash_input, algorithm=AUDIT_TRANSIT_HASH_ALGO
+            )
+            return response["data"]["hmac"]
+        except Exception as exc:
+            raise CipherError(
+                f"Transit row seal {what} failed (key={self._audit_key!r}): "
+                f"{vault_failure_text(exc)}"
+            ) from exc
+
+    def seal_hmac(self, digest: bytes) -> object:
+        """Transit's ``hmac`` of a row seal input's 32-byte ``digest`` under the latest version.
+        Blocking."""
+        return self._seal_generate(base64.b64encode(digest).decode("ascii"), "HMAC")
+
+    def seal_probe(self) -> object:
+        """Transit's ``hmac`` over fixed input under the active audit key's latest version: the
+        probe that tells an unverifiable seal from an outage. Fixed input, so no row decides it.
+        Blocking."""
+        return self._seal_generate(_VERSION_PROBE_INPUT, "probe")
+
+    def verify_seal_hmac(self, key_name: str, digest: bytes, mac: str) -> object:
+        """Transit's ``verify`` of ``mac`` over ``digest`` under ``key_name``, at the version ``mac``
+        names; it never regenerates and compares, since a MAC under a newer version differs from
+        every stored one. Returns Transit's raw ``valid`` (``False`` is ``valid: false``); the sealer
+        checks its shape. An HTTP 400 or 403 raises
+        :class:`~messagefoundry.store.crypto.TransitSealRefused` with that status, raised outside the
+        handler so no chain carries Vault's reply; anything else raises :class:`CipherError`.
+        Blocking."""
+        hash_input = base64.b64encode(digest).decode("ascii")
+        refused = 0
+        try:
+            response: Any = self._client.secrets.transit.verify_signed_data(
+                name=key_name,
+                hash_input=hash_input,
+                hmac=mac,
+                hash_algorithm=AUDIT_TRANSIT_HASH_ALGO,
+            )
+            return response["data"]["valid"]
+        except Exception as exc:
+            refused = 400 if is_vault_bad_request(exc) else 403 if is_vault_forbidden(exc) else 0
+            if not refused:
+                raise CipherError(
+                    f"Transit row seal verify failed (key={key_name!r}): {vault_failure_text(exc)}"
+                ) from exc
+        raise TransitSealRefused(refused)
 
     def audit_mac_fn(self) -> AuditMacFn:
         """The audit-chain MAC provider: route each row's MAC through Transit (:meth:`audit_hmac`). The
@@ -518,7 +594,9 @@ def transit_cipher_required_capabilities() -> dict[str, frozenset[str]]:
     metadata (``transit/keys/<key>``, read); :meth:`TransitCipher.encrypt` and
     :meth:`TransitCipher.decrypt` update ``transit/encrypt/<data key>`` and
     ``transit/decrypt/<data key>``; :meth:`TransitCipher.audit_hmac` updates
-    ``transit/hmac/<audit key>``, which is the data key when no audit key is set. Raises
+    ``transit/hmac/<audit key>``, which is the data key when no audit key is set, and the row seal
+    check (:meth:`TransitCipher.verify_seal_hmac`, ADR 0217) updates
+    ``transit/verify/<audit key>``. Raises
     :class:`KeyProviderError` when the data-key name is not set, as the cipher itself does."""
     key_name, audit_key = _key_names()
     read, update = frozenset({"read"}), frozenset({"update"})
@@ -528,4 +606,5 @@ def transit_cipher_required_capabilities() -> dict[str, frozenset[str]]:
         f"{TRANSIT_MOUNT}/decrypt/{key_name}": update,
         f"{TRANSIT_MOUNT}/keys/{audit_key}": read,
         f"{TRANSIT_MOUNT}/hmac/{audit_key}": update,
+        f"{TRANSIT_MOUNT}/verify/{audit_key}": update,
     }

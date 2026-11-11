@@ -28,6 +28,7 @@ from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.row_seal import RowSealer
 from messagefoundry.store.store import (
     AD_ROLE_MAP,
     AD_SCOPE_MAP,
@@ -69,12 +70,17 @@ def _raw_for(path: Path) -> Any:
     return raw
 
 
+async def _holds(*_: object) -> bool:
+    """A seal check switched off: every row holds."""
+    return True
+
+
 async def test_the_role_seal_contract_holds_on_sqlite(keyed: tuple[MessageStore, Path]) -> None:
     store, path = keyed
     await assert_role_seal_contract(store, _raw_for(path))
 
 
-@pytest.mark.parametrize("check", ["role_seal_ok", "ad_map_seal_ok"])
+@pytest.mark.parametrize("check", ["role_seal_ok_async", "ad_map_seal_ok_async"])
 async def test_the_contract_fails_when_the_service_checks_no_seal(
     keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch, check: str
 ) -> None:
@@ -83,7 +89,7 @@ async def test_the_contract_fails_when_the_service_checks_no_seal(
     import messagefoundry.auth.service as service_module
 
     store, path = keyed
-    monkeypatch.setattr(service_module, check, lambda sealer, row: True)
+    monkeypatch.setattr(service_module, check, _holds)
     with pytest.raises(AssertionError):
         await assert_role_seal_contract(store, _raw_for(path))
 
@@ -234,7 +240,7 @@ async def test_rotation_leaves_a_failing_role_and_map_as_they_are(
     wrote, which still verifies beside it."""
     store, path = keyed
     sealer = store.row_sealer()
-    assert sealer is not None
+    assert isinstance(sealer, RowSealer)  # a local key: the sync check is the one under test
     service = AuthService(store, AuthSettings())
     await service.initialize()
     good = (

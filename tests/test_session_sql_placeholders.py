@@ -26,6 +26,7 @@ import pytest
 
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
+from messagefoundry.store.row_seal import SealPager
 from messagefoundry.store.store import GLOBAL_SESSION_EPOCH_SQL
 
 _HASH = "a" * 64
@@ -183,6 +184,7 @@ def _mssql_store(seen: list[tuple[str, tuple[Any, ...]]]) -> Any:
     store._acquire_wait = AcquireWaitHistogram()
     store.committed_txns = 0
     store._row_sealer = None  # keyless: the write helper rewrites the row with an empty seal
+    store._seal_pager = SealPager()  # ADR 0217: a revoke builds its outcome on the store's pager
 
     @asynccontextmanager
     async def _acquire() -> AsyncIterator[_MssqlConn]:
@@ -298,7 +300,7 @@ async def test_sqlserver_revoke_user_sessions_counts_its_output_rowset(revoked: 
     seen: list[tuple[str, tuple[Any, ...]]] = []
     store = _nocount_store(seen, [(f"{n:064x}",) for n in range(revoked)])
 
-    async def bump(cur: Any, user_id: str) -> None:
+    async def bump(cur: Any, user_id: str, _outcome: Any) -> None:
         # The epoch is raised through the sealed user write helper, which this fake driver cannot
         # read a users row for; its own contract runs against a real server (BACKLOG #2592).
         seen.append(("raise the epoch", (user_id,)))
@@ -429,6 +431,7 @@ def _pg_store(seen: list[tuple[str, tuple[Any, ...]]]) -> Any:
     store._settings = StoreSettings()
     store._acquire_wait = AcquireWaitHistogram()
     store._row_sealer = None  # keyless: the write helper rewrites the row with an empty seal
+    store._seal_pager = SealPager()  # ADR 0217: a revoke builds its outcome on the store's pager
 
     @asynccontextmanager
     async def _timed_acquire(*, record: bool = True) -> AsyncIterator[_PgConn]:

@@ -194,10 +194,11 @@ from messagefoundry.store.queue_tag import (
 )
 from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
-    SESSION_KIND,
     USER_KIND,
-    RowSealer,
+    AnyRowSealer,
     RowSealError,
+    SealPager,
+    row_sealer_for_cipher,
 )
 from messagefoundry.store.schema_verify import IndexShape
 from messagefoundry.store.sealed_cache import (
@@ -261,7 +262,6 @@ from messagefoundry.store.store import (
     DestinationMetrics,
     DiskFreeStatus,
     EnrolmentCodeOutcome,
-    EpochBump,
     EpochRaise,
     FailOutcome,
     FederatedUnbind,
@@ -290,6 +290,7 @@ from messagefoundry.store.store import (
     ResendSourceNotFound,
     RestoreRecord,
     RevokeResult,
+    RevokeSealOutcome,
     RoleGrant,
     RoleRow,
     SecretRotationMetaRow,
@@ -309,12 +310,12 @@ from messagefoundry.store.store import (
     _opt_float,
     _session_cap_groups,
     _transit_attestation_row,
-    ad_map_write,
+    ad_map_write_async,
     admin_guard_counts,
     append_rename_audits,
-    approval_fails_seal,
-    approval_tombstone,
-    approval_update,
+    approval_fails_seal_async,
+    approval_tombstone_async,
+    approval_update_async,
     audit_active_key_id,
     audit_append_refusal,
     audit_append_secret,
@@ -337,12 +338,12 @@ from messagefoundry.store.store import (
     federated_bind,
     federated_unbind,
     first_admin_grant,
-    first_sealed_approval,
+    first_sealed_approval_async,
     full_authentication_clear,
     global_epoch_or_refuse,
     global_epoch_raise,
     global_epoch_unmoved,
-    held_approval_tombstone,
+    held_approval_tombstone_async,
     if_applied,
     inheritance_plan,
     inheriting_children,
@@ -359,6 +360,7 @@ from messagefoundry.store.store import (
     owned_lane_scope,
     passkey_digest,
     password_change,
+    raise_account_epoch,
     read_newest_keyed_audit_row,
     read_transit_bound_attestation_rows,
     reauth_stamp,
@@ -375,20 +377,21 @@ from messagefoundry.store.store import (
     require_ingress_audit,
     require_notify_email,
     require_operator_audit,
-    role_seal_ok,
+    require_role_seal_for_write,
+    require_user_seal_for_write,
     roles_if_held,
     roll_audit_key_range,
     rotation_reseal,
     scope_if_source,
     scope_withdrawal,
-    seal_approval,
-    seal_role,
-    seal_session,
-    seal_user,
+    seal_approval_async,
+    seal_role_async,
+    seal_session_async,
+    seal_user_async,
     session_insert_params,
-    session_owes_unproven_factor,
+    session_owes_unproven_factor_async,
     session_reseal_params,
-    session_seal_ok,
+    session_writer_seal_check,
     settle_newest_keyed_audit_row,
     settle_transit_bound_attestation,
     should_record_event,
@@ -404,10 +407,10 @@ from messagefoundry.store.store import (
     user_disabled_change,
     user_insert_params,
     user_reseal_params,
-    user_seal_ok,
     verify_audit_rows,
     webauthn_insert_params,
     without_role,
+    write_kept_session,
 )
 from messagefoundry.store.transit_attestation import TransitBoundAttestation
 from messagefoundry.support.redact import redact_log_line
@@ -2112,7 +2115,8 @@ class PostgresStore:
         self._settings = settings
         self._cipher: Cipher = cipher or IdentityCipher()
         # BACKLOG #2592: the row sealer, fixed for the handle's life; None on a keyless store.
-        self._row_sealer: RowSealer | None = RowSealer.for_cipher(self._cipher)
+        self._row_sealer: AnyRowSealer | None = row_sealer_for_cipher(self._cipher)
+        self._seal_pager = SealPager()
         # A1 live cost counters (QueueStore protocol / `/stats` uniformity). Exposed at 0 on this backend:
         # counting is fully wired on SQLite + SQL Server, whose explicit ``conn.commit()`` / body-insert
         # sites funnel through single helpers; Postgres commits implicitly via ``async with
@@ -9245,7 +9249,7 @@ class PostgresStore:
                 await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
                 # The open-request rule is the Store protocol's; the SQLite and SQL Server
                 # twins state it in their own SQL, and the shared repeat contract checks all three.
-                joined = first_sealed_approval(
+                joined = await first_sealed_approval_async(
                     self._row_sealer,
                     await conn.fetch(
                         _PG_APPROVAL_SELECT + " WHERE operation = $1 AND params = $2"
@@ -9277,11 +9281,11 @@ class PostgresStore:
         transaction. Returns whether a row was written."""
         sealer = self._row_sealer
         if current is None:
-            await conn.execute(_PG_APPROVAL_INSERT, *seal_approval(sealer, new).write_params())
+            sealed = await seal_approval_async(sealer, new)
+            await conn.execute(_PG_APPROVAL_INSERT, *sealed.write_params())
             return True
-        result = await conn.execute(
-            _PG_APPROVAL_UPDATE, *approval_update(sealer, current, new).update_params(current)
-        )
+        updated = await approval_update_async(sealer, current, new)
+        result = await conn.execute(_PG_APPROVAL_UPDATE, *updated.update_params(current))
         return _rowcount(result) > 0
 
     async def get_pending_approval(self, approval_id: str) -> Row | None:
@@ -9374,7 +9378,7 @@ class PostgresStore:
                 found is not None
                 and str(found["status"]) == "pending"
                 and found["seal"] == seal_read
-                and approval_fails_seal(self._row_sealer, found)
+                and await approval_fails_seal_async(self._row_sealer, found)
                 and await self._tombstone_approval(
                     conn,
                     approval_id,
@@ -9397,7 +9401,7 @@ class PostgresStore:
             _PG_APPROVAL_TOMBSTONE,
             approver,
             float(decided_at),
-            approval_tombstone(
+            await approval_tombstone_async(
                 self._row_sealer, approval_id, approver=approver, decided_at=decided_at
             ),
             approval_id,
@@ -9474,14 +9478,16 @@ class PostgresStore:
         """One row of :meth:`reseal_approval_records`, read under its lock: re-sealed as a request,
         or, when it fails that seal, as a tombstone that holds (BACKLOG #3638). Raises
         :class:`RowSealError` when neither holds, before any statement runs, so the transaction
-        rolls back clean; store.py's twin states the rest of the contract."""
+        rolls back clean; store.py's twin states the rest of the contract, the Transit census
+        pin included (ADR 0217 slice 1b-ii)."""
         try:
             current = ApprovalRow.from_mapping(found)
             return await self._write_approval(conn, current, current=current)
-        except RowSealError:
-            tombstone = held_approval_tombstone(self._row_sealer, found)
-            if tombstone is None:
-                raise
+        except RowSealError as exc:
+            refused = exc
+        tombstone = await held_approval_tombstone_async(self._row_sealer, found)
+        if tombstone is None:
+            raise refused
         return await self._reseal_tombstone(
             conn, str(found["id"]), *tombstone, seal_read=found["seal"]
         )
@@ -9493,7 +9499,7 @@ class PostgresStore:
         ``MessageStore._reseal_tombstone`` states the contract."""
         result = await conn.execute(
             _PG_APPROVAL_TOMBSTONE_RESEAL,
-            approval_tombstone(
+            await approval_tombstone_async(
                 self._row_sealer, approval_id, approver=approver, decided_at=decided_at
             ),
             approval_id,
@@ -9833,7 +9839,7 @@ class PostgresStore:
         # BACKLOG #2592: the whole row, sealed, in one INSERT.
         await self._execute_with_audits(
             _PG_USER_INSERT,
-            user_insert_params(seal_user(self._row_sealer, record)),
+            user_insert_params(await seal_user_async(self._row_sealer, record)),
             audits,
             now=now,
         )
@@ -9876,15 +9882,14 @@ class PostgresStore:
         current = await self._read_user_record(conn, user_id)
         if current is None:
             return None
-        if not user_seal_ok(self._row_sealer, current):
-            raise RowSealError(USER_KIND)
+        await require_user_seal_for_write(self._row_sealer, current)
         changed = change(current)
         if changed is None:
             return None
         if changed.roles != current.roles:
             roles = await conn.fetch("SELECT id FROM roles")
             changed = existing_roles_only(current, changed, [str(r["id"]) for r in roles])
-        updated = seal_user(self._row_sealer, changed)
+        updated = await seal_user_async(self._row_sealer, changed)
         status = await conn.execute(_PG_USER_RESEAL, *user_reseal_params(updated, current))
         if _rowcount(status) != 1:
             return None
@@ -9917,8 +9922,7 @@ class PostgresStore:
         the contract."""
         current = await self._read_user_record(conn, user_id)
         if current is not None:
-            if not user_seal_ok(self._row_sealer, current):
-                raise RowSealError(USER_KIND)
+            await require_user_seal_for_write(self._row_sealer, current)
             if (
                 self._row_sealer is not None
                 and not removes_all
@@ -9932,17 +9936,27 @@ class PostgresStore:
             await self._write_user(conn, user_id, lambda r: r.changed(cred_digest=digest))
         return count
 
-    async def _bump_session_epoch(self, conn: Any, user_id: str) -> EpochRaise | None:
+    async def _bump_session_epoch(
+        self, conn: Any, user_id: str, outcome: RevokeSealOutcome
+    ) -> EpochRaise | None:
         """Raise the account's session epoch through the write helper, inside ``conn``'s
         transaction (BACKLOG #2592), and report the raise (BACKLOG #4975); store.py's
-        ``MessageStore._bump_session_epoch`` says why a record that fails its seal does not stop
-        the revoke that called this, and reports no raise."""
-        bump = EpochBump()
-        try:
-            return bump.raised(await self._write_user(conn, user_id, bump))
-        except RowSealError:
-            log.warning("an account's record failed its integrity seal; its sessions end anyway")
-            return None
+        ``MessageStore._bump_session_epoch`` says why a seal refusal does not stop the revoke that
+        called this, and reports no raise, and the residual that leaves for an account read as
+        Holds later."""
+        return await raise_account_epoch(
+            lambda bump: self._write_user(conn, user_id, bump),
+            outcome,
+            user_id,
+            lambda: self._lock_account_row(conn, user_id),
+        )
+
+    async def _lock_account_row(self, conn: Any, user_id: str) -> None:
+        """Lock the account row as :meth:`_write_user`'s read does, calling no Transit: a revoke a
+        Transit Outage tripped still holds every account row before its session sweep, the lock
+        order :meth:`revoke_all_sessions` relies on (decision d20261109T200352805-599b24, item
+        2)."""
+        await conn.fetchval("SELECT 1 FROM users WHERE id=$1 FOR UPDATE", user_id)
 
     async def reseal_user_records(self) -> tuple[int, int]:
         """Re-seal every user record under the active key, for ``rotate-key`` (BACKLOG #2592);
@@ -9951,7 +9965,7 @@ class PostgresStore:
         if sealer is None:
             return 0, 0
         cipher = self._cipher
-        if not isinstance(cipher, AesGcmCipher):  # no in-process keys, so no sealer either
+        if not isinstance(cipher, AesGcmCipher):  # no in-process keys: a Transit sealer, if any
             return 0, 0
         change = rotation_reseal(
             sealer,
@@ -10397,7 +10411,7 @@ class PostgresStore:
                     "SELECT * FROM sessions WHERE token_hash=$1 FOR UPDATE", for_session
                 )
                 # No account: the insert below meets the foreign key (BACKLOG #1807).
-                if record is not None and session_owes_unproven_factor(
+                if record is not None and await session_owes_unproven_factor_async(
                     self._row_sealer,
                     None if session is None else SessionRecord.from_mapping(dict(session)),
                     record,
@@ -10798,7 +10812,8 @@ class PostgresStore:
     async def _write_role(self, conn: Any, row: RoleRow) -> None:
         """The one writer of a ``roles`` row (BACKLOG #2592); store.py's
         ``MessageStore._write_role`` states the contract. Call it inside ``conn``'s transaction."""
-        await conn.execute(_PG_ROLE_UPSERT, *seal_role(self._row_sealer, row).write_params())
+        sealed = await seal_role_async(self._row_sealer, row)
+        await conn.execute(_PG_ROLE_UPSERT, *sealed.write_params())
 
     async def list_roles(self) -> Sequence[Row]:
         return await self._fetchall("SELECT * FROM roles ORDER BY id")
@@ -11042,7 +11057,7 @@ class PostgresStore:
         )
         rows = await conn.fetch(sql.pairs)
         current = AdMap.of(name, [(str(r[0]), str(r[1])) for r in rows], str(seal or ""))
-        new = ad_map_write(self._row_sealer, current, change)
+        new = await ad_map_write_async(self._row_sealer, current, change)
         if new is None:
             return False
         if new.pairs != current.pairs:
@@ -11083,7 +11098,11 @@ class PostgresStore:
                 if locked is None:
                     continue
                 role = RoleRow.from_mapping(dict(locked))
-                if not role_seal_ok(sealer, role):
+                # The write path's own refusal (ADR 0217 (c) step 1), as store.py's twin: a Forged
+                # row is counted refused, as on main.
+                try:
+                    await require_role_seal_for_write(sealer, role)
+                except RowSealError:
                     refused += 1
                     continue
                 await self._write_role(conn, role)
@@ -11171,7 +11190,7 @@ class PostgresStore:
                 # would be minted dead. revoke_all_sessions says why this read never waits.
                 global_epoch=await self._global_session_epoch(conn),
             )
-            record = seal_session(self._row_sealer, record)
+            record = await seal_session_async(self._row_sealer, record)
             await conn.execute(_PG_SESSION_INSERT, *session_insert_params(record))
         return True
 
@@ -11192,9 +11211,8 @@ class PostgresStore:
         current = SessionRecord.from_mapping(dict(row))
         if current.revoked_at is not None:
             return None
-        if not session_seal_ok(self._row_sealer, current):
-            raise RowSealError(SESSION_KIND)
-        updated = seal_session(self._row_sealer, change(current))
+        await session_writer_seal_check(self._row_sealer, current)
+        updated = await seal_session_async(self._row_sealer, change(current))
         status = await conn.execute(_PG_SESSION_RESEAL, *session_reseal_params(updated, current))
         return updated if _rowcount(status) > 0 else None
 
@@ -11208,10 +11226,16 @@ class PostgresStore:
         value = await conn.fetchval(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}")
         return None if value is None else int(value)
 
-    def row_sealer(self) -> RowSealer | None:
+    def row_sealer(self) -> AnyRowSealer | None:
         """This store's row sealer, or ``None`` on a keyless store (BACKLOG #2592). See
         :meth:`messagefoundry.store.base.AuthStore.row_sealer`."""
         return self._row_sealer
+
+    def seal_pager(self) -> SealPager:
+        """This store's seal page (decision d20261109T200352805-599b24 on ADR 0217, item 5). The
+        engine, the serve lifespan and ``admin-revoke-sessions`` arm it on their alert sink; each
+        disarms only its own registration."""
+        return self._seal_pager
 
     async def get_session(self, token_hash: str) -> SessionRecord | None:
         d = await self._fetchone("SELECT * FROM sessions WHERE token_hash=$1", token_hash)
@@ -11335,8 +11359,9 @@ class PostgresStore:
         (:meth:`_keep_or_end_session`, follow-up to BACKLOG #4975). The borrow is
         :meth:`_after_commit_txn`'s, for the reason it gives."""
         now = time.time() if now is None else now
-        async with self._after_commit_txn() as conn:
-            raised = await self._bump_session_epoch(conn, user_id)
+        outcome = RevokeSealOutcome(self._seal_pager)
+        async with outcome.committing(self.record_audit), self._after_commit_txn() as conn:
+            raised = await self._bump_session_epoch(conn, user_id, outcome)
             status = await conn.execute(
                 _PG_REVOKE_USER_SESSIONS_SQL + " AND ($3::text IS NULL OR token_hash != $3)",
                 now,
@@ -11344,23 +11369,36 @@ class PostgresStore:
                 except_token_hash,
             )
             if except_token_hash is None:
-                return RevokeResult(_rowcount(status))
-            unmoved = global_epoch_unmoved(await self._global_session_epoch_value(conn))
-            return await self._keep_or_end_session(
-                conn,
-                _rowcount(status),
-                except_token_hash,
-                KeptSessionRestamp(user_id, raised, unmoved),
-                now,
-            )
+                result = RevokeResult(_rowcount(status))
+            else:
+                unmoved = global_epoch_unmoved(await self._global_session_epoch_value(conn))
+                result = await self._keep_or_end_session(
+                    conn,
+                    _rowcount(status),
+                    except_token_hash,
+                    KeptSessionRestamp(user_id, raised, unmoved),
+                    now,
+                    outcome,
+                )
+        return result
 
     async def _keep_or_end_session(
-        self, conn: Any, revoked: int, token_hash: str, restamp: KeptSessionRestamp, now: float
+        self,
+        conn: Any,
+        revoked: int,
+        token_hash: str,
+        restamp: KeptSessionRestamp,
+        now: float,
+        outcome: RevokeSealOutcome,
     ) -> RevokeResult:
         """Re-stamp the session a revoke keeps, or end it where ``restamp`` declines, inside
         ``conn``'s transaction (follow-up to BACKLOG #4975); store.py's
         ``MessageStore._keep_or_end_session`` states the contract."""
-        if restamp.kept(await self._write_session(conn, token_hash, restamp)):
+        if not outcome.tripped and restamp.kept(
+            await write_kept_session(
+                self._write_session(conn, token_hash, restamp), outcome, token_hash
+            )
+        ):
             return RevokeResult(revoked, kept=True)
         status = await conn.execute(
             _PG_END_DECLINED_KEPT_SESSION_SQL, now, restamp.user_id, token_hash
@@ -11396,6 +11434,16 @@ class PostgresStore:
         epoch reads it without a lock clause, and under MVCC such a read never waits on a writer,
         so holding it while the loop below waits on account rows cannot close a cycle."""
         now = time.time() if now is None else now
+        outcome = RevokeSealOutcome(self._seal_pager)
+        async with outcome.committing(self.record_audit):
+            result = await self._revoke_all_sessions_on(except_token_hash, now, outcome)
+        return result
+
+    async def _revoke_all_sessions_on(
+        self, except_token_hash: str | None, now: float, outcome: RevokeSealOutcome
+    ) -> RevokeResult:
+        """The body of :meth:`revoke_all_sessions`, in its own transaction, which has committed
+        when this returns."""
         async with self._timed_acquire() as conn, conn.transaction():
             global_raised = global_epoch_raise(
                 global_epoch_or_refuse(
@@ -11406,7 +11454,7 @@ class PostgresStore:
                 )
             )
             raised = {
-                str(row["id"]): await self._bump_session_epoch(conn, str(row["id"]))
+                str(row["id"]): await self._bump_session_epoch(conn, str(row["id"]), outcome)
                 for row in await conn.fetch("SELECT id FROM users ORDER BY id")
             }
             status = await conn.execute(_PG_REVOKE_ALL_SESSIONS_SQL, now, except_token_hash)
@@ -11425,6 +11473,7 @@ class PostgresStore:
                 except_token_hash,
                 KeptSessionRestamp(owner, raised.get(owner), global_raised),
                 now,
+                outcome,
             )
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
