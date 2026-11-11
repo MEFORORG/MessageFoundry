@@ -84,9 +84,12 @@ any listener on this host whose port the connection's author named.
   The `host[:port]` lists, such as `allowed_http`, read a host-only entry as any port; on this list
   that would re-open the hole the list closes.
 - **The gate judges the dialled address.** It reads the sidecar through
-  `ech_sidecar_url_from_settings`, the resolver the connector dials from, refuses a user or a
-  password in the URL, and compares the host and the port urllib dials (80 or 443 where the URL
-  names none).
+  `ech_sidecar_url_from_settings`, the resolver the connector dials from, and compares the host and
+  the port urllib dials (80 or 443 where the URL names none). The resolver refuses a user or a
+  password in the URL, so a directly built connector refuses it too, and tells the operator to put
+  a credential meant for the sidecar in the sidecar's own configuration: the engine has no setting
+  for one, and the connection's own `Authorization` header reaches the sidecar on every request.
+  The gate refuses port 0 in its own words, since no entry can list it.
 
 ## Context
 

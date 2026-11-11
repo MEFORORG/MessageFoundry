@@ -1580,7 +1580,7 @@ transport's list is set, an outbound of that transport not on it is **refused at
 > Direct-only instance passes the gate, and the deny default holds every other transport closed.
 > With the switch written `false`, only the first six count, because the other transports would
 > then stay allow-any. A mail-only instance with that opt-out **exits 2** with *"outbound egress is
-> UNRESTRICTED … refusing to start"*, and the message names the override. `allowed_recipient_domains`,
+> UNRESTRICTED … refusing to start"*, and the message names the override. At least `allowed_recipient_domains`,
 > `allowed_proxy`, `allowed_ech_sidecar` and `allowed_syslog` never count. Every list still *gates* its own transport once the instance starts.
 >
 > Under `enforcement = warn` the two refusals become warnings and start. **No instance is exempt**

@@ -24,7 +24,7 @@ from pydantic import ValidationError
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import WiringError
-from messagefoundry.transports.egress import check_egress_allowed
+from messagefoundry.transports.egress import check_egress_allowed, http_dial_port
 from messagefoundry.transports.rest import RestDestination
 from tests._egress_policy import permitting
 
@@ -195,6 +195,60 @@ def test_a_sidecar_url_with_a_credential_is_refused_and_not_echoed(
     # every request through the sidecar to the partner.
     assert "sidecar's own configuration" in str(caught.value)
     assert "egress denied" in caplog.text
+
+
+def _gate(sidecar: str) -> None:
+    check_egress_allowed(_ech(sidecar), _egress("127.0.0.1:8123"))
+
+
+def _direct(sidecar: str) -> None:
+    RestDestination(_ech(sidecar))
+
+
+@pytest.mark.parametrize("build", [_gate, _direct], ids=["egress-gate", "direct-build"])
+@pytest.mark.parametrize(
+    "sidecar",
+    [
+        # NFKC turns the fullwidth solidus into '/', so urlsplit refuses the netloc.
+        "http://svc:s3cr3t-token／q@127.0.0.1:8123",
+        "http://svc:s3cr3t-token@127.0.0.1:8123",
+        "http://127.0.0.1:s3cr3t-token",
+    ],
+)
+def test_a_sidecar_refusal_never_points_a_credential_at_the_connection(
+    build: Any, sidecar: str
+) -> None:
+    """A credential written into the sidecar URL is the sidecar's, and the connection's
+    basic_user or bearer_token would carry it on through the sidecar to the partner. So no
+    sidecar refusal tells the operator to put it there, the unparseable shape included. The
+    refusal lives in the resolver the connector dials from, so a RestDestination built without
+    the egress gate refuses too."""
+    with pytest.raises(ValueError) as caught:
+        build(sidecar)
+    message = str(caught.value)
+    assert "s3cr3t" not in message
+    assert "basic_user" not in message
+    assert "bearer_token" not in message
+    assert "sidecar's own configuration" in message
+
+
+def test_a_sidecar_at_port_0_is_refused_in_its_own_words() -> None:
+    """No entry can list port 0, so "not in the allowlist" would send the operator looking for an
+    entry to add. Refused in fixed words, before the list is read, empty or not."""
+    for egress in (_egress("127.0.0.1:8123"), _egress()):
+        with pytest.raises(WiringError, match=r"names port 0") as caught:
+            check_egress_allowed(_ech("http://127.0.0.1:0"), egress)
+        assert "not in the" not in str(caught.value)
+        assert "is empty" not in str(caught.value)
+
+
+def test_http_dial_port_refuses_a_scheme_it_has_no_default_for() -> None:
+    assert http_dial_port("HTTP", None) == 80
+    assert http_dial_port("https", 8443) == 8443
+    with pytest.raises(ValueError, match=r"only an http or https URL"):
+        http_dial_port("ftp", None)
+    with pytest.raises(ValueError, match=r"only an http or https URL"):
+        http_dial_port("ftp", 21)
 
 
 def test_an_unlisted_refusal_names_the_host_and_never_the_url(

@@ -2602,6 +2602,16 @@ def proxy_config_from_settings(
 
 # --- ECH egress route (ADR 0139, ASVS 12.1.5) ---------------------------------------------------------
 
+#: Where a refused ``ech_sidecar`` value is told to put a credential instead (BACKLOG #5528). Not
+#: the connection's ``basic_user`` or ``bearer_token``: the general remedy would send a credential
+#: meant for the sidecar on through it to the partner. The one text for the resolver below and,
+#: through it, the egress gate.
+_ECH_SIDECAR_CREDENTIAL_USE = (
+    "the sidecar's own configuration (the engine has no setting for a credential meant for the "
+    "sidecar; this connection's own Authorization header and any token-endpoint request reach "
+    "the sidecar too, on their way upstream)"
+)
+
 
 def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
     """The loopback ECH-sidecar base URL for this connection (ADR 0139), or ``None`` when ``ech_egress``
@@ -2628,6 +2638,10 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
     this accepts is a host no opener sends through a proxy. That covers the token-endpoint hop too,
     which is re-addressed to the sidecar on the token provider's opener.
 
+    A credential in the URL is refused too, by :func:`refuse_url_credentials` with the remedy
+    :data:`_ECH_SIDECAR_CREDENTIAL_USE` (BACKLOG #5528): urllib would dial ``user:pw@host`` as the
+    host. It is refused here, not only at the egress gate, so a directly built connector refuses it.
+
     Inert until a destination actually publishes an ECHConfig (as of 2026-07 a DoH probe found no EHR
     endpoint does — demand-gated, ADR 0139)."""
     if not s.get("ech_egress"):
@@ -2641,7 +2655,12 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
         )
     # Never a bare urlsplit, and never the raw value in the message: a URL can carry userinfo
     # (BACKLOG #2686).
-    parsed = _split_or_refuse(sidecar, "ech_sidecar", use=_URL_CREDENTIAL_USE, error=ValueError)
+    refuse_url_credentials(
+        sidecar, "ech_sidecar", use=_ECH_SIDECAR_CREDENTIAL_USE, error=ValueError
+    )
+    parsed = _split_or_refuse(
+        sidecar, "ech_sidecar", use=_ECH_SIDECAR_CREDENTIAL_USE, error=ValueError
+    )
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ValueError(
             f"ech_sidecar must be an http(s):// loopback URL, got {_redact_url(sidecar)!r} "
