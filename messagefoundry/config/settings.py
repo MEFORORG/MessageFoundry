@@ -9728,9 +9728,9 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"{floor}, and the page about one account the directory keeps failing for, "
                     f"which comes once {run} of up to that account's last {window} probes "
                     f"fail, at least {(run - 1) * interval} s after its first such probe. The "
-                    "longer interval spaces that account's probes further apart, so the page "
-                    "comes later in time, and a failure bounded in time can end before it pages "
-                    "at all",
+                    "longer interval spaces that account's probes further apart, which changes "
+                    "which failures that vary over time raise that page, and when, and a failure "
+                    "bounded in time can end before it pages at all",
                 )
             )
         if run > _auth_default("ad_reconcile_outage_passes"):
@@ -9769,10 +9769,10 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"{_auth_default('ad_session_recheck_max_users')}, so a larger estate takes "
                     f"more passes to cover, and {late}. The smaller sample is also the breaker's "
                     "denominator, so a smaller wave of revocations aborts the pass. In an estate "
-                    "larger than the sample each account is probed less often, so the page about "
-                    "one account the directory keeps failing for, which counts that account's "
-                    "probes, comes later in time too, and a failure bounded in time can end "
-                    "before it pages at all",
+                    "larger than the sample each account is probed less often, which changes "
+                    "which failures that vary over time raise the page about one account the "
+                    "directory keeps failing for, and when, since it counts that account's "
+                    "probes, and a failure bounded in time can end before it pages at all",
                 )
             )
         brake = (

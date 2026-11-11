@@ -802,7 +802,8 @@ def test_a_reconciler_loosening_names_the_delay_to_the_unreachable_account_page(
 ) -> None:
     """BACKLOG #3709. The page about one account the directory keeps failing for counts that
     account's own probes, so a longer interval or a smaller per-pass budget spaces them further
-    apart: the page comes later in time, and a failure bounded in time can end before it pages.
+    apart: that changes which failures that vary over time raise the page, and when, and a
+    failure bounded in time can end before it pages.
     The loosening says so."""
     assert words in dict(_pairs(auth=_ad(**{field: value})))[field]
 
