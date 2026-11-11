@@ -325,8 +325,8 @@ class TransitCipher(_UnmarkedPolicy):
         A 400 whose body hvac fails on raises neither of those (BACKLOG #6707). Such bodies
         include at least these, when the Content-Type is exactly ``application/json``: one that
         parses as JSON that is not an object (a bare list or ``null``, for example), one whose
-        ``errors`` list holds an entry that is not text, and one whose ``errors`` value is a number
-        such as ``5``, or ``true``. On each, hvac 2.4.0 raises ``AttributeError`` or ``TypeError``
+        ``errors`` list holds an entry that is not text, and one whose ``errors`` value is a nonzero
+        number such as ``5``, or ``true``. On each, hvac 2.4.0 raises ``AttributeError`` or ``TypeError``
         in place of ``InvalidRequest``. A ``MemoryError`` that hvac raises while it joins a truthy
         ``errors`` value, before it raises any ``InvalidRequest``, is not read as a refusal either.
         Each raises plain :class:`CipherError`, so the walk could not run and no tamper alert

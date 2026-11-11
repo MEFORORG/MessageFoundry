@@ -462,7 +462,7 @@ section 0): this is what the first deployment's first routine rotation would hav
    #6707). Such bodies include at least these, when the Content-Type is exactly
    `application/json`: one that parses as JSON that is not an object (a bare list or `null`, for
    example), one whose `errors` list holds an entry that is not text, and one whose `errors`
-   value is a number such as `5`, or `true`. On each, hvac 2.4.0 raises `AttributeError` or
+   value is a nonzero number such as `5`, or `true`. On each, hvac 2.4.0 raises `AttributeError` or
    `TypeError` in place of `InvalidRequest`. A `MemoryError` that hvac raises while it joins a
    truthy `errors` value, before it raises any `InvalidRequest`, is not read as a refusal either.
    Each is a plain `CipherError`, so a version planted behind a proxy that wrote such a body would
