@@ -108,7 +108,9 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
       upload is skipped and the release is published once the `pypi` approval is given. Set, the
       publish refuses while the upload has not run, which is what a "Re-run failed jobs" after
       setting it would do; re-run the `release-webconsole` job instead, which re-runs the jobs after
-      it. GitHub allows that re-run only within 30 days of the run's first attempt.
+      it. [docs/SUPPLY-CHAIN.md](../../docs/SUPPLY-CHAIN.md), *The draft*, gives the other
+      remedies, including the one for a copy of the variable on the `pypi` environment, and the
+      30-day limit on any re-run.
 
 ## 7. Post-publish verification
 

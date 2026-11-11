@@ -161,7 +161,7 @@ Facts the labels leave out:
   `release-webconsole` on a console tag), which re-runs the jobs after it, or the variable is unset
   and the publisher re-run. If the refusal is from a copy of the variable on the `pypi`
   environment, remove the copy, then re-run the build job. GitHub allows a re-run only within 30
-  days of a run's first attempt, so past that only a new run from a tag push finishes the release.
+  days of a run's first attempt, so past that no re-run finishes the release.
 - **The provenance gate.** The tagged commit must be on `main`, and each required check's latest
   run on it must have passed. A red run after the merge blocks the tag even if the merge-queue run
   passed. To clear it, re-run the failed job on that commit, then re-run the release. A check

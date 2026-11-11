@@ -76,8 +76,13 @@
 # compared as Actions compares (ignoring case), and refuses while it is 'true' and the upload did
 # not run. That last read covers at least a variable set after the build job read it, whether by
 # a re-run of failed jobs reusing the build job's output or while the upload waited for its
-# approval, and an environment copy that differs; re-running the build job, which re-runs the jobs
-# after it, reads it afresh. Unset, the upload step is skipped and the release still goes public.
+# approval, and an environment copy that differs. Re-running the build job, which re-runs the jobs
+# after it, reads it afresh; an environment copy must be removed first, then the build job re-run,
+# since a re-run of failed jobs alone reuses the upload's skipped outcome and is refused again. The
+# refusal's text omits that second step, and its first cause can be the wrong one: a variable unset
+# while the upload waited for its approval and set again before the publisher ran was set when the
+# build job read it. Re-running the build job clears that case too. Unset, the upload step is
+# skipped and the release still goes public.
 #
 # THE HAND-OVER. Each build job records the digests once its last gate has passed, and its last
 # step uploads the files. Neither step has an `if:`, so any earlier failure skips both. In `release`
@@ -90,8 +95,8 @@
 # harness publishes from `publish-pypi`, under the engine's one approval (owner ruling 2026-10-16), so
 # that approval must land inside the 30 days. GitHub re-runs a run, or any job in it, only within 30
 # days of its first attempt, so no re-run rebuilds the files after that: every re-run remedy in this
-# file, and in the draft publishers' errors, holds only inside that window, and a draft left past it
-# needs a new run from a tag push.
+# file, and in the draft publishers' errors, holds only inside that window, and no re-run finishes a
+# draft left past it.
 #
 # PyPI publish uses Trusted Publishing (OIDC) — no API token. OWNER PREREQ (one-time, before the first
 # tag): claim the `messagefoundry` PyPI project + configure a Trusted Publisher (a PENDING publisher works
@@ -2017,11 +2022,7 @@ jobs:
       contents: write   # gh release edit (take the console release out of draft)
     steps:
       # No checkout: gh reads the repository from GH_REPO, and this job runs no repository code.
-      # The error's environment-copy remedy is incomplete: once the copy is removed, re-run the
-      # build job as well, since a re-run of failed jobs alone reuses the upload's skipped outcome
-      # and is refused again. Its first cause can also be the wrong one: a variable unset while the
-      # upload waited for its approval and set again before this job ran was set when the build job
-      # read it. Re-running the build job clears that case too.
+      # The error's text omits two things; the header's paragraph on the gate variables says which.
       - name: Publish the draft console GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -2473,11 +2474,7 @@ jobs:
       contents: write   # gh release edit (take the release out of draft)
     steps:
       # No checkout: gh reads the repository from GH_REPO, and this job runs no repository code.
-      # The error's environment-copy remedy is incomplete: once the copy is removed, re-run the
-      # build job as well, since a re-run of failed jobs alone reuses the upload's skipped outcome
-      # and is refused again. Its first cause can also be the wrong one: a variable unset while the
-      # upload waited for its approval and set again before this job ran was set when the build job
-      # read it. Re-running the build job clears that case too.
+      # The error's text omits two things; the header's paragraph on the gate variables says which.
       - name: Publish the draft GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

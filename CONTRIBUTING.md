@@ -262,13 +262,13 @@ version.
    The test sweeps all six documents `docs/README.md` lists under *Start here*, so an engine pin,
    console pin or *for engine* phrase added to any of them is held too. A `$V` line is held only in
    the two guides named above. Run the test after the bump.
-5. The console pairing prose. Move the engine pin in the pairing install line of `README.md` and
-   of `packaging/messagefoundry-webconsole/README.md` on every bump: the same test holds both to
-   `__version__`, so they cannot wait. Move by hand the engine versions that prose names as
-   sharing the console's seam, and the engine version in the *Admin console* section of
-   `docs/SERVICE.md`. No test holds those. **Check the UI seam first** (below): if it moved, the
-   console pin beside each engine pin names a console that refuses the new engine, so the bump
-   needs the console release beside it, which moves those console pins.
+5. The console pairing prose. **Check the UI seam first** (below): if it moved, the console pin
+   beside each engine pin below names a console that refuses the new engine, so the bump needs
+   the console release beside it, which moves those console pins. Then move the engine pin in the
+   pairing install line of `README.md` and of `packaging/messagefoundry-webconsole/README.md` on
+   every bump: the same test holds both to `__version__`, so they cannot wait. Move by hand the
+   engine versions that prose names as sharing the console's seam, and the engine version in the
+   *Admin console* section of `docs/SERVICE.md`. No test holds those.
 6. `CHANGELOG.md`: run `python scripts/release/changelog_fragments.py assemble`, then rename
    `[Unreleased]` to the version and add a fresh, empty `[Unreleased]` above it.
    [changelog.d/README.md](changelog.d/README.md), *At release*, gives the order. Then move the
