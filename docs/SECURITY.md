@@ -5605,12 +5605,13 @@ durable token storage, not the shape: the extension's SecretStorage cache is a l
 and federated legs below ship off: `[auth].ad_enabled`, `[auth].kerberos_enabled` and
 `[auth].oidc_enabled` all default to false.
 
-- **The engine** mints every session at one site, `AuthService._issue_session` in
-  `messagefoundry/auth/service.py`, the engine's only caller of `Store.create_session`. It keeps
-  only the token's hash, and stamps the absolute lifetime at mint from `[security].max_session_hours`.
+- **The engine** creates every session row at one site, `AuthService._issue_session` in
+  `messagefoundry/auth/service.py`, the engine's only caller of `Store.create_session`, and stamps
+  the absolute lifetime there from `[security].max_session_hours`. A rotation mints a new token for
+  an existing row through `Store.rotate_session` instead. The store keeps only the token's hash.
 - **The web console, `apiclient` and the VS Code extension** hold the token (table above). The
   extension signs in through `POST /auth/login` with a local account: `/auth/providers` reports
-  `ad` as false, and the engine refuses `provider: "ad"` (BACKLOG #1137).
+  `ad` as false, and the engine refuses `provider: "ad"`.
 - **LDAP (Active Directory)**, under `ad_enabled`, is the directory the Kerberos and OIDC legs
   resolve a principal against, and the bind the directory session reconciler uses. It accepts no
   directory-password sign-in; that pathway is retired (BACKLOG #1137). The reconciler can revoke a
@@ -5618,10 +5619,8 @@ and federated legs below ship off: `[auth].ad_enabled`, `[auth].kerberos_enabled
 - **Kerberos (Windows SSO)** creates a directory session through `POST /auth/negotiate` and the
   console's `GET /ui/sso` when `kerberos_enabled` is set. The engine reads no ticket lifetime, so such
   a session's absolute lifetime is the engine's own flat cap, not the directory's (ADR 0079).
-- **OIDC** creates a federated session when `oidc_enabled` is set. Its absolute lifetime is the
-  earliest of the engine's cap, the signature-verified `id_token` `exp`, the IdP `auth_time` plus
-  `[auth].oidc_max_age_seconds`, and `[auth].oidc_session_max_hours` when that is set (ADR 0142,
-  BACKLOG #1150).
+- **OIDC** creates a federated session when `oidc_enabled` is set. The IdP's assertions can only
+  shorten its absolute lifetime below the engine's cap; *Federated sign-in* above states the caps.
 
 ### A revoked privilege reaches the next request, with exceptions (ASVS 8.3.2)
 
