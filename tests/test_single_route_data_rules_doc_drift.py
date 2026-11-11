@@ -27,9 +27,10 @@ of the bullet. The console paragraph of the blockquote is read from the code and
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
@@ -394,6 +395,111 @@ async def _measure_ui_connection_page(k: _Callers) -> None:
     assert await page("allchannels", names) == [200, 200, 200, 404]
 
 
+@contextlib.asynccontextmanager
+async def _ui_sessions(k: _Callers, *usernames: str) -> AsyncIterator[dict[str, httpx.AsyncClient]]:
+    """One console client per user, each signed in ONCE through the cookie flow, so a measurement's
+    run of requests does not trip the sign-in rate limit."""
+    app = create_app(k.engine, auth=k.service, serve_ui=True, webauthn_rp_from_request=True)
+    async with contextlib.AsyncExitStack() as stack:
+        clients: dict[str, httpx.AsyncClient] = {}
+        for username in usernames:
+            c = await stack.enter_async_context(
+                httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+            )
+            r = await c.post("/ui/login", data={"username": username, "password": PW})
+            assert r.status_code == 303 and c.cookies.get("mf_session"), (username, r.text)
+            clients[username] = c
+        yield clients
+
+
+async def _measure_ui_resend_done(k: _Callers) -> None:
+    pytest.importorskip("messagefoundry_webconsole")
+    ids = await k.message_ids()
+    # A resend of IB_A's message to OB_X under one key. The store call the JSON resend makes; the
+    # route under test reads only its record, so the lane state is not part of the rule.
+    outcome = await k.engine.store.resend_to(
+        message_id=ids["IB_A"], to="OB_X", idempotency_key="k-ran", audit=lambda _o: None
+    )
+    assert outcome.status == "resent", outcome
+    path, ran = f"/ui/messages/{ids['IB_A']}/resend-done", {"to": "OB_X", "key": "k-ran"}
+    # Scoped to the target alone, with no scope on the origin IB_A.
+    target_only = await _operator(k.service, "target_only")
+    await k.service.set_channel_scope(target_only, ["OB_X"], actor="admin")
+    async with _ui_sessions(k, "scoped", "allchannels", "target_only") as ui:
+        # Scoped to IB_A, the ORIGIN channel, but not to the target OB_X: no record, as for a bad
+        # key.
+        hidden = await ui["scoped"].get(path, params=ran)
+        assert hidden.status_code == 404 and "No such resend" in hidden.text, hidden.status_code
+        # Control: the all-channels caller sees the page; a key, a target or a message the record
+        # does not name is "No such resend" for it too.
+        shown = await ui["allchannels"].get(path, params=ran)
+        assert shown.status_code == 200 and "No such resend" not in shown.text, shown.status_code
+        for p, to, key in (
+            (path, "OB_X", "never-used"),
+            (path, "IB_B", "k-ran"),
+            (f"/ui/messages/{ids['IB_B']}/resend-done", "OB_X", "k-ran"),
+        ):
+            r = await ui["allchannels"].get(p, params={"to": to, "key": key})
+            assert r.status_code == 404 and "No such resend" in r.text, (p, to, key)
+        # The origin channel is not checked: the target-only caller is shown the page, which
+        # names no source.
+        alone = await ui["target_only"].get(path, params=ran)
+        assert alone.status_code == 200 and "No such resend" not in alone.text, alone.status_code
+        assert "IB_A" not in alone.text and "copied from" not in alone.text
+
+
+async def _measure_ui_suspend_refusal(k: _Callers) -> None:
+    pytest.importorskip("messagefoundry_webconsole")
+    # The fixture's one open alert per connection, so the page's list is scoped against a known set.
+    ids = {
+        a.connection: a.id
+        for a in await k.engine.store.list_active_alert_instances(allowed_channels=None)
+    }
+    # A suspender holding monitoring:diagnose WITHOUT monitoring:read, scoped to IB_A like "scoped".
+    role = await k.service.create_custom_role(
+        display_name="Alert Suspender",
+        description=None,
+        permissions=["monitoring:diagnose"],
+        actor="test",
+    )
+    suspender = await _operator(k.service, "suspender")
+    await k.service.set_roles(suspender, [role.id], actor="admin")
+    await k.service.set_channel_scope(suspender, ["IB_A"], actor="admin")
+    store = k.engine.store
+
+    async def suspended() -> list[float | None]:
+        rows = [await store.get_alert_instance(i, allowed_channels=None) for i in ids.values()]
+        return [row.suspended_until if row is not None else None for row in rows]
+
+    before = await suspended()
+    async with _ui_sessions(k, "suspender", "scoped", "allchannels") as ui:
+
+        async def refuse(username: str, alert_id: int) -> httpx.Response:
+            return await ui[username].post(
+                f"/ui/alerts/{alert_id}/suspend",
+                data={"minutes": "0"},
+                headers={"Sec-Fetch-Site": "same-origin"},
+            )
+
+        # Refused before the alert is read: an in-scope id, an out-of-scope one and an unknown
+        # one alike.
+        pages: dict[tuple[str, int], str] = {}
+        for alert_id in (ids["IB_A"], ids["IB_B"], 999_999):
+            for username in ("suspender", "scoped"):
+                r = await refuse(username, alert_id)
+                assert r.status_code == 400 and "suspend window" in r.text, (username, alert_id)
+                pages[username, alert_id] = r.text
+        assert await suspended() == before
+        narrow = pages["suspender", ids["IB_A"]]
+        # The list is the caller's scoped one, and without monitoring:read the rules are left out.
+        assert "IB_A" in narrow and "IB_B" not in narrow
+        assert ">Rules<" not in narrow
+        # Control: an operator holds monitoring:read, so the same refusal shows the rules; the
+        # all-channels operator's list carries the alert the scoped one's does not.
+        assert ">Rules<" in pages["scoped", ids["IB_A"]]
+        assert "IB_B" in (await refuse("allchannels", ids["IB_A"])).text
+
+
 class _Rule(NamedTuple):
     #: The routes its bullet must name, written as the doc backticks them, compared as exact tokens.
     routes: tuple[str, ...]
@@ -492,6 +598,33 @@ _RULES: dict[str, _Rule] = {
         _measure_ui_connection_page,
         # The bullet names the JSON routes' 403 to contrast with, so the contradiction is the verb.
         forbidden=("answers 403",),
+    ),
+    "ui-resend-done": _Rule(
+        ("GET /ui/messages/{message_id}/resend-done",),
+        (
+            "404",
+            "`key`",
+            "outside the caller's channel scope",
+            "does not check scope on the message's origin channel",
+            "target alone",
+            "no source",
+        ),
+        _measure_ui_resend_done,
+        # Vault BACKLOG #4776 item 1 is open: the route does not check the origin channel today.
+        forbidden=("403", "checks scope on the origin", "origin channel is checked"),
+    ),
+    "ui-suspend-refusal": _Rule(
+        ("POST /ui/alerts/{alert_id}/suspend",),
+        (
+            "400",
+            "before it reads the alert",
+            "unknown one",
+            "channel scope",
+            "`monitoring:read`",
+            "`monitoring:diagnose`",
+        ),
+        _measure_ui_suspend_refusal,
+        forbidden=("404",),
     ),
 }
 

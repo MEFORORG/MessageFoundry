@@ -1933,7 +1933,7 @@ the console routes with a rule of their own.
 | `POST` | `/ui/alerts/{alert_id}/ack` | `monitoring:diagnose` | `require_ui` |
 | `POST` | `/ui/alerts/{alert_id}/resolve` | `monitoring:diagnose` | `require_ui` |
 | `POST` | `/ui/alerts/{alert_id}/resume` | `monitoring:diagnose` | `require_ui` |
-| `POST` | `/ui/alerts/{alert_id}/suspend` | `monitoring:diagnose` | `require_ui` |
+| `POST` | `/ui/alerts/{alert_id}/suspend` | `monitoring:diagnose` | `require_ui` — data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `GET` | `/ui/approvals` | `approvals:approve` | `require_ui` |
 | `POST` | `/ui/approvals/{approval_id}/approve` | `approvals:approve` | `require_ui_step_up` — the fresh step-up the JSON approve asks for (#3241 R4); a stale window lands back on the page to approve again; the requester can never approve their own request |
 | `POST` | `/ui/approvals/{approval_id}/reject` | `approvals:approve` | `require_ui` |
@@ -1981,7 +1981,7 @@ the console routes with a rule of their own.
 | `POST` | `/ui/messages/{message_id}/edit-resend` | `messages:edit`**+**`messages:view_raw` | `require_ui_step_up_action` |
 | `GET` | `/ui/messages/{message_id}/parse-tree` | `messages:view_raw` | `require_ui` |
 | `GET` | `/ui/messages/{message_id}/resend-confirm` | `messages:resend` | `require_ui` |
-| `GET` | `/ui/messages/{message_id}/resend-done` | `messages:resend` | `require_ui` |
+| `GET` | `/ui/messages/{message_id}/resend-done` | `messages:resend` | `require_ui` — data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `POST` | `/ui/messages/{message_id}/replay` | `messages:replay` | `require_ui_step_up` |
 | `POST` | `/ui/messages/{message_id}/resend` | `messages:resend` | `require_ui_step_up_action` |
 | `GET` | `/ui/messages/{message_id}/summary` | `messages:view_raw` | `require_ui` |
@@ -2343,8 +2343,8 @@ the same permission set on the same method reds CI until it is listed here.
 > `test_webui_bulk.py` pins the bulk page's 403 for an in-scope name no connection uses, on both
 > roles.
 
-> **Single-route data rules: at least these routes narrow or refuse by scope or owner, each in its
-> own way (BACKLOG #1151).** Their route rows above point here. A *scoped caller* is any
+> **Single-route data rules: at least these routes narrow or refuse by scope, owner or permission,
+> each in its own way (BACKLOG #1151).** Their route rows above point here. A *scoped caller* is any
 > non-administrator without the all-channels grant, including one with no channel at all. An
 > administrator is always all-channels, as the DLQ-SCOPE blockquote says, whatever scope is stored.
 >
@@ -2407,6 +2407,18 @@ the same permission set on the same method reds CI until it is listed here.
 >   that exists nowhere. That differs from the 403 the JSON per-name routes give, and it writes no
 >   `auth.channel_denied` row. Its reason page, `/ui/connection/{name}/events/{event_id}/reason`,
 >   shares the rule. On an in-scope page, a refused event read shows an empty event list.
+> - `GET /ui/messages/{message_id}/resend-done` answers 404 "No such resend" unless the store holds
+>   a resend record under the `key` it names, for that message and for the target `to` names. It
+>   also answers 404 when that target is outside the caller's channel scope, the same answer an
+>   unknown `key` gets. It does not read the message, so it
+>   does not check scope on the message's origin channel, and a caller scoped to the target alone
+>   is shown the page. The page names the target and no source. Whether the origin channel should be
+>   checked here is an open question (vault BACKLOG #4776 item 1).
+> - `POST /ui/alerts/{alert_id}/suspend` refuses a `minutes` window the JSON route would refuse with
+>   400, and re-renders the alerts page carrying the refusal. It refuses before it reads the alert,
+>   so an alert id outside the scope, or an unknown one, gets the same 400. The page lists only the
+>   active alerts in the caller's channel scope. It shows the alert rules only to a caller that also
+>   holds `monitoring:read`, since the route itself needs only `monitoring:diagnose`.
 >
 > The console reaches the same rules, because its routes call these handlers in-process. That
 > covers at least `/ui/messages/search/layered`, the `/ui/statistics/reset*` routes, the four
@@ -5586,18 +5598,6 @@ session took no part in is not evidence about the session. (The retired PySide6 
 OS-keyring token cache is an accepted retirement loss — BACKLOG #103. That retired one *instance* of
 durable token storage, not the shape: the extension's SecretStorage cache is a live one.)
 
-### A revoked privilege reaches the next request, with exceptions (ASVS 8.3.2)
-
-A change made in the engine reaches the caller's next HTTP request, with the exceptions below.
-
-The engine re-reads the session row, the user row and the stored roles on every request that carries a
-session token. It also re-checks the idle and absolute timeouts and the disabled flag.
-
-Sessions are opaque server-side tokens, so no permission travels in a token the client holds. A request
-authenticated by a service certificate has no session, but the engine still re-reads its user row and
-roles. For a directory account it also asks the directory on that request, and keeps only the stored
-roles and channels the account's current groups still map to. One exception: when none of its groups
-is in the scope map, a scope an administrator set stays as stored (BACKLOG #2316).
 **At least these systems create, hold or manage a session that reaches the engine.** The three
 federated sign-in legs ship off: `[auth].ad_enabled`, `[auth].kerberos_enabled` and
 `[auth].oidc_enabled` all default to false.
@@ -5621,6 +5621,18 @@ federated sign-in legs ship off: `[auth].ad_enabled`, `[auth].kerberos_enabled` 
   earliest of the engine's cap, the signature-verified `id_token` `exp`, and
   `[auth].oidc_session_max_hours` when that is set (ADR 0142).
 
+### A revoked privilege reaches the next request, with exceptions (ASVS 8.3.2)
+
+A change made in the engine reaches the caller's next HTTP request, with the exceptions below.
+
+The engine re-reads the session row, the user row and the stored roles on every request that carries a
+session token. It also re-checks the idle and absolute timeouts and the disabled flag.
+
+Sessions are opaque server-side tokens, so no permission travels in a token the client holds. A request
+authenticated by a service certificate has no session, but the engine still re-reads its user row and
+roles. For a directory account it also asks the directory on that request, and keeps only the stored
+roles and channels the account's current groups still map to. One exception: when none of its groups
+is in the scope map, a scope an administrator set stays as stored (BACKLOG #2316).
 
 At least these changes reach the next request, and each one also revokes the affected sessions:
 
