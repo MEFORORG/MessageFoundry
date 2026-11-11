@@ -7625,12 +7625,13 @@ async def test_a_held_role_error_is_raised_first_when_the_revoke_then_fails(
     ],
     ids=["unknown-role", "seal", "refused-control"],
 )
-async def test_a_reconciled_role_retry_refused_before_it_wrote_tells_nobody_and_ends_nothing(
+async def test_a_reconciled_role_retry_refused_before_it_wrote_tells_nobody_but_ends_sessions(
     monkeypatch: pytest.MonkeyPatch, retry_error: Exception, unwritten: bool
 ) -> None:
     """BACKLOG #2221, #3018 step 4. A role write whose retry its store refuses before it writes
-    changed nothing: the revocation raises it with no notice, no grant page, no noted row and no
-    session end. The control: a retry that may have committed still does all four."""
+    changed nothing: the revocation sends no notice, no grant page and no noted row, still ends
+    the sessions and reports, and does not raise, so the pass goes on. A seal failure is reported
+    as one. The control: a retry that may have committed does all four, then raises."""
     store, _, service, tokens = await _scoped_service(_GRP_A)
     try:
         notifier, revocation, _target = await _role_revocation(store, service)
@@ -7645,16 +7646,22 @@ async def test_a_reconciled_role_retry_refused_before_it_wrote_tells_nobody_and_
                 raise sqlite3.OperationalError("synthetic first")
             raise retry_error
 
+        drift: list[str] = []
+        service._integrity_alert = drift.append
         monkeypatch.setattr(store, "set_user_roles_if_held", failing)
-        with pytest.raises(type(retry_error)):
-            await service._apply_reconcile_revocation(
-                revocation, watermark=await service._audit_watermark()
-            )
+        watermark = await service._audit_watermark()
+        if unwritten:
+            outcome = await service._apply_reconcile_revocation(revocation, watermark=watermark)
+        else:
+            with pytest.raises(type(retry_error)):
+                await service._apply_reconcile_revocation(revocation, watermark=watermark)
         assert len(calls) == 2
         if unwritten:
+            assert outcome == "reported"
             assert notifier.sent == [] and grants == []
             assert service._reconcile_refused_rows == []
-            assert await service.identity_for_token(tokens["jdoe"]) is not None
+            assert await service.identity_for_token(tokens["jdoe"]) is None
+            assert len(drift) == (1 if isinstance(retry_error, RowSealError) else 0)
         else:
             assert [e.event_type for e in notifier.sent] == [ROLES_CHANGED]
             assert grants == [("jdoe", "directory_reconcile")]
@@ -7668,7 +7675,7 @@ async def test_an_error_building_the_reconciled_role_row_writes_nothing_and_tell
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """BACKLOG #2221. An error building the role row comes before any write, so the revocation
-    raises it with no write, no notice and no session end."""
+    writes no role and sends no notice, but still ends the sessions, and does not raise."""
     store, _, service, tokens = await _scoped_service(_GRP_A)
     try:
         notifier, revocation, _target = await _role_revocation(store, service)
@@ -7681,13 +7688,14 @@ async def test_an_error_building_the_reconciled_role_row_writes_nothing_and_tell
             return real(value)
 
         monkeypatch.setattr(service_module, "_json", failing)
-        with pytest.raises(TypeError):
-            await service._apply_reconcile_revocation(
-                revocation, watermark=await service._audit_watermark()
-            )
+        outcome = await service._apply_reconcile_revocation(
+            revocation, watermark=await service._audit_watermark()
+        )
+        monkeypatch.undo()
+        assert outcome == "reported"
         assert await store.get_user_role_ids(revocation.user_id) == before
         assert notifier.sent == []
-        assert await service.identity_for_token(tokens["jdoe"]) is not None
+        assert await service.identity_for_token(tokens["jdoe"]) is None
     finally:
         await store.close()
 
@@ -7724,5 +7732,43 @@ async def test_a_read_back_that_finds_the_account_gone_counts_as_not_written(
         assert roles.result is False and not roles.written and roles.retried
         monkeypatch.undo()
         assert len(await store.list_audit(action="auth.ad_roles_resynced")) == rows_before
+    finally:
+        await store.close()
+
+
+async def test_a_role_write_that_wrote_nothing_does_not_end_the_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #2221. jdoe's role write is refused before it writes, every time. The pass logs it,
+    ends jdoe's sessions and goes on: asmith, demoted in the same pass, is still written and
+    signed out, and the pass returns its plan rather than raising."""
+    store, ldap, service, _ = await _scoped_service(_GRP_A, names=("jdoe", "asmith"))
+    try:
+        await store.set_ad_group_role_map([(_GRP_A, "operator")])
+        tokens = {
+            name: await _signed_in_ad_user(service, store, name) for name in ("jdoe", "asmith")
+        }
+        jdoe = await store.get_user_by_username("jdoe")
+        assert jdoe is not None
+        ldap.present["jdoe"] = _principal("jdoe")
+        ldap.present["asmith"] = _principal("asmith")
+        real = store.set_user_roles_if_held
+
+        async def refused_for_jdoe(user_id: str, *args: Any, **kwargs: Any) -> bool:
+            if user_id == jdoe.id:
+                raise UnknownRoleError(["synthetic"])
+            return await real(user_id, *args, **kwargs)
+
+        monkeypatch.setattr(store, "set_user_roles_if_held", refused_for_jdoe)
+        plan = await service.reconcile_directory_sessions()
+        monkeypatch.undo()
+        assert sorted(r.username for r in plan.revocations) == ["asmith", "jdoe"]
+        asmith = await store.get_user_by_username("asmith")
+        assert asmith is not None and await store.get_user_role_ids(asmith.id) == []
+        assert await store.get_user_role_ids(jdoe.id) == ["operator"]
+        for name in ("jdoe", "asmith"):
+            token = tokens[name]
+            assert token is not None
+            assert await service.identity_for_token(token) is None, name
     finally:
         await store.close()

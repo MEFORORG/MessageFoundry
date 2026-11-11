@@ -3200,19 +3200,23 @@ with no page.
   `ad_session_revoked`, which does not name the role. The later sign-in then gains nothing, so it
   raises no `administrator_granted`." Vault BACKLOG #3141 added the reconciler's alert.
   - **At the account's next sign-in.** The engine writes an `auth.ad_roles_resynced` audit row
-    with the old and new roles, in the role write's transaction. If the store refuses it there,
-    the roles are written without it and the row is then written on its own. Refused again, the
-    row is lost, `audit_write_failed` pages keyed `directory-sign-in:auth.ad_roles_resynced`, and
-    the sign-in fails. An error there that is not a store refusal, such as a defect, also fails
-    the sign-in, even when its row then lands on its own, and so does an error from writing the
-    roles again. In each of these cases the engine first tries to revoke the account's other
-    sessions and sends the notice below. A retry whose record write raises before it writes, for
-    an added role with no `roles` row or a record that fails its seal, is taken as writing
-    nothing: it fails the sign-in at once, with no revoke, notice or alert. A first try that
-    committed with its reply lost, followed by another writer deleting that role or breaking the
-    seal before the retry, is taken the same way and goes unreported. The engine also sends a best-effort roles-changed notice to that
-    account's own notification address, when the account has one and security notices are set
-    up. The sign-in route raises `administrator_granted`, keyed `user:<username>`, with
+    with the old and new roles, in the role write's transaction, and sends a best-effort
+    roles-changed notice to that account's own notification address, when the account has one and
+    security notices are set up. If the store refuses the row there, the roles are written without
+    it and the row is then written on its own. Refused again, the row is lost,
+    `audit_write_failed` pages keyed `directory-sign-in:auth.ad_roles_resynced`, and the sign-in
+    fails. An error there that is not a store refusal, such as a defect, also fails the sign-in,
+    even when its row then lands on its own, and so does an error from writing the roles again.
+    In each of these cases the engine first tries to revoke the account's other sessions and sends
+    the notice. **A role write taken as writing nothing** is a retry whose record write raises
+    before it writes, for an added role with no `roles` row or a record that fails its seal, and,
+    at the reconciler, an error building the role row. It changed no role, so it sends no
+    roles-changed notice and raises no `administrator_granted` or `audit_write_failed` alert. It is
+    logged at ERROR naming the account and the error, a record that fails its seal is reported as
+    one (`integrity_drift`), and the account's other sessions still end, since the directory's
+    roles may remove one. Here it then fails the sign-in. A first try that committed with its
+    reply lost, followed by another writer deleting that role or breaking the seal before the
+    retry, is taken the same way: that change is told and paged to nobody. The sign-in route raises `administrator_granted`, keyed `user:<username>`, with
     `granted_by` set to `<directory>` and `via` naming the route: `directory_sign_in_negotiate`
     for `POST /auth/negotiate`, `directory_sign_in_sso` for `GET /ui/sso`, and
     `directory_sign_in_oidc` for the `/ui/oidc` callback. A sign-in the engine refuses after the
@@ -5675,10 +5679,13 @@ reconciler then reports too. Any other error from the retry or that read counts 
 well: any `no_enabled_administrator` or `administrator_granted` alert the change is due is raised,
 the revoke is still tried and the user told, and then the error is raised, which ends the pass
 with no `ad_session_revoked` alert for that account. A retry whose record write raises before it
-writes, for an added role with no `roles` row or a record that fails its seal, and an error
-building the role row, are taken as writing nothing: the error is raised at once, with no revoke,
-notice or alert, and ends the pass. The sign-in's race above, of a committed first try and another
-writer before the retry, applies here too. A write that finds the roles moved to another set since
+writes, and an error building the role row, are taken as writing nothing, as *A directory grant*
+under [Dual-control approval](#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235)
+states. Here the revocation still revokes the session, raises `ad_session_revoked`, and does not
+end the pass, so later accounts are still reached. The roles stay as stored, so the next pass
+plans the change again. Of the sign-in's race, only the seal half applies here: a role deleted
+before the retry also leaves the account's roles, so the compare-and-set declines before it
+writes. A write that finds the roles moved to another set since
 the apply read them writes nothing. A sign-in that wrote between the pass's plan and its apply is
 still overwritten, as is a newer write of the same set the apply read. The second still reports when
 it ends a session the first had not yet ended; `AuthService._apply_reconcile_revocation` names that
@@ -5695,8 +5702,8 @@ the role write's (BACKLOG #3018 step 4). If either is refused there, the write i
 without its row and the row is written on its own. A row refused that second time is lost, and a
 pass that completes pages `audit_write_failed` keyed `directory-reconciler:<action>`, once per
 action. A pass that raises part-way raises no such page, and its refused rows have only their
-ERROR lines. An error in either write or its row that is not a store refusal, other than one
-taken as writing nothing (above), still ends the pass,
+ERROR lines. An error in either write or its row that is not a store refusal, other than a role
+write taken as writing nothing (above), still ends the pass,
 and that account gets no `ad_session_revoked` alert; a role change's `no_enabled_administrator`
 and `administrator_granted` alerts are raised before it. The error is raised only after that
 account's revoke has been tried, again without its row if the row raised. A revoke that raises
