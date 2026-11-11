@@ -366,9 +366,11 @@ _LOADERS: dict[str, frozenset[str]] = {
     "_lookup_by_username": frozenset({"get_user_by_username"}),
     "_lookup_by_directory_object_id": frozenset({"get_user_by_directory_object_id"}),
     "_load_user_by_federated_subject": frozenset({"get_user_by_federated_subject"}),
-    "_load_users": frozenset({"list_users"}),
-    # BACKLOG #5520: the public list, which checks each row through `_verified`.
+    # BACKLOG #5520: the public list, which checks each row through `_checked_by_id`; the scans'
+    # `_load_users` reads through it, so the two agree on every row.
     "list_checked_users": frozenset({"list_users"}),
+    # The re-read by id after a check that raced a delete or a re-key (BACKLOG #5520).
+    "_checked_by_id": frozenset({"get_user"}),
     # The role rows, and one re-read by id before a failing pair is reported.
     "_verified": frozenset({"get_user_role_grants", "get_user"}),
     "_verified_passkeys": frozenset({"list_webauthn_credentials"}),

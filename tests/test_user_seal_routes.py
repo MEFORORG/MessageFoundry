@@ -5,14 +5,17 @@
 ``GET /users``, ``GET /users/{id}/federated-identity``, ``GET /users/{id}/channel-scope`` and
 ``GET /users/{id}/permissions`` read through :meth:`AuthService.checked_user` and
 :meth:`AuthService.list_checked_users`, so a row altered outside the store is never served with a
-200, and its failure writes the ``integrity.authority_seal_failed`` row and raises the alert. The
-list keeps such an account by id alone (:class:`IntegrityFailedUser`); each single-account read, and
+200, and its failure is handed to the seal-failure report, whose first report in each interval
+writes the ``integrity.authority_seal_failed`` row and raises the alert. The list keeps such an
+account by id alone (:class:`IntegrityFailedUser`); each single-account read, and
 ``PATCH /users/{id}``, answers 423. Each test has a control: the same read of an intact account,
-and of an unknown id, which stays a 404.
+and of an unknown id, which stays a 404. A row that races a write while it is read is never answered
+as a failing record, so a 423 always follows an established failure.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -31,7 +34,7 @@ from messagefoundry.auth.service import (
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.store.store import AdminRemoval, MessageStore
+from messagefoundry.store.store import AdminRemoval, MessageStore, UserRecord
 from tests.test_api_auth import ABSENT_USER_ID, _add, _auth, _login, _reauth
 from tests.test_user_seal import _raw_for
 
@@ -227,3 +230,137 @@ def test_a_user_list_entry_reads_either_shape_and_never_the_other() -> None:
     assert IntegrityFailedUser.model_fields.keys() == {"id", "integrity_failed"}
     with pytest.raises(ValueError):
         IntegrityFailedUser.model_validate({"id": "c"})
+
+
+def _empty_grants(engine: Engine, user_id: str) -> None:
+    """Make ``user_id``'s role rows read as empty, so its record fails its seal on every check."""
+    store = engine.store
+    real_grants = store.get_user_role_grants
+
+    async def no_grants(uid: str) -> list[object]:
+        return [] if uid == user_id else list(await real_grants(uid))
+
+    store.get_user_role_grants = no_grants  # type: ignore[method-assign,assignment]
+
+
+def _race_every_read(engine: Engine, user_id: str) -> None:
+    """Make every check of ``user_id`` race a write: its role rows read as empty, so the pair fails
+    its seal, and every row read returns the account under a new name, as a rename committing
+    between each two reads would. Nothing about the stored record fails; every failure is a race."""
+    _empty_grants(engine, user_id)
+    store = engine.store
+    real_get_user = store.get_user
+    renames = iter(range(1, 1_000))
+
+    async def renamed(uid: str) -> UserRecord | None:
+        row = await real_get_user(uid)
+        if row is None or uid != user_id:
+            return row
+        return dataclasses.replace(row, username=f"{row.username}-renamed-{next(renames)}")
+
+    store.get_user = renamed  # type: ignore[method-assign,assignment]
+
+
+@pytest.mark.parametrize("suffix", ["federated-identity", "channel-scope", "permissions"])
+async def test_a_read_that_races_every_pass_is_never_an_unreported_423(
+    keyed: tuple[Engine, Path], suffix: str
+) -> None:
+    """BACKLOG #5520: a check that races a rename is unreported, so it must not answer 423. Before
+    the fix two such races in a row did: the re-read raced too, and the route answered 423 with no
+    ``integrity.authority_seal_failed`` row and no alert. The list listed it as failed, unreported."""
+    engine, _ = keyed
+    service, alerts, _intact, victim = await _setup(engine)
+    async with _client(engine, service) as c:
+        token = (await _login(c, "root")).json()["token"]
+        _race_every_read(engine, victim)
+        raced = await c.get(f"/users/{victim}/{suffix}", headers=_auth(token))
+        listed = await c.get("/users", headers=_auth(token))
+    assert raced.status_code == 404, raced.text
+    assert listed.status_code == 200
+    assert victim not in {row["id"] for row in listed.json()}
+    assert await _seal_failures(engine, victim) == 0
+    assert not any(victim in alert for alert in alerts)
+
+
+async def test_a_race_free_failure_of_the_same_shape_is_a_reported_423(
+    keyed: tuple[Engine, Path],
+) -> None:
+    """The control for the race test: the same empty role rows with no rename between the reads is
+    an established failure, answered 423 and listed as failed, and reported."""
+    engine, _ = keyed
+    service, alerts, _intact, victim = await _setup(engine)
+    async with _client(engine, service) as c:
+        token = (await _login(c, "root")).json()["token"]
+        _empty_grants(engine, victim)
+        refused = await c.get(f"/users/{victim}/channel-scope", headers=_auth(token))
+        listed = await c.get("/users", headers=_auth(token))
+    assert refused.status_code == 423, refused.text
+    assert {"id": victim, "integrity_failed": True} in listed.json()
+    assert await _seal_failures(engine, victim) == 1
+    assert any(victim in alert for alert in alerts)
+
+
+async def test_a_refusal_inside_the_report_interval_adds_no_row(
+    keyed: tuple[Engine, Path],
+) -> None:
+    """What docs/SECURITY.md, *What an admin user read reports*, states: the report is rate-limited
+    per account, so a second 423 inside the interval writes no second row. The 423 still stands,
+    because the failure itself was established."""
+    engine, path = keyed
+    service, alerts, _intact, victim = await _setup(engine)
+    await _tamper(path, victim)
+    async with _client(engine, service) as c:
+        token = (await _login(c, "root")).json()["token"]
+        first = await c.get(f"/users/{victim}/channel-scope", headers=_auth(token))
+        second = await c.get(f"/users/{victim}/permissions", headers=_auth(token))
+    assert first.status_code == second.status_code == 423
+    assert await _seal_failures(engine, victim) == 1
+    assert sum(victim in alert for alert in alerts) == 1
+
+
+async def test_patch_spends_its_grant_on_a_423(keyed: tuple[Engine, Path]) -> None:
+    """The cost docs/SECURITY.md states: the gate spends the single-use ``admin_user_update`` grant
+    before the route reads the account, so a 423 leaves none. The next PATCH, of an intact account,
+    is refused for the step-up; the control re-authenticates and is served."""
+    engine, path = keyed
+    service, _alerts, intact, victim = await _setup(engine)
+    await _tamper(path, victim)
+    async with _client(engine, service) as c:
+        token = (await _login(c, "root")).json()["token"]
+        _, token = await _reauth(c, token, purpose="admin_user_update")
+        refused = await c.patch(
+            f"/users/{victim}", json={"display_name": "x"}, headers=_auth(token)
+        )
+        spent = await c.patch(f"/users/{intact}", json={"display_name": "x"}, headers=_auth(token))
+        _, token = await _reauth(c, token, purpose="admin_user_update")
+        served = await c.patch(f"/users/{intact}", json={"display_name": "x"}, headers=_auth(token))
+    assert refused.status_code == 423, refused.text
+    assert spent.status_code == 403, spent.text
+    assert spent.headers.get("X-Step-Up-Action") == "admin_user_update"
+    assert served.status_code == 200, served.text
+
+
+_SECURITY_MD = Path(__file__).resolve().parents[1] / "docs" / "SECURITY.md"
+_STATEMENT = "**What an admin user read reports (BACKLOG #5520).**"
+
+
+def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
+    """docs/SECURITY.md states the rate-limited report, the race and the PATCH grant cost once, and
+    every route row that answers for a failing record points at that statement rather than
+    claiming an audit row and an alert of its own."""
+    text = _SECURITY_MD.read_text("utf-8")
+    assert text.count(_STATEMENT) == 1
+    body = " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
+    for fact in (
+        "`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`",
+        "only the first refusal of an account in each report interval",
+        "adds no row and no alert",
+        "never as a failing record",
+        "the single-use `admin_user_update` grant, so its 423 and its 404 cost that proof",
+    ):
+        assert fact in body, fact
+    rows = [line for line in text.splitlines() if line.startswith("|") and "#5520" in line]
+    assert len(rows) == 5, rows
+    for row in rows:
+        assert "*What an admin user read reports* below this table" in row, row
+        assert "audit row and alert" not in row and "audited and alerted" not in row, row

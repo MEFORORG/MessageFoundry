@@ -344,8 +344,10 @@ async def _refuse_if_self(
 
 async def _checked_user(service: AuthService, user_id: str) -> VerifiedUser:
     """The account an admin route reads, its record checked against its seal (BACKLOG #5520), or
-    the route's refusal: 404 when no row is there, 423 when the row's record fails its check. The
-    service has audited and alerted that failure, and nothing of the row is answered."""
+    the route's refusal: 404 when no row is there, 423 when the row's record fails its check, with
+    nothing of the row answered. What the 423 reports, rate-limited per account, is
+    :class:`~messagefoundry.auth.service.UserSealRefused`'s to say; docs/SECURITY.md, *What an
+    admin user read reports*, is the operator's statement of it."""
     try:
         user = await service.checked_user(user_id)
     except UserSealRefused as exc:
@@ -1544,6 +1546,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # BACKLOG #5520: the checked record, so a row whose record fails its seal answers 423, as
         # GET /users shows it, rather than the store's refused write. Its profile fields fill an
         # omitted PATCH field below, so an unchecked value is never written back.
+        # The gate above has already spent the single-use admin_user_update grant, so this 423 and
+        # the 404 cost the proof. Checking first would need the proof moved into this route, and
+        # the console calls this function after its own gate has spent its grant, so that move
+        # would need the console path reworked too; admin_user_update is not a refundable action
+        # (_REFUNDABLE_ACTIONS, ADR 0197). docs/SECURITY.md states the cost.
         current = await _checked_user(service, user_id)
         if body.disabled:
             await _refuse_if_self(
