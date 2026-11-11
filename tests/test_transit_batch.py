@@ -10,7 +10,10 @@ whole batch when one item fails. Synthetic data only."""
 
 from __future__ import annotations
 
+import base64
+import json
 import os
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +24,11 @@ pytest.importorskip("hvac", reason="Transit batch tests need the [vault] extra")
 
 import requests
 from cryptography.exceptions import InvalidTag
-from hvac.exceptions import InvalidRequest  # type: ignore[import-untyped]
+from hvac.exceptions import (  # type: ignore[import-untyped]
+    Forbidden,
+    InvalidRequest,
+    UnexpectedError,
+)
 
 from messagefoundry.store import crypto, crypto_transit
 from messagefoundry.store.cipher_cells import (
@@ -96,8 +103,10 @@ class _BatchTransit(_FakeTransit):
                 result["error"] = "cipher: message authentication failed"
                 failed = True
             results.append(result)
-        if failed:  # Vault answers the whole batch 400 when any item fails
-            raise InvalidRequest("cipher: message authentication failed")
+        if failed:
+            # Vault answers the whole batch 400 when any item fails, and its body, which hvac makes
+            # the message, is every item's result: the others' plaintext included.
+            raise InvalidRequest(json.dumps({"data": {"batch_results": results}}))
         return {"data": {"batch_results": self._tampered(results)}}
 
     def _tampered(self, results: list[dict[str, Any]]) -> Any:
@@ -179,6 +188,9 @@ def test_one_failed_value_is_reported_as_its_own_and_no_other() -> None:
     assert not isinstance(results[2], CipherUnavailableError)
     # The batch's 400, then each value alone to learn which one failed.
     assert transit.decrypt_requests == 1 + 5
+    # The 400's body held the other values' plaintext; no result carries it on its chain.
+    leaked = base64.b64encode(b"value 0").decode("ascii")
+    assert leaked not in "".join(traceback.format_exception(results[2]))
 
 
 def test_an_item_error_in_a_batch_that_answered_is_that_items_alone() -> None:
@@ -317,8 +329,10 @@ def test_a_batch_cipher_answering_short_is_refused() -> None:
         def decrypt_many(self, items: Any) -> list[str | CipherError]:
             return []
 
-    with pytest.raises(CipherError):
-        _decrypt_values(Short(_FakeClient(_BatchTransit()), _KEY), [("mfenc:v3:vault:v1:x", None)])
+    results = _decrypt_values(
+        Short(_FakeClient(_BatchTransit()), _KEY), [("mfenc:v3:vault:v1:x", None)]
+    )
+    assert len(results) == 1 and isinstance(results[0], CipherUnavailableError)
 
 
 def test_asking_value_by_value_stops_once_transit_cannot_serve() -> None:
@@ -361,3 +375,77 @@ def test_later_batches_are_not_sent_once_transit_cannot_serve() -> None:
     assert len(results) == len(items)
     assert all(isinstance(r, CipherUnavailableError) for r in results)
     assert all(isinstance(r, CipherError) and isinstance(r.__cause__, OSError) for r in results)
+
+
+def test_a_batch_refusal_other_than_a_400_fails_every_value_and_sends_no_more() -> None:
+    transit = _BatchTransit()
+    cipher = _cipher(transit)
+    items = _sealed(cipher, crypto.BATCH_MAX_ITEMS * 2 + 5)
+
+    def forbidden(**_: Any) -> dict[str, Any]:
+        transit.decrypt_requests += 1
+        raise Forbidden("permission denied")
+
+    transit.decrypt_data = forbidden  # type: ignore[method-assign]
+    transit.decrypt_requests = 0
+    results = cipher.decrypt_many(items)
+    assert transit.decrypt_requests == 1  # not one request per value, and no later batch
+    assert all(isinstance(r, CipherError) and isinstance(r.__cause__, Forbidden) for r in results)
+
+
+def test_a_mismatched_reply_is_no_verdict() -> None:
+    transit = _BatchTransit()
+    cipher = _cipher(transit)
+    items = _sealed(cipher, 3)
+    transit.tamper = lambda r: r[:-1]
+    assert all(isinstance(r, CipherUnavailableError) for r in cipher.decrypt_many(items))
+
+
+async def test_an_unanswered_batch_ends_the_audit_walk(tmp_path: Path) -> None:
+    transit = _BatchTransit()
+    db = tmp_path / "store.db"
+    await _write_messages(db, 50, _cipher(transit))
+    transit.tamper = lambda r: list(reversed(r))
+    transit.decrypt_requests = 0
+    conn = connect_readonly(db, busy_timeout=5.0)
+    try:
+        with pytest.raises(CipherUnavailableError):
+            audit_cipher_cells(conn, _cipher(transit))
+    finally:
+        conn.close()
+    assert transit.decrypt_requests == 1  # no cell was counted damaged on a reply that judged none
+
+
+def test_a_refused_encrypt_batch_seals_each_value_alone() -> None:
+    transit = _BatchTransit()
+    cipher = _cipher(transit)
+    real = transit.encrypt_data
+
+    def too_large(**kw: Any) -> dict[str, Any]:
+        if kw.get("batch_input") is not None:
+            transit.encrypt_requests += 1
+            raise UnexpectedError("413 Request Entity Too Large")
+        return real(**kw)
+
+    transit.encrypt_data = too_large  # type: ignore[method-assign]
+    items = [(f"plain {i}", cell_aad("t", "c", i)) for i in range(4)]
+    sealed = encrypt_many(cipher, items)
+    assert transit.encrypt_requests == 1 + 4
+    assert [cipher.decrypt(v, aad=aad) for v, (_, aad) in zip(sealed, items, strict=True)] == [
+        p for p, _ in items
+    ]
+
+
+def test_an_encrypt_batch_transit_could_not_serve_raises() -> None:
+    transit = _BatchTransit()
+    cipher = _cipher(transit)
+
+    def down(**_: Any) -> dict[str, Any]:
+        transit.encrypt_requests += 1
+        raise requests.exceptions.ConnectionError("synthetic: connection refused")
+
+    transit.encrypt_data = down  # type: ignore[method-assign]
+    transit.encrypt_requests = 0
+    with pytest.raises(CipherUnavailableError):
+        encrypt_many(cipher, [("a", None), ("b", None)])
+    assert transit.encrypt_requests == 1

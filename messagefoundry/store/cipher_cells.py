@@ -49,6 +49,7 @@ from messagefoundry.store.crypto import (
     Cipher,
     CipherError,
     CipherItem,
+    CipherUnavailableError,
     batch_chars,
     cell_aad,
     decrypt_or_error,
@@ -500,7 +501,11 @@ def _is_outage(error: CipherError) -> bool:
     an unreachable Vault (a ``requests`` connection error or timeout is one), and an ``hvac``
     error for a reply. Vault answers a value it cannot authenticate with HTTP 400, which ``hvac``
     raises as ``InvalidRequest``; any other ``hvac`` error (a sealed Vault, a token refused, a
-    5xx) is the service. At least those shapes; a cause of any other kind counts as the value's."""
+    5xx) is the service. At least those shapes; a cause of any other kind counts as the value's.
+    A :class:`CipherUnavailableError` is one whatever its cause: it says the service gave no
+    verdict on the value, which is how a batch fails the values it was not answered for."""
+    if isinstance(error, CipherUnavailableError):
+        return True
     cause = error.__cause__
     if isinstance(cause, OSError):
         return True
@@ -574,9 +579,13 @@ def _decrypt_values(cipher: Cipher, items: list[CipherItem]) -> list[str | Ciphe
     than zipped."""
     if isinstance(cipher, BatchCipher):
         opened = cipher.decrypt_many(items)
-        if len(opened) != len(items):
-            raise CipherError(f"{type(cipher).__name__} answered {len(opened)} of {len(items)}")
-        return opened
+        if len(opened) == len(items):
+            return opened
+        # No verdict on any value, so the walk stops on it as an outage rather than read one.
+        short = CipherUnavailableError(
+            f"{type(cipher).__name__} answered {len(opened)} of {len(items)} values"
+        )
+        return [CipherUnavailableError(str(short)) for _ in items]
     return [decrypt_or_error(cipher, stored, aad) for stored, aad in items]
 
 

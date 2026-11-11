@@ -641,7 +641,8 @@ class CipherUnavailableError(CipherError):
 
     :class:`~messagefoundry.store.crypto_transit.TransitCipher` raises it from ``encrypt`` and
     ``decrypt`` when Transit could not be reached or answered that it could not serve the request,
-    which :func:`~messagefoundry.store.keyprovider_vault.is_vault_unavailable` decides. Every other
+    which :func:`~messagefoundry.store.keyprovider_vault.is_vault_unavailable` decides, and for
+    each value of a batch whose reply does not match the request (BACKLOG #6706). Every other
     Transit failure, a refused tag among them, stays plain :class:`CipherError`, so a value Transit
     refused is never read as an outage.
 
@@ -782,11 +783,11 @@ CipherItem = tuple[str, bytes | None]
 #: The most values one batch carries (BACKLOG #6706): one Transit ``batch_input`` request, or one
 #: batch a cipher-cell walk opens.
 BATCH_MAX_ITEMS = 128
-#: The most base64 characters, values and associated data together (:func:`batch_chars`), one
-#: batch carries (BACKLOG #6706). Far under Vault's default 32 MiB request bound, so the reply,
-#: which is no larger, stays far under ``strict_requests.MAX_VAULT_REPLY_BYTES``. A value larger
-#: than this on its own is a batch of its own, which Transit sends as a single request.
-BATCH_MAX_CHARS = 4 * 1024 * 1024
+#: The most base64 characters, values and associated data together (:func:`batch_chars`), that
+#: a batch of more than one value carries (BACKLOG #6706). Kept under a common proxy body bound
+#: (nginx's 1 MiB default) and far under Vault's own 32 MiB, with room for the JSON around it. A
+#: value larger than this is a batch of its own, which Transit sends as a single request, as before.
+BATCH_MAX_CHARS = 512 * 1024
 
 
 def b64_chars(n: int) -> int:
