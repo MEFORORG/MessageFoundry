@@ -45,18 +45,12 @@ MAX_ASSOCIATION_READ_BYTES = 1 << 20
 
 
 def dicom_extra_missing() -> str | None:
-    """None when pydicom and pynetdicom both import and pydicom still has the header readers the
-    deflate guard replays, else why not (a reason to report, not a pass)."""
+    """None when pydicom and pynetdicom both import, else why not (a reason to report, not a pass)."""
     try:
         import pydicom  # noqa: F401
         import pynetdicom  # noqa: F401
     except ImportError as exc:
         return f"the [dicom] extra (pydicom + pynetdicom) is not installed: {exc}"
-    try:
-        # Without them the guard refuses every payload, and dcmread alone would inflate unbounded.
-        load_header_readers()
-    except RuntimeError as exc:
-        return str(exc)
     return None
 
 
@@ -145,6 +139,13 @@ class DimseDriver(Driver):
             return [Injection(error=missing) for _ in payloads]
         from pydicom import dcmread
 
+        try:
+            # A pydicom without the readers the guard replays is not a missing extra, so it stays out
+            # of dicom_extra_missing (a scenario would skip on it); every payload fails instead, with
+            # nothing sent and nothing raised from inject() (the Driver contract).
+            load_header_readers()
+        except RuntimeError as exc:
+            return [Injection(error=str(exc)) for _ in payloads]
         capped_ae = _capped_ae_class()
 
         unreadable = parse_error_types()
@@ -156,7 +157,7 @@ class DimseDriver(Driver):
                 # The guard replays dcmread's header read, so it sits inside the same handler, and
                 # it takes dcmread's force: change one and you must change the other.
                 guard_part10_deflate(payload, force=False)
-                dataset = dcmread(BytesIO(payload))
+                dataset = dcmread(BytesIO(payload), force=False)
                 sop_class = dataset.SOPClassUID
                 transfer_syntax = dataset.file_meta.TransferSyntaxUID
                 dataset.SOPInstanceUID  # noqa: B018  (send_c_store needs it; refuse here, not there)

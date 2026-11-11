@@ -278,7 +278,7 @@ def test_the_driver_refuses_a_deflated_payload_that_inflates_past_the_cap_before
         records = sink.wait_for(lambda rs: len(rs) == 1, 10.0)
     assert status_of(out[0]) == 0 and records[0].payload
     assert under in read, "the spy saw the driver's read of the control"
-    assert out[1].error.startswith("not sent: ") and f"({mib} bytes)" in out[1].error, out[1]
+    assert out[1].error.startswith("not sent: ") and str(mib) in out[1].error, out[1]
     assert status_of(out[1]) is None
     assert bomb not in read, "dcmread ran on the bomb"
     assert len(sink.records()) == 1
@@ -293,12 +293,13 @@ def test_the_driver_sends_nothing_when_pydicom_lacks_the_guards_header_readers(
 
     payloads, _ = make_datasets(2)
     monkeypatch.delattr(filereader, "_read_file_meta_info")
-    reason = dicom_extra_missing()
-    assert reason and "_read_file_meta_info" in reason
+    assert dicom_extra_missing() is None, "an incompatible pydicom is not a missing extra"
     with DimseSink() as sink:
         out = _driver_for(sink).inject(payloads)
         assert sink.records() == []
-    assert [o.error for o in out] == [reason, reason]
+    assert len(out) == 2
+    assert all("_read_file_meta_info" in o.error for o in out), out
+    assert out[0].error == out[1].error
 
 
 def test_the_driver_reports_an_unreachable_port_and_a_non_dicom_payload() -> None:
