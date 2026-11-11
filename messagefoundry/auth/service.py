@@ -2036,8 +2036,8 @@ class UserSealRefused(RuntimeError):
     """:meth:`AuthService.checked_user` found the account's row, and its record fails its integrity
     seal (BACKLOG #5520). The failure was handed to the seal-failure report, which writes the audit
     row and raises the alert only for the first failure of the account in each report interval
-    (:data:`~messagefoundry.store.row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS`), so a refusal
-    inside that interval adds no row. Not "no such user": the row is there, and an administrator
+    (:data:`~messagefoundry.store.row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS`) of this
+    service's process, so a refusal inside that interval adds no row. Not "no such user": the row is there, and an administrator
     may still delete it. The admin routes answer it 423."""
 
 
@@ -3591,7 +3591,9 @@ class _SealCheck:
     #5520). Three outcomes: ``user`` set, the record passes its seal; ``failed``, it fails, and the
     failure was handed to :meth:`AuthService._user_seal_failed`; neither, no account, or one whose
     row was deleted, renamed, rebound or re-keyed between its reads, which is not reported. Only
-    ``failed`` establishes that a record fails its seal."""
+    ``failed`` reads as a record that fails its seal. It means two reads naming the same account
+    both failed, which two honest role writes committing across both reads can also produce: a
+    false alarm that docs/SECURITY.md, *What an admin user read reports*, states."""
 
     user: VerifiedUser | None = None
     failed: bool = False
@@ -11529,7 +11531,7 @@ class AuthService:
         :meth:`_lookup_user`, :meth:`_lookup_by_username`, :meth:`_lookup_by_directory_object_id`,
         :meth:`_load_user_by_federated_subject`, :meth:`list_checked_users`,
         :meth:`_checked_by_id` and :meth:`_verified`, the ONLY readers of the store's user readers
-        in this service, beside the two existence questions; ``tests/test_user_seal.py`` holds
+        in this service, beside the three existence questions; ``tests/test_user_seal.py`` holds
         that. See :meth:`_verified` for what ``None`` covers."""
         return (await self._lookup_user(user_id)).user
 

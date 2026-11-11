@@ -1655,15 +1655,19 @@ tuple: they act only on the caller's own account.
 **What an admin user read reports (BACKLOG #5520).** `GET /users`, `GET /users/{user_id}/permissions`,
 `PATCH /users/{user_id}`, `GET /users/{user_id}/federated-identity` and `GET /users/{user_id}/channel-scope`
 read each account with its whole record checked against its integrity seal. A failure is reported
-per account and rate-limited: only the first refusal of an account in each report interval
-(`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs a WARNING, writes the
-`integrity.authority_seal_failed` audit row and raises the `integrity_drift` alert. A refusal
-inside that interval, from any of these routes or any other reader of the same account, answers
-423 or lists the account as failed and adds no row and no alert. A record is refused only once its
-failure is established, by two failing reads that name the same account. A row deleted, renamed,
-rebound or re-keyed while it is read is unreported and read again by id, up to three checks: one
-that then passes is served, or listed as it now reads, and one deleted meanwhile, or racing every
-check, reads as gone, a 404 or left out of the list. A race is never answered as a failing record. `PATCH /users/{user_id}` reads
+per account and rate-limited, in each engine process: only the first refusal of an account in
+each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs a WARNING, writes
+the `integrity.authority_seal_failed` audit row and raises the `integrity_drift` alert. A refusal
+inside that interval, from any of these routes or any other reader of the same account in that
+process, answers 423 or lists the account as failed and adds no row and no alert. Each engine
+process sharing the store keeps its own interval, so each may report the same account once. A
+record is refused only after two failing reads that name the same account. A row deleted,
+renamed, rebound or re-keyed while it is read is unreported and read again by id, up to three
+checks: one that then passes is served, or listed as it now reads, and one deleted meanwhile, or
+racing every check, reads as gone, a 404 or left out of the list, never as a failing record.
+**Two honest role writes to the account that commit across both of those reads are still
+answered as a failing record and reported**, a false alarm the reads cannot tell from tampering,
+because the role rows are read apart from the account's row. `PATCH /users/{user_id}` reads
 the account after its gate has spent the single-use `admin_user_update` grant, so its 423 and its
 404 cost that proof, as the console's `POST /ui/users/{user_id}/update` does after its own gate.
 

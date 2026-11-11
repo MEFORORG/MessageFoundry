@@ -90,7 +90,7 @@ ACCEPTED = [
     "client",
     "sysadmin",
     # What the module docstring says the rule admits: a space separator inside the name.
-    "a　b",
+    "a\u3000b",
 ]
 
 
