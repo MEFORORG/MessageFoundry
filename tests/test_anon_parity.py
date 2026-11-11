@@ -109,10 +109,13 @@ def test_vendored_hl7data_matches_generator_source() -> None:
 
 
 def test_leak_token_table_matches_publish_guard() -> None:
+    # The tee reads its tables from its own guard instance at each scan (BACKLOG #5541), so this
+    # pins that the guard it loads holds the same tables as the guard loaded here. It held a
+    # site-code binding too, which nothing read: the site code is checked field-anchored through
+    # surrogates.message_has_site_code, and that binding was removed.
     sf = _load_scan_forbidden()
-    assert tee_leak.ESTATE_TOKENS == sf.ESTATE_TOKENS  # type: ignore[attr-defined]
-    assert tee_leak.SITE_CODE_RE.pattern == sf.SITE_CODE_RE.pattern  # type: ignore[attr-defined]
-    assert [(p.pattern, r) for p, r in tee_leak.FORBIDDEN] == [
+    assert tee_leak.estate_tokens() == sf.ESTATE_TOKENS  # type: ignore[attr-defined]
+    assert [(p.pattern, r) for p, r in tee_leak.forbidden_names()] == [
         (p.pattern, r)
         for p, r in sf.FORBIDDEN  # type: ignore[attr-defined]
     ]
@@ -152,7 +155,7 @@ def test_leak_tables_are_sourced_from_the_guard_when_present() -> None:
         pytest.skip(
             "no token source configured (fork CI / fresh clone) — tables legitimately empty"
         )
-    assert tee_leak.FORBIDDEN and tee_leak.ESTATE_TOKENS
+    assert tee_leak.forbidden_names() and tee_leak.estate_tokens()
 
 
 # Synthetic-PHI-shape inputs (never a real value) whose UNMAPPED fields carry SSN/phone/MRN shapes,
@@ -163,7 +166,11 @@ _LEAK_PARITY_INPUTS = [
     "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y\rDST|1|123-45-6789",
     "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y"
     "\rDST|1|202-555-0188|(202) 555-0188",
-    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1|98765^^^HOSP^MR||X^Y",
+    # A Z-segment, since BACKLOG #5533 mapped PID-2, the unmapped field this used before.
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y\rZPI|1|98765^^^HOSP^MR",
+    # BACKLOG #5532: shapes and an id type written with HL7 escape sequences, decoded by both.
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y"
+    "\rZPI|1|123\\X2D\\45\\X2D\\6789|555\\X2D\\555\\X2D\\0188|98765^^^H^M\\X52\\|A\\T\\B\\.br\\C",
     "MSH|^~\\&|A|B|C|D|20260101120000||ADT^A01|M1|P|2.5.1"
     "\rEVN|A01|20260101120000\rOBX|1|NM|8480-6^Systolic^LN||128|mm[Hg]",
     # BACKLOG #1710: a line with no segment id (refused, never named) beside a blank one (ignored).
@@ -179,6 +186,9 @@ _LEAK_PARITY_INPUTS = [
     "MSH-^~\\&-A-B-C-D-20260101--ADT^A01-M1-P-2.5.1\rPID-1--1^^^H^MR--X^Y"
     "\rZZZ-1-123-45-6789\rZZZ-1-555-555-0100\rOBX-1-NM-8480^S^LN--000-12-3456\rzz-123-45-6789",
     "MSH ^~\\& A B C D 20260101  ADT^A01 M1 P 2.5.1\rPID 1  1^^^H^MR  X^Y\rZZZ 1 (555) 555-0100",
+    # BACKLOG #5533/#5534: shapes in the components an identifier rule keeps, as written and escaped.
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1|M7^^^H^MR^202-555-0188|1^^^H^MR||X^Y"
+    "\rGT1|1|G8^^123\\X2D\\45\\X2D\\6789^H^GN",
 ]
 
 
