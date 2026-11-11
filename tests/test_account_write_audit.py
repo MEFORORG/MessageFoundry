@@ -534,25 +534,21 @@ async def test_a_sign_in_whose_role_retry_raises_still_ends_the_sessions_and_tel
 
 
 @pytest.mark.parametrize(
-    ("retry_error", "unwritten"),
+    "retry_error",
     [
-        (UnknownRoleError([ADMIN]), True),
-        (RowSealError("synthetic"), True),
-        (sqlite3.OperationalError("synthetic retry"), False),
+        UnknownRoleError([ADMIN]),
+        RowSealError("synthetic"),
+        sqlite3.OperationalError("synthetic retry"),
     ],
-    ids=["unknown-role", "seal", "refused-control"],
+    ids=["unknown-role", "seal", "refused"],
 )
-async def test_a_sign_in_role_retry_refused_before_it_wrote_tells_nobody_but_ends_the_sessions(
-    store: MessageStore,
-    monkeypatch: pytest.MonkeyPatch,
-    retry_error: Exception,
-    unwritten: bool,
+async def test_a_sign_in_role_retry_refused_before_it_wrote_still_fails_closed(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, retry_error: Exception
 ) -> None:
     """BACKLOG #2221. A retry its store refuses before it writes, for a role that does not exist
-    or a record that fails its seal, changed nothing: the sign-in raises it with no notice, no
-    grant page and no audit page, but still ends the account's other sessions, since the
-    directory's roles may remove one. A seal failure is reported as one. The control: a retry
-    that may have committed does all four."""
+    or a record that fails its seal, is taken as a write that may have committed, like any other
+    retry error: the sign-in ends the other sessions through ``_revoke_after_commit``, tells the
+    user, pages the grant and the lost row, then raises. Nothing is carved out for it."""
     service, _first, grants, audit_pages = await _signed_in(store, "viewer")
     await service.set_ad_group_map([("cn=mf-ops,dc=x", ADMIN)], actor="admin")
     service._security_notifier.sent.clear()
@@ -572,77 +568,25 @@ async def test_a_sign_in_role_retry_refused_before_it_wrote_tells_nobody_but_end
         revokes.append(user_id)
         return await real_revoke(user_id, **kwargs)
 
-    # The unwritten path ends the sessions through the store directly, with no miss row.
-    direct: list[str] = []
-    real_direct = store.revoke_user_sessions
-
-    async def revoke_direct(user_id: str, **kwargs: Any) -> Any:
-        direct.append(user_id)
-        return await real_direct(user_id, **kwargs)
-
-    drift: list[str] = []
-    service._integrity_alert = drift.append
     monkeypatch.setattr(store, "set_user_roles", failing)
     monkeypatch.setattr(service, "_revoke_after_commit", revoke)
-    monkeypatch.setattr(store, "revoke_user_sessions", revoke_direct)
     with pytest.raises(type(retry_error)):
         await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)
     assert len(calls) == 2
-    if unwritten:
-        assert service._security_notifier.sent == []
-        assert grants == [] and audit_pages == [] and revokes == [] and len(direct) == 1
-        assert len(drift) == (1 if isinstance(retry_error, RowSealError) else 0)
-    else:
-        assert [e.username for e in service._security_notifier.sent] == ["jdoe"]
-        assert grants == [("jdoe", "directory_sign_in")]
-        assert audit_pages == ["auth.ad_roles_resynced"]
-        assert len(revokes) == 1
+    assert [e.username for e in service._security_notifier.sent] == ["jdoe"]
+    assert grants == [("jdoe", "directory_sign_in")]
+    assert audit_pages == ["auth.ad_roles_resynced"]
+    assert len(revokes) == 1
 
 
-@pytest.mark.parametrize(
-    "retry_error", [UnknownRoleError([ADMIN]), RowSealError("synthetic")], ids=["role", "seal"]
-)
-async def test_a_held_first_role_error_is_raised_when_the_retry_wrote_nothing(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch, retry_error: Exception
-) -> None:
-    """BACKLOG #2221. A held first error, then a retry refused before it wrote: the held error is
-    the one raised, with the retry's named on it, and nobody is told or paged, but the other
-    sessions still end. A retry that failed its seal is reported as one."""
-    service, _first, grants, audit_pages = await _signed_in(store, "viewer")
-    await service.set_ad_group_map([("cn=mf-ops,dc=x", ADMIN)], actor="admin")
-    service._security_notifier.sent.clear()
-    calls: list[int] = []
-
-    async def failing(*_args: object, **_kwargs: object) -> None:
-        calls.append(1)
-        if len(calls) == 1:
-            raise NotImplementedError("synthetic first")
-        raise retry_error
-
-    revokes: list[str] = []
-
-    async def revoke(user_id: str, **_kwargs: Any) -> None:
-        revokes.append(user_id)
-
-    drift: list[str] = []
-    service._integrity_alert = drift.append
-    monkeypatch.setattr(store, "set_user_roles", failing)
-    monkeypatch.setattr(store, "revoke_user_sessions", revoke)
-    with pytest.raises(NotImplementedError) as raised:
-        await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)
-    assert any(type(retry_error).__name__ in note for note in raised.value.__notes__)
-    assert service._security_notifier.sent == []
-    assert grants == [] and audit_pages == [] and len(revokes) == 1
-    assert len(drift) == (1 if isinstance(retry_error, RowSealError) else 0)
-
-
-async def test_a_sign_in_demotion_that_wrote_nothing_still_ends_the_other_sessions(
+async def test_a_sign_in_demotion_whose_role_write_raises_before_it_writes_ends_the_sessions(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #2221. The directory demotes jdoe from Administrator, and the role write raises an
-    error marked unwritten. Keeping the other sessions would leave them on the role the directory
-    removed, so they end; nobody is told a role changed and no grant is paged."""
-    service, first, grants, audit_pages = await _signed_in(store, ADMIN)
+    """BACKLOG #2221. The directory demotes jdoe from Administrator, and the role write raises
+    before it writes, on both tries. Keeping the other sessions would leave them on the role the
+    directory removed, so they end before the error is raised. The notice still goes although no
+    role changed: the engine errs loud, never open."""
+    service, first, grants, _audit_pages = await _signed_in(store, ADMIN)
     # Through the store, not the service, whose map edit would end ``first`` itself.
     await store.set_ad_group_role_map([("cn=mf-ops,dc=x", VIEWER)])
     service._security_notifier.sent.clear()
@@ -657,5 +601,5 @@ async def test_a_sign_in_demotion_that_wrote_nothing_still_ends_the_other_sessio
     assert await service.identity_for_token(first) is None, "a demotion kept a stale session"
     user = await store.get_user_by_username("jdoe")
     assert user is not None and await store.get_user_role_ids(user.id) == [ADMIN]
-    assert service._security_notifier.sent == []
-    assert grants == [] and audit_pages == []
+    assert [e.username for e in service._security_notifier.sent] == ["jdoe"]
+    assert grants == []
