@@ -150,13 +150,18 @@ Facts the labels leave out:
 - **The draft.** The engine's GitHub release stays a draft until the harness wheel is on it
   too, and until every upload `publish-pypi` runs has succeeded. With `PUBLISH_HARNESS` unset,
   that is the toolkit and the engine only. A separate job publishes it last, so no
-  job adds an asset to a published release. The console's release is a draft too, until its wheel
-  is on PyPI. With `PUBLISH_WEBCONSOLE` unset, the console upload is skipped and the console's
-  release is still published, as the engine's is with `PUBLISH_HARNESS` unset. With either variable
-  set, its draft publisher reads it again when it runs and refuses to publish the release while
-  that run skipped the upload. A re-run that reused an earlier reading of the variable can still
-  skip the upload, and on an engine tag the toolkit and engine are on PyPI by then. The release
-  stays a draft until the build job is re-run, or the variable is unset and the publisher re-run.
+  job adds an asset to a published release. The console's release is a draft too, until its
+  `publish-pypi-webconsole` job has succeeded. With `PUBLISH_WEBCONSOLE` set, that job uploads the
+  wheel first. Unset, the console upload is skipped and the console's release is still published
+  once the `pypi` approval is given, as the engine's is with `PUBLISH_HARNESS` unset. With either
+  variable set, its draft publisher reads it again when it runs and refuses to publish the release
+  while that run skipped the upload. A re-run that reused an earlier reading of the variable can
+  still skip the upload, and on an engine tag the toolkit and engine are on PyPI by then. The
+  release stays a draft until its build job is re-run (`release-harness` on an engine tag,
+  `release-webconsole` on a console tag), which re-runs the jobs after it, or the variable is unset
+  and the publisher re-run. If the refusal is from a copy of the variable on the `pypi`
+  environment, remove the copy, then re-run the build job. GitHub allows a re-run only within 30
+  days of a run's first attempt, so past that only a new run from a tag push finishes the release.
 - **The provenance gate.** The tagged commit must be on `main`, and each required check's latest
   run on it must have passed. A red run after the merge blocks the tag even if the merge-queue run
   passed. To clear it, re-run the failed job on that commit, then re-run the release. A check

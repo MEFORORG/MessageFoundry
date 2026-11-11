@@ -88,7 +88,10 @@
 # exercises the upload half; no dispatch runs a publish job, so the download and the check first run
 # on a real tag. A tag keeps the files 30 days from the end of the build job, a dispatch 1 day. The
 # harness publishes from `publish-pypi`, under the engine's one approval (owner ruling 2026-10-16), so
-# that approval must land inside the 30 days, or a re-run of every job rebuilds the files.
+# that approval must land inside the 30 days. GitHub re-runs a run, or any job in it, only within 30
+# days of its first attempt, so no re-run rebuilds the files after that: every re-run remedy in this
+# file, and in the draft publishers' errors, holds only inside that window, and a draft left past it
+# needs a new run from a tag push.
 #
 # PyPI publish uses Trusted Publishing (OIDC) — no API token. OWNER PREREQ (one-time, before the first
 # tag): claim the `messagefoundry` PyPI project + configure a Trusted Publisher (a PENDING publisher works
@@ -1850,8 +1853,9 @@ jobs:
       # release) would fail with "release not found" on every console tag, killing the job, and with it
       # publish-pypi-webconsole, which needs it — i.e. the PyPI name could never be claimed.
       #
-      # A DRAFT, LIKE THE ENGINE'S, UNTIL THE WHEEL IS ON PYPI; publish-github-release-webconsole
-      # says the rest (vault BACKLOG #2975).
+      # A DRAFT, LIKE THE ENGINE'S, UNTIL publish-pypi-webconsole HAS SUCCEEDED, which uploads the
+      # wheel only with PUBLISH_WEBCONSOLE set; publish-github-release-webconsole says the rest
+      # (vault BACKLOG #2975).
       #
       # The re-run arm is equally load-bearing: v0.3.1 showed a bare `gh release create` turns a single
       # PyPI failure into a permanent retry deadlock (every re-run dies here and SKIPS the publish, so a
@@ -1994,7 +1998,8 @@ jobs:
           verbose: true
           print-hash: true
 
-  # PUBLISH THE CONSOLE'S GITHUB RELEASE ONCE ITS WHEEL IS ON PYPI (vault BACKLOG #2975). Before this
+  # PUBLISH THE CONSOLE'S GITHUB RELEASE ONCE ITS UPLOAD JOB HAS SUCCEEDED (vault BACKLOG #2975),
+  # with the wheel on PyPI when PUBLISH_WEBCONSOLE is set and with no upload when it is not. Before this
   # job, release-webconsole published its release in the call that made it, so the release was public
   # before the `pypi` approval was even asked for, and a refused approval left a public release with
   # no PyPI upload. Now the release is a draft, and this job takes it public after
@@ -2012,6 +2017,11 @@ jobs:
       contents: write   # gh release edit (take the console release out of draft)
     steps:
       # No checkout: gh reads the repository from GH_REPO, and this job runs no repository code.
+      # The error's environment-copy remedy is incomplete: once the copy is removed, re-run the
+      # build job as well, since a re-run of failed jobs alone reuses the upload's skipped outcome
+      # and is refused again. Its first cause can also be the wrong one: a variable unset while the
+      # upload waited for its approval and set again before this job ran was set when the build job
+      # read it. Re-running the build job clears that case too.
       - name: Publish the draft console GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -2450,7 +2460,8 @@ jobs:
   # If `release-harness` or `publish-pypi` fails, this job is skipped and the release stays a draft.
   # Re-running the failed jobs finishes the release, unless PUBLISH_HARNESS was set after
   # `release-harness` read it: then this job refuses, and its error names the job to re-run. A
-  # draft is never published with an asset missing.
+  # draft is never published with an asset missing. The refusal comes after `publish-pypi`, so on
+  # that path the toolkit and the engine are already on PyPI while the release stays a draft.
   publish-github-release:
     # The event-and-ref pair sits on the job, so a dispatch never schedules it at all.
     if: github.repository == 'MEFORORG/MessageFoundry' && !startsWith(github.ref_name, 'webconsole-') && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
@@ -2462,6 +2473,11 @@ jobs:
       contents: write   # gh release edit (take the release out of draft)
     steps:
       # No checkout: gh reads the repository from GH_REPO, and this job runs no repository code.
+      # The error's environment-copy remedy is incomplete: once the copy is removed, re-run the
+      # build job as well, since a re-run of failed jobs alone reuses the upload's skipped outcome
+      # and is refused again. Its first cause can also be the wrong one: a variable unset while the
+      # upload waited for its approval and set again before this job ran was set when the build job
+      # read it. Re-running the build job clears that case too.
       - name: Publish the draft GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
