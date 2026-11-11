@@ -75,9 +75,11 @@ address-space boundary and the codec are the load-bearing controls.
 
 **Fail-closed.** Any isolation denial — a forbidden import/op, a resource cap exceeded, a worker
 crash, a rejected frame, or an unmarshallable payload/run-context — raises :class:`SandboxError`. The
-caller (the router/transform worker) routes it to ``ERROR``/dead-letter **post-ACK** via the existing
-``_apply_router_internal_error`` / ``_apply_transform_internal_error`` paths — never a NAK, never an
-accept-and-drop, never a crashed connection.
+caller (the router/transform worker) hands it, **post-ACK**, to the ``[delivery] internal_error``
+policy via the existing ``_apply_router_internal_error`` / ``_apply_transform_internal_error`` paths:
+``ERROR``/dead-letter under the default ``continue``; under ``stop`` the inbound stops with a
+``connection_stopped`` alert and its head row is re-pended, or dead-lettered once its attempts reach
+the retry cap. Never a NAK, never an accept-and-drop.
 
 **Engine-side validation stays engine-side.** The worker describes only the *shape* of the
 Router/Handler return value; the fail-closed handler-name / outbound-name validation (see
@@ -851,7 +853,8 @@ class SandboxSessionClosed(SandboxError):
     and a router or transform worker may have resolved that session just before. An earlier dispatch
     on the same session may have run (``route_only`` runs the Router, then each ``accepts=``
     predicate), which is safe to repeat because Routers are pure. The runner retries on a fresh
-    session or re-pends the row, and never dead-letters it as a Router or Handler fault (vault
+    session or re-pends the row, and never hands it to the ``[delivery] internal_error`` policy as
+    a Router or Handler fault (vault
     BACKLOG #2772)."""
 
 
@@ -1135,8 +1138,9 @@ class SandboxSession:
                     "among them, so config must read such a value under another name. Every "
                     "Router and Handler can read what is listed, so never list a secret."
                 )
-                # Short before the differences: a dead-lettered message keeps about the first 200
-                # characters of this, behind its stage prefix and the exception's type name.
+                # Short before the differences: a failed message's stored error keeps about the
+                # first 200 characters of this, behind its stage prefix and the exception's type
+                # name.
                 refusal = (
                     f"sandbox worker for inbound {self._inbound!r} refused: its graph differs from "
                     f"the engine's. {'. '.join(differing)}. {causes}"
@@ -1305,7 +1309,7 @@ class SandboxSession:
 
         :data:`_EOF` is the opposite case and must NOT be treated the same way. It is a parent-private
         singleton with no wire form (see :class:`_Eof`), so a worker cannot manufacture one — it
-        carries no trust information at all, only "the peer is gone". Dead-lettering on it would fail
+        carries no trust information at all, only "the peer is gone". Failing a call on it would fail
         closed against a signal that proves nothing: a child that crashes in the instant *after*
         writing a correct, correlation-proven answer would lose a message it had already answered, and
         a child that died between dispatches would lose the next one instead of respawning
@@ -1660,7 +1664,8 @@ class SandboxSession:
     def _busy_refusal(lookup: codec.LookupRequest) -> str:
         fn = _LOOKUP_FN[lookup.kind]
         return (
-            # Short, scope first: a dead-letter keeps about the first 200 characters of this.
+            # Short, scope first: a failed message's stored error keeps about the first 200
+            # characters of this.
             f"{fn}({_shown_name(lookup.connection)!r}) refused: this inbound's sandbox session "
             "runs one lookup per connection, and one the wall cap cut off is still running "
             "(ADR 0147)"

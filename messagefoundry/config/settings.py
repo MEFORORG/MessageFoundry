@@ -2547,8 +2547,9 @@ class SandboxSettings(_Section):
     zero overhead** — the isolation seam is invisible. ``mode="subprocess"`` runs each inbound's
     Router/Handler in a **persistent per-inbound worker child** (never a per-message fork), enforcing
     a forbidden-import guard (socket/store/crypto), the resource caps below, and a fail-closed refusal
-    of the live ``db_lookup``/``fhir_lookup`` bridges. An isolation denial routes the message to
-    ``ERROR``/dead-letter **post-ACK** (no NAK), never dropping it.
+    of the live ``db_lookup``/``fhir_lookup`` bridges. An isolation denial fails the message's call
+    **post-ACK** (no NAK), never dropping it, and the ``[delivery] internal_error`` policy handles
+    it: ``ERROR``/dead-letter under the default ``continue``, a stopped inbound under ``stop``.
 
     **What turning it on costs, all of it measured in ADR 0087 (do not re-derive):**
 
@@ -2562,9 +2563,11 @@ class SandboxSettings(_Section):
       sandbox field, so ``mode="off"`` set for one Handler runs **every** Router and Handler in the
       process in-process, not just that one.
     * **``wall_seconds`` starts being enforced.** At ``mode="off"`` there is no timeout at all; at
-      ``mode="subprocess"`` or ``mode="isolated"`` the parent kills a worker that overruns and dead-letters that message
-      post-ACK. A busy-loop can no longer wedge intake, **and** a legitimately slow Handler that used
-      to finish now dead-letters. ``startup_seconds`` and the POSIX ``mem_mb`` arm with it.
+      ``mode="subprocess"`` or ``mode="isolated"`` the parent kills a worker that overruns and fails
+      that message's call post-ACK, for the ``[delivery] internal_error`` policy to handle
+      (``ERROR``/dead-letter under the default ``continue``, a stopped inbound under ``stop``). A
+      busy-loop can no longer wedge intake, **and** a legitimately slow Handler that used to finish
+      now fails. ``startup_seconds`` and the POSIX ``mem_mb`` arm with it.
     * **Throughput** ~0.19 ms per dispatch with no reference view; a 20k-entry crosswalk ~4.5 ms
       marshalling and ~6.2 ms end-to-end, ~1.4x a pickle round-trip — inside the pipeline's existing
       per-interface bound. **One message is not one dispatch:** a message routed to one handler with
@@ -2592,8 +2595,9 @@ class SandboxSettings(_Section):
     # POSIX-only memory cap (MiB) inside the child (no-op on Windows). None disables it. On Linux it is
     # HEADROOM above the loaded graph: RLIMIT_DATA at the worker's VmData after load_config, plus this,
     # with MALLOC_ARENA_MAX=2 so thread arenas cannot keep spending it.
-    # Elsewhere on POSIX it is an absolute RLIMIT_AS cap. A call that hits it dead-letters and its
-    # worker is recycled (ADR 0087, amendment of 2026-10-11).
+    # Elsewhere on POSIX it is an absolute RLIMIT_AS cap. A call that hits it fails, for the
+    # [delivery] internal_error policy to handle (dead-letter under the default continue, a stopped
+    # inbound under stop), and its worker is recycled (ADR 0087, amendment of 2026-10-11).
     mem_mb: int | None = Field(default=512, ge=1)
     # Bound (seconds) on the one-time child bootstrap (config load + guard install) before start fails.
     startup_seconds: float = Field(default=30.0, gt=0)
