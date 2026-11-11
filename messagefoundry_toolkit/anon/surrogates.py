@@ -203,8 +203,9 @@ def surrogate_address(rep: str, keyer: Keyer, seps: Seps) -> str:
 
 #: The 1-based CX components an identifier surrogate keeps as captured: CX.3 check-digit scheme,
 #: CX.4 assigning authority, CX.5 identifier type, CX.6 assigning facility, CX.9 assigning
-#: jurisdiction and CX.10 assigning agency. They name who issued the id, not whose it is, and
-#: routing and correlation read them. Every other component past the first is blanked: CX.2, the
+#: jurisdiction and CX.10 assigning agency. They describe the id, its scheme, type and issuer,
+#: rather than hold it, and routing and correlation read them. They are kept as the sender wrote
+#: them, so the leak-check scans them for the shapes it knows (``leak.kept_component_hits``). Every other component past the first is blanked: CX.2, the
 #: check digit, is computed from the real id and is wrong for the fabricated one; CX.7 and CX.8
 #: are the effective and expiration dates; and a component past CX.10, such as a security check,
 #: is blanked until someone decides it is safe to keep (BACKLOG #5534).

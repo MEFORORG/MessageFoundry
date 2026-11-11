@@ -53,6 +53,7 @@ from tee.anon.leak import (
     MALFORMED_LINE_HIT,
     CoverageTally,
     LeakReport,
+    has_other_cause,
     mapped_field_advice,
 )
 from tee.anon.rules import (
@@ -780,13 +781,18 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
     # is the only place to say so.
     residue_reports = 0
     residue_advice: dict[str, None] = {}
+    # Whether such a report also had another cause, which needs the general advice as well.
+    residue_mixed = False
 
     def _tally(report: LeakReport) -> None:
-        nonlocal residue_reports
+        nonlocal residue_reports, residue_mixed
         coverage.add(report)
         advice = mapped_field_advice(report)
-        residue_reports += bool(advice)
-        residue_advice.update(dict.fromkeys(advice))
+        if advice:
+            residue_reports += 1
+            residue_advice.update(dict.fromkeys(advice))
+            undecided = args.require_full_coverage and bool(report.undecided_fields)
+            residue_mixed = residue_mixed or has_other_cause(report) or undecided
 
     for row in rows:
         text = row.raw.decode("latin-1")  # lossless byte<->char, matches the capture sink
@@ -848,7 +854,11 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
                 f"{residue_reports} of them carried a PHI shape in a field a rule maps, past its "
                 "first component, where a retarget or an identifier rule left it as captured. "
                 f"{' '.join(residue_advice)} A keep would leave the whole field.",
-                *(["For the others:", *steps] if residue_reports < failed else ["Then retry."]),
+                *(
+                    ["For the others:", *steps]
+                    if residue_reports < failed or residue_mixed
+                    else ["Then retry."]
+                ),
             ]
         print(
             f"error: {failed} of {len(rows)} message(s) failed anonymization, still carried a "

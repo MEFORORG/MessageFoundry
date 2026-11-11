@@ -2393,12 +2393,13 @@ Properties of the anonymizer:
 - **Width/shape-preserving surrogates** — a surrogate keeps the original's width/shape so the
   scrubbed dataset stays structurally realistic. An identifier surrogate (`mrn`, `id`) fabricates
   every letter and digit of the id, as ASCII; `ssn` writes fabricated digits. Each keeps only the
-  CX components that name who issued it: CX.3 to CX.6, CX.9 and CX.10. It blanks CX.2, the check digit, the CX.7 and
+  CX components that describe the id rather than hold it: CX.3 to CX.6, CX.9 and CX.10. They are
+  the check-digit scheme, the identifier type and the issuer's names. It blanks CX.2, the check digit, the CX.7 and
   CX.8 dates, and anything past CX.10. `PID-20`, a driver's licence, takes the `dln` kind: the
-  number is fabricated, the issuing state kept and the expiry blanked (BACKLOG #5534). A kept
-  component is still leak-scanned for a dashed SSN and a punctuated phone number, as written and
-  decoded, though a rule maps the field, so either one refuses there as it would in a field no
-  rule maps. Any other text a sender puts in one, such as a name, passes. The kept positions are
+  number is fabricated, the issuing state kept and the expiry blanked (BACKLOG #5534). The
+  leak-check still scans a kept component, as written and decoded. A dashed SSN or a punctuated
+  phone number there refuses, as it would in a field no rule maps. Any other text a sender puts
+  in one, such as a name, passes. The kept positions are
   CX positions whatever the field's type, so an overlay that points an EI field such as `OBR-3` at `id` blanks EI.2, the namespace id.
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
   loose string search. With no site prefix loaded it matches nothing, and

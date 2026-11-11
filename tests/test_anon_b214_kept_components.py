@@ -125,6 +125,20 @@ def test_a_retargeted_field_is_reported_once_as_a_retarget(anon: ModuleType) -> 
 
 
 @_EACH
+def test_a_retarget_between_identifier_kinds_reads_as_a_kept_component(anon: ModuleType) -> None:
+    """mrn keeps CX.6 as id does, so pointing PID-3 back at its default kind would not clear the
+    hit. It reads as a kept component, with the advice that does clear it."""
+    rules = (
+        *(rule for rule in anon.DEFAULT_RULES if rule.path != "PID-3"),
+        anon.FieldRule("PID-3", anon.SurrogateKind.ID),
+    )
+    text = "\r".join((_HEADER, "PID|1||M77^^^H^MR^202-555-0188"))
+    report = anon.leak.leak_report(text, rules=rules)
+    assert report.structural_hits == [f"phone-shaped value {anon.leak.KEPT_COMPONENT} in PID-3"]
+    assert anon.leak.mapped_field_advice(report) == [anon.leak.KEPT_COMPONENT_ADVICE]
+
+
+@_EACH
 def test_a_keep_on_the_field_leaves_it_to_the_unmapped_scan(anon: ModuleType) -> None:
     """A keep in place of the default rewrite leaves the field unmapped, so its own detectors
     refuse it; the kept-component scan has nothing to add."""

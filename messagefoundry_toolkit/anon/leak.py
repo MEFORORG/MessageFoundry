@@ -678,8 +678,9 @@ def past_first_component_hits(
     punctuated phone, as written and decoded as :func:`_structural_reasons` reads a value:
 
     * a default field a retarget points at a different kind (:func:`.rules.retargeted_defaults`,
-      BACKLOG #3493). Its hits read :data:`RETARGET_RESIDUE`.
-    * any other field an ``id``, ``mrn``, ``ssn`` or ``dln`` rule rewrites
+      BACKLOG #3493). Its hits read :data:`RETARGET_RESIDUE`, unless its default kind is one
+      of the identifier kinds below, which would keep the same components.
+    * every other field an ``id``, ``mrn``, ``ssn`` or ``dln`` rule rewrites
       (:data:`.surrogates.COMPONENT_KEEPING_KINDS`), whose surrogate keeps the issuer components
       as the sender wrote them (BACKLOG #5533, #5534). Its hits read :data:`KEPT_COMPONENT`.
 
@@ -692,8 +693,13 @@ def past_first_component_hits(
 
     The walk names a segment by every rule's path, so a segment only these rules name keeps its
     address in a message whose HL7 version does not define it."""
-    retargeted = {default.path for default, _ in retargeted_defaults(rules)}
-    paths = retargeted | {r.path for r in rules if r.kind in COMPONENT_KEEPING_KINDS}
+    retargets = retargeted_defaults(rules)
+    # A retarget away from an identifier kind is labelled as one. From one identifier kind to
+    # another, the default kind keeps components too, so pointing the field back would not
+    # clear the hit: it reads as a kept component, with that advice.
+    residue = {d.path for d, _ in retargets if d.kind not in COMPONENT_KEEPING_KINDS}
+    keeping = {r.path for r in rules if r.kind in COMPONENT_KEEPING_KINDS}
+    paths = {d.path for d, _ in retargets} | keeping
     parsed = read_message_seps(text)
     if not paths or parsed is None:
         return []
@@ -704,7 +710,7 @@ def past_first_component_hits(
     for address, value in walk:
         if address not in paths:
             continue
-        label = RETARGET_RESIDUE if address in retargeted else KEPT_COMPONENT
+        label = RETARGET_RESIDUE if address in residue else KEPT_COMPONENT
         rest = seps.repetition.join(
             seps.component.join(["", *rep.split(seps.component)[1:]])
             for rep in value.split(seps.repetition)
@@ -917,11 +923,6 @@ _MAPPED_FIELD_ADVICE: tuple[tuple[str, str], ...] = (
 )
 
 
-def has_retarget_residue(report: LeakReport) -> bool:
-    """True if ``report`` holds a hit from :func:`retarget_residue_hits`."""
-    return any(RETARGET_RESIDUE in hit for hit in report.structural_hits)
-
-
 def mapped_field_advice(report: LeakReport) -> list[str]:
     """The advice for each kind of hit in a mapped field that ``report`` holds
     (:func:`past_first_component_hits`), in a fixed order. Empty when it holds none. A keep is
@@ -931,6 +932,13 @@ def mapped_field_advice(report: LeakReport) -> list[str]:
         for label, advice in _MAPPED_FIELD_ADVICE
         if any(label in hit for hit in report.structural_hits)
     ]
+
+
+def has_other_cause(report: LeakReport) -> bool:
+    """True if ``report`` holds a hit that is not in a mapped field, such as a token or a shape
+    in a field no rule maps, so its fix is not only the advice :func:`mapped_field_advice`
+    gives."""
+    return any(not any(label in hit for label, _ in _MAPPED_FIELD_ADVICE) for hit in report.hits)
 
 
 def refusal_advice(

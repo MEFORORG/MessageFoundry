@@ -277,14 +277,21 @@ def test_a_residue_refusal_is_not_told_to_add_a_keep(
     assert "555-0199" not in error
 
 
+@pytest.mark.parametrize("other", [False, True], ids=["kept-only", "kept-and-unmapped"])
 def test_a_kept_component_refusal_is_not_told_to_add_a_keep(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    other: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     # PID-21 takes the mrn kind by default and keeps CX.4 as captured, so a dashed SSN there is
     # refused (BACKLOG #5533, #5534). The field is mapped, so the run line names the kept-component
-    # fix, and neither the old advice nor the retarget advice.
+    # fix, and not the retarget advice. The same report with a phone in an unmapped field as well
+    # needs the general advice too, or the next run refuses again on it.
     path = str(tmp_path / "kept.db")
     row = "PID|1||999^^^H^MR||DOE^JOHN" + "|" * 16 + "M77^^^123-45-6789^MR"
+    if other:
+        row += "\rZPD|1|202-555-0188"
     raw = f"MSH|^~\\&|SAPP|SFAC|RAPP|RFAC|20260101||ADT^A01|K0|P|2.5.1\r{row}"
 
     async def seed() -> None:
@@ -304,10 +311,12 @@ def test_a_kept_component_refusal_is_not_told_to_add_a_keep(
     (error,) = [line for line in capsys.readouterr().err.splitlines() if line.startswith("error:")]
     assert tee.anon.leak.KEPT_COMPONENT_ADVICE in error
     assert "A keep would leave the whole field." in error
-    assert "Then retry." in error
-    assert _GENERAL not in error
+    assert ("Then retry." in error) is not other
+    assert ("For the others: Extend" in error) is other
+    assert (_GENERAL in error) is other
     assert _TOLD.capitalize() not in error
     assert "123-45-6789" not in error
+    assert "202-555-0188" not in error
 
 
 def test_a_keep_and_a_retarget_each_get_a_line(
