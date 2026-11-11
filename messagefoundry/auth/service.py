@@ -2141,7 +2141,8 @@ class UserSealRefused(RuntimeError):
     row and raises the alert only for the first failure of the account in each report interval
     (:data:`~messagefoundry.store.row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS`) of this
     service's process, so a refusal inside that interval adds no row. Not "no such user": the row is there, and an administrator
-    may still delete it. The admin routes answer it 423."""
+    may still delete it. The admin routes answer it 423. A record Vault transit cannot verify is
+    refused the same way, reported under ``integrity.authority_seal_unverifiable`` (ADR 0217)."""
 
 
 @dataclass(frozen=True)
@@ -3709,7 +3710,9 @@ class _SealCheck:
     ``failed`` reads as a record that fails its seal. From :meth:`AuthService._verified` it means
     two reads naming the same account both failed, which two honest role writes committing across
     both reads can also produce: a false alarm that docs/SECURITY.md, *What an admin user read
-    reports*, states. :meth:`AuthService._checked_by_id` also sets it when it fails closed."""
+    reports*, states. :meth:`AuthService._checked_by_id` also sets it when it fails closed, and
+    for a record Vault transit cannot verify, which it hands to
+    :meth:`AuthService._user_seal_unverifiable` instead (ADR 0217 (a))."""
 
     user: VerifiedUser | None = None
     failed: bool = False
@@ -12021,8 +12024,11 @@ class AuthService:
         outside this service that SHOWS it (BACKLOG #5520). ``None`` when no row is there. Raises
         :class:`UserSealRefused` only when :meth:`_verified` established that the record fails,
         or :meth:`_checked_by_id` failed closed, and handed that to the seal-failure report, so
-        the caller can say so rather than answer "no such user". :meth:`_checked_by_id` says how a
-        row read mid-write is answered."""
+        the caller can say so rather than answer "no such user". A record Vault transit cannot
+        verify raises it too, reported under its own cause (ADR 0217 (a)). A Vault transit Outage
+        raises :class:`~messagefoundry.store.row_seal.TransitSealUnavailableError`, paged, which the
+        admin routes answer 503. :meth:`_checked_by_id` says how a row read mid-write is
+        answered."""
         found = await self._checked_by_id(user_id)
         if found.failed:
             raise UserSealRefused(USER_SEAL_REFUSED)
@@ -12036,7 +12042,9 @@ class AuthService:
 
         Each row is checked by :meth:`_checked_by_id`, which says how a row read mid-write is
         answered: one it reads as gone is left out, and one renamed meanwhile is listed as it now
-        reads."""
+        reads. One Vault transit cannot verify is listed as failing; a Vault transit Outage on any
+        row raises :class:`~messagefoundry.store.row_seal.TransitSealUnavailableError` and lists
+        nothing (ADR 0217)."""
         out: list[ListedUser] = []
         for raw in await self._store.list_users():
             found = await self._checked_by_id(raw.id, raw)
@@ -12060,7 +12068,17 @@ class AuthService:
                 raw = await self._store.get_user(user_id)
                 if raw is None:
                     return _SealCheck()
-            found = await self._verified(raw)
+            try:
+                found = await self._verified(raw)
+            except TransitSealUnverifiableError as exc:
+                # ADR 0217 (a): denied as a failed seal is, so the account lists as integrity-failed
+                # and can still be deleted, under its own audit action and page.
+                await self._user_seal_unverifiable(raw.id, exc)
+                return _SealCheck(failed=True)
+            except TransitSealUnavailableError:
+                # ADR 0217, the Outage row: paged, no seal failure recorded, the read refused.
+                self._user_seal_outage()
+                raise
             if found.settled:
                 return found
             raw = None
@@ -12071,6 +12089,51 @@ class AuthService:
         # store that compares ids case-insensitively shares the account's report interval.
         await self._user_seal_failed(still_there.id)
         return _SealCheck(failed=True)
+
+    async def _user_seal_unverifiable(
+        self, user_id: str, exc: TransitSealUnverifiableError
+    ) -> None:
+        """Report an account whose record Vault transit could not verify on an admin read (ADR 0217
+        (a)): a page through the store's :class:`~messagefoundry.store.row_seal.SealPager` under the
+        row's capped Unverifiable subject, then a WARNING and a soft
+        :data:`AUTHORITY_SEAL_UNVERIFIABLE_ACTION` row carrying the triage versions. Throttled per
+        account on a key of its own, so it never holds back the account's Forged report."""
+        if not self._seal_failures_reported.due(f"unverifiable:{USER_KIND}:{user_id}"):
+            return
+        reason = (
+            f"a {USER_KIND} record's integrity seal could not be verified by Vault transit and it was"
+            f" refused (account {scrub_log_argument(user_id)}); check that Vault is healthy and that"
+            " every node holds the audit key's latest version, then retry"
+        )
+        pager = getattr(self._store, "seal_pager", None)
+        if callable(pager):
+            pager().unverifiable(USER_KIND, user_id, reason)
+        _log.warning("%s", reason)
+        detail = {
+            "kind": USER_KIND,
+            "user_id": user_id,
+            "stored_version": exc.stored_version,
+            "probe_version": exc.probe_version,
+        }
+        await write_audit_soft(
+            lambda: self._audit(AUTHORITY_SEAL_UNVERIFIABLE_ACTION, detail=_json(detail)),
+            log=_log,
+            message="the %s audit row for an unverified user record could not be written",
+            args=(AUTHORITY_SEAL_UNVERIFIABLE_ACTION,),
+            errors=audit_write_errors(),
+            defects=AUDIT_WRITE_DEFECTS,
+        )
+
+    def _user_seal_outage(self) -> None:
+        """Page a Vault transit Outage met checking an account's record on an admin read under the
+        shared ``authority-seal-transit`` subject (ADR 0217, *The four answers*), with no audit row:
+        an Outage records no seal failure."""
+        pager = getattr(self._store, "seal_pager", None)
+        if callable(pager):
+            pager().outage(
+                f"a {USER_KIND} record's integrity seal could not be made or checked through Vault"
+                " transit; the read was refused"
+            )
 
     async def identity_for_checked_user(self, user: VerifiedUser) -> Identity:
         """:meth:`identity_for_user_id` for an account the caller already read through

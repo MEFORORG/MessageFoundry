@@ -1681,7 +1681,11 @@ tampering, because the role rows are read apart from the account's row. Where
 after its gate has spent the single-use `admin_user_update` grant, so its 423 and its 404 cost that
 proof, as the console's `POST /ui/users/{user_id}/update` does after its own gate. Where it is
 off, the gate checks the step-up session window instead and spends nothing, so neither answer
-costs a proof.
+costs a proof. On a `vault_transit` store (ADR 0217), a record Vault transit cannot verify is
+answered the same way, a 423 or listed as failed, but reported under
+`integrity.authority_seal_unverifiable` and paged under its own capped subject, on an interval of
+its own. A Vault transit Outage on any account these reads check answers 503 with `Retry-After`,
+lists nothing, pages `authority-seal-transit` and writes no audit row.
 
 #### Audit
 
