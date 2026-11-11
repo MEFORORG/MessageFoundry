@@ -296,8 +296,7 @@ class UserCreateRequest(RequestModel):
     ``RequestModel`` refuses an unknown key, so a caller still sending ``password`` gets 422 rather
     than a credential it believes it chose."""
 
-    #: Refused when blank, white space at either end, holding a control character, or one of the
-    #: audit trail's synthetic actor forms (BACKLOG #5521, ``auth/usernames.py``).
+    #: Refused, 422, by the new-username rule ``auth/usernames.py`` states (BACKLOG #5521).
     username: NewUsername
     display_name: str | None = Field(default=None, max_length=_NAME_MAX)
     #: REQUIRED (BACKLOG #2018, ASVS 6.3.7). It seeds both the profile address and ``notify_email``,

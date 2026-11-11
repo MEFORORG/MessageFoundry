@@ -355,7 +355,7 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
         "`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`",
         "only the first refusal of an account in each report interval",
         "adds no row and no alert",
-        "never as a failing record",
+        "A race is never answered as a failing record",
         "the single-use `admin_user_update` grant, so its 423 and its 404 cost that proof",
     ):
         assert fact in body, fact

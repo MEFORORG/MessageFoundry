@@ -149,7 +149,7 @@ from messagefoundry.auth.tokens import (
 from messagefoundry.auth.tokens import (
     credential_id_hash as _credential_id_hash,  # locals and parameters here use the bare name
 )
-from messagefoundry.auth.usernames import username_refusal
+from messagefoundry.auth.usernames import BLANK_USERNAME_REFUSAL, username_refusal
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.secretprovider import (
     SecretProvider,
@@ -3553,8 +3553,9 @@ _ADMINISTRATOR_EXISTS_REFUSAL: Final = (
     " `admin-unlock` if that administrator is locked out"
 )
 #: The first refusal of both :meth:`AuthService.provision_first_administrator` and its pre-check
-#: :meth:`AuthService.provision_refusal`, so the two answer a blank name alike (BACKLOG #3391).
-_BLANK_USERNAME_REFUSAL: Final = "a username is required and must not be blank"
+#: :meth:`AuthService.provision_refusal`, so the two answer a blank name alike (BACKLOG #3391), and
+#: the new-username rule's, so `POST /users` answers it alike too (BACKLOG #5521).
+_BLANK_USERNAME_REFUSAL: Final = BLANK_USERNAME_REFUSAL
 
 
 def _lookup_keys(user: UserRecord) -> tuple[str | None, ...]:
@@ -17328,9 +17329,9 @@ class AuthService:
         surfaces require an address before they reach this method (``UserCreateRequest.email``).
 
         **``username`` IS CHECKED FIRST (BACKLOG #5521)**, by
-        :func:`~messagefoundry.auth.usernames.username_refusal`: a blank name, white space at either
-        end, a control character, or one of the audit trail's synthetic actor forms raises
-        :class:`InvalidUsername` before any credential is generated or anything is written.
+        :func:`~messagefoundry.auth.usernames.username_refusal`, whose module states the rule: a
+        name it refuses raises :class:`InvalidUsername` before any credential is generated or
+        anything is written.
 
         Raises :class:`UsernameTaken` when a concurrent create took ``username`` after the caller's
         own check (BACKLOG #1808)."""

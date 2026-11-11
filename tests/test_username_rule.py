@@ -64,6 +64,13 @@ REFUSED = [
     "a\u2028b",
     "a\ud800b",
     "\uff53\uff59\uff53\uff54\uff45\uff4d",
+    # Default-ignorable code points outside the control categories: a combining grapheme joiner and
+    # a variation selector that leave "system" reading as "system", and a name of Hangul fillers.
+    "sys\u034ftem",
+    "system\ufe0f",
+    "\u3164",
+    "\uffa0bob",
+    "bob\U000e0100",
 ]
 
 #: The controls: names beside each refused form that the rule must leave alone.
@@ -82,6 +89,8 @@ ACCEPTED = [
     "cli",
     "client",
     "sysadmin",
+    # What the module docstring says the rule admits: a space separator inside the name.
+    "a　b",
 ]
 
 
