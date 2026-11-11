@@ -30,7 +30,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import hashlib  # noqa: F401 - crypto-inventory anchor: XML-DSig digests run via signxml/cryptography
-import logging
+import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -40,8 +40,6 @@ from messagefoundry.parsing.xml.harden import parse_bytes
 
 if TYPE_CHECKING:
     from cryptography.x509 import Certificate
-
-_log = logging.getLogger(__name__)
 
 __all__ = [
     "UNREADABLE_SIGNING_KEY",
@@ -347,14 +345,14 @@ def _coverage_refusal(root: Any, result: Any, location: str) -> str | None:
     return None
 
 
-@functools.cache
 def _anchor_faults() -> tuple[type[Exception], ...]:
     """The exception types :func:`_read_anchor` reports as an anchor that cannot be read.
 
-    pyOpenSSL is optional, so its error joins only when it imports; without it no pin can be a
-    pyOpenSSL object, so nothing can raise that error. Its import can fail with more than
-    :class:`ImportError`, such as an :class:`AttributeError` from a pyOpenSSL that does not match
-    the installed ``cryptography``, so any failure there leaves its error out rather than escaping.
+    pyOpenSSL is optional, and its error joins only when ``OpenSSL.crypto`` is already loaded. It is
+    read from :data:`sys.modules`, never imported, because an import here could fail on a broken
+    install with any exception at all. A pyOpenSSL pin has loaded the module before the read
+    starts. An object that first loads pyOpenSSL inside its own ``to_cryptography()`` and raises
+    that error is not caught, and the error escapes as raised.
     """
     from cryptography.exceptions import UnsupportedAlgorithm
 
@@ -364,17 +362,10 @@ def _anchor_faults() -> tuple[type[Exception], ...]:
         AttributeError,
         UnsupportedAlgorithm,
     )
-    try:
-        from OpenSSL.crypto import Error as openssl_error
-    except ImportError:
-        return faults
-    except Exception as exc:
-        # Logged, with only the type, because a broken install is otherwise invisible.
-        _log.warning(
-            "pyOpenSSL failed to import (%s); its error is not an anchor fault", type(exc).__name__
-        )
-        return faults
-    return (*faults, openssl_error)
+    openssl_error = getattr(sys.modules.get("OpenSSL.crypto"), "Error", None)
+    if isinstance(openssl_error, type) and issubclass(openssl_error, Exception):
+        return (*faults, openssl_error)
+    return faults
 
 
 def _read_anchor(
@@ -399,7 +390,7 @@ def _read_anchor(
     # Looked up outside the try, so a signxml without them is not blamed on the anchor.
     add_pem_header = signxml.util.add_pem_header
     chain_verifier = signxml.util.X509CertChainVerifier
-    # Before the try: an except clause's expression runs only once a fault is in flight, so a
+    # Before the try: an except clause's expression runs only once a fault is in flight, so any
     # failure computing it there would replace that fault and chain onto it.
     faults = _anchor_faults()
     try:
@@ -529,7 +520,10 @@ def verify(
     one, whose key cannot be loaded or whose pyOpenSSL conversion fails, a CA file holding no
     certificate, or a CA path the platform cannot encode or decode; and :class:`OSError` if
     ``ca_pem_file`` cannot be opened or read from, such as a missing file or a ``str`` or ``bytes``
-    path holding a NUL. A fault of another type, such as one a pin's own ``to_cryptography()``
+    path holding a NUL. The read turns a :class:`ValueError`, :class:`TypeError`,
+    :class:`AttributeError`, ``cryptography``'s ``UnsupportedAlgorithm`` and, where pyOpenSSL is
+    loaded when the read starts, its ``OpenSSL.crypto.Error`` into that :class:`ValueError`; a
+    fault of any other type, such as a :class:`RuntimeError` a pin's own ``to_cryptography()``
     raises, escapes as raised. Only reading is checked there: a pin whose key type signxml cannot
     verify with, such as Ed25519, or a CA certificate in the file whose key cannot be loaded, fails
     per document instead, as an ``XmlError`` or an ``InvalidCertificate`` result.
