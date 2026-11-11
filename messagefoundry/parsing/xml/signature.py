@@ -42,7 +42,7 @@ __all__ = [
 class XmlSignatureResult:
     """The outcome of an XML-DSig verification.
 
-    ``verified`` is True iff the signature is valid against the supplied certificate/CA, its key
+    ``verified`` is True only if the signature is valid against the supplied certificate/CA, its key
     clears the strength floor, it covers the document outside the ``ds:Signature`` element as
     exclusive C14N with comments reads it, AND that element holds only ``ds:SignedInfo``,
     ``ds:SignatureValue`` and ``ds:KeyInfo``, with no comment or processing instruction and only the
@@ -338,16 +338,15 @@ def _read_anchor(
 ) -> Any:
     """Fail on an unreadable anchor before signxml's call, whose errors :func:`verify` blames on the
     document. Returns the pinned certificate, or ``None``. Like signxml, it skips ``ca_pem_file``
-    when a certificate is pinned.
+    when a certificate is pinned, and it reads that file through signxml's own loader.
     """
-    # Imported here, not at module top, as in _signing_key_refusal.
-    from cryptography import x509
-
     if x509_cert is not None:
+        # Imported here, not at module top, as in _signing_key_refusal.
+        from cryptography import x509
+
         return x509.load_pem_x509_certificate(signxml.util.add_pem_header(x509_cert))
     if ca_pem_file is not None:
-        with open(ca_pem_file, "rb") as pems:
-            x509.load_pem_x509_certificates(pems.read())
+        signxml.util.X509CertChainVerifier(ca_pem_file=ca_pem_file).store  # noqa: B018 - it loads
     return None
 
 
@@ -376,8 +375,9 @@ def verify(
     example a signed element under a new document element, or a comment the signature excluded.
     Exclusive C14N drops a namespace declaration that no element or attribute name uses, so under
     an exclusive-C14N signer such a declaration is unsigned anywhere in the document, including a
-    prefix only a QName in content, such as an ``xsi:type`` value, resolves through. Inside ``ds:Signature``, no comment or processing
-    instruction is admitted anywhere, and neither is any element, attribute or text that
+    prefix only a QName in content, such as an ``xsi:type`` value, resolves through. Inside
+    ``ds:Signature``, no comment or processing instruction is admitted anywhere, and neither is any
+    element, attribute or text that
     :func:`_signature_holds_unsigned_content` does not admit. Each of those is refused: with
     :data:`UNSIGNED_CONTENT` unless an earlier check refuses it first, such as the key floor, the
     cryptography, or signxml's own schema check, which raises :class:`XmlError` rather than
@@ -426,19 +426,6 @@ def verify(
     root = parse_bytes(document)
     verifier = signxml.XMLVerifier()
     config = _approved_signature_config(signxml)
-    # What signxml and the libraries under it raise on a signature they cannot process, measured on
-    # signxml 5.2.0; several quote the document (BACKLOG #2816, #5372). Caught only around this call.
-    from cryptography.exceptions import UnsupportedAlgorithm
-
-    unprocessable = (
-        signxml.exceptions.SignXMLException,
-        load_lxml().LxmlError,
-        ValueError,
-        TypeError,
-        KeyError,
-        NotImplementedError,
-        UnsupportedAlgorithm,
-    )
     try:
         result = verifier.verify(
             root,
@@ -448,9 +435,14 @@ def verify(
         )
     except signxml.exceptions.InvalidSignature as exc:
         return XmlSignatureResult(verified=False, reason=type(exc).__name__)
-    except unprocessable as exc:
-        # A data error, routed by type name only. Raised after the handler ends, so the library's
-        # exception is on neither __cause__ nor __context__ (BACKLOG #1796).
+    except Exception as exc:  # noqa: BLE001 - the anchor was read above; the rest is the document
+        # Measured on signxml 5.2.0, malformed signature content raises at least nine types from
+        # signxml, lxml, cryptography and builtins, and several quote the document (BACKLOG #2816,
+        # #5372). A list of types would let the next one escape with that text. The anchor is read
+        # before this call and the config is signxml's own default narrowed, so what the call
+        # raises is about the document. The type name is kept, so a library fault still names
+        # itself. Raised after the handler ends, so the exception is on neither __cause__ nor
+        # __context__ (BACKLOG #1796).
         fault = type(exc).__name__
     else:
         refusal = _signing_key_refusal(result) or _coverage_refusal(root, result, config.location)

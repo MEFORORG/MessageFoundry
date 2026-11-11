@@ -1379,13 +1379,12 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.keywrap",
         }
     ),
-    # BACKLOG #5372: verify() parses the caller's anchor, a pinned certificate or a CA file's
-    # certificates, before signxml's call, so an unreadable anchor is not blamed on the document.
+    # BACKLOG #5372: verify() parses a pinned certificate before signxml's call, so an unreadable
+    # anchor is not blamed on the document.
     "messagefoundry/parsing/xml/signature.py": frozenset(
         {
             "key_cert:cryptography.hazmat.primitives.serialization.load_pem_public_key",
             "key_cert:cryptography.x509.load_pem_x509_certificate",
-            "key_cert:cryptography.x509.load_pem_x509_certificates",
             "sign_verify:.verify()",
         }
     ),

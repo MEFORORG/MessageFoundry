@@ -4,8 +4,7 @@
 (vault BACKLOG #2816, #5372).
 
 Before this, malformed content inside ``ds:Signature`` escaped ``verify()`` as whatever signxml,
-lxml or ``cryptography`` raised: ``DocumentInvalid``, ``ValueError``, ``TypeError``, ``KeyError``,
-``NotImplementedError``, ``UnsupportedAlgorithm`` or ``C14NError``. Several of those messages quote
+lxml or ``cryptography`` raised, at least the types named below. Several of those messages quote
 the document, against the module's PHI rule. Each shape below is one an inbound document can carry,
 and each now raises :class:`XmlError` naming only the exception type, with nothing on
 ``__cause__`` or ``__context__``. A coverage comparison that cannot canonicalize the document fails
@@ -169,6 +168,15 @@ def test_a_der_encoded_key_value_signxml_cannot_compare() -> None:
     )
     doc = _after_x509_data(_sign(_BODY), _der_key_value(der))
     _unprocessable(doc, _pinned(), "NotImplementedError")
+
+
+def test_an_empty_x509_certificate_on_the_ca_path(tmp_path: Path) -> None:
+    """signxml decodes the empty element's ``None`` text: ``AttributeError``, before any key."""
+    doc, kwargs = _signed_and_anchor(_key(), "ca_pem_file", tmp_path)
+    doc = _replace(
+        doc, rb"<ds:X509Certificate>[^<]*</ds:X509Certificate>", b"<ds:X509Certificate/>"
+    )
+    _unprocessable(doc, kwargs, "AttributeError")
 
 
 def test_an_x509_certificate_that_is_not_a_certificate_on_the_ca_path(tmp_path: Path) -> None:
