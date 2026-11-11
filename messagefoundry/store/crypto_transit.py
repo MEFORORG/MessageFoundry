@@ -322,7 +322,8 @@ class TransitCipher(_UnmarkedPolicy):
         :func:`_names_no_version_reason` does not read the 400 as Vault's own refusal, for example a
         proxy's page, or when reading it runs out of memory or stack (BACKLOG #6707).
 
-        A 400 whose body hvac fails on raises neither of those (BACKLOG #6707). For example, these
+        A 400 on which hvac raises an exception other than ``InvalidRequest`` raises neither of
+        those (BACKLOG #6707). For example, these
         exact 400 bodies with the Content-Type exactly ``application/json``: ``[]``, ``null``,
         ``{"errors":[{"message":"x"}]}``, ``{"errors":[1]}``, ``{"errors":5}`` and
         ``{"errors":true}``. On each, hvac 2.4.0 raises ``AttributeError`` or ``TypeError`` in

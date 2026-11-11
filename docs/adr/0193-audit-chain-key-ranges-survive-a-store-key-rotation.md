@@ -457,9 +457,10 @@ section 0): this is what the first deployment's first routine rotation would hav
    version answers with a string that does not start with `vault:v<pinned>:`, raises it. An empty
    answer or one naming no version passes too, and a proxy, not Transit, can author the 400
    (corrected 2026-11-11, BACKLOG #6707). The walk records a break at that row, naming the
-   version, and goes on. A 400 whose body hvac fails on raises neither
-   `AuditKeyVersionRefusedError` nor its subclass `AuditKeyVersionUnverifiedError` (BACKLOG
-   #6707). For example, these exact 400 bodies with the Content-Type exactly `application/json`:
+   version, and goes on. A 400 on which hvac raises an exception other than `InvalidRequest`
+   raises neither `AuditKeyVersionRefusedError` nor its subclass `AuditKeyVersionUnverifiedError`
+   (BACKLOG #6707). For example, these exact 400 bodies with the Content-Type exactly
+   `application/json`:
    `[]`, `null`, `{"errors":[{"message":"x"}]}`, `{"errors":[1]}`, `{"errors":5}` and
    `{"errors":true}`. On each, hvac 2.4.0 raises `AttributeError` or `TypeError` in place of
    `InvalidRequest`. A `MemoryError` that hvac raises while it joins a
