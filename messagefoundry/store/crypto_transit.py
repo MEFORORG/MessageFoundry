@@ -119,6 +119,11 @@ _VERSION_REFUSAL_TEXTS = (
 #: and a fixed algorithm, so at least the input-encoding and algorithm 400s are not reachable from
 #: it.
 _NOT_VERSION_TEXTS = frozenset({"missing input for hmac", "encryption key not found"})
+#: The longest reply body, in characters, that :func:`_names_no_version_reason` parses when hvac
+#: parsed none (BACKLOG #6707). Vault's own refusal is far shorter. Without a bound, a very large
+#: body would be parsed whole on the audit walk, and a MemoryError there would turn a row's break
+#: into a walk that could not run. A longer body is not read as a version refusal.
+_REPARSED_BODY_MAX_CHARS = 64 * 1024
 
 
 def _names_no_version_reason(exc: Exception) -> bool:
@@ -132,11 +137,16 @@ def _names_no_version_reason(exc: Exception) -> bool:
     error's text: :class:`~messagefoundry.store.crypto.AuditKeyVersionUnverifiedError` rather than
     its parent.
 
-    hvac fills ``exc.errors`` only when the reply's Content-Type is exactly ``application/json``,
-    so a proxy that adds a charset leaves the same JSON in ``exc.text``; that is read the same way."""
+    When hvac raised ``InvalidRequest`` at all, it fills ``exc.errors`` only when the reply's
+    Content-Type is exactly ``application/json``, so a proxy that adds a charset leaves the same
+    JSON in ``exc.text``; that is read the same way, but only when hvac parsed no JSON
+    (``exc.json`` is None) and the body is at most :data:`_REPARSED_BODY_MAX_CHARS` long. A longer
+    body is True, unparsed."""
     errors: object = getattr(exc, "errors", None)
     body: object = getattr(exc, "text", None)
-    if errors is None and isinstance(body, str):
+    if errors is None and getattr(exc, "json", None) is None and isinstance(body, str):
+        if len(body) > _REPARSED_BODY_MAX_CHARS:
+            return True  # too long to be Vault's own refusal, and never parsed (BACKLOG #6707)
         parsed, refused = json_loads_or_refusal(body)
         if refused is None and isinstance(parsed, dict):
             errors = parsed.get("errors")
@@ -275,10 +285,12 @@ class TransitCipher(_UnmarkedPolicy):
 
         ``key_version`` pins the Transit key version; ``None`` means Transit's latest. A check of a
         stored MAC passes the version that MAC names (BACKLOG #2337), so a key rotation does not make
-        an older row read as forged. A pinned call Transit refuses for its version alone raises
-        :class:`AuditKeyVersionRefusedError` (see :meth:`_refuses_only_version`), or its subclass
-        :class:`AuditKeyVersionUnverifiedError` when :func:`_names_no_version_reason` does not read
-        the 400 as a version refusal (BACKLOG #6707)."""
+        an older row read as forged. A pinned call that gets HTTP 400 while a probe under the
+        latest version answers raises :class:`AuditKeyVersionRefusedError` (see
+        :meth:`_refuses_only_version`); Transit refusing the version is one cause, not the only one.
+        It raises the subclass :class:`AuditKeyVersionUnverifiedError` when
+        :func:`_names_no_version_reason` does not read the 400 as Vault's own refusal, for example a
+        proxy's page, or when the reply is too large to read (BACKLOG #6707)."""
         inp = base64.b64encode(data).decode("ascii")
         kwargs: dict[str, Any] = {
             "name": self._audit_key,
@@ -292,7 +304,14 @@ class TransitCipher(_UnmarkedPolicy):
             mac = response["data"]["hmac"]  # "vault:v1:…" — no key, no plaintext
         except Exception as exc:
             if key_version is not None and self._refuses_only_version(exc, key_version):
-                if _names_no_version_reason(exc):  # the same flow, labelled apart (BACKLOG #6707)
+                # The same flow, labelled apart (BACKLOG #6707). A reply too large to read, such as
+                # a huge errors list, is not read as a refusal: escaping here, the error would make
+                # the walk "could not run" and drop the row's break and its alert.
+                try:
+                    unverified = _names_no_version_reason(exc)
+                except (MemoryError, RecursionError):
+                    unverified = True
+                if unverified:
                     raise AuditKeyVersionUnverifiedError(key_version) from exc
                 raise AuditKeyVersionRefusedError(key_version) from exc
             raise CipherError(
@@ -311,7 +330,8 @@ class TransitCipher(_UnmarkedPolicy):
         raises another class, so none of those reads as a refused version. A 400 can also mean the
         key itself is missing, so a probe under the latest version, over FIXED input, must succeed
         too. Fixed input keeps a row's own content from deciding the answer. The probe must also
-        name a different version, or the refusal was not about the version.
+        answer with a string that does not start ``vault:v<pinned>:``; an empty string or one
+        naming no version passes too.
 
         This infers the cause from the reply; it does not read the key's version range. So a node
         whose copy of the key lags a rotation can refuse a real, newer version and still pass."""

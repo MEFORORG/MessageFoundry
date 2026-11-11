@@ -624,7 +624,9 @@ class UnauthenticatedCipherError(CipherError):
 
 
 class AuditKeyVersionRefusedError(CipherError):
-    """Transit refused an audit MAC pinned to one key version, and still answers under the latest.
+    """An audit MAC pinned to one key version got HTTP 400 read as a refusal of that version, while
+    Transit still answers under the latest. Transit's own refusal is one cause; the subclass
+    :class:`AuditKeyVersionUnverifiedError` covers a 400 whose reply does not read as one.
 
     The pinned version comes from a stored audit hash, which a DML writer can plant (BACKLOG #2337).
     So the refusal is evidence about that ROW, and the chain walk reports a break there. It is never
@@ -646,7 +648,8 @@ class AuditKeyVersionRefusedError(CipherError):
 class AuditKeyVersionUnverifiedError(AuditKeyVersionRefusedError):
     """An audit MAC pinned to one key version got HTTP 400 that
     :func:`~messagefoundry.store.crypto_transit._names_no_version_reason` does not read as a version
-    refusal, while the key still answers under the latest (BACKLOG #6707).
+    refusal, or whose reply is too large to read, while the key still answers under the latest
+    (BACKLOG #6707).
 
     The 400 may still be a refusal of the version: a proxy can replace Vault's reply with its own
     page, and that cannot be told apart from a tamper behind it. So this is a subclass, and a

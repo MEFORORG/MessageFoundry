@@ -622,7 +622,11 @@ def test_a_non_text_entry_in_vault_errors_is_labelled_a_refused_version() -> Non
 
 
 class _ProxiedRotatingTransit(_RotatingTransit):
-    """``_RotatingTransit`` behind a proxy that replaces every 400 reply with its own page."""
+    """``_RotatingTransit`` behind a proxy that replaces every 400 reply with its own: the body
+    ``page`` and, as hvac fills it from JSON, the ``errors`` list."""
+
+    page: str | None = _PROXY_PAGE
+    errors: list[str] | None = None
 
     def generate_hmac(self, **kw: Any) -> dict[str, Any]:
         from hvac.exceptions import InvalidRequest
@@ -630,7 +634,7 @@ class _ProxiedRotatingTransit(_RotatingTransit):
         try:
             return super().generate_hmac(**kw)
         except InvalidRequest:
-            raise InvalidRequest(_PROXY_PAGE, text=_PROXY_PAGE) from None
+            raise InvalidRequest(self.page, errors=self.errors, text=self.page) from None
 
 
 async def test_a_planted_version_behind_a_proxy_is_a_chain_break_on_the_startup_walk(
@@ -669,6 +673,99 @@ async def test_a_planted_genesis_version_behind_a_proxy_opens_and_reads_as_a_bre
     finally:
         await store.close()
     assert not ok and "seq=1," in str(msg), msg
+
+
+def _past_the_reparse_bound(head: str, tail: str) -> str:
+    """``head`` + padding + ``tail``, one character longer than the body the cipher re-parses."""
+    from messagefoundry.store.crypto_transit import _REPARSED_BODY_MAX_CHARS
+
+    return head + " " * (_REPARSED_BODY_MAX_CHARS + 1 - len(head) - len(tail)) + tail
+
+
+def test_an_oversized_vault_shaped_body_is_labelled_unconfirmed_unparsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6707 item 48: a body past the bound is never parsed, so a huge reply cannot raise
+    a MemoryError out of the label. It is labelled unconfirmed, even though it holds Vault's own
+    refusal text."""
+    from messagefoundry.store import crypto_transit
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    def must_not_parse(*_a: Any, **_kw: Any) -> Any:
+        raise AssertionError("an oversized body was parsed")
+
+    monkeypatch.setattr(crypto_transit, "json_loads_or_refusal", must_not_parse)
+    body = _past_the_reparse_bound('{"errors": ["no such key version"], "pad": "', '"}')
+    assert isinstance(
+        _pinned_refusal("vault:v2:AAAA", None, text=body), AuditKeyVersionUnverifiedError
+    )
+
+
+class _PaddedProxiedRotatingTransit(_ProxiedRotatingTransit):
+    """A proxy whose 400 page is padded past the body the cipher re-parses."""
+
+    page = _past_the_reparse_bound(_PROXY_PAGE, "")
+
+
+class _ExplodingText(str):
+    """An ``errors`` entry whose ``strip``, the first step of the cipher's lower-cased copy, fails
+    as copying a huge list would: with MemoryError."""
+
+    __slots__ = ()
+
+    def strip(self, chars: str | None = None) -> str:
+        raise MemoryError
+
+
+class _HugeErrorsRotatingTransit(_ProxiedRotatingTransit):
+    """A 400 carrying a huge Vault ``errors`` list, as hvac fills it, and no body to re-parse."""
+
+    page = None
+    errors = [_ExplodingText("no such key version")] * 20_000
+
+
+@pytest.mark.parametrize(
+    "transit_class",
+    [
+        pytest.param(_PaddedProxiedRotatingTransit, id="oversized-body"),
+        pytest.param(_HugeErrorsRotatingTransit, id="oversized-errors-list"),
+    ],
+)
+async def test_a_reply_too_large_to_read_is_still_a_chain_break_on_the_startup_walk(
+    transit_class: type[_RotatingTransit],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #6707 item 48: a MemoryError while reading the 400 must not escape as a non-cipher
+    error, or the walk logs "could not run" and drops the row's break and its alert. The parser
+    raises MemoryError if it is reached at all, and it must not be reached for a body past the
+    bound; a huge ``errors`` list, which hvac parsed, fails in the lower-cased copy instead."""
+    from messagefoundry.store import crypto_transit
+
+    parsed: list[int] = []
+
+    def out_of_memory(raw: str, **_kw: Any) -> Any:
+        parsed.append(len(raw))
+        raise MemoryError
+
+    monkeypatch.setattr(crypto_transit, "json_loads_or_refusal", out_of_memory)
+    _needs_hvac()
+    _use_fake(monkeypatch, transit_class())
+    db = tmp_path / "oversized-reply.db"
+    seq = await _chain_with_a_planted_version(db)
+    store = await _transit_store(db)
+    try:
+        ok, msg = await store.verify_audit_chain()
+        sink, lines = await _walk_on_start(store, caplog)
+    finally:
+        await store.close()
+    assert not ok and f"seq={seq}," in str(msg), msg
+    assert f"pinned to key version {_UNHELD_VERSION} got HTTP 400" in str(msg), msg
+    assert [name for name, _ in sink.events] == ["audit-chain"], sink.events
+    assert f"seq={seq}," in sink.events[0][1], sink.events
+    assert not any("could not run" in line for line in lines), lines
+    assert parsed == [], parsed  # the bound, not the MemoryError catch, kept the parser away
 
 
 def test_a_refused_key_version_survives_a_pickle_with_its_text() -> None:

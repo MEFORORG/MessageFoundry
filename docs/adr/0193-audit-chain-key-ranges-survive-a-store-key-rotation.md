@@ -450,9 +450,11 @@ section 0): this is what the first deployment's first routine rotation would hav
    The chain walk (`_audit_row_mac`), the genesis-row check at open, and the one-row MAC check
    behind the Transit attestation all go through it. The recompute is compared with the stored
    string in constant time (`hmac.compare_digest`).
-3. **A refused version is a break at that row; an outage is not.** A pinned call that Transit
-   answers with HTTP 400 for that version alone raises `AuditKeyVersionRefusedError`
-   (`TransitCipher._refuses_only_version`). The walk records a break at that row, naming the
+3. **A refused version is a break at that row; an outage is not.** A pinned call that gets HTTP
+   400, while a probe under the latest version answers with a string that does not start with
+   `vault:v<pinned>:`, raises `AuditKeyVersionRefusedError` (`TransitCipher._refuses_only_version`).
+   An empty answer or one naming no version passes too, and a proxy, not Transit, can author the
+   400 (corrected 2026-11-11, BACKLOG #6707). The walk records a break at that row, naming the
    version, and goes on. Any other failure, an unreachable Vault among them, is a `CipherError`:
    the walk could not run, and no tamper alert fires.
 
