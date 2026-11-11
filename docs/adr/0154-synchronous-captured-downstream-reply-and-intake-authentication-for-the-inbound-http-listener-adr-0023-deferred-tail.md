@@ -1769,7 +1769,11 @@ address a listed proxy writes in `X-Forwarded-For`. The warning then also carrie
 `; forwarded_for=<address>`. The peer column of each stays the socket peer.
 
 The recorded value is an address the listener parsed and wrote back out, never the header's own
-text, and still no credential crosses the boundary. The budget is keyed on that address, or on
-its `/64` for IPv6 outside the IPv4-carrying prefixes CONNECTIONS.md names, and the socket peer's
-key follows the same rule. The HTTP listener's
-`trusted_proxies` row in [CONNECTIONS.md](../CONNECTIONS.md) says how the header is read.
+text, and still no credential crosses the boundary. The budget key is not always that address.
+An IPv4 client keys on its address and an IPv6 client on its `/64`, except in the IPv4-carrying
+prefixes CONNECTIONS.md names, where it keys on the IPv4 client the address carries (at least
+under NAT64's well-known prefix, Teredo and 6to4) or on the whole address. A bare IPv6 hop that
+also reads as an address and a port is keyed on each of its readings that CONNECTIONS.md says is
+kept, so one failure may charge a second key beside the recorded address's. The socket peer's key
+follows the same rules. The HTTP listener's `trusted_proxies` row in
+[CONNECTIONS.md](../CONNECTIONS.md) says how the header is read.
