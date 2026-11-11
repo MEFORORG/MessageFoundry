@@ -832,9 +832,9 @@ def test_a_refusal_names_its_fixed_reason(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("location", "reason"),
     [
-        # Opening a directory raises an OSError (PermissionError on Windows, IsADirectoryError on
-        # read elsewhere), and a NUL in the path a ValueError. Both used to fail the build as "a link
-        # out, or a file parse_bytes refuses", neither of which happened.
+        # Reading a directory raises an OSError (PermissionError from the open on Windows; elsewhere
+        # the fstat check refuses it before any read), and a NUL in the path a ValueError. Both used
+        # to fail the build as "a link out, or a file parse_bytes refuses", neither of which happened.
         pytest.param("dir5537.xsd", "a location that cannot be read as a file", id="directory"),
         pytest.param("dir5537%00.xsd", "a location that cannot be read as a file", id="nul-byte"),
         # abspath maps a reserved device name to a device path, which used to read as outside the

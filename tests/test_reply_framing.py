@@ -26,6 +26,7 @@ import io
 import logging
 import pickle
 import socket
+import ssl
 import sys
 import threading
 import unicodedata
@@ -1481,24 +1482,30 @@ def _call_origins(func: ast.expr, bindings: _Bindings) -> set[tuple[str, bool]]:
     return {(f"{root}.{tail}" if tail else root, imported) for root, imported in roots}
 
 
-def _is_stock(origin: str, imported: bool) -> bool:
-    return origin.rpartition(".")[2] in _STOCK_OPENER_CALLS and not (
-        imported and origin in _NOT_STOCK_OPENERS
-    )
+def _is_stock(origin: str, imported: bool, names: frozenset[str] = _STOCK_OPENER_CALLS) -> bool:
+    """Any part of ``origin`` is one of ``names``, and no allow-listed import gave it."""
+    if imported and any(
+        origin == entry or origin.startswith(entry + ".") for entry in _NOT_STOCK_OPENERS
+    ):
+        return False
+    return not names.isdisjoint(origin.split("."))
 
 
 def _stock_calls(tree: ast.AST) -> list[tuple[int, str]]:
-    """``(line, origin)`` for each call whose origin ends in a stock name, and for each class with
-    such a base, whose origin reads ``class Name(base origin)``.
+    """``(line, origin)`` for each call whose origin names a stock name in any part, and for each
+    class with such a base, or with a base named like a class ``_SANCTIONED_STOCK_SITES`` lets
+    stand, whose origin reads ``class Name(base origin)``.
 
     The import decides, not the spelling: ``from http.client import HTTPConnection as C`` then
     ``C(host)`` is a stock call, and starlette's ``HTTPConnection`` under its own name is not. An
-    origin outside urllib and ``http.client`` that ends in a stock name is still an offence unless
+    origin outside urllib and ``http.client`` that names a stock name is still an offence unless
     ``_NOT_STOCK_OPENERS`` names it, because urllib3's connections, for one, read a reply head with
     ``http.client``'s class too. The allow-list clears only an origin an import gave, never a
-    spelling. A base is resolved the way a call's target is, so a subclass of
-    ``urllib.request.OpenerDirector`` is found under any alias or dotted spelling. A class built on
-    that subclass is not reported itself, since the subclass it builds on already is.
+    spelling. Any part counts, so ``urllib.request.OpenerDirector.add_handler(opener, handler)``,
+    which skips a subclass's own ``add_handler``, is an offence too. A base is resolved the way a
+    call's target is, so a subclass of ``urllib.request.OpenerDirector`` is found under any alias
+    or dotted spelling. So is a class built on a sanctioned class, from whatever module, which
+    that sanction's check never sees.
 
     At least these pass unseen: a stock class held in a variable first, as in
     ``C = http.client.HTTPConnection`` then ``C(host)``, which a planted control pins, or
@@ -1508,16 +1515,20 @@ def _stock_calls(tree: ast.AST) -> list[tuple[int, str]]:
     bindings = _bindings(tree)
     found: list[tuple[int, str]] = []
     for node in ast.walk(tree):
+        # A set, so one call or base whose root resolves two ways is reported once per origin.
+        # sorted only so a failure lists them in a stable order.
         if isinstance(node, ast.Call):
-            # sorted only so a failure lists a call's origins in a stable order.
-            for origin, imported in sorted(_call_origins(node.func, bindings)):
-                if _is_stock(origin, imported):
-                    found.append((node.lineno, origin))
+            calls = {o for o, i in _call_origins(node.func, bindings) if _is_stock(o, i)}
+            found.extend((node.lineno, origin) for origin in sorted(calls))
         elif isinstance(node, ast.ClassDef):
-            for base in node.bases:
-                for origin, imported in sorted(_call_origins(base, bindings)):
-                    if _is_stock(origin, imported):
-                        found.append((node.lineno, f"class {node.name}({origin})"))
+            names = _STOCK_OPENER_CALLS | _SANCTIONED_CLASSES
+            bases = {
+                origin
+                for base in node.bases
+                for origin, imported in _call_origins(base, bindings)
+                if _is_stock(origin, imported, names)
+            }
+            found.extend((node.lineno, f"class {node.name}({origin})") for origin in sorted(bases))
     return found
 
 
@@ -1527,16 +1538,31 @@ def _strict_opener_is_strict() -> None:
 
 
 def _strict_connections_read_strictly() -> None:
-    """The strict connections: each one's response_class is StrictHTTPResponse."""
-    from messagefoundry.transports import bounded_read, strict_requests
+    """The strict connections: each one's response_class is StrictHTTPResponse, so each reads a
+    reply head the way build_strict_opener's handlers do."""
+    from messagefoundry.transports import bounded_read
 
-    for connection in (
+    connections: list[type] = [
         bounded_read._StrictHTTPConnection,  # noqa: SLF001
         bounded_read._StrictHTTPSConnection,  # noqa: SLF001
-        strict_requests._StrictHeadHTTPConnection,  # noqa: SLF001
-        strict_requests._StrictHeadHTTPSConnection,  # noqa: SLF001
-    ):
-        assert connection.response_class is StrictHTTPResponse, connection
+    ]
+    try:
+        from messagefoundry.transports import strict_requests
+    except ModuleNotFoundError as exc:
+        # Without the [vault] extra nothing can build its connections, so there is nothing to read.
+        if exc.name not in ("requests", "urllib3"):
+            raise
+    else:
+        pools = strict_requests._narrowed_pool_classes(  # noqa: SLF001
+            ssl.create_default_context, connector="probe", judge_proxy_leg=lambda _c, _h: None
+        )
+        connections += [
+            strict_requests._StrictHeadHTTPConnection,  # noqa: SLF001
+            strict_requests._StrictHeadHTTPSConnection,  # noqa: SLF001
+            pools["https"].ConnectionCls,  # NarrowedHTTPSConnection
+        ]
+    for connection in connections:
+        assert getattr(connection, "response_class", None) is StrictHTTPResponse, connection
 
 
 def _schema_opener_is_confined() -> None:
@@ -1559,7 +1585,8 @@ def _schema_opener_is_confined() -> None:
 
 
 #: ``(module under messagefoundry/, origin as _stock_calls reports it) -> the check it rests on``,
-#: whose docstring says why it may stand. Each must be found exactly once.
+#: whose docstring says why it may stand. Each must be found exactly once, and the scan runs each
+#: check.
 _SANCTIONED_STOCK_SITES: dict[tuple[str, str], Callable[[], None]] = {
     ("transports/bounded_read.py", "urllib.request.build_opener"): _strict_opener_is_strict,
     (
@@ -1579,18 +1606,30 @@ _SANCTIONED_STOCK_SITES: dict[tuple[str, str], Callable[[], None]] = {
         "class _StrictHeadHTTPSConnection(urllib3.connection.HTTPSConnection)",
     ): _strict_connections_read_strictly,
     (
+        "transports/strict_requests.py",
+        "class NarrowedHTTPSConnection(_StrictHeadHTTPSConnection)",
+    ): _strict_connections_read_strictly,
+    (
         "parsing/xml/schema.py",
         "class _ConfinedOpener(urllib.request.OpenerDirector)",
     ): _schema_opener_is_confined,
 }
 
+#: The class each sanctioned ``class Name(...)`` site defines. A base naming one is reported.
+_SANCTIONED_CLASSES = frozenset(
+    origin.removeprefix("class ").partition("(")[0]
+    for _, origin in _SANCTIONED_STOCK_SITES
+    if origin.startswith("class ")
+)
+
 
 def test_no_engine_module_builds_a_stock_opener() -> None:
     """A source scan, because some openers (the SOAP mutual-TLS one, at least) need key material to
-    build. Every urllib opener in the engine must come from build_strict_opener. Calls and class
+    build. Every urllib opener and ``http.client`` connection in the engine must come from
+    build_strict_opener, except the sites ``_SANCTIONED_STOCK_SITES`` names. Calls and class
     bases are found in the syntax tree, so a docstring that names one is neither, and each is judged
-    by where its import says it came from (``_stock_calls``). ``_SANCTIONED_STOCK_SITES`` names the
-    only sites that may stand, and each one's check runs here."""
+    by where its import says it came from (``_stock_calls``). Each sanctioned site's check runs
+    here."""
     for entry in _NOT_STOCK_OPENERS:
         module, _, name = entry.rpartition(".")
         assert hasattr(importlib.import_module(module), name), f"{entry} is not an import origin"
@@ -1605,7 +1644,7 @@ def test_no_engine_module_builds_a_stock_opener() -> None:
         # import still spells the stock name in the import itself. NFKC is how the parser reads
         # an identifier, so a look-alike spelling is not skipped either.
         normalized = unicodedata.normalize("NFKC", text)
-        if not any(name in normalized for name in _STOCK_OPENER_CALLS):
+        if not any(name in normalized for name in _STOCK_OPENER_CALLS | _SANCTIONED_CLASSES):
             continue
         rel = path.relative_to(root).as_posix()
         for lineno, origin in _stock_calls(ast.parse(text)):
@@ -1723,6 +1762,27 @@ def test_no_engine_module_builds_a_stock_opener() -> None:
             id="starlette-base",
         ),
         pytest.param(
+            "from starlette.requests import HTTPConnection\nHTTPConnection.url_for(c, 'n')",
+            False,
+            id="starlette-attribute",
+        ),
+        pytest.param(
+            "import urllib.request\nurllib.request.OpenerDirector.add_handler(o, h)",
+            True,
+            id="unbound-stock-method",
+        ),
+        pytest.param(
+            "from messagefoundry.parsing.xml.schema import _ConfinedOpener as Q\nclass W(Q): pass",
+            True,
+            id="subclass-of-a-sanctioned-class",
+        ),
+        pytest.param(
+            "from messagefoundry.transports import bounded_read as b\n"
+            "class L(b._StrictHTTPSConnection): pass",
+            True,
+            id="subclass-of-a-sanctioned-connection",
+        ),
+        pytest.param(
             "import urllib.request\nclass H(urllib.request.BaseHandler): pass",
             False,
             id="handler-base",
@@ -1753,3 +1813,16 @@ def test_the_stock_opener_guard_judges_the_import_not_the_spelling(
     neighbouring shapes that build no stock opener do not (BACKLOG #3360)."""
     found = _stock_calls(ast.parse(source))
     assert bool(found) is offending, found
+
+
+def test_a_site_whose_root_resolves_two_ways_is_reported_once() -> None:
+    """The exactly-once count on a sanctioned site would otherwise read a shadowed root, such as a
+    parameter named ``urllib``, as a second site."""
+    source = (
+        "import urllib.request\nclass O(urllib.request.OpenerDirector): pass\n"
+        "def f(urllib):\n    urllib.request.urlopen('u')\n"
+    )
+    assert _stock_calls(ast.parse(source)) == [
+        (2, "class O(urllib.request.OpenerDirector)"),
+        (4, "urllib.request.urlopen"),
+    ]

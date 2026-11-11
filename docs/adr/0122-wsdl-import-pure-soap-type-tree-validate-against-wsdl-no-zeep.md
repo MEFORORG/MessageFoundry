@@ -199,7 +199,9 @@ Two statements above were false in the shipped code, and both are corrected here
   as named, a link at that name included, and checked by `parse_bytes`; it is handed to `xmlschema`
   as a file URL, so an include that includes it back is recognised rather than loaded twice. A
   location that holds a newline or opens with `<`, which `xmlschema` would parse as an inline
-  document past the opener, is refused in every schema document read. A location the opener
+  document past the opener, is refused in an inline schema, in the file the caller names, and in
+  each file read under the confinement root; the bundled schemas are read as they are, unchecked
+  for it. A location the opener
   refuses, at least a file under the root that declares a DOCTYPE or is malformed, a link the walk
   refuses (out of the root, to a UNC or device path, or through more than 32 links), a location
   that cannot be read as a file, such as a directory or a file the process may not read, under the

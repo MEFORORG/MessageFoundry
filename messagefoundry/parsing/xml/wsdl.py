@@ -247,7 +247,7 @@ def _locator(location: str) -> str:
     if not text:
         return "an empty location"
     slashed = text.replace("\\", "/")
-    if slashed.lower().startswith("//?/unc/"):
+    if slashed.lower().startswith(("//?/unc/", "//./unc/")):
         return "a network path"
     if slashed.startswith("//?/") and slashed[5:6] == ":" and slashed[4:5].isalpha():
         return "a local path"

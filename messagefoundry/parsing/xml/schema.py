@@ -51,8 +51,9 @@ class XmlSchemaResult:
     reasons: tuple[str, ...] = ()
 
 
-#: Byte-order marks a bytes schema document may open with. No filesystem path starts with one, so a
-#: bytes source carrying one is the XSD itself (BACKLOG #5537).
+#: Byte-order marks a bytes schema document may open with. A bytes source opening with one is taken
+#: for the XSD itself, never a path, so a file whose name opens with those bytes cannot be named as
+#: bytes (BACKLOG #5537).
 _BOMS = (
     codecs.BOM_UTF8,
     codecs.BOM_UTF16_LE,
@@ -124,8 +125,8 @@ def _native(path: str) -> str:
 
 
 #: The reparse-tag bit Windows sets on every tag that names another path: a symlink, a junction (which
-#: ``S_ISLNK`` does not report) and others. The same bit ``pipeline/dr_backup.py`` reads; ``parsing/``
-#: may not import it from there.
+#: ``S_ISLNK`` does not report) and others. The same bit ``transports/file.py`` defines and
+#: ``pipeline/dr_backup.py`` imports from it; ``parsing/`` may import neither.
 _NAME_SURROGATE = 0x20000000
 _MAX_LINKS = 32
 _MAX_PATH = 248  # CreateDirectory's limit, below MAX_PATH's 260, so a directory is covered too
