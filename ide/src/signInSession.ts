@@ -45,8 +45,11 @@ export interface TokenCache {
 }
 
 /** How long the sign-in request may go silent, in ms. It runs the engine's password hash and its
- *  per-account queue, so it gets far more than a status read. */
-export const SIGN_IN_TIMEOUT_MS = 30_000;
+ *  per-account queue, so it gets far more than a status read, and outlasts the engine's default
+ *  request deadline (vault BACKLOG #2950). Matches the Python client's `SIGN_IN_TIMEOUT_SECONDS`
+ *  (`messagefoundry/apiclient/client.py`, which says why); `tests/test_apiclient_sign_in_timeout.py`
+ *  pins both. */
+export const SIGN_IN_TIMEOUT_MS = 130_000;
 
 /** The longest any wait here lasts, in ms: past the request timeout, so a waiter outlasts the attempt. */
 export const SIGN_IN_WAIT_MS = SIGN_IN_TIMEOUT_MS + 5_000;

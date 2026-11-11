@@ -144,13 +144,15 @@ _HTTP_PENDING_APPROVAL = 202
 #: under the account's re-proof lock, and ``verify_mfa`` also under its credential lock), and
 #: ``change_password``, whose current-password proof runs under the re-proof lock. Matches
 #: the IDE's ``SIGN_IN_TIMEOUT_MS`` (``ide/src/signInSession.ts``). The lock itself takes no
-#: timeout (``keyed_lock.hold_keyed_lock``), but the engine's request deadline,
-#: ``api.request_timeout.DEFAULT_REQUEST_TIMEOUT_SECONDS`` (120 s), cancels a handler still
-#: waiting on it and answers 503. This value is SHORTER than that deadline, so a queue between 30
-#: and 120 s still outlasts the client while the engine goes on to finish: it makes a lost reply
-#: rarer than the 5 s default did, and does not rule one out. It is a floor on the read phase only
+#: timeout (``keyed_lock.hold_keyed_lock``), but the engine's default request deadline,
+#: ``api.request_timeout.DEFAULT_REQUEST_TIMEOUT_SECONDS``, cancels a handler still waiting on it
+#: and answers 503. This value is LONGER than that deadline, so at the default the engine answers,
+#: with its reply or its 503, before this client gives up on the read: a queue can no longer
+#: outlast the client while the engine goes on to finish. A lost reply is still possible, from the
+#: transport itself or from an engine whose deadline was raised past this value. The order is
+#: pinned by ``tests/test_apiclient_sign_in_timeout.py``. It is a floor on the read phase only
 #: (:meth:`EngineClient._sign_in_timeout`); every other request keeps the client's timeout.
-SIGN_IN_TIMEOUT_SECONDS = 30.0
+SIGN_IN_TIMEOUT_SECONDS = 130.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1238,7 +1240,11 @@ class EngineClient:
 
         ``enrolment_code`` is the single-use issued enrolment code (ADR 0207), which a
         directory account's first factor needs on a session its identity provider did not stamp.
-        It is sent only when given."""
+        It is sent only when given.
+
+        Refused before anything is sent on a cleartext non-loopback hop, like :meth:`verify_mfa`:
+        the body carries a second factor whether or not a token is held."""
+        self._refuse_credential_on_cleartext("a second factor")
         body: dict[str, str] = {"code": code}
         if enrolment_code is not None:
             body["enrolment_code"] = enrolment_code
@@ -1755,9 +1761,8 @@ class EngineClient:
           with a 401 until the caller signs in again. A timeout is the likely way in: a sign-in
           waiting in the engine's per-account queue can outlast the client, while the engine goes
           on to finish it. This request therefore waits at least :data:`SIGN_IN_TIMEOUT_SECONDS`
-          (30 s) for its reply rather than the client's 5 s default (vault BACKLOG #2950). That
-          makes a lost reply rarer, not impossible: the engine's own request deadline is longer,
-          so a queue between the two still outlasts it. Before, the old token stayed live in that case. The new session nobody holds stays valid
+          for its reply rather than the client's 5 s default (vault BACKLOG #2950; that constant
+          says why a lost reply is rarer and still possible). Before, the old token stayed live in that case. The new session nobody holds stays valid
           until it idles out or expires, as it did before. This is the accepted price of ending the
           old session ahead of the cap. It is not harmless.
 
@@ -1837,10 +1842,11 @@ class EngineClient:
 
         **A lost reply leaves the outcome unknown.** The current-password proof queues behind the
         account's re-proof lock, so this request waits at least the sign-in's read (vault BACKLOG
-        #2950, :data:`SIGN_IN_TIMEOUT_SECONDS`). A queue longer than that, and shorter than the
-        engine's request deadline, still outlasts it: the engine may finish the change and end the
-        session while this raises :class:`ApiError` before the token is dropped. The held token is
-        then refused with a 401, and the new password, not the old one, is the one that signs in.
+        #2950, :data:`SIGN_IN_TIMEOUT_SECONDS`). A reply that is still lost leaves the engine free to finish the change
+        and end the session while this raises :class:`ApiError` before the token is dropped. The
+        held token is then refused with a 401, and the new password, not the old one, is the one
+        that signs in. This method does not clear the token on that error, because the change may
+        not have landed, and clearing would then strand a live session nobody holds.
 
         Refused before anything is sent on a cleartext non-loopback hop, like :meth:`login`: the
         body carries two passwords whether or not a token is held."""

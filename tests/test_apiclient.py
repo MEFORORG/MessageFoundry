@@ -567,15 +567,18 @@ def test_the_plaintext_escape_still_permits_an_unauthenticated_remote_read() -> 
         (lambda c: c.login("alice", "hunter2"), "a password"),
         (lambda c: c.reauth("hunter2"), "a password"),
         (lambda c: c.verify_mfa("123456"), "a second factor"),
+        (lambda c: c.confirm_mfa("123456"), "a second factor"),
+        (lambda c: c.change_password("hunter2", "hunter3"), "a password"),
     ],
-    ids=["set_token", "login", "reauth", "verify_mfa"],
+    ids=["set_token", "login", "reauth", "verify_mfa", "confirm_mfa", "change_password"],
 )
 def test_the_plaintext_escape_refuses_every_credential(
     call: Callable[[EngineClient], object], what: str
 ) -> None:
-    """Each of the four entry points that attaches or proves a credential must refuse, and the
+    """Each entry point that attaches or proves a credential must refuse, and the
     refusal must reach the transport seam ZERO times -- a credential that goes out and is then
-    reported as refused has already crossed the wire.
+    reported as refused has already crossed the wire. No token is held, so ``_request`` has no
+    bearer to refuse: for every call but ``set_token`` only the entry-point refusal stops the body.
 
     Mutation: drop any one ``_refuse_credential_on_cleartext`` call. Red: that parametrization
     records a request on a hop the message says carries none."""
