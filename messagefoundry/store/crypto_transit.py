@@ -146,7 +146,14 @@ def _names_no_version_reason(exc: Exception) -> bool:
     body: object = getattr(exc, "text", None)
     if errors is None and getattr(exc, "json", None) is None and isinstance(body, str):
         if len(body) > _REPARSED_BODY_MAX_CHARS:
-            return True  # too long to be Vault's own refusal, and never parsed (BACKLOG #6707)
+            # Too long to be Vault's own refusal, and never parsed (BACKLOG #6707).
+            log.warning(
+                "a pinned audit MAC got a 400 whose %d-character body is past the %d-character "
+                "bound; not read as a version refusal",
+                len(body),
+                _REPARSED_BODY_MAX_CHARS,
+            )
+            return True
         parsed, refused = json_loads_or_refusal(body)
         if refused is None and isinstance(parsed, dict):
             errors = parsed.get("errors")
@@ -286,7 +293,8 @@ class TransitCipher(_UnmarkedPolicy):
         ``key_version`` pins the Transit key version; ``None`` means Transit's latest. A check of a
         stored MAC passes the version that MAC names (BACKLOG #2337), so a key rotation does not make
         an older row read as forged. A pinned call that gets HTTP 400 while a probe under the
-        latest version answers raises :class:`AuditKeyVersionRefusedError` (see
+        latest version answers with a string that does not start ``vault:v<pinned>:`` raises
+        :class:`AuditKeyVersionRefusedError` (see
         :meth:`_refuses_only_version`); Transit refusing the version is one cause, not the only one.
         It raises the subclass :class:`AuditKeyVersionUnverifiedError` when
         :func:`_names_no_version_reason` does not read the 400 as Vault's own refusal, for example a
@@ -308,17 +316,19 @@ class TransitCipher(_UnmarkedPolicy):
                 # stack while it is read, such as a huge errors list, is not read as a refusal:
                 # escaping here, the error would make the walk "could not run" and drop the row's
                 # break and its alert.
+                unreadable: str | None = None
                 try:
                     unverified = _names_no_version_reason(exc)
                 except (MemoryError, RecursionError) as read_exc:
+                    unverified, unreadable = True, type(read_exc).__name__
+                if unreadable is not None:  # logged once the handler has freed what it held
                     log.warning(
-                        "could not read Transit's 400 for audit key version %d (%s); labelled "
+                        "could not read the 400 for audit key version %d (%s); labelled "
                         "unconfirmed (key=%r)",
                         key_version,
-                        type(read_exc).__name__,
+                        unreadable,
                         self._audit_key,
                     )
-                    unverified = True
                 if unverified:
                     raise AuditKeyVersionUnverifiedError(key_version) from exc
                 raise AuditKeyVersionRefusedError(key_version) from exc

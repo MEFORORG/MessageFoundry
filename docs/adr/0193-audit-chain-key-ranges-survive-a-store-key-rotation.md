@@ -486,7 +486,8 @@ named Transit's verify call as the fix for this limit; it is not built. Until it
 the audit key's `min_encryption_version` above the oldest version a stored row names: every older
 row would then read as a break in `audit-verify`, and in the startup walk where it is on.
 
-`_refuses_only_version` infers a refused version from Transit's reply; it does not read the key's
+`_refuses_only_version` infers a refused version from the reply, which a proxy can author (item
+3); it does not read the key's
 version range. So a node whose copy of the key lags a rotation can refuse a real, newer version, and
 that row reads as a break too.
 
