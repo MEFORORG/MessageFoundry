@@ -344,8 +344,12 @@ def test_a_real_pyopenssl_pin_that_cannot_convert_is_an_anchor_fault() -> None:
 
 def _drop_every_openssl_module(monkeypatch: pytest.MonkeyPatch) -> None:
     """Remove ``OpenSSL`` and every ``OpenSSL.*`` entry from :data:`sys.modules` for the test, so no
-    pyOpenSSL module is loaded; monkeypatch puts them back afterwards."""
-    for name in [n for n in sys.modules if n == "OpenSSL" or n.startswith("OpenSSL.")]:
+    pyOpenSSL module is loaded. Afterwards monkeypatch puts back what was there and removes the
+    ``OpenSSL`` and ``OpenSSL.crypto`` entries a test's stub import adds, so no stub leaks."""
+    names = {"OpenSSL", "OpenSSL.crypto", *(n for n in sys.modules if n.startswith("OpenSSL."))}
+    for name in names:
+        # setitem first records the entry, or its absence, so undoing it also drops an added one.
+        monkeypatch.setitem(sys.modules, name, ModuleType(name))
         monkeypatch.delitem(sys.modules, name)
 
 
@@ -394,6 +398,24 @@ def test_an_error_named_like_pyopenssls_elsewhere_is_not_an_anchor_fault() -> No
             raise error(_PLANTED)
 
     with pytest.raises(error):
+        verify(_sign(_BODY), x509_cert=_Pin())  # type: ignore[arg-type]
+
+
+def test_a_fault_is_classified_by_its_type_not_its_class_attribute() -> None:
+    """An exception whose ``__class__`` claims a fault type is classified by its real type, as an
+    except clause would, so a :class:`RuntimeError` posing as a :class:`ValueError` escapes."""
+
+    class _Posing(RuntimeError):
+        @property  # type: ignore[misc]
+        def __class__(self) -> type:
+            return ValueError
+
+    class _Pin:
+        def to_cryptography(self) -> object:
+            raise _Posing(_PLANTED)
+
+    assert isinstance(_Posing(), ValueError), "the stand-in no longer poses"
+    with pytest.raises(_Posing):
         verify(_sign(_BODY), x509_cert=_Pin())  # type: ignore[arg-type]
 
 
@@ -459,13 +481,14 @@ class _FailingLoader(importlib.abc.Loader):
         raise RuntimeError("stub lazy pyOpenSSL")
 
 
-@pytest.mark.parametrize("anchor", ["valid", "unreadable"])
+@pytest.mark.parametrize("anchor", ["valid", "unreadable", "missing CA file"])
 def test_a_lazy_pyopenssl_entry_that_fails_on_access_does_not_break_the_read(
-    anchor: str, monkeypatch: pytest.MonkeyPatch
+    anchor: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An ``OpenSSL.crypto`` entry in :data:`sys.modules` made by :class:`importlib.util.LazyLoader`
     runs pyOpenSSL on its first attribute access. The read must not touch it, so a valid pin still
-    verifies and an unreadable one is still the anchor ``ValueError``."""
+    verifies, an unreadable one is still the anchor ``ValueError``, and a missing CA file, whose
+    fault reaches the by-name check, is still the documented :class:`OSError`."""
     spec = importlib.util.spec_from_loader(
         "OpenSSL.crypto", importlib.util.LazyLoader(_FailingLoader())
     )
@@ -475,6 +498,10 @@ def test_a_lazy_pyopenssl_entry_that_fails_on_access_does_not_break_the_read(
     monkeypatch.setitem(sys.modules, "OpenSSL.crypto", lazy)
     if anchor == "valid":
         assert verify(_sign(_BODY), x509_cert=_cert_pem()).verified
+    elif anchor == "missing CA file":
+        with pytest.raises(FileNotFoundError) as missing:
+            verify(_sign(_BODY), ca_pem_file=str(tmp_path / "missing.pem"))
+        assert_chain_severed(missing.value)
     else:
         with pytest.raises(ValueError) as caught:
             verify(_sign(_BODY), x509_cert=b"not a certificate")
@@ -486,11 +513,15 @@ def test_a_lazy_pyopenssl_entry_that_fails_on_access_does_not_break_the_read(
 
 
 def test_the_docstring_names_every_fault_the_read_turns() -> None:
-    """``verify()``'s docstring names every fault type the anchor read turns into its
-    ``ValueError``, read from the tuple the read itself uses."""
-    doc = verify.__doc__ or ""
-    for fault in sigmod._anchor_fault_types():
-        assert fault.__name__ in doc, fault
+    """The sentence in ``verify()``'s docstring that lists the faults the anchor read turns into its
+    ``ValueError`` names every type in the tuple the read uses, and pyOpenSSL's error."""
+    doc = " ".join((verify.__doc__ or "").split())
+    listed = re.search(r"The read turns (.*?) into that :class:`ValueError`", doc)
+    assert listed is not None, "the docstring no longer carries the list"
+    for name in [f.__name__ for f in sigmod._anchor_fault_types()] + ["OpenSSL.crypto.Error"]:
+        assert name in listed.group(1), name
+    # Negative control: a type the read lets escape is not in the span.
+    assert "RuntimeError" not in listed.group(1)
 
 
 def test_a_pin_of_no_readable_type_is_an_anchor_fault() -> None:

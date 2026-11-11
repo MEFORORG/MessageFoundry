@@ -359,7 +359,8 @@ def _is_anchor_fault(exc: Exception, fault_types: tuple[type[Exception], ...]) -
     would replace the fault in flight and chain onto it. pyOpenSSL's error is matched on its class
     and its bases by name; :func:`verify` states what that admits.
     """
-    if isinstance(exc, fault_types):
+    # The type itself, as an except clause matches, not exc.__class__, which an object can redefine.
+    if issubclass(type(exc), fault_types):
         return True
     for klass in type(exc).__mro__:
         # The class's own entry, not the attribute, which a base or a metaclass could supply.
@@ -415,11 +416,12 @@ def _read_anchor(
             isinstance(ca_pem_file, bytes) and b"\0" in ca_pem_file
         ):
             # open() refuses such a path with ValueError, which would read as a file that does not
-            # parse. No file has that path, so it is one that cannot be opened. OSError is not one
-            # of the faults caught below, so it is raised as is.
+            # parse. No file has that path, so it is one that cannot be opened. _is_anchor_fault
+            # does not admit OSError, so it is re-raised as is.
             raise OSError("ca_pem_file cannot be opened: the path holds a NUL")
         return None, chain_verifier(ca_pem_file=ca_pem_file).store
     except Exception as exc:
+        # Broad, then narrowed: pyOpenSSL's error is matched by name, which no except clause can do.
         if not _is_anchor_fault(exc, fault_types):
             raise
         fault = f"{name} cannot be read: {type(exc).__name__}"
@@ -530,10 +532,11 @@ def verify(
     :class:`AttributeError`, ``cryptography``'s ``UnsupportedAlgorithm`` and pyOpenSSL's
     ``OpenSSL.crypto.Error`` into that :class:`ValueError`; a fault of any other type, such as a
     :class:`RuntimeError` a pin's own ``to_cryptography()`` raises, escapes as raised. pyOpenSSL's
-    error is recognised by name, never by importing pyOpenSSL, so the read neither needs it nor
-    runs it: any exception whose class, or a base of it, is named ``Error`` and defined in a module
-    whose name starts with ``OpenSSL.`` counts, including one from a module of that name that is
-    not pyOpenSSL. Only reading is checked there: a pin whose key type signxml cannot
+    error is recognised by name, so classifying a fault never imports pyOpenSSL or runs any of it;
+    a pyOpenSSL pin's own ``to_cryptography()`` still runs it. Any exception whose class, or a base
+    of it, has the qualified name ``Error`` and is defined in a module whose name starts with
+    ``OpenSSL.`` counts, including ``OpenSSL.SSL.Error`` and its subclasses and one from a module
+    of that name that is not pyOpenSSL. Only reading is checked there: a pin whose key type signxml cannot
     verify with, such as Ed25519, or a CA certificate in the file whose key cannot be loaded, fails
     per document instead, as an ``XmlError`` or an ``InvalidCertificate`` result.
     Raises :class:`~messagefoundry.parsing.xml.errors.XmlError` if signxml or a library
