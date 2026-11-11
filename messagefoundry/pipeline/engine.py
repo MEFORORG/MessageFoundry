@@ -3313,9 +3313,11 @@ class Engine:
         load read it, the managed app's start parsed its values from those bytes
         (:meth:`apply_start_env_values`), so the digest names the value-file bytes the start
         applied; one the load could not read is left out, and the folder's other files are folded
-        and not parsed. A value file anywhere but that folder is in no start digest, even one
-        inside the config directory under another ``[environments].dir``. The directory is read
-        for the advisory VCS head alone.
+        and not parsed. A value file anywhere but that folder is parsed as values from no start
+        snapshot, even one inside the config directory under another ``[environments].dir``, so the
+        digest does not name it as the values the start applied; at least one in ``codesets/`` can
+        still be loaded and folded, as a code-set table. The directory is read for the advisory VCS
+        head alone.
 
         A running graph that carries no snapshot gets none of that: the digest is of the directory
         as it is now, so any covered file can be left out and a later edit can reach it. A digest
@@ -3339,10 +3341,11 @@ class Engine:
         what the start's ``config_loaded`` digest folds (:meth:`capture_start_provenance`), so those
         bytes replace that read: an edit between the build and the load is then both applied and
         named. A value file anywhere but that folder, one inside the config directory under another
-        ``[environments].dir`` included, is in no start snapshot and no published digest, so the
-        values read at the build stand. So do they where the load's snapshot could not read the
-        value file, as under an antivirus lock: the digest then leaves the file out, or the folder
-        holding it, and names it as such. A no-op with no snapshot or no
+        ``[environments].dir`` included, is parsed as values from no start snapshot, so the values
+        read at the build stand; at least one in ``codesets/`` can still be loaded and folded, as a
+        code-set table. So do they where the load's snapshot could not read the value file, as
+        under an antivirus lock: the digest then leaves the file out, or the folder holding it, and
+        names it as such. A no-op with no snapshot or no
         :class:`~messagefoundry.config.environments.SnapshotEnvValuesProvider`; another provider's
         values stay the build's, a limit docs/SECURITY.md records.
 

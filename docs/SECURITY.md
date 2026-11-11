@@ -2914,10 +2914,11 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   at release unless the edit is reverted, and then it can be released;
 - in a cluster, the release compares the digest with the disk of the node that handles the approve,
   which may not be the node that took it;
-- a value file anywhere but the config directory's `environments/` folder is parsed from no start
-  snapshot, one inside the config directory under another `[environments].dir` included, so no start
-  digest names it as the values the start applied; one in `codesets/` can still be folded, as a
-  code-set table. With `serve`'s value provider, a value file in the `environments/` folder is
+- a value file anywhere but the config directory's `environments/` folder is parsed as values from
+  no start snapshot, one inside the config directory under another `[environments].dir` included, so
+  no start digest names it as the values the start applied; at least one in `codesets/` can still be
+  loaded and folded, as a code-set table. With `serve`'s value provider, a value file in the
+  `environments/` folder is
   parsed from the load's snapshot, the one the start's `config_loaded` digest folds, so that digest
   names the value-file bytes the start applied (vault BACKLOG #2596). The digest folds every `.toml`
   file the load could list and read in that folder, so it also names bytes the start never parsed:
