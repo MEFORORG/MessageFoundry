@@ -30,6 +30,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import hashlib  # noqa: F401 - crypto-inventory anchor: XML-DSig digests run via signxml/cryptography
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -39,6 +40,8 @@ from messagefoundry.parsing.xml.harden import parse_bytes
 
 if TYPE_CHECKING:
     from cryptography.x509 import Certificate
+
+_log = logging.getLogger(__name__)
 
 __all__ = [
     "UNREADABLE_SIGNING_KEY",
@@ -349,7 +352,9 @@ def _anchor_faults() -> tuple[type[Exception], ...]:
     """The exception types :func:`_read_anchor` reports as an anchor that cannot be read.
 
     pyOpenSSL is optional, so its error joins only when it imports; without it no pin can be a
-    pyOpenSSL object, so nothing can raise that error.
+    pyOpenSSL object, so nothing can raise that error. Its import can fail with more than
+    :class:`ImportError`, such as an :class:`AttributeError` from a pyOpenSSL that does not match
+    the installed ``cryptography``, so any failure there leaves its error out rather than escaping.
     """
     from cryptography.exceptions import UnsupportedAlgorithm
 
@@ -362,6 +367,12 @@ def _anchor_faults() -> tuple[type[Exception], ...]:
     try:
         from OpenSSL.crypto import Error as openssl_error
     except ImportError:
+        return faults
+    except Exception as exc:
+        # Logged, with only the type, because a broken install is otherwise invisible.
+        _log.warning(
+            "pyOpenSSL failed to import (%s); its error is not an anchor fault", type(exc).__name__
+        )
         return faults
     return (*faults, openssl_error)
 
@@ -388,6 +399,9 @@ def _read_anchor(
     # Looked up outside the try, so a signxml without them is not blamed on the anchor.
     add_pem_header = signxml.util.add_pem_header
     chain_verifier = signxml.util.X509CertChainVerifier
+    # Before the try: an except clause's expression runs only once a fault is in flight, so a
+    # failure computing it there would replace that fault and chain onto it.
+    faults = _anchor_faults()
     try:
         if x509_cert is not None:
             cert: Any = x509_cert
@@ -410,7 +424,7 @@ def _read_anchor(
             # of the faults caught below, so it is raised as is.
             raise OSError("ca_pem_file cannot be opened: the path holds a NUL")
         return None, chain_verifier(ca_pem_file=ca_pem_file).store
-    except _anchor_faults() as exc:
+    except faults as exc:
         fault = f"{name} cannot be read: {type(exc).__name__}"
     raise ValueError(fault)
 

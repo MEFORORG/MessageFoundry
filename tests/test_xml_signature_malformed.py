@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import base64
 import re
+import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -321,6 +323,51 @@ def test_a_ca_path_holding_a_nul_is_one_that_cannot_be_opened(nul_path: str | by
     not parse; ``verify()`` documents a CA file that cannot be opened as :class:`OSError`."""
     with pytest.raises(OSError, match="cannot be opened") as caught:
         verify(_sign(_BODY), ca_pem_file=nul_path)
+    assert_chain_severed(caught.value)
+
+
+@pytest.fixture
+def _pyopenssl_import_raises_attribute_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """A stub ``OpenSSL`` package whose import raises :class:`AttributeError`, as a pyOpenSSL that
+    does not match the installed ``cryptography`` can. The anchor-fault set is rebuilt against it,
+    and rebuilt again afterwards against the real one."""
+    package = tmp_path / "stub" / "OpenSSL"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("raise AttributeError('stub pyOpenSSL')\n")
+    monkeypatch.syspath_prepend(str(package.parent))
+    for name in ("OpenSSL", "OpenSSL.crypto"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    sigmod._anchor_faults.cache_clear()
+    yield
+    sigmod._anchor_faults.cache_clear()
+
+
+@pytest.mark.usefixtures("_pyopenssl_import_raises_attribute_error")
+def test_a_failing_pyopenssl_import_neither_replaces_nor_chains_onto_an_anchor_fault(
+    tmp_path: Path,
+) -> None:
+    """A missing CA file still raises the documented :class:`OSError`, with nothing chained, when
+    pyOpenSSL's import fails with something other than :class:`ImportError`. The import ran inside
+    the ``except`` clause's expression, after the fault was raised, so its error replaced the fault
+    and carried it on ``__context__``."""
+    with pytest.raises(OSError) as caught:
+        verify(_sign(_BODY), ca_pem_file=str(tmp_path / "missing.pem"))
+    assert isinstance(caught.value, FileNotFoundError)
+    assert_chain_severed(caught.value)
+
+
+@pytest.mark.usefixtures("_pyopenssl_import_raises_attribute_error")
+def test_a_failing_pyopenssl_import_still_reports_an_unreadable_ca_file(tmp_path: Path) -> None:
+    """The faults that do not need pyOpenSSL are still refused as the anchor ``ValueError``. This
+    failed too before the fix, because every caught fault ran the import."""
+    doc, kwargs = _signed_and_anchor(_key(), "ca_pem_file", tmp_path)
+    Path(kwargs["ca_pem_file"]).write_bytes(b"not a certificate")
+    with pytest.raises(ValueError) as caught:
+        verify(doc, **kwargs)
+    assert not isinstance(caught.value, XmlError)
+    assert str(caught.value).startswith("ca_pem_file cannot be read: ")
     assert_chain_severed(caught.value)
 
 
