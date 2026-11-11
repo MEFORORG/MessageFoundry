@@ -92,7 +92,9 @@ def test_rotate_key_refuses_vault_transit_mode_before_vault_or_the_store(
     # The refusal names the Vault settings that retire a version itself, rather than pointing at a
     # document to name them (the PR 2823 hold, F1).
     assert "data key's min_decryption_version" in captured.err, captured.err
-    assert "audit key's min_encryption_version" in captured.err, captured.err
+    assert "audit key's min_decryption_version" in captured.err, captured.err
+    # BACKLOG #2720: the audit walk verifies, so min_encryption_version is not a floor it reads.
+    assert "min_encryption_version" not in captured.err, captured.err
     assert "MEFOR_STORE_TRANSIT_AUDIT_KEY names another" in captured.err, captured.err
     assert "Trimming a version" in captured.err, captured.err
     assert "cannot be undone" in captured.err, captured.err

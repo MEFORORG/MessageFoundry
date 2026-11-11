@@ -503,6 +503,49 @@ async def test_a_malformed_stored_mac_is_a_break_with_no_verify_call(
     assert len(transit.verified) == rows - 1, transit.verified  # every row but the malformed one
 
 
+async def test_a_non_text_row_hash_still_costs_one_round_trip(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """SQLite keeps a BLOB in the TEXT column. It is a break, and it costs the same one round trip
+    a malformed MAC does."""
+    transit = _RotatingTransit()
+    _use_fake(monkeypatch, transit)
+    db = tmp_path / "blob.db"
+    seq = (await _mixed_chain(transit, db))["test.v1"]
+    _dml(db, "UPDATE audit_log SET row_hash = X'00' WHERE seq = ?", (seq,))
+    store = await _transit_store(db)
+    transit.pinned.clear()
+    try:
+        ok, msg = await store.verify_audit_chain()
+    finally:
+        await store.close()
+    assert not ok and f"seq={seq}," in str(msg), msg
+    assert transit.pinned == [None], transit.pinned
+
+
+async def test_a_failed_cost_call_beside_a_malformed_mac_is_still_a_break(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The round trip a malformed MAC costs carries no verdict, so its failure must not turn the
+    row's break into a walk that could not run."""
+    transit = _RotatingTransit()
+    _use_fake(monkeypatch, transit)
+    db = tmp_path / "cost-fails.db"
+    seq = (await _mixed_chain(transit, db))["test.v1"]
+    _dml(db, "UPDATE audit_log SET row_hash = ? WHERE seq = ?", ("f" * 64, seq))
+    store = await _transit_store(db)
+
+    def refused(**_kw: Any) -> dict[str, Any]:
+        raise httpx.ConnectError("rate limited")
+
+    monkeypatch.setattr(transit, "generate_hmac", refused)
+    try:
+        ok, msg = await store.verify_audit_chain()
+    finally:
+        await store.close()
+    assert not ok and f"seq={seq}," in str(msg), msg
+
+
 def test_a_verify_reply_of_an_unexpected_shape_is_a_plain_cipher_error() -> None:
     """Transit's ``valid`` must be a bool; anything else is a check that could not run, never a
     pass and never a refused version."""

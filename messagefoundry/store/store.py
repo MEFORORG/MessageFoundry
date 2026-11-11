@@ -6726,8 +6726,10 @@ def _audit_row_mac(
     except TypeError:
         return None
     stored = row["row_hash"]
-    # `is True`: only a bool True passes, so a provider answering a truthy non-bool fails closed.
-    return stored if isinstance(stored, str) and mac.verify(data, stored) is True else None
+    # A non-text hash is checked as the empty string, which is never a MAC, so it still costs the
+    # one round trip a malformed MAC does. `is True`: a truthy non-bool answer fails closed.
+    checked = stored if isinstance(stored, str) else ""
+    return stored if mac.verify(data, checked) is True and checked else None
 
 
 def _audit_digest_line(r: Mapping[str, Any]) -> bytes:

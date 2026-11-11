@@ -349,7 +349,8 @@ class TransitCipher(_UnmarkedPolicy):
         ``stored`` that :func:`~messagefoundry.store.row_seal.transit_mac_version` does not accept
         is ``False`` with no ``verify`` call, so no malformed value reaches Transit to draw a 400.
         It still costs one round trip, an :meth:`audit_hmac` of ``data`` whose answer is
-        discarded, so a malformed row is no cheaper to check than a clean one. ``False`` is also
+        discarded, so a malformed row is no cheaper to check than a clean one; a failure of that
+        call is logged, and the answer stays ``False``. ``False`` is also
         Transit's ``valid: false``.
 
         A 400 that hvac raises as ``InvalidRequest``, while a probe under the latest version
@@ -372,8 +373,14 @@ class TransitCipher(_UnmarkedPolicy):
         version = transit_mac_version(stored)
         if version is None:
             # Still one round trip, as a clean row costs, so a malformed row is not cheaper to
-            # check (``verify_audit_chain``, ASVS 11.2.4). Its answer cannot match ``stored``.
-            self.audit_hmac(data)
+            # check (``verify_audit_chain``, ASVS 11.2.4). Its answer cannot match ``stored``, and
+            # its failure must not turn this row's break into a walk that could not run.
+            try:
+                self.audit_hmac(data)
+            except CipherError as exc:
+                log.warning(
+                    "the cost-only audit HMAC beside a malformed stored MAC failed: %s", exc
+                )
             return False
         try:
             valid = self._transit_verify(self._audit_key, data, stored)
