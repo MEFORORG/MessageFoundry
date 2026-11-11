@@ -430,26 +430,51 @@ def test_a_service_bind_whose_open_fails_after_the_connect_closes_its_socket(
     assert conn.socket is None
 
 
-def test_a_user_or_decoy_bind_whose_open_fails_closes_its_socket() -> None:
+def _dead_port() -> int:
+    """A loopback port nothing listens on, so a connect to it is refused."""
+    import socket
+
+    with socket.create_server(("127.0.0.1", 0)) as listener:
+        port: int = listener.getsockname()[1]
+    return port
+
+
+@pytest.mark.parametrize("how", ["wrap-refused", "connect-refused"])
+def test_a_user_or_decoy_bind_whose_open_fails_closes_its_socket(how: str) -> None:
     """The same rule for the second connect, through a real ldap3 stack, on both branches of the
-    #1140 bind (BACKLOG #3017). A failed open leaves the connection closed with its socket held, so
-    the ``unbind`` ``_released`` used to end it with sent nothing and closed nothing, and the
-    socket stayed open until the object was collected. The two branches still answer alike."""
-    sockets: dict[str, Any] = {}
+    #1140 bind (BACKLOG #3017), for a TLS wrap refused before ``ssl`` takes the socket over and for
+    a connect the directory refused. A failed open leaves the connection closed with its socket
+    held, and ldap3's ``unbind`` does nothing on a closed connection, so before #3017 the socket
+    stayed open until the object was collected. The two branches still answer alike."""
+    second: dict[str, Any] = {}
     texts: dict[str, str] = {}
     real = ldap3.Connection
+    dead = _dead_port()
 
-    def refused_wrap(connection: Any, *_args: Any, **_kwargs: Any) -> None:
-        sockets[branch] = connection.socket
+    def refused_wrap(*_args: Any, **_kwargs: Any) -> None:
         raise ssl.SSLError("synthetic-leak-3017")
 
     class RefusedSecondOpen(real):  # type: ignore[misc, valid-type]
         def __init__(self, server: Any = None, **kwargs: Any) -> None:
             super().__init__(server, **kwargs)
-            if kwargs.get("user") != _SERVICE_DN:
-                # Each bind builds its own Server, so this refuses only the second connect.
+            if kwargs.get("user") == _SERVICE_DN:
+                return
+            # Each bind builds its own Server, so this refuses only the second connect.
+            open_socket = self.strategy._open_socket
+
+            def held_open(*args: Any, **kwargs: Any) -> None:
+                try:
+                    open_socket(*args, **kwargs)
+                finally:
+                    # Read as the open ends: the close under test then drops conn.socket.
+                    second[branch] = self.socket
+
+            self.strategy._open_socket = held_open
+            if how == "wrap-refused":
                 self.server.ssl = True
                 self.server.tls = SimpleNamespace(wrap_socket=refused_wrap)
+            else:
+                self.server.port = dead
 
     for branch, search in (("absent", lambda _raw: [_done(0)]), ("present", _alice)):
         with (
@@ -459,23 +484,32 @@ def test_a_user_or_decoy_bind_whose_open_fails_closes_its_socket() -> None:
             mp.setattr(ldap3, "Connection", RefusedSecondOpen)
             with pytest.raises(LdapError) as err:
                 authenticator.authenticate("alice", _PASSWORD)
-        # The wrap runs only on a connected socket, so reaching it proves the second connect.
-        assert branch in sockets, f"the {branch} branch never reached the second connect"
         texts[branch] = str(err.value)
-    left_open = [branch for branch, sock in sockets.items() if sock.fileno() != -1]
+    # ldap3 sets conn.socket before the connect, so a failed open still holds one.
+    assert sorted(second) == ["absent", "present"], "a branch never reached the second connect"
+    assert all(sock is not None for sock in second.values()), second
+    left_open = [branch for branch, sock in second.items() if sock.fileno() != -1]
     assert left_open == [], f"left its socket open: {left_open}"
     assert texts["absent"] == texts["present"], texts
     assert "synthetic-leak" not in texts["absent"]
 
 
-def test_a_block_that_raised_on_an_open_connection_is_still_unbound() -> None:
-    """The control: only a closed connection is closed in place of the unbind. A refusal raised
-    after a bind that opened, such as a referral, still unbinds."""
-    unbinds: list[str] = []
-    conn = SimpleNamespace(closed=False, unbind=lambda: unbinds.append("unbind"))
+def test_a_block_that_raised_on_an_open_connection_is_unbound_and_not_closed_again() -> None:
+    """The control: an unbind that completes clears the connection's socket, as ldap3's does, so
+    nothing is closed after it. A refusal raised after a bind that opened, such as a referral,
+    still unbinds."""
+    calls: list[str] = []
+    conn = SimpleNamespace(socket=object())
+
+    def unbind() -> None:
+        calls.append("unbind")
+        conn.socket = None
+
+    conn.unbind = unbind
+    conn.strategy = SimpleNamespace(close=lambda: calls.append("close"))
     with pytest.raises(LdapReferralError), ldap_module._released(conn, "user bind"):
         raise LdapReferralError("synthetic")
-    assert unbinds == ["unbind"]
+    assert calls == ["unbind"]
 
 
 @pytest.mark.parametrize(
