@@ -376,7 +376,7 @@ def _read_anchor(
     :func:`_verifier_type` hands the store to signxml's chain check. A pinned ``cryptography``
     certificate object is passed through, any object with ``to_cryptography()``, such as a
     pyOpenSSL one, is converted through it, and anything else is read as PEM text. A caught fault
-    becomes a new :class:`ValueError` raised after the handler ends, so nothing is chained.
+    becomes a new :class:`ValueError` raised after the handler ends, so the fault is not chained.
     """
     # Imported here, not at module top, as in _signing_key_refusal.
     from cryptography import x509
@@ -510,13 +510,15 @@ def verify(
     is read and ``ca_pem_file`` is ignored, as signxml does (vault BACKLOG #6120), so a
     ``ca_pem_file`` that cannot be read beside a pin is not refused. The anchor that is used is read
     before the document, and one that cannot be read is refused there with at least these types:
-    :class:`ValueError`, whose fixed message names only the anchor and the fault's type and chains
-    nothing, such as for a pinned certificate that is not one, whose key cannot be loaded or whose
-    pyOpenSSL conversion fails, or a CA file holding no certificate; and :class:`OSError` if
-    ``ca_pem_file`` cannot be opened or read from, including a path holding a NUL. Only reading is
-    checked there: a pin whose key type signxml cannot verify with, such as Ed25519, or a CA
-    certificate in the file whose key cannot be loaded, fails per document instead, as an
-    ``XmlError`` or an ``InvalidCertificate`` result.
+    :class:`ValueError`, whose fixed message names only the anchor and the fault's type, with the
+    fault on neither ``__cause__`` nor ``__context__``, such as for a pinned certificate that is not
+    one, whose key cannot be loaded or whose pyOpenSSL conversion fails, a CA file holding no
+    certificate, or a CA path the platform cannot encode or decode; and :class:`OSError` if
+    ``ca_pem_file`` cannot be opened or read from, such as a missing file or a ``str`` or ``bytes``
+    path holding a NUL. A fault of another type, such as one a pin's own ``to_cryptography()``
+    raises, escapes as raised. Only reading is checked there: a pin whose key type signxml cannot
+    verify with, such as Ed25519, or a CA certificate in the file whose key cannot be loaded, fails
+    per document instead, as an ``XmlError`` or an ``InvalidCertificate`` result.
     Raises :class:`~messagefoundry.parsing.xml.errors.XmlError` if signxml or a library
     under it cannot process the signature, such as a schema-invalid or empty ``ds:SignatureValue``
     or key data it cannot read (vault BACKLOG #2816, #5372). That message names only the library's

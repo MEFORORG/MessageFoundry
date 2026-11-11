@@ -300,8 +300,8 @@ def test_a_pin_that_converts_to_something_else_is_an_anchor_fault() -> None:
 
 def test_a_pyopenssl_pin_whose_conversion_fails_is_an_anchor_fault() -> None:
     """A pin whose ``to_cryptography()`` raises pyOpenSSL's own error is refused as the documented
-    anchor ``ValueError``, with a fixed message and nothing chained. A stand-in raises it, because a
-    real pyOpenSSL certificate converts; the planted text shows nothing of the error is carried."""
+    anchor ``ValueError``, with a fixed message and nothing chained. A stand-in raises it with
+    planted text, which shows that nothing of the error is carried."""
     crypto = pytest.importorskip("OpenSSL.crypto")
 
     class _UnconvertiblePin:
