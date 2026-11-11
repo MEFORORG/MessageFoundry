@@ -388,10 +388,21 @@ def test_a_pin_that_loads_pyopenssl_while_converting_is_an_anchor_fault(
     assert_chain_severed(caught.value)
 
 
-def test_an_error_named_like_pyopenssls_elsewhere_is_not_an_anchor_fault() -> None:
-    """Only a class named ``Error`` in an ``OpenSSL.`` module counts: an ``Error`` from any other
-    module escapes as raised, as any fault of a type the read does not turn does."""
-    error = type("Error", (Exception,), {"__module__": "notopenssl.crypto"})
+@pytest.mark.parametrize(
+    ("module", "qualname"),
+    [
+        ("notopenssl.crypto", "Error"),
+        ("OpenSSLfoo.crypto", "Error"),
+        ("OpenSSL.crypto", "Outer.Error"),
+    ],
+    ids=["another module", "a prefix without the dot", "a nested Error"],
+)
+def test_an_error_named_like_pyopenssls_elsewhere_is_not_an_anchor_fault(
+    module: str, qualname: str
+) -> None:
+    """Only a class whose qualified name is ``Error`` and whose module starts with ``OpenSSL.``
+    counts: any other escapes as raised, as any fault of a type the read does not turn does."""
+    error = type("Error", (Exception,), {"__module__": module, "__qualname__": qualname})
 
     class _Pin:
         def to_cryptography(self) -> object:

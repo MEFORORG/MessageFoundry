@@ -383,8 +383,9 @@ def _read_anchor(
     certificate is pinned, and it reads that file through signxml's own loader;
     :func:`_verifier_type` hands the store to signxml's chain check. A pinned ``cryptography``
     certificate object is passed through, any object with ``to_cryptography()``, such as a
-    pyOpenSSL one, is converted through it, and anything else is read as PEM text. A caught fault
-    becomes a new :class:`ValueError` raised after the handler ends, so the fault is not chained.
+    pyOpenSSL one, is converted through it, and anything else is read as PEM text. A fault
+    :func:`_is_anchor_fault` admits becomes a new :class:`ValueError` raised after the handler
+    ends, so the fault is not chained; any other is re-raised as is.
     """
     # Imported here, not at module top, as in _signing_key_refusal.
     from cryptography import x509
@@ -417,7 +418,7 @@ def _read_anchor(
         ):
             # open() refuses such a path with ValueError, which would read as a file that does not
             # parse. No file has that path, so it is one that cannot be opened. _is_anchor_fault
-            # does not admit OSError, so it is re-raised as is.
+            # does not admit a plain OSError, so it is re-raised as is.
             raise OSError("ca_pem_file cannot be opened: the path holds a NUL")
         return None, chain_verifier(ca_pem_file=ca_pem_file).store
     except Exception as exc:
@@ -534,7 +535,7 @@ def verify(
     :class:`RuntimeError` a pin's own ``to_cryptography()`` raises, escapes as raised. pyOpenSSL's
     error is recognised by name, so classifying a fault never imports pyOpenSSL or runs any of it;
     a pyOpenSSL pin's own ``to_cryptography()`` still runs it. Any exception whose class, or a base
-    of it, has the qualified name ``Error`` and is defined in a module whose name starts with
+    of it, has the qualified name ``Error`` and declares a ``__module__`` starting with
     ``OpenSSL.`` counts, including ``OpenSSL.SSL.Error`` and its subclasses and one from a module
     of that name that is not pyOpenSSL. Only reading is checked there: a pin whose key type signxml cannot
     verify with, such as Ed25519, or a CA certificate in the file whose key cannot be loaded, fails
