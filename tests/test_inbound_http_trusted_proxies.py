@@ -114,24 +114,25 @@ async def test_a_spoofed_left_most_value_cannot_mint_a_fresh_budget() -> None:
         # The plain case: one hop, the client.
         ([PROXY], [f"X-Forwarded-For: {CLIENT_A}"], CLIENT_A),
         # A listed inner proxy is skipped; the first unlisted hop from the right is the client.
-        ([PROXY, "10.0.0.0/8"], [f"X-Forwarded-For: {CLIENT_A}, 10.1.2.3"], CLIENT_A),
+        ([PROXY, "10.0.0.0/24"], [f"X-Forwarded-For: {CLIENT_A}, 10.0.0.3"], CLIENT_A),
         # Header lines join in order, as uvicorn joins them: the walk crosses a line boundary.
         (
-            [PROXY, "10.0.0.0/8"],
-            [f"X-Forwarded-For: {CLIENT_A}", "X-Forwarded-For: 10.1.2.3"],
+            [PROXY, "10.0.0.0/24"],
+            [f"X-Forwarded-For: {CLIENT_A}", "X-Forwarded-For: 10.0.0.3"],
             CLIENT_A,
         ),
         # A port on a hop is read the way uvicorn reads it, so the key is the address alone.
         ([PROXY], [f"X-Forwarded-For: {CLIENT_A}:51234"], CLIENT_A),
-        ([PROXY], ["X-Forwarded-For: [2001:db8::7]:443"], "2001:db8::7"),
+        # An IPv6 client keys on its /64 (BACKLOG #5525 repair).
+        ([PROXY], ["X-Forwarded-For: [2001:db8::7]:443"], "2001:db8::/64"),
         # A mapped spelling keys the same budget as the plain one.
         ([PROXY], [f"X-Forwarded-For: ::ffff:{CLIENT_A}"], CLIENT_A),
         # The client's own text left of the hop the proxy appended is never read.
         ([PROXY], [f"X-Forwarded-For: 198.51.100.7, {CLIENT_A}"], CLIENT_A),
         ([PROXY], [f"X-Forwarded-For: unknown, {CLIENT_A}"], CLIENT_A),
         # A zone is dropped, so text after '%' never becomes a key or a recorded value.
-        ([PROXY], ["X-Forwarded-For: fe80::1%x; mode=none"], "fe80::1"),
-        ([PROXY], ["X-Forwarded-For: [fe80::1%eth0]:80"], "fe80::1"),
+        ([PROXY], ["X-Forwarded-For: fe80::1%x; mode=none"], "fe80::/64"),
+        ([PROXY], ["X-Forwarded-For: [fe80::1%eth0]:80"], "fe80::/64"),
         # A missing header from a listed peer falls back to the socket peer.
         ([PROXY], [], PROXY),
         # So does an unparseable hop, never a literal like "unknown".
@@ -140,7 +141,7 @@ async def test_a_spoofed_left_most_value_cannot_mint_a_fresh_budget() -> None:
         ([PROXY], [f"X-Forwarded-For: {CLIENT_A}, garbage"], PROXY),
         # Every hop listed: the client was itself a proxy. uvicorn takes the left-most value here,
         # which this listener never does; it keys on the socket peer.
-        ([PROXY, "10.0.0.0/8"], ["X-Forwarded-For: 10.9.9.9, 10.1.2.3"], PROXY),
+        ([PROXY, "10.0.0.0/24"], ["X-Forwarded-For: 10.0.0.9, 10.0.0.3"], PROXY),
         # An underscore spelling is a different header to a proxy that does not fold it.
         ([PROXY], [f"X_Forwarded_For: {CLIENT_A}"], PROXY),
         # With no trusted_proxies the header is never read.
@@ -274,13 +275,14 @@ def test_a_padded_header_is_read_no_further_than_the_hop_bound() -> None:
     source = HttpSource(
         Source(
             type=ConnectorType.HTTP,
-            settings={"port": 0, "intake_auth": "api_key", "trusted_proxies": ["10.0.0.0/8"]},
+            settings={"port": 0, "intake_auth": "api_key", "trusted_proxies": ["10.0.0.0/24"]},
         )
     )
 
     def key(hops: list[str]) -> str | None:
         head = HttpRequest("POST", "/", {}, b"", frozenset(), ",".join(hops))
-        return source._forwarded_client(head, "10.0.0.1")
+        found = source._forwarded_client(head, "10.0.0.1")
+        return None if found is None else str(found)
 
     listed = ["10.0.0.2"] * (_MAX_FORWARDED_HOPS - 1)
     assert key([CLIENT_A, *listed]) == CLIENT_A  # the client is the bound's last hop
@@ -293,7 +295,8 @@ def test_entries_that_together_span_a_family_are_refused() -> None:
     upper_half = str(ipaddress.IPv4Network((2**31, 1)))
     with pytest.raises(ValueError, match="whole address family"):
         trusted_proxy_networks(["0.0.0.0/1", upper_half])
-    assert len(trusted_proxy_networks(["0.0.0.0/1", "10.0.0.5"])) == 2  # half is not all
+    with pytest.raises(ValueError, match=r"more than a /16"):  # half is not all, but is too wide
+        trusted_proxy_networks(["0.0.0.0/1", "10.0.0.5"])
 
 
 def test_none_reads_as_unset() -> None:
@@ -326,3 +329,290 @@ def test_the_setting_is_refused_with_the_global_budget_off(glob: int | None) -> 
 def test_a_bare_string_is_refused_rather_than_read_as_characters() -> None:
     with pytest.raises(WiringError, match="must be a list"):
         Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), trusted_proxies="10.0.0.5")
+
+
+# --- the 2026-11-10 repair: no client may mint more budgets than one real address holds ----------
+
+
+def _v4(first: int, prefix: int) -> str:
+    """An IPv4 network built rather than written, so no routable literal sits in the source."""
+    return str(ipaddress.IPv4Network((first << 24, prefix)))
+
+
+def _v6(first_hextet: int, prefix: int) -> str:
+    return str(ipaddress.IPv6Network((first_hextet << 112, prefix)))
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        # Near-whole ranges loaded with only a WARNING and acted as '*'.
+        [_v6(0x2000, 3)],
+        [_v4(0, 1), _v4(128, 2), _v4(192, 3)],
+        # The floor itself: one prefix wider than a /16 of IPv4 or a /48 of IPv6 ...
+        ["10.0.0.0/15"],
+        ["2001:db8::/47"],
+        # ... and a set that only together goes past it.
+        ["10.0.0.0/16", "10.1.0.5"],
+        ["2001:db8::/48", "2001:db8:1::/64"],
+        # A mapped entry counts toward IPv4, the family it names.
+        ["10.0.0.0/16", "::ffff:10.1.0.0/112"],
+    ],
+)
+def test_a_list_spanning_more_than_the_floor_is_refused(entries: list[str]) -> None:
+    with pytest.raises(ValueError, match=r"span more than a /(16|48)") as excinfo:
+        trusted_proxy_networks(entries)
+    for entry in entries:
+        assert entry not in str(excinfo.value)
+    with pytest.raises(WiringError, match="span more than"):
+        Http(port=8080, intake_auth="api_key", intake_api_key=env("k"), trusted_proxies=entries)
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        ["10.0.0.0/16"],
+        ["10.0.0.0/17", "10.0.128.0/17"],
+        ["2001:db8::/48"],
+        # One IPv6 host is one of the 65,536 /64 networks a /48 holds, so this is just inside.
+        ["2001:db8::/49", "2001:db8:1::5"],
+        ["10.0.0.0/16", "2001:db8::/48"],  # each family is bounded on its own
+    ],
+)
+def test_a_list_within_the_floor_loads(entries: list[str]) -> None:
+    assert trusted_proxy_networks(entries)
+
+
+@pytest.mark.parametrize(
+    ("hop", "key"),
+    [
+        # Every address in one /64 keys one budget.
+        ("2001:db8::1", "2001:db8::/64"),
+        ("[2001:db8::ffff:1]:443", "2001:db8::/64"),
+        ("2001:db8:0:1::1", "2001:db8:0:1::/64"),
+        # An unbracketed IPv6 hop with a port is ambiguous and not read: the socket peer keys.
+        ("2001:db8::1:1234", PROXY),
+        ("2001:db8::7:80", PROXY),
+        # Its control: a bare hop whose last group cannot be a port alone is read.
+        ("2001:db8::7", "2001:db8::/64"),
+        ("2001:db8::a:b", "2001:db8::/64"),
+    ],
+)
+async def test_an_ipv6_client_keys_on_its_64_and_an_ambiguous_hop_is_not_read(
+    hop: str, key: str
+) -> None:
+    limiter = _CountingLimiter()
+    src = await _proxied(trusted_proxies=[PROXY])
+    src.intake_rate_limiter = limiter
+    try:
+        await _request(src.sockport, raw=_raw_with(["x-api-key: wrong", f"X-Forwarded-For: {hop}"]))
+    finally:
+        await src.stop()
+    assert limiter.checks == [key]
+
+
+async def test_rotating_ipv6_addresses_inside_one_64_mints_no_budget() -> None:
+    """The row's rule: ten failures from ten addresses in one /64 spend one budget, and a client in
+    another /64 behind the same proxy is still accepted."""
+    limiter = _IntakeRateLimiter(per_peer=10, glob=60)
+    src = await _proxied(trusted_proxies=[PROXY])
+    src.intake_rate_limiter = limiter
+    try:
+        for i in range(10):
+            await _request(
+                src.sockport,
+                headers={"x-api-key": "wrong", "X-Forwarded-For": f"[2001:db8::{i + 1:x}]:5000"},
+            )
+        rotated = await _request(
+            src.sockport, headers={"x-api-key": KEY, "X-Forwarded-For": "2001:db8::abcd"}
+        )
+        other = await _request(
+            src.sockport, headers={"x-api-key": KEY, "X-Forwarded-For": "2001:db8:0:1::abcd"}
+        )
+    finally:
+        await src.stop()
+    assert rotated.status in (429, 0), rotated.status
+    assert other.status == 202, other.status
+
+
+@pytest.mark.parametrize(
+    ("peer", "key"),
+    [
+        ("127.0.0.1", "127.0.0.1"),
+        # One host, one budget, whichever spelling the socket gives.
+        ("::ffff:127.0.0.1", "127.0.0.1"),
+        ("fe80::1%eth0", "fe80::/64"),
+        ("fe80::1", "fe80::/64"),
+        # The socket peer gets the /64 rule a forwarded client gets.
+        ("2001:db8::5", "2001:db8::/64"),
+        (None, "unknown"),
+    ],
+)
+def test_a_socket_peer_keys_as_a_forwarded_client_does(peer: str | None, key: str) -> None:
+    from messagefoundry.transports.http_listener import _peer_budget_key
+
+    assert _peer_budget_key(peer) == key
+
+
+def test_a_mapped_socket_peer_still_reads_as_a_listed_proxy() -> None:
+    from messagefoundry.config.models import ConnectorType, Source
+    from messagefoundry.transports.http_listener import HttpRequest
+
+    source = HttpSource(
+        Source(
+            type=ConnectorType.HTTP,
+            settings={"port": 0, "intake_auth": "api_key", "trusted_proxies": ["10.0.0.5"]},
+        )
+    )
+    head = HttpRequest("POST", "/", {}, b"", frozenset(), CLIENT_A)
+    assert str(source._forwarded_client(head, "::ffff:10.0.0.5")) == CLIENT_A
+
+
+@pytest.mark.parametrize("default", [["*"], ["0.0.0.0/0"], ["10.0.0.0/8"], "10.0.0.5"])
+def test_an_env_default_is_read_by_the_rule_a_literal_is(default: object) -> None:
+    """The default is written in the config, so the load refuses it as it refuses the literal,
+    and ``check`` sees it without an environment. Before, only serve did."""
+    with pytest.raises(WiringError, match=r"env\(\) default= is refused"):
+        Http(
+            port=8080,
+            intake_auth="api_key",
+            intake_api_key=env("k"),
+            trusted_proxies=env("proxies", default=default),
+        )
+
+
+def test_an_env_value_given_as_text_gets_its_own_refusal() -> None:
+    """A MEFOR_VALUE_* variable is always text. The listener reads the resolved value, and says
+    where a list can be written rather than only that it must be one."""
+    from messagefoundry.config.models import ConnectorType, Source
+
+    spec = Http(
+        port=8080, intake_auth="api_key", intake_api_key=env("k"), trusted_proxies=env("proxies")
+    )
+    resolved = resolve_env_settings(spec.settings, {"k": "x", "proxies": "10.0.0.5"})
+    with pytest.raises(ValueError, match="MEFOR_VALUE_") as excinfo:
+        HttpSource(Source(type=ConnectorType.HTTP, settings={**resolved, "port": 0}))
+    assert "10.0.0.5" not in str(excinfo.value)
+
+
+def _http_registry(**listeners: Any) -> Any:
+    from messagefoundry.config.wiring import Registry, build_inbound_connection
+
+    reg = Registry()
+    for name, proxies in listeners.items():
+        spec = Http(
+            port=8080, intake_auth="api_key", intake_api_key=env("k"), trusted_proxies=proxies
+        )
+        reg.add_inbound(build_inbound_connection(name, spec, router="R"))
+    return reg
+
+
+def test_a_listener_trusted_proxies_is_a_named_loosening() -> None:
+    """Listed in ``security_loosenings()`` as the ``[api]`` ranges are, which ``GET
+    /security/posture``, the start's audit row and the ``posture_loosened`` alert all read."""
+    from messagefoundry.config.settings import (
+        AiSettings,
+        AlertsSettings,
+        ApiSettings,
+        ApprovalsSettings,
+        AuthSettings,
+        BackupSettings,
+        CertMonitorSettings,
+        SecretRotationSettings,
+        SecretsSettings,
+        SecuritySettings,
+        StoreSettings,
+        security_loosenings,
+    )
+    from messagefoundry.config.wiring import (
+        UNRESOLVED_LISTENER_PROXIES,
+        listener_trusted_proxy_hops,
+    )
+
+    reg = _http_registry(
+        IB_HOST=["10.0.0.5"], IB_RANGE=["10.0.0.0/24"], IB_ENV=env("p"), IB_NONE=[]
+    )
+    assert listener_trusted_proxy_hops(reg) == [
+        ("IB_ENV", UNRESOLVED_LISTENER_PROXIES),
+        ("IB_HOST", ""),
+        ("IB_RANGE", "range"),
+    ]
+    # Resolved with the instance's values: an empty list names nothing, a host is named.
+    assert "IB_ENV" not in dict(listener_trusted_proxy_hops(reg, env_values={"p": []}))
+    assert dict(listener_trusted_proxy_hops(reg, env_values={"p": ["10.0.0.6"]}))["IB_ENV"] == ""
+
+    def pairs(hops: tuple[str, ...]) -> dict[str, str]:
+        return dict(
+            security_loosenings(
+                SecuritySettings(),
+                StoreSettings(),
+                AuthSettings(),
+                AlertsSettings(),
+                SecretRotationSettings(),
+                cleartext_hops=(),
+                expiry_relaxed_hops=(),
+                hostname_unchecked_hops=(),
+                query_credential_hops=(),
+                unverified_db_hops=(),
+                attested_hops=(),
+                revocation_attested_hops=(),
+                path_form_fhir_hops=(),
+                ech_cleartext_sidecar_hops=(),
+                api=ApiSettings(),
+                approvals=ApprovalsSettings(),
+                cert_monitor=CertMonitorSettings(),
+                backup=BackupSettings(),
+                secrets=SecretsSettings(),
+                ai=AiSettings(),
+                store_privilege=None,
+                audit_chain_unkeyed=None,
+                remote_debug=None,
+                startup=None,
+                service_env=None,
+                listener_trusted_proxy_hops=hops,
+            )
+        )
+
+    risk = pairs(("IB_HOST", "IB_RANGE (range)"))["listener_trusted_proxies"]
+    assert "IB_HOST" in risk and "IB_RANGE (range)" in risk and "IB_NONE" not in risk
+    assert "listener_trusted_proxies" not in pairs(())  # control: nothing listed, nothing named
+
+
+async def test_the_posture_route_names_a_listener_trusted_proxies(tmp_path: Any) -> None:
+    """The live graph's listener reaches ``GET /security/posture``, which the start's audit row
+    and the ``posture_loosened`` alert read through the same function."""
+    import httpx
+
+    from messagefoundry.api import create_app
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline import Engine
+
+    eng = await Engine.create(
+        tmp_path / "posture.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        eng.add_registry(_http_registry(IB_PROXIED=["10.0.0.0/24"], IB_DIRECT=[]))
+        app = create_app(eng, allow_no_auth=True)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            body = (await client.get("/security/posture")).json()
+    finally:
+        await eng.stop()
+    entry = next(e for e in body["loosenings"] if e["switch"] == "listener_trusted_proxies")
+    assert "IB_PROXIED (range)" in entry["risk"]
+    assert "IB_DIRECT" not in entry["risk"]
+
+
+def test_the_settings_view_shows_the_proxy_addresses() -> None:
+    """``trusted_proxies`` ends in ``proxies``, a URL word, but holds addresses an operator needs
+    to read, never a URL that could carry a credential."""
+    from messagefoundry.config.wiring import _is_url_setting, redacted_settings
+
+    assert not _is_url_setting("trusted_proxies")
+    assert _is_url_setting("http_proxies")  # control: the suffix rule still holds elsewhere
+    spec = Http(
+        port=8080, intake_auth="api_key", intake_api_key=env("k"), trusted_proxies=["10.0.0.5"]
+    )
+    assert redacted_settings(spec.settings)["trusted_proxies"] == ["10.0.0.5"]

@@ -10109,6 +10109,7 @@ def security_loosenings(
     remote_debug: RemoteDebugPosture | None,
     startup: StartupPosture | None,
     service_env: ServiceEnvPosture | None,
+    listener_trusted_proxy_hops: Sequence[str] = (),
 ) -> list[tuple[str, str]]:
     """The ``[security]`` switches at their INSECURE value, plus the enumerated deviations outside that
     section, as ``(switch, plain-language risk)``.
@@ -10276,7 +10277,10 @@ def security_loosenings(
     ``path_form_fhir_hops`` is an outbound ``FHIR()`` connection that sets
     ``update_url_form="path"``, or may through an ``env()`` value (vault BACKLOG #2571), and
     ``ech_cleartext_sidecar_hops`` is a ``REST`` outbound whose ECH sidecar is an ``http://`` URL
-    (ADR 0139). They arrive as plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
+    (ADR 0139), and ``listener_trusted_proxy_hops`` is an inbound ``Http()`` listener with a
+    non-empty ``trusted_proxies`` (BACKLOG #5525), read by ``listener_trusted_proxy_hops``, which
+    walks the ``HTTP`` inbounds. That one alone has a default, empty, so the callers that have no
+    graph need not name it; every caller with a graph passes it. They arrive as plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
     caller resolves them through the shared readers in ``config.wiring``
     (``accepted_cleartext_hops``, which walks both outbound connections and ``FhirLookup`` read
     connections; ``expiry_relaxed_hops``, which walks outbound and the inbound REMOTEFILE pollers;
@@ -10963,6 +10967,23 @@ def security_loosenings(
                 "sidecar listener encrypts the hop. A name marked possibly has an env() value this "
                 "reading could not resolve, and the above holds of it only if it resolves to an "
                 "http:// sidecar with ech_egress on",
+            )
+        )
+    # BACKLOG #5525, owner ruling 2026-11-10: an HTTP listener that keys its failed-attempt budget
+    # on the client a listed proxy forwards. Reported for any non-empty list, as [api] ranges are
+    # for theirs: each listed proxy may key the budget on any address it writes.
+    if listener_trusted_proxy_hops:
+        named = ", ".join(sorted(listener_trusted_proxy_hops))
+        out.append(
+            (
+                "listener_trusted_proxies",
+                f"{len(listener_trusted_proxy_hops)} HTTP listener(s) key the failed-attempt budget "
+                f"on the client address a listed proxy writes in X-Forwarded-For ({named}) -- "
+                "each listed proxy, and every host inside a listed range, may write any address "
+                "there and so hold a fresh per-peer budget per address (per /64 for IPv6), which "
+                "leaves the global "
+                "budget as the only bound on guessing through it. A name marked range lists a "
+                "range; a name marked possibly has an env() value this reading could not resolve",
             )
         )
     # --- the STORE PRINCIPAL's observed privilege posture (#1008, ASVS 13.2.2). An OBSERVATION, like

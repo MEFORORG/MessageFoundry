@@ -214,6 +214,8 @@ __all__ = [
     "accepted_cleartext_hops",
     "ech_cleartext_sidecar_hops",
     "UNRESOLVED_ECH_SIDECAR",
+    "listener_trusted_proxy_hops",
+    "UNRESOLVED_LISTENER_PROXIES",
     "expiry_relaxed_hops",
     "hostname_unchecked_hops",
     "path_form_fhir_updates",
@@ -2090,9 +2092,10 @@ def connector_secret_env_values(
 _URL_SETTING_SUFFIXES = ("url", "uri", "endpoint", "proxy", "urls", "uris", "endpoints", "proxies")
 
 #: Names that end in a URL word and hold no URL: a proxy EXCLUSION host list and an on/off flag
-#: (BACKLOG #2721 shape 6). Matched as the whole name or after a ``_``, so ``proxy_no_proxy`` is one
+#: (BACKLOG #2721 shape 6), and the HTTP listener's list of proxy addresses, which an operator
+#: needs to read in the settings view (BACKLOG #5525). Matched as the whole name or after a ``_``, so ``proxy_no_proxy`` is one
 #: of them and ``proxy_url`` is not. The cost of a miss here is only over-masking.
-_NOT_URL_SETTING_TAILS = ("no_proxy", "use_proxy")
+_NOT_URL_SETTING_TAILS = ("no_proxy", "use_proxy", "trusted_proxies")
 
 
 def _is_url_setting(name: str) -> bool:
@@ -3249,19 +3252,24 @@ def Http(
     _validate_sync_reply(settings)
     # BACKLOG #5525, owner ruling 2026-11-10 ("Per-connection proxies"). Read by the listener's own
     # reader, so the factory and the listener cannot disagree on an entry; never [api].trusted_proxies.
-    # The list refusal runs first, as its rule requires. A whole-setting env() is read by the
-    # listener once resolved, which is the only place its entries exist.
+    # The list refusal runs first, as its rule requires. A whole-setting env() is read through the
+    # same reader twice more: its default= here, since the config holds it and `check` loads it,
+    # and its environment value by the listener once resolved, at the build `check` and serve run.
     _reject_envref_in_lists("Http", trusted_proxies=trusted_proxies)
-    if not isinstance(trusted_proxies, EnvRef):
-        from messagefoundry.transports.http_listener import trusted_proxy_networks
+    written: Any = trusted_proxies
+    if isinstance(trusted_proxies, EnvRef):
+        written = None if trusted_proxies.default is _UNSET else trusted_proxies.default
+    from messagefoundry.transports.http_listener import trusted_proxy_networks
 
-        refusal: str | None = None
-        try:
-            trusted_proxy_networks(trusted_proxies)
-        except ValueError as exc:
-            refusal = str(exc)  # withholds every value; raised below, outside this handler
-        if refusal is not None:
-            raise WiringError(refusal)
+    refusal: str | None = None
+    try:
+        trusted_proxy_networks(written)
+    except ValueError as exc:
+        refusal = str(exc)  # withholds every value; raised below, outside this handler
+    if refusal is not None:
+        if written is not trusted_proxies:
+            refusal = f"Http trusted_proxies env() default= is refused: {refusal}"
+        raise WiringError(refusal)
     if trusted_proxies and intake_auth not in _INTAKE_KEY_MODES:
         raise WiringError(
             f"Http sets trusted_proxies but intake_auth={intake_auth!r}; it keys the failed-attempt "
@@ -7307,6 +7315,55 @@ def ech_cleartext_sidecar_hops(
             continue
         note = UNRESOLVED_ECH_SIDECAR if egress is _UNRESOLVED else "an http:// sidecar"
         out.append((oc.name, note))
+    return sorted(out)
+
+
+#: The note :func:`listener_trusted_proxy_hops` gives a listener whose ``trusted_proxies`` is an
+#: ``env()`` value it could not resolve.
+UNRESOLVED_LISTENER_PROXIES = "possibly: an env() value this reading could not resolve"
+
+
+def listener_trusted_proxy_hops(
+    registry: Registry, *, env_values: Mapping[str, Any] | None = None
+) -> list[tuple[str, str]]:
+    """Every inbound ``Http()`` listener that trusts ``X-Forwarded-For`` from a listed proxy, as
+    ``(name, note)`` (BACKLOG #5525).
+
+    The single reader of that set, on the contract of :func:`ech_cleartext_sidecar_hops`:
+    ``GET /security/posture`` reads it for the ``listener_trusted_proxies`` entry of
+    ``security_loosenings()``, which the ``posture_loosened`` alert and the start's audit row read
+    too. Sorted by name.
+
+    Any non-empty list is named, a single proxy address included. A listed proxy may key the
+    failed-attempt budget on any address it writes, so each client behind it holds its own
+    per-peer budget, and the global budget is then the only bound on guessing across them; the
+    ``[api]`` list names only ranges because there a single proxy changes no budget. The note is
+    ``"range"`` where an entry covers more than one address, since every host inside it is trusted
+    as a proxy, and empty otherwise. An ``env()`` value is resolved against ``env_values`` as the
+    build resolves it; one this cannot resolve is named with :data:`UNRESOLVED_LISTENER_PROXIES`,
+    never left off. A ``deployed=False`` listener with an ``env()`` value is skipped, as
+    :func:`ech_cleartext_sidecar_hops` skips one, since its values are never resolved. A value the
+    build would refuse is skipped too: no listener is built from it."""
+    from messagefoundry.transports.http_listener import trusted_proxy_networks
+
+    out: list[tuple[str, str]] = []
+    for ic in registry.inbound.values():
+        if ic.spec.type != ConnectorType.HTTP:
+            continue
+        raw = ic.spec.settings.get("trusted_proxies")
+        if not ic.deployed and isinstance(raw, EnvRef):
+            continue
+        value = _db_setting(ic.spec.settings, "trusted_proxies", None, env_values)
+        if value is _UNRESOLVED:
+            out.append((ic.name, UNRESOLVED_LISTENER_PROXIES))
+            continue
+        try:
+            networks = trusted_proxy_networks(value)
+        except ValueError:
+            continue  # the build refuses this list, so no listener reads it
+        if networks:
+            ranged = any(network.num_addresses > 1 for network in networks)
+            out.append((ic.name, "range" if ranged else ""))
     return sorted(out)
 
 

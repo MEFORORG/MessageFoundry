@@ -730,6 +730,16 @@ _HOP_PORT_RE = re.compile(r"[0-9]{1,5}")
 #: The most listed hops the walk reads before it gives up and keys on the socket peer. A real proxy
 #: chain is a handful of hops; the bound keeps a padded header from costing the event loop more.
 _MAX_FORWARDED_HOPS = 32
+#: The prefix an IPv6 budget key keeps. A host is usually handed a whole ``/64`` and may pick any
+#: address in it, so keying on the full address would let it mint a fresh budget per address.
+_IPV6_KEY_PREFIX = 64
+#: The most budget keys the listed ranges of one family may hold together: addresses for IPv4, and
+#: ``/64`` networks for IPv6, the unit an IPv6 key is. ``2**16`` is one ``/16`` of IPv4 or one
+#: ``/48`` of IPv6. Every host inside a listed range is trusted as a proxy and may write any
+#: ``X-Forwarded-For`` it likes, so this bounds how many hosts may do that. It is a size, not a
+#: whole-family test, so a near-whole range such as ``2000::/3``, or ``/1`` to ``/3`` pieces
+#: that leave one gap, is refused as the refused ``'*'`` is (BACKLOG #5525).
+_PROXY_SPAN_LIMIT = 1 << 16
 
 _ProxyNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 _HopAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
@@ -745,10 +755,20 @@ def trusted_proxy_networks(value: Any) -> tuple[_ProxyNetwork, ...]:
     trusting the admin API's proxy says nothing about who fronts a partner intake socket. Entries
     that together trust a whole address family, as ``_classify_proxy_entries`` counts them (two
     ``/1`` halves included), are refused here too, since that is ``'*'`` written as networks; the
-    ``[api]`` load only warns about those. An IPv4-mapped entry is read as the IPv4 range it names, the form
+    ``[api]`` load only warns about those. So are entries that together span more than
+    :data:`_PROXY_SPAN_LIMIT` budget keys of one family, more than a ``/16`` of IPv4 or a ``/48``
+    of IPv6. An IPv4-mapped entry is read as the IPv4 range it names, the form
     :func:`_hop_address` hands the walk, so one proxy matches in either spelling."""
     if value is None:
         return ()
+    if isinstance(value, str):
+        # Its own message: a MEFOR_VALUE_* variable is always text, so "must be a list" alone
+        # would send an operator looking for a list syntax the variable cannot hold.
+        raise ValueError(
+            "Http trusted_proxies must be a list of proxy addresses or CIDR networks, and it is "
+            "text (value withheld). An env() value from a MEFOR_VALUE_* variable is always text: "
+            "write the list in environments/<env>.toml, or list the proxies in the config"
+        )
     if not isinstance(value, (list, tuple)):
         raise ValueError(
             "Http trusted_proxies must be a list of proxy addresses or CIDR networks, "
@@ -776,6 +796,28 @@ def trusted_proxy_networks(value: Any) -> tuple[_ProxyNetwork, ...]:
             "failed-attempt budget key. List the reverse proxy's exact address(es) instead "
             "(values withheld)."
         )
+    v4 = [network for network in networks if isinstance(network, ipaddress.IPv4Network)]
+    v6 = [network for network in networks if isinstance(network, ipaddress.IPv6Network)]
+    # A key is an IPv4 address or an IPv6 /64, so an IPv6 range counts its /64s, a host as one.
+    spans = (
+        (4, "/16", sum(n.num_addresses for n in ipaddress.collapse_addresses(v4))),
+        (
+            6,
+            "/48",
+            sum(
+                max(1, n.num_addresses >> (128 - _IPV6_KEY_PREFIX))
+                for n in ipaddress.collapse_addresses(v6)
+            ),
+        ),
+    )
+    for version, floor, keys in spans:
+        if keys > _PROXY_SPAN_LIMIT:
+            raise ValueError(
+                f"Http trusted_proxies entries together span more than a {floor} of IPv{version}. "
+                "Every host inside a listed range may write its own X-Forwarded-For and so choose "
+                "its own failed-attempt budget key. List the reverse proxy's exact address(es), or "
+                f"ranges that together stay within a {floor} (values withheld)."
+            )
     return tuple(networks)
 
 
@@ -804,13 +846,16 @@ def _refused_entry_reason(entry: str) -> str:
 
 
 def _hop_address(text: str) -> _HopAddress | None:
-    """One ``X-Forwarded-For`` hop, or a socket peer, as an address; ``None`` when it is not one.
+    """One ``X-Forwarded-For`` hop as an address; ``None`` when it is not one.
 
-    Reads a bare address, ``a.b.c.d:port``, ``[v6]`` and ``[v6]:port``, the forms uvicorn's walk
-    reads. Anything else, ``unknown`` and an empty hop included, is ``None`` and never becomes a
-    budget key. An IPv6 zone is dropped, as ``netaddr`` drops it from a socket peer, so the key and
-    the recorded address never carry text after a ``%``. An IPv4-mapped address is read as its
-    IPv4 address, so a client keys one budget whichever spelling a dual-stack proxy writes."""
+    Reads a bare address, ``a.b.c.d:port``, ``[v6]`` and ``[v6]:port``. Anything else, ``unknown``
+    and an empty hop included, is ``None`` and never becomes a budget key. So is an ambiguous bare
+    IPv6 hop: ``2001:db8::1:1234`` is a valid address, and also ``2001:db8::1`` with a port, so a
+    proxy writing the client's port that way would key each connection on its own address. A bare
+    IPv6 hop is ambiguous when its last group is decimal digits and dropping that group still
+    leaves an address. uvicorn reads such a hop as an address; this walk does not, and falls back
+    to the socket peer. The bracketed form says where the address ends and is always read. The
+    address is then read by :func:`_peer_address`."""
     host = text.strip(" \t")
     if host.startswith("["):
         inner, closed, rest = host[1:].partition("]")
@@ -821,8 +866,23 @@ def _hop_address(text: str) -> _HopAddress | None:
         host, _, port = host.partition(":")
         if not _HOP_PORT_RE.fullmatch(port):
             return None
+    elif host.count(":") > 1:
+        head, _, last = host.partition("%")[0].rpartition(":")
+        if _HOP_PORT_RE.fullmatch(last) and _peer_address(head) is not None:
+            return None
+    return _peer_address(host)
+
+
+def _peer_address(text: str | None) -> _HopAddress | None:
+    """A plain address, a socket peer or a hop's host, normalised; ``None`` when it is not one.
+
+    An IPv6 zone is dropped, as ``netaddr`` drops it from a socket peer, so the key and the
+    recorded address never carry text after a ``%``. An IPv4-mapped address is read as its IPv4
+    address, so a client keys one budget whichever spelling a dual-stack socket or proxy gives."""
+    if text is None:
+        return None
     try:
-        address = ipaddress.ip_address(host)
+        address = ipaddress.ip_address(text)
     except ValueError:
         return None
     if isinstance(address, ipaddress.IPv6Address):
@@ -831,6 +891,24 @@ def _hop_address(text: str) -> _HopAddress | None:
         if address.ipv4_mapped is not None:
             return address.ipv4_mapped
     return address
+
+
+def _budget_key(address: _HopAddress) -> str:
+    """The failed-attempt budget key for ``address``: an IPv4 address as written, an IPv6 address
+    as its ``/64``, so rotating addresses inside one ``/64`` mints no budget (BACKLOG #5525)."""
+    if isinstance(address, ipaddress.IPv6Address):
+        return str(ipaddress.IPv6Network((address, _IPV6_KEY_PREFIX), strict=False))
+    return str(address)
+
+
+def _peer_budget_key(peer_host: str | None) -> str:
+    """The budget key for a socket peer, read as a forwarded client is read: normalised by
+    :func:`_peer_address` and keyed by :func:`_budget_key`, so one host never holds two budgets
+    under two spellings. A peer that is not an address keys as it was given, or ``unknown``."""
+    address = _peer_address(peer_host)
+    if address is None:
+        return peer_host or "unknown"
+    return _budget_key(address)
 
 
 def _with_forwarded(text: str, exc: HttpRequestError) -> str:
@@ -1462,7 +1540,7 @@ class HttpSource(SourceConnector):
         """
         if self.intake_auth != "mtls_subject":
             return None
-        peer = peer_host or "unknown"
+        peer = _peer_budget_key(peer_host)
         limited = self._rate_limit_refusal(peer)
         if limited is not None:
             return limited
@@ -1545,13 +1623,16 @@ class HttpSource(SourceConnector):
         if head.method in _HEALTH_PROBE_METHODS and self.intake_auth_health == "allow":
             return  # explicit opt-out for a load-balancer probe that cannot carry the credential
         forwarded = self._forwarded_client(head, peer_host)
+        key = _peer_budget_key(peer_host) if forwarded is None else _budget_key(forwarded)
         try:
-            self._authorize_credential(head, forwarded or peer_host or "unknown")
+            self._authorize_credential(head, key)
         except HttpRequestError as exc:
-            exc.forwarded_for = forwarded  # recorded beside the socket peer, never instead of it
+            # Recorded beside the socket peer, never instead of it, and as the address itself: the
+            # key may be its /64, which says less about who sent the request.
+            exc.forwarded_for = None if forwarded is None else str(forwarded)
             raise
 
-    def _forwarded_client(self, head: HttpRequest, peer_host: str | None) -> str | None:
+    def _forwarded_client(self, head: HttpRequest, peer_host: str | None) -> _HopAddress | None:
         """The client address a listed proxy forwarded, or ``None`` to key on the socket peer.
 
         uvicorn's walk (BACKLOG #5525): the header counts only when the socket peer is a listed
@@ -1563,7 +1644,7 @@ class HttpSource(SourceConnector):
         address, so no budget is ever keyed on text a client wrote."""
         if not self._trusted_proxies or not head.forwarded_header or peer_host is None:
             return None
-        peer = _hop_address(peer_host)
+        peer = _peer_address(peer_host)
         if peer is None or not self._is_trusted_proxy(peer):
             return None
         # Read hop by hop from the right with rfind, so each hop is scanned once and nothing left of
@@ -1577,7 +1658,7 @@ class HttpSource(SourceConnector):
             if address is None:
                 return None
             if not self._is_trusted_proxy(address):
-                return str(address)
+                return address
             if start < 0:
                 return None
             end = start
