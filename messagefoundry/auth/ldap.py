@@ -1141,11 +1141,13 @@ def _close_without_sending(conn: Any, why: str) -> None:
     place of the caller's answer it would replace a refusal every caller reads as an
     ``LdapError`` with an unhandled one (BACKLOG #3017).
 
-    **The rule, stated here once (BACKLOG #3017): when the service-account bind's open fails, its
-    socket is closed at once, by the engine or by ``ssl``, not by the collector, at least in the
-    cases below.** ldap3 2.9.1's ``close`` shuts the socket only once an open has completed, and a
-    failed open leaves ``conn.closed`` true. It does not yet hold for a user or decoy bind, which
-    ``_released`` ends with an ``unbind`` that does nothing on a closed connection.
+    **The rule, stated here once (BACKLOG #3017): when a bind's open fails, the service account's,
+    a user's or the decoy's, its socket is closed at once, by the engine or by ``ssl``, not by the
+    collector, at least in the cases below.** ldap3 2.9.1's ``close`` shuts the socket only once an
+    open has completed, and a failed open leaves ``conn.closed`` true. ``_service_conn`` closes
+    the service account's here. A user or decoy bind's is closed here by ``_released``, which
+    calls this in place of an ``unbind`` when its block raised on a closed connection, because
+    ldap3's ``unbind`` does nothing on one.
 
     * Before ``ssl`` takes the socket over, it is the last connected socket on ``conn.socket``, and
       it is closed here directly, whatever ``close`` did. Read from the ldap3 and ``ssl`` source,
@@ -1679,6 +1681,10 @@ def _released(conn: Any, what: str) -> Iterator[_Release]:
     marking its answer, such as the user bind that proved the password, gets the unbind's error
     raised after it, and the caller fails closed as before. Fail-closed is the default, so a new
     caller that decides a pass inherits it without a check of its own; only a refusal opts out.
+
+    **A block that raised on a closed connection is closed, not unbound (BACKLOG #3017),** by
+    :func:`_close_without_sending`, whose docstring states the rule; the block's exception is
+    raised as before.
     """
     import ldap3
 
@@ -1686,10 +1692,13 @@ def _released(conn: Any, what: str) -> Iterator[_Release]:
     try:
         yield release
     except BaseException:
-        try:
-            conn.unbind()
-        except ldap3.core.exceptions.LDAPException as failed:
-            _unbind_failed(conn, what, failed)
+        if conn.closed:
+            _close_without_sending(conn, f"after a failed {what} open")
+        else:
+            try:
+                conn.unbind()
+            except ldap3.core.exceptions.LDAPException as failed:
+                _unbind_failed(conn, what, failed)
         raise
     try:
         conn.unbind()

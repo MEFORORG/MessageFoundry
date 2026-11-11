@@ -705,7 +705,9 @@ def test_an_unbind_error_never_replaces_how_the_block_ended(
     unbind_fault = ldap3.core.exceptions.LDAPSocketSendError("synthetic")
     closes: list[str] = []
     conn = SimpleNamespace(
-        unbind=_raise(unbind_fault), strategy=SimpleNamespace(close=lambda: closes.append("x"))
+        closed=False,  # an open connection: a block that raised is unbound (ldap._released)
+        unbind=_raise(unbind_fault),
+        strategy=SimpleNamespace(close=lambda: closes.append("x")),
     )
     refusal = LdapUndecodableError("synthetic refusal")
     with pytest.raises(LdapUndecodableError) as raised, ldap_module._released(conn, "user bind"):

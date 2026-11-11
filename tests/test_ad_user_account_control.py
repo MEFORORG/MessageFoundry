@@ -244,6 +244,9 @@ def _install_directory(monkeypatch: pytest.MonkeyPatch, directory: _Directory) -
             self.result: dict[str, Any] | None = None  # no referral
             # Read by doubles layered over this one, to tell the service account's bind apart.
             self._bind_dn: str | None = kwargs.get("user")
+            # Read as open, so a block that raised is unbound, never closed in its place
+            # (ldap._released): no fake open fails.
+            self.closed = False
 
         def __enter__(self) -> FakeConnection:
             return self

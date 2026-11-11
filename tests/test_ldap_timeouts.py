@@ -162,6 +162,9 @@ def _install_fakes(
             self._bind_dn: str | None = kwargs.get("user")
             self.result: dict[str, Any] | None = None  # no referral
             self.strategy = SimpleNamespace(close=lambda: rec.closes.append(self._bind_dn))
+            # Read as open, so a block that raised is unbound, never closed in its place
+            # (ldap._released): no fake open fails.
+            self.closed = False
 
         def __enter__(self) -> FakeConnection:
             return self
