@@ -3291,7 +3291,8 @@ with no page.
     security notices are set up. If the store refuses the row there, the roles are written without
     it and the row is then written on its own. Refused again, the row is lost,
     `audit_write_failed` pages keyed `directory-sign-in:auth.ad_roles_resynced`, and the sign-in
-    fails. An error there that is not a store refusal, such as a defect, also fails the sign-in,
+    fails. An error there that is not a store refusal, such as a defect or a store that is not the
+    shape the statement needs (a missing table or column, say), also fails the sign-in,
     even when its row then lands on its own, and so does an error from writing the roles again.
     In each of these cases the engine first tries to revoke the account's other sessions and sends
     the notice. The sign-in route raises `administrator_granted`, keyed `user:<username>`, with
@@ -5791,7 +5792,8 @@ the role write's (BACKLOG #3018 step 4). If either is refused there, the write i
 without its row and the row is written on its own. A row refused that second time is lost, and a
 pass that completes pages `audit_write_failed` keyed `directory-reconciler:<action>`, once per
 action. A pass that raises part-way raises no such page, and its refused rows have only their
-ERROR lines. An error in either write or its row that is not a store refusal still ends the pass,
+ERROR lines. An error in either write or its row that is not a store refusal, such as a defect or
+a store that is not the shape the statement needs, still ends the pass,
 and that account gets no `ad_session_revoked` alert; a role change's `no_enabled_administrator`
 and `administrator_granted` alerts are raised before it. The error is raised only after that
 account's revoke has been tried, again without its row if the row raised. A revoke that raises
