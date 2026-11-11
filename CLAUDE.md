@@ -621,7 +621,7 @@ Manager's watch reached the cloud session 29 seconds after its question.
   retirement runs ahead of the plan's order; SAIDS section 6.2 and its A.6 record the gap. Which
   filed build rows and owner-accepted ADR direction are not new product scope, and the limits on
   that, are stated once in plan section 3's class C row; plan section 12 records the owner
-  rulings it rests on. Point
+  rulings and the seat decisions it rests on. Point
   the brief at the relevant existing code; it measurably improves the result.
 - The rest of the Manager's dispatch rules bind only that seat. Korus `roles/MANAGER.md` carries
   them; read it at `origin/main`. Every brief ends with push, then report. A brief names who else is
