@@ -6,8 +6,12 @@ Limb 1: ``http_auth`` set to anything but ``digest`` (a typo, say) read as auth 
 posture reader agreed. It is refused now, through one predicate the reader shares.
 
 Limb 2: a static ``bearer_token``, Basic pair or ``Authorization`` header rode beside Digest on
-REST, SOAP and FHIR. urllib lets a request header override the Digest handler's own, so the static
-credential is what would have crossed. Refused once, in ``digest_handler_from_settings``.
+REST, SOAP and FHIR. urllib lets a request header override the Digest handler's own, so where the
+static credential was sent it is what would have crossed; a lone Basic half sent nothing. All are
+refused under one rule, a connection configures exactly one HTTP credential, by
+``refuse_http_digest_conflicts``. REST, SOAP and FHIR call it at the top of construction, and
+``digest_handler_from_settings`` calls it again. A signing header named ``Authorization`` is
+refused the same way.
 
 Limb 3 (also #2707 closing step 1): ``ech_egress`` replaced the opener that held the Digest
 handler, so a REST connection built with no Digest auth. The pair is refused at construction; the
@@ -30,6 +34,7 @@ from messagefoundry.transports.http_auth import (
     digest_handler_from_settings,
     http_digest_selected,
     is_authorization_header_name,
+    refuse_http_digest_conflicts,
     with_http_digest,
     with_oauth2_client_credentials,
 )
@@ -123,6 +128,31 @@ def test_control_basic_without_digest_builds(ctype: ConnectorType) -> None:
     assert not _has_digest(_build(ctype, settings))
 
 
+@pytest.mark.parametrize("name", ["Authorization", "authorization", "Authorization	"])
+@pytest.mark.parametrize("ctype", [ConnectorType.REST, ConnectorType.SOAP])
+def test_a_signing_header_named_authorization_is_refused_beside_digest(
+    ctype: ConnectorType, name: str
+) -> None:
+    """``_post`` writes the detached JWS under ``sign_header`` per request, so under the
+    Authorization name it would replace the Digest response. The refusal runs before the signing
+    key is read, so a placeholder key is enough here."""
+    settings = _digest_spec(ctype)
+    settings.update({"sign_private_key": "placeholder", "sign_header": name})
+    with pytest.raises(HttpAuthError, match="signing header named Authorization") as ei:
+        _build(ctype, settings)
+    assert _PW not in str(ei.value)
+
+
+def test_control_the_default_signing_header_beside_digest_passes_the_screen() -> None:
+    settings = {**_digest_spec(ConnectorType.REST), "sign_private_key": "placeholder"}
+    assert refuse_http_digest_conflicts(settings)
+    settings["sign_header"] = "X-JWS-Signature"
+    assert refuse_http_digest_conflicts(settings)
+    # Signing switched off writes no header, so the Authorization name is not a conflict then.
+    settings.update({"sign_header": "Authorization", "sign_enabled": False})
+    assert refuse_http_digest_conflicts(settings)
+
+
 def test_control_a_non_auth_static_header_beside_digest_builds() -> None:
     assert _has_digest(
         _build(ConnectorType.REST, _digest_spec(ConnectorType.REST, headers={"X-Trace": "1"}))
@@ -177,7 +207,8 @@ def test_the_census_shares_the_predicate_and_does_not_raise() -> None:
     "name", ["Authorization\t", " authorization", "AUTHORIZATION\x00", "Authorization\x7f"]
 )
 def test_an_authorization_header_however_spelled_is_refused_beside_digest(name: str) -> None:
-    """``http.client`` sends such a name as written, and a peer may read it as the plain header."""
+    """``http.client`` sends most such names as written, and a peer may read one as the plain
+    header; a leading space makes it refuse the request instead. Each is refused here either way."""
     assert is_authorization_header_name(name)
     with pytest.raises(HttpAuthError, match="beside a static credential"):
         _build(ConnectorType.REST, _digest_spec(ConnectorType.REST, headers={name: "Basic x"}))

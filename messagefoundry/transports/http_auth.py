@@ -346,8 +346,9 @@ _AUTHORIZATION_NAME = re.compile(
 
 def is_authorization_header_name(name: str) -> bool:
     """Whether ``name`` is the ``Authorization`` header, however it is spelled (BACKLOG #5529).
-    ``http.client`` sends a name ending in a space, a tab, a NUL or a DEL as it is written, and a
-    peer may read each as the plain name, so a bare ``lower()`` comparison is not enough."""
+    ``http.client`` sends a name ending in a space, a tab, a NUL or a DEL, or starting with a NUL or
+    a DEL, as it is written, and a peer may read each as the plain name, so a bare ``lower()``
+    comparison is not enough."""
     return _AUTHORIZATION_NAME.fullmatch(name) is not None
 
 
@@ -379,11 +380,13 @@ def refuse_http_digest_conflicts(s: Mapping[str, Any]) -> bool:
     The connectors call this at the top of construction, so a connection that will not build logs
     no insecure-hop crossing or warning first; :func:`digest_handler_from_settings` calls it again.
     Refuses an unrecognised ``http_auth`` (:func:`http_digest_selected`), and with Digest selected,
-    a static ``bearer_token``, ``basic_user``, ``basic_password`` or ``Authorization`` entry in
-    ``headers``: urllib lets a request header override the Digest handler's own, so where such a
-    credential is sent it replaces the Digest response on the wire. Also refuses, here rather than
-    late, a SMART or OAuth2 bearer provider beside Digest and a missing Digest user or password.
-    Names settings, never a value."""
+    a static ``bearer_token``, ``basic_user``, ``basic_password``, ``Authorization`` entry in
+    ``headers`` or signing header named ``Authorization``: a connection configures exactly one HTTP
+    credential. Where such a credential is sent it would replace the Digest response on the wire,
+    because urllib lets a request header override the one the Digest handler adds; a lone Basic
+    half sends nothing, and is refused under the same rule. Also refuses, here rather than late, a
+    SMART or OAuth2 bearer provider beside Digest and a missing Digest user or password. Names
+    settings, never a value."""
     if not http_digest_selected(s):
         return False
     # Read strictly: a non-bool flag raises HttpAuthError naming the connection (#2232).
@@ -393,6 +396,11 @@ def refuse_http_digest_conflicts(s: Mapping[str, Any]) -> bool:
     extra = s.get("headers")
     if isinstance(extra, Mapping) and any(is_authorization_header_name(str(k)) for k in extra):
         static.append("an Authorization entry in headers")
+    # A detached JWS written under the Authorization name (with_signing's header_name) is a header
+    # _post sets per request, so it would replace the Digest response the same way.
+    signing = s.get("sign_private_key") and s.get("sign_enabled", True)
+    if signing and is_authorization_header_name(str(s.get("sign_header") or "")):
+        static.append("a signing header named Authorization")
     if static:
         raise HttpAuthError(
             f"{prefix}HTTP Digest cannot be configured beside a static credential "
@@ -415,10 +423,11 @@ def digest_handler_from_settings(
     s: Mapping[str, Any], *, url: str
 ) -> urllib.request.HTTPDigestAuthHandler | None:
     """An :class:`urllib.request.HTTPDigestAuthHandler` pre-loaded with the connection's credentials
-    (BACKLOG #65, RFC 7616), or ``None`` when HTTP Digest auth is off (``http_auth`` unset or
-    blank) — byte-identical. Any other value than ``digest`` raises, as do the conflicts
-    :func:`refuse_http_digest_conflicts` names. The connector folds the returned handler into its per-connection opener; urllib then
-    answers the endpoint's ``401`` Digest challenge and retries within one ``opener.open()``.
+    (BACKLOG #65, RFC 7616), or ``None`` when HTTP Digest auth is off (``http_auth`` unset, falsy
+    or blank) — byte-identical. Any other value than ``digest`` raises, as do the conflicts
+    :func:`refuse_http_digest_conflicts` names. The connector folds the returned handler into its
+    per-connection opener; urllib then answers the endpoint's ``401`` Digest challenge and retries
+    within one ``opener.open()``.
 
     Refuses to run over cleartext ``http`` to an off-box host (the digest response is a credential),
     through the rule the delivery cells' credentials share (``refuse_cleartext_credential_hop``): only
@@ -558,9 +567,10 @@ def with_http_digest(
 
     ``user`` / ``password`` may be :func:`~messagefoundry.config.wiring.env` references. Mutually exclusive
     with a bearer provider (SMART / OAuth2-CC), with a static ``bearer_token``, ``basic_user`` or
-    ``basic_password``, with an ``Authorization`` entry in ``headers`` (#5529), and on REST with
-    ``ech_egress``; refused over cleartext ``http`` to a host off this
-    machine, with no escape (vault BACKLOG #3533 item 4). Mutates ``spec`` in place and returns it."""
+    ``basic_password``, with an ``Authorization`` entry in ``headers`` or a signing header named
+    ``Authorization`` (#5529), and on REST with ``ech_egress``; refused over cleartext ``http`` to a
+    host off this machine, with no escape (vault BACKLOG #3533 item 4). Mutates ``spec`` in place
+    and returns it."""
     _require_http_spec(spec, "HTTP Digest")
     spec.settings.update(
         {"http_auth": "digest", "http_auth_user": user, "http_auth_password": password}

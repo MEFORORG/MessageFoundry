@@ -1253,11 +1253,7 @@ class FhirDestination(DestinationConnector):
 
         digest = digest_handler_from_settings(s, url=self.base_url)
         if digest is not None:
-            if self._token_provider is not None:
-                raise HttpAuthError(
-                    "a connection cannot use BOTH a bearer-token provider and HTTP Digest auth "
-                    "(mutually exclusive — configure exactly one)"
-                )
+            # A bearer provider beside Digest was refused in refuse_http_digest_conflicts (#5529).
             if _is_shared_no_redirect_opener(self._opener):
                 # _no_redirect_opener, not a bare build_opener: the bare form lets urllib fill in an
                 # HTTPSHandler whose context the engine never names, so the forward-secrecy assertion
@@ -1487,7 +1483,7 @@ class FhirDestination(DestinationConnector):
         # credentials), and that token is the one value the construction gate could not see -- the URL
         # and the static headers were already bounded there. Gated here so an operator's "test
         # connection" fails with the real reason rather than an opaque wire error. The SOAP probe
-        # deliberately has no equivalent: it mints nothing, so a gate there could not fire.
+        # mints and gates the same way (BACKLOG #5526).
         try:
             enforce_send_time_length_limits(
                 req.full_url,

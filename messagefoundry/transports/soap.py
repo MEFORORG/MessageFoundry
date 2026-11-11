@@ -400,9 +400,10 @@ def _drop_authorization(headers: dict[str, str]) -> None:
     """Remove every spelling of ``Authorization`` from a static header table, so the credential the
     connection configures owns the one header (BACKLOG #5526). For a name in plain letters urllib
     capitalises it and the last write wins, so the configured value already crossed, though the
-    table held two keys. A name with a tab, a NUL or a DEL at an end is not merged, so the static
-    value crossed too, as a second header a peer may read as ``Authorization``. The REST, FHIR and
-    DICOMweb header builders do not purge."""
+    table held two keys. A name ending in a space or a tab, or with a NUL or a DEL at either end,
+    is not merged, so the static value crossed too, as a second header a peer may read as
+    ``Authorization``. A leading space or tab made ``http.client`` refuse the request instead. The
+    REST, FHIR and DICOMweb header builders do not purge."""
     from messagefoundry.transports.http_auth import is_authorization_header_name
 
     for key in [k for k in headers if is_authorization_header_name(k)]:
@@ -615,11 +616,7 @@ class SoapDestination(DestinationConnector):
             )
         digest = digest_handler_from_settings(s, url=self.url)
         if digest is not None:
-            if self._token_provider is not None:
-                raise HttpAuthError(
-                    "a connection cannot use BOTH a bearer-token provider and HTTP Digest auth "
-                    "(mutually exclusive — configure exactly one)"
-                )
+            # A bearer provider beside Digest was refused in refuse_http_digest_conflicts (#5529).
             if _is_shared_no_redirect_opener(self._opener):
                 # _no_redirect_opener, not a bare build_opener: the bare form lets urllib fill in an
                 # HTTPSHandler whose context the engine never names, so the forward-secrecy assertion
@@ -759,8 +756,9 @@ class SoapDestination(DestinationConnector):
     def _refuse_half_credential_pairs(self, s: dict[str, Any]) -> None:
         """A credential pair is both halves or neither (BACKLOG #5526). Read here, on the resolved
         settings, because the ``Soap()`` factory sees ``env()`` references and cannot tell one that
-        resolves empty from a set value. One half alone would send no HTTP Basic header, or stamp a
-        UsernameToken with an empty password. The message names keys, never a value."""
+        resolves empty from a set value. One Basic half alone would send no HTTP Basic header; a
+        token user alone would stamp a UsernameToken with an empty password, and a token password
+        alone would stamp none. The message names keys, never a value."""
         prefix = hop_name_prefix(self._connection_name)
         if bool(s.get("basic_user")) != bool(s.get("basic_password")):
             raise HttpAuthError(
@@ -937,15 +935,37 @@ class SoapDestination(DestinationConnector):
         # Reachability only: a HEAD reaches the endpoint without POSTing an envelope. An HTTP response
         # means the host answered (a 405 is still a pass), but a 401/403 means the configured
         # credentials would be rejected — surface that as a failure. Connection/DNS/TLS/timeout fails.
-        # ASVS 4.2.5: deliberately NO send-time length gate here. Unlike the REST and FHIR probes,
-        # this one does not mint a bearer -- it ships ``self.url`` and ``self._headers`` verbatim, and
-        # both were bounded at construction. A gate here could not fire on any input, and a guard that
-        # cannot fail reads as coverage without being it.
-        # BACKLOG #2196: the hop re-check _post runs, before a byte crosses.
+        # BACKLOG #2196: the hop re-check _post runs, before the bearer is minted below.
         assert_probe_hop(self._hop_guard, self.url, connector="SOAP")
+        headers = self._headers
+        if self._token_provider is not None:
+            # BACKLOG #5526: the probe presents the credential a send presents. Construction purges a
+            # static Authorization header once a provider exists, so a probe that did not mint would
+            # carry no credential at all. A token-endpoint failure raises DeliveryError.
+            headers = {
+                **self._headers,
+                "Authorization": f"Bearer {self._token_provider.access_token()}",
+            }
         req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
-            self.url, headers=self._headers, method="HEAD"
+            self.url, headers=headers, method="HEAD"
         )
+        # ASVS 4.2.5: the minted bearer is the one value the construction gate could not see; the URL
+        # and the static headers were bounded there. As in the REST and FHIR probes.
+        try:
+            enforce_send_time_length_limits(
+                req.full_url,
+                headers,
+                connector=f"SOAP {_redact_url(self.url)} probe",
+                minted_credential_names=(
+                    frozenset({"Authorization"})
+                    if self._token_provider is not None
+                    else frozenset()
+                ),
+            )
+        except NegativeAckError as exc:
+            if exc.credential_fault and self._token_provider is not None:
+                self._token_provider.invalidate()
+            raise
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
                 # ASVS 15.2.2: the HEAD probe body is discarded, but an unbounded drain would let a

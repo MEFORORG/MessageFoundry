@@ -13,6 +13,8 @@ settings, so an ``env()`` that resolves to an empty string is refused as well as
 
 from __future__ import annotations
 
+import urllib.request
+
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
@@ -138,8 +140,9 @@ def test_a_static_authorization_header_of_any_casing_is_purged(
 ) -> None:
     """For a name in plain letters this is hardening: urllib capitalises header names and the last
     write wins, so the configured credential already reached the wire, though ``_headers`` held two
-    keys. A name with a tab or a space at an end is not merged by urllib, so before this change the
-    static value crossed as a second header beside the configured one. Now exactly one is held."""
+    keys. A name ending in a tab is not merged by urllib, so before this change the static value
+    crossed as a second header beside the configured one; a leading space made ``http.client``
+    refuse the request. Now exactly one is held."""
     d = _dest(headers={casing: "Basic STATIC"}, **cred)
     keys = _auth_keys(d)
     assert keys == ["Authorization"]
@@ -163,3 +166,90 @@ def test_a_minted_bearer_also_owns_the_authorization_header() -> None:
 def test_control_a_static_authorization_header_alone_is_kept() -> None:
     d = _dest(headers={"authorization": "Basic STATIC"})
     assert _auth_keys(d) == ["authorization"]
+
+
+# --- the probe presents the credential a send presents -----------------------------------------
+
+
+class _Provider:
+    def access_token(self) -> str:
+        return "AT-synthetic"
+
+    def invalidate(self) -> None:
+        pass
+
+
+class _Resp:
+    headers: dict[str, str] = {}
+    status = 200
+
+    def read(self, amt: int = -1) -> bytes:
+        return b""
+
+    def __enter__(self) -> _Resp:
+        return self
+
+    def __exit__(self, *a: object) -> None:
+        return None
+
+
+class _RecordingOpener:
+    def __init__(self) -> None:
+        self.requests: list[urllib.request.Request] = []
+
+    def open(self, req: urllib.request.Request, timeout: float | None = None) -> _Resp:
+        self.requests.append(req)
+        return _Resp()
+
+
+def test_the_probe_mints_the_bearer_a_send_presents() -> None:
+    """The minted-bearer purge above removes a static Authorization header once a provider exists.
+    A probe that sent ``_headers`` verbatim then carried no credential at all, where before the
+    purge it carried the static one. It now mints, as ``_post`` and the REST and FHIR probes do."""
+    spec = with_oauth2_client_credentials(
+        Soap(url=URL, headers={"authorization": "Basic STATIC"}),
+        token_url="https://auth.example.com/token",
+        client_id="cid",
+        client_secret="cs-synthetic",  # noqa: S106 -- a synthetic test credential
+    )
+    d = _build(spec.settings)
+    d._token_provider = _Provider()
+    opener = _RecordingOpener()
+    d._opener = opener  # type: ignore[assignment]
+    d._probe()
+    (req,) = opener.requests
+    assert req.get_method() == "HEAD"
+    sent = [v for k, v in req.header_items() if is_authorization_header_name(k)]
+    assert sent == ["Bearer AT-synthetic"]
+
+
+def test_control_the_probe_without_a_provider_sends_the_static_headers() -> None:
+    d = _dest(basic_user="svc", basic_password=_PW)
+    opener = _RecordingOpener()
+    d._opener = opener  # type: ignore[assignment]
+    d._probe()
+    (req,) = opener.requests
+    assert req.get_header("Authorization", "").startswith("Basic ")
+
+
+# --- with ws_security off, the ws_* pair is not read ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "half",
+    [{"ws_username": "svc"}, {"ws_password": _PW}],
+    ids=["user-only", "password-only"],
+)
+def test_with_ws_security_off_a_half_ws_pair_builds_and_stamps_nothing(
+    half: dict[str, str],
+) -> None:
+    """The ADR 0015 amendment of 2026-11-10: with ``ws_security`` off the pair is not refused, and
+    nothing of it reaches the wire, neither in the envelope nor as a header."""
+    d = _dest(soap_version="1.2", **half)
+    env = d._wrap_envelope("<op/>")
+    assert "Security" not in env
+    assert "svc" not in env and _PW not in env
+    assert not _auth_keys(d)
+    assert all("svc" not in v and _PW not in v for v in d._headers.values())
+    census = {"ws_security": False, **half}
+    assert _http_static(ConnectorType.SOAP, census, False) == []
