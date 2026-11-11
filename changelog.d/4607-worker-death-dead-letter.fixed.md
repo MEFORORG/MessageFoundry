@@ -6,8 +6,8 @@
   `ERROR`. No claim raises that count, so a row claimed in the same batch as the dying one is never
   counted, and a crash or stop mid-row never adds to it. Below the cap the row stays in flight,
   paged by the in-flight watch, until the next start. "Every time" means across passes that each
-  claim the row anew, after a restart or a Postgres lease reclaim: a dead worker's row is not yet
-  re-claimed in the same process. An outbound row counts a death as a failed send under its lane's
+  claim the row anew, after a restart or a Postgres lease reclaim: a respawned worker does not yet
+  re-claim the row its predecessor died on. An outbound row counts a death as a failed send under its lane's
   retry policy, so a lane set to retry forever never dead-letters on a death; a batching outbound
   lane does not count deaths yet. A death on a lane a
   pooled dispatcher drains fires `connection_stopped`. `KeyboardInterrupt`, `SystemExit`,

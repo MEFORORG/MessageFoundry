@@ -284,14 +284,25 @@ async def test_the_count_survives_recovery_and_a_claim_never_raises_it(
     assert await _row(store, mid, Stage.INGRESS) == ("inflight", 2, 1)
 
 
-async def test_a_row_not_in_flight_is_not_counted(store: MessageStore) -> None:
-    mid = await store.enqueue_ingress(channel_id="IB", raw=_hl7("PENDING"))
-    cur = await store._db.execute("SELECT id FROM queue WHERE message_id=?", (mid,))
-    fetched = await cur.fetchone()
-    assert fetched is not None
-    counted = await store.record_worker_death(str(fetched["id"]), 1, "router worker killed")
+async def test_a_death_on_a_row_already_re_pended_is_still_counted(store: MessageStore) -> None:
+    """A Postgres lease sweep can re-pend the row before the death is recorded; the death is the
+    row's all the same (review round 2), or a row that hangs past the lease and then kills its
+    worker would never reach the cap."""
+    mid = await store.enqueue_ingress(channel_id="IB", raw=_hl7("SWEPT"))
+    item = await _claim(store, "IB", Stage.INGRESS)
+    await store.reset_stale_inflight()  # stands in for the sweep
+    counted = await store.record_worker_death(item.id, LIMIT, "router worker killed by _Kill")
+    assert (counted.deaths, counted.dead) == (1, False)
+    assert await _row(store, mid, Stage.INGRESS) == ("pending", 1, 1)
+
+
+async def test_a_resolved_row_is_not_counted(store: MessageStore) -> None:
+    mid = await store.enqueue_message(channel_id="IB", raw=_hl7("DONE"), deliveries=[("OB", "p")])
+    item = await _claim(store, "OB", Stage.OUTBOUND)
+    assert await store.mark_done(item.id)
+    counted = await store.record_worker_death(item.id, 1, "delivery worker killed by _Kill")
     assert (counted.deaths, counted.dead) == (0, False)
-    assert await _row(store, mid, Stage.INGRESS) == ("pending", 0, 0)
+    assert await _row(store, mid, Stage.OUTBOUND) == ("done", 1, 0)
 
 
 async def test_a_replay_resets_the_count_with_attempts(store: MessageStore) -> None:
@@ -425,6 +436,8 @@ async def test_a_store_fault_leaves_the_row_in_flight_and_the_death_raised(
         (asyncio.CancelledError(), False),
         (GeneratorExit(), False),
         (ValueError("an ordinary fault"), False),
+        (BaseExceptionGroup("stops", [SystemExit(0), KeyboardInterrupt()]), False),
+        (BaseExceptionGroup("mixed", [SystemExit(0), _Kill()]), True),
     ],
 )
 def test_only_a_death_is_counted(exc: BaseException, counted: bool) -> None:

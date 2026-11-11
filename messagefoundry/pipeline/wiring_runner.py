@@ -1491,10 +1491,15 @@ def _kills_the_worker(exc: BaseException) -> bool:
     and forbids the ``await`` that records the death; and never ``KeyboardInterrupt`` or
     ``SystemExit``, which end the process for a reason that is not the row's (owner ruling
     2026-11-11)."""
-    return not isinstance(
+    if isinstance(
         exc,
         (Exception, asyncio.CancelledError, GeneratorExit, KeyboardInterrupt, SystemExit),
-    )
+    ):
+        return False
+    if isinstance(exc, BaseExceptionGroup):
+        # A group is a death only where one of its members is: a group of stops is still a stop.
+        return any(_kills_the_worker(member) for member in exc.exceptions)
+    return True
 
 
 def _records_worker_death(worker: str) -> Callable[[_ItemBody], _ItemBody]:
@@ -12438,8 +12443,9 @@ class RegistryRunner:
         ``ERROR``. Below it the row stays in flight, as on ``main``: the in-flight watch pages it,
         and ``reset_stale_inflight`` brings it back at the next start with its count kept.
         "Repeatedly" therefore means across passes that each claimed the row anew, after a restart
-        or a Postgres lease reclaim; this process does not re-claim a dead worker's row, which is
-        #4607 steps 1, 2 and 5.
+        or a Postgres lease reclaim. A per_lane worker is respawned, but its dying row stays in
+        flight, so this process does not re-claim it unless a lease sweep re-pends it; recovering a
+        dead worker's held rows in-process is #4607 steps 1, 2 and 5.
 
         **An outbound row** counts the death as a failed send under the lane's own retry policy
         (owner ruling 2026-11-11). Its count is the ``attempts`` the claim raised, which also holds
@@ -12485,7 +12491,9 @@ class RegistryRunner:
                         "unlimited" if cap is None else cap,
                     )
                     return
-                failed = await self.store.mark_failed(item.id, error, retry)
+                # Through _mark_failed_and_arm, so a re-pend below (the store's attempts lower
+                # than the claim's copy) still arms the lane's retry wake.
+                failed = await self._mark_failed_and_arm(name, item.id, error, retry)
                 if failed.retry_at is not None:
                     # The store's attempts were below the cap the claim's copy reached: something
                     # in the body already returned an attempt. mark_failed re-pended the row.
