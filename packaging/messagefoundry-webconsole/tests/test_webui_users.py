@@ -129,6 +129,61 @@ def test_users_page_hides_the_scope_columns_from_a_reader_who_is_not_shown_scope
     assert "(none)" in shown
 
 
+def test_users_page_lists_an_integrity_failed_account_by_id_alone() -> None:
+    """BACKLOG #5520: an account whose record fails its seal arrives as its id alone. Its row names
+    the id and says the check failed, keeps the table's column count, and links nowhere, since the
+    detail page still reads the row unchecked. The control is an intact account beside it."""
+    from messagefoundry.api.auth_models import IntegrityFailedUser, UserSummary
+    from messagefoundry_webconsole.pages.admin import users_page
+
+    intact = UserSummary(
+        id="u1",
+        username="intact",
+        auth_provider="local",
+        disabled=False,
+        roles=["operator"],
+        channel_scope_withheld=False,
+    )
+    failed = IntegrityFailedUser(id="f" * 32, integrity_failed=True)
+    rendered = str(users_page([intact, failed]))
+    assert "integrity check failed" in rendered and "f" * 32 in rendered
+    assert f'href="/ui/users/{"f" * 32}"' not in rendered
+    assert 'href="/ui/users/u1"' in rendered  # control
+    rows = re.findall(r"<tr>(.*?)</tr>", rendered, re.S)
+    assert len({row.count("<td") for row in rows if "<td" in row}) == 1
+
+
+async def test_the_console_update_does_not_render_a_record_that_fails_its_seal(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5520: PATCH's handler answers 423 when the account's record fails its seal. The
+    console's update route raises it as is rather than re-rendering the detail page, which reads the
+    row unchecked and would show what the engine refused to. The seal failure is stood in for at
+    the service's checked reader; the control is the same post with the reader intact."""
+    from _ui_clients import SAME_ORIGIN, cookie_login, mint_bound_proof, provision, ui_client
+
+    from messagefoundry.auth.service import USER_SEAL_REFUSED, UserSealRefused
+
+    service = await _service(engine)
+    await provision(service, "root", [Role.ADMINISTRATOR.value])
+    victim = await provision(service, "victim", [Role.VIEWER.value])
+    form = {"display_name": "Shown-Name", "email": ""}
+    async with ui_client(engine, service) as c:
+        await cookie_login(c, "root")
+        await mint_bound_proof(c, f"/ui/users/{victim}")
+        ok = await c.post(f"/ui/users/{victim}/update", data=form, headers=SAME_ORIGIN)
+        assert ok.status_code == 303  # control
+
+        async def refused(user_id: str) -> None:
+            raise UserSealRefused(USER_SEAL_REFUSED)
+
+        monkeypatch.setattr(service, "checked_user", refused)
+        await mint_bound_proof(c, f"/ui/users/{victim}")
+        r = await c.post(f"/ui/users/{victim}/update", data=form, headers=SAME_ORIGIN)
+    assert r.status_code == 423
+    assert "Shown-Name" not in r.text
+
+
 async def test_users_page_shows_scopes_only_to_a_users_manage_holder(engine: Engine) -> None:
     """The route half of the rule above: a users:read-only reader, here a custom role, sees no
     account's channels on /ui/users, while an administrator sees them (BACKLOG #3189)."""
@@ -213,6 +268,20 @@ async def test_create_user_end_to_end(engine: Engine) -> None:
         assert (
             shown is not None and (await service.login("newop", html.unescape(shown.group(1)))).ok
         )
+
+
+async def test_the_console_create_refuses_a_reserved_or_control_username(engine: Engine) -> None:
+    """BACKLOG #5521: the console builds the same request model, so it inherits the username rule.
+    A reserved actor name and a name holding a control character re-render the form with a 400,
+    and write nothing. The control is an ordinary name, created."""
+    service = await _service(engine)
+    async with _boss_client(engine, service) as c:
+        for name in ("system", "system:rotate-key", "<oidc>", "a\x07b"):
+            r = await _post_pairs(c, "/ui/users", [("username", name), ("email", "x@example.test")])
+            assert r.status_code == 400, name
+            assert await service.store.get_user_by_username(name) is None
+        ok = await _post_pairs(c, "/ui/users", [("username", "sysop"), ("email", "x@example.test")])
+        assert ok.status_code == 200 and "Account created" in ok.text
 
 
 async def test_create_user_duplicate_rerenders_without_password(engine: Engine) -> None:
