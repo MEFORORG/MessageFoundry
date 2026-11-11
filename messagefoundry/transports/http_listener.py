@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import bisect
 import contextlib
+import functools
 import ipaddress
 import json
 import logging
@@ -736,8 +737,10 @@ _MAX_FORWARDED_HOPS = 32
 _IPV6_KEY_PREFIX = 64
 #: IPv6 prefixes whose addresses carry an IPv4 client, so one ``/64`` of them holds unrelated
 #: hosts: the NAT64 well-known and local-use prefixes (RFC 6052, RFC 8215), Teredo (RFC 4380) and
-#: the deprecated IPv4-compatible form. An address in one keys on itself, as an IPv4 client does,
-#: and a listed range in one counts its addresses toward the span limit, not its ``/64`` networks.
+#: the deprecated IPv4-compatible form. An address in one never keys on its ``/64``
+#: (:func:`_budget_key`), and a listed range in one counts its addresses toward the span limit,
+#: not its ``/64`` networks.
+_NAT64_WELL_KNOWN = ipaddress.IPv6Network("64:ff9b::/96")
 _IPV4_EMBEDDING_PREFIXES = tuple(
     ipaddress.IPv6Network(prefix)
     for prefix in ("64:ff9b::/96", "64:ff9b:1::/48", "2001::/32", "::/96")
@@ -768,7 +771,7 @@ def trusted_proxy_networks(value: Any) -> tuple[_ProxyNetwork, ...]:
     ``[api]`` load only warns about those. So are entries that together span more than
     :data:`_PROXY_SPAN_LIMIT` budget keys of one family, more than a ``/16`` of IPv4 or a ``/48``
     of IPv6. An IPv4-mapped entry is read as the IPv4 range it names, the form
-    :func:`_hop_address` hands the walk, so one proxy matches in either spelling."""
+    :func:`_hop_readings` hands the walk, so one proxy matches in either spelling."""
     if value is None:
         return ()
     if isinstance(value, str):
@@ -784,10 +787,20 @@ def trusted_proxy_networks(value: Any) -> tuple[_ProxyNetwork, ...]:
             "Http trusted_proxies must be a list of proxy addresses or CIDR networks, "
             "e.g. trusted_proxies=['10.0.0.5']"
         )
-    networks: list[_ProxyNetwork] = []
     for index, entry in enumerate(value):
         if not isinstance(entry, str):
             raise ValueError(f"Http trusted_proxies item {index} must be a string (value withheld)")
+    return _validated_proxy_networks(tuple(value))
+
+
+@functools.lru_cache(maxsize=64)
+def _validated_proxy_networks(value: tuple[str, ...]) -> tuple[_ProxyNetwork, ...]:
+    """:func:`trusted_proxy_networks` for a list already known to hold strings. Cached, because
+    ``GET /security/posture`` and each start and reload audit read every listener's list again on
+    the event loop, and a list the span limit admits may hold 65,536 entries; a refusal raises, so
+    it is never cached and every read refuses it again."""
+    networks: list[_ProxyNetwork] = []
+    for index, entry in enumerate(value):
         parsed = _parsed_proxy_or_none(entry)
         if parsed is None:
             # Raised outside the parse's handler and never quoted: _parse_trusted_proxy's message
@@ -827,7 +840,8 @@ def trusted_proxy_networks(value: Any) -> tuple[_ProxyNetwork, ...]:
 
 def _v6_key_count(network: ipaddress.IPv6Network) -> int:
     """How many budget keys an IPv6 range holds: its ``/64`` networks, or, where it overlaps an
-    IPv4-embedding prefix whose addresses each key on themselves, its addresses."""
+    IPv4-embedding prefix, where a key is an address or an embedded IPv4 client, its addresses,
+    which bound the keys there."""
     if any(network.overlaps(prefix) for prefix in _IPV4_EMBEDDING_PREFIXES):
         return network.num_addresses
     return max(1, network.num_addresses >> (128 - _IPV6_KEY_PREFIX))
@@ -882,38 +896,40 @@ def _refused_entry_reason(entry: str) -> str:
     return "has host bits set; list the proxy's own address, or the range's network address"
 
 
-def _hop_address(text: str) -> _HopAddress | None:
-    """One ``X-Forwarded-For`` hop as an address; ``None`` when it is not one.
+def _hop_readings(text: str) -> tuple[_HopAddress, ...]:
+    """One ``X-Forwarded-For`` hop as the address or addresses it may name; empty when none.
 
     Reads a bare address, ``a.b.c.d:port``, ``[v6]`` and ``[v6]:port``. Anything else, ``unknown``
-    and an empty hop included, is ``None`` and never becomes a budget key. A bare IPv6 hop is
+    and an empty hop included, is empty and never becomes a budget key. A bare IPv6 hop is
     ambiguous when its last group is decimal digits and dropping that group still leaves an
-    address: ``2001:db8::1:1234`` is an address, and also ``2001:db8::1`` with a port. Where the
-    two readings give one budget key, the usual case since both share the ``/64``, the hop is read
-    as uvicorn reads it, as the whole address. Where they give two, it is ``None`` and the walk
-    falls back to the socket peer, so a client cannot pick between two keys by its choice of
-    interface identifier. The bracketed form says where the address ends and is always read. The
-    address is then read by :func:`_peer_address`."""
+    address: ``2001:db8::1:1234`` is an address, and also ``2001:db8::1`` with a port. Such a hop
+    yields both, the whole address first, as uvicorn reads it. The caller keys the budget on every
+    reading, so a client cannot escape its own budget by choosing an interface identifier that
+    makes its hop ambiguous: one of the two readings is its real address, and that one is always
+    charged. The bracketed form says where the address ends and yields one. Each address is read
+    by :func:`_peer_address`."""
     host = text.strip(" \t")
     bracketed = host.startswith("[")
     if bracketed:
         inner, closed, rest = host[1:].partition("]")
         if not closed or (rest and not (rest[:1] == ":" and _HOP_PORT_RE.fullmatch(rest[1:]))):
-            return None
+            return ()
         host = inner
     elif host.count(":") == 1:
         host, _, port = host.partition(":")
         if not _HOP_PORT_RE.fullmatch(port):
-            return None
+            return ()
     address = _peer_address(host)
-    if address is not None and not bracketed and host.count(":") > 1:
+    if address is None:
+        return ()
+    if not bracketed and host.count(":") > 1:
         # Checked only once the hop parsed, so the second parse runs for a bare IPv6 hop alone.
         head, _, last = host.partition("%")[0].rpartition(":")
         if _HOP_PORT_RE.fullmatch(last):
             other = _peer_address(head)
-            if other is not None and _budget_key(other) != _budget_key(address):
-                return None
-    return address
+            if other is not None:
+                return (address, other)
+    return (address,)
 
 
 def _peer_address(text: str | None) -> _HopAddress | None:
@@ -938,13 +954,23 @@ def _peer_address(text: str | None) -> _HopAddress | None:
 
 def _budget_key(address: _HopAddress) -> str:
     """The failed-attempt budget key for ``address``: an IPv4 address as written, an IPv6 address
-    as its ``/64``, so rotating addresses inside one ``/64`` mints no budget (BACKLOG #5525). An
-    address in an IPv4-embedding prefix keys on itself, since its ``/64`` holds unrelated clients."""
-    if isinstance(address, ipaddress.IPv6Address) and not any(
-        address in prefix for prefix in _IPV4_EMBEDDING_PREFIXES
-    ):
-        return str(ipaddress.IPv6Network((address, _IPV6_KEY_PREFIX), strict=False))
-    return str(address)
+    as its ``/64``, so rotating addresses inside one ``/64`` mints no budget (BACKLOG #5525).
+
+    An address in an IPv4-embedding prefix does not key on its ``/64``, which holds unrelated
+    clients. Where the IPv4 client sits at a fixed place, it keys as that IPv4 address, so a client
+    holds one budget whichever way it arrives: the low 32 bits under NAT64's well-known
+    ``64:ff9b::/96``, and the client field under Teredo, whose other bits a client may vary. In
+    the rest, NAT64's local-use ``64:ff9b:1::/48``, whose embedding depends on the operator's
+    prefix length, and ``::/96``, the address keys on itself."""
+    if isinstance(address, ipaddress.IPv4Address):
+        return str(address)
+    if address in _NAT64_WELL_KNOWN:
+        return str(ipaddress.IPv4Address(int(address) & 0xFFFFFFFF))
+    if address.teredo is not None:
+        return str(address.teredo[1])
+    if any(address in prefix for prefix in _IPV4_EMBEDDING_PREFIXES):
+        return str(address)
+    return str(ipaddress.IPv6Network((address, _IPV6_KEY_PREFIX), strict=False))
 
 
 def _peer_budget_key(peer_host: str | None, address: _HopAddress | None = None) -> str:
@@ -1538,14 +1564,15 @@ class HttpSource(SourceConnector):
     # only true because the budget is consulted read-only and charged on failure; a limiter that
     # charged per attempt would refuse authenticated traffic here, and THAT would be silent loss.
 
-    def _rate_limit_refusal(self, peer: str) -> HttpRequestError | None:
-        """The ``429`` if ``peer`` has spent its failed-attempt budget, else ``None``.
+    def _rate_limit_refusal(self, peers: tuple[str, ...]) -> HttpRequestError | None:
+        """The ``429`` if any of ``peers`` has spent its failed-attempt budget, else ``None``.
 
         Consulted **read-only** and **before** any credential comparison: the point of the budget is
-        to bound guessing, and a successful authentication must never consume it.
+        to bound guessing, and a successful authentication must never consume it. ``peers`` holds
+        one key, or two for an ambiguous forwarded hop (BACKLOG #5525).
         """
         limiter = self.intake_rate_limiter
-        if limiter is None or limiter.check(peer):
+        if limiter is None or all(limiter.check(peer) for peer in peers):
             return None
         return HttpRequestError(
             429,
@@ -1554,8 +1581,8 @@ class HttpSource(SourceConnector):
             headers={"Retry-After": "60"},
         )
 
-    def _charged(self, peer: str, refusal: HttpRequestError) -> HttpRequestError:
-        """Charge one FAILED attempt against ``peer`` and hand the refusal straight back.
+    def _charged(self, peers: tuple[str, ...], refusal: HttpRequestError) -> HttpRequestError:
+        """Charge one FAILED attempt against each of ``peers`` and hand the refusal straight back.
 
         Takes an already-built refusal rather than its parts so every ``kind=`` stays a literal at a
         visible ``HttpRequestError(...)`` call site. CI derives the whole ``connection_event``
@@ -1564,12 +1591,14 @@ class HttpSource(SourceConnector):
         §7. An undeclared kind is then refused by the store at write time, and the event is lost.
         """
         if self.intake_rate_limiter is not None:
-            self.intake_rate_limiter.charge_failure(peer)
+            for peer in peers:
+                self.intake_rate_limiter.charge_failure(peer)
         return refusal
 
-    def _note_intake_success(self, peer: str) -> None:
+    def _note_intake_success(self, peers: tuple[str, ...]) -> None:
         if self.intake_rate_limiter is not None:
-            self.intake_rate_limiter.note_success(peer)
+            for peer in peers:
+                self.intake_rate_limiter.note_success(peer)
 
     def _authorize_peer_cert(
         self, writer: asyncio.StreamWriter, peer_host: str | None
@@ -1590,7 +1619,7 @@ class HttpSource(SourceConnector):
         """
         if self.intake_auth != "mtls_subject":
             return None
-        peer = _peer_budget_key(peer_host)
+        peer = (_peer_budget_key(peer_host),)
         limited = self._rate_limit_refusal(peer)
         if limited is not None:
             return limited
@@ -1674,17 +1703,25 @@ class HttpSource(SourceConnector):
             return  # explicit opt-out for a load-balancer probe that cannot carry the credential
         peer = _peer_address(peer_host)
         forwarded = self._forwarded_client(head, peer)
-        key = _peer_budget_key(peer_host, peer) if forwarded is None else _budget_key(forwarded)
+        keys = (
+            tuple(dict.fromkeys(_budget_key(reading) for reading in forwarded))
+            if forwarded
+            else (_peer_budget_key(peer_host, peer),)
+        )
         try:
-            self._authorize_credential(head, key)
+            self._authorize_credential(head, keys)
         except HttpRequestError as exc:
             # Recorded beside the socket peer, never instead of it, and as the address itself: the
-            # key may be its /64, which says less about who sent the request.
-            exc.forwarded_for = None if forwarded is None else str(forwarded)
+            # key may be its /64, which says less about who sent the request. An ambiguous hop is
+            # recorded as its whole-address reading, uvicorn's.
+            exc.forwarded_for = str(forwarded[0]) if forwarded else None
             raise
 
-    def _forwarded_client(self, head: HttpRequest, peer: _HopAddress | None) -> _HopAddress | None:
-        """The client address a listed proxy forwarded, or ``None`` to key on the socket peer.
+    def _forwarded_client(
+        self, head: HttpRequest, peer: _HopAddress | None
+    ) -> tuple[_HopAddress, ...]:
+        """The client address a listed proxy forwarded, as :func:`_hop_readings` reads its hop, or
+        empty to key on the socket peer.
 
         uvicorn's walk (BACKLOG #5525): the header counts only when the socket peer is a listed
         proxy; the hops are read right to left, a listed hop is skipped, and the first unlisted one
@@ -1692,11 +1729,13 @@ class HttpSource(SourceConnector):
         cannot choose it; everything left of it is the client's own text and is never read.
         uvicorn takes the left-most hop when every hop is listed, and this walk does not: it falls
         back to the socket peer then, as it does for a missing header or a hop that is not an
-        address, so no budget is ever keyed on text a client wrote."""
+        address, so no budget is ever keyed on text a client wrote. An ambiguous hop is a listed
+        hop only where every reading is listed; otherwise it is the client, keyed on every reading,
+        so no reading a client can steer onto a listed address moves the walk past it."""
         if not self._trusted_proxies or not head.forwarded_header:
-            return None
+            return ()
         if peer is None or not self._is_trusted_proxy(peer):
-            return None
+            return ()
         # Read hop by hop from the right with rfind, so each hop is scanned once and nothing left of
         # the client is touched, and stop after _MAX_FORWARDED_HOPS: a host inside a listed range
         # may pad the header with listed hops up to max_header_bytes, on the event loop.
@@ -1704,22 +1743,22 @@ class HttpSource(SourceConnector):
         end = len(header)
         for _ in range(_MAX_FORWARDED_HOPS):
             start = header.rfind(",", 0, end)
-            address = _hop_address(header[start + 1 : end])
-            if address is None:
-                return None
-            if not self._is_trusted_proxy(address):
-                return address
+            readings = _hop_readings(header[start + 1 : end])
+            if not readings:
+                return ()
+            if not all(self._is_trusted_proxy(reading) for reading in readings):
+                return readings
             if start < 0:
-                return None
+                return ()
             end = start
-        return None
+        return ()
 
     def _is_trusted_proxy(self, address: _HopAddress) -> bool:
         # Matched within the address's own family, so no spelling crosses over.
         return address in self._proxy_matcher
 
-    def _authorize_credential(self, head: HttpRequest, peer: str) -> None:
-        """The budget check and the credential comparison, keyed on ``peer``."""
+    def _authorize_credential(self, head: HttpRequest, peer: tuple[str, ...]) -> None:
+        """The budget check and the credential comparison, keyed on each key in ``peer``."""
         limited = self._rate_limit_refusal(peer)
         if limited is not None:
             raise limited
@@ -1773,7 +1812,7 @@ class HttpSource(SourceConnector):
             return
         # The reason is a fixed string at every call site, never request data, so it is safe to log.
         # It is what tells a repeated credential header apart from a wrong key (BACKLOG #2051). The
-        # forwarded address is request data, but only ever an address `_hop_address` parsed and
+        # forwarded address is request data, but only ever an address `_hop_readings` parsed and
         # re-rendered, never the header's own text (BACKLOG #5525).
         logger.warning(
             "HTTP intake authentication refused: peer=%s forwarded_for=%s mode=%s outcome=%s "

@@ -284,7 +284,7 @@ def test_a_padded_header_is_read_no_further_than_the_hop_bound() -> None:
     def key(hops: list[str]) -> str | None:
         head = HttpRequest("POST", "/", {}, b"", frozenset(), ",".join(hops))
         found = source._forwarded_client(head, ipaddress.ip_address("10.0.0.1"))
-        return None if found is None else str(found)
+        return str(found[0]) if found else None
 
     listed = ["10.0.0.2"] * (_MAX_FORWARDED_HOPS - 1)
     assert key([CLIENT_A, *listed]) == CLIENT_A  # the client is the bound's last hop
@@ -424,29 +424,29 @@ def test_a_list_within_the_floor_loads(entries: list[str]) -> None:
 
 
 @pytest.mark.parametrize(
-    ("hop", "key"),
+    ("hop", "keys"),
     [
         # Every address in one /64 keys one budget.
-        ("2001:db8::1", "2001:db8::/64"),
-        ("[2001:db8::ffff:1]:443", "2001:db8::/64"),
-        ("2001:db8:0:1::1", "2001:db8:0:1::/64"),
-        # A bare hop that also reads as an address and a port, where both readings share a /64:
-        # one key either way, so it is read, and the client cannot fall back by choosing it.
-        ("2001:db8::1:1234", "2001:db8::/64"),
-        ("2001:db8::7:80", "2001:db8::/64"),
-        # Where the two readings key different /64s, it is not read: the socket peer keys.
-        ("2001:db8::1:2:3:4:5", PROXY),
-        # Its control: a bare hop whose last group cannot be a port alone is read.
-        ("2001:db8::7", "2001:db8::/64"),
-        ("2001:db8::a:b", "2001:db8::/64"),
-        # A NAT64 client keys on its whole address: its /64 holds every IPv4 client. So the two
-        # readings of a bare hop there always key apart, and an ambiguous one is not read.
-        ("[64:ff9b::c000:221]:80", "64:ff9b::c000:221"),
-        ("64:ff9b::c000:221", PROXY),
+        ("2001:db8::1", ["2001:db8::/64"]),
+        ("[2001:db8::ffff:1]:443", ["2001:db8::/64"]),
+        ("2001:db8:0:1::1", ["2001:db8:0:1::/64"]),
+        # A bare hop that also reads as an address and a port is keyed on both readings. Where
+        # they share a /64, that is one key.
+        ("2001:db8::1:1234", ["2001:db8::/64"]),
+        ("2001:db8::7:80", ["2001:db8::/64"]),
+        # Where they key two, both are checked and both charged; the socket peer is never keyed.
+        ("2001:db8::1:2:3:4:5", ["2001:db8:0:1::/64", "2001:db8::/64"]),
+        # Its control: a bare hop whose last group cannot be a port alone is read once.
+        ("2001:db8::7", ["2001:db8::/64"]),
+        ("2001:db8::a:b", ["2001:db8::/64"]),
+        # A NAT64 client keys as the IPv4 client it carries, never on the /64 every IPv4 client
+        # behind NAT64 shares. A bare hop there always reads two keys.
+        ("[64:ff9b::c000:221]:80", ["192.0.2.33"]),
+        ("64:ff9b::c000:221", ["192.0.2.33", "0.0.192.0"]),
     ],
 )
-async def test_an_ipv6_client_keys_on_its_64_and_an_ambiguous_hop_is_not_read(
-    hop: str, key: str
+async def test_an_ipv6_client_keys_on_its_64_and_an_ambiguous_hop_on_both_readings(
+    hop: str, keys: list[str]
 ) -> None:
     limiter = _CountingLimiter()
     src = await _proxied(trusted_proxies=[PROXY])
@@ -455,7 +455,37 @@ async def test_an_ipv6_client_keys_on_its_64_and_an_ambiguous_hop_is_not_read(
         await _request(src.sockport, raw=_raw_with(["x-api-key: wrong", f"X-Forwarded-For: {hop}"]))
     finally:
         await src.stop()
-    assert limiter.checks == [key]
+    assert limiter.checks == keys
+    assert limiter.charges == keys
+
+
+async def test_an_ambiguous_hop_cannot_leave_the_clients_own_budget() -> None:
+    """A client whose hop it can make ambiguous, by its choice of interface identifier, still
+    spends its own /64's budget on every failure, so alternating the two forms gains nothing."""
+    limiter = _IntakeRateLimiter(per_peer=10, glob=60)
+    src = await _proxied(trusted_proxies=[PROXY])
+    src.intake_rate_limiter = limiter
+    try:
+        for i in range(10):
+            hop = "[2001:db8:0:1::abcd]" if i % 2 else "2001:db8::1:2:3:4:5"
+            await _request(src.sockport, headers={"x-api-key": "wrong", "X-Forwarded-For": hop})
+        ambiguous = await _request(
+            src.sockport, headers={"x-api-key": KEY, "X-Forwarded-For": "2001:db8::1:2:3:4:6"}
+        )
+        proxy = await _request(src.sockport, headers={"x-api-key": KEY})
+    finally:
+        await src.stop()
+    assert ambiguous.status in (429, 0), ambiguous.status
+    # The proxy's own key was never charged, so a request keyed on it is still accepted.
+    assert proxy.status == 202, proxy.status
+
+
+def test_a_validated_list_is_read_once() -> None:
+    """Posture reads and every start and reload audit read each listener's list again, on the
+    event loop, so a list that validated is not validated again."""
+    assert trusted_proxy_networks(["10.0.0.5", "10.0.1.0/24"]) is trusted_proxy_networks(
+        ("10.0.0.5", "10.0.1.0/24")
+    )
 
 
 async def test_rotating_ipv6_addresses_inside_one_64_mints_no_budget() -> None:
@@ -492,11 +522,14 @@ async def test_rotating_ipv6_addresses_inside_one_64_mints_no_budget() -> None:
         ("fe80::1", "fe80::/64"),
         # The socket peer gets the /64 rule a forwarded client gets.
         ("2001:db8::5", "2001:db8::/64"),
-        # Except in a prefix that carries an IPv4 client, where each address is its own key:
-        # NAT64 (well-known and local-use), Teredo and the IPv4-compatible form.
-        ("64:ff9b::c000:221", "64:ff9b::c000:221"),
+        # Except in a prefix that carries an IPv4 client. NAT64's well-known prefix and Teredo key
+        # as the IPv4 client they carry, the budget that client holds over IPv4, whatever Teredo
+        # flag or port bits it varies; NAT64's local-use prefix and the IPv4-compatible form key
+        # on the whole address.
+        ("64:ff9b::c000:221", "192.0.2.33"),
+        ("2001:0:c000:201:0:0:3fff:fdf5", "192.0.2.10"),
+        ("2001:0:c000:201:8000:63bf:3fff:fdf5", "192.0.2.10"),
         ("64:ff9b:1::c000:221", "64:ff9b:1::c000:221"),
-        ("2001:0:c000:201::1", "2001:0:c000:201::1"),
         ("::1", "::1"),
         (None, "unknown"),
     ],
@@ -520,7 +553,9 @@ def test_a_mapped_socket_peer_still_reads_as_a_listed_proxy() -> None:
     from messagefoundry.transports.http_listener import _peer_address
 
     head = HttpRequest("POST", "/", {}, b"", frozenset(), CLIENT_A)
-    assert str(source._forwarded_client(head, _peer_address("::ffff:10.0.0.5"))) == CLIENT_A
+    assert source._forwarded_client(head, _peer_address("::ffff:10.0.0.5")) == (
+        ipaddress.ip_address(CLIENT_A),
+    )
 
 
 @pytest.mark.parametrize("default", [["*"], ["0.0.0.0/0"], ["10.0.0.0/8"], "10.0.0.5"])

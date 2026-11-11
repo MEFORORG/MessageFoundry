@@ -2152,7 +2152,8 @@ def _posture_loosenings(
             "tls_revocation_attested / FHIR update_url_form / http ECH sidecar / HTTP listener "
             "trusted_proxies declarations are "
             "NOT included "
-            "(see `messagefoundry check`)"
+            "(see `messagefoundry check`, which reports all but the HTTP listener "
+            "trusted_proxies; those are reported only here, on an engine with a graph)"
         )
     if visible is not None:
         # With no graph too: the [security] opt-outs keyed by connection are still narrowed.
