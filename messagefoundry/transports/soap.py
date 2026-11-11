@@ -404,7 +404,7 @@ def _drop_authorization(headers: dict[str, str]) -> None:
     is not merged, so the static value crossed too, as a second header a peer may read as
     ``Authorization``. A leading space or tab made ``http.client`` refuse the request instead. The
     REST, FHIR and DICOMweb header builders do not purge. A signing header named ``Authorization``
-    is not in this table: ``_post`` writes it per request, and only beside Digest is it refused."""
+    is not in this table: ``_post`` writes it per request, and it is refused only beside Digest."""
     from messagefoundry.transports.http_auth import is_authorization_header_name
 
     for key in [k for k in headers if is_authorization_header_name(k)]:
@@ -850,7 +850,8 @@ class SoapDestination(DestinationConnector):
         from messagefoundry.transports.smart import smart_auth_configured
 
         # A minted bearer owns the header too: _post and _probe write it per request (#5526). Purged
-        # here, before the construction gates judge the table, so none counts a header never sent.
+        # here, before the length gate judges this table, so it does not refuse a header never sent.
+        # The cleartext and verify-off refusals read the settings (http_credentials_sent), not this.
         if auth is not None or oauth2_auth_configured(s) or smart_auth_configured(s):
             _drop_authorization(headers)
         if auth is not None:

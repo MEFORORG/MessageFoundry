@@ -115,6 +115,14 @@ def test_ws_security_no_longer_borrows_the_basic_pair() -> None:
     assert _http_static(ConnectorType.SOAP, census, False) == ["HTTP Basic"]
 
 
+def test_the_census_lists_a_username_token_only_for_a_whole_pair() -> None:
+    """A half pair refuses the build, so it is not a hop the census reports (repair round 2)."""
+    for half in ({"ws_username": "svc"}, {"ws_password": _PW}):
+        assert _http_static(ConnectorType.SOAP, {"ws_security": True, **half}, False) == []
+    whole = {"ws_security": True, "ws_username": "svc", "ws_password": _PW}
+    assert _http_static(ConnectorType.SOAP, whole, False) == ["WS-Security UsernameToken"]
+
+
 def test_control_a_whole_username_token_pair_stamps_the_token() -> None:
     d = _dest(soap_version="1.2", ws_security=True, ws_username="svc", ws_password=_PW)
     env = d._wrap_envelope("<op/>")

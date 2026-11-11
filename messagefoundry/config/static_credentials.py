@@ -201,9 +201,13 @@ def _http_static(ctype: ConnectorType, settings: Mapping[str, Any], token: bool)
     if _digest(settings):
         out.append("HTTP Digest")
     if ctype is ConnectorType.SOAP:
-        # The connector stamps a UsernameToken only when it has a user (``_build_wsse_header``), and
-        # with ws_security on it refuses to build on one half of the pair (#5526).
-        if settings.get("ws_security") and settings.get("ws_username"):
+        # With ws_security on the connector refuses to build on one half of the pair (#5526), so
+        # only a whole pair is a hop that runs; a refused build is not listed (as for proxy_url).
+        if (
+            settings.get("ws_security")
+            and settings.get("ws_username")
+            and settings.get("ws_password")
+        ):
             out.append("WS-Security UsernameToken")
         if settings.get("body_secret_tokens"):
             out.append("body secrets")

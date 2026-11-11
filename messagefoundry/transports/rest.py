@@ -2772,7 +2772,10 @@ class RestDestination(DestinationConnector):
         self._hop_guard: InsecureHopGuard | None = None
         # BACKLOG #5529: an http_auth this connection cannot honour is refused first, so a connection
         # that never builds logs no insecure-hop crossing or warning below. Lazy: http_auth imports rest.
-        from messagefoundry.transports.http_auth import refuse_http_digest_conflicts
+        from messagefoundry.transports.http_auth import (
+            refuse_authorization_signer_beside_digest,
+            refuse_http_digest_conflicts,
+        )
 
         digest_selected = refuse_http_digest_conflicts(s)
         # ADR 0139 (ASVS 12.1.5): opt-in ECH SNI-hiding. When set, this connection re-addresses each
@@ -2851,8 +2854,6 @@ class RestDestination(DestinationConnector):
         # identical). Built here so a bad key/algorithm fails loud at connector construction (check/
         # dry-run/start), like a bad TLS cert; the per-request signature is minted in _post (off-loop).
         self._signer: MessageSigner | None = signer_from_destination(config)
-        from messagefoundry.transports.http_auth import refuse_authorization_signer_beside_digest
-
         refuse_authorization_signer_beside_digest(
             None if self._signer is None else self._signer.header_name,
             digest=digest_selected,

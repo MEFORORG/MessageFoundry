@@ -11,7 +11,7 @@ static credential was sent it is what would have crossed; a lone Basic half sent
 refused under one rule, beside Digest a connection configures exactly one HTTP credential, by
 ``refuse_http_digest_conflicts``. REST, SOAP and FHIR call it at the top of construction, and
 ``digest_handler_from_settings`` calls it again. A signing header named ``Authorization`` is
-refused once REST or SOAP has built the signer, by ``refuse_authorization_signer_beside_digest``.
+refused once the connector has built the signer, by ``refuse_authorization_signer_beside_digest``.
 
 Limb 3 (also #2707 closing step 1): ``ech_egress`` replaced the opener that held the Digest
 handler, so a REST connection built with no Digest auth. The pair is refused at construction; the
@@ -152,7 +152,7 @@ def _signed(ctype: ConnectorType, header: str, **over: object) -> dict[str, obje
 
 
 @pytest.mark.parametrize("name", ["Authorization", "authorization", "Authorization\t"])
-@pytest.mark.parametrize("ctype", [ConnectorType.REST, ConnectorType.SOAP])
+@pytest.mark.parametrize("ctype", list(_FACTORIES), ids=[c.value for c in _FACTORIES])
 def test_a_signing_header_named_authorization_is_refused_beside_digest(
     ctype: ConnectorType, name: str
 ) -> None:

@@ -424,7 +424,7 @@ def refuse_authorization_signer_beside_digest(
     so under that name it would replace the Digest response on the wire. ``sign_header`` is the
     built signer's ``header_name``, or ``None`` when signing is off, so the typed
     ``Destination.sign`` and the flat ``sign_*`` settings are read by the one rule that builds the
-    signer. Called by REST and SOAP, the two connectors that sign."""
+    signer. Called by REST, SOAP and FHIR, the Digest connectors that build a signer."""
     if digest and sign_header is not None and is_authorization_header_name(sign_header):
         raise HttpAuthError(
             f"{hop_name_prefix(connection)}HTTP Digest cannot be configured beside a signing "
