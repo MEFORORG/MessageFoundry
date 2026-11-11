@@ -955,19 +955,14 @@ count is above `0` (vault BACKLOG #2613).
 - **What you lose, the unreachable-account page:** the page about one account the directory keeps
   failing for (vault BACKLOG #3100) counts that account's own probes, not outage passes: it pages
   once `ad_reconcile_outage_passes` of its last `2 * ad_reconcile_outage_passes - 1` probes fail,
-  in a row or alternating with answers (vault BACKLOG #3709). A larger value both widens that
-  window and asks for more failures in it, so the page is not ordered by the value: some cyclic
-  patterns that page at `3` never page at a larger value, for example an account down for three
-  probes and up for four never holds four failures in seven at `4`, and some that never page at
-  `3` page at a larger one, for example down for two and up for three at `4`. Nor does a larger
-  value delay the page in every pattern: an account that fails twice, answers three times, then
-  keeps failing pages one probe sooner at `4` than at `3`. So a value above `3` can leave a pattern
-  unpaged, page it later, or page it sooner. What it does raise is the least delay, which runs from
-  that account's first failing probe, not from the first outage pass, and needs that many failing
-  probes in a row. A longer `ad_session_recheck_seconds`, or an `ad_session_recheck_max_users`
-  below `200` in an estate larger than the budget, delays the page in every pattern, since each
-  stretches the time between one account's probes. The `ad_reconcile_outage_passes` row of
-  [CONFIGURATION.md](CONFIGURATION.md) states when it comes.
+  in a row or alternating with answers (vault BACKLOG #3709). Its time runs from that account's
+  first failing probe, not from the first outage pass. A value of `ad_reconcile_outage_passes`
+  other than `3` changes which failure patterns raise this page, and when. It does not simply
+  delay it: a pattern that pages at one value may never page at another. A longer
+  `ad_session_recheck_seconds`, or an `ad_session_recheck_max_users` below `200` in an estate
+  larger than the budget, spaces this account's probes further apart, so the page comes later in
+  time. A failure bounded in time can end before it pages at all. The
+  `ad_reconcile_outage_passes` row of [CONFIGURATION.md](CONFIGURATION.md) states when it comes.
 - **Not named:** fewer strikes, a larger budget, or a higher brake threshold. Each ends sessions
   sooner or ends more of them, and none keeps a session the directory withdrew, though a larger
   budget can stretch the outage page, as the bullet above says. Nor is a shorter
