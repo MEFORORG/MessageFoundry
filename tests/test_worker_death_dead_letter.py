@@ -106,7 +106,7 @@ Drive = Callable[[str, OutboxItem], Awaitable[Any]]
 
 
 def _driver(runner: RegistryRunner, claim_mode: str, stage: str) -> Drive:
-    """The per_lane loops call the per-item body; the pooled dispatcher calls the adapter around it."""
+    """The per_lane loops call the per-item body; the pooled dispatcher calls its adapter."""
     attr = f"_process_{stage}_item" if claim_mode == "per_lane" else f"_dispatch_{stage}"
     return getattr(runner, attr)
 
@@ -386,6 +386,36 @@ async def test_a_death_after_the_send_was_marked_done_leaves_it_done(
     assert await _dead_rows(store) == 0
 
 
+@pytest.mark.parametrize("done", [False, True])
+async def test_a_retry_branch_miss_on_a_resolved_row_arms_no_wake(
+    tmp_path: Path, store: MessageStore, monkeypatch: pytest.MonkeyPatch, done: bool
+) -> None:
+    """The store counted fewer attempts than the claim, so ``mark_failed`` takes its retry branch,
+    whose ``retry_at`` comes back even when its status term skipped the row (ADR 0157 Amendment
+    A). A DONE row is left DONE and arms no wake; the control arm, a row still in flight, is
+    re-pended and armed, so the test can tell the two apart."""
+    runner = _runner(_registry(tmp_path), store, "per_lane")
+    runner._retry["OB"] = RetryPolicy(max_attempts=1, backoff_seconds=0.01)
+    armed: list[str] = []
+    monkeypatch.setattr(runner, "_arm_retry", lambda lane, failed: armed.append(lane))
+    mid = await store.enqueue_message(channel_id="IB", raw=_hl7("MISS"), deliveries=[("OB", "p")])
+    item = await _claim(store, "OB", Stage.OUTBOUND)
+    assert item.attempts == 1
+    if done:
+        assert await store.mark_done(item.id)
+    await store._db.execute("UPDATE queue SET attempts=0 WHERE id=?", (item.id,))
+    await store._db.commit()
+    await runner._record_worker_death("delivery", "OB", item, _Kill())
+    status = (await _row(store, mid, Stage.OUTBOUND))[0]
+    if done:
+        assert status == OutboxStatus.DONE.value
+        assert armed == []
+    else:
+        assert status == OutboxStatus.PENDING.value
+        assert armed == ["OB"]
+    assert await _dead_rows(store) == 0
+
+
 @pytest.mark.parametrize(
     "status", [OutboxStatus.DONE.value, OutboxStatus.DEAD.value, OutboxStatus.CANCELLED.value]
 )
@@ -472,7 +502,8 @@ def test_an_excluded_exception_passes_the_body_wrapper_uncounted(
         raise exc
 
     wrapped = _records_worker_death("router")(body)
-    coro = cast(Coroutine[Any, Any, Any], wrapped(_Runner(), "IB", object()))  # type: ignore[arg-type]
+    started = wrapped(_Runner(), "IB", object())  # type: ignore[arg-type]
+    coro = cast(Coroutine[Any, Any, Any], started)
     with pytest.raises(type(exc)):
         coro.send(None)
     assert recorded == (["counted"] if counted else [])
