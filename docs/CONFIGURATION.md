@@ -1983,8 +1983,9 @@ started together, can each raise it; the alert list folds them into one instance
   either fingerprint could not be taken, since then the engine compared nothing, and `loaded` is `false`
   when it is the loaded one. With no graph running, `drift` is `false`. A backup compares nothing:
   it records what its `config_fingerprint` left out as `config_unreadable_files`.
-- A start's fingerprint is of the bytes its load read. A start resolves `env()` values earlier, when the engine is built, so for `environments/` files that means the bytes the load
-  read, not the bytes the values came from. Just after the load it fingerprints
+- A start's fingerprint is of the bytes its load read. A start parses `env()` values from a value
+  file in `environments/` out of those bytes too, so the fingerprint names the values it applied;
+  a value file outside the config directory is in no fingerprint. Just after the load it fingerprints
   the directory once more, and compares both with the baseline, so `config_changed` fires when
   either differs. When the two cover the same files and differ, an edit landed after the load read
   that file, and the comparison is `changed_during_load`. The alert then names the directory's

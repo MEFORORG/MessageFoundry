@@ -2914,11 +2914,10 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   at release unless the edit is reverted, and then it can be released;
 - in a cluster, the release compares the digest with the disk of the node that handles the approve,
   which may not be the node that took it;
-- a start's `config_loaded` digest may name value-file bytes the start did not apply, where the
-  value file is in the `environments/` folder. A start resolves its environment values when the
-  engine is built, and its digest reads that folder later, in the load's snapshot. So an edit in
-  between is in the digest and not in the running values. A value file outside the config
-  directory is in no start digest, so a start records nothing about it;
+- a value file outside the config directory is in no start digest, so a start records nothing
+  about the values it applied from it. A value file in the `environments/` folder is parsed from
+  the load's snapshot, the one the start's `config_loaded` digest folds, so that digest names the
+  bytes the start applied (vault BACKLOG #2596);
 - a restart, a cluster convergence reload, a DR activation and a sandbox worker respawn check no
   approved digest. Whether a restart under dual control refuses an unapproved digest is an open
   owner question.
