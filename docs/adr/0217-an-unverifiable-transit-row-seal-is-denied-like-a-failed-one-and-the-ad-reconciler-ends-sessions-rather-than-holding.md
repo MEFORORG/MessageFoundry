@@ -991,6 +991,19 @@ session, approval, on SQLite, PostgreSQL and SQL Server):
    test drives each type through each named path and asserts the audit row, and a new path is added
    to that list by the slice that adds it. In a process with no alert sink, such as the CLI, the
    audit row is written and the page is not; the engine pages the row when it next reads it.
+   **A correction, added 2026-11-11:** "the CLI maps the typed error to its own refusal text and
+   exit code, never to the CLI's defect report" does not hold at this head:
+   `messagefoundry/__main__.py` and `cli_common.py` catch neither `TransitSealUnverifiableError`
+   nor `TransitSealUnavailableError`. For `provision-admin` the service now answers the
+   Unverifiable case itself. `AuthService._unverifiable_account_held`, asked by both
+   `provision_refusal` and `provision_first_administrator` before any account write, refuses
+   while any account reads Unverifiable, the named one included, since such a record's roles are
+   part of what its seal covers. The command then ends in its own refusal text and exit code,
+   having cleared and written nothing;
+   `tests/test_provision_admin_unverifiable_administrator.py::test_an_unverifiable_administrator_refuses_provision_before_any_write`
+   pins that. At least two cases still reach the CLI's defect report: a Vault transit Outage on any
+   account, and an account that first reads Unverifiable after that check, at the grant's guard
+   (`admin_guard_counts`). Both are named here for filing on vault BACKLOG #8202.
 4. **Wording follows the cause.** An unverifiable refusal never says "forged" or "does not
    verify"; it says Vault transit could not verify the seal, and gives the recovery text from (a).
    An Outage says the seal "could not be made or checked through Vault transit", never that Vault
@@ -1040,21 +1053,21 @@ session, approval, on SQLite, PostgreSQL and SQL Server):
   admin user read change (commit 67c274348b on PR 2860) an Unverifiable account is reported there
   with `_user_seal_unverifiable`: a WARNING and a soft `integrity.authority_seal_unverifiable` row,
   written at the pre-check. One service runs both reads, and its per-account report throttle
-  holds a report for `SEAL_FAILURE_REPORT_INTERVAL_SECONDS` (300 seconds), so the second read
-  reports again only when more than that has passed since the first. The page reaches no sink on
-  this path, since the command arms no `SealPager`. The account is then dropped, so an
-  Unverifiable Administrator is not counted and the self-sufficient-Administrator refusal can
-  pass, while the grant's guard, `admin_guard_counts`, raises on that same row. The command then
-  does at least this before its grant reaches gap (1): it creates or takes over the named local
-  account, on the takeover branch clearing the earlier holder's TOTP, passkeys and sessions and,
-  where a notice channel is wired, telling the address that row held; and it writes the password,
-  any TOTP enrolment and the notice address. The defect report then leaves that local account
-  roleless. While the Administrator's row stays Unverifiable, a re-run takes the takeover branch
-  over that roleless account and fails the same way. Where the named account's own row is the
-  Unverifiable one, the pre-check's `_lookup_by_username` raises instead, before any prompt, with
-  no report of its own: it calls `_verified`, which has no Transit catch. A Vault transit Outage on
-  the first read raises before any account write, with no audit row of its own, and its page
-  reaches no sink either. Beneath all of these, (c) item 2's catch census test,
+  (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) usually keeps the second read from
+  reporting again. The page reaches no sink on this path, since the command arms no `SealPager`.
+  The scan drops the account, so the self-sufficient-Administrator refusal cannot count it, and
+  each of the two steps then asks `AuthService._unverifiable_account_held`, which refuses while
+  any account reads Unverifiable, before any account write: the command ends in its own refusal
+  text, having cleared no holder's factors or sessions and written no credential. (c) item 3's
+  correction names the test that pins this. **This replaces an earlier text of this same
+  correction (2026-11-11), which described the head before that check:** the command created or
+  took over the named local account, on the takeover branch cleared the earlier holder's TOTP,
+  passkeys and sessions, and wrote the password, TOTP and notice address before the grant's guard
+  raised on the same row, leaving the account roleless, and a re-run failed the same way. That path
+  is closed for an account that reads Unverifiable at the check. It stays open for one that first
+  reads Unverifiable, or meets an Outage, at the grant's guard, after those writes. A Vault transit
+  Outage on the first read raises before any account write, with no audit row of its own, and its
+  page reaches no sink either. Beneath all of these, (c) item 2's catch census test,
   (c) item 3's API backstop for both refusal types, and *The four answers*' "The API answers an
   Outage with HTTP 503 and `Retry-After`" are not yet built on every path: a refusal no caller maps
   reaches the engine's generic handler as a 500. The sign-in audit actions this ADR names,
@@ -1274,7 +1287,7 @@ Lander files them (korus `roles/BUILDER.md` 1c routes filings to the Lander):
 | 3.r7 | The same base64 line at three call sites | **Fixed in build:** with 3.6's helper. |
 | 4 | Unverifiable AD map holds every diff; demotions stop revoking; no reconcile alert; page can fold into the cap | **Moot under design:** (b) ends `main`'s own set below the brake and the groups-moved set above it, writes no role, and pages every such pass under the map's uncapped subject. |
 | 5 | Role delete raw-deletes map pairs of an unverifiable map | **Fixed in build:** (d) step 3 leaves an Unverifiable map untouched. |
-| 6 | `provision-admin` unverifiable refusal falls to the CLI defect report | **Fixed in build:** (c) step 3. |
+| 6 | `provision-admin` unverifiable refusal falls to the CLI defect report | **Fixed in build, in part (corrected 2026-11-11; this cell read "Fixed in build: (c) step 3").** The service refuses `provision-admin` in its own words before any account write while any account reads Unverifiable; an Outage, and an account that first reads Unverifiable at the grant, still reach the defect report. (c) item 3's correction says what the head does. |
 | 7 | Writes and the approval gate page under the request id | **Fixed in build:** (c) step 1, the stored id. |
 | 8 | `directory_map_unverifiable` audited as `auth.login_failed`, weight 1 | **Fixed in build:** (e). |
 | 9 | Forgery wording on unverifiable refusals; stale changelog fragment and `docs/PHI.md` lines; simplifications | **Fixed in build:** (c) step 4 wording; the docs slice rewrites the fragment and the `docs/PHI.md` recovery and seal text to this ADR; simplifications are taken where a slice touches the code. |
