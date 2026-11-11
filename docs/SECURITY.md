@@ -2919,14 +2919,14 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   nothing about the values it applied from it. With `serve`'s value provider, a value file in the
   `environments/` folder is parsed from the load's snapshot, the one the start's `config_loaded`
   digest folds, so that digest names the value-file bytes the start applied (vault BACKLOG
-  #2596). The digest folds at least every readable `.toml` file in that folder, so it also names
-  bytes the start never parsed: another environment's value file, and in the default layout, where
-  the start's value file is outside the config directory, a same-named file left in that folder.
-  Where the load could not read the start's own value file in that folder, the start applies the
-  values read when the engine was built, which no digest names, and the digest names the file, or
-  a folder holding it, as left out. An embedded engine whose provider cannot read a snapshot, or
-  whose start does not call `Engine.apply_start_env_values`, resolves its values when the engine
-  is built, so its digest may name `environments/` bytes it did not apply;
+  #2596). The digest folds every `.toml` file the load could list and read in that folder, so it
+  also names bytes the start never parsed: another environment's value file, and in the default
+  layout, where the start's value file is outside the config directory, a same-named file left in
+  that folder. Where the load could not read the start's own value file in that folder, the start
+  applies the values read when the engine was built, which no digest names, and the digest names
+  the file, or a folder holding it, as left out. An embedded engine whose provider cannot read a
+  snapshot, or whose start does not call `Engine.apply_start_env_values`, resolves its values when
+  the engine is built, so its digest may name `environments/` bytes it did not apply;
 - a restart, a cluster convergence reload, a DR activation and a sandbox worker respawn check no
   approved digest. Whether a restart under dual control refuses an unapproved digest is an open
   owner question.
