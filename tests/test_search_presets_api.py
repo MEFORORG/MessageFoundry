@@ -27,6 +27,7 @@ from messagefoundry.store import MessageStore
 from messagefoundry.store.cell_tag import PRESET_TAG_FAILED_ACTION
 from messagefoundry.store.crypto import (
     AesGcmCipher,
+    CipherError,
     CipherUnavailableError,
     generate_key,
     make_cipher,
@@ -470,7 +471,9 @@ async def test_a_plain_cipher_error_on_the_criteria_answers_423_not_500(
             assert "unmarked" not in r.text and "MRN999" not in r.text
             assert raised[-1].__context__ is None and raised[-1].__cause__ is None
             logged = _layered_refusal_log(caplog)
-            assert any(f"refused preset {pid}: " in rec.getMessage() for rec in logged)
+            assert [
+                rec.levelno for rec in logged if f"refused preset {pid}: " in rec.getMessage()
+            ] == [logging.ERROR]
             assert all("MRN999" not in rec.getMessage() for rec in logged)
 
             side.execute("UPDATE search_presets SET criteria='' WHERE id=?", (pid,))
@@ -483,18 +486,19 @@ async def test_a_plain_cipher_error_on_the_criteria_answers_423_not_500(
         await keyed.stop()
 
 
-async def test_a_key_service_outage_on_the_criteria_answers_503_with_retry_after(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """BACKLOG #5523, after #3734: Vault Transit's outage reaches the route as the
-    ``CipherUnavailableError`` that ``open_tagged_cell`` re-raises for a cipher with no
-    ``holds_key_for``. The keyless store's cipher has none either, so its ``decrypt`` stands in for
-    Transit's, and the error takes the store's real path. It is a 503 with Retry-After, not the 423
-    that would send an operator after a preset that is fine, and not a 500. The outage text stays
-    off the response and its chain."""
+async def _layered_with_decrypt_raising(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    exc: CipherError,
+) -> tuple[httpx.Response, list[StarletteHTTPException], str]:
+    """One layered recall of a fresh preset whose criteria ``decrypt`` raises ``exc``: the
+    response, the HTTP exceptions the app raised, and the preset id. Vault Transit's cipher has no
+    ``holds_key_for``, so ``open_tagged_cell`` re-raises its errors as they are. The keyless
+    store's cipher has none either, so its ``decrypt`` stands in for Transit's, and the error takes
+    the store's real path."""
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
-    from messagefoundry.transports.http_listener import TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS
 
     service = await _user(engine, Role.OPERATOR, "op")
     app = create_app(engine, auth=service)
@@ -505,19 +509,33 @@ async def test_a_key_service_outage_on_the_criteria_answers_503_with_retry_after
             "/search/presets", json={"name": "n", "criteria": {"content": "MRN999"}}, headers=h
         )
         assert r.status_code == 200, r.text
-        pid = r.json()["id"]
+        pid = str(r.json()["id"])
 
         assert isinstance(engine.store, MessageStore)
         cipher = engine.store._cipher
         assert not hasattr(cipher, "holds_key_for")  # else open_tagged_cell reads it as drift
 
-        def _outage(stored: str, **_kw: object) -> str:
-            raise CipherUnavailableError("Transit unreachable for key mf-store-secret")
+        def _raise(stored: str, **_kw: object) -> str:
+            raise exc
 
-        monkeypatch.setattr(cipher, "decrypt", _outage)
+        monkeypatch.setattr(cipher, "decrypt", _raise)
         caplog.set_level(logging.WARNING, logger="messagefoundry.api.app")
         r = await c.get("/search/layered", params={"presets": pid}, headers=h)
         monkeypatch.undo()
+    return r, raised, pid
+
+
+async def test_a_key_service_outage_on_the_criteria_answers_503_with_retry_after(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5523, after #3734: Vault Transit's outage reaches the route as a
+    ``CipherUnavailableError``. It is a 503 with Retry-After, not the 423 that would send an
+    operator after a preset that is fine, and not a 500. The outage text stays off the response
+    and its chain, and is logged at WARNING, as the upload routes log theirs."""
+    from messagefoundry.transports.http_listener import TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS
+
+    outage = CipherUnavailableError("Transit unreachable for key mf-store-secret")
+    r, raised, pid = await _layered_with_decrypt_raising(engine, monkeypatch, caplog, outage)
     assert r.status_code == 503, r.text
     assert r.headers["Retry-After"] == str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)
     assert "Transit" not in r.text and "mf-store-secret" not in r.text
@@ -529,6 +547,24 @@ async def test_a_key_service_outage_on_the_criteria_answers_503_with_retry_after
         " mf-store-secret"
         for rec in _layered_refusal_log(caplog)
     )
+
+
+async def test_a_transit_refusal_on_the_criteria_is_logged_at_error(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5523: under Vault Transit a criteria cell planted across owners is refused as a
+    plain ``CipherError``, not a ``CellTagError``, so it writes no integrity audit row and raises
+    no alert, and its log record is its only signal. It is a 423, logged at ERROR with the type
+    name alone: no exception object, cipher text or criteria."""
+    refusal = CipherError("Transit decrypt refused (key='mf-store-secret'): MRN999")
+    r, raised, pid = await _layered_with_decrypt_raising(engine, monkeypatch, caplog, refusal)
+    assert r.status_code == 423, r.text
+    assert "mf-store-secret" not in r.text and "MRN999" not in r.text
+    assert raised[-1].__context__ is None and raised[-1].__cause__ is None
+    # _layered_refusal_log also checks no record carries exc_info or a non-str arg.
+    assert [(rec.levelno, rec.getMessage()) for rec in _layered_refusal_log(caplog)] == [
+        (logging.ERROR, f"layered search refused preset {pid}: CipherError")
+    ]
 
 
 async def test_layered_search_feeds_the_summary_access_audit(engine: Engine) -> None:

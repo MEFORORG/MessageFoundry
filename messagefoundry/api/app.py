@@ -9598,7 +9598,10 @@ def create_app(
                 # BACKLOG #5523: a key or format problem the cipher raises as is, for example an
                 # unmarked value planted in a keyed store, or a value Vault Transit refused. It
                 # answered 500. The type name only: the text is the cipher's, not this route's.
-                _log.warning("layered search refused preset %s: %s", preset_id, type(exc).__name__)
+                # ERROR: under Transit a cell planted across owners lands here, not in the
+                # CellTagError arm, so it is neither audited nor alerted and this is its only
+                # signal. The outage above stays a WARNING: it says nothing about the cell.
+                _log.error("layered search refused preset %s: %s", preset_id, type(exc).__name__)
                 refusal = HTTPException(
                     423,
                     f"preset {preset_id} cannot be opened with the store's keys and cannot be used;"
