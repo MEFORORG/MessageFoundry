@@ -1377,10 +1377,11 @@ _LXML_STAR_IMPORT = "import *"
 _LXML_GETATTR = "getattr"
 _LXML_REPORTED = _LXML_PARSE_CALLS | _LXML_TREE_METHODS | {_LXML_STAR_IMPORT, _LXML_GETATTR}
 #: Everything a file outside ``harden.py`` reads off an lxml binding today. None of it parses:
-#: ``tostring`` serialises a tree and ``XPathError`` is an exception class. This is the allow-list
+#: ``tostring`` serialises a tree, and ``XPathError`` and ``C14NError`` are exception classes
+#: (``parsing/xml/signature.py`` catches the second, BACKLOG #2816). This is the allow-list
 #: behind the deny-list above, so an entry point that :data:`_LXML_PARSE_CALLS` does not name still
 #: fails until someone reads what it does and adds it to one of the two.
-_LXML_NON_PARSING_READS = frozenset({"tostring", "XPathError"})
+_LXML_NON_PARSING_READS = frozenset({"tostring", "XPathError", "C14NError"})
 #: The ``_deps.py`` loader that returns the ``lxml.etree`` module.
 _LXML_LOADERS = frozenset({"load_lxml"})
 _LXML_PARSE_HOME = "messagefoundry/parsing/xml/harden.py"
