@@ -37,6 +37,7 @@ from messagefoundry.store.store import (
     MessageStore,
     RevokeSealOutcome,
     SessionRecord,
+    no_audit_row,
 )
 from tests._transit_seal_fake import FakeBackend, with_version
 
@@ -122,7 +123,7 @@ async def test_an_unverifiable_account_still_has_every_session_ended(
     for _ in range(2):
         await _session(store, "u-1")
     _plant(path, "users", "authz_seal", "id", "u-1")
-    result = await store.revoke_user_sessions("u-1")
+    result = await store.revoke_user_sessions("u-1", audit=no_audit_row)
     assert result.count == 2 and _live(path, "u-1") == 0
     # Unverifiable is no Outage, so no authority-seal-transit page; since decision
     # d20261109T200352805-599b24 item 4 it pages under its own capped subject instead.
@@ -141,7 +142,7 @@ async def test_an_outage_at_the_epoch_raise_still_ends_every_session_and_pages(
     store._row_sealer = TransitRowSealer(backend)  # nothing cached: the raise meets Transit
     backend.down = True
     try:
-        result = await store.revoke_user_sessions("u-1")
+        result = await store.revoke_user_sessions("u-1", audit=no_audit_row)
     finally:
         backend.down = False
     assert result.count == 2 and _live(path, "u-1") == 0
@@ -168,11 +169,15 @@ async def test_an_unverifiable_kept_session_is_ended_too(
     await _user(store, "u-1")
     await _session(store, "u-1")
     kept = await _session(store, "u-1")
-    result = await store.revoke_user_sessions("u-1", except_token_hash=hash_token(kept))
+    result = await store.revoke_user_sessions(
+        "u-1", except_token_hash=hash_token(kept), audit=no_audit_row
+    )
     assert result.kept and _live(path, "u-1") == 1
     other = await _session(store, "u-1")
     _plant(path, "sessions", "seal", "token_hash", hash_token(kept))
-    result = await store.revoke_user_sessions("u-1", except_token_hash=hash_token(kept))
+    result = await store.revoke_user_sessions(
+        "u-1", except_token_hash=hash_token(kept), audit=no_audit_row
+    )
     assert not result.kept and result.ended_kept and _live(path, "u-1") == 0
     assert other
 
@@ -356,7 +361,9 @@ async def test_a_forged_account_still_runs_the_kept_sessions_seal_check(
         return await write_session(token_hash, change)
 
     monkeypatch.setattr(store, "_write_session", counting)
-    result = await store.revoke_user_sessions("u-1", except_token_hash=hash_token(kept))
+    result = await store.revoke_user_sessions(
+        "u-1", except_token_hash=hash_token(kept), audit=no_audit_row
+    )
     assert writes == [hash_token(kept)] and not result.kept and _live(path, "u-1") == 0
 
 
@@ -402,7 +409,7 @@ async def _outage_revoke(store: MessageStore, backend: FakeBackend, user_id: str
     store._row_sealer = TransitRowSealer(backend)  # nothing cached: the raise meets Transit
     backend.down = True
     try:
-        await store.revoke_user_sessions(user_id)
+        await store.revoke_user_sessions(user_id, audit=no_audit_row)
     finally:
         backend.down = False
 
@@ -584,7 +591,7 @@ async def test_an_unverifiable_account_is_audited_and_paged_after_the_revoke_com
     _plant(path, "users", "authz_seal", "id", "u-1")
     in_txn: list[bool] = []
     _post_commit_audit(store, in_txn)
-    await store.revoke_user_sessions("u-1")
+    await store.revoke_user_sessions("u-1", audit=no_audit_row)
     assert in_txn == [False]
     (detail,) = await _audits(store, "integrity.authority_seal_unverifiable")
     assert detail["kind"] == "user" and detail["user_id"] == "u-1" and detail["during"] == "revoke"
@@ -616,7 +623,9 @@ async def test_an_unverifiable_kept_session_is_audited_by_its_ref_only(
     await _user(store, "u-1")
     kept = await _session(store, "u-1")
     _plant(path, "sessions", "seal", "token_hash", hash_token(kept))
-    result = await store.revoke_user_sessions("u-1", except_token_hash=hash_token(kept))
+    result = await store.revoke_user_sessions(
+        "u-1", except_token_hash=hash_token(kept), audit=no_audit_row
+    )
     assert result.ended_kept
     (detail,) = await _audits(store, "integrity.authority_seal_unverifiable")
     assert detail["kind"] == "session" and detail["session"] == hash_token(kept)[:12]
@@ -642,7 +651,7 @@ async def test_a_refused_audit_row_still_pages_and_keeps_the_revoke(
         raise fault("synthetic audit fault")
 
     store.record_audit = refused  # type: ignore[method-assign]
-    result = await store.revoke_user_sessions("u-1")
+    result = await store.revoke_user_sessions("u-1", audit=no_audit_row)
     assert result.count == 1 and _live(path, "u-1") == 0
     assert len(pages) == 1
     assert any("could not be written" in r.getMessage() for r in caplog.records)
@@ -1011,7 +1020,9 @@ async def test_a_revoke_that_fails_audits_and_pages_its_held_refusals(
 
         monkeypatch.setattr(store, "record_audit", refused)
     with pytest.raises(RowSealError):
-        await store.revoke_user_sessions("u-1", except_token_hash=hash_token(kept))
+        await store.revoke_user_sessions(
+            "u-1", except_token_hash=hash_token(kept), audit=no_audit_row
+        )
     assert _live(path, "u-1") == 2  # rolled back
     assert len(pages) == 1
     assert "failed before its commit was confirmed" in pages[0]
@@ -1046,7 +1057,7 @@ async def test_a_refusal_is_logged_only_after_the_outcome_is_known(
     handler = _Watch(level=logging.WARNING)
     logger.addHandler(handler)
     try:
-        await store.revoke_user_sessions("u-1")
+        await store.revoke_user_sessions("u-1", audit=no_audit_row)
     finally:
         logger.removeHandler(handler)
     refused = [(in_txn, m) for in_txn, m in seen if "was refused" in m]
@@ -1116,11 +1127,13 @@ async def test_a_refusal_only_a_failed_attempt_met_is_reported_as_retried(
     _forged_kept_session(monkeypatch, store)
     async with deferred_revoke_reports():
         with pytest.raises(RowSealError):
-            await store.revoke_user_sessions("u-1", except_token_hash=hash_token(kept))
+            await store.revoke_user_sessions(
+                "u-1", except_token_hash=hash_token(kept), audit=no_audit_row
+            )
         assert pages == []  # held for the scope
         monkeypatch.undo()
         await _user(store, "u-2")  # a later attempt, which meets no refusal, commits
-        await store.revoke_user_sessions("u-2")
+        await store.revoke_user_sessions("u-2", audit=no_audit_row)
     (detail,) = await _audits(store, "integrity.authority_seal_unverifiable")
     assert detail["committed"] is False and detail["retry_committed"] is True
     assert len(pages) == 1 and pages[0].endswith("a retry of the revoke then committed")

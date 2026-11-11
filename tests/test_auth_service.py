@@ -367,7 +367,7 @@ async def test_session_validation_idle_and_absolute_timeout() -> None:
             password_generated=False,
             audits=(),
         )
-        await store.set_user_roles("u1", ["viewer"])
+        await store.set_user_roles("u1", ["viewer"], audits=())
         now = time.time()
         # a fresh session resolves to an identity
         await store.create_session(

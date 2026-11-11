@@ -99,7 +99,7 @@ async def _service(engine: Engine, *, held: Role | None, bind: bool) -> AuthServ
         audits=(),
     )
     if held is not None:
-        await engine.store.set_user_roles(user_id, [held.value], assigned_by="ad-sync")
+        await engine.store.set_user_roles(user_id, [held.value], assigned_by="ad-sync", audits=())
     if bind:
         await service.bind_federated_subject(
             user_id, _SUBJECT, expected_issuer=None, expected_subject=None, actor="admin"

@@ -101,7 +101,9 @@ async def _must_change_admin(service: AuthService) -> str:
         audits=(),
     )
     await service.initialize()  # seeds the roles the assignment below refers to
-    await service.store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by="test")
+    await service.store.set_user_roles(
+        user_id, [Role.ADMINISTRATOR.value], assigned_by="test", audits=()
+    )
     return _ADMIN_USERNAME
 
 

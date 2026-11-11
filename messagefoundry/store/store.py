@@ -8959,7 +8959,9 @@ class AuditAppend:
 
     For a record that must not outlive, or be outlived by, the row it describes. Written as a
     second call, a crash between the two kept the change and lost its record. At least these take
-    them: ``create_user`` and ``update_user_profile`` (BACKLOG #2221), the operator mutations
+    them: ``create_user``, ``update_user_profile``, ``set_user_roles`` and
+    ``remove_unless_last_admin`` (BACKLOG #2221), ``revoke_user_sessions`` through an
+    :data:`OperatorAudit` (BACKLOG #3018 step 4), the operator mutations
     through an :data:`OperatorAudit` (BACKLOG #2624), the four operator alert mutations (vault
     BACKLOG #3217), a dual-control request and its transitions (vault BACKLOG #2255), and
     ``replace_totp_enrolment`` (ADR 0171 Amendment B). Each joins the hash chain
@@ -9047,6 +9049,15 @@ refused too (BACKLOG #5071, :func:`require_ingress_audit`).
 It must be pure and quick: it runs inside the mutation's transaction, which holds the mutation's
 row locks (and on SQLite the writer lock). It runs BEFORE the audit chain's lock is taken, so it must
 not read chain state."""
+
+
+def no_audit_row(_result: object) -> None:
+    """An :data:`OperatorAudit` that records nothing, for a write whose caller records it itself.
+
+    ``revoke_user_sessions`` takes one (BACKLOG #3018 step 4). Most of its callers end the sessions
+    as the tail of a change that carries its own row, such as a password reset or a disable, so the
+    revoke has nothing of its own to record."""
+    return None
 
 
 #: The columns every backend reads a ``transit_bound_attestation`` row by (BACKLOG #2337).
@@ -19360,10 +19371,12 @@ class MessageStore:
         role_ids: Sequence[str] = (),
         assigned_by: str | None = None,
         now: float | None = None,
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """The last-administrator guard and its write in one transaction (vault BACKLOG #2779); see
         ``AuthStore``. The writer lock serializes it against every other writer in this process,
-        which is every writer this file has."""
+        which is every writer this file has. ``audits`` are appended only when the change is
+        applied, before the one commit (BACKLOG #2221)."""
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
             if change.takes_role(admin_role_id, role_ids):
@@ -19387,7 +19400,9 @@ class MessageStore:
                 )
             else:
                 assert_never(change)
+            appended = await self._append_audits(audits, now=now)
             await self._commit()
+        tee_audits(audits, appended, ts=now)
         return True
 
     async def grant_first_admin_unless_admin_exists(
@@ -19771,13 +19786,17 @@ class MessageStore:
         *,
         assigned_by: str | None = None,
         now: float | None = None,
+        audits: Sequence[AuditAppend],
     ) -> None:
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
             await self._write_user(
                 user_id, lambda r: r.with_roles(role_ids, assigned_by=assigned_by, now=now)
             )
+            # BACKLOG #2221. Before the one commit, so a failed append rolls the roles back.
+            appended = await self._append_audits(audits, now=now)
             await self._commit()
+        tee_audits(audits, appended, ts=now)
 
     async def set_user_roles_if_held(
         self,
@@ -19787,17 +19806,26 @@ class MessageStore:
         expected_role_ids: Iterable[str],
         assigned_by: str | None = None,
         now: float | None = None,
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """The compare-and-set role write (vault BACKLOG #3085); see ``AuthStore``. Under the one
-        writer lock, so no other write to the row lands between the compare and the write."""
+        writer lock, so no other write to the row lands between the compare and the write.
+        ``audits`` are appended only when it writes, before the one commit (BACKLOG #3018 step 4).
+        """
         now = time.time() if now is None else now
         change = roles_if_held(
             role_ids, expected_role_ids=expected_role_ids, assigned_by=assigned_by, now=now
         )
+        appended: list[AppendedAuditRow] = []
         async with _writer_txn(self._db, self._lock):
             written = await self._write_user(user_id, change)
+            if written is not None:
+                appended = await self._append_audits(audits, now=now)
             await self._commit()
-        return written is not None
+        if written is None:
+            return False
+        tee_audits(audits, appended, ts=now)
+        return True
 
     async def set_user_channel_scope(
         self,
@@ -20281,7 +20309,12 @@ class MessageStore:
         return ended
 
     async def revoke_user_sessions(
-        self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
+        self,
+        user_id: str,
+        *,
+        except_token_hash: str | None = None,
+        now: float | None = None,
+        audit: OperatorAudit[RevokeResult],
     ) -> RevokeResult:
         """Revoke a user's active sessions; with ``except_token_hash`` set, all **but** that one (the
         caller's current session — "sign out everywhere else"), which is kept only when it is
@@ -20295,10 +20328,18 @@ class MessageStore:
         missing row (:func:`global_epoch_unmoved`, :class:`KeptSessionRestamp`, BACKLOG #4975);
         otherwise it is ended with the rest and counted (:meth:`_keep_or_end_session`). If its
         own seal does not verify, that raises :class:`RowSealError` and the whole transaction,
-        revokes included, rolls back."""
+        revokes included, rolls back. ``audit``'s row is appended before the one commit, so a
+        failed append rolls the revokes back too (BACKLOG #3018 step 4)."""
+        require_operator_audit(audit, "store.revoke_user_sessions")  # BACKLOG #5069
         now = time.time() if now is None else now
         outcome = RevokeSealOutcome(self._seal_pager)
-        async with outcome.committing(self.record_audit), _writer_txn(self._db, self._lock):
+        # AuditedWrite inside the seal report: the operator row's tee runs as the commit
+        # lands, before the report awaits, so a report that raises cannot cost the tee.
+        async with (
+            outcome.committing(self.record_audit),
+            AuditedWrite(now) as written,
+            _writer_txn(self._db, self._lock),
+        ):
             raised = await self._bump_session_epoch(user_id, outcome)
             if except_token_hash is None:
                 cur = await self._db.execute(_REVOKE_USER_SESSIONS_SQL, (now, user_id))
@@ -20319,6 +20360,7 @@ class MessageStore:
                     now,
                     outcome,
                 )
+            await self._append_operator_audit(written, audit, result)
             await self._commit()
         return result
 

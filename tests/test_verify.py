@@ -1590,7 +1590,7 @@ def _store_with_accounts(path: Path, *, lockable: bool) -> StoreSettings:
                 audits=(),
             )
             await handle.upsert_role(role_id=Role.VIEWER.value, display_name="Viewer")
-            await handle.set_user_roles("u-1", [Role.VIEWER.value], assigned_by="test")
+            await handle.set_user_roles("u-1", [Role.VIEWER.value], assigned_by="test", audits=())
         finally:
             await handle.close()
 

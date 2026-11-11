@@ -374,6 +374,11 @@ class ReconcilePlan:
     #: Whether this pass reached the directory after a run that paged, in this process (BACKLOG
     #: #3709). Read like the other ``*_clear`` flags: the caller resolves the outage's instance on it.
     outage_clear: bool = False
+    #: Set by the auth service after the pass, never by :func:`plan_pass` (BACKLOG #3018 step 2):
+    #: the audit action of each row the pass could not write, one entry per refused write. The
+    #: lifespan task pages ``audit_write_failed`` once per action. Set on every plan the pass
+    #: returns, an aborted or outage-shaped one included.
+    audit_refused: tuple[str, ...] = ()
 
     @property
     def directory_outage(self) -> bool:

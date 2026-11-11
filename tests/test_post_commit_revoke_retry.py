@@ -74,7 +74,7 @@ async def _custom_role_edit(service: AuthService, store: MessageStore, _i: Any) 
         permissions=["messages:view_summary"],
         actor="admin",
     )
-    await store.set_user_roles("u1", ["viewer", role.id], assigned_by="test")
+    await store.set_user_roles("u1", ["viewer", role.id], assigned_by="test", audits=())
     await service.update_custom_role(
         role.id,
         display_name="Synthetic",
@@ -119,7 +119,7 @@ async def _account(store: MessageStore, service: AuthService) -> tuple[Any, list
         password_generated=False,
         audits=(),
     )
-    await store.set_user_roles("u1", ["viewer"], assigned_by="test")
+    await store.set_user_roles("u1", ["viewer"], assigned_by="test", audits=())
     hashes: list[str] = []
     identity: Any = None
     for _ in range(2):
@@ -302,7 +302,7 @@ async def _two_holders_of_a_custom_role(
             password_generated=False,
             audits=(),
         )
-        await store.set_user_roles(n, ["viewer", role.id], assigned_by="test")
+        await store.set_user_roles(n, ["viewer", role.id], assigned_by="test", audits=())
         sessions[n] = n[-1] * 64
         await store.create_session(token_hash=sessions[n], user_id=n, expires_at=9e9)
     return role.id, sessions

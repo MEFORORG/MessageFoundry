@@ -15372,12 +15372,16 @@ class SqlServerStore:
         role_ids: Sequence[str] = (),
         assigned_by: str | None = None,
         now: float | None = None,
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """The last-administrator guard and its write in one transaction (vault BACKLOG #2779); see
         ``AuthStore``. Takes ``_ADMIN_GUARD_LOCK`` before the read, so under RCSI the read sees
-        whatever an earlier holder committed before releasing it."""
+        whatever an earlier holder committed before releasing it. ``audits`` are appended only when
+        the change is applied, before the one commit (BACKLOG #2221). With audits the in-process
+        ``_audit_lock`` is taken before the connection, the order ``_execute_with_audits`` uses."""
         now = time.time() if now is None else now
-        async with self._acquire() as conn:
+        appended: list[AppendedAuditRow] = []
+        async with self._audit_lock if audits else nullcontext(), self._acquire() as conn:
             try:
                 async with self._cursor(conn) as cur:
                     if change.takes_role(admin_role_id, role_ids):
@@ -15413,12 +15417,14 @@ class SqlServerStore:
                         )
                     else:
                         assert_never(change)
+                    appended = await self._append_audits(cur, audits, now=now)
                     await self._commit(conn)
             except Exception:
                 # BACKLOG #1940: a failed rollback must not hand the open transaction, and the
                 # applock it owns, to the next borrower of this pooled connection.
                 await self._rollback_or_discard(conn)
                 raise
+        tee_audits(audits, appended, ts=now)
         return True
 
     async def grant_first_admin_unless_admin_exists(
@@ -15681,10 +15687,15 @@ class SqlServerStore:
         *,
         assigned_by: str | None = None,
         now: float | None = None,
+        audits: Sequence[AuditAppend],
     ) -> None:
         now = time.time() if now is None else now
-        await self._write_user_txn(
-            user_id, lambda r: r.with_roles(role_ids, assigned_by=assigned_by, now=now)
+        # BACKLOG #2221: the role write's own transaction carries its rows.
+        await self._write_user_with_audits(
+            user_id,
+            lambda r: r.with_roles(role_ids, assigned_by=assigned_by, now=now),
+            audits,
+            now=now,
         )
 
     async def set_user_roles_if_held(
@@ -15695,15 +15706,36 @@ class SqlServerStore:
         expected_role_ids: Iterable[str],
         assigned_by: str | None = None,
         now: float | None = None,
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """The compare-and-set role write (vault BACKLOG #3085); see ``AuthStore``. The compare
         runs on the row ``_write_user`` reads under ``UPDLOCK, ROWLOCK``, so a concurrent writer
-        waits."""
+        waits. ``audits`` are appended only when it writes, before the one commit, under the lock
+        order :meth:`_write_user_with_audits` uses (BACKLOG #3018 step 4)."""
         now = time.time() if now is None else now
         change = roles_if_held(
             role_ids, expected_role_ids=expected_role_ids, assigned_by=assigned_by, now=now
         )
-        return await self._write_user_txn(user_id, change) is not None
+        if not audits:
+            return await self._write_user_txn(user_id, change) is not None
+        async with self._audit_lock:  # noqa: SIM117
+            async with self._acquire() as conn:
+                try:
+                    async with self._cursor(conn) as cur:
+                        written = await self._write_user(cur, user_id, change)
+                        appended = (
+                            []
+                            if written is None
+                            else await self._append_audits(cur, audits, now=now)
+                        )
+                        await self._commit(conn)
+                except Exception:
+                    await self._rollback_or_discard(conn)
+                    raise
+        if written is None:
+            return False
+        tee_audits(audits, appended, ts=now)
+        return True
 
     async def set_user_channel_scope(
         self,
@@ -16364,7 +16396,12 @@ class SqlServerStore:
         return ended
 
     async def revoke_user_sessions(
-        self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
+        self,
+        user_id: str,
+        *,
+        except_token_hash: str | None = None,
+        now: float | None = None,
+        audit: OperatorAudit[RevokeResult],
     ) -> RevokeResult:
         """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count
         and whether the kept session was re-stamped (:class:`RevokeResult`, BACKLOG #4975).
@@ -16380,39 +16417,50 @@ class SqlServerStore:
         too, read while the account row is held, as ``create_session`` reads it, without refusing
         a missing row (store.py's ``global_epoch_unmoved``), and ended where it is declined
         (:meth:`_keep_or_end_session`, follow-up to BACKLOG #4975). The borrow is
-        :meth:`_acquire_after_commit`'s, for the reason it gives (BACKLOG #3023)."""
+        :meth:`_acquire_after_commit`'s, for the reason it gives (BACKLOG #3023).
+
+        ``audit``'s row is appended last, before the one commit, as an operator mutation's is
+        (:meth:`_append_operator_audit` says why the in-process ``_audit_lock`` is not taken), so
+        a failed append rolls the revokes back (BACKLOG #3018 step 4)."""
+        require_operator_audit(audit, "store.revoke_user_sessions")  # BACKLOG #5069
         now = time.time() if now is None else now
         outcome = RevokeSealOutcome(self._seal_pager)
+        # AuditedWrite inside the seal report: the operator row's tee runs as the commit
+        # lands, before the report awaits, so a report that raises cannot cost the tee.
         async with (
             outcome.committing(self.record_audit),
+            AuditedWrite(now) as written,
             self._acquire_after_commit() as conn,
-            self._cursor(conn) as cur,
         ):
             try:
-                raised = await self._bump_session_epoch(cur, user_id, outcome)
-                if except_token_hash is None:
-                    await cur.execute(_MSSQL_REVOKE_USER_SESSIONS_SQL, (now, user_id))
-                else:
-                    await cur.execute(
-                        _MSSQL_REVOKE_USER_SESSIONS_SQL + _MSSQL_EXCEPT_TOKEN_HASH_SQL,
-                        (now, user_id, except_token_hash),
-                    )
-                revoked = len(await cur.fetchall())
-                if except_token_hash is None:
-                    result = RevokeResult(revoked)
-                else:
-                    unmoved = global_epoch_unmoved(await self._global_session_epoch_value(cur))
-                    result = await self._keep_or_end_session(
-                        cur,
-                        revoked,
-                        except_token_hash,
-                        KeptSessionRestamp(user_id, raised, unmoved),
-                        now,
-                        outcome,
-                    )
-                await self._commit(conn)
+                async with self._cursor(conn) as cur:
+                    raised = await self._bump_session_epoch(cur, user_id, outcome)
+                    if except_token_hash is None:
+                        await cur.execute(_MSSQL_REVOKE_USER_SESSIONS_SQL, (now, user_id))
+                    else:
+                        await cur.execute(
+                            _MSSQL_REVOKE_USER_SESSIONS_SQL + _MSSQL_EXCEPT_TOKEN_HASH_SQL,
+                            (now, user_id, except_token_hash),
+                        )
+                    revoked = len(await cur.fetchall())
+                    if except_token_hash is None:
+                        result = RevokeResult(revoked)
+                    else:
+                        unmoved = global_epoch_unmoved(await self._global_session_epoch_value(cur))
+                        result = await self._keep_or_end_session(
+                            cur,
+                            revoked,
+                            except_token_hash,
+                            KeptSessionRestamp(user_id, raised, unmoved),
+                            now,
+                            outcome,
+                        )
+                    await self._append_operator_audit(cur, written, audit, result)
+                    await self._commit(conn)
             except Exception:
-                await conn.rollback()
+                # BACKLOG #1940: the audit INSERT must not ride a recycled connection; see
+                # _rollback_or_discard. After the cursor block, as _write_user_with_audits runs it.
+                await self._rollback_or_discard(conn)
                 raise
         return result
 

@@ -46,6 +46,7 @@ from messagefoundry.store.store import (
     WebAuthnCredential,
     ad_map_seal_ok_async,
     approval_seal_ok_async,
+    no_audit_row,
     role_seal_ok_async,
     session_seal_ok_async,
     user_seal_ok_async,
@@ -100,7 +101,7 @@ async def _user(store: MessageStore, user_id: str, *roles: str) -> None:
         audits=(),
     )
     if roles:
-        await store.set_user_roles(user_id, list(roles))
+        await store.set_user_roles(user_id, list(roles), audits=())
 
 
 async def _session(store: MessageStore, user_id: str) -> str:
@@ -252,7 +253,7 @@ async def test_the_last_administrator_guard_runs_through_transit(
 
     async def removable(target: str) -> bool:
         return await store.remove_unless_last_admin(
-            target, AdminRemoval.SET_ROLES, admin_role_id=ADMIN, role_ids=[VIEWER]
+            target, AdminRemoval.SET_ROLES, admin_role_id=ADMIN, role_ids=[VIEWER], audits=()
         )
 
     _sql(path, "UPDATE users SET display_name=? WHERE id=?", ("bent", "b"))
@@ -414,13 +415,13 @@ async def test_epoch_raise_census_an_unverifiable_account_has_its_sessions_ended
     planted = await _session(store, "u-1")
     forged = await _session(store, "u-2")
     _plant(path, "users", "authz_seal", "id", "u-1")
-    assert (await store.revoke_user_sessions("u-1")).count == 1
+    assert (await store.revoke_user_sessions("u-1", audit=no_audit_row)).count == 1
     (planted_revoked_at,) = _sql(
         path, "SELECT revoked_at FROM sessions WHERE token_hash=?", (hash_token(planted),)
     )[0]
     assert planted_revoked_at is not None
     _sql(path, "UPDATE users SET display_name=? WHERE id=?", ("bent", "u-2"))
-    result = await store.revoke_user_sessions("u-2")
+    result = await store.revoke_user_sessions("u-2", audit=no_audit_row)
     assert result.count == 1
     (revoked_at,) = _sql(
         path, "SELECT revoked_at FROM sessions WHERE token_hash=?", (hash_token(forged),)
@@ -440,7 +441,9 @@ async def test_kept_session_census_an_unverifiable_kept_session_is_ended(
     kept = await _session(store, "u-1")
     other = await _session(store, "u-1")
     _plant(path, "sessions", "seal", "token_hash", hash_token(kept))
-    result = await store.revoke_user_sessions("u-1", except_token_hash=hash_token(kept))
+    result = await store.revoke_user_sessions(
+        "u-1", except_token_hash=hash_token(kept), audit=no_audit_row
+    )
     assert not result.kept and result.ended_kept and result.count == 2
     for token in (kept, other):
         (revoked_at,) = _sql(

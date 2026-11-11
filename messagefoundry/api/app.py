@@ -469,6 +469,7 @@ from messagefoundry.pipeline.alerts import (
     administrator_granted_alert,
     authority_seal_alert,
     authority_seal_page,
+    directory_sign_in_audit_alert,
     no_enabled_administrator_alert,
     step_up_return_audit_alert,
     store_cipher_refusal_forwarder,
@@ -11770,7 +11771,12 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     resolving is an idempotent update, and a resolve the notifier failed to write is retried that
     way. A process clears only what it watched open, so a fresh process resolves no alert an
     earlier run left open (:func:`_without_inherited_clears` drops that clear);
-    ``_mark_reconcile_clears`` states that rule once."""
+    ``_mark_reconcile_clears`` states that rule once.
+
+    A row the pass could not write pages ``audit_write_failed`` first, once per action and on
+    every shape of pass, keyed ``directory-reconciler:<action>`` (BACKLOG #3018 step 2;
+    :func:`_alert_refused_reconciler_rows`)."""
+    _alert_refused_reconciler_rows(plan, sink)
     if plan.directory_outage:
         # A paging refusal is not the outage, so an outage-shaped pass still pages for it (vault
         # BACKLOG #3696). An outage applies no revocation, so nothing here pages ahead of it.
@@ -11847,6 +11853,26 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         sink.ad_reconcile_breaker_cleared(_REFERRAL_ALERT_SOURCE)
     if plan.outage_clear:
         sink.ad_reconcile_breaker_cleared(_OUTAGE_ALERT_SOURCE)
+
+
+#: The prefix of the ``audit_write_failed`` key for a reconcile row the store refused (BACKLOG
+#: #3018 step 2). The action follows it, so each lost kind of row is its own instance; the colon
+#: keeps the key outside the connection-name grammar, as ``approval:<id>`` does.
+_RECONCILER_AUDIT_ALERT_PREFIX: Final = "directory-reconciler"
+
+
+def _alert_refused_reconciler_rows(plan: ReconcilePlan, sink: AlertSink) -> None:
+    """Page ``audit_write_failed`` once for each action the pass could not write a row for
+    (BACKLOG #3018 step 2). The service logged each at ERROR with the account; the page carries
+    only the action, as the alert's contract says. A sink that breaks its never-raise contract
+    costs that page only, so the reconcile alerts after it still fire."""
+    for action in dict.fromkeys(plan.audit_refused):
+        try:
+            sink.audit_write_failed(f"{_RECONCILER_AUDIT_ALERT_PREFIX}:{action}", action=action)
+        except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract
+            _log.exception(
+                "directory reconcile: the audit_write_failed alert for %s failed to emit", action
+            )
 
 
 def _alert_paging_refusals(plan: ReconcilePlan, sink: AlertSink) -> None:
@@ -12968,6 +12994,11 @@ def create_managed_app(
                     # BACKLOG #3965: the step-up return audit budget's all-callers backstop pages
                     # audit_write_failed here when it stops a row, at most once a window.
                     step_up_return_audit_alert=step_up_return_audit_alert(
+                        notifier or LoggingAlertSink()
+                    ),
+                    # BACKLOG #2221: a directory sign-in's role-sync row refused twice pages
+                    # audit_write_failed here.
+                    sign_in_audit_alert=directory_sign_in_audit_alert(
                         notifier or LoggingAlertSink()
                     ),
                     # BACKLOG #3937: the relying party a passkey must be under to count as a way
