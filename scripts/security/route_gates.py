@@ -70,7 +70,6 @@ import inspect
 import linecache
 import re
 import types
-from collections import deque
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, Literal
@@ -565,9 +564,13 @@ def _effective_routes(owner: Starlette | APIRouter | Mount) -> Iterator[tuple[Ba
     registered on ``owner`` directly. The walk takes the PATH and methods from it. An HTTP route's
     gate comes from the route's own dependencies.
 
-    Raises through :func:`_refuse_low_priority_routes` when ``owner``, or any ``Mount`` reachable
-    beneath a mount it yields, holds a low-priority route, before that mount is yielded, so a caller
-    that does not descend is refused as one that does (vault BACKLOG #3177)."""
+    Each ``Mount`` is walked through, and every mount beneath it, before it is yielded, so a caller
+    that does not descend is refused as one that does (vault BACKLOG #3177). So the walk raises, at
+    least, :func:`_refuse_low_priority_routes`'s refusal for ``owner`` or any of those mounts, and any
+    other error the walk raises for a route beneath a yielded mount, such as a ``ValueError`` for an
+    included route with no rebuilt copy or :class:`MissingFastAPISymbol`. The descent reads
+    ``Mount.routes``, so it reaches neither a ``Host`` nor an app the mount sees only through a
+    middleware wrapper."""
     _refuse_low_priority_routes(owner)
     routes: Sequence[BaseRoute] = owner.routes
     # One entry at a time, so a context with no rebuilt copy is known to be the entry itself only
@@ -599,12 +602,9 @@ def _effective_routes(owner: Starlette | APIRouter | Mount) -> Iterator[tuple[Ba
                 )
             served = original
         if isinstance(served, Mount):
-            # Every mount is checked, with every mount beneath it, before it is yielded, so the
-            # refusal does not depend on a caller descending into it; a mount holding only a
-            # frontend group has no routes and is never descended into at all (vault BACKLOG
-            # #3177). Draining the mount's own walk runs the owner check at its top on the mount
-            # and the same check here on each mount it yields.
-            deque(_effective_routes(served), maxlen=0)
+            # Walked through only for its refusals; the docstring says what that covers.
+            for _ in _effective_routes(served):
+                pass
         yield original, served
 
 

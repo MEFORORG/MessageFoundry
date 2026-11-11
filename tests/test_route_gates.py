@@ -926,6 +926,20 @@ def test_a_frontend_group_fails_the_walk_rather_than_passing_unvisited(
         consume(app)
 
 
+def test_a_mount_inside_a_mounted_app_with_no_frontend_group_passes_without_a_descent() -> None:
+    """The control for the two-mounts-deep shape: checking every mount beneath a yielded mount
+    refuses only a low-priority route, never the nesting itself."""
+    innermost = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+    innermost.add_api_route("/deep", _ok)
+    outer = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+    outer.add_api_route("/outer", _ok)
+    outer.mount("/inner", innermost)
+    app = FastAPI(openapi_url=None)
+    app.mount("/outer", outer)
+    assert len(list(route_gates._effective_routes(app))) == 1
+    assert ("GET", "/outer/inner/deep") in _rows_by_key(app)
+
+
 def test_a_renamed_low_priority_list_fails_the_walk_by_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
