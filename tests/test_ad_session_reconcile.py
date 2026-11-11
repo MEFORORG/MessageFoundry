@@ -7109,18 +7109,20 @@ async def test_a_role_revocation_commits_its_roles_row_with_the_role_write(
         )
         assert actors == ["jdoe"] * refused
         assert sorted(await store.get_user_role_ids(user.id)) == sorted(target)
-        rows = [
-            json.loads(r["detail"]) for r in await store.list_audit(action="auth.ad_roles_resynced")
-        ]
-        if refused == 2:
-            assert rows == []
-            assert service._reconcile_refused_rows == ["auth.ad_roles_resynced"]
-        else:
-            assert rows == [{"from": before, "to": sorted(target), "via": "ad-reconcile"}]
-            assert service._reconcile_refused_rows == []
-        assert len(_revoked_rows(await store.list_audit())) == 1
+        audit = await store.list_audit(limit=1000)
     finally:
         await store.close()
+    # The whole trail, so the absence below is read from rows that exist: the revoke's row is in it
+    # whatever the role row's fate. At the top level, where the vacuous-absence lint reads a guard.
+    assert audit
+    rows = [json.loads(r["detail"]) for r in audit if r["action"] == "auth.ad_roles_resynced"]
+    if refused == 2:
+        assert rows == []
+        assert service._reconcile_refused_rows == ["auth.ad_roles_resynced"]
+    else:
+        assert rows == [{"from": before, "to": sorted(target), "via": "ad-reconcile"}]
+        assert service._reconcile_refused_rows == []
+    assert len(_revoked_rows(audit)) == 1
 
 
 async def test_two_reconcilers_that_both_read_the_old_roles_report_the_change_once() -> None:
