@@ -353,7 +353,9 @@ def _local_path(text: str | bytes | os.PathLike[str], what: str) -> str:
     if scheme == "file":
         if parts.netloc.lower() not in ("", "localhost"):
             raise _SourceRefused(f"{what} that is a file URL naming a host")
-        source = urllib.request.url2pathname(parts.path)
+        source = urllib.request.url2pathname(parts.path).strip()
+        if not source:  # "file:" or "file://localhost" names no path; abspath would supply one
+            raise _SourceRefused(f"{what} that is a file URL naming no path")
     elif scheme and not (len(scheme) == 1 and source[1:2] == ":"):  # a drive letter is not a scheme
         raise _SourceRefused(f"{what} that is not a local path")
     local = _local(source)
@@ -485,10 +487,15 @@ def validate_against(
     # untrusted body still goes through the XXE/DTD lockdown, not xmlschema's own loader.
     root = parse_bytes(document)
     reasons: list[str] = []
-    for error in schema.iter_errors(root):
-        # PHI-safe: the element path + xmlschema's reason category (its 'reason' can embed the value,
-        # so we use the validator/path + the error *type*, not the raw reason text).
-        path = getattr(error, "path", None) or "/"
-        reasons.append(f"{path}: {type(error).__name__}")
+    try:
+        for error in schema.iter_errors(root):
+            # PHI-safe: the element path + xmlschema's reason category (its 'reason' can embed the
+            # value, so we use the validator/path + the error *type*, not the raw reason text).
+            path = getattr(error, "path", None) or "/"
+            reasons.append(f"{path}: {type(error).__name__}")
+    except _ResourceRefused as exc:
+        # xmlschema may load a namespace while validating (a wildcard meeting a namespace it holds
+        # a location for); a refusal there is the schema failing to load, never a valid result.
+        raise XmlValidationError(f"could not load XSD schema: {exc}") from exc
     _ = etree  # ensure the extra is present for callers that re-serialize after validating
     return XmlSchemaResult(valid=not reasons, reasons=tuple(reasons))

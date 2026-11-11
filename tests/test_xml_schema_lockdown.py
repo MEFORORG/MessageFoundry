@@ -809,6 +809,37 @@ def test_schema_root_is_refused_for_an_inline_schema(tmp_path: Path) -> None:
         validate_against("<patient>x</patient>", _CLEAN, schema_root=tmp_path)
 
 
+@pytest.mark.parametrize("url", ["file:", "file://", "file://localhost", "file:///"])
+def test_a_file_url_naming_no_path_is_refused(url: str, tmp_path: Path) -> None:
+    # url2pathname gives "" (or "/"), and abspath("") is the working directory: under the Windows
+    # service that can be C:\Windows\System32, so as a schema_root it widened reads to all of it.
+    main = _write_path_schema(tmp_path, "inc.xsd")
+    with pytest.raises(XmlValidationError, match="naming no path|filesystem root"):
+        validate_against("<patient>x</patient>", str(main), schema_root=url)
+    with pytest.raises(XmlValidationError):
+        validate_against("<patient>x</patient>", url)
+
+
+def test_a_refusal_while_validating_is_a_schema_load_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With no bundled root (xmlschema installed on a UNC path), a lax ##other wildcard meeting an
+    # xlink element makes xmlschema load the bundled xlink.xsd during iter_errors, and the opener
+    # refuses it. That refusal escaped validate_against as the private _ResourceRefused.
+    from messagefoundry.parsing.xml import schema as schema_mod
+
+    monkeypatch.setattr(schema_mod, "_bundled_root", lambda module_file: ())
+    schema = (
+        f'<xs:schema {_XS} targetNamespace="urn:t"><xs:element name="e"><xs:complexType>'
+        '<xs:sequence><xs:any namespace="##other" processContents="lax"/></xs:sequence>'
+        "</xs:complexType></xs:element></xs:schema>"
+    )
+    doc = '<t:e xmlns:t="urn:t"><l:simple xmlns:l="http://www.w3.org/1999/xlink"/></t:e>'
+    with pytest.raises(XmlValidationError) as ei:
+        validate_against(doc, schema)
+    assert "_ResourceRefused" in _causes(ei.value)
+
+
 @pytest.mark.parametrize("root", ["", "   "])
 def test_an_empty_schema_root_is_refused(root: str, tmp_path: Path) -> None:
     # abspath("") is the working directory, which would widen the root past the schema's own.
