@@ -123,6 +123,21 @@ from messagefoundry.redaction import json_loads_or_refusal
 #: keeps the in-process keyed/keyless path (byte-identical to pre-ADR-0138 for the default cipher).
 AuditMacFn = Callable[[bytes], str]
 
+
+@runtime_checkable
+class AuditMacVerifier(Protocol):
+    """An :data:`AuditMacFn` that also checks a STORED MAC itself (BACKLOG #2720).
+
+    The audit walk asks :meth:`verify` whether a row's stored MAC is the MAC of the row's bytes,
+    rather than computing a fresh MAC and comparing the two. Transit's ``verify`` call is one: it
+    checks a MAC at the key version the MAC names, so a row made under an older version still
+    verifies after the key rotates."""
+
+    def __call__(self, data: bytes, /) -> str: ...
+
+    def verify(self, data: bytes, stored: str, /) -> bool: ...
+
+
 if TYPE_CHECKING:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from cryptography.hazmat.primitives.hmac import HMAC
@@ -652,7 +667,8 @@ class CipherUnavailableError(CipherError):
 
 
 class AuditKeyVersionRefusedError(CipherError):
-    """An audit MAC pinned to one key version got HTTP 400 read as a refusal of that version, while
+    """A Transit check of a stored audit MAC, made at the key version that MAC names, got HTTP 400
+    read as a refusal of that version, while
     Transit still answers under the latest. Transit's own refusal is one cause; the subclass
     :class:`AuditKeyVersionUnverifiedError` covers a 400 whose reply does not read as one.
 
@@ -674,7 +690,7 @@ class AuditKeyVersionRefusedError(CipherError):
 
 
 class AuditKeyVersionUnverifiedError(AuditKeyVersionRefusedError):
-    """An audit MAC pinned to one key version got HTTP 400 that
+    """A Transit check of a stored audit MAC at one key version got HTTP 400 that
     :func:`~messagefoundry.store.crypto_transit._names_no_version_reason` does not read as a version
     refusal, or whose reading runs out of memory or stack, while the key still answers under the
     latest (BACKLOG #6707).

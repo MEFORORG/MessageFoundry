@@ -7,7 +7,10 @@
   2026-10-20*, which adds a scheme to each range record and supersedes nothing. **Amended
   2026-10-27** (BACKLOG #2720): see *Amendment 2026-10-27*, which records what a Transit key
   rotation does to the chain. It supersedes only the clause, stated twice, that put Transit's key
-  versioning outside this ADR; that the engine sees one Transit range still stands.
+  versioning outside this ADR; that the engine sees one Transit range still stands. **Amended
+  2026-11-11** (BACKLOG #2720): see *Amendment 2026-11-11*, under which the walk checks each Transit
+  row MAC with Transit's verify call. It supersedes the 2026-10-27 amendment's item 2 and its
+  *Why regenerating pinned stands in for Transit's verify call*, and closes that amendment's edge.
 - **Date:** 2026-09-23
 - **Related:** BACKLOG #1904 (the defect), #1905 (keyless chain after `provision-admin`), #190 (the
   keyed chain and its watermark), [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)
@@ -445,7 +448,8 @@ section 0): this is what the first deployment's first routine rotation would hav
 
 1. **An append names its version.** It calls `generate_hmac` unpinned, so Transit uses its latest
    version, and the string it stores carries that version.
-2. **A check recomputes pinned to the stored version.** `_version_pinned_mac` in `store/store.py`
+2. **A check recomputes pinned to the stored version.** (Superseded 2026-11-11: see *Amendment
+   2026-11-11*. `_version_pinned_mac` is gone.) `_version_pinned_mac` in `store/store.py`
    reads `<N>` from the stored string and calls `TransitCipher.audit_hmac(data, key_version=N)`.
    The chain walk (`_audit_row_mac`), the genesis-row check at open, and the one-row MAC check
    behind the Transit attestation all go through it. The recompute is compared with the stored
@@ -473,6 +477,8 @@ section 0): this is what the first deployment's first routine rotation would hav
 
 ### Why regenerating pinned stands in for Transit's verify call
 
+Superseded 2026-11-11: the walk now makes Transit's verify call (*Amendment 2026-11-11*).
+
 #2720 asked for Transit's verify call on the stored string in place of regenerate-and-compare. The
 pinned recompute gives the two properties that call would:
 
@@ -494,10 +500,8 @@ key's `min_encryption_version` does this, so every row sealed under a lower vers
 as a break, and so would the attestation, with no re-attest hint. That limit is specific to
 regenerating. Vault's Transit API documentation, read on 2026-10-27, says a pinned HMAC generate
 needs a version at or above the key's `min_encryption_version`, and that `min_decryption_version`
-is the floor for verifying an HMAC. No Vault or OpenBao server was run to confirm it. PR 2167
-named Transit's verify call as the fix for this limit; it is not built. Until it is, do not raise
-the audit key's `min_encryption_version` above the oldest version a stored row names: every older
-row would then read as a break in `audit-verify`, and in the startup walk where it is on.
+is the floor for verifying an HMAC. Closed 2026-11-11: the walk verifies instead of regenerating,
+so `min_encryption_version` no longer bears on it (*Amendment 2026-11-11*).
 
 `_refuses_only_version` infers a refused version from the reply, which a proxy can author (item
 3); it does not read the key's
@@ -510,9 +514,53 @@ All against an in-process fake Transit client with key versions, never a real se
 `tests/test_transit_bound_attestation.py`:
 
 - `test_rotating_the_transit_key_keeps_the_attestation` -- the chain and the attestation verify
-  after the fake key moves from version 1 to version 2, and the recompute was pinned to version 1.
+  after the fake key moves from version 1 to version 2. Since 2026-11-11 it checks that Transit
+  verified at version 1 and no call was pinned.
 - `test_a_planted_unheld_key_version_is_a_chain_break_on_the_startup_walk` and
   `test_a_planted_unheld_key_version_on_the_genesis_row_opens_and_reads_as_a_break` -- a planted
   version is a break at its row.
 - `test_a_transit_outage_on_the_startup_walk_still_could_not_run` and
-  `test_a_transient_failure_of_a_pinned_call_is_not_a_planted_version` -- an outage is not a break.
+  `test_a_transient_failure_of_the_verify_call_is_not_a_planted_version` (renamed 2026-11-11) --
+  an outage is not a break.
+
+## Amendment 2026-11-11 -- the walk checks each Transit row MAC with Transit's verify call
+
+- **Status:** Accepted -- built with the change (BACKLOG #2720, closing step 1).
+- **Supersedes:** the 2026-10-27 amendment's item 2 and its *Why regenerating pinned stands in for
+  Transit's verify call*. It closes that amendment's edge.
+
+### What changes
+
+1. **A stored MAC is checked by Transit, never regenerated.** `TransitCipher.audit_mac_fn` returns
+   an `AuditMacVerifier` (`store/crypto.py`). For one, `_audit_row_mac` in `store/store.py` calls
+   `TransitCipher.verify_audit_hmac(data, stored)`, which makes Transit's `verify` call on the
+   stored string. Transit checks it at the version it names. The chain walk, the genesis-row check
+   at open, the pin check, and the one-row MAC checks behind the Transit attestation and keyed
+   evidence all go through `_audit_row_mac`. An append still calls `generate_hmac` unpinned.
+2. **The policy floor that applies is `min_decryption_version`.** Vault's `pathHMACVerify` at
+   commit cbc874e2358f, read on 2026-11-11, refuses a version above the latest (*"invalid HMAC:
+   version is too new"*) or below `min_decryption_version`, and does not read
+   `min_encryption_version`. So raising `min_encryption_version` leaves older rows verifying, and
+   raising `min_decryption_version` above a version a stored row names makes that row a break.
+   No Vault or OpenBao server was run to confirm it.
+3. **A malformed stored MAC is a break with no Transit call.** A stored string that
+   `row_seal.transit_mac_version` does not accept reads as not verified, so no malformed value
+   reaches Transit to draw a 400.
+4. **Refusals and outages are classified as before.** A 400 on the verify call goes through
+   `_refuses_only_version` and `_names_no_version_reason` (2026-10-27 amendment, item 3), so it
+   raises `AuditKeyVersionRefusedError` or `AuditKeyVersionUnverifiedError` and is a break at that
+   row with the alert, or a plain `CipherError`, and the walk could not run. Transit's
+   `valid: false` is a break. A `valid` that is not a bool is a `CipherError`.
+5. **The in-process key paths are unchanged.** A plain MAC provider, an in-heap key and the keyless
+   mode still recompute and compare in constant time.
+
+### Evidence
+
+In-process fake Transit, never a real server, in `tests/test_transit_bound_attestation.py`. Its
+`_RotatingTransit` models both policy floors as item 2 reads them.
+
+- `test_a_mixed_v1_and_v2_chain_verifies_after_a_rotation`.
+- `test_raising_min_encryption_version_past_v1_leaves_v1_rows_verifying`.
+- `test_raising_min_decryption_version_past_v1_is_a_break_with_the_alert`.
+- `test_a_tampered_row_in_a_mixed_chain_still_breaks` and
+  `test_a_malformed_stored_mac_is_a_break_with_no_transit_call`.

@@ -21,7 +21,7 @@ import sqlite3
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import httpx
 import pytest
@@ -42,6 +42,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.store.base import open_store
 from messagefoundry.store.crypto import CipherError
+from messagefoundry.store.row_seal import transit_mac_version
 from messagefoundry.store.store import MessageStore
 from messagefoundry.store.transit_attestation import (
     TRANSIT_BOUND_ATTESTED_ACTION,
@@ -244,14 +245,36 @@ async def test_a_forged_audit_row_does_not_verify(store: MessageStore, tmp_path:
 
 
 class _RotatingTransit(_FakeTransit):
-    """Fake Transit with key versions: ``generate_hmac`` uses the latest unless ``key_version`` pins
-    one, as the real engine does, and each version MACs under its own secret. A version above the
-    latest is refused with HTTP 400, as real Transit refuses it."""
+    """Fake Transit with key versions, each MACing under its own secret, and the key's two policy
+    floors, modelled on Vault's ``path_hmac.go`` at cbc874e2358f. ``generate_hmac`` uses the latest
+    unless ``key_version`` pins one, and refuses a pinned version below ``min_encryption_version``.
+    ``verify_signed_data`` checks at the version the MAC names: one above the latest, or below
+    ``min_decryption_version``, is refused with HTTP 400; ``min_encryption_version`` plays no part
+    there, as in Vault."""
 
     def __init__(self) -> None:
         super().__init__()
         self.latest = 1
+        self.min_encryption_version = 1
+        self.min_decryption_version = 1
+        #: The ``key_version`` of every ``generate_hmac`` call (``None`` is the latest).
         self.pinned: list[int | None] = []
+        #: The version every ``verify_signed_data`` call checked at.
+        self.verified: list[int] = []
+
+    @staticmethod
+    def _refuse(text: str) -> NoReturn:
+        # The [vault] extra's class, which the cipher classifies on. Only a test that reaches a
+        # refusal gets here, and _needs_hvac() skips those without the extra.
+        from hvac.exceptions import InvalidRequest  # type: ignore[import-untyped]
+
+        # hvac carries Vault's JSON `errors` list.
+        raise InvalidRequest(errors=[text])
+
+    def _mac(self, name: str, version: int, hash_input: str) -> str:
+        secret = self._hmac_secret[name] + version.to_bytes(4, "big")
+        digest = hmac.new(secret, base64.b64decode(hash_input), hashlib.sha256).digest()
+        return f"vault:v{version}:" + base64.b64encode(digest).decode("ascii")
 
     def generate_hmac(
         self,
@@ -264,27 +287,23 @@ class _RotatingTransit(_FakeTransit):
     ) -> dict[str, Any]:
         self.pinned.append(key_version)
         if key_version is not None and key_version > self.latest:
-            # The [vault] extra's class, which the cipher classifies on. Only a test that pins an
-            # unheld version reaches this, and _needs_hvac() skips those without the extra.
-            from hvac.exceptions import InvalidRequest  # type: ignore[import-untyped]
-
-            # hvac carries Vault's JSON `errors` list; this is the text Vault's HMACKey answers.
-            raise InvalidRequest(
-                errors=[f"key version does not exist; latest key version is {self.latest}"]
-            )
+            self._refuse(f"key version does not exist; latest key version is {self.latest}")
+        if key_version is not None and key_version < self.min_encryption_version:
+            self._refuse("cannot generate HMAC: version is too old (disallowed by policy)")
         version = self.latest if key_version is None else key_version
-        secret = self._hmac_secret[name] + version.to_bytes(4, "big")
-        digest = hmac.new(secret, base64.b64decode(hash_input), hashlib.sha256).digest()
-        return {"data": {"hmac": f"vault:v{version}:" + base64.b64encode(digest).decode("ascii")}}
+        return {"data": {"hmac": self._mac(name, version, hash_input)}}
 
     def verify_signed_data(
         self, *, name: str, hash_input: str, hmac: str, hash_algorithm: str = "sha2-256", **_: Any
     ) -> dict[str, Any]:
-        # Transit `verify` at the version the MAC names, for the row sealer's start probe (ADR 0217).
-        version = int(hmac.removeprefix("vault:v").partition(":")[0])
-        secret = self._hmac_secret[name] + version.to_bytes(4, "big")
-        digest = _hmac_lib.new(secret, base64.b64decode(hash_input), hashlib.sha256).digest()
-        expected = f"vault:v{version}:" + base64.b64encode(digest).decode("ascii")
+        version = transit_mac_version(hmac)
+        assert version is not None, hmac  # the cipher hands Transit only a well-formed MAC
+        self.verified.append(version)
+        if version > self.latest:
+            self._refuse("invalid HMAC: version is too new")
+        if version < self.min_decryption_version:
+            self._refuse("cannot verify HMAC: version is too old (disallowed by policy)")
+        expected = self._mac(name, version, hash_input)
         return {"data": {"valid": _hmac_lib.compare_digest(expected, hmac)}}
 
 
@@ -292,7 +311,7 @@ async def test_rotating_the_transit_key_keeps_the_attestation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The operator attests that they rotate the key, so a rotation must not read as a forgery: the
-    check recomputes the audit row's MAC under the version that row names, not Transit's latest."""
+    check asks Transit to verify the audit row's MAC at the version that row names."""
     transit = _RotatingTransit()
     _use_fake(monkeypatch, transit)
     db = tmp_path / "rotating.db"
@@ -310,13 +329,195 @@ async def test_rotating_the_transit_key_keeps_the_attestation(
         raise
     assert got is not None and got.audit_gap is None, got
     assert chain_ok, chain_msg
-    assert 1 in transit.pinned
+    # Checked by Transit's verify at the version the row names, never regenerated (BACKLOG #2720).
+    assert 1 in transit.verified
+    assert set(transit.pinned) == {None}, transit.pinned
     await _start(again, SecurityEnforcement.ENFORCE)  # no raise; stopping closes the store
+
+
+# --- the audit chain checks each row with Transit's verify (BACKLOG #2720) -----------------------
+
+
+async def _mixed_chain(transit: _RotatingTransit, db: Path) -> dict[str, int]:
+    """A Transit store whose audit chain has rows under key version 1, then, after a rotation,
+    rows under version 2. Returns each test row's sequence number, by action."""
+    store = await _transit_store(db)
+    try:
+        await store.record_audit("test.v1", actor="cli:tester")
+        transit.latest = 2  # Transit rotated the key; new MACs are vault:v2:
+        await store.record_audit("test.v2", actor="cli:tester")
+    finally:
+        await store.close()
+    con = sqlite3.connect(db)
+    try:
+        rows = con.execute("SELECT seq, action, row_hash FROM audit_log ORDER BY seq").fetchall()
+    finally:
+        con.close()
+    versions = {transit_mac_version(str(h)) for _, _, h in rows}
+    assert versions == {1, 2}, rows  # the chain really is mixed
+    return {str(action): int(seq) for seq, action, _ in rows}
+
+
+async def test_a_mixed_v1_and_v2_chain_verifies_after_a_rotation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    transit = _RotatingTransit()
+    _use_fake(monkeypatch, transit)
+    db = tmp_path / "mixed.db"
+    await _mixed_chain(transit, db)
+    transit.pinned.clear()
+    store = await _transit_store(db)
+    try:
+        ok, msg = await store.verify_audit_chain()
+    finally:
+        await store.close()
+    assert ok, msg
+    assert {1, 2} <= set(transit.verified), transit.verified
+    # No MAC was regenerated to compare: every hmac call since is an unpinned append or probe.
+    assert set(transit.pinned) <= {None}, transit.pinned
+
+
+async def test_raising_min_encryption_version_past_v1_leaves_v1_rows_verifying(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``min_encryption_version`` stops Transit making a v1 MAC, not checking one. A walk that
+    regenerated each row's MAC at its own version broke at row 1 here; verify does not."""
+    _needs_hvac()
+    transit = _RotatingTransit()
+    _use_fake(monkeypatch, transit)
+    db = tmp_path / "min-encryption.db"
+    seqs = await _mixed_chain(transit, db)
+    transit.min_encryption_version = 2
+    store = await _transit_store(db)
+    try:
+        ok, msg = await store.verify_audit_chain()
+        sink, lines = await _walk_on_start(store, caplog)
+        await store.record_audit("test.after", actor="cli:tester")  # appends still work, at v2
+        again_ok, again_msg = await store.verify_audit_chain()
+    finally:
+        await store.close()
+    assert ok, msg
+    assert again_ok, again_msg
+    assert sink.events == [], sink.events
+    assert not any("could not run" in line for line in lines), lines
+    assert 1 in transit.verified and seqs["test.v1"] > 1
+
+
+async def test_raising_min_decryption_version_past_v1_is_a_break_with_the_alert(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``min_decryption_version`` IS the floor for checking an HMAC: a v1 row Transit will no
+    longer verify is still a break at row 1, with the tamper alert, never a walk that could not
+    run."""
+    _needs_hvac()
+    transit = _RotatingTransit()
+    _use_fake(monkeypatch, transit)
+    db = tmp_path / "min-decryption.db"
+    await _mixed_chain(transit, db)
+    transit.min_encryption_version = transit.min_decryption_version = 2
+    store = await _transit_store(db)
+    try:
+        ok, msg = await store.verify_audit_chain()
+        sink, lines = await _walk_on_start(store, caplog)
+    finally:
+        await store.close()
+    assert not ok and "seq=1," in str(msg), msg
+    assert "Transit refused audit key version 1" in str(msg), msg
+    assert [name for name, _ in sink.events] == ["audit-chain"], sink.events
+    assert not any("could not run" in line for line in lines), lines
+
+
+@pytest.mark.parametrize("which", ["test.v1", "test.v2"])
+@pytest.mark.parametrize("edit", ["detail", "mac"])
+async def test_a_tampered_row_in_a_mixed_chain_still_breaks(
+    which: str, edit: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An edited row, or an altered MAC of the right shape, is Transit's ``valid: false`` at that
+    row, under either version."""
+    transit = _RotatingTransit()
+    _use_fake(monkeypatch, transit)
+    db = tmp_path / "tampered.db"
+    seq = (await _mixed_chain(transit, db))[which]
+    if edit == "detail":
+        _dml(db, "UPDATE audit_log SET detail = 'edited' WHERE seq = ?", (seq,))
+    else:
+        con = sqlite3.connect(db)
+        try:
+            (stored,) = con.execute(
+                "SELECT row_hash FROM audit_log WHERE seq = ?", (seq,)
+            ).fetchone()
+        finally:
+            con.close()
+        head, _, body = str(stored).rpartition(":")
+        flipped = bytes([base64.b64decode(body)[0] ^ 1]) + base64.b64decode(body)[1:]
+        _dml(
+            db,
+            "UPDATE audit_log SET row_hash = ? WHERE seq = ?",
+            (f"{head}:" + base64.b64encode(flipped).decode("ascii"), seq),
+        )
+    store = await _transit_store(db)
+    try:
+        ok, msg = await store.verify_audit_chain()
+    finally:
+        await store.close()
+    assert not ok and f"seq={seq}," in str(msg), msg
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        pytest.param("vault:v1:AAAA", id="short-digest"),
+        pytest.param("vault:v1:!!not base64!!", id="not-base64"),
+        pytest.param("vault:v01:" + base64.b64encode(bytes(32)).decode("ascii"), id="zero-padded"),
+        pytest.param("f" * 64, id="no-prefix"),
+    ],
+)
+async def test_a_malformed_stored_mac_is_a_break_with_no_transit_call(
+    stored: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A stored MAC Transit would refuse for its shape never reaches Transit, so no 400 on it can
+    read as an outage: it is a break at that row."""
+    transit = _RotatingTransit()
+    _use_fake(monkeypatch, transit)
+    db = tmp_path / "malformed.db"
+    seq = (await _mixed_chain(transit, db))["test.v1"]
+    _dml(db, "UPDATE audit_log SET row_hash = ? WHERE seq = ?", (stored, seq))
+    store = await _transit_store(db)
+    transit.verified.clear()
+    try:
+        ok, msg = await store.verify_audit_chain()
+    finally:
+        await store.close()
+    assert not ok and f"seq={seq}," in str(msg), msg
+    con = sqlite3.connect(db)
+    try:
+        (rows,) = con.execute("SELECT COUNT(*) FROM audit_log").fetchone()
+    finally:
+        con.close()
+    assert len(transit.verified) == rows - 1, transit.verified  # every row but the malformed one
+
+
+def test_a_verify_reply_of_an_unexpected_shape_is_a_plain_cipher_error() -> None:
+    """Transit's ``valid`` must be a bool; anything else is a check that could not run, never a
+    pass and never a refused version."""
+    from messagefoundry.store.crypto import AuditKeyVersionRefusedError
+    from messagefoundry.store.crypto_transit import TransitCipher
+    from tests.test_crypto_transit import _FakeClient
+
+    class _Transit(_FakeTransit):
+        def verify_signed_data(self, **_kw: Any) -> dict[str, Any]:
+            return {"data": {"valid": "true"}}
+
+    cipher = TransitCipher(_FakeClient(_Transit()), _KEY_NAME)
+    with pytest.raises(CipherError) as caught:
+        cipher.verify_audit_hmac(b"row", cipher.audit_hmac(b"row"))
+    assert not isinstance(caught.value, AuditKeyVersionRefusedError)
 
 
 #: A Transit key version the fake does not hold, as a DML writer would plant it.
 _UNHELD_VERSION = 9999999
-_PLANTED = f"vault:v{_UNHELD_VERSION}:AAAA"
+#: Well-formed, so it reaches Transit; a malformed one is a break with no Transit call at all.
+_PLANTED = f"vault:v{_UNHELD_VERSION}:" + base64.b64encode(bytes(32)).decode("ascii")
 
 
 def _needs_hvac() -> None:
@@ -453,6 +654,7 @@ async def test_a_transit_outage_on_the_startup_walk_still_could_not_run(
         raise httpx.ConnectError("Vault is unreachable")
 
     monkeypatch.setattr(transit, "generate_hmac", unreachable)
+    monkeypatch.setattr(transit, "verify_signed_data", unreachable)
     try:
         sink, lines = await _walk_on_start(store, caplog)
     finally:
@@ -461,10 +663,10 @@ async def test_a_transit_outage_on_the_startup_walk_still_could_not_run(
     assert any("could not run" in line for line in lines), lines
 
 
-async def test_a_transient_failure_of_a_pinned_call_is_not_a_planted_version(
+async def test_a_transient_failure_of_the_verify_call_is_not_a_planted_version(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A dropped connection on a pinned call, while the latest version still answers, must not
+    """A dropped connection on the verify call, while the latest version still answers, must not
     read as a refused key version. Only Transit's 400 for the version is that; anything else is a
     check that could not run, so a clean row is never reported as tampered."""
     transit = _RotatingTransit()
@@ -472,14 +674,11 @@ async def test_a_transient_failure_of_a_pinned_call_is_not_a_planted_version(
     db = tmp_path / "transient.db"
     store = await _transit_store(db)
     await store.record_audit("test.clean", actor="cli:tester")
-    real = transit.generate_hmac
 
-    def drop_pinned(**kw: Any) -> dict[str, Any]:
-        if kw.get("key_version") is not None:
-            raise httpx.ConnectError("connection reset")
-        return real(**kw)
+    def drop(**_kw: Any) -> dict[str, Any]:
+        raise httpx.ConnectError("connection reset")
 
-    monkeypatch.setattr(transit, "generate_hmac", drop_pinned)
+    monkeypatch.setattr(transit, "verify_signed_data", drop)
     try:
         sink, lines = await _walk_on_start(store, caplog)
     finally:
@@ -488,17 +687,22 @@ async def test_a_transient_failure_of_a_pinned_call_is_not_a_planted_version(
     assert any("could not run" in line for line in lines), lines
 
 
-#: Vault's own text for a pinned ``hmac`` call refused for its version, as hvac carries it.
+#: Vault's own text for an audit-MAC call refused for its version, as hvac carries it.
 _VERSION_400 = ("key version does not exist; latest key version is 2",)
 #: A proxy's or WAF's own 400 page: no Vault JSON at all.
 _PROXY_PAGE = "<html><body><h1>400 Bad Request</h1></body></html>"
 
 
+#: A well-formed stored MAC naming key version 3, as the cipher's verify call is handed one.
+_V3_MAC = "vault:v3:" + base64.b64encode(bytes(32)).decode("ascii")
+
+
 def _pinned_refusal(
     answer: Any, errors: Any = _VERSION_400, *, text: str | None = None
 ) -> CipherError:
-    """What the cipher raises when a pinned call gets a 400 carrying ``errors`` (hvac's ``errors``
-    list) and body ``text``, and the probe gets ``answer`` (a reply, or an exception to raise)."""
+    """What the cipher raises when its verify of a MAC naming version 3 gets a 400 carrying
+    ``errors`` (hvac's ``errors`` list) and body ``text``, and the probe gets ``answer`` (a reply,
+    or an exception to raise)."""
     _needs_hvac()
     from hvac.exceptions import InvalidRequest
 
@@ -506,17 +710,18 @@ def _pinned_refusal(
     from tests.test_crypto_transit import _FakeClient
 
     class _Transit(_FakeTransit):
-        def generate_hmac(self, **kw: Any) -> dict[str, Any]:
-            if kw.get("key_version") is not None:
-                listed = list(errors) if errors is not None else None
-                raise InvalidRequest("bad request", errors=listed, text=text)
+        def verify_signed_data(self, **_kw: Any) -> dict[str, Any]:
+            listed = list(errors) if errors is not None else None
+            raise InvalidRequest("bad request", errors=listed, text=text)
+
+        def generate_hmac(self, **_kw: Any) -> dict[str, Any]:
             if isinstance(answer, Exception):
                 raise answer
             return {"data": {"hmac": answer}}
 
     cipher = TransitCipher(_FakeClient(_Transit()), _KEY_NAME)
     with pytest.raises(CipherError) as caught:
-        cipher.audit_hmac(b"row", key_version=3)
+        cipher.verify_audit_hmac(b"row", _V3_MAC)
     return caught.value
 
 
@@ -639,11 +844,11 @@ class _ProxiedRotatingTransit(_RotatingTransit):
     page: str | None = _PROXY_PAGE
     errors: list[str] | None = None
 
-    def generate_hmac(self, **kw: Any) -> dict[str, Any]:
+    def verify_signed_data(self, **kw: Any) -> dict[str, Any]:
         from hvac.exceptions import InvalidRequest
 
         try:
-            return super().generate_hmac(**kw)
+            return super().verify_signed_data(**kw)
         except InvalidRequest:
             raise InvalidRequest(self.page, errors=self.errors, text=self.page) from None
 

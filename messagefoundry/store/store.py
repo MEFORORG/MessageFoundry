@@ -38,7 +38,6 @@ import asyncio
 import functools
 import hashlib
 import hmac
-import inspect
 import json
 import logging
 import math
@@ -134,6 +133,7 @@ from messagefoundry.store.crypto import (
     AesGcmCipher,
     AuditKeyVersionRefusedError,
     AuditMacFn,
+    AuditMacVerifier,
     AuditScheme,
     Cipher,
     CipherError,
@@ -5545,6 +5545,33 @@ def report_approval_reseal(resealed: int, refused: int) -> None:
 # key is configured, AES-256-GCM when MEFOR_STORE_ENCRYPTION_KEY is set. See STORE-1.
 
 
+def _audit_row_bytes(
+    prev_hash: str,
+    *,
+    seq: int,
+    ts: float,
+    actor: str | None,
+    action: str,
+    channel_id: str | None,
+    detail: str | None,
+    client: str | None,
+) -> bytes:
+    """The bytes :func:`audit_row_hash` MACs for one row: its eight typed fields, encoded. Raises
+    :class:`TypeError` on a value of a type no engine build writes."""
+    return encode_typed_fields(
+        (
+            ("seq", seq),
+            ("prev_hash", prev_hash),
+            ("ts", float(ts) if isinstance(ts, int) and not isinstance(ts, bool) else ts),
+            ("actor", actor),
+            ("action", action),
+            ("channel_id", channel_id),
+            ("detail", detail),
+            ("client", client),
+        )
+    )
+
+
 def audit_row_hash(
     prev_hash: str,
     *,
@@ -5585,17 +5612,15 @@ def audit_row_hash(
 
     ``ts`` is normalised to ``float``, so an integer timestamp a caller passed hashes as the float the
     column hands back."""
-    data = encode_typed_fields(
-        (
-            ("seq", seq),
-            ("prev_hash", prev_hash),
-            ("ts", float(ts) if isinstance(ts, int) and not isinstance(ts, bool) else ts),
-            ("actor", actor),
-            ("action", action),
-            ("channel_id", channel_id),
-            ("detail", detail),
-            ("client", client),
-        )
+    data = _audit_row_bytes(
+        prev_hash,
+        seq=seq,
+        ts=ts,
+        actor=actor,
+        action=action,
+        channel_id=channel_id,
+        detail=detail,
+        client=client,
     )
     if mac is not None:
         return mac(data)  # computed inside the isolated module (Transit); no in-heap key
@@ -6686,21 +6711,22 @@ def _audit_row_mac(
     """The hash ``row`` should carry, chained from ``prev``, or ``None`` when a chained column holds a
     value of a type no engine build writes -- which the walk reports as a break rather than raising.
 
-    A MAC provider is pinned to the Transit key version ``row``'s stored hash names
-    (:func:`_version_pinned_mac`), so a row sealed before a key rotation still verifies after it.
-    It may raise :class:`~messagefoundry.store.crypto.AuditKeyVersionRefusedError`."""
-    if mac is not None:
-        mac = _version_pinned_mac(mac, row["row_hash"])
+    A MAC provider that checks a stored MAC itself
+    (:class:`~messagefoundry.store.crypto.AuditMacVerifier`, Transit's ``verify`` call) is asked
+    whether ``row``'s stored hash is the MAC of the row's bytes: the stored hash is returned when it
+    verifies, and ``None`` when it does not (BACKLOG #2720). No MAC is regenerated, so a row made
+    under an older Transit key version still verifies after the key rotates. That check may raise
+    :class:`~messagefoundry.store.crypto.AuditKeyVersionRefusedError`."""
+    fields = {column: row[column] for column in _AUDIT_CHAINED_COLUMNS}
     try:
-        return audit_row_hash(
-            prev,
-            seq=row["seq"],
-            **{column: row[column] for column in _AUDIT_CHAINED_COLUMNS},
-            key=key,
-            mac=mac,
-        )
+        # `mac is None` first: the in-heap key path skips the Protocol check, which is not free.
+        if mac is None or not isinstance(mac, AuditMacVerifier):
+            return audit_row_hash(prev, seq=row["seq"], **fields, key=key, mac=mac)
+        data = _audit_row_bytes(prev, seq=row["seq"], **fields)
     except TypeError:
         return None
+    stored = row["row_hash"]
+    return stored if isinstance(stored, str) and mac.verify(data, stored) else None
 
 
 def _audit_digest_line(r: Mapping[str, Any]) -> bytes:
@@ -9116,38 +9142,6 @@ def transit_withdrawn_audit(
     return AuditAppend(TRANSIT_BOUND_WITHDRAWN_ACTION, actor=actor, detail=json.dumps(detail))
 
 
-#: Transit's HMAC string names the key version that made it: ``vault:v<N>:<base64>``.
-_TRANSIT_MAC_VERSION: Final = re.compile(r"vault:v([1-9][0-9]{0,9}):")
-
-
-def _version_pinned_mac(mac: AuditMacFn, stored: object) -> AuditMacFn:
-    """``mac`` pinned to the Transit key version ``stored`` was made under, or ``mac`` unchanged
-    when ``stored`` names no version.
-
-    Transit's ``generate_hmac`` uses the key's LATEST version unless told otherwise. So after the
-    operator rotates the key, as the attestation says they will, an unpinned recompute yields
-    ``vault:v2:...`` against a stored ``vault:v1:...`` and the attestation reads as forged. Pinning
-    keeps the check exact: the recompute still runs inside Transit under the stored version's key,
-    so a writer without Transit access still cannot forge a match. A provider whose signature takes
-    no ``key_version`` (a plain ``Callable[[bytes], str]``) is returned unpinned, as before."""
-    match = _TRANSIT_MAC_VERSION.match(stored) if isinstance(stored, str) else None
-    if match is None:
-        return mac
-    try:
-        pinnable = "key_version" in inspect.signature(mac).parameters
-    except (TypeError, ValueError):  # a builtin or C callable with no introspectable signature
-        pinnable = False
-    if not pinnable:
-        return mac
-    version = int(match.group(1))
-    versioned = cast("Callable[..., str]", mac)
-
-    def pinned(data: bytes) -> str:
-        return versioned(data, key_version=version)
-
-    return pinned
-
-
 #: One read for :func:`load_transit_bound_attestation`: ``(sql, params) -> row or None``. ``sql``
 #: carries ``?`` placeholders; the Postgres store rewrites them to ``$n`` before it runs.
 type TransitAttestationFetch = Callable[
@@ -9203,11 +9197,11 @@ async def settle_transit_bound_attestation(
     """``read``'s attestation, with ``audit_gap`` set when its audit row's MAC does not verify.
 
     ``None`` when no row is recorded. The check reuses the chain's own pieces: the row MAC
-    (:func:`_audit_row_mac`, under the key of the row's range and the Transit key version its hash
-    names) and the constant-time compare. It walks no chain, so it costs one MAC. A MAC provider
-    runs off the event loop, because it is a blocking Vault call. A Transit refusal of that call,
-    such as a key version a forged hash names that does not exist, reads as a gap, not an error, so
-    a row anyone with DML wrote cannot stop a ``warn`` start."""
+    (:func:`_audit_row_mac`, under the key of the row's range, by Transit's own ``verify`` for a
+    Transit MAC) and the constant-time compare. It walks no chain, so it costs one MAC. A MAC
+    provider runs off the event loop, because it is a blocking Vault call. A Transit refusal of
+    that call, such as a key version a forged hash names that does not exist, reads as a gap, not
+    an error, so a row anyone with DML wrote cannot stop a ``warn`` start."""
     attestation = read.attestation
     if attestation is None or read.mac_check is None:
         return attestation
