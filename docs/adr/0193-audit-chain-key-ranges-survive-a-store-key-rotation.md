@@ -457,15 +457,17 @@ section 0): this is what the first deployment's first routine rotation would hav
    version answers with a string that does not start with `vault:v<pinned>:`, raises it. An empty
    answer or one naming no version passes too, and a proxy, not Transit, can author the 400
    (corrected 2026-11-11, BACKLOG #6707). The walk records a break at that row, naming the
-   version, and goes on. A 400 whose body hvac fails on is not one (corrected 2026-11-11, PR 2877
-   hold 6790543984). When the Content-Type is exactly `application/json` and the body is not a
-   JSON object (a bare list or `null`, for example), holds an `errors` list with an entry that is
-   not text, or has an `errors` value such as a number, hvac 2.4.0 raises `AttributeError` or
-   `TypeError` in place of `InvalidRequest`. hvac running out of memory while it joins a very
-   large `errors` list fails the same way. Each is a plain `CipherError`, so a version planted
-   behind a proxy that wrote such a body would not read as a break. Any other failure, an
-   unreachable Vault among them, is a `CipherError` too. In every such case the walk could not
-   run, and no tamper alert fires.
+   version, and goes on. A 400 whose body hvac fails on raises neither
+   `AuditKeyVersionRefusedError` nor its subclass (corrected 2026-11-11, BACKLOG #6707; this item
+   said every pinned 400 with such a probe answer raised `AuditKeyVersionRefusedError`). When the
+   Content-Type is exactly `application/json` and the body parses as JSON that is not an object
+   (a bare list or `null`, for example), holds an `errors` list with an entry that is not text,
+   or has an `errors` value of a nonzero number or `true`, hvac 2.4.0 raises `AttributeError` or
+   `TypeError` in place of `InvalidRequest`. A `MemoryError` that hvac raises while it joins a
+   truthy `errors` value, before any `InvalidRequest` exists, ends the same way. Each is a plain
+   `CipherError`, so a version planted behind a proxy that wrote such a body would not read as a
+   break. Any other failure, an unreachable Vault among them, is a `CipherError` too. In every
+   such case the walk could not run, and no tamper alert fires.
 
 ### Why regenerating pinned stands in for Transit's verify call
 
