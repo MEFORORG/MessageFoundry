@@ -1121,6 +1121,15 @@ fleet, so never take them*.
   *"Merge, file rows (Recommended)"* on engine PRs 2675 and 2676, and *"Merge both, file rows"* on
   engine PRs 2691 and 2671. `CLAUDE.md` section 5 cites the signed text, under R5.
 
+  **CORRECTED 2026-11-11, added after the move.** The paragraph above said R2 amends those rulings
+  in their *"filing mechanics only"*. R2's signed text also says *"The merge still never waits on
+  an open finding"*, so it governs the order of filing and merging as well. The owner's words
+  quoted under 2026-10-12, *"Let me merge when the open findings are filed as rows"*, stay as the
+  record of what was approved that day; they no longer state the order. Decision
+  d20261111T061703900-432f31, decided by the Lander under the owner's delegation of 2026-11-11,
+  applies R2's order. `CLAUDE.md` section 5 states it once, in its merge bullet, so read it there.
+  Which findings go to the owner is unchanged.
+
 - **A PR's merge state is a join over clocks, and the join is the part you must not miss.**
   `gh pr view <N> --json mergeStateStatus` is the starting read, never the verdict: it reports
   `BEHIND` or `DIRTY` in preference to `BLOCKED`, so it hides one blocking reason behind another.
