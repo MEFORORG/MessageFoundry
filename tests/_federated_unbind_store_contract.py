@@ -22,6 +22,8 @@ import asyncio
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 
+from messagefoundry.store.store import no_audit_row
+
 ISSUER = "https://idp.example/tenant"
 #: The subject the first account starts bound to, and the one a re-bind must be free to replace.
 FIRST_SUB = "S-1-unbind-first"
@@ -520,7 +522,7 @@ async def _sweep_by_unbind(store: Any, account: str) -> int:
 
 
 async def _sweep_by_revoke(store: Any, account: str) -> int:
-    return int((await store.revoke_user_sessions(account, now=3.0)).count)
+    return int((await store.revoke_user_sessions(account, now=3.0, audit=no_audit_row)).count)
 
 
 async def _sweep_every_account(store: Any, account: str) -> int:

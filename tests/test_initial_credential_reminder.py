@@ -493,7 +493,7 @@ async def test_an_unresolvable_issuer_is_skipped_and_the_reason_logged(
             reason = "more than one administrator"
         elif case == "demoted":
             alice = await _account(service, "alice", email="alice@example.org", actor="root")
-            await store.set_user_roles(root, ["viewer"], assigned_by="sam")
+            await store.set_user_roles(root, ["viewer"], assigned_by="sam", audits=())
             reason = "no longer holds users:manage"
         elif case == "renamed_onto":
             # A directory rename landed the name "root" on an account after the row was written.

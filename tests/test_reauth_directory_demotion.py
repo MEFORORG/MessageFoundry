@@ -177,7 +177,7 @@ async def test_the_re_bind_judges_the_roles_read_after_the_bind(
 
     async def bind_then_resync(username: str, password: str, *, object_id: str) -> _DirectoryRebind:
         rebind = await original(username, password, object_id=object_id)
-        await store.set_user_roles(s.identity.user_id, ["viewer"], assigned_by="ad-sync")
+        await store.set_user_roles(s.identity.user_id, ["viewer"], assigned_by="ad-sync", audits=())
         return rebind
 
     monkeypatch.setattr(s.service, "_reauth_ad", bind_then_resync)
@@ -314,7 +314,7 @@ async def test_the_scope_test_skips_an_administrator_and_keeps_a_manual_scope(
         [(_OPERATORS, "administrator"), (_VIEWERS, "viewer")], actor="admin"
     )
     assert await judged('["IB_A"]', SCOPE_SOURCE_AD, _VIEWERS, _OPERATORS) is None
-    await store.set_user_roles(user_id, ["administrator"])
+    await store.set_user_roles(user_id, ["administrator"], audits=())
     assert await judged('["IB_A"]', SCOPE_SOURCE_AD, _OPERATORS) is None
 
 

@@ -33,7 +33,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.store.store import MessageStore, UserRow, session_seal_ok
+from messagefoundry.store.store import MessageStore, UserRow, no_audit_row, session_seal_ok
 from tests.test_b2614_revoke_all import RawSql, _mint, _sqlite_raw, _user
 
 
@@ -178,7 +178,9 @@ async def assert_global_epoch_contract(store: Any, raw: RawSql) -> None:
     assert replayed is not None and restored is not None
     assert replayed.user_epoch == restored.session_epoch  # current on its account's epoch...
     assert replayed.global_epoch == restored.global_session_epoch - 1  # ...one global epoch behind
-    result = await store.revoke_user_sessions(frank, except_token_hash=hash_token(lagging))
+    result = await store.revoke_user_sessions(
+        frank, except_token_hash=hash_token(lagging), audit=no_audit_row
+    )
     assert (result.count, result.kept, result.ended_kept) == (1, False, True)
     left = await store.get_session(hash_token(lagging))
     assert left is not None and left.revoked_at is not None  # ended, in the same transaction
@@ -190,7 +192,9 @@ async def assert_global_epoch_contract(store: Any, raw: RawSql) -> None:
     # Control: a session current on both epochs, kept by the same per-account revoke, is stamped
     # with the account's new epoch, keeps its global stamp, and stays live.
     current = await _mint(store, frank)
-    result = await store.revoke_user_sessions(frank, except_token_hash=hash_token(current))
+    result = await store.revoke_user_sessions(
+        frank, except_token_hash=hash_token(current), audit=no_audit_row
+    )
     assert (result.count, result.kept, result.ended_kept) == (0, True, False)
     stamped = await store.get_session(hash_token(current))
     account_now = await store.get_user(frank)
@@ -280,11 +284,15 @@ async def test_the_per_account_revoke_ends_its_kept_session_with_no_global_epoch
     await _user(store, "b5091-row")
     kept = await _mint(store, "b5091-row")
     other = await _mint(store, "b5091-row")
-    result = await store.revoke_user_sessions("b5091-row", except_token_hash=hash_token(kept))
+    result = await store.revoke_user_sessions(
+        "b5091-row", except_token_hash=hash_token(kept), audit=no_audit_row
+    )
     assert (result.count, result.kept, result.ended_kept) == (1, True, False)  # control
     other = await _mint(store, "b5091-row")
     await _sqlite_raw(path)("DELETE FROM global_session_epoch", ())
-    result = await store.revoke_user_sessions("b5091-row", except_token_hash=hash_token(kept))
+    result = await store.revoke_user_sessions(
+        "b5091-row", except_token_hash=hash_token(kept), audit=no_audit_row
+    )
     assert (result.count, result.kept, result.ended_kept) == (2, False, True)
     for token in (kept, other):
         row = await store.get_session(hash_token(token))

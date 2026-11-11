@@ -1782,7 +1782,7 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
         "cases, at least the breaker case is pinned by calling it in "
         "tests/test_directory_last_admin_alert.py and the recheck-0 case in "
         "tests/test_ad_session_reconcile.py; no code test pins that a sign-in failing after the "
-        "role write raises nothing, and the no-live-session case was not traced"
+        "role sync raises nothing, and the no-live-session case was not traced"
     ),
     ("test_security_doc_drift.py", "test_retired_ws_cookie_wording_is_absent_from_sibling_docs"): (
         "absence of retired prose in two sibling docs (BACKLOG #1959)"
@@ -4470,7 +4470,7 @@ def test_the_changelog_states_the_directory_grant_limits() -> None:
     cases is pinned elsewhere, if at all (see ``_REVIEWED_TEXT_CHECKS``)."""
     cases = (
         "at least these cases raise none",
-        "fails with a server error after the role write",
+        "a server error after the revoke and the notice",
         "mass-revoke breaker aborts writes no roles",
         "holds no live session",
         "`[auth].ad_session_recheck_seconds` is 0",

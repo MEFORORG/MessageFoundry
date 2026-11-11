@@ -85,7 +85,7 @@ async def create_admin(service: AuthService) -> AdminAccount:
         audits=(),
     )
     await service.initialize()  # seeds the roles the assignment below refers to
-    await store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by="test")
+    await store.set_user_roles(user_id, [Role.ADMINISTRATOR.value], assigned_by="test", audits=())
     return AdminAccount(user_id=user_id, username=ADMIN_USERNAME, password=ADMIN_PASSWORD)
 
 

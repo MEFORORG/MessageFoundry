@@ -1055,7 +1055,7 @@ async def test_auth_users_roles_sessions(store) -> None:
     user = await store.get_user_by_username("alice")
     assert user is not None and user.id == "u1" and user.password_hash == "hash"
 
-    await store.set_user_roles("u1", ["operator"], assigned_by="t", now=2.0)
+    await store.set_user_roles("u1", ["operator"], assigned_by="t", now=2.0, audits=())
     assert await store.get_user_role_ids("u1") == ["operator"]
 
     await store.set_ad_group_role_map([("CN=Ops,DC=x", "operator")])
@@ -1102,6 +1102,14 @@ async def test_concurrent_admin_removals_leave_one(store) -> None:
     from tests._last_admin_store_contract import assert_concurrent_removals_leave_one
 
     await assert_concurrent_removals_leave_one(store)
+
+
+async def test_account_write_audit_contract(store) -> None:
+    """BACKLOG #2221 and #3018 step 4 on Postgres: each audited account write commits its row in
+    its own transaction, or neither lands. The contract is ``tests/_account_write_audit_contract.py``."""
+    from tests._account_write_audit_contract import assert_account_write_audit_contract
+
+    await assert_account_write_audit_contract(store)
 
 
 async def test_role_write_if_held_contract(store) -> None:

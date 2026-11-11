@@ -30,7 +30,7 @@ from messagefoundry.store.row_seal import (
     RowSealKeyRetiredError,
     TransitRowSealer,
 )
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import MessageStore, no_audit_row
 from tests._admin_account import login_admin
 from tests._transit_seal_fake import RETIRED, FakeBackend
 
@@ -115,7 +115,9 @@ async def test_a_revoke_ends_a_retired_key_kept_session_quietly(
     pages: list[str] = []
     store.seal_pager().arm(lambda subject, reason: pages.append(subject))
     caplog.set_level(logging.INFO, logger="messagefoundry.store.store")
-    result = await store.revoke_user_sessions("u-1", except_token_hash=hash_token(token))
+    result = await store.revoke_user_sessions(
+        "u-1", except_token_hash=hash_token(token), audit=no_audit_row
+    )
     assert not result.kept and result.ended_kept
     conn = sqlite3.connect(path)
     try:

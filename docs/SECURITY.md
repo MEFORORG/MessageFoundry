@@ -3277,8 +3277,9 @@ with no page.
 - **A directory grant.** An account can get Administrator because the *directory* added it to a
   group already mapped to Administrator. The engine sees that grant in one of the two places below,
   whichever comes first. Either one raises `administrator_granted`, but at least these cases raise
-  none. A sign-in that sees it first and fails with a server error after the role write loses it;
-  the retry then gains nothing. A reconciler pass the mass-revoke breaker aborts writes no roles.
+  none. A sign-in that sees it first and fails with a server error after the revoke and the
+  notice, for example in the session mint, loses it; the retry then gains nothing. A reconciler
+  pass the mass-revoke breaker aborts writes no roles.
   An account that never signs in again raises nothing when no pass reaches it: it holds no live
   session, or `[auth].ad_session_recheck_seconds` is 0. So watch membership of the mapped group in
   the directory itself.
@@ -3289,18 +3290,28 @@ with no page.
   `ad_session_revoked`, which does not name the role. The later sign-in then gains nothing, so it
   raises no `administrator_granted`." Vault BACKLOG #3141 added the reconciler's alert.
   - **At the account's next sign-in.** The engine writes an `auth.ad_roles_resynced` audit row
-    with the old and new roles. It also sends a best-effort roles-changed notice to that
-    account's own notification address, when the account has one and security notices are set
-    up. The sign-in route raises `administrator_granted`, keyed `user:<username>`, with
+    with the old and new roles, in the role write's transaction, and sends a best-effort
+    roles-changed notice to that account's own notification address, when the account has one and
+    security notices are set up. If the store refuses the row there, the roles are written without
+    it and the row is then written on its own. Refused again, the row is lost,
+    `audit_write_failed` pages keyed `directory-sign-in:auth.ad_roles_resynced`, and the sign-in
+    fails. An error there that is not a store refusal, such as a defect, also fails the sign-in,
+    even when its row then lands on its own, and so does an error from writing the roles again.
+    In each of these cases the engine first tries to revoke the account's other sessions and sends
+    the notice. The sign-in route raises `administrator_granted`, keyed `user:<username>`, with
     `granted_by` set to `<directory>` and `via` naming the route: `directory_sign_in_negotiate`
     for `POST /auth/negotiate`, `directory_sign_in_sso` for `GET /ui/sso`, and
     `directory_sign_in_oidc` for the `/ui/oidc` callback. A sign-in the engine refuses after the
-    sync ran raises it too, because the role was written all the same. An account that already
+    sync ran raises it too, because the role was written all the same. When the role sync holds
+    an error until after the revoke and the notice, or the revoke raises, the route gets no
+    outcome, so the engine raises the alert itself before the sign-in fails, with `via` set to
+    `directory_sign_in`. An account that already
     held Administrator raises nothing.
   - **Sooner, when the account holds a live session.** A pass of the
     [directory reconciler](#directory-session-reconciliation--propagating-an-ad-disable-adr-0079-mechanism-2)
     that completes stores the new roles and revokes the session. It writes
-    `auth.ad_session_revoked` with the new roles, sends the same notice, and raises
+    `auth.ad_roles_resynced` in the role write's transaction and `auth.ad_session_revoked`, with
+    the new roles, in the revoke's, sends the same notice, and raises
     `ad_session_revoked` with reason `roles_changed`. Right after the role write it raises
     `administrator_granted`, keyed `user:<username>`, with `granted_by` set to `<directory>` and
     `via` set to `directory_reconcile`. That alert clears the account's `no_enabled_administrator`
@@ -5761,7 +5772,13 @@ Any other revocation that ends nothing and changes no role, such as a scope, rol
 unkeyed one, is quiet too. Two reconcilers that both read the audit chain before either writes its
 row both report. Two that both read the old roles do not, because the role write is a
 compare-and-set on the roles it read (vault BACKLOG #3085): only the first counts the change, and
-the second, ending no session, is quiet. A write that finds the roles moved to another set since
+the second, ending no session, is quiet. The exception is a write that raises and is applied
+again: when the retry finds the roles moved, it reads them back, and finding them as it would
+write them counts the change too, as does a store refusal of that read, and such a second
+reconciler then reports too. Any other error from the retry or that read counts the change as
+well: any `no_enabled_administrator` or `administrator_granted` alert the change is due is raised,
+the revoke is still tried and the user told, and then the error is raised, which ends the pass
+with no `ad_session_revoked` alert for that account. A write that finds the roles moved to another set since
 the apply read them writes nothing. A sign-in that wrote between the pass's plan and its apply is
 still overwritten, as is a newer write of the same set the apply read. The second still reports when
 it ends a session the first had not yet ended; `AuthService._apply_reconcile_revocation` names that
@@ -5772,11 +5789,21 @@ notice.
 A pass that fails part-way keeps the audit rows for what it already revoked, but raises no alert for
 them. A refused audit write does not end the pass (BACKLOG #3018). That holds for the store errors
 the reconciler treats as a refusal. Any other error still ends the pass. The reconciler logs
-a refused row at ERROR, naming the action and the account. For at least the
-`auth.ad_session_revoked` row, that line is the only record of the row, and nothing writes it
-later. Any notice that account was due still goes. Its alert still goes too, unless something later in the
-same pass raises and ends it. Then that account has neither its row nor its alert. A later refused
-audit write does not end the pass. The `auth.ad_username_refreshed` row is different: it commits in
+a refused row at ERROR, naming the action and the account. The `auth.ad_session_revoked` row
+commits in the revoke's own transaction, and a role revocation's `auth.ad_roles_resynced` row in
+the role write's (BACKLOG #3018 step 4). If either is refused there, the write is applied again
+without its row and the row is written on its own. A row refused that second time is lost, and a
+pass that completes pages `audit_write_failed` keyed `directory-reconciler:<action>`, once per
+action. A pass that raises part-way raises no such page, and its refused rows have only their
+ERROR lines. An error in either write or its row that is not a store refusal still ends the pass,
+and that account gets no `ad_session_revoked` alert; a role change's `no_enabled_administrator`
+and `administrator_granted` alerts are raised before it. The error is raised only after that
+account's revoke has been tried, again without its row if the row raised. A revoke that raises
+twice is raised after a role change's user is told of it; any other revocation's user is told
+nothing then. A revoke that lands, with only its row raising, sends the notice the revocation is
+due, if any, before the error is raised. When the role write's retry found its read-back refused, the row written on its own
+carries `"read_back": "refused"`. Any notice that account was due still goes. Its alert still goes too, unless something
+later in the same pass raises and ends it. A later refused audit write does not end the pass. The `auth.ad_username_refreshed` row is different: it commits in
 the rename's own transaction (BACKLOG #3018 step 7), so a refused one rolls the rename back. The
 account's row keeps its old name, and there is no `auth.ad_username_refreshed` row and no
 username_changed notice on that pass. The engine would apply it on a pass or sign-in that reaches

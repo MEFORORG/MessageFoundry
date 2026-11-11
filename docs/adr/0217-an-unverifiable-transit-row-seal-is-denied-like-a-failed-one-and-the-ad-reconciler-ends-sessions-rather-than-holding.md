@@ -758,6 +758,11 @@ it supersedes, and only where it disagrees; the earlier text is kept as it was.
   `_POST_COMMIT_REVOKE_ATTEMPTS` (3) times from `_revoke_after_commit`, and up to twice from
   `revoke_other_sessions` and `revoke_every_session`, which retry once. A refusal that an attempt
   which committed also met is reported once, by that attempt.
+- **Note, recorded 2026-11-11: "three callers" is not the whole list.** Since BACKLOG #3018 step 4
+  merged with this ADR's build, at least a fourth caller retries a failed revoke: the directory
+  reconciler's `_revoke_with_row`, which applies a revoke that failed with its audit row again
+  without it, inside the same kind of `deferred_revoke_reports` scope. So a refusal that only its
+  failed attempts met can be reported up to twice from it too.
 - **The AD-map piece of slice 3 is built (owner ruling 2026-11-10, in session: *"Hold, build AD-map
   piece"*).** Before it, an Unverifiable or Outage answer on an AD map raised out of
   `reconcile_directory_sessions`; the reconcile loop in `api/app.py` logged "pass failed" and the
