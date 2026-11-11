@@ -17,7 +17,8 @@
   need #1498 open.** The Lander filed both on 2026-09-27 for Manager batch 164. This ADR names them
   as of 2026-10-02. §7.1 says which rows each covers. The five ODBC rows are a named gap by owner
   ruling since 2026-10-05, and their driver test is BACKLOG #3009. The paragraph below §7.1's ODBC
-  table holds the ruling's limits.
+  table holds the ruling's limits. §7.1's amendment of 2026-11-11 summarises the test's two
+  recorded runs.
   **The three Vault hops §7.1 graded *a guard is possible* are guarded as of 2026-10-13, by owner
   ruling of that date (vault BACKLOG #2983).** Each refuses unless its own settings pair attests,
   and no CRL lever is built. §12 holds the ruling and its limits.
@@ -1215,17 +1216,16 @@ of the list above:
 
 | Hop (file, symbol) | What crosses | How it verifies the peer | Revocation check | Grade |
 |---|---|---|---|---|
-| SQL Server store: `store/sqlserver.py`, `connection_string` | the whole PHI store on that backend, and the SQL login under SQL authentication | ODBC Driver 18, named in the string. `Encrypt=yes` and `TrustServerCertificate=no` by default, emitted last (*code*). Microsoft's table says the driver checks the server certificate for that pair (*documentation*). With `ssl_root_cert` set, the string also carries `ServerCertificate=` (*code*), and since 2026-10-17 `Encrypt=strict` in place of `Encrypt=yes`; see the finding below and its amendment. The weakened arm, `trust_server_certificate=true` or `encrypt=false`, is verify-off and is refused on an enforcing instance (*code*) | None in the engine (*code*). The driver's own: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
-| DATABASE connector, SQL Server preset: `transports/database.py`, `_build_dsn`, reached through `_build_connection` by `DatabaseDestination` and `DatabaseSource` | rows built from messages, rows polled into messages, the SQL login | The same two keywords, emitted last (*code*). The driver is the `odbc_driver` setting, which defaults to ODBC Driver 18 (*code*). This builder emits no `ServerCertificate=` (*code*). The weakened arm is verify-off: it is refused on an enforcing instance unless the connection declares `tls_hop_attested` (*code*) | None in the engine (*code*). The driver's own: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
-| DATABASE connector, generic dialect: `transports/database.py`, `_build_odbc_dsn`, the other arm of `_build_connection` | the same | The operator's driver and its own keywords. Only a keyword on `_ODBC_PARAM_ALLOWLIST` passes through `odbc_params` (*code*). The engine cannot tell whether a keyword's value verifies the peer, and the builder's docstring says so (*code*). `generic_cleartext_hop_guard` gates a connection that sets no TLS mode, or sets one to a value meaning TLS is not required. On an enforcing instance it refuses that hop off-loopback unless the connection is attested or declares cleartext accepted (*code*). The psqlODBC and MySQL ODBC documentation was not read for revocation. *(CORRECTED 2026-10-30, BACKLOG #2483: this cell read "sets no TLS keyword" and "documentation was not read". The guard now keys on a TLS mode, and the two drivers' TLS-mode keywords have since been read; their revocation behaviour has not.)* | None in the engine (*code*). The allowlist holds no CRL keyword, so a driver's own CRL option could not be set through the engine today (*code*). Each driver's own behaviour: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** Two limits in the paragraph below the table bear hardest here. This arm counts among the five by the Manager's reading. It can also name a driver other than Driver 18. The list above does not name this arm |
-| `db_lookup` reads: `transports/database.py`, `DatabaseLookupExecutor.__init__` | lookup parameters taken from a message, the rows that come back, the SQL login | `_build_dsn(read_only=True)`, so the SQL Server preset row applies. The generic dialect cannot be reached from here (*code*) | None in the engine (*code*). The driver's own: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
-| DATABASE reference-sync source: `pipeline/reference_sync.py`, `database_source_dsn` and `_load_database_source` | reference rows, the SQL login | `_build_dsn` and a pool of its own, so the SQL Server preset row applies. A reference source takes no dialect (*code*) | None in the engine (*code*). The driver's own: *not established* | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
+| SQL Server store: `store/sqlserver.py`, `connection_string` | the whole PHI store on that backend, and the SQL login under SQL authentication | ODBC Driver 18, named in the string. `Encrypt=yes` and `TrustServerCertificate=no` by default, emitted last (*code*). Microsoft's table says the driver checks the server certificate for that pair (*documentation*). With `ssl_root_cert` set, the string also carries `ServerCertificate=` (*code*), and since 2026-10-17 `Encrypt=strict` in place of `Encrypt=yes`; see the finding below and its amendment. The weakened arm, `trust_server_certificate=true` or `encrypt=false`, is verify-off and is refused on an enforcing instance (*code*) | None in the engine (*code*). The driver's own: *not established*; §7.1's amendment of 2026-11-11 states what BACKLOG #3009's test measured | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
+| DATABASE connector, SQL Server preset: `transports/database.py`, `_build_dsn`, reached through `_build_connection` by `DatabaseDestination` and `DatabaseSource` | rows built from messages, rows polled into messages, the SQL login | The same two keywords, emitted last (*code*). The driver is the `odbc_driver` setting, which defaults to ODBC Driver 18 (*code*). This builder emits no `ServerCertificate=` (*code*). The weakened arm is verify-off: it is refused on an enforcing instance unless the connection declares `tls_hop_attested` (*code*) | None in the engine (*code*). The driver's own: *not established*; §7.1's amendment of 2026-11-11 states what BACKLOG #3009's test measured | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
+| DATABASE connector, generic dialect: `transports/database.py`, `_build_odbc_dsn`, the other arm of `_build_connection` | the same | The operator's driver and its own keywords. Only a keyword on `_ODBC_PARAM_ALLOWLIST` passes through `odbc_params` (*code*). The engine cannot tell whether a keyword's value verifies the peer, and the builder's docstring says so (*code*). `generic_cleartext_hop_guard` gates a connection that sets no TLS mode, or sets one to a value meaning TLS is not required. On an enforcing instance it refuses that hop off-loopback unless the connection is attested or declares cleartext accepted (*code*). The psqlODBC and MySQL ODBC documentation was not read for revocation. *(CORRECTED 2026-10-30, BACKLOG #2483: this cell read "sets no TLS keyword" and "documentation was not read". The guard now keys on a TLS mode, and the two drivers' TLS-mode keywords have since been read; their revocation behaviour has not.)* | None in the engine (*code*). The allowlist holds no CRL keyword, so a driver's own CRL option could not be set through the engine today (*code*). Each driver's own behaviour: *not established*; §7.1's amendment of 2026-11-11 states what BACKLOG #3009's test measured | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** Two limits in the paragraph below the table bear hardest here. This arm counts among the five by the Manager's reading. It can also name a driver other than Driver 18. The list above does not name this arm |
+| `db_lookup` reads: `transports/database.py`, `DatabaseLookupExecutor.__init__` | lookup parameters taken from a message, the rows that come back, the SQL login | `_build_dsn(read_only=True)`, so the SQL Server preset row applies. The generic dialect cannot be reached from here (*code*) | None in the engine (*code*). The driver's own: *not established*; §7.1's amendment of 2026-11-11 states what BACKLOG #3009's test measured | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
+| DATABASE reference-sync source: `pipeline/reference_sync.py`, `database_source_dsn` and `_load_database_source` | reference rows, the SQL login | `_build_dsn` and a pool of its own, so the SQL Server preset row applies. A reference source takes no dialect (*code*) | None in the engine (*code*). The driver's own: *not established*; §7.1's amendment of 2026-11-11 states what BACKLOG #3009's test measured | **Named gap, by owner ruling R6 of `ASVS-OWNER-RULINGS-2026-10-05.md`; no guard built.** The driver test is BACKLOG #3009, and the paragraph below the table holds its limits |
 | Vault key provider: `store/keyprovider_vault.py`, `_build_client`. `store_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, the store's data-encryption key back | `hvac` over `requests`. Each handshake runs on a fresh context from the factory `assert_hvac_tls_suites` returns, set per connection by `_narrowed_pool_classes` in `transports/strict_requests.py` (*code*). The context requires a verified peer and checks the host name (*measured*). It trusts the file `MEFOR_STORE_VAULT_CA_FILE` names. With that unset the engine passes no anchor, and the pinned libraries choose one: hvac reads `VAULT_CACERT` and `VAULT_CAPATH`, requests reads `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE`, and the certifi bundle is last (*code*, in hvac 2.4.0 and requests 2.34.2). `verify=False` is refused, and so is a connection that would verify no peer (*code*). Through an `https://` proxy there is a second verified leg, to the proxy, on its own context from the same factory (*code*). This note does not grade that leg as a row. *(Since 2026-10-26 that leg has a guard of its own, vault BACKLOG #3561; §12 says how.)* | None. The factory never calls `harden_crl_check` (*code*). A context it built had `VERIFY_CRL_CHECK_LEAF` clear and no CRL loaded, and the same read returned true for a control context with the flag set (*measured*, with hvac 2.4.0, requests 2.34.2 and urllib3 2.8.0). A search of those installed `requests` and `urllib3` packages found no CRL or OCSP handling (*code*) | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits. Its `https://` proxy leg is guarded too, since 2026-10-26 (vault BACKLOG #3561) |
 | Vault Transit cipher: `store/crypto_transit.py`, which calls the key provider's `_build_client` | the Vault token, and message bodies sent to Vault to encrypt and decrypt | The key provider's row applies: it is the same client build (*code*) | None, as the key provider's row | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits. Its `https://` proxy leg is guarded too, since 2026-10-26 (vault BACKLOG #3561) |
 | Vault secret provider: `config/secretprovider_vault.py`, its own `_build_client`. `secrets_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, connector credentials back | The same shape as the key provider, proxy leg included, with `MEFOR_SECRETS_VAULT_CA_FILE` as its anchor (*code*) | None, as the key provider's row | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits. Its `https://` proxy leg is guarded too, since 2026-10-26 (vault BACKLOG #3561) |
 
-**The ODBC hops are a named gap by owner ruling, and the driver test has run twice, not
-yet on the SQL Server test box.**
+**The ODBC hops are a named gap by owner ruling, and the driver test has two recorded runs.**
 *(Until 2026-11-11 this lead-in ended "and the driver test is still owed.")* BACKLOG #2194
 names three outcomes for a hop: a guard, a documented driver control, or an accepted gap. The owner
 ruled on 2026-10-05, in an AskUserQuestion answer to the batch 191 Manager. The record is R6 of the
@@ -1242,9 +1242,11 @@ ruling:
 - **The ruling rests on Microsoft's driver.** The question cited Microsoft's driver documentation,
   and the test names ODBC Driver 18 only. Another driver can serve these hops, as the second
   bullet of the 2026-10-04 reading below says. No owner answer and no planned test covers one.
-- **The drivers' own revocation behaviour is measured only in part.** The ruling's "then test it"
-  half has run twice, each time with a control certificate that is not revoked. The amendment of 2026-11-11
-  below states what was measured and the limits of that measurement. *(Until
+- **Driver 18's revocation behaviour is measured on one build on Windows, and other drivers' is
+  unmeasured.** The ruling's "then test it" half has two recorded runs, and neither record says
+  its run was on the SQL Server test box. The test needs a SQL Server whose certificate can be
+  revoked. A control connection to a certificate that is not revoked shows that a refusal comes
+  from the revocation. The amendment of 2026-11-11 below states what the runs measured. *(Until
   2026-11-11 this bullet read: "**The drivers' own revocation behaviour is still unmeasured.** The
   ruling's "then test it" half is owed. It needs a SQL Server whose certificate can be revoked. A
   control connection to a certificate that is not revoked shows that a refusal comes from the
@@ -1253,8 +1255,9 @@ ruling:
   under what conditions. If it does not, R6 does not say whether the gap stands or the owner's
   other two options come back. BACKLOG #3009's third closing step says the gap stands. That is
   the ledger row's wording, not the owner's, so it is the owner's to decide when a result exists.
-  *(Note 2026-11-11: a result exists, in the amendment below. The owner has not ruled on what it
-  means for the grade, so the five rows keep the grade R6 gives them.)*
+  *(Note 2026-11-11: a result exists, in the amendment of that date below. The owner has not
+  ruled on what it means for the grade, and that amendment does not change the grade: the five
+  rows keep the grade R6 gives them.)*
 
 *(Until 2026-10-11 this paragraph read: "**What is open on the five ODBC hops.** BACKLOG #2194 names
 three outcomes for a hop: a guard, a documented driver control, or an accepted gap. This note
@@ -1289,26 +1292,26 @@ chosen option gives for building no guard:
 
 **Amendment 2026-11-11 -- what the ODBC Driver 18 test measured (vault BACKLOG #3009).** This is a
 public summary of two private test records in the vault, one per run of the vault's ODBC
-revocation runbook. Their contents beyond this summary are not repeated here. It changes no grade
-and no code.
+revocation runbook. Their contents beyond this summary are not repeated here. It changes no code.
+For the grade, the fourth limit under the ruling above holds.
 
-- **Where it ran.** Two runs, on 2026-10-16 and 2026-10-17. The first run's record says it ran on
-  a disposable virtual machine built for the test, not on the SQL Server test box. The second run's
-  record says its run followed a revert to a checkpoint dated 2026-10-16, a tightening of folder
-  permissions and a new checkpoint. It does not itself say the machine was the first run's. The
-  runbook names the SQL Server test box as where the test runs next, and no run there is
-  recorded. In both runs the client ran on the same machine as SQL Server, so no off-box hop was
-  exercised.
-- **Versions.** ODBC Driver 18 for SQL Server, 64-bit, reporting driver version `18.07.0001`.
-  Windows Server 2022 Datacenter, build 20348, update revision 5256. SQL Server 2022 RTM,
-  16.0.1000.6. The engine's Python environment supplied only pyodbc 5.3.0. The records do not
-  give the interpreter's version.
-- **How the revocation was published.** In each run, a throwaway test root, with no intermediate CA, issued two
-  server certificates and revoked one. An HTTP listener on the same machine served a signed CRL
-  listing it. The other certificate was the control. SQL Server ran on each in turn. Before the
-  legs, Windows' own chain check reported the revoked certificate as revoked, fetching the list
-  to do so, and passed the control. No OCSP responder was offered.
-- **Which shapes were tried.** At least these, as connection strings the runbook carries, copied
+- **Where it ran.** Two runs, dated 2026-10-16 and 2026-10-17 in Central time. In UTC, the
+  first run's legs ran from 02:22 to 02:25 and the second's from 05:18 to 05:19, both on
+  2026-10-17. The first run's record says it ran on a disposable virtual machine built for the
+  test, not on the SQL Server test box, and that the runbook puts the next run there. The second
+  run's record does not name its machine. It says the run followed a revert to checkpoint
+  `post-3009-clean-2026-10-16`, a tightening of folder permissions and a new checkpoint,
+  `post-3009-acl-2026-10-17`. No run on the SQL Server test box is recorded.
+- **Versions.** ODBC Driver 18 for SQL Server, 64-bit: `msodbcsql18.dll` ProductVersion 18.7
+  build 1.1, reporting driver version `18.07.0001`. Windows Server 2022 Datacenter, build 20348,
+  update revision 5256. SQL Server 2022 RTM, 16.0.1000.6. The engine's Python environment
+  supplied only pyodbc 5.3.0. The records do not give the interpreter's version.
+- **How the revocation was published.** In each run, a throwaway test root issued two server
+  certificates and revoked one. An HTTP listener on the same machine served a signed CRL listing
+  it. The other certificate was the control. SQL Server ran on each in turn. Before the legs,
+  Windows' own chain check reported the revoked certificate as revoked, fetching the list to do
+  so, and passed the control.
+- **Which shapes were tried.** These five connection strings, which the runbook carries, copied
   from the engine's code before the amendment of 2026-10-17 below:
   - the store and the DATABASE SQL Server preset, one string;
   - `db_lookup`;
@@ -1317,11 +1320,12 @@ and no code.
   - the store with the other certificate pinned under `Encrypt=yes`.
 
   The first four ran on both certificates, with the CRL cache cleared and again with the list
-  cached; the fifth ran with the cache cleared only. The second run added the two pinned strings
-  with `Encrypt=strict` in place of `Encrypt=yes`, with the cache cleared only. No leg exercised
-  the reference-sync source's own builder or pool. The store has not sent the two `Encrypt=yes`
-  pinned strings since that amendment (`odbc_connection_string`, `messagefoundry/odbc_dsn.py`,
-  *code*), and neither record compares its current string with a tested one.
+  cached; the fifth ran with the cache cleared only. The second run's script added two strings of
+  its own, the two pinned strings with `Encrypt=strict` in place of `Encrypt=yes`, run with the
+  cache cleared only. No leg ran any engine builder or pool. The store has not sent the two
+  `Encrypt=yes` pinned strings since that amendment (`odbc_connection_string`,
+  `messagefoundry/odbc_dsn.py`, *code*), and neither record compares its current string with a
+  tested one.
 - **What the driver did.** Every leg of the five `Encrypt=yes` strings connected, on the revoked
   certificate as on the control. The list's listener logged no request during any leg of either
   run. Read by the runbook's own table, for the first four strings the driver did not use this
@@ -1332,16 +1336,20 @@ and no code.
   revocation. What the pin legs mean for the pin is the amendment of 2026-10-17 below. For the
   strict legs that reading is the second record's own, because the runbook's table has no row
   for them.
-- **The limits.** At least these. Only that driver build, and only Windows Server 2022. Linux,
-  macOS, other Driver 18 builds, and other drivers, which the generic dialect and the
-  `odbc_driver` setting can name, were not measured. Only a CRL over HTTP: OCSP was not offered,
-  so this does not show that the driver never checks revocation. Only a same-machine connection.
-  The strings were the runbook's, so the result says nothing directly about how the engine builds
-  or sends its own strings. A single-level chain from a throwaway root.
+- **The limits.** At least these.
+  - Only that driver build, only Windows Server 2022, and only SQL Server 2022 RTM. Linux, macOS,
+    other Driver 18 builds, and other drivers, which the generic dialect and the `odbc_driver`
+    setting can name, were not measured.
+  - Only a CRL over HTTP. No OCSP responder was offered, so this does not show that the driver
+    never checks revocation.
+  - Only a same-machine connection: the client ran on the machine SQL Server ran on, so no
+    off-box hop was exercised. The server's name resolved to an IPv6 address of that machine,
+    link-local in the first record, so both records say the legs probably connected over IPv6.
+  - Only strings written out in the runbook and the script, so the result says nothing directly
+    about how the engine builds or sends its own strings.
+  - Only a single-level chain from a throwaway root, with no intermediate CA.
 
-**What the result means for the five rows' grade is not decided here.** The fourth limit under
-the ruling, above, *What a result would mean for the grade is not ruled*, says why, and the owner
-has not ruled on it.
+*(End of the amendment of 2026-11-11. The next paragraph continues the 2026-10-04 note.)*
 
 **What is open on the three Vault hops.** *(Built on 2026-10-13, under vault BACKLOG #2983;
 §12 is the record. This paragraph and its two facts are kept as written. Fact 1 no longer holds:
@@ -1426,9 +1434,9 @@ DIRECT; §11 lists the edit.)* Add these rows to it:
   read "Five more rows wait on an owner answer, beside DIRECT.")*
 - Three more hops could take a guard, beside the seven BACKLOG #2193 tracks. *(Since 2026-10-13
   those three, the Vault hops, are guarded by attestation; §12.)*
-- Whether the ODBC drivers check revocation is still not established in general. The amendment of
-  2026-11-11 above states what BACKLOG #3009's test measured, and its limits. *(Until 2026-11-11 this read: "The ODBC drivers' own revocation
-  behaviour is still not established. BACKLOG #3009 is the test.")*
+- Whether the ODBC drivers check revocation is still not established. The amendment of
+  2026-11-11 above states what BACKLOG #3009's test measured. *(Until 2026-11-11 this read: "The
+  ODBC drivers' own revocation behaviour is still not established. BACKLOG #3009 is the test.")*
 
 The heading in section 7, "SOME HOPS ARE STILL UNGRADED", now holds only in this sense: **read the
 eight as "at least these", per SDS-3.6.** This note re-read the hops the list named. It did not
@@ -1533,7 +1541,8 @@ cells, whose old grade is quoted once, in the grades bullet:
 **Where the facts live.** The paragraph below §7.1's ODBC table is where this file states the
 ruling's limits and what the test must show. Other places name the ruling and point there. When
 BACKLOG #3009 has a result, it goes in that paragraph. *(Note 2026-11-11: the result is in §7.1's
-amendment of that date, after the 2026-10-04 reading that follows that paragraph.)*
+amendment of that date, after the 2026-10-04 reading that follows that paragraph. What the test
+must show is still stated in that paragraph's third limit.)*
 
 **What this amendment does not do.** It builds no guard, changes no code and measures nothing.
 
