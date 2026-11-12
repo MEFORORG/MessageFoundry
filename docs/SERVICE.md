@@ -687,8 +687,7 @@ NSSM environment.
   access list it needs, and the rest of the rules are stated once, in
   [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). Move each
   of the engine's own secret settings here from the service's NSSM list, where `serve` and
-  `supervise` refuse it and an app built with `create_app` or `create_managed_app` names it
-  instead (the previous bullet links where that is stated); a `MEFOR_VALUE_*` value there is not
+  `supervise` refuse it (the previous bullet links where that is stated); a `MEFOR_VALUE_*` value there is not
   refused.
 
 > **External vault / managed identity.** DPAPI is the built-in on-box option. The engine can also call

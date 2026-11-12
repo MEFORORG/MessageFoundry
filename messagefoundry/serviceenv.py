@@ -336,8 +336,8 @@ def _started_by_something_else(
         keys_in_environment=keys,
         detail=(
             f"nssm.exe (process {nssm}) is above {image}, which is neither a Python interpreter "
-            "nor messagefoundry.exe, so the engine cannot tell whether it runs as that service or was started from a shell "
-            "inside it"
+            "nor messagefoundry.exe, so the engine cannot tell whether it runs as that service "
+            "or was started from a shell inside it"
         ),
     )
 

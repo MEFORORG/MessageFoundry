@@ -2634,8 +2634,7 @@ count is above `0` (vault BACKLOG #2613).
   the first reading an app built without them takes.
 - **How to clear them:** remove each named variable from the registry value the entry names, NSSM's
   list or the service's own `Environment` value, and from the machine-wide environment. Keep the
-  store key in a DPAPI-protected key file. Let NSSM start the Python interpreter or
-  `messagefoundry.exe` directly.
+  store key in a DPAPI-protected key file. Let NSSM start the interpreter directly.
 - **Not covered**, at least: a service host other than NSSM, an `nssm.exe` under another name,
   and a secret a connection reads through `env()`, whose name only your config knows.
 

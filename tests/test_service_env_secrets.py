@@ -327,7 +327,9 @@ def test_a_console_script_launcher_under_nssm_names_only_the_unobservable_entry(
         probe=probe, environ={"MEFOR_STORE_ENCRYPTION_KEY": _KEY_VALUE}
     )
     assert posture.status is ServiceEnvStatus.UNOBSERVABLE
-    assert "is above uvicorn.exe" in posture.detail
+    assert "is above uvicorn.exe, which is neither a Python interpreter nor messagefoundry.exe" in (
+        posture.detail
+    )
     assert probe.asked == []
     assert service_env_refusal(posture) is None
     assert _names(posture) == ["service_environment_unobservable"]
