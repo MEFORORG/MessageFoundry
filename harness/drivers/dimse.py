@@ -10,7 +10,8 @@ for Out of Resources, ``b"C000"`` for Cannot Understand). A status is an answer,
 the same way an MLLP ``AE`` is; ``error`` is set only when no status came back at all.
 
 ``pynetdicom`` and ``pydicom`` are the ``[dicom]`` extra and are imported inside :meth:`inject`, so
-harness discovery never fails without them; without them every payload reports an error.
+harness discovery never fails without them; without them, or with a ``pydicom`` that lacks the
+header readers the deflate guard replays, every payload reports an error and none is sent.
 """
 
 from __future__ import annotations
@@ -22,6 +23,9 @@ from typing import Any
 
 from harness.drivers import Driver, Injection
 from harness.endpoints import Endpoints
+from messagefoundry.parsing.dicom._deps import load_header_readers, parse_error_types
+from messagefoundry.parsing.dicom._inflate import guard_part10_deflate
+from messagefoundry.parsing.dicom.errors import DicomBombError
 
 KIND = "dimse"
 
@@ -135,18 +139,31 @@ class DimseDriver(Driver):
             return [Injection(error=missing) for _ in payloads]
         from pydicom import dcmread
 
-        from messagefoundry.parsing.dicom._deps import parse_error_types
-
+        try:
+            # A pydicom without the readers the guard replays is not a missing extra, so it stays out
+            # of dicom_extra_missing (a scenario would skip on it); every payload fails instead, with
+            # nothing sent and nothing raised from inject() (the Driver contract).
+            load_header_readers()
+        except RuntimeError as exc:
+            return [Injection(error=str(exc)) for _ in payloads]
         capped_ae = _capped_ae_class()
 
         unreadable = parse_error_types()
         outcomes: list[Injection] = []
         for payload in payloads:
             try:
-                dataset = dcmread(BytesIO(payload))
+                # ASVS 5.2.3: dcmread inflates a Deflated Explicit VR LE Data Set unbounded, so bound
+                # it first with the engine's own Part-10 guard and its cap (vault BACKLOG #4808).
+                # The guard replays dcmread's header read, so it sits inside the same handler, and
+                # it takes dcmread's force: change one and you must change the other.
+                guard_part10_deflate(payload, force=False)
+                dataset = dcmread(BytesIO(payload), force=False)
                 sop_class = dataset.SOPClassUID
                 transfer_syntax = dataset.file_meta.TransferSyntaxUID
                 dataset.SOPInstanceUID  # noqa: B018  (send_c_store needs it; refuse here, not there)
+            except DicomBombError as exc:  # a ValueError, so it must come before `unreadable`
+                outcomes.append(Injection(error=f"not sent: {exc}"))
+                continue
             except unreadable as exc:
                 outcomes.append(
                     Injection(error=f"not a DICOM Part-10 object ({type(exc).__name__})")

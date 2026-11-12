@@ -9,8 +9,12 @@ the ``messagefoundry check`` structural gate on emitted modules, and the untrust
 from __future__ import annotations
 
 import ast
+import gc
 import json
+import random
 import re
+from collections.abc import Callable
+from itertools import product
 from pathlib import Path
 
 import pytest
@@ -19,12 +23,16 @@ from messagefoundry.checks import run_checks
 from messagefoundry.parsing.message import Message
 from messagefoundry_toolkit.corepoint_import import (
     _CONTAINER_KIND_BY_TAG,
+    _ROLE_BY_CLASS,
+    _SPAN_CLOSE,
+    _SPAN_OPEN,
     _STATEMENT_VERBS,
     _UNDERSTOOD,
     _VERB_CONNECTIVES,
     Action,
     Control,
     CorepointImportError,
+    RoleToken,
     Step,
     UnmappedAction,
     _corepoint_path,
@@ -35,6 +43,7 @@ from messagefoundry_toolkit.corepoint_import import (
     _operands_from_roles,
     _role_prose,
     _role_verb,
+    _strip_tags,
     _understood_list,
     generate_module,
     import_corepoint,
@@ -45,6 +54,7 @@ from messagefoundry_toolkit.corepoint_import import (
     strip_markup,
     tokenize_statement,
 )
+from tests._growth import _growth_between
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = REPO_ROOT / "tests" / "fixtures" / "corepoint"
@@ -754,6 +764,132 @@ def test_strip_markup_recovers_the_verb() -> None:
     # a ``<`` that the tag-strip then eats out of the statement itself.
     assert strip_markup("<b>ItemCopy</b> &amp;lt;kept&amp;gt;") == "ItemCopy &lt;kept&gt;"
     assert strip_markup("   <i></i>  ") == ""
+
+
+# The pattern ``strip_markup`` used before #4036, kept here as the reference its output must match.
+_OLD_MARKUP_TAG = re.compile(r"<[^>]+>")
+
+
+def test_the_tag_strip_matches_the_old_regex_on_every_short_string() -> None:
+    """Exhaustive over ``<``, ``>``, a letter and a newline up to length 8: same output as the regex."""
+    for length in range(9):
+        for chars in product("<>a\n", repeat=length):
+            data = "".join(chars)
+            assert _strip_tags(data) == _OLD_MARKUP_TAG.sub("", data), repr(data)
+
+
+# 8x the input: a linear scan grows about 8x per call, the old ones about 64x (#4036). The controls
+# run at the smaller lengths, which keep that separation at a fraction of the quadratic cost.
+_GROWTH_LENGTHS = (2048, 16384)
+_CONTROL_LENGTHS = (512, 4096)
+_MAX_GROWTH = 24.0
+
+
+def _reading(
+    call: Callable[[str], object],
+    unit: str,
+    lengths: tuple[int, int],
+    *,
+    done: Callable[[float], bool],
+) -> float:
+    """A growth reading over ``unit`` runs of ``lengths``, taken again up to three times, with GC off,
+    until ``done`` holds, so one preemption on a loaded runner cannot fake a curve or hide one."""
+    short, long = (unit * n for n in lengths)
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        for _ in range(3):
+            growth = _growth_between(call, short, long, rounds=5)
+            if done(growth):
+                break
+    finally:
+        if was_enabled:
+            gc.enable()
+    return growth
+
+
+def _assert_linear_with_control(
+    old: Callable[[str], object], new: Callable[[str], object], unit: str
+) -> None:
+    """The old code runs first as the positive control, so a box that cannot see the difference
+    reds the test instead of passing it."""
+    control = _reading(old, unit, _CONTROL_LENGTHS, done=lambda g: g > _MAX_GROWTH)
+    assert control > _MAX_GROWTH, (
+        f"the old code grew only {control:.1f}x across {_CONTROL_LENGTHS}, under {_MAX_GROWTH}x, "
+        "so this box or probe cannot tell; fix the fixture, do not raise the bar"
+    )
+    growth = _reading(new, unit, _GROWTH_LENGTHS, done=lambda g: g < _MAX_GROWTH)
+    assert growth < _MAX_GROWTH, f"grew {growth:.1f}x across {_GROWTH_LENGTHS} on {unit!r} runs"
+
+
+@pytest.mark.parametrize("unit", ["<", "<a", "<\n"])
+def test_the_markup_strip_is_linear_on_unclosed_tags(unit: str) -> None:
+    """#4036: a run of ``<`` with no closing ``>`` made the regex retry from every ``<``."""
+    _assert_linear_with_control(lambda text: _OLD_MARKUP_TAG.sub("", text), strip_markup, unit)
+
+
+def _old_parse_roles(data: str) -> tuple[RoleToken, ...]:
+    """``parse_roles`` before #4036, which searched for both span kinds on every pass."""
+    tokens: list[RoleToken] = []
+    stack: list[str] = []
+    saw_span = False
+    pos = 0
+
+    def flush(upto: int) -> None:
+        run = strip_markup(data[pos:upto])
+        if run:
+            cls = stack[-1] if stack else ""
+            tokens.append(RoleToken(_ROLE_BY_CLASS.get(cls, "text") if cls else "text", run, cls))
+
+    while pos < len(data):
+        opening = _SPAN_OPEN.search(data, pos)
+        closing = _SPAN_CLOSE.search(data, pos)
+        if opening is None and closing is None:
+            break
+        if closing is None or (opening is not None and opening.start() < closing.start()):
+            assert opening is not None
+            flush(opening.start())
+            stack.append(opening.group(1).lower())
+            saw_span = True
+            pos = opening.end()
+        else:
+            flush(closing.start())
+            if stack:
+                stack.pop()
+            pos = closing.end()
+    if not saw_span:
+        return ()
+    flush(len(data))
+    return tuple(tokens)
+
+
+_ROLE_FRAGMENTS = (
+    "<span class='path'>",
+    '<span class="Keyword">',
+    "<span  class='detail' >",
+    "</span>",
+    "</span >",
+    "x",
+    " to ",
+    "<",
+    ">",
+    "<b>",
+    "&amp;lt;",
+)
+
+
+def test_parse_roles_matches_its_old_scan_on_random_markup() -> None:
+    rng = random.Random(4036)
+    for _ in range(3000):
+        data = "".join(rng.choice(_ROLE_FRAGMENTS) for _ in range(rng.randrange(13)))
+        assert parse_roles(data) == _old_parse_roles(data), repr(data)
+
+
+@pytest.mark.parametrize("unit", ["</span>", "<span class='a'>"])
+def test_parse_roles_is_linear_on_a_run_of_one_span_kind(unit: str) -> None:
+    """#4036: with only one span kind present, the other kind's search scanned to the end on
+    every pass."""
+    _assert_linear_with_control(_old_parse_roles, parse_roles, unit)
 
 
 def test_markup_stripped_statements_classify_in_the_fixture() -> None:
