@@ -753,9 +753,9 @@ start. ADR 0102's 2026-10-11 amendment leaves it unscheduled: a seat decision un
 2026-10-08, not an owner ruling.
 
 > *Amendment (vault BACKLOG #5712, 2026-11-12):* "which a fresh bootstrap lacks" does not make the probe
-> unconditional. The probe counts any `dr_backup` row in the restored database, including one written after
-> the restore, on the DR box or elsewhere. The condition it holds under, and where the remaining writers are
-> stated, are in the 2026-11-12 amendment to
+> unconditional: a `dr_backup` row written into an unrestored database lets it pass a false attestation,
+> and the same row can make the restore token refuse a valid restore. The condition, and where the remaining
+> writers are stated, are in the 2026-11-12 amendment to
 > [ADR 0102](0102-server-db-dr-restore-vintage-completeness-attestation-residual.md). This paragraph's text
 > is unchanged.
 

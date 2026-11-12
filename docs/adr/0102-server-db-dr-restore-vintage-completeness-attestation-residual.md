@@ -95,6 +95,9 @@ Accepting a residual **does not** change any scorecard status; it changes it fro
 
 ### (b) — the opt-in restore-token vintage floor (the low-risk build)
 
+*Amended 2026-11-12 (vault BACKLOG #5712): a `dr_backup` row written into the DR database after the
+restore can make this check refuse a valid restore; see the 2026-11-12 amendment.*
+
 A new **opt-in** `[dr].restore_token` (default `""` = OFF). When set, it is a **local/UNC path** to a small
 JSON token file the DBA/operator places on the DR box **as part of the native-restore runbook**, recording
 the **expected source-backup anchor**:
@@ -216,6 +219,8 @@ to schedule separately** — not to be started without owner sign-off (CLAUDE.md
 - A newer engine backup that ran between the operator recording the anchor and the DBA taking the native
   backup shifts the "latest" anchor; the runbook pins the anchor to the **native-backup point-in-time** to
   avoid a false abort.
+  *Amended 2026-11-12 (vault BACKLOG #5712): a successful `dr_backup` row written into the DR database
+  after the restore is a second false-abort cause; see the 2026-11-12 amendment.*
 
 **Out of scope**
 
@@ -275,27 +280,31 @@ premise is false. A DR box runs single-node, because ADR 0096 refuses `[dr]` tog
 so it leads its own `NullCoordinator`. With `[backup].enabled`, its `BackupRunner` would have written
 `dr_backup` audit rows into the database it stands by on. The fix does not change leadership: a passive
 standby still leads its own coordinator. What changed is that `BackupRunner` starts no scheduled pass
-while the engine reports the box as a passive standby.
+while the engine reports the box as paused: while it is a passive standby, and during an activation until
+its reload has completed.
 
 **What the false premise reaches.**
 
 - *The probe, item 2.* `Store.has_prior_backup_history()` counts any `dr_backup` row, a failure row
-  included, whoever wrote it. So the probe fails a mistaken attestation closed only while the DR
-  database holds no `dr_backup` row other than those restored from the primary. A row from any other
-  writer, on the DR box or on another host pointed at that database, passes it. The attestation is then
-  the only gate, unless `[dr].restore_token` is set.
-- *The restore token, option (b).* A standby's own successful row carries its own archive name and
+  included, whoever wrote it. On an unrestored database, which is the case the
+  probe exists to catch, it fails a mistaken attestation closed only while that database holds no
+  `dr_backup` row at all. A row from any writer, on the DR box or on another host pointed at that
+  database, passes it. The attestation is then the only gate, unless `[dr].restore_token` is set.
+- *The restore token, option (b).* A successful row written into the DR database after the restore,
+  by a standby before this fix or by a remaining writer after it, carries its own archive name and
   becomes the latest successful `dr_backup` archive the token check compares. A correct
   `expected_backup_archive` then mismatches, and a valid restore is refused with
   `dr_activation_aborted`. That is a second false-abort cause beside the one *Negative / risks* names.
 - *Option (c), the risk acceptance.* It describes the compensating controls as "both fail-closed". The
   probe is fail-closed only under the condition above.
 
-**Where the remaining writers are stated.** Once, in the comment above `self._dr_paused` in
-`BackupRunner.__init__`, in `messagefoundry/pipeline/dr_backup.py`. Read that comment rather than a list
-here.
+**Where the remaining writers are stated.** The writers on a DR box are stated once, in the comment
+above `self._dr_paused` in `BackupRunner.__init__`, in `messagefoundry/pipeline/dr_backup.py`. Read that
+comment rather than a list here. A writer on another host pointed at the DR database is outside that
+comment, and counts all the same.
 
-**What this amendment does not change.** It edits no text above: each original sentence stands as
-written, with a dated pointer after it. It does not change the signed row in
+**What this amendment does not change.** It rewrites no sentence above. It adds dated pointers, and
+the only text it changed is the Status line's 2026-10-11 pointer, which said "the amendment at the end"
+and now names its date. It does not change the signed row in
 `ASVS-L3-RISK-ACCEPTANCE-REGISTER.md`, whose compensating-control wording (c) mirrors. Whether that row
 must change is not decided here.
