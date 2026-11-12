@@ -3,7 +3,7 @@
 """BACKLOG #1151 -- the single-route data rules, executed and documented.
 
 ``docs/SECURITY.md`` carries a blockquote headed *Single-route data rules*. It states at least
-eleven data rules that each sit on one route, or one family of routes, and that the route rows
+thirteen data rules that each sit on one route, or one family of routes, and that the route rows
 themselves only point to. This file keeps that blockquote true in the same two halves as
 ``tests/test_monitoring_scope_doc_drift.py``, on the same seeded estate (inbounds ``IB_A`` and
 ``IB_B``, shared outbound ``OB_X``):
@@ -11,7 +11,10 @@ themselves only point to. This file keeps that blockquote true in the same two h
 * one measurement per rule EXECUTES the route against a channel-scoped operator, with an
   all-channels operator in the same run as the positive control. The security-event feed has no
   channel axis: it is keyed on the caller's own account, and its control is the raw audit log. The
-  approval release narrows its REQUESTER's scope, and its control is a release that runs;
+  approval release narrows its REQUESTER's scope, and its control is a release that runs. The
+  suspend refusal page's rules gate is a permission fact, and its control is a ``monitoring:read``
+  holder. The ``/ui`` suspend measurement also asserts, on purpose, the open defect its bullet
+  names: a missing or empty window is read as 60 minutes;
 * :func:`test_security_doc_states_each_single_route_rule` reads the blockquote and requires each
   rule's routes and key facts in that rule's own bullet, every bullet to belong to a rule, and each
   route's row in the route map to point at the blockquote.
@@ -27,9 +30,11 @@ of the bullet. The console paragraph of the blockquote is read from the code and
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
-from collections.abc import Awaitable, Callable
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
@@ -48,6 +53,7 @@ from messagefoundry.auth.service import (
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.store import no_audit_row
 from tests._doc_blockquote import blockquote_lines, plant_in_blockquote, route_tokens, unwrap
 from tests.test_approvals import ON, _add, _token
 from tests.test_approvals import _client as _approvals_client
@@ -394,6 +400,175 @@ async def _measure_ui_connection_page(k: _Callers) -> None:
     assert await page("allchannels", names) == [200, 200, 200, 404]
 
 
+@contextlib.asynccontextmanager
+async def _ui_sessions(k: _Callers, *usernames: str) -> AsyncIterator[dict[str, httpx.AsyncClient]]:
+    """One console client per user, each signed in ONCE through the cookie flow, so a measurement's
+    run of requests does not trip the sign-in rate limit."""
+    app = create_app(k.engine, auth=k.service, serve_ui=True, webauthn_rp_from_request=True)
+    async with contextlib.AsyncExitStack() as stack:
+        clients: dict[str, httpx.AsyncClient] = {}
+        for username in usernames:
+            c = await stack.enter_async_context(
+                httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+            )
+            r = await c.post("/ui/login", data={"username": username, "password": PW})
+            assert r.status_code == 303 and c.cookies.get("mf_session"), (username, r.text)
+            clients[username] = c
+        yield clients
+
+
+async def _measure_ui_resend_done(k: _Callers) -> None:
+    pytest.importorskip("messagefoundry_webconsole")
+    ids = await k.message_ids()
+    # A resend of IB_A's message, copied from its OB_X body, to the target OB_Y under one key. The
+    # store call the JSON resend makes; the route under test reads only its record, so the lane
+    # state, and whether OB_Y is registered, is not part of the rule. Source and target differ, so
+    # a page that named the source would show a name the target does not.
+    outcome = await k.engine.store.resend_to(
+        message_id=ids["IB_A"],
+        to="OB_Y",
+        from_="OB_X",
+        idempotency_key="k-ran",
+        audit=no_audit_row,
+    )
+    assert (outcome.status, outcome.from_destination) == ("resent", "OB_X"), outcome
+    path, ran = f"/ui/messages/{ids['IB_A']}/resend-done", {"to": "OB_Y", "key": "k-ran"}
+    # Scoped to the target alone, with no scope on the origin IB_A.
+    target_only = await _operator(k.service, "target_only")
+    await k.service.set_channel_scope(target_only, ["OB_Y"], actor="admin")
+    async with _ui_sessions(k, "scoped", "allchannels", "target_only") as ui:
+        # Scoped to IB_A, the ORIGIN channel, but not to the target OB_Y: no record, as for a bad
+        # key.
+        hidden = await ui["scoped"].get(path, params=ran)
+        assert hidden.status_code == 404 and "No such resend" in hidden.text, hidden.status_code
+        # Control: the all-channels caller sees the page; a key, a target or a message the record
+        # does not name is "No such resend" for it too.
+        shown = await ui["allchannels"].get(path, params=ran)
+        assert shown.status_code == 200 and "OB_Y" in shown.text, shown.status_code
+        for p, to, key in (
+            (path, "OB_Y", "never-used"),
+            (path, "OB_X", "k-ran"),
+            (f"/ui/messages/{ids['IB_B']}/resend-done", "OB_Y", "k-ran"),
+        ):
+            r = await ui["allchannels"].get(p, params={"to": to, "key": key})
+            assert r.status_code == 404 and "No such resend" in r.text, (p, to, key)
+        # A target that fails the connection-name rule is refused before any lookup.
+        bad = await ui["allchannels"].get(path, params={"to": "<b>x</b>", "key": "k-ran"})
+        assert bad.status_code == 422, bad.status_code
+        # The origin channel is not checked: the target-only caller is shown the page, which
+        # names the target and neither the origin channel nor the source lane.
+        alone = await ui["target_only"].get(path, params=ran)
+        assert alone.status_code == 200 and "OB_Y" in alone.text, alone.status_code
+        assert "IB_A" not in alone.text and "OB_X" not in alone.text
+
+
+async def _measure_ui_suspend_refusal(k: _Callers) -> None:
+    pytest.importorskip("messagefoundry_webconsole")
+    # The fixture's one open alert per connection, so the page's list is scoped against a known set.
+    ids = {
+        a.connection: a.id
+        for a in await k.engine.store.list_active_alert_instances(allowed_channels=None)
+    }
+    # A suspender holding monitoring:diagnose WITHOUT monitoring:read, scoped to IB_A like "scoped".
+    role = await k.service.create_custom_role(
+        display_name="Alert Suspender",
+        description=None,
+        permissions=["monitoring:diagnose"],
+        actor="test",
+    )
+    suspender = await _operator(k.service, "suspender")
+    await k.service.set_roles(suspender, [role.id], actor="admin")
+    await k.service.set_channel_scope(suspender, ["IB_A"], actor="admin")
+    store = k.engine.store
+
+    async def suspended() -> list[float | None]:
+        rows = [await store.get_alert_instance(i, allowed_channels=None) for i in ids.values()]
+        return [row.suspended_until if row is not None else None for row in rows]
+
+    async def suspend_minutes() -> list[float]:
+        rows = await store.list_audit(action="alert_suspend", limit=500)
+        return sorted(json.loads(r["detail"])["minutes"] for r in rows)
+
+    async def audit_actions() -> tuple[int, list[str]]:
+        """The admission-row count, and every other action, as ``_measure_alert_writes`` reads
+        them."""
+        actions = [r["action"] for r in await store.list_audit(limit=10_000)]
+        granted = "auth.permission_granted"
+        return actions.count(granted), [a for a in actions if a != granted]
+
+    # The JSON route refuses the same bad windows with 422, before it reads the alert: an
+    # out-of-scope id and an unknown one get the 422 too. A missing window is refused as well.
+    for alert_id in (ids["IB_B"], 999_999):
+        for body in ({"minutes": 0}, {}, {"minutes": "  "}, {"minutes": "abc"}):
+            r = await k.c.post(f"/alerts/{alert_id}/suspend", json=body, headers=k.scoped)
+            assert r.status_code == 422, (alert_id, body, r.text)
+
+    before, rows_before = await suspended(), await suspend_minutes()
+    async with _ui_sessions(k, "suspender", "scoped", "allchannels") as ui:
+
+        async def post(username: str, alert_id: int, form: dict[str, str]) -> httpx.Response:
+            return await ui[username].post(
+                f"/ui/alerts/{alert_id}/suspend",
+                data=form,
+                headers={"Sec-Fetch-Site": "same-origin"},
+            )
+
+        # Refused before the alert is read: an in-scope id, an out-of-scope one and an unknown
+        # one alike.
+        pages: dict[tuple[str, int], str] = {}
+        for alert_id in (ids["IB_A"], ids["IB_B"], 999_999):
+            for username in ("suspender", "scoped", "allchannels"):
+                r = await post(username, alert_id, {"minutes": "0"})
+                assert r.status_code == 400 and "suspend window" in r.text, (username, alert_id)
+                pages[username, alert_id] = r.text
+        # A window of only whitespace does not parse, so it is refused, not read as 60.
+        r = await post("suspender", ids["IB_A"], {"minutes": "  "})
+        assert r.status_code == 400 and "suspend window" in r.text, r.status_code
+        # No refusal muted an alert or wrote a suspend audit row.
+        assert await suspended() == before and await suspend_minutes() == rows_before
+        # A valid window reaches the JSON handler, which reads the alert through the scope: an
+        # out-of-scope id and an unknown one answer its 404, with no state change and no audit
+        # row of any action, and require_ui writes no admission row either.
+        granted_before, others_before = await audit_actions()
+        for alert_id in (ids["IB_B"], ids["OB_X"], 999_999):
+            r = await post("suspender", alert_id, {"minutes": "5"})
+            assert r.status_code == 404, (alert_id, r.status_code)
+        assert await suspended() == before
+        assert await audit_actions() == (granted_before, others_before)
+        # Control for the row count, on the same app: the JSON gate's admission row is counted.
+        r = await ui["scoped"].post("/alerts/999999/suspend", json={"minutes": 5}, headers=k.scoped)
+        assert r.status_code == 404 and (await audit_actions())[0] > granted_before, r.text
+        # Control for the scope read: the scoped suspender reaches its own alert.
+        r = await post("suspender", ids["IB_A"], {"minutes": "5"})
+        assert r.status_code == 303, r.status_code
+        # The open defect the bullet names: an empty window and a missing one are read as 60
+        # minutes, and the audit row records 60 as if it were the request. A fix that refuses
+        # them must also change the bullet and its "60 minutes" and "open defect" facts.
+        started = time.time()
+        for alert_id, form in ((ids["IB_A"], {"minutes": ""}), (ids["IB_B"], {})):
+            r = await post("allchannels", alert_id, form)
+            assert r.status_code == 303, (
+                f"{form} answered {r.status_code}: if the 60-minute substitute is fixed, update "
+                "the /ui suspend bullet in docs/SECURITY.md and its _RULES facts with it"
+            )
+        assert await suspend_minutes() == sorted([*rows_before, 5.0, 60.0, 60.0])
+        after = dict(zip(ids, await suspended(), strict=True))
+        for name in ("IB_A", "IB_B"):
+            until = after[name]
+            assert until is not None and started + 3540 <= until <= time.time() + 3600, name
+        assert after["OB_X"] == dict(zip(ids, before, strict=True))["OB_X"]
+        narrow = pages["suspender", ids["IB_A"]]
+        # The list is the caller's scoped one, which leaves out the shared outbound IB_A feeds, and
+        # without monitoring:read the rules are left out.
+        assert "IB_A" in narrow and "IB_B" not in narrow and "OB_X" not in narrow
+        assert ">Rules<" not in narrow
+        # Control: an operator holds monitoring:read, so the same refusal shows the rules; the
+        # all-channels operator's list carries the alerts the scoped one's does not.
+        assert ">Rules<" in pages["scoped", ids["IB_A"]]
+        wide = pages["allchannels", ids["IB_A"]]
+        assert "IB_B" in wide and "OB_X" in wide
+
+
 class _Rule(NamedTuple):
     #: The routes its bullet must name, written as the doc backticks them, compared as exact tokens.
     routes: tuple[str, ...]
@@ -492,6 +667,49 @@ _RULES: dict[str, _Rule] = {
         _measure_ui_connection_page,
         # The bullet names the JSON routes' 403 to contrast with, so the contradiction is the verb.
         forbidden=("answers 403",),
+    ),
+    "ui-resend-done": _Rule(
+        ("GET /ui/messages/{message_id}/resend-done",),
+        (
+            "404",
+            "`key`",
+            "422",
+            "outside the caller's channel scope",
+            "does not check scope on the message's origin channel",
+            "target alone",
+            "no source",
+        ),
+        _measure_ui_resend_done,
+        # Vault BACKLOG #4776 item 1 is open: the route does not check the origin channel today.
+        # A bare "answers 403" is not forbidden here: the gate does answer 403 to a caller without
+        # messages:resend. The scope refusal is the 404 the measurement executes.
+        forbidden=(
+            "scope answers 403",
+            "403 when that target",
+            "checks scope on the origin",
+            "origin channel is checked",
+        ),
+    ),
+    "ui-suspend-refusal": _Rule(
+        ("POST /ui/alerts/{alert_id}/suspend",),
+        (
+            "400",
+            "only whitespace",
+            "422",
+            "before they read the alert",
+            "unknown one",
+            "60 minutes",
+            "open defect",
+            "the alert-writes rule above applies, its 404 included",
+            "`require_ui`, which writes no `auth.permission_granted` row",
+            "channel scope",
+            "`monitoring:read`",
+            "`monitoring:diagnose`",
+        ),
+        _measure_ui_suspend_refusal,
+        # A valid window can 404 in the handler, so only the refusal's 404 is wrong. A whitespace
+        # window is refused, so "blank" would claim what only an empty one does.
+        forbidden=("the same 404", "blank"),
     ),
 }
 

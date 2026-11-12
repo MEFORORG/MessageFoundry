@@ -1933,7 +1933,7 @@ the console routes with a rule of their own.
 | `POST` | `/ui/alerts/{alert_id}/ack` | `monitoring:diagnose` | `require_ui` |
 | `POST` | `/ui/alerts/{alert_id}/resolve` | `monitoring:diagnose` | `require_ui` |
 | `POST` | `/ui/alerts/{alert_id}/resume` | `monitoring:diagnose` | `require_ui` |
-| `POST` | `/ui/alerts/{alert_id}/suspend` | `monitoring:diagnose` | `require_ui` |
+| `POST` | `/ui/alerts/{alert_id}/suspend` | `monitoring:diagnose` | `require_ui` — data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `GET` | `/ui/approvals` | `approvals:approve` | `require_ui` |
 | `POST` | `/ui/approvals/{approval_id}/approve` | `approvals:approve` | `require_ui_step_up` — the fresh step-up the JSON approve asks for (#3241 R4); a stale window lands back on the page to approve again; the requester can never approve their own request |
 | `POST` | `/ui/approvals/{approval_id}/reject` | `approvals:approve` | `require_ui` |
@@ -1981,7 +1981,7 @@ the console routes with a rule of their own.
 | `POST` | `/ui/messages/{message_id}/edit-resend` | `messages:edit`**+**`messages:view_raw` | `require_ui_step_up_action` |
 | `GET` | `/ui/messages/{message_id}/parse-tree` | `messages:view_raw` | `require_ui` |
 | `GET` | `/ui/messages/{message_id}/resend-confirm` | `messages:resend` | `require_ui` |
-| `GET` | `/ui/messages/{message_id}/resend-done` | `messages:resend` | `require_ui` |
+| `GET` | `/ui/messages/{message_id}/resend-done` | `messages:resend` | `require_ui` — data rule: *Single-route data rules* below (BACKLOG #1151) |
 | `POST` | `/ui/messages/{message_id}/replay` | `messages:replay` | `require_ui_step_up` |
 | `POST` | `/ui/messages/{message_id}/resend` | `messages:resend` | `require_ui_step_up_action` |
 | `GET` | `/ui/messages/{message_id}/summary` | `messages:view_raw` | `require_ui` |
@@ -2343,8 +2343,8 @@ the same permission set on the same method reds CI until it is listed here.
 > `test_webui_bulk.py` pins the bulk page's 403 for an in-scope name no connection uses, on both
 > roles.
 
-> **Single-route data rules: at least these routes narrow or refuse by scope or owner, each in its
-> own way (BACKLOG #1151).** Their route rows above point here. A *scoped caller* is any
+> **Single-route data rules: at least these routes narrow or refuse by scope, owner or permission,
+> each in its own way (BACKLOG #1151).** Their route rows above point here. A *scoped caller* is any
 > non-administrator without the all-channels grant, including one with no channel at all. An
 > administrator is always all-channels, as the DLQ-SCOPE blockquote says, whatever scope is stored.
 >
@@ -2407,6 +2407,29 @@ the same permission set on the same method reds CI until it is listed here.
 >   that exists nowhere. That differs from the 403 the JSON per-name routes give, and it writes no
 >   `auth.channel_denied` row. Its reason page, `/ui/connection/{name}/events/{event_id}/reason`,
 >   shares the rule. On an in-scope page, a refused event read shows an empty event list.
+> - `GET /ui/messages/{message_id}/resend-done` answers 404 "No such resend" unless the store holds
+>   a resend record under the `key` it names, for that message and for the target `to` names. It
+>   also answers 404 when that target is outside the caller's channel scope, the same answer an
+>   unknown `key` gets. A `to` that fails the connection-name rule is refused with 422 before any
+>   lookup. It does not read the message, so it does not check scope on the message's origin
+>   channel, and a caller scoped to the target alone is shown the page. The page names the target
+>   and no source. Whether the origin channel should be checked here is an open question (vault
+>   BACKLOG #4776 item 1).
+> - `POST /ui/alerts/{alert_id}/suspend` refuses with 400 a `minutes` value that does not parse as a
+>   number, such as one of only whitespace, or that falls outside the suspend window's bounds, and
+>   re-renders the alerts page carrying the refusal. The JSON route refuses the same values with
+>   422. Both routes refuse before they read the alert, so for such a value an alert id outside the
+>   scope, or an unknown one, gets the same 400 here. A missing `minutes`, or an empty
+>   one, is not refused: `ui_suspend_alert` in `messagefoundry_webconsole/routes/monitoring_writes.py`
+>   reads it as 60 minutes, suspends the alert and writes `"minutes": 60.0` into the
+>   `alert_suspend` audit row, where the JSON route refuses it with 422. That contradicts the
+>   route's own BACKLOG #1744 comment, which says the 60-minute substitute was removed. It is an
+>   open defect. With a window it accepts, the route calls the JSON handler `suspend_alert`
+>   in-process, so the alert-writes rule above applies, its 404 included, except for the admission
+>   row: the route's gate is `require_ui`, which writes no `auth.permission_granted` row. The page
+>   lists only the active alerts in the caller's channel scope. It shows the alert rules only to a
+>   caller that also holds `monitoring:read`, since the route itself needs only
+>   `monitoring:diagnose`.
 >
 > The console reaches the same rules, because its routes call these handlers in-process. That
 > covers at least `/ui/messages/search/layered`, the `/ui/statistics/reset*` routes, the four
@@ -2417,11 +2440,13 @@ the same permission set on the same method reds CI until it is listed here.
 > `POST /ui/messages/search/presets/{preset_id}/delete` swallows the 404 and redirects, so another
 > user's preset id looks like one already deleted. `/ui/connections/purge-confirm` checks the
 > purge rule itself, before any purge: a scoped caller gets its own 403 and denial row. The
-> `/ui/nav-status` alert bell is null without `monitoring:diagnose`.
+> `/ui/nav-status` alert bell is null without `monitoring:diagnose`. The `/ui` suspend differs
+> in at least the ways its own bullet above states.
 >
 > `tests/test_single_route_data_rules_doc_drift.py` executes the main facts of each bullet, with an
 > all-channels caller as the control. The security-event feed has no channel axis, so its control
-> is the raw audit log. It reds if a bullet loses its route, a named fact, or its
+> is the raw audit log. The suspend page's rules gate is a permission fact, so its control is a
+> `monitoring:read` holder. It reds if a bullet loses its route, a named fact, or its
 > route-map pointer, or names a route nothing executes. It does not execute this console paragraph,
 > the outbound-by-name case, or the administrator case; those are read from the code.
 
@@ -5595,6 +5620,33 @@ a 401 from a request that carried the token; a background timer never clears it,
 session took no part in is not evidence about the session. (The retired PySide6 desktop console's
 OS-keyring token cache is an accepted retirement loss — BACKLOG #103. That retired one *instance* of
 durable token storage, not the shape: the extension's SecretStorage cache is a live one.)
+
+**At least these systems create, hold or manage a session that reaches the engine.** The directory
+and federated legs below ship off: `[auth].ad_enabled`, `[auth].kerberos_enabled` and
+`[auth].oidc_enabled` all default to false.
+
+- **The engine** creates every session row at one site, `AuthService._issue_session` in
+  `messagefoundry/auth/service.py`, the engine's only caller of `Store.create_session`, and stamps
+  the absolute lifetime there from `[security].max_session_hours`. A rotation mints a new token for
+  an existing row through `Store.rotate_session` instead. The store keeps only the token's hash.
+- **At least the web console, `apiclient` and the VS Code extension** hold the token (table
+  above), and so does `tee compare`, which takes a bearer token on its command line (`--token` in
+  `tee/__main__.py`). The extension signs in through `POST /auth/login` with a local account:
+  `/auth/providers` reports `ad` as false, and the engine refuses `provider: "ad"`.
+- **LDAP (Active Directory)**, under `ad_enabled`, is the directory the Kerberos and OIDC legs
+  resolve a principal against, and the bind the directory session reconciler uses. It accepts no
+  directory-password sign-in; that pathway is retired (BACKLOG #1137). It does bind a directory
+  account's own password on the step-up re-bind, `AuthService._reauth_ad`, which at least
+  `POST /me/reauth` and `POST /ui/reauth` reach through `AuthService.reauth`. A session the OIDC
+  login minted is refused there before any bind (`AuthService.session_steps_up_at_idp`). A step-up
+  that `AuthService.reauth` grants, on either provider, stamps the session's `reauth_at` and
+  rotates the session. The reconciler can revoke a directory account's live sessions, and
+  *Directory session reconciliation* below states when.
+- **Kerberos (Windows SSO)** creates a directory session through `POST /auth/negotiate` and the
+  console's `GET /ui/sso` when `kerberos_enabled` is set. The engine reads no ticket lifetime, so such
+  a session's absolute lifetime is the engine's own flat cap, not the directory's (ADR 0079).
+- **OIDC** creates a federated session when `oidc_enabled` is set. The IdP's assertions can only
+  shorten its absolute lifetime below the engine's cap; *Federated sign-in* above states the caps.
 
 ### A revoked privilege reaches the next request, with exceptions (ASVS 8.3.2)
 
