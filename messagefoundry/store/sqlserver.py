@@ -14030,10 +14030,10 @@ class SqlServerStore:
         Constant-time, full-walk (ASVS 11.2.4) — see the SQLite twin
         (:meth:`~messagefoundry.store.store.MessageStore.verify_audit_chain`) and
         :func:`~messagefoundry.store.store.verify_audit_rows`, which say which row compares are
-        :func:`hmac.compare_digest` and which are Transit's own ``verify``. The anchor head is
-        compared with :func:`hmac.compare_digest` over
-        :func:`~messagefoundry.store.store.audit_mac_bytes`. A break does not end the walk, and the
-        first divergent row id is reported after it (BACKLOG #1904 made the walk shared)."""
+        :func:`hmac.compare_digest` and which are Transit's own ``verify``. A break does not end
+        the walk, and the first divergent row id is reported after it (BACKLOG #1904 made the walk
+        shared). Only when the walk found no break is the anchor head compared, with
+        :func:`hmac.compare_digest` over :func:`~messagefoundry.store.store.audit_mac_bytes`."""
         # The walk is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each keyed row
         # is checked under the key of its OWN range, so a rotation no longer reads as tampering.
         return verify_audit_rows(
