@@ -91,6 +91,9 @@ __all__ = [
     "ledger_holds",
     "DeliveryError",
     "NegativeAckError",
+    "INSECURE_HOP_REFUSED_CODE",
+    "insecure_hop_refused",
+    "closed_connector_error",
     "SourceStartupError",
     "TestNotSupportedError",
     "DeliveryResponse",
@@ -1327,6 +1330,47 @@ class NegativeAckError(DeliveryError):
         self.permanent = permanent
         self.credential_fault = credential_fault
         self.config_fault = config_fault
+
+
+#: ``NegativeAckError.code`` of a delivery its send-time hop re-check refused (:func:`insecure_hop_refused`).
+INSECURE_HOP_REFUSED_CODE = "insecure-hop-refused"
+
+
+def insecure_hop_refused(exc: Exception, *, connector: str) -> NegativeAckError:
+    """The delivery-time form of a send-time hop refusal ``exc`` (BACKLOG #2989, #5719, #5718).
+
+    The HTTP family's ``InsecureHopGuard.assert_delivery_url`` (``transports/rest.py``) and the
+    raw-TCP family's ``InsecureHopGuard.assert_delivery`` (``transports/mllp.py``) both raise it, so
+    the two classify alike. Only an outbound whose send calls one of those two classifies its
+    refusal: at least MLLP, X12 and the HTTP family do; an outbound that still calls the bare
+    ``assert_send`` leaves the refusal an internal error. A permanent configuration fault: the guard keys on the connection's own
+    target and the posture captured when it was built, so every queued row would meet the same
+    refusal until an operator changes the connection and reloads. Under the default
+    ``credential_fault_policy`` the delivery worker stops the lane and keeps the queue. The text is
+    the guard's, which names the connection, the cell and the hop, and no message content."""
+    return NegativeAckError(
+        f"{connector} send refused: {exc}",
+        code=INSECURE_HOP_REFUSED_CODE,
+        permanent=True,
+        config_fault=True,
+    )
+
+
+def closed_connector_error(
+    transport: str, host: str, port: int, *, written: bool = False
+) -> DeliveryError:
+    """The retryable error of a send that reached an outbound ``aclose()`` already closed.
+
+    A reload swaps the connector out and closes the old one, so a send still holding it retries on
+    the replacement. It is a plain :class:`DeliveryError` on purpose: never a permanent or
+    configuration fault, because the replacement may deliver where the closed connector would not.
+    ``written`` says the close cut a send whose payload had already been written, so the partner may
+    hold it and the retry may deliver it twice."""
+    when = " after the payload was written (delivery indeterminate)" if written else ""
+    return DeliveryError(
+        f"{transport} destination {host}:{port} is closed (stop/reload){when}; "
+        "delivery retries on the replacement connector"
+    )
 
 
 class TestNotSupportedError(Exception):

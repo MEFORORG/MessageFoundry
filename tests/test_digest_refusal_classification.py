@@ -45,7 +45,11 @@ from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.store.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.transports import build_destination
-from messagefoundry.transports.base import DeliveryError, NegativeAckError
+from messagefoundry.transports.base import (
+    INSECURE_HOP_REFUSED_CODE,
+    DeliveryError,
+    NegativeAckError,
+)
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.http_auth import (
     HttpAuthError,
@@ -55,7 +59,6 @@ from messagefoundry.transports.http_auth import (
 from messagefoundry.transports.rest import (
     AUTH_CHALLENGE_REFUSED,
     AUTH_CHALLENGE_REFUSED_CODE,
-    INSECURE_HOP_REFUSED_CODE,
     InsecureHopGuard,
     ProxyConfig,
     auth_challenge_refused,

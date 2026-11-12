@@ -114,8 +114,10 @@ from messagefoundry.transports.base import (
     InboundHandler,
     NegativeAckError,
     SourceConnector,
+    closed_connector_error,
     float_setting,
     hold_and_retry,
+    insecure_hop_refused,
     intake_open,
     owes_hl7_reply,
     port_setting,
@@ -537,6 +539,19 @@ class InsecureHopGuard:
             raise InsecureHopRefused(
                 f"{hop_name_prefix(self.connection)}{self.cell}: {self._detail()}"
             )
+
+    def assert_delivery(self, *, connector: str) -> None:
+        """:meth:`assert_send` for a delivery, with the refusal classified (BACKLOG #5719, #5718).
+
+        The raw :class:`~messagefoundry.config.tls_policy.InsecureHopRefused` is a ``ValueError``,
+        which the delivery worker would file as an internal error and, under the default policy,
+        dead-letter row by row. It is raised instead as the lane-stopping configuration fault
+        :func:`~messagefoundry.transports.base.insecure_hop_refused` builds, as the HTTP family's
+        ``assert_delivery_url`` raises it."""
+        try:
+            self.assert_send()
+        except InsecureHopRefused as exc:
+            raise insecure_hop_refused(exc, connector=connector) from exc
 
 
 def _set_tcp_nodelay(writer: asyncio.StreamWriter) -> None:
@@ -1082,13 +1097,19 @@ class MLLPDestination(DestinationConnector):
                 "MLLPDestination.send() called concurrently on one instance — the delivery worker "
                 "must be the lane's single serial sender (per-lane FIFO invariant, ADR 0067)"
             )
+        # A send that reaches a connector aclose() already closed (a reload swapped it out) retries on
+        # the replacement. Checked before the hop guard, whose refusal now stops the lane, so a stale
+        # guard on a replaced connector never stops a lane its replacement would deliver on (#5719).
+        if self._closed:
+            raise closed_connector_error("MLLP", self.host, self.port)
         self._sending = True
         try:
             if self._hop_guard is not None:
                 # Zero-I/O byte-crossing backstop (#200): assert the cleartext hop is still permitted
                 # before any payload byte leaves the box (defense in depth against a reload routing PHI
-                # around the construction-only gate).
-                self._hop_guard.assert_send()
+                # around the construction-only gate). A refusal is a lane-stopping configuration
+                # fault, never an internal error (BACKLOG #5719).
+                self._hop_guard.assert_delivery(connector="MLLP")
             payload = self._rewrite_for_wire(payload)
             # ADR 0205 rule 1: frame once, before any dial; the four paths below only write bytes.
             wire = frame_for_delivery(MLLP_CODEC, payload, self.encoding, transport="MLLP")
@@ -1218,13 +1239,6 @@ class MLLPDestination(DestinationConnector):
         reconnect-before-first-byte (uncharged) → write/drain/ACK-read (any failure after ``write()``
         is charged, names its phase, and discards the connection) → re-cache on a fully-successful
         transaction (including a NAK) unless the peer left extra bytes behind (desync guard)."""
-        if self._closed:
-            # aclose() already ran (engine stop / reload swap) — never re-establish a socket the
-            # lifecycle can no longer close. Fail loud; the retry lands on the replacement connector.
-            raise DeliveryError(
-                f"MLLP destination {self.host}:{self.port} is closed (stop/reload); "
-                "delivery retries on the replacement connector"
-            )
         conn = self._conn
         if conn is not None:
             reason = self._stale_reason(*conn)
@@ -1244,7 +1258,16 @@ class MLLPDestination(DestinationConnector):
                 await self._close_bounded(conn[1])
                 conn = None
         if conn is None:
+            # aclose() (engine stop / reload swap) may run during the stale socket's close above or
+            # during the dial below, and it cannot see a socket that is not cached yet. Never cache
+            # a socket the lifecycle can no longer close: fail loud, and the retry lands on the
+            # replacement connector. send() checks first, before the hop guard.
+            if self._closed:
+                raise closed_connector_error("MLLP", self.host, self.port)
             conn = await self._dial()
+            if self._closed:
+                await self._close_bounded(conn[1])
+                raise closed_connector_error("MLLP", self.host, self.port)
             self._established_at = time.monotonic()
         reader, writer = conn
         # Keep the in-flight connection visible in the cache slot so a concurrent aclose() (the
@@ -1349,13 +1372,6 @@ class MLLPDestination(DestinationConnector):
         reconnect, never a mis-parse). Reuse-time liveness → reconnect-before-first-byte (uncharged) →
         write/drain → re-cache on drain success; any failure after ``write()`` discards the connection
         (charged; the next send re-dials)."""
-        if self._closed:
-            # aclose() already ran (engine stop / reload swap) — never re-establish a socket the
-            # lifecycle can no longer close. Fail loud; the retry lands on the replacement connector.
-            raise DeliveryError(
-                f"MLLP destination {self.host}:{self.port} is closed (stop/reload); "
-                "delivery retries on the replacement connector"
-            )
         conn = self._conn
         if conn is not None:
             reason = self._stale_reason(*conn)
@@ -1374,7 +1390,16 @@ class MLLPDestination(DestinationConnector):
                 await self._close_bounded(conn[1])
                 conn = None
         if conn is None:
+            # aclose() (engine stop / reload swap) may run during the stale socket's close above or
+            # during the dial below, and it cannot see a socket that is not cached yet. Never cache
+            # a socket the lifecycle can no longer close: fail loud, and the retry lands on the
+            # replacement connector. send() checks first, before the hop guard.
+            if self._closed:
+                raise closed_connector_error("MLLP", self.host, self.port)
             conn = await self._dial()
+            if self._closed:
+                await self._close_bounded(conn[1])
+                raise closed_connector_error("MLLP", self.host, self.port)
             self._established_at = time.monotonic()
         _reader, writer = conn
         # Keep the in-flight connection visible so a concurrent aclose() (the documented reload race)

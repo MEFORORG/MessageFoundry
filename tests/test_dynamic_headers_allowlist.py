@@ -29,11 +29,10 @@ from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.store.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.transports import build_destination
-from messagefoundry.transports.base import NegativeAckError
+from messagefoundry.transports.base import INSECURE_HOP_REFUSED_CODE, NegativeAckError
 from messagefoundry.transports.fhir import FhirDestination
 from messagefoundry.transports.rest import (
     DYNAMIC_HEADER_REFUSED_CODE,
-    INSECURE_HOP_REFUSED_CODE,
     VERIFY_OFF_STATIC_HEADER_ALLOWLIST,
     InsecureHopGuard,
     RestDestination,
