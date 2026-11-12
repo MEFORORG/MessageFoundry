@@ -454,3 +454,72 @@ async def test_stop_stays_bounded_when_a_reply_turn_never_leaves(
     data = await _post_then_stop(src, handler, blocked)
     assert loop.time() - started < 3.0, "stop() outlived its grace"
     assert not data.startswith(b"HTTP/1.1 2"), "a cancelled turn must not read as answered"
+
+
+class _PeerClosedWriter:
+    """A writer whose transport is already closing, as one is after a peer's close_notify or reset."""
+
+    def __init__(self) -> None:
+        self.written: list[bytes] = []
+
+    def is_closing(self) -> bool:
+        return True
+
+    def write(self, data: bytes) -> None:
+        self.written.append(data)
+
+    async def drain(self) -> None:
+        return None
+
+
+def _complete_post() -> asyncio.StreamReader:
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"POST /ingest HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\n{}")
+    reader.feed_eof()
+    return reader
+
+
+async def test_a_request_read_in_full_is_committed_when_the_peer_already_closed() -> None:
+    # BACKLOG #5715, a regression its round-2 commit made: `_serve_one` dropped a request read in
+    # full whenever its writer was closing. A peer that closes right after a complete POST closes
+    # the writer too, so that request would have been taken off the wire with no ingress row and no
+    # event. Only a stopping listener may decline it; a serving one commits it as before.
+    src = HttpSource(Source(type=ConnectorType.HTTP, settings={"host": "127.0.0.1", "port": 0}))
+    committed: list[bytes] = []
+
+    async def handler(raw: bytes) -> IngressReceipt:
+        committed.append(raw)
+        return IngressReceipt.accepted("msg-1")
+
+    await src.start(receipt_handler(handler))
+    try:
+        writer: Any = _PeerClosedWriter()
+        await src._serve_one(_complete_post(), writer, peer_host="127.0.0.1")
+    finally:
+        await src.stop()
+    assert committed == [b"{}"], "a request read in full was dropped with no ingress row"
+
+
+async def test_a_request_read_in_full_as_stop_closes_its_writer_is_not_handed_on(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The case the early return exists for: stop() closed this writer while the request's last
+    # bytes sat in the reader's buffer, so no answer could reach the peer. Nothing is handed on, and
+    # the decline is logged, since no ingress row or connection event records it.
+    src = HttpSource(Source(type=ConnectorType.HTTP, settings={"host": "127.0.0.1", "port": 0}))
+    committed: list[bytes] = []
+
+    async def handler(raw: bytes) -> IngressReceipt:
+        committed.append(raw)
+        return IngressReceipt.accepted("msg-1")
+
+    await src.start(receipt_handler(handler))
+    await src.stop()
+    closed = _PeerClosedWriter()
+    writer: Any = closed
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.http_listener"):
+        result = await src._serve_one(_complete_post(), writer, peer_host="127.0.0.1")
+    assert result is False
+    assert committed == []
+    assert closed.written == []
+    assert "was not committed or answered" in caplog.text
