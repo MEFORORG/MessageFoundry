@@ -505,6 +505,7 @@ from messagefoundry.pipeline.wiring_runner import (
     DrParkedError,
     NotDeployedError,
     RegistryRunner,
+    RunnerNotRunningError,
     ShardLaneOwnershipError,
 )
 from messagefoundry.privilege_probes import probe_vault
@@ -966,6 +967,12 @@ def _replay_in_scope(identity: Identity, channel_id: str | None) -> bool:
     return identity.can_access_channel(channel_id)
 
 
+#: The INFO line for an alert control action the runner refused because its graph is down, as on a
+#: demoted follower (BACKLOG #5702). The node that runs the graph acts on its own alert.
+_ALERT_GRAPH_DOWN: Final = (
+    "alert control_action %s for %r not run: this engine's graph is not running"
+)
+
 #: Which namespace each alert control action restarts (BACKLOG #2528).
 _CONTROL_ACTION_SIDE: Final = {"restart_inbound": "inbound", "restart_outbound": "outbound"}
 
@@ -1023,7 +1030,10 @@ async def _alert_control_action(
                 target,
             )
             return
-        await rr.restart_inbound(target)
+        try:
+            await rr.restart_inbound(target)
+        except RunnerNotRunningError:
+            _log.info(_ALERT_GRAPH_DOWN, action, target)
     elif action == "restart_outbound":
         if rr.outbound_dr_failed(target):
             # Its build failed as it left the DR park (vault BACKLOG #3263). A reload or an
@@ -1042,6 +1052,8 @@ async def _alert_control_action(
                 "alert control_action restart_outbound for %r not run: the DR run-profile parks it",
                 target,
             )
+        except RunnerNotRunningError:
+            _log.info(_ALERT_GRAPH_DOWN, action, target)
 
 
 def _upload_owner(meta: UploadedFileMeta) -> dict[str, str]:
@@ -5871,6 +5883,10 @@ def create_app(
                 # is a CONFIG change (flip deployed=true + reload + supply its env() values), not a
                 # runtime action. (stop never raises: an already-parked lane is a no-op.)
                 raise HTTPException(409, str(exc)) from None
+            except RunnerNotRunningError as exc:
+                # BACKLOG #5702: the graph is down, as on a demoted follower whose API still serves,
+                # so a start would bind a listener outside the engine lifecycle. 503, as no runner is.
+                raise HTTPException(503, str(exc)) from None
             except TrustAnchorError as exc:
                 # vault BACKLOG #2371: an Ftp poller's CA was refused. The runner recorded it failed
                 # and logged why. Raised below, outside this handler, so the refusal, which names
@@ -5943,6 +5959,10 @@ def create_app(
                 # vault BACKLOG #3067: start, stop and restart of an outbound the DR run-profile parks
                 # are refused, so the lane keeps the park until the reload after POST /dr/release.
                 raise HTTPException(409, str(exc)) from None
+            except RunnerNotRunningError as exc:
+                # BACKLOG #5702: the graph is down, so a start would spawn a delivery worker outside
+                # the engine lifecycle and a stop would record a pause a later start inherits.
+                raise HTTPException(503, str(exc)) from None
             if held:
                 await _record_refused_control_audit(
                     engine,

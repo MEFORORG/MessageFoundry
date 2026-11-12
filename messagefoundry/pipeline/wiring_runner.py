@@ -540,6 +540,27 @@ class ShardLaneOwnershipError(RuntimeError):
         self.shard = shard
 
 
+class RunnerNotRunningError(RuntimeError):
+    """A run-state CONTROL (an inbound start or restart, an outbound start, stop or restart)
+    targeted a runner whose graph is not running (BACKLOG #5702).
+
+    Refused rather than acted on. The graph is down, at least before :meth:`RegistryRunner.start`
+    and after a teardown, which includes the ADR 0157 demoted follower, whose ``_stop_graph`` stops
+    the runner while the API keeps serving. A start there would bind a live listener or spawn a
+    delivery worker outside the engine lifecycle, so a node that is not the leader would take
+    traffic, and a stop would record a pause that a later promotion's start inherits. An inbound
+    stop is not refused: with the graph down it has nothing to unbind and records nothing. The API
+    maps this to 503, as it does a missing runner."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(
+            f"connection {name!r}: this engine's graph is not running (stopped, or a standby or "
+            "demoted node), so it takes no connection control; issue it against the node that runs "
+            "the graph"
+        )
+        self.name = name
+
+
 # A delivery worker backs off this long after an *unexpected* error (e.g. the store being briefly
 # unavailable) before retrying, so a transient failure logs once and recovers instead of hot-looping.
 _WORKER_ERROR_BACKOFF_SECONDS = 1.0
@@ -3992,6 +4013,7 @@ class RegistryRunner:
         scheduler or an alert rule does nothing (:meth:`_dr_refuses`). Only an ``operator`` start
         raises ``connection_started`` (BACKLOG #1741, :meth:`_resolving_start`)."""
         async with self._reload_lock:
+            self._require_running(name)
             if self._dr_refuses(name, operator=operator):
                 return
             await self._resolving_start(name, resolve=operator)
@@ -4063,6 +4085,7 @@ class RegistryRunner:
         # One lock span so stop+start is atomic w.r.t. a concurrent reload (review M-10). Refused
         # whole on a passive standby, so an engine restart cannot drop an operator's start either.
         async with self._reload_lock:
+            self._require_running(name)
             if self._dr_refuses(name, operator=operator):
                 return
             await self._stop_inbound_unsafe(name)
@@ -4108,6 +4131,13 @@ class RegistryRunner:
         )
         return True
 
+    def _require_running(self, name: str) -> None:
+        """Refuse a run-state control while the graph is not running (BACKLOG #5702), with
+        :class:`RunnerNotRunningError`. Read under the reload lock, which :meth:`start` and every
+        teardown also hold, so the flag cannot change between this read and the act."""
+        if not self._running:
+            raise RunnerNotRunningError(name)
+
     def _require_owned_destination(self, name: str) -> None:
         """Refuse an outbound CONTROL for a lane another shard owns (ADR 0073). Without this, a
         non-owning shard's pause reports quiesced instantly (it has no worker/dispatcher lane) and
@@ -4150,6 +4180,7 @@ class RegistryRunner:
         ``hold_on_store_fault`` is the operator control route's alone: see
         :meth:`_start_outbound_unsafe`, which raises for it (vault BACKLOG #3746)."""
         async with self._reload_lock:
+            self._require_running(name)
             self._require_owned_destination(name)
             self._refuse_dr_parked(name)
             if not self._outbound_start_permitted(name):
@@ -4168,6 +4199,7 @@ class RegistryRunner:
         holding its rows, and a stop would turn the engine's park into an operator pause that the
         reload after a release could not lift (vault BACKLOG #3067)."""
         async with self._reload_lock:
+            self._require_running(name)
             self._require_owned_destination(name)
             self._refuse_dr_parked(name)
             self._stop_outbound_unsafe(name)
@@ -4200,6 +4232,7 @@ class RegistryRunner:
         ``hold_on_store_fault`` is the operator control route's alone, as on :meth:`start_outbound`.
         The stop half has run by then, so a raise leaves the lane paused."""
         async with self._reload_lock:
+            self._require_running(name)
             self._require_owned_destination(name)
             self._refuse_dr_parked(name)
             engine_parked = name in self._gate_parked
