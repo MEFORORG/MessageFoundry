@@ -476,6 +476,23 @@ async def test_a_demoted_node_with_a_paused_lane_releases_and_stops(
     assert again is not None and again.id == head.id
 
 
+async def test_a_demoted_node_with_no_connector_spends_no_attempt(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No pause and no halt, so the seam lets the head through to the single-row body. Its
+    leadership check comes before the missing-connector arm, so a demoted node releases the head
+    and STOPs the lane rather than charging it a failed attempt."""
+    head = await _one_claimed_head(store)
+    runner = _paced_runner(store, _Recorder())
+    runner._retry[DEST] = RetryPolicy(max_attempts=1)  # one charged attempt would dead-letter it
+    del runner._destinations[DEST]
+    monkeypatch.setattr(runner._coordinator, "is_leader", lambda: False)
+    result = await runner._dispatch_delivery(DEST, head)
+    assert result.kind is LaneResultKind.STOP
+    (row,) = await store.outbox_for(head.message_id)
+    assert (row["status"], row["attempts"], row["last_error"]) == ("pending", 0, None)
+
+
 async def test_a_halted_head_on_a_demoted_node_with_no_connector_spends_no_attempt(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

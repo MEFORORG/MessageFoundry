@@ -666,7 +666,8 @@ class StageDispatcher:
         purge's PENDING-only ``cancel_queued`` could never clear. So a lane mid-episode
         (CLAIMING/PROCESSING) is
         marked ``pause_pending`` and reaches PAUSED at the terminal transition / next empty claim, after
-        its <=1 in-flight OUTBOUND head finishes (delivered, or re-pended PENDING by a FIFO RETRY) —
+        its <=1 in-flight OUTBOUND head finishes (delivered, re-pended PENDING by a FIFO RETRY, or
+        handed back unsent by the runner's pause gate, BACKLOG #5709) —
         leaving zero rows INFLIGHT, which is exactly the require-stopped-before-purge precondition."""
         st = self._states.get(key)
         if st is None:  # not yet registered — create it already PAUSED so a first wake can't arm it

@@ -1108,6 +1108,48 @@ async def test_a_demotion_and_a_pause_while_the_envelope_is_framed_send_nothing(
     assert await _attempts(store, mids) == [0, 0, 0]
 
 
+async def test_a_demotion_alone_while_the_envelope_is_framed_sends_nothing(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Leadership is lost while the envelope is framed, with no pause and no halt. The gate right
+    before the send asks for leadership too, so a stale ex-leader sends nothing and releases every
+    member for the new leader."""
+    mids = await _enqueue(store, 3)
+    runner = _runner(store)
+    rec = _Recorder()
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
+    real_encode = wiring_runner.encode_batch
+
+    def _encode_then_demote(*args: Any, **kwargs: Any) -> str:
+        _demote(runner, monkeypatch)
+        return real_encode(*args, **kwargs)
+
+    monkeypatch.setattr(wiring_runner, "encode_batch", _encode_then_demote)
+    head = await store.claim_next_fifo(DEST)
+    outcome, _ = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    assert rec.sent == []
+    assert outcome is wiring_runner._ItemOutcome.STOPPED
+    assert await _states(store, mids) == [QUEUED] * 3
+    assert await _attempts(store, mids) == [0, 0, 0]
+
+
+async def test_a_demoted_node_with_no_connector_spends_no_attempt_on_a_batch(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A demoted node whose lane has no connector, with no pause and no halt. The leadership check
+    comes before the missing-connector arm, so the members are released and the lane STOPs rather
+    than every member being charged a failed attempt."""
+    mids = await _enqueue(store, 2)
+    runner = _runner(store)
+    _wire_batch(runner, _Recorder(), BatchConfig(max_count=5, max_wait_ms=1))
+    del runner._destinations[DEST]
+    _demote(runner, monkeypatch)
+    head = await store.claim_next_fifo(DEST)
+    outcome, _ = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    assert outcome is wiring_runner._ItemOutcome.STOPPED
+    assert await _attempts(store, mids) == [0, 0]
+
+
 async def test_a_demotion_and_a_pause_before_every_member_is_refused_writes_no_refusal(
     store: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
