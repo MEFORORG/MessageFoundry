@@ -4783,7 +4783,9 @@ class UnknownRoleError(LookupError):
     Raised by each backend's ``_write_user`` for an id the write ADDS whose role was gone when the
     write read the ``roles`` table, so a role deleted after a caller's own check is not granted. A
     delete that commits after that read is refused instead by the ``user_roles`` foreign key, which
-    every backend has, as the driver's integrity error. Either way no record seals the id."""
+    every backend has, as the driver's integrity error. Either way no record seals the id. SQL
+    Server's ``_write_ad_map`` raises it too, through :func:`existing_role_pairs_only` (BACKLOG
+    #5725), where SQLite and Postgres raise their driver's integrity error from the map's key."""
 
     def __init__(self, role_ids: Sequence[str]) -> None:
         self.role_ids = tuple(role_ids)
@@ -4940,8 +4942,9 @@ class AdMap:
     ``name`` is the map (:data:`AD_MAPS`). ``pairs`` are sorted ``(ad_group, value)``, the value
     being a role id or a channel; the seal covers them and the name. ``missing`` names mapped role
     ids with no ``roles`` row when the role map was read. It is not sealed: it is read beside the
-    map so a deleted role is never handed out, on SQL Server especially, where the role map has no
-    role foreign key. The channel map's ``missing`` is always empty."""
+    map so a deleted role is never handed out, on SQL Server especially, where the role map's
+    foreign key is ``WITH NOCHECK`` and compares in the database collation, so the read matches a
+    role id exactly (BACKLOG #5725). The channel map's ``missing`` is always empty."""
 
     name: str
     pairs: tuple[tuple[str, str], ...] = ()
@@ -4962,7 +4965,9 @@ class AdMap:
     def from_entries(cls, name: str, entries: Iterable[tuple[str, str]]) -> AdMap:
         """The map an administrator's entries describe, as the map stores them: group names as
         :func:`ad_group_keys` keeps them. A channel is stripped and a blank one dropped; a role id
-        is kept as given, and an unknown one is refused by the roles foreign key."""
+        is kept as given, and an unknown one is refused at the write: by the roles foreign key on
+        SQLite and Postgres, and on SQL Server, whose case-insensitive collation that key cannot
+        rely on, by :func:`existing_role_pairs_only` before the key (BACKLOG #5725)."""
         if name == AD_SCOPE_MAP:
             entries = [(g, v.strip()) for g, v in entries if v.strip()]
         return cls.of(name, ((g.strip().lower(), v) for g, v in entries if g.strip()))
@@ -5023,7 +5028,8 @@ async def ad_map_seal_ok_async(sealer: AnyRowSealer | None, current: AdMap) -> b
 
 
 #: A write to one AD map, for a backend's ``_write_ad_map``: a whole replacement map, which keeps
-#: nothing stored and so is never refused, or an edit of the stored map, which is checked first.
+#: nothing stored and so is never refused over the stored map's seal, or an edit of the stored map,
+#: which is checked first. Either is refused for a role id that names no role (BACKLOG #5725).
 AdMapChange = AdMap | Callable[[AdMap], AdMap]
 
 
@@ -5068,6 +5074,42 @@ def _ad_map_if_changed(current: AdMap, new: AdMap) -> AdMap | None:
     if new.pairs == current.pairs and new.seal == current.seal:
         return None
     return new
+
+
+def existing_role_pairs_only(
+    current: AdMap, change: AdMapChange, present: Iterable[str]
+) -> AdMapChange:
+    """``change`` to the role map with every role id that has no ``roles`` row handled, given the
+    ids that have one, compared EXACTLY (BACKLOG #5725). The role map's twin of
+    :func:`existing_roles_only`: a backend whose role foreign key cannot refuse every such id calls
+    it inside its ``_write_ad_map`` transaction, before the write seals anything.
+
+    A whole replacement, an administrator's save, naming any role id not in ``present`` raises
+    :class:`UnknownRoleError`, as the foreign key does on SQLite and Postgres, so neither a deleted
+    role's id nor a case or trailing-space variant of a live one is ever sealed in. An edit raises
+    for a pair it ADDS; a pair ``current`` already held is dropped instead: a row a deleted role, or
+    a write before this check, left behind, which grants nothing, and which an edit such as a role
+    delete or a key rotation's re-seal must not be refused over."""
+    held = frozenset(present)
+
+    def checked(new: AdMap, had: frozenset[tuple[str, str]]) -> AdMap:
+        added = sorted({pair[1] for pair in new.pairs if pair[1] not in held and pair not in had})
+        if added:
+            raise UnknownRoleError(added)
+        kept = tuple(pair for pair in new.pairs if pair[1] in held)
+        if len(kept) == len(new.pairs):
+            return new
+        log.warning(
+            "an AD role map write dropped %d pair(s) whose role id matches no role exactly"
+            " (BACKLOG #5725)",
+            len(new.pairs) - len(kept),
+        )
+        return replace(new, pairs=kept)
+
+    if isinstance(change, AdMap):
+        return checked(change, frozenset())
+    had = frozenset(current.pairs)
+    return lambda m: checked(change(m), had)
 
 
 class AdMapSql(NamedTuple):
@@ -9180,6 +9222,65 @@ type TransitAttestationFetch = Callable[
 ]
 
 
+#: How many statements :func:`_exact_audit_row` may issue before it fails closed (BACKLOG #5726).
+#: A variant row needs a write outside the engine or an account whose name differs only in case,
+#: so a lookup that meets this many is refused rather than walked further.
+_EXACT_AUDIT_WALK_STEPS: Final = 64
+
+
+async def _exact_audit_row(
+    fetch: TransitAttestationFetch,
+    columns: str,
+    where: str,
+    params: tuple[object, ...],
+    exact: Callable[[Mapping[str, Any]], bool],
+    *,
+    above: int | None = None,
+    at_most: int | None = None,
+) -> Mapping[str, Any] | None:
+    """The newest ``audit_log`` row numbered above ``above`` and at most ``at_most`` that matches
+    ``where`` EXACTLY, read through ``fetch``.
+
+    BACKLOG #5726: ``where`` compares text in the database collation, which on SQL Server folds
+    case and pads trailing spaces, so ``MAX(seq)`` alone could pick a variant row (another account
+    whose name differs only in case, or a row written outside the engine) and shadow the row the
+    caller wants, refusing genuine evidence. Each row ``where`` finds is therefore checked with
+    ``exact`` in Python, and a variant is stepped past, one indexed lookup each, until an exact
+    row or none is left: one more statement per variant row, each an aggregate over the rows
+    ``where`` matches. The bound moves strictly every step, so the walk ends. On SQLite and
+    Postgres, which compare exactly, the first row is the answer.
+
+    A variant row whose ``seq`` is not an integer is RETURNED, not stepped past or read as none:
+    every caller rechecks the row exactly and refuses it, so a malformed read fails closed, and the
+    supersession check, for which "no row" means "nothing supersedes", never fails open. So is the
+    last variant row once :data:`_EXACT_AUDIT_WALK_STEPS` statements are spent: anyone who can
+    write ``audit_log`` could otherwise make one lookup issue a statement per planted row."""
+    hi = at_most
+    row: Mapping[str, Any] | None = None
+    for _ in range(_EXACT_AUDIT_WALK_STEPS):
+        conds, args = [where], list(params)
+        if above is not None:
+            conds.append("seq > ?")
+            args.append(above)
+        if hi is not None:
+            conds.append("seq <= ?")
+            args.append(hi)
+        row = await fetch(
+            f"SELECT {columns} FROM audit_log WHERE seq ="
+            f" (SELECT MAX(seq) FROM audit_log WHERE {' AND '.join(conds)})",
+            tuple(args),
+        )
+        if row is None or exact(row):
+            return row
+        seq = _strict_int(row["seq"])
+        if seq is None:
+            return row
+        hi = seq - 1
+        if above is not None and hi <= above:
+            return None
+    return row  # the walk's budget is spent on variants: fail closed, as above
+
+
 @dataclass(frozen=True, slots=True)
 class TransitAttestationRead:
     """What :func:`read_transit_bound_attestation_rows` gathered inside one read: the attestation,
@@ -9272,12 +9373,18 @@ async def _transit_attestation_audit_gap(
     if audit["action"] != TRANSIT_BOUND_ATTESTED_ACTION:
         return f"audit row {seq} is not an attestation"
     # The newest attest-or-withdraw row must be this one, so a row replayed after a withdraw, or
-    # after a later attestation, does not count.
-    newest = await fetch(
-        "SELECT MAX(seq) AS newest FROM audit_log WHERE action IN (?, ?)",
-        (TRANSIT_BOUND_ATTESTED_ACTION, TRANSIT_BOUND_WITHDRAWN_ACTION),
+    # after a later attestation, does not count. Read as "no such row above it", matched exactly,
+    # so a padded or case-variant action above it does not count either (BACKLOG #5726).
+    marks = (TRANSIT_BOUND_ATTESTED_ACTION, TRANSIT_BOUND_WITHDRAWN_ACTION)
+    later = await _exact_audit_row(
+        fetch,
+        "seq, action",
+        "action IN (?, ?)",
+        marks,
+        lambda r: r["action"] in marks,
+        above=seq,
     )
-    if newest is None or _strict_int(newest["newest"]) != seq:
+    if later is not None:
         return f"a later attest or withdraw audit row supersedes audit row {seq}"
     try:
         detail = json.loads(audit["detail"] or "")
@@ -9322,11 +9429,17 @@ async def _audit_row_mac_check(
         if before is None:
             return f"audit row {seq - 1}, which audit row {seq} chains from, is missing"
         prev = before["row_hash"]
-    # The key of the row's own range: the newest genesis or range row at or below it.
-    opening = await fetch(
-        "SELECT seq, action, detail FROM audit_log WHERE seq ="
-        " (SELECT MAX(seq) FROM audit_log WHERE action = ? AND seq <= ?)",
-        (AUDIT_KEY_EPOCH_ACTION, seq),
+    # The key of the row's own range: the newest genesis or range row at or below it, its action
+    # matched exactly so a variant row cannot shadow it (BACKLOG #5726).
+    opening = await _exact_audit_row(
+        fetch,
+        "seq, action, detail",
+        "action = ?",
+        (AUDIT_KEY_EPOCH_ACTION,),
+        lambda r: r["action"] == AUDIT_KEY_EPOCH_ACTION,
+        # Never below the genesis position: a planted row numbered 0 or less is no range opening.
+        above=0,
+        at_most=seq,
     )
     key_id: str | None = None
     scheme: AuditScheme | None = None
@@ -9402,15 +9515,20 @@ async def read_newest_keyed_audit_row(
     :func:`settle_newest_keyed_audit_row` once the read is released."""
     if active_key_id is None:
         return None
-    audit = await fetch(
-        "SELECT seq, ts, actor, action, channel_id, detail, client, row_hash FROM audit_log"
-        " WHERE seq = (SELECT MAX(seq) FROM audit_log WHERE action = ? AND actor = ? AND seq > ?)",
-        (action, actor, after_seq),
+    # A padding or case-folding collation must not widen the query, nor let a variant row (an
+    # account whose name differs only in case) shadow the actor's own newer row (BACKLOG #5726).
+    audit = await _exact_audit_row(
+        fetch,
+        "seq, ts, actor, action, channel_id, detail, client, row_hash",
+        "action = ? AND actor = ?",
+        (action, actor),
+        lambda r: r["action"] == action and r["actor"] == actor,
+        above=after_seq,
     )
     if audit is None:
         return None
     seq = _strict_int(audit["seq"])
-    # Matched again here, exactly: a padding or case-folding collation must not widen the query.
+    # Matched again here, exactly, whatever the walk above returned.
     if seq is None or seq <= after_seq or audit["action"] != action or audit["actor"] != actor:
         return None
     found = await _audit_row_mac_check(

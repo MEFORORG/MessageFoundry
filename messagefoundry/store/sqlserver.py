@@ -343,6 +343,7 @@ from messagefoundry.store.store import (
     enrolment_code_spend,
     escalation_passkeys,
     escalation_verdict,
+    existing_role_pairs_only,
     existing_roles_only,
     federated_bind,
     federated_unbind,
@@ -908,7 +909,13 @@ _MSSQL_AD_MAP_SQL: Final[Mapping[str, AdMapSql]] = MappingProxyType(
                 " UNION ALL"
                 " SELECT N'pair' AS k, m.ad_group AS a, m.role_id AS b,"
                 " CASE WHEN r.id IS NULL THEN 0 ELSE 1 END AS live"
+                # BACKLOG #5725: a pair is live only on an EXACT role id. The binary collation
+                # refuses a case variant; equal DATALENGTH refuses a trailing-space variant, which
+                # every SQL Server = comparison pads away, binary ones too.
+                # The plain equality keeps the roles primary-key seek; the other two decide.
                 " FROM ad_group_role_map m LEFT JOIN roles r ON r.id = m.role_id"
+                " AND r.id = m.role_id COLLATE Latin1_General_100_BIN2"
+                " AND DATALENGTH(r.id) = DATALENGTH(m.role_id)"
             ),
             pairs="SELECT ad_group, role_id FROM ad_group_role_map",
             clear="DELETE FROM ad_group_role_map",
@@ -1567,9 +1574,21 @@ class _SyncHandoffPool:
 # absolute bytes, and the DDL lint tests pin the proc render. Every STEP's comments live here with
 # the text they document.
 
+#: The binary collation every claim lane comparison pins (BACKLOG #5721; see _fifo_heads_steps).
+_LANE_BIN: Final[str] = " COLLATE Latin1_General_100_BIN2"
+
+
+def _lane_eq(col: str, lane: str) -> str:
+    """A lane column equal to a binary-labelled ``lane`` reference, exactly (BACKLOG #5721).
+
+    The first conjunct compares in the database collation so the lane-column seek survives; the
+    binary second conjunct is the residual that decides. A bare ``col = lane`` would compare binary
+    too, but converts the column and loses the seek."""
+    return f"{col} = {lane} COLLATE DATABASE_DEFAULT AND {col}{_LANE_BIN} = {lane}"
+
 
 def _fifo_heads_steps(
-    *, lane_col: str, lane_source: str, epoch_guard: str, head_skip_markers: bool = True
+    *, lane_col: str, lane_source: str, epoch_guard: str, v1_bytes: bool = False
 ) -> str:
     """The shared claim body (ADR 0066 §3.2 probe-then-claim, #285 inversion). ``lane_col`` is the
     code-controlled lane-column literal (``channel_id``/``destination_name``); ``lane_source`` the
@@ -1577,11 +1596,32 @@ def _fifo_heads_steps(
     the OPENJSON decode on the proc); ``epoch_guard`` the H1 fence predicate applied to the STEP-3
     probe AND the STEP-5 UPDATE (spliced-or-empty on the batch, fixed-nullable on the proc).
 
-    ``head_skip_markers=False`` renders the body WITHOUT the BACKLOG #1270 marker arm, byte for byte
-    the body the ``_v1`` procs shipped. Only :func:`_claim_proc_body` passes it, and only for a name
-    in ``_RETAINED_CLAIM_PROCS``; everything this build CALLS has the arm."""
+    LANE NAMES COMPARE BINARY (BACKLOG #5721). A connection name is case-sensitive everywhere else
+    in the engine: the registry is a dict, and SQLite and Postgres compare it exactly. The queue's
+    lane columns carry no COLLATE, so under a case-insensitive database collation ``IB_A`` and
+    ``ib_a`` would match each other's rows: the batch then inserted one queue row into ``@heads``
+    under both lanes (a primary-key violation), while the proc's DISTINCT lane decode merged the
+    two names. Every lane comparison here therefore pins ``Latin1_General_100_BIN2``. The
+    discovery and probe keep a ``COLLATE DATABASE_DEFAULT`` equality beside the binary one so the
+    lane-column seek on ``ix_queue_fifo_*_seq`` survives; the binary conjunct is the residual that
+    decides. ``@heads.lane`` is declared binary, so its column-to-column comparisons need no
+    COLLATE, and the marker arm re-labels it to the database default to stay UNION-compatible with
+    the claimed rows' lane column.
+
+    ``v1_bytes=True`` renders the body byte for byte as the ``_v1`` procs shipped: no BACKLOG #1270
+    marker arm and no #5721 binary lane comparisons. Only :func:`_claim_proc_body` passes it, and
+    only for a name in ``_RETAINED_CLAIM_PROCS``; everything this build CALLS is rendered without
+    it."""
+    if v1_bytes:
+        heads_lane, partition = "", "l.lane"
+        discover = f"{lane_col} = l.lane"
+        probe = f"qq.{lane_col} = L.lane"
+    else:
+        heads_lane, partition = _LANE_BIN, f"l.lane{_LANE_BIN}"
+        discover = _lane_eq(lane_col, "l.lane")
+        probe = _lane_eq(f"qq.{lane_col}", "L.lane")
     return (
-        " DECLARE @heads TABLE (lane NVARCHAR(256) NOT NULL,"
+        f" DECLARE @heads TABLE (lane NVARCHAR(256){heads_lane} NOT NULL,"
         " id NVARCHAR(64) NOT NULL PRIMARY KEY,"
         " seq BIGINT NOT NULL, rn INT NOT NULL, due BIT NOT NULL);"
         " DECLARE @locked TABLE (id NVARCHAR(64) NOT NULL PRIMARY KEY);"
@@ -1596,11 +1636,11 @@ def _fifo_heads_steps(
         # index seek per lane on ix_queue_fifo_in_seq / ix_queue_fifo_out_seq.
         " INSERT INTO @heads (lane, id, seq, rn, due)"
         " SELECT l.lane, h.id, h.seq,"
-        " ROW_NUMBER() OVER (PARTITION BY l.lane ORDER BY h.seq),"
+        f" ROW_NUMBER() OVER (PARTITION BY {partition} ORDER BY h.seq),"
         " IIF(h.next_attempt_at <= @now, 1, 0)"
         f" FROM {lane_source} AS l(lane)"
         " CROSS APPLY (SELECT TOP (@k) id, seq, next_attempt_at FROM queue"
-        f" WHERE stage = @stage AND {lane_col} = l.lane AND status = @pending"
+        f" WHERE stage = @stage AND {discover} AND status = @pending"
         " ORDER BY seq) AS h;"
         # STEP 2: contiguous-DUE cutoff. A not-due row truncates AT itself; a not-due HEAD
         # empties the lane (head-of-line preserved).
@@ -1623,7 +1663,7 @@ def _fifo_heads_steps(
         " INSERT INTO @locked (id)"
         " SELECT h.id FROM (SELECT lane, MAX(seq) AS maxseq FROM @heads GROUP BY lane) AS L"
         " CROSS APPLY (SELECT qq.id FROM queue qq WITH (UPDLOCK, ROWLOCK, READPAST)"
-        f" WHERE qq.stage = @stage AND qq.{lane_col} = L.lane AND qq.status = @pending"
+        f" WHERE qq.stage = @stage AND {probe} AND qq.status = @pending"
         f" AND qq.seq <= L.maxseq{epoch_guard}) AS h;"
         # STEP 4: head-pinned contiguity — keep, per lane, the longest prefix anchored at rn=1
         # whose EVERY member is locked; rn=1 missing drops the whole lane => EMPTY, never seq N+1.
@@ -1648,12 +1688,15 @@ def _fifo_heads_steps(
         " SELECT kp.id AS keep_id, c.id, c.message_id, c.channel_id, c.destination_name,"
         " c.handler_name, c.payload, c.attempts, c.seq, c.created_at"
         " FROM @keep kp LEFT JOIN @claimed c ON c.id = kp.id"
-        + (_head_skip_marker_arm(lane_col, epoch_guard) if head_skip_markers else ";")
+        + (";" if v1_bytes else _head_skip_marker_arm(lane_col, epoch_guard))
     )
 
 
 def _head_skip_marker_arm(lane_col: str, epoch_guard: str) -> str:
     """The sole result set's BACKLOG #1270 arm, appended by :func:`_fifo_heads_steps`."""
+    # The binary @heads.lane would conflict with the claimed rows' lane column under UNION ALL
+    # (two different implicit collations); the explicit label resolves it (BACKLOG #5721).
+    lane = "h.lane COLLATE DATABASE_DEFAULT"
     return (
         # BACKLOG #1270, the head-of-line skip: one marker row per lane whose DUE head (rn=1; STEP 2
         # already removed a not-due head) the STEP-3 probe could not lock. STEP 4 emptied that lane,
@@ -1661,7 +1704,7 @@ def _head_skip_marker_arm(lane_col: str, epoch_guard: str) -> str:
         # marker, with the lane in its own lane column. The epoch guard keeps a fenced ex-leader,
         # whose probe declines every row, from reporting its whole chunk as skipped.
         " UNION ALL SELECT NULL, NULL, NULL,"
-        + (" h.lane, NULL," if lane_col == "channel_id" else " NULL, h.lane,")
+        + (f" {lane}, NULL," if lane_col == "channel_id" else f" NULL, {lane},")
         + " NULL, NULL, NULL, NULL, NULL FROM @heads h"
         " WHERE h.rn = 1 AND NOT EXISTS (SELECT 1 FROM @locked k WHERE k.id = h.id)"
         f"{epoch_guard};"
@@ -1689,14 +1732,21 @@ _RETAINED_CLAIM_PROCS: Final[tuple[tuple[str, str], ...]] = (
     ("mefor_claim_fifo_heads_cid_v1", "channel_id"),
     ("mefor_claim_fifo_heads_dst_v1", "destination_name"),
 )
-#: Retained names whose body predates the BACKLOG #1270 marker arm.
-_PRE_MARKER_CLAIM_PROCS: Final[frozenset[str]] = frozenset(n for n, _ in _RETAINED_CLAIM_PROCS)
+#: Retained names whose body is frozen at the bytes they shipped with (before BACKLOG #1270).
+_V1_CLAIM_PROCS: Final[frozenset[str]] = frozenset(n for n, _ in _RETAINED_CLAIM_PROCS)
 
 # The OPENJSON lane decode (compat >= 130): one NVARCHAR(MAX) JSON-array parameter, so no delimiter
 # contract is ever imposed on connection names (lane names are data, never concatenated into SQL).
-# The explicit CAST keeps the `{lane_col} = l.lane` predicate seek-clean against the NVARCHAR(256)
-# column; DISTINCT is belt-and-suspenders under the caller's preserved request-order dedupe.
+# The explicit CAST types the decoded lane as the NVARCHAR(256) lane column is typed; DISTINCT is
+# belt-and-suspenders under the caller's preserved request-order dedupe. The DISTINCT is binary, as
+# the caller's dedupe is: under the database collation it would merge two lane names that differ
+# only in case (BACKLOG #5721). That makes l.lane explicitly binary, so the discovery compares
+# through _lane_eq, which keeps the seek.
 _CLAIM_PROC_LANE_SOURCE = (
+    f"(SELECT DISTINCT CAST(j.[value] AS NVARCHAR(256)){_LANE_BIN} FROM OPENJSON(@lanes) AS j)"
+)
+#: The lane decode the retained ``_v1`` bodies shipped with, before BACKLOG #5721.
+_CLAIM_PROC_LANE_SOURCE_V1: Final[str] = (
     "(SELECT DISTINCT CAST(j.[value] AS NVARCHAR(256)) FROM OPENJSON(@lanes) AS j)"
 )
 # The H1 epoch fence in its fixed nullable form, on BOTH sites (STEP-3 probe and STEP-5 UPDATE):
@@ -1760,7 +1810,15 @@ class _FencedWrite(Exception):
 # silently, so ``_claim_proc_stored_forms`` RAISES rather than falling through.
 # tests/test_adr0114_claim_proc.py re-states this literal independently on purpose — do NOT
 # collapse that assertion onto this constant, or the check stops being a check.
-_CLAIM_PROC_HEAD: Final[str] = "CREATE OR ALTER PROCEDURE dbo."
+#
+# The head is UNQUALIFIED (BACKLOG #5722), so the proc lands in the deploying principal's default
+# schema: the same schema the batch's unqualified CREATE TABLEs land in, which is the store's
+# schema. A dbo head on a store provisioned in another schema put the proc where its unqualified
+# `queue` reference does not resolve to the store's table. The gate and the CALL then address it in
+# the schema of the queue table the engine resolves (SqlServerStore._gate_claim_proc).
+_CLAIM_PROC_HEAD: Final[str] = "CREATE OR ALTER PROCEDURE "
+#: The head the retained ``_v1`` bodies shipped with, kept so their bytes do not move.
+_CLAIM_PROC_V1_HEAD: Final[str] = "CREATE OR ALTER PROCEDURE dbo."
 
 
 def _claim_proc_body(proc_name: str, lane_col: str) -> str:
@@ -1784,8 +1842,9 @@ def _claim_proc_body(proc_name: str, lane_col: str) -> str:
     reset authority on every non-clean path). SET NOCOUNT *is* exit-restored at proc exit — a real,
     honestly-stated delta from the batch (the outbound post-proc H2 statements may emit rowcount
     DONE tokens; harmless for the execute/fetchone consumers — ADR 0114 §3)."""
+    v1 = proc_name in _V1_CLAIM_PROCS
     return (
-        f"{_CLAIM_PROC_HEAD}{proc_name}"
+        f"{_CLAIM_PROC_V1_HEAD if v1 else _CLAIM_PROC_HEAD}{proc_name}"
         " @now FLOAT, @stage NVARCHAR(16), @k INT,"
         " @pending NVARCHAR(32), @inflight NVARCHAR(32),"
         " @lanes NVARCHAR(MAX),"
@@ -1797,10 +1856,10 @@ def _claim_proc_body(proc_name: str, lane_col: str) -> str:
         " SET LOCK_TIMEOUT 0;"
         + _fifo_heads_steps(
             lane_col=lane_col,
-            lane_source=_CLAIM_PROC_LANE_SOURCE,
+            lane_source=_CLAIM_PROC_LANE_SOURCE_V1 if v1 else _CLAIM_PROC_LANE_SOURCE,
             epoch_guard=_CLAIM_PROC_EPOCH_GUARD,
-            # Keyed on the name: a retained pre-#1270 version renders the bytes it shipped with.
-            head_skip_markers=proc_name not in _PRE_MARKER_CLAIM_PROCS,
+            # Keyed on the name: a retained _v1 renders the bytes it shipped with.
+            v1_bytes=v1,
         )
         + " IF @fold_reset = 1 SET LOCK_TIMEOUT -1;"
     )
@@ -1821,6 +1880,16 @@ def _claim_proc_ddl(proc_name: str, lane_col: str) -> str:
     under the SAME name. That is a redeploy, not a version: a result-set change still needs a new
     proc name, or an older build sharing the store calls a body it cannot parse (BACKLOG #1270)."""
     body = _claim_proc_body(proc_name, lane_col).replace("'", "''")
+    # The schema the head creates the proc in: dbo for a retained _v1 head, else the principal's
+    # default schema, where an unqualified CREATE lands (BACKLOG #5722). A called proc deploys only
+    # where the queue table resolves for this principal too: the startup gate looks for it in that
+    # table's schema, so a proc created anywhere else would be an orphan its own `queue` reference
+    # need not reach (tables kept in dbo, re-provisioned by a login whose default schema is another).
+    if proc_name in _V1_CLAIM_PROCS:
+        schema, store_schema_check = "'dbo'", ""
+    else:
+        schema = "QUOTENAME(SCHEMA_NAME())"
+        store_schema_check = " AND OBJECT_SCHEMA_NAME(OBJECT_ID(N'queue', N'U')) = SCHEMA_NAME()"
     version_check = (
         "CAST(SERVERPROPERTY('EngineEdition') AS INT) >= 5"
         " OR TRY_CAST(PARSENAME(CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)), 4)"
@@ -1834,12 +1903,12 @@ def _claim_proc_ddl(proc_name: str, lane_col: str) -> str:
         "IF (SELECT compatibility_level FROM sys.databases WHERE name = DB_NAME()) >= 130"
         " AND HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE PROCEDURE') = 1"
         # CREATE PROCEDURE alone is NOT sufficient: creating (or CREATE OR ALTER-ing) a proc in
-        # dbo also requires ALTER on the schema — a least-privilege principal holding only the
-        # database-level permission would pass a narrower guard and then FAIL the must-succeed
+        # a schema also requires ALTER on that schema — a least-privilege principal holding only
+        # the database-level permission would pass a narrower guard and then FAIL the must-succeed
         # _ensure_schema transaction (a flag-OFF open outage, the exact failure this guard
-        # exists to make impossible). Probing both closes it; ALTER ON SCHEMA::dbo also covers
-        # the OR ALTER re-apply against an existing proc.
-        " AND HAS_PERMS_BY_NAME('dbo', 'SCHEMA', 'ALTER') = 1"
+        # exists to make impossible). Probing both closes it; ALTER on the target schema also
+        # covers the OR ALTER re-apply against an existing proc.
+        f" AND HAS_PERMS_BY_NAME({schema}, 'SCHEMA', 'ALTER') = 1{store_schema_check}"
         f" AND ({version_check})"
         f" EXEC(N'{body}')"
     )
@@ -1884,8 +1953,14 @@ def _normalize_tsql(text: str) -> str:
 # _claim_proc_body() renders. `CREATE PROC`, a lower-cased head, or any other spelling this deploy
 # path cannot emit is positive evidence of an out-of-band hand deploy, which is precisely the AC-7
 # signal, and MUST keep failing the gate. This is not a compatibility grab-bag.
+#
+# The rewrite was measured on the dbo-qualified head this code deployed before BACKLOG #5722. That
+# the engine deletes the two tokens the same way before an unqualified name is an inference, not a
+# measurement; the live leg's gate-passes assertion (tests/test_adr0114_claim_proc_live.py) is what
+# checks it, and a wrong inference degrades the gate loudly rather than widening it. A
+# schema-qualified stored head is now a hand deploy too, and fails the gate.
 _CLAIM_PROC_STORED_HEADS: Final[tuple[tuple[str, str], ...]] = (
-    ("rewritten", "CREATE PROCEDURE dbo."),
+    ("rewritten", "CREATE PROCEDURE "),
     ("verbatim", _CLAIM_PROC_HEAD),
 )
 
@@ -1910,6 +1985,16 @@ def _claim_proc_stored_forms(proc_name: str, lane_col: str) -> dict[str, str]:
         )
     tail = shipped[len(_CLAIM_PROC_HEAD) :]
     return {label: _normalize_tsql(head + tail) for label, head in _CLAIM_PROC_STORED_HEADS}
+
+
+#: The proc gate's first probe: the compat level, and the bracket-quoted schema of the queue table
+#: this login resolves, the same way every unqualified claim reference resolves it: the default
+#: schema, then dbo (BACKLOG #5722). NULL when the table does not resolve.
+_CLAIM_PROC_GATE_SQL: Final[str] = (
+    "SELECT compatibility_level,"
+    " QUOTENAME(OBJECT_SCHEMA_NAME(OBJECT_ID(N'queue', N'U'))) AS store_schema"
+    " FROM sys.databases WHERE name = DB_NAME()"
+)
 
 
 def _claim_proc_shipped_hashes() -> dict[str, dict[str, str]]:
@@ -2680,6 +2765,17 @@ _SCHEMA: list[str] = [
         -- 2 x (512 + 64) bytes, is past a clustered key's 900 and inside a nonclustered one's 1700.
         ad_group NVARCHAR(512) NOT NULL, role_id NVARCHAR(64) NOT NULL,
         CONSTRAINT pk_ad_group_role_map PRIMARY KEY NONCLUSTERED (ad_group, role_id))""",
+    # BACKLOG #5725: the role foreign key SQLite and Postgres declare on this map, so a map write
+    # that commits while its custom role is deleted fails one of the two writes. It compares in the
+    # database collation, so on a case-insensitive database it would take a case variant of a live
+    # id: _write_ad_map refuses those exactly first, and the map read matches exactly. WITH NOCHECK
+    # as fk_user_roles_role is, and the writer drops a left-behind pair.
+    """IF OBJECT_ID('fk_ad_group_role_map_role','F') IS NULL
+        ALTER TABLE ad_group_role_map WITH NOCHECK
+            ADD CONSTRAINT fk_ad_group_role_map_role FOREIGN KEY (role_id) REFERENCES roles(id)""",
+    # The key's check on a role delete seeks this index; the primary key leads with ad_group.
+    """IF INDEXPROPERTY(OBJECT_ID('ad_group_role_map'),'ix_ad_group_role_map_role','IndexID') IS NULL
+        CREATE INDEX ix_ad_group_role_map_role ON ad_group_role_map(role_id)""",
     """IF OBJECT_ID('ad_group_scope_map','U') IS NULL CREATE TABLE ad_group_scope_map (
         -- BACKLOG #3187: NONCLUSTERED for the same reason; this key is 2 x (512 + 256) bytes.
         ad_group NVARCHAR(512) NOT NULL, channel NVARCHAR(256) NOT NULL,
@@ -3482,6 +3578,9 @@ class SqlServerStore:
         # ("rewritten" on every engine measured to date; "verbatim" would mean this server does NOT
         # rewrite CREATE OR ALTER — an engine difference worth knowing about, not a tamper event).
         self._claim_proc_head_forms: dict[str, str] = {}
+        # The bracket-quoted schema the gate verified both procs in, and the CALL addresses them in
+        # (BACKLOG #5722). Set only by a passing gate; None keeps the claim on the batch.
+        self._claim_proc_schema: str | None = None
         self._claim_proc_setinputsizes_warned = False
         # ADR 0114 sub-lever B (fifo_claim_prepared): stable claim text + a retained prepared
         # cursor on store-owned dedicated connections (INGRESS/ROUTED). Read ONCE at open; the
@@ -3561,7 +3660,15 @@ class SqlServerStore:
         ``fifo_claim_proc`` flag was ON at open AND the startup gate verified both deployed proc
         bodies + compat >= 130. False when the flag is off or the gate degraded (see
         :attr:`claim_proc_degraded_reason`)."""
-        return self._claim_proc_effective
+        return self._claim_proc_live
+
+    @property
+    def _claim_proc_live(self) -> bool:
+        """The one predicate every reader of "the proc path is on" uses: the gate passed AND
+        recorded the schema the CALL names (BACKLOG #5722). The gate sets both together; requiring
+        both keeps the gauge, the status, the prepared-gate supersession and the dispatch from ever
+        disagreeing, and a flag set without a schema runs the batch rather than a CALL to nowhere."""
+        return self._claim_proc_effective and self._claim_proc_schema is not None
 
     @property
     def claim_proc_degraded_reason(self) -> str | None:
@@ -3589,62 +3696,28 @@ class SqlServerStore:
         The comparison is against the STORED forms, not against ``_claim_proc_body()`` directly:
         the engine rewrites the ``CREATE OR ALTER`` head when it stores the module, so comparing
         with the submitted text can never match (the defect that left this gate inert in every
-        deployment from the feature shipping until this commit)."""
+        deployment from the feature shipping until this commit).
+
+        The procs are looked up in the schema of the ``queue`` table this login resolves, which is
+        the table every claim and the proc body's own unqualified references reach (BACKLOG
+        #5722). The deploy creates them there, since the head is unqualified and lands where the
+        batch's tables do. A passing gate records that schema for the CALL."""
         reason: str | None = None
         head_forms: dict[str, str] = {}
+        schema: str | None = None
         try:
-            row = await self._fetchone(
-                "SELECT compatibility_level FROM sys.databases WHERE name = DB_NAME()"
-            )
+            row = await self._fetchone(_CLAIM_PROC_GATE_SQL)
             compat = int(row["compatibility_level"]) if row else 0
+            schema = row["store_schema"] if row else None
             if compat < 130:
                 reason = f"database compatibility_level {compat} < 130 (OPENJSON unavailable)"
+            elif schema is None:
+                reason = (
+                    "the queue table does not resolve for this login, so the gate cannot tell"
+                    " which schema the claim procedures belong in"
+                )
             else:
-                expected = _claim_proc_shipped_hashes()
-                for proc_name in (_CLAIM_PROC_CID, _CLAIM_PROC_DST):
-                    # OBJECT_ID rides along so a NULL body can be told apart from an ABSENT proc.
-                    # MEASURED: a principal holding only EXECUTE on the proc gets a non-NULL
-                    # OBJECT_ID and a NULL OBJECT_DEFINITION — the module is deployed and working,
-                    # and the compat probe above still passes. Without the id, that reads as
-                    # "missing" and sends the operator to grant CREATE PROCEDURE, which is not the
-                    # problem and does not fix it. WITH ENCRYPTION produces the identical NULL.
-                    row = await self._fetchone(
-                        "SELECT OBJECT_ID(?) AS oid, OBJECT_DEFINITION(OBJECT_ID(?)) AS body",
-                        (f"dbo.{proc_name}", f"dbo.{proc_name}"),
-                    )
-                    deployed = row["body"] if row else None
-                    if not deployed:
-                        if (row["oid"] if row else None) is None:
-                            reason = (
-                                f"stored procedure dbo.{proc_name} is missing (guarded DDL skipped —"
-                                " create procedure / ALTER-on-schema denied, or a pre-2016-SP1"
-                                " engine?)"
-                            )
-                        else:
-                            reason = (
-                                f"stored procedure dbo.{proc_name} is DEPLOYED but its definition is"
-                                " unreadable (OBJECT_ID resolves, OBJECT_DEFINITION is NULL) — the"
-                                " proc is not missing and create procedure is not the fix. Either"
-                                " this principal lacks view definition on it (grant view definition"
-                                f" on OBJECT::dbo.{proc_name} to <the engine's principal>) or the"
-                                " module was created with encryption. The gate compares the body"
-                                " hash, so it cannot pass on a body it cannot read"
-                            )
-                        break
-                    got = hashlib.sha256(_normalize_tsql(deployed).encode()).hexdigest()
-                    matched = expected[proc_name].get(got)
-                    if matched is None:
-                        reason = (
-                            f"stored procedure dbo.{proc_name} body matches no form this build"
-                            " deploys — an out-of-band edit, a hand deploy (a head spelling this"
-                            " code cannot emit, e.g. create proc or a differing case), a renamed"
-                            " proc (sp_rename does not rewrite the stored definition), or a build"
-                            " whose body was changed without bumping the proc version. The"
-                            " shipped batch runs. Compare OBJECT_DEFINITION(OBJECT_ID('dbo."
-                            f"{proc_name}')) against this build's own definition to see the drift"
-                        )
-                        break
-                    head_forms[proc_name] = matched
+                reason, head_forms = await self._verify_claim_procs(schema)
         except Exception as exc:  # noqa: BLE001 - §4: ANY gate failure degrades, never an outage
             # A transient probe failure (e.g. a hiccup on the metadata read) must not fail the
             # open — the ADR's rule is total: any gate miss runs the shipped batch, loudly.
@@ -3654,10 +3727,13 @@ class SqlServerStore:
             self._claim_proc_degraded_reason = None
             self._claim_proc_input_sizes = _claim_proc_param_pins()
             self._claim_proc_head_forms = head_forms
+            self._claim_proc_schema = schema
             log.info(
                 "fifo_claim_proc: startup gate PASSED — pooled claims will use"
-                " dbo.%s / dbo.%s (ADR 0114 sub-lever A); stored head forms: %s",
+                " %s.%s / %s.%s (ADR 0114 sub-lever A); stored head forms: %s",
+                schema,
                 _CLAIM_PROC_CID,
+                schema,
                 _CLAIM_PROC_DST,
                 head_forms,
             )
@@ -3675,12 +3751,62 @@ class SqlServerStore:
         else:
             self._claim_proc_effective = False
             self._claim_proc_degraded_reason = reason
+            self._claim_proc_schema = None
             log.warning(
                 "fifo_claim_proc requested but DEGRADED to the shipped ad-hoc batch: %s"
                 " (claims keep flowing on the batch path — no lane outage; fix the condition"
                 " and restart to activate the proc path)",
                 reason,
             )
+
+    async def _verify_claim_procs(self, schema: str) -> tuple[str | None, dict[str, str]]:
+        """Probe both called procs in ``schema`` (bracket-quoted) for :meth:`_gate_claim_proc`:
+        ``(reason, {})`` on the first miss, else ``(None, head form per proc)``."""
+        expected = _claim_proc_shipped_hashes()
+        head_forms: dict[str, str] = {}
+        for proc_name in (_CLAIM_PROC_CID, _CLAIM_PROC_DST):
+            qualified = f"{schema}.{proc_name}"
+            # OBJECT_ID rides along so a NULL body can be told apart from an ABSENT proc.
+            # MEASURED: a principal holding only EXECUTE on the proc gets a non-NULL OBJECT_ID and a
+            # NULL OBJECT_DEFINITION — the module is deployed and working, and the compat probe
+            # still passes. Without the id, that reads as "missing" and sends the operator to grant
+            # CREATE PROCEDURE, which is not the problem and does not fix it. WITH ENCRYPTION
+            # produces the identical NULL.
+            row = await self._fetchone(
+                "SELECT OBJECT_ID(?) AS oid, OBJECT_DEFINITION(OBJECT_ID(?)) AS body",
+                (qualified, qualified),
+            )
+            deployed = row["body"] if row else None
+            if not deployed:
+                if (row["oid"] if row else None) is None:
+                    return (
+                        f"stored procedure {qualified} is missing (guarded DDL skipped — create"
+                        " procedure / ALTER-on-schema denied, a pre-2016-SP1 engine, or a"
+                        " provisioning login whose default schema is not the queue table's? It is"
+                        " looked for in the schema of the queue table this login resolves)"
+                    ), {}
+                return (
+                    f"stored procedure {qualified} is DEPLOYED but its definition is unreadable"
+                    " (OBJECT_ID resolves, OBJECT_DEFINITION is NULL) — the proc is not missing"
+                    " and create procedure is not the fix. Either this principal lacks view"
+                    f" definition on it (grant view definition on OBJECT::{qualified} to <the"
+                    " engine's principal>) or the module was created with encryption. The gate"
+                    " compares the body hash, so it cannot pass on a body it cannot read"
+                ), {}
+            got = hashlib.sha256(_normalize_tsql(deployed).encode()).hexdigest()
+            matched = expected[proc_name].get(got)
+            if matched is None:
+                return (
+                    f"stored procedure {qualified} body matches no form this build deploys — an"
+                    " out-of-band edit, a hand deploy (a head spelling this code cannot emit,"
+                    " e.g. create proc, a schema-qualified name or a differing case), a renamed"
+                    " proc (sp_rename does not rewrite the stored definition), or a build whose"
+                    " body was changed without bumping the proc version. The shipped batch runs."
+                    f" Compare OBJECT_DEFINITION(OBJECT_ID('{qualified}')) against this build's"
+                    " own definition to see the drift"
+                ), {}
+            head_forms[proc_name] = matched
+        return None, head_forms
 
     @staticmethod
     def _sync_setinputsizes(cur: Any) -> Any | None:
@@ -3778,7 +3904,7 @@ class SqlServerStore:
                 " would evict the retained cursor's one-slot prepare cache every call) — logging"
                 " and no-op'ing per ADR 0114 AC-13"
             )
-        elif self._claim_proc_effective:
+        elif self._claim_proc_live:
             # §5 compose-or-compete: the retained handle competes with the proc's RPC for the
             # same bytes — if A is green, B is retired, not stacked (recorded superseded-for-now).
             reason = (
@@ -5959,7 +6085,7 @@ class SqlServerStore:
         if not self._fifo_claim_proc:
             return None
         return ClaimProcStatus(
-            effective=self._claim_proc_effective,
+            effective=self._claim_proc_live,
             degraded_reason=self._claim_proc_degraded_reason,
             head_forms=dict(self._claim_proc_head_forms),
         )
@@ -11000,7 +11126,12 @@ class SqlServerStore:
         # C without a third variant); everything after cur.execute — the drain, the kept==claimed
         # adjudication, the H2 loop, _commit, the 1222 translation, and the shielded finally-guard
         # — is the same code on both paths (AC-9). The gate degraded => the shipped batch, loudly.
-        use_proc = self._fifo_claim_proc and self._claim_proc_effective
+        # The CALL names the schema the gate verified the procs in (BACKLOG #5722); None keeps the
+        # claim on the batch, and _claim_proc_live is the same predicate the gauge reports.
+        proc_schema = (
+            self._claim_proc_schema if self._fifo_claim_proc and self._claim_proc_live else None
+        )
+        use_proc = proc_schema is not None
         # ADR 0114 sub-lever B (fifo_claim_prepared): the non-DDL fallback lane — the SAME stable
         # encoding as the proc (one JSON lanes parameter, fixed-nullable fence) as a client-side
         # batch with the trailing reset INSIDE the text, executed on a store-owned dedicated
@@ -11023,9 +11154,9 @@ class SqlServerStore:
             and fold
         )
         args: tuple[Any, ...]
-        if use_proc:
+        if proc_schema is not None:
             proc_name = _CLAIM_PROC_CID if lane_col == "channel_id" else _CLAIM_PROC_DST
-            sql = f"{{CALL dbo.{proc_name} (?,?,?,?,?,?,?,?,?)}}"
+            sql = f"{{CALL {proc_schema}.{proc_name} (?,?,?,?,?,?,?,?,?)}}"
             args = (
                 now,
                 stage,
@@ -11428,24 +11559,33 @@ class SqlServerStore:
         ``DISTINCT`` in the recursive member of a recursive CTE, so the loose-index-scan emulation the
         other dialects use (anchor ``MIN(lane)`` + recurse ``MIN(lane) WHERE lane > prev``) is invalid
         here (error 467) and has no legal recursive rewrite. This plain derived-table + ``CROSS APPLY``
-        form is O(pending rows at ``stage``) rather than O(distinct lanes) — an index-only, ordered,
-        ``TOP``-bounded stream-distinct that is ~free at idle; a true skip-scan is a later perf concern
-        (SQL Server has no native skip-scan operator).
+        form is O(pending rows at ``stage``) rather than O(distinct lanes) — an index-only read that
+        is ~free at idle; a true skip-scan is a later perf concern (SQL Server has no native
+        skip-scan operator). The binary DISTINCT below cannot ride the index's database-collation
+        order, so it is a hash aggregate (memory scales with distinct lanes, not rows) plus a sort
+        of the distinct lanes, and the ``@after`` cursor filters rather than seeks; the rows read
+        are the same pending rows the ordered stream-distinct read.
 
         Unlike :meth:`claim_fifo_heads`, this is a pure RCSI snapshot read with NO locking hints, so it
         can never WAIT on a row lock — it needs no ``SET LOCK_TIMEOUT 0`` never-block guard (ADR 0066
-        §9)."""
+        §9).
+
+        Lanes are told apart BINARY, as the claim tells them apart (BACKLOG #5721): the DISTINCT, the
+        ``@after`` cursor and the ``ORDER BY`` all run in ``Latin1_General_100_BIN2``, and the head read
+        keeps a seekable database-collation equality beside the binary one that decides. Under a
+        case-insensitive collation a folding DISTINCT would surface only one of two lanes whose names
+        differ only in case, and the sweep would never ready the other."""
         lane_col = self._lane_col(stage)  # code-controlled literal
         sql = (
             "SET NOCOUNT ON;"
             " DECLARE @stage NVARCHAR(16) = ?, @pending NVARCHAR(32) = ?, @limit INT = ?,"
             " @after NVARCHAR(256) = ?;"
             " SELECT TOP (@limit) d.lane, h.next_attempt_at"
-            f" FROM (SELECT DISTINCT {lane_col} AS lane FROM queue"
+            f" FROM (SELECT DISTINCT {lane_col}{_LANE_BIN} AS lane FROM queue"
             f" WHERE stage = @stage AND status = @pending"
-            f" AND (@after IS NULL OR {lane_col} > @after)) d"
+            f" AND (@after IS NULL OR {lane_col}{_LANE_BIN} > @after)) d"
             " CROSS APPLY (SELECT TOP (1) next_attempt_at FROM queue"
-            f" WHERE stage = @stage AND {lane_col} = d.lane AND status = @pending"
+            f" WHERE stage = @stage AND {_lane_eq(lane_col, 'd.lane')} AND status = @pending"
             " ORDER BY seq) h"
             " ORDER BY d.lane;"
         )
@@ -15752,9 +15892,14 @@ class SqlServerStore:
         (ADR 0045 D4); never touches a built-in row. Returns ``True`` if removed."""
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                await cur.execute("SELECT builtin FROM roles WHERE id=?", (role_id,))
+                await cur.execute("SELECT builtin, id FROM roles WHERE id=?", (role_id,))
                 row = await cur.fetchone()
-                if row is None or int(row[0]) != 0:
+                # BACKLOG #5725: the lookup compares in the database collation, so it also finds at
+                # least a case or trailing-space variant of the caller's id. That is not this role.
+                # The service's holder reads fold case, so they would find a case variant's holders
+                # but miss at least a trailing-space variant's, whose revocations a delete here
+                # would skip. The service refuses any inexact id before this; refused here too.
+                if row is None or int(row[0]) != 0 or str(row[1]) != role_id:
                     await conn.rollback()
                     return False
                 # BACKLOG #2592: each holder re-sealed without the role, and only a refused holder's
@@ -16102,9 +16247,10 @@ class SqlServerStore:
 
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
         """The role ids the role map gives ``groups``, its seal UNCHECKED; store.py's twin says
-        why. BACKLOG #2592: a pair whose role has no roles row is left out, because this backend's
-        map has no role foreign key and can hold a deleted role's id. The user write path refuses
-        such an id, which would refuse the sign-in; SQLite and Postgres refuse the map row itself."""
+        why. BACKLOG #2592: a pair whose role has no roles row, matched exactly, is left out,
+        because this backend's role foreign key is ``WITH NOCHECK`` and compares in the database
+        collation, so the map can hold a deleted role's id or a case variant of a live one (BACKLOG
+        #5725). The user write path refuses such an id, which would refuse the sign-in."""
         return (await self.get_ad_map(AD_ROLE_MAP)).values_for(groups)
 
     async def get_ad_map(self, name: str) -> AdMap:
@@ -16131,7 +16277,12 @@ class SqlServerStore:
         """The one writer of an AD directory map and its seal (BACKLOG #2592); store.py's
         ``MessageStore._write_ad_map`` states the contract. Call it on ``cur`` inside an open
         transaction. The map's seal key is read under ``UPDLOCK, HOLDLOCK`` first, which locks it
-        whether or not its row exists yet, so two writes of one map run one after the other."""
+        whether or not its row exists yet, so two writes of one map run one after the other.
+
+        BACKLOG #5725: a role map write checks its role ids against the ``roles`` rows EXACTLY
+        (:func:`existing_role_pairs_only`), because ``fk_ad_group_role_map_role`` compares in the
+        database collation and would take a case variant of a live id. The key still refuses a
+        role deleted after this read; no role-row lock is taken, as in ``_write_user``."""
         sql = _MSSQL_AD_MAP_SQL[name]
         await cur.execute(
             "SELECT seal FROM authority_set_seal WITH (UPDLOCK, HOLDLOCK) WHERE name=?", (name,)
@@ -16143,6 +16294,10 @@ class SqlServerStore:
             [(str(r[0]), str(r[1])) for r in await cur.fetchall()],
             str(seal_rows[0][0] or "") if seal_rows else "",
         )
+        if name == AD_ROLE_MAP:
+            await cur.execute("SELECT id FROM roles")
+            present = [str(r[0]) for r in await cur.fetchall()]
+            change = existing_role_pairs_only(current, change, present)
         new = await ad_map_write_async(self._row_sealer, current, change)
         if new is None:
             return False

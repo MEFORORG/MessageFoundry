@@ -12859,11 +12859,19 @@ class AuthService:
         question, as :meth:`_username_held` is: a role that fails its seal can still be saved again,
         which re-seals it, or deleted. Only a ``bool`` leaves here, never the unchecked row. A row
         whose ``builtin`` column is set is not a custom role, whatever its id says: the store's own
-        delete and its unsealed count read that column, so this answer must match theirs."""
+        delete and its unsealed count read that column, so this answer must match theirs.
+
+        BACKLOG #5725: the row's id must equal ``role_id`` exactly. A store whose id column
+        compares in its database collation (SQL Server) finds the stored row from at least a case
+        or trailing-space variant too, and a collation may fold more. A variant is not the role: a
+        save under it would seal the stored row under another id, and the SQL Server delete
+        refuses it."""
         if not is_custom_role_id(role_id):
             return False
         found = await self._store.get_role(role_id)
-        return found is not None and not bool(found["builtin"])
+        if found is None or str(found["id"]) != role_id:
+            return False
+        return not bool(found["builtin"])
 
     async def _role_seal_failed(self, role_id: str) -> None:
         """Report a custom role whose row failed its integrity seal (BACKLOG #2592), through
@@ -18973,7 +18981,10 @@ class AuthService:
         # the role in place, and not recorded as a miss after a committed change (vault #3023).
         for user_id in await self._custom_role_holders(role_id):
             await self._store.revoke_user_sessions(user_id, audit=no_audit_row)
-        await self._store.delete_custom_role(role_id)
+        # BACKLOG #5725: the store refuses a role it does not find as a custom role by this exact
+        # id. That deleted nothing, so no row may record a deletion; the caller answers not found.
+        if not await self._store.delete_custom_role(role_id):
+            raise ValueError("no such custom role")
         await self._audit("role.deleted", actor=actor, detail=_json({"role_id": role_id}))
 
     async def sessions_ended_by_custom_role_save(self, role_id: str) -> frozenset[str]:
@@ -18986,8 +18997,10 @@ class AuthService:
 
         Compared without case. A store whose id columns compare case-insensitively (SQL Server)
         finds the role from another spelling, and the console passes its path to these routes as
-        a plain str, so an exact match would let a save under ``CUSTOM:...`` change the role and
-        end nobody's sessions, the caller's included (the vault BACKLOG #3259 class)."""
+        a plain str (the vault BACKLOG #3259 class). Since BACKLOG #5725 the save and the delete
+        themselves refuse any id that is not the stored one exactly (:meth:`_custom_role_held`),
+        so this fold is no longer what stops a variant save from skipping revocation; it keeps the
+        step-up gate asking for proof whenever the store would find the role, and is kept."""
         wanted = role_id.casefold()
         return frozenset(
             user.id

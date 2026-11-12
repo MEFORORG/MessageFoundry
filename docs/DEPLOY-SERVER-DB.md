@@ -250,11 +250,17 @@ Vault and LDAP*.
 > calls are the two lane-family claim procs, and only when `[store].fifo_claim_proc = true` — SQL
 > Server only, default `false` ([`CONFIGURATION.md`](CONFIGURATION.md) `[store]`). (`sp_getapplock`,
 > used on every finalize and at schema init, is a **system** procedure `public` can already execute —
-> no grant.) Their *creation* rides the schema batch, so step 4 deploys them. It is
-> permission-guarded and self-no-ops when the provisioning principal cannot take it. If you enable the
+> no grant.) Their *creation* rides the schema batch, so step 4 deploys them, in the provisioning
+> login's default schema, where the batch creates the tables; it needs `CREATE PROCEDURE` and
+> `ALTER` on that schema. It is permission-guarded and self-no-ops when the provisioning principal
+> cannot take it, or when the `queue` table does not resolve to that same schema for it. **The
+> procs live in the store's schema:** the schema of the `queue` table, wherever the batch first
+> created it. A login whose default schema is not that one deploys no procs at all. The startup
+> gate looks for them in the schema of the `queue` table the runtime login resolves, and the claim
+> calls them there. If you enable the
 > flag, grant the runtime login `EXECUTE` and `VIEW DEFINITION` on both procs the engine calls
-> (`dbo.mefor_claim_fifo_heads_cid_v2` and `_dst_v2`). Each new proc version needs its own grant; a
-> grant made on `_v1` does not cover `_v2`. Without
+> (`mefor_claim_fifo_heads_cid_v2` and `_dst_v2`, in the store's schema). Each new proc version
+> needs its own grant; a grant made on `_v1` does not cover `_v2`. Without
 > `VIEW DEFINITION` the startup gate cannot read the bodies it verifies and degrades to the shipped
 > batch.
 
