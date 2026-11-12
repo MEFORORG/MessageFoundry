@@ -550,7 +550,8 @@ class _RecordingTransit:
 
     def generate_hmac(self, *, name: str, mount_point: str = "transit", **_: Any) -> dict[str, Any]:
         self.paths.add(f"{mount_point}/hmac/{name}")
-        return {"data": {"hmac": "vault:v1:synthetic-mac"}}
+        # Well-formed, since the audit append refuses a MAC its own check would reject.
+        return {"data": {"hmac": "vault:v1:" + base64.b64encode(b"\x00" * 32).decode("ascii")}}
 
     def verify_signed_data(
         self, *, name: str, mount_point: str = "transit", **_: Any

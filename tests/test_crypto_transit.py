@@ -242,6 +242,38 @@ def test_audit_hmac_failure_is_type_only(monkeypatch: pytest.MonkeyPatch) -> Non
     assert "DOE" not in str(excinfo.value)
 
 
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "",
+        None,
+        b"vault:v1:",
+        "vault:v1:synthetic-mac",
+        "vault:v0:" + base64.b64encode(bytes(32)).decode("ascii"),
+        "vault:v1:" + base64.b64encode(bytes(31)).decode("ascii"),
+        "v1:" + base64.b64encode(bytes(32)).decode("ascii"),
+    ],
+)
+def test_audit_hmac_refuses_a_reply_its_own_check_would_reject(
+    monkeypatch: pytest.MonkeyPatch, reply: object
+) -> None:
+    # BACKLOG #2720: the append writes only a MAC `verify_audit_hmac` could accept; anything else
+    # would be a row certain to read as a break, so the append fails loudly instead.
+    class _OddHmac(_FakeTransit):
+        def generate_hmac(self, **_: Any) -> dict[str, Any]:
+            return {"data": {"hmac": reply}}
+
+    monkeypatch.setenv("MEFOR_STORE_TRANSIT_KEY", _KEY_NAME)
+    monkeypatch.setattr(
+        crypto_transit, "_build_client", lambda addr, token, **_: _FakeClient(_OddHmac())
+    )
+    cipher = build_transit_cipher(StoreSettings())
+    with pytest.raises(CipherError, match="not a well-formed Transit MAC"):
+        cipher.audit_hmac(b"canonical")
+    with pytest.raises(CipherError, match="not a well-formed Transit MAC"):
+        cipher.audit_mac_fn()(b"canonical")  # the provider the store's append calls
+
+
 def test_unmarked_value_refused_unless_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
     # BACKLOG #1169: this used to pin a passthrough. The Transit cipher now refuses an unmarked value
     # exactly as the in-process one does; the opt-out and a purged '' still pass.

@@ -580,7 +580,10 @@ async def test_a_transit_refusal_of_a_forged_key_version_is_a_gap(
     """A DML writer sets both hashes to a key version Transit does not hold. Transit refuses to
     verify at it; that must read as unattested, so a warn start still starts."""
     _needs_hvac()
-    _use_fake(monkeypatch, _RotatingTransit())
+    from messagefoundry.store.crypto import AuditKeyVersionRefusedError
+
+    transit = _RotatingTransit()
+    _use_fake(monkeypatch, transit)
     db = tmp_path / "forged-version.db"
     store = await _transit_store(db)
     recorded = await _attest(store)
@@ -588,12 +591,22 @@ async def test_a_transit_refusal_of_a_forged_key_version_is_a_gap(
     _dml(db, "UPDATE transit_bound_attestation SET audit_hash = ? WHERE id = 1", (_PLANTED,))
     _dml(db, "UPDATE audit_log SET row_hash = ? WHERE seq = ?", (_PLANTED, recorded.audit_seq))
     again = await _transit_store(db)
+    transit.verified.clear()
     try:
         got = await again.get_transit_bound_attestation()
     except BaseException:
         await again.close()
         raise
-    assert got is not None and got.audit_gap is not None and "Transit refused" in got.audit_gap
+    # The whole gap text, so it is the refused-version outcome and no other: an AssertionError in
+    # the fake, or any CipherError the cipher does not classify as a refused version, also writes a
+    # gap starting "Transit refused to check", and must fail here.
+    assert got is not None
+    assert got.audit_gap == (
+        f"Transit refused to check audit row {recorded.audit_seq}'s MAC: "
+        f"{AuditKeyVersionRefusedError(_UNHELD_VERSION)}"
+    ), got.audit_gap
+    # The refusal came from Transit's verify, at the planted version.
+    assert transit.verified == [_UNHELD_VERSION], transit.verified
     await _start(again, SecurityEnforcement.WARN)  # no raise
 
 

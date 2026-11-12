@@ -324,7 +324,9 @@ class TransitCipher(_UnmarkedPolicy):
         ADR 0138 §To-resolve: this moves the audit chain from keyless SHA-256 to
         forgery-**resistant** without an in-heap key, closing the ASVS 16.4.2 residual for
         ``vault_transit`` mode. Fail-closed: any Transit error raises :class:`CipherError`
-        (type-only — the canonical row bytes are PHI-derived and never surfaced)."""
+        (type-only — the canonical row bytes are PHI-derived and never surfaced). A reply that
+        :func:`~messagefoundry.store.row_seal.transit_mac_version` does not accept raises
+        :class:`CipherError` too, so no row is written that its own check would read as a break."""
         inp = base64.b64encode(data).decode("ascii")
         try:
             response: Any = self._client.secrets.transit.generate_hmac(
@@ -335,16 +337,27 @@ class TransitCipher(_UnmarkedPolicy):
             raise CipherError(
                 f"Transit audit HMAC failed (key={self._audit_key!r}): {vault_failure_text(exc)}"
             ) from exc
-        if not isinstance(mac, str) or not mac:
-            raise CipherError(f"Transit returned an empty audit HMAC (key={self._audit_key!r})")
+        # The writer refuses what the reader would reject: a reply ``transit_mac_version`` does not
+        # accept would be written as a row :meth:`verify_audit_hmac` is certain to read as a break
+        # (BACKLOG #2720), so the append fails loudly here instead.
+        if not isinstance(mac, str) or transit_mac_version(mac) is None:
+            raise CipherError(
+                f"Transit returned an audit HMAC that is not a well-formed Transit MAC "
+                f"(key={self._audit_key!r})"
+            )
         return mac
 
     def verify_audit_hmac(self, data: bytes, stored: str) -> bool:
         """Whether ``stored`` is Transit's HMAC of ``data`` under the audit key: Transit's own
         ``verify`` call, at the version ``stored`` names (BACKLOG #2720). It never regenerates and
-        compares. Transit verifies an HMAC at any version from the key's ``min_decryption_version``
-        up to its latest, so a row made under a version below ``min_encryption_version`` still
-        verifies.
+        compares. Transit verifies an HMAC at a version from the key's ``min_decryption_version``
+        up to its latest that the key still holds with an HMAC key, so a row made under a version
+        below ``min_encryption_version`` still verifies. A version trimmed below
+        ``min_available_version`` is not held and is refused (``no such key version``); Vault keeps
+        ``min_available_version`` at or below ``min_decryption_version``, both in its ``trim`` call
+        and in its key config write, so no trimmed version lies inside that span. Read on
+        2026-11-11 from Vault ``pathHMACVerify``, ``path_trim.go``, ``path_keys_config.go`` and
+        ``keysutil.Policy.HMACKey`` at cbc874e2358f; OpenBao was not read for it.
 
         ``stored`` that :func:`~messagefoundry.store.row_seal.transit_mac_version` does not accept
         is ``False`` with no ``verify`` call, so no malformed value reaches Transit to draw a 400.

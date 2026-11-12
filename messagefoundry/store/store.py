@@ -6995,9 +6995,12 @@ def verify_audit_rows(
     a Transit round trip, so K walks would cost K times N of them. Keyed on ``seq``, the chain's own
     coordinate, never on the row id, which can skip numbers.
 
-    **Constant-time, full-walk (ASVS 11.2.4)**, as before: every row MAC is compared with
-    :func:`hmac.compare_digest` over :func:`audit_mac_bytes`, the walk always runs to completion, and
-    the first divergent position is reported after it. A structural break is reported at its own
+    **Constant-time, full-walk (ASVS 11.2.4)**: an in-heap row MAC is compared with
+    :func:`hmac.compare_digest` over :func:`audit_mac_bytes`. Under ``vault_transit`` the compare of
+    a row MAC is Transit's own ``verify`` call, made inside Vault (:func:`_audit_row_mac`); the
+    ``compare_digest`` the walk still runs there sets the stored hash beside itself, or beside
+    ``None`` when Transit did not verify it, and decides nothing. The walk always runs to
+    completion, and the first divergent position is reported after it. A structural break is reported at its own
     position, with the reason."""
     # The row AT seq 1, not the row that sorts first, which is the rule the open applies too
     # (``load_audit_chain``). A row added below the genesis row must not change what the chain is:
