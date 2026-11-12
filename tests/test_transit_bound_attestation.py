@@ -623,23 +623,28 @@ class _StartupSink(LoggingAlertSink):
         self.events.append((name, reason))
 
 
-async def _chain_with_a_planted_version(db: Path) -> int:
-    """A Transit store whose audit chain has one middle row naming a key version Transit does not
-    hold, as a DML writer would plant it. Returns that row's sequence number."""
+async def _chain_with_a_tampered_middle_row(db: Path, column: str, value: str) -> int:
+    """A Transit store whose audit chain has one middle row whose ``column`` a DML writer set to
+    ``value``. Returns that row's sequence number."""
     _needs_hvac()
     store = await _transit_store(db)
     try:
-        await store.record_audit("test.planted", actor="cli:tester")
+        await store.record_audit("test.tampered", actor="cli:tester")
         await store.record_audit("test.after", actor="cli:tester")
     finally:
         await store.close()
     con = sqlite3.connect(db)
     try:
-        (seq,) = con.execute("SELECT seq FROM audit_log WHERE action = 'test.planted'").fetchone()
+        (seq,) = con.execute("SELECT seq FROM audit_log WHERE action = 'test.tampered'").fetchone()
     finally:
         con.close()
-    _dml(db, "UPDATE audit_log SET row_hash = ? WHERE seq = ?", (_PLANTED, seq))
+    _dml(db, f"UPDATE audit_log SET {column} = ? WHERE seq = ?", (value, seq))
     return int(seq)
+
+
+async def _chain_with_a_planted_version(db: Path) -> int:
+    """One middle row naming a key version Transit does not hold, as a DML writer would plant it."""
+    return await _chain_with_a_tampered_middle_row(db, "row_hash", _PLANTED)
 
 
 async def _walk_on_start(
@@ -775,22 +780,8 @@ class _SizeCappedTransit(_RotatingTransit):
 
 
 async def _chain_with_an_oversize_row(db: Path) -> int:
-    """A Transit store whose audit chain has one middle row a DML writer grew past the request cap,
-    MAC left as it was. Returns that row's sequence number."""
-    _needs_hvac()
-    store = await _transit_store(db)
-    try:
-        await store.record_audit("test.grown", actor="cli:tester")
-        await store.record_audit("test.after", actor="cli:tester")
-    finally:
-        await store.close()
-    con = sqlite3.connect(db)
-    try:
-        (seq,) = con.execute("SELECT seq FROM audit_log WHERE action = 'test.grown'").fetchone()
-    finally:
-        con.close()
-    _dml(db, "UPDATE audit_log SET detail = ? WHERE seq = ?", ("x" * (4 * _REQUEST_CAP_CHARS), seq))
-    return int(seq)
+    """One middle row a DML writer grew past the request cap, MAC left as it was."""
+    return await _chain_with_a_tampered_middle_row(db, "detail", "x" * (4 * _REQUEST_CAP_CHARS))
 
 
 async def test_a_row_transit_refuses_for_its_size_is_a_chain_break_on_the_startup_walk(
@@ -843,16 +834,16 @@ async def test_a_service_failure_of_the_verify_call_still_could_not_run(
     calls; a status hvac does not name (a 504) is read as the service only when a verify over fixed
     input fails too, as it does while the gateway is down."""
     _needs_hvac()
-    transit = _SizeCappedTransit()
+    from messagefoundry.store.crypto_transit import _VERSION_PROBE_INPUT
+
+    transit = _RotatingTransit()
     _use_fake(monkeypatch, transit)
-    db = tmp_path / "service.db"
-    await _chain_with_an_oversize_row(db)
-    store = await _transit_store(db)
+    store = await _transit_store(tmp_path / "service.db")
+    await store.record_audit("test.clean", actor="cli:tester")
     real_verify = transit.verify_signed_data
-    probe_input = base64.b64encode(b"messagefoundry audit key version probe").decode("ascii")
 
     def failing(*, hash_input: str, **kw: Any) -> dict[str, Any]:
-        if hash_input == probe_input and not probe_fails:
+        if hash_input == _VERSION_PROBE_INPUT and not probe_fails:
             return real_verify(hash_input=hash_input, **kw)
         raise _hvac_error(error)("the service failed")
 

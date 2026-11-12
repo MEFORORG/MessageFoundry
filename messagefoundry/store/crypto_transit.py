@@ -270,8 +270,10 @@ def _plaintext(value: object) -> str | None:
 
 
 #: The fixed input of the probe that tells a refused key version from an outage (BACKLOG #2337).
-#: Base64, as Transit takes it. It carries no row data, so no row can decide the probe's answer.
-_VERSION_PROBE_INPUT = base64.b64encode(b"messagefoundry audit key version probe").decode("ascii")
+#: It carries no row data, so no row can decide the probe's answer.
+_VERSION_PROBE_BYTES = b"messagefoundry audit key version probe"
+#: :data:`_VERSION_PROBE_BYTES` in base64, as Transit takes it.
+_VERSION_PROBE_INPUT = base64.b64encode(_VERSION_PROBE_BYTES).decode("ascii")
 
 
 def _transit_failure(op: str, key: str, exc: Exception) -> CipherError:
@@ -808,9 +810,7 @@ class TransitCipher(_UnmarkedPolicy):
             mac = probe["data"]["hmac"]
             if not isinstance(mac, str) or transit_mac_version(mac) is None:
                 return False
-            valid = self._transit_verify(
-                self._audit_key, base64.b64decode(_VERSION_PROBE_INPUT), mac
-            )
+            valid = self._transit_verify(self._audit_key, _VERSION_PROBE_BYTES, mac)
         except Exception as probe_exc:  # the fixed input fails too: the service, not the row
             log.warning(
                 "an audit MAC verify failed, and a verify over fixed input failed too (key=%r): %s",
