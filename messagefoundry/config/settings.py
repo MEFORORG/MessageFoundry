@@ -10342,7 +10342,8 @@ def security_loosenings(
     Windows service, whether its registry-held environment lists could be read, and whether a
     store key reaches it through its environment. An engine secret in those lists refuses the
     start of ``serve`` and ``supervise``, which never reach this registry then; an engine neither
-    started names what they refuse here as ``secret_in_service_environment``. ``None`` has the
+    started names what they refuse here as ``secret_in_service_environment``, where it finds its
+    service. ``None`` has the
     meaning it has for ``remote_debug``.
 
     The sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:

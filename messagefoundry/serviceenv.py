@@ -26,10 +26,10 @@ key, and the Service Control Manager's own ``Environment`` value on the service'
 
 **How the engine finds its own service.** Under NSSM the engine is a child of ``nssm.exe``, or a
 grandchild when a virtual environment's ``python.exe`` starts the base interpreter, or further
-down under ``supervise``. The reading walks up through Python interpreter processes only. When
-the first other process is ``nssm.exe``, it asks the Service Control Manager which service runs
-there. Any other process means the engine was started by something else, such as a shell, even
-when that shell itself runs under some other NSSM service.
+down under ``supervise``. The reading walks up through Python interpreter and
+``messagefoundry.exe`` processes only. When the first other process is ``nssm.exe``, it asks the
+Service Control Manager which service runs there. Any other process means the engine was started
+by something else, such as a shell, even when that shell itself runs under some other NSSM service.
 
 **What it does not cover**, at least: a service host other than NSSM, an ``nssm.exe`` renamed to
 something else, a launcher between NSSM and the interpreter that is not a Python interpreter or

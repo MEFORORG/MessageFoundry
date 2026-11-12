@@ -158,7 +158,8 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
   and `supervise`, under every enforcement setting, as a store key there already did, and the
   refusal names this directory as the way in. The `service_environment_secret` loosening is
   removed; an app built without either command, such as one built with `create_app(engine)`,
-  names what they refuse as `secret_in_service_environment`. The other half, refusing such a
+  names what they refuse as `secret_in_service_environment` where it finds its service. The
+  other half, refusing such a
   secret found in the environment elsewhere, is not built: one reaching the engine from the
   machine-wide environment, or from its own environment when the service's lists could not be
   read, is neither refused nor named, since only a store key's names are read there (vault

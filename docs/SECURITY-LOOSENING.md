@@ -2603,7 +2603,7 @@ count is above `0` (vault BACKLOG #2613).
   `create_app(engine)`, runs no such refusal and is not refused. It is named, with the refusal's
   finding and remedy, only where the refusal would fire (`messagefoundry/serviceenv.py`): the
   engine found its service, the way the bullet *How the engine finds its own service* below
-  says, and either a secret is in that service's lists or the lists could not be read and a
+  says, and either an engine secret is in that service's lists or the lists could not be read and a
   store key is in the engine's own environment. A console-script launcher such as `uvicorn.exe`
   or `hypercorn.exe` between NSSM and the interpreter is neither a Python interpreter nor
   `messagefoundry.exe`, so the engine does not find its service there and this entry is not
@@ -2617,17 +2617,18 @@ count is above `0` (vault BACKLOG #2613).
   machine-wide environment.
 - **`service_environment_unobservable`: the engine could not finish the reading.** The entry
   carries the reason: an ancestor process that could not be queried, an `nssm.exe` with no
-  service, an `nssm.exe` above a process that is not Python, or a registry key it could not read.
-  It starts unless the last case applies with a store key in its environment. Check the lists
-  yourself.
+  service, an `nssm.exe` above a process that is neither Python nor `messagefoundry.exe`, or a
+  registry key it could not read. It starts unless the last case applies with a store key in its
+  environment. Check the lists yourself.
 - **How the engine finds its own service:** it walks up through the Python interpreter and
-  `messagefoundry.exe` processes above it. When the first other process is `nssm.exe`, it asks the Service Control Manager which
-  service runs there. When that process is anything else, such as a shell, the engine is not a
-  service, unless an `nssm.exe` sits further up. Then it cannot tell a wrapper NSSM starts from a
-  shell inside another NSSM service, and names `service_environment_unobservable`.
-- **Where they are reported:** except `secret_in_service_environment`, whose bullet above says
-  where, the serve-time loosening warning and `GET /security/posture`, each for the engine's own
-  process. `supervise` logs one WARNING for each entry at start.
+  `messagefoundry.exe` processes above it. When the first other process is `nssm.exe`, it asks
+  the Service Control Manager which service runs there. When that process is anything else, such
+  as a shell, the engine is not a service, unless an `nssm.exe` sits further up. Then it cannot
+  tell a wrapper NSSM starts from a shell inside another NSSM service, and names
+  `service_environment_unobservable`.
+- **Where they are reported:** `secret_in_service_environment` is reported where its bullet above
+  says. The others are reported in the serve-time loosening warning and `GET /security/posture`,
+  each for the engine's own process, and `supervise` logs one WARNING for each of them at start.
   `messagefoundry security show` is a separate process, so it reports none of them, and its scope
   line says so. The reading is taken once per process: as `serve` or `supervise` starts, or at
   the first reading an app built without them takes.

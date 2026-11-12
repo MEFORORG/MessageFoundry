@@ -326,9 +326,9 @@ variable the service needs in one call, or the ones you leave out are gone at th
 That includes the `MEFOR_SECRETS_DIRECTORY` entry the installer wrote: without it the engine reads
 no file in the secrets directory, and every secret moved there is missing, with no error naming
 the directory. Read the list first with `nssm get MessageFoundry AppEnvironmentExtra`.
-**No secret goes in that list:** the engine refuses to start with one of its own secret settings
-there, because any local user can read the list. Use the DPAPI key file for the store key, and the
-secrets directory for the rest (see
+**No secret goes in that list:** `serve` and `supervise` refuse to start with one of the engine's
+own secret settings there, because any local user can read the list. Use the DPAPI key file for
+the store key, and the secrets directory for the rest (see
 [Protect the store encryption key at rest](#protect-the-store-encryption-key-at-rest-wp-11d)).
 
 **A `PYTHON*` variable in that list does nothing for the engine.** The service starts the
@@ -636,8 +636,8 @@ NSSM environment.
   `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` (see [PHI.md](PHI.md) §3). Delete the old file only after
   the rotation, once nothing still needs its key. Set that retired key in the shell that runs
   `rotate-key`, never in the service's NSSM list: `serve` and `supervise` refuse to start with it
-  there. The
-  service's first start after a rotation needs no retired key ([PHI.md](PHI.md) §3, BACKLOG #3472).
+  there. The service's first start after a rotation needs no retired key ([PHI.md](PHI.md) §3,
+  BACKLOG #3472).
   **CORRECTED 2026-10-01:** this said `protect-key` locks the file to the minting admin plus SYSTEM
   after writing it, and that a rotation writes the new key "to the file" (vault BACKLOG #2601).
 
@@ -653,9 +653,9 @@ NSSM environment.
 
   **`serve` and `supervise` refuse to start when the store key, or a retired one, is in that
   list**, or in the service's own `Environment` registry value, whatever `[security].enforcement`
-  says (vault BACKLOG #2595). Move the key to the DPAPI key file above. A retired key belongs in the shell
-  that runs `messagefoundry rotate-key`, not in the service. What the engine reads, what it
-  refuses and what it does not cover are in
+  says (vault BACKLOG #2595). Move the key to the DPAPI key file above. A retired key belongs in
+  the shell that runs `messagefoundry rotate-key`, not in the service. What the engine reads, what
+  it refuses and what it does not cover are in
   [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#store_key_in_service_environment-service_environment_unobservable-and-secret_in_service_environment-secrets-in-the-windows-services-environment).
 
 - **The other secrets: a secrets directory (any platform).** At least the engine's own secret
