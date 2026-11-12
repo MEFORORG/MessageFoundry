@@ -267,6 +267,26 @@ async def test_the_fused_path_settles_the_row_as_the_split_path_does(
         assert expected in rec.dead[0][1]
 
 
+async def test_a_reload_before_prepare_that_drops_the_whole_feed_reverts_the_row(
+    store: MessageStore,
+) -> None:
+    # The concurrent batch path reads `ic` at batch start and awaits a semaphore before it calls
+    # _prepare_routed. A reload in that wait that drops the inbound AND its handler must revert the
+    # row, as a missing inbound always is, not dead-letter it as a missing handler.
+    calls: list[str] = []
+    runner = RegistryRunner(
+        _registry(calls), store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
+    item = await _routed_item(store)
+    stale_ic = runner.registry.inbound[LOOP]
+    runner.registry = _swapped_graph("inbound")  # drops the inbound, its router and the handler
+
+    prep = await runner._prepare_routed(LOOP, stale_ic, item)
+
+    assert prep.inbound_gone and not prep.missing_handler
+    assert calls == []
+
+
 @pytest.mark.parametrize("read", ["metadata", "reply"])
 async def test_a_key_service_outage_re_pends_rather_than_dead_letters(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, read: str

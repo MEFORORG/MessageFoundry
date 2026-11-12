@@ -581,6 +581,11 @@ class _ConnectorRetired(Exception):
 # unavailable) before retrying, so a transient failure logs once and recovers instead of hot-looping.
 _WORKER_ERROR_BACKOFF_SECONDS = 1.0
 
+# How long a #122 log-write halt waits for the reload lock before it pages anyway (BACKLOG #5704).
+# The halt reads what it stops under that lock, so the page that counts them waits for it too; past
+# this bound a slow or wedged holder would be holding back the one channel that still works.
+_LOG_HALT_PAGE_WAIT_SECONDS = 0.5
+
 
 # A per-lane worker's run of faults closes on the first healthy pass or empty claim at least this
 # long after its last fault (see _WorkerFaultLog).
@@ -5875,22 +5880,41 @@ class RegistryRunner:
             return  # latched: one halt per break
         self._log_write_stopped = True
         detail = f"application log sink {sink!r} is unwritable ({reason})"
+        # The operator's own pauses as they stood when the halt fired. A lane paused after this, by
+        # a racing reload that read the latch above (ADR 0189 door six), was paused because of this
+        # failure, so the halt still counts and reports it.
+        paused_before = set(self._outbound_paused)
         # Alert BEFORE stopping, and through the NOTIFIER rather than a log line: the sink this is
         # about is the one that just broke, so a log line may never land. If the stop itself wedges,
-        # the operator has already been told why the engine is going quiet. With the lock free the
-        # page goes out under it at no cost, since an uncontended acquire does not yield, and so
-        # carries the count of what this halt stops. With a reload holding it the page goes out NOW,
-        # because a slow or wedged reload must not hold back the one channel that still works; the
-        # count is not known yet, so it says the stop waits on that reload instead.
-        paged_early = self._reload_lock.locked()
-        if paged_early:
+        # the operator has already been told why the engine is going quiet. The page counts what the
+        # halt stops, which is read under the lock (below), so it waits for the lock, but only for
+        # a bound: past it the page goes out at once, saying the stop is pending, because a slow or
+        # wedged holder must not hold back the one channel that still works. The count follows in a
+        # second page once the halt has stopped them.
+        lock = self._reload_lock
+        paged_early = False
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=_LOG_HALT_PAGE_WAIT_SECONDS)
+        except TimeoutError:
+            paged_early = True
             self._page_log_halt(
                 sink,
-                f"{reason}; a reload holds the engine, and this process's connections stop once "
-                "it finishes",
+                f"{reason}; the halt is waiting for another engine operation, such as a reload, "
+                "to finish, and stops this process's connections once it does",
                 stopped=None,
             )
-        async with self._reload_lock:
+            await lock.acquire()
+        try:
+            if not self._log_write_stopped:
+                # A recovery probe that ran while the halt waited (a reload's un-park gate, an
+                # operator restart) re-validated the log by writing to it and cleared the latch. The
+                # log works, so stopping now would halt a healthy engine.
+                log.warning(
+                    "log-failure halt for sink %r abandoned: the application log was re-validated "
+                    "while the halt waited",
+                    sink,
+                )
+                return
             # SNAPSHOT UNDER THE LOCK, never before it (BACKLOG #5704). A reload holding the lock has
             # unbound every listener at its step 1 and rebinds them at step 2. Its rebind gate,
             # :meth:`_resume_inbound_processing`, refuses only an inbound already in `_log_halted`,
@@ -5903,10 +5927,13 @@ class RegistryRunner:
             outbounds = [
                 name
                 for name in self.registry.outbound
-                if self._owns_destination(name) and name not in self._outbound_paused
+                if self._owns_destination(name) and name not in paused_before
             ]
-            if not paged_early:
-                self._page_log_halt(sink, reason, stopped=len(inbounds) + len(outbounds))
+            self._page_log_halt(
+                sink,
+                f"{reason}; the halt has now stopped them" if paged_early else reason,
+                stopped=len(inbounds) + len(outbounds),
+            )
             # THE INTERNAL STAGES FIRST, and they are not an afterthought — they are the half that
             # makes this an enforcement. See :meth:`_halt_inbound_processing`.
             #
@@ -5924,6 +5951,8 @@ class RegistryRunner:
                     # fail-closed halt, so a partial stop is strictly better than an abandoned one.
                     log.exception("log-failure stop: inbound %r did not stop cleanly", name)
             self._pause_delivery_lanes(outbounds)
+        finally:
+            lock.release()
         for name in inbounds + outbounds:
             try:
                 # ADR 0014's connection_stopped reports a stop but was never DRIVEN by a log-write
@@ -11832,35 +11861,12 @@ class RegistryRunner:
         ``(STOPPED, None)`` on a missing inbound or the STOP internal-error policy — the body already
         ``mark_failed``'d / dead-lettered the head per policy). The per_lane loop reads only
         ``outcome[0]``. Store errors propagate to the caller's backoff."""
-        ic = self.registry.inbound.get(name)
-        if ic is None:
-            # Inbound removed; nothing to transform with until a reload restores it (which
-            # re-arms this worker). Revert the row (retry-forever) and exit (mirrors the
-            # router worker), so the ACKed-but-unprocessed message is never dropped. The
-            # worker releases the unprocessed batch tail as it returns (_release_tail_on_stop,
-            # ADR 0157 Inc 2), so the tail keeps its FIFO position and the reload that
-            # restores the inbound drains it with the rest of the backlog.
-            # max_attempts=None is EXPLICIT (#1051): RetryPolicy's own default is now the finite 100,
-            # so a bare RetryPolicy() here would dead-letter an ACKed-but-never-attempted message
-            # purely for outliving a reload — the one thing these three sites exist to prevent.
-            await self.store.mark_failed(
-                item.id, "inbound not in registry", RetryPolicy(max_attempts=None)
-            )
-            return _ItemOutcome.STOPPED, None
-        hname = item.handler_name
-        if hname is None or hname not in self.registry.handlers:
-            # Handler gone (removed/renamed since routing). Can't transform this row;
-            # dead-letter it (message ERROR, replayable once restored) — the per-row analogue
-            # of the startup dead_letter_missing_handlers sweep. Dead-lettering (vs reverting)
-            # avoids a hot-loop on a permanently-missing handler and gives operator visibility.
-            log.warning(
-                "transform worker %r: handler %r for %s is missing; dead-lettering",
-                name,
-                hname,
-                item.id,
-            )
-            await self.store.dead_letter_now(item.id, f"handler {hname!r} removed from registry")
-            return _ItemOutcome.PROCESSED, None
+        # A missing inbound or handler is settled in ONE place, _apply_routed, which this path, the
+        # concurrent path and the fused path all reach (BACKLOG #5708).
+        dropped = self._dropped_by_reload(name, item)
+        if dropped is not None:
+            return await self._apply_routed(name, item, dropped)
+        ic = self.registry.inbound[name]
         # ADR 0071 B5 PR3 — fused transform+handoff dispatch (SQL Server, pooled, flag on). Fuse
         # transform_one (CONTENT) + transform_handoff_sync (INFRA) into ONE worker hop, gated on
         # the real guard _fusion_active. The missing-handler guard above STAYS ahead of this: the
@@ -11872,8 +11878,9 @@ class RegistryRunner:
             if result.xform_exc is not None:  # CONTENT: a handler raise → internal-error policy
                 return await self._apply_transform_internal_error(name, item, result.xform_exc)
             if isinstance(result.handoff_exc, CellTagError):
-                # BACKLOG #2593: the message's own metadata cell failed its row tag (in the sync
-                # handoff, which rolled back, or in the loopback read). Dead-letter the row (message
+                # BACKLOG #2593: the message's own metadata cell failed its row tag in the sync
+                # handoff, which rolled back (one in the loopback read comes back as `settled`
+                # instead, BACKLOG #5708). Dead-letter the row (message
                 # ERROR) and audit it, as the async transform_handoff does, rather than re-pend a
                 # row that would fail the same way until the inbound stopped.
                 await dead_letter_on_cell_tag(self._cell_tag_sink, item.id, result.handoff_exc)
@@ -12017,9 +12024,15 @@ class RegistryRunner:
         alone had stranded. :meth:`_dropped_by_reload` now settles each as the runner already
         settles it before any await. From that check to the dispatch nothing awaits, so the
         transform, its code sets and its content type all come from one graph."""
+        # On entry as well as after the read: the concurrent batch path awaits its semaphore before
+        # it calls here, with an `ic` it read at batch start, so a reload can already have dropped
+        # the inbound. Inbound first, so a reload that drops a whole feed reverts the row rather
+        # than dead-lettering it as a missing handler.
+        dropped = self._dropped_by_reload(name, item)
+        if dropped is not None:
+            return dropped
         hname = item.handler_name
-        if hname is None or hname not in self.registry.handlers:
-            return _RoutedPrep(missing_handler=True)
+        assert hname is not None  # _dropped_by_reload settles a row with no handler name
         # ADR 0013 Increment 2: for a RE-INGRESSED message (only ever on a loopback inbound),
         # feed the run-context `response` provider the ORIGIN request's captured replies so its
         # Handler can read them via response_get(dest). A normal message → None (byte-identical,
@@ -12034,12 +12047,12 @@ class RegistryRunner:
             except CellTagError as err:
                 return _RoutedPrep(tag_failure=err)
             except _UnreadableLoopbackRow as err:
-                return _RoutedPrep(unreadable=err)
-        # After the loopback read, and on every inbound: the concurrent batch path awaits its
-        # semaphore before it calls here, with an `ic` it read at batch start.
-        dropped = self._dropped_by_reload(name, item)
-        if dropped is not None:
-            return dropped
+                # Dropped with the traceback, whose frames hold the decrypted metadata as locals.
+                return _RoutedPrep(unreadable=err.with_traceback(None))
+            # The read awaited, so a reload may have dropped the inbound or the handler since.
+            dropped = self._dropped_by_reload(name, item)
+            if dropped is not None:
+                return dropped
         # No await from here to the dispatch, so this is the graph the transform runs under.
         registry = self.registry
         try:
@@ -12136,9 +12149,15 @@ class RegistryRunner:
             await self.store.dead_letter_now(item.id, str(prep.unreadable))
             return _ItemOutcome.PROCESSED, None
         if prep.inbound_gone:
-            # BACKLOG #5708: a reload dropped the inbound during the loopback read. The same revert
-            # as _process_routed_item's missing-inbound exit, and for its reason: retry-forever
-            # (max_attempts=None, #1051), so a reload alone never dead-letters an ACKed message.
+            # Inbound removed; nothing to transform with until a reload restores it (which
+            # re-arms this worker). Revert the row (retry-forever) and exit (mirrors the
+            # router worker), so the ACKed-but-unprocessed message is never dropped. The
+            # worker releases the unprocessed batch tail as it returns (_release_tail_on_stop,
+            # ADR 0157 Inc 2), so the tail keeps its FIFO position and the reload that
+            # restores the inbound drains it with the rest of the backlog.
+            # max_attempts=None is EXPLICIT (#1051): RetryPolicy's own default is now the finite 100,
+            # so a bare RetryPolicy() here would dead-letter an ACKed-but-never-attempted message
+            # purely for outliving a reload — the one thing these three sites exist to prevent.
             await self.store.mark_failed(
                 item.id, "inbound not in registry", RetryPolicy(max_attempts=None)
             )
@@ -12328,17 +12347,10 @@ class RegistryRunner:
             try:
                 response_view = await self._loopback_response_view(item)
             except CellTagError as err:
-                return _FusedTransformResult(
-                    deliveries=[],
-                    pt_deliveries=[],
-                    applied_state=[],
-                    xform_exc=None,
-                    handoff_exc=err,
-                    outbound_wakes=(),
-                    ingress_wakes=(),
-                )
+                settled = _RoutedPrep(tag_failure=err)
             except _UnreadableLoopbackRow as err:
-                settled = _RoutedPrep(unreadable=err)
+                # Dropped with the traceback, whose frames hold the decrypted metadata as locals.
+                settled = _RoutedPrep(unreadable=err.with_traceback(None))
             if settled is None:
                 # The read awaited, so a reload may have dropped the inbound or the handler.
                 settled = self._dropped_by_reload(name, item)

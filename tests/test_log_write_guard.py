@@ -634,13 +634,14 @@ async def test_the_halt_is_latched_so_a_second_event_does_not_restop(store: Mess
 
 
 async def test_a_halt_racing_a_reload_stops_the_listeners_that_reload_rebound(
-    store: MessageStore,
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # BACKLOG #5704. A reload holding the lock has unbound every listener (its step 1) and is about
     # to rebind them, and to add a lane. A halt that fires then must stop what the reload leaves
     # bound, not what was bound when the halt fired. The reload's own rebind gate cannot refuse here:
     # it refuses only an inbound already in `_log_halted`, and the halt has not yet taken the lock to
     # put anything there.
+    monkeypatch.setattr(wiring_runner, "_LOG_HALT_PAGE_WAIT_SECONDS", 0.01)
     sink = _RecordingSink()
     runner, old_source = _graph(store, sink)
     halt: asyncio.Future[None] | None = None
@@ -654,14 +655,14 @@ async def test_a_halt_racing_a_reload_stops_the_listeners_that_reload_rebound(
                 )
             )
         )
-        await asyncio.sleep(0)  # the halt runs up to the lock and waits there
+        await asyncio.sleep(0.2)  # past the bounded wait: the halt pages, then waits on the lock
         assert runner._log_write_stopped and not halt.done()
-        # The page went out already, rather than waiting on a reload that may be slow or wedged.
-        # It cannot count what the halt will stop yet, so it says the stop waits on the reload.
+        # The page went out already, rather than waiting on a holder that may be slow or wedged.
+        # It cannot count what the halt will stop yet, so it says the stop is pending.
         assert len(sink.log_failures) == 1
         name, stage, reason, stopped = sink.log_failures[0]
         assert (name, stage, stopped) == ("file", "unwritable", None)
-        assert reason.startswith("disk full; a reload holds the engine")
+        assert reason.startswith("disk full; the halt is waiting for another engine operation")
         # The reload's step 2: the listener comes back up, and the new graph adds an outbound.
         rebound = _StubSource()
         runner._sources[INBOUND] = rebound  # type: ignore[assignment]
@@ -670,6 +671,9 @@ async def test_a_halt_racing_a_reload_stops_the_listeners_that_reload_rebound(
                 OUTBOUND_ADDED, ConnectionSpec(ConnectorType.MLLP, {"host": "h", "port": 2})
             )
         )
+        # The reload's step 3 pauses a running lane itself, because it reads the latch (ADR 0189
+        # door six). That lane was stopped by this failure too, so the halt must still report it.
+        runner._stop_outbound_unsafe(OUTBOUND)
     finally:
         runner._reload_lock.release()
         if halt is not None and not halt.done():
@@ -680,9 +684,54 @@ async def test_a_halt_racing_a_reload_stops_the_listeners_that_reload_rebound(
     assert rebound.stopped is True, "the halt left a listener the reload rebound open"
     assert INBOUND not in runner._sources
     assert {OUTBOUND, OUTBOUND_ADDED} <= runner._outbound_paused
-    assert len(sink.log_failures) == 1, "the halt paged twice for one break"
+    # The second page carries the count, read once the reload had finished.
+    assert len(sink.log_failures) == 2
+    assert sink.log_failures[1][3] == 3
+    assert sink.log_failures[1][2] == "disk full; the halt has now stopped them"
     assert sorted(name for name, _ in sink.stopped) == [INBOUND, OUTBOUND, OUTBOUND_ADDED]
     assert old_source.stopped is False  # the reload, not the halt, unbound the old one
+
+
+async def test_an_uncontended_halt_pages_once_with_its_count(store: MessageStore) -> None:
+    # The bounded wait costs nothing when the lock is free: one page, carrying the count.
+    sink = _RecordingSink()
+    runner, _source = _graph(store, sink)
+
+    await runner._respond_to_log_sink_event(
+        LogSinkEvent(sink="file", stage="unwritable", reason="disk full", stop_requested=True)
+    )
+
+    assert sink.log_failures == [("file", "unwritable", "disk full", 2)]
+
+
+async def test_a_halt_whose_latch_a_recovery_cleared_while_it_waited_stops_nothing(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A recovery probe that ran under the lock (a reload's un-park gate, an operator restart)
+    # re-validated the log by writing to it and cleared the latch. The log works, so the halt that
+    # was waiting must not then stop a healthy engine.
+    monkeypatch.setattr(wiring_runner, "_LOG_HALT_PAGE_WAIT_SECONDS", 0.01)
+    sink = _RecordingSink()
+    runner, source = _graph(store, sink)
+    await runner._reload_lock.acquire()
+    try:
+        halt = asyncio.ensure_future(
+            runner._respond_to_log_sink_event(
+                LogSinkEvent(
+                    sink="file", stage="unwritable", reason="disk full", stop_requested=True
+                )
+            )
+        )
+        await asyncio.sleep(0.05)
+        runner._log_write_stopped = False  # what _log_recovery_ok does when revalidate() passes
+    finally:
+        runner._reload_lock.release()
+    await asyncio.wait_for(halt, timeout=5.0)
+
+    assert source.stopped is False
+    assert OUTBOUND not in runner._outbound_paused
+    assert INBOUND not in runner._log_halted
+    assert sink.stopped == []
 
 
 async def test_an_alert_sink_that_raises_does_not_abort_the_halt(store: MessageStore) -> None:
