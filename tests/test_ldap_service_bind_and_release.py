@@ -12,7 +12,7 @@ Six properties are pinned, each with the test that failed before the change:
 * a failed service-account bind closes its socket, at least on an error raised after the socket
   opened, such as on a password SASLprep refuses, and on a failed open the rule in
   ``ldap._close_without_sending`` names (L4; the host name refusal is pinned in
-  ``tests/test_ldap_tls.py``);
+  ``tests/test_ldap_tls.py``), and so does a failed open on the user bind and the decoy bind;
 * a service-account bind refused with a referral is refused as a referral, and any other refusal
   names its result code, through a real ldap3 stack;
 * a sign-in or step-up leg answers a directory error for any fault the authenticator raises, with
@@ -28,6 +28,8 @@ import functools
 import inspect
 import json
 import logging
+import socket
+import ssl
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -45,6 +47,7 @@ from messagefoundry.auth.ldap import (
 )
 from messagefoundry.auth.service import AuthService
 from messagefoundry.store.store import MessageStore
+from tests.test_ldap_bind_result_codes import _alice
 from tests.test_ldap_error_mapping import _faulting
 from tests.test_ldap_referrals import _BIND_RESPONSE
 from tests.test_ldap_search_result_codes import _done, _scripted_dc
@@ -236,8 +239,6 @@ def test_a_failed_search_still_unbinds_the_service_connection(
 def test_an_ldap3_socket_error_names_the_interpreters_error_type() -> None:
     """ldap3 merges the interpreter's error into its own class, so the type tells a CA mismatch
     from a refused port without quoting the text, which can name the directory's addresses."""
-    import ssl
-
     from ldap3.core.exceptions import LDAPSocketOpenError, communication_exception_factory
 
     merged = communication_exception_factory(
@@ -406,8 +407,6 @@ def test_a_service_bind_whose_open_fails_after_the_connect_closes_its_socket(
     """Through a real ldap3 stack, the first case of the rule in ``ldap._close_without_sending``:
     a TLS wrap that raises before ``ssl`` takes the socket over. The domain controller sees the
     socket end."""
-    import ssl
-
     built: list[Any] = []
     real = ldap3.Connection
 
@@ -430,6 +429,115 @@ def test_a_service_bind_whose_open_fails_after_the_connect_closes_its_socket(
     assert "synthetic-leak" not in str(err.value)
     [conn] = built
     assert conn.socket is None
+
+
+@pytest.mark.parametrize("how", ["wrap-refused", "connect-refused"])
+def test_a_user_or_decoy_bind_whose_open_fails_closes_its_socket(how: str) -> None:
+    """The same rule for the second connect, through a real ldap3 stack, on both branches of the
+    #1140 bind (BACKLOG #3017), for a TLS wrap refused before ``ssl`` takes the socket over and for
+    a connect the directory refused. A failed open leaves the connection closed with its socket
+    held, and ldap3's ``unbind`` does nothing on a closed connection, so before #3017 the socket
+    stayed open until the object was collected. The two branches still answer alike. The refused
+    port is held bound, exclusively where Windows offers it, and not listening while both branches
+    run."""
+    # Per branch: the second connect's socket, and whether it was open as the open ended.
+    second: dict[str, tuple[Any, bool]] = {}
+    texts: dict[str, str] = {}
+    real = ldap3.Connection
+
+    def refused_wrap(*_args: Any, **_kwargs: Any) -> None:
+        raise ssl.SSLError("synthetic-leak-3017")
+
+    class RefusedSecondOpen(real):  # type: ignore[misc, valid-type]
+        def __init__(self, server: Any = None, **kwargs: Any) -> None:
+            super().__init__(server, **kwargs)
+            if kwargs.get("user") == _SERVICE_DN:
+                return
+            # Each bind builds its own Server, so this refuses only the second connect.
+            open_socket = self.strategy._open_socket
+
+            def held_open(*args: Any, **kwargs: Any) -> None:
+                try:
+                    open_socket(*args, **kwargs)
+                finally:
+                    # Read as the open ends: the close under test then drops conn.socket, and a
+                    # socket open here and read closed below closed after it.
+                    sock = self.socket
+                    second[branch] = (sock, sock is not None and sock.fileno() != -1)
+
+            self.strategy._open_socket = held_open
+            if how == "wrap-refused":
+                self.server.ssl = True
+                self.server.tls = SimpleNamespace(wrap_socket=refused_wrap)
+            else:
+                self.server.port = dead
+
+    with socket.socket() as held:
+        exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)  # Windows only
+        if exclusive is not None:
+            held.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+        held.bind(("127.0.0.1", 0))
+        dead = int(held.getsockname()[1])
+        for branch, search in (("absent", lambda _raw: [_done(0)]), ("present", _alice)):
+            with (
+                pytest.MonkeyPatch.context() as mp,
+                _scripted_dc(search) as (dc, authenticator),
+            ):
+                mp.setattr(ldap3, "Connection", RefusedSecondOpen)
+                with pytest.raises(LdapError) as err:
+                    authenticator.authenticate("alice", _PASSWORD)
+                # The service account bound and the user search ran, so the refused open was the
+                # second connect, whose release is under test, not the service account's.
+                assert len(dc.searches) == 1, f"the {branch} branch never searched"
+            texts[branch] = str(err.value)
+    # Both branches recorded their second connect's socket, so the absence check below has a
+    # population to walk; the exact set is pinned by the next assertion.
+    assert len(second) >= 2, second
+    # ldap3 sets conn.socket before the connect, so a failed open still holds one, still open.
+    was_open = {branch: opened for branch, (_sock, opened) in second.items()}
+    assert was_open == {"absent": True, "present": True}, was_open
+    left_open = [branch for branch, (sock, _) in second.items() if sock.fileno() != -1]
+    assert left_open == [], f"left its socket open: {left_open}"
+    assert texts["absent"] == texts["present"], texts
+    assert "synthetic-leak" not in texts["absent"]
+
+
+def test_a_block_that_raised_on_an_open_connection_is_unbound_and_not_closed_again() -> None:
+    """The control: an unbind that sets ``conn.socket`` to None, as this stand-in does and as
+    ``ldap._end_release`` says ldap3's does once it sends its request, leaves nothing to close
+    after it. A refusal raised after a bind that opened, such as a referral, still unbinds."""
+    calls: list[str] = []
+    conn = SimpleNamespace(socket=object())
+
+    def unbind() -> None:
+        calls.append("unbind")
+        conn.socket = None
+
+    conn.unbind = unbind
+    conn.strategy = SimpleNamespace(close=lambda: calls.append("close"))
+    with pytest.raises(LdapReferralError), ldap_module._released(conn, "user bind"):
+        raise LdapReferralError("synthetic")
+    assert calls == ["unbind"]
+
+
+def test_an_unbind_defect_still_propagates_and_its_socket_is_closed() -> None:
+    """An unbind error that is not ldap3's is an engine defect and escapes as itself, and the
+    socket the unbind left is closed all the same, which hides nothing (BACKLOG #3017)."""
+    calls: list[str] = []
+    defect = TypeError("synthetic engine defect")
+
+    def unbind() -> None:
+        raise defect
+
+    conn = SimpleNamespace(
+        unbind=unbind,
+        socket=SimpleNamespace(close=lambda: calls.append("socket")),
+        strategy=SimpleNamespace(close=lambda: calls.append("strategy")),
+    )
+    with pytest.raises(TypeError) as raised, ldap_module._released(conn, "user bind") as release:
+        release.answer_stands = True
+    assert raised.value is defect
+    assert calls == ["strategy", "socket"]
 
 
 @pytest.mark.parametrize(
@@ -634,8 +742,6 @@ def test_the_login_error_detail_holds_only_names_the_code_defines() -> None:
     """BACKLOG #3196, #3727: the code, ldap3's name for it and the engine's name for the operation,
     and the interpreter error an ldap3 socket error merges in, which tells a CA mismatch from a
     refused port. None of the text."""
-    import ssl
-
     from ldap3.core.exceptions import LDAPSocketOpenError, communication_exception_factory
 
     unanswered = ldap_module._unanswered("user search", 51)
