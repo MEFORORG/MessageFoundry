@@ -647,8 +647,10 @@ class CipherUnavailableError(CipherError):
     and, in ``decrypt_many``, for each value it never asked for once one value gave no verdict
     (:func:`gave_no_verdict`). That covers a refusal such as a 403 too: the value asked for keeps
     its own plain :class:`CipherError`, and the values after it, never asked for, get this class.
-    Every other Transit failure, a refused tag among them, stays plain :class:`CipherError`, so a
-    value Transit refused is never read as an outage.
+    Every other Transit failure, a refused tag among them, stays plain :class:`CipherError`. A
+    reader that tells an outage from a value's failure by :func:`gave_no_verdict` still reads some
+    of those as an outage: one whose cause is an ``OSError`` or an ``hvac`` error other than a 400
+    (a 403, say). A refused tag, Vault's 400, is read as the value's.
 
     It lives here rather than beside the Transit cipher so that ``uploads.py``, a leaf that imports
     only this module, can tell it apart: the upload routes answer it 503 with ``Retry-After``, where
@@ -838,12 +840,33 @@ def gave_no_verdict(error: CipherError) -> bool:
     )
 
 
+#: How many links of an error's ``__cause__``/``__context__`` chain :func:`detached` clears.
+_DETACH_DEPTH = 16
+
+
+def detached(error: CipherError) -> CipherError:
+    """``error``, with the traceback of it and of each error on its cause and context chain
+    cleared, for an error that is returned rather than raised (BACKLOG #6706). A traceback's
+    frames, through ``f_back``, reach the batch path's locals, which hold the other values'
+    plaintext; the error's type, text and chain are kept."""
+    seen: set[int] = set()
+    link: BaseException | None = error
+    for _ in range(_DETACH_DEPTH):
+        if link is None or id(link) in seen:
+            break
+        seen.add(id(link))
+        link.__traceback__ = None
+        link = link.__cause__ or link.__context__
+    return error
+
+
 def decrypt_or_error(cipher: Cipher, stored: str, aad: bytes | None) -> str | CipherError:
-    """``cipher.decrypt(stored, aad=aad)``, with its :class:`CipherError` returned, not raised."""
+    """``cipher.decrypt(stored, aad=aad)``, with its :class:`CipherError` returned, not raised,
+    and :func:`detached`."""
     try:
         return cipher.decrypt(stored, aad=aad)
     except CipherError as exc:
-        return exc
+        return detached(exc)
 
 
 def encrypt_many(cipher: Cipher, items: Sequence[CipherItem]) -> list[str]:

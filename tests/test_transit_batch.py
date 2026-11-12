@@ -577,3 +577,60 @@ def test_the_send_alone_state_outlives_one_call() -> None:
     for _ in range(3):
         assert cipher.decrypt_many(items) == ["value 0", "value 1", "value 2"]
     assert batches == 1
+
+
+def test_an_encrypt_batch_400_or_unread_failure_keeps_batching_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transit = _BatchTransit()
+    cipher = _cipher(transit)
+    real = transit.encrypt_data
+
+    def bad_request(**kw: Any) -> dict[str, Any]:
+        if kw.get("batch_input") is not None:
+            raise InvalidRequest("synthetic batch 400")
+        return real(**kw)
+
+    transit.encrypt_data = bad_request  # type: ignore[method-assign]
+    items = [("a", None), ("b", None)]
+    assert all(v.startswith("mfenc:v3:") for v in cipher.encrypt_many(items))
+    assert cipher._batch_alone is False  # a 400 never turns batching off
+
+    def broken(exc: BaseException) -> bool:
+        raise RuntimeError("synthetic classifier fault")
+
+    monkeypatch.setattr(crypto_transit, "is_vault_bad_request", broken)
+    assert all(v.startswith("mfenc:v3:") for v in cipher.encrypt_many(items))
+    assert cipher._batch_alone is False  # nor does a failure the classifier could not read
+
+
+def _frames_reach(error: BaseException, needle: str) -> bool:
+    """Whether any frame reachable from ``error``'s chain of tracebacks holds ``needle`` in a
+    local, as a string or inside a list, tuple or dict of strings."""
+    seen: set[int] = set()
+    link: BaseException | None = error
+    while link is not None and id(link) not in seen:
+        seen.add(id(link))
+        tb = link.__traceback__
+        while tb is not None:
+            frame: Any = tb.tb_frame
+            while frame is not None:
+                for value in frame.f_locals.values():
+                    if needle in repr(value):
+                        return True
+                frame = frame.f_back
+            tb = tb.tb_next
+        link = link.__cause__ or link.__context__
+    return False
+
+
+def test_no_returned_error_reaches_another_values_plaintext() -> None:
+    transit = _BatchTransit()
+    cipher = _cipher(transit)
+    items = _sealed(cipher, 4)
+    items[3] = (items[3][0], cell_aad("t", "c", 999))  # the batch answers 400, then each alone
+    results = cipher.decrypt_many(items)
+    assert results[:3] == ["value 0", "value 1", "value 2"]
+    error = results[3]
+    assert isinstance(error, CipherError)
+    assert not _frames_reach(error, "value 0")

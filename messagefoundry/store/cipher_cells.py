@@ -53,6 +53,7 @@ from messagefoundry.store.crypto import (
     batch_chars,
     cell_aad,
     decrypt_or_error,
+    detached,
     gave_no_verdict,
 )
 from messagefoundry.store.queue_tag import QUEUE_TAG_COLUMNS, QueueTagError, queue_row_aad
@@ -590,7 +591,8 @@ def _open_queued(opening: _Opening) -> bool:
             try:
                 spec.check(result, *key)
             except CipherError as exc:
-                reading = _failed(spec, cipher, stored, where, exc)
+                # Detached: this frame holds the batch's other plaintexts (BACKLOG #6706).
+                reading = _failed(spec, cipher, stored, where, detached(exc))
         opening.readings[slot] = reading
         if reading.error is not None and _is_outage(reading.error):
             del opening.readings[slot + 1 :]

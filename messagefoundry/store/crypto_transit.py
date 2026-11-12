@@ -507,7 +507,9 @@ class TransitCipher(_UnmarkedPolicy):
         raises :class:`CipherUnavailableError`, and so does a reply :func:`_batch_replies` refuses,
         except one with no ``reference`` echo (:data:`UNECHOED`). That reply, or a batch Transit
         refused, a proxy's request-size bound among them, seals each value of the batch alone, and
-        this cipher then sends every later value alone. A batch of one is a single request."""
+        this cipher then sends every later value alone. Vault's 400 to a batch, or a failure the
+        classifier could not read (:func:`_classify_batch_failure`), seals that batch alone and
+        leaves batching on. A batch of one is a single request."""
         costs = [
             b64_chars(len(plaintext.encode("utf-8"))) + batch_chars("", aad)
             for plaintext, aad in items
@@ -519,22 +521,25 @@ class TransitCipher(_UnmarkedPolicy):
                 sealed.extend(self.encrypt(plaintext, aad=aad) for plaintext, aad in batch)
                 continue
             outcome = self._encrypt_batch(batch)
-            if isinstance(outcome, str):
-                sealed.extend(self.encrypt(plaintext, aad=aad) for plaintext, aad in batch)
-                self._send_alone_from_now("encrypt", outcome)
-            else:
+            if isinstance(outcome, list):
                 sealed.extend(outcome)
+                continue
+            sealed.extend(self.encrypt(plaintext, aad=aad) for plaintext, aad in batch)
+            if outcome is not None:
+                self._send_alone_from_now("encrypt", outcome)
         return sealed
 
-    def _encrypt_batch(self, batch: list[CipherItem]) -> list[str] | str:
-        """One batch request of :meth:`encrypt_many`: the sealed values in its order, or why the
-        values must be sealed alone: ``"refused"`` or ``"did not echo the reference of"``."""
+    def _encrypt_batch(self, batch: list[CipherItem]) -> list[str] | str | None:
+        """One batch request of :meth:`encrypt_many`: the sealed values in its order; else why the
+        values must be sealed alone and later ones too, ``"refused"`` or ``"did not echo the
+        reference of"``; else ``None``, for Vault's 400 or an unread failure, sealed alone with
+        batching left on."""
         sent = [
             (base64.b64encode(plaintext.encode("utf-8")).decode("ascii"), aad)
             for plaintext, aad in batch
         ]
         response: Any = None
-        failed = unavailable = False
+        failed = unavailable = bad_request = False
         failure_type = ""
         try:
             response = self._client.secrets.transit.encrypt_data(
@@ -543,13 +548,13 @@ class TransitCipher(_UnmarkedPolicy):
         except Exception as exc:
             # Type-only message: the plaintext going in is PHI; never surface it or the key material.
             failed, failure_type = True, type(exc).__name__
-            unavailable, _bad_request = _classify_batch_failure(exc)
+            unavailable, bad_request = _classify_batch_failure(exc)
         if unavailable:
             raise CipherUnavailableError(
                 f"Transit encrypt failed (key={self._key!r}): {failure_type}"
             )
         if failed:
-            return "refused"
+            return None if bad_request else "refused"
         replies = _batch_replies(response, len(batch))
         if replies == UNECHOED:
             return "did not echo the reference of"
