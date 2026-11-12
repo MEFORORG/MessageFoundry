@@ -43,7 +43,8 @@ async def test_the_call_names_the_schema_the_gate_verified(
 
 
 async def test_a_schema_name_is_bracket_quoted(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The name comes from the server, but it is still an identifier spliced into SQL text.
+    # The name comes from the server, but it is still an identifier spliced into SQL text, so the
+    # gate takes it QUOTENAME'd and uses that form for the probe and the CALL.
     store = await _gate(_gate_rows(schema="odd]name"), monkeypatch)
     assert store.claim_proc_effective is True, store.claim_proc_degraded_reason
     assert store._claim_proc_schema == "[odd]]name]"

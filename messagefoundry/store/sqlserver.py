@@ -1967,16 +1967,14 @@ def _claim_proc_stored_forms(proc_name: str, lane_col: str) -> dict[str, str]:
     return {label: _normalize_tsql(head + tail) for label, head in _CLAIM_PROC_STORED_HEADS}
 
 
-#: The schema of the queue table this login resolves, the same way every unqualified claim
-#: reference resolves it: the default schema, then dbo (BACKLOG #5722).
-_CLAIM_PROC_SCHEMA_SQL: Final[str] = (
-    "SELECT OBJECT_SCHEMA_NAME(OBJECT_ID(N'queue', N'U')) AS store_schema"
+#: The proc gate's first probe: the compat level, and the bracket-quoted schema of the queue table
+#: this login resolves, the same way every unqualified claim reference resolves it: the default
+#: schema, then dbo (BACKLOG #5722). NULL when the table does not resolve.
+_CLAIM_PROC_GATE_SQL: Final[str] = (
+    "SELECT compatibility_level,"
+    " QUOTENAME(OBJECT_SCHEMA_NAME(OBJECT_ID(N'queue', N'U'))) AS store_schema"
+    " FROM sys.databases WHERE name = DB_NAME()"
 )
-
-
-def _bracket_ident(name: str) -> str:
-    """``name`` as a T-SQL bracket-quoted identifier, the client-side ``QUOTENAME``."""
-    return "[" + name.replace("]", "]]") + "]"
 
 
 def _claim_proc_shipped_hashes() -> dict[str, dict[str, str]]:
@@ -3669,28 +3667,23 @@ class SqlServerStore:
         head_forms: dict[str, str] = {}
         schema: str | None = None
         try:
-            row = await self._fetchone(
-                "SELECT compatibility_level FROM sys.databases WHERE name = DB_NAME()"
-            )
+            row = await self._fetchone(_CLAIM_PROC_GATE_SQL)
             compat = int(row["compatibility_level"]) if row else 0
+            schema = row["store_schema"] if row else None
             if compat < 130:
                 reason = f"database compatibility_level {compat} < 130 (OPENJSON unavailable)"
+            elif schema is None:
+                reason = (
+                    "the queue table does not resolve for this login, so the gate cannot tell"
+                    " which schema the claim procedures belong in"
+                )
             else:
-                row = await self._fetchone(_CLAIM_PROC_SCHEMA_SQL)
-                store_schema = row["store_schema"] if row else None
-                if store_schema is None:
-                    reason = (
-                        "the queue table does not resolve for this login, so the gate cannot tell"
-                        " which schema the claim procedures belong in"
-                    )
-                else:
-                    schema = _bracket_ident(str(store_schema))
-                    reason = await self._verify_claim_procs(schema, head_forms)
+                reason = await self._verify_claim_procs(schema, head_forms)
         except Exception as exc:  # noqa: BLE001 - §4: ANY gate failure degrades, never an outage
             # A transient probe failure (e.g. a hiccup on the metadata read) must not fail the
             # open — the ADR's rule is total: any gate miss runs the shipped batch, loudly.
             reason = f"startup-gate probe failed: {codec_safe_str(exc)}"
-        if reason is None and schema is not None:
+        if reason is None:
             self._claim_proc_effective = True
             self._claim_proc_degraded_reason = None
             self._claim_proc_input_sizes = _claim_proc_param_pins()

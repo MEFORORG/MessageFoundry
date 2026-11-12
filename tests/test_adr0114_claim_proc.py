@@ -343,10 +343,10 @@ def _gate_rows(
         body = resolve(value, proc, col)
         return {"oid": oid if oid is not None else (917578307 if body else None), "body": body}
 
-    quoted = "[" + (schema or "").replace("]", "]]") + "]"
+    # What QUOTENAME returns for the schema; NULL in, NULL out.
+    quoted = None if schema is None else "[" + schema.replace("]", "]]") + "]"
     return {
-        "compat": {"compatibility_level": compat},
-        "schema": {"store_schema": schema},
+        "compat": {"compatibility_level": compat, "store_schema": quoted},
         f"{quoted}.mefor_claim_fifo_heads_cid_v2": answer(
             cid_body, cid_oid, "mefor_claim_fifo_heads_cid_v2", "channel_id"
         ),
@@ -360,10 +360,12 @@ def _stub_fetchone(store: SqlServerStore, answers: dict[str, dict[str, Any] | No
     # The stub pins the EXACT probe SQL (not substrings): a typo'd probe would KeyError here
     # rather than silently matching.
     async def fake_fetchone(sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
-        if sql == "SELECT compatibility_level FROM sys.databases WHERE name = DB_NAME()":
+        if sql == (
+            "SELECT compatibility_level,"
+            " QUOTENAME(OBJECT_SCHEMA_NAME(OBJECT_ID(N'queue', N'U'))) AS store_schema"
+            " FROM sys.databases WHERE name = DB_NAME()"
+        ):
             return answers["compat"]
-        if sql == "SELECT OBJECT_SCHEMA_NAME(OBJECT_ID(N'queue', N'U')) AS store_schema":
-            return answers["schema"]
         assert sql == "SELECT OBJECT_ID(?) AS oid, OBJECT_DEFINITION(OBJECT_ID(?)) AS body", (
             f"unexpected probe: {sql}"
         )
