@@ -25,6 +25,7 @@ from messagefoundry.config.wiring import Http, WiringError
 from messagefoundry.transports.base import InboundReply, ReplyOutcome
 from messagefoundry.transports.http_listener import HttpSource
 from messagefoundry.transports.receipt import IngressReceipt, RefusalKind, receipt_handler
+from tests.test_inbound_http_source import _reader_from
 
 
 def test_valid_configurations_build() -> None:
@@ -316,3 +317,216 @@ async def test_a_hostile_partner_content_type_cannot_take_the_turn_down() -> Non
     assert body.decode() == REPLY_BODY
     assert "x-evil" not in headers, "a partner injected a header through Content-Type"
     assert headers["content-type"] == "application/json"
+
+
+async def test_a_turn_woken_by_stop_writes_its_503_before_the_writers_close() -> None:
+    # BACKLOG #5715: stop() wakes the blocked reply waiters and then closes every client writer. With
+    # no yield between, the woken turn would write its 503 to a closing transport, and a demoted
+    # caller would get a bare connection close instead of the answer the HA design depends on.
+    src = HttpSource(
+        Source(
+            type=ConnectorType.HTTP,
+            settings={"host": "127.0.0.1", "port": 0, "reply_from": "OB_PARTNER"},
+        )
+    )
+    blocked = asyncio.Event()
+    drained = asyncio.Event()
+
+    async def handler(raw: bytes) -> IngressReceipt:
+        return IngressReceipt.accepted("msg-1")
+
+    async def resolver(message_id: str) -> InboundReply:
+        blocked.set()
+        await drained.wait()
+        return InboundReply(ReplyOutcome.SHUTTING_DOWN)
+
+    reasons: list[str] = []
+
+    def drain(reason: str) -> None:
+        reasons.append(reason)
+        drained.set()
+
+    src.sync_reply = resolver
+    src.reply_drain = drain
+    data = await _post_then_stop(src, handler, blocked)
+    assert reasons == ["shutting_down"]
+    head, _, body = data.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.1 503 "), f"the woken turn's answer was lost: {data!r}"
+    assert b"\r\nRetry-After: 5" in head
+    assert _json.loads(body)["status"] == "shutting_down"
+
+
+async def _post_then_stop(src: HttpSource, handler: Any, blocked: asyncio.Event) -> bytes:
+    """Start ``src``, POST once, run stop() once ``blocked`` is set, and return all the peer read."""
+    await src.start(receipt_handler(handler))
+    stopped = False
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", src.sockport)
+        try:
+            writer.write(b"POST /ingest HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\n{}")
+            await writer.drain()
+            await asyncio.wait_for(blocked.wait(), 5.0)
+            await src.stop()
+            stopped = True
+            return await asyncio.wait_for(reader.read(-1), 5.0)
+        finally:
+            writer.close()
+            await asyncio.gather(writer.wait_closed(), return_exceptions=True)
+    finally:
+        if not stopped:
+            await src.stop()
+
+
+async def test_a_request_mid_commit_at_stop_still_gets_its_202() -> None:
+    # BACKLOG #5715, the receipt path: stop() closed the writer of a request whose commit was still
+    # running, so its 202 was discarded and the sender would resend a body already committed. A
+    # request read in full now keeps its writer until its answer is written.
+    src = HttpSource(Source(type=ConnectorType.HTTP, settings={"host": "127.0.0.1", "port": 0}))
+    blocked = asyncio.Event()
+
+    async def handler(raw: bytes) -> IngressReceipt:
+        blocked.set()
+        await asyncio.sleep(0.2)  # the commit, still running when stop() begins
+        return IngressReceipt.accepted("msg-1")
+
+    data = await _post_then_stop(src, handler, blocked)
+    assert data.startswith(b"HTTP/1.1 202 "), f"the committed request's 202 was lost: {data!r}"
+
+
+async def test_a_reply_turn_mid_commit_at_stop_answers_503_never_degraded() -> None:
+    # A reply_from turn whose commit finishes after stop() began must not arm the drained rendezvous
+    # and answer `degraded` (a 504 by default): ADR 0154 D5 never answers 504 on a demotion.
+    src = HttpSource(
+        Source(
+            type=ConnectorType.HTTP,
+            settings={"host": "127.0.0.1", "port": 0, "reply_from": "OB_PARTNER"},
+        )
+    )
+    blocked = asyncio.Event()
+    resolved: list[str] = []
+
+    async def handler(raw: bytes) -> IngressReceipt:
+        blocked.set()
+        await asyncio.sleep(0.2)  # the commit, still running when stop() begins
+        return IngressReceipt.accepted("msg-1")
+
+    async def resolver(message_id: str) -> InboundReply:
+        resolved.append(message_id)
+        return InboundReply(ReplyOutcome.DEGRADED)
+
+    src.sync_reply = resolver
+    src.reply_drain = lambda reason: None
+    data = await _post_then_stop(src, handler, blocked)
+    head, _, body = data.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.1 503 "), f"a stopping listener answered {data!r}"
+    assert b"\r\nRetry-After: 5" in head
+    assert _json.loads(body)["status"] == "shutting_down"
+    assert resolved == [], "a stopping listener armed the rendezvous"
+
+
+async def test_stop_stays_bounded_when_a_reply_turn_never_leaves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The writer stop() leaves open is still bounded by the shutdown grace: a turn the drain does not
+    # wake is cancelled at the grace, as every client task is, and stop() returns.
+    import messagefoundry.transports.http_listener as http_listener
+
+    monkeypatch.setattr(http_listener, "_CLIENT_SHUTDOWN_GRACE", 0.3)
+    src = HttpSource(
+        Source(
+            type=ConnectorType.HTTP,
+            settings={"host": "127.0.0.1", "port": 0, "reply_from": "OB_PARTNER"},
+        )
+    )
+    blocked = asyncio.Event()
+
+    async def handler(raw: bytes) -> IngressReceipt:
+        return IngressReceipt.accepted("msg-1")
+
+    async def resolver(message_id: str) -> InboundReply:
+        blocked.set()
+        await asyncio.Event().wait()  # ignores the drain
+        raise AssertionError("unreachable")
+
+    src.sync_reply = resolver
+    src.reply_drain = lambda reason: None
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    data = await _post_then_stop(src, handler, blocked)
+    assert loop.time() - started < 3.0, "stop() outlived its grace"
+    assert not data.startswith(b"HTTP/1.1 2"), "a cancelled turn must not read as answered"
+
+
+class _ClosedWriter:
+    """A writer whose transport is already closing. Its drain raises, as a real closed one's does."""
+
+    def __init__(self) -> None:
+        self.written: list[bytes] = []
+
+    def is_closing(self) -> bool:
+        return True
+
+    def write(self, data: bytes) -> None:
+        self.written.append(data)
+
+    async def drain(self) -> None:
+        raise ConnectionResetError("closed")
+
+
+_COMPLETE_POST = b"POST /ingest HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\n{}"
+
+
+async def test_a_request_read_in_full_is_committed_when_the_peer_already_closed() -> None:
+    # BACKLOG #5715, a regression its round-2 commit made: `_serve_one` dropped a request read in
+    # full whenever its writer was closing. A peer's TLS close_notify or reset right after a
+    # complete POST closes the writer too (a plain-TCP FIN does not), so that request would have
+    # been taken off the wire with no ingress row. Only a stopping listener may decline it; a
+    # serving one commits it as before, and only its answer is lost.
+    src = HttpSource(Source(type=ConnectorType.HTTP, settings={"host": "127.0.0.1", "port": 0}))
+    committed: list[bytes] = []
+
+    async def handler(raw: bytes) -> IngressReceipt:
+        committed.append(raw)
+        return IngressReceipt.accepted("msg-1")
+
+    await src.start(receipt_handler(handler))
+    try:
+        writer: Any = _ClosedWriter()
+        # The lost answer raises out to `_on_client`'s OSError arm, which records `peer_reset`.
+        with pytest.raises(ConnectionResetError):
+            await src._serve_one(await _reader_from(_COMPLETE_POST), writer, peer_host="127.0.0.1")
+    finally:
+        await src.stop()
+    assert committed == [b"{}"], "a request read in full was dropped with no ingress row"
+
+
+async def test_a_request_read_in_full_on_a_stopped_listener_is_not_handed_on(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The state the early return exists for: stop() closed this writer while the request's last
+    # bytes sat in the reader's buffer, so no answer could reach the peer. Nothing is handed on. Its
+    # `closed` event reads as an ordinary close, so a WARNING records the declined body; a health
+    # probe would never have been committed, so it logs nothing.
+    src = HttpSource(Source(type=ConnectorType.HTTP, settings={"host": "127.0.0.1", "port": 0}))
+    committed: list[bytes] = []
+
+    async def handler(raw: bytes) -> IngressReceipt:
+        committed.append(raw)
+        return IngressReceipt.accepted("msg-1")
+
+    await src.start(receipt_handler(handler))
+    await src.stop()
+    closed = _ClosedWriter()
+    writer: Any = closed
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.http_listener"):
+        result = await src._serve_one(
+            await _reader_from(_COMPLETE_POST), writer, peer_host="127.0.0.1"
+        )
+        assert "was not committed or answered" in caplog.text
+        caplog.clear()
+        probe = await _reader_from(b"HEAD /health HTTP/1.1\r\nHost: h\r\n\r\n")
+        assert await src._serve_one(probe, writer, peer_host="127.0.0.1") is False
+        assert caplog.text == ""
+    assert result is False
+    assert committed == []
+    assert closed.written == []
