@@ -1068,3 +1068,71 @@ async def test_a_pause_that_lands_before_every_member_is_refused_writes_no_refus
     await run_one_batch(runner, DEST)
     assert rec.sent == []
     assert await _states(store, mids) == [QUEUED, QUEUED]  # handed back, not dead-lettered
+
+
+# --- the pre-send gate on a demoted node: release and STOP, never send or dead-letter -------------
+
+
+def _demote(runner: RegistryRunner, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runner._coordinator, "is_leader", lambda: False)
+
+
+async def test_a_demotion_and_a_pause_while_the_envelope_is_framed_send_nothing(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Leadership is lost and a pause lands while the envelope is framed, after the leadership
+    check. The gate right before the send refuses on the pause whoever leads: the demoted node
+    releases every member and STOPs the lane for the new leader, as its leadership check does.
+    Before the repair that gate also asked for leadership, so a demoted node sent the envelope
+    past the pause."""
+    mids = await _enqueue(store, 3)
+    runner = _runner(store)
+    rec = _Recorder()
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
+    real_encode = wiring_runner.encode_batch
+    framed: list[int] = []
+
+    def _encode_then_demote_and_pause(*args: Any, **kwargs: Any) -> str:
+        framed.append(1)
+        runner._outbound_paused.add(DEST)
+        _demote(runner, monkeypatch)
+        return real_encode(*args, **kwargs)
+
+    monkeypatch.setattr(wiring_runner, "encode_batch", _encode_then_demote_and_pause)
+    head = await store.claim_next_fifo(DEST)
+    outcome, park_until = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    assert framed == [1]  # the control: the leadership check passed and framing really ran
+    assert rec.sent == []  # no egress from a demoted node past the pause
+    assert outcome is wiring_runner._ItemOutcome.STOPPED and park_until is None
+    assert await _states(store, mids) == [QUEUED] * 3  # released for the new leader
+    assert await _attempts(store, mids) == [0, 0, 0]
+
+
+async def test_a_demotion_and_a_pause_before_every_member_is_refused_writes_no_refusal(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every member holds a frame byte, and leadership is lost with a pause while they hydrate.
+    No refusal is written under the pause: the members are released for the new leader and the
+    lane STOPs. Before the repair a demoted node dead-lettered them."""
+    bodies = [_msg(n).replace("DOE", "DOE" + chr(0x0B)) for n in (1, 2)]
+    mids = await _enqueue_bodies(store, bodies)
+    runner = _runner(store)
+    rec = MllpRecorder(DEST)
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
+    real_hydrate = runner._hydrate_payload
+
+    async def _hydrate_then_demote_and_pause(payload: str, message_id: str) -> str:
+        runner._outbound_paused.add(DEST)
+        _demote(runner, monkeypatch)
+        return await real_hydrate(payload, message_id)
+
+    monkeypatch.setattr(runner, "_hydrate_payload", _hydrate_then_demote_and_pause)
+    head = await store.claim_next_fifo(DEST)
+    try:
+        outcome, _ = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    finally:
+        await rec.aclose()
+    assert rec.sent == []
+    assert outcome is wiring_runner._ItemOutcome.STOPPED
+    assert await _states(store, mids) == [QUEUED, QUEUED]  # released, not dead-lettered
+    assert await _attempts(store, mids) == [0, 0]

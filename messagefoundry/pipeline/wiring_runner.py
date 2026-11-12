@@ -9934,13 +9934,7 @@ class RegistryRunner:
         # single-node NullCoordinator is_leader() is always True, so this never fires and the
         # delivery path is byte-identical.
         if not self._coordinator.is_leader():
-            await self.store.release_claimed([item.id])
-            log.warning(
-                "delivery worker %r: leadership lost before send; released %d claimed row(s) "
-                "un-errored (no attempt spent) and stopped the lane for the new leader",
-                name,
-                1,
-            )
+            await self._release_for_new_leader(name, [item.id])
             return _ItemOutcome.STOPPED, None
         # The payload handed to connector.send, for forget_payload once a transient failure
         # dead-letters the row at the retry cap. None until a live send is attempted.
@@ -10361,13 +10355,7 @@ class RegistryRunner:
         # attempts and applies it to all N, so a finite retry cap dead-letters the whole batch on a
         # leadership change, un-sent.
         if not self._coordinator.is_leader():
-            await self.store.release_claimed(ids)
-            log.warning(
-                "delivery worker %r: leadership lost before send; released %d claimed row(s) "
-                "un-errored (no attempt spent) and stopped the lane for the new leader",
-                name,
-                len(ids),
-            )
+            await self._release_for_new_leader(name, ids)
             return _ItemOutcome.STOPPED, None
         # Frame + send inside ONE try so a FRAMING error (an unparseable / non-HL7 head member — MLLP is
         # payload-agnostic, ADR 0004, so a non-hl7v2 feed can reach here) routes to the internal-error
@@ -10452,15 +10440,16 @@ class RegistryRunner:
                     encode_batch, members, control_id=control_id, timestamp=timestamp
                 )
                 # BACKLOG #5706: the lane gate once more, right before the send, since hydration and
-                # the two thread hops above are awaits a pause or the halt can land in. Synchronous,
-                # so nothing here can raise into the arms below; the hand-back runs after the try.
-                gated = self._hand_back_due(name)
+                # the two thread hops above are awaits a pause or the halt can land in, and so can a
+                # demotion. Synchronous, so nothing here can raise into the arms below; the members
+                # go back after the try, released for the new leader on a demoted node.
+                gated = not self._lane_may_deliver(name)
                 if not gated and not self._simulate.get(name, False):  # shadow suppresses egress
                     await connector.send(envelope)
             else:
                 # Every member was refused: nothing to send, but the same gate decides whether the
                 # refusals are written now or the members go back for a re-run to refuse again.
-                gated = self._hand_back_due(name)
+                gated = not self._lane_may_deliver(name)
         except NegativeAckError as exc:
             # #109 (ADR 0095), the batch twin of the single-row branch in
             # :meth:`_process_delivery_item`, which carries the reasoning. A bad credential is not a
@@ -10574,7 +10563,7 @@ class RegistryRunner:
             if gated:
                 # Every member, the refused ones too: none was resolved, and a re-run refuses them
                 # again. No await since the gate read, so it still holds here.
-                return _ItemOutcome.PROCESSED, await self._hand_back(name, [it.id for it in items])
+                return await self._refuse_claimed(name, [it.id for it in items])
             if ids:  # nothing was sent when every member was refused
                 self._note_lane_healthy(name)
                 self._clear_store_read_faults(name)
@@ -12433,9 +12422,37 @@ class RegistryRunner:
         Synchronous, so the allowed path awaits nothing extra."""
         return not self._lane_may_deliver(name) and self._coordinator.is_leader()
 
+    async def _refuse_claimed(self, name: str, ids: list[str]) -> tuple[_ItemOutcome, float | None]:
+        """Resolve claimed, unsent OUTBOUND rows of ``name`` that the lane gate
+        (:meth:`_lane_may_deliver`) has refused. None is sent, dead-lettered or charged an attempt.
+
+        A leader hands them back through :meth:`_hand_back` and parks. A demoted node releases them
+        and STOPs the lane for the new leader, as the send path's leadership check does and as the
+        per_lane worker's per-item gate does (#2771): a hand-back there would reschedule rows a
+        successor may already own, and park instead of stopping. The demoted node answers here
+        rather than leaving the rows to that check, since the missing-connector arm ahead of it
+        would spend an attempt on each, and a pause or halt that lands after the check would
+        otherwise not stop the send."""
+        if self._coordinator.is_leader():
+            return _ItemOutcome.PROCESSED, await self._hand_back(name, ids)
+        await self._release_for_new_leader(name, ids)
+        return _ItemOutcome.STOPPED, None
+
+    async def _release_for_new_leader(self, name: str, ids: list[str]) -> None:
+        """Release claimed, unsent OUTBOUND rows of ``name`` on a node that has lost leadership
+        (the L1 check; :meth:`_process_delivery_item` carries the reasoning). No attempt is spent.
+        The caller then STOPs the lane."""
+        await self.store.release_claimed(ids)
+        log.warning(
+            "delivery worker %r: leadership lost before send; released %d claimed row(s) "
+            "un-errored (no attempt spent) and stopped the lane for the new leader",
+            name,
+            len(ids),
+        )
+
     async def _hand_back(self, name: str, ids: list[str]) -> float:
-        """Hand claimed, unsent OUTBOUND rows back once :meth:`_hand_back_due` has said so for
-        ``name``, and return the park deadline.
+        """Hand claimed, unsent OUTBOUND rows of ``name`` back for a leader, from
+        :meth:`_refuse_claimed`, and return the park deadline.
 
         The #122 halt (ADR 0189) RESCHEDULES them to the deadline, for the reason
         :meth:`_dispatch_delivery` gives: the head is then not due, so the sweep does not re-ready
