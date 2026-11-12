@@ -2167,14 +2167,17 @@ class HttpSource(SourceConnector):
         # Only a STOPPING listener takes this path. A writer can also be closing because the peer
         # closed it, a TLS close_notify or a reset right after a complete request; that request was
         # read in full while the listener serves, so it is committed below as before, and only its
-        # answer is lost (count-and-log, BACKLOG #5715).
+        # answer is lost (count-and-log, BACKLOG #5715). The connection's `closed` event reads as an
+        # ordinary close, so the WARNING is what records a declined body; a health probe or a 405
+        # would never have been committed, so it logs nothing.
         if self._admission.stopping and writer.is_closing():
-            logger.warning(
-                "HTTP source %s: a request read in full as stop() closed its connection was not "
-                "committed or answered; the sender would resend it (peer=%s)",
-                self._log_name,
-                peer_host or "unknown",
-            )
+            if request.method in _BODY_METHODS:
+                logger.warning(
+                    "HTTP source %s: a request read in full as stop() closed its connection was "
+                    "not committed or answered; the sender would resend it (peer=%s)",
+                    self._log_name,
+                    peer_host or "unknown",
+                )
             return False
         # Read in full, so stop() leaves this writer open for the answer (BACKLOG #5715). Dropped in
         # `_on_client`'s finally, beside `_clients`. Nothing awaits between the check above and here.
