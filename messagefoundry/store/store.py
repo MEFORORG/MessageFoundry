@@ -7000,8 +7000,8 @@ def verify_audit_rows(
     a row MAC is Transit's own ``verify`` call, made inside Vault (:func:`_audit_row_mac`); the
     ``compare_digest`` the walk still runs there sets the stored hash beside itself, or beside
     ``None`` when Transit did not verify it, and decides nothing. The walk always runs to
-    completion, and the first divergent position is reported after it. A structural break is reported at its own
-    position, with the reason."""
+    completion, and the first divergent position is reported after it. A structural break is
+    reported at its own position, with the reason."""
     # The row AT seq 1, not the row that sorts first, which is the rule the open applies too
     # (``load_audit_chain``). A row added below the genesis row must not change what the chain is:
     # with a key in hand it would leave every row's MAC uncompared, and with none it would make a

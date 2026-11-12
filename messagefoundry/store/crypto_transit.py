@@ -326,7 +326,8 @@ class TransitCipher(_UnmarkedPolicy):
         ``vault_transit`` mode. Fail-closed: any Transit error raises :class:`CipherError`
         (type-only — the canonical row bytes are PHI-derived and never surfaced). A reply that
         :func:`~messagefoundry.store.row_seal.transit_mac_version` does not accept raises
-        :class:`CipherError` too, so no row is written that its own check would read as a break."""
+        :class:`CipherError` too, so no malformed MAC is written. A well-formed MAC can still read
+        as a break later, for example one a proxy or the wrong key answered."""
         inp = base64.b64encode(data).decode("ascii")
         try:
             response: Any = self._client.secrets.transit.generate_hmac(
@@ -337,8 +338,8 @@ class TransitCipher(_UnmarkedPolicy):
             raise CipherError(
                 f"Transit audit HMAC failed (key={self._audit_key!r}): {vault_failure_text(exc)}"
             ) from exc
-        # The writer refuses what the reader would reject: a reply ``transit_mac_version`` does not
-        # accept would be written as a row :meth:`verify_audit_hmac` is certain to read as a break
+        # The writer refuses what the reader is certain to reject: a reply ``transit_mac_version``
+        # does not accept would be written as a row :meth:`verify_audit_hmac` reads as a break
         # (BACKLOG #2720), so the append fails loudly here instead.
         if not isinstance(mac, str) or transit_mac_version(mac) is None:
             raise CipherError(

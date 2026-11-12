@@ -594,19 +594,19 @@ async def test_a_transit_refusal_of_a_forged_key_version_is_a_gap(
     transit.verified.clear()
     try:
         got = await again.get_transit_bound_attestation()
+        # The whole gap text, so it is the refused-version outcome and no other: an AssertionError
+        # in the fake, or any CipherError the cipher does not classify as a refused version, also
+        # writes a gap starting "Transit refused to check", and must fail here.
+        assert got is not None
+        assert got.audit_gap == (
+            f"Transit refused to check audit row {recorded.audit_seq}'s MAC: "
+            f"{AuditKeyVersionRefusedError(_UNHELD_VERSION)}"
+        ), got.audit_gap
+        # The refusal came from Transit's verify, at the planted version.
+        assert transit.verified == [_UNHELD_VERSION], transit.verified
     except BaseException:
         await again.close()
         raise
-    # The whole gap text, so it is the refused-version outcome and no other: an AssertionError in
-    # the fake, or any CipherError the cipher does not classify as a refused version, also writes a
-    # gap starting "Transit refused to check", and must fail here.
-    assert got is not None
-    assert got.audit_gap == (
-        f"Transit refused to check audit row {recorded.audit_seq}'s MAC: "
-        f"{AuditKeyVersionRefusedError(_UNHELD_VERSION)}"
-    ), got.audit_gap
-    # The refusal came from Transit's verify, at the planted version.
-    assert transit.verified == [_UNHELD_VERSION], transit.verified
     await _start(again, SecurityEnforcement.WARN)  # no raise
 
 
