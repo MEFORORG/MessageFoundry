@@ -4948,7 +4948,12 @@ class RegistryRunner:
             ev.clear()
         if not self._per_lane_delivery(name):  # ADR 0066 D4: per-LANE, see _stop_outbound_unsafe
             d = self._dispatchers.get(Stage.OUTBOUND)
-            if d is not None:
+            # Only the owning engine shard arms a lane (ADR 0073), as in _unpark_outbound_lane. A
+            # park registers the lane PAUSED on every engine shard's dispatcher, and the public door
+            # refuses a non-owner, but an internal caller does not ask: a non-owner that resumed
+            # it here claimed beside the owner (BACKLOG #5703). per_lane needs no test here, since
+            # _spawn_worker spawns nothing for a lane another engine shard owns.
+            if d is not None and self._owns_destination(name):
                 self._resume_pooled_lane(d, Stage.OUTBOUND, name)
         else:
             # per_lane: release the loop-top gate; respawn the worker if it exited (STOP policy / crash).
@@ -5020,7 +5025,11 @@ class RegistryRunner:
         halt, ``deployed=False`` or ``auto_start=False``. The lane then stays as that state leaves
         it, and the ordinary recovery for that state brings it up. So does a refused CA the reload
         kept (vault BACKLOG #2371): resuming would read the CA again and alert a second time. An
-        operator start, or a config change the reload checks, brings that lane up."""
+        operator start, or a config change the reload checks, brings that lane up.
+
+        Only the owning engine shard's calendar parks a lane, so only the owner reaches here for
+        it; :meth:`_start_outbound_unsafe` arms nothing on a non-owner either way (BACKLOG
+        #5703)."""
         if (
             self._schedule_holds(name, "outbound")
             or self._delivery_halted
@@ -7942,6 +7951,11 @@ class RegistryRunner:
             if (
                 name in self._gate_parked
                 and oc.schedule is not None
+                # Only the owner's calendar runs the lane (_reconcile_schedule), so a non-owner
+                # engine shard keeps the ordinary unpark below, which arms nothing for a lane it
+                # does not own. Passed to its calendar, the park waited for a resume that armed
+                # the lane here beside the owner (BACKLOG #5703).
+                and self._owns_destination(name)
                 and not oc.schedule.is_active(self._schedule_clock())
                 and not self._dr_passive
                 and not self._below_dr_threshold(oc.priority)
