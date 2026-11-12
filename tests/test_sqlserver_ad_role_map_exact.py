@@ -59,12 +59,20 @@ def test_an_edit_drops_a_left_behind_pair_rather_than_refusing() -> None:
     assert after.pairs == ((_G, "viewer"),)
 
 
-def test_a_replacement_may_not_re_add_a_left_behind_id_to_another_group() -> None:
+def test_an_edit_may_not_re_add_a_left_behind_id_to_another_group() -> None:
     """Only the exact pair the map already held counts as left behind; the same dead id under a
     new group is an addition, and refused."""
     current = AdMap.of(AD_ROLE_MAP, [(_H, "gone")])
     with pytest.raises(UnknownRoleError):
-        _apply(current, AdMap.of(AD_ROLE_MAP, [(_H, "gone"), (_G, "gone")]))
+        _apply(current, lambda m: AdMap.of(AD_ROLE_MAP, [*m.pairs, (_G, "gone")]))
+
+
+def test_a_replacement_resubmitting_a_left_behind_pair_is_refused() -> None:
+    """An administrator's save is checked whole, as the foreign key on SQLite and Postgres checks
+    it: a pair the stored map already held is no exemption for a save."""
+    current = AdMap.of(AD_ROLE_MAP, [(_G, "viewer"), (_H, "VIEWER")])
+    with pytest.raises(UnknownRoleError):
+        _apply(current, AdMap.of(AD_ROLE_MAP, [(_G, "viewer"), (_H, "VIEWER")]))
 
 
 class _Cur:

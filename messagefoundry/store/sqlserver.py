@@ -15892,11 +15892,16 @@ class SqlServerStore:
         (ADR 0045 D4); never touches a built-in row. Returns ``True`` if removed."""
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                await cur.execute("SELECT builtin FROM roles WHERE id=?", (role_id,))
+                await cur.execute("SELECT builtin, id FROM roles WHERE id=?", (role_id,))
                 row = await cur.fetchone()
                 if row is None or int(row[0]) != 0:
                     await conn.rollback()
                     return False
+                # BACKLOG #5725: the stored id from here on. The lookup above compares in the
+                # database collation, so the caller's id may be a case variant of it; the map's
+                # exact edit below would then remove nothing, and the role delete would fail
+                # fk_ad_group_role_map_role on the pair it left.
+                role_id = str(row[1])
                 # BACKLOG #2592: each holder re-sealed without the role, and only a refused holder's
                 # own row deleted; store.py says why there is no bulk delete. A grant committed
                 # after the holder read keeps its row, so the role delete below then fails the

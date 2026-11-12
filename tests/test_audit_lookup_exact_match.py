@@ -120,7 +120,7 @@ def test_the_instrument_folds_case_and_pads() -> None:
     made.db.close()
 
 
-@pytest.mark.parametrize("variant", ["U", "u ", " u"])
+@pytest.mark.parametrize("variant", ["U", "u ", "U  "])
 async def test_a_variant_actors_newer_row_does_not_shadow_the_actors_evidence(
     log: _Log, variant: str
 ) -> None:
@@ -209,3 +209,17 @@ async def test_the_walk_steps_strictly_and_ends(log: _Log) -> None:
         at_most=5,
     )
     assert found is not None and found["seq"] == 3
+
+
+async def test_a_variant_row_with_a_malformed_seq_is_returned_so_callers_refuse_it() -> None:
+    """A row the walk cannot step past fails closed: it is handed back, so the supersession check
+    reads it as superseding and the evidence check rechecks it and refuses it."""
+    rows = iter([{"seq": "3", "action": "ACT"}])
+
+    async def fetch(sql: str, params: tuple[object, ...]) -> Mapping[str, Any] | None:
+        return next(rows, None)
+
+    found = await _exact_audit_row(
+        fetch, "seq, action", "action = ?", ("act",), lambda r: r["action"] == "act", above=1
+    )
+    assert found == {"seq": "3", "action": "ACT"}

@@ -5081,14 +5081,15 @@ def existing_role_pairs_only(
     :func:`existing_roles_only`: a backend whose role foreign key cannot refuse every such id calls
     it inside its ``_write_ad_map`` transaction, before the write seals anything.
 
-    A pair the write ADDS whose role id is not in ``present`` raises :class:`UnknownRoleError`, so
-    neither a deleted role's id nor a case or trailing-space variant of a live one is ever sealed
-    in. A pair ``current`` already held is dropped instead: a row its deleted role left behind,
-    which grants nothing, and which an edit such as a role delete must not be refused over."""
+    A whole replacement, an administrator's save, naming any role id not in ``present`` raises
+    :class:`UnknownRoleError`, as the foreign key does on SQLite and Postgres, so neither a deleted
+    role's id nor a case or trailing-space variant of a live one is ever sealed in. An edit raises
+    for a pair it ADDS; a pair ``current`` already held is dropped instead: a row a deleted role, or
+    a write before this check, left behind, which grants nothing, and which an edit such as a role
+    delete or a key rotation's re-seal must not be refused over."""
     held = frozenset(present)
-    had = frozenset(current.pairs)
 
-    def checked(new: AdMap) -> AdMap:
+    def checked(new: AdMap, had: frozenset[tuple[str, str]]) -> AdMap:
         added = sorted({pair[1] for pair in new.pairs if pair[1] not in held and pair not in had})
         if added:
             raise UnknownRoleError(added)
@@ -5096,14 +5097,16 @@ def existing_role_pairs_only(
         if len(kept) == len(new.pairs):
             return new
         log.warning(
-            "an AD role map write dropped %d pair(s) whose role no longer exists (BACKLOG #5725)",
+            "an AD role map write dropped %d pair(s) whose role id matches no role exactly"
+            " (BACKLOG #5725)",
             len(new.pairs) - len(kept),
         )
         return replace(new, pairs=kept)
 
     if isinstance(change, AdMap):
-        return checked(change)
-    return lambda m: checked(change(m))
+        return checked(change, frozenset())
+    had = frozenset(current.pairs)
+    return lambda m: checked(change(m), had)
 
 
 class AdMapSql(NamedTuple):
@@ -9234,8 +9237,13 @@ async def _exact_audit_row(
     whose name differs only in case, or a row written outside the engine) and shadow the row the
     caller wants, refusing genuine evidence. Each row ``where`` finds is therefore checked with
     ``exact`` in Python, and a variant is stepped past, one indexed lookup each, until an exact
-    row or none is left. The bound moves strictly every step, so the walk ends. On SQLite and
-    Postgres, which compare exactly, the first row is the answer."""
+    row or none is left: one more statement per variant row, each an aggregate over the rows
+    ``where`` matches. The bound moves strictly every step, so the walk ends. On SQLite and
+    Postgres, which compare exactly, the first row is the answer.
+
+    A variant row whose ``seq`` is not an integer is RETURNED, not stepped past or read as none:
+    every caller rechecks the row exactly and refuses it, so a malformed read fails closed, and the
+    supersession check, for which "no row" means "nothing supersedes", never fails open."""
     hi = at_most
     while True:
         conds, args = [where], list(params)
@@ -9254,8 +9262,10 @@ async def _exact_audit_row(
             return row
         seq = _strict_int(row["seq"])
         if seq is None:
-            return None
+            return row
         hi = seq - 1
+        if above is not None and hi <= above:
+            return None
 
 
 @dataclass(frozen=True, slots=True)

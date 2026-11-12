@@ -191,7 +191,9 @@ async def assert_role_seal_contract(store: Any, raw: RawSql) -> None:
     stored = await store.get_ad_map(AD_ROLE_MAP)
     for bogus in (Role.VIEWER.value.upper(), Role.VIEWER.value + " ", "contract-no-such-role"):
         try:
-            await store.set_ad_group_role_map([(_GROUP, Role.VIEWER.value), (_GROUP, bogus)])
+            # Under another group, so a case-insensitive primary key on (group, role) cannot
+            # refuse it as a duplicate of the control pair and stand in for the check under test.
+            await store.set_ad_group_role_map([(_GROUP, Role.VIEWER.value), (_OTHER_GROUP, bogus)])
         except UnknownRoleError:
             pass
         except Exception as exc:  # noqa: BLE001 - each backend raises its own integrity class
