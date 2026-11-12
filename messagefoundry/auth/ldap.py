@@ -1142,13 +1142,15 @@ def _close_without_sending(conn: Any, why: str) -> None:
     ``LdapError`` with an unhandled one (BACKLOG #3017).
 
     **The rule, stated here once (BACKLOG #3017): when a bind's open fails, its socket is closed
-    by the engine or by ``ssl``, not by the collector.** It holds at least in the cases below. It
+    by the engine or by ``ssl``, not by the collector, at least in the cases below.** It
     holds for at least the service account's bind, a user's and the decoy's. ldap3 2.9.1's
     ``close`` shuts the socket only once an open has completed, and a failed open leaves
     ``conn.closed`` true. ``_service_conn`` closes the service account's here. ``_released``
     closes a user or decoy bind's here, through ``_end_release``. It does not cover every
     candidate address: ldap3's ``open`` puts each candidate's new socket on ``conn.socket``,
-    replacing the one before, and a socket so replaced is not reached here.
+    replacing the one before, and a socket so replaced is not reached here. That gap also opens
+    when the open fails on one candidate and then succeeds on a later one: nothing reaches the
+    first candidate's socket then either.
 
     * Before ``ssl`` takes the socket over, it is the last socket ldap3 put on ``conn.socket``,
       connected or not, and it is closed here directly, whatever ``close`` did. Read from the
