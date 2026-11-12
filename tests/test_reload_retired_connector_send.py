@@ -318,16 +318,19 @@ async def test_a_store_fault_handing_back_before_the_send_is_not_an_internal_err
 
 class _SlowClose(_HeldDestination):
     """A close that fails the send at once and then takes its time, as a transport's bounded close
-    of a connect-per-send socket can. It records whether the lane could still claim at its start."""
+    of a connect-per-send socket can. It records, at its start, whether the lane could still claim
+    and whether it read quiesced with the send in flight."""
 
     def __init__(self, runner: RegistryRunner) -> None:
         super().__init__()
         self.runner = runner
         self.release = asyncio.Event()
         self.lane_open_at_close: bool | None = None
+        self.quiesced_at_close: bool | None = None
 
     async def aclose(self) -> None:
         self.lane_open_at_close = self.runner._lane_may_deliver(_OB)
+        self.quiesced_at_close = self.runner.outbound_quiesced(_OB)
         self.closed.set()
         await self.release.wait()
 
@@ -340,7 +343,8 @@ async def test_a_send_a_parking_reload_cuts_is_not_reclaimed_during_the_close(
     """A reload that parks the lane (``deployed=False``, or ``auto_start=False`` on a lane an
     operator stopped) parks it before it closes the connector. The close fails the send, which
     hands its row back with a retry due now; a lane still open would re-claim it during the close,
-    find no connector, and charge it an attempt the reload caused (BACKLOG #5718)."""
+    find no connector, and charge it an attempt the reload caused (BACKLOG #5718). The lane does
+    not read quiesced, the purge precondition, while that send is still in flight."""
     runner = RegistryRunner(
         _registry(tmp_path, tmp_path / "out_old"),
         store,
@@ -351,13 +355,13 @@ async def test_a_send_a_parking_reload_cuts_is_not_reclaimed_during_the_close(
     )
     await runner.start()
     old = _SlowClose(runner)
-    await runner._destinations[_OB].aclose()
-    runner._destinations[_OB] = old
-    message_id = await store.enqueue_message(
-        channel_id="IB_RELOAD", raw=ADT, deliveries=[(_OB, ADT)], now=_time.time()
-    )
     reload: asyncio.Task[Any] | None = None
     try:
+        await runner._destinations[_OB].aclose()
+        runner._destinations[_OB] = old
+        message_id = await store.enqueue_message(
+            channel_id="IB_RELOAD", raw=ADT, deliveries=[(_OB, ADT)], now=_time.time()
+        )
         await asyncio.wait_for(old.started.wait(), timeout=10)
         if flag == "auto_start":
             # The auto_start gate takes only a lane that is not up: an operator stop, with the send
@@ -373,6 +377,7 @@ async def test_a_send_a_parking_reload_cuts_is_not_reclaimed_during_the_close(
         reload = asyncio.create_task(runner.reload(new))
         await asyncio.wait_for(old.closed.wait(), timeout=10)
         assert old.lane_open_at_close is False
+        assert old.quiesced_at_close is False
         row = await _settled_row(store, message_id)
         # Give a re-claim the time it would need, and stop early if one charges the row.
         deadline = _time.monotonic() + 1.0

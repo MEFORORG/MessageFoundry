@@ -7968,12 +7968,18 @@ class RegistryRunner:
             # the Send). No worker is spawned; a worker that predates the flip stays alive but PARKED at
             # its pause gate — never cancel one, a cancelled mid-delivery row strands INFLIGHT forever.
             if not oc.deployed:
-                # PARKED BEFORE THE CLOSE, as the DR branch below parks first. The close may fail a
-                # send in flight on the connector, and :meth:`_release_retired` hands its row back
-                # with a retry due now; an open lane re-claimed it during the close, found no
-                # connector and charged it an attempt the reload caused (BACKLOG #5718). Parked,
-                # the lane gate (:meth:`_lane_may_deliver`) refuses that claim un-charged.
-                self._park_outbound_lane(name)
+                # A LIVE LANE IS PARKED BEFORE THE CLOSE, as the DR branch below parks one. The close
+                # may fail a send in flight on the connector, and :meth:`_release_retired` hands its
+                # row back with a retry due now; an open lane re-claimed it during the close, found
+                # no connector and charged it an attempt the reload caused (BACKLOG #5718). Parked,
+                # the lane gate (:meth:`_lane_may_deliver`) refuses that claim un-charged. Parked
+                # the cooperative way, as :meth:`_dr_park_outbound` parks a live lane, so it reads
+                # quiesced, the purge precondition, only once that send resolves. A lane that is not
+                # live has its gate closed already, or no connector to close.
+                live = self._outbound_lane_live(name)
+                if live:
+                    self._stop_outbound_unsafe(name)
+                    self._gate_parked.add(name)
                 stale = self._destinations.pop(name, None)
                 if stale is not None:
                     await stale.aclose()
@@ -7981,6 +7987,8 @@ class RegistryRunner:
                 self._dr_unbuilt.pop(name, None)
                 # Not deployed outranks a DR park, so a door refuses it as not deployed.
                 self._filtered.pop(("outbound", name), None)
+                if not live:
+                    self._park_outbound_lane(name)
                 continue
             # Per-connection auto-start (#115): a reload must not RESURRECT a start-disabled lane. It had
             # no gate at all here, and in the DEFAULT pooled mode `live` below is keyed on the CONNECTOR
@@ -7991,13 +7999,15 @@ class RegistryRunner:
             # down (never started, started-then-stopped, or newly ADDED by this reload) stays parked with
             # no connector — its queued rows are retained PENDING, exactly like the DR park below.
             if not oc.auto_start and not self._outbound_lane_live(name):
-                # Parked before the close, for the reason the deployed=False branch above gives.
-                self._park_outbound_lane(name)
+                # Closing before the park re-opens no claim here, unlike the deployed=False branch
+                # above: a lane that is not live and still has a connector is paused, so its gate is
+                # closed for the whole close (BACKLOG #5718).
                 stale = self._destinations.pop(name, None)
                 if stale is not None:
                     await stale.aclose()
                 self._failed.pop(("outbound", name), None)
                 self._dr_unbuilt.pop(name, None)
+                self._park_outbound_lane(name)
                 # The DR park is recorded here too, as at start (_start_outbound), so the doors
                 # refuse a start the profile would not allow (vault BACKLOG #3067).
                 self._dr_filters_out(name, oc.priority, kind="outbound")
