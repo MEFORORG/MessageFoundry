@@ -316,3 +316,53 @@ async def test_a_hostile_partner_content_type_cannot_take_the_turn_down() -> Non
     assert body.decode() == REPLY_BODY
     assert "x-evil" not in headers, "a partner injected a header through Content-Type"
     assert headers["content-type"] == "application/json"
+
+
+async def test_a_turn_woken_by_stop_writes_its_503_before_the_writers_close() -> None:
+    # BACKLOG #5715: stop() wakes the blocked reply waiters and then closes every client writer. With
+    # no yield between, the woken turn would write its 503 to a closing transport, and a demoted
+    # caller would get a bare connection close instead of the answer the HA design depends on.
+    src = HttpSource(
+        Source(
+            type=ConnectorType.HTTP,
+            settings={"host": "127.0.0.1", "port": 0, "reply_from": "OB_PARTNER"},
+        )
+    )
+    blocked = asyncio.Event()
+    drained = asyncio.Event()
+
+    async def handler(raw: bytes) -> IngressReceipt:
+        return IngressReceipt.accepted("msg-1")
+
+    async def resolver(message_id: str) -> InboundReply:
+        blocked.set()
+        await drained.wait()
+        return InboundReply(ReplyOutcome.SHUTTING_DOWN)
+
+    def drain(reason: str) -> None:
+        assert reason == "shutting_down"
+        drained.set()
+
+    src.sync_reply = resolver
+    src.reply_drain = drain
+    await src.start(receipt_handler(handler))
+    stopped = False
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", src.sockport)
+        try:
+            writer.write(b"POST /ingest HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\n{}")
+            await writer.drain()
+            await asyncio.wait_for(blocked.wait(), 5.0)
+            await src.stop()
+            stopped = True
+            data = await asyncio.wait_for(reader.read(-1), 5.0)
+        finally:
+            writer.close()
+            await asyncio.gather(writer.wait_closed(), return_exceptions=True)
+    finally:
+        if not stopped:
+            await src.stop()
+    head, _, body = data.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.1 503 "), f"the woken turn's answer was lost: {data!r}"
+    assert b"\r\nRetry-After: 5" in head
+    assert _json.loads(body)["status"] == "shutting_down"

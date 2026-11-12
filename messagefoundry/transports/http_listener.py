@@ -1302,6 +1302,9 @@ class HttpSource(SourceConnector):
         # connections and bound the wait (mirrors MLLPSource, review H-2 / #55).
         self._clients: set[asyncio.StreamWriter] = set()
         self._client_tasks: set[asyncio.Task[None]] = set()
+        #: One future per turn inside `_respond_with_sync_reply`, resolved when it leaves, so stop()
+        #: can let the turns its drain woke write their answers before it closes the writers.
+        self._reply_turns: set[asyncio.Future[None]] = set()
         #: Which loaded client CA signed a peer's leaf. Only ``mtls_subject`` reads it, so no other
         #: mode pays for parsing the trust store. ``None`` there means no client CA was loaded, and
         #: then no certificate names an issuer, so every one is denied. Built after every check
@@ -1583,6 +1586,13 @@ class HttpSource(SourceConnector):
         # Each woken turn resolves `shutting_down` and writes its own 503 + Retry-After through its
         # still-open writer on the way out, inside the same bounded grace the teardown already has.
         # No-op when nothing is armed, so a listener with no reply_from is byte-identical.
+        #
+        # Waking is not enough on its own (BACKLOG #5715): a woken turn runs only once this
+        # coroutine yields, and the loop below would close its writer first. So wait for every turn
+        # inside `_respond_with_sync_reply` to leave it, out of the same grace the client tasks get
+        # below, not on top of it.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _CLIENT_SHUTDOWN_GRACE
         if self.reply_drain is not None:
             self.reply_drain("shutting_down")
         # Close established clients BEFORE awaiting the server (server.wait_closed() hangs on py3.12.1+
@@ -1590,6 +1600,9 @@ class HttpSource(SourceConnector):
         # still finishes its commit (the body is durably stored before the 202, so at-least-once holds).
         # Then await the connection tasks with a bounded grace and cancel any stragglers (review H-2).
         try:
+            # Only a drained turn is woken; with no drain hook, waiting would just spend the grace.
+            if self.reply_drain is not None and self._reply_turns:
+                await asyncio.wait(self._reply_turns, timeout=max(0.0, deadline - loop.time()))
             # A socket still in its TLS handshake is this listener's own from its accept on
             # (BACKLOG #2479). Where it upgrades TLS itself it is in `_clients` (`_on_tls_accept`),
             # so this loop closes it and its handshake fails rather than completing mid-stop. Under
@@ -1602,7 +1615,9 @@ class HttpSource(SourceConnector):
                 handshake.cancel()
             pending = [task for task in self._client_tasks if not task.done()]
             if pending:
-                _done, still_running = await asyncio.wait(pending, timeout=_CLIENT_SHUTDOWN_GRACE)
+                _done, still_running = await asyncio.wait(
+                    pending, timeout=max(0.0, deadline - loop.time())
+                )
                 for task in still_running:
                     task.cancel()
                 if still_running:
@@ -2199,7 +2214,15 @@ class HttpSource(SourceConnector):
             return False
 
         if self.reply_from and self.sync_reply is not None:
-            await self._respond_with_sync_reply(writer, message_id)
+            # Registered for stop() (BACKLOG #5715), which waits on it once its drain has woken
+            # the resolver, so the answer is written before the writer is closed.
+            turn: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            self._reply_turns.add(turn)
+            try:
+                await self._respond_with_sync_reply(writer, message_id)
+            finally:
+                self._reply_turns.discard(turn)
+                turn.set_result(None)
             return False
 
         accepted = {"status": "accepted", "message_id": message_id}
