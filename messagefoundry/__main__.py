@@ -11115,7 +11115,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "values, so rotating is safe and retiring a version that still seals a value or MACs "
             "an audit row is not. At least these retire one. Raising the data key's "
             "min_decryption_version above a version stops the values sealed under it from "
-            "decrypting. Raising the audit key's min_encryption_version above a version breaks "
+            "decrypting. Raising the audit key's min_decryption_version above a version breaks "
             "the audit chain at every row MACed under it; the audit key is the data key unless "
             "MEFOR_STORE_TRANSIT_AUDIT_KEY names another. Trimming a version off either key does "
             "the same to what it sealed or MACed, and cannot be undone. docs/SECURITY.md, under "

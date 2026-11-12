@@ -9854,10 +9854,12 @@ class PostgresStore:
         from :meth:`audit_anchor` (held out-of-band) to also detect tail-truncation.
 
         Constant-time, full-walk (ASVS 11.2.4) — see the SQLite twin
-        (:meth:`~messagefoundry.store.store.MessageStore.verify_audit_chain`): every row MAC and the
-        anchor head are compared with :func:`hmac.compare_digest` over
-        :func:`~messagefoundry.store.store.audit_mac_bytes`, and the walk always completes before the
-        first divergent row id is reported."""
+        (:meth:`~messagefoundry.store.store.MessageStore.verify_audit_chain`) and
+        :func:`~messagefoundry.store.store.verify_audit_rows`, which say which row compares are
+        :func:`hmac.compare_digest` and which are Transit's own ``verify``. A break does not end
+        the walk, and the first divergent row id is reported after it. Only when the walk found no
+        break is the anchor head compared, with :func:`hmac.compare_digest` over
+        :func:`~messagefoundry.store.store.audit_mac_bytes`."""
         # The walk is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each keyed row
         # is checked under the key of its OWN range, so a rotation no longer reads as tampering.
         return verify_audit_rows(

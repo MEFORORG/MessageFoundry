@@ -7715,8 +7715,10 @@ while the store opens, before it reads a row.
 
 **A check stopped part way stays exit 1, deliberately.** Under
 `cipher_provider = "vault_transit"` each row goes to Transit for its MAC. So a row's own content can
-make Transit refuse, for example a row too large for one request. A row the driver cannot read does
-the same. A code that read as "not checked" would let a writer plant such a row and hide every
+make Transit refuse in a way the walk cannot tell from an outage, for example a row too large for
+one request whose refusal reaches the engine as a dropped connection rather than as Vault's HTTP
+413 (a 413 reads as a break at that row; see the planted-version paragraph below). A row the driver
+cannot read does the same. A code that read as "not checked" would let a writer plant such a row and hide every
 break. The walk reports a break only when it finishes, so a break it had already met is lost too.
 The cause's class on the `FAIL` line is a hint, not a diagnosis: a refused row can also surface as
 a connection error. The open reads some of the chain's rows too, such as row 1 and the newest row.
@@ -8097,23 +8099,26 @@ row: it must exist, be the newest attest or withdraw row, name the same key, rea
 carry the recorded hash, and verify under the audit key of its range. On `vault_transit` that key is
 inside Transit, so a writer with database rights and no Transit access cannot seal a new one. A row
 that fails any check counts as no attestation, and the start log and the posture say which check
-failed. The check recomputes the MAC under the Transit key version the audit row names, so
-rotating the key, which is what the operator attests to, keeps the attestation. The audit chain
-walk pins the version the same way, so a rotation does not read as a chain break either.
+failed. The check is Transit's own verify call on the stored MAC, at the key version it names,
+so rotating the key, which is what the operator attests to, keeps the attestation. The audit chain
+walk checks every row the same way, so a rotation does not read as a chain break either.
 
 **A planted key version is a break at its row.** A writer can plant a version Transit does not
 hold. Transit refuses it with HTTP 400 while it still answers under the latest version. The walk
 then reports a break at that row and keeps going. `audit-verify` names the row and exits 1. With
 `[integrity].audit_verify_on_start` on, the startup check also raises its `audit-chain` alert.
-Other failures still stop the walk as a check that could not run. Those include at least an
-outage, a dropped connection, and a row too large for one request.
+So is a row whose own request Transit refuses, such as one Vault answers with HTTP 413 past
+`max_request_size`; ADR 0193's 2026-11-11 amendment, item 4, says how a refusal is told from the
+service failing. Other failures still stop the walk as a check that could not run. Those include
+at least an outage and a dropped connection.
 
-**Retiring an old version of the audit key breaks the chain.** Transit also refuses a version below the key's
-`min_encryption_version`, or one trimmed away. Every audit row sealed under that version then reads
-as a break, `audit-verify` exits 1, and the attestation counts as none. The audit key is the data
-key unless `MEFOR_STORE_TRANSIT_AUDIT_KEY` names another. So raising the data key's minimum version
-breaks the chain too. Rotating is safe; retiring is not. The break text names both causes, a planted
-version and a retired one.
+**Retiring an old version of the audit key breaks the chain.** Transit's verify also refuses a
+version below the key's `min_decryption_version`, or one trimmed away. Every audit row sealed under
+that version then reads as a break, `audit-verify` exits 1, and the attestation counts as none. The
+audit key is the data key unless `MEFOR_STORE_TRANSIT_AUDIT_KEY` names another. So raising the data
+key's `min_decryption_version` breaks the chain too; ADR 0193's 2026-11-11 amendment says which
+floor applies and what that rests on. Rotating is safe; retiring is not. The break text names both
+causes, a planted version and a retired one.
 
 **What this check does not catch: a replay after a deleted withdraw row.** A writer can delete the
 withdraw row and re-insert the old attestation row. This check does not see that. If other audit

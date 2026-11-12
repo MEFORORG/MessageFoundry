@@ -23,9 +23,10 @@ same cell see the same stable AAD, so binding is symmetric by construction.
 **Audit chain (keyed IN Transit).** :meth:`audit_mac_key` returns ``None`` — there is no in-heap DEK to
 HKDF a raw HMAC key from — but the chain is **not** keyless: :meth:`audit_mac_fn` hands the store a
 Transit-backed MAC (:meth:`audit_hmac` → Transit ``generate_hmac``), so every audit row's MAC is computed
-INSIDE the isolated module and the key never enters heap. This lifts the audit chain from keyless SHA-256
-(tamper-evident) to forgery-**resistant** (ADR 0138 §To-resolve, closing the ASVS 16.4.2 residual for this
-mode). The MAC key defaults to the data key and is overridable to a dedicated Transit key via
+INSIDE the isolated module and the key never enters heap. The walk checks each stored row MAC with
+Transit ``verify`` (:meth:`verify_audit_hmac`), never by regenerating it. This lifts the audit chain
+from keyless SHA-256 (tamper-evident) to forgery-**resistant** (ADR 0138 §To-resolve, closing the
+ASVS 16.4.2 residual for this mode). The MAC key defaults to the data key and is overridable to a dedicated Transit key via
 ``MEFOR_STORE_TRANSIT_AUDIT_KEY`` for domain separation.
 
 **Fail-closed (ADR 0138).** Missing config, an unreachable/unknown Transit key, or a key whose TYPE
@@ -62,7 +63,7 @@ from messagefoundry.store.crypto import (
     MARKER_PREFIX,
     AuditKeyVersionRefusedError,
     AuditKeyVersionUnverifiedError,
-    AuditMacFn,
+    AuditMacVerifier,
     CipherError,
     CipherItem,
     CipherUnavailableError,
@@ -88,6 +89,7 @@ from messagefoundry.store.keyprovider_vault import (
     store_vault_hop,
     vault_failure_text,
 )
+from messagefoundry.store.row_seal import transit_mac_version
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import StoreSettings
@@ -113,10 +115,12 @@ _ENV_TRANSIT_KEY = "MEFOR_STORE_TRANSIT_KEY"
 #: :data:`~messagefoundry.store.keyprovider_vault.TRANSIT_KEY_TYPES_AUDIT` (BACKLOG #1166); a shared key
 #: is held to the narrower data-key set, because it has to do both jobs.
 _ENV_AUDIT_KEY = "MEFOR_STORE_TRANSIT_AUDIT_KEY"
-#: Texts Transit's ``hmac`` endpoint answers a refused key VERSION with, lower-cased (BACKLOG #6707).
-#: Read on 2026-11-10 from Vault ``builtin/logical/transit/path_hmac.go`` and
+#: Texts Transit's ``hmac`` and ``verify`` endpoints answer a refused key VERSION with, lower-cased
+#: (BACKLOG #6707). Read on 2026-11-10 from Vault ``builtin/logical/transit/path_hmac.go`` and
 #: ``sdk/helper/keysutil/policy.go`` (``HMACKey``, ``safeGetKeyEntry``) at commit cbc874e2358f, and
-#: from OpenBao, which says the same, at 80e208bf4f83 and 79e101fe2e59. They never decide whether
+#: from OpenBao, which says the same, at 80e208bf4f83 and 79e101fe2e59. ``version is too new`` was
+#: read on 2026-11-11 from Vault's ``pathHMACVerify`` at cbc874e2358f only (BACKLOG #2720); OpenBao
+#: was not read for it. They never decide whether
 #: the row is a break, and are read only inside an ``errors`` value that is a list
 #: (:func:`_names_no_version_reason`): a list entry holding one keeps the refused-version label,
 #: even beside a reason in :data:`_NOT_VERSION_TEXTS`. One anywhere else, such as in a bare JSON
@@ -126,12 +130,13 @@ _VERSION_REFUSAL_TEXTS = (
     "no such key version",
     "version is too old (disallowed by policy)",
     "no hmac key exists for that key version",
+    "version is too new",
 )
-#: Whole Vault error texts, lower-cased, that say a pinned ``hmac`` 400 is NOT about the version
+#: Whole Vault error texts, lower-cased, that say an audit-MAC 400 is NOT about the version
 #: (BACKLOG #6707), from the same Vault source. Matched whole once stripped and lower-cased, never
-#: as a substring. Kept short on purpose: :meth:`TransitCipher.audit_hmac` sends base64 it encoded
-#: and a fixed algorithm, so at least the input-encoding and algorithm 400s are not reachable from
-#: it.
+#: as a substring. Kept short on purpose: :meth:`TransitCipher.verify_audit_hmac` sends base64 it
+#: encoded, a fixed algorithm and only a MAC that :func:`transit_mac_version` accepts, so at least
+#: the input-encoding, MAC-shape and algorithm 400s are not reachable from it.
 _NOT_VERSION_TEXTS = frozenset({"missing input for hmac", "encryption key not found"})
 #: The longest reply body, in characters, that :func:`_names_no_version_reason` parses when hvac
 #: parsed none (BACKLOG #6707). Vault's own refusal is far shorter. Without a bound, a very large
@@ -141,7 +146,7 @@ _REPARSED_BODY_MAX_CHARS = 64 * 1024
 
 
 def _names_no_version_reason(exc: Exception) -> bool:
-    """Whether a pinned ``hmac`` 400 is NOT read as a version refusal (BACKLOG #6707). Only an
+    """Whether an audit-MAC ``verify`` 400 is NOT read as a version refusal (BACKLOG #6707). Only an
     ``errors`` value that is a list is read. With none, this is True whatever the reply says: at
     least a proxy or WAF page, text that is not JSON, a bare JSON list, and a string or object
     ``errors`` value. A list is True only when it is non-empty, every entry is text whose whole
@@ -162,7 +167,7 @@ def _names_no_version_reason(exc: Exception) -> bool:
         if len(body) > _REPARSED_BODY_MAX_CHARS:
             # Too long to be Vault's own refusal, and never parsed (BACKLOG #6707).
             log.warning(
-                "a pinned audit MAC got a 400 whose %d-character body is past the %d-character "
+                "an audit MAC verify got a 400 whose %d-character body is past the %d-character "
                 "bound; not read as a version refusal",
                 len(body),
                 _REPARSED_BODY_MAX_CHARS,
@@ -265,8 +270,10 @@ def _plaintext(value: object) -> str | None:
 
 
 #: The fixed input of the probe that tells a refused key version from an outage (BACKLOG #2337).
-#: Base64, as Transit takes it. It carries no row data, so no row can decide the probe's answer.
-_VERSION_PROBE_INPUT = base64.b64encode(b"messagefoundry audit key version probe").decode("ascii")
+#: It carries no row data, so no row can decide the probe's answer.
+_VERSION_PROBE_BYTES = b"messagefoundry audit key version probe"
+#: :data:`_VERSION_PROBE_BYTES` in base64, as Transit takes it.
+_VERSION_PROBE_INPUT = base64.b64encode(_VERSION_PROBE_BYTES).decode("ascii")
 
 
 def _transit_failure(op: str, key: str, exc: Exception) -> CipherError:
@@ -599,25 +606,64 @@ class TransitCipher(_UnmarkedPolicy):
         """No in-heap DEK, so no retired roots either (BACKLOG #2592)."""
         return ()
 
-    def audit_hmac(self, data: bytes, *, key_version: int | None = None) -> str:
+    def audit_hmac(self, data: bytes) -> str:
         """Compute the audit-chain row MAC INSIDE Transit (``generate_hmac``) — no key ever enters heap.
 
-        Returns Transit's own ``vault:v1:…`` HMAC string (deterministic for a given input+key+version, so
-        the chain round-trips at :meth:`~messagefoundry.store.store.MessageStore.verify_audit_chain`; a
-        different input yields a different MAC → tamper/forgery is detected). ADR 0138 §To-resolve: this
-        moves the audit chain from keyless SHA-256 to forgery-**resistant** without an in-heap key,
-        closing the ASVS 16.4.2 residual for ``vault_transit`` mode. Fail-closed: any Transit error raises
-        :class:`CipherError` (type-only — the canonical row bytes are PHI-derived and never surfaced).
+        Returns Transit's own ``vault:v<N>:…`` HMAC string under the key's latest version; the
+        string names that version, which is what :meth:`verify_audit_hmac` later checks the row at.
+        ADR 0138 §To-resolve: this moves the audit chain from keyless SHA-256 to
+        forgery-**resistant** without an in-heap key, closing the ASVS 16.4.2 residual for
+        ``vault_transit`` mode. Fail-closed: any Transit error raises :class:`CipherError`
+        (type-only — the canonical row bytes are PHI-derived and never surfaced). A reply that
+        :func:`~messagefoundry.store.row_seal.transit_mac_version` does not accept raises
+        :class:`CipherError` too, so no malformed MAC is written. A well-formed MAC can still read
+        as a break later, for example one a proxy or the wrong key answered."""
+        inp = base64.b64encode(data).decode("ascii")
+        try:
+            response: Any = self._client.secrets.transit.generate_hmac(
+                name=self._audit_key, hash_input=inp, algorithm=AUDIT_TRANSIT_HASH_ALGO
+            )
+            mac = response["data"]["hmac"]  # "vault:v1:…" — no key, no plaintext
+        except Exception as exc:
+            raise CipherError(
+                f"Transit audit HMAC failed (key={self._audit_key!r}): {vault_failure_text(exc)}"
+            ) from exc
+        # The writer refuses what the reader is certain to reject: a reply ``transit_mac_version``
+        # does not accept would be written as a row :meth:`verify_audit_hmac` reads as a break
+        # (BACKLOG #2720), so the append fails loudly here instead.
+        if not isinstance(mac, str) or transit_mac_version(mac) is None:
+            raise CipherError(
+                f"Transit returned an audit HMAC that is not a well-formed Transit MAC "
+                f"(key={self._audit_key!r})"
+            )
+        return mac
 
-        ``key_version`` pins the Transit key version; ``None`` means Transit's latest. A check of a
-        stored MAC passes the version that MAC names (BACKLOG #2337), so a key rotation does not make
-        an older row read as forged. A pinned call that gets an HTTP 400 that hvac raises as
-        ``InvalidRequest``, while a probe under the latest version answers with a string that does
-        not start ``vault:v<pinned>:``, raises :class:`AuditKeyVersionRefusedError` (see
-        :meth:`_refuses_only_version`); Transit refusing the version is one cause, not the only one.
-        It raises the subclass :class:`AuditKeyVersionUnverifiedError` when
-        :func:`_names_no_version_reason` does not read the 400 as Vault's own refusal, for example a
-        proxy's page, or when reading it runs out of memory or stack (BACKLOG #6707).
+    def verify_audit_hmac(self, data: bytes, stored: str) -> bool:
+        """Whether ``stored`` is Transit's HMAC of ``data`` under the audit key: Transit's own
+        ``verify`` call, at the version ``stored`` names (BACKLOG #2720). It never regenerates and
+        compares. Transit verifies an HMAC at a version from the key's ``min_decryption_version``
+        up to its latest that the key still holds with an HMAC key, so a row made under a version
+        below ``min_encryption_version`` still verifies. A version trimmed below
+        ``min_available_version`` is never inside that span: Vault keeps ``min_available_version``
+        at or below ``min_decryption_version``, both in its ``trim`` call and in its key config
+        write, so a trimmed version is refused as below ``min_decryption_version``. Read on
+        2026-11-11 from Vault ``pathHMACVerify``, ``path_trim.go``, ``path_keys_config.go`` and
+        ``keysutil.Policy.HMACKey`` at cbc874e2358f; OpenBao was not read for it.
+
+        ``stored`` that :func:`~messagefoundry.store.row_seal.transit_mac_version` does not accept
+        is ``False`` with no ``verify`` call, so no malformed value reaches Transit to draw a 400.
+        It still costs one round trip, an :meth:`audit_hmac` of ``data`` whose answer is
+        discarded, so a malformed row is no cheaper to check than a clean one; a failure of that
+        call is logged, and the answer stays ``False``. ``False`` is also
+        Transit's ``valid: false``.
+
+        A 400 that hvac raises as ``InvalidRequest``, while a probe under the latest version
+        answers with a string that does not start ``vault:v<N>:`` for the version ``stored``
+        names, raises :class:`AuditKeyVersionRefusedError` (see :meth:`_refuses_only_version`);
+        Transit refusing the version is one cause, not the only one. It raises the subclass
+        :class:`AuditKeyVersionUnverifiedError` when :func:`_names_no_version_reason` does not read
+        the 400 as Vault's own refusal, for example a proxy's page, or when reading it runs out of
+        memory or stack (BACKLOG #6707).
 
         A 400 on which hvac raises an exception other than ``InvalidRequest`` raises neither of
         those (BACKLOG #6707). For example, these
@@ -626,58 +672,168 @@ class TransitCipher(_UnmarkedPolicy):
         ``{"errors":true}``. On each, hvac 2.4.0 raises ``AttributeError`` or ``TypeError`` in
         place of ``InvalidRequest``. A ``MemoryError`` that hvac raises while it joins a truthy
         ``errors`` value, before it raises any ``InvalidRequest``, is not read as a refusal either.
-        Each raises plain :class:`CipherError`, so the walk could not run and no tamper alert
-        fires."""
-        inp = base64.b64encode(data).decode("ascii")
-        kwargs: dict[str, Any] = {
-            "name": self._audit_key,
-            "hash_input": inp,
-            "algorithm": AUDIT_TRANSIT_HASH_ALGO,
-        }
-        if key_version is not None:
-            kwargs["key_version"] = key_version
+
+        A failure of the verify call not read as a refused version, and not one
+        :func:`is_vault_unavailable` reads as an outage, is checked once the handler has let go
+        of the failed request (BACKLOG #2720): a verify over FIXED input must succeed
+        (:meth:`_fixed_input_verifies`), and then the row's own verify is asked once more
+        (:meth:`_recheck_refused_row`, which says how the second ask is read). Where that reads
+        the row as refused, the answer is ``False``, a break at that row, as a forged MAC is; a
+        Vault that answers HTTP 413 past ``max_request_size`` to a planted oversize row is one
+        such case. Every other failure, a failed fixed-input verify among them, and a reply of an
+        unexpected shape, raises plain :class:`CipherError`, so the walk could not run and no
+        tamper alert fires. Blocking."""
+        version = transit_mac_version(stored)
+        if version is None:
+            # Still one round trip, as a clean row costs, so a malformed row is not cheaper to
+            # check (``verify_audit_chain``, ASVS 11.2.4). Its answer cannot match ``stored``, and
+            # its failure must not turn this row's break into a walk that could not run.
+            try:
+                self.audit_hmac(data)
+            except CipherError as exc:
+                log.warning(
+                    "the cost-only audit HMAC beside a malformed stored MAC failed: %s", exc
+                )
+            return False
+        failed: Exception | None = None
         try:
-            response: Any = self._client.secrets.transit.generate_hmac(**kwargs)
-            mac = response["data"]["hmac"]  # "vault:v1:…" — no key, no plaintext
+            response: Any = self._transit_verify_call(self._audit_key, data, stored)
         except Exception as exc:
-            if key_version is not None and self._refuses_only_version(exc, key_version):
-                # The same flow, labelled apart (BACKLOG #6707). A reply that runs out of memory or
-                # stack while it is read, such as a huge errors list, is not read as a refusal:
-                # escaping here, the error would make the walk "could not run" and drop the row's
-                # break and its alert.
-                unreadable: str | None = None
-                try:
-                    unverified = _names_no_version_reason(exc)
-                except (MemoryError, RecursionError) as read_exc:
-                    unverified, unreadable = True, type(read_exc).__name__
-                if unreadable is not None:  # logged once the handler has freed what it held
-                    log.warning(
-                        "could not read the 400 for audit key version %d (%s); labelled "
-                        "unconfirmed (key=%r)",
-                        key_version,
-                        unreadable,
-                        self._audit_key,
-                    )
-                if unverified:
-                    raise AuditKeyVersionUnverifiedError(key_version) from exc
-                raise AuditKeyVersionRefusedError(key_version) from exc
+            settled = self._settled_verify_failure(exc, version)
+            if settled is not None:
+                raise settled from exc
+            # Checked below, once this handler has let go of the failed request, which for a
+            # planted oversize row holds the whole upload (BACKLOG #2720). The traceback goes
+            # with it; the error itself stays as the cause of whatever is raised.
+            failed = exc.with_traceback(None)
+        if failed is not None:
+            return self._recheck_refused_row(data, stored, version, failed)
+        return self._verify_answer(response)
+
+    def _settled_verify_failure(self, exc: Exception, version: int) -> CipherError | None:
+        """The error an audit-MAC verify failure at ``version`` raises at once, or ``None`` for one
+        :meth:`_recheck_refused_row` must check: a refused version (:meth:`_refuses_only_version`)
+        is :class:`AuditKeyVersionRefusedError` or :class:`AuditKeyVersionUnverifiedError`, and an
+        outage (:meth:`_is_outage`) is plain :class:`CipherError`. Runs inside the caller's
+        handler. Blocking."""
+        if self._refuses_only_version(exc, version):
+            # The same flow, labelled apart (BACKLOG #6707). A reply that runs out of memory or
+            # stack while it is read, such as a huge errors list, is not read as a refusal:
+            # escaping here, the error would make the walk "could not run" and drop the row's
+            # break and its alert.
+            unreadable: str | None = None
+            try:
+                unverified = _names_no_version_reason(exc)
+            except (MemoryError, RecursionError) as read_exc:
+                unverified, unreadable = True, type(read_exc).__name__
+            if unreadable is not None:
+                log.warning(
+                    "could not read the 400 for audit key version %d (%s); labelled "
+                    "unconfirmed (key=%r)",
+                    version,
+                    unreadable,
+                    self._audit_key,
+                )
+            if unverified:
+                return AuditKeyVersionUnverifiedError(version)
+            return AuditKeyVersionRefusedError(version)
+        if self._is_outage(exc):
+            return self._verify_failed(exc)
+        return None
+
+    def _verify_failed(self, exc: Exception) -> CipherError:
+        """The could-not-run error for an audit-MAC verify that failed with ``exc``; the caller
+        raises it ``from exc``, so a reader of the cause's class still tells an outage from a
+        refusal."""
+        return CipherError(
+            f"Transit audit HMAC verify failed (key={self._audit_key!r}): {vault_failure_text(exc)}"
+        )
+
+    def _recheck_refused_row(
+        self, data: bytes, stored: str, version: int, failed: Exception
+    ) -> bool:
+        """:meth:`verify_audit_hmac` for a row whose verify at ``version`` failed with ``failed``,
+        which :meth:`_settled_verify_failure` left to this (BACKLOG #2720). Raises
+        :class:`CipherError` from ``failed`` unless a verify over fixed input succeeds. Then asks
+        the row's own verify once more, so a failure that cleared is not read as the row's: an
+        answer is read as usual, and a failure goes through :meth:`_settled_verify_failure` again.
+        A failure that leaves unsettled is ``False``, logged, only when a verify over fixed input
+        succeeds once more after it; otherwise it raises :class:`CipherError`, since the service
+        failed between the asks. Blocking."""
+        if not self._fixed_input_verifies():
+            raise self._verify_failed(failed) from failed
+        again: Exception | None = None
+        try:
+            response: Any = self._transit_verify_call(self._audit_key, data, stored)
+        except Exception as exc:
+            settled = self._settled_verify_failure(exc, version)
+            if settled is not None:
+                raise settled from exc
+            again = exc.with_traceback(None)
+        if again is None:
+            return self._verify_answer(response)
+        if not self._fixed_input_verifies():
+            raise self._verify_failed(again) from again
+        log.warning(
+            "Transit refused the audit MAC verify of one row twice while a verify over fixed "
+            "input succeeded before and after (key=%r): %s; read as a break at that row",
+            self._audit_key,
+            vault_failure_text(again),
+        )
+        return False
+
+    def _verify_answer(self, response: Any) -> bool:
+        """Transit's ``valid`` from a ``verify`` reply; :class:`CipherError` for a reply of an
+        unexpected shape, a ``valid`` that is not a bool among them."""
+        try:
+            valid = response["data"]["valid"]
+        except (KeyError, TypeError, IndexError):
+            valid = None
+        if not isinstance(valid, bool):
             raise CipherError(
-                f"Transit audit HMAC failed (key={self._audit_key!r}): {vault_failure_text(exc)}"
-            ) from exc
-        if not isinstance(mac, str) or not mac:
-            raise CipherError(f"Transit returned an empty audit HMAC (key={self._audit_key!r})")
-        return mac
+                f"Transit returned an audit HMAC verify reply of an unexpected shape "
+                f"(key={self._audit_key!r})"
+            )
+        return valid
+
+    def _transit_verify_call(self, key_name: str, data: bytes, mac: str) -> object:
+        """Transit's ``verify`` of ``mac`` over ``data`` under ``key_name``: the raw reply. Any
+        failure of the call propagates as raised, for the caller to classify. Blocking."""
+        response: object = self._client.secrets.transit.verify_signed_data(
+            name=key_name,
+            hash_input=base64.b64encode(data).decode("ascii"),
+            hmac=mac,
+            hash_algorithm=AUDIT_TRANSIT_HASH_ALGO,
+        )
+        return response
+
+    def _transit_verify(self, key_name: str, data: bytes, mac: str) -> object:
+        """Transit's raw ``valid`` from :meth:`_transit_verify_call`. Any failure, a reply of an
+        unexpected shape included, propagates as raised. Blocking."""
+        response: Any = self._transit_verify_call(key_name, data, mac)
+        return response["data"]["valid"]
+
+    def _probe_mac(self) -> object:
+        """Transit's ``hmac`` over FIXED input under the audit key's latest version, raw. Fixed
+        input keeps a row's own content from deciding a probe. Any failure propagates. Blocking."""
+        probe: Any = self._client.secrets.transit.generate_hmac(
+            name=self._audit_key,
+            hash_input=_VERSION_PROBE_INPUT,
+            algorithm=AUDIT_TRANSIT_HASH_ALGO,
+        )
+        return probe["data"]["hmac"]
 
     def _refuses_only_version(self, exc: Exception, key_version: int) -> bool:
-        """Whether ``exc``, raised by a call pinned to ``key_version``, is Transit refusing that
-        version rather than an outage (BACKLOG #2337).
+        """Whether ``exc``, raised by an audit-MAC verify at ``key_version``, is Transit refusing
+        that version rather than an outage (BACKLOG #2337).
 
-        Transit answers a version above the latest, or below the policy minimum, with HTTP 400,
-        which hvac raises as ``InvalidRequest``. A dropped connection, a rate limit or a sealed node
-        raises another class, so none of those reads as a refused version. A 400 can also mean the
+        Transit's ``verify`` answers a version above the latest, or below the key's
+        ``min_decryption_version``, with HTTP 400, which hvac raises as ``InvalidRequest``. A
+        dropped connection, a rate limit or a sealed node raises another class, so none of those
+        reads as a refused version. A 400 can also mean the
         key itself is missing, so a probe under the latest version, over FIXED input, must succeed
         too. Fixed input keeps a row's own content from deciding the answer. The probe must also
-        answer with a string that does not start ``vault:v<pinned>:``; an empty string or one
+        answer with a string that does not start ``vault:v<key_version>:``; an empty string or one
         naming no version passes too.
 
         This infers the cause from the reply; it does not read the key's version range. So a node
@@ -685,12 +841,7 @@ class TransitCipher(_UnmarkedPolicy):
         if not is_vault_bad_request(exc):
             return False
         try:
-            probe: Any = self._client.secrets.transit.generate_hmac(
-                name=self._audit_key,
-                hash_input=_VERSION_PROBE_INPUT,
-                algorithm=AUDIT_TRANSIT_HASH_ALGO,
-            )
-            answered = probe["data"]["hmac"]
+            answered = self._probe_mac()
         except Exception as probe_exc:  # the latest version fails too: not a version refusal
             log.warning(
                 "Transit refused audit key version %d, and the probe under the latest version failed "
@@ -701,6 +852,50 @@ class TransitCipher(_UnmarkedPolicy):
             )
             return False
         return isinstance(answered, str) and not answered.startswith(f"vault:v{key_version}:")
+
+    def _is_outage(self, exc: Exception) -> bool:
+        """:func:`is_vault_unavailable` for an audit-MAC verify failure. Runs inside the caller's
+        handler, so a classifier that raises is logged by type alone and read as an outage, the
+        reading that keeps a failure a walk that could not run."""
+        try:
+            return is_vault_unavailable(exc)
+        except Exception as fault:  # noqa: BLE001 -- see the docstring
+            log.warning(
+                "Transit failure classifier raised %s; read as an outage", type(fault).__name__
+            )
+            return True
+
+    def _fixed_input_verifies(self) -> bool:
+        """Whether Transit's ``verify`` works over FIXED input: :meth:`_probe_mac` under the latest
+        version, then a ``verify`` of that MAC answering ``valid: true`` (BACKLOG #2720). A token
+        refused the ``verify`` path, a missing key or a gateway that is down fails it, so such a
+        failure on a row stays a walk that could not run. Any failure is ``False``, logged.
+        Blocking."""
+        try:
+            mac = self._probe_mac()
+            if not isinstance(mac, str) or transit_mac_version(mac) is None:
+                log.warning(
+                    "an audit MAC verify failed, and the fixed-input probe answered no "
+                    "well-formed MAC (key=%r)",
+                    self._audit_key,
+                )
+                return False
+            valid = self._transit_verify(self._audit_key, _VERSION_PROBE_BYTES, mac)
+        except Exception as probe_exc:  # the fixed input fails too: the service, not the row
+            log.warning(
+                "an audit MAC verify failed, and a verify over fixed input failed too (key=%r): %s",
+                self._audit_key,
+                vault_failure_text(probe_exc),
+            )
+            return False
+        if valid is not True:
+            log.warning(
+                "an audit MAC verify failed, and a verify over fixed input did not answer valid "
+                "(key=%r)",
+                self._audit_key,
+            )
+            return False
+        return True
 
     # --- The row seal backend (ADR 0217; TransitSealBackend in store/row_seal.py) -----------------
 
@@ -751,16 +946,9 @@ class TransitCipher(_UnmarkedPolicy):
         :class:`~messagefoundry.store.crypto.TransitSealRefused` with that status, raised outside the
         handler so no chain carries Vault's reply; anything else raises :class:`CipherError`.
         Blocking."""
-        hash_input = base64.b64encode(digest).decode("ascii")
         refused = 0
         try:
-            response: Any = self._client.secrets.transit.verify_signed_data(
-                name=key_name,
-                hash_input=hash_input,
-                hmac=mac,
-                hash_algorithm=AUDIT_TRANSIT_HASH_ALGO,
-            )
-            return response["data"]["valid"]
+            return self._transit_verify(key_name, digest, mac)
         except Exception as exc:
             refused = 400 if is_vault_bad_request(exc) else 403 if is_vault_forbidden(exc) else 0
             if not refused:
@@ -769,11 +957,28 @@ class TransitCipher(_UnmarkedPolicy):
                 ) from exc
         raise TransitSealRefused(refused)
 
-    def audit_mac_fn(self) -> AuditMacFn:
-        """The audit-chain MAC provider: route each row's MAC through Transit (:meth:`audit_hmac`). The
-        store uses this INSTEAD of an in-heap ``hmac.new(key, …)`` when present, so the audit chain is
+    def audit_mac_fn(self) -> AuditMacVerifier:
+        """The audit-chain MAC provider: route each row's MAC through Transit (:meth:`audit_hmac`),
+        and check each stored one with Transit's ``verify`` (:meth:`verify_audit_hmac`). The store
+        uses this INSTEAD of an in-heap ``hmac.new(key, …)`` when present, so the audit chain is
         keyed even though :meth:`audit_mac_key` is ``None`` (the key stays inside the isolated module)."""
-        return self.audit_hmac
+        return _TransitAuditMac(self)
+
+
+class _TransitAuditMac:
+    """:meth:`TransitCipher.audit_mac_fn`'s provider: an
+    :class:`~messagefoundry.store.crypto.AuditMacVerifier` over one cipher (BACKLOG #2720)."""
+
+    __slots__ = ("_cipher",)
+
+    def __init__(self, cipher: TransitCipher) -> None:
+        self._cipher = cipher
+
+    def __call__(self, data: bytes, /) -> str:
+        return self._cipher.audit_hmac(data)
+
+    def verify(self, data: bytes, stored: str, /) -> bool:
+        return self._cipher.verify_audit_hmac(data, stored)
 
 
 def _key_names() -> tuple[str, str]:
@@ -882,9 +1087,9 @@ def transit_cipher_required_capabilities() -> dict[str, frozenset[str]]:
     metadata (``transit/keys/<key>``, read); :meth:`TransitCipher.encrypt` and
     :meth:`TransitCipher.decrypt` update ``transit/encrypt/<data key>`` and
     ``transit/decrypt/<data key>``; :meth:`TransitCipher.audit_hmac` updates
-    ``transit/hmac/<audit key>``, which is the data key when no audit key is set, and the row seal
-    check (:meth:`TransitCipher.verify_seal_hmac`, ADR 0217) updates
-    ``transit/verify/<audit key>``. Raises
+    ``transit/hmac/<audit key>``, which is the data key when no audit key is set, and the audit
+    walk's check (:meth:`TransitCipher.verify_audit_hmac`, BACKLOG #2720) and the row seal check
+    (:meth:`TransitCipher.verify_seal_hmac`, ADR 0217) update ``transit/verify/<audit key>``. Raises
     :class:`KeyProviderError` when the data-key name is not set, as the cipher itself does."""
     key_name, audit_key = _key_names()
     read, update = frozenset({"read"}), frozenset({"update"})
