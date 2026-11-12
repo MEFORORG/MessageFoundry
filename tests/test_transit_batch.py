@@ -217,8 +217,10 @@ def test_an_item_error_in_a_batch_that_answered_is_that_items_alone() -> None:
         pytest.param(lambda r: [*r, r[0]], id="long"),
         pytest.param(lambda r: list(reversed(r)), id="reordered"),
         pytest.param(
-            lambda r: [{k: v for k, v in x.items() if k != "reference"} for x in r],
-            id="no-reference",
+            # One result without its reference beside others that carry one: not an unechoing
+            # Transit (which falls back to single requests), so the order cannot be trusted.
+            lambda r: [{k: v for k, v in r[0].items() if k != "reference"}, *r[1:]],
+            id="one-reference-missing",
         ),
         pytest.param(lambda r: {"0": r[0]}, id="not-a-list"),
     ],
@@ -392,6 +394,10 @@ def test_a_batch_refusal_other_than_a_400_fails_every_value_and_sends_no_more() 
     # The batch, then the first value alone, which is refused too: no verdict, so no more.
     assert transit.decrypt_requests == 2
     assert all(isinstance(r, CipherError) and isinstance(r.__cause__, Forbidden) for r in results)
+    # The value asked for keeps its own refusal; every value never asked for is no verdict.
+    assert not isinstance(results[0], CipherUnavailableError)
+    assert all(isinstance(r, CipherUnavailableError) for r in results[1:])
+    assert cipher._batch_alone is False  # Transit served no single value, so batching stays on
 
 
 def test_a_mismatched_reply_is_no_verdict() -> None:
@@ -486,3 +492,78 @@ def test_a_refused_decrypt_batch_asks_alone_and_stops_batching() -> None:
     transit.decrypt_data = too_large  # type: ignore[method-assign]
     assert cipher.decrypt_many(items) == [f"value {i}" for i in range(len(items))]
     assert batches == 1  # the second run went value by value without a batch first
+
+
+def _without_reference(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{k: v for k, v in r.items() if k != "reference"} for r in results]
+
+
+def test_a_reply_with_no_reference_echo_is_asked_for_alone() -> None:
+    transit = _BatchTransit()
+    cipher = _cipher(transit)
+    items = _sealed(cipher, 5)
+    transit.tamper = _without_reference
+    transit.decrypt_requests = 0
+    assert cipher.decrypt_many(items) == [f"value {i}" for i in range(5)]
+    assert transit.decrypt_requests == 1 + 5  # the unused batch, then each value alone
+    transit.decrypt_requests = 0
+    assert cipher.decrypt_many(items) == [f"value {i}" for i in range(5)]
+    assert transit.decrypt_requests == 5  # the cipher now sends each value alone
+
+
+async def test_the_first_keyed_open_succeeds_when_transit_does_not_echo_reference(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "store.db"
+    await _write_messages(db, 200)  # keyless: legacy plaintext the keyed open seals
+    transit = _BatchTransit()
+    transit.tamper = _without_reference
+    store = await MessageStore.open(db, cipher=_cipher(transit))
+    await store.close()
+    # One batch, unused, then every value alone.
+    assert transit.encrypt_requests == 1 + 600
+    conn = connect_readonly(db, busy_timeout=5.0)
+    try:
+        audit = audit_cipher_cells(conn, _cipher(transit))
+    finally:
+        conn.close()
+    assert (audit.opened, audit.failed, audit.legacy, audit.unmarked) == (600, 0, 0, 0)
+
+
+def test_a_classifier_that_raises_on_a_batch_400_carries_no_body_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transit = _BatchTransit()
+    cipher = _cipher(transit)
+    items = _sealed(cipher, 4)
+    items[1] = (items[1][0], cell_aad("t", "c", 999))  # the batch then answers 400 with a body
+
+    def broken(exc: BaseException) -> bool:
+        raise RuntimeError("synthetic classifier fault")
+
+    monkeypatch.setattr(crypto_transit, "is_vault_bad_request", broken)
+    results = cipher.decrypt_many(items)  # nothing escapes
+    assert results[0] == "value 0" and results[2] == "value 2" and results[3] == "value 3"
+    assert isinstance(results[1], CipherError)
+    leaked = base64.b64encode(b"value 0").decode("ascii")
+    assert leaked not in "".join(traceback.format_exception(results[1]))
+
+
+def test_the_send_alone_state_outlives_one_call() -> None:
+    transit = _BatchTransit()
+    cipher = _cipher(transit)
+    items = _sealed(cipher, 3)
+    real = transit.decrypt_data
+    batches = 0
+
+    def too_large(**kw: Any) -> dict[str, Any]:
+        nonlocal batches
+        if kw.get("batch_input") is not None:
+            batches += 1
+            raise UnexpectedError("413 Request Entity Too Large")
+        return real(**kw)
+
+    transit.decrypt_data = too_large  # type: ignore[method-assign]
+    for _ in range(3):
+        assert cipher.decrypt_many(items) == ["value 0", "value 1", "value 2"]
+    assert batches == 1

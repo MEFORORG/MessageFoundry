@@ -200,33 +200,56 @@ def _batches(costs: Sequence[int]) -> list[list[int]]:
     return runs
 
 
-def _batch_replies(response: Any, sent: int) -> list[Mapping[str, Any]] | None:
+#: :func:`_batch_replies`' answer for a reply of the right length, every result an object, that
+#: carries no ``reference`` at all: a Transit that does not echo it. Its order cannot be checked,
+#: so it is not used, and the batch's values are asked for alone, as before batching.
+UNECHOED = "unechoed"
+
+
+def _batch_replies(response: Any, sent: int) -> list[Mapping[str, Any]] | str | None:
     """Transit's ``batch_results``, when it is a list of ``sent`` objects whose ``reference`` is
-    each one's own place in the request, as sent (BACKLOG #6706); ``None`` otherwise, and the
-    caller then refuses every value of the batch. Vault echoes ``reference`` on every result, so
-    a reply that drops, adds or reorders one is caught here rather than zipped."""
+    each one's own place in the request, as sent (BACKLOG #6706). :data:`UNECHOED` when it is
+    ``sent`` objects none of which carries a ``reference``. ``None`` for any other reply, which
+    the caller reads as no verdict on any value of the batch. So a reply that drops, adds or
+    reorders a result is never zipped onto the request."""
     data = response.get("data") if isinstance(response, dict) else None
     replies = data.get("batch_results") if isinstance(data, dict) else None
     if not isinstance(replies, list) or len(replies) != sent:
         return None
-    if not all(
-        isinstance(reply, dict) and reply.get("reference") == str(place)
-        for place, reply in enumerate(replies)
-    ):
+    if not all(isinstance(reply, dict) for reply in replies):
+        return None
+    if all("reference" not in reply for reply in replies):
+        return UNECHOED
+    if not all(reply.get("reference") == str(place) for place, reply in enumerate(replies)):
         return None
     return replies
 
 
 def _unasked(failure: CipherError, count: int) -> list[str | CipherError]:
-    """``count`` copies of a failure that gave no verdict on any value of a batch, for values
-    Transit was not asked for, or not answered for, alone. Each carries ``failure``'s cause, as
-    ``raise ... from`` sets it, which is what a reader that tells an outage from a refusal reads."""
+    """``count`` :class:`CipherUnavailableError` copies of a failure that gave no verdict, for
+    values of a batch Transit was not asked for, or not answered for, alone. Each carries
+    ``failure``'s cause, as ``raise ... from`` sets it, which is what a reader that tells an
+    outage from a refusal reads."""
     copies: list[str | CipherError] = []
     for _ in range(count):
-        error = type(failure)(str(failure))
+        error = CipherUnavailableError(str(failure))
         error.__cause__ = failure.__cause__
         copies.append(error)
     return copies
+
+
+def _classify_batch_failure(exc: Exception) -> tuple[bool, bool]:
+    """Whether a batch request's ``exc`` is Transit giving no verdict
+    (:func:`is_vault_unavailable`), and whether it is Vault's HTTP 400 (BACKLOG #6706). Flags
+    only: Vault's 400 and 500 bodies to a batch are its whole ``batch_results``, other values'
+    plaintext included, and hvac makes that body the error's message (BACKLOG #2085), so the
+    caller keeps nothing of ``exc``. Runs inside the caller's handler, so a classifier that
+    raises is caught here and logged by type alone; it reads as a refusal that is not a 400."""
+    try:
+        return is_vault_unavailable(exc), is_vault_bad_request(exc)
+    except Exception as fault:  # noqa: BLE001 -- see the docstring
+        log.warning("Transit failure classifier raised %s; read as a refusal", type(fault).__name__)
+        return False, False
 
 
 def _plaintext(value: object) -> str | None:
@@ -283,6 +306,9 @@ class TransitCipher(_UnmarkedPolicy):
         # The Transit key the audit-chain HMAC runs under. Defaults to the data key (Transit HMAC works
         # on any key type) so the chain is keyed-in-Transit by default; a dedicated key domain-separates.
         self._audit_key = audit_key or key_name
+        # Set once Transit refused a batch, or answered one without a `reference`, and then
+        # served its values alone: every later value goes alone too (BACKLOG #6706).
+        self._batch_alone = False
 
     @property
     def transit_key_name(self) -> str:
@@ -364,25 +390,15 @@ class TransitCipher(_UnmarkedPolicy):
             batch_input.append(item)
         return batch_input
 
-    def _batch_failure(self, op: str, exc: Exception) -> CipherUnavailableError | None:
-        """For a batch request that raised ``exc``: a :class:`CipherUnavailableError` naming only
-        the key and ``exc``'s type where Transit gave no verdict (:func:`is_vault_unavailable`),
-        else ``None``, a refusal (BACKLOG #6706). Nothing returned keeps ``exc``: Vault's 400 and
-        500 bodies to a batch are its whole ``batch_results``, other values' plaintext included,
-        and hvac makes that body the error's message (BACKLOG #2085). A classifier fault reads as
-        a refusal, as in :func:`_transit_failure`."""
-        try:
-            unavailable = is_vault_unavailable(exc)
-        except Exception as fault:  # noqa: BLE001 -- see the docstring
+    def _send_alone_from_now(self, op: str, why: str) -> None:
+        if not self._batch_alone:
             log.warning(
-                "Transit failure classifier raised %s; read as a refusal", type(fault).__name__
+                "Transit %s a batch %s (key=%r); sending each value alone from now on",
+                why,
+                op,
+                self._key,
             )
-            unavailable = False
-        if not unavailable:
-            return None
-        return CipherUnavailableError(
-            f"Transit {op} failed (key={self._key!r}): {type(exc).__name__}"
-        )
+        self._batch_alone = True
 
     def decrypt_many(self, items: Sequence[CipherItem]) -> list[str | CipherError]:
         """Each ``(stored, aad)`` of ``items`` opened, in order, in as few Transit ``decrypt``
@@ -393,11 +409,14 @@ class TransitCipher(_UnmarkedPolicy):
         A batch request Transit could not serve fails every value not yet answered with a
         :class:`CipherUnavailableError`, and no later request is sent. Any other failure of a batch
         request, Vault's HTTP 400 when one value in it fails or a proxy's size refusal among them,
-        asks for each value of that batch alone, so each gets the verdict :meth:`decrypt` gives it,
-        until one gives no verdict (:func:`~messagefoundry.store.crypto.gave_no_verdict`). Once a
-        batch is refused for any reason but a 400, later values are asked for alone. A reply
-        :func:`_batch_replies` does not match to the request is no verdict on any value of the
-        batch. A batch of one is a single request."""
+        asks for each value of that batch alone, so each gets the verdict :meth:`decrypt` gives it.
+        So does a reply with no ``reference`` echo (:data:`UNECHOED`). Asking alone stops at the
+        first value that gives no verdict (:func:`~messagefoundry.store.crypto.gave_no_verdict`),
+        and every value not yet answered then fails, unasked, with a
+        :class:`CipherUnavailableError`. When a refusal other than a 400, or an unechoed reply, is
+        followed by single requests Transit serves, this cipher sends every later value alone. Any
+        other reply :func:`_batch_replies` refuses is no verdict on any value of the batch. A batch
+        of one is a single request."""
         results: dict[int, str | CipherError] = {}
         sealed: list[int] = []
         for index, (stored, aad) in enumerate(items):
@@ -406,27 +425,26 @@ class TransitCipher(_UnmarkedPolicy):
             else:
                 results[index] = decrypt_or_error(self, stored, aad)
         down: CipherError | None = None
-        alone = False
         for run in _batches([batch_chars(*items[i]) for i in sealed]):
             picked = [sealed[i] for i in run]
             batch = [items[i] for i in picked]
             if down is not None:
                 opened = _unasked(down, len(picked))
-            elif alone or len(batch) == 1:
+            elif self._batch_alone or len(batch) == 1:
                 opened = self._decrypt_alone(batch)
             else:
-                opened, alone = self._decrypt_batch(batch)
-            last = opened[-1] if opened else None
-            if down is None and isinstance(last, CipherError) and gave_no_verdict(last):
-                down = last
+                opened = self._decrypt_batch(batch)
+            down = next(
+                (r for r in opened if isinstance(r, CipherError) and gave_no_verdict(r)), None
+            )
             for index, result in zip(picked, opened, strict=True):
                 results[index] = result
         return [results[index] for index in range(len(items))]
 
     def _decrypt_alone(self, batch: list[CipherItem]) -> list[str | CipherError]:
         """Each value of ``batch`` in its own request, until one gives no verdict
-        (:func:`~messagefoundry.store.crypto.gave_no_verdict`); the values after it fail with it,
-        unasked."""
+        (:func:`~messagefoundry.store.crypto.gave_no_verdict`); the values after it fail, unasked,
+        with a :class:`CipherUnavailableError`."""
         opened: list[str | CipherError] = []
         for stored, aad in batch:
             result = decrypt_or_error(self, stored, aad)
@@ -436,38 +454,40 @@ class TransitCipher(_UnmarkedPolicy):
                 break
         return opened
 
-    def _decrypt_batch(self, batch: list[CipherItem]) -> tuple[list[str | CipherError], bool]:
+    def _decrypt_batch(self, batch: list[CipherItem]) -> list[str | CipherError]:
         """One batch request of :meth:`decrypt_many`, every value ``mfenc:v3``: the results in
-        its order, and whether later values go alone (a refusal other than Vault's 400)."""
+        its order."""
         sent = [(stored[len(_V3_PREFIX) :], aad) for stored, aad in batch]
         response: Any = None
-        failed = refused_batch = False
-        down: CipherUnavailableError | None = None
+        failed = unavailable = bad_request = False
+        failure_type = ""
         try:
             response = self._client.secrets.transit.decrypt_data(
                 name=self._key, batch_input=self._batch_input("ciphertext", sent)
             )
         except Exception as exc:
-            # Only flags leave this handler (see _batch_failure); the values are asked for below.
-            failed = True
-            down = self._batch_failure("decrypt", exc)
-            refused_batch = not is_vault_bad_request(exc)
-        if down is not None:
-            return _unasked(down, len(batch)), False
-        if failed:
-            if refused_batch:
-                log.warning(
-                    "Transit refused a batch decrypt (key=%r); asking for each value alone",
-                    self._key,
-                )
-            return self._decrypt_alone(batch), refused_batch
-        replies = _batch_replies(response, len(batch))
-        if replies is None:
+            # Only flags and a type name leave this handler (see _classify_batch_failure).
+            failed, failure_type = True, type(exc).__name__
+            unavailable, bad_request = _classify_batch_failure(exc)
+        if unavailable:
+            down = CipherUnavailableError(
+                f"Transit decrypt failed (key={self._key!r}): {failure_type}"
+            )
+            return _unasked(down, len(batch))
+        replies = None if failed else _batch_replies(response, len(batch))
+        if failed or replies == UNECHOED:
+            opened = self._decrypt_alone(batch)
+            served = not any(isinstance(r, CipherError) and gave_no_verdict(r) for r in opened)
+            if served and not bad_request:
+                why = "refused" if failed else "did not echo the reference of"
+                self._send_alone_from_now("decrypt", why)
+            return opened
+        if not isinstance(replies, list):
             mismatch = CipherUnavailableError(
                 f"Transit's batch decrypt reply does not match the request (key={self._key!r})"
             )
-            return _unasked(mismatch, len(batch)), False
-        opened: list[str | CipherError] = []
+            return _unasked(mismatch, len(batch))
+        opened = []
         for reply in replies:
             if reply.get("error"):
                 # Vault's own text is not quoted: it is a reply this process did not write.
@@ -475,60 +495,62 @@ class TransitCipher(_UnmarkedPolicy):
                 continue
             plaintext = _plaintext(reply.get("plaintext"))
             opened.append(plaintext if plaintext is not None else self._malformed_plaintext())
-        return opened, False
+        return opened
 
     def encrypt_many(self, items: Sequence[CipherItem]) -> list[str]:
         """Each ``(plaintext, aad)`` of ``items`` sealed, in order, in as few Transit ``encrypt``
         requests as the batch bounds allow (BACKLOG #6706). Any failure raises as :meth:`encrypt`
         does, so no value is returned unless all sealed. A batch request Transit could not serve
-        raises :class:`CipherUnavailableError`, and so does a reply :func:`_batch_replies` does not
-        match to the request. One it refused, a proxy's request-size bound among them, seals each
-        value of that batch, and every later one, alone. A batch of one is a single request."""
+        raises :class:`CipherUnavailableError`, and so does a reply :func:`_batch_replies` refuses,
+        except one with no ``reference`` echo (:data:`UNECHOED`). That reply, or a batch Transit
+        refused, a proxy's request-size bound among them, seals each value of the batch alone, and
+        this cipher then sends every later value alone. A batch of one is a single request."""
         costs = [
             b64_chars(len(plaintext.encode("utf-8"))) + batch_chars("", aad)
             for plaintext, aad in items
         ]
         sealed: list[str] = []
-        alone = False
         for run in _batches(costs):
             batch = [items[i] for i in run]
-            if alone or len(batch) == 1:
+            if self._batch_alone or len(batch) == 1:
                 sealed.extend(self.encrypt(plaintext, aad=aad) for plaintext, aad in batch)
                 continue
-            batch_sealed = self._encrypt_batch(batch)
-            if batch_sealed is None:
-                alone = True
-                log.warning(
-                    "Transit refused a batch encrypt (key=%r); sealing each value alone", self._key
-                )
-                batch_sealed = [self.encrypt(plaintext, aad=aad) for plaintext, aad in batch]
-            sealed.extend(batch_sealed)
+            outcome = self._encrypt_batch(batch)
+            if isinstance(outcome, str):
+                sealed.extend(self.encrypt(plaintext, aad=aad) for plaintext, aad in batch)
+                self._send_alone_from_now("encrypt", outcome)
+            else:
+                sealed.extend(outcome)
         return sealed
 
-    def _encrypt_batch(self, batch: list[CipherItem]) -> list[str] | None:
-        """One batch request of :meth:`encrypt_many`: the sealed values in its order, or ``None``
-        when Transit refused the batch."""
+    def _encrypt_batch(self, batch: list[CipherItem]) -> list[str] | str:
+        """One batch request of :meth:`encrypt_many`: the sealed values in its order, or why the
+        values must be sealed alone: ``"refused"`` or ``"did not echo the reference of"``."""
         sent = [
             (base64.b64encode(plaintext.encode("utf-8")).decode("ascii"), aad)
             for plaintext, aad in batch
         ]
         response: Any = None
-        failed = False
-        down: CipherUnavailableError | None = None
+        failed = unavailable = False
+        failure_type = ""
         try:
             response = self._client.secrets.transit.encrypt_data(
                 name=self._key, batch_input=self._batch_input("plaintext", sent)
             )
         except Exception as exc:
             # Type-only message: the plaintext going in is PHI; never surface it or the key material.
-            failed = True
-            down = self._batch_failure("encrypt", exc)
-        if down is not None:
-            raise down
+            failed, failure_type = True, type(exc).__name__
+            unavailable, _bad_request = _classify_batch_failure(exc)
+        if unavailable:
+            raise CipherUnavailableError(
+                f"Transit encrypt failed (key={self._key!r}): {failure_type}"
+            )
         if failed:
-            return None
+            return "refused"
         replies = _batch_replies(response, len(batch))
-        if replies is None:
+        if replies == UNECHOED:
+            return "did not echo the reference of"
+        if not isinstance(replies, list):
             raise CipherUnavailableError(
                 f"Transit's batch encrypt reply does not match the request (key={self._key!r})"
             )
