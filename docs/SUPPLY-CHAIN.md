@@ -118,7 +118,7 @@ flowchart TB
 **Legend.** Rounded boxes are events and outside services. The cylinder is the `main` branch. Each
 group's title names the workflow its boxes belong to. The job boxes outside a group are in
 `release.yml` too. The merge checks group shows at least the checks that bear on the package. A
-dotted arrow is a publish step that runs when its repository variable is set. Here and below, a
+dotted arrow is a publish step that runs when its variable is set. Here and below, a
 variable counts as set only when its value is `true`, in any case, since Actions compares strings
 ignoring case; any other value, `1` included, reads as unset.
 
@@ -172,15 +172,18 @@ Facts the labels leave out:
   the build job (`release-harness` on an engine tag, `release-webconsole` on a console tag), which
   re-runs the jobs after it, so the upload asks for the `pypi` approval again, and reads the
   variable afresh in each, so it clears both. While the variable still reads `true`, a "Re-run
-  failed jobs" reuses the upload's outcome and is refused again. To finish it without the upload, remove any copy from the `pypi` environment, unset the variable and re-run
-  the publisher, then set it again before the next release, or that release skips its upload too
-  and still goes public.
+  failed jobs" reuses the upload's outcome and is refused again. To finish it without the upload, remove any copy from the `pypi` environment, set the
+  repository variable to a value other than `true`, such as `false`, and re-run the publisher,
+  then set it back to `true` before the next release, or that release skips its upload too and
+  still goes public. A repository variable takes precedence over an organization variable of the
+  same name, so this changes the value for this repository only. Do not edit or delete an
+  organization copy, which other repositories may read.
 
   GitHub allows a re-run only within 30 days of a run's first attempt, so past that no re-run
   finishes the release. When this refusal is what holds the draft, at least two routes are left:
   the publisher's own command run by hand, `gh release edit <tag> --draft=false --repo
-  MEFORORG/MessageFoundry`, which publishes the draft without that upload, as unsetting the
-  variable would; and a new version under a new tag. Run by hand on a draft held for any other
+  MEFORORG/MessageFoundry`, which publishes the draft without that upload, as the remedy without
+  the upload would; and a new version under a new tag. Run by hand on a draft held for any other
   reason, such as a failed build job or a refused approval, the same command publishes a release
   with an asset missing or a package not on PyPI.
 - **The provenance gate.** The tagged commit must be on `main`, and each required check's latest
