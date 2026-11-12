@@ -2418,16 +2418,15 @@ the same permission set on the same method reds CI until it is listed here.
 > - `POST /ui/alerts/{alert_id}/suspend` refuses with 400 a `minutes` value that does not parse as a
 >   number, such as one of only whitespace, or that falls outside the suspend window's bounds, and
 >   re-renders the alerts page carrying the refusal. The JSON route refuses the same values with
->   422. It refuses before it reads the alert, as the JSON route does, so for such a value an alert
->   id outside the scope, or an unknown one, gets the same 400. A missing `minutes`, or an empty
+>   422. Both routes refuse before they read the alert, so for such a value an alert id outside the
+>   scope, or an unknown one, gets the same 400 here. A missing `minutes`, or an empty
 >   one, is not refused: `ui_suspend_alert` in `messagefoundry_webconsole/routes/monitoring_writes.py`
 >   reads it as 60 minutes, suspends the alert and writes `"minutes": 60.0` into the
 >   `alert_suspend` audit row, where the JSON route refuses it with 422. That contradicts the
 >   route's own BACKLOG #1744 comment, which says the 60-minute substitute was removed. It is an
->   open defect, not yet filed. With a window it accepts, the route calls the JSON handler
->   `suspend_alert` in-process, which reads the alert through the caller's scope: an alert outside
->   the scope, or an unknown one, answers that handler's 404, with no state change and no audit
->   row. The route's gate is `require_ui`, which writes no `auth.permission_granted` row. The page
+>   open defect. With a window it accepts, the route calls the JSON handler `suspend_alert`
+>   in-process, so the alert-writes rule above applies, its 404 included, except for the admission
+>   row: the route's gate is `require_ui`, which writes no `auth.permission_granted` row. The page
 >   lists only the active alerts in the caller's channel scope. It shows the alert rules only to a
 >   caller that also holds `monitoring:read`, since the route itself needs only
 >   `monitoring:diagnose`.
@@ -2441,8 +2440,8 @@ the same permission set on the same method reds CI until it is listed here.
 > `POST /ui/messages/search/presets/{preset_id}/delete` swallows the 404 and redirects, so another
 > user's preset id looks like one already deleted. `/ui/connections/purge-confirm` checks the
 > purge rule itself, before any purge: a scoped caller gets its own 403 and denial row. The
-> `/ui/nav-status` alert bell is null without `monitoring:diagnose`. The `/ui` suspend's
-> differences are in its own bullet above.
+> `/ui/nav-status` alert bell is null without `monitoring:diagnose`. The `/ui` suspend differs
+> in at least the ways its own bullet above states.
 >
 > `tests/test_single_route_data_rules_doc_drift.py` executes the main facts of each bullet, with an
 > all-channels caller as the control. The security-event feed has no channel axis, so its control
@@ -5629,8 +5628,8 @@ and federated legs below ship off: `[auth].ad_enabled`, `[auth].kerberos_enabled
   resolve a principal against, and the bind the directory session reconciler uses. It accepts no
   directory-password sign-in; that pathway is retired (BACKLOG #1137). It does bind a directory
   account's own password on the step-up re-bind, `AuthService._reauth_ad`, which `POST /me/reauth`
-  and `POST /ui/reauth` reach through `AuthService.reauth`. A good re-bind stamps the session's
-  `reauth_at` and rotates the session. The reconciler can revoke a directory account's live
+  and `POST /ui/reauth` reach through `AuthService.reauth`. A step-up that `AuthService.reauth`
+  grants stamps the session's `reauth_at` and rotates the session. The reconciler can revoke a directory account's live
   sessions, and *Directory session reconciliation* below states when.
 - **Kerberos (Windows SSO)** creates a directory session through `POST /auth/negotiate` and the
   console's `GET /ui/sso` when `kerberos_enabled` is set. The engine reads no ticket lifetime, so such

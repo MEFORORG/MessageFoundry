@@ -32,6 +32,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import json
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -529,14 +530,23 @@ async def _measure_ui_suspend_refusal(k: _Callers) -> None:
             assert r.status_code == 404, (alert_id, r.status_code)
         assert await suspended() == before and await suspend_minutes() == rows_before
         assert await granted() == granted_before
+        # Control for the row count: the JSON gate's admission row is counted.
+        r = await k.c.post("/alerts/999999/suspend", json={"minutes": 5}, headers=k.scoped)
+        assert r.status_code == 404 and await granted() > granted_before, r.text
+        # Control for the scope read: the scoped suspender reaches its own alert.
+        r = await post("suspender", ids["IB_A"], {"minutes": "5"})
+        assert r.status_code == 303, r.status_code
         # The open defect the bullet names: an empty window and a missing one are read as 60
         # minutes, and the audit row records 60 as if it were the request.
+        started = time.time()
         for alert_id, form in ((ids["IB_A"], {"minutes": ""}), (ids["IB_B"], {})):
             r = await post("allchannels", alert_id, form)
             assert r.status_code == 303, (form, r.status_code)
-        assert await suspend_minutes() == sorted([*rows_before, 60.0, 60.0])
+        assert await suspend_minutes() == sorted([*rows_before, 5.0, 60.0, 60.0])
         after = dict(zip(ids, await suspended(), strict=True))
-        assert after["IB_A"] is not None and after["IB_B"] is not None
+        for name in ("IB_A", "IB_B"):
+            until = after[name]
+            assert until is not None and started + 3540 <= until <= time.time() + 3600, name
         assert after["OB_X"] == dict(zip(ids, before, strict=True))["OB_X"]
         narrow = pages["suspender", ids["IB_A"]]
         # The list is the caller's scoped one, which leaves out the shared outbound IB_A feeds, and
@@ -662,9 +672,9 @@ _RULES: dict[str, _Rule] = {
         ),
         _measure_ui_resend_done,
         # Vault BACKLOG #4776 item 1 is open: the route does not check the origin channel today.
-        # "answers 403" is not forbidden here: the gate does answer 403 to a caller without
-        # messages:resend. The scope answer is the 404 the measurement executes.
-        forbidden=("checks scope on the origin", "origin channel is checked"),
+        # A bare "answers 403" is not forbidden here: the gate does answer 403 to a caller without
+        # messages:resend. The scope refusal is the 404 the measurement executes.
+        forbidden=("scope answers 403", "checks scope on the origin", "origin channel is checked"),
     ),
     "ui-suspend-refusal": _Rule(
         ("POST /ui/alerts/{alert_id}/suspend",),
@@ -672,11 +682,11 @@ _RULES: dict[str, _Rule] = {
             "400",
             "only whitespace",
             "422",
-            "before it reads the alert",
+            "before they read the alert",
             "unknown one",
             "60 minutes",
             "open defect",
-            "that handler's 404",
+            "the alert-writes rule above applies, its 404 included",
             "`require_ui`, which writes no `auth.permission_granted` row",
             "channel scope",
             "`monitoring:read`",
