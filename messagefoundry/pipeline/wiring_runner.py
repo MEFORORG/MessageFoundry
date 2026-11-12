@@ -12387,15 +12387,13 @@ class RegistryRunner:
             # climbing one is not. Only here, above the pacing wait: a halt that lands during the
             # wait is the documented pause lag, not a door.
             self._halted_claim_gate_hits += 1
-        # BACKLOG #5709: the operator pause too, not only the halt, before the pacing wait and again
-        # after it, as the per_lane worker asks per item (#2771). A pause that lands while this lane's
-        # head is in flight sets pause_pending on the dispatcher, but the head itself is past every
-        # dispatcher gate, so without these the head would still be sent.
-        if (park_until := await self._hand_back_unsent(lane, [item.id])) is not None:
-            return LaneItemResult(LaneResultKind.RETRY, park_until)
         # BACKLOG #82: pace this lane's egress BEFORE the send seam (mirrors the per_lane worker) so one
         # hook covers the single-message AND batch bodies in the POOLED claim mode too.
-        await self._pace_outbound(lane)
+        # BACKLOG #5709: the lane gate, the pause as well as the halt, is asked before the wait and
+        # again after it, as the per_lane worker asks per item (#2771). A pause that lands with the
+        # head in flight is past every dispatcher gate, so only this one stops the send.
+        if self._lane_may_deliver(lane):
+            await self._pace_outbound(lane)
         if (park_until := await self._hand_back_unsent(lane, [item.id])) is not None:
             return LaneItemResult(LaneResultKind.RETRY, park_until)
         # #134 (ADR 0082): batch inside the pooled claim (decision #5) — the dispatcher claims one head
@@ -12419,7 +12417,10 @@ class RegistryRunner:
 
         The deadline is a park for the pooled dispatcher only. A paused lane has ``pause_pending``
         set there and goes to PAUSED at its terminal transition, ignoring it. The per_lane worker
-        reads only the outcome and reaches its loop-top gates next."""
+        reads only the outcome and reaches its loop-top gates next; it meets this helper only through
+        the batch body's post-window gate, so a halt there reschedules where its own per-item gate
+        releases. Both hand the rows back unsent, and a worker halted at its loop top claims nothing
+        until a restart, by which time the backoff has passed."""
         if self._lane_may_deliver(name):
             return None
         park_until = time.time() + _WORKER_ERROR_BACKOFF_SECONDS

@@ -2743,9 +2743,8 @@ async def test_pause_while_claiming_then_claim_raises_routes_to_paused(
     try:
         d.mark_ready(lane)
         assert await _wait_until(lambda: d.phase(lane) == _LanePhase.CLAIMING)
-        d.pause_lane(
-            lane
-        )  # lands during the (blocked) claim -> pause_pending, phase STILL CLAIMING
+        # Lands during the (blocked) claim: pause_pending, phase STILL CLAIMING.
+        d.pause_lane(lane)
         assert d.phase(lane) == _LanePhase.CLAIMING
         assert hits == []
         blocker.set()  # the claim RAISES -> the error branch must route the lane to PAUSED

@@ -1188,21 +1188,15 @@ class StageDispatcher:
             )
         except Exception as exc:  # noqa: BLE001 — a store error must not kill the claimer loop
             # Return the whole chunk to READY, release the reserved slots, back off this partition.
-            # The end stamp rides the LANE EPISODE lever, the one that opened the episode in
-            # _assemble_chunk. Reading it on the claim lever instead left it zero when only the episode
-            # lever was on, so every drop booked a negative duration (BACKLOG #5699).
+            # The end stamp rides the lane-episode lever, which stamped the start (BACKLOG #5699).
             err_ns = time.perf_counter_ns() if self._lane_episode_timing else 0
             for lane in lanes:
                 st = self._states[lane]
                 # S_lane DROP (error path): the claim rendered no service — the same exclusion the claim
                 # timer already makes for a raised claim — but the lane WAS occupied for that interval,
-                # so it is booked as `dropped` (occupancy), never as `episode` (service).
-                # BACKLOG #5699: an operator pause that landed while the claim was in flight is honoured
-                # here exactly as on the empty-claim branch below. Readying the lane instead left
-                # pause_pending set on a claimable lane, so its next claim could deliver a head past
-                # the pause, and nothing re-fired on_lane_paused.
-                to = _LanePhase.PAUSED if st.pause_pending else _LanePhase.READY
-                self._end_claim(lane, st, err_ns, to)
+                # so it is booked as `dropped` (occupancy), never as `episode` (service). A pause that
+                # landed mid-claim goes to PAUSED instead: _end_claim honours it (BACKLOG #5699).
+                self._end_claim(lane, st, err_ns, _LanePhase.READY)
             # BACKLOG #1844: on a backoff, with the running count (messagefoundry.log_backoff).
             claimer.faults = claimer.faults.record(
                 log,
@@ -1254,8 +1248,8 @@ class StageDispatcher:
                     stage=self._stage.value, claimers=len(self._claimers)
                 )
             # ONE clock read for every non-service release this dispatch pass books (they all end at the same
-            # instant — the claim has returned and this loop is await-free). Zero when the lever is off;
-            # the LANE EPISODE lever, which stamped the start these releases are measured from (#5699).
+            # instant — the claim has returned and this loop is await-free). Zero when the lane-episode
+            # lever, which stamped the start, is off (#5699).
             rel_ns = time.perf_counter_ns() if self._lane_episode_timing else 0
             # BACKLOG #1270: did THIS round-trip abort on a store lock timeout? An ATTEMPT-level fact, so
             # it is read once here and booked once below — never per lane. Booking it per lane is the
@@ -1887,6 +1881,10 @@ class StageDispatcher:
         a drop, and move the lane to ``to``. READY uses ``woken``, defaulting to the lane's own
         ``ready_woken``; STOPPED raises ``connection_stopped`` with ``detail``.
 
+        READY on a lane with ``pause_pending`` lands the pause instead (BACKLOG #5699): a pause that
+        arrived while the lane was CLAIMING must never leave it claimable, whichever release path
+        ends the claim. A READY lane with ``pause_pending`` would deliver its next head past it.
+
         BACKLOG #2075. The slot goes back FIRST, and at most once per reservation. If the bookkeeping
         after it raises, the lane is left CLAIMING with its slot already returned, and the claimer
         dies. The respawn's adoption then ends the lane's claim again, and the second release is a
@@ -1894,6 +1892,8 @@ class StageDispatcher:
         itself raised after the lane had already left CLAIMING, because nothing would come back."""
         self._release_lane_slot(st)
         self._drop_lane_episode(st, end_ns)
+        if to is _LanePhase.READY and st.pause_pending:
+            to = _LanePhase.PAUSED
         if to is _LanePhase.READY:
             self._to_ready(lane, woken=st.ready_woken if woken is None else woken)
         elif to is _LanePhase.PAUSED:
