@@ -2469,10 +2469,8 @@ class RegistryRunner:
         """``d.resume_lane(name)``, lifting the operator hold only when it re-arms something.
         resume_lane re-arms a PAUSED lane and, since BACKLOG #5700, a STOPPED one, so a start lifts
         a STOP the operator never paused over. A lane still CLAIMING or PROCESSING is re-armed by
-        nothing here, so a hold a STOP site recorded before its lane reached STOPPED stays in place.
-        A PAUSED or STOPPED lane has nothing in flight, so no STOP can land behind this read."""
-        rearms = d.paused(name) or d.stopped(name)
-        d.resume_lane(name)
+        nothing here, so a hold a STOP site recorded before its lane reached STOPPED stays in place."""
+        rearms = d.resume_lane(name)
         kind = _HOLD_DIRECTION.get(stage)
         if rearms and kind is not None:
             self._release_operator_hold(name, kind)

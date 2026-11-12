@@ -690,11 +690,16 @@ class StageDispatcher:
         else:  # STOPPED — operator intent overrides a content-STOP
             self._to_paused(key, st)
 
-    def resume_lane(self, key: str) -> None:
-        """Operator RESUME for a paused or STOPPED lane (sync). Re-arm a fully-PAUSED lane from the head via
-        ``mark_ready`` AND request an immediate sweep, so a head that backed off while paused is
-        re-evaluated promptly (never stranded until the next periodic sweep) — folds the low finding on a
-        resumed-lane RETRY head. An unknown lane is a no-op.
+    def resume_lane(self, key: str) -> bool:
+        """Operator RESUME for a PAUSED or STOPPED lane (sync); returns whether it re-armed the lane.
+        Re-arm a fully-PAUSED lane from the head via ``mark_ready`` AND request an immediate sweep,
+        so a head that backed off while paused is re-evaluated promptly (never stranded until the
+        next periodic sweep) — folds the low finding on a resumed-lane RETRY head. An unknown lane
+        is a no-op.
+
+        A STOPPED lane is re-armed too (BACKLOG #5700), for every stage: each caller is an operator
+        start or restart, of an outbound or of an inbound recovering from a #122 log halt, and the
+        per_lane twin of each respawns a worker that a STOP had ended.
 
         CANCEL A STILL-PENDING PAUSE: a lane paused while mid-episode (CLAIMING/PROCESSING) carries
         ``pause_pending`` and has NOT yet reached PAUSED. A ``restart_outbound`` calls stop+start in ONE
@@ -703,12 +708,12 @@ class StageDispatcher:
         quiesce to PAUSED after resume returned, with nothing left to re-arm it (a wedged lane)."""
         st = self._states.get(key)
         if st is None:
-            return
+            return False
         if st.phase in (_LanePhase.CLAIMING, _LanePhase.PROCESSING):
             st.pause_pending = (
                 False  # cancel the not-yet-landed pause; the episode resumes normally
             )
-            return
+            return False
         if st.phase is _LanePhase.STOPPED:
             # BACKLOG #5700: an operator start of a lane still at STOPPED (a credential,
             # configuration or claimer-death STOP it never paused over) re-arms it, as the
@@ -717,14 +722,15 @@ class StageDispatcher:
             # as pause_lane already lets it.
             self._unpark(key, woken=True)
             self._sweep_now.set()
-            return
+            return True
         if st.phase is not _LanePhase.PAUSED:
-            return
+            return False
         st.pause_pending = False
         st.claimer_deaths = 0  # an operator re-arm starts a fresh #2074 budget, as notify_work does
         st.phase = _LanePhase.IDLE
         self.mark_ready(key, woken=True)  # IDLE -> READY + enqueue (T2)
         self._sweep_now.set()
+        return True
 
     # --- lifecycle -----------------------------------------------------------
 
@@ -1969,8 +1975,9 @@ class StageDispatcher:
         """PARKED/STOPPED -> READY (T18/T19): cancel the park timer, clear dirty, enqueue.
 
         Sharp edge (ADR 0070 fix B, test 3): reset ``infra_error_streak`` ONLY on the STOPPED→READY
-        resume — a ``notify_work`` reload re-arm of a deliberately-STOPPED lane, keyed on the lane
-        being STOPPED at entry (the sole caller that unparks a STOPPED lane). NEVER reset on the shared
+        resume — a ``notify_work`` reload re-arm or a ``resume_lane`` operator re-arm (BACKLOG #5700)
+        of a deliberately-STOPPED lane, keyed on the lane being STOPPED at entry (the only callers
+        that unpark a STOPPED lane). NEVER reset on the shared
         PARKED park-timer / sweep unpark (which keeps ``phase is PARKED`` here): if a still-faulting
         head's park-timer unpark reset the streak, the ``stop`` threshold would never accrue and the
         original ~4×/s spin would silently return. Guard it on the pre-transition phase, not on
@@ -2276,8 +2283,8 @@ class StageDispatcher:
 
     def stopped(self, key: str) -> bool:
         """Whether ``key`` is in the STOPPED phase (a STOP not yet re-armed). The runner reads it before
-        a :meth:`notify_work` broadcast, to know which lanes the broadcast is about to re-arm. False
-        for an unknown lane."""
+        a :meth:`notify_work` broadcast, to know which lanes the broadcast is about to re-arm, and
+        for an outbound's status reads (BACKLOG #5701). False for an unknown lane."""
         st = self._states.get(key)
         return st is not None and st.phase is _LanePhase.STOPPED
 

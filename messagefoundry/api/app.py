@@ -753,8 +753,8 @@ def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
 def _live_outbound_status(rr: RegistryRunner, name: str) -> str:
     """One outbound's live display state, gated on the runner's own ``running`` flag.
 
-    ``outbound_status`` reports "running" for any lane ABSENT from ``_outbound_paused`` that no STOP
-    holds down (BACKLOG #5701) and never reads the graph flag, so ungated it answers "running" on a node whose graph is down -- the ADR 0157
+    ``outbound_status`` reports "running" for any lane ABSENT from ``_outbound_paused`` that no
+    STOP holds down (BACKLOG #5701) and never reads the graph flag, so ungated it answers "running" on a node whose graph is down -- the ADR 0157
     demoted follower, where ``_stop_graph`` stops only the runner and the API keeps serving. Display
     reads of ``outbound_status`` go through here so the rows and graph nodes built from it cannot
     disagree (BACKLOG #1568 gated the standalone row; #1814 the traffic-edge row and
@@ -5664,7 +5664,7 @@ def create_app(
             #
             # `rr.running` gates the live state (`_live_outbound_status`, shared with the traffic-edge row
             # above and `/graph/edges` since #1814) because `outbound_status` reports "running" for any lane
-            # merely ABSENT from `_outbound_paused` — it never consults the graph flag (the same trap
+            # ABSENT from `_outbound_paused` that no STOP holds down — it never consults the graph flag (the same trap
             # `/status` documents at its KPI split, which is why that block uses `outbound_running`).
             # Ungated, a node whose graph is down but whose API still serves — the ADR 0157 demoted
             # follower, where `_stop_graph` stops only the runner — would answer one `/connections` with
@@ -10173,8 +10173,9 @@ def create_app(
             # inbound twin as failed (see wiring_runner's `Direction`).
             failed_in = [name for name in in_deployed if rr.inbound_failed(name) is not None]
             # outbound_running (not outbound_status) so the running/stopped split gates on the engine
-            # actually running AND the lane not operator-paused — consistent with inbound_running's
-            # actually-started semantics (outbound_status reports "running" for any non-paused lane even
+            # actually running AND the lane neither operator-paused nor STOP-held (#5701) — consistent
+            # with inbound_running's actually-started semantics (outbound_status reports "running" for
+            # any non-paused, non-held lane even
             # before start, which would over-count a built-but-not-started runner).
             out_running = sum(1 for name in out_deployed if rr.outbound_running(name))
             conn_total = total + len(out_deployed)
