@@ -267,6 +267,7 @@ from messagefoundry.transports.admission import RefusalLog
 from messagefoundry.transports.base import (
     ENCODING_CODE,
     ConnectionEventSink,
+    DeliveryResponse,
     InboundHandler,
     IntakeAuditSink,
     IntakeGate,
@@ -570,6 +571,14 @@ class RunnerNotRunningError(RuntimeError):
         )
         self.name = name
 
+
+class _SendSuperseded(Exception):
+    """A reload cancelled a send on the connector it replaced (:meth:`RegistryRunner._send_on`)."""
+
+
+# How long a reload waits for a send it cancelled on a replaced connector to end, before it closes
+# that connector anyway. A send that ignores its cancellation must not hold the reload lock for good.
+_REPLACED_SEND_CANCEL_SECONDS = 5.0
 
 # A delivery worker backs off this long after an *unexpected* error (e.g. the store being briefly
 # unavailable) before retrying, so a transient failure logs once and recovers instead of hot-looping.
@@ -1954,6 +1963,8 @@ class RegistryRunner:
         # on resume/re-stop. outbound_quiesced() — the PURGE precondition — is set-membership AND this
         # Event set, so 'stopped' means truly quiesced, not merely "won't claim new".
         self._outbound_quiesced: dict[str, asyncio.Event] = {}
+        # Every connector send in flight, as its task, mapped to its connector (_send_on).
+        self._sends: dict[asyncio.Task[Any], DestinationConnector] = {}
         # per_lane-mode resume Events: the delivery worker awaits its lane's Event at the loop-top pause
         # gate; start_outbound sets it. Unused for a lane the pooled OUTBOUND dispatcher drains (its
         # resume_lane re-arms instead) — but a pooled ordering=unordered lane keeps its own worker
@@ -8161,7 +8172,26 @@ class RegistryRunner:
         that raises is logged and appended to ``failures`` rather than raised: the new connector is
         already live, and the reload's rollback restores intake and never the outbound mapping, so
         raising would put the old graph back beside a connector built from the new one (engine PR
-        2815). A cancellation still propagates."""
+        2815). A cancellation still propagates.
+
+        A send still in flight on ``replaced`` is cancelled and awaited first (BACKLOG #5718), at
+        most :data:`_REPLACED_SEND_CANCEL_SECONDS`: closing under it left the send running on a
+        connector the lane no longer uses, or failed it with the close, which charged its rows an
+        attempt for a reload. Its rows are then released for the new connector
+        (:meth:`_release_superseded`)."""
+        sends = [task for task, conn in self._sends.items() if conn is replaced]
+        if sends:
+            for task in sends:
+                task.cancel()
+            _, pending = await asyncio.wait(sends, timeout=_REPLACED_SEND_CANCEL_SECONDS)
+            if pending:
+                log.warning(
+                    "reload: %d send(s) on the replaced connector of outbound %r did not end "
+                    "within %.0fs of their cancellation; closing it under them",
+                    len(pending),
+                    name,
+                    _REPLACED_SEND_CANCEL_SECONDS,
+                )
         try:
             await replaced.aclose()
         except Exception as exc:  # noqa: BLE001 - a connector's close can fail in any way; logged
@@ -10111,13 +10141,15 @@ class RegistryRunner:
                     # user-metadata bag so it can project http.header.* entries onto the request. The
                     # read touches only the small metadata column (never the raw body).
                     metadata = await self._user_metadata_for(item.message_id)
-                    response = await connector.send(payload, metadata=metadata)
+                    response = await self._send_on(connector, payload, metadata=metadata)
                 else:
                     # Default: NO metadata read and the historical send(payload) call shape —
                     # byte-identical for every non-consuming connector.
-                    response = await connector.send(payload)
+                    response = await self._send_on(connector, payload)
                 if self._delivery_phase_timing:
                     self._delivery_phase_stats.record_send_ack(time.perf_counter_ns() - _send_t0)
+        except _SendSuperseded:
+            return await self._release_superseded(name, [item.id])
         except NegativeAckError as exc:
             # Partner rejection. AR/CR (permanent) → fail-fast: the partner will never
             # accept this message, so dead-letter it now rather than block the FIFO lane
@@ -10566,7 +10598,11 @@ class RegistryRunner:
             # the try, through :meth:`_refuse_claimed`.
             gated = not self._may_send(name)
             if kept and not gated and not self._simulate.get(name, False):  # shadow: no egress
-                await connector.send(envelope)
+                await self._send_on(connector, envelope)
+        except _SendSuperseded:
+            # Every member, the refused ones too, as the gated hand-back below: none was resolved,
+            # and the new connector checks them again.
+            return await self._release_superseded(name, [it.id for it in items])
         except NegativeAckError as exc:
             # #109 (ADR 0095), the batch twin of the single-row branch in
             # :meth:`_process_delivery_item`, which carries the reasoning. A bad credential is not a
@@ -12584,6 +12620,47 @@ class RegistryRunner:
         else:
             await self.store.release_claimed(ids)
         return park_until
+
+    async def _send_on(
+        self, connector: DestinationConnector, payload: str, **kwargs: Any
+    ) -> DeliveryResponse | ReplyBodyDropped | None:
+        """``connector.send(payload, **kwargs)`` as its own task, recorded in :attr:`_sends`, so a
+        reload that replaces the connector can cancel the send without cancelling the delivery task
+        that holds the claim (:meth:`_close_replaced`, BACKLOG #5718). Cancelling that task instead
+        would strand its rows INFLIGHT (:meth:`_stop_outbound_unsafe` says why). Started eagerly, so
+        a send runs at once, and one that never suspends costs no extra loop turn.
+
+        Raises :class:`_SendSuperseded` when the send was cancelled and this task was not: the
+        reload's cancellation, which the caller answers with :meth:`_release_superseded`. A
+        cancellation of this task, such as a teardown's, reaches the send through the await and
+        propagates as itself. A send that had already completed returns or raises as it ended."""
+        task = asyncio.create_task(connector.send(payload, **kwargs), eager_start=True)
+        self._sends[task] = connector
+        try:
+            return await task
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if task.cancelled() and current is not None and not current.cancelling():
+                raise _SendSuperseded from None
+            raise
+        finally:
+            del self._sends[task]
+
+    async def _release_superseded(
+        self, name: str, ids: list[str]
+    ) -> tuple[_ItemOutcome, float | None]:
+        """Release the claimed rows of ``name`` whose send a reload cancelled (:meth:`_send_on`).
+        No attempt is spent and the due time is kept, so the lane claims them again at once and
+        sends them through the connector that replaced the old one. The partner may have received
+        the cancelled send, so this can deliver one twice, which at-least-once allows."""
+        await self.store.release_claimed(ids)
+        log.info(
+            "delivery worker %r: a reload replaced the connector mid-send; released %d claimed "
+            "row(s) un-errored (no attempt spent) for a resend through the new connector",
+            name,
+            len(ids),
+        )
+        return _ItemOutcome.PROCESSED, None
 
     async def _dispatch_response(self, lane: str, item: OutboxItem) -> LaneItemResult:
         return _to_lane_result(await self._process_response_item(lane, item))
