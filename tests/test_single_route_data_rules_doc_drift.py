@@ -13,7 +13,8 @@ themselves only point to. This file keeps that blockquote true in the same two h
   channel axis: it is keyed on the caller's own account, and its control is the raw audit log. The
   approval release narrows its REQUESTER's scope, and its control is a release that runs. The
   suspend refusal page's rules gate is a permission fact, and its control is a ``monitoring:read``
-  holder;
+  holder. The ``/ui`` suspend measurement also asserts, on purpose, the open defect its bullet
+  names: a missing or empty window is read as 60 minutes;
 * :func:`test_security_doc_states_each_single_route_rule` reads the blockquote and requires each
   rule's routes and key facts in that rule's own bullet, every bullet to belong to a rule, and each
   route's row in the route map to point at the blockquote.
@@ -488,13 +489,17 @@ async def _measure_ui_suspend_refusal(k: _Callers) -> None:
         rows = await store.list_audit(action="alert_suspend", limit=500)
         return sorted(json.loads(r["detail"])["minutes"] for r in rows)
 
-    async def granted() -> int:
-        return len(await store.list_audit(action="auth.permission_granted", limit=10_000))
+    async def audit_actions() -> tuple[int, list[str]]:
+        """The admission-row count, and every other action, as ``_measure_alert_writes`` reads
+        them."""
+        actions = [r["action"] for r in await store.list_audit(limit=10_000)]
+        granted = "auth.permission_granted"
+        return actions.count(granted), [a for a in actions if a != granted]
 
     # The JSON route refuses the same bad windows with 422, before it reads the alert: an
     # out-of-scope id and an unknown one get the 422 too. A missing window is refused as well.
     for alert_id in (ids["IB_B"], 999_999):
-        for body in ({"minutes": 0}, {}):
+        for body in ({"minutes": 0}, {}, {"minutes": "  "}, {"minutes": "abc"}):
             r = await k.c.post(f"/alerts/{alert_id}/suspend", json=body, headers=k.scoped)
             assert r.status_code == 422, (alert_id, body, r.text)
 
@@ -523,25 +528,29 @@ async def _measure_ui_suspend_refusal(k: _Callers) -> None:
         assert await suspended() == before and await suspend_minutes() == rows_before
         # A valid window reaches the JSON handler, which reads the alert through the scope: an
         # out-of-scope id and an unknown one answer its 404, with no state change and no audit
-        # row, and require_ui writes no admission row either.
-        granted_before = await granted()
+        # row of any action, and require_ui writes no admission row either.
+        granted_before, others_before = await audit_actions()
         for alert_id in (ids["IB_B"], ids["OB_X"], 999_999):
             r = await post("suspender", alert_id, {"minutes": "5"})
             assert r.status_code == 404, (alert_id, r.status_code)
-        assert await suspended() == before and await suspend_minutes() == rows_before
-        assert await granted() == granted_before
-        # Control for the row count: the JSON gate's admission row is counted.
-        r = await k.c.post("/alerts/999999/suspend", json={"minutes": 5}, headers=k.scoped)
-        assert r.status_code == 404 and await granted() > granted_before, r.text
+        assert await suspended() == before
+        assert await audit_actions() == (granted_before, others_before)
+        # Control for the row count, on the same app: the JSON gate's admission row is counted.
+        r = await ui["scoped"].post("/alerts/999999/suspend", json={"minutes": 5}, headers=k.scoped)
+        assert r.status_code == 404 and (await audit_actions())[0] > granted_before, r.text
         # Control for the scope read: the scoped suspender reaches its own alert.
         r = await post("suspender", ids["IB_A"], {"minutes": "5"})
         assert r.status_code == 303, r.status_code
         # The open defect the bullet names: an empty window and a missing one are read as 60
-        # minutes, and the audit row records 60 as if it were the request.
+        # minutes, and the audit row records 60 as if it were the request. A fix that refuses
+        # them must also change the bullet and its "60 minutes" and "open defect" facts.
         started = time.time()
         for alert_id, form in ((ids["IB_A"], {"minutes": ""}), (ids["IB_B"], {})):
             r = await post("allchannels", alert_id, form)
-            assert r.status_code == 303, (form, r.status_code)
+            assert r.status_code == 303, (
+                f"{form} answered {r.status_code}: if the 60-minute substitute is fixed, update "
+                "the /ui suspend bullet in docs/SECURITY.md and its _RULES facts with it"
+            )
         assert await suspend_minutes() == sorted([*rows_before, 5.0, 60.0, 60.0])
         after = dict(zip(ids, await suspended(), strict=True))
         for name in ("IB_A", "IB_B"):
@@ -674,7 +683,12 @@ _RULES: dict[str, _Rule] = {
         # Vault BACKLOG #4776 item 1 is open: the route does not check the origin channel today.
         # A bare "answers 403" is not forbidden here: the gate does answer 403 to a caller without
         # messages:resend. The scope refusal is the 404 the measurement executes.
-        forbidden=("scope answers 403", "checks scope on the origin", "origin channel is checked"),
+        forbidden=(
+            "scope answers 403",
+            "403 when that target",
+            "checks scope on the origin",
+            "origin channel is checked",
+        ),
     ),
     "ui-suspend-refusal": _Rule(
         ("POST /ui/alerts/{alert_id}/suspend",),

@@ -5621,16 +5621,17 @@ and federated legs below ship off: `[auth].ad_enabled`, `[auth].kerberos_enabled
   an existing row through `Store.rotate_session` instead. The store keeps only the token's hash.
 - **At least the web console, `apiclient` and the VS Code extension** hold the token (table
   above), and so does `tee compare`, which takes a bearer token on its command line (`--token` in
-  `tee/__main__.py`). The
-  extension signs in through `POST /auth/login` with a local account: `/auth/providers` reports
-  `ad` as false, and the engine refuses `provider: "ad"`.
+  `tee/__main__.py`). The extension signs in through `POST /auth/login` with a local account:
+  `/auth/providers` reports `ad` as false, and the engine refuses `provider: "ad"`.
 - **LDAP (Active Directory)**, under `ad_enabled`, is the directory the Kerberos and OIDC legs
   resolve a principal against, and the bind the directory session reconciler uses. It accepts no
   directory-password sign-in; that pathway is retired (BACKLOG #1137). It does bind a directory
-  account's own password on the step-up re-bind, `AuthService._reauth_ad`, which `POST /me/reauth`
-  and `POST /ui/reauth` reach through `AuthService.reauth`. A step-up that `AuthService.reauth`
-  grants stamps the session's `reauth_at` and rotates the session. The reconciler can revoke a directory account's live
-  sessions, and *Directory session reconciliation* below states when.
+  account's own password on the step-up re-bind, `AuthService._reauth_ad`, which at least
+  `POST /me/reauth` and `POST /ui/reauth` reach through `AuthService.reauth`. A session the OIDC
+  login minted is refused there before any bind (`AuthService.session_steps_up_at_idp`). A step-up
+  that `AuthService.reauth` grants, on either provider, stamps the session's `reauth_at` and
+  rotates the session. The reconciler can revoke a directory account's live sessions, and
+  *Directory session reconciliation* below states when.
 - **Kerberos (Windows SSO)** creates a directory session through `POST /auth/negotiate` and the
   console's `GET /ui/sso` when `kerberos_enabled` is set. The engine reads no ticket lifetime, so such
   a session's absolute lifetime is the engine's own flat cap, not the directory's (ADR 0079).
