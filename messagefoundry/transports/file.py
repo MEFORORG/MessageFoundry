@@ -1243,19 +1243,21 @@ class FileSource(SourceConnector):
     async def _quarantine(
         self, path: Path, read_id: _FileId | None, kind: str, reason: str
     ) -> bool:
-        """Move a rejected file to ``.error`` and record the event; return whether the file has left the
-        drop directory, which is what charges the per-tick budget (:meth:`_at_ceiling`, BACKLOG #5717).
+        """Move a rejected file to ``.error`` and record the event; return whether a copy was archived,
+        which is what charges the per-tick budget (:meth:`_at_ceiling`, BACKLOG #5717).
 
-        A file the move left in place is examined again next scan, so it charges nothing: charging it
-        would let a stuck reject that sorts early spend the whole budget on every scan, and the healthy
-        drops behind it would never be ingested. That covers at least a move that archived nothing (a
-        locked file, an unwritable ``.error``, a read-only share under ``leave``), which :meth:`_move`
-        logs and which records no event, and one that archived a copy but could not remove the
-        original, which records the event because the copy is in ``.error``."""
+        A move that archived nothing (a locked file, an unwritable ``.error``, a read-only share under
+        ``leave``) is logged by :meth:`_move`, records no event, and leaves the file to be examined
+        again on a later scan. It charges nothing: charging it would let stuck rejects that sort early
+        spend the budget on every scan and hold back the healthy drops behind them.
+
+        A move that archived a copy but could not remove the original still charges, although the
+        original stays. Not charging it would let every such reject write a fresh copy into
+        ``.error`` on every later scan with nothing bounding how many a tick writes."""
         if not await self._run_fs(self._move, path, self.error_dir, read_id):
             return False
         await self._emit_event(kind, reason=reason)
-        return not await self._run_fs(os.path.lexists, path)
+        return True
 
     async def _emit_event(self, kind: str, *, reason: str | None = None) -> None:
         """Record a quarantine in the connection-event log (BACKLOG #1621), **fail-soft**.
@@ -1299,12 +1301,13 @@ class FileSource(SourceConnector):
 
         **What charges the budget, and why the exceptions are not an oversight.** Only a file this scan
         FINISHED with charges: one handed to the pipeline, or a reject (oversize, a failed gunzip, a
-        content-vs-type mismatch, a scanner rejection) that :meth:`_quarantine` moved out of the drop
-        directory. Each of those is meant to leave the candidate set, so the next scan starts on new
-        work; a handed-off file whose move or delete then fails stays in place and still charges. The arms that leave a file
-        **in place** to be retried — a file not yet settled (#1811) or changed during the read (#116), a
-        locked/vanished file, a malfunctioning scan hook, a handler failure, a reject whose move to
-        ``.error`` failed (BACKLOG #5717) — deliberately do NOT charge. If they did, a permanently stuck
+        content-vs-type mismatch, a scanner rejection) that :meth:`_quarantine` archived to ``.error``.
+        Each of those is meant to leave the candidate set, so the next scan starts on new work. At
+        least two still charge though the file stays: a handed-off file whose move or delete fails, and
+        a reject archived as a copy whose original could not be removed. At least these arms leave a
+        file **in place** to be retried and deliberately do NOT charge: a file not yet settled (#1811)
+        or changed during the read (#116), a locked/vanished file, a malfunctioning scan hook, a handler
+        failure, a reject of which no copy was archived (BACKLOG #5717). If they did, a permanently stuck
         file that sorts early would eat the whole budget on every scan and the healthy files behind it
         would never be ingested. A budget can only be charged by something that makes progress.
 

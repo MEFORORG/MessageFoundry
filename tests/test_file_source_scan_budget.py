@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A FILE source charges its per-tick budget only for a reject that left the drop directory
+"""A FILE source charges its per-tick budget only for a reject of which a copy reached ``.error``
 (BACKLOG #5717).
 
 ``_scan_once`` used to count every quarantine arm against ``poll_max_files`` whether or not the move
 to ``.error`` succeeded. A reject the move left in place (a locked file, an unwritable ``.error``, a
-read-only share under ``after_read = "leave"``) is examined again on the next scan, so one that sorts
-early would spend the budget on every scan and the healthy drops behind it would never be ingested.
+read-only share under ``after_read = "leave"``) is examined again on a later scan, so rejects that
+sort early would spend the budget on each scan that examines them and hold back the healthy drops.
 
 Deliberately ASCII-only: pytest echoes a failing body to a cp1252 console on Windows.
 """
@@ -129,12 +129,13 @@ async def test_a_reject_whose_move_failed_does_not_spend_the_budget(
     assert sink.kinds == [], "a reject that was not archived records no quarantine event"
 
 
-async def test_a_reject_archived_but_not_removed_does_not_spend_the_budget(
+async def test_a_reject_archived_but_not_removed_still_spends_the_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``_move`` also answers True when it archived a copy and could not remove the original, which
-    stays in the drop directory. Mutation: charge on ``_move``'s answer alone. Red: the healthy drop
-    waits."""
+    stays in the drop directory. It still charges: otherwise every later scan would write another copy
+    into ``.error`` with nothing bounding how many a tick writes. Mutation: charge only once the file
+    is gone. Red: the healthy drop goes in the same scan."""
     inbox, source, sink, handed_off = _setup(
         tmp_path, {}, b"%PDF-1.7 not an HL7 message", _HL7, False
     )
@@ -154,7 +155,7 @@ async def test_a_reject_archived_but_not_removed_does_not_spend_the_budget(
     assert (inbox / ".error" / _REJECT).exists()
     assert (inbox / _REJECT).exists()
     assert sink.kinds == ["file_content_mismatch"], "the copy in .error is a real quarantine"
-    assert handed_off == [_HL7], "the healthy drop behind the unremoved reject was ingested"
+    assert handed_off == [], "the budget of one was spent on the archived copy"
 
 
 async def test_an_archived_reject_still_spends_the_budget(tmp_path: Path) -> None:
