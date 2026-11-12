@@ -473,9 +473,16 @@ class BackupRunner:
         clock: Callable[[], float] = time.time,
         coordinator: ClusterCoordinator | None = None,
         hop_posture: HopPosture | None = None,
+        dr_standby: Callable[[], bool] | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
+        # Read at each pass. While it answers True this box is a passive DR standby, and no pass runs
+        # (vault BACKLOG #5712): a pass writes a `dr_backup` audit row, and the server-DB live seed
+        # probe reads any such row as proof the database was restored from a primary, so a
+        # standby's own row would pass that probe on an unrestored database. It would also become
+        # the latest anchor the restore-token check compares, and refuse a valid restore.
+        self._dr_standby = dr_standby
         # The store settings carry the KeyProvider seam (ADR 0019) — the archive's KEY SOURCE. Typed
         # loosely to avoid importing StoreSettings here; resolve_active_key takes it.
         self._store_settings = store_settings
@@ -571,11 +578,18 @@ class BackupRunner:
         target = self._settings.schedule_time()
         if target is None:
             return False
-        if not self._coordinator.is_leader():
-            return False  # leader-gated: a follower never backs up the shared destination (AC-12)
+        if not self._may_back_up():
+            return False
         lt = time.localtime(now)
         reached = (lt.tm_hour, lt.tm_min) >= target
         return reached and self._last_backup_day != _day_key(now)
+
+    def _may_back_up(self) -> bool:
+        """Leader-gated, so a follower never backs up the shared destination (AC-12), and never on
+        a passive DR standby (vault BACKLOG #5712, see ``dr_standby``)."""
+        if not self._coordinator.is_leader():
+            return False
+        return self._dr_standby is None or not self._dr_standby()
 
     # --- one pass ------------------------------------------------------------
 
@@ -589,12 +603,13 @@ class BackupRunner:
         the rule it follows is stated once, at :data:`_STAGING_SUFFIX`.
 
         Leader-gated (AC-12): a non-leader returns ``None`` without touching the store or the shared
-        destination (so in a cluster exactly one node backs up). On success records a ``dr_backup`` audit
+        destination (so in a cluster exactly one node backs up), and so does a passive DR standby
+        (vault BACKLOG #5712). On success records a ``dr_backup`` audit
         row + returns the :class:`BackupResult`; on failure records a ``dr_backup`` ERROR row, raises
         ``AlertSink.backup_failed``, leaves any prior good archive intact, and re-raises
         :class:`BackupError`. ``force_config_only`` (the CLI ``--config-only`` flag) backs up the config
         bundle only even on a SQLite store (a server-DB store is always config-only per the boundary)."""
-        if not self._coordinator.is_leader():
+        if not self._may_back_up():
             return None
         now = self._clock() if now is None else now
         self._last_backup_day = _day_key(now)  # advance the daily cadence even if this pass fails

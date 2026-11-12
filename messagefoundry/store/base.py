@@ -2338,7 +2338,8 @@ class AuditStore(Protocol):
         """True iff the audit log carries at least one ``dr_backup`` row — the #102 server-DB DR-seed
         gate's "restored, not freshly-bootstrapped" signal. A ``dr_backup`` row is written on every
         leader-gated backup SUCCESS (the run that PRODUCES a seed archive), so a server DB restored from
-        an operating primary carries ≥1; a passive DR standby is never the leader and writes none, so a
+        an operating primary carries ≥1; a passive DR standby runs no backup pass and writes none
+        (vault BACKLOG #5712), so a
         fresh/unrestored DR DB (non-empty only because provisioning, engine startup and operator
         sign-in wrote to it) has zero. Read-only (a single indexed existence check), all backends.
         NOTE: this proves prior backup history, NOT vintage/completeness of a DBA-managed restore

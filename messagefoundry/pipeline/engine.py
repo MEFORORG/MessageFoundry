@@ -1117,9 +1117,13 @@ class Engine:
         activation would bind, so a reload here refuses what that activation would refuse."""
         # Without store settings there is no coordinator (dr_coordinator), so nothing could
         # activate the box; parking its intake for good would leave it dead, not passive.
-        if self._dr_settings.enabled and not self._dr_active and self._store_settings is not None:
+        if self._is_passive_dr_standby() and self._store_settings is not None:
             return self._dr_settings.priority_threshold
         return None
+
+    def _is_passive_dr_standby(self) -> bool:
+        """Whether this is a DR standby (``[dr].enabled``) that is not activated."""
+        return self._dr_settings.enabled and not self._dr_active
 
     @property
     def dr_active(self) -> bool:
@@ -2313,6 +2317,9 @@ class Engine:
                 alert_sink=self._alert_sink,
                 coordinator=self._coordinator,
                 hop_posture=self._hop_posture,
+                # A passive DR standby writes no dr_backup row; read live, so an activation starts
+                # the passes and a release stops them (vault BACKLOG #5712).
+                dr_standby=self._is_passive_dr_standby,
             )
             self._backup_runner.start()
         # [cert_monitor] TLS-cert expiry monitor (Q5c) — a maintenance task like retention, independent
