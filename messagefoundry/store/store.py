@@ -9217,6 +9217,53 @@ type TransitAttestationFetch = Callable[
 ]
 
 
+async def _exact_audit_row(
+    fetch: TransitAttestationFetch,
+    columns: str,
+    where: str,
+    params: tuple[object, ...],
+    exact: Callable[[Mapping[str, Any]], bool],
+    *,
+    above: int | None = None,
+    at_most: int | None = None,
+    newest: bool = True,
+) -> Mapping[str, Any] | None:
+    """The newest (or, with ``newest=False``, the oldest) ``audit_log`` row numbered above
+    ``above`` and at most ``at_most`` that matches ``where`` EXACTLY, read through ``fetch``.
+
+    BACKLOG #5726: ``where`` compares text in the database collation, which on SQL Server folds
+    case and pads trailing spaces, so ``MAX(seq)`` alone could pick a variant row (another account
+    whose name differs only in case, or a row written outside the engine) and shadow the row the
+    caller wants, refusing genuine evidence. Each row ``where`` finds is therefore checked with
+    ``exact`` in Python, and a variant is stepped past, one indexed lookup each, until an exact
+    row or none is left. The bound moves strictly every step, so the walk ends. On SQLite and
+    Postgres, which compare exactly, the first row is the answer."""
+    agg = "MAX" if newest else "MIN"
+    lo, hi = above, at_most
+    while True:
+        conds, args = [where], list(params)
+        if lo is not None:
+            conds.append("seq > ?")
+            args.append(lo)
+        if hi is not None:
+            conds.append("seq <= ?")
+            args.append(hi)
+        row = await fetch(
+            f"SELECT {columns} FROM audit_log WHERE seq ="
+            f" (SELECT {agg}(seq) FROM audit_log WHERE {' AND '.join(conds)})",
+            tuple(args),
+        )
+        if row is None or exact(row):
+            return row
+        seq = _strict_int(row["seq"])
+        if seq is None:
+            return None
+        if newest:
+            hi = seq - 1
+        else:
+            lo = seq
+
+
 @dataclass(frozen=True, slots=True)
 class TransitAttestationRead:
     """What :func:`read_transit_bound_attestation_rows` gathered inside one read: the attestation,
@@ -9309,12 +9356,19 @@ async def _transit_attestation_audit_gap(
     if audit["action"] != TRANSIT_BOUND_ATTESTED_ACTION:
         return f"audit row {seq} is not an attestation"
     # The newest attest-or-withdraw row must be this one, so a row replayed after a withdraw, or
-    # after a later attestation, does not count.
-    newest = await fetch(
-        "SELECT MAX(seq) AS newest FROM audit_log WHERE action IN (?, ?)",
-        (TRANSIT_BOUND_ATTESTED_ACTION, TRANSIT_BOUND_WITHDRAWN_ACTION),
+    # after a later attestation, does not count. Read as "no such row above it", matched exactly,
+    # so a padded or case-variant action above it does not count either (BACKLOG #5726).
+    marks = (TRANSIT_BOUND_ATTESTED_ACTION, TRANSIT_BOUND_WITHDRAWN_ACTION)
+    later = await _exact_audit_row(
+        fetch,
+        "seq, action",
+        "action IN (?, ?)",
+        marks,
+        lambda r: r["action"] in marks,
+        above=seq,
+        newest=False,
     )
-    if newest is None or _strict_int(newest["newest"]) != seq:
+    if later is not None:
         return f"a later attest or withdraw audit row supersedes audit row {seq}"
     try:
         detail = json.loads(audit["detail"] or "")
@@ -9359,11 +9413,15 @@ async def _audit_row_mac_check(
         if before is None:
             return f"audit row {seq - 1}, which audit row {seq} chains from, is missing"
         prev = before["row_hash"]
-    # The key of the row's own range: the newest genesis or range row at or below it.
-    opening = await fetch(
-        "SELECT seq, action, detail FROM audit_log WHERE seq ="
-        " (SELECT MAX(seq) FROM audit_log WHERE action = ? AND seq <= ?)",
-        (AUDIT_KEY_EPOCH_ACTION, seq),
+    # The key of the row's own range: the newest genesis or range row at or below it, its action
+    # matched exactly so a variant row cannot shadow it (BACKLOG #5726).
+    opening = await _exact_audit_row(
+        fetch,
+        "seq, action, detail",
+        "action = ?",
+        (AUDIT_KEY_EPOCH_ACTION,),
+        lambda r: r["action"] == AUDIT_KEY_EPOCH_ACTION,
+        at_most=seq,
     )
     key_id: str | None = None
     scheme: AuditScheme | None = None
@@ -9439,15 +9497,20 @@ async def read_newest_keyed_audit_row(
     :func:`settle_newest_keyed_audit_row` once the read is released."""
     if active_key_id is None:
         return None
-    audit = await fetch(
-        "SELECT seq, ts, actor, action, channel_id, detail, client, row_hash FROM audit_log"
-        " WHERE seq = (SELECT MAX(seq) FROM audit_log WHERE action = ? AND actor = ? AND seq > ?)",
-        (action, actor, after_seq),
+    # A padding or case-folding collation must not widen the query, nor let a variant row (an
+    # account whose name differs only in case) shadow the actor's own newer row (BACKLOG #5726).
+    audit = await _exact_audit_row(
+        fetch,
+        "seq, ts, actor, action, channel_id, detail, client, row_hash",
+        "action = ? AND actor = ?",
+        (action, actor),
+        lambda r: r["action"] == action and r["actor"] == actor,
+        above=after_seq,
     )
     if audit is None:
         return None
     seq = _strict_int(audit["seq"])
-    # Matched again here, exactly: a padding or case-folding collation must not widen the query.
+    # Matched again here, exactly, whatever the walk above returned.
     if seq is None or seq <= after_seq or audit["action"] != action or audit["actor"] != actor:
         return None
     found = await _audit_row_mac_check(
