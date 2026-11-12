@@ -1141,12 +1141,15 @@ def _close_without_sending(conn: Any, why: str) -> None:
     place of the caller's answer it would replace a refusal every caller reads as an
     ``LdapError`` with an unhandled one (BACKLOG #3017).
 
-    **The rule, stated here once (BACKLOG #3017): when a bind's open fails, the service account's,
-    a user's or the decoy's, its socket is closed at once, by the engine or by ``ssl``, not by the
-    collector, at least in the cases below.** ldap3 2.9.1's ``close`` shuts the socket only once an
-    open has completed, and a failed open leaves ``conn.closed`` true. ``_service_conn`` closes
-    the service account's here. ``_released`` closes a user or decoy bind's here, after an
-    ``unbind`` that does nothing on a closed connection (``_end_release``).
+    **The rule, stated here once (BACKLOG #3017): when a bind's open fails, the socket left on
+    ``conn.socket`` is closed by the engine or by ``ssl``, not by the collector, for at least the
+    service account's bind, a user's and the decoy's, and at least in the cases below.** ldap3
+    2.9.1's ``close`` shuts the socket only once an open has completed, and a failed open leaves
+    ``conn.closed`` true. ``_service_conn`` closes the service account's here. ``_released``
+    closes a user or decoy bind's here, after an ``unbind`` that does nothing on a closed
+    connection (``_end_release``). ldap3's ``open`` puts each candidate address's socket on
+    ``conn.socket`` in turn, so the one closed here is the last candidate's; a socket an earlier
+    candidate's failed connect left is not reached here.
 
     * Before ``ssl`` takes the socket over, it is the last socket ldap3 put on ``conn.socket``,
       connected or not, and it is closed here directly, whatever ``close`` did. Read from the
@@ -1664,8 +1667,10 @@ def _end_release(conn: Any, what: str) -> None:
 
     BACKLOG #3017. ldap3 2.9.1's ``unbind`` does nothing on a closed connection, and a failed open
     leaves one closed with its socket still held, so without the second step that socket stayed
-    open until the object was collected. :func:`_close_without_sending` states the rule. An
-    unbind that completes clears ``conn.socket``, so the second step then does nothing."""
+    open until the object was collected. :func:`_close_without_sending` states the rule. On an
+    open connection the unbind closes the socket and sets ``conn.socket`` to None
+    (``BaseStrategy._close_socket``), so the second step then does nothing; on a closed one it
+    leaves ``conn.socket`` set, and the second step closes it."""
     import ldap3
 
     try:

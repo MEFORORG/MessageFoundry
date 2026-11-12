@@ -28,6 +28,7 @@ import functools
 import inspect
 import json
 import logging
+import socket
 import ssl
 from pathlib import Path
 from types import SimpleNamespace
@@ -46,7 +47,6 @@ from messagefoundry.auth.ldap import (
 )
 from messagefoundry.auth.service import AuthService
 from messagefoundry.store.store import MessageStore
-from tests._vault_hop_sockets import _closed_port
 from tests.test_ldap_bind_result_codes import _alice
 from tests.test_ldap_error_mapping import _faulting
 from tests.test_ldap_referrals import _BIND_RESPONSE
@@ -437,11 +437,14 @@ def test_a_user_or_decoy_bind_whose_open_fails_closes_its_socket(how: str) -> No
     #1140 bind (BACKLOG #3017), for a TLS wrap refused before ``ssl`` takes the socket over and for
     a connect the directory refused. A failed open leaves the connection closed with its socket
     held, and ldap3's ``unbind`` does nothing on a closed connection, so before #3017 the socket
-    stayed open until the object was collected. The two branches still answer alike."""
+    stayed open until the object was collected. The two branches still answer alike. The refused
+    port is held bound and not listening for the whole test, so no other server can take it."""
     second: dict[str, Any] = {}
+    open_at_end: dict[str, bool] = {}
     texts: dict[str, str] = {}
     real = ldap3.Connection
-    dead = _closed_port()
+    held = socket.socket()
+    dead = 0
 
     def refused_wrap(*_args: Any, **_kwargs: Any) -> None:
         raise ssl.SSLError("synthetic-leak-3017")
@@ -460,6 +463,8 @@ def test_a_user_or_decoy_bind_whose_open_fails_closes_its_socket(how: str) -> No
                 finally:
                     # Read as the open ends: the close under test then drops conn.socket.
                     second[branch] = self.socket
+                    # Open here, so a closed socket below is the release's doing.
+                    open_at_end[branch] = self.socket is not None and self.socket.fileno() != -1
 
             self.strategy._open_socket = held_open
             if how == "wrap-refused":
@@ -468,21 +473,25 @@ def test_a_user_or_decoy_bind_whose_open_fails_closes_its_socket(how: str) -> No
             else:
                 self.server.port = dead
 
-    for branch, search in (("absent", lambda _raw: [_done(0)]), ("present", _alice)):
-        with (
-            pytest.MonkeyPatch.context() as mp,
-            _scripted_dc(search) as (dc, authenticator),
-        ):
-            mp.setattr(ldap3, "Connection", RefusedSecondOpen)
-            with pytest.raises(LdapError) as err:
-                authenticator.authenticate("alice", _PASSWORD)
-            # The service account bound and the user search ran, so the refused open was the
-            # second connect, whose release is under test, not the service account's.
-            assert len(dc.searches) == 1, f"the {branch} branch never searched"
-        texts[branch] = str(err.value)
-    # ldap3 sets conn.socket before the connect, so a failed open still holds one.
+    with held:
+        held.bind(("127.0.0.1", 0))
+        dead = int(held.getsockname()[1])
+        for branch, search in (("absent", lambda _raw: [_done(0)]), ("present", _alice)):
+            with (
+                pytest.MonkeyPatch.context() as mp,
+                _scripted_dc(search) as (dc, authenticator),
+            ):
+                mp.setattr(ldap3, "Connection", RefusedSecondOpen)
+                with pytest.raises(LdapError) as err:
+                    authenticator.authenticate("alice", _PASSWORD)
+                # The service account bound and the user search ran, so the refused open was the
+                # second connect, whose release is under test, not the service account's.
+                assert len(dc.searches) == 1, f"the {branch} branch never searched"
+            texts[branch] = str(err.value)
+    # ldap3 sets conn.socket before the connect, so a failed open still holds one, still open.
     assert sorted(second) == ["absent", "present"], "a branch never reached the second connect"
     assert all(sock is not None for sock in second.values()), second
+    assert open_at_end == {"absent": True, "present": True}, open_at_end
     left_open = [branch for branch, sock in second.items() if sock.fileno() != -1]
     assert left_open == [], f"left its socket open: {left_open}"
     assert texts["absent"] == texts["present"], texts
@@ -490,9 +499,10 @@ def test_a_user_or_decoy_bind_whose_open_fails_closes_its_socket(how: str) -> No
 
 
 def test_a_block_that_raised_on_an_open_connection_is_unbound_and_not_closed_again() -> None:
-    """The control: an unbind that completes clears the connection's socket, as ldap3's does, so
-    nothing is closed after it. A refusal raised after a bind that opened, such as a referral,
-    still unbinds."""
+    """The control: on an open connection ldap3 2.9.1's unbind closes the socket and sets
+    ``conn.socket`` to None (``BaseStrategy._close_socket``), as this stand-in does, so nothing is
+    closed after it. A refusal raised after a bind that opened, such as a referral, still
+    unbinds."""
     calls: list[str] = []
     conn = SimpleNamespace(socket=object())
 
