@@ -116,6 +116,11 @@ async def test_the_sql_server_writer_refuses_before_it_writes(bogus: str) -> Non
         await _store()._write_ad_map(
             cur, AD_ROLE_MAP, AdMap.of(AD_ROLE_MAP, [(_G, "viewer"), (_H, bogus)])
         )
+    # The positive control: the recorder caught the seal, pairs and roles reads, the exact check's
+    # read last, so the refusal came from that check and an empty ``writes`` is not a recorder that
+    # saw nothing. The write test below runs the same filter and finds the writes.
+    assert len(cur.sql) >= 3
+    assert cur.sql[-1] == ("SELECT id FROM roles", ())
     writes = [s for s, _ in cur.sql if not s.lstrip().upper().startswith("SELECT")]
     assert writes == [], "nothing may be cleared, inserted or sealed"
 
@@ -131,6 +136,8 @@ async def test_the_sql_server_writer_writes_known_ids() -> None:
     sql = ss._MSSQL_AD_MAP_SQL[AD_ROLE_MAP]
     assert (sql.insert, (_H, "operator")) in cur.sql
     assert any(s == ss._MSSQL_SET_SEAL_MERGE for s, _ in cur.sql)
+    writes = [s for s, _ in cur.sql if not s.lstrip().upper().startswith("SELECT")]
+    assert sql.insert in writes and ss._MSSQL_SET_SEAL_MERGE in writes
 
 
 async def test_the_scope_map_writer_reads_no_roles() -> None:
