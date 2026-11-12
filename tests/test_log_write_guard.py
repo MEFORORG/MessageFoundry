@@ -643,6 +643,7 @@ async def test_a_halt_racing_a_reload_stops_the_listeners_that_reload_rebound(
     # put anything there.
     sink = _RecordingSink()
     runner, old_source = _graph(store, sink)
+    halt: asyncio.Future[None] | None = None
     await runner._reload_lock.acquire()
     try:
         runner._sources.pop(INBOUND)  # the reload's step 1: every listener unbound
@@ -655,6 +656,12 @@ async def test_a_halt_racing_a_reload_stops_the_listeners_that_reload_rebound(
         )
         await asyncio.sleep(0)  # the halt runs up to the lock and waits there
         assert runner._log_write_stopped and not halt.done()
+        # The page went out already, rather than waiting on a reload that may be slow or wedged.
+        # It cannot count what the halt will stop yet, so it says the stop waits on the reload.
+        assert len(sink.log_failures) == 1
+        name, stage, reason, stopped = sink.log_failures[0]
+        assert (name, stage, stopped) == ("file", "unwritable", None)
+        assert reason.startswith("disk full; a reload holds the engine")
         # The reload's step 2: the listener comes back up, and the new graph adds an outbound.
         rebound = _StubSource()
         runner._sources[INBOUND] = rebound  # type: ignore[assignment]
@@ -665,15 +672,40 @@ async def test_a_halt_racing_a_reload_stops_the_listeners_that_reload_rebound(
         )
     finally:
         runner._reload_lock.release()
-    await halt
+        if halt is not None and not halt.done():
+            # Awaited here on success too, so a failed assertion above never leaves the halt
+            # running against a half-built rig after the test has ended.
+            await asyncio.wait_for(halt, timeout=5.0)
 
     assert rebound.stopped is True, "the halt left a listener the reload rebound open"
     assert INBOUND not in runner._sources
     assert {OUTBOUND, OUTBOUND_ADDED} <= runner._outbound_paused
-    # The count is of the lanes this halt stopped, read once the reload had finished.
-    assert sink.log_failures == [("file", "unwritable", "disk full", 3)]
+    assert len(sink.log_failures) == 1, "the halt paged twice for one break"
     assert sorted(name for name, _ in sink.stopped) == [INBOUND, OUTBOUND, OUTBOUND_ADDED]
     assert old_source.stopped is False  # the reload, not the halt, unbound the old one
+
+
+async def test_an_alert_sink_that_raises_does_not_abort_the_halt(store: MessageStore) -> None:
+    # BACKLOG #5704. The latch is one-shot and set before the page, so a page that raised and took
+    # the halt down with it would leave the engine processing unlogged, with every later event
+    # returning on the latch.
+    class _RaisingSink(_RecordingSink):
+        def log_write_failed(
+            self, name: str, *, stage: str, reason: str, stopped: int | None = None
+        ) -> None:
+            raise RuntimeError("notifier down")
+
+    sink = _RaisingSink()
+    runner, source = _graph(store, sink)
+
+    await runner._respond_to_log_sink_event(
+        LogSinkEvent(sink="file", stage="unwritable", reason="disk full", stop_requested=True)
+    )
+
+    assert source.stopped is True
+    assert OUTBOUND in runner._outbound_paused
+    assert INBOUND in runner._log_halted
+    assert sorted(name for name, _ in sink.stopped) == [INBOUND, OUTBOUND]
 
 
 async def test_the_escalation_bridges_from_a_worker_thread_onto_the_engine_loop(
