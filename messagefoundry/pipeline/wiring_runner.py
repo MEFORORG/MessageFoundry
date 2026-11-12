@@ -239,7 +239,7 @@ from messagefoundry.pipeline.stage_dispatcher import (
     wait_to_retry,
 )
 from messagefoundry.pipeline.sync_reply import SyncReplyMetrics, SyncReplyResolverImpl
-from messagefoundry.redaction import safe_exc, safe_text
+from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
 from messagefoundry.store import (
     FailOutcome,
     MessageStatus,
@@ -250,7 +250,7 @@ from messagefoundry.store import (
 )
 from messagefoundry.store.base import AuditStore, pool_over_provisioned_warning
 from messagefoundry.store.cell_tag import CellTagError, CellTagSink, dead_letter_on_cell_tag
-from messagefoundry.store.crypto import CipherError
+from messagefoundry.store.crypto import CipherError, gave_no_verdict
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.sealed_cache import point_in_time
 from messagefoundry.store.store import REINGRESS_PEEK_FAILED, ConnectionEventWrite, OwnedLanes
@@ -1600,7 +1600,10 @@ class _RoutedPrep:
     while every store handoff stays serial and in ascending claim order — so per-destination outbound
     FIFO (``ORDER BY seq``, ADR 0059; correct only under one serial writer per lane) is preserved.
     Exactly one field is populated: ``missing_handler`` (the row's handler is gone → dead-letter on
-    apply), ``tag_failure`` (the loopback metadata read failed its tag → dead-letter on apply), ``error`` (the handler raised → internal-error policy on apply), or ``outcome`` (the
+    apply), ``tag_failure`` (the loopback metadata read failed its tag → dead-letter on apply),
+    ``unreadable`` (the loopback's correlation could not be read → dead-letter on apply),
+    ``inbound_gone`` (a reload dropped the inbound → revert and STOP on apply), ``error``
+    (the handler raised → internal-error policy on apply), or ``outcome`` (the
     transform produced deliveries/state/meta to hand off). A handler raise is captured here rather than
     raised so a concurrent ``gather`` never cancels a sibling (ADR 0057 policy is applied on the serial
     apply, in claim order)."""
@@ -1610,6 +1613,22 @@ class _RoutedPrep:
     outcome: TransformOutcome | None = None
     #: The loopback metadata read met a cell that fails its row tag → dead-letter on apply (#2593).
     tag_failure: CellTagError | None = None
+    #: The loopback's correlation could not be read from the row → dead-letter on apply (#5708).
+    unreadable: _UnreadableLoopbackRow | None = None
+    #: A reload dropped the inbound while the loopback read awaited → revert retry-forever and STOP
+    #: on apply, as :meth:`RegistryRunner._process_routed_item` does for a missing inbound (#5708).
+    inbound_gone: bool = False
+
+
+class _UnreadableLoopbackRow(Exception):
+    """A re-ingressed loopback row whose origin replies cannot be read from the store, because its
+    metadata cell does not decrypt, is not JSON, or carries a correlation id that is not a string, or
+    because a captured reply does not decrypt (BACKLOG #5708).
+
+    Each fails the same way on every pass, so a row that raised it would be re-pended at the head of a
+    strict-FIFO lane forever. The transform stage dead-letters it instead, as the response stage does an
+    undecryptable reply body (BACKLOG #4995). The text names the fault class only, never message
+    content, because it becomes the dead-letter reason."""
 
 
 def _contiguous_by_message(items: Sequence[OutboxItem]) -> list[list[OutboxItem]]:
@@ -1703,6 +1722,10 @@ class _FusedTransformResult:
     handoff_exc: Exception | None
     outbound_wakes: tuple[str, ...]
     ingress_wakes: tuple[str, ...]
+    #: The row was settled before anything ran: its loopback correlation could not be read, or a
+    #: reload dropped its inbound or handler during that read (BACKLOG #5708). The caller applies
+    #: it through :meth:`RegistryRunner._apply_routed`, as the split path does.
+    settled: _RoutedPrep | None = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -11782,52 +11805,33 @@ class RegistryRunner:
         ``(STOPPED, None)`` on a missing inbound or the STOP internal-error policy — the body already
         ``mark_failed``'d / dead-lettered the head per policy). The per_lane loop reads only
         ``outcome[0]``. Store errors propagate to the caller's backoff."""
-        ic = self.registry.inbound.get(name)
-        if ic is None:
-            # Inbound removed; nothing to transform with until a reload restores it (which
-            # re-arms this worker). Revert the row (retry-forever) and exit (mirrors the
-            # router worker), so the ACKed-but-unprocessed message is never dropped. The
-            # worker releases the unprocessed batch tail as it returns (_release_tail_on_stop,
-            # ADR 0157 Inc 2), so the tail keeps its FIFO position and the reload that
-            # restores the inbound drains it with the rest of the backlog.
-            # max_attempts=None is EXPLICIT (#1051): RetryPolicy's own default is now the finite 100,
-            # so a bare RetryPolicy() here would dead-letter an ACKed-but-never-attempted message
-            # purely for outliving a reload — the one thing these three sites exist to prevent.
-            await self.store.mark_failed(
-                item.id, "inbound not in registry", RetryPolicy(max_attempts=None)
-            )
-            return _ItemOutcome.STOPPED, None
-        hname = item.handler_name
-        if hname is None or hname not in self.registry.handlers:
-            # Handler gone (removed/renamed since routing). Can't transform this row;
-            # dead-letter it (message ERROR, replayable once restored) — the per-row analogue
-            # of the startup dead_letter_missing_handlers sweep. Dead-lettering (vs reverting)
-            # avoids a hot-loop on a permanently-missing handler and gives operator visibility.
-            log.warning(
-                "transform worker %r: handler %r for %s is missing; dead-lettering",
-                name,
-                hname,
-                item.id,
-            )
-            await self.store.dead_letter_now(item.id, f"handler {hname!r} removed from registry")
-            return _ItemOutcome.PROCESSED, None
+        # A missing inbound or handler is settled in ONE place, _apply_routed, which this path, the
+        # concurrent path and the fused path all reach (BACKLOG #5708).
+        dropped = self._dropped_by_reload(name, item)
+        if dropped is not None:
+            return await self._apply_routed(name, item, dropped)
+        ic = self.registry.inbound[name]
         # ADR 0071 B5 PR3 — fused transform+handoff dispatch (SQL Server, pooled, flag on). Fuse
         # transform_one (CONTENT) + transform_handoff_sync (INFRA) into ONE worker hop, gated on
-        # the real guard _fusion_active. The missing-handler guard above STAYS ahead of this: the
-        # fused callable only asserts hname is not None, it does NOT check hname in
-        # registry.handlers. The callable does its OWN loopback response_view prefetch on the loop
-        # (do not double-read here). Byte-identical when fusion is off / non-SS.
+        # the real guard _fusion_active. The missing inbound/handler guard above STAYS ahead of
+        # this. For a loopback row the fused callable re-checks both after its OWN response_view
+        # prefetch on the loop (do not double-read here), because that read awaits; either way it
+        # hands the executor the graph it read with no await since the last check (BACKLOG #5708).
+        # Byte-identical when fusion is off / non-SS.
         if self._fusion_active:
             result = await self._fused_transform_and_handoff(name, ic, item)
             if result.xform_exc is not None:  # CONTENT: a handler raise → internal-error policy
                 return await self._apply_transform_internal_error(name, item, result.xform_exc)
             if isinstance(result.handoff_exc, CellTagError):
-                # BACKLOG #2593: the message's own metadata cell failed its row tag (in the sync
-                # handoff, which rolled back, or in the loopback read). Dead-letter the row (message
+                # BACKLOG #2593: the message's own metadata cell failed its row tag in the sync
+                # handoff, which rolled back (one in the loopback read comes back as `settled`
+                # instead, BACKLOG #5708). Dead-letter the row (message
                 # ERROR) and audit it, as the async transform_handoff does, rather than re-pend a
                 # row that would fail the same way until the inbound stopped.
                 await dead_letter_on_cell_tag(self._cell_tag_sink, item.id, result.handoff_exc)
                 return _ItemOutcome.PROCESSED, None
+            if result.settled is not None:  # BACKLOG #5708: nothing ran; settle as the split path
+                return await self._apply_routed(name, item, result.settled)
             if result.handoff_exc is not None:  # INFRA: acquire/handoff fault → propagate → T17
                 raise result.handoff_exc
             # LOOP-side publish of the committed transform-state (the sync twin never mutates the
@@ -11852,6 +11856,72 @@ class RegistryRunner:
         """The store as the dead-letter-and-audit sink a cell-tag failure needs (BACKLOG #2593).
         ``record_audit`` lives on AuditStore, which every shipped backend implements."""
         return cast(CellTagSink, self.store)
+
+    async def _loopback_response_view(self, item: OutboxItem) -> dict[str, Any] | None:
+        """The origin request's captured replies for a re-ingressed loopback row (ADR 0013 Increment
+        2), as ``{destination_name: latest CapturedResponse}``, or ``None`` when the row carries no
+        correlation. Shared by the split transform path and the fused one, so the two cannot drift.
+
+        Raises :class:`CellTagError` for a metadata cell that fails its row tag (BACKLOG #2593), and
+        :class:`_UnreadableLoopbackRow` for every other way the row's own content makes the read fail
+        (BACKLOG #5708): a metadata cell that does not decrypt, metadata that is not JSON or is nested
+        past json's depth limit, a correlation id that is not a string, or a captured reply that does
+        not decrypt. A cipher that gave no verdict on the value (:func:`gave_no_verdict`, such as an
+        unreachable Vault Transit) is the key service failing rather than the row, so that
+        ``CipherError`` propagates as INFRA and the row re-pends, as any other store fault does. Each
+        refusal is raised outside the handler that caught it, so no decrypted text rides its chain."""
+        unreadable: str | None = None
+        try:
+            raw_meta = await self.store.message_metadata_json(item.message_id)
+        except CellTagError:
+            raise
+        except CipherError as exc:
+            if gave_no_verdict(exc):
+                raise
+            unreadable = f"loopback metadata does not decrypt ({type(exc).__name__})"
+        if unreadable is not None:
+            raise _UnreadableLoopbackRow(unreadable)
+        meta: Any = {}
+        if raw_meta:
+            meta, hint = json_loads_or_refusal(raw_meta)
+            if hint is not None:
+                raise _UnreadableLoopbackRow(f"loopback metadata is not JSON ({hint})")
+        corr = meta.get("correlation_id") if isinstance(meta, dict) else None
+        if corr is None:
+            return None
+        if not isinstance(corr, str):
+            raise _UnreadableLoopbackRow(
+                f"loopback correlation id is not a string ({type(corr).__name__})"
+            )
+        if not corr:
+            return None
+        try:
+            replies = await self.store.correlate_response(corr)
+        except CipherError as exc:
+            if gave_no_verdict(exc):
+                raise
+            unreadable = (
+                f"a captured reply for this loopback does not decrypt ({type(exc).__name__})"
+            )
+        if unreadable is not None:
+            raise _UnreadableLoopbackRow(unreadable)
+        # correlate_response orders by (dest, response_seq), so the last per destination wins (the
+        # authoritative reply). Immutable committed rows → re-run-stable (ADR 0009).
+        return {c.destination_name: c for c in replies}
+
+    def _dropped_by_reload(self, name: str, item: OutboxItem) -> _RoutedPrep | None:
+        """How to settle a routed row whose inbound or handler the LIVE graph no longer has, or
+        ``None`` when it has both (BACKLOG #5708). Called after the loopback reads, which await, so a
+        reload can have swapped the graph since the caller's own checks. The dispositions are the
+        ones :meth:`_process_routed_item` gives the same two cases before any await: a missing
+        inbound reverts the row retry-forever and stops the lane, and a missing handler
+        dead-letters it. Neither is a Handler fault, so neither reaches the internal-error policy."""
+        registry = self.registry
+        if name not in registry.inbound:
+            return _RoutedPrep(inbound_gone=True)
+        if item.handler_name is None or item.handler_name not in registry.handlers:
+            return _RoutedPrep(missing_handler=True)
+        return None
 
     async def _prepare_routed(
         self,
@@ -11889,31 +11959,47 @@ class RegistryRunner:
         path) the live ``state_view()`` is used, exactly as before — byte-identical.
 
         An unexpected store-read fault (loopback metadata read) PROPAGATES — the caller treats
-        it as INFRA and backs off, exactly like the inlined path."""
+        it as INFRA and backs off, exactly like the inlined path.
+
+        **The graph is re-read after the loopback reads (BACKLOG #5708).** Those reads await, as does
+        the concurrent batch path's semaphore before this method runs, and a reload can swap the graph
+        in that window. Read live after it with no check, a dropped inbound
+        raised ``KeyError`` and a dropped handler raised inside ``transform_one``, and both reached
+        the internal-error policy as a Handler fault, which dead-letters an ACKed message the reload
+        alone had stranded. :meth:`_dropped_by_reload` now settles each as the runner already
+        settles it before any await. From that check to the dispatch nothing awaits, so the
+        transform, its code sets and its content type all come from one graph."""
+        # On entry as well as after the read: the concurrent batch path awaits its semaphore before
+        # it calls here, with an `ic` it read at batch start, so a reload can already have dropped
+        # the inbound. Inbound first, so a reload that drops a whole feed reverts the row rather
+        # than dead-lettering it as a missing handler.
+        dropped = self._dropped_by_reload(name, item)
+        if dropped is not None:
+            return dropped
         hname = item.handler_name
-        if hname is None or hname not in self.registry.handlers:
-            return _RoutedPrep(missing_handler=True)
+        assert hname is not None  # _dropped_by_reload settles a row with no handler name
         # ADR 0013 Increment 2: for a RE-INGRESSED message (only ever on a loopback inbound),
         # feed the run-context `response` provider the ORIGIN request's captured replies so its
         # Handler can read them via response_get(dest). A normal message → None (byte-identical,
         # and the metadata read is skipped entirely for non-loopback inbounds).
         response_view: dict[str, Any] | None = None
         if ic.spec.type is ConnectorType.LOOPBACK:
-            # Only the metadata cell is read. One that fails its row tag (BACKLOG #2593) makes the
-            # row a dead-letter on apply, not an infrastructure fault that re-pends it forever.
+            # A metadata cell that fails its row tag (BACKLOG #2593), and a correlation that cannot
+            # be read at all (BACKLOG #5708), each make the row a dead-letter on apply, not a fault
+            # that re-pends it at the head of this FIFO lane forever.
             try:
-                raw_meta = await self.store.message_metadata_json(item.message_id)
+                response_view = await self._loopback_response_view(item)
             except CellTagError as err:
                 return _RoutedPrep(tag_failure=err)
-            meta = json.loads(raw_meta) if raw_meta else {}
-            corr = meta.get("correlation_id") if isinstance(meta, dict) else None
-            if corr:
-                # {destination_name: latest CapturedResponse}: correlate_response orders by
-                # (dest, response_seq), so the last per destination wins (the authoritative
-                # reply). Immutable committed rows → re-run-stable (ADR 0009).
-                response_view = {
-                    c.destination_name: c for c in await self.store.correlate_response(corr)
-                }
+            except _UnreadableLoopbackRow as err:
+                # Dropped with the traceback, whose frames hold the decrypted metadata as locals.
+                return _RoutedPrep(unreadable=err.with_traceback(None))
+            # The read awaited, so a reload may have dropped the inbound or the handler since.
+            dropped = self._dropped_by_reload(name, item)
+            if dropped is not None:
+                return dropped
+        # No await from here to the dispatch, so this is the graph the transform runs under.
+        registry = self.registry
         try:
             # Same as the router worker, plus the transform-only providers: publish the
             # run-scoped views so call-time code_set(...)/reference(...)/state_get(...)/
@@ -11923,7 +12009,7 @@ class RegistryRunner:
             # from the run_context registry (transform phase) — features add one provider,
             # never edit this call site.
             transform_rc = RunContext(
-                code_sets=self.registry.code_sets,
+                code_sets=registry.code_sets,
                 reference_view=self.store.reference_view(),
                 # BACKLOG #214: sequential/single-row/fused path (state_snapshot is None) reads the LIVE
                 # view — byte-identical. A concurrent sibling-run passes a FROZEN run-start copy so every
@@ -11947,7 +12033,7 @@ class RegistryRunner:
                 # activated) into the worker thread, so code_set()/reference()/state_get()/
                 # current_environment() — and db_lookup()/fhir_lookup() on the lookup path —
                 # resolve there while the loop stays free.
-                content_type = self.registry.inbound[name].content_type.value
+                content_type = registry.inbound[name].content_type.value
                 # Activate whichever live-lookup runner(s) the graph declares so a Handler call
                 # to db_lookup()/fhir_lookup() resolves inside the worker thread, bridging back
                 # onto the loop (run_coroutine_threadsafe). Both are the deliberate
@@ -11967,7 +12053,7 @@ class RegistryRunner:
                     outcome = await self._off_loop_sandboxed(
                         name,
                         transform_one,
-                        self.registry,
+                        registry,
                         hname,
                         item.payload,
                         content_type,
@@ -11999,6 +12085,28 @@ class RegistryRunner:
             # BACKLOG #2593: the loopback read met a message cell that fails its row tag.
             await dead_letter_on_cell_tag(self._cell_tag_sink, item.id, prep.tag_failure)
             return _ItemOutcome.PROCESSED, None
+        if prep.unreadable is not None:
+            # BACKLOG #5708: the loopback's correlation fails the same way on every pass, so
+            # dead-letter it (message ERROR, replayable) rather than re-pend it at the lane head.
+            log.warning(
+                "transform worker %r: %s for %s; dead-lettering", name, prep.unreadable, item.id
+            )
+            await self.store.dead_letter_now(item.id, str(prep.unreadable))
+            return _ItemOutcome.PROCESSED, None
+        if prep.inbound_gone:
+            # Inbound removed; nothing to transform with until a reload restores it (which
+            # re-arms this worker). Revert the row (retry-forever) and exit (mirrors the
+            # router worker), so the ACKed-but-unprocessed message is never dropped. The
+            # worker releases the unprocessed batch tail as it returns (_release_tail_on_stop,
+            # ADR 0157 Inc 2), so the tail keeps its FIFO position and the reload that
+            # restores the inbound drains it with the rest of the backlog.
+            # max_attempts=None is EXPLICIT (#1051): RetryPolicy's own default is now the finite 100,
+            # so a bare RetryPolicy() here would dead-letter an ACKed-but-never-attempted message
+            # purely for outliving a reload — the one thing these three sites exist to prevent.
+            await self.store.mark_failed(
+                item.id, "inbound not in registry", RetryPolicy(max_attempts=None)
+            )
+            return _ItemOutcome.STOPPED, None
         if prep.missing_handler:
             # Handler gone (removed/renamed since routing). Can't transform this row;
             # dead-letter it (message ERROR, replayable once restored) — the per-row analogue
@@ -12177,28 +12285,35 @@ class RegistryRunner:
         # byte-identical to the split _process_routed_item path.
         response_view: dict[str, Any] | None = None
         if ic.spec.type is ConnectorType.LOOPBACK:
-            # Only the metadata cell is read. One that fails its row tag (BACKLOG #2593) comes back
-            # as the handoff fault the caller dead-letters, as the split path's prep does.
+            # A metadata cell that fails its row tag (BACKLOG #2593), or a correlation that cannot be
+            # read at all (BACKLOG #5708), comes back as `settled`, which the caller dead-letters
+            # through _apply_routed, as the split path's prep does.
+            settled: _RoutedPrep | None = None
             try:
-                raw_meta = await self.store.message_metadata_json(item.message_id)
+                response_view = await self._loopback_response_view(item)
             except CellTagError as err:
+                settled = _RoutedPrep(tag_failure=err)
+            except _UnreadableLoopbackRow as err:
+                # Dropped with the traceback, whose frames hold the decrypted metadata as locals.
+                settled = _RoutedPrep(unreadable=err.with_traceback(None))
+            if settled is None:
+                # The read awaited, so a reload may have dropped the inbound or the handler.
+                settled = self._dropped_by_reload(name, item)
+            if settled is not None:
                 return _FusedTransformResult(
                     deliveries=[],
                     pt_deliveries=[],
                     applied_state=[],
                     xform_exc=None,
-                    handoff_exc=err,
+                    handoff_exc=None,
                     outbound_wakes=(),
                     ingress_wakes=(),
+                    settled=settled,
                 )
-            meta = json.loads(raw_meta) if raw_meta else {}
-            corr = meta.get("correlation_id") if isinstance(meta, dict) else None
-            if corr:
-                response_view = {
-                    c.destination_name: c for c in await self.store.correlate_response(corr)
-                }
+        # No await from here to the dispatch, so this is the graph the transform runs under.
+        registry = self.registry
         rc = RunContext(
-            code_sets=self.registry.code_sets,
+            code_sets=registry.code_sets,
             reference_view=self.store.reference_view(),
             state_view=self.store.state_view(),
             response_view=response_view,
@@ -12207,15 +12322,12 @@ class RegistryRunner:
             message_id=item.message_id,  # #162: key the unmapped-capture drain per message
             snapshot_on_send=self._snapshot_on_send,  # ADR 0104 copy-on-Send (fused path)
         )
-        content_type = ic.content_type.value
+        content_type = registry.inbound[name].content_type.value
         return await loop.run_in_executor(
             self._fuse_transform_executor,
-            self._run_fused_transform,
-            name,
-            item,
-            rc,
-            content_type,
-            now,
+            functools.partial(
+                self._run_fused_transform, name, item, rc, content_type, now, registry=registry
+            ),
         )
 
     def _run_fused_transform(
@@ -12225,6 +12337,8 @@ class RegistryRunner:
         rc: RunContext,
         content_type: str,
         now: float | None,
+        *,
+        registry: Registry,
     ) -> _FusedTransformResult:
         """The synchronous transform-fusion body (runs on ``_fuse_transform_executor``). Re-establishes
         run_contexts AND the live-lookup ExitStack itself (a db_lookup/fhir_lookup call bridges back to
@@ -12232,7 +12346,12 @@ class RegistryRunner:
         acquires a fresh ``outbound`` sync connection and runs ``transform_handoff_sync`` in its own
         committed txn (INFRA boundary — a raise here is ``handoff_exc``), returning the committed
         transform-state the LOOP must republish via ``publish_state_cache`` (the sync twin never mutates
-        the loop-owned cache)."""
+        the loop-owned cache).
+
+        ``registry`` is the graph the caller checked the row against on the loop, with no await
+        between that check and this dispatch (BACKLOG #5708). It is required, never defaulted to the
+        live ``self.registry``: a reload can swap that while this body waits for an executor
+        thread, and a handler the swapped-in graph dropped would then raise as a Handler fault."""
         hname = item.handler_name
         assert hname is not None, "fused transform requires a routed row carrying a handler_name"
         try:
@@ -12242,7 +12361,7 @@ class RegistryRunner:
                 if self._fhir_lookup_executor is not None:
                     lookup_stack.enter_context(fhir_lookup_activated(self._run_fhir_lookup))
                 deliveries_preview, state_preview, meta_preview, declined = transform_one(
-                    self.registry, hname, item.payload, content_type
+                    registry, hname, item.payload, content_type
                 )
         # CONTENT: transform_one raise → PR3 re-raises inside internal_error try. SystemExit too: a
         # Handler's sys.exit() is a content fault here, not an engine stop (UserCodeCalledSysExit, #3134).
