@@ -4836,10 +4836,11 @@ step over, capped at 64 of those.
 pre-ingest scan hook, a handler failure, and a listing entry refused as an unsafe name all leave the
 item where it is. Charging those would let one permanently stuck item consume the whole ceiling on every
 tick and starve the healthy items behind it. Only an item the tick finished with — handed off, or
-quarantined to the error directory — charges. **One gap in that rule:** a quarantine whose move to
-the error directory fails still charges, although the file stays where it was. A file that can never
-be quarantined would therefore spend the budget on every tick, which is the starvation this rule exists
-to prevent.
+quarantined to the error directory — charges. On `File(...)` a reject the move leaves in place does
+not charge (BACKLOG #5717). **One gap in that rule remains on `Sftp(...)`/`Ftp(...)`:** a quarantine
+whose move to the error directory fails still charges there, although the file stays where it was. A
+file that can never be quarantined would therefore spend the budget on every tick, which is the
+starvation this rule exists to prevent.
 
 **A database row that cannot become a body does not spend it either, and the two sources reach that
 by different routes.** A file source charges on **completion**, so it simply does not count an item it
