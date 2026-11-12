@@ -65,6 +65,7 @@ from messagefoundry.pipeline.cluster import (
     note_stamp_fault,
     paused_read_budget_seconds,
     rows_affected,
+    run_maintenance_loop,
     stamped_config_digest,
     stepdown_pause_seconds,
     stop_tasks_within,
@@ -141,13 +142,14 @@ class SqlServerCoordinator:
         # ADR 0157 Inc 0: the clamp on at least the maintenance loop's heartbeat, claim/renew and
         # config-version refresh, and on the stepdown's release write, as DbCoordinator._call_tick
         # bounds them (BACKLOG #5064, #6472). Unlike _call_tick, it is not on the engine's start-up
-        # seed, which keeps [store].command_timeout (config_version). Each clamped one runs in
-        # series with the renew or under _leadership_lock, so [store].command_timeout there would
-        # delay the renew. SqlServerStore._fetchone_clamped says how it is applied, why one costs
-        # up to about twice the clamp, three times when its rollback runs, and why the COMMIT is
-        # outside it. The clamp bounds each statement, not
-        # the tick: nothing checks that the heartbeat interval plus the loop's statements fit
-        # inside the fence, on either backend. The paused tick's owner read takes the smaller of
+        # seed, which keeps [store].command_timeout (config_version). Each clamped one is the renew,
+        # runs under _leadership_lock, or runs in the loop's side pass, which a statement at
+        # [store].command_timeout would hold for that long. SqlServerStore._fetchone_clamped says
+        # how it is applied, why one costs up to about twice the clamp, three times when its
+        # rollback runs, and why the COMMIT is outside it. Since BACKLOG #5710 the heartbeat and
+        # the refresh no longer delay the renew (run_maintenance_loop), so the gap between two
+        # renews is the heartbeat interval or the renew's own cost, whichever is longer; nothing
+        # checks that cost against the fence. The paused tick's owner read takes the smaller of
         # the clamp and half its own budget (_paused_read_budget), and stop()'s release its own bound.
         self._renew_timeout = lease_renew_timeout_seconds
         if lease_renew_timeout_seconds < 1.0:
@@ -322,8 +324,8 @@ class SqlServerCoordinator:
         return await self._read_config_version(None)
 
     async def _refresh_config_version(self) -> int:
-        """:meth:`config_version` under the renew clamp, for the maintenance loop, which runs it in
-        series with the renew (BACKLOG #6472). The clamp is not the same bound as on Postgres:
+        """:meth:`config_version` under the renew clamp, for the maintenance loop's side pass
+        (BACKLOG #6472, #5710). The clamp is not the same bound as on Postgres:
         there the borrow and statement share one deadline, while here each gets the clamp, so the
         call can take about twice it, three times when a rollback runs, plus a COMMIT nothing is
         known to bound (SqlServerStore._fetchone_clamped)."""
@@ -467,8 +469,9 @@ class SqlServerCoordinator:
 
     async def heartbeat_once(self) -> None:
         # Refresh last_seen (wall clock, like DbCoordinator) and fold the current is_leader flag — the
-        # flag lags by at most one tick (the loop beats before _maintain_leadership). Zero extra writes.
-        # Under the renew clamp, because it runs before the renew in the same tick (BACKLOG #6472).
+        # flag lags by at most one tick (the loop beats just after _maintain_leadership, BACKLOG #5710).
+        # Zero extra writes. Under the renew clamp (BACKLOG #6472): it no longer delays the renew,
+        # but an unbounded one would starve the next beat and hold up stop().
         await self._store._execute_clamped(
             "UPDATE nodes SET last_seen=?, status=?, is_leader=? WHERE node_id=?",
             (time.time(), "active", 1 if self._is_leader else 0, self.node_id),
@@ -476,29 +479,20 @@ class SqlServerCoordinator:
         )
 
     async def _heartbeat_loop(self) -> None:
-        while not self._stop.is_set():
-            # Fixed labels: the names these steps logged before the refresh was split out, so the
-            # warning text does not change (BACKLOG #6472).
-            for name, step in (
+        # The renew first and alone, the other two beside it, in lockstep with
+        # DbCoordinator._heartbeat_loop (BACKLOG #5710); run_maintenance_loop says why. Fixed
+        # labels: the names these steps logged before the refresh was split out, so the warning
+        # text does not change (BACKLOG #6472).
+        await run_maintenance_loop(
+            stop=self._stop,
+            interval=self._heartbeat_seconds,
+            lease_step=("_maintain_leadership", self._maintain_leadership),
+            side_steps=(
                 ("heartbeat_once", self.heartbeat_once),
-                ("_maintain_leadership", self._maintain_leadership),
                 ("config_version", self._refresh_config_version),
-            ):
-                try:
-                    await step()
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    log.warning(
-                        "cluster: %s failed for node %s; will retry: %s",
-                        name,
-                        self.node_id,
-                        safe_exc(exc),
-                    )
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=self._heartbeat_seconds)
-            except TimeoutError:
-                continue
+            ),
+            node_id=self.node_id,
+        )
 
     async def _maintain_leadership(self) -> None:
         # The claim AND the bookkeeping that reads its result run under the lock: the promotion decision

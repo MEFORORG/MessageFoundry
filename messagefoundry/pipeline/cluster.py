@@ -65,7 +65,7 @@ import math
 import os
 import socket
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple, Protocol, runtime_checkable
 from uuid import uuid4
@@ -431,6 +431,75 @@ def _log_task_outcome(task: asyncio.Task[None]) -> None:
     exc = task.exception()
     if exc is not None:
         log.warning("cluster: a background task ended with an error at stop: %s", safe_exc(exc))
+
+
+#: One maintenance step: the label its failure is logged under, and the coroutine function.
+MaintenanceStep = tuple[str, Callable[[], Awaitable[object]]]
+
+
+async def _run_maintenance_steps(steps: Sequence[MaintenanceStep], node_id: str) -> None:
+    """Run ``steps`` in series, logging each failure and going on to the next: a transient blip in
+    one must not kill membership, and none of them demotes (the fence watchdog does that)."""
+    for label, step in steps:
+        try:
+            await step()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "cluster: %s failed for node %s; will retry: %s", label, node_id, safe_exc(exc)
+            )
+
+
+async def run_maintenance_loop(
+    *,
+    stop: asyncio.Event,
+    interval: float,
+    lease_step: MaintenanceStep,
+    side_steps: Sequence[MaintenanceStep],
+    node_id: str,
+) -> None:
+    """Both coordinators' maintenance loop: the lease step on a fixed cadence, and the other
+    statements beside it, never in front of it (BACKLOG #5710).
+
+    **Why the lease step runs alone.** The fence watchdog demotes a leader whose last confirmed
+    renew was issued more than the fence timeout ago, so every second between two renews counts
+    against the fence. When the heartbeat and the config-version refresh ran in series with the
+    renew, each one's bound, up to twice the renew clamp, and the fixed sleep after them all added
+    to that gap: on the shipped 10/20/30 timings, a refresh stalled after one renew and a heartbeat
+    stalled before the next would have put about 28 s between them, and a healthy leader would have
+    self-fenced over two statements that are not the lease. Now the renew is issued at the start of
+    each tick, ticks start ``interval`` apart on the loop's monotonic clock whatever the tick
+    cost, and the other statements run as a task of their own, so the gap between two renews is
+    ``interval`` or the renew's own round trip, whichever is longer. Only the lease statement's
+    own slowness can fence the node now, which is what the fence exists to detect.
+
+    **At most one side pass at a time.** A tick whose previous side pass is still running starts
+    none, so a stalled statement cannot pile passes up on the pool; the next tick starts a fresh
+    one. The side pass keeps the step order it was given.
+
+    Exits when ``stop`` is set, waking at once rather than sleeping out the interval. On exit,
+    cancelled or not, it cancels a side pass still running and waits for it, so the caller's
+    bounded wait on this task covers that pass too: a heartbeat left running past ``stop()`` could
+    land after the ``left`` tombstone."""
+    loop = asyncio.get_running_loop()
+    side: asyncio.Task[None] | None = None
+    try:
+        while not stop.is_set():
+            # The next tick is due one interval after this one STARTED, so a slow tick shortens the
+            # wait rather than adding to it.
+            due = loop.time() + interval
+            await _run_maintenance_steps((lease_step,), node_id)
+            if side is None or side.done():
+                side = asyncio.create_task(_run_maintenance_steps(side_steps, node_id))
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=max(0.0, due - loop.time()))
+            except TimeoutError:
+                continue
+    finally:
+        if side is not None:
+            side.cancel()
+            await asyncio.wait((side,))
 
 
 class StepdownOutcome(NamedTuple):
@@ -1488,9 +1557,10 @@ class DbCoordinator:
         at the renew clamp with its borrow and release (BACKLOG #2523): the heartbeat, the claim, the
         config-version refresh, and a stepdown's release write. Each costs at most twice the clamp.
 
-        The loop runs its statements in series with the renew, so each one's bound delays the next
-        renew, and the fence watchdog counts that delay; a fence-sized heartbeat could self-fence a
-        leader whose lease statement was fine. A tick that holds the lock over a hung claim lets it go
+        The heartbeat and the refresh no longer run in series with the renew (BACKLOG #5710,
+        :func:`run_maintenance_loop`), but a pass of them that never ended would starve the next one
+        and hold a connection, and a cancelled one would hold up ``stop()``, so they keep the clamp.
+        A tick that holds the lock over a hung claim lets it go
         within twice the clamp. And the clamp bounds a renew from the instant it is issued, which is
         ADR 0157 Inc 0's premise; :func:`_call_within` says what that costs on a busy pool."""
         return await _call_within(self._pool, self._renew_timeout, method, sql, *args)
@@ -1578,9 +1648,10 @@ class DbCoordinator:
         discrete coroutine (the loop's single beat) so a test can advance the heartbeat deterministically
         without racing the loop's sleep.
 
-        The folded flag rides the EXISTING heartbeat UPDATE — zero extra writes. It lags by at most one
-        tick because the loop beats BEFORE :meth:`_maintain_leadership` runs, so a just-acquired/just-lost
-        leadership is reflected on the next beat; that one-tick lag is fine for an observability endpoint
+        The folded flag rides the EXISTING heartbeat UPDATE — zero extra writes. The loop beats just
+        AFTER :meth:`_maintain_leadership` (BACKLOG #5710), so a tick's own acquire or loss is folded
+        in by its beat, and a fence or stepdown between beats by the next one; that lag of up to one
+        tick is fine for an observability endpoint
         (and a clean :meth:`stop` clears the flag immediately, while a crash leaves it stale for the
         freshness filter in :meth:`cluster_members` to discard)."""
         await self._call_tick(
@@ -1593,57 +1664,27 @@ class DbCoordinator:
         )
 
     async def _heartbeat_loop(self) -> None:
-        """The unified per-tick maintenance loop: each ``heartbeat_seconds`` it (1) refreshes
-        ``last_seen`` and (2) maintains leadership (acquire when not leader, liveness-check when
-        leader). A DB error in either is logged and the loop keeps going (a transient blip mustn't kill
-        membership); it exits promptly on stop by waiting on the stop event rather than a bare sleep."""
-        while not self._stop.is_set():
-            try:
-                await self.heartbeat_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                # A heartbeat miss is recoverable (the leader sweep tolerates a late beat within the
-                # node_timeout); log and retry next tick rather than tearing down membership. Include
-                # the redacted exception so a persistent failure (pool closed, auth) is diagnosable;
-                # the message is bounded by the configured interval.
-                log.warning(
-                    "cluster: heartbeat failed for node %s; will retry: %s",
-                    self.node_id,
-                    safe_exc(exc),
-                )
-            try:
-                await self._maintain_leadership()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                # Lease maintenance is best-effort per tick (e.g. a momentary pool hiccup). We do NOT
-                # demote here on a DB error — _last_renew_ok simply isn't advanced, so the fence
-                # watchdog demotes us if the failure persists past the fence timeout. Just log + retry.
-                log.warning(
-                    "cluster: leadership maintenance failed for node %s; will retry: %s",
-                    self.node_id,
-                    safe_exc(exc),
-                )
-            try:
-                # Track B Step 6: refresh the cached cluster-wide config version so the engine's
-                # convergence loop polls it cheaply (config_version_cached) without a DB round-trip. A
-                # stale tick just delays a follower's reload by one interval (harmless), so log + retry.
-                await self.config_version()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                log.warning(
-                    "cluster: config-version refresh failed for node %s; will retry: %s",
-                    self.node_id,
-                    safe_exc(exc),
-                )
-            try:
-                # Wake immediately on stop() instead of sleeping out the full interval — cooperative
-                # cancellation without relying on Task.cancel alone.
-                await asyncio.wait_for(self._stop.wait(), timeout=self._heartbeat_seconds)
-            except TimeoutError:
-                continue  # interval elapsed — beat again
+        """The unified maintenance loop: each ``heartbeat_seconds`` it maintains leadership (acquire
+        when not leader, renew when leader), and beside that refreshes ``last_seen`` and the cached
+        config version. A DB error in any step is logged and the loop keeps going (a transient blip
+        mustn't kill membership); it exits promptly on stop. :func:`run_maintenance_loop` says why
+        the renew runs first and alone (BACKLOG #5710)."""
+        await run_maintenance_loop(
+            stop=self._stop,
+            interval=self._heartbeat_seconds,
+            # Lease maintenance is best-effort per tick (e.g. a momentary pool hiccup). We do NOT
+            # demote on a DB error: _last_renew_ok simply isn't advanced, so the fence watchdog
+            # demotes us if the failure persists past the fence timeout.
+            lease_step=("leadership maintenance", self._maintain_leadership),
+            side_steps=(
+                # A heartbeat miss is recoverable (the freshness filter tolerates a late beat within
+                # node_timeout), and a stale config version just delays a follower's reload by one
+                # interval (Track B Step 6), so both only log and retry.
+                ("heartbeat", self.heartbeat_once),
+                ("config-version refresh", self.config_version),
+            ),
+            node_id=self.node_id,
+        )
 
     # --- leader election: self-fencing lease (Track B Step 4 / Workstream A2) ----
 
