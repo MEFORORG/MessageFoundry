@@ -603,8 +603,8 @@ What counts as expected start-up code, and what each entry leaves open, is in
 
 PHI columns are AES-256-GCM-encrypted at rest when a key is configured (see [PHI.md](PHI.md) §3).
 The key is a base64 32-byte secret. Two ways to supply it. **Under the Windows service, use the
-DPAPI key file.** The engine refuses to start when the store key is in the service's NSSM
-environment.
+DPAPI key file.** `serve` and `supervise` refuse to start when the store key is in the service's
+NSSM environment.
 
 - **DPAPI-protected key file (Windows).** Keep the key in a file that Windows DPAPI binds to *this
   machine*, so a copied file is useless elsewhere and no plaintext key is in the environment:
@@ -635,7 +635,8 @@ environment.
   `encryption_key_file` at it, and run `messagefoundry rotate-key` with the prior key in
   `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` (see [PHI.md](PHI.md) §3). Delete the old file only after
   the rotation, once nothing still needs its key. Set that retired key in the shell that runs
-  `rotate-key`, never in the service's NSSM list: the engine refuses to start with it there. The
+  `rotate-key`, never in the service's NSSM list: `serve` and `supervise` refuse to start with it
+  there. The
   service's first start after a rotation needs no retired key ([PHI.md](PHI.md) §3, BACKLOG #3472).
   **CORRECTED 2026-10-01:** this said `protect-key` locks the file to the minting admin plus SYSTEM
   after writing it, and that a rotation writes the new key "to the file" (vault BACKLOG #2601).
@@ -651,9 +652,8 @@ environment.
   **CORRECTED 2026-10-01:** this read "readable by any local administrator".
 
   **`serve` and `supervise` refuse to start when the store key, or a retired one, is in that
-  list**, or in
-  the service's own `Environment` registry value, whatever `[security].enforcement` says (vault
-  BACKLOG #2595). Move the key to the DPAPI key file above. A retired key belongs in the shell
+  list**, or in the service's own `Environment` registry value, whatever `[security].enforcement`
+  says (vault BACKLOG #2595). Move the key to the DPAPI key file above. A retired key belongs in the shell
   that runs `messagefoundry rotate-key`, not in the service. What the engine reads, what it
   refuses and what it does not cover are in
   [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#store_key_in_service_environment-service_environment_unobservable-and-secret_in_service_environment-secrets-in-the-windows-services-environment).

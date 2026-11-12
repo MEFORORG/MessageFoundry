@@ -18,8 +18,8 @@ key, and the Service Control Manager's own ``Environment`` value on the service'
   ``MEFOR_SECRETS_DIRECTORY`` names (:mod:`messagefoundry.engine_secrets`, ADR 0214), and the
   refusal points there (vault BACKLOG #2595, slice B).
 * **Both refusals are ``serve``'s and ``supervise``'s.** An API app neither of them started, such
-  as one built with ``create_app(engine)``, is not refused and names what they refuse as the
-  loosening ``secret_in_service_environment`` instead.
+  as one built with ``create_app(engine)``, is not refused. Where it finds its service, it names
+  what they refuse as the loosening ``secret_in_service_environment`` instead.
 * **A store key that reaches a Windows service through its environment is named** (key-custody
   slice S2a), wherever it came from, since the machine-wide environment is readable by every
   local user too.

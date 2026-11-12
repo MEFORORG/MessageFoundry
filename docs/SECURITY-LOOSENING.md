@@ -2601,14 +2601,15 @@ count is above `0` (vault BACKLOG #2613).
 - **`secret_in_service_environment`: what `serve` and `supervise` refuse, in an engine neither
   started.** An application that builds the API without them, for example with
   `create_app(engine)`, runs no such refusal and is not refused. It is named, with the refusal's
-  finding and remedy, only where `service_env_refusal` in `messagefoundry/serviceenv.py` would refuse: the
-  engine found its service, which needs NSSM to start a Python interpreter or `messagefoundry.exe`
-  (`_is_engine_launcher`), and either a secret is in that service's lists or the lists could not
-  be read and a store key is in the engine's own environment. A console-script launcher such as
-  `uvicorn.exe` or `hypercorn.exe` between NSSM and the interpreter fails that test, so the
-  reading is `service_environment_unobservable` with no service and this entry is not named. It
-  is reported only in that application's process, at least in `GET /security/posture`. An engine
-  embedded with no API has no posture to name it in. Clear it the way the refusal says.
+  finding and remedy, only where the refusal would fire (`messagefoundry/serviceenv.py`): the
+  engine found its service, the way the bullet *How the engine finds its own service* below
+  says, and either a secret is in that service's lists or the lists could not be read and a
+  store key is in the engine's own environment. A console-script launcher such as `uvicorn.exe`
+  or `hypercorn.exe` between NSSM and the interpreter is neither a Python interpreter nor
+  `messagefoundry.exe`, so the engine does not find its service there and this entry is not
+  named. It is reported only in that application's process, at least in `GET /security/posture`
+  and in the loosenings its audit rows record. An engine embedded with no API has no posture to
+  name it in. Clear it the way the refusal says.
 - **`store_key_in_service_environment`: a store key reaches the service through its
   environment.** It is named wherever the key came from, once the engine knows its service. The
   machine-wide environment is readable by every local user too. Under `serve` and `supervise` a
@@ -2619,13 +2620,14 @@ count is above `0` (vault BACKLOG #2613).
   service, an `nssm.exe` above a process that is not Python, or a registry key it could not read.
   It starts unless the last case applies with a store key in its environment. Check the lists
   yourself.
-- **How the engine finds its own service:** it walks up through the Python interpreter processes
-  above it. When the first other process is `nssm.exe`, it asks the Service Control Manager which
+- **How the engine finds its own service:** it walks up through the Python interpreter and
+  `messagefoundry.exe` processes above it. When the first other process is `nssm.exe`, it asks the Service Control Manager which
   service runs there. When that process is anything else, such as a shell, the engine is not a
   service, unless an `nssm.exe` sits further up. Then it cannot tell a wrapper NSSM starts from a
   shell inside another NSSM service, and names `service_environment_unobservable`.
-- **Where they are reported:** the serve-time loosening warning and `GET /security/posture`, each
-  for the engine's own process. `supervise` logs one WARNING for each entry at start.
+- **Where they are reported:** except `secret_in_service_environment`, whose bullet above says
+  where, the serve-time loosening warning and `GET /security/posture`, each for the engine's own
+  process. `supervise` logs one WARNING for each entry at start.
   `messagefoundry security show` is a separate process, so it reports none of them, and its scope
   line says so. The reading is taken once per process: as `serve` or `supervise` starts, or at
   the first reading an app built without them takes.
