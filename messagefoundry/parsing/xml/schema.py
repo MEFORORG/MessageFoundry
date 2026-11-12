@@ -277,7 +277,9 @@ def _url_path(path: str) -> str:
     ``file:////C:/schemas/main.xsd``, and ``url2pathname`` reads it as ``C:\\schemas\\main.xsd``,
     as it did before BACKLOG #5537; kept, it read as ``\\\\C:\\...``, a UNC path, and was refused.
     On POSIX it is a name like any other, so the path stays a UNC path there and is refused."""
-    authority = urlsplit("file:" + path).netloc
+    # Only a path opening with "/" can carry an authority. Splitting it bare cannot read a drive such
+    # as "C:" as a scheme, since a scheme never opens with "/", and builds no file: URI to do so.
+    authority = urlsplit(path).netloc if path.startswith("/") else ""
     if not authority or (os.name == "nt" and authority[1:2] == ":"):
         return urllib.request.url2pathname(path)
     return unquote(
