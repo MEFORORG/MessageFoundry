@@ -633,6 +633,49 @@ async def test_the_halt_is_latched_so_a_second_event_does_not_restop(store: Mess
     assert len(sink.log_failures) == 1
 
 
+async def test_a_halt_racing_a_reload_stops_the_listeners_that_reload_rebound(
+    store: MessageStore,
+) -> None:
+    # BACKLOG #5704. A reload holding the lock has unbound every listener (its step 1) and is about
+    # to rebind them, and to add a lane. A halt that fires then must stop what the reload leaves
+    # bound, not what was bound when the halt fired. The reload's own rebind gate cannot refuse here:
+    # it refuses only an inbound already in `_log_halted`, and the halt has not yet taken the lock to
+    # put anything there.
+    sink = _RecordingSink()
+    runner, old_source = _graph(store, sink)
+    await runner._reload_lock.acquire()
+    try:
+        runner._sources.pop(INBOUND)  # the reload's step 1: every listener unbound
+        halt = asyncio.ensure_future(
+            runner._respond_to_log_sink_event(
+                LogSinkEvent(
+                    sink="file", stage="unwritable", reason="disk full", stop_requested=True
+                )
+            )
+        )
+        await asyncio.sleep(0)  # the halt runs up to the lock and waits there
+        assert runner._log_write_stopped and not halt.done()
+        # The reload's step 2: the listener comes back up, and the new graph adds an outbound.
+        rebound = _StubSource()
+        runner._sources[INBOUND] = rebound  # type: ignore[assignment]
+        runner.registry.add_outbound(
+            OutboundConnection(
+                OUTBOUND_ADDED, ConnectionSpec(ConnectorType.MLLP, {"host": "h", "port": 2})
+            )
+        )
+    finally:
+        runner._reload_lock.release()
+    await halt
+
+    assert rebound.stopped is True, "the halt left a listener the reload rebound open"
+    assert INBOUND not in runner._sources
+    assert {OUTBOUND, OUTBOUND_ADDED} <= runner._outbound_paused
+    # The count is of the lanes this halt stopped, read once the reload had finished.
+    assert sink.log_failures == [("file", "unwritable", "disk full", 3)]
+    assert sorted(name for name, _ in sink.stopped) == [INBOUND, OUTBOUND, OUTBOUND_ADDED]
+    assert old_source.stopped is False  # the reload, not the halt, unbound the old one
+
+
 async def test_the_escalation_bridges_from_a_worker_thread_onto_the_engine_loop(
     store: MessageStore,
 ) -> None:

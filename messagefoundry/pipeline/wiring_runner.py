@@ -5852,22 +5852,31 @@ class RegistryRunner:
             return  # latched: one halt per break
         self._log_write_stopped = True
         detail = f"application log sink {sink!r} is unwritable ({reason})"
-        inbounds = [name for name in self.registry.inbound if name in self._sources]
-        outbounds = [
-            name
-            for name in self.registry.outbound
-            if self._owns_destination(name) and name not in self._outbound_paused
-        ]
-        # Alert BEFORE stopping, and through the NOTIFIER rather than a log line: the sink this is
-        # about is the one that just broke, so a log line may never land. If the stop itself wedges,
-        # the operator has already been told why the engine is going quiet.
-        self._alert_sink.log_write_failed(
-            sink,
-            stage="unwritable",
-            reason=reason,
-            stopped=len(inbounds) + len(outbounds),
-        )
         async with self._reload_lock:
+            # SNAPSHOT UNDER THE LOCK, never before it (BACKLOG #5704). A reload holding the lock has
+            # unbound every listener at its step 1 and rebinds them at step 2. Its rebind gate,
+            # :meth:`_resume_inbound_processing`, refuses only an inbound already in `_log_halted`,
+            # and nothing is there until :meth:`_halt_inbound_processing` below runs. So a list read
+            # before the lock would miss every listener that reload was rebinding, or adding, and the
+            # halt would leave those bound, ACKing into the lanes it is about to pause. The same holds
+            # for an outbound that reload adds. The latch above is set first, before any await, so the
+            # delivery tier's own gates read it from here on whatever the list holds.
+            inbounds = [name for name in self.registry.inbound if name in self._sources]
+            outbounds = [
+                name
+                for name in self.registry.outbound
+                if self._owns_destination(name) and name not in self._outbound_paused
+            ]
+            # Alert BEFORE stopping, and through the NOTIFIER rather than a log line: the sink this
+            # is about is the one that just broke, so a log line may never land. If the stop itself
+            # wedges, the operator has already been told why the engine is going quiet. After the
+            # lock rather than before it, so the count is of the lanes this halt actually stops.
+            self._alert_sink.log_write_failed(
+                sink,
+                stage="unwritable",
+                reason=reason,
+                stopped=len(inbounds) + len(outbounds),
+            )
             # THE INTERNAL STAGES FIRST, and they are not an afterthought — they are the half that
             # makes this an enforcement. See :meth:`_halt_inbound_processing`.
             #
