@@ -6995,10 +6995,12 @@ def verify_audit_rows(
     a Transit round trip, so K walks would cost K times N of them. Keyed on ``seq``, the chain's own
     coordinate, never on the row id, which can skip numbers.
 
-    **Constant-time, full-walk (ASVS 11.2.4)**: a row MAC recomputed under an in-heap key, or by a
-    plain MAC provider that does not check a stored MAC itself (such as a Transit ``generate_hmac``
-    callable, which computes it in the vault), is compared with the stored one in the engine by
-    :func:`hmac.compare_digest` over :func:`audit_mac_bytes`. Under ``vault_transit`` the compare of
+    **Constant-time, full-walk (ASVS 11.2.4)**: a keyless SHA-256 row hash, a row MAC recomputed
+    under an in-heap key, and one from a plain :data:`AuditMacFn` that does not check a stored MAC
+    itself are compared with the stored hash in the engine by :func:`hmac.compare_digest` over
+    :func:`audit_mac_bytes`. A plain provider may compute its MAC outside the engine; the shipped
+    ``vault_transit`` cipher passes an :class:`~messagefoundry.store.crypto.AuditMacVerifier`
+    instead (``TransitCipher.audit_mac_fn``). Under ``vault_transit`` the compare of
     a row MAC is Transit's own ``verify`` call, made inside Vault (:func:`_audit_row_mac`); the
     ``compare_digest`` the walk still runs there sets the stored hash beside itself, or beside
     ``None`` when Transit did not verify it, and decides nothing. The walk always runs to
@@ -18486,8 +18488,8 @@ class MessageStore:
         chains cleanly. Pass ``expected_anchor`` (a ``(count, head_hash)`` previously returned by
         :meth:`audit_anchor` and held out-of-band) to also detect that tail-truncation (review low-1).
 
-        **Constant-time, full-walk (ASVS 11.2.4).** A row MAC recomputed under an in-heap key or by a
-        plain MAC provider is compared with the stored one by :func:`hmac.compare_digest` over
+        **Constant-time, full-walk (ASVS 11.2.4).** A keyless row hash, and a row MAC recomputed
+        under an in-heap key or by a plain MAC provider, are compared with the stored hash by :func:`hmac.compare_digest` over
         :func:`audit_mac_bytes`, as :func:`verify_audit_rows` says (never ``!=``, which short-circuits on
         the first differing byte and leaks a forged digest's shared-prefix length), and the walk ALWAYS
         runs to completion — the first divergent row id is recorded and reported *after* the walk, so
