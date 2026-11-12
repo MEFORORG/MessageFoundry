@@ -453,7 +453,10 @@ def missing_service_config_refusal(
 
 def service_env_loosenings(posture: ServiceEnvPosture) -> list[tuple[str, str]]:
     """The ``(name, plain-language risk)`` entries for ``posture``. One place for the wording, so
-    ``security_loosenings()`` and the ``supervise`` start-up lines cannot say different things."""
+    ``security_loosenings()`` and the ``supervise`` start-up lines cannot say different things.
+
+    A caller that refuses on :func:`service_env_refusal` checks it first, as ``serve`` and
+    ``supervise`` do, so ``secret_in_service_environment`` reaches only a caller that does not."""
     out: list[tuple[str, str]] = []
     if posture.status is ServiceEnvStatus.UNOBSERVABLE:
         out.append(
@@ -487,8 +490,7 @@ def service_env_loosenings(posture: ServiceEnvPosture) -> list[tuple[str, str]]:
         out.append(
             (
                 "secret_in_service_environment",
-                f"{refused}. `serve` and `supervise` refuse to start on this; this engine was "
-                "started by neither, so nothing refused it",
+                f"{refused}. `serve` and `supervise` refuse to start on this",
             )
         )
     return out

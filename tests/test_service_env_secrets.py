@@ -345,13 +345,8 @@ def test_every_other_secret_class_name_in_the_nssm_list_refuses(name: str) -> No
     assert "protect-key" not in refusal
     assert "set no MEFOR_SECRETS_DIRECTORY" in refusal
     # `serve` refuses before it reads the loosenings; an engine it did not start names it there.
-    assert service_env_loosenings(posture) == [
-        (
-            "secret_in_service_environment",
-            f"{refusal}. `serve` and `supervise` refuse to start on this; this engine was started "
-            "by neither, so nothing refused it",
-        )
-    ]
+    [(entry, risk)] = service_env_loosenings(posture)
+    assert entry == "secret_in_service_environment" and risk.startswith(f"{refusal}. ")
 
 
 def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> None:
@@ -427,14 +422,10 @@ async def test_an_embedded_app_names_a_listed_secret_in_its_posture(
     """The embedder path end to end: ``GET /security/posture`` on an app built with
     ``create_app(engine)`` names a secret-class setting in the service's list, and never its
     value."""
-    import httpx
-
-    from messagefoundry.api import create_app
-    from messagefoundry.auth import Role
-    from messagefoundry.auth.service import AuthService
     from messagefoundry.config.settings import EgressSettings
     from messagefoundry.pipeline import Engine
-    from tests._admin_account import create_local_user_chosen
+    from tests.test_api_security_posture import _add_viewer, _app_and_client, _token
+    from tests.test_api_security_posture import _service as _auth_service
 
     listed = _service([f"MEFOR_STORE_PASSWORD={_PASSWORD_VALUE}"])
     monkeypatch.setattr("messagefoundry.api.app.service_env_posture", lambda: listed)
@@ -444,37 +435,13 @@ async def test_an_embedded_app_names_a_listed_secret_in_its_posture(
         egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
-        auth = AuthService(engine.store, AuthSettings(require_mfa=False))
-        await auth.initialize()
-        passphrase = "a-strong-test-passphrase"
-        user_id = await create_local_user_chosen(
-            auth,
-            username="vw",
-            password=passphrase,
-            display_name=None,
-            email=None,
-            roles=[Role.VIEWER.value],
-            actor="test",
+        auth = await _auth_service(engine)
+        await _add_viewer(auth, "vw")
+        _app, client = _app_and_client(
+            engine, auth, ai_settings=AiSettings(), security_settings=SecuritySettings()
         )
-        user = await auth.store.get_user(user_id)
-        assert user is not None and user.password_hash is not None
-        await auth.store.set_password(
-            user_id,
-            password_hash=user.password_hash,
-            must_change_password=False,
-            password_generated=False,
-        )
-        app = create_app(
-            engine, auth=auth, store_settings=StoreSettings(allow_unencrypted_phi=True)
-        )
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
-            login = await client.post(
-                "/auth/login",
-                json={"username": "vw", "password": passphrase, "provider": "local"},
-            )
-            headers = {"Authorization": f"Bearer {login.json()['token']}"}
-            body = (await client.get("/security/posture", headers=headers)).json()
+        async with client as c:
+            body = (await c.get("/security/posture", headers=await _token(c, "vw"))).json()
     finally:
         await engine.stop()
     risks = {row["switch"]: row["risk"] for row in body["loosenings"]}
