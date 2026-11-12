@@ -7663,8 +7663,10 @@ while the store opens, before it reads a row.
 
 **A check stopped part way stays exit 1, deliberately.** Under
 `cipher_provider = "vault_transit"` each row goes to Transit for its MAC. So a row's own content can
-make Transit refuse, for example a row too large for one request. A row the driver cannot read does
-the same. A code that read as "not checked" would let a writer plant such a row and hide every
+make Transit refuse in a way the walk cannot tell from an outage, for example a row too large for
+one request whose refusal reaches the engine as a dropped connection rather than as Vault's HTTP
+413 (a 413 reads as a break at that row; see the planted-version paragraph below). A row the driver
+cannot read does the same. A code that read as "not checked" would let a writer plant such a row and hide every
 break. The walk reports a break only when it finishes, so a break it had already met is lost too.
 The cause's class on the `FAIL` line is a hint, not a diagnosis: a refused row can also surface as
 a connection error. The open reads some of the chain's rows too, such as row 1 and the newest row.
@@ -8053,10 +8055,10 @@ walk checks every row the same way, so a rotation does not read as a chain break
 hold. Transit refuses it with HTTP 400 while it still answers under the latest version. The walk
 then reports a break at that row and keeps going. `audit-verify` names the row and exits 1. With
 `[integrity].audit_verify_on_start` on, the startup check also raises its `audit-chain` alert.
-So is a row whose own request Transit refuses while a verify over fixed input still succeeds,
-such as a row too large for one request (`TransitCipher._refuses_only_this_row`). Other failures
-still stop the walk as a check that could not run. Those include at least an outage and a dropped
-connection.
+So is a row whose own verify fails twice, with a failure that is not an outage, while a verify
+over fixed input between the two succeeds, such as a row Vault answers with HTTP 413 past
+`max_request_size` (`TransitCipher._recheck_refused_row`). Other failures still stop the walk as a
+check that could not run. Those include at least an outage and a dropped connection.
 
 **Retiring an old version of the audit key breaks the chain.** Transit's verify also refuses a
 version below the key's `min_decryption_version`, or one trimmed away. Every audit row sealed under

@@ -563,6 +563,27 @@ def test_a_verify_reply_of_an_unexpected_shape_is_a_plain_cipher_error() -> None
     assert not isinstance(caught.value, AuditKeyVersionRefusedError)
 
 
+@pytest.mark.parametrize(
+    "reply", [{"data": {}}, {}, None, "not a mapping"], ids=["no-valid", "no-data", "none", "text"]
+)
+def test_a_verify_reply_with_no_valid_is_a_plain_cipher_error(reply: Any) -> None:
+    """A reply that carries no ``valid`` at all is a check that could not run, never a break:
+    the reply's shape is read once the call returned, not classified as a failed call."""
+    from messagefoundry.store.crypto import AuditKeyVersionRefusedError
+    from messagefoundry.store.crypto_transit import TransitCipher
+    from tests.test_crypto_transit import _FakeClient
+
+    class _Transit(_FakeTransit):
+        def verify_signed_data(self, **_kw: Any) -> Any:
+            return reply
+
+    cipher = TransitCipher(_FakeClient(_Transit()), _KEY_NAME)
+    with pytest.raises(CipherError) as caught:
+        cipher.verify_audit_hmac(b"row", cipher.audit_hmac(b"row"))
+    assert not isinstance(caught.value, AuditKeyVersionRefusedError)
+    assert "unexpected shape" in str(caught.value)
+
+
 #: A Transit key version the fake does not hold, as a DML writer would plant it.
 _UNHELD_VERSION = 9999999
 #: Well-formed, so it reaches Transit; a malformed one is a break with no Transit call at all.
@@ -733,8 +754,8 @@ async def test_a_transit_outage_on_the_startup_walk_still_could_not_run(
 async def test_a_transient_failure_of_the_verify_call_is_not_a_planted_version(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A dropped connection on the verify call, while the latest version still answers, must not
-    read as a refused key version. Only Transit's 400 for the version is that; anything else is a
+    """A failure on every verify call, the fixed-input probe's included, while the latest version
+    still answers its ``hmac``, must not read as a refused key version or as the row's: it is a
     check that could not run, so a clean row is never reported as tampered."""
     transit = _RotatingTransit()
     _use_fake(monkeypatch, transit)
@@ -805,11 +826,16 @@ async def test_a_row_transit_refuses_for_its_size_is_a_chain_break_on_the_startu
     assert not any("could not run" in line for line in lines), lines
 
 
-def _hvac_error(name: str) -> type[Exception]:
+def _service_error(name: str) -> Exception:
+    """An instance of the hvac or requests error class ``name`` names."""
+    import requests
     from hvac import exceptions  # type: ignore[import-untyped]
 
-    error: type[Exception] = getattr(exceptions, name)
-    return error
+    if name.startswith("requests."):
+        error: type[Exception] = getattr(requests.exceptions, name.removeprefix("requests."))
+    else:
+        error = getattr(exceptions, name)
+    return error("the service failed")
 
 
 @pytest.mark.parametrize(
@@ -819,6 +845,8 @@ def _hvac_error(name: str) -> type[Exception]:
         pytest.param("InternalServerError", False, id="500"),
         pytest.param("BadGateway", False, id="502"),
         pytest.param("VaultDown", False, id="503"),
+        pytest.param("requests.ConnectionError", False, id="dropped-connection"),
+        pytest.param("requests.ReadTimeout", False, id="timeout"),
         pytest.param("UnexpectedError", True, id="504-gateway-down"),
     ],
 )
@@ -829,31 +857,68 @@ async def test_a_service_failure_of_the_verify_call_still_could_not_run(
     error: str,
     probe_fails: bool,
 ) -> None:
-    """A 429 or a 5xx on a row's verify is the service, not the row: the walk could not run, and
-    no tamper alert fires. An outage status is never probed, so these fail only the rows' own
-    calls; a status hvac does not name (a 504) is read as the service only when a verify over fixed
-    input fails too, as it does while the gateway is down."""
+    """A failure on a row's verify that :func:`is_vault_unavailable` reads as an outage (at least
+    a 429, 500, 502 or 503, a dropped connection and a timeout) is the service, not the row: the
+    walk could not run, and no tamper alert fires. Those are never probed, so here they fail only
+    the rows' own calls. A status hvac does not name, a 504 among them, is read as the service
+    when a verify over fixed input fails too, as it does while the gateway is down."""
     _needs_hvac()
     from messagefoundry.store.crypto_transit import _VERSION_PROBE_INPUT
 
     transit = _RotatingTransit()
     _use_fake(monkeypatch, transit)
     store = await _transit_store(tmp_path / "service.db")
-    await store.record_audit("test.clean", actor="cli:tester")
-    real_verify = transit.verify_signed_data
-
-    def failing(*, hash_input: str, **kw: Any) -> dict[str, Any]:
-        if hash_input == _VERSION_PROBE_INPUT and not probe_fails:
-            return real_verify(hash_input=hash_input, **kw)
-        raise _hvac_error(error)("the service failed")
-
-    monkeypatch.setattr(transit, "verify_signed_data", failing)
     try:
+        await store.record_audit("test.clean", actor="cli:tester")
+        real_verify = transit.verify_signed_data
+
+        def failing(*, hash_input: str, **kw: Any) -> dict[str, Any]:
+            if hash_input == _VERSION_PROBE_INPUT and not probe_fails:
+                return real_verify(hash_input=hash_input, **kw)
+            raise _service_error(error)
+
+        monkeypatch.setattr(transit, "verify_signed_data", failing)
         sink, lines = await _walk_on_start(store, caplog)
     finally:
         await store.close()
     assert sink.events == []
     assert any("could not run" in line for line in lines), lines
+
+
+async def test_a_verify_failure_that_clears_on_the_second_ask_is_not_a_break(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failure hvac does not name (a 504, say) on one row's verify, gone by the time the
+    fixed-input probe and the second ask run, reads as Transit's answer to that second ask: a clean
+    row stays clean, and no tamper alert fires (BACKLOG #2720)."""
+    _needs_hvac()
+    from hvac.exceptions import UnexpectedError
+
+    from messagefoundry.store.crypto_transit import _VERSION_PROBE_INPUT
+
+    transit = _RotatingTransit()
+    _use_fake(monkeypatch, transit)
+    store = await _transit_store(tmp_path / "cleared.db")
+    try:
+        await store.record_audit("test.clean", actor="cli:tester")
+        real_verify = transit.verify_signed_data
+        failed: list[str] = []
+
+        def once(*, hash_input: str, **kw: Any) -> dict[str, Any]:
+            if hash_input != _VERSION_PROBE_INPUT and not failed:
+                failed.append(hash_input)
+                raise UnexpectedError("gateway timeout")
+            return real_verify(hash_input=hash_input, **kw)
+
+        monkeypatch.setattr(transit, "verify_signed_data", once)
+        ok, msg = await store.verify_audit_chain()
+        sink, lines = await _walk_on_start(store, caplog)
+    finally:
+        await store.close()
+    assert failed, "the fake never failed a row's verify"
+    assert ok, msg
+    assert sink.events == []
+    assert not any("could not run" in line for line in lines), lines
 
 
 #: Vault's own text for an audit-MAC call refused for its version, as hvac carries it.

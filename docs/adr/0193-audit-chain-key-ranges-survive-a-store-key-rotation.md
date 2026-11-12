@@ -555,11 +555,14 @@ All against an in-process fake Transit client with key versions, never a real se
    "a pinned call" now reads as this verify call), so it
    raises `AuditKeyVersionRefusedError` or `AuditKeyVersionUnverifiedError` and is a break at that
    row with the alert, or a plain `CipherError`, and the walk could not run. A failure of the
-   verify call that is neither of those is a break at that row when `_refuses_only_this_row`
-   reads it as Transit refusing the row's own request: not an outage `is_vault_unavailable`
-   names, while a `generate_hmac` and a verify over fixed input succeed. A planted row past
-   `max_request_size` (HTTP 413) is one such case (BACKLOG #2720). Transit's `valid: false` is a
-   break. A `valid` that is not a bool is a `CipherError`.
+   verify call that is neither a refused version nor an outage `is_vault_unavailable` names is
+   checked by `_recheck_refused_row` once the handler has let go of it (BACKLOG #2720): a
+   `generate_hmac` and a verify over fixed input must succeed, and then the row's own verify is
+   asked once more. A second failure that is not an outage is a break at that row; an answer is
+   read as usual. A planted row past `max_request_size` (HTTP 413) is one such case. So, while
+   the fixed input verifies, are the 400 bodies the 2026-10-27 amendment's item 3 lists as a plain
+   `CipherError`; this item replaces that reading for them. Transit's `valid: false` is a break.
+   A reply with no bool `valid` is a `CipherError`.
 5. **A range row's handover tag is not moved.** `_audit_tag_ok` still regenerates the tag under
    the outgoing key and compares it.
 6. **The in-process key paths are unchanged.** A plain MAC provider, an in-heap key and the keyless
