@@ -12370,14 +12370,20 @@ class RegistryRunner:
             # Counted, because reaching this line means SOME path armed an unpaused lane while the
             # halt held — the missing-door signal the latch cannot get by enumeration. See
             # :attr:`halted_claim_gate_hits` for why a small count at the halt is expected and a
-            # climbing one is not.
+            # climbing one is not. Only here, above the pacing wait: a halt that lands during the
+            # wait is the documented pause lag, not a door.
             self._halted_claim_gate_hits += 1
-            park_until = time.time() + _WORKER_ERROR_BACKOFF_SECONDS
-            await self.store.reschedule_claimed([item.id], park_until)
+        # BACKLOG #5709: the operator pause too, not only the halt, before the pacing wait and again
+        # after it, as the per_lane worker asks per item (#2771). A pause that lands while this lane's
+        # head is in flight sets pause_pending on the dispatcher, but the head itself is past every
+        # dispatcher gate, so without these the head would still be sent.
+        if (park_until := await self._hand_back_unsent(lane, [item.id])) is not None:
             return LaneItemResult(LaneResultKind.RETRY, park_until)
         # BACKLOG #82: pace this lane's egress BEFORE the send seam (mirrors the per_lane worker) so one
         # hook covers the single-message AND batch bodies in the POOLED claim mode too.
         await self._pace_outbound(lane)
+        if (park_until := await self._hand_back_unsent(lane, [item.id])) is not None:
+            return LaneItemResult(LaneResultKind.RETRY, park_until)
         # #134 (ADR 0082): batch inside the pooled claim (decision #5) — the dispatcher claims one head
         # per lane as always; a batching lane's delivery body coalesces its own tail (claim_next_fifo)
         # into one BHS…BTS envelope, so per_lane and pooled share the exact batch body with NO change to
@@ -12386,6 +12392,28 @@ class RegistryRunner:
         if batch_cfg is not None:
             return _to_lane_result(await self._process_delivery_batch(lane, item, batch_cfg))
         return _to_lane_result(await self._process_delivery_item(lane, item))
+
+    async def _hand_back_unsent(self, name: str, ids: list[str]) -> float | None:
+        """Hand claimed, unsent OUTBOUND rows back when :meth:`_lane_may_deliver` refuses ``name``,
+        and return the park deadline; ``None``, writing nothing, when the lane may deliver.
+
+        The #122 halt (ADR 0189) RESCHEDULES them to the deadline, for the reason
+        :meth:`_dispatch_delivery` gives: the head is then not due, so the sweep does not re-ready
+        it about four times a second while the disk stays broken. An operator pause RELEASES them
+        with their due time kept, as the per_lane worker's per-item gate does (#2771), so a resume
+        claims the head at once. Neither spends an attempt, and both keep ``seq``.
+
+        The deadline is a park for the pooled dispatcher only. A paused lane has ``pause_pending``
+        set there and goes to PAUSED at its terminal transition, ignoring it. The per_lane worker
+        reads only the outcome and reaches its loop-top gates next."""
+        if self._lane_may_deliver(name):
+            return None
+        park_until = time.time() + _WORKER_ERROR_BACKOFF_SECONDS
+        if self._delivery_halted:
+            await self.store.reschedule_claimed(ids, park_until)
+        else:
+            await self.store.release_claimed(ids)
+        return park_until
 
     async def _dispatch_response(self, lane: str, item: OutboxItem) -> LaneItemResult:
         return _to_lane_result(await self._process_response_item(lane, item))

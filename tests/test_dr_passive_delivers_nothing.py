@@ -435,7 +435,11 @@ async def test_an_activation_on_a_shard_that_does_not_own_a_lane_leaves_it_alone
 async def test_a_release_charges_no_attempt_to_a_row_its_lane_had_claimed(tmp_path: Path) -> None:
     """A paced lane holds a claimed row while it waits out its interval. Red before the repair:
     the release closed the connector under it, and the row was charged a failed attempt for a
-    park. The release now waits for the lane to go idle first."""
+    park. The release now waits for the lane to go idle first.
+
+    The row is not sent either (BACKLOG #5709). The flip to passive parks the lane through the same
+    outbound stop an operator's pause takes, and the pooled seam asks that pause again after the
+    pacing wait, so the row goes back pending, unsent, with its attempt given back."""
     store = await MessageStore.open(tmp_path / "paced.db")
     runner = RegistryRunner(
         _one_outbound_graph(tmp_path, send_min_interval_seconds=0.6),
@@ -465,7 +469,8 @@ async def test_a_release_charges_no_attempt_to_a_row_its_lane_had_claimed(tmp_pa
         await runner.close_passive_connectors()
         await asyncio.sleep(1.0)  # past the interval, so the claimed row has resolved
         (second,) = await store.outbox_for(ids[1])
-        assert (second["status"], second["last_error"]) == ("done", None)  # sent, never failed
+        # Handed back unsent, never failed: no egress from a lane parked passive.
+        assert (second["status"], second["last_error"], second["attempts"]) == ("pending", None, 0)
     finally:
         await runner.stop()
         await store.close()
