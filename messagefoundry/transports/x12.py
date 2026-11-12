@@ -55,6 +55,7 @@ from messagefoundry.transports.base import (
     InboundHandler,
     NegativeAckError,
     SourceConnector,
+    closed_connector_error,
     encode_wire_body,
     float_setting,
     owes_hl7_reply,
@@ -244,6 +245,9 @@ class X12Destination(DestinationConnector):
         # Fail-loud serial-send guard (no lock — a lock would mask the invariant violation).
         self._sending = False
         self._closed = False
+        # The connect-per-send socket in flight, so aclose() can close it under the send as it closes
+        # the persistent one (BACKLOG #5718). None between sends and on the persistent path.
+        self._inflight: asyncio.StreamWriter | None = None
         #: Reconnects observed (stale-detect, post-error discard, desync guard) — log-only.
         self.reconnects: int = 0
         # #200 (ADR 0092): X12-over-TCP has NO TLS at all, so every off-loopback egress is a cleartext
@@ -275,16 +279,25 @@ class X12Destination(DestinationConnector):
                 "X12Destination.send() called concurrently on one instance — the delivery worker "
                 "must be the lane's single serial sender (per-lane FIFO invariant, ADR 0067)"
             )
+        # A send that reaches a connector aclose() already closed (a reload swapped it out) retries on
+        # the replacement. Checked before the hop guard, so a stale guard on a replaced connector never
+        # stops a lane its replacement would deliver on (BACKLOG #5718).
+        if self._closed:
+            raise self._closed_error()
         self._sending = True
         try:
             # Zero-I/O byte-crossing backstop (#200) before the first byte (defense in depth against a
-            # reload routing PHI around the construction gate).
-            self._hop_guard.assert_send()
+            # reload routing PHI around the construction gate). A refusal is a lane-stopping
+            # configuration fault, never an internal error (BACKLOG #5718).
+            self._hop_guard.assert_delivery(connector="X12")
             if not self.persistent:
                 return await self._send_once(payload)
             return await self._send_persistent(payload)
         finally:
             self._sending = False
+
+    def _closed_error(self, *, written: bool = False) -> DeliveryError:
+        return closed_connector_error("X12", self.host, self.port, written=written)
 
     async def _dial(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         """One connection attempt — a charged :class:`DeliveryError` on failure. Exactly one dial per
@@ -297,12 +310,20 @@ class X12Destination(DestinationConnector):
             raise DeliveryError(f"X12 connect to {self.host}:{self.port} failed: {exc}") from exc
 
     async def _send_once(self, payload: str) -> DeliveryResponse | None:
-        """Connect-per-send (``persistent=false``) — byte-identical wire behavior to the pre-#97 code,
-        with the close now bounded (#55) and the fail-loud serial-``send()`` assert in :meth:`send`.
-        Reads the returned interchange when capturing it, when a TA1 is contractually required, or for
-        the legacy ``expect_reply`` confirmation; fire-and-forget (none set) is byte-identical."""
+        """Connect-per-send (``persistent=false``) — the pre-#97 wire behavior, with the close now
+        bounded (#55) and the fail-loud serial-``send()`` assert in :meth:`send`. Reads the returned
+        interchange when capturing it, when a TA1 is contractually required, or for the legacy
+        ``expect_reply`` confirmation; fire-and-forget (none set) writes the same bytes. Since BACKLOG
+        #5718 a reload's ``aclose()`` closes this socket too: a send it cuts after the write fails
+        as a retryable, indeterminate delivery, and the retry on the replacement may deliver the
+        interchange twice, as on the persistent path."""
         need_reply = self.expect_reply or self.capture_response or self.ta1_required
         reader, writer = await self._dial()
+        if self._closed:
+            # aclose() ran during the dial, so it could not see this socket (BACKLOG #5718).
+            await self._close_bounded(writer)
+            raise self._closed_error()
+        self._inflight = writer
         try:
             # verbatim — the interchange is the frame. encode_wire_body, not a bare .encode(): a
             # UnicodeEncodeError is a ValueError, so the `except (TimeoutError, OSError)` below would
@@ -318,10 +339,15 @@ class X12Destination(DestinationConnector):
                     if self.capture_response:
                         return response
         except TimeoutError as exc:
+            if self._closed:
+                raise self._closed_error(written=True) from exc
             raise DeliveryError("X12 timed out") from exc
         except OSError as exc:
+            if self._closed:
+                raise self._closed_error(written=True) from exc
             raise DeliveryError(f"X12 I/O error: {exc}") from exc
         finally:
+            self._inflight = None
             await self._close_bounded(writer)
         return None
 
@@ -332,11 +358,6 @@ class X12Destination(DestinationConnector):
         business 271/277/278) reply is a **complete transaction on a healthy transport**, so the
         connection stays cached and a TA1*R :class:`NegativeAckError` does NOT discard it (mirrors
         MLLP's NAK-keeps-connection, AC-10)."""
-        if self._closed:
-            raise DeliveryError(
-                f"X12 destination {self.host}:{self.port} is closed (stop/reload); "
-                "delivery retries on the replacement connector"
-            )
         need_reply = self.expect_reply or self.capture_response or self.ta1_required
         conn = self._conn
         if conn is not None:
@@ -353,7 +374,15 @@ class X12Destination(DestinationConnector):
                 await self._close_bounded(conn[1])
                 conn = None
         if conn is None:
+            # aclose() may run during the stale socket's close above or during the dial below, and it
+            # cannot see a socket that is not cached yet. Without these checks the send would cache
+            # the new socket and deliver on the replaced connector (BACKLOG #5718).
+            if self._closed:
+                raise self._closed_error()
             conn = await self._dial()
+            if self._closed:
+                await self._close_bounded(conn[1])
+                raise self._closed_error()
             self._established_at = time.monotonic()
         reader, writer = conn
         # Keep the in-flight connection visible so a concurrent aclose() (the reload race) closes it
@@ -466,6 +495,15 @@ class X12Destination(DestinationConnector):
         while True:
             chunk = await reader.read(4096)
             if not chunk:
+                if self._closed:
+                    # aclose() closed the socket under the read, which then reads as the PEER
+                    # closing, so name the engine's own close and spare the partner the blame. The
+                    # read follows a completed write, so delivery is indeterminate. Decided here,
+                    # at the end of stream, so a fault in a reply the partner sent, such as one
+                    # over the size cap, keeps its own error even when the failing read drained
+                    # the stream to the close's end (BACKLOG #5718). A partner close that a reload
+                    # races can still read as the engine's; both retry.
+                    raise self._closed_error(written=True)
                 raise DeliveryError("X12 peer closed before returning an interchange")
             try:
                 for interchange in decoder.feed(chunk):
@@ -647,14 +685,18 @@ class X12Destination(DestinationConnector):
             pass
 
     async def aclose(self) -> None:
-        """Close the cached persistent connection (engine stop / reload swap — the runner calls this for
-        every replaced/removed connector). Idempotent; bounded; safe concurrently with an in-flight send
-        (closing the socket under it makes that send fail loud → charged → retried)."""
+        """Close the cached persistent connection and any connect-per-send socket in flight (engine
+        stop / reload swap — the runner calls this for every replaced/removed connector). Idempotent;
+        bounded; safe concurrently with an in-flight send: closing the socket under it makes that send
+        fail loud, charged and then retried, on either path since BACKLOG #5718."""
         self._closed = True
         conn = self._conn
         self._conn = None
         if conn is not None:
             await self._close_bounded(conn[1])
+        inflight = self._inflight
+        if inflight is not None:
+            await self._close_bounded(inflight)
 
 
 # --- source ------------------------------------------------------------------
