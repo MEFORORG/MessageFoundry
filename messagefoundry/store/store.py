@@ -4940,8 +4940,9 @@ class AdMap:
     ``name`` is the map (:data:`AD_MAPS`). ``pairs`` are sorted ``(ad_group, value)``, the value
     being a role id or a channel; the seal covers them and the name. ``missing`` names mapped role
     ids with no ``roles`` row when the role map was read. It is not sealed: it is read beside the
-    map so a deleted role is never handed out, on SQL Server especially, where the role map has no
-    role foreign key. The channel map's ``missing`` is always empty."""
+    map so a deleted role is never handed out, on SQL Server especially, where the role map's
+    foreign key is ``WITH NOCHECK`` and compares in the database collation, so the read matches a
+    role id exactly (BACKLOG #5725). The channel map's ``missing`` is always empty."""
 
     name: str
     pairs: tuple[tuple[str, str], ...] = ()
@@ -4962,7 +4963,9 @@ class AdMap:
     def from_entries(cls, name: str, entries: Iterable[tuple[str, str]]) -> AdMap:
         """The map an administrator's entries describe, as the map stores them: group names as
         :func:`ad_group_keys` keeps them. A channel is stripped and a blank one dropped; a role id
-        is kept as given, and an unknown one is refused by the roles foreign key."""
+        is kept as given, and an unknown one is refused at the write: by the roles foreign key on
+        SQLite and Postgres, and on SQL Server, whose case-insensitive collation that key cannot
+        rely on, by :func:`existing_role_pairs_only` before the key (BACKLOG #5725)."""
         if name == AD_SCOPE_MAP:
             entries = [(g, v.strip()) for g, v in entries if v.strip()]
         return cls.of(name, ((g.strip().lower(), v) for g, v in entries if g.strip()))
@@ -5068,6 +5071,40 @@ def _ad_map_if_changed(current: AdMap, new: AdMap) -> AdMap | None:
     if new.pairs == current.pairs and new.seal == current.seal:
         return None
     return new
+
+
+def existing_role_pairs_only(
+    current: AdMap, change: AdMapChange, present: Iterable[str]
+) -> AdMapChange:
+    """``change`` to the role map with every role id that has no ``roles`` row handled, given the
+    ids that have one, compared EXACTLY (BACKLOG #5725). The role map's twin of
+    :func:`existing_roles_only`: a backend whose role foreign key cannot refuse every such id calls
+    it inside its ``_write_ad_map`` transaction, before the write seals anything.
+
+    A pair the write ADDS whose role id is not in ``present`` raises :class:`UnknownRoleError`, so
+    neither a deleted role's id nor a case or trailing-space variant of a live one is ever sealed
+    in. A pair ``current`` already held is dropped instead: a row its deleted role left behind,
+    which grants nothing, and which an edit such as a role delete must not be refused over."""
+    held = frozenset(present)
+
+    def checked(new: AdMap) -> AdMap:
+        added = sorted(
+            {pair[1] for pair in new.pairs if pair[1] not in held and pair not in current.pairs}
+        )
+        if added:
+            raise UnknownRoleError(added)
+        kept = tuple(pair for pair in new.pairs if pair[1] in held)
+        if len(kept) == len(new.pairs):
+            return new
+        log.warning(
+            "an AD role map write dropped %d pair(s) whose role no longer exists (BACKLOG #5725)",
+            len(new.pairs) - len(kept),
+        )
+        return replace(new, pairs=kept)
+
+    if isinstance(change, AdMap):
+        return checked(change)
+    return lambda m: checked(change(m))
 
 
 class AdMapSql(NamedTuple):

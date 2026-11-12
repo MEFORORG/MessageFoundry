@@ -343,6 +343,7 @@ from messagefoundry.store.store import (
     enrolment_code_spend,
     escalation_passkeys,
     escalation_verdict,
+    existing_role_pairs_only,
     existing_roles_only,
     federated_bind,
     federated_unbind,
@@ -908,7 +909,12 @@ _MSSQL_AD_MAP_SQL: Final[Mapping[str, AdMapSql]] = MappingProxyType(
                 " UNION ALL"
                 " SELECT N'pair' AS k, m.ad_group AS a, m.role_id AS b,"
                 " CASE WHEN r.id IS NULL THEN 0 ELSE 1 END AS live"
-                " FROM ad_group_role_map m LEFT JOIN roles r ON r.id = m.role_id"
+                # BACKLOG #5725: a pair is live only on an EXACT role id. The binary collation
+                # refuses a case variant; equal DATALENGTH refuses a trailing-space variant, which
+                # every SQL Server = comparison pads away, binary ones too.
+                " FROM ad_group_role_map m LEFT JOIN roles r"
+                " ON r.id = m.role_id COLLATE Latin1_General_100_BIN2"
+                " AND DATALENGTH(r.id) = DATALENGTH(m.role_id)"
             ),
             pairs="SELECT ad_group, role_id FROM ad_group_role_map",
             clear="DELETE FROM ad_group_role_map",
@@ -2758,6 +2764,17 @@ _SCHEMA: list[str] = [
         -- 2 x (512 + 64) bytes, is past a clustered key's 900 and inside a nonclustered one's 1700.
         ad_group NVARCHAR(512) NOT NULL, role_id NVARCHAR(64) NOT NULL,
         CONSTRAINT pk_ad_group_role_map PRIMARY KEY NONCLUSTERED (ad_group, role_id))""",
+    # BACKLOG #5725: the role foreign key SQLite and Postgres declare on this map, so a map write
+    # that commits while its custom role is deleted fails one of the two writes. It compares in the
+    # database collation, so on a case-insensitive database it would take a case variant of a live
+    # id: _write_ad_map refuses those exactly first, and the map read matches exactly. WITH NOCHECK
+    # as fk_user_roles_role is, and the writer drops a left-behind pair.
+    """IF OBJECT_ID('fk_ad_group_role_map_role','F') IS NULL
+        ALTER TABLE ad_group_role_map WITH NOCHECK
+            ADD CONSTRAINT fk_ad_group_role_map_role FOREIGN KEY (role_id) REFERENCES roles(id)""",
+    # The key's check on a role delete seeks this index; the primary key leads with ad_group.
+    """IF INDEXPROPERTY(OBJECT_ID('ad_group_role_map'),'ix_ad_group_role_map_role','IndexID') IS NULL
+        CREATE INDEX ix_ad_group_role_map_role ON ad_group_role_map(role_id)""",
     """IF OBJECT_ID('ad_group_scope_map','U') IS NULL CREATE TABLE ad_group_scope_map (
         -- BACKLOG #3187: NONCLUSTERED for the same reason; this key is 2 x (512 + 256) bytes.
         ad_group NVARCHAR(512) NOT NULL, channel NVARCHAR(256) NOT NULL,
@@ -16224,9 +16241,10 @@ class SqlServerStore:
 
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
         """The role ids the role map gives ``groups``, its seal UNCHECKED; store.py's twin says
-        why. BACKLOG #2592: a pair whose role has no roles row is left out, because this backend's
-        map has no role foreign key and can hold a deleted role's id. The user write path refuses
-        such an id, which would refuse the sign-in; SQLite and Postgres refuse the map row itself."""
+        why. BACKLOG #2592: a pair whose role has no roles row, matched exactly, is left out,
+        because this backend's role foreign key is ``WITH NOCHECK`` and compares in the database
+        collation, so the map can hold a deleted role's id or a case variant of a live one (BACKLOG
+        #5725). The user write path refuses such an id, which would refuse the sign-in."""
         return (await self.get_ad_map(AD_ROLE_MAP)).values_for(groups)
 
     async def get_ad_map(self, name: str) -> AdMap:
@@ -16253,7 +16271,12 @@ class SqlServerStore:
         """The one writer of an AD directory map and its seal (BACKLOG #2592); store.py's
         ``MessageStore._write_ad_map`` states the contract. Call it on ``cur`` inside an open
         transaction. The map's seal key is read under ``UPDLOCK, HOLDLOCK`` first, which locks it
-        whether or not its row exists yet, so two writes of one map run one after the other."""
+        whether or not its row exists yet, so two writes of one map run one after the other.
+
+        BACKLOG #5725: a role map write checks its role ids against the ``roles`` rows EXACTLY
+        (:func:`existing_role_pairs_only`), because ``fk_ad_group_role_map_role`` compares in the
+        database collation and would take a case variant of a live id. The key still refuses a
+        role deleted after this read; no role-row lock is taken, as in ``_write_user``."""
         sql = _MSSQL_AD_MAP_SQL[name]
         await cur.execute(
             "SELECT seal FROM authority_set_seal WITH (UPDLOCK, HOLDLOCK) WHERE name=?", (name,)
@@ -16265,6 +16288,10 @@ class SqlServerStore:
             [(str(r[0]), str(r[1])) for r in await cur.fetchall()],
             str(seal_rows[0][0] or "") if seal_rows else "",
         )
+        if name == AD_ROLE_MAP:
+            await cur.execute("SELECT id FROM roles")
+            present = [str(r[0]) for r in await cur.fetchall()]
+            change = existing_role_pairs_only(current, change, present)
         new = await ad_map_write_async(self._row_sealer, current, change)
         if new is None:
             return False

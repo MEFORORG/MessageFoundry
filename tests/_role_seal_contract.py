@@ -25,6 +25,7 @@ from messagefoundry.store.store import (
     AD_SCOPE_MAP,
     SCOPE_SOURCE_AD,
     RoleRow,
+    UnknownRoleError,
     ad_map_seal_ok,
     role_seal_ok,
 )
@@ -181,6 +182,24 @@ async def assert_role_seal_contract(store: Any, raw: RawSql) -> None:
         Role.VIEWER.value,
         Role.ADMINISTRATOR.value,
     }
+
+    # --- BACKLOG #5725: a role id with no roles row, matched EXACTLY, is never sealed in ---------
+    # SQLite and Postgres refuse it with their role foreign key; SQL Server's key compares in the
+    # database collation, which CI's leg runs case-insensitive, so its writer checks exactly first.
+    # The write is refused and the stored map, seal included, is unchanged; the save above is the
+    # control that a known id takes.
+    stored = await store.get_ad_map(AD_ROLE_MAP)
+    for bogus in (Role.VIEWER.value.upper(), Role.VIEWER.value + " ", "contract-no-such-role"):
+        try:
+            await store.set_ad_group_role_map([(_GROUP, Role.VIEWER.value), (_GROUP, bogus)])
+        except UnknownRoleError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - each backend raises its own integrity class
+            names = [c.__name__ for c in type(exc).__mro__]
+            assert any("Integrity" in n or "ForeignKey" in n for n in names), (bogus, names)
+        else:
+            raise AssertionError(f"the role map sealed in {bogus!r}, which names no role")
+        assert await store.get_ad_map(AD_ROLE_MAP) == stored, bogus
 
     # --- a pair re-pointed, or the seal deleted, outside the store also grants nothing -------
     await store.set_ad_group_role_map([(_GROUP, Role.VIEWER.value)])
