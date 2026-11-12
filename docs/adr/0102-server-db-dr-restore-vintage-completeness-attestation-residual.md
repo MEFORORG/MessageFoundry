@@ -1,6 +1,6 @@
 # 0102 — Server-DB DR restore vintage/completeness: accept the residual (+ an opt-in restore-token vintage floor)
 
-- **Status:** Accepted (2026-07-12) — design + risk-acceptance recorded; optional restore-token cross-check built. **Amended 2026-10-11** (BACKLOG #1502): option (a) is not scheduled; see the amendment at the end. Seat decision under owner delegation 2026-10-08, not an owner ruling.  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
+- **Status:** Accepted (2026-07-12) — design + risk-acceptance recorded; optional restore-token cross-check built. **Amended 2026-10-11** (BACKLOG #1502): option (a) is not scheduled; see the 2026-10-11 amendment. Seat decision under owner delegation 2026-10-08, not an owner ruling. **Amended 2026-11-12** (vault BACKLOG #5712): the provenance probe's premise that a passive DR standby is "never the backup leader" is false, so the probe fails closed only under a condition; see the 2026-11-12 amendment at the end.  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
 - **Date:** 2026-07-12
 - **Related:** [ADR 0048](0048-third-tier-disaster-recovery-standby.md) (third-tier DR standby — owns the
   activation refusal this residual lives inside; the `_verify_live_server_seed` gate + the cold-restore
@@ -30,13 +30,10 @@ dropping the very clinical feeds DR exists to protect.
 1. an explicit **per-activation DBA attestation** (`dba_attests_restored=true`) — the engine cannot itself
    restore a DBA-managed DB, so activation must be a deliberate act; and
 2. a live **restore-provenance probe** (`Store.has_prior_backup_history()` — ≥ 1 `dr_backup` audit row):
-   the restored DB must carry backup history. A mistaken attestation over a fresh DB fails closed
-   (defense in depth) only while nothing on the DR box has written a `dr_backup` row into it.
-   *Correction (vault BACKLOG #5712):* this said a passive DR standby, "never the backup leader",
-   lacks that history. That was false: a lone DR box always leads its own coordinator, so with
-   `[backup].enabled` it would have written its own rows. The engine now starts no backup pass on a
-   passive standby, but other writers remain; they are stated once, at `BackupRunner`'s `dr_paused` in
-   `messagefoundry/pipeline/dr_backup.py`, and a row any of them writes passes this probe.
+   the restored DB must carry backup history, which a passive DR standby (never the backup leader) lacks. A
+   mistaken attestation over a fresh DB still fails closed (defense in depth).
+   *Amended 2026-11-12 (vault BACKLOG #5712): the premise "never the backup leader" is false, so the
+   fail-closed claim in this item holds only under a condition; see the 2026-11-12 amendment at the end.*
 
 This is deliberately **weaker** than the SQLite default (which snapshot-verifies the whole store:
 `integrity_check` + per-table row counts). The **residual** #102 itself documents, and #223 tracks:
@@ -87,6 +84,8 @@ code comment:
   (theme *PHI data-plane integrity*), with its compensating controls (attestation + provenance probe, both
   fail-closed) and an explicit **trigger to re-score** ("a stale/partial DBA restore causing a clinical
   data-loss incident, or an adopter contract that mandates engine-verified DR vintage").
+  *Amended 2026-11-12 (vault BACKLOG #5712): the provenance probe is fail-closed only under a condition;
+  see the 2026-11-12 amendment at the end. That amendment does not change the register row.*
 - It is made explicit to operators in ADR 0048's **cold-restore runbook**: the per-activation DBA
   attestation is a *deliberate correctness assertion*, and the DBA — not the engine — owns proving the
   native restore is the **intended vintage and complete**.
@@ -265,3 +264,38 @@ now has a dated pointer here, and none of their wording changed:
 - the first bullet under *Out of scope*, "owner decision, scheduled separately";
 - the last box under *To resolve on acceptance*, "Owner decision (separate schedule)". It stays
   unticked.
+
+## Amendment (2026-11-12) -- the provenance probe fails closed only under a condition (vault BACKLOG #5712)
+
+**Basis: a defect found and fixed under vault BACKLOG #5712, not an owner ruling.**
+
+Item 2 of #102's fix, under *Context*, says a passive DR standby lacks backup history because it is
+"never the backup leader", and that a mistaken attestation over a fresh DB "still fails closed". The
+premise is false. A DR box runs single-node, because ADR 0096 refuses `[dr]` together with `[cluster]`,
+so it leads its own `NullCoordinator`. With `[backup].enabled`, its `BackupRunner` would have written
+`dr_backup` audit rows into the database it stands by on. The fix does not change leadership: a passive
+standby still leads its own coordinator. What changed is that `BackupRunner` starts no scheduled pass
+while the engine reports the box as a passive standby.
+
+**What the false premise reaches.**
+
+- *The probe, item 2.* `Store.has_prior_backup_history()` counts any `dr_backup` row, a failure row
+  included, whoever wrote it. So the probe fails a mistaken attestation closed only while the DR
+  database holds no `dr_backup` row other than those restored from the primary. A row from any other
+  writer, on the DR box or on another host pointed at that database, passes it. The attestation is then
+  the only gate, unless `[dr].restore_token` is set.
+- *The restore token, option (b).* A standby's own successful row carries its own archive name and
+  becomes the latest successful `dr_backup` archive the token check compares. A correct
+  `expected_backup_archive` then mismatches, and a valid restore is refused with
+  `dr_activation_aborted`. That is a second false-abort cause beside the one *Negative / risks* names.
+- *Option (c), the risk acceptance.* It describes the compensating controls as "both fail-closed". The
+  probe is fail-closed only under the condition above.
+
+**Where the remaining writers are stated.** Once, in the comment above `self._dr_paused` in
+`BackupRunner.__init__`, in `messagefoundry/pipeline/dr_backup.py`. Read that comment rather than a list
+here.
+
+**What this amendment does not change.** It edits no text above: each original sentence stands as
+written, with a dated pointer after it. It does not change the signed row in
+`ASVS-L3-RISK-ACCEPTANCE-REGISTER.md`, whose compensating-control wording (c) mirrors. Whether that row
+must change is not decided here.
