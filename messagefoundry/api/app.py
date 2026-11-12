@@ -745,10 +745,9 @@ def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
     the compensating-control-on-a-false-premise shape (SDS-3.7).
 
     A lane a STOP holds down (BACKLOG #5701) is named too: a start with the cause unfixed would
-    re-authenticate toward the partner lockout a credential STOP protects against. The reason
-    describes the lane at this read only. It does not say the lane stays down until an operator
-    acts, because that is false in pooled mode: any ``notify_work`` broadcast re-arms a STOPPED lane
-    and drops its hold (:meth:`RegistryRunner.outbound_stop_held` lists what sends one)."""
+    re-authenticate toward the partner lockout a credential STOP protects against. It does not say
+    the lane stays down until an operator acts, which is false (``RegistryRunner.outbound_stop_held``
+    says what else re-arms it)."""
     if rr.outbound_status(name) == "log_halted":
         return (
             f"outbound {name!r} is halted: this engine cannot write its application log, so nothing "
@@ -967,12 +966,6 @@ def _replay_in_scope(identity: Identity, channel_id: str | None) -> bool:
     return identity.can_access_channel(channel_id)
 
 
-#: The INFO line for an alert control action the runner refused because its graph is down, as on a
-#: demoted follower (BACKLOG #5702). The node that runs the graph acts on its own alert.
-_ALERT_GRAPH_DOWN: Final = (
-    "alert control_action %s for %r not run: this engine's graph is not running"
-)
-
 #: Which namespace each alert control action restarts (BACKLOG #2528).
 _CONTROL_ACTION_SIDE: Final = {"restart_inbound": "inbound", "restart_outbound": "outbound"}
 
@@ -1030,10 +1023,7 @@ async def _alert_control_action(
                 target,
             )
             return
-        try:
-            await rr.restart_inbound(target)
-        except RunnerNotRunningError:
-            _log.info(_ALERT_GRAPH_DOWN, action, target)
+        await _alert_restart(rr.restart_inbound, action, target)
     elif action == "restart_outbound":
         if rr.outbound_dr_failed(target):
             # Its build failed as it left the DR park (vault BACKLOG #3263). A reload or an
@@ -1046,14 +1036,27 @@ async def _alert_control_action(
             )
             return
         try:
-            await rr.restart_outbound(target)
+            await _alert_restart(rr.restart_outbound, action, target)
         except DrParkedError:
             _log.info(
                 "alert control_action restart_outbound for %r not run: the DR run-profile parks it",
                 target,
             )
-        except RunnerNotRunningError:
-            _log.info(_ALERT_GRAPH_DOWN, action, target)
+
+
+async def _alert_restart(
+    restart: Callable[[str], Awaitable[None]], action: str, target: str
+) -> None:
+    """``restart(target)``, logged at INFO and not raised when the runner's graph is down, as on a
+    demoted follower (BACKLOG #5702). The node that runs the graph acts on its own alert."""
+    try:
+        await restart(target)
+    except RunnerNotRunningError:
+        _log.info(
+            "alert control_action %s for %r not run: this engine's graph is not running",
+            action,
+            target,
+        )
 
 
 def _upload_owner(meta: UploadedFileMeta) -> dict[str, str]:

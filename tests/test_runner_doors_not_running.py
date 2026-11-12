@@ -18,15 +18,7 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.api.app import _alert_control_action
-from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import EgressSettings
-from messagefoundry.config.wiring import (
-    ConnectionSpec,
-    InboundConnection,
-    OutboundConnection,
-    Registry,
-    Send,
-)
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.wiring_runner import (
     RegistryRunner,
@@ -34,8 +26,9 @@ from messagefoundry.pipeline.wiring_runner import (
     TeardownReason,
 )
 from messagefoundry.store import MessageStore
+from tests.test_shard_lane_ownership import _unsharded_registry
 
-_IN, _OUT = "file_in", "file_out"
+_IN, _OUT = "file_in", "file_out"  # _unsharded_registry's names
 CLAIM_MODES = ["per_lane", "pooled"]
 
 
@@ -46,38 +39,10 @@ async def store(tmp_path: Path):
     await s.close()
 
 
-def _registry(tmp_path: Path) -> Registry:
-    inbox, outdir = tmp_path / "in", tmp_path / "out"
-    inbox.mkdir(exist_ok=True)
-    outdir.mkdir(exist_ok=True)
-    reg = Registry()
-    reg.add_inbound(
-        InboundConnection(
-            _IN,
-            ConnectionSpec(
-                ConnectorType.FILE,
-                {"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.05},
-            ),
-            router="r",
-        )
-    )
-    reg.add_outbound(
-        OutboundConnection(
-            _OUT,
-            ConnectionSpec(
-                ConnectorType.FILE, {"directory": str(outdir), "filename": "{MSH-10}.hl7"}
-            ),
-        )
-    )
-    reg.add_router("r", lambda m: ["h"])
-    reg.add_handler("h", lambda m: Send(_OUT, m))
-    return reg
-
-
 async def _demoted_runner(store: MessageStore, tmp_path: Path, claim_mode: str) -> RegistryRunner:
     """A runner that ran its graph and was then demoted, as a follower's is."""
     runner = RegistryRunner(
-        _registry(tmp_path),
+        _unsharded_registry(tmp_path),
         store,
         claim_mode=claim_mode,
         poll_interval=0.02,
@@ -116,6 +81,10 @@ async def test_a_demoted_runner_refuses_every_run_state_door(
         assert runner._outbound_paused == set()
         # An inbound stop has nothing to undo on a downed graph, so it is not refused.
         await runner.stop_inbound(_IN)
+        # The pause the old stop_outbound recorded here outlived the teardown that had already
+        # run, so the next promotion's start brought the lane up paused with no operator act.
+        await runner.start()
+        assert runner.outbound_status(_OUT) == "running"
     finally:
         await runner.stop()
 
@@ -124,29 +93,12 @@ async def test_a_never_started_runner_refuses_an_inbound_start(
     store: MessageStore, tmp_path: Path
 ) -> None:
     runner = RegistryRunner(
-        _registry(tmp_path), store, egress=EgressSettings(deny_by_default=False)
+        _unsharded_registry(tmp_path), store, egress=EgressSettings(deny_by_default=False)
     )
     try:
         with pytest.raises(RunnerNotRunningError):
             await runner.start_inbound(_IN, operator=True)
         assert runner._sources == {}
-    finally:
-        await runner.stop()
-
-
-@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
-async def test_a_refused_stop_leaves_the_next_start_unpaused(
-    store: MessageStore, tmp_path: Path, claim_mode: str
-) -> None:
-    """The pause the old stop_outbound recorded on a downed runner outlived the teardown that had
-    already run, so a later promotion's start brought the lane up paused with no operator act."""
-    runner = await _demoted_runner(store, tmp_path, claim_mode)
-    try:
-        with pytest.raises(RunnerNotRunningError):
-            await runner.stop_outbound(_OUT)
-        await runner.start()
-        assert runner.outbound_running(_OUT)
-        assert runner.outbound_status(_OUT) == "running"
     finally:
         await runner.stop()
 
@@ -176,7 +128,7 @@ async def test_the_control_route_answers_503_on_a_downed_graph(tmp_path: Path) -
         poll_interval=0.02,
         egress_settings=EgressSettings(deny_by_default=False),
     )
-    engine.add_registry(_registry(tmp_path))
+    engine.add_registry(_unsharded_registry(tmp_path))
     await engine.start()
     try:
         rr = engine.registry_runner

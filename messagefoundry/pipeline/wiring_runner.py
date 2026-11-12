@@ -2143,9 +2143,9 @@ class RegistryRunner:
         # (#109), a connection configuration fault (#2083), the internal-error STOP policy, or a
         # pooled dispatcher's own STOP (the ADR 0070 T17 infra-fault bound, the #2074 claimer-death
         # bound; see _pooled_stop_hold). The scheduler reads this so a window close or open never
-        # undoes one (see _schedule_holds, which also names every path that clears a record). Clearing
-        # is not operator-only: pooled, every notify_work broadcast that finds the lane STOPPED clears
-        # it (outbound_stop_held lists what sends one). Keyed by direction for the reason _failed is.
+        # undoes one (see _schedule_holds, which also names every path that clears a record, and
+        # outbound_stop_held: an operator is not the only one). Keyed by direction for the reason
+        # _failed is.
         # `_stop_hold_logged` keeps the scheduler's notice to once.
         self._stop_held: set[tuple[Direction, str]] = set()
         self._stop_hold_logged: set[tuple[Direction, str]] = set()
@@ -2492,7 +2492,15 @@ class RegistryRunner:
         """``d.resume_lane(name)``, lifting the operator hold only when it re-arms something.
         resume_lane re-arms a PAUSED lane and, since BACKLOG #5700, a STOPPED one, so a start lifts
         a STOP the operator never paused over. A lane still CLAIMING or PROCESSING is re-armed by
-        nothing here, so a hold a STOP site recorded before its lane reached STOPPED stays in place."""
+        nothing here, so a hold a STOP site recorded before its lane reached STOPPED stays in place.
+
+        An OUTBOUND lane is re-armed only on the engine shard that owns it (ADR 0073). A park
+        registers the lane PAUSED on every engine shard's dispatcher, and a resume makes it READY
+        with no ownership test of its own, so a non-owner that resumed it would claim beside the
+        owner: at every lane at an activation (vault BACKLOG #3262), and through an internal start
+        such as the resume of a lane whose schedule a reload removed (BACKLOG #5703)."""
+        if stage is Stage.OUTBOUND and not self._owns_destination(name):
+            return
         rearms = d.resume_lane(name)
         kind = _HOLD_DIRECTION.get(stage)
         if rearms and kind is not None:
@@ -4024,7 +4032,7 @@ class RegistryRunner:
         fresh bind, an inbound already listening, and a log-write refusal that undid its own bind,
         which :meth:`_emit_inbound_started` reads as not running."""
         await self._checked_inbound_start(name)
-        if resolve and self._running:
+        if resolve:
             self._emit_inbound_started(name)
 
     async def _checked_inbound_start(self, name: str) -> None:
@@ -4096,10 +4104,10 @@ class RegistryRunner:
                 # rule firing on this alert from re-alerting on every restart it drives. Only an
                 # inbound start() would bind: a name this runner does not hold (another engine
                 # shard's, a typo) or a deployed=False one is refused, not a failure to record.
-                # Nor is a raise after the bind, while the listener is up, or on a stopped runner.
+                # Nor is a raise after the bind, while the listener is up. A stopped runner never
+                # gets here: the door refuses it first (BACKLOG #5702).
                 if (
                     not operator
-                    and self._running
                     and not self.inbound_running(name)
                     and name in self.registry.inbound
                     and self._deployed(name, "inbound")
@@ -4519,12 +4527,7 @@ class RegistryRunner:
             ev.clear()
         if not self._per_lane_delivery(name):  # ADR 0066 D4: per-LANE, see _stop_outbound_unsafe
             d = self._dispatchers.get(Stage.OUTBOUND)
-            # Only the owning engine shard arms a lane (ADR 0073). A park registers the lane
-            # PAUSED on every shard's dispatcher, and a resume makes it READY with no ownership
-            # test of its own, so a non-owner that resumed it would claim beside the owner. A
-            # passive standby parks every lane, which made that every lane at an activation
-            # (vault BACKLOG #3262).
-            if d is not None and self._owns_destination(name):
+            if d is not None:  # a non-owner engine shard arms nothing (_resume_pooled_lane)
                 self._resume_pooled_lane(d, Stage.OUTBOUND, name)
         else:
             self._outbound_resume.setdefault(name, asyncio.Event()).set()
@@ -4948,12 +4951,7 @@ class RegistryRunner:
             ev.clear()
         if not self._per_lane_delivery(name):  # ADR 0066 D4: per-LANE, see _stop_outbound_unsafe
             d = self._dispatchers.get(Stage.OUTBOUND)
-            # Only the owning engine shard arms a lane (ADR 0073), as in _unpark_outbound_lane. A
-            # park registers the lane PAUSED on every engine shard's dispatcher, and the public door
-            # refuses a non-owner, but an internal caller does not ask: a non-owner that resumed
-            # it here claimed beside the owner (BACKLOG #5703). per_lane needs no test here, since
-            # _spawn_worker spawns nothing for a lane another engine shard owns.
-            if d is not None and self._owns_destination(name):
+            if d is not None:  # a non-owner engine shard arms nothing (_resume_pooled_lane)
                 self._resume_pooled_lane(d, Stage.OUTBOUND, name)
         else:
             # per_lane: release the loop-top gate; respawn the worker if it exited (STOP policy / crash).
@@ -5025,11 +5023,7 @@ class RegistryRunner:
         halt, ``deployed=False`` or ``auto_start=False``. The lane then stays as that state leaves
         it, and the ordinary recovery for that state brings it up. So does a refused CA the reload
         kept (vault BACKLOG #2371): resuming would read the CA again and alert a second time. An
-        operator start, or a config change the reload checks, brings that lane up.
-
-        Only the owning engine shard's calendar parks a lane, so only the owner reaches here for
-        it; :meth:`_start_outbound_unsafe` arms nothing on a non-owner either way (BACKLOG
-        #5703)."""
+        operator start, or a config change the reload checks, brings that lane up."""
         if (
             self._schedule_holds(name, "outbound")
             or self._delivery_halted
@@ -5216,8 +5210,8 @@ class RegistryRunner:
         """Record that ``name``'s ``kind`` lane halted on a STOP whose cause the calendar must not
         retry (at least a #109 credential fault, a #2083 configuration fault, the internal-error STOP
         policy, or a pooled dispatcher's T17 or claimer-death STOP via :meth:`_pooled_stop_hold`).
-        The record does not wait for an operator: :meth:`_schedule_holds` names what clears it, a
-        pooled ``notify_work`` broadcast among them. Called at the STOP site as its last step
+        Despite the name, clearing it needs no operator (:meth:`outbound_stop_held`). Called at the
+        STOP site as its last step
         before it returns STOPPED, so it sits AFTER the ``connection_stopped`` alert: an alert that
         raises means the site never returns STOPPED and the lane keeps running, so there is no STOP
         to hold. The scheduler reads it through :meth:`_schedule_holds`."""
@@ -7951,10 +7945,8 @@ class RegistryRunner:
             if (
                 name in self._gate_parked
                 and oc.schedule is not None
-                # Only the owner's calendar runs the lane (_reconcile_schedule), so a non-owner
-                # engine shard keeps the ordinary unpark below, which arms nothing for a lane it
-                # does not own. Passed to its calendar, the park waited for a resume that armed
-                # the lane here beside the owner (BACKLOG #5703).
+                # Only the owner's calendar runs the lane (_reconcile_schedule); a non-owner keeps
+                # the ordinary unpark below (ADR 0073, BACKLOG #5703).
                 and self._owns_destination(name)
                 and not oc.schedule.is_active(self._schedule_clock())
                 and not self._dr_passive

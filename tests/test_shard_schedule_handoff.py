@@ -17,12 +17,11 @@ from __future__ import annotations
 
 import asyncio
 import time as _time
-from datetime import UTC, datetime, time
 from pathlib import Path
 
 import pytest
 
-from messagefoundry.config.models import ActiveWindow, ConnectorType, Schedule
+from messagefoundry.config.models import ConnectorType, Schedule
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
@@ -34,19 +33,17 @@ from messagefoundry.config.wiring import (
 from messagefoundry.pipeline.sharding import filter_registry_for_shard
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
+from tests.test_connection_scheduler import _OUT_OF_WINDOW, _wait_until, _weekday_window
 from tests.test_shard_lane_ownership import ADT, UNIVERSE, _pick_dest
 
-# Monday 18:00 UTC, after a weekday 08:00-17:00 window has closed.
-_OUT_OF_WINDOW = datetime(2026, 7, 13, 18, tzinfo=UTC)
-_WINDOW = Schedule(
-    windows=[
-        ActiveWindow(
-            days=frozenset({0, 1, 2, 3, 4}), start=time(8, 0), end=time(17, 0), timezone="UTC"
-        )
-    ]
-)
-# Ten pooled sweep intervals: a lane that was re-armed claims its row well inside this.
-_CLAIM_WINDOW_SECONDS = 0.5
+_WINDOW = _weekday_window()  # closed at _OUT_OF_WINDOW
+_SWEEP_SECONDS = 0.05
+# Three sweeps after the owner's lane delivered, which a lane re-armed beside it would use too.
+_TOP_UP_SECONDS = 3 * _SWEEP_SECONDS
+
+
+def _delivered(outdir: Path) -> bool:
+    return any(outdir.iterdir())
 
 
 @pytest.fixture
@@ -115,7 +112,7 @@ async def test_a_non_owner_does_not_resume_a_lane_its_handoff_took(
         _registry(tmp_path, dests, auto_start=False, schedule=_WINDOW),
         store,
         claim_mode="pooled",
-        pooled_sweep_interval=0.05,
+        pooled_sweep_interval=_SWEEP_SECONDS,
         schedule_clock=lambda: _OUT_OF_WINDOW,
         egress=EgressSettings(deny_by_default=False),
     )
@@ -135,9 +132,9 @@ async def test_a_non_owner_does_not_resume_a_lane_its_handoff_took(
         assert foreign not in runner._schedule_parked
         # The schedule goes: the owner resumes its lane, and this shard must not arm the other.
         await runner.reload(_registry(tmp_path, dests, auto_start=True, schedule=None))
-        await asyncio.sleep(_CLAIM_WINDOW_SECONDS)
-        (owned_row,) = await store.outbox_for(ids[owned])
-        assert owned_row["status"] == "done"  # the control: the resume path is live here
+        # The control: the resume path is live here, for the lane this engine shard owns.
+        await _wait_until(lambda: _delivered(tmp_path / owned))
+        await asyncio.sleep(_TOP_UP_SECONDS)
         (foreign_row,) = await store.outbox_for(ids[foreign])
         assert foreign_row["status"] == "pending" and foreign_row["attempts"] == 0
         assert list((tmp_path / foreign).iterdir()) == []
@@ -155,18 +152,20 @@ async def test_a_non_owner_start_of_a_paused_lane_arms_nothing(
         _registry(tmp_path, [owned, foreign], auto_start=False, schedule=None),
         store,
         claim_mode="pooled",
-        pooled_sweep_interval=0.05,
+        pooled_sweep_interval=_SWEEP_SECONDS,
         egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     try:
         message_id = await store.enqueue_message(
-            channel_id="in_a", raw=ADT, deliveries=[(foreign, ADT)], now=_time.time()
+            channel_id="in_a", raw=ADT, deliveries=[(foreign, ADT), (owned, ADT)], now=_time.time()
         )
         async with runner._reload_lock:
             await runner._start_outbound_unsafe(foreign)
-        await asyncio.sleep(_CLAIM_WINDOW_SECONDS)
-        (row,) = await store.outbox_for(message_id)
+            await runner._start_outbound_unsafe(owned)  # the control
+        await _wait_until(lambda: _delivered(tmp_path / owned))
+        await asyncio.sleep(_TOP_UP_SECONDS)
+        (row,) = [r for r in await store.outbox_for(message_id) if r["destination_name"] == foreign]
         assert row["status"] == "pending" and row["attempts"] == 0
         assert list((tmp_path / foreign).iterdir()) == []
     finally:
