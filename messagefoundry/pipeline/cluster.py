@@ -169,6 +169,14 @@ def heartbeat_lapsed(last_beat_ok: float | None, now: float, node_timeout_second
     )
 
 
+#: The SELECT behind :meth:`ClusterCoordinator.cluster_members`, which both DB coordinators send
+#: unchanged, and which a refused late hold sends under its own bound (BACKLOG #5711).
+NODES_SELECT = (
+    "SELECT node_id, host, pid, started_at, last_seen, status, is_leader, "
+    "acquire_delay_seconds, promotable FROM nodes ORDER BY node_id"
+)
+
+
 def members_from_node_rows(
     rows: Sequence[Any], now: float, node_timeout_seconds: float
 ) -> list[ClusterMember]:
@@ -721,17 +729,50 @@ def past_fence(baseline: float, now: float, fence_timeout_seconds: float) -> boo
     return now - baseline > fence_timeout_seconds
 
 
-def late_hold_pause_seconds(lease_ttl_seconds: float, heartbeat_seconds: float) -> float:
-    """How long a node declines to claim after refusing a late hold (BACKLOG #5711).
+def late_hold_pause_seconds(
+    lease_ttl_seconds: float,
+    heartbeat_seconds: float,
+    members: Sequence[ClusterMember] | None,
+    node_id: str,
+) -> float:
+    """How long a node declines to claim after refusing a late hold (BACKLOG #5711), given the
+    membership it read just after the refusal, or None when that read failed.
 
-    The refused claim renewed the row to the DB clock's then-now plus the TTL, so the row stays this
-    node's for a TTL, and a standby can take it only after that. The pause is that TTL plus
-    :func:`stepdown_pause_seconds` with no sibling delay, two heartbeats, for the reason that pause
-    has them: a sibling looks at the expired row once per interval at an unrelated phase. It lifts
-    early once a read shows another node holding the row. A sibling whose ``acquire_delay_seconds``
-    exceeds those two heartbeats can lose the row back to this node's undelayed renew arm when the
-    pause ends; nothing here reads the sibling delays, unlike a stepdown."""
-    return lease_ttl_seconds + stepdown_pause_seconds(heartbeat_seconds, 0.0)
+    **No pause when no other node could take the lease.** With no other promotable node with a
+    fresh heartbeat (:func:`has_promotable_sibling`), pausing only leaves the cluster leaderless:
+    this node is the one candidate, so it claims again on its next tick, as before the refusal
+    existed, and promotes if that claim returns in time. A node that never promotes cannot open a
+    two-leader window, so skipping the pause costs no fencing.
+
+    Otherwise the refused claim renewed the row to the DB clock's then-now plus the TTL, so the row
+    stays this node's for up to a TTL, and a sibling can take it only after that plus its own
+    ``acquire_delay_seconds``. The pause is that TTL plus :func:`stepdown_pause_seconds` with the
+    longest such delay, as a stepdown's is, so this node's undelayed renew arm cannot take the row
+    back from a delayed sibling still waiting. It lifts early once a read shows another node holding
+    the row. An unread membership counts as a sibling with no delay: the pause only ever delays this
+    node's own claim."""
+    if members is not None and not has_promotable_sibling(members, node_id):
+        return 0.0
+    delay = 0.0 if members is None else longest_promotable_sibling_delay(members, node_id)
+    return lease_ttl_seconds + stepdown_pause_seconds(heartbeat_seconds, delay)
+
+
+def log_late_hold_refusal(
+    node_id: str, late_by: float, fence_timeout_seconds: float, pause: float
+) -> None:
+    """The one warning both coordinators log for a refused late hold (BACKLOG #5711)."""
+    if pause > 0:
+        outcome = f"not claiming for {pause:.1f}s so a standby can take the lease"
+    else:
+        outcome = "no other promotable node has a fresh heartbeat, so it claims again next tick"
+    log.warning(
+        "cluster: node %s lease claim returned %.1fs after it was issued, past the %.1fs fence "
+        "timeout; not leading on it, and %s",
+        node_id,
+        late_by,
+        fence_timeout_seconds,
+        outcome,
+    )
 
 
 def fence_tick_seconds(fence_timeout_seconds: float) -> float:
@@ -1616,11 +1657,7 @@ class DbCoordinator:
 
         One DB read, returned ordered by ``node_id`` for a stable listing; off the message hot path
         (operator-driven)."""
-        rows = await self._call(
-            "fetch",
-            "SELECT node_id, host, pid, started_at, last_seen, status, is_leader, "
-            "acquire_delay_seconds, promotable FROM nodes ORDER BY node_id",
-        )
+        rows = await self._call("fetch", NODES_SELECT)
         return members_from_node_rows(rows, time.time(), self._node_timeout_seconds)
 
     async def leadership_lease(self) -> tuple[str | None, float | None]:
@@ -1839,7 +1876,7 @@ class DbCoordinator:
                     # BACKLOG #5711, in lockstep with SqlServerCoordinator. The row is ours, so the
                     # baseline stays stamped for may_own_lease_row, but it is already past the
                     # fence: demote and pause rather than promote on it.
-                    self._refuse_late_hold(issued_at)
+                    await self._refuse_late_hold(issued_at)
                     return
                 if not self._is_leader:
                     self._is_leader = True
@@ -1861,10 +1898,10 @@ class DbCoordinator:
                 )  # #145 (inverse → auto-resolves)
                 self._fire_on_demote()  # ADR 0157 Inc 5
 
-    def _refuse_late_hold(self, issued_at: float) -> None:
+    async def _refuse_late_hold(self, issued_at: float) -> None:
         """Act on a hold whose claim returned more than the fence timeout after it was issued
         (BACKLOG #5711): never promote on it, demote a node that still reads leader, and pause this
-        node's own claims for :func:`late_hold_pause_seconds`.
+        node's own claims for :func:`late_hold_pause_seconds`, which reads the membership first.
 
         The baseline such a claim stamps is already past the fence, so the watchdog would demote on
         its next tick. Promoting first would raise an acquire edge, and an engine promotion, for
@@ -1877,26 +1914,45 @@ class DbCoordinator:
         again on every tick. A node whose claims keep returning late would then hold the row for
         ever and never lead, and no standby could take it. Pausing lets the row expire on the DB
         clock, and the pause lifts as soon as a read shows another node took it, as after a
-        stepdown. The demotion is unconditional rather than through :meth:`_check_fence`, so a
-        second clock read cannot leave the gate set with the epoch cleared, and the alert names the
-        cause rather than a lease about to expire. Pure in-memory, under the caller's
-        :attr:`_leadership_lock`."""
+        stepdown. When no other promotable node has a fresh heartbeat there is nobody to lock out,
+        so there is no pause, and the next tick claims as it did before this refusal existed.
+
+        **No lease write here.** Expiring the row early would let a sibling take it at once, while
+        the DEMOTE teardown this demotion starts still runs on its budget of ``ttl - fence - tick``
+        (ADR 0157): that would be the two-leader window the fence exists to prevent. Leaving the row
+        to expire keeps the margin a self-fence has.
+
+        The demotion is unconditional rather than through :meth:`_check_fence`, so a second clock
+        read cannot leave the gate set with the epoch cleared, and the alert names the cause rather
+        than a lease about to expire. Under the caller's :attr:`_leadership_lock`; the demotion and
+        the pause are set before the membership read's await, so a cancellation inside it leaves
+        the node demoted and paused, and the read is bounded as the paused tick's owner read is
+        (:func:`paused_read_budget_seconds`), because a retried stepdown waits on that lock."""
         now = self._monotonic()
-        pause = late_hold_pause_seconds(self._lease_ttl, self._heartbeat_seconds)
-        self._no_claim_until = max(self._no_claim_until, now + pause)
-        self._leader_epoch = None
-        log.warning(
-            "cluster: node %s lease claim returned %.1fs after it was issued, past the %.1fs fence "
-            "timeout; not leading on it, and not claiming for %.1fs so a standby can take the lease",
-            self.node_id,
-            now - issued_at,
-            self._fence_timeout,
-            pause,
+        prior = self._no_claim_until
+        self._no_claim_until = max(
+            prior, now + late_hold_pause_seconds(self._lease_ttl, self._heartbeat_seconds, None, "")
         )
+        self._leader_epoch = None
         if self._is_leader:
             self._is_leader = False
             self._alert_leadership_lost("lease claim returned past the fence timeout")
             self._fire_on_demote()  # ADR 0157 Inc 5
+        members: list[ClusterMember] | None = None
+        try:
+            rows = await _call_within(self._pool, self._paused_read_timeout, "fetch", NODES_SELECT)
+            members = members_from_node_rows(rows, time.time(), self._node_timeout_seconds)
+        except Exception as exc:
+            log.warning(
+                "cluster: node %s could not read cluster membership after a late lease claim: %s",
+                self.node_id,
+                safe_exc(exc),
+            )
+        pause = late_hold_pause_seconds(
+            self._lease_ttl, self._heartbeat_seconds, members, self.node_id
+        )
+        self._no_claim_until = max(prior, now + pause)
+        log_late_hold_refusal(self.node_id, now - issued_at, self._fence_timeout, pause)
 
     async def _claim_or_renew_lease(self) -> bool:
         """Atomically acquire OR renew the leadership lease and return whether this node now holds it.

@@ -13,6 +13,7 @@ claim replaced, so no database is needed.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -132,7 +133,8 @@ async def test_a_late_hold_pauses_this_nodes_claims_past_the_ttl(
     """Without the pause, the undelayed renew arm would renew the row on every tick, so a node
     whose claims keep returning late would hold it for ever without leading, and no standby could
     take it. The pause outlasts the TTL the refused claim stamped; it lifts early once a read
-    shows another owner, as the stepdown pause does."""
+    shows another owner, as the stepdown pause does. Here the membership read fails (the stand-in
+    has no pool), so the pause assumes a sibling with no delay could take the lease."""
     clock = _Clock()
     coord = make(clock)
     _claim_taking(coord, clock, _FENCE + 0.5)
@@ -155,9 +157,102 @@ async def test_a_claim_returning_at_the_fence_still_promotes(
     assert coord._no_claim_until == 0.0
 
 
+def _node(node_id: str, *, promotable: bool = True, delay: float = 0.0) -> dict[str, object]:
+    """A fresh, active ``nodes`` row, as the membership read returns it."""
+    now = time.time()
+    return {
+        "node_id": node_id,
+        "host": "h",
+        "pid": 1,
+        "started_at": now,
+        "last_seen": now,
+        "status": "active",
+        "is_leader": False,
+        "acquire_delay_seconds": delay,
+        "promotable": promotable,
+    }
+
+
+class _MembersPool(LendsItself):
+    """Postgres: answers the membership read a refused late hold sends."""
+
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self.rows = rows
+
+    async def fetch(self, sql: str, *args: object) -> list[dict[str, object]]:
+        assert "FROM nodes" in sql, sql
+        return self.rows
+
+
+class _MembersStore:
+    """SQL Server: answers the same read through the store's clamped fetch."""
+
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self.rows = rows
+        self.clamps: list[float | None] = []
+
+    async def _fetch_rows(
+        self, sql: str, params: tuple[object, ...], timeout_clamp: float | None = None
+    ) -> list[dict[str, object]]:
+        assert "FROM nodes" in sql, sql
+        self.clamps.append(timeout_clamp)
+        return self.rows
+
+
+_WITH_MEMBERS: list[tuple[str, Callable[[_Clock, list[dict[str, object]]], Any]]] = [
+    (
+        "postgres",
+        lambda clock, rows: DbCoordinator(
+            _MembersPool(rows), "A", leader_fence_timeout_seconds=_FENCE, monotonic=clock
+        ),
+    ),
+    (
+        "sqlserver",
+        lambda clock, rows: SqlServerCoordinator(
+            _MembersStore(rows), "A", leader_fence_timeout_seconds=_FENCE, monotonic=clock
+        ),
+    ),
+]
+
+
+@pytest.mark.parametrize(("_name", "make"), _WITH_MEMBERS, ids=_IDS)
+async def test_a_late_hold_with_no_promotable_sibling_does_not_pause(
+    _name: str, make: Callable[[_Clock, list[dict[str, object]]], Any]
+) -> None:
+    """Nobody else could take the row, so a pause would only leave the cluster leaderless, for the
+    TTL plus two heartbeats, about 50 s at the defaults. Before the fix it paused that long; now the
+    next tick claims, as it did before the refusal existed. A non-promotable sibling, a stale one
+    and a cleanly stopped one do not count."""
+    clock = _Clock()
+    stale = _node("C")
+    stale["last_seen"] = time.time() - 3600.0
+    left = _node("D")
+    left["status"] = "left"
+    coord = make(clock, [_node("A"), _node("B", promotable=False), stale, left])
+    _claim_taking(coord, clock, _FENCE + 0.5)
+    await coord._maintain_leadership()
+    assert coord.is_leader() is False
+    assert coord._no_claim_until <= clock.t
+
+
+@pytest.mark.parametrize(("_name", "make"), _WITH_MEMBERS, ids=_IDS)
+async def test_a_late_hold_pause_waits_out_the_longest_sibling_delay(
+    _name: str, make: Callable[[_Clock, list[dict[str, object]]], Any]
+) -> None:
+    """With a promotable sibling the pause is the TTL plus the stepdown pause for the longest
+    sibling delay, so this node's undelayed renew arm cannot take the row back from a delayed
+    sibling still waiting. Before the fix the delay was not read and the pause was 50 s."""
+    clock = _Clock()
+    coord = make(clock, [_node("A"), _node("B", delay=25.0), _node("C", delay=5.0)])
+    _claim_taking(coord, clock, _FENCE + 0.5)
+    await coord._maintain_leadership()
+    assert coord._no_claim_until == clock.t + 30.0 + 2 * 10.0 + 25.0
+
+
 class _LeasePool(LendsItself):
-    """The two lease statements a paused Postgres tick can send: the claim, which holds and runs
-    ``claim_seconds`` on the node's clock, and the pause's owner read, which reports ``owner``."""
+    """The lease statements a paused Postgres tick can send: the claim, which holds and runs
+    ``claim_seconds`` on the node's clock, and the pause's owner read, which reports ``owner``; and
+    the membership read a refused late hold sends, which reports ``members``."""
 
     def __init__(self, clock: _Clock) -> None:
         self._clock = clock
@@ -165,6 +260,11 @@ class _LeasePool(LendsItself):
         self.claim_seconds = 0.0
         self.claims = 0
         self.owner_reads = 0
+        self.members = [_node("A"), _node("B")]
+
+    async def fetch(self, sql: str, *args: object) -> list[dict[str, object]]:
+        assert "FROM nodes" in sql, sql
+        return self.members
 
     async def fetchrow(self, sql: str, *args: object) -> dict[str, object]:
         if "INSERT INTO leader_lease" in sql:
@@ -202,3 +302,69 @@ async def test_the_paused_tick_sends_no_claim_and_lifts_once_another_node_holds_
 
     await coord._maintain_leadership()
     assert pool.claims == 2
+
+
+async def test_with_no_promotable_sibling_the_next_tick_claims_and_leads_again() -> None:
+    """End to end on Postgres: a lone promotable node refuses one late renew, and its next tick
+    claims and leads again, as it did before this item. Before the fix that tick sent only the
+    paused owner read, for about 50 s."""
+    clock = _Clock()
+    pool = _LeasePool(clock)
+    pool.members = [_node("A"), _node("B", promotable=False)]
+    coord = DbCoordinator(pool, "A", leader_fence_timeout_seconds=_FENCE, monotonic=clock)
+    pool.claim_seconds = _FENCE + 0.5
+    await coord._maintain_leadership()
+    assert (pool.claims, coord.is_leader()) == (1, False)
+
+    pool.claim_seconds = 0.0
+    clock.t += 10.0
+    await coord._maintain_leadership()
+    assert (pool.claims, pool.owner_reads) == (2, 0)
+    assert coord.is_leader() is True
+
+
+class _LeaseStore:
+    """The SQL Server twin of :class:`_LeasePool`: the MERGE claim, the paused owner read, and the
+    membership read, each through the store's clamped calls."""
+
+    def __init__(self, clock: _Clock) -> None:
+        self._clock = clock
+        self.owner = "A"
+        self.claim_seconds = 0.0
+        self.claims = 0
+        self.owner_reads = 0
+        self.members = [_node("A"), _node("B")]
+
+    async def _fetchone_clamped(
+        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
+    ) -> dict[str, object]:
+        if "MERGE leader_lease" in sql:
+            self.claims += 1
+            self._clock.t += self.claim_seconds
+            return {"owner": "A", "leader_epoch": 1}
+        assert "SELECT owner FROM leader_lease" in sql, sql
+        self.owner_reads += 1
+        return {"owner": self.owner}
+
+    async def _fetch_rows(
+        self, sql: str, params: tuple[object, ...], timeout_clamp: float | None = None
+    ) -> list[dict[str, object]]:
+        assert "FROM nodes" in sql, sql
+        return self.members
+
+
+async def test_sqlserver_with_no_promotable_sibling_the_next_tick_claims_and_leads_again() -> None:
+    """The SQL Server twin of the Postgres test above."""
+    clock = _Clock()
+    store = _LeaseStore(clock)
+    store.members = [_node("A")]
+    coord = SqlServerCoordinator(store, "A", leader_fence_timeout_seconds=_FENCE, monotonic=clock)
+    store.claim_seconds = _FENCE + 0.5
+    await coord._maintain_leadership()
+    assert (store.claims, coord.is_leader()) == (1, False)
+
+    store.claim_seconds = 0.0
+    clock.t += 10.0
+    await coord._maintain_leadership()
+    assert (store.claims, store.owner_reads) == (2, 0)
+    assert coord.is_leader() is True

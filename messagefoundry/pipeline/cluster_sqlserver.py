@@ -54,6 +54,7 @@ from typing import TYPE_CHECKING, Any
 
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import (
+    NODES_SELECT,
     SIDE_STEP_CLAMPS,
     STOP_WRITE_TIMEOUT_SECONDS,
     ClusterMember,
@@ -64,6 +65,7 @@ from messagefoundry.pipeline.cluster import (
     heartbeat_lapsed,
     late_hold_pause_seconds,
     lease_release_unconfirmed,
+    log_late_hold_refusal,
     members_from_node_rows,
     note_stamp_fault,
     past_fence,
@@ -387,10 +389,7 @@ class SqlServerCoordinator:
         """One :class:`ClusterMember` per node. Built by the shared ``members_from_node_rows``, so the
         freshness verdict, the derived leader and ``fresh`` match ``DbCoordinator.cluster_members``
         exactly: a crashed ex-leader's stale flag is never the live leader on either backend."""
-        rows = await self._store._fetchall(
-            "SELECT node_id, host, pid, started_at, last_seen, status, is_leader,"
-            " acquire_delay_seconds, promotable FROM nodes ORDER BY node_id"
-        )
+        rows = await self._store._fetchall(NODES_SELECT)
         return members_from_node_rows(rows, time.time(), self._node_timeout_seconds)
 
     async def leadership_lease(self) -> tuple[str | None, float | None]:
@@ -537,7 +536,7 @@ class SqlServerCoordinator:
                     # (SqlServerStore._fetchone_clamped), so a claim can return past the fence. The
                     # row is ours, so the baseline stays for may_own_lease_row; demote and pause,
                     # never promote.
-                    self._refuse_late_hold(issued_at)
+                    await self._refuse_late_hold(issued_at)
                     return
                 if not self._is_leader:
                     self._is_leader = True
@@ -552,25 +551,37 @@ class SqlServerCoordinator:
                 )  # #145 (inverse → auto-resolves)
                 self._fire_on_demote()  # ADR 0157 Inc 5
 
-    def _refuse_late_hold(self, issued_at: float) -> None:
+    async def _refuse_late_hold(self, issued_at: float) -> None:
         """Mirrors :meth:`DbCoordinator._refuse_late_hold` (BACKLOG #5711); read its docstring for
-        why it demotes unconditionally and why it pauses this node's claims."""
+        why it demotes unconditionally, why it pauses this node's claims only when another node
+        could take the lease, and why it sends no lease write. The membership read is bounded as the
+        paused tick's owner read is, budget and driver clamp both."""
         now = self._monotonic()
-        pause = late_hold_pause_seconds(self._lease_ttl, self._heartbeat_seconds)
-        self._no_claim_until = max(self._no_claim_until, now + pause)
-        self._leader_epoch = None
-        log.warning(
-            "cluster: node %s lease claim returned %.1fs after it was issued, past the %.1fs fence "
-            "timeout; not leading on it, and not claiming for %.1fs so a standby can take the lease",
-            self.node_id,
-            now - issued_at,
-            self._fence_timeout,
-            pause,
+        prior = self._no_claim_until
+        self._no_claim_until = max(
+            prior, now + late_hold_pause_seconds(self._lease_ttl, self._heartbeat_seconds, None, "")
         )
+        self._leader_epoch = None
         if self._is_leader:
             self._is_leader = False
             self._alert_leadership_lost("lease claim returned past the fence timeout")
             self._fire_on_demote()  # ADR 0157 Inc 5
+        members: list[ClusterMember] | None = None
+        try:
+            async with asyncio.timeout(self._paused_read_budget):
+                rows = await self._store._fetch_rows(NODES_SELECT, (), self._paused_read_clamp())
+            members = members_from_node_rows(rows, time.time(), self._node_timeout_seconds)
+        except Exception as exc:
+            log.warning(
+                "cluster: node %s could not read cluster membership after a late lease claim: %s",
+                self.node_id,
+                safe_exc(exc),
+            )
+        pause = late_hold_pause_seconds(
+            self._lease_ttl, self._heartbeat_seconds, members, self.node_id
+        )
+        self._no_claim_until = max(prior, now + pause)
+        log_late_hold_refusal(self.node_id, now - issued_at, self._fence_timeout, pause)
 
     async def _claim_or_renew_lease(self) -> bool:
         """Atomically acquire (fresh / expired) or renew (already ours) the single leadership lease, all
