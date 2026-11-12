@@ -379,8 +379,9 @@ def test_tcp_and_x12_acceptance_is_permanent_not_transitional() -> None:
 # --- send-time backstop (zero-I/O, before the first payload byte) -------------
 
 
-#: The outbounds whose send raises the refusal classified, as a NegativeAckError (BACKLOG #5719).
-_CLASSIFIED = (MLLPDestination,)
+#: The outbounds whose send raises the refusal classified, as a NegativeAckError (BACKLOG #5719,
+#: #5718).
+_CLASSIFIED = (MLLPDestination, X12Destination)
 
 
 def refuse_guard() -> InsecureHopGuard:
@@ -410,8 +411,8 @@ async def test_send_asserts_before_any_io(build_cfg, connector) -> None:
     # Build the connector OUTSIDE the stamped gate (constructs cleanly, guard.posture is None), then
     # swap in a REFUSE guard: send() must raise at the byte-crossing assertion BEFORE it opens any
     # socket / association / FTP connection (the remote host is never dialed — no network needed).
-    # MLLP raises the refusal classified, as a lane-stopping configuration fault whose cause is the
-    # refusal (BACKLOG #5719); tests/test_rawtcp_hop_refusal_stops_lane.py pins the class.
+    # MLLP and X12 raise the refusal classified, as a lane-stopping configuration fault whose cause
+    # is the refusal (BACKLOG #5719, #5718); tests/test_rawtcp_hop_refusal_stops_lane.py pins it.
     dest = connector(build_cfg(LOOPBACK))
     dest._hop_guard = refuse_guard()
     with pytest.raises((InsecureHopRefused, NegativeAckError)) as refused:

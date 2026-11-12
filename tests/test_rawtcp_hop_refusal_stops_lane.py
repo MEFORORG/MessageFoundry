@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A raw-TCP outbound's send-time hop refusal stops the lane and keeps the queue.
 
-BACKLOG #5719 (MLLP). The send-time backstop, ``InsecureHopGuard.assert_send``, raised a bare
+BACKLOG #5719 (MLLP) and #5718 (X12). The send-time backstop, ``InsecureHopGuard.assert_send``, raised a bare
 ``InsecureHopRefused``, a ``ValueError``. The delivery worker files an unclassified exception as an
 internal error and, under the default ``internal_error`` policy, dead-letters the row, so a
 configuration refusal that every queued row would meet would have emptied the lane's queue into the
@@ -10,11 +10,18 @@ dead-letter queue one row at a time. ``InsecureHopGuard.assert_delivery`` raises
 permanent configuration fault the HTTP family already raises (``assert_delivery_url``), which the
 worker answers by stopping the lane and releasing the row un-errored.
 
-Synthetic HL7 only; no socket is opened, because the refusal fires before any dial.
+BACKLOG #5718 also covers the reload half on the X12 side: a send that reaches a connector the
+reload already closed retries on the replacement, before the hop guard can stop the lane, and
+``aclose`` closes a connect-per-send socket in flight, as it already closed the persistent one, so
+that send fails as a retryable ``DeliveryError`` instead of running on to its full timeout.
+
+Synthetic HL7 and X12 only. The refusal tests open no socket, because the refusal fires before any
+dial; the in-flight test uses a loopback peer.
 """
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -28,10 +35,12 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.store.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.transports.base import (
     INSECURE_HOP_REFUSED_CODE,
+    DeliveryError,
     DestinationConnector,
     NegativeAckError,
 )
 from messagefoundry.transports.mllp import InsecureHopGuard, MLLPDestination
+from messagefoundry.transports.x12 import X12Destination
 
 RAW = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\r"
 CHANNEL = "IB_TEST"
@@ -58,6 +67,19 @@ def _mllp(name: str = "OB_MLLP") -> MLLPDestination:
     # swapped in after, standing in for a posture that changed after construction.
     dest = MLLPDestination(
         Destination(name=name, type=ConnectorType.MLLP, settings={"host": LOOPBACK, "port": 5000})
+    )
+    dest._hop_guard = _refusing_guard(name)
+    return dest
+
+
+def _x12(name: str = "OB_X12", *, port: int = 5000, **settings: object) -> X12Destination:
+    """An X12 outbound built as :func:`_mllp` builds MLLP's, refusing guard swapped in."""
+    dest = X12Destination(
+        Destination(
+            name=name,
+            type=ConnectorType.X12,
+            settings={"host": LOOPBACK, "port": port, **settings},
+        )
     )
     dest._hop_guard = _refusing_guard(name)
     return dest
@@ -169,3 +191,76 @@ async def test_an_mllp_send_time_refusal_stops_the_lane_and_keeps_the_row(tmp_pa
     assert status == OutboxStatus.PENDING.value, "the row was not kept for the operator"
     assert [name for name, _ in sink.stopped] == ["OB_MLLP"]
     assert f"configuration fault ({INSECURE_HOP_REFUSED_CODE})" in sink.stopped[0][1]
+
+
+# --- BACKLOG #5718: X12 ---------------------------------------------------------------------------
+
+#: A synthetic, PHI-free interchange envelope. The refusal tests never parse it.
+X12 = (
+    "ISA*00*          *00*          *ZZ*SENDERID       *ZZ*RECEIVERID     *240101*1200*^*00501"
+    "*000000001*0*P*:~IEA*1*000000001~"
+)
+
+
+async def test_x12_send_raises_the_configuration_fault() -> None:
+    with pytest.raises(NegativeAckError) as refused:
+        await _x12().send(X12)
+    _assert_config_fault(refused.value, "X12")
+
+
+async def test_an_x12_send_time_refusal_stops_the_lane_and_keeps_the_row(tmp_path: Path) -> None:
+    outcome, status, sink = await _deliver_one(tmp_path, "OB_X12", _x12())
+    assert outcome is _ItemOutcome.STOPPED
+    assert status == OutboxStatus.PENDING.value, "the row was not kept for the operator"
+    assert [name for name, _ in sink.stopped] == ["OB_X12"]
+    assert f"configuration fault ({INSECURE_HOP_REFUSED_CODE})" in sink.stopped[0][1]
+
+
+@pytest.mark.parametrize("persistent", [False, True], ids=["connect-per-send", "persistent"])
+async def test_a_closed_x12_connector_retries_before_its_guard_can_stop_the_lane(
+    persistent: bool,
+) -> None:
+    """A reload swaps the connector out and closes it. A send that still reaches the old one is a
+    retry on the replacement, never the old guard's lane-stopping refusal: the replacement may
+    deliver where the stale one refuses."""
+    dest = _x12(persistent=persistent)
+    await dest.aclose()
+    with pytest.raises(DeliveryError) as raised:
+        await dest.send(X12)
+    assert not isinstance(raised.value, NegativeAckError)
+    assert "is closed (stop/reload)" in str(raised.value)
+
+
+async def test_aclose_closes_a_connect_per_send_in_flight() -> None:
+    """The reload half of BACKLOG #5718. The peer reads the interchange and never answers, so the
+    send waits on its reply. Before the fix aclose closed only the cached persistent socket, so this
+    send ran on against the replaced connector until its 30 second timeout."""
+    received = asyncio.Event()
+
+    async def silent_peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.read(4096)
+        received.set()
+        try:
+            await reader.read(4096)  # until the sender's socket closes
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(silent_peer, LOOPBACK, 0)
+    port = int(server.sockets[0].getsockname()[1])
+    dest = X12Destination(
+        Destination(
+            name="OB_X12",
+            type=ConnectorType.X12,
+            settings={"host": LOOPBACK, "port": port, "expect_reply": True, "timeout_seconds": 30},
+        )
+    )
+    try:
+        send = asyncio.create_task(dest.send(X12))
+        await asyncio.wait_for(received.wait(), 5)
+        await dest.aclose()
+        with pytest.raises(DeliveryError):
+            await asyncio.wait_for(send, 5)
+        assert dest._inflight is None
+    finally:
+        server.close()
+        await asyncio.wait_for(server.wait_closed(), 5)
