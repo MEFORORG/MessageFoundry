@@ -1038,10 +1038,11 @@ class FileSource(SourceConnector):
         if self._refused:
             self._refused.intersection_update(str(p) for p in candidates)
         disposed = 0  # files this tick finished with — the per-tick ceiling's budget (_at_ceiling)
+        retried = 0  # files this tick read and left in place — the ceiling's second budget (#5717)
         for position, path in enumerate(candidates):
             if self._stop.is_set():
                 break  # shutting down — leave the rest for the next start (at-least-once)
-            if self._at_ceiling(disposed, len(candidates) - position):
+            if self._at_ceiling(disposed, retried, len(candidates) - position):
                 break
             # One stat serves the leave-mode key, the settle gate and the before-read side of the #116
             # partial-write check, so the key recorded below describes the bytes actually read. The size
@@ -1089,6 +1090,8 @@ class FileSource(SourceConnector):
                     f"{exc} exceeds max_file_bytes {self.max_file_bytes}",
                 ):
                     disposed += 1
+                else:
+                    retried += 1
                 continue
             except OSError as exc:
                 self._log_unreadable(path, exc)
@@ -1109,6 +1112,7 @@ class FileSource(SourceConnector):
                 )
                 # The file is still moving, so it must settle again from its latest stat (#1811).
                 self._remember_sig(path, read_sig)
+                retried += 1
                 continue
             if self.decompress == "gzip":
                 # Decompress BEFORE the sniff, the AV/ICAP scan, and the batch split (ADR 0123): each
@@ -1135,6 +1139,8 @@ class FileSource(SourceConnector):
                         path, read_id, "file_decompress_failed", safe_exc(exc, file_name=path.name)
                     ):
                         disposed += 1
+                    else:
+                        retried += 1
                     continue
             if not _content_matches_declared(self.content_type, raw):
                 # Content doesn't match the declared content_type (a PDF on a json inbound, a non-ISA
@@ -1161,6 +1167,8 @@ class FileSource(SourceConnector):
                     f"does not match declared content type {declared}",
                 ):
                     disposed += 1
+                else:
+                    retried += 1
                 continue
             try:
                 # The scan hook operates on already-read bytes (it may itself dial an AV/ICAP service),
@@ -1180,6 +1188,8 @@ class FileSource(SourceConnector):
                     path, read_id, "file_scan_rejected", safe_exc(exc, file_name=path.name)
                 ):
                     disposed += 1
+                else:
+                    retried += 1
                 continue
             except Exception as exc:  # noqa: BLE001 - operator scan hook: any failure fails closed
                 # The scan hook MALFUNCTIONED (AV/ICAP unreachable, a plugin bug) — NOT a content
@@ -1193,6 +1203,7 @@ class FileSource(SourceConnector):
                     safe_name(path.name),
                     safe_exc(exc, file_name=path.name),
                 )
+                retried += 1
                 continue
             try:
                 with self._store_call():
@@ -1215,6 +1226,7 @@ class FileSource(SourceConnector):
                     safe_name(path.name),
                     safe_exc(exc, file_name=path.name),
                 )
+                retried += 1
                 continue
             if not completed:
                 # Stopped between a batch file's hand-offs (#1620). The file stays put, so the next
@@ -1248,8 +1260,10 @@ class FileSource(SourceConnector):
 
         A move that archived nothing (a locked file, an unwritable ``.error``, a read-only share under
         ``leave``) is logged by :meth:`_move`, records no event, and leaves the file to be examined
-        again on a later scan. It charges nothing: charging it would let stuck rejects that sort early
-        spend the budget on every scan and hold back the healthy drops behind them.
+        again on a later scan. It does not charge the budget: charging it would let stuck rejects that
+        sort early spend the budget on every scan and hold back the healthy drops behind them. It
+        charges the second budget instead, the one that bounds files read and left in place
+        (:meth:`_at_ceiling`).
 
         A move that archived a copy but could not remove the original still charges, although the
         original stays. Not charging it would let every such reject write a fresh copy into
@@ -1290,9 +1304,9 @@ class FileSource(SourceConnector):
             self._in_store_call = False
             self._store_call_ended = time.monotonic()
 
-    def _at_ceiling(self, disposed: int, remaining: int) -> bool:
-        """True when this scan has spent its per-tick budget (``poll_max_files``) and must stop, leaving
-        ``remaining`` candidates for the next scan.
+    def _at_ceiling(self, disposed: int, retried: int, remaining: int) -> bool:
+        """True when this scan has spent either per-tick budget (each ``poll_max_files``) and must stop,
+        leaving ``remaining`` candidates for the next scan.
 
         **Nothing is dropped.** A file this scan does not reach is still in the drop directory, so the
         next scan takes it — the same at-least-once deferral a transient read failure already produces.
@@ -1311,17 +1325,27 @@ class FileSource(SourceConnector):
         file that sorts early would eat the whole budget on every scan and the healthy files behind it
         would never be ingested. A budget can only be charged by something that makes progress.
 
+        **The second budget, ``retried``, bounds the work spent on files left in place** (BACKLOG
+        #5717). Each of those arms that runs after a completed read charges it: a file changed during
+        the read, a malfunctioning scan hook, a handler failure, a reject of which no copy was
+        archived. It is capped at ``poll_max_files`` too, so a scan reads to the end and scans at most
+        twice ``poll_max_files`` files. The cost: once that many files left in place sort ahead, the
+        files behind them wait, as they did before #5717 when such rejects charged the first budget.
+        A read that fails (a locked or vanished file) or is refused charges neither.
+
         This bounds the INGEST, not the listing: ``_candidates`` still globs and sorts the whole
         directory, because picking the first N in name/mtime order requires seeing all of them. The
         per-file cost the ceiling removes is the read, the scan hook, the pipeline hand-off and the
         durable commit — not the stat."""
-        if self.poll_max_files is None or disposed < self.poll_max_files:
+        cap = self.poll_max_files
+        if cap is None or (disposed < cap and retried < cap):
             return False
         logger.info(
-            "file source %s reached poll_max_files (%s) this scan; %d candidate(s) left for the next "
-            "poll (deferred, not dropped)",
+            "file source %s reached poll_max_files (%s) this scan, in files %s; %d candidate(s) left "
+            "for the next poll (deferred, not dropped)",
             self.directory,
-            self.poll_max_files,
+            cap,
+            "finished with" if disposed >= cap else "read and left in place",
             remaining,
         )
         return True

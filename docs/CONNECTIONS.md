@@ -4826,8 +4826,12 @@ drains would only move the backlog from the source system into this engine's sto
 the interval, or set the knob to `0` for that connection.
 
 **What it bounds, and what it does not.** It bounds the ingest — the read, the pre-ingest scan, the
-pipeline hand-off and the durable commit. The `File(...)` source still lists and sorts the whole
-directory each scan, because taking the first N in name or mtime order requires seeing all of them. On
+pipeline hand-off and the durable commit. The read and the scan of a file left in place for a retry
+are the exception: `File(...)` bounds them with a second budget, stated below after *Files left for a
+retry*, and on `Sftp(...)`/`Ftp(...)` at least a malfunctioning pre-ingest scan hook and a handler
+failure leave a file read and scanned without counting it, so there the ceiling does not bound them.
+The `File(...)` source still lists and sorts the whole directory each scan, because taking the first N
+in name or mtime order requires seeing all of them. On
 the database source the ceiling is charged at the **fetch**, so the rest of the result set is never
 pulled out of the driver. One poll asks the driver for at most `poll_max_rows` plus the rows it had to
 step over, capped at 64 of those.
@@ -4837,12 +4841,21 @@ pre-ingest scan hook, a handler failure, and a listing entry refused as an unsaf
 item where it is. Charging those would let one permanently stuck item consume the whole ceiling on every
 tick and starve the healthy items behind it. Only an item the tick finished with — handed off, or
 quarantined to the error directory — charges. On `File(...)` a reject of which no copy reached the
-error directory does not charge (BACKLOG #5717). **At least these gaps in that rule remain:** on
-`Sftp(...)`/`Ftp(...)` a quarantine whose move to the error directory fails still charges, and on
-`File(...)` a handed-off file whose move or delete fails, or a reject copied to the error directory
-whose original could not be removed, still charges. Each such file stays where it was, so one that can
-never leave would spend the budget on every tick it is examined, which is the starvation this rule
-exists to prevent.
+error directory does not charge (BACKLOG #5717).
+
+**On `File(...)` a second budget of the same size bounds the files a tick reads and leaves in place**
+(BACKLOG #5717). At least a file that changed while it was read, a malfunctioning pre-ingest scan
+hook, a handler failure and a reject of which no copy reached the error directory each charge it. A
+tick stops when either budget is spent, so it reads to the end, and runs the pre-ingest scan on, at
+most twice `poll_max_files` files. A read that fails, such as on a locked or vanished file, charges
+neither. The cost: once `poll_max_files` files that stay in place sort ahead of the healthy drops, a
+tick stops before reaching those drops, so they wait until the stuck files leave.
+
+**At least these gaps in the completion rule remain:** on `Sftp(...)`/`Ftp(...)` a quarantine whose
+move to the error directory fails still charges, and on `File(...)` a handed-off file whose move or
+delete fails, or a reject copied to the error directory whose original could not be removed, still
+charges. Each such file stays where it was, so one that can never leave would spend the budget on every
+tick it is examined, which is the starvation this rule exists to prevent.
 
 **A database row that cannot become a body does not spend it either, and the two sources reach that
 by different routes.** A file source charges on **completion**, so it simply does not count an item it

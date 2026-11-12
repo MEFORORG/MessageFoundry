@@ -8,12 +8,16 @@ to ``.error`` succeeded. A reject the move left in place (a locked file, an unwr
 read-only share under ``after_read = "leave"``) is examined again on a later scan, so rejects that
 sort early would spend the budget on each scan that examines them and hold back the healthy drops.
 
+Such a reject, and every other file a scan reads and leaves in place, charges a second budget of the
+same size instead, so the read and the pre-ingest scan stay bounded per tick (``_at_ceiling``).
+
 Deliberately ASCII-only: pytest echoes a failing body to a cp1252 console on Windows.
 """
 
 from __future__ import annotations
 
 import gzip
+import logging
 import shutil
 from collections.abc import Iterator
 from pathlib import Path
@@ -22,6 +26,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Source
+from messagefoundry.transports import file as file_mod
 from messagefoundry.transports.file import FileSource, ScanRejected, set_scan_hook
 
 _HL7 = b"MSH|^~\\&|SND|FAC|RCV|FAC|20260101120000||ADT^A01|CTL5717|P|2.5.1\rPID|1||12345\r"
@@ -66,16 +71,28 @@ def _no_scan_hook() -> Iterator[None]:
 
 
 def _setup(
-    tmp_path: Path, settings: dict[str, Any], reject: bytes, healthy: bytes, scan_hook: bool
+    tmp_path: Path,
+    settings: dict[str, Any],
+    reject: bytes,
+    healthy: bytes,
+    scan_hook: bool,
+    *,
+    cap: int = 1,
+    rejects: int = 1,
+    healthies: int = 1,
 ) -> tuple[Path, FileSource, _Sink, list[bytes]]:
+    """The first reject is named ``_REJECT`` and the first healthy drop ``_HEALTHY``; the rest follow
+    each in name order, so every reject sorts ahead of every healthy drop."""
     inbox = tmp_path / "in"
     inbox.mkdir()
-    (inbox / _REJECT).write_bytes(reject)
-    (inbox / _HEALTHY).write_bytes(healthy)
+    for n in range(rejects):
+        (inbox / (_REJECT if n == 0 else f"a_reject{n}.hl7")).write_bytes(reject)
+    for n in range(healthies):
+        (inbox / (_HEALTHY if n == 0 else f"b_healthy{n}.hl7")).write_bytes(healthy)
     source = FileSource(
         Source(
             type=ConnectorType.FILE,
-            settings={"directory": str(inbox), "poll_max_files": 1, **settings},
+            settings={"directory": str(inbox), "poll_max_files": cap, **settings},
         )
     )
     sink = _Sink()
@@ -93,6 +110,35 @@ def _setup(
     return inbox, source, sink, handed_off
 
 
+def _refuse_error_moves(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Make every move to ``.error`` archive nothing, as a locked file or an unwritable ``.error``
+    would; return the names refused, in order."""
+    real_move = FileSource._move
+    refused: list[str] = []
+
+    def move(self: FileSource, path: Path, dest_dir: Path, *rest: Any, **kw: Any) -> bool:
+        if dest_dir == self.error_dir:
+            refused.append(path.name)
+            return False  # as _move reports an archive it could not make
+        return real_move(self, path, dest_dir, *rest, **kw)
+
+    monkeypatch.setattr(FileSource, "_move", move)
+    return refused
+
+
+def _record_reads(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record the name of every file a scan reads (each call into the confined read)."""
+    real_read = file_mod._read_confined
+    reads: list[str] = []
+
+    def read(path: Path, *rest: Any, **kw: Any) -> Any:
+        reads.append(path.name)
+        return real_read(path, *rest, **kw)
+
+    monkeypatch.setattr(file_mod, "_read_confined", read)
+    return reads
+
+
 @pytest.mark.parametrize(
     ("kind", "settings", "reject", "healthy", "scan_hook"), _ARMS, ids=[a[0] for a in _ARMS]
 )
@@ -106,27 +152,105 @@ async def test_a_reject_whose_move_failed_does_not_spend_the_budget(
     healthy: bytes,
     scan_hook: bool,
 ) -> None:
-    """Mutation: charge any one quarantine arm whatever the move returned (the old ``disposed += 1``
-    outside the ``if``). Red: that arm's scan stops at the reject and the healthy drop waits."""
-    inbox, source, sink, handed_off = _setup(tmp_path, settings, reject, healthy, scan_hook)
-    real_move = FileSource._move
-    refused: list[str] = []
-
-    def move(self: FileSource, path: Path, dest_dir: Path, *rest: Any, **kw: Any) -> bool:
-        if dest_dir == self.error_dir:
-            refused.append(path.name)
-            return False  # as _move reports an archive it could not make
-        return real_move(self, path, dest_dir, *rest, **kw)
-
-    monkeypatch.setattr(FileSource, "_move", move)
+    """A budget of two, one stuck reject and two healthy drops behind it: both healthy drops go in one
+    scan. Mutation: charge any one quarantine arm whatever the move returned (the old
+    ``disposed += 1`` outside the ``if``). Red: that arm's scan stops after one healthy drop."""
+    inbox, source, sink, handed_off = _setup(
+        tmp_path, settings, reject, healthy, scan_hook, cap=2, healthies=2
+    )
+    refused = _refuse_error_moves(monkeypatch)
 
     await source._scan_once()  # the settle poll (BACKLOG #1811)
     await source._scan_once()
 
     assert refused == [_REJECT], f"the {kind} arm really tried the move (not a vacuous pass)"
-    assert handed_off == [_HL7], "the healthy drop behind the stuck reject was ingested this scan"
+    assert handed_off == [_HL7, _HL7], "both healthy drops behind the stuck reject went this scan"
     assert (inbox / _REJECT).exists(), "the unmoved reject is left in place, not dropped"
     assert sink.kinds == [], "a reject that was not archived records no quarantine event"
+
+
+@pytest.mark.parametrize(
+    ("kind", "settings", "reject", "healthy", "scan_hook"), _ARMS, ids=[a[0] for a in _ARMS]
+)
+@pytest.mark.usefixtures("_no_scan_hook")
+async def test_rejects_left_in_place_are_read_at_most_the_ceiling_per_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+    settings: dict[str, Any],
+    reject: bytes,
+    healthy: bytes,
+    scan_hook: bool,
+) -> None:
+    """Five stuck rejects ahead of a healthy drop, against a budget of two: one scan reads two of the
+    rejects, scans them where the arm scans, and stops. The healthy drop waits for a later scan, which
+    is the cost of the bound, and is still in place.
+
+    Mutation: leave an unarchived reject uncharged on the second budget (drop its
+    ``retried += 1``). Red: the scan reads all five rejects and hands off the healthy drop."""
+    inbox, source, _sink, handed_off = _setup(
+        tmp_path, settings, reject, healthy, scan_hook, cap=2, rejects=5
+    )
+    refused = _refuse_error_moves(monkeypatch)
+    scanned: list[str] = []
+    if scan_hook:
+
+        def hook(raw: bytes, name: str) -> None:
+            scanned.append(name)
+            _scan_rejects_marked(raw, name)
+
+        set_scan_hook(hook)
+
+    await source._scan_once()  # the settle poll (BACKLOG #1811)
+    reads = _record_reads(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="messagefoundry.transports.file"):
+        await source._scan_once()
+
+    stuck = [_REJECT, "a_reject1.hl7"]
+    assert reads == stuck, f"the {kind} scan read only the ceiling of stuck rejects"
+    assert refused == stuck
+    if scan_hook:
+        assert scanned == stuck, "the pre-ingest scan ran only on the ceiling of stuck rejects"
+    assert handed_off == []
+    assert "read and left in place" in caplog.text
+    assert (inbox / _HEALTHY).exists(), "the healthy drop is deferred, not dropped"
+
+
+@pytest.mark.parametrize("arm", ["scan_hook_error", "handler_error"])
+@pytest.mark.usefixtures("_no_scan_hook")
+async def test_other_files_left_in_place_after_a_read_are_bounded_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arm: str
+) -> None:
+    """A malfunctioning scan hook and a failing handler each leave a file in place after reading it,
+    and charge the same second budget: four such files against a budget of two, one scan, two reads.
+
+    Mutation: drop the ``retried += 1`` on that arm. Red: the scan reads all four."""
+    _inbox, source, _sink, _handed = _setup(
+        tmp_path, {}, _HL7, _HL7, False, cap=2, rejects=4, healthies=0
+    )
+    attempts: list[str] = []
+    if arm == "scan_hook_error":
+
+        def hook(_raw: bytes, name: str) -> None:
+            attempts.append(name)
+            raise RuntimeError("scanner unreachable")
+
+        set_scan_hook(hook)
+    else:
+
+        async def handler(_raw: bytes) -> str | None:
+            attempts.append("handled")
+            raise OSError("store unavailable")
+
+        source._handler = handler
+
+    await source._scan_once()  # the settle poll (BACKLOG #1811)
+    reads = _record_reads(monkeypatch)
+    await source._scan_once()
+
+    assert len(reads) == 2, f"the {arm} scan read only the ceiling of files it left in place"
+    assert len(attempts) == 2
 
 
 async def test_a_reject_archived_but_not_removed_still_spends_the_budget(
