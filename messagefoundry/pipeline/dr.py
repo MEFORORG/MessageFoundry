@@ -1122,9 +1122,10 @@ class DrCoordinator:
         2. a **live restore-provenance probe** (:meth:`Store.has_prior_backup_history`): the restored DB
            must carry ≥1 ``dr_backup`` audit row — present on any DB restored from an operating primary
            (the primary writes one on every leader-gated backup, the run that produced the seed) and ABSENT
-           on a fresh DR-box install (the engine starts no backup pass on a passive standby, vault
-           BACKLOG #5712; the ``messagefoundry backup`` command is not gated, and a row it writes on
-           the standby would pass this probe). An unreachable DB / missing
+           on a fresh DR-box install, where the engine starts no backup pass while passive (vault
+           BACKLOG #5712). What can still write such a row on a DR box, and so pass this probe, is
+           stated once at :class:`~messagefoundry.pipeline.dr_backup.BackupRunner`'s
+           ``dr_paused``. An unreachable DB / missing
            ``audit_log`` raises → abort; a fresh/unrestored DB (no ``dr_backup`` row) → abort **even when
            attested** (defense in depth: a mistaken attestation must still fail closed). The probe runs off
            the event loop via the async store API (a pooled read-only round-trip; no mutation).

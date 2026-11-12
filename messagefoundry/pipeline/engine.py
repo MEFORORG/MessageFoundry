@@ -1120,17 +1120,13 @@ class Engine:
         activation would bind, so a reload here refuses what that activation would refuse."""
         # Without store settings there is no coordinator (dr_coordinator), so nothing could
         # activate the box; parking its intake for good would leave it dead, not passive.
-        if self._is_passive_dr_standby() and self._store_settings is not None:
+        if self._dr_settings.enabled and not self._dr_active and self._store_settings is not None:
             return self._dr_settings.priority_threshold
         return None
 
-    def _is_passive_dr_standby(self) -> bool:
-        """Whether this is a DR standby (``[dr].enabled``) that is not activated."""
-        return self._dr_settings.enabled and not self._dr_active
-
     def _dr_backup_paused(self) -> bool:
         """Whether the backup runner must skip its pass (vault BACKLOG #5712; the reason is at
-        :class:`~messagefoundry.pipeline.dr_backup.BackupRunner`'s ``passive_standby``): on a
+        :class:`~messagefoundry.pipeline.dr_backup.BackupRunner`'s ``dr_paused``): on a
         passive DR standby, and during an activation until its reload has completed. Applied
         implies latched, since every flip of the latch to False clears it."""
         return self._dr_settings.enabled and not self._dr_profile_applied
@@ -1817,14 +1813,12 @@ class Engine:
     def _make_reference_runner(self) -> ReferenceSyncRunner:
         """Build the reference sync runner; its specs and its env() values are read **live**, so a
         reload's swapped declarations, and a value it adds or rotates, are picked up without
-        rebuilding it (vault BACKLOG #5698). Both come from the registry runner, which swaps and
-        rolls back its graph and its values together under its reload lock, so a sync never pairs a
-        new spec with the old values; with no registry runner, the engine's applied values."""
+        rebuilding it (vault BACKLOG #5698).
 
-        def env_values() -> Mapping[str, Any]:
-            rr = self._registry_runner
-            return rr.env_values if rr is not None else self._env_values
-
+        The values are the engine's applied ones, set only once a reload has committed, never the
+        registry runner's, which hold a reload's values before it can still be refused. A sync
+        during a reload can still pair the specs of one graph with the other graph's values, and
+        fail that set; the sync after the reload corrects it."""
         return ReferenceSyncRunner(
             self.store,
             lambda: (
@@ -1833,7 +1827,7 @@ class Engine:
                 else []
             ),
             self._reference_settings or ReferenceSettings(),
-            env_values=env_values,
+            env_values=lambda: self._env_values,
             egress=self._egress_settings,
             alert_sink=self._alert_sink,
             # Track B Step 6: gate materialize-from-source on the leader; every node still converges its
@@ -2339,7 +2333,7 @@ class Engine:
                 coordinator=self._coordinator,
                 hop_posture=self._hop_posture,
                 # Read at each pass (vault BACKLOG #5712).
-                passive_standby=self._dr_backup_paused,
+                dr_paused=self._dr_backup_paused,
             )
             self._backup_runner.start()
         # [cert_monitor] TLS-cert expiry monitor (Q5c) — a maintenance task like retention, independent

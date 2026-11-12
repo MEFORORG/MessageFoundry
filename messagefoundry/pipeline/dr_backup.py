@@ -473,18 +473,22 @@ class BackupRunner:
         clock: Callable[[], float] = time.time,
         coordinator: ClusterCoordinator | None = None,
         hop_posture: HopPosture | None = None,
-        passive_standby: Callable[[], bool] = lambda: False,
+        dr_paused: Callable[[], bool] = lambda: False,
     ) -> None:
         self._store = store
         self._settings = settings
-        # Read at each pass. While it answers True this box is a passive DR standby, and no pass
-        # starts (vault BACKLOG #5712): a pass writes a `dr_backup` audit row, and the server-DB live
-        # seed probe reads any such row as proof the database was restored from a primary, so a
-        # standby's own row would pass that probe on an unrestored database. It would also become
-        # the latest anchor the restore-token check compares, and refuse a valid restore. A pass
-        # already running when it turns True still finishes and records its row. The `backup`
-        # command builds its runner without it, so it is not gated.
-        self._passive_standby = passive_standby
+        # Read before each pass starts; while it answers True, none starts (vault BACKLOG #5712).
+        # The engine answers True on a passive DR standby, and during an activation until its reload
+        # has completed. A pass writes a `dr_backup` audit row, and the server-DB live seed probe
+        # reads any such row as proof the database was restored from a primary, so a standby's own
+        # row would pass that probe on an unrestored database. It would also become the latest
+        # anchor the restore-token check compares, and refuse a valid restore.
+        # THIS IS THE ONE STATEMENT OF WHAT STILL WRITES SUCH A ROW ON A DR BOX; the probe's
+        # docstrings point here. At least: the `messagefoundry backup` command, which builds its
+        # runner without this gate; a pass already running when the gate turns True, which
+        # finishes and records its row; and a box booted with `[dr].activate = true`, which is not
+        # paused.
+        self._dr_paused = dr_paused
         # The store settings carry the KeyProvider seam (ADR 0019) — the archive's KEY SOURCE. Typed
         # loosely to avoid importing StoreSettings here; resolve_active_key takes it.
         self._store_settings = store_settings
@@ -541,8 +545,11 @@ class BackupRunner:
             self._settings.retention_keep,
             self._settings.snapshot_method,
         )
-        if self._passive_standby():
-            log.info("DR backup: no pass runs while this box is a passive DR standby")
+        if self._dr_paused():
+            log.info(
+                "DR backup: no pass starts while this box is a passive DR standby; an activation "
+                "starts them once its reload has completed"
+            )
 
     async def stop(self) -> None:
         self._stop.set()
@@ -582,22 +589,16 @@ class BackupRunner:
         target = self._settings.schedule_time()
         if target is None:
             return False
-        if not self._coordinator.is_leader():
+        if not self._may_back_up():
             return False
         lt = time.localtime(now)
         reached = (lt.tm_hour, lt.tm_min) >= target
-        if self._passive_standby():
-            # The day's slot passes unused, as the pass it stands for would have used it, so an
-            # activation later that day does not start a backup during the takeover.
-            if reached:
-                self._last_backup_day = _day_key(now)
-            return False
         return reached and self._last_backup_day != _day_key(now)
 
     def _may_back_up(self) -> bool:
-        """Leader-gated, so a follower never backs up the shared destination (AC-12), and never on
-        a passive DR standby (vault BACKLOG #5712, see ``passive_standby``)."""
-        return self._coordinator.is_leader() and not self._passive_standby()
+        """Leader-gated, so a follower never backs up the shared destination (AC-12), and never
+        while ``dr_paused`` answers True (vault BACKLOG #5712)."""
+        return self._coordinator.is_leader() and not self._dr_paused()
 
     # --- one pass ------------------------------------------------------------
 

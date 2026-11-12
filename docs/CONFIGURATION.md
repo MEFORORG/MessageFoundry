@@ -3152,6 +3152,12 @@ store DEK (ADR 0019 KeyProvider), applies keep-N retention, runs a lightweight r
 UNC only, so it adds no egress. On a **server-DB** store (Postgres/SQL Server) the *database* backup is
 DBA-delegated (#52): config-only, or skipped, per `config_only_on_server_db`. **A config-only pass with no config to archive fails** as a `snapshot` failure, before it publishes an archive or prunes an older one, rather than publish an archive that would verify and take a keep-N slot while carrying nothing to restore (vault BACKLOG #5220). It fails at least when the config dir cannot be listed, when no config dir is loaded, when `include_config = false`, and when the walk adds no regular file, such as a dir that is empty or holds only links. On a server-DB store, where every pass is config-only, `enabled = true` with `include_config = false` and `config_only_on_server_db = true` is refused at load, by at least `serve`, `check` and the `messagefoundry backup` command, which turns `enabled` on for its own run. The same load refuses at least `restore`, `restore-verify` and `rotate-key`, and the error names the one-line fix, `[backup].include_config = true`. A pass forced config-only on SQLite (`messagefoundry backup --config-only`) is judged at run time only.
 
+**On a DR standby (`[dr].enabled = true`) the engine starts no scheduled pass while the box is passive**,
+and starts them once an activation's reload has completed (vault BACKLOG #5712). A pass would write a
+`dr_backup` row, which the server-DB DR seed gate reads as proof the database was restored from the
+primary. What can still write such a row on a DR box, the `messagefoundry backup` command among them, is
+stated once in the `dr_paused` comment of `BackupRunner`.
+
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | bool | `false` | opt-in master switch; a deployment with no `[backup]` is unaffected |
