@@ -17,6 +17,9 @@ key, and the Service Control Manager's own ``Environment`` value on the service'
   says.** The same ruling covers it. Its protected alternative is the secrets directory
   ``MEFOR_SECRETS_DIRECTORY`` names (:mod:`messagefoundry.engine_secrets`, ADR 0214), and the
   refusal points there (vault BACKLOG #2595, slice B).
+* **Both refusals are ``serve``'s and ``supervise``'s.** An engine neither of them started, such
+  as an app built with ``create_app(engine)``, names what they refuse as the loosening
+  ``secret_in_service_environment`` instead.
 * **A store key that reaches a Windows service through its environment is named** (key-custody
   slice S2a), wherever it came from, since the machine-wide environment is readable by every
   local user too.
@@ -473,6 +476,19 @@ def service_env_loosenings(posture: ServiceEnvPosture) -> list[tuple[str, str]]:
                 "able to read: the service's registry key, or the machine-wide environment. Keep "
                 "the store key in a DPAPI-protected key file ([store].encryption_key_file, made "
                 "with `messagefoundry protect-key`)",
+            )
+        )
+    # What `serve` and `supervise` refuse, named for an engine neither started, such as an app an
+    # embedder built with `create_app(engine)`: nothing refused that start, so the posture names
+    # it rather than going quiet. Those two refuse before they read this list, so it never
+    # reaches them.
+    refused = service_env_refusal(posture)
+    if refused is not None:
+        out.append(
+            (
+                "secret_in_service_environment",
+                f"{refused}. `serve` and `supervise` refuse to start on this; this engine was "
+                "started by neither, so nothing refused it",
             )
         )
     return out

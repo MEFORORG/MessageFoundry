@@ -344,7 +344,14 @@ def test_every_other_secret_class_name_in_the_nssm_list_refuses(name: str) -> No
     # The store key's remedy is not offered for a secret that is not the store key.
     assert "protect-key" not in refusal
     assert "set no MEFOR_SECRETS_DIRECTORY" in refusal
-    assert service_env_loosenings(posture) == []
+    # `serve` refuses before it reads the loosenings; an engine it did not start names it there.
+    assert service_env_loosenings(posture) == [
+        (
+            "secret_in_service_environment",
+            f"{refusal}. `serve` and `supervise` refuse to start on this; this engine was started "
+            "by neither, so nothing refused it",
+        )
+    ]
 
 
 def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> None:
@@ -389,6 +396,95 @@ def test_the_named_not_refused_entry_is_gone() -> None:
     assert "service_environment_secret" not in _registry_names(posture)
 
 
+@pytest.mark.parametrize(
+    "posture",
+    [
+        _service(["MEFOR_STORE_PASSWORD=x"]),
+        _service([f"MEFOR_STORE_ENCRYPTION_KEY={_KEY_VALUE}"]),
+        read_service_env_posture(
+            probe=_Probe(ancestors=_UNDER_NSSM, services={100: "MessageFoundry"}, unreadable=True),
+            environ={"MEFOR_STORE_ENCRYPTION_KEY": _KEY_VALUE},
+        ),
+    ],
+    ids=["store-password-listed", "store-key-listed", "unreadable-list-key-in-environment"],
+)
+def test_every_posture_serve_refuses_is_named_where_serve_did_not_run(
+    posture: ServiceEnvPosture,
+) -> None:
+    """An engine ``serve`` did not start, such as an embedder's ``create_app(engine)``, ran no
+    refusal. The removed ``service_environment_secret`` entry used to name a listed secret there,
+    so the loosening registry names each posture the refusal refuses, with the refusal's own
+    text, rather than going quiet."""
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    entries = dict(_registry_entries(posture))
+    assert entries["secret_in_service_environment"].startswith(f"{refusal}. ")
+
+
+async def test_an_embedded_app_names_a_listed_secret_in_its_posture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The embedder path end to end: ``GET /security/posture`` on an app built with
+    ``create_app(engine)`` names a secret-class setting in the service's list, and never its
+    value."""
+    import httpx
+
+    from messagefoundry.api import create_app
+    from messagefoundry.auth import Role
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline import Engine
+    from tests._admin_account import create_local_user_chosen
+
+    listed = _service([f"MEFOR_STORE_PASSWORD={_PASSWORD_VALUE}"])
+    monkeypatch.setattr("messagefoundry.api.app.service_env_posture", lambda: listed)
+    engine = await Engine.create(
+        tmp_path / "embedded.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        auth = AuthService(engine.store, AuthSettings(require_mfa=False))
+        await auth.initialize()
+        passphrase = "a-strong-test-passphrase"
+        user_id = await create_local_user_chosen(
+            auth,
+            username="vw",
+            password=passphrase,
+            display_name=None,
+            email=None,
+            roles=[Role.VIEWER.value],
+            actor="test",
+        )
+        user = await auth.store.get_user(user_id)
+        assert user is not None and user.password_hash is not None
+        await auth.store.set_password(
+            user_id,
+            password_hash=user.password_hash,
+            must_change_password=False,
+            password_generated=False,
+        )
+        app = create_app(
+            engine, auth=auth, store_settings=StoreSettings(allow_unencrypted_phi=True)
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            login = await client.post(
+                "/auth/login",
+                json={"username": "vw", "password": passphrase, "provider": "local"},
+            )
+            headers = {"Authorization": f"Bearer {login.json()['token']}"}
+            body = (await client.get("/security/posture", headers=headers)).json()
+    finally:
+        await engine.stop()
+    risks = {row["switch"]: row["risk"] for row in body["loosenings"]}
+    assert (
+        "MEFOR_STORE_PASSWORD (in Parameters\\AppEnvironmentExtra) is set in"
+        in (risks["secret_in_service_environment"])
+    )
+    assert _PASSWORD_VALUE not in str(body)
+
+
 def test_a_non_secret_variable_in_the_nssm_list_is_neither_refused_nor_named() -> None:
     """``MEFOR_VALUE_*`` names are an operator's ``env()`` values, not secret-class settings, and
     the windows-service-smoke rig sets some in its NSSM list."""
@@ -408,9 +504,12 @@ def test_a_non_secret_variable_in_the_nssm_list_is_neither_refused_nor_named() -
 
 
 def _registry_names(service_env: ServiceEnvPosture | None) -> list[str]:
-    return [
-        name
-        for name, _risk in security_loosenings(
+    return [name for name, _risk in _registry_entries(service_env)]
+
+
+def _registry_entries(service_env: ServiceEnvPosture | None) -> list[tuple[str, str]]:
+    return list(
+        security_loosenings(
             SecuritySettings(),
             StoreSettings(),
             AuthSettings(),
@@ -437,7 +536,7 @@ def _registry_names(service_env: ServiceEnvPosture | None) -> list[str]:
             startup=None,
             service_env=service_env,
         )
-    ]
+    )
 
 
 def test_the_registry_names_a_store_key_reaching_a_service_through_its_environment() -> None:

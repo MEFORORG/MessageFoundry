@@ -2577,7 +2577,7 @@ count is above `0` (vault BACKLOG #2613).
   a virtual environment. An engine shard reports `interpreter_not_isolated` for itself: the
   supervisor starts it with `-P`, not `-I`.
 
-### `store_key_in_service_environment` and `service_environment_unobservable`: secrets in the Windows service's environment
+### `store_key_in_service_environment`, `service_environment_unobservable` and `secret_in_service_environment`: secrets in the Windows service's environment
 
 > **OBSERVATIONS, not switches.** No setting declares them. They follow from where the engine's
 > Windows service gets its environment. Vault BACKLOG #2595 and #2601.
@@ -2598,6 +2598,10 @@ count is above `0` (vault BACKLOG #2613).
   refuse a store key in their own environment when they found their service but could not read
   its lists, since the key most likely came from there; another secret in their own environment is
   not refused then.
+- **`secret_in_service_environment`: what `serve` and `supervise` refuse, in an engine neither
+  started.** An application that builds the API with `create_app(engine)` runs no such refusal,
+  so its posture names each case above that would refuse, with the refusal's own text. Clear it
+  the way the refusal says.
 - **`store_key_in_service_environment`: a store key reaches the service through its
   environment.** It is named wherever the key came from, once the engine knows its service. The
   machine-wide environment is readable by every local user too. A key in the service's own
@@ -2682,7 +2686,7 @@ chapter was not part of the verification above.
 | `audit_chain_unkeyed` (observed keyless audit chain on a keyed store) | V16 Security Logging and Error Handling | **AU-9** Protection of Audit Information · **AU-9(3)** Cryptographic Protection | §164.312(b) Audit Controls · §164.312(c)(1) Integrity |
 | `remote_debug_enabled` / `remote_debug_unguarded` (observed remote-debugging interface of the engine process) | V13 Configuration | **CM-7** Least Functionality | §164.312(a)(1) Access Control |
 | `interpreter_not_isolated` / `startup_code_unexpected` / `startup_directory_writable` / `startup_directory_unchecked` (observed launch flags and start-up code of the engine's interpreter) | V13 Configuration | **CM-7** Least Functionality · **SI-7** Software, Firmware, and Information Integrity · **CM-5** Access Restrictions for Change | §164.312(c)(1) Integrity · §164.312(a)(1) Access Control |
-| `store_key_in_service_environment` / `service_environment_unobservable` (observed engine secrets in the Windows service's environment) | V13 Configuration (13.3.1) | **SC-12** Cryptographic Key Establishment and Management · **SC-28** Protection of Information at Rest · **AC-3** Access Enforcement | §164.312(a)(1) Access Control · §164.312(a)(2)(iv) Encryption and Decryption |
+| `store_key_in_service_environment` / `service_environment_unobservable` / `secret_in_service_environment` (observed engine secrets in the Windows service's environment) | V13 Configuration (13.3.1) | **SC-12** Cryptographic Key Establishment and Management · **SC-28** Protection of Information at Rest · **AC-3** Access Enforcement | §164.312(a)(1) Access Control · §164.312(a)(2)(iv) Encryption and Decryption |
 
 > **There is no longer a synthetic-vs-PHI split to crosswalk.** It was risk-based tailoring keyed on
 > `handles_real_patient_data` — an instance carrying no ePHI being out of scope for the ePHI-specific

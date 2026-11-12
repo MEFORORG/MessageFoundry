@@ -655,7 +655,7 @@ environment.
   BACKLOG #2595). Move the key to the DPAPI key file above. A retired key belongs in the shell
   that runs `messagefoundry rotate-key`, not in the service. What the engine reads, what it
   refuses and what it does not cover are in
-  [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#store_key_in_service_environment-and-service_environment_unobservable-secrets-in-the-windows-services-environment).
+  [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#store_key_in_service_environment-service_environment_unobservable-and-secret_in_service_environment-secrets-in-the-windows-services-environment).
 
 - **The other secrets: a secrets directory (any platform).** At least the engine's own secret
   settings other than the store key, among them the database password, and every `MEFOR_VALUE_*`
