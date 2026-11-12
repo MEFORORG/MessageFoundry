@@ -5880,7 +5880,8 @@ class SqlServerStore:
         :meth:`_fetch_rows` passes the lease claim's clamp, so a stalled rollback
         after a failed claim cannot hold ``_leadership_lock`` past it (BACKLOG #5066), and
         :meth:`_write_rows` passes it for every clamped write (BACKLOG #5064): a stepdown's release
-        write, which holds the same lock, the heartbeat, which runs in series with the renew, and
+        write, which holds the same lock, the heartbeat, which runs in the maintenance loop's side
+        pass (BACKLOG #5710), and
         stop()'s two writes at the shutdown bound.
 
         The discard is :func:`_detach_connection`, the same detach :meth:`_release_dirty` uses, and
@@ -6164,9 +6165,10 @@ class SqlServerStore:
         a read, whose docstring says what that leaves unbounded, the COMMIT included, and what a
         timed-out borrow advises (BACKLOG #5064). The cluster heartbeat and the lease release are
         at least its callers. The
-        heartbeat runs in series with the renew and a stepdown's release under
-        ``_leadership_lock``, so ``[store].command_timeout`` there would delay the renew (BACKLOG
-        #6472); ``stop()`` passes its own bound instead of the renew clamp."""
+        heartbeat runs in the maintenance loop's side pass, which a statement at
+        ``[store].command_timeout`` would hold that long (BACKLOG #6472, #5710), and a stepdown's
+        release under ``_leadership_lock``, where it would delay the renew; ``stop()`` passes its
+        own bound instead of the renew clamp."""
         return await self._write_rows(sql, params, timeout_clamp)
 
     async def _write_rows(

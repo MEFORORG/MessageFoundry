@@ -122,7 +122,9 @@ cluster coordinates the parts that must not double-run or interleave:
   measured on the database's own clock, so node clock skew doesn't affect who may hold it); a standby
   acquires only once that lease has **expired**. A leader that cannot renew within
   `leader_fence_timeout_seconds` (< the TTL) **self-fences** — it stops *reporting itself* leader before
-  the lease can expire and a standby acquire it (the split-brain guard). Two caveats if you tune these
+  the lease can expire and a standby acquire it (the split-brain guard). A leader whose own heartbeat
+  has not landed for `node_timeout_seconds` stands down too, because its siblings already read it as
+  dead, and it claims nothing until a heartbeat lands ([BACKLOG #5710](BACKLOG.md)). Two caveats if you tune these
   down from the shipped `10 / 20 / 30`: the usable margin is smaller than `ttl - fence`, because the
   fence baseline is taken after the renew round trip returns while the expiry is stamped on the database
   clock at statement execution, and detection lands up to one fence tick late; and the config validator
@@ -213,8 +215,16 @@ releases its lease. It is true at least in these cases:
 
 - while the node leads;
 - on a self-fenced node, whose flag is clear (so it reports `standby`) while its lease row still
-  names it;
+  names it, and the same way on a node that stood down because its own heartbeat lapsed;
+- after the node refused a lease claim that returned past `leader_fence_timeout_seconds`, which
+  renewed its row even though the node did not lead on it, possibly without ever reporting leader;
 - while an earlier stepdown's release write is owed, after a `503` that could not confirm it.
+
+The second and third cases end once the node finds the lease naming another node: a claim the
+database answers that way, or, while its claims are paused, the read each paused tick takes instead
+of claiming. A node standing down on a lapsed heartbeat does neither until a heartbeat lands, so
+for it the case lasts at least that long. A paused read clears only those cases; an owed write
+stays owed until a stepdown sends it.
 
 It means "may own". The write only matches a row that names this node, so if another node has
 already taken the lease, the stepdown releases nothing and answers `409`. The web console reads this

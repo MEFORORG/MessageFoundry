@@ -1953,6 +1953,31 @@ deadlock, timeout — SQLSTATE class `08`/`40` or `HYTxx`) → `DeliveryError`, 
 **permanent** failure (constraint / data / syntax) **and a payload that doesn't match the statement** →
 `NegativeAckError` → **dead-letter** (a retry can't fix it).
 
+**Connection faults (BACKLOG #5713).** Some permanent failures are the connection's, not the
+message's. These stop the lane and keep the queue under the default `credential_fault_policy`
+(ADR 0095), so the queued rows are not dead-lettered one by one.
+
+These rules apply only while the connection is opened, before the statement runs. Once it runs,
+a permanent state is the message's, as above.
+
+- A refused login (SQLSTATE class `28`) is a credential fault.
+- A missing ODBC driver or DSN (class `IM`) is a configuration fault. So is a missing `sqlserver`
+  extra, and unixODBC's `01000` for a driver library it cannot load.
+- Any other error while connecting is retried, with or without a SQLSTATE. A server in recovery
+  or failing over may refuse a login under `42000` or `HY000`.
+
+**Reading a captured result (BACKLOG #5714).** This applies with `capture_response` or
+`capture_out_params` on. A driver error raised while the result is read is the statement's own
+failure. So is one raised while `capture_out_params` moves to the next result set. Examples are a
+deadlock, a procedure's own error and a dropped link. The write is rolled back and classified as
+above, never committed. A statement with no result set is read from the cursor's `description`,
+so it still captures nothing. Some errors are the driver client failing to read a value it was
+sent. At least these leave the capture unparseable and the write committed: an error with no
+SQLSTATE, such as an unsupported column type, and `07006`. On the walk to the next result set,
+`IM001`, `HYC00` and `HY007` end the walk with what was read. `capture_response`
+alone reads only the first result set, so an error from a later statement in the batch is not
+read before the commit.
+
 **Security.** Values are bound as **parameters** (never string-interpolated into SQL); the connection
 string checks every value (no connection-string injection; the SQL Server preset braces each one, and the generic dialect braces the driver name, and the password for the drivers it lists, and sends the rest plain, see [*Values*](#values-on-the-generic-dialect)); TLS is **on by default** and a
 weakened posture (`encrypt=false` / `trust_server_certificate=true`, `dialect="sqlserver"` only) is
