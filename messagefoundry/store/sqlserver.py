@@ -13923,9 +13923,8 @@ class SqlServerStore:
         :func:`~messagefoundry.store.store.verify_audit_rows`, which say which row compares are
         :func:`hmac.compare_digest` and which are Transit's own ``verify``. The anchor head is
         compared with :func:`hmac.compare_digest` over
-        :func:`~messagefoundry.store.store.audit_mac_bytes`, and the walk always completes before the
-        first divergent row id is reported. The walk is the shared
-        :func:`~messagefoundry.store.store.verify_audit_rows` (BACKLOG #1904)."""
+        :func:`~messagefoundry.store.store.audit_mac_bytes`. A break does not end the walk, and the
+        first divergent row id is reported after it (BACKLOG #1904 made the walk shared)."""
         # The walk is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each keyed row
         # is checked under the key of its OWN range, so a rotation no longer reads as tampering.
         return verify_audit_rows(

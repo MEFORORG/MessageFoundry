@@ -7003,8 +7003,10 @@ def verify_audit_rows(
     instead (``TransitCipher.audit_mac_fn``). Under ``vault_transit`` the compare of
     a row MAC is Transit's own ``verify`` call, made inside Vault (:func:`_audit_row_mac`); the
     ``compare_digest`` the walk still runs there sets the stored hash beside itself, or beside
-    ``None`` when Transit did not verify it, and decides nothing. The walk always runs to
-    completion, and the first divergent position is reported after it. A structural break is
+    ``None`` when Transit did not verify it, and decides nothing. A break does not end the walk:
+    it runs on, and the first divergent position is reported after it. A MAC call that raises
+    anything but :class:`~messagefoundry.store.crypto.AuditKeyVersionRefusedError` ends the walk
+    with that error, so the walk could not run. A structural break is
     reported at its own position, with the reason."""
     # The row AT seq 1, not the row that sorts first, which is the rule the open applies too
     # (``load_audit_chain``). A row added below the genesis row must not change what the chain is:
@@ -18489,10 +18491,12 @@ class MessageStore:
         :meth:`audit_anchor` and held out-of-band) to also detect that tail-truncation (review low-1).
 
         **Constant-time, full-walk (ASVS 11.2.4).** A keyless row hash, and a row MAC recomputed
-        under an in-heap key or by a plain MAC provider, are compared with the stored hash by :func:`hmac.compare_digest` over
-        :func:`audit_mac_bytes`, as :func:`verify_audit_rows` says (never ``!=``, which short-circuits on
-        the first differing byte and leaks a forged digest's shared-prefix length), and the walk ALWAYS
-        runs to completion — the first divergent row id is recorded and reported *after* the walk, so
+        under an in-heap key or by a plain MAC provider, are compared with the stored hash by
+        :func:`hmac.compare_digest` over :func:`audit_mac_bytes`, as :func:`verify_audit_rows` says
+        (never ``!=``, which short-circuits on the first differing byte and leaks a forged digest's
+        shared-prefix length), and a break does not end the walk (a MAC call that raises can, as
+        :func:`verify_audit_rows` says) — the first divergent row id is recorded and reported
+        *after* the walk, so
         total verify time is a function of the chain LENGTH, not of where a forgery sits. The reported
         message still names that row id: position is disclosed deliberately, in the operator-facing
         result, so an alert stays actionable — what the change removes is the *timing* side channel, not
