@@ -2504,11 +2504,10 @@ class RegistryRunner:
         a STOP the operator never paused over. A lane still CLAIMING or PROCESSING is re-armed by
         nothing here, so a hold a STOP site recorded before its lane reached STOPPED stays in place.
 
-        An OUTBOUND lane is re-armed only on the engine shard that owns it (ADR 0073). A park
-        registers the lane PAUSED on every engine shard's dispatcher, and a resume makes it READY
-        with no ownership test of its own, so a non-owner that resumed it would claim beside the
-        owner: at every lane at an activation (vault BACKLOG #3262), and through an internal start
-        such as the resume of a lane whose schedule a reload removed (BACKLOG #5703)."""
+        An OUTBOUND lane is re-armed only on the engine shard that owns it (ADR 0073, BACKLOG
+        #5703). This test is the second line behind :meth:`_pause_pooled_outbound`, which keeps the
+        lane off a non-owner's dispatcher: a resume makes a held lane READY with no ownership test
+        of its own, and a non-owner that armed one would claim beside the owner."""
         if stage is Stage.OUTBOUND and not self._owns_destination(name):
             return
         rearms = d.resume_lane(name)
@@ -4298,9 +4297,7 @@ class RegistryRunner:
         # ADR 0066 D4: the branch is per-LANE, not per-mode — a pooled UNORDERED lane has a delivery
         # worker and no dispatcher entry, so pausing it through the dispatcher would never quiesce it.
         if not self._per_lane_delivery(name):
-            d = self._dispatchers.get(Stage.OUTBOUND)
-            if d is not None:
-                d.pause_lane(name)  # fires on_lane_paused synchronously if the lane is already idle
+            self._pause_pooled_outbound(name)
         else:
             # per_lane: clear the resume Event so the worker blocks at its loop-top gate, then nudge it
             # so it reaches the gate promptly (sets the quiescence Event once its <=1 head has resolved).
@@ -4339,15 +4336,40 @@ class RegistryRunner:
         self._gate_parked.add(name)
         self._outbound_quiesced.setdefault(name, asyncio.Event()).set()
         if not self._per_lane_delivery(name):  # ADR 0066 D4: per-LANE, see _stop_outbound_unsafe
-            d = self._dispatchers.get(Stage.OUTBOUND)
-            if d is not None:
-                d.pause_lane(name)
-            # d is None at boot (_start_outbound runs before the dispatchers exist) — _start_pooled_
-            # dispatchers replays _outbound_paused onto the fresh OUTBOUND dispatcher before it starts.
+            self._pause_pooled_outbound(name)
         else:
             # per_lane: the delivery worker blocks at its loop-top pause gate until start_outbound sets
             # this (a cleared Event is the gate; setdefault creates it cleared, clear() is for a re-park).
             self._outbound_resume.setdefault(name, asyncio.Event()).clear()
+
+    def _pause_pooled_outbound(self, name: str) -> None:
+        """Pause pooled outbound ``name`` on the OUTBOUND dispatcher, only on the engine shard that
+        owns it (ADR 0073). Every runner pause of a pooled outbound lane comes through here.
+
+        A non-owner's dispatcher therefore never holds the lane: its seed, sweep and broadcast read
+        :meth:`_pooled_lane_provider` and its wakes pass :meth:`_wake_lane`, both owned lanes only,
+        and a pause was the one other way in. A resume there is then a no-op (``resume_lane``
+        ignores an unknown lane), so nothing arms the lane beside its owner (BACKLOG #5703). A
+        non-owner has nothing of the lane in flight, so the lane reads quiesced at once; a PAUSED
+        entry there could drift from the runner's records and leave the lane ``stopping`` for good.
+
+        With no dispatcher yet (boot, as ``_start_outbound`` runs first), the owner's pause waits
+        for :meth:`_replay_pooled_pauses`."""
+        if not self._owns_destination(name):
+            self._mark_outbound_quiesced(name)
+            return
+        d = self._dispatchers.get(Stage.OUTBOUND)
+        if d is not None:
+            d.pause_lane(name)  # fires on_lane_paused synchronously if the lane is already idle
+
+    def _replay_pooled_pauses(self) -> None:
+        """Apply every recorded outbound pause to the OUTBOUND dispatcher, at its start and after a
+        reload's broadcast. A worker-drained lane is skipped (ADR 0066 D4): it has no dispatcher
+        entry, and ``pause_lane`` is create-or-stick, so a replay would hand the dispatcher a lane a
+        worker owns."""
+        for n in self._outbound_paused:
+            if not self._per_lane_delivery(n):
+                self._pause_pooled_outbound(n)
 
     def _refuse_dr_parked(self, name: str) -> None:
         """Raise :class:`DrParkedError` if the DR run-profile parks outbound ``name``. Asked by every
@@ -7175,7 +7197,7 @@ class RegistryRunner:
                 # without this would hand a deliberately-down lane to a claimer — and
                 # `_reload_pooled_dispatchers`' own re-pause sweep has already run by the time a
                 # reconcile reaches here, so nothing downstream would repair it.
-                out.pause_lane(name)
+                self._pause_pooled_outbound(name)
             log.error(
                 "outbound %r would have TWO consumers: a per-lane delivery worker and the pooled "
                 "OUTBOUND dispatcher, which already holds the lane at phase %r. Refusing to spawn "
@@ -7437,13 +7459,7 @@ class RegistryRunner:
         # auto_start=False lane is already in _outbound_paused with no dispatcher to tell — without this
         # replay the boot gate would be defeated by step (3)'s seed-all-READY. pause_lane on an
         # unregistered key registers it ALREADY-PAUSED, so the seed cannot arm it (#115).
-        # ADR 0066 D4: a worker-drained lane is NOT replayed — it has no dispatcher entry, and creating
-        # one here (pause_lane is create-or-stick) would hand the dispatcher a lane a worker owns.
-        out = self._dispatchers.get(Stage.OUTBOUND)
-        if out is not None:
-            for n in self._outbound_paused:
-                if not self._per_lane_delivery(n):
-                    out.pause_lane(n)
+        self._replay_pooled_pauses()
         # (2.6) THE #122 SIBLING OF (2.5), and it fails the same way if it is missing: replay an
         # in-force log-failure halt onto the FRESH INGRESS/ROUTED/RESPONSE dispatchers before step (3)
         # seeds every lane READY. Without it a runner that came up into an unwritable application log
@@ -7615,11 +7631,7 @@ class RegistryRunner:
         # nudge and the re-pause. notify_work already SKIPS PAUSED lanes (the primary reload-survival
         # fix), so this only matters if a lane's PAUSED phase was somehow lost; pause_lane is idempotent
         # on an already-PAUSED lane.
-        out = self._dispatchers.get(Stage.OUTBOUND)
-        if out is not None:
-            for n in self._outbound_paused:
-                if not self._per_lane_delivery(n):  # ADR 0066 D4, as in _start_pooled_dispatchers
-                    out.pause_lane(n)
+        self._replay_pooled_pauses()
         # …and the #122 halt on the INTERNAL stages, for the same reason and in the same gap. A
         # reload never LIFTS a halt (that rides _resume_inbound_processing, which is gated on the log
         # working again), so re-applying it here can only ever be a no-op or a repair; a lane whose
@@ -7958,9 +7970,6 @@ class RegistryRunner:
             if (
                 name in self._gate_parked
                 and oc.schedule is not None
-                # Only the owner's calendar runs the lane (_reconcile_schedule); a non-owner keeps
-                # the ordinary unpark below (ADR 0073, BACKLOG #5703).
-                and self._owns_destination(name)
                 and not oc.schedule.is_active(self._schedule_clock())
                 and not self._dr_passive
                 and not self._below_dr_threshold(oc.priority)
@@ -7968,7 +7977,9 @@ class RegistryRunner:
                 # This reload would resume the lane, and its window is closed. So the park passes
                 # to the calendar and the lane stays paused (vault BACKLOG #3262). Lifting it
                 # here delivered held rows outside the window, until the scheduler's own stop
-                # got the reload lock. The scheduler starts the lane when its window opens.
+                # got the reload lock. The scheduler starts the lane when its window opens. On an
+                # engine shard that does not own the lane the park stays: its calendar never runs
+                # the lane (_reconcile_schedule), and its dispatcher never holds it (ADR 0073).
                 self._gate_parked.discard(name)
                 self._schedule_parked.add(name)
             if self._leaves_passive_park(name, oc):
