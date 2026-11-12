@@ -14,6 +14,9 @@ invariants can't silently regress.
   unescaped leaf could still grow ~256x, so a pattern ran over a value orders of magnitude larger
   than the cap suggested. Routing patterns come from the trusted code-first Handler author — but a
   planted catastrophic pattern would still be a latent CPU-DoS, so the shape is forbidden outright.
+* **No unrecorded many-starts regex.** A resolved pattern of the quadratic shape of BACKLOG #4036
+  (``<[^>]+>``) reds the build unless :data:`_MANY_STARTS_FULLMATCH_ONLY` records it. What the
+  matcher reads, and what it does not, is in the comment above :data:`_MANY_STARTS_BOUND`.
 * **One parser per type.** stdlib ``json`` is the sole JSON parser and ``urllib.parse.urlsplit`` the
   sole URL parser, so an SSRF/egress host check can never disagree with the request it guards about a
   URL's host. Importing an alternate JSON parser (orjson/ujson/...) or the inconsistent ``urlparse``
@@ -72,6 +75,7 @@ invariants can't silently regress.
 from __future__ import annotations
 
 import ast
+import functools
 import importlib.util
 import re
 import re._constants as sre_constants
@@ -559,6 +563,13 @@ def find_nested_quantifiers(source: str) -> list[str]:
     return [s for s in _regex_literals(source) if _has_nested_quantifier(s)]
 
 
+@functools.cache
+def _scanned(path: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """:func:`_regex_scan` of ``path``, read once per run, since the tree walks below share it."""
+    resolved, unresolved = _regex_scan(path.read_text(encoding="utf-8"))
+    return tuple(resolved), tuple(unresolved)
+
+
 def _py_files(*roots: Path) -> list[Path]:
     """Every first-party ``.py`` under ``roots`` (default :data:`_SOURCE_ROOTS`).
 
@@ -767,11 +778,183 @@ _UNSCANNABLE_RE_PATTERNS = {
 
 
 def test_no_catastrophic_regex_in_source() -> None:
-    offenders: list[str] = []
-    for path in _py_files():
-        for pat in find_nested_quantifiers(path.read_text(encoding="utf-8")):
-            offenders.append(f"{path.relative_to(_REPO)}: {pat!r}")
+    files = _py_files()
+    assert files
+    offenders = [
+        f"{path.relative_to(_REPO)}: {pat!r}"
+        for path in files
+        for pat in _scanned(path)[0]
+        if _has_nested_quantifier(pat)
+    ]
     assert not offenders, "nested-quantifier (ReDoS) regex(es) found:\n" + "\n".join(offenders)
+
+
+# The MANY-STARTS shape (BACKLOG #4036): an unanchored pattern that opens with a literal prefix,
+# then an unbounded repeat of one item that can match every character of that prefix, then more
+# that cannot match empty. On a run of the prefix with nothing to end the match,
+# ``search``/``sub``/``findall`` start at every copy and each start scans to the end of the run, so
+# the cost is quadratic in the input. ``<[^>]+>`` was the measured case: 1,008 ms at 64,000 ``<``.
+# Nested quantifiers are not involved, so the matcher above does not see it. Lazy and possessive
+# repeats are no remedy here: each start still scans the run.
+#
+# What it reads: a group with no quantifier is read as its contents, so ``<([^>]+)>`` is read as
+# ``<[^>]+>``; an optional repeat that cannot cross the prefix (``<\s*[^>]+>``) is stepped over; a
+# repeat bounded above :data:`_MANY_STARTS_BOUND` counts as unbounded. The scan records no compile
+# flags, so an item is read as if IGNORECASE and DOTALL were on, and a pattern that parses only
+# under VERBOSE is read that way. A pattern that parses neither way is flagged.
+# What it misses: at least an alternation or a class in first place, and a required repeat before
+# the one that crosses the run (``<\s+[^>]+>``). It cannot see the call either, so a pattern used
+# only with ``match``/``fullmatch``, which starts once and is linear, is flagged all the same; the
+# ones in the tree are recorded in :data:`_MANY_STARTS_FULLMATCH_ONLY`.
+_MANY_STARTS_BOUND = 1024
+_CATEGORY_CLASSES = {
+    sre_constants.CATEGORY_DIGIT: r"\d",
+    sre_constants.CATEGORY_NOT_DIGIT: r"\D",
+    sre_constants.CATEGORY_SPACE: r"\s",
+    sre_constants.CATEGORY_NOT_SPACE: r"\S",
+    sre_constants.CATEGORY_WORD: r"\w",
+    sre_constants.CATEGORY_NOT_WORD: r"\W",
+}
+
+
+def _item_matches(op: Any, arg: Any, char: str) -> bool:
+    """Whether the one-character item ``(op, arg)`` can match ``char`` in either case; True when it
+    cannot tell, so an item this does not model is flagged rather than missed."""
+    if op == sre_constants.ANY:
+        return True  # DOTALL may be on
+    if op not in (sre_constants.LITERAL, sre_constants.NOT_LITERAL, sre_constants.IN):
+        return True
+    for code in {ord(char.lower()), ord(char.upper())}:
+        if op == sre_constants.LITERAL and arg == code:
+            return True
+        if op == sre_constants.NOT_LITERAL and arg != code:
+            return True
+        if op != sre_constants.IN:
+            continue
+        negated = bool(arg) and arg[0][0] == sre_constants.NEGATE
+        hit = False
+        for sub_op, sub_arg in arg:
+            if sub_op == sre_constants.NEGATE:
+                continue
+            if sub_op == sre_constants.LITERAL:
+                hit = hit or sub_arg == code
+            elif sub_op == sre_constants.RANGE:
+                hit = hit or sub_arg[0] <= code <= sub_arg[1]
+            elif sub_op == sre_constants.CATEGORY and sub_arg in _CATEGORY_CLASSES:
+                hit = hit or re.fullmatch(_CATEGORY_CLASSES[sub_arg], chr(code)) is not None
+            else:
+                return True
+        if hit != negated:
+            return True
+    return False
+
+
+def _ungrouped(items: Any) -> list[Any]:
+    """``items`` with each group that carries no quantifier replaced by its contents, recursively."""
+    out: list[Any] = []
+    for op, arg in items:
+        if op == sre_constants.SUBPATTERN:
+            out.extend(_ungrouped(arg[3]))
+        else:
+            out.append((op, arg))
+    return out
+
+
+def _has_many_starts_shape(pattern: str) -> bool:
+    """True if ``pattern`` has the many-starts shape the comment above describes."""
+    try:
+        parsed = sre_parser.parse(pattern)
+    except re.error:
+        try:
+            parsed = sre_parser.parse(pattern, re.VERBOSE)
+        except re.error:
+            return True  # unreadable: flag rather than miss
+    seq = _ungrouped(parsed)
+    prefix = ""
+    while len(prefix) < len(seq) and seq[len(prefix)][0] == sre_constants.LITERAL:
+        prefix += chr(seq[len(prefix)][1])
+    if not prefix:
+        return False
+    repeats = (sre_constants.MAX_REPEAT, sre_constants.MIN_REPEAT, sre_constants.POSSESSIVE_REPEAT)
+    for i in range(len(prefix), len(seq)):
+        op, arg = seq[i]
+        if op not in repeats:
+            return False
+        low, high, body = arg
+        body = _ungrouped(body)
+        crosses = len(body) == 1 and all(_item_matches(body[0][0], body[0][1], ch) for ch in prefix)
+        if crosses and (high == sre_constants.MAXREPEAT or high > _MANY_STARTS_BOUND):
+            rest = sre_parser.SubPattern(parsed.state, seq[i + 1 :])
+            return bool(rest.getwidth()[0] > 0)
+        if low != 0 or crosses:
+            return False
+    return False
+
+
+#: Every many-starts pattern in the walked roots, as ``path -> the exact patterns``. Each is used
+#: only with ``fullmatch``, which tries one start, so the shape costs it linear time; the matcher
+#: cannot see the call. A new entry, or a changed one, reds the build until it is read and recorded.
+_MANY_STARTS_FULLMATCH_ONLY = {
+    "messagefoundry/config/atomic_edit.py": (r"\.(?P<name>.+)\.[a-z0-9_]{8}\.edit",),
+    "messagefoundry/store/postgres.py": (r'"((?:[^"]|"")+)"',),
+    "messagefoundry/verify/cipher_policy.py": (r'OPENSSLDIR: "(.+)"',),
+}
+
+
+def test_no_many_starts_regex_in_source() -> None:
+    files = _py_files()
+    assert files
+    found: dict[str, tuple[str, ...]] = {}
+    for path in files:
+        shaped = tuple(pat for pat in _scanned(path)[0] if _has_many_starts_shape(pat))
+        if shaped:
+            found[path.relative_to(_REPO).as_posix()] = shaped
+    assert found == _MANY_STARTS_FULLMATCH_ONLY, (
+        "a many-starts (quadratic) regex was added or changed"
+    )
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "<[^>]+>",  # the #4036 case
+        "<[^>]*>",
+        "<.*?>",  # lazy: each start still scans the run
+        "<[^>]++>",  # possessive: same
+        "<[^>]{1,}>",
+        "<[^>]{1,100000}>",  # a bound past any input it would see
+        "<([^>]+)>",  # a group with no quantifier is its contents
+        "<(.*?)>",
+        "<span[^>]*>",  # a literal prefix the repeat crosses
+        "<\\s*[^>]+>",  # an optional repeat stepped over
+        "(?i)a[A]+b",  # IGNORECASE: the class matches the opening char
+        "(?s)\n.+x",  # DOTALL: the dot matches the newline
+        "\n  <[^>]+>   # a tag (\n",  # parses only under VERBOSE
+        "a\\w+b",
+        "1\\d*x",
+        "<[a-z<]+>",
+    ],
+)
+def test_the_many_starts_matcher_flags_the_shape(pattern: str) -> None:
+    assert _has_many_starts_shape(pattern), pattern
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "<[^<>]+>",  # the class excludes the opening char, so a run of it ends each try at once
+        "<[^>]+",  # nothing required after the repeat: every start matches
+        "<[^>]+>?",  # what follows can match empty: every start matches
+        "#.*$",  # the same: ``$`` matches empty, at the end of the run
+        "^<[^>]+>",  # anchored
+        "<[^>]{1,64}>",  # bounded
+        "a\\d+b",  # the class cannot match the opening char
+        "ab[a]+c",  # the repeat cannot cross the whole prefix
+        "(<[^>]+>|x)",  # an alternation in first place: outside this matcher, as its comment says
+    ],
+)
+def test_the_many_starts_matcher_passes_what_it_does_not_model_as_quadratic(pattern: str) -> None:
+    assert not _has_many_starts_shape(pattern), pattern
 
 
 def test_the_scanners_blind_spots_are_the_recorded_ones() -> None:
@@ -780,7 +963,7 @@ def test_the_scanners_blind_spots_are_the_recorded_ones() -> None:
     # one red the build rather than leaving a silently stale docstring.
     actual: dict[str, tuple[str, ...]] = {}
     for path in _py_files():
-        _resolved, unresolved = _regex_scan(path.read_text(encoding="utf-8"))
+        _resolved, unresolved = _scanned(path)
         if unresolved:
             actual[path.relative_to(_REPO).as_posix()] = tuple(unresolved)
     assert actual == _UNSCANNABLE_RE_PATTERNS
@@ -976,7 +1159,7 @@ def test_a_wrapper_that_compiles_its_argument_is_read_at_the_call_site() -> None
     # walked past. Before the wrapper table the scanner resolved ZERO patterns in that whole package.
     resolved: list[str] = []
     for path in _py_files(_REPO / "messagefoundry_webconsole"):
-        resolved += _regex_scan(path.read_text(encoding="utf-8"))[0]
+        resolved += _scanned(path)[0]
     assert len(resolved) >= 25, f"the console route table stopped resolving: {len(resolved)}"
     assert any(p.startswith("^/ui/") for p in resolved), resolved
 
