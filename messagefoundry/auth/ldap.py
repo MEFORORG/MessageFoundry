@@ -1148,9 +1148,8 @@ def _close_without_sending(conn: Any, why: str) -> None:
     ``conn.closed`` true. ``_service_conn`` closes the service account's here. ``_released``
     closes a user or decoy bind's here, through ``_end_release``. It does not cover every
     candidate address: ldap3's ``open`` puts each candidate's new socket on ``conn.socket``,
-    replacing the one before, and a socket so replaced is not reached here. That gap also opens
-    when the open fails on one candidate and then succeeds on a later one: nothing reaches the
-    first candidate's socket then either.
+    replacing the one before, and a socket so replaced is not reached here, whether the open then
+    fails on a later candidate or succeeds on one.
 
     * Before ``ssl`` takes the socket over, it is the last socket ldap3 put on ``conn.socket``,
       connected or not, and it is closed here directly, whatever ``close`` did. Read from the
