@@ -912,8 +912,9 @@ _MSSQL_AD_MAP_SQL: Final[Mapping[str, AdMapSql]] = MappingProxyType(
                 # BACKLOG #5725: a pair is live only on an EXACT role id. The binary collation
                 # refuses a case variant; equal DATALENGTH refuses a trailing-space variant, which
                 # every SQL Server = comparison pads away, binary ones too.
-                " FROM ad_group_role_map m LEFT JOIN roles r"
-                " ON r.id = m.role_id COLLATE Latin1_General_100_BIN2"
+                # The plain equality keeps the roles primary-key seek; the other two decide.
+                " FROM ad_group_role_map m LEFT JOIN roles r ON r.id = m.role_id"
+                " AND r.id = m.role_id COLLATE Latin1_General_100_BIN2"
                 " AND DATALENGTH(r.id) = DATALENGTH(m.role_id)"
             ),
             pairs="SELECT ad_group, role_id FROM ad_group_role_map",

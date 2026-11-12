@@ -133,8 +133,8 @@ async def test_the_scope_map_writer_reads_no_roles() -> None:
 def test_the_map_read_counts_a_pair_live_only_on_an_exact_role_id() -> None:
     read = ss._MSSQL_AD_MAP_SQL[AD_ROLE_MAP].read
     assert (
-        " FROM ad_group_role_map m LEFT JOIN roles r"
-        " ON r.id = m.role_id COLLATE Latin1_General_100_BIN2"
+        " FROM ad_group_role_map m LEFT JOIN roles r ON r.id = m.role_id"
+        " AND r.id = m.role_id COLLATE Latin1_General_100_BIN2"
         " AND DATALENGTH(r.id) = DATALENGTH(m.role_id)"
     ) in read
 

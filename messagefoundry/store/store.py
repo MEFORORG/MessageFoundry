@@ -5086,11 +5086,10 @@ def existing_role_pairs_only(
     in. A pair ``current`` already held is dropped instead: a row its deleted role left behind,
     which grants nothing, and which an edit such as a role delete must not be refused over."""
     held = frozenset(present)
+    had = frozenset(current.pairs)
 
     def checked(new: AdMap) -> AdMap:
-        added = sorted(
-            {pair[1] for pair in new.pairs if pair[1] not in held and pair not in current.pairs}
-        )
+        added = sorted({pair[1] for pair in new.pairs if pair[1] not in held and pair not in had})
         if added:
             raise UnknownRoleError(added)
         kept = tuple(pair for pair in new.pairs if pair[1] in held)
@@ -9226,10 +9225,9 @@ async def _exact_audit_row(
     *,
     above: int | None = None,
     at_most: int | None = None,
-    newest: bool = True,
 ) -> Mapping[str, Any] | None:
-    """The newest (or, with ``newest=False``, the oldest) ``audit_log`` row numbered above
-    ``above`` and at most ``at_most`` that matches ``where`` EXACTLY, read through ``fetch``.
+    """The newest ``audit_log`` row numbered above ``above`` and at most ``at_most`` that matches
+    ``where`` EXACTLY, read through ``fetch``.
 
     BACKLOG #5726: ``where`` compares text in the database collation, which on SQL Server folds
     case and pads trailing spaces, so ``MAX(seq)`` alone could pick a variant row (another account
@@ -9238,19 +9236,18 @@ async def _exact_audit_row(
     ``exact`` in Python, and a variant is stepped past, one indexed lookup each, until an exact
     row or none is left. The bound moves strictly every step, so the walk ends. On SQLite and
     Postgres, which compare exactly, the first row is the answer."""
-    agg = "MAX" if newest else "MIN"
-    lo, hi = above, at_most
+    hi = at_most
     while True:
         conds, args = [where], list(params)
-        if lo is not None:
+        if above is not None:
             conds.append("seq > ?")
-            args.append(lo)
+            args.append(above)
         if hi is not None:
             conds.append("seq <= ?")
             args.append(hi)
         row = await fetch(
             f"SELECT {columns} FROM audit_log WHERE seq ="
-            f" (SELECT {agg}(seq) FROM audit_log WHERE {' AND '.join(conds)})",
+            f" (SELECT MAX(seq) FROM audit_log WHERE {' AND '.join(conds)})",
             tuple(args),
         )
         if row is None or exact(row):
@@ -9258,10 +9255,7 @@ async def _exact_audit_row(
         seq = _strict_int(row["seq"])
         if seq is None:
             return None
-        if newest:
-            hi = seq - 1
-        else:
-            lo = seq
+        hi = seq - 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -9366,7 +9360,6 @@ async def _transit_attestation_audit_gap(
         marks,
         lambda r: r["action"] in marks,
         above=seq,
-        newest=False,
     )
     if later is not None:
         return f"a later attest or withdraw audit row supersedes audit row {seq}"

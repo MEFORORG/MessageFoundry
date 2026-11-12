@@ -198,13 +198,14 @@ async def test_the_walk_steps_strictly_and_ends(log: _Log) -> None:
         )
         is None
     )
-    oldest = await _exact_audit_row(
+    # Within the bounds, each step moves down past a row the check refuses, to the one it takes.
+    found = await _exact_audit_row(
         log.fetch,
         "seq, action",
         "action = ?",
         ("act",),
-        lambda r: r["action"] == "ACT",
+        lambda r: r["seq"] == 3,
         above=2,
-        newest=False,
+        at_most=5,
     )
-    assert oldest is not None and oldest["seq"] == 3
+    assert found is not None and found["seq"] == 3
