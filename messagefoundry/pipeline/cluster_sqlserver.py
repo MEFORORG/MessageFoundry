@@ -65,11 +65,13 @@ from messagefoundry.pipeline.cluster import (
     heartbeat_lapsed,
     late_hold_pause_seconds,
     lease_release_unconfirmed,
+    log_heartbeat_lapse_stand_down,
     log_late_hold_refusal,
     members_from_node_rows,
     note_stamp_fault,
     past_fence,
     paused_read_budget_seconds,
+    read_members_or_none,
     rows_affected,
     run_maintenance_loop,
     stamped_config_digest,
@@ -559,29 +561,25 @@ class SqlServerCoordinator:
         now = self._monotonic()
         prior = self._no_claim_until
         self._no_claim_until = max(
-            prior, now + late_hold_pause_seconds(self._lease_ttl, self._heartbeat_seconds, None, "")
+            prior, now + late_hold_pause_seconds(self._lease_ttl, self._heartbeat_seconds)
         )
         self._leader_epoch = None
         if self._is_leader:
             self._is_leader = False
             self._alert_leadership_lost("lease claim returned past the fence timeout")
             self._fire_on_demote()  # ADR 0157 Inc 5
-        members: list[ClusterMember] | None = None
-        try:
-            async with asyncio.timeout(self._paused_read_budget):
-                rows = await self._store._fetch_rows(NODES_SELECT, (), self._paused_read_clamp())
-            members = members_from_node_rows(rows, time.time(), self._node_timeout_seconds)
-        except Exception as exc:
-            log.warning(
-                "cluster: node %s could not read cluster membership after a late lease claim: %s",
-                self.node_id,
-                safe_exc(exc),
-            )
+        members = await read_members_or_none(
+            self._fetch_members_for_late_hold, self.node_id, self._node_timeout_seconds
+        )
         pause = late_hold_pause_seconds(
             self._lease_ttl, self._heartbeat_seconds, members, self.node_id
         )
         self._no_claim_until = max(prior, now + pause)
         log_late_hold_refusal(self.node_id, now - issued_at, self._fence_timeout, pause)
+
+    async def _fetch_members_for_late_hold(self) -> Any:
+        async with asyncio.timeout(self._paused_read_budget):
+            return await self._store._fetch_rows(NODES_SELECT, (), self._paused_read_clamp())
 
     async def _claim_or_renew_lease(self) -> bool:
         """Atomically acquire (fresh / expired) or renew (already ours) the single leadership lease, all
@@ -679,7 +677,9 @@ class SqlServerCoordinator:
             self._check_fence()
 
     def _check_fence(self) -> None:
-        if not self._is_leader or self._stand_aside_on_lapse():
+        if not self._is_leader:
+            return
+        if self._stand_aside_on_lapse():  # demotes on a lapsed heartbeat
             return
         last = self._last_renew_ok
         if last is None:
@@ -707,14 +707,7 @@ class SqlServerCoordinator:
         if self._is_leader:
             self._is_leader = False
             self._leader_epoch = None
-            log.warning(
-                "cluster: node %s stood down: its last heartbeat to land was issued %.1fs ago, past"
-                " node_timeout_seconds (%.1fs), so the cluster reads it as dead; not claiming the"
-                " lease until a heartbeat lands",
-                self.node_id,
-                now - last,
-                self._node_timeout_seconds,
-            )
+            log_heartbeat_lapse_stand_down(self.node_id, now - last, self._node_timeout_seconds)
             self._alert_leadership_lost("heartbeat lapsed")
             self._fire_on_demote()  # ADR 0157 Inc 5
         return True

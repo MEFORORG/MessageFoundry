@@ -155,17 +155,27 @@ def heartbeat_is_fresh(last_seen: float | None, now: float, node_timeout_seconds
     return last_seen is not None and (now - last_seen) <= node_timeout_seconds
 
 
-def heartbeat_lapsed(last_beat_ok: float | None, now: float, node_timeout_seconds: float) -> bool:
+def heartbeat_lapsed(last_beat_ok: float, now: float, node_timeout_seconds: float) -> bool:
     """Whether this node's own last heartbeat to return was issued more than
     ``node_timeout_seconds`` before ``now``, both on its monotonic clock (BACKLOG #5710).
 
     :func:`heartbeat_is_fresh` applied to the node's own record, so the node reads itself lapsed at
     the instant a sibling reading its ``last_seen`` would, give or take the skew between their wall
     clocks. Both coordinators stop leading and stop claiming while it holds: a sibling then reads
-    the node as dead, and at least the approvals' stranded-release check acts on that reading. None,
-    before the first registration, is not lapsed."""
-    return last_beat_ok is not None and not heartbeat_is_fresh(
-        last_beat_ok, now, node_timeout_seconds
+    the node as dead, and at least the approvals' stranded-release check acts on that reading.
+    The callers treat no beat yet, before the first registration, as not lapsed."""
+    return not heartbeat_is_fresh(last_beat_ok, now, node_timeout_seconds)
+
+
+def log_heartbeat_lapse_stand_down(node_id: str, age: float, node_timeout_seconds: float) -> None:
+    """The one warning both coordinators log when a lapsed heartbeat demotes them (BACKLOG #5710)."""
+    log.warning(
+        "cluster: node %s stood down: its last heartbeat to land was issued %.1fs ago, past"
+        " node_timeout_seconds (%.1fs), so the cluster reads it as dead; not claiming the lease"
+        " until a heartbeat lands",
+        node_id,
+        age,
+        node_timeout_seconds,
     )
 
 
@@ -732,11 +742,12 @@ def past_fence(baseline: float, now: float, fence_timeout_seconds: float) -> boo
 def late_hold_pause_seconds(
     lease_ttl_seconds: float,
     heartbeat_seconds: float,
-    members: Sequence[ClusterMember] | None,
-    node_id: str,
+    members: Sequence[ClusterMember] | None = None,
+    node_id: str = "",
 ) -> float:
-    """How long a node declines to claim after refusing a late hold (BACKLOG #5711), given the
-    membership it read just after the refusal, or None when that read failed.
+    """How long ``node_id`` declines to claim after refusing a late hold (BACKLOG #5711), given
+    the membership it read just after the refusal, or None, the default, when that read failed or
+    has not run yet.
 
     **No pause when no other node could take the lease.** With no other promotable node with a
     fresh heartbeat (:func:`has_promotable_sibling`), pausing only leaves the cluster leaderless:
@@ -755,6 +766,24 @@ def late_hold_pause_seconds(
         return 0.0
     delay = 0.0 if members is None else longest_promotable_sibling_delay(members, node_id)
     return lease_ttl_seconds + stepdown_pause_seconds(heartbeat_seconds, delay)
+
+
+async def read_members_or_none(
+    fetch: Callable[[], Awaitable[Sequence[Any]]], node_id: str, node_timeout_seconds: float
+) -> list[ClusterMember] | None:
+    """The membership a refused late hold reads (BACKLOG #5711), through each coordinator's own
+    bounded ``fetch`` of :data:`NODES_SELECT`; None, logged, when the read fails, which
+    :func:`late_hold_pause_seconds` takes as a sibling with no delay."""
+    try:
+        rows = await fetch()
+    except Exception as exc:
+        log.warning(
+            "cluster: node %s could not read cluster membership after a late lease claim: %s",
+            node_id,
+            safe_exc(exc),
+        )
+        return None
+    return members_from_node_rows(rows, time.time(), node_timeout_seconds)
 
 
 def log_late_hold_refusal(
@@ -1933,23 +1962,18 @@ class DbCoordinator:
         now = self._monotonic()
         prior = self._no_claim_until
         self._no_claim_until = max(
-            prior, now + late_hold_pause_seconds(self._lease_ttl, self._heartbeat_seconds, None, "")
+            prior, now + late_hold_pause_seconds(self._lease_ttl, self._heartbeat_seconds)
         )
         self._leader_epoch = None
         if self._is_leader:
             self._is_leader = False
             self._alert_leadership_lost("lease claim returned past the fence timeout")
             self._fire_on_demote()  # ADR 0157 Inc 5
-        members: list[ClusterMember] | None = None
-        try:
-            rows = await _call_within(self._pool, self._paused_read_timeout, "fetch", NODES_SELECT)
-            members = members_from_node_rows(rows, time.time(), self._node_timeout_seconds)
-        except Exception as exc:
-            log.warning(
-                "cluster: node %s could not read cluster membership after a late lease claim: %s",
-                self.node_id,
-                safe_exc(exc),
-            )
+        members = await read_members_or_none(
+            lambda: _call_within(self._pool, self._paused_read_timeout, "fetch", NODES_SELECT),
+            self.node_id,
+            self._node_timeout_seconds,
+        )
         pause = late_hold_pause_seconds(
             self._lease_ttl, self._heartbeat_seconds, members, self.node_id
         )
@@ -2100,7 +2124,9 @@ class DbCoordinator:
         """Demote (self-fence) if we are leader but haven't confirmed a lease hold within the fence
         timeout, or if our own heartbeat has lapsed (:meth:`_stand_aside_on_lapse`). Pure in-memory;
         called by the watchdog (and directly by tests)."""
-        if not self._is_leader or self._stand_aside_on_lapse():
+        if not self._is_leader:
+            return
+        if self._stand_aside_on_lapse():  # demotes on a lapsed heartbeat
             return
         last = self._last_renew_ok
         if last is None:
@@ -2137,14 +2163,7 @@ class DbCoordinator:
         if self._is_leader:
             self._is_leader = False
             self._leader_epoch = None
-            log.warning(
-                "cluster: node %s stood down: its last heartbeat to land was issued %.1fs ago, past"
-                " node_timeout_seconds (%.1fs), so the cluster reads it as dead; not claiming the"
-                " lease until a heartbeat lands",
-                self.node_id,
-                now - last,
-                self._node_timeout_seconds,
-            )
+            log_heartbeat_lapse_stand_down(self.node_id, now - last, self._node_timeout_seconds)
             self._alert_leadership_lost("heartbeat lapsed")
             self._fire_on_demote()  # ADR 0157 Inc 5
         return True
