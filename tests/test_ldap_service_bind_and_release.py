@@ -443,8 +443,6 @@ def test_a_user_or_decoy_bind_whose_open_fails_closes_its_socket(how: str) -> No
     open_at_end: dict[str, bool] = {}
     texts: dict[str, str] = {}
     real = ldap3.Connection
-    held = socket.socket()
-    dead = 0
 
     def refused_wrap(*_args: Any, **_kwargs: Any) -> None:
         raise ssl.SSLError("synthetic-leak-3017")
@@ -473,7 +471,7 @@ def test_a_user_or_decoy_bind_whose_open_fails_closes_its_socket(how: str) -> No
             else:
                 self.server.port = dead
 
-    with held:
+    with socket.socket() as held:
         held.bind(("127.0.0.1", 0))
         dead = int(held.getsockname()[1])
         for branch, search in (("absent", lambda _raw: [_done(0)]), ("present", _alice)):
