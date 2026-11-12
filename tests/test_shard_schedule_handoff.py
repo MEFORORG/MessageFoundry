@@ -32,7 +32,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline.sharding import filter_registry_for_shard
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
-from messagefoundry.store import MessageStore
+from messagefoundry.store import MessageStore, Stage
 from tests.test_connection_scheduler import _OUT_OF_WINDOW, _wait_until, _weekday_window
 from tests.test_shard_lane_ownership import ADT, UNIVERSE, _pick_dest
 
@@ -142,6 +142,9 @@ async def test_a_non_owner_does_not_resume_a_lane_its_handoff_took(
         (foreign_row,) = await store.outbox_for(ids[foreign])
         assert foreign_row["status"] == "pending" and foreign_row["attempts"] == 0
         assert list((tmp_path / foreign).iterdir()) == []
+        # The invariant itself, timing-free: this engine shard's dispatcher still holds the lane
+        # PAUSED, where a re-arm would have moved it on.
+        assert runner._dispatchers[Stage.OUTBOUND].paused(foreign)
     finally:
         await runner.stop()
 
@@ -172,5 +175,8 @@ async def test_a_non_owner_start_of_a_paused_lane_arms_nothing(
         (row,) = [r for r in await store.outbox_for(message_id) if r["destination_name"] == foreign]
         assert row["status"] == "pending" and row["attempts"] == 0
         assert list((tmp_path / foreign).iterdir()) == []
+        # The invariant itself, timing-free: this engine shard's dispatcher still holds the lane
+        # PAUSED, where a re-arm would have moved it on.
+        assert runner._dispatchers[Stage.OUTBOUND].paused(foreign)
     finally:
         await runner.stop()

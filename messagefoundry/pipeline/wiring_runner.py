@@ -287,7 +287,13 @@ from messagefoundry.transports.http_listener import reply_seconds
 from messagefoundry.transports.mllp import build_ack
 from messagefoundry.transports.receipt import IngressReceipt, RefusalKind, receipt_handler
 
-__all__ = ["DrParkedError", "NotDeployedError", "RegistryRunner", "ShardLaneOwnershipError"]
+__all__ = [
+    "DrParkedError",
+    "NotDeployedError",
+    "RegistryRunner",
+    "RunnerNotRunningError",
+    "ShardLaneOwnershipError",
+]
 
 type Direction = Literal["inbound", "outbound"]
 """Which table a connection name was declared in. A name may be in BOTH (``Registry._add``
@@ -541,8 +547,8 @@ class ShardLaneOwnershipError(RuntimeError):
 
 
 class RunnerNotRunningError(RuntimeError):
-    """A run-state CONTROL (an inbound start or restart, an outbound start, stop or restart)
-    targeted a runner whose graph is not running (BACKLOG #5702).
+    """A run-state CONTROL (at least an inbound start or restart, an outbound start, stop or
+    restart) targeted a runner whose graph is not running (BACKLOG #5702).
 
     Refused rather than acted on. The graph is down, at least before :meth:`RegistryRunner.start`
     and after a teardown, which includes the ADR 0157 demoted follower, whose ``_stop_graph`` stops
@@ -559,8 +565,8 @@ class RunnerNotRunningError(RuntimeError):
     def __init__(self, name: str) -> None:
         super().__init__(
             f"connection {name!r}: this engine's graph is not running (stopped, or a demoted "
-            "node), so it takes no connection control; issue it against the node that runs the "
-            "graph"
+            "node), so it takes no connection control until the graph runs again; on a cluster, "
+            "the leader runs it"
         )
         self.name = name
 
@@ -3268,8 +3274,8 @@ class RegistryRunner:
         and otherwise the record goes where the lane is re-armed (:meth:`_schedule_holds`). Per_lane,
         that is a fresh delivery worker, which at least an operator start and a reload spawn.
         Pooled, it is at least an operator start (:meth:`_resume_pooled_lane`) and every
-        ``notify_work`` broadcast
-        that finds the lane STOPPED (:meth:`_broadcast_to`): a reload, the engine's wake after a
+        ``notify_work`` broadcast that finds the lane STOPPED (:meth:`_broadcast_to`), sent at
+        least by a reload, the engine's wake after a
         replay, resend, resubmit, upload or dead-letter replay of any message, a DR release drain,
         and a clustered leader's lease reclaim. None of those is an act on this lane, and the
         reclaim is no operator's act at all, so a pooled credential STOP can re-arm, and
@@ -4037,7 +4043,7 @@ class RegistryRunner:
         fresh bind, an inbound already listening, and a log-write refusal that undid its own bind,
         which :meth:`_emit_inbound_started` reads as not running."""
         await self._checked_inbound_start(name)
-        if resolve:
+        if resolve and self._running:  # the doors refuse a downed graph first; a second line
             self._emit_inbound_started(name)
 
     async def _checked_inbound_start(self, name: str) -> None:
@@ -4109,10 +4115,11 @@ class RegistryRunner:
                 # rule firing on this alert from re-alerting on every restart it drives. Only an
                 # inbound start() would bind: a name this runner does not hold (another engine
                 # shard's, a typo) or a deployed=False one is refused, not a failure to record.
-                # Nor is a raise after the bind, while the listener is up. A stopped runner never
-                # gets here: the door refuses it first (BACKLOG #5702).
+                # Nor is a raise after the bind, while the listener is up, or on a stopped runner,
+                # which the door refuses first (BACKLOG #5702).
                 if (
                     not operator
+                    and self._running
                     and not self.inbound_running(name)
                     and name in self.registry.inbound
                     and self._deployed(name, "inbound")
@@ -4195,8 +4202,8 @@ class RegistryRunner:
         ``hold_on_store_fault`` is the operator control route's alone: see
         :meth:`_start_outbound_unsafe`, which raises for it (vault BACKLOG #3746)."""
         async with self._reload_lock:
-            self._require_running(name)
             self._require_owned_destination(name)
+            self._require_running(name)
             self._refuse_dr_parked(name)
             if not self._outbound_start_permitted(name):
                 return
@@ -4214,8 +4221,8 @@ class RegistryRunner:
         holding its rows, and a stop would turn the engine's park into an operator pause that the
         reload after a release could not lift (vault BACKLOG #3067)."""
         async with self._reload_lock:
-            self._require_running(name, residual_ok=True)
             self._require_owned_destination(name)
+            self._require_running(name, residual_ok=True)
             self._refuse_dr_parked(name)
             self._stop_outbound_unsafe(name)
 
@@ -4247,8 +4254,8 @@ class RegistryRunner:
         ``hold_on_store_fault`` is the operator control route's alone, as on :meth:`start_outbound`.
         The stop half has run by then, so a raise leaves the lane paused."""
         async with self._reload_lock:
-            self._require_running(name)
             self._require_owned_destination(name)
+            self._require_running(name)
             self._refuse_dr_parked(name)
             engine_parked = name in self._gate_parked
             try:

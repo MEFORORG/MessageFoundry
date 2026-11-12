@@ -1872,8 +1872,9 @@ class StageDispatcher:
         after the alert and whether or not it raised: a raising sink does not undo the STOP here.
 
         NOT for the T16 content STOP. Its body is a runner STOP site, and each such site decides for
-        itself whether its STOP needs an operator: a credential fault does, a leadership loss or a
-        removed inbound does not. Reporting those here would hold lanes nothing needs to clear."""
+        itself whether its STOP is held against the calendar: a credential fault is, a leadership
+        loss or a removed inbound is not. Reporting those here would hold lanes nothing needs to
+        clear."""
         if self._on_lane_stopped is not None:
             try:
                 self._on_lane_stopped(lane)

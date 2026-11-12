@@ -748,6 +748,12 @@ def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
     re-authenticate toward the partner lockout a credential STOP protects against. It does not say
     the lane stays down until an operator acts, which is false (``RegistryRunner.outbound_stop_held``
     says what else re-arms it)."""
+    if not rr.running:
+        # BACKLOG #5702: the start this would point at is refused on a downed graph.
+        return (
+            f"outbound {name!r} is not running because this engine's graph is not running "
+            "(stopped, or a demoted node); resend through the engine that runs the graph"
+        )
     if rr.outbound_status(name) == "log_halted":
         return (
             f"outbound {name!r} is halted: this engine cannot write its application log, so nothing "
@@ -1048,7 +1054,7 @@ async def _alert_restart(
     restart: Callable[[str], Awaitable[None]], action: str, target: str
 ) -> None:
     """``restart(target)``, logged at INFO and not raised when the runner's graph is down, as on a
-    demoted follower (BACKLOG #5702). The node that runs the graph acts on its own alert."""
+    demoted follower (BACKLOG #5702), where the leader, if there is one, acts on its own alert."""
     try:
         await restart(target)
     except RunnerNotRunningError:
@@ -4146,8 +4152,9 @@ async def _record_refused_control_audit(
     store_fault: bool,
     client: str | None,
 ) -> None:
-    """:func:`_record_control_audit` for a start or restart that was refused: an inbound's, or an
-    outbound's the store stopped. ``role`` is the resolved role and ``running`` the lane's state
+    """:func:`_record_control_audit` for a control that was refused: at least an inbound start or
+    restart, an outbound start or restart the store stopped, and any start, stop or restart a downed
+    graph refused (BACKLOG #5702), whose row carries no ``reason``. ``role`` is the resolved role and ``running`` the lane's state
     after the refusal, which is not always stopped: at least a lane that failed at boot on a store
     fault stays unpaused through a start the store stopped.
 
@@ -5936,8 +5943,8 @@ def create_app(
             )
             return {"name": name, "running": running}
         if rr is not None and side == "out":
-            held = False
-            graph_down: RunnerNotRunningError | None = None
+            out_refused: HTTPException | None = None
+            out_store_fault = False
             try:
                 if action == "start":
                     await rr.start_outbound(name, hold_on_store_fault=True)
@@ -5950,7 +5957,8 @@ def create_app(
                 # resumed. Answered below, outside this handler, as the inbound arm does.
                 if explicit_cause(exc, AnchorStoreUnavailable) is None:
                     raise
-                held = True
+                out_store_fault = True
+                out_refused = HTTPException(503, _anchor_store_detail(action))
             except ShardLaneOwnershipError as exc:
                 # ADR 0073: this shard never runs the lane, so acting here would only produce a
                 # vacuous 'stopped' (and unlock purge) while the owner keeps delivering.
@@ -5967,8 +5975,8 @@ def create_app(
             except RunnerNotRunningError as exc:
                 # BACKLOG #5702: the graph is down, so a start would spawn a delivery worker outside
                 # the engine lifecycle and a stop would record a pause a later start inherits.
-                graph_down = exc
-            if graph_down is not None:
+                out_refused = HTTPException(503, str(exc))
+            if out_refused is not None:
                 await _record_refused_control_audit(
                     engine,
                     identity,
@@ -5976,22 +5984,10 @@ def create_app(
                     action,
                     role="destination",
                     running=rr.outbound_running(name),
-                    store_fault=False,
+                    store_fault=out_store_fault,
                     client=client,
                 )
-                raise HTTPException(503, str(graph_down))
-            if held:
-                await _record_refused_control_audit(
-                    engine,
-                    identity,
-                    name,
-                    action,
-                    role="destination",
-                    running=rr.outbound_running(name),
-                    store_fault=True,
-                    client=client,
-                )
-                raise HTTPException(503, _anchor_store_detail(action))
+                raise out_refused
             running = rr.outbound_running(name)
             await _record_control_audit(
                 engine, identity, name, action, role="destination", running=running, client=client

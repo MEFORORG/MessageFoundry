@@ -18,7 +18,7 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
-from messagefoundry.api.app import _alert_control_action
+from messagefoundry.api.app import _alert_control_action, _outbound_down_detail
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.wiring_runner import (
@@ -82,6 +82,8 @@ async def test_a_demoted_runner_refuses_every_run_state_door(
         assert runner._sources == {}
         assert runner._workers == {}
         assert runner._outbound_paused == set()
+        # A resend refusal names the downed graph, not the start it refuses.
+        assert "graph is not running" in _outbound_down_detail(runner, _OUT)
         # An inbound stop has nothing to undo on a downed graph, so it is not refused.
         await runner.stop_inbound(_IN)
         # The pause the old stop_outbound recorded here outlived the teardown that had already
