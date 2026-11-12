@@ -98,7 +98,9 @@ async def store(tmp_path: Path):
     await s.close()
 
 
-def _registry(tmp_path: Path, outdir: Path) -> Registry:
+def _registry(
+    tmp_path: Path, outdir: Path, *, deployed: bool = True, auto_start: bool = True
+) -> Registry:
     inbox = tmp_path / "in"
     inbox.mkdir(exist_ok=True)
     outdir.mkdir(exist_ok=True)
@@ -119,6 +121,8 @@ def _registry(tmp_path: Path, outdir: Path) -> Registry:
             ConnectionSpec(
                 ConnectorType.FILE, {"directory": str(outdir), "filename": "{MSH-10}.hl7"}
             ),
+            deployed=deployed,
+            auto_start=auto_start,
         )
     )
     reg.add_router("r", lambda m: [])
@@ -310,6 +314,78 @@ async def test_a_store_fault_handing_back_before_the_send_is_not_an_internal_err
         await runner._process_delivery_item(BATCH_DEST, item)
     (row,) = await store.outbox_for(message_id)
     assert row["status"] == "inflight" and not row["last_error"]
+
+
+class _SlowClose(_HeldDestination):
+    """A close that fails the send at once and then takes its time, as a transport's bounded close
+    of a connect-per-send socket can. It records whether the lane could still claim at its start."""
+
+    def __init__(self, runner: RegistryRunner) -> None:
+        super().__init__()
+        self.runner = runner
+        self.release = asyncio.Event()
+        self.lane_open_at_close: bool | None = None
+
+    async def aclose(self) -> None:
+        self.lane_open_at_close = self.runner._lane_may_deliver(_OB)
+        self.closed.set()
+        await self.release.wait()
+
+
+@pytest.mark.parametrize("claim_mode", ["per_lane", "pooled"])
+@pytest.mark.parametrize("flag", ["deployed", "auto_start"])
+async def test_a_send_a_parking_reload_cuts_is_not_reclaimed_during_the_close(
+    store: MessageStore, tmp_path: Path, claim_mode: str, flag: str
+) -> None:
+    """A reload that parks the lane (``deployed=False``, or ``auto_start=False`` on a lane an
+    operator stopped) parks it before it closes the connector. The close fails the send, which
+    hands its row back with a retry due now; a lane still open would re-claim it during the close,
+    find no connector, and charge it an attempt the reload caused (BACKLOG #5718)."""
+    runner = RegistryRunner(
+        _registry(tmp_path, tmp_path / "out_old"),
+        store,
+        claim_mode=claim_mode,
+        poll_interval=0.02,
+        pooled_sweep_interval=0.05,
+        egress=EgressSettings(deny_by_default=False),
+    )
+    await runner.start()
+    old = _SlowClose(runner)
+    await runner._destinations[_OB].aclose()
+    runner._destinations[_OB] = old
+    message_id = await store.enqueue_message(
+        channel_id="IB_RELOAD", raw=ADT, deliveries=[(_OB, ADT)], now=_time.time()
+    )
+    reload: asyncio.Task[Any] | None = None
+    try:
+        await asyncio.wait_for(old.started.wait(), timeout=10)
+        if flag == "auto_start":
+            # The auto_start gate takes only a lane that is not up: an operator stop, with the send
+            # still in flight on the connector. That stop already closes the lane gate, so this leg
+            # pins the outcome; the deployed leg is the one the close-then-park order failed.
+            await runner.stop_outbound(_OB)
+        new = _registry(
+            tmp_path,
+            tmp_path / "out_old",
+            deployed=flag != "deployed",
+            auto_start=flag != "auto_start",
+        )
+        reload = asyncio.create_task(runner.reload(new))
+        await asyncio.wait_for(old.closed.wait(), timeout=10)
+        assert old.lane_open_at_close is False
+        row = await _settled_row(store, message_id)
+        # Give a re-claim the time it would need, and stop early if one charges the row.
+        deadline = _time.monotonic() + 1.0
+        while _time.monotonic() < deadline and not row["last_error"]:
+            await asyncio.sleep(0.02)
+            (row,) = await store.outbox_for(message_id)
+        assert row["status"] == "pending"
+        assert row["attempts"] == 0 and not row["last_error"]
+    finally:
+        old.release.set()
+        if reload is not None:
+            await asyncio.wait_for(reload, timeout=10)
+        await runner.stop()
 
 
 async def test_a_batch_send_the_reload_close_fails_is_not_charged(store: MessageStore) -> None:
