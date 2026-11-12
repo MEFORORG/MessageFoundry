@@ -12,6 +12,8 @@ on every backend, the SQL Server live leg included, is ``tests/_role_seal_contra
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
@@ -162,3 +164,37 @@ def test_the_schema_declares_the_role_foreign_key_and_its_index() -> None:
         "IF INDEXPROPERTY(OBJECT_ID('ad_group_role_map'),'ix_ad_group_role_map_role','IndexID')"
         " IS NULL CREATE INDEX ix_ad_group_role_map_role ON ad_group_role_map(role_id)"
     ) in flat
+
+
+@pytest.mark.parametrize("asked", ["custom:ABC", "custom:abc "])
+async def test_a_role_delete_by_a_variant_id_deletes_nothing(asked: str) -> None:
+    """The roles lookup compares in the database collation and finds the stored role for a variant
+    id; the caller's holder and session reads matched the variant, not it, so the delete is refused
+    as no such role rather than removing a role whose holders nobody revoked."""
+    ops: list[str] = []
+
+    class _DelCur:
+        async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
+            ops.append(sql)
+
+        async def fetchone(self) -> tuple[Any, ...]:
+            return (0, "custom:abc")  # builtin = 0, the stored id
+
+    class _Conn:
+        async def rollback(self) -> None:
+            ops.append("ROLLBACK")
+
+    store = _store()
+
+    @asynccontextmanager
+    async def acquire() -> AsyncIterator[_Conn]:
+        yield _Conn()
+
+    @asynccontextmanager
+    async def cursor(conn: Any) -> AsyncIterator[_DelCur]:
+        yield _DelCur()
+
+    store._acquire = acquire  # type: ignore[method-assign]
+    store._cursor = cursor  # type: ignore[method-assign]
+    assert await store.delete_custom_role(asked) is False
+    assert ops == ["SELECT builtin, id FROM roles WHERE id=?", "ROLLBACK"]

@@ -26,6 +26,7 @@ import pytest
 
 from messagefoundry.store.crypto import AUDIT_SCHEME_IN_HEAP, audit_key_id, generate_key
 from messagefoundry.store.store import (
+    _EXACT_AUDIT_WALK_STEPS,
     AUDIT_KEY_EPOCH_ACTION,
     _exact_audit_row,
     _transit_attestation_audit_gap,
@@ -223,3 +224,39 @@ async def test_a_variant_row_with_a_malformed_seq_is_returned_so_callers_refuse_
         fetch, "seq, action", "action = ?", ("act",), lambda r: r["action"] == "act", above=1
     )
     assert found == {"seq": "3", "action": "ACT"}
+
+
+async def test_the_walk_fails_closed_once_its_budget_is_spent(log: _Log) -> None:
+    """Planted variants past the budget cannot make one lookup issue a statement each: the walk
+    hands back a variant, which every caller refuses. The control is a walk inside the budget."""
+    mine = log.append("act", "u")
+    for _ in range(_EXACT_AUDIT_WALK_STEPS - 1):
+        log.append("act", "U")
+    assert await log.keyed("act", "u") == mine  # control: the exact row is the last step
+    log.append("act", "U")
+    assert await log.keyed("act", "u") is None
+
+
+async def test_the_key_range_walk_never_goes_below_the_genesis_position(log: _Log) -> None:
+    """A row numbered 0 is no range opening, even when the genesis row reads as a variant."""
+    log.db.execute(
+        "UPDATE audit_log SET action = ? WHERE seq = 1", (AUDIT_KEY_EPOCH_ACTION.upper(),)
+    )
+    log.db.execute(
+        "INSERT INTO audit_log (seq, ts, actor, action, channel_id, detail, client, row_hash)"
+        " SELECT 0, ts, actor, ?, channel_id, detail, client, row_hash FROM audit_log WHERE seq = 1",
+        (AUDIT_KEY_EPOCH_ACTION,),
+    )
+    seqs: list[object] = []
+    real = log.fetch
+
+    async def fetch(sql: str, params: tuple[object, ...]) -> Mapping[str, Any] | None:
+        found = await real(sql, params)
+        if found is not None and "action = ? AND seq > ? AND seq <= ?" in sql:
+            seqs.append(found["seq"])
+        return found
+
+    log.fetch = fetch  # type: ignore[method-assign]
+    log.append("act", "u")
+    assert await log.keyed("act", "u") is None
+    assert 0 not in seqs, "the walk read the row numbered 0 as a range opening candidate"

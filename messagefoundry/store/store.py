@@ -4783,7 +4783,9 @@ class UnknownRoleError(LookupError):
     Raised by each backend's ``_write_user`` for an id the write ADDS whose role was gone when the
     write read the ``roles`` table, so a role deleted after a caller's own check is not granted. A
     delete that commits after that read is refused instead by the ``user_roles`` foreign key, which
-    every backend has, as the driver's integrity error. Either way no record seals the id."""
+    every backend has, as the driver's integrity error. Either way no record seals the id. SQL
+    Server's ``_write_ad_map`` raises it too, through :func:`existing_role_pairs_only` (BACKLOG
+    #5725), where SQLite and Postgres raise their driver's integrity error from the map's key."""
 
     def __init__(self, role_ids: Sequence[str]) -> None:
         self.role_ids = tuple(role_ids)
@@ -5026,7 +5028,8 @@ async def ad_map_seal_ok_async(sealer: AnyRowSealer | None, current: AdMap) -> b
 
 
 #: A write to one AD map, for a backend's ``_write_ad_map``: a whole replacement map, which keeps
-#: nothing stored and so is never refused, or an edit of the stored map, which is checked first.
+#: nothing stored and so is never refused over the stored map's seal, or an edit of the stored map,
+#: which is checked first. Either is refused for a role id that names no role (BACKLOG #5725).
 AdMapChange = AdMap | Callable[[AdMap], AdMap]
 
 
@@ -9219,6 +9222,12 @@ type TransitAttestationFetch = Callable[
 ]
 
 
+#: How many statements :func:`_exact_audit_row` may issue before it fails closed (BACKLOG #5726).
+#: A variant row needs a write outside the engine or an account whose name differs only in case,
+#: so a lookup that meets this many is refused rather than walked further.
+_EXACT_AUDIT_WALK_STEPS: Final = 64
+
+
 async def _exact_audit_row(
     fetch: TransitAttestationFetch,
     columns: str,
@@ -9243,9 +9252,12 @@ async def _exact_audit_row(
 
     A variant row whose ``seq`` is not an integer is RETURNED, not stepped past or read as none:
     every caller rechecks the row exactly and refuses it, so a malformed read fails closed, and the
-    supersession check, for which "no row" means "nothing supersedes", never fails open."""
+    supersession check, for which "no row" means "nothing supersedes", never fails open. So is the
+    last variant row once :data:`_EXACT_AUDIT_WALK_STEPS` statements are spent: anyone who can
+    write ``audit_log`` could otherwise make one lookup issue a statement per planted row."""
     hi = at_most
-    while True:
+    row: Mapping[str, Any] | None = None
+    for _ in range(_EXACT_AUDIT_WALK_STEPS):
         conds, args = [where], list(params)
         if above is not None:
             conds.append("seq > ?")
@@ -9266,6 +9278,7 @@ async def _exact_audit_row(
         hi = seq - 1
         if above is not None and hi <= above:
             return None
+    return row  # the walk's budget is spent on variants: fail closed, as above
 
 
 @dataclass(frozen=True, slots=True)
@@ -9424,6 +9437,8 @@ async def _audit_row_mac_check(
         "action = ?",
         (AUDIT_KEY_EPOCH_ACTION,),
         lambda r: r["action"] == AUDIT_KEY_EPOCH_ACTION,
+        # Never below the genesis position: a planted row numbered 0 or less is no range opening.
+        above=0,
         at_most=seq,
     )
     key_id: str | None = None
