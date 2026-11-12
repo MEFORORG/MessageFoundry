@@ -1796,8 +1796,10 @@ class Engine:
     # --- reference sets (ADR 0006) -------------------------------------------
 
     def _make_reference_runner(self) -> ReferenceSyncRunner:
-        """Build the reference sync runner; its specs are read **live** from the current registry, so a
-        reload's swapped declarations are picked up without rebuilding it."""
+        """Build the reference sync runner; its specs and its env() values are read **live** from the
+        current registry and the engine's applied values, so a reload's swapped declarations, and a
+        value it adds or rotates, are picked up without rebuilding it (vault BACKLOG #5698). The values
+        are the ones a start or a reload applied, :meth:`apply_start_env_values` included."""
         return ReferenceSyncRunner(
             self.store,
             lambda: (
@@ -1806,7 +1808,7 @@ class Engine:
                 else []
             ),
             self._reference_settings or ReferenceSettings(),
-            env_values=self._env_values,
+            env_values=lambda: self._env_values,
             egress=self._egress_settings,
             alert_sink=self._alert_sink,
             # Track B Step 6: gate materialize-from-source on the leader; every node still converges its
