@@ -339,12 +339,24 @@ async def test_a_turn_woken_by_stop_writes_its_503_before_the_writers_close() ->
         await drained.wait()
         return InboundReply(ReplyOutcome.SHUTTING_DOWN)
 
+    reasons: list[str] = []
+
     def drain(reason: str) -> None:
-        assert reason == "shutting_down"
+        reasons.append(reason)
         drained.set()
 
     src.sync_reply = resolver
     src.reply_drain = drain
+    data = await _post_then_stop(src, handler, blocked)
+    assert reasons == ["shutting_down"]
+    head, _, body = data.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.1 503 "), f"the woken turn's answer was lost: {data!r}"
+    assert b"\r\nRetry-After: 5" in head
+    assert _json.loads(body)["status"] == "shutting_down"
+
+
+async def _post_then_stop(src: HttpSource, handler: Any, blocked: asyncio.Event) -> bytes:
+    """Start ``src``, POST once, run stop() once ``blocked`` is set, and return all the peer read."""
     await src.start(receipt_handler(handler))
     stopped = False
     try:
@@ -355,14 +367,59 @@ async def test_a_turn_woken_by_stop_writes_its_503_before_the_writers_close() ->
             await asyncio.wait_for(blocked.wait(), 5.0)
             await src.stop()
             stopped = True
-            data = await asyncio.wait_for(reader.read(-1), 5.0)
+            return await asyncio.wait_for(reader.read(-1), 5.0)
         finally:
             writer.close()
             await asyncio.gather(writer.wait_closed(), return_exceptions=True)
     finally:
         if not stopped:
             await src.stop()
-    head, _, body = data.partition(b"\r\n\r\n")
-    assert head.startswith(b"HTTP/1.1 503 "), f"the woken turn's answer was lost: {data!r}"
-    assert b"\r\nRetry-After: 5" in head
-    assert _json.loads(body)["status"] == "shutting_down"
+
+
+async def test_a_request_mid_commit_at_stop_still_gets_its_202() -> None:
+    # BACKLOG #5715, the receipt path: stop() closed the writer of a request whose commit was still
+    # running, so its 202 was discarded and the sender would resend a body already committed. A
+    # request read in full now keeps its writer until its answer is written.
+    src = HttpSource(Source(type=ConnectorType.HTTP, settings={"host": "127.0.0.1", "port": 0}))
+    blocked = asyncio.Event()
+
+    async def handler(raw: bytes) -> IngressReceipt:
+        blocked.set()
+        await asyncio.sleep(0.2)  # the commit, still running when stop() begins
+        return IngressReceipt.accepted("msg-1")
+
+    data = await _post_then_stop(src, handler, blocked)
+    assert data.startswith(b"HTTP/1.1 202 "), f"the committed request's 202 was lost: {data!r}"
+
+
+async def test_stop_stays_bounded_when_a_reply_turn_never_leaves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The writer stop() leaves open is still bounded by the shutdown grace: a turn the drain does not
+    # wake is cancelled at the grace, as every client task is, and stop() returns.
+    import messagefoundry.transports.http_listener as http_listener
+
+    monkeypatch.setattr(http_listener, "_CLIENT_SHUTDOWN_GRACE", 0.3)
+    src = HttpSource(
+        Source(
+            type=ConnectorType.HTTP,
+            settings={"host": "127.0.0.1", "port": 0, "reply_from": "OB_PARTNER"},
+        )
+    )
+    blocked = asyncio.Event()
+
+    async def handler(raw: bytes) -> IngressReceipt:
+        return IngressReceipt.accepted("msg-1")
+
+    async def resolver(message_id: str) -> InboundReply:
+        blocked.set()
+        await asyncio.Event().wait()  # ignores the drain
+        raise AssertionError("unreachable")
+
+    src.sync_reply = resolver
+    src.reply_drain = lambda reason: None
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    data = await _post_then_stop(src, handler, blocked)
+    assert loop.time() - started < 3.0, "stop() outlived its grace"
+    assert not data.startswith(b"HTTP/1.1 2"), "a cancelled turn must not read as answered"
