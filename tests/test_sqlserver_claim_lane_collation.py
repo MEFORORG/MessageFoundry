@@ -102,3 +102,30 @@ async def test_case_variant_lanes_reach_the_batch_as_two_lanes() -> None:
     assert kind == "execute-batch"
     assert "(VALUES (?),(?))" in sql
     assert params[5:7] == ("IB_CASE", "ib_case")
+
+
+@pytest.mark.parametrize(
+    ("stage", "lane_col"), [("ingress", "channel_id"), ("outbound", "destination_name")]
+)
+async def test_lane_discovery_tells_case_variants_apart(
+    stage: str, lane_col: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sweep's lane discovery must surface every lane the binary claim treats as its own: a
+    folding DISTINCT would list one of two case variants, and the sweep would never ready the other.
+    The DISTINCT, the after cursor and the ORDER BY are binary; the head read keeps the seekable
+    database-collation equality beside the binary one."""
+    seen: list[str] = []
+
+    async def fake_fetchall(sql: str, params: tuple[object, ...] = ()) -> list[dict[str, object]]:
+        seen.append(sql)
+        return []
+
+    store = _bare_store(fold=False, epoch=False)
+    monkeypatch.setattr(store, "_fetchall", fake_fetchall)
+    await store.list_fifo_lanes(stage)
+    (sql,) = seen
+    assert f"SELECT DISTINCT {lane_col} {_BIN} AS lane FROM queue" in sql
+    assert f"(@after IS NULL OR {lane_col} {_BIN} > @after)" in sql
+    assert f"{lane_col} = d.lane COLLATE DATABASE_DEFAULT AND {lane_col} {_BIN} = d.lane AND" in sql
+    assert sql.endswith(" ORDER BY d.lane;"), "d.lane is binary, so the page order is too"
+    assert re.findall(rf"{lane_col} = d\.lane(?! COLLATE)", sql) == []

@@ -1725,10 +1725,13 @@ _V1_CLAIM_PROCS: Final[frozenset[str]] = frozenset(n for n, _ in _RETAINED_CLAIM
 
 # The OPENJSON lane decode (compat >= 130): one NVARCHAR(MAX) JSON-array parameter, so no delimiter
 # contract is ever imposed on connection names (lane names are data, never concatenated into SQL).
-# The explicit CAST keeps the `{lane_col} = l.lane` predicate seek-clean against the NVARCHAR(256)
-# column; DISTINCT is belt-and-suspenders under the caller's preserved request-order dedupe. The
-# DISTINCT is binary, as the caller's dedupe is: under the database collation it would merge two
-# lane names that differ only in case (BACKLOG #5721).
+# The explicit CAST types the decoded lane as the NVARCHAR(256) lane column is typed; DISTINCT is
+# belt-and-suspenders under the caller's preserved request-order dedupe. The DISTINCT is binary, as
+# the caller's dedupe is: under the database collation it would merge two lane names that differ
+# only in case (BACKLOG #5721). That makes l.lane explicitly binary, so the discovery's seekable
+# conjunct must re-label it COLLATE DATABASE_DEFAULT (_fifo_heads_steps): a bare
+# `{lane_col} = l.lane` would compare binary, which is correct but converts the column and loses the
+# seek.
 _CLAIM_PROC_LANE_SOURCE = (
     f"(SELECT DISTINCT CAST(j.[value] AS NVARCHAR(256)){_LANE_BIN} FROM OPENJSON(@lanes) AS j)"
 )
@@ -1868,8 +1871,15 @@ def _claim_proc_ddl(proc_name: str, lane_col: str) -> str:
     proc name, or an older build sharing the store calls a body it cannot parse (BACKLOG #1270)."""
     body = _claim_proc_body(proc_name, lane_col).replace("'", "''")
     # The schema the head creates the proc in: dbo for a retained _v1 head, else the principal's
-    # default schema, where an unqualified CREATE lands (BACKLOG #5722).
-    schema = "'dbo'" if proc_name in _V1_CLAIM_PROCS else "QUOTENAME(SCHEMA_NAME())"
+    # default schema, where an unqualified CREATE lands (BACKLOG #5722). A called proc deploys only
+    # where the queue table resolves for this principal too: the startup gate looks for it in that
+    # table's schema, so a proc created anywhere else would be an orphan its own `queue` reference
+    # need not reach (tables kept in dbo, re-provisioned by a login whose default schema is another).
+    if proc_name in _V1_CLAIM_PROCS:
+        schema, store_schema_check = "'dbo'", ""
+    else:
+        schema = "QUOTENAME(SCHEMA_NAME())"
+        store_schema_check = " AND OBJECT_SCHEMA_NAME(OBJECT_ID(N'queue', N'U')) = SCHEMA_NAME()"
     version_check = (
         "CAST(SERVERPROPERTY('EngineEdition') AS INT) >= 5"
         " OR TRY_CAST(PARSENAME(CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)), 4)"
@@ -1888,7 +1898,7 @@ def _claim_proc_ddl(proc_name: str, lane_col: str) -> str:
         # _ensure_schema transaction (a flag-OFF open outage, the exact failure this guard
         # exists to make impossible). Probing both closes it; ALTER on the target schema also
         # covers the OR ALTER re-apply against an existing proc.
-        f" AND HAS_PERMS_BY_NAME({schema}, 'SCHEMA', 'ALTER') = 1"
+        f" AND HAS_PERMS_BY_NAME({schema}, 'SCHEMA', 'ALTER') = 1{store_schema_check}"
         f" AND ({version_check})"
         f" EXEC(N'{body}')"
     )
@@ -3678,7 +3688,7 @@ class SqlServerStore:
                     " which schema the claim procedures belong in"
                 )
             else:
-                reason = await self._verify_claim_procs(schema, head_forms)
+                reason, head_forms = await self._verify_claim_procs(schema)
         except Exception as exc:  # noqa: BLE001 - §4: ANY gate failure degrades, never an outage
             # A transient probe failure (e.g. a hiccup on the metadata read) must not fail the
             # open — the ADR's rule is total: any gate miss runs the shipped batch, loudly.
@@ -3720,10 +3730,11 @@ class SqlServerStore:
                 reason,
             )
 
-    async def _verify_claim_procs(self, schema: str, head_forms: dict[str, str]) -> str | None:
+    async def _verify_claim_procs(self, schema: str) -> tuple[str | None, dict[str, str]]:
         """Probe both called procs in ``schema`` (bracket-quoted) for :meth:`_gate_claim_proc`:
-        the degrade reason, or None with ``head_forms`` filled in for each proc."""
+        ``(reason, {})`` on the first miss, else ``(None, head form per proc)``."""
         expected = _claim_proc_shipped_hashes()
+        head_forms: dict[str, str] = {}
         for proc_name in (_CLAIM_PROC_CID, _CLAIM_PROC_DST):
             qualified = f"{schema}.{proc_name}"
             # OBJECT_ID rides along so a NULL body can be told apart from an ABSENT proc.
@@ -3741,9 +3752,10 @@ class SqlServerStore:
                 if (row["oid"] if row else None) is None:
                     return (
                         f"stored procedure {qualified} is missing (guarded DDL skipped — create"
-                        " procedure / ALTER-on-schema denied, or a pre-2016-SP1 engine? It is"
+                        " procedure / ALTER-on-schema denied, a pre-2016-SP1 engine, or a"
+                        " provisioning login whose default schema is not the queue table's? It is"
                         " looked for in the schema of the queue table this login resolves)"
-                    )
+                    ), {}
                 return (
                     f"stored procedure {qualified} is DEPLOYED but its definition is unreadable"
                     " (OBJECT_ID resolves, OBJECT_DEFINITION is NULL) — the proc is not missing"
@@ -3751,7 +3763,7 @@ class SqlServerStore:
                     f" definition on it (grant view definition on OBJECT::{qualified} to <the"
                     " engine's principal>) or the module was created with encryption. The gate"
                     " compares the body hash, so it cannot pass on a body it cannot read"
-                )
+                ), {}
             got = hashlib.sha256(_normalize_tsql(deployed).encode()).hexdigest()
             matched = expected[proc_name].get(got)
             if matched is None:
@@ -3763,9 +3775,9 @@ class SqlServerStore:
                     " body was changed without bumping the proc version. The shipped batch runs."
                     f" Compare OBJECT_DEFINITION(OBJECT_ID('{qualified}')) against this build's"
                     " own definition to see the drift"
-                )
+                ), {}
             head_forms[proc_name] = matched
-        return None
+        return None, head_forms
 
     @staticmethod
     def _sync_setinputsizes(cur: Any) -> Any | None:
@@ -11085,13 +11097,7 @@ class SqlServerStore:
         # C without a third variant); everything after cur.execute — the drain, the kept==claimed
         # adjudication, the H2 loop, _commit, the 1222 translation, and the shielded finally-guard
         # — is the same code on both paths (AC-9). The gate degraded => the shipped batch, loudly.
-        # The CALL names the schema the gate verified the procs in (BACKLOG #5722); a passing gate
-        # always records it, so the schema check only keeps a hand-set flag off a CALL to nowhere.
-        use_proc = (
-            self._fifo_claim_proc
-            and self._claim_proc_effective
-            and self._claim_proc_schema is not None
-        )
+        use_proc = self._fifo_claim_proc and self._claim_proc_effective
         # ADR 0114 sub-lever B (fifo_claim_prepared): the non-DDL fallback lane — the SAME stable
         # encoding as the proc (one JSON lanes parameter, fixed-nullable fence) as a client-side
         # batch with the trailing reset INSIDE the text, executed on a store-owned dedicated
@@ -11116,7 +11122,13 @@ class SqlServerStore:
         args: tuple[Any, ...]
         if use_proc:
             proc_name = _CLAIM_PROC_CID if lane_col == "channel_id" else _CLAIM_PROC_DST
-            sql = f"{{CALL {self._claim_proc_schema}.{proc_name} (?,?,?,?,?,?,?,?,?)}}"
+            # The CALL names the schema the gate verified the procs in (BACKLOG #5722). A passing
+            # gate sets it together with _claim_proc_effective, so the two cannot disagree; one
+            # without the other is a defect, raised rather than run on a path the gauge misreports.
+            schema = self._claim_proc_schema
+            if schema is None:
+                raise RuntimeError("fifo_claim_proc is effective but the gate recorded no schema")
+            sql = f"{{CALL {schema}.{proc_name} (?,?,?,?,?,?,?,?,?)}}"
             args = (
                 now,
                 stage,
@@ -11525,18 +11537,25 @@ class SqlServerStore:
 
         Unlike :meth:`claim_fifo_heads`, this is a pure RCSI snapshot read with NO locking hints, so it
         can never WAIT on a row lock — it needs no ``SET LOCK_TIMEOUT 0`` never-block guard (ADR 0066
-        §9)."""
+        §9).
+
+        Lanes are told apart BINARY, as the claim tells them apart (BACKLOG #5721): the DISTINCT, the
+        ``@after`` cursor and the ``ORDER BY`` all run in ``Latin1_General_100_BIN2``, and the head read
+        keeps a seekable database-collation equality beside the binary one that decides. Under a
+        case-insensitive collation a folding DISTINCT would surface only one of two lanes whose names
+        differ only in case, and the sweep would never ready the other."""
         lane_col = self._lane_col(stage)  # code-controlled literal
         sql = (
             "SET NOCOUNT ON;"
             " DECLARE @stage NVARCHAR(16) = ?, @pending NVARCHAR(32) = ?, @limit INT = ?,"
             " @after NVARCHAR(256) = ?;"
             " SELECT TOP (@limit) d.lane, h.next_attempt_at"
-            f" FROM (SELECT DISTINCT {lane_col} AS lane FROM queue"
+            f" FROM (SELECT DISTINCT {lane_col}{_LANE_BIN} AS lane FROM queue"
             f" WHERE stage = @stage AND status = @pending"
-            f" AND (@after IS NULL OR {lane_col} > @after)) d"
+            f" AND (@after IS NULL OR {lane_col}{_LANE_BIN} > @after)) d"
             " CROSS APPLY (SELECT TOP (1) next_attempt_at FROM queue"
-            f" WHERE stage = @stage AND {lane_col} = d.lane AND status = @pending"
+            f" WHERE stage = @stage AND {lane_col} = d.lane COLLATE DATABASE_DEFAULT"
+            f" AND {lane_col}{_LANE_BIN} = d.lane AND status = @pending"
             " ORDER BY seq) h"
             " ORDER BY d.lane;"
         )

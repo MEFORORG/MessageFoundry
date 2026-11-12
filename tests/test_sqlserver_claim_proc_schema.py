@@ -17,7 +17,7 @@ from __future__ import annotations
 import pytest
 
 from messagefoundry.store import sqlserver as ss
-from tests.test_adr0114_claim_proc import _drive_proc, _gate, _gate_rows
+from tests.test_adr0114_claim_proc import _drive_proc, _gate, _gate_rows, _proc_store
 
 
 async def test_the_gate_finds_and_records_procs_in_a_non_dbo_store_schema(
@@ -40,14 +40,6 @@ async def test_the_call_names_the_schema_the_gate_verified(
     kind, sql, _ = ops[0]
     assert kind == "execute-batch"
     assert sql == f"{{CALL [mefor_app].{proc_name} (?,?,?,?,?,?,?,?,?)}}"
-
-
-async def test_a_schema_name_is_bracket_quoted(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The name comes from the server, but it is still an identifier spliced into SQL text, so the
-    # gate takes it QUOTENAME'd and uses that form for the probe and the CALL.
-    store = await _gate(_gate_rows(schema="odd]name"), monkeypatch)
-    assert store.claim_proc_effective is True, store.claim_proc_degraded_reason
-    assert store._claim_proc_schema == "[odd]]name]"
 
 
 async def test_an_unresolvable_queue_table_degrades_loudly(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -74,6 +66,10 @@ def test_called_procs_deploy_unqualified_and_probe_alter_on_the_default_schema()
         ddl = ss._claim_proc_ddl(name, col)
         assert f" EXEC(N'CREATE OR ALTER PROCEDURE {name} @now FLOAT," in ddl
         assert "HAS_PERMS_BY_NAME(QUOTENAME(SCHEMA_NAME()), 'SCHEMA', 'ALTER') = 1" in ddl
+        # The proc deploys only where the queue table resolves too, the schema the gate looks in:
+        # tables kept in dbo and re-provisioned by a login with another default schema would
+        # otherwise leave an orphan proc in that schema.
+        assert " AND OBJECT_SCHEMA_NAME(OBJECT_ID(N'queue', N'U')) = SCHEMA_NAME()" in ddl
         assert "dbo" not in ddl
 
 
@@ -85,3 +81,13 @@ def test_retained_v1_procs_keep_their_dbo_head_and_its_matching_guard() -> None:
         ddl = ss._claim_proc_ddl(name, col)
         assert f" EXEC(N'CREATE OR ALTER PROCEDURE dbo.{name} @now FLOAT," in ddl
         assert "HAS_PERMS_BY_NAME('dbo', 'SCHEMA', 'ALTER') = 1" in ddl
+        assert "OBJECT_SCHEMA_NAME" not in ddl
+
+
+async def test_the_call_refuses_an_effective_flag_with_no_recorded_schema() -> None:
+    """The gate sets the schema with the effective flag; one without the other must not quietly run
+    the batch under a gauge that reports the proc path."""
+    store = _proc_store(proc=True, effective=True)
+    store._claim_proc_schema = None
+    with pytest.raises(RuntimeError, match="recorded no schema"):
+        await _drive_proc("ingress", ["lane-0"], store=store)

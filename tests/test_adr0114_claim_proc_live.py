@@ -180,6 +180,15 @@ async def test_case_variant_lanes_claim_apart_on_both_paths(proc_store: SqlServe
     """BACKLOG #5721: two lanes whose names differ only in case are two lanes on BOTH dispatch paths.
     Under a case-insensitive database collation the batch used to fail on the @heads primary key and
     the proc merged the two names. Each lane must claim its own head, and the paths must agree."""
+    # On a case-sensitive database the two names never compared equal, so the old code passed too.
+    row = await proc_store._fetchone(
+        "SELECT CAST(DATABASEPROPERTYEX(DB_NAME(), 'Collation') AS NVARCHAR(128)) AS c"
+    )
+    collation = str(row["c"]) if row else ""
+    if "_CI" not in collation.upper():
+        pytest.skip(
+            f"database collation {collation!r} is not case-insensitive; this leg is vacuous"
+        )
     lanes = ["IB_CASE_LANE", "ib_case_lane"]
     mids = {
         lane: await proc_store.enqueue_ingress(channel_id=lane, raw=f"MSH|^~\\&|CASE|{lane}")

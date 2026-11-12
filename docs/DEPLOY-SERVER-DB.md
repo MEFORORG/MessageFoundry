@@ -253,11 +253,13 @@ Vault and LDAP*.
 > no grant.) Their *creation* rides the schema batch, so step 4 deploys them, in the provisioning
 > login's default schema, where the batch creates the tables; it needs `CREATE PROCEDURE` and
 > `ALTER` on that schema. It is permission-guarded and self-no-ops when the provisioning principal
-> cannot take it. If you enable the flag, grant the runtime login `EXECUTE` and `VIEW DEFINITION`
-> on both procs the engine calls (`mefor_claim_fifo_heads_cid_v2` and `_dst_v2`, in the store's
-> schema: `dbo` unless the provisioning login's default schema is another). The startup gate looks
-> for them in the schema of the `queue` table the runtime login resolves. Each new proc version needs its own grant; a
-> grant made on `_v1` does not cover `_v2`. Without
+> cannot take it, or when the `queue` table does not resolve to that same schema for it. **The
+> procs live in the store's schema:** the schema of the `queue` table, which is `dbo` unless the
+> provisioning login's default schema is another. The startup gate looks for them in the schema of
+> the `queue` table the runtime login resolves, and the claim calls them there. If you enable the
+> flag, grant the runtime login `EXECUTE` and `VIEW DEFINITION` on both procs the engine calls
+> (`mefor_claim_fifo_heads_cid_v2` and `_dst_v2`, in the store's schema). Each new proc version
+> needs its own grant; a grant made on `_v1` does not cover `_v2`. Without
 > `VIEW DEFINITION` the startup gate cannot read the bodies it verifies and degrades to the shipped
 > batch.
 
