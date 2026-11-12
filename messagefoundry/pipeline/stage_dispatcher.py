@@ -243,9 +243,8 @@ class _LanePhase(Enum):
     CLAIMING = auto()  # in the current claim_fifo_heads batch (slot reserved)
     PROCESSING = auto()  # a live serializer is draining its claimed prefix (slot consumed)
     PARKED = auto()  # head backing off until park_until; unpark by timer / sweep-due / notify_work
-    STOPPED = (
-        auto()
-    )  # deliberately halted; re-armed by reload / notify_work or an operator resume_lane (#5700)
+    # Deliberately halted; re-armed by reload / notify_work or an operator resume_lane (#5700).
+    STOPPED = auto()
     # Operator PAUSE (connection controls): delivery halted by an operator; queued rows RETAINED PENDING.
     # A NEW distinct phase — NOT STOPPED, which notify_work/reload deliberately resurrect and which means
     # content-STOP. PAUSED is reload-surviving: only pause_lane's counterpart resume_lane re-arms it; a
@@ -271,7 +270,8 @@ class _LaneState:
     ready_woken: bool = True
     # ADR 0070 fix B: consecutive zero-progress (i==0) T17 infra faults for this lane. Incremented on
     # each such fault, reset to 0 on clean drain / forward-progress-or-non-infra RETRY / the STOPPED→
-    # READY notify_work or resume_lane resume (NEVER on a PARKED park-timer/sweep unpark — the sharp edge, §3). Reaches
+    # READY notify_work or resume_lane resume (NEVER on a PARKED park-timer/sweep unpark — the sharp
+    # edge, §3). Reaches
     # infra_fault_stop_after → STOP (stop policy). In-memory only; intentionally lost on restart.
     infra_error_streak: int = 0
     # ADR 0070 retry_forever: True once the throttled lane_stuck alert has fired for the current stuck
@@ -700,10 +700,8 @@ class StageDispatcher:
         is a no-op.
 
         A STOPPED lane is re-armed too (BACKLOG #5700), for every stage, as :meth:`notify_work`
-        already re-arms one. The runner's callers include at least an operator start or restart, a
-        scheduler window open, an alert rule's restart, a reload lifting an engine park, and an
-        inbound's recovery from a #122 log halt. A scheduler window open never reaches a lane the
-        runner holds for an operator, since the runner refuses that start first.
+        already re-arms one. Which callers may reach a STOPPED lane is the runner's to decide
+        (``RegistryRunner._resume_pooled_lane`` and ``_schedule_holds``).
 
         CANCEL A STILL-PENDING PAUSE: a lane paused while mid-episode (CLAIMING/PROCESSING) carries
         ``pause_pending`` and has NOT yet reached PAUSED. A ``restart_outbound`` calls stop+start in ONE
@@ -1078,8 +1076,8 @@ class StageDispatcher:
         partition waits out the respawn backoff each time. Unlike the T17 bound this applies under
         ``retry_forever`` as well, because the cost of retrying lands on the lane's siblings.
 
-        The streak resets here, so every re-arm path (``notify_work``, an operator resume from
-        PAUSED) starts a fresh budget. A lane at the threshold is therefore always the lane just
+        The streak resets here, so every re-arm path (at least ``notify_work`` and an operator
+        resume from PAUSED or, since #5700, STOPPED) starts a fresh budget. A lane at the threshold is therefore always the lane just
         charged, never a sibling abandoned behind it. The wording says the deaths were raised WHILE
         dispatching the lane: a raise from shared machinery in that window is charged to it too."""
         deaths = st.claimer_deaths
@@ -2195,7 +2193,8 @@ class StageDispatcher:
         """The sweep found an owned lane's HEAD due. Ready it per phase (T20), including UNPARKING a
         PARKED lane whose backoff has elapsed (the bounded backstop for a lost park timer — a due head
         is legitimately re-claimable, distinct from a wake behind a still-backing-off head which stays
-        parked). A deliberately STOPPED lane is left halted (only reload/notify_work re-arms it)."""
+        parked). A deliberately STOPPED lane is left halted (reload, notify_work or an operator
+        resume_lane re-arms it, #5700; the sweep never does)."""
         st = self._states.get(lane)
         if st is None:  # T1 create-or-stick, sweep-sourced
             self.mark_ready(lane, woken=False)
@@ -2287,8 +2286,9 @@ class StageDispatcher:
 
     def stopped(self, key: str) -> bool:
         """Whether ``key`` is in the STOPPED phase (a STOP not yet re-armed). The runner reads it before
-        a :meth:`notify_work` broadcast, to know which lanes the broadcast is about to re-arm, and
-        for an outbound's status reads (BACKLOG #5701). False for an unknown lane."""
+        a :meth:`notify_work` broadcast, to know which lanes the broadcast is about to re-arm. The
+        outbound status reads do not read it: they read the runner's operator stop-hold record
+        (``RegistryRunner.outbound_stop_held`` says why). False for an unknown lane."""
         st = self._states.get(key)
         return st is not None and st.phase is _LanePhase.STOPPED
 
