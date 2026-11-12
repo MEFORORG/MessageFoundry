@@ -9692,7 +9692,7 @@ class RegistryRunner:
                             # As _process_delivery_item's leadership check does: hand back only this
                             # item and stop. The tail is the successor's promotion recovery, and
                             # parking at the pause gate would signal quiescence over it.
-                            await self.store.release_claimed([item.id])
+                            await self._release_for_new_leader(name, [item.id])
                             return
                         # Unsent, so release_claimed (no attempt spent, seq kept), and then the loop
                         # top signals quiescence and parks or returns. Not _release_tail_on_stop,
@@ -10368,7 +10368,7 @@ class RegistryRunner:
         # by id and never by content, and names none when the fault is the batch's (vault BACKLOG
         # #5100).
         current: str | None = None
-        # Set by the gate right before the send; the rows are handed back after the try.
+        # Set by the lane gate inside the try; :meth:`_refuse_claimed` resolves the rows after it.
         gated = False
         try:
             # #149 (ADR 0105 Phase 1b): re-attach each member's detached document VERBATIM before framing
@@ -10442,7 +10442,7 @@ class RegistryRunner:
                 # BACKLOG #5706: the lane gate once more, right before the send, since hydration and
                 # the two thread hops above are awaits a pause or the halt can land in, and so can a
                 # demotion. Synchronous, so nothing here can raise into the arms below; the members
-                # go back after the try, released for the new leader on a demoted node.
+                # go back after the try, through :meth:`_refuse_claimed`.
                 gated = not self._lane_may_deliver(name)
                 if not gated and not self._simulate.get(name, False):  # shadow suppresses egress
                     await connector.send(envelope)
@@ -12401,8 +12401,7 @@ class RegistryRunner:
         # BACKLOG #5709: the lane gate, the pause as well as the halt, is asked before the wait and
         # again after it, as the per_lane worker asks per item (#2771). A pause that lands with the
         # head in flight is past every dispatcher gate, so only this one stops the send.
-        # A demoted node is refused here too, so a halted or paused head never reaches the
-        # missing-connector arm, which would spend an attempt on it.
+        # A demoted node is refused here too; :meth:`_refuse_claimed` says why.
         if self._lane_may_deliver(lane):
             await self._pace_outbound(lane)
         if not self._lane_may_deliver(lane):
