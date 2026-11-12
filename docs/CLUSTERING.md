@@ -215,8 +215,15 @@ releases its lease. It is true at least in these cases:
 
 - while the node leads;
 - on a self-fenced node, whose flag is clear (so it reports `standby`) while its lease row still
-  names it;
+  names it, and the same way on a node that stood down because its own heartbeat lapsed;
+- after the node refused a lease claim that returned past `leader_fence_timeout_seconds`, which
+  renewed its row even though the node did not lead on it, possibly without ever reporting leader;
 - while an earlier stepdown's release write is owed, after a `503` that could not confirm it.
+
+The second and third cases end once the node finds the lease naming another node: a claim the
+database answers that way, or, while its claims are paused, the read each paused tick takes instead
+of claiming. A paused read clears only those cases; an owed write stays owed until a stepdown
+sends it.
 
 It means "may own". The write only matches a row that names this node, so if another node has
 already taken the lease, the stepdown releases nothing and answers `409`. The web console reads this

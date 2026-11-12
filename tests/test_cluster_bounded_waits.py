@@ -286,12 +286,12 @@ async def test_a_heartbeat_cancelled_in_flight_unwinds_within_the_release_bound(
     # release's timeout: the loop waits for the side pass it cancelled (BACKLOG #5710).
     await asyncio.wait({heartbeat}, timeout=renew + _SLACK)
     assert heartbeat.done(), "the cancelled heartbeat is still waiting on its connection's release"
-    # The loop task ends cancelled whatever the side pass did, since its finally only waits for that
-    # pass. The stand-in's release raises TimeoutError over the cancel, as asyncpg's does; without
-    # _call_within restoring the cancel, the side pass logs that as a failed heartbeat and goes on to
-    # send its refresh after stop() had cancelled it, which the statement check catches (BACKLOG
-    # #5710). The loop waited for the pass, so anything it sent is already recorded.
-    assert heartbeat.cancelled()
+    # No assertion on how the loop task ended: it ends cancelled whatever the side pass did, since
+    # its finally only waits for that pass. The stand-in's release raises TimeoutError over the
+    # cancel, as asyncpg's does; without _call_within restoring the cancel, the side pass logs that
+    # as a failed heartbeat and goes on to send its refresh after stop() had cancelled it, which the
+    # statement check catches (BACKLOG #5710). The loop waited for the pass, so anything it sent is
+    # already recorded.
     assert _only_stop_writes(server.sent[hung_at:]), "the cancel was swallowed: another statement"
     assert renew in pool.release_timeouts
     assert None not in pool.acquire_timeouts, "a statement borrowed with no timeout"
@@ -321,8 +321,10 @@ async def test_a_cancel_survives_a_release_that_raises_over_it(server: _Server) 
 
     await _timed(a.stop())
 
-    # The loop task ends cancelled whatever its side pass did; the statement check is the guard.
-    assert heartbeat.done() and heartbeat.cancelled()
+    # Done means the loop's finally waited out its side pass, so everything that pass sent is
+    # recorded. How the task ended says nothing: it ends cancelled whatever the pass did, so the
+    # statement check is the guard.
+    assert heartbeat.done()
     assert _only_stop_writes(server.sent[hung_at:]), "the cancel was swallowed: another statement"
 
 

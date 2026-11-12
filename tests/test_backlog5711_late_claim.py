@@ -368,3 +368,34 @@ async def test_sqlserver_with_no_promotable_sibling_the_next_tick_claims_and_lea
     await coord._maintain_leadership()
     assert (store.claims, store.owner_reads) == (2, 0)
     assert coord.is_leader() is True
+
+
+async def test_sqlserver_the_pause_lift_clears_the_baseline_once_another_node_holds_the_row() -> (
+    None
+):
+    """The SQL Server twin of the Postgres pause-lift test: a paused tick sends only the owner read,
+    and once that read names another node the pause lifts and the baseline the refused hold left
+    is cleared, so the node no longer reads as owning the row; the tick after that claims."""
+    clock = _Clock()
+    store = _LeaseStore(clock)
+    coord = SqlServerCoordinator(store, "A", leader_fence_timeout_seconds=_FENCE, monotonic=clock)
+    store.claim_seconds = _FENCE + 0.5
+    await coord._maintain_leadership()
+    assert (store.claims, coord.is_leader()) == (1, False)
+
+    store.claim_seconds = 0.0
+    clock.t += 10.0
+    await coord._maintain_leadership()
+    assert (store.claims, store.owner_reads) == (1, 1)
+    assert coord.may_own_lease_row() is True  # the row still names this node
+
+    store.owner = "B"
+    clock.t += 10.0
+    await coord._maintain_leadership()
+    assert (store.claims, store.owner_reads) == (1, 2)
+    assert coord._no_claim_until == 0.0
+    assert coord._last_renew_ok is None
+    assert coord.may_own_lease_row() is False
+
+    await coord._maintain_leadership()
+    assert store.claims == 2

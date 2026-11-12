@@ -1113,11 +1113,13 @@ class ClusterCoordinator(Protocol):
 
         True when the gate reads True, when an earlier release write is owed, or when a confirmed
         hold has not been cleared since. The last one is at least the self-fence window, where the
-        gate is clear on this node's clock while its lease row still names it on the DB clock, and
-        a hold refused because its claim returned past the fence (BACKLOG #5711), which can name a
-        node that never read leader. False after a
-        release that returned, after a claim the DB answered with another owner's lease, and always
-        on :class:`NullCoordinator`, which has no lease row. Cheap and synchronous, like
+        gate is clear on this node's clock while its lease row still names it on the DB clock; a
+        stand-down on a lapsed heartbeat (BACKLOG #5710), which leaves the row the same way; and a
+        hold refused because its claim returned past the fence (BACKLOG #5711), which can name a
+        node that never read leader. False after a release that returned, after a claim the DB
+        answered with another owner's lease, after a paused tick's read of a row naming another
+        node unless a release write is still owed (that read clears the hold, not the owed write;
+        BACKLOG #5711), and always on :class:`NullCoordinator`, which has no lease row. Cheap and synchronous, like
         :meth:`is_leader`: it reads cached state only, outside the leadership lock, so the answer is
         point-in-time.
 
