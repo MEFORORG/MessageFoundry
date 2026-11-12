@@ -505,6 +505,7 @@ from messagefoundry.pipeline.wiring_runner import (
     DrParkedError,
     NotDeployedError,
     RegistryRunner,
+    RunnerNotRunningError,
     ShardLaneOwnershipError,
 )
 from messagefoundry.privilege_probes import probe_vault
@@ -741,11 +742,27 @@ def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
     a nicety. "start it before resending" is the right instruction for an operator-paused lane and the
     WRONG one for a halted engine, where the same door the message points at is refused until the
     application log is writable again — a 409 that sends an operator to a control that cannot help is
-    the compensating-control-on-a-false-premise shape (SDS-3.7)."""
+    the compensating-control-on-a-false-premise shape (SDS-3.7).
+
+    A lane a STOP holds down (BACKLOG #5701) is named too: a start with the cause unfixed would
+    re-authenticate toward the partner lockout a credential STOP protects against. It does not say
+    the lane stays down until an operator acts, which is false (``RegistryRunner.outbound_stop_held``
+    says what else re-arms it)."""
+    if not rr.running:
+        # BACKLOG #5702: the start this would point at is refused on a downed graph.
+        return (
+            f"outbound {name!r} is not running because this engine's graph is not running "
+            "(stopped, or a demoted node); resend through the engine that runs the graph"
+        )
     if rr.outbound_status(name) == "log_halted":
         return (
             f"outbound {name!r} is halted: this engine cannot write its application log, so nothing "
             "is being delivered anywhere — fix the log, then start the connection, then resend"
+        )
+    if rr.outbound_stop_held(name):
+        return (
+            f"outbound {name!r} is stopped: a fault halted it, such as a credential or "
+            "configuration fault — fix the cause, then start the connection, then resend"
         )
     return f"outbound {name!r} is not running — start it before resending"
 
@@ -753,9 +770,9 @@ def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
 def _live_outbound_status(rr: RegistryRunner, name: str) -> str:
     """One outbound's live display state, gated on the runner's own ``running`` flag.
 
-    ``outbound_status`` reports "running" for any lane merely ABSENT from ``_outbound_paused`` and never
-    reads the graph flag, so ungated it answers "running" on a node whose graph is down -- the ADR 0157
-    demoted follower, where ``_stop_graph`` stops only the runner and the API keeps serving. Display
+    ``outbound_status`` reports "running" for any lane ABSENT from ``_outbound_paused`` that no
+    STOP holds down (BACKLOG #5701) and never reads the graph flag, so ungated it answers
+    "running" on a node whose graph is down -- the ADR 0157 demoted follower, where ``_stop_graph`` stops only the runner and the API keeps serving. Display
     reads of ``outbound_status`` go through here so the rows and graph nodes built from it cannot
     disagree (BACKLOG #1568 gated the standalone row; #1814 the traffic-edge row and
     ``/graph/edges``). The literal "draining" an edge row gives an outbound the live graph no longer
@@ -1012,7 +1029,7 @@ async def _alert_control_action(
                 target,
             )
             return
-        await rr.restart_inbound(target)
+        await _alert_restart(rr.restart_inbound, action, target)
     elif action == "restart_outbound":
         if rr.outbound_dr_failed(target):
             # Its build failed as it left the DR park (vault BACKLOG #3263). A reload or an
@@ -1025,12 +1042,27 @@ async def _alert_control_action(
             )
             return
         try:
-            await rr.restart_outbound(target)
+            await _alert_restart(rr.restart_outbound, action, target)
         except DrParkedError:
             _log.info(
                 "alert control_action restart_outbound for %r not run: the DR run-profile parks it",
                 target,
             )
+
+
+async def _alert_restart(
+    restart: Callable[[str], Awaitable[None]], action: str, target: str
+) -> None:
+    """``restart(target)``, logged at INFO and not raised when the runner's graph is down, as on a
+    demoted follower (BACKLOG #5702), where the leader, if there is one, acts on its own alert."""
+    try:
+        await restart(target)
+    except RunnerNotRunningError:
+        _log.info(
+            "alert control_action %s for %r not run: this engine's graph is not running",
+            action,
+            target,
+        )
 
 
 def _upload_owner(meta: UploadedFileMeta) -> dict[str, str]:
@@ -4120,8 +4152,9 @@ async def _record_refused_control_audit(
     store_fault: bool,
     client: str | None,
 ) -> None:
-    """:func:`_record_control_audit` for a start or restart that was refused: an inbound's, or an
-    outbound's the store stopped. ``role`` is the resolved role and ``running`` the lane's state
+    """:func:`_record_control_audit` for a control that was refused: at least an inbound start or
+    restart, an outbound start or restart the store stopped, and any start, stop or restart a downed
+    graph refused (BACKLOG #5702), whose row carries no ``reason``. ``role`` is the resolved role and ``running`` the lane's state
     after the refusal, which is not always stopped: at least a lane that failed at boot on a store
     fault stays unpaused through a start the store stopped.
 
@@ -5664,8 +5697,8 @@ def create_app(
             #
             # `rr.running` gates the live state (`_live_outbound_status`, shared with the traffic-edge row
             # above and `/graph/edges` since #1814) because `outbound_status` reports "running" for any lane
-            # merely ABSENT from `_outbound_paused` — it never consults the graph flag (the same trap
-            # `/status` documents at its KPI split, which is why that block uses `outbound_running`).
+            # ABSENT from `_outbound_paused` that no STOP holds down — it never consults the graph
+            # flag (the same trap `/status` documents at its KPI split, which is why that block uses `outbound_running`).
             # Ungated, a node whose graph is down but whose API still serves — the ADR 0157 demoted
             # follower, where `_stop_graph` stops only the runner — would answer one `/connections` with
             # "stopped" inbound rows beside "running" outbound ones. Before #1568 no such row existed on
@@ -5860,6 +5893,11 @@ def create_app(
                 # is a CONFIG change (flip deployed=true + reload + supply its env() values), not a
                 # runtime action. (stop never raises: an already-parked lane is a no-op.)
                 raise HTTPException(409, str(exc)) from None
+            except RunnerNotRunningError as exc:
+                # BACKLOG #5702: the graph is down, as on a demoted follower whose API still serves,
+                # so a start would bind a listener outside the engine lifecycle. 503, as no runner
+                # is, and audited below as every refused inbound start or restart is.
+                refused = HTTPException(503, str(exc))
             except TrustAnchorError as exc:
                 # vault BACKLOG #2371: an Ftp poller's CA was refused. The runner recorded it failed
                 # and logged why. Raised below, outside this handler, so the refusal, which names
@@ -5905,7 +5943,8 @@ def create_app(
             )
             return {"name": name, "running": running}
         if rr is not None and side == "out":
-            held = False
+            out_refused: HTTPException | None = None
+            out_store_fault = False
             try:
                 if action == "start":
                     await rr.start_outbound(name, hold_on_store_fault=True)
@@ -5918,7 +5957,8 @@ def create_app(
                 # resumed. Answered below, outside this handler, as the inbound arm does.
                 if explicit_cause(exc, AnchorStoreUnavailable) is None:
                     raise
-                held = True
+                out_store_fault = True
+                out_refused = HTTPException(503, _anchor_store_detail(action))
             except ShardLaneOwnershipError as exc:
                 # ADR 0073: this shard never runs the lane, so acting here would only produce a
                 # vacuous 'stopped' (and unlock purge) while the owner keeps delivering.
@@ -5932,7 +5972,11 @@ def create_app(
                 # vault BACKLOG #3067: start, stop and restart of an outbound the DR run-profile parks
                 # are refused, so the lane keeps the park until the reload after POST /dr/release.
                 raise HTTPException(409, str(exc)) from None
-            if held:
+            except RunnerNotRunningError as exc:
+                # BACKLOG #5702: the graph is down, so a start would spawn a delivery worker outside
+                # the engine lifecycle and a stop would record a pause a later start inherits.
+                out_refused = HTTPException(503, str(exc))
+            if out_refused is not None:
                 await _record_refused_control_audit(
                     engine,
                     identity,
@@ -5940,10 +5984,10 @@ def create_app(
                     action,
                     role="destination",
                     running=rr.outbound_running(name),
-                    store_fault=True,
+                    store_fault=out_store_fault,
                     client=client,
                 )
-                raise HTTPException(503, _anchor_store_detail(action))
+                raise out_refused
             running = rr.outbound_running(name)
             await _record_control_audit(
                 engine, identity, name, action, role="destination", running=running, client=client
@@ -10173,9 +10217,10 @@ def create_app(
             # inbound twin as failed (see wiring_runner's `Direction`).
             failed_in = [name for name in in_deployed if rr.inbound_failed(name) is not None]
             # outbound_running (not outbound_status) so the running/stopped split gates on the engine
-            # actually running AND the lane not operator-paused — consistent with inbound_running's
-            # actually-started semantics (outbound_status reports "running" for any non-paused lane even
-            # before start, which would over-count a built-but-not-started runner).
+            # actually running AND the lane neither operator-paused nor STOP-held (#5701) — consistent
+            # with inbound_running's actually-started semantics (outbound_status reports "running" for
+            # any non-paused, non-held lane even before start, which would over-count a
+            # built-but-not-started runner).
             out_running = sum(1 for name in out_deployed if rr.outbound_running(name))
             conn_total = total + len(out_deployed)
             conn_running = running + out_running

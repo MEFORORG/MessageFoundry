@@ -287,7 +287,13 @@ from messagefoundry.transports.http_listener import reply_seconds
 from messagefoundry.transports.mllp import build_ack
 from messagefoundry.transports.receipt import IngressReceipt, RefusalKind, receipt_handler
 
-__all__ = ["DrParkedError", "NotDeployedError", "RegistryRunner", "ShardLaneOwnershipError"]
+__all__ = [
+    "DrParkedError",
+    "NotDeployedError",
+    "RegistryRunner",
+    "RunnerNotRunningError",
+    "ShardLaneOwnershipError",
+]
 
 type Direction = Literal["inbound", "outbound"]
 """Which table a connection name was declared in. A name may be in BOTH (``Registry._add``
@@ -538,6 +544,37 @@ class ShardLaneOwnershipError(RuntimeError):
         self.name = name
         self.owner = owner
         self.shard = shard
+
+
+class RunnerNotRunningError(RuntimeError):
+    """A run-state CONTROL (at least an inbound start or restart, an outbound start, stop or
+    restart) targeted a runner whose graph is not running (BACKLOG #5702).
+
+    Refused rather than acted on. The graph is down, at least before :meth:`RegistryRunner.start`
+    and after a teardown, which includes the ADR 0157 demoted follower, whose ``_stop_graph`` stops
+    the runner while the API keeps serving. A start there would bind a live listener or spawn a
+    delivery worker outside the engine lifecycle, and a stop would record a pause that a later
+    promotion's start inherits. The test is the runner's own flag, not leadership: a node that has
+    lost its lease but not yet stopped its graph still takes the controls until it does.
+
+    An inbound stop is not refused, and neither is an outbound stop while a teardown that raised or
+    was cancelled has left state behind (``has_residual_state``): either may still have a live
+    listener or lane to take down, and the next start tears that state down again, pause records
+    included. The API maps this to 503, as it does a missing runner."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(
+            f"connection {name!r}: this engine's graph is not running (stopped, or a demoted "
+            "node), so it takes no connection control until the graph runs again; on a cluster, "
+            "the leader runs it"
+        )
+        self.name = name
+
+
+class _ConnectorRetired(Exception):
+    """Raised inside the single-row send path's ``try`` when a reload retired its connector before
+    the send (:meth:`RegistryRunner._connector_retired`). Its own arm only records it, so the hand
+    back runs after the ``try``, where a store fault cannot reach the internal-error arm."""
 
 
 # A delivery worker backs off this long after an *unexpected* error (e.g. the store being briefly
@@ -2137,12 +2174,14 @@ class RegistryRunner:
         # so it reads as an operator pause that no reload lifts; this lets a reload that removes the
         # schedule resume the lane (#2069). Any later start or stop of the lane drops the entry.
         self._schedule_parked: set[str] = set()
-        # Lanes halted by a STOP that only an operator may lift, at least: a credential fault (#109),
-        # a connection configuration fault (#2083), the internal-error STOP policy, or a pooled
-        # dispatcher's own STOP (the ADR 0070 T17 infra-fault bound, the #2074 claimer-death bound;
-        # see _pooled_stop_hold). The scheduler reads this so a window close or open never undoes
-        # one (see _schedule_holds, which also names every path that clears a record). Keyed by
-        # direction for the reason _failed is. `_stop_hold_logged` keeps the scheduler's notice to once.
+        # Lanes halted by a STOP whose cause the calendar must not retry, at least: a credential fault
+        # (#109), a connection configuration fault (#2083), the internal-error STOP policy, or a
+        # pooled dispatcher's own STOP (the ADR 0070 T17 infra-fault bound, the #2074 claimer-death
+        # bound; see _pooled_stop_hold). The scheduler reads this so a window close or open never
+        # undoes one (see _schedule_holds, which also names every path that clears a record, and
+        # outbound_stop_held: an operator is not the only one). Keyed by direction for the reason
+        # _failed is.
+        # `_stop_hold_logged` keeps the scheduler's notice to once.
         self._stop_held: set[tuple[Direction, str]] = set()
         self._stop_hold_logged: set[tuple[Direction, str]] = set()
         # ADR 0071 B5 thread-hop fusion. FROZEN intent read ONCE here; a /config/reload never re-reads it
@@ -2486,11 +2525,17 @@ class RegistryRunner:
 
     def _resume_pooled_lane(self, d: StageDispatcher, stage: Stage, name: str) -> None:
         """``d.resume_lane(name)``, lifting the operator hold only when it re-arms something.
-        resume_lane re-arms a PAUSED lane and ignores a STOPPED one, so a start on a lane still at
-        STOPPED leaves its hold in place. A PAUSED lane has nothing in flight, so no STOP can land
-        behind this read."""
-        rearms = d.paused(name)
-        d.resume_lane(name)
+        resume_lane re-arms a PAUSED lane and, since BACKLOG #5700, a STOPPED one, so a start lifts
+        a STOP the operator never paused over. A lane still CLAIMING or PROCESSING is re-armed by
+        nothing here, so a hold a STOP site recorded before its lane reached STOPPED stays in place.
+
+        An OUTBOUND lane is re-armed only on the engine shard that owns it (ADR 0073, BACKLOG
+        #5703). This test is the second line behind :meth:`_pause_pooled_outbound`, which keeps the
+        lane off a non-owner's dispatcher: a resume makes a held lane READY with no ownership test
+        of its own, and a non-owner that armed one would claim beside the owner."""
+        if stage is Stage.OUTBOUND and not self._owns_destination(name):
+            return
+        rearms = d.resume_lane(name)
         kind = _HOLD_DIRECTION.get(stage)
         if rearms and kind is not None:
             self._release_operator_hold(name, kind)
@@ -3340,9 +3385,46 @@ class RegistryRunner:
         **False for every lane while :attr:`_delivery_halted`**, whatever the pause set says. A lane a
         door never gated (or one an unguarded path brought up) is not in ``_outbound_paused`` and was
         reporting as actively delivering while the claim gate refused every row — the console's own
-        running/stopped split reading the opposite of what the engine does."""
+        running/stopped split reading the opposite of what the engine does.
+
+        **False for a lane a STOP holds down** (:meth:`outbound_stop_held`, BACKLOG #5701), for the
+        same reason: it is not in ``_outbound_paused`` either, and delivers nothing until something
+        re-arms it, at least an operator start or a reload."""
         self._validate_outbound(name)
-        return self._running and not self._delivery_halted and name not in self._outbound_paused
+        return (
+            self._running
+            and not self._delivery_halted
+            and name not in self._outbound_paused
+            and not self.outbound_stop_held(name)
+        )
+
+    def outbound_stop_held(self, name: str) -> bool:
+        """Whether outbound ``name`` is held down by a recorded STOP (BACKLOG #5701), in either
+        claim mode: the :attr:`_stop_held` record, written at least for a credential or
+        configuration fault, the internal-error STOP policy, and a pooled T17 or claimer-death
+        stop. Never raises.
+
+        **An operator is not the only thing that lifts it.** A full teardown clears every record,
+        and otherwise the record goes where the lane is re-armed (:meth:`_schedule_holds`). Per_lane,
+        that is a fresh delivery worker, which at least an operator start and a reload spawn.
+        Pooled, it is at least an operator start (:meth:`_resume_pooled_lane`) and every
+        ``notify_work`` broadcast that finds the lane STOPPED (:meth:`_broadcast_to`), sent at
+        least by a reload, the engine's wake after a
+        replay, resend, resubmit, upload or dead-letter replay of any message, a DR release drain,
+        and a clustered leader's lease reclaim. None of those is an act on this lane, and the
+        reclaim is no operator's act at all, so a pooled credential STOP can re-arm, and
+        authenticate again, with nobody having fixed its cause.
+
+        A pooled lane its dispatcher STOPPED with no record, as a leadership-loss STOP leaves it, is
+        not one. Its node is giving up the graph, and reading that lane as down would let the
+        scheduler, which starts an in-window lane that reads as not running, re-arm the STOP on
+        every tick.
+
+        The record is written at the STOP site a little before a pooled lane reaches STOPPED, so
+        this reads True while the episode the STOP ends is still finishing, with a row possibly
+        still in flight. It is cleared where the lane is re-armed (:meth:`_schedule_holds` names at
+        least those primitives)."""
+        return ("outbound", name) in self._stop_held
 
     def outbound_quiesced(self, name: str) -> bool:
         """Whether a PAUSED outbound has fully DRAINED to zero in-flight — the PURGE precondition. True
@@ -3357,10 +3439,11 @@ class RegistryRunner:
 
     def outbound_status(self, name: str) -> str:
         """Delivery status for one outbound: 'log_halted' (#122 — this process cannot write its
-        application log, so NO lane delivers), 'running' (not paused), 'stopping' (paused, an
-        in-flight head still resolving — the quiescence Event not yet set), or 'stopped' (paused AND
-        quiesced — zero in-flight, safe to purge). A name not in ``_outbound_paused`` → 'running' (the
-        status-plumbing caller already special-cases failed/filtered; a real unknown 404s on control).
+        application log, so NO lane delivers), 'running' (not paused and not STOP-held), 'stopping'
+        (paused, an in-flight head still resolving — the quiescence Event not yet set), or 'stopped'
+        (paused AND quiesced — zero in-flight, safe to purge — or held down by a STOP). A name not in
+        ``_outbound_paused`` and not STOP-held → 'running' (the status-plumbing caller already
+        special-cases failed/filtered; a real unknown 404s on control).
 
         **'log_halted' is FIRST and process-wide, because the halt is (ADR 0189).** The cause is a
         root-logger handler set with no per-connection attribution to narrow it with, so while
@@ -3373,11 +3456,17 @@ class RegistryRunner:
 
         Purge-eligibility is unaffected and deliberately separate: :meth:`outbound_quiesced` still
         answers off the pause set, so a halted-and-quiesced lane stays purgeable (the API surfaces
-        that as its own ``paused`` field, never collapsed into this string)."""
+        that as its own ``paused`` field, never collapsed into this string).
+
+        **A lane a STOP holds down reads 'stopped'** (:meth:`outbound_stop_held`, BACKLOG #5701), not
+        'running': it delivers nothing until something re-arms it, at least an operator start or a
+        reload. That 'stopped' does not say the lane is quiesced or purgeable, since a row can still
+        be in flight as the STOP lands; the ``paused`` field the API reports beside it does. A
+        paused lane is read first, so a pause over a STOP still reports its own quiescence."""
         if self._delivery_halted:
             return "log_halted"
         if name not in self._outbound_paused:
-            return "running"
+            return "stopped" if self.outbound_stop_held(name) else "running"
         return "stopped" if self.outbound_quiesced(name) else "stopping"
 
     def outbound_waiting_for_reply(self, name: str) -> bool:
@@ -4077,6 +4166,7 @@ class RegistryRunner:
         scheduler or an alert rule does nothing (:meth:`_dr_refuses`). Only an ``operator`` start
         raises ``connection_started`` (BACKLOG #1741, :meth:`_resolving_start`)."""
         async with self._reload_lock:
+            self._require_running(name)
             if self._dr_refuses(name, operator=operator):
                 return
             await self._resolving_start(name, resolve=operator)
@@ -4087,7 +4177,7 @@ class RegistryRunner:
         fresh bind, an inbound already listening, and a log-write refusal that undid its own bind,
         which :meth:`_emit_inbound_started` reads as not running."""
         await self._checked_inbound_start(name)
-        if resolve and self._running:
+        if resolve and self._running:  # the doors refuse a downed graph first; a second line
             self._emit_inbound_started(name)
 
     async def _checked_inbound_start(self, name: str) -> None:
@@ -4148,6 +4238,7 @@ class RegistryRunner:
         # One lock span so stop+start is atomic w.r.t. a concurrent reload (review M-10). Refused
         # whole on a passive standby, so an engine restart cannot drop an operator's start either.
         async with self._reload_lock:
+            self._require_running(name)
             if self._dr_refuses(name, operator=operator):
                 return
             await self._stop_inbound_unsafe(name)
@@ -4158,7 +4249,8 @@ class RegistryRunner:
                 # rule firing on this alert from re-alerting on every restart it drives. Only an
                 # inbound start() would bind: a name this runner does not hold (another engine
                 # shard's, a typo) or a deployed=False one is refused, not a failure to record.
-                # Nor is a raise after the bind, while the listener is up, or on a stopped runner.
+                # Nor is a raise after the bind, while the listener is up, or on a stopped runner,
+                # which the door refuses first (BACKLOG #5702).
                 if (
                     not operator
                     and self._running
@@ -4193,6 +4285,15 @@ class RegistryRunner:
         )
         return True
 
+    def _require_running(self, name: str, *, residual_ok: bool = False) -> None:
+        """Refuse a run-state control while the graph is not running (BACKLOG #5702), with
+        :class:`RunnerNotRunningError`. Read under the reload lock, which :meth:`start` and every
+        teardown also hold, so the flag cannot change between this read and the act.
+        ``residual_ok`` lets a stop through while a failed teardown left lanes behind; the error's
+        docstring says why."""
+        if not self._running and not (residual_ok and self.has_residual_state):
+            raise RunnerNotRunningError(name)
+
     def _require_owned_destination(self, name: str) -> None:
         """Refuse an outbound CONTROL for a lane another shard owns (ADR 0073). Without this, a
         non-owning shard's pause reports quiesced instantly (it has no worker/dispatcher lane) and
@@ -4205,8 +4306,8 @@ class RegistryRunner:
             )
 
     async def start_outbound(self, name: str, *, hold_on_store_fault: bool = False) -> None:
-        """RESUME delivery on one outbound connection (no-op if not paused). The OPPOSITE primitive to
-        the inbound stop/start: it un-pauses DELIVERY, keeping the connector WARM. Takes the reload lock
+        """RESUME delivery on one outbound connection (a no-op if neither paused nor STOPPED,
+        BACKLOG #5700). The OPPOSITE primitive to the inbound stop/start: it un-pauses DELIVERY, keeping the connector WARM. Takes the reload lock
         so it can't race a concurrent reload/stop (review M-10). Sharded: owner-only (ADR 0073).
 
         **REFUSES while a #122 log-failure halt is in force and the log is still unwritable** —
@@ -4236,6 +4337,7 @@ class RegistryRunner:
         :meth:`_start_outbound_unsafe`, which raises for it (vault BACKLOG #3746)."""
         async with self._reload_lock:
             self._require_owned_destination(name)
+            self._require_running(name)
             self._refuse_dr_parked(name)
             if not self._outbound_start_permitted(name):
                 return
@@ -4254,6 +4356,7 @@ class RegistryRunner:
         reload after a release could not lift (vault BACKLOG #3067)."""
         async with self._reload_lock:
             self._require_owned_destination(name)
+            self._require_running(name, residual_ok=True)
             self._refuse_dr_parked(name)
             self._stop_outbound_unsafe(name)
 
@@ -4286,6 +4389,7 @@ class RegistryRunner:
         The stop half has run by then, so a raise leaves the lane paused."""
         async with self._reload_lock:
             self._require_owned_destination(name)
+            self._require_running(name)
             self._refuse_dr_parked(name)
             engine_parked = name in self._gate_parked
             try:
@@ -4328,9 +4432,7 @@ class RegistryRunner:
         # ADR 0066 D4: the branch is per-LANE, not per-mode — a pooled UNORDERED lane has a delivery
         # worker and no dispatcher entry, so pausing it through the dispatcher would never quiesce it.
         if not self._per_lane_delivery(name):
-            d = self._dispatchers.get(Stage.OUTBOUND)
-            if d is not None:
-                d.pause_lane(name)  # fires on_lane_paused synchronously if the lane is already idle
+            self._pause_pooled_outbound(name)
         else:
             # per_lane: clear the resume Event so the worker blocks at its loop-top gate, then nudge it
             # so it reaches the gate promptly (sets the quiescence Event once its <=1 head has resolved).
@@ -4369,15 +4471,40 @@ class RegistryRunner:
         self._gate_parked.add(name)
         self._outbound_quiesced.setdefault(name, asyncio.Event()).set()
         if not self._per_lane_delivery(name):  # ADR 0066 D4: per-LANE, see _stop_outbound_unsafe
-            d = self._dispatchers.get(Stage.OUTBOUND)
-            if d is not None:
-                d.pause_lane(name)
-            # d is None at boot (_start_outbound runs before the dispatchers exist) — _start_pooled_
-            # dispatchers replays _outbound_paused onto the fresh OUTBOUND dispatcher before it starts.
+            self._pause_pooled_outbound(name)
         else:
             # per_lane: the delivery worker blocks at its loop-top pause gate until start_outbound sets
             # this (a cleared Event is the gate; setdefault creates it cleared, clear() is for a re-park).
             self._outbound_resume.setdefault(name, asyncio.Event()).clear()
+
+    def _pause_pooled_outbound(self, name: str) -> None:
+        """Pause pooled outbound ``name`` on the OUTBOUND dispatcher, only on the engine shard that
+        owns it (ADR 0073). Every runner pause of a pooled outbound lane comes through here.
+
+        A non-owner's dispatcher therefore never holds the lane: its seed, sweep and broadcast read
+        :meth:`_pooled_lane_provider` and its wakes pass :meth:`_wake_lane`, both owned lanes only,
+        and a pause was the one other way in. A resume there is then a no-op (``resume_lane``
+        ignores an unknown lane), so nothing arms the lane beside its owner (BACKLOG #5703). A
+        non-owner has nothing of the lane in flight, so the lane reads quiesced at once; a PAUSED
+        entry there could drift from the runner's records and leave the lane ``stopping`` for good.
+
+        With no dispatcher yet (boot, as ``_start_outbound`` runs first), the owner's pause waits
+        for :meth:`_replay_pooled_pauses`."""
+        if not self._owns_destination(name):
+            self._mark_outbound_quiesced(name)
+            return
+        d = self._dispatchers.get(Stage.OUTBOUND)
+        if d is not None:
+            d.pause_lane(name)  # fires on_lane_paused synchronously if the lane is already idle
+
+    def _replay_pooled_pauses(self) -> None:
+        """Apply every recorded outbound pause to the OUTBOUND dispatcher, at its start and after a
+        reload's broadcast. A worker-drained lane is skipped (ADR 0066 D4): it has no dispatcher
+        entry, and ``pause_lane`` is create-or-stick, so a replay would hand the dispatcher a lane a
+        worker owns."""
+        for n in self._outbound_paused:
+            if not self._per_lane_delivery(n):
+                self._pause_pooled_outbound(n)
 
     def _refuse_dr_parked(self, name: str) -> None:
         """Raise :class:`DrParkedError` if the DR run-profile parks outbound ``name``. Asked by every
@@ -4571,12 +4698,7 @@ class RegistryRunner:
             ev.clear()
         if not self._per_lane_delivery(name):  # ADR 0066 D4: per-LANE, see _stop_outbound_unsafe
             d = self._dispatchers.get(Stage.OUTBOUND)
-            # Only the owning engine shard arms a lane (ADR 0073). A park registers the lane
-            # PAUSED on every shard's dispatcher, and a resume makes it READY with no ownership
-            # test of its own, so a non-owner that resumed it would claim beside the owner. A
-            # passive standby parks every lane, which made that every lane at an activation
-            # (vault BACKLOG #3262).
-            if d is not None and self._owns_destination(name):
+            if d is not None:  # a non-owner engine shard arms nothing (_resume_pooled_lane)
                 self._resume_pooled_lane(d, Stage.OUTBOUND, name)
         else:
             self._outbound_resume.setdefault(name, asyncio.Event()).set()
@@ -5002,7 +5124,7 @@ class RegistryRunner:
             ev.clear()
         if not self._per_lane_delivery(name):  # ADR 0066 D4: per-LANE, see _stop_outbound_unsafe
             d = self._dispatchers.get(Stage.OUTBOUND)
-            if d is not None:
+            if d is not None:  # a non-owner engine shard arms nothing (_resume_pooled_lane)
                 self._resume_pooled_lane(d, Stage.OUTBOUND, name)
         else:
             # per_lane: release the loop-top gate; respawn the worker if it exited (STOP policy / crash).
@@ -5070,7 +5192,7 @@ class RegistryRunner:
 
     async def _resume_unscheduled_outbound(self, name: str) -> None:
         """Resume a lane the calendar parked, now that its schedule is gone. Left paused whenever
-        something other than the calendar also holds it down: an operator-required STOP, a #122 log
+        something other than the calendar also holds it down: a recorded STOP, a #122 log
         halt, ``deployed=False`` or ``auto_start=False``. The lane then stays as that state leaves
         it, and the ordinary recovery for that state brings it up. So does a refused CA the reload
         kept (vault BACKLOG #2371): resuming would read the CA again and alert a second time. An
@@ -5173,7 +5295,7 @@ class RegistryRunner:
             return
         active = schedule.is_active(self._schedule_clock())
         running = self.inbound_running(name) if kind == "inbound" else self.outbound_running(name)
-        # An operator-required STOP (at least a #109 credential fault, a #2083 configuration fault, or
+        # A recorded STOP (at least a #109 credential fault, a #2083 configuration fault, or
         # the internal-error STOP policy) outranks the calendar. The start branch must not re-arm it:
         # that re-tries a bad credential at every window open, which is the partner lockout the STOP
         # exists to prevent. The OUTBOUND park must
@@ -5258,9 +5380,11 @@ class RegistryRunner:
         self._record_failed(name, exc, kind="inbound")
 
     def _hold_for_operator(self, name: str, kind: Direction) -> None:
-        """Record that ``name``'s ``kind`` lane halted on a STOP only an operator may lift (at least a
-        #109 credential fault, a #2083 configuration fault, the internal-error STOP policy, or a pooled dispatcher's T17 or
-        claimer-death STOP via :meth:`_pooled_stop_hold`). Called at the STOP site as its last step
+        """Record that ``name``'s ``kind`` lane halted on a STOP whose cause the calendar must not
+        retry (at least a #109 credential fault, a #2083 configuration fault, the internal-error STOP
+        policy, or a pooled dispatcher's T17 or claimer-death STOP via :meth:`_pooled_stop_hold`).
+        Despite the name, clearing it needs no operator (:meth:`outbound_stop_held`). Called at the
+        STOP site as its last step
         before it returns STOPPED, so it sits AFTER the ``connection_stopped`` alert: an alert that
         raises means the site never returns STOPPED and the lane keeps running, so there is no STOP
         to hold. The scheduler reads it through :meth:`_schedule_holds`."""
@@ -5333,7 +5457,7 @@ class RegistryRunner:
                 # dropped here keeps draining, and can STOP, on the engine shard that owns it.
                 or not self._owns_destination(name)
                 or self.outbound_failed(name) is not None
-                or ("outbound", name) in self._stop_held
+                or self.outbound_stop_held(name)
                 or self.outbound_dr_failed(name)
                 or (
                     name in self._outbound_paused
@@ -5354,8 +5478,8 @@ class RegistryRunner:
         self._stop_hold_logged.discard((kind, name))
 
     def _schedule_holds(self, name: str, kind: Direction) -> bool:
-        """Whether the scheduler must leave ``name``'s ``kind`` lane alone because an operator-required
-        STOP halted it. Logs once per hold.
+        """Whether the scheduler must leave ``name``'s ``kind`` lane alone because a recorded STOP
+        halted it (:meth:`outbound_stop_held` says what else clears it). Logs once per hold.
 
         The record alone decides, and it is not cross-checked against the lane's live state. That check
         was tried and it races: the STOP site records the hold before its lane reaches STOPPED (a pooled
@@ -5366,18 +5490,19 @@ class RegistryRunner:
         doors that call them (a door list is a completeness claim nobody can check, and a door can
         fail part way, as a reload that rolls back does): a fresh per_lane worker
         (:meth:`_spawn_worker`, :meth:`_ensure_inbound_workers`), a pooled broadcast that re-arms a
-        lane it found STOPPED (:meth:`_broadcast_to`), a pooled resume of a PAUSED lane
+        lane it found STOPPED (:meth:`_broadcast_to`, sent by more than an operator: see
+        :meth:`outbound_stop_held`), a pooled resume of a PAUSED or STOPPED lane
         (:meth:`_resume_pooled_lane`), and a full teardown. An operator start that re-arms nothing,
-        such as ``start_outbound`` on a pooled lane still at STOPPED, leaves the hold in place."""
+        such as ``start_outbound`` on a pooled lane still finishing the episode its STOP ends,
+        leaves the hold in place."""
         key = (kind, name)
         if key not in self._stop_held:
             return False
         if key not in self._stop_hold_logged:
             self._stop_hold_logged.add(key)
             log.warning(
-                "schedule: %s connection %r is held by an operator-required STOP; the schedule "
-                "leaves it stopped until it is re-armed (fix the cause, then restart the "
-                "connection or reload)",
+                "schedule: %s connection %r is held by a STOP; the schedule leaves it stopped "
+                "until it is re-armed (fix the cause, then restart the connection or reload)",
                 kind,
                 name,
             )
@@ -7227,7 +7352,7 @@ class RegistryRunner:
                 # without this would hand a deliberately-down lane to a claimer — and
                 # `_reload_pooled_dispatchers`' own re-pause sweep has already run by the time a
                 # reconcile reaches here, so nothing downstream would repair it.
-                out.pause_lane(name)
+                self._pause_pooled_outbound(name)
             log.error(
                 "outbound %r would have TWO consumers: a per-lane delivery worker and the pooled "
                 "OUTBOUND dispatcher, which already holds the lane at phase %r. Refusing to spawn "
@@ -7489,13 +7614,7 @@ class RegistryRunner:
         # auto_start=False lane is already in _outbound_paused with no dispatcher to tell — without this
         # replay the boot gate would be defeated by step (3)'s seed-all-READY. pause_lane on an
         # unregistered key registers it ALREADY-PAUSED, so the seed cannot arm it (#115).
-        # ADR 0066 D4: a worker-drained lane is NOT replayed — it has no dispatcher entry, and creating
-        # one here (pause_lane is create-or-stick) would hand the dispatcher a lane a worker owns.
-        out = self._dispatchers.get(Stage.OUTBOUND)
-        if out is not None:
-            for n in self._outbound_paused:
-                if not self._per_lane_delivery(n):
-                    out.pause_lane(n)
+        self._replay_pooled_pauses()
         # (2.6) THE #122 SIBLING OF (2.5), and it fails the same way if it is missing: replay an
         # in-force log-failure halt onto the FRESH INGRESS/ROUTED/RESPONSE dispatchers before step (3)
         # seeds every lane READY. Without it a runner that came up into an unwritable application log
@@ -7667,11 +7786,7 @@ class RegistryRunner:
         # nudge and the re-pause. notify_work already SKIPS PAUSED lanes (the primary reload-survival
         # fix), so this only matters if a lane's PAUSED phase was somehow lost; pause_lane is idempotent
         # on an already-PAUSED lane.
-        out = self._dispatchers.get(Stage.OUTBOUND)
-        if out is not None:
-            for n in self._outbound_paused:
-                if not self._per_lane_delivery(n):  # ADR 0066 D4, as in _start_pooled_dispatchers
-                    out.pause_lane(n)
+        self._replay_pooled_pauses()
         # …and the #122 halt on the INTERNAL stages, for the same reason and in the same gap. A
         # reload never LIFTS a halt (that rides _resume_inbound_processing, which is gated on the log
         # working again), so re-applying it here can only ever be a no-op or a repair; a lane whose
@@ -7800,8 +7915,9 @@ class RegistryRunner:
     async def _reconcile_outbounds(self, old: Registry, new: Registry) -> list[tuple[str, str]]:
         """Bring the outbound connectors/workers in line with ``new`` without tearing down a live
         worker (so its in-flight outbox batch keeps draining). A worker re-resolves its connector
-        per item, so a changed connector is swapped in place; the old one is closed (a single racing
-        send at most fails and retries — outbounds are idempotent). An outbound dropped by ``new`` is
+        per item, so a changed connector is swapped in place; the old one is closed. A send already
+        in flight on it is not cancelled; :meth:`_connector_retired` (BACKLOG #5718) says how its
+        delivery path settles it. An outbound dropped by ``new`` is
         left running so rows already queued to it still drain. Connector builds here cannot fail —
         :meth:`_build_check` already validated them before any quiesce. Returns the lanes whose
         replaced connector failed to close (:meth:`_close_replaced`)."""
@@ -8017,7 +8133,9 @@ class RegistryRunner:
                 # This reload would resume the lane, and its window is closed. So the park passes
                 # to the calendar and the lane stays paused (vault BACKLOG #3262). Lifting it
                 # here delivered held rows outside the window, until the scheduler's own stop
-                # got the reload lock. The scheduler starts the lane when its window opens.
+                # got the reload lock. The scheduler starts the lane when its window opens. On an
+                # engine shard that does not own the lane the park stays: its calendar never runs
+                # the lane (_reconcile_schedule), and its dispatcher never holds it (ADR 0073).
                 self._gate_parked.discard(name)
                 self._schedule_parked.add(name)
             if self._leaves_passive_park(name, oc):
@@ -8199,7 +8317,10 @@ class RegistryRunner:
         that raises is logged and appended to ``failures`` rather than raised: the new connector is
         already live, and the reload's rollback restores intake and never the outbound mapping, so
         raising would put the old graph back beside a connector built from the new one (engine PR
-        2815). A cancellation still propagates."""
+        2815). A cancellation still propagates.
+
+        A send in flight on ``replaced`` is not cancelled here; its delivery path settles it
+        (:meth:`_connector_retired`, BACKLOG #5718)."""
         try:
             await replaced.aclose()
         except Exception as exc:  # noqa: BLE001 - a connector's close can fail in any way; logged
@@ -9756,11 +9877,19 @@ class RegistryRunner:
 
     def _lane_may_deliver(self, name: str) -> bool:
         """The two conditions :meth:`_delivery_worker`'s loop-top gates refuse a claim on (the #122
-        halt and the pause), as one predicate for its per-item re-check (#2771). A new loop-top
+        halt and the pause), as one predicate for its per-item re-check (#2771), the pooled seam's
+        gates around its pacing wait (#5709) and the batch body's (#5706). A new loop-top
         gate belongs here as well, or a claimed batch keeps sending under it. The pause is
         :attr:`_outbound_paused`, which a schedule window or a DR park joins through the same
         outbound stop an operator's takes; nothing here reads either directly."""
         return not self._delivery_halted and name not in self._outbound_paused
+
+    def _may_send(self, name: str) -> bool:
+        """:meth:`_lane_may_deliver`, and this node still leads (the L1 check, which
+        :meth:`_process_delivery_item` explains): the question asked of claimed rows right before a
+        send. A refusal resolves through :meth:`_refuse_claimed`. Synchronous; ``is_leader`` reads
+        cached state."""
+        return self._lane_may_deliver(name) and self._coordinator.is_leader()
 
     async def _delivery_worker(self, name: str) -> None:
         # B11: was the previous wait a wake (.set() — herd) or a poll-interval timeout (idle)? Seeds
@@ -9879,7 +10008,7 @@ class RegistryRunner:
                             # As _process_delivery_item's leadership check does: hand back only this
                             # item and stop. The tail is the successor's promotion recovery, and
                             # parking at the pause gate would signal quiescence over it.
-                            await self.store.release_claimed([item.id])
+                            await self._release_for_new_leader(name, [item.id])
                             return
                         # Unsent, so release_claimed (no attempt spent, seq kept), and then the loop
                         # top signals quiescence and parks or returns. Not _release_tail_on_stop,
@@ -10072,27 +10201,14 @@ class RegistryRunner:
         §4.5). A store READ fault before the send (a :class:`_StoreReadFault`) re-pends the row on its
         retry backoff (vault BACKLOG #2756); any other store error propagates to the caller's
         backoff."""
-        # Connector + retry re-resolved per item so a reload can swap an outbound's
-        # settings under us with at most one racing send (which fails + retries —
-        # outbounds are idempotent). retry_until is the row's re-pend deadline when a send failure
-        # re-pends it (mark_failed); None for a delivered / dead-lettered / stopped row. The pooled
-        # dispatcher parks the lane on a non-None value; the per_lane loop ignores it.
+        # Connector + retry re-resolved per item so a reload can swap an outbound's settings under
+        # us. A send on a connector the reload took out of the lane is not charged for it
+        # (:meth:`_connector_retired`, BACKLOG #5718). retry_until is the row's re-pend deadline
+        # when a send failure re-pends it (mark_failed); None for a delivered / dead-lettered /
+        # stopped row. The pooled dispatcher parks the lane on a non-None value; the per_lane loop
+        # ignores it.
         retry_until: float | None = None
         retry = self._retry.get(name) or RetryPolicy()
-        connector = self._destinations.get(name)
-        if connector is None:
-            # No connector for a claimed row: either a brief mid-reconcile window, or this
-            # outbound failed to build at start (ADR 0031) and its lane is degraded. Either
-            # way RETRY the row (never strand/drop it) — it self-heals when a reload/restart
-            # builds the connector — and alert on the growing backlog of a failed lane.
-            failure = self.outbound_failed(name)
-            detail = f"outbound failed to start: {failure}" if failure else "outbound reloading"
-            failed = await self._mark_failed_and_arm(name, item.id, detail, retry)
-            self._note_retry_exhausted(
-                name, _EngineCause.NO_CONNECTOR, failed, message_id=item.message_id
-            )
-            await self._delivery_failure_alert_checks(name)
-            return _ItemOutcome.PROCESSED, failed.retry_at
         # L1 pre-send leadership re-check (active-passive HA). The graph runs on the leader
         # ONLY, but leadership can be lost (a self-fence) BETWEEN claiming this row and the
         # send below. A cheap, SYNCHRONOUS is_leader() read (cached state — no DB round-trip)
@@ -10120,18 +10236,30 @@ class RegistryRunner:
         # at the DB inside the claim transaction even if this in-memory check raced. On the
         # single-node NullCoordinator is_leader() is always True, so this never fires and the
         # delivery path is byte-identical.
+        #
+        # Asked ahead of the missing-connector arm below, which would otherwise charge a demoted
+        # node's row the same failed attempt.
         if not self._coordinator.is_leader():
-            await self.store.release_claimed([item.id])
-            log.warning(
-                "delivery worker %r: leadership lost before send; released %d claimed row(s) "
-                "un-errored (no attempt spent) and stopped the lane for the new leader",
-                name,
-                1,
-            )
+            await self._release_for_new_leader(name, [item.id])
             return _ItemOutcome.STOPPED, None
+        connector = self._destinations.get(name)
+        if connector is None:
+            # No connector for a claimed row: either a brief mid-reconcile window, or this
+            # outbound failed to build at start (ADR 0031) and its lane is degraded. Either
+            # way RETRY the row (never strand/drop it) — it self-heals when a reload/restart
+            # builds the connector — and alert on the growing backlog of a failed lane.
+            failure = self.outbound_failed(name)
+            detail = f"outbound failed to start: {failure}" if failure else "outbound reloading"
+            failed = await self._mark_failed_and_arm(name, item.id, detail, retry)
+            self._note_retry_exhausted(
+                name, _EngineCause.NO_CONNECTOR, failed, message_id=item.message_id
+            )
+            await self._delivery_failure_alert_checks(name)
+            return _ItemOutcome.PROCESSED, failed.retry_at
         # The payload handed to connector.send, for forget_payload once a transient failure
         # dead-letters the row at the retry cap. None until a live send is attempted.
         sent: str | None = None
+        retired = False  # a reload retired `connector` before the send (_connector_retired)
         try:
             if self._simulate.get(name, False):
                 # Shadow / parallel-run (#15): suppress the real egress entirely — no bytes/
@@ -10178,11 +10306,16 @@ class RegistryRunner:
                 # DeliveryError (caught below → retry), so a handle NEVER reaches the connector.
                 payload = sent = await self._hydrate_payload(item.payload, item.message_id)
                 _send_t0 = time.perf_counter_ns() if self._delivery_phase_timing else 0
-                if getattr(connector, "consumes_metadata", False):
-                    # #68: an opted-in outbound (REST/FHIR with dynamic_headers) gets this message's
-                    # user-metadata bag so it can project http.header.* entries onto the request. The
-                    # read touches only the small metadata column (never the raw body).
-                    metadata = await self._user_metadata_for(item.message_id)
+                # #68: an opted-in outbound (REST/FHIR with dynamic_headers) gets this message's
+                # user-metadata bag so it can project http.header.* entries onto the request. The
+                # read touches only the small metadata column (never the raw body).
+                consumes = getattr(connector, "consumes_metadata", False)
+                metadata = await self._user_metadata_for(item.message_id) if consumes else None
+                # BACKLOG #5718: the reads above are awaits a reload can land in. A connector it took
+                # out of the lane since `connector` was read is not sent on.
+                if self._connector_retired(name, connector):
+                    raise _ConnectorRetired  # handed back after the try, out of the arms' reach
+                if consumes:
                     response = await connector.send(payload, metadata=metadata)
                 else:
                     # Default: NO metadata read and the historical send(payload) call shape —
@@ -10190,6 +10323,8 @@ class RegistryRunner:
                     response = await connector.send(payload)
                 if self._delivery_phase_timing:
                     self._delivery_phase_stats.record_send_ack(time.perf_counter_ns() - _send_t0)
+        except _ConnectorRetired:
+            retired = True
         except NegativeAckError as exc:
             # Partner rejection. AR/CR (permanent) → fail-fast: the partner will never
             # accept this message, so dead-letter it now rather than block the FIFO lane
@@ -10206,6 +10341,10 @@ class RegistryRunner:
             # would only be the first of the lane's whole queue. The "dead_letter" policy opts back
             # into the historical fail-fast dead-letter of just this row, for both.
             fault = self._lane_stopping_fault(exc)
+            if fault is not None and sent is not None and self._connector_retired(name, connector):
+                # BACKLOG #5718: a credential or configuration fault on a connector a reload
+                # retired is that connector's, and the reload may be its fix. The new one is tried.
+                return await self._release_retired(name, [item.id])
             if fault is not None:
                 await self._stop_lane_retaining(name, [item.id], exc, fault)
                 return _ItemOutcome.STOPPED, None
@@ -10252,7 +10391,10 @@ class RegistryRunner:
         except DeliveryError as exc:
             # Transport failure (connect/IO/timeout/unparseable ACK) — transient; retry
             # per policy (the shipped cap is 100 attempts, then the row dead-letters into the
-            # replayable DLQ — bounded, not discarded).
+            # replayable DLQ — bounded, not discarded). One whose connector a reload took out of
+            # the lane under it, such as a close that failed it, is the reload's (BACKLOG #5718).
+            if sent is not None and self._connector_retired(name, connector):
+                return await self._release_retired(name, [item.id])
             failed = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
             retry_until = failed.retry_at
             self._note_retry_exhausted(name, exc, failed, message_id=item.message_id)
@@ -10266,7 +10408,10 @@ class RegistryRunner:
             # dead-letters this row and advances so a code bug can't wedge the lane forever.
             # STOP's mark_failed re-pends the row, or dead-letters it at a finite retry cap. Log
             # the exception TYPE only — the full detail goes to the secured store's last_error,
-            # never the general log (PHI).
+            # never the general log (PHI). A connector a reload retired can fail its send in any
+            # way as it closes, so that is the reload's first (BACKLOG #5718).
+            if sent is not None and self._connector_retired(name, connector):
+                return await self._release_retired(name, [item.id])
             if (
                 self._internal_error.get(name, self._internal_error_default)
                 is InternalErrorPolicy.STOP
@@ -10302,8 +10447,10 @@ class RegistryRunner:
             await self.store.dead_letter_now(item.id, f"internal error: {safe_exc(exc)}")
         else:
             # #46: a successful delivery means the lane is up — edge-trigger
-            # connection_restored if it had been marked down (no-op otherwise).
-            self._note_lane_healthy(name)
+            # connection_restored if it had been marked down (no-op otherwise). Not for a send
+            # that completed on a connector a reload retired: it says nothing of the new one.
+            if not self._connector_retired(name, connector):
+                self._note_lane_healthy(name)
             self._clear_store_read_faults(name)
             # ADR 0013: a capturing outbound returns a DeliveryResponse; persist the reply
             # AND mark the row done in ONE transaction (exactly-once capture). A non-capturing
@@ -10388,6 +10535,8 @@ class RegistryRunner:
             # neither phase, so there is nothing new to summarize).
             if self._delivery_phase_timing:
                 self._delivery_phase_stats.maybe_emit(stage="outbound")
+        if retired:
+            return await self._release_retired(name, [item.id])
         return _ItemOutcome.PROCESSED, retry_until
 
     async def _process_delivery_batch(
@@ -10406,6 +10555,8 @@ class RegistryRunner:
         ``claim_next_fifo`` — the same H2 skip-and-complete single claim) until **either** ``cfg.max_count``
         rows are held **or** ``cfg.max_wait_ms`` has elapsed since the head's ingest time **or** a graceful
         stop signals a flush (ADR 0082 decision #4) — whichever comes first — then frame + ``send`` **once**
+        (an operator pause or the #122 halt also ends the window, and then every member is handed
+        back unsent rather than flushed; BACKLOG #5706)
         + complete all N in one store transaction. Mirrors the single-row disposition ladder over the whole
         batch: on success ``mark_batch_done`` all N; a transient/transport failure ``mark_batch_failed`` all
         N (re-claimed as the identical prefix); a permanent reject ``dead_letter_batch`` all N (decision #1).
@@ -10450,7 +10601,8 @@ class RegistryRunner:
             return await self._deliver_coalesced_batch(name, cfg, members)
         except Exception:
             # EXCEPT, never FINALLY. Every normal return below has already resolved all N (done /
-            # dead-lettered / re-pended failed) or released them (leadership lost), so a `finally`
+            # dead-lettered / re-pended failed) or handed them back (leadership lost, a pause, the
+            # #122 halt), so a `finally`
             # would re-pend rows that legitimately completed. ``reschedule_claimed`` being
             # ``status='inflight'``-guarded is what makes this safe over a PARTIALLY resolved set —
             # it is not a licence to run the re-pend unconditionally.
@@ -10501,7 +10653,9 @@ class RegistryRunner:
         # projected by every outbound claim; fall back to now defensively (a slightly later window start).
         base = head.created_at if head.created_at is not None else time.time()
         deadline = base + cfg.max_wait_ms / 1000.0
-        while len(items) < cfg.max_count:
+        # BACKLOG #5706: an operator pause or the #122 halt ends the window too, so the window claims
+        # no further row under either; the gate below the loop hands back what it already holds.
+        while len(items) < cfg.max_count and self._lane_may_deliver(name):
             more = await self.store.claim_next_fifo(name)
             if more is not None:
                 items.append(more)
@@ -10521,7 +10675,21 @@ class RegistryRunner:
             except TimeoutError:
                 pass
         ids = [it.id for it in items]
+        # BACKLOG #5706: asked again after the window, which can last up to max_wait_ms, and before
+        # the missing-connector arm, which would spend an attempt on every member. Every member goes
+        # back unsent, the head included: the per_lane worker passes it here with no further gate of
+        # its own, and the pooled adapter returns this outcome as its own. A demoted node releases
+        # them and stops the lane instead. The gate that guards the send itself is the one right
+        # before it.
+        #
+        # It is also the L1 batch twin, ahead of the missing-connector arm for the same reason; see
+        # the single-item path for the full rationale. The stakes are higher here: mark_batch_failed
+        # decides ONE disposition from the head's attempts and applies it to all N, so a finite
+        # retry cap dead-letters the whole batch on a leadership change, un-sent.
+        if not self._may_send(name):
+            return await self._refuse_claimed(name, ids)
         retry_until: float | None = None
+        retired = sending = False  # a reload retired `connector` (_connector_retired); the send ran
         connector = self._destinations.get(name)
         if connector is None:
             failure = self.outbound_failed(name)
@@ -10530,19 +10698,6 @@ class RegistryRunner:
             self._note_retry_exhausted(name, _EngineCause.NO_CONNECTOR, failed, batch=True)
             await self._delivery_failure_alert_checks(name)
             return _ItemOutcome.PROCESSED, failed.retry_at
-        # L1 batch twin — see the single-item path for the full rationale. Same reasoning, and the
-        # stakes are higher here: mark_batch_failed decides ONE disposition from the head's
-        # attempts and applies it to all N, so a finite retry cap dead-letters the whole batch on a
-        # leadership change, un-sent.
-        if not self._coordinator.is_leader():
-            await self.store.release_claimed(ids)
-            log.warning(
-                "delivery worker %r: leadership lost before send; released %d claimed row(s) "
-                "un-errored (no attempt spent) and stopped the lane for the new leader",
-                name,
-                len(ids),
-            )
-            return _ItemOutcome.STOPPED, None
         # Frame + send inside ONE try so a FRAMING error (an unparseable / non-HL7 head member — MLLP is
         # payload-agnostic, ADR 0004, so a non-hl7v2 feed can reach here) routes to the internal-error
         # policy below (dead-letter / STOP) instead of stranding every claimed row INFLIGHT forever with
@@ -10554,6 +10709,8 @@ class RegistryRunner:
         # by id and never by content, and names none when the fault is the batch's (vault BACKLOG
         # #5100).
         current: str | None = None
+        # Set by the lane gate inside the try; :meth:`_refuse_claimed` resolves the rows after it.
+        gated = False
         try:
             # #149 (ADR 0105 Phase 1b): re-attach each member's detached document VERBATIM before framing
             # the envelope, so a batched streaming feed delivers full inline documents (never a raw
@@ -10610,15 +10767,33 @@ class RegistryRunner:
                 first = kept[0]  # the envelope's head is the first member that survived
                 # The head's own fields: a non-HL7 head faults here, and it is this member's.
                 current = first.id
-                control_id = Message.parse(first.payload).control_id or first.id  # stable
+                # This parse and encode_batch below each run in a thread (BACKLOG #5706). Both scale
+                # with the members' size, and on the event loop a large member would stall every
+                # lane, listener and the API while it parsed.
+                parsed = await asyncio.to_thread(Message.parse, first.payload)
+                control_id = parsed.control_id or first.id  # stable
                 timestamp = _hl7_batch_timestamp(first.created_at)
                 # encode_batch parses the HYDRATED head for the separators and normalizes every
                 # member, in one call, so a fault inside it cannot be told apart by member; the
                 # send is the whole envelope's. Neither names one.
                 current = None
-                envelope = encode_batch(members, control_id=control_id, timestamp=timestamp)
-                if not self._simulate.get(name, False):  # shadow suppresses the real egress
-                    await connector.send(envelope)
+                envelope = await asyncio.to_thread(
+                    encode_batch, members, control_id=control_id, timestamp=timestamp
+                )
+            # BACKLOG #5706: the gate once more, right before the send, since hydration and the two
+            # thread hops above are awaits a pause, the halt or a demotion can land in. With every
+            # member refused there is nothing to send, but the same gate decides whether the
+            # refusals are written now or the members go back for a re-run to refuse again.
+            # Synchronous, so nothing here can raise into the arms below; the members go back after
+            # the try, through :meth:`_refuse_claimed`. A connector a reload took out of the lane in
+            # those awaits gates the send too (BACKLOG #5718): it is not sent on, and the members go
+            # back through :meth:`_release_retired`.
+            may_send = self._may_send(name)
+            retired = may_send and self._connector_retired(name, connector)
+            gated = not may_send or retired
+            if kept and not gated and not self._simulate.get(name, False):  # shadow: no egress
+                sending = True
+                await connector.send(envelope)
         except NegativeAckError as exc:
             # #109 (ADR 0095), the batch twin of the single-row branch in
             # :meth:`_process_delivery_item`, which carries the reasoning. A bad credential is not a
@@ -10630,6 +10805,9 @@ class RegistryRunner:
             # permanent one reaches here only from the send, so only a member's transient refusal,
             # which re-pends the batch, names the member (vault BACKLOG #5100).
             fault = self._lane_stopping_fault(exc)
+            if fault is not None and self._connector_retired(name, connector):
+                # BACKLOG #5718, as the single row: the reload may be this fault's fix.
+                return await self._release_retired(name, [it.id for it in items])
             if fault is not None:
                 # Refused members first: a store fault here then escapes before the stop, not
                 # after a stop and alert are already recorded, so #109 cannot loop on re-auth.
@@ -10670,6 +10848,10 @@ class RegistryRunner:
             self._note_retry_exhausted(name, _EngineCause.STORE_READ, failed, batch=True)
             await self._delivery_failure_alert_checks(name)
         except DeliveryError as exc:
+            # BACKLOG #5718, as the single row, for a fault the send raised rather than a member's
+            # own step. Every member goes back, as the gated hand-back below.
+            if sending and self._connector_retired(name, connector):
+                return await self._release_retired(name, [it.id for it in items])
             failed = await self._mark_batch_failed_and_arm(
                 name, ids, _member_error(safe_exc(exc), current), retry
             )
@@ -10691,7 +10873,10 @@ class RegistryRunner:
             # replayable from the DLQ) so a code bug or a mis-typed feed can't wedge the lane.
             # A fault one member's own step raised (its re-attach, its frame check, or the head's
             # parse) names that member by its outbox id, never its content, in the log, the stored
-            # error and the alert (vault BACKLOG #5100).
+            # error and the alert (vault BACKLOG #5100). One the send of a connector a reload
+            # retired raised is the reload's (BACKLOG #5718), as the single row.
+            if sending and self._connector_retired(name, connector):
+                return await self._release_retired(name, [it.id for it in items])
             member = _batch_member(current)
             if (
                 self._internal_error.get(name, self._internal_error_default)
@@ -10729,8 +10914,15 @@ class RegistryRunner:
                 ids, _member_error(f"internal error: {safe_exc(exc)}", current)
             )
         else:
+            if gated:
+                # Every member, the refused ones too: none was resolved, and a re-run refuses them
+                # again. No await since the gate read, so it still holds here.
+                if retired:
+                    return await self._release_retired(name, [it.id for it in items])
+                return await self._refuse_claimed(name, [it.id for it in items])
             if ids:  # nothing was sent when every member was refused
-                self._note_lane_healthy(name)
+                if not self._connector_retired(name, connector):  # as the single row
+                    self._note_lane_healthy(name)
                 self._clear_store_read_faults(name)
                 await self.store.mark_batch_done(ids)
         await self._dead_letter_refused(name, refused)
@@ -12552,20 +12744,27 @@ class RegistryRunner:
         # was never sent. A plain release_claimed leaves the head past-due, so the ~0.25 s sweep
         # re-readies it and the gate re-fires ~4x/s for as long as the disk stays broken; dating it
         # into the future collapses that to the backoff cadence. STOP would be worse than a park in
-        # one specific way — resume_lane only re-arms a PAUSED lane, so a later start_outbound could
-        # not lift a STOPPED one, while a PARKED lane's own timer unparks it.
+        # one specific way — a STOPPED lane waits for an operator's start (which re-arms it since
+        # BACKLOG #5700), while a PARKED lane's own timer unparks it. That is a leader's
+        # disposition: a demoted node releases the head and STOPs the lane for the new leader, as
+        # its leadership check always has (:meth:`_refuse_claimed`).
         if self._delivery_halted:
             # Counted, because reaching this line means SOME path armed an unpaused lane while the
             # halt held — the missing-door signal the latch cannot get by enumeration. See
             # :attr:`halted_claim_gate_hits` for why a small count at the halt is expected and a
-            # climbing one is not.
+            # climbing one is not. Only here, above the pacing wait: a halt that lands during the
+            # wait is the documented pause lag, not a door.
             self._halted_claim_gate_hits += 1
-            park_until = time.time() + _WORKER_ERROR_BACKOFF_SECONDS
-            await self.store.reschedule_claimed([item.id], park_until)
-            return LaneItemResult(LaneResultKind.RETRY, park_until)
         # BACKLOG #82: pace this lane's egress BEFORE the send seam (mirrors the per_lane worker) so one
         # hook covers the single-message AND batch bodies in the POOLED claim mode too.
-        await self._pace_outbound(lane)
+        # BACKLOG #5709: the lane gate, the pause as well as the halt, is asked before the wait and
+        # again after it, as the per_lane worker asks per item (#2771). A pause that lands with the
+        # head in flight is past every dispatcher gate, so only this one stops the send.
+        # A demoted node is refused here too; :meth:`_refuse_claimed` says why.
+        if self._lane_may_deliver(lane):
+            await self._pace_outbound(lane)
+        if not self._lane_may_deliver(lane):
+            return _to_lane_result(await self._refuse_claimed(lane, [item.id]))
         # #134 (ADR 0082): batch inside the pooled claim (decision #5) — the dispatcher claims one head
         # per lane as always; a batching lane's delivery body coalesces its own tail (claim_next_fifo)
         # into one BHS…BTS envelope, so per_lane and pooled share the exact batch body with NO change to
@@ -12574,6 +12773,94 @@ class RegistryRunner:
         if batch_cfg is not None:
             return _to_lane_result(await self._process_delivery_batch(lane, item, batch_cfg))
         return _to_lane_result(await self._process_delivery_item(lane, item))
+
+    async def _refuse_claimed(self, name: str, ids: list[str]) -> tuple[_ItemOutcome, float | None]:
+        """Resolve claimed, unsent OUTBOUND rows of ``name`` that the lane gate
+        (:meth:`_lane_may_deliver`) has refused, and those :meth:`_release_retired` hands it
+        under a halt or on a demoted node. None is sent here, dead-lettered or charged an attempt.
+
+        A leader hands them back through :meth:`_hand_back` and parks. A demoted node releases them
+        and STOPs the lane for the new leader, as the send path's leadership check does and as the
+        per_lane worker's per-item gate does (#2771): a hand-back there would reschedule rows a
+        successor may already own, and park instead of stopping. The demoted node answers here
+        rather than leaving the rows to that check, since the missing-connector arm ahead of it
+        would spend an attempt on each, and a pause or halt that lands after the check would
+        otherwise not stop the send."""
+        if self._coordinator.is_leader():
+            return _ItemOutcome.PROCESSED, await self._hand_back(name, ids)
+        await self._release_for_new_leader(name, ids)
+        return _ItemOutcome.STOPPED, None
+
+    def _connector_retired(self, name: str, connector: DestinationConnector) -> bool:
+        """Whether a reload has taken ``connector`` out of outbound ``name``'s lane since the
+        delivery path read it: replaced it with a rebuild, or popped it for a park (BACKLOG #5718).
+
+        The reload does not cancel a send in flight on it: a send running on a thread would go on
+        after a cancellation, and a resend beside it would deliver twice. Its close may fail that
+        send, and most connectors' closes do not wait for it. So the delivery path asks here. Before
+        the send, a retired connector is not sent on. After it, a transport fault, an internal error
+        or a credential or configuration fault from it is the reload's, the last because the reload
+        may be its fix, and the rows go back un-charged (:meth:`_release_retired`). A send that
+        completed keeps its result, and so does any other refusal, which is the partner's answer
+        about the message."""
+        return self._destinations.get(name) is not connector
+
+    async def _release_retired(
+        self, name: str, ids: list[str]
+    ) -> tuple[_ItemOutcome, float | None]:
+        """Hand claimed rows of ``name`` back un-errored, with no attempt spent and their due time
+        kept, because a reload retired the connector they were meant for
+        (:meth:`_connector_retired`). The lane sends them through the connector that replaced it,
+        if one did, at once: the pooled dispatcher gets a retry due now, not a park. Under a halt or
+        on a demoted node they resolve as :meth:`_refuse_claimed` resolves gated rows. The partner
+        may have received a send that failed late, so this can deliver one twice, which
+        at-least-once allows."""
+        log.info(
+            "delivery worker %r: a reload retired the connector under %d claimed row(s); handed "
+            "back un-errored (no attempt spent)",
+            name,
+            len(ids),
+        )
+        if self._delivery_halted or not self._coordinator.is_leader():
+            return await self._refuse_claimed(name, ids)
+        await self.store.release_claimed(ids)
+        return _ItemOutcome.PROCESSED, time.time()
+
+    async def _release_for_new_leader(self, name: str, ids: list[str]) -> None:
+        """Release claimed, unsent OUTBOUND rows of ``name`` on a node that has lost leadership
+        (the L1 check; :meth:`_process_delivery_item` carries the reasoning). No attempt is spent.
+        The caller then STOPs the lane."""
+        await self.store.release_claimed(ids)
+        log.warning(
+            "delivery worker %r: leadership lost before send; released %d claimed row(s) "
+            "un-errored (no attempt spent) and stopped the lane for the new leader",
+            name,
+            len(ids),
+        )
+
+    async def _hand_back(self, name: str, ids: list[str]) -> float:
+        """Hand claimed, unsent OUTBOUND rows of ``name`` back for a leader, from
+        :meth:`_refuse_claimed`, and return the park deadline.
+
+        The #122 halt (ADR 0189) RESCHEDULES them to the deadline, for the reason
+        :meth:`_dispatch_delivery` gives: the head is then not due, so the sweep does not re-ready
+        it about four times a second while the disk stays broken. An operator pause RELEASES them
+        with their due time kept, as the per_lane worker's per-item gate does (#2771), so a resume
+        claims the head at once. Neither spends an attempt, and both keep ``seq``.
+
+        The deadline is a park for the pooled dispatcher only. A paused lane has ``pause_pending``
+        set there and goes to PAUSED at its terminal transition, ignoring it. The per_lane worker
+        reads only the outcome and reaches its loop-top gates next; it meets this helper through at
+        least the batch body's gates and :meth:`_release_retired` under a halt, so a halt there
+        reschedules where its own per-item gate releases.
+        Both hand the rows back unsent, and a worker halted at its loop top claims nothing until a
+        restart, by which time the backoff has passed."""
+        park_until = time.time() + _WORKER_ERROR_BACKOFF_SECONDS
+        if self._delivery_halted:
+            await self.store.reschedule_claimed(ids, park_until)
+        else:
+            await self.store.release_claimed(ids)
+        return park_until
 
     async def _dispatch_response(self, lane: str, item: OutboxItem) -> LaneItemResult:
         return _to_lane_result(await self._process_response_item(lane, item))
