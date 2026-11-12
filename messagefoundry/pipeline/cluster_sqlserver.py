@@ -480,8 +480,8 @@ class SqlServerCoordinator:
 
     async def heartbeat_once(self) -> None:
         # Refresh last_seen (wall clock, like DbCoordinator) and fold the current is_leader flag — the
-        # flag lags by one tick (the loop beats just after _maintain_leadership, BACKLOG #5710), or
-        # longer while ticks skip a side pass that has not finished.
+        # flag lags by up to one tick (the loop starts each beat with its tick, beside
+        # _maintain_leadership, BACKLOG #5710), or longer while a beat runs past its tick.
         # Zero extra writes. Under the renew clamp (BACKLOG #6472): it no longer delays the renew,
         # but an unbounded one would starve the next beat and hold up stop(). A beat that returns
         # stamps its issue instant, as DbCoordinator.heartbeat_once does (BACKLOG #5710).
@@ -502,10 +502,8 @@ class SqlServerCoordinator:
             stop=self._stop,
             interval=self._heartbeat_seconds,
             lease_step=("_maintain_leadership", self._maintain_leadership),
-            side_steps=(
-                ("heartbeat_once", self.heartbeat_once),
-                ("config_version", self._refresh_config_version),
-            ),
+            heartbeat_step=("heartbeat_once", self.heartbeat_once),
+            side_steps=(("config_version", self._refresh_config_version),),
             side_step_timeout=SIDE_STEP_CLAMPS * self._renew_timeout,
             node_id=self.node_id,
         )
@@ -516,7 +514,7 @@ class SqlServerCoordinator:
         # this tick's own stale result. Mirrors DbCoordinator._maintain_leadership.
         async with self._leadership_lock:
             # No claim while this node's own heartbeat has lapsed (BACKLOG #5710).
-            if self._stand_aside_on_lapse():
+            if self._stand_down_if_lapsed():
                 return
             # ADR 0157 Inc 0: read the baseline BEFORE the claim is issued, not after it returns. The
             # lease expiry it races is stamped on the DB clock inside this round trip, so a baseline
@@ -540,6 +538,8 @@ class SqlServerCoordinator:
                     # never promote.
                     await self._refuse_late_hold(issued_at)
                     return
+                if self._stand_down_if_lapsed():
+                    return  # lapsed while the claim was in flight; DbCoordinator's tick says why
                 if not self._is_leader:
                     self._is_leader = True
                     log.info("cluster: node %s acquired leadership (lease)", self.node_id)
@@ -561,7 +561,9 @@ class SqlServerCoordinator:
         now = self._monotonic()
         prior = self._no_claim_until
         self._no_claim_until = max(
-            prior, now + late_hold_pause_seconds(self._lease_ttl, self._heartbeat_seconds)
+            prior,
+            now
+            + late_hold_pause_seconds(self._lease_ttl, self._heartbeat_seconds, None, self.node_id),
         )
         self._leader_epoch = None
         if self._is_leader:
@@ -679,7 +681,7 @@ class SqlServerCoordinator:
     def _check_fence(self) -> None:
         if not self._is_leader:
             return
-        if self._stand_aside_on_lapse():  # demotes on a lapsed heartbeat
+        if self._stand_down_if_lapsed():  # demotes on a lapsed heartbeat
             return
         last = self._last_renew_ok
         if last is None:
@@ -697,16 +699,17 @@ class SqlServerCoordinator:
             self._alert_leadership_lost("self-fenced")  # #145 (inverse → auto-resolves)
             self._fire_on_demote()  # ADR 0157 Inc 5
 
-    def _stand_aside_on_lapse(self) -> bool:
-        """Mirrors :meth:`DbCoordinator._stand_aside_on_lapse` (BACKLOG #5710); read its docstring
+    def _stand_down_if_lapsed(self) -> bool:
+        """Mirrors :meth:`DbCoordinator._stand_down_if_lapsed` (BACKLOG #5710); read its docstring
         for why a node whose own heartbeat lapsed neither leads nor claims."""
         now = self._monotonic()
         last = self._last_beat_ok
         if last is None or not heartbeat_lapsed(last, now, self._node_timeout_seconds):
             return False
+        # Cleared whether or not it leads: a claim that returned after the lapse cached an epoch.
+        self._leader_epoch = None
         if self._is_leader:
             self._is_leader = False
-            self._leader_epoch = None
             log_heartbeat_lapse_stand_down(self.node_id, now - last, self._node_timeout_seconds)
             self._alert_leadership_lost("heartbeat lapsed")
             self._fire_on_demote()  # ADR 0157 Inc 5

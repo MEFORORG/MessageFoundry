@@ -222,8 +222,9 @@ releases its lease. It is true at least in these cases:
 
 The second and third cases end once the node finds the lease naming another node: a claim the
 database answers that way, or, while its claims are paused, the read each paused tick takes instead
-of claiming. A paused read clears only those cases; an owed write stays owed until a stepdown
-sends it.
+of claiming. A node standing down on a lapsed heartbeat does neither until a heartbeat lands, so
+for it the case lasts at least that long. A paused read clears only those cases; an owed write
+stays owed until a stepdown sends it.
 
 It means "may own". The write only matches a row that names this node, so if another node has
 already taken the lease, the stepdown releases nothing and answers `409`. The web console reads this

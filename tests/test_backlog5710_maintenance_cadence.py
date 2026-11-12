@@ -141,7 +141,8 @@ async def test_ticks_are_paced_from_their_start_not_their_end() -> None:
             stop=stop,
             interval=0.4,
             lease_step=("renew", slow_renew),
-            side_steps=(("heartbeat", noop),),
+            heartbeat_step=("heartbeat", noop),
+            side_steps=(),
             side_step_timeout=5.0,
             node_id="A",
         ),
@@ -175,7 +176,8 @@ async def test_a_failing_step_is_logged_and_the_loop_goes_on(
             stop=stop,
             interval=0.01,
             lease_step=("leadership maintenance", renew),
-            side_steps=(("heartbeat", beat),),
+            heartbeat_step=("heartbeat", beat),
+            side_steps=(),
             side_step_timeout=5.0,
             node_id="A",
         ),
@@ -261,7 +263,8 @@ async def test_a_deferred_pass_runs_as_soon_as_the_slow_one_ends() -> None:
             stop=stop,
             interval=0.4,
             lease_step=("renew", renew),
-            side_steps=(("heartbeat", beat),),
+            heartbeat_step=("heartbeat", beat),
+            side_steps=(),
             side_step_timeout=5.0,
             node_id="A",
         ),
@@ -366,3 +369,34 @@ async def test_a_heartbeat_inside_node_timeout_costs_the_leader_nothing(
     await coord._maintain_leadership()
     assert coord.is_leader() is True
     assert events == ["claim", "claim", "claim"]
+
+
+@pytest.mark.parametrize(("_name", "make"), _LAPSE_COORDINATORS, ids=_LAPSE_IDS)
+async def test_a_lapse_found_while_the_claim_is_in_flight_is_not_undone_by_its_return(
+    _name: str, make: Callable[[_Clock], Any]
+) -> None:
+    """The tick's own lapse check passes, then the watchdog finds the heartbeat lapsed while the
+    renew is in flight and demotes. The renew returns held inside the fence, and the tick must not
+    promote on it: before the fix it did, so the node flapped lost, acquired, lost."""
+    clock = _Clock()
+    coord = make(clock)
+    events = _leading(coord)
+    await coord.heartbeat_once()
+    await coord._maintain_leadership()
+    clock.t += 15.0
+    await coord._maintain_leadership()
+    clock.t += 14.5  # 29.5 s since the heartbeat: the tick's own check passes
+
+    async def claim_while_the_watchdog_runs() -> bool:
+        events.append("claim")
+        clock.t += 1.0
+        coord._check_fence()  # the watchdog's tick, while the renew is in flight
+        coord._leader_epoch = 7
+        return True
+
+    coord._claim_or_renew_lease = claim_while_the_watchdog_runs
+    coord._alert_leadership_acquired = lambda: events.append("acquired")
+    await coord._maintain_leadership()
+    assert coord.is_leader() is False
+    assert coord.current_epoch() is None
+    assert events == ["claim", "claim", "claim", "lost: heartbeat lapsed"]

@@ -159,9 +159,10 @@ def heartbeat_lapsed(last_beat_ok: float, now: float, node_timeout_seconds: floa
     """Whether this node's own last heartbeat to return was issued more than
     ``node_timeout_seconds`` before ``now``, both on its monotonic clock (BACKLOG #5710).
 
-    :func:`heartbeat_is_fresh` applied to the node's own record, so the node reads itself lapsed at
-    the instant a sibling reading its ``last_seen`` would, give or take the skew between their wall
-    clocks. Both coordinators stop leading and stop claiming while it holds: a sibling then reads
+    :func:`heartbeat_is_fresh` applied to the node's own record, so the node reads itself lapsed
+    about when a sibling reading its ``last_seen`` would. Not exactly then: the sibling compares
+    its own wall clock, which may be skewed, against its own ``node_timeout_seconds``, which may be
+    set differently, and the watchdog acts up to one fence tick late. Both coordinators stop leading and stop claiming while it holds: a sibling then reads
     the node as dead, and at least the approvals' stranded-release check acts on that reading.
     The callers treat no beat yet, before the first registration, as not lapsed."""
     return not heartbeat_is_fresh(last_beat_ok, now, node_timeout_seconds)
@@ -504,17 +505,58 @@ async def _run_maintenance_steps(
                 )
 
 
+class _SideLane:
+    """One lane of the maintenance loop's side work (BACKLOG #5710): at most one pass of its steps in
+    flight, each step cancelled past ``step_timeout``, and a kick that finds a pass running owes one
+    more, run as soon as that pass ends. A flag, not a count, so however many ticks a pass
+    outlasted, it owes one."""
+
+    def __init__(
+        self,
+        steps: Sequence[MaintenanceStep],
+        node_id: str,
+        step_timeout: float,
+        stop: asyncio.Event,
+    ) -> None:
+        self._steps = steps
+        self._node_id = node_id
+        self._step_timeout = step_timeout
+        self._stop = stop
+        self._owed = False
+        self.task: asyncio.Task[None] | None = None
+
+    def kick(self) -> None:
+        if self.task is None or self.task.done():
+            self.task = asyncio.create_task(self._passes())
+            return
+        self._owed = True
+        log.warning(
+            "cluster: node %s deferred this tick's %s: the previous pass is still running,"
+            " and the next starts when it ends",
+            self._node_id,
+            " and ".join(label for label, _ in self._steps),
+        )
+
+    async def _passes(self) -> None:
+        while True:
+            await _run_maintenance_steps(self._steps, self._node_id, self._step_timeout)
+            if not self._owed or self._stop.is_set():
+                return
+            self._owed = False
+
+
 async def run_maintenance_loop(
     *,
     stop: asyncio.Event,
     interval: float,
     lease_step: MaintenanceStep,
+    heartbeat_step: MaintenanceStep,
     side_steps: Sequence[MaintenanceStep],
     side_step_timeout: float,
     node_id: str,
 ) -> None:
-    """Both coordinators' maintenance loop: the lease step on a fixed cadence, and the other
-    statements beside it, never in front of it (BACKLOG #5710).
+    """Both coordinators' maintenance loop: the lease step on a fixed cadence, and the heartbeat
+    and the other statements beside it, never in front of it (BACKLOG #5710).
 
     **Why the lease step runs alone.** The fence watchdog demotes a leader whose last confirmed
     renew was issued more than the fence timeout ago, so every second between two renews counts
@@ -524,73 +566,62 @@ async def run_maintenance_loop(
     stalled before the next would have put about 28 s between them, and a healthy leader would have
     self-fenced over two statements that are not the lease. Now the renew is issued at the start of
     each tick, ticks start ``interval`` apart on the loop's monotonic clock whatever the tick
-    cost, and the other statements run as a task of their own, so the gap between two renews is
-    ``interval`` or the renew's own round trip, whichever is longer. The side pass can still
-    reach the renew through the pool: it holds a connection while the renew borrows one, and the
-    renew's borrow counts against its clamp, so on a pool with no connection to spare a slow side
-    statement can still fail a renew. It no longer adds its own duration to the gap.
+    cost, and the other statements run as tasks of their own, so the gap between two renews is
+    ``interval`` or the renew's own round trip, whichever is longer. They can still reach the renew
+    through the pool: each holds a connection while the renew borrows one, and the renew's borrow
+    counts against its clamp, so on a pool with no connection to spare a slow side statement can
+    still fail a renew. They no longer add their own duration to the gap.
 
-    **At most one side pass at a time, and none lost.** A tick whose previous side pass is still
-    running starts none, so a stalled statement cannot pile passes up on the pool. It logs that it
-    deferred, and the pass still running runs one more as soon as it ends, so a slow heartbeat
-    delays the next one rather than costing a whole interval. The side pass keeps the step order it
-    was given.
+    **The heartbeat has a lane of its own, started with the tick.** A node whose own heartbeat
+    lapsed stops leading (:func:`heartbeat_lapsed`), so the heartbeat cannot wait on the lease
+    step or on the config-version refresh, or a slow one of those would push ``last_seen`` toward
+    ``node_timeout_seconds`` the way the old serial loop pushed the renew toward the fence. Its
+    lane starts as each tick starts, beside the renew, so beats are issued ``interval`` apart
+    while each lands within its tick. The refresh runs in a second lane once the lease step
+    returns.
+
+    **At most one pass per lane at a time, and none lost.** A tick whose lane is still running
+    starts no second pass there, so a stalled statement cannot pile passes up on the pool. It logs
+    that it deferred, and the lane runs one more pass as soon as the running one ends, so a slow
+    heartbeat delays the next one rather than costing a whole interval.
 
     **Each side step is cancelled past ``side_step_timeout``.** Before the split a step that never
     returned (a SQL Server COMMIT nothing bounds) held the renew behind it, and the fence demoted the
     leader; beside the renew, the same hung step would leave the node leading with its
     ``last_seen`` and cached config version frozen. The bound lets the next pass borrow a fresh
     connection; the store quarantines the cancelled one. It does not make a heartbeat land, so the
-    coordinators also stop leading, and stop claiming, while their own last heartbeat to return was
-    issued more than ``node_timeout_seconds`` ago (:func:`heartbeat_lapsed`), the instant a sibling
-    would read them as dead. At the shipped timings that takes about two heartbeats in a row that
-    fail, overrun or are slow, so one slow heartbeat followed by a normal one costs the leader
-    nothing.
+    coordinators also stop leading, and stop claiming, while their own last heartbeat to land was
+    issued more than ``node_timeout_seconds`` ago, about when a sibling would read them as dead. At
+    the shipped timings that takes about two heartbeats in a row that fail, overrun or are slow,
+    so one slow heartbeat followed by a normal one costs the leader nothing.
 
     Exits when ``stop`` is set, waking at once rather than sleeping out the interval. On exit,
-    cancelled or not, it cancels a side pass still running and waits for it to unwind. The caller's
-    bounded wait on this task, ``stop()``'s :data:`STOP_WRITE_TIMEOUT_SECONDS`, covers that pass
-    only when it unwinds within that bound; one that does not is left finishing on its own, and a
-    heartbeat it sent can then land after the ``left`` tombstone, as :func:`stop_tasks_within`
-    says."""
+    cancelled or not, it cancels each lane's pass still running and waits for them to unwind. The
+    caller's bounded wait on this task, ``stop()``'s :data:`STOP_WRITE_TIMEOUT_SECONDS`, covers
+    them only when they unwind within that bound; one that does not is left finishing on its own,
+    and a heartbeat it sent can then land after the ``left`` tombstone, as
+    :func:`stop_tasks_within` says."""
     loop = asyncio.get_running_loop()
-    side: asyncio.Task[None] | None = None
-    owed = False
-
-    async def side_passes() -> None:
-        # One pass, then one more for each tick that came while it ran; a flag, not a count, so
-        # however many ticks it outlasted, it owes one pass.
-        nonlocal owed
-        while True:
-            await _run_maintenance_steps(side_steps, node_id, side_step_timeout)
-            if not owed or stop.is_set():
-                return
-            owed = False
-
+    beat = _SideLane((heartbeat_step,), node_id, side_step_timeout, stop)
+    side = _SideLane(side_steps, node_id, side_step_timeout, stop)
     try:
         while not stop.is_set():
             # The next tick is due one interval after this one STARTED, so a slow tick shortens the
             # wait rather than adding to it.
             due = loop.time() + interval
+            beat.kick()
             await _run_maintenance_steps((lease_step,), node_id)
-            if side is None or side.done():
-                side = asyncio.create_task(side_passes())
-            else:
-                owed = True
-                log.warning(
-                    "cluster: node %s deferred this tick's %s: the previous pass is still running,"
-                    " and the next starts when it ends",
-                    node_id,
-                    " and ".join(label for label, _ in side_steps),
-                )
+            side.kick()
             try:
                 await asyncio.wait_for(stop.wait(), timeout=max(0.0, due - loop.time()))
             except TimeoutError:
                 continue
     finally:
-        if side is not None:
-            side.cancel()
-            await asyncio.wait((side,))
+        running = [lane.task for lane in (beat, side) if lane.task is not None]
+        for task in running:
+            task.cancel()
+        if running:
+            await asyncio.wait(running)
 
 
 class StepdownOutcome(NamedTuple):
@@ -742,12 +773,12 @@ def past_fence(baseline: float, now: float, fence_timeout_seconds: float) -> boo
 def late_hold_pause_seconds(
     lease_ttl_seconds: float,
     heartbeat_seconds: float,
-    members: Sequence[ClusterMember] | None = None,
-    node_id: str = "",
+    members: Sequence[ClusterMember] | None,
+    node_id: str,
 ) -> float:
     """How long ``node_id`` declines to claim after refusing a late hold (BACKLOG #5711), given
-    the membership it read just after the refusal, or None, the default, when that read failed or
-    has not run yet.
+    the membership it read just after the refusal, or None when that read failed or has not run
+    yet.
 
     **No pause when no other node could take the lease.** With no other promotable node with a
     fresh heartbeat (:func:`has_promotable_sibling`), pausing only leaves the cluster leaderless:
@@ -791,7 +822,7 @@ def log_late_hold_refusal(
 ) -> None:
     """The one warning both coordinators log for a refused late hold (BACKLOG #5711)."""
     if pause > 0:
-        outcome = f"not claiming for {pause:.1f}s so a standby can take the lease"
+        outcome = f"not claiming for {pause:.1f}s so another node can take the lease"
     else:
         outcome = "no other promotable node has a fresh heartbeat, so it claims again next tick"
     log.warning(
@@ -1819,10 +1850,10 @@ class DbCoordinator:
         discrete coroutine (the loop's single beat) so a test can advance the heartbeat deterministically
         without racing the loop's sleep.
 
-        The folded flag rides the EXISTING heartbeat UPDATE — zero extra writes. The loop beats just
-        AFTER :meth:`_maintain_leadership` (BACKLOG #5710), so a tick's own acquire or loss is folded
-        in by its beat, and a fence or stepdown between beats by the next one. That lag of up to one
-        tick, longer while ticks skip a side pass that has not finished, is fine for an
+        The folded flag rides the EXISTING heartbeat UPDATE — zero extra writes. The loop starts
+        each beat with its tick, beside :meth:`_maintain_leadership` (BACKLOG #5710), so a tick's
+        own acquire or loss, and a fence or stepdown between beats, are folded in by the next beat.
+        That lag of up to one tick, longer while a beat runs past its tick, is fine for an
         observability endpoint
         (and a clean :meth:`stop` clears the flag immediately, while a crash leaves it stale for the
         freshness filter in :meth:`cluster_members` to discard).
@@ -1853,13 +1884,11 @@ class DbCoordinator:
             # demote on a DB error: _last_renew_ok simply isn't advanced, so the fence watchdog
             # demotes us if the failure persists past the fence timeout.
             lease_step=("leadership maintenance", self._maintain_leadership),
-            side_steps=(
-                # A heartbeat miss is recoverable (the freshness filter tolerates a late beat within
-                # node_timeout), and a stale config version just delays a follower's reload by one
-                # interval (Track B Step 6), so both only log and retry.
-                ("heartbeat", self.heartbeat_once),
-                ("config-version refresh", self.config_version),
-            ),
+            # A heartbeat miss is recoverable (the freshness filter tolerates a late beat within
+            # node_timeout), and a stale config version just delays a follower's reload by one
+            # interval (Track B Step 6), so both only log and retry.
+            heartbeat_step=("heartbeat", self.heartbeat_once),
+            side_steps=(("config-version refresh", self.config_version),),
             side_step_timeout=SIDE_STEP_CLAMPS * self._renew_timeout,
             node_id=self.node_id,
         )
@@ -1874,7 +1903,7 @@ class DbCoordinator:
         On hold: stamp ``_last_renew_ok`` (monotonic) so the fence watchdog knows we are fresh, and
         promote if we weren't already leader, unless the claim returned past the fence timeout, when
         :meth:`_refuse_late_hold` demotes and pauses instead (BACKLOG #5711). No claim at all while
-        this node's own heartbeat has lapsed (:meth:`_stand_aside_on_lapse`, BACKLOG #5710). On not-hold: demote if we were leader (someone else holds
+        this node's own heartbeat has lapsed (:meth:`_stand_down_if_lapsed`, BACKLOG #5710). On not-hold: demote if we were leader (someone else holds
         it / our lease expired). A DB error propagates to the loop, which logs and retries — we do NOT
         demote on an error here; ``_last_renew_ok`` simply isn't advanced, so the fence watchdog demotes
         us only if the failure persists past the fence timeout (and always before the lease can expire).
@@ -1896,7 +1925,7 @@ class DbCoordinator:
         lock's comment in ``__init__``.
         """
         async with self._leadership_lock:
-            if self._stand_aside_on_lapse():
+            if self._stand_down_if_lapsed():
                 return
             # ADR 0157 Inc 0 — read the paragraph above before moving this below the claim.
             issued_at = self._monotonic()
@@ -1908,6 +1937,11 @@ class DbCoordinator:
                     # baseline stays stamped for may_own_lease_row, but it is already past the
                     # fence: demote and pause rather than promote on it.
                     await self._refuse_late_hold(issued_at)
+                    return
+                if self._stand_down_if_lapsed():
+                    # The watchdog can find the heartbeat lapsed while the claim is in flight, and
+                    # demote; promoting on the claim's return would undo that. The row is ours, so
+                    # the baseline stays stamped, as after the lapse check before the claim.
                     return
                 if not self._is_leader:
                     self._is_leader = True
@@ -1962,7 +1996,9 @@ class DbCoordinator:
         now = self._monotonic()
         prior = self._no_claim_until
         self._no_claim_until = max(
-            prior, now + late_hold_pause_seconds(self._lease_ttl, self._heartbeat_seconds)
+            prior,
+            now
+            + late_hold_pause_seconds(self._lease_ttl, self._heartbeat_seconds, None, self.node_id),
         )
         self._leader_epoch = None
         if self._is_leader:
@@ -2122,11 +2158,11 @@ class DbCoordinator:
 
     def _check_fence(self) -> None:
         """Demote (self-fence) if we are leader but haven't confirmed a lease hold within the fence
-        timeout, or if our own heartbeat has lapsed (:meth:`_stand_aside_on_lapse`). Pure in-memory;
+        timeout, or if our own heartbeat has lapsed (:meth:`_stand_down_if_lapsed`). Pure in-memory;
         called by the watchdog (and directly by tests)."""
         if not self._is_leader:
             return
-        if self._stand_aside_on_lapse():  # demotes on a lapsed heartbeat
+        if self._stand_down_if_lapsed():  # demotes on a lapsed heartbeat
             return
         last = self._last_renew_ok
         if last is None:
@@ -2145,7 +2181,7 @@ class DbCoordinator:
             self._alert_leadership_lost("self-fenced")  # #145 (inverse → auto-resolves)
             self._fire_on_demote()  # ADR 0157 Inc 5
 
-    def _stand_aside_on_lapse(self) -> bool:
+    def _stand_down_if_lapsed(self) -> bool:
         """Whether this node's own heartbeat has lapsed (:func:`heartbeat_lapsed`), demoting it first
         if it leads (BACKLOG #5710). Pure in-memory, so the watchdog can call it lock-free.
 
@@ -2160,9 +2196,10 @@ class DbCoordinator:
         last = self._last_beat_ok
         if last is None or not heartbeat_lapsed(last, now, self._node_timeout_seconds):
             return False
+        # Cleared whether or not it leads: a claim that returned after the lapse cached an epoch.
+        self._leader_epoch = None
         if self._is_leader:
             self._is_leader = False
-            self._leader_epoch = None
             log_heartbeat_lapse_stand_down(self.node_id, now - last, self._node_timeout_seconds)
             self._alert_leadership_lost("heartbeat lapsed")
             self._fire_on_demote()  # ADR 0157 Inc 5
@@ -2316,7 +2353,7 @@ class DbCoordinator:
 
         Three disjuncts. The gate reads True. An earlier write is owed
         (:attr:`_lease_release_owed`). Or ``_last_renew_ok`` is set: a hold was confirmed and nothing
-        has cleared it since. Three things clear the baseline: a release, a claim the DB answered
+        has cleared it since. At least these clear the baseline: a release, a claim the DB answered
         with another owner's live lease (:meth:`_claim_or_renew_lease`), which clears the owed flag
         too, and a paused tick's read of a row naming another owner (BACKLOG #5711), which does not.
         So the last disjunct is the self-fence
