@@ -571,3 +571,7 @@ In-process fake Transit, never a real server, in `tests/test_transit_bound_attes
 - `test_raising_min_decryption_version_past_v1_is_a_break_with_the_alert`.
 - `test_a_tampered_row_in_a_mixed_chain_still_breaks` and
   `test_a_malformed_stored_mac_is_a_break_with_no_verify_call`.
+
+Item 1's append refusal is pinned in `tests/test_crypto_transit.py`:
+
+- `test_audit_hmac_refuses_a_reply_its_own_check_would_reject`.
