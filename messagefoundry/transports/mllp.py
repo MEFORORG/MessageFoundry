@@ -106,7 +106,6 @@ from messagefoundry.tls_handshake_failures import (
 )
 from messagefoundry.transports.admission import FrameClock, ListenerAdmission, PeerInfo, RefusalLog
 from messagefoundry.transports.base import (
-    INSECURE_HOP_REFUSED_CODE,
     INTAKE_AUDIT_ACTIONS,
     DeliveryError,
     DeliveryResponse,
@@ -117,6 +116,7 @@ from messagefoundry.transports.base import (
     SourceConnector,
     float_setting,
     hold_and_retry,
+    insecure_hop_refused,
     intake_open,
     owes_hl7_reply,
     port_setting,
@@ -544,21 +544,13 @@ class InsecureHopGuard:
 
         The raw :class:`~messagefoundry.config.tls_policy.InsecureHopRefused` is a ``ValueError``,
         which the delivery worker would file as an internal error and, under the default policy,
-        dead-letter row by row. The guard keys on the connection's own host and the posture captured
-        when it was built, so every queued row would meet the same refusal until an operator changes
-        the connection and reloads: a permanent configuration fault, as the HTTP family's
-        ``assert_delivery_url`` raises (``transports/rest.py``). Under the default
-        ``credential_fault_policy`` the lane stops and the queue stays. The text names the
-        connection, the cell, the host and port, and no message content."""
+        dead-letter row by row. It is raised instead as the lane-stopping configuration fault
+        :func:`~messagefoundry.transports.base.insecure_hop_refused` builds, as the HTTP family's
+        ``assert_delivery_url`` raises it."""
         try:
             self.assert_send()
         except InsecureHopRefused as exc:
-            raise NegativeAckError(
-                f"{connector} send refused: {exc}",
-                code=INSECURE_HOP_REFUSED_CODE,
-                permanent=True,
-                config_fault=True,
-            ) from exc
+            raise insecure_hop_refused(exc, connector=connector) from exc
 
 
 def _set_tcp_nodelay(writer: asyncio.StreamWriter) -> None:

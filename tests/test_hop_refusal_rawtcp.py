@@ -415,13 +415,11 @@ async def test_send_asserts_before_any_io(build_cfg, connector) -> None:
     # is the refusal (BACKLOG #5719, #5718); tests/test_rawtcp_hop_refusal_stops_lane.py pins it.
     dest = connector(build_cfg(LOOPBACK))
     dest._hop_guard = refuse_guard()
-    with pytest.raises((InsecureHopRefused, NegativeAckError)) as refused:
+    classified = connector in _CLASSIFIED
+    with pytest.raises(NegativeAckError if classified else InsecureHopRefused) as refused:
         await dest.send("MSH|^~\\&|A|B|C|D|20260101||ADT^A01|1|P|2.5\r")
-    if connector in _CLASSIFIED:
-        assert isinstance(refused.value, NegativeAckError)
+    if classified:
         assert isinstance(refused.value.__cause__, InsecureHopRefused)
-    else:
-        assert isinstance(refused.value, InsecureHopRefused)
 
 
 def test_assert_send_matrix() -> None:

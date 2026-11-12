@@ -90,6 +90,7 @@ from messagefoundry.transports.base import (
     ReplyBodyDropped,
     encode_wire_body,
     float_setting,
+    insecure_hop_refused,
     register_destination,
 )
 from messagefoundry.transports.bounded_read import (
@@ -928,20 +929,13 @@ class InsecureHopGuard:
         :class:`InsecureHopRefused`, a ``ValueError``, left the send unclassified, and the delivery
         worker filed it as an internal error. :func:`assert_probe_hop` is the probe's twin.
 
-        A permanent configuration fault, as :func:`auth_challenge_refused` is. The guard keys on the
-        connection's own URL and the posture captured when it was built, so every queued row would
-        meet the same refusal until an operator changes the connection and reloads. Under the
-        default ``credential_fault_policy`` the lane stops and the queue stays. The text names the
-        connection, the cell, the host and the redacted URL, and no message content."""
+        A permanent configuration fault, as :func:`auth_challenge_refused` is; :func:`insecure_hop_refused`
+        says why. The text names the connection, the cell, the host and the redacted URL, and no
+        message content."""
         try:
             self.assert_send_url(url)
         except InsecureHopRefused as exc:
-            raise NegativeAckError(
-                f"{connector} send refused: {exc}",
-                code=INSECURE_HOP_REFUSED_CODE,
-                permanent=True,
-                config_fault=True,
-            ) from exc
+            raise insecure_hop_refused(exc, connector=connector) from exc
 
 
 def assert_probe_hop(guard: InsecureHopGuard | None, url: str, *, connector: str) -> None:

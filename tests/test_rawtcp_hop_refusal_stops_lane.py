@@ -22,6 +22,7 @@ dial; the in-flight test uses a loopback peer.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -62,27 +63,43 @@ def _refusing_guard(connection: str) -> InsecureHopGuard:
     )
 
 
-def _mllp(name: str = "OB_MLLP") -> MLLPDestination:
+#: A synthetic, PHI-free interchange envelope. The refusal tests never parse it.
+X12 = (
+    "ISA*00*          *00*          *ZZ*SENDERID       *ZZ*RECEIVERID     *240101*1200*^*00501"
+    "*000000001*0*P*:~IEA*1*000000001~"
+)
+
+
+def _mllp() -> MLLPDestination:
     # Built on loopback with no stamped posture, so construction passes; the refusing guard is
     # swapped in after, standing in for a posture that changed after construction.
     dest = MLLPDestination(
-        Destination(name=name, type=ConnectorType.MLLP, settings={"host": LOOPBACK, "port": 5000})
+        Destination(
+            name="OB_MLLP", type=ConnectorType.MLLP, settings={"host": LOOPBACK, "port": 5000}
+        )
     )
-    dest._hop_guard = _refusing_guard(name)
+    dest._hop_guard = _refusing_guard("OB_MLLP")
     return dest
 
 
-def _x12(name: str = "OB_X12", *, port: int = 5000, **settings: object) -> X12Destination:
+def _x12(**settings: object) -> X12Destination:
     """An X12 outbound built as :func:`_mllp` builds MLLP's, refusing guard swapped in."""
     dest = X12Destination(
         Destination(
-            name=name,
+            name="OB_X12",
             type=ConnectorType.X12,
-            settings={"host": LOOPBACK, "port": port, **settings},
+            settings={"host": LOOPBACK, "port": 5000, **settings},
         )
     )
-    dest._hop_guard = _refusing_guard(name)
+    dest._hop_guard = _refusing_guard("OB_X12")
     return dest
+
+
+#: (build, payload, connection name, connector label) for each outbound the two rows fixed.
+_REFUSING = [
+    pytest.param(_mllp, RAW, "OB_MLLP", "MLLP", id="mllp-5719"),
+    pytest.param(_x12, X12, "OB_X12", "X12", id="x12-5718"),
+]
 
 
 def _assert_config_fault(err: NegativeAckError, connector: str) -> None:
@@ -101,31 +118,32 @@ def test_assert_delivery_classifies_the_refusal() -> None:
     assert f"{REMOTE}:5000" in str(refused.value)
 
 
-def test_assert_delivery_is_silent_where_assert_send_is() -> None:
+@pytest.mark.parametrize(
+    ("host", "posture"),
+    [(REMOTE, None), (LOOPBACK, HopPosture(enforcing=True))],
+    ids=["unstamped", "loopback"],
+)
+def test_assert_delivery_is_silent_where_assert_send_is(
+    host: str, posture: HopPosture | None
+) -> None:
     InsecureHopGuard(
-        host=REMOTE,
+        host=host,
         port=5000,
         cell="t",
         description="d",
         attested=False,
         attested_reason=None,
-        posture=None,
-    ).assert_delivery(connector="MLLP")
-    InsecureHopGuard(
-        host=LOOPBACK,
-        port=5000,
-        cell="t",
-        description="d",
-        attested=False,
-        attested_reason=None,
-        posture=HopPosture(enforcing=True),
+        posture=posture,
     ).assert_delivery(connector="MLLP")
 
 
-async def test_mllp_send_raises_the_configuration_fault() -> None:
+@pytest.mark.parametrize(("build", "payload", "name", "label"), _REFUSING)
+async def test_send_raises_the_configuration_fault(
+    build: Callable[[], DestinationConnector], payload: str, name: str, label: str
+) -> None:
     with pytest.raises(NegativeAckError) as refused:
-        await _mllp().send(RAW)
-    _assert_config_fault(refused.value, "MLLP")
+        await build().send(payload)
+    _assert_config_fault(refused.value, label)
 
 
 class _Stops(LoggingAlertSink):
@@ -185,35 +203,22 @@ async def _deliver_one(
         await store.close()
 
 
-async def test_an_mllp_send_time_refusal_stops_the_lane_and_keeps_the_row(tmp_path: Path) -> None:
-    outcome, status, sink = await _deliver_one(tmp_path, "OB_MLLP", _mllp())
+@pytest.mark.parametrize(("build", "payload", "name", "label"), _REFUSING)
+async def test_a_send_time_refusal_stops_the_lane_and_keeps_the_row(
+    tmp_path: Path,
+    build: Callable[[], DestinationConnector],
+    payload: str,
+    name: str,
+    label: str,
+) -> None:
+    outcome, status, sink = await _deliver_one(tmp_path, name, build())
     assert outcome is _ItemOutcome.STOPPED
     assert status == OutboxStatus.PENDING.value, "the row was not kept for the operator"
-    assert [name for name, _ in sink.stopped] == ["OB_MLLP"]
+    assert [stopped for stopped, _ in sink.stopped] == [name]
     assert f"configuration fault ({INSECURE_HOP_REFUSED_CODE})" in sink.stopped[0][1]
 
 
-# --- BACKLOG #5718: X12 ---------------------------------------------------------------------------
-
-#: A synthetic, PHI-free interchange envelope. The refusal tests never parse it.
-X12 = (
-    "ISA*00*          *00*          *ZZ*SENDERID       *ZZ*RECEIVERID     *240101*1200*^*00501"
-    "*000000001*0*P*:~IEA*1*000000001~"
-)
-
-
-async def test_x12_send_raises_the_configuration_fault() -> None:
-    with pytest.raises(NegativeAckError) as refused:
-        await _x12().send(X12)
-    _assert_config_fault(refused.value, "X12")
-
-
-async def test_an_x12_send_time_refusal_stops_the_lane_and_keeps_the_row(tmp_path: Path) -> None:
-    outcome, status, sink = await _deliver_one(tmp_path, "OB_X12", _x12())
-    assert outcome is _ItemOutcome.STOPPED
-    assert status == OutboxStatus.PENDING.value, "the row was not kept for the operator"
-    assert [name for name, _ in sink.stopped] == ["OB_X12"]
-    assert f"configuration fault ({INSECURE_HOP_REFUSED_CODE})" in sink.stopped[0][1]
+# --- BACKLOG #5718: the reload half, X12 ----------------------------------------------------------
 
 
 @pytest.mark.parametrize("persistent", [False, True], ids=["connect-per-send", "persistent"])

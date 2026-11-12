@@ -353,8 +353,6 @@ class X12Destination(DestinationConnector):
         business 271/277/278) reply is a **complete transaction on a healthy transport**, so the
         connection stays cached and a TA1*R :class:`NegativeAckError` does NOT discard it (mirrors
         MLLP's NAK-keeps-connection, AC-10)."""
-        if self._closed:
-            raise self._closed_error()
         need_reply = self.expect_reply or self.capture_response or self.ta1_required
         conn = self._conn
         if conn is not None:
