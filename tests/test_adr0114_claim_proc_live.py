@@ -85,11 +85,23 @@ async def proc_store() -> AsyncIterator[SqlServerStore]:
 async def test_open_deploys_procs_and_gate_passes(proc_store: SqlServerStore) -> None:
     assert proc_store.claim_proc_effective is True
     assert proc_store.claim_proc_degraded_reason is None
+    # BACKLOG #5722: the unqualified head deployed the procs in the login's default schema, and
+    # the gate found them in the schema of the queue table this login resolves; the two agree.
+    row = await proc_store._fetchone(
+        "SELECT QUOTENAME(SCHEMA_NAME()) AS default_schema,"
+        " QUOTENAME(OBJECT_SCHEMA_NAME(OBJECT_ID(N'queue', N'U'))) AS store_schema"
+    )
+    assert row is not None
+    assert proc_store._claim_proc_schema == row["store_schema"] == row["default_schema"]
     for proc in (ss._CLAIM_PROC_CID, ss._CLAIM_PROC_DST):
+        qualified = f"{proc_store._claim_proc_schema}.{proc}"
         row = await proc_store._fetchone(
-            "SELECT OBJECT_DEFINITION(OBJECT_ID(?)) AS body", (f"dbo.{proc}",)
+            "SELECT OBJECT_DEFINITION(OBJECT_ID(?)) AS body", (qualified,)
         )
-        assert row is not None and row["body"], f"dbo.{proc} not deployed"
+        assert row is not None and row["body"], f"{qualified} not deployed"
+        # The stored head is the unqualified rewrite, so the "rewritten" head form is the one
+        # the gate matched (the inference _CLAIM_PROC_STORED_HEADS records, checked here).
+        assert proc_store._claim_proc_head_forms[proc] == "rewritten"
 
 
 async def test_a_deployed_proc_can_return_a_null_definition(proc_store: SqlServerStore) -> None:
@@ -127,7 +139,7 @@ async def test_ac8_trancount_on_exit_equals_entry(proc_store: SqlServerStore) ->
             await cur.execute("SELECT @@TRANCOUNT")
             before = (await cur.fetchone())[0]
             await cur.execute(
-                f"{{CALL dbo.{ss._CLAIM_PROC_CID} (?,?,?,?,?,?,?,?,?)}}",
+                f"{{CALL {proc_store._claim_proc_schema}.{ss._CLAIM_PROC_CID} (?,?,?,?,?,?,?,?,?)}}",
                 (0.0, Stage.INGRESS.value, 1, "pending", "inflight", "[]", None, None, 0),
             )
             await cur.fetchall()  # drain the sole (empty) result set
@@ -203,7 +215,8 @@ async def test_ac7_tampered_body_degrades_next_open(proc_store: SqlServerStore) 
         " assertions below are vacuous"
     )
     await proc_store._execute(
-        f"ALTER PROCEDURE dbo.{ss._CLAIM_PROC_CID} @now FLOAT, @stage NVARCHAR(16), @k INT,"
+        f"ALTER PROCEDURE {proc_store._claim_proc_schema}.{ss._CLAIM_PROC_CID}"
+        " @now FLOAT, @stage NVARCHAR(16), @k INT,"
         " @pending NVARCHAR(32), @inflight NVARCHAR(32), @lanes NVARCHAR(MAX),"
         " @lease_key NVARCHAR(256) = NULL, @leader_epoch BIGINT = NULL, @fold_reset BIT = 0"
         " AS SELECT 1 WHERE 1=0;"

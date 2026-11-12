@@ -73,8 +73,9 @@ from tests.test_adr0114_claim_fold import (
     _wire,
 )
 
-_CALL_CID = "{CALL dbo.mefor_claim_fifo_heads_cid_v2 (?,?,?,?,?,?,?,?,?)}"
-_CALL_DST = "{CALL dbo.mefor_claim_fifo_heads_dst_v2 (?,?,?,?,?,?,?,?,?)}"
+# The CALL names the schema the gate verified the procs in (BACKLOG #5722); these rigs set [dbo].
+_CALL_CID = "{CALL [dbo].mefor_claim_fifo_heads_cid_v2 (?,?,?,?,?,?,?,?,?)}"
+_CALL_DST = "{CALL [dbo].mefor_claim_fifo_heads_dst_v2 (?,?,?,?,?,?,?,?,?)}"
 
 _FAKE_PINS = [(1, 0, 0)] * 9  # stands in for _claim_proc_param_pins() (pyodbc-free CI)
 
@@ -97,6 +98,7 @@ def _proc_store(
     store._fifo_claim_proc = proc
     store._claim_proc_effective = effective
     store._claim_proc_input_sizes = pins
+    store._claim_proc_schema = "[dbo]" if effective else None
     return store
 
 
@@ -152,7 +154,7 @@ async def test_lint_batch_renders_from_the_shared_fragments() -> None:
 def test_lint_proc_body_is_header_plus_fragments_plus_tail(proc_name: str, lane_col: str) -> None:
     body = ss._claim_proc_body(proc_name, lane_col)
     expected = (
-        f"CREATE OR ALTER PROCEDURE dbo.{proc_name}"
+        f"CREATE OR ALTER PROCEDURE {proc_name}"
         " @now FLOAT, @stage NVARCHAR(16), @k INT,"
         " @pending NVARCHAR(32), @inflight NVARCHAR(32),"
         " @lanes NVARCHAR(MAX),"
@@ -232,7 +234,9 @@ def test_ac8_proc_body_hard_rules() -> None:
         # The head anchor the startup gate expands on. Stated INDEPENDENTLY of _CLAIM_PROC_HEAD on
         # purpose — collapsing this onto the constant would make the check tautological, and a
         # leading comment / semicolon / SET here silently breaks the gate's stored-form expansion.
-        assert body.startswith(f"CREATE OR ALTER PROCEDURE dbo.{proc_name} ")
+        # Unqualified, so the proc lands in the deploying principal's default schema with the
+        # store's tables (BACKLOG #5722).
+        assert body.startswith(f"CREATE OR ALTER PROCEDURE {proc_name} ")
 
 
 def test_ac10_guarded_ddl_rides_schema() -> None:
@@ -247,7 +251,9 @@ def test_ac10_guarded_ddl_rides_schema() -> None:
             "IF (SELECT compatibility_level FROM sys.databases WHERE name = DB_NAME()) >= 130"
         )
         assert "HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE PROCEDURE') = 1" in ddl
-        assert "HAS_PERMS_BY_NAME('dbo', 'SCHEMA', 'ALTER') = 1" in ddl
+        # ALTER on the schema the unqualified head creates the proc in (BACKLOG #5722), not dbo.
+        assert "HAS_PERMS_BY_NAME(QUOTENAME(SCHEMA_NAME()), 'SCHEMA', 'ALTER') = 1" in ddl
+        assert "HAS_PERMS_BY_NAME('dbo'" not in ddl
         assert "SERVERPROPERTY('EngineEdition')" in ddl
         assert "13.0.4001".replace(".", "") or True  # documentation anchor; version parse below
         assert "PARSENAME" in ddl and "4001" in ddl
@@ -290,7 +296,7 @@ def test_object_definition_fixture_actually_perturbs() -> None:
         stored = _as_object_definition(submitted)
         assert stored != submitted, "the fixture must model a real transform"
         assert len(submitted) - len(stored) == 7, "OR + ALTER deleted, separators kept"
-        assert stored.startswith("CREATE   PROCEDURE dbo."), stored[:40]
+        assert stored.startswith(f"CREATE   PROCEDURE {proc} "), stored[:40]
         assert submitted.split()[3:] == stored.split()[1:], "only the head differs"
 
 
@@ -301,8 +307,13 @@ def _gate_rows(
     dst_body: str | None = "STORED",
     cid_oid: int | None = None,
     dst_oid: int | None = None,
+    schema: str | None = "dbo",
 ) -> dict[str, dict[str, Any] | None]:
     """Build the _fetchone stub's answers.
+
+    ``schema`` is the schema the queue table resolves in for this login (``None``: it does not
+    resolve). The procs are answered only under that schema's bracket-quoted name, so a gate that
+    looked anywhere else would KeyError (BACKLOG #5722).
 
     "STORED" (the DEFAULT) resolves to the shipped body as OBJECT_DEFINITION actually returns it —
     the form a real server can produce. "SUBMITTED" resolves to the verbatim text this code sends,
@@ -332,12 +343,14 @@ def _gate_rows(
         body = resolve(value, proc, col)
         return {"oid": oid if oid is not None else (917578307 if body else None), "body": body}
 
+    quoted = "[" + (schema or "").replace("]", "]]") + "]"
     return {
         "compat": {"compatibility_level": compat},
-        "dbo.mefor_claim_fifo_heads_cid_v2": answer(
+        "schema": {"store_schema": schema},
+        f"{quoted}.mefor_claim_fifo_heads_cid_v2": answer(
             cid_body, cid_oid, "mefor_claim_fifo_heads_cid_v2", "channel_id"
         ),
-        "dbo.mefor_claim_fifo_heads_dst_v2": answer(
+        f"{quoted}.mefor_claim_fifo_heads_dst_v2": answer(
             dst_body, dst_oid, "mefor_claim_fifo_heads_dst_v2", "destination_name"
         ),
     }
@@ -349,6 +362,8 @@ def _stub_fetchone(store: SqlServerStore, answers: dict[str, dict[str, Any] | No
     async def fake_fetchone(sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
         if sql == "SELECT compatibility_level FROM sys.databases WHERE name = DB_NAME()":
             return answers["compat"]
+        if sql == "SELECT OBJECT_SCHEMA_NAME(OBJECT_ID(N'queue', N'U')) AS store_schema":
+            return answers["schema"]
         assert sql == "SELECT OBJECT_ID(?) AS oid, OBJECT_DEFINITION(OBJECT_ID(?)) AS body", (
             f"unexpected probe: {sql}"
         )
@@ -410,11 +425,11 @@ def test_ac7_expected_hashes_are_exactly_two_named_constants(proc_name: str, lan
     strongest reason this shape was chosen. A third head silently appended later turns this RED."""
     tail = ss._claim_proc_body(proc_name, lane_col)[len(ss._CLAIM_PROC_HEAD) :]
     want = {
+        hashlib.sha256(ss._normalize_tsql("CREATE PROCEDURE " + tail).encode()).hexdigest(): (
+            "rewritten"
+        ),
         hashlib.sha256(
-            ss._normalize_tsql("CREATE PROCEDURE dbo." + tail).encode()
-        ).hexdigest(): "rewritten",
-        hashlib.sha256(
-            ss._normalize_tsql("CREATE OR ALTER PROCEDURE dbo." + tail).encode()
+            ss._normalize_tsql("CREATE OR ALTER PROCEDURE " + tail).encode()
         ).hexdigest(): "verbatim",
     }
     assert ss._claim_proc_shipped_hashes()[proc_name] == want
@@ -448,7 +463,16 @@ async def test_ac7_gate_accepts_a_non_rewriting_engines_verbatim_storage(
 
 
 @pytest.mark.parametrize(
-    "head", ["CREATE   PROC dbo.", "create   procedure dbo.", "CrEaTe   pRoCeDuRe dbo."]
+    "head",
+    [
+        "CREATE   PROC ",
+        "create   procedure ",
+        "CrEaTe   pRoCeDuRe ",
+        # BACKLOG #5722: the shipped head is unqualified, so a schema-qualified stored head is a
+        # hand deploy too, including the dbo head this code deployed before.
+        "CREATE   PROCEDURE dbo.",
+        "CREATE   PROCEDURE [dbo].",
+    ],
 )
 async def test_ac7_gate_rejects_head_forms_this_deploy_path_cannot_emit(
     head: str, monkeypatch: pytest.MonkeyPatch
@@ -456,7 +480,8 @@ async def test_ac7_gate_rejects_head_forms_this_deploy_path_cannot_emit(
     """ANTI-OVER-WIDE guard. `CREATE PROC` and case-differing heads are MEASURED to survive the
     server round-trip, and `_claim_proc_ddl` provably cannot emit them — so each is affirmative
     evidence of an out-of-band hand deploy, which IS the AC-7 event. A two-sided regex
-    canonicalization accepts all three and launders exactly the signal the gate exists to raise."""
+    canonicalization accepts all of them and launders exactly the signal the gate exists to
+    raise."""
     tail = ss._claim_proc_body("mefor_claim_fifo_heads_cid_v2", "channel_id")[
         len(ss._CLAIM_PROC_HEAD) :
     ]
@@ -505,9 +530,7 @@ async def test_ac7_gate_degrades_loudly_when_the_body_head_anchor_breaks(
         ({"cid_body": None}, "is missing"),
         ({"dst_body": None}, "is missing"),
         (
-            {
-                "cid_body": "CREATE OR ALTER PROCEDURE dbo.mefor_claim_fifo_heads_cid_v2 AS SELECT 1;"
-            },
+            {"cid_body": "CREATE OR ALTER PROCEDURE mefor_claim_fifo_heads_cid_v2 AS SELECT 1;"},
             "matches no form this build deploys",
         ),
         ({"compat": 120}, "compatibility_level 120 < 130"),
@@ -634,10 +657,12 @@ def test_ac9_result_processing_is_one_shared_path_after_the_pin_clear() -> None:
 # RE-PINNED IN PLACE for BACKLOG #5721 (binary lane comparisons), under the existing _v2 names: the
 # sole result set's shape is unchanged, so an older build calling _v2 still parses every row, and no
 # deployed database holds _v2 (MessageFoundry has never been deployed). Measured substitution-only:
-# reverting the collation clauses reproduces the previous pins.
+# reverting the collation clauses reproduces the previous pins. RE-PINNED again for BACKLOG #5722,
+# the unqualified head (the proc lands in the store's schema): restoring `dbo.` after the head
+# reproduces the #5721 pins, so nothing else moved.
 _GOLDEN_PROC_BODY_SHA256 = {
-    "mefor_claim_fifo_heads_cid_v2": "a3e95d082eb8add25bccc2f45516a2e9553f8d5ffde3b35cfde4b9a991f37c79",
-    "mefor_claim_fifo_heads_dst_v2": "1db40ff807c5612d1e31f954f2fe36a7a5835670de3bd0fa6b057fd72b0aaaf9",
+    "mefor_claim_fifo_heads_cid_v2": "c2dddb3139890fd403fe087f875e7385f0434b755f0f99086018651f9b264c69",
+    "mefor_claim_fifo_heads_dst_v2": "a0a3bec4e5c13f03c362ce405e381c30643969e80076fe45e4b1ffec7f166d45",
 }
 # The retained _v1 bodies, pinned at their origin/main values (before BACKLOG #1270). ADR 0114: a
 # newer build's _v2 never touches _v1, because an older build sharing the store mid-upgrade still

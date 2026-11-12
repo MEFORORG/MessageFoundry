@@ -1797,7 +1797,15 @@ class _FencedWrite(Exception):
 # silently, so ``_claim_proc_stored_forms`` RAISES rather than falling through.
 # tests/test_adr0114_claim_proc.py re-states this literal independently on purpose — do NOT
 # collapse that assertion onto this constant, or the check stops being a check.
-_CLAIM_PROC_HEAD: Final[str] = "CREATE OR ALTER PROCEDURE dbo."
+#
+# The head is UNQUALIFIED (BACKLOG #5722), so the proc lands in the deploying principal's default
+# schema: the same schema the batch's unqualified CREATE TABLEs land in, which is the store's
+# schema. A dbo head on a store provisioned in another schema put the proc where its unqualified
+# `queue` reference does not resolve to the store's table. The gate and the CALL then address it in
+# the schema of the queue table the engine resolves (SqlServerStore._gate_claim_proc).
+_CLAIM_PROC_HEAD: Final[str] = "CREATE OR ALTER PROCEDURE "
+#: The head the retained ``_v1`` bodies shipped with, kept so their bytes do not move.
+_CLAIM_PROC_V1_HEAD: Final[str] = "CREATE OR ALTER PROCEDURE dbo."
 
 
 def _claim_proc_body(proc_name: str, lane_col: str) -> str:
@@ -1823,7 +1831,7 @@ def _claim_proc_body(proc_name: str, lane_col: str) -> str:
     DONE tokens; harmless for the execute/fetchone consumers — ADR 0114 §3)."""
     v1 = proc_name in _V1_CLAIM_PROCS
     return (
-        f"{_CLAIM_PROC_HEAD}{proc_name}"
+        f"{_CLAIM_PROC_V1_HEAD if v1 else _CLAIM_PROC_HEAD}{proc_name}"
         " @now FLOAT, @stage NVARCHAR(16), @k INT,"
         " @pending NVARCHAR(32), @inflight NVARCHAR(32),"
         " @lanes NVARCHAR(MAX),"
@@ -1859,6 +1867,9 @@ def _claim_proc_ddl(proc_name: str, lane_col: str) -> str:
     under the SAME name. That is a redeploy, not a version: a result-set change still needs a new
     proc name, or an older build sharing the store calls a body it cannot parse (BACKLOG #1270)."""
     body = _claim_proc_body(proc_name, lane_col).replace("'", "''")
+    # The schema the head creates the proc in: dbo for a retained _v1 head, else the principal's
+    # default schema, where an unqualified CREATE lands (BACKLOG #5722).
+    schema = "'dbo'" if proc_name in _V1_CLAIM_PROCS else "QUOTENAME(SCHEMA_NAME())"
     version_check = (
         "CAST(SERVERPROPERTY('EngineEdition') AS INT) >= 5"
         " OR TRY_CAST(PARSENAME(CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)), 4)"
@@ -1872,12 +1883,12 @@ def _claim_proc_ddl(proc_name: str, lane_col: str) -> str:
         "IF (SELECT compatibility_level FROM sys.databases WHERE name = DB_NAME()) >= 130"
         " AND HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE PROCEDURE') = 1"
         # CREATE PROCEDURE alone is NOT sufficient: creating (or CREATE OR ALTER-ing) a proc in
-        # dbo also requires ALTER on the schema — a least-privilege principal holding only the
-        # database-level permission would pass a narrower guard and then FAIL the must-succeed
+        # a schema also requires ALTER on that schema — a least-privilege principal holding only
+        # the database-level permission would pass a narrower guard and then FAIL the must-succeed
         # _ensure_schema transaction (a flag-OFF open outage, the exact failure this guard
-        # exists to make impossible). Probing both closes it; ALTER ON SCHEMA::dbo also covers
-        # the OR ALTER re-apply against an existing proc.
-        " AND HAS_PERMS_BY_NAME('dbo', 'SCHEMA', 'ALTER') = 1"
+        # exists to make impossible). Probing both closes it; ALTER on the target schema also
+        # covers the OR ALTER re-apply against an existing proc.
+        f" AND HAS_PERMS_BY_NAME({schema}, 'SCHEMA', 'ALTER') = 1"
         f" AND ({version_check})"
         f" EXEC(N'{body}')"
     )
@@ -1922,8 +1933,14 @@ def _normalize_tsql(text: str) -> str:
 # _claim_proc_body() renders. `CREATE PROC`, a lower-cased head, or any other spelling this deploy
 # path cannot emit is positive evidence of an out-of-band hand deploy, which is precisely the AC-7
 # signal, and MUST keep failing the gate. This is not a compatibility grab-bag.
+#
+# The rewrite was measured on the dbo-qualified head this code deployed before BACKLOG #5722. That
+# the engine deletes the two tokens the same way before an unqualified name is an inference, not a
+# measurement; the live leg's gate-passes assertion (tests/test_adr0114_claim_proc_live.py) is what
+# checks it, and a wrong inference degrades the gate loudly rather than widening it. A
+# schema-qualified stored head is now a hand deploy too, and fails the gate.
 _CLAIM_PROC_STORED_HEADS: Final[tuple[tuple[str, str], ...]] = (
-    ("rewritten", "CREATE PROCEDURE dbo."),
+    ("rewritten", "CREATE PROCEDURE "),
     ("verbatim", _CLAIM_PROC_HEAD),
 )
 
@@ -1948,6 +1965,18 @@ def _claim_proc_stored_forms(proc_name: str, lane_col: str) -> dict[str, str]:
         )
     tail = shipped[len(_CLAIM_PROC_HEAD) :]
     return {label: _normalize_tsql(head + tail) for label, head in _CLAIM_PROC_STORED_HEADS}
+
+
+#: The schema of the queue table this login resolves, the same way every unqualified claim
+#: reference resolves it: the default schema, then dbo (BACKLOG #5722).
+_CLAIM_PROC_SCHEMA_SQL: Final[str] = (
+    "SELECT OBJECT_SCHEMA_NAME(OBJECT_ID(N'queue', N'U')) AS store_schema"
+)
+
+
+def _bracket_ident(name: str) -> str:
+    """``name`` as a T-SQL bracket-quoted identifier, the client-side ``QUOTENAME``."""
+    return "[" + name.replace("]", "]]") + "]"
 
 
 def _claim_proc_shipped_hashes() -> dict[str, dict[str, str]]:
@@ -3520,6 +3549,9 @@ class SqlServerStore:
         # ("rewritten" on every engine measured to date; "verbatim" would mean this server does NOT
         # rewrite CREATE OR ALTER — an engine difference worth knowing about, not a tamper event).
         self._claim_proc_head_forms: dict[str, str] = {}
+        # The bracket-quoted schema the gate verified both procs in, and the CALL addresses them in
+        # (BACKLOG #5722). Set only by a passing gate; None keeps the claim on the batch.
+        self._claim_proc_schema: str | None = None
         self._claim_proc_setinputsizes_warned = False
         # ADR 0114 sub-lever B (fifo_claim_prepared): stable claim text + a retained prepared
         # cursor on store-owned dedicated connections (INGRESS/ROUTED). Read ONCE at open; the
@@ -3627,9 +3659,15 @@ class SqlServerStore:
         The comparison is against the STORED forms, not against ``_claim_proc_body()`` directly:
         the engine rewrites the ``CREATE OR ALTER`` head when it stores the module, so comparing
         with the submitted text can never match (the defect that left this gate inert in every
-        deployment from the feature shipping until this commit)."""
+        deployment from the feature shipping until this commit).
+
+        The procs are looked up in the schema of the ``queue`` table this login resolves, which is
+        the table every claim and the proc body's own unqualified references reach (BACKLOG
+        #5722). The deploy creates them there, since the head is unqualified and lands where the
+        batch's tables do. A passing gate records that schema for the CALL."""
         reason: str | None = None
         head_forms: dict[str, str] = {}
+        schema: str | None = None
         try:
             row = await self._fetchone(
                 "SELECT compatibility_level FROM sys.databases WHERE name = DB_NAME()"
@@ -3638,64 +3676,32 @@ class SqlServerStore:
             if compat < 130:
                 reason = f"database compatibility_level {compat} < 130 (OPENJSON unavailable)"
             else:
-                expected = _claim_proc_shipped_hashes()
-                for proc_name in (_CLAIM_PROC_CID, _CLAIM_PROC_DST):
-                    # OBJECT_ID rides along so a NULL body can be told apart from an ABSENT proc.
-                    # MEASURED: a principal holding only EXECUTE on the proc gets a non-NULL
-                    # OBJECT_ID and a NULL OBJECT_DEFINITION — the module is deployed and working,
-                    # and the compat probe above still passes. Without the id, that reads as
-                    # "missing" and sends the operator to grant CREATE PROCEDURE, which is not the
-                    # problem and does not fix it. WITH ENCRYPTION produces the identical NULL.
-                    row = await self._fetchone(
-                        "SELECT OBJECT_ID(?) AS oid, OBJECT_DEFINITION(OBJECT_ID(?)) AS body",
-                        (f"dbo.{proc_name}", f"dbo.{proc_name}"),
+                row = await self._fetchone(_CLAIM_PROC_SCHEMA_SQL)
+                store_schema = row["store_schema"] if row else None
+                if store_schema is None:
+                    reason = (
+                        "the queue table does not resolve for this login, so the gate cannot tell"
+                        " which schema the claim procedures belong in"
                     )
-                    deployed = row["body"] if row else None
-                    if not deployed:
-                        if (row["oid"] if row else None) is None:
-                            reason = (
-                                f"stored procedure dbo.{proc_name} is missing (guarded DDL skipped —"
-                                " create procedure / ALTER-on-schema denied, or a pre-2016-SP1"
-                                " engine?)"
-                            )
-                        else:
-                            reason = (
-                                f"stored procedure dbo.{proc_name} is DEPLOYED but its definition is"
-                                " unreadable (OBJECT_ID resolves, OBJECT_DEFINITION is NULL) — the"
-                                " proc is not missing and create procedure is not the fix. Either"
-                                " this principal lacks view definition on it (grant view definition"
-                                f" on OBJECT::dbo.{proc_name} to <the engine's principal>) or the"
-                                " module was created with encryption. The gate compares the body"
-                                " hash, so it cannot pass on a body it cannot read"
-                            )
-                        break
-                    got = hashlib.sha256(_normalize_tsql(deployed).encode()).hexdigest()
-                    matched = expected[proc_name].get(got)
-                    if matched is None:
-                        reason = (
-                            f"stored procedure dbo.{proc_name} body matches no form this build"
-                            " deploys — an out-of-band edit, a hand deploy (a head spelling this"
-                            " code cannot emit, e.g. create proc or a differing case), a renamed"
-                            " proc (sp_rename does not rewrite the stored definition), or a build"
-                            " whose body was changed without bumping the proc version. The"
-                            " shipped batch runs. Compare OBJECT_DEFINITION(OBJECT_ID('dbo."
-                            f"{proc_name}')) against this build's own definition to see the drift"
-                        )
-                        break
-                    head_forms[proc_name] = matched
+                else:
+                    schema = _bracket_ident(str(store_schema))
+                    reason = await self._verify_claim_procs(schema, head_forms)
         except Exception as exc:  # noqa: BLE001 - §4: ANY gate failure degrades, never an outage
             # A transient probe failure (e.g. a hiccup on the metadata read) must not fail the
             # open — the ADR's rule is total: any gate miss runs the shipped batch, loudly.
             reason = f"startup-gate probe failed: {codec_safe_str(exc)}"
-        if reason is None:
+        if reason is None and schema is not None:
             self._claim_proc_effective = True
             self._claim_proc_degraded_reason = None
             self._claim_proc_input_sizes = _claim_proc_param_pins()
             self._claim_proc_head_forms = head_forms
+            self._claim_proc_schema = schema
             log.info(
                 "fifo_claim_proc: startup gate PASSED — pooled claims will use"
-                " dbo.%s / dbo.%s (ADR 0114 sub-lever A); stored head forms: %s",
+                " %s.%s / %s.%s (ADR 0114 sub-lever A); stored head forms: %s",
+                schema,
                 _CLAIM_PROC_CID,
+                schema,
                 _CLAIM_PROC_DST,
                 head_forms,
             )
@@ -3713,12 +3719,60 @@ class SqlServerStore:
         else:
             self._claim_proc_effective = False
             self._claim_proc_degraded_reason = reason
+            self._claim_proc_schema = None
             log.warning(
                 "fifo_claim_proc requested but DEGRADED to the shipped ad-hoc batch: %s"
                 " (claims keep flowing on the batch path — no lane outage; fix the condition"
                 " and restart to activate the proc path)",
                 reason,
             )
+
+    async def _verify_claim_procs(self, schema: str, head_forms: dict[str, str]) -> str | None:
+        """Probe both called procs in ``schema`` (bracket-quoted) for :meth:`_gate_claim_proc`:
+        the degrade reason, or None with ``head_forms`` filled in for each proc."""
+        expected = _claim_proc_shipped_hashes()
+        for proc_name in (_CLAIM_PROC_CID, _CLAIM_PROC_DST):
+            qualified = f"{schema}.{proc_name}"
+            # OBJECT_ID rides along so a NULL body can be told apart from an ABSENT proc.
+            # MEASURED: a principal holding only EXECUTE on the proc gets a non-NULL OBJECT_ID and a
+            # NULL OBJECT_DEFINITION — the module is deployed and working, and the compat probe
+            # still passes. Without the id, that reads as "missing" and sends the operator to grant
+            # CREATE PROCEDURE, which is not the problem and does not fix it. WITH ENCRYPTION
+            # produces the identical NULL.
+            row = await self._fetchone(
+                "SELECT OBJECT_ID(?) AS oid, OBJECT_DEFINITION(OBJECT_ID(?)) AS body",
+                (qualified, qualified),
+            )
+            deployed = row["body"] if row else None
+            if not deployed:
+                if (row["oid"] if row else None) is None:
+                    return (
+                        f"stored procedure {qualified} is missing (guarded DDL skipped — create"
+                        " procedure / ALTER-on-schema denied, or a pre-2016-SP1 engine? It is"
+                        " looked for in the schema of the queue table this login resolves)"
+                    )
+                return (
+                    f"stored procedure {qualified} is DEPLOYED but its definition is unreadable"
+                    " (OBJECT_ID resolves, OBJECT_DEFINITION is NULL) — the proc is not missing"
+                    " and create procedure is not the fix. Either this principal lacks view"
+                    f" definition on it (grant view definition on OBJECT::{qualified} to <the"
+                    " engine's principal>) or the module was created with encryption. The gate"
+                    " compares the body hash, so it cannot pass on a body it cannot read"
+                )
+            got = hashlib.sha256(_normalize_tsql(deployed).encode()).hexdigest()
+            matched = expected[proc_name].get(got)
+            if matched is None:
+                return (
+                    f"stored procedure {qualified} body matches no form this build deploys — an"
+                    " out-of-band edit, a hand deploy (a head spelling this code cannot emit,"
+                    " e.g. create proc, a schema-qualified name or a differing case), a renamed"
+                    " proc (sp_rename does not rewrite the stored definition), or a build whose"
+                    " body was changed without bumping the proc version. The shipped batch runs."
+                    f" Compare OBJECT_DEFINITION(OBJECT_ID('{qualified}')) against this build's"
+                    " own definition to see the drift"
+                )
+            head_forms[proc_name] = matched
+        return None
 
     @staticmethod
     def _sync_setinputsizes(cur: Any) -> Any | None:
@@ -11038,7 +11092,13 @@ class SqlServerStore:
         # C without a third variant); everything after cur.execute — the drain, the kept==claimed
         # adjudication, the H2 loop, _commit, the 1222 translation, and the shielded finally-guard
         # — is the same code on both paths (AC-9). The gate degraded => the shipped batch, loudly.
-        use_proc = self._fifo_claim_proc and self._claim_proc_effective
+        # The CALL names the schema the gate verified the procs in (BACKLOG #5722); a passing gate
+        # always records it, so the schema check only keeps a hand-set flag off a CALL to nowhere.
+        use_proc = (
+            self._fifo_claim_proc
+            and self._claim_proc_effective
+            and self._claim_proc_schema is not None
+        )
         # ADR 0114 sub-lever B (fifo_claim_prepared): the non-DDL fallback lane — the SAME stable
         # encoding as the proc (one JSON lanes parameter, fixed-nullable fence) as a client-side
         # batch with the trailing reset INSIDE the text, executed on a store-owned dedicated
@@ -11063,7 +11123,7 @@ class SqlServerStore:
         args: tuple[Any, ...]
         if use_proc:
             proc_name = _CLAIM_PROC_CID if lane_col == "channel_id" else _CLAIM_PROC_DST
-            sql = f"{{CALL dbo.{proc_name} (?,?,?,?,?,?,?,?,?)}}"
+            sql = f"{{CALL {self._claim_proc_schema}.{proc_name} (?,?,?,?,?,?,?,?,?)}}"
             args = (
                 now,
                 stage,

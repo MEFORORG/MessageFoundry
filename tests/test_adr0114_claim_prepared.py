@@ -660,6 +660,7 @@ async def test_ac13_gate_superseded_by_green_proc_gate(
     store._fifo_claim_proc = True
     store._claim_proc_effective = True
     store._claim_proc_input_sizes = _FAKE_PROC_PINS
+    store._claim_proc_schema = "[dbo]"  # a passing proc gate records it (BACKLOG #5722)
     with caplog.at_level(logging.INFO, logger="messagefoundry.store.sqlserver"):
         await _gate_prepared(store, monkeypatch)
     assert store.claim_prepared_effective is False
@@ -671,7 +672,7 @@ async def test_ac13_gate_superseded_by_green_proc_gate(
     await rig.claim()
     kind, sql, params = rig.ops[0]
     assert kind == "execute-batch@pool"
-    assert sql.startswith("{CALL dbo.mefor_claim_fifo_heads_cid_v2")
+    assert sql.startswith("{CALL [dbo].mefor_claim_fifo_heads_cid_v2")
     assert len(params) == 9
     assert rig.conns == []
 
