@@ -460,9 +460,11 @@ async def test_a_lock_timeout_is_still_the_answer_when_the_tick_outlasts_the_fen
 
     with pytest.raises(StepdownLockTimeout):
         await a.step_down_leadership(sibling_acquire_delay_seconds=0.0)
-    server.answer.set()  # the server answers at last, and the tick renews
+    server.answer.set()  # the server answers at last, and the tick's renew lands
     await _timed(tick)
-    assert a.is_leader() is True
+    # The renew returned past the fence, so the tick fences rather than keep the node leader on a
+    # baseline already older than the fence (BACKLOG #5711). Before that it read True here.
+    assert a.is_leader() is False
 
 
 # --- the paused tick's owner read (BACKLOG #2540) ----------------------------------------------

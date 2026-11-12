@@ -640,6 +640,13 @@ def lease_release_unconfirmed(node_id: str) -> str:
     )
 
 
+def claim_returned_late(issued_at: float, now: float, fence_timeout_seconds: float) -> bool:
+    """Whether a lease claim issued at ``issued_at`` returned past the fence timeout, by the same
+    strict test the fence watchdog applies to that baseline (BACKLOG #5711). Shared by both
+    coordinators so the two cannot drift from each other or from ``_check_fence``."""
+    return now - issued_at > fence_timeout_seconds
+
+
 def fence_tick_seconds(fence_timeout_seconds: float) -> float:
     """The self-fence watchdog tick. Shared by both coordinators AND by the demotion budget below, so
     the budget and the watchdog it is derived from cannot drift apart."""
@@ -1721,6 +1728,12 @@ class DbCoordinator:
             held = await self._claim_or_renew_lease()
             if held:
                 self._last_renew_ok = issued_at
+                if claim_returned_late(issued_at, self._monotonic(), self._fence_timeout):
+                    # BACKLOG #5711, in lockstep with SqlServerCoordinator. The row is ours, so the
+                    # baseline stays stamped for may_own_lease_row, but it is already past the
+                    # fence: fence now rather than promote on it.
+                    self._refuse_late_hold(issued_at)
+                    return
                 if not self._is_leader:
                     self._is_leader = True
                     log.info("cluster: node %s acquired leadership (lease)", self.node_id)
@@ -1740,6 +1753,28 @@ class DbCoordinator:
                     "lease taken or expired"
                 )  # #145 (inverse → auto-resolves)
                 self._fire_on_demote()  # ADR 0157 Inc 5
+
+    def _refuse_late_hold(self, issued_at: float) -> None:
+        """Act on a hold whose claim returned more than the fence timeout after it was issued
+        (BACKLOG #5711), by not promoting and by fencing a node that still reads leader.
+
+        The baseline such a claim stamps is already past the fence, so the watchdog would demote on
+        its next tick. Promoting first would raise an acquire edge, and an engine promotion, for
+        that tick at most; and a claim whose return was held up past its own lease stamp plus the
+        TTL may return after a standby took the expired row, which is a two-leader window for that
+        tick. Fencing here is the conservative direction: the next tick's claim, if it returns in
+        time, promotes. Pure in-memory, under the caller's :attr:`_leadership_lock`."""
+        log.warning(
+            "cluster: node %s lease claim returned %.1fs after it was issued, past the %.1fs fence "
+            "timeout; not acting on it",
+            self.node_id,
+            self._monotonic() - issued_at,
+            self._fence_timeout,
+        )
+        self._check_fence()
+        # _check_fence drops the epoch of a node it demotes; a node that was not leader must not
+        # present the one this claim cached either.
+        self._leader_epoch = None
 
     async def _claim_or_renew_lease(self) -> bool:
         """Atomically acquire OR renew the leadership lease and return whether this node now holds it.

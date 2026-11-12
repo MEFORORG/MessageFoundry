@@ -59,6 +59,7 @@ from messagefoundry.pipeline.cluster import (
     StepdownOutcome,
     StepdownReleaseUnconfirmed,
     acquire_leadership_lock,
+    claim_returned_late,
     default_node_id,
     lease_release_unconfirmed,
     members_from_node_rows,
@@ -514,6 +515,12 @@ class SqlServerCoordinator:
             held = await self._claim_or_renew_lease()
             if held:
                 self._last_renew_ok = issued_at  # stamp for the fence watchdog
+                if claim_returned_late(issued_at, self._monotonic(), self._fence_timeout):
+                    # BACKLOG #5711: the clamp bounds the borrow and statement but not the COMMIT
+                    # (SqlServerStore._fetchone_clamped), so a claim can return past the fence. The
+                    # row is ours, so the baseline stays for may_own_lease_row; fence, never promote.
+                    self._refuse_late_hold(issued_at)
+                    return
                 if not self._is_leader:
                     self._is_leader = True
                     log.info("cluster: node %s acquired leadership (lease)", self.node_id)
@@ -526,6 +533,18 @@ class SqlServerCoordinator:
                     "lease taken or expired"
                 )  # #145 (inverse → auto-resolves)
                 self._fire_on_demote()  # ADR 0157 Inc 5
+
+    def _refuse_late_hold(self, issued_at: float) -> None:
+        """Mirrors :meth:`DbCoordinator._refuse_late_hold` (BACKLOG #5711); read its docstring."""
+        log.warning(
+            "cluster: node %s lease claim returned %.1fs after it was issued, past the %.1fs fence "
+            "timeout; not acting on it",
+            self.node_id,
+            self._monotonic() - issued_at,
+            self._fence_timeout,
+        )
+        self._check_fence()
+        self._leader_epoch = None
 
     async def _claim_or_renew_lease(self) -> bool:
         """Atomically acquire (fresh / expired) or renew (already ours) the single leadership lease, all
