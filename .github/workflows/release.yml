@@ -77,7 +77,7 @@
 # not run. That last read covers at least a variable set after the build job read it, whether by
 # a re-run of failed jobs reusing the build job's output or while the upload waited for its
 # approval, and an environment copy that differs. docs/SUPPLY-CHAIN.md, *The draft*, says what to
-# do on a refusal, including what the refusal's own text omits. Unset, the upload step is skipped
+# do on a refusal, including past GitHub's 30-day re-run window. Unset, the upload step is skipped
 # and the release still goes public.
 #
 # THE HAND-OVER. Each build job records the digests once its last gate has passed, and its last
@@ -2017,7 +2017,7 @@ jobs:
       contents: write   # gh release edit (take the console release out of draft)
     steps:
       # No checkout: gh reads the repository from GH_REPO, and this job runs no repository code.
-      # The error's text omits part of the remedy; docs/SUPPLY-CHAIN.md, *The draft*, says what to do.
+      # The error's text points to docs/SUPPLY-CHAIN.md, *The draft*, for the routes left past the re-run window.
       - name: Publish the draft console GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -2469,7 +2469,7 @@ jobs:
       contents: write   # gh release edit (take the release out of draft)
     steps:
       # No checkout: gh reads the repository from GH_REPO, and this job runs no repository code.
-      # The error's text omits part of the remedy; docs/SUPPLY-CHAIN.md, *The draft*, says what to do.
+      # The error's text points to docs/SUPPLY-CHAIN.md, *The draft*, for the routes left past the re-run window.
       - name: Publish the draft GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

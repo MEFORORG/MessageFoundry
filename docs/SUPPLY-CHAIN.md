@@ -158,18 +158,21 @@ Facts the labels leave out:
   published once the `pypi` approval is given, as the engine's is with `PUBLISH_HARNESS` unset.
   With either variable set, its draft publisher reads it again when it runs and refuses to publish
   the release while that run skipped the upload. On an engine tag the toolkit and engine are on
-  PyPI by then. The refusal's own text omits part of the remedy, and it does not say which cause
-  fired. At least these two can, alone or together:
+  PyPI by then. The refusal's text names two causes and both remedies below, but not which cause
+  fired, and points here for the routes left past GitHub's re-run window. At least these two can
+  fire, alone or together:
   - The `pypi` environment holds its own copy of the variable, with a value other than `true`.
-    Look at that environment's variables in the repository settings to see whether it does.
+    Look at that environment's variables in the repository settings to see whether it holds one
+    now.
   - The build job read the variable before it was set, or the upload read it while it was unset
     and it was set again before the publisher ran. Treat this as possible whenever the refusal
     fires; the remedy below clears it either way, so it need not be told apart.
 
   To finish the release with the upload, remove any copy from the `pypi` environment, then re-run
   the build job (`release-harness` on an engine tag, `release-webconsole` on a console tag), which
-  re-runs the jobs after it and reads the variable afresh in each, so it clears both. A
-  "Re-run failed jobs" reuses the upload's skipped outcome and is refused again. To finish it
+  re-runs the jobs after it, the upload's `pypi` approval included, and reads the variable afresh
+  in each, so it clears both. While the variable still reads `true`, a "Re-run failed jobs"
+  reuses the upload's outcome and is refused again. To finish it
   without the upload, remove any copy from the `pypi` environment, unset the variable and re-run
   the publisher, then set it again before the next release, or that release skips its upload too
   and still goes public.
