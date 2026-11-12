@@ -10313,7 +10313,9 @@ class RegistryRunner:
         # projected by every outbound claim; fall back to now defensively (a slightly later window start).
         base = head.created_at if head.created_at is not None else time.time()
         deadline = base + cfg.max_wait_ms / 1000.0
-        while len(items) < cfg.max_count:
+        # BACKLOG #5706: an operator pause or the #122 halt ends the window too, so the window claims
+        # no further row under either; the gate below the loop hands back what it already holds.
+        while len(items) < cfg.max_count and self._lane_may_deliver(name):
             more = await self.store.claim_next_fifo(name)
             if more is not None:
                 items.append(more)
@@ -10333,6 +10335,12 @@ class RegistryRunner:
             except TimeoutError:
                 pass
         ids = [it.id for it in items]
+        # BACKLOG #5706: asked again after the window, which can last up to max_wait_ms, as both
+        # callers ask it before the pacing wait and after it. Every member goes back unsent, the head
+        # included: the per_lane worker passes it here with no further gate of its own, and the
+        # pooled adapter returns this outcome as its own.
+        if (park_until := await self._hand_back_unsent(name, ids)) is not None:
+            return _ItemOutcome.PROCESSED, park_until
         retry_until: float | None = None
         connector = self._destinations.get(name)
         if connector is None:
@@ -10422,13 +10430,19 @@ class RegistryRunner:
                 first = kept[0]  # the envelope's head is the first member that survived
                 # The head's own fields: a non-HL7 head faults here, and it is this member's.
                 current = first.id
-                control_id = Message.parse(first.payload).control_id or first.id  # stable
+                # This parse and encode_batch below each run in a thread (BACKLOG #5706). Both scale
+                # with the members' size, and on the event loop a large member would stall every
+                # lane, listener and the API while it parsed.
+                parsed = await asyncio.to_thread(Message.parse, first.payload)
+                control_id = parsed.control_id or first.id  # stable
                 timestamp = _hl7_batch_timestamp(first.created_at)
                 # encode_batch parses the HYDRATED head for the separators and normalizes every
                 # member, in one call, so a fault inside it cannot be told apart by member; the
                 # send is the whole envelope's. Neither names one.
                 current = None
-                envelope = encode_batch(members, control_id=control_id, timestamp=timestamp)
+                envelope = await asyncio.to_thread(
+                    encode_batch, members, control_id=control_id, timestamp=timestamp
+                )
                 if not self._simulate.get(name, False):  # shadow suppresses the real egress
                     await connector.send(envelope)
         except NegativeAckError as exc:

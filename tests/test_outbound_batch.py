@@ -910,3 +910,110 @@ async def test_completion_fault_repends_every_member_pooled(
     assert depth == 3
     assert await store.count_dead(allowed_channels=None) == 0
     assert len(rec.sent) == 1 and "BTS|3" in rec.sent[0]
+
+
+# --- BACKLOG #5706: the coalescing window honours a pause and the #122 halt, and parses off the loop -
+
+
+async def _attempts(store: Any, mids: Sequence[str]) -> list[int]:
+    return [int(r["attempts"]) for mid in mids for r in await store.outbox_for(mid)]
+
+
+async def test_a_paused_lane_claims_no_window_and_sends_nothing(store: Any) -> None:
+    """A head handed to the batch body of a lane already paused coalesces nothing and sends
+    nothing. Before the fix the window asked only the stop event, so it claimed the lane's tail and
+    sent the envelope past the pause."""
+    mids = await _enqueue(store, 3)
+    runner = _runner(store)
+    rec = _Recorder()
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
+    head = await store.claim_next_fifo(DEST)
+    runner._outbound_paused.add(DEST)
+    outcome, park_until = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    assert rec.sent == []  # no egress past the pause
+    assert outcome is wiring_runner._ItemOutcome.PROCESSED and park_until is not None
+    assert await _states(store, mids) == [QUEUED] * 3  # the head released, the tail never claimed
+    assert await _attempts(store, mids) == [0, 0, 0]  # no attempt spent on any of them
+
+
+async def test_a_pause_mid_window_stops_claiming_and_hands_every_member_back(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pause lands after the window has claimed one extra row. The window claims no further row
+    and the body hands the head and that extra back unsent. The control is the claim count: the
+    window really was coalescing when the pause landed."""
+    mids = await _enqueue(store, 4)
+    runner = _runner(store)
+    rec = _Recorder()
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=60000))
+    head = await store.claim_next_fifo(DEST)
+    real_claim = store.claim_next_fifo
+    window_claims = 0
+
+    async def _claim_then_pause(name: str, *args: Any, **kwargs: Any) -> Any:
+        nonlocal window_claims
+        window_claims += 1
+        got = await real_claim(name, *args, **kwargs)
+        runner._outbound_paused.add(DEST)  # the operator pause lands inside the window
+        return got
+
+    monkeypatch.setattr(store, "claim_next_fifo", _claim_then_pause)
+    outcome, park_until = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    assert window_claims == 1  # the window claimed one extra, then stopped claiming
+    assert rec.sent == []
+    assert outcome is wiring_runner._ItemOutcome.PROCESSED and park_until is not None
+    assert await _states(store, mids) == [QUEUED] * 4
+    assert await _attempts(store, mids) == [0, 0, 0, 0]
+
+
+async def test_a_halt_mid_window_reschedules_every_member_unsent(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The #122 log-write halt lands inside the window. Nothing is sent unlogged, and the claimed
+    members are rescheduled into the future rather than released past due, as the pooled claim gate
+    does under the halt."""
+    mids = await _enqueue(store, 3)
+    runner = _runner(store)
+    rec = _Recorder()
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=60000))
+    head = await store.claim_next_fifo(DEST)
+    real_claim = store.claim_next_fifo
+
+    async def _claim_then_halt(name: str, *args: Any, **kwargs: Any) -> Any:
+        got = await real_claim(name, *args, **kwargs)
+        runner._log_write_stopped = True  # what both halt sites set
+        return got
+
+    monkeypatch.setattr(store, "claim_next_fifo", _claim_then_halt)
+    outcome, park_until = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    assert rec.sent == []  # no unlogged egress
+    assert outcome is wiring_runner._ItemOutcome.PROCESSED and park_until is not None
+    assert await _states(store, mids) == [QUEUED] * 3
+    assert await _attempts(store, mids) == [0, 0, 0]
+    assert await real_claim(DEST) is None  # rescheduled: the head is not due yet
+
+
+async def test_the_batch_head_is_parsed_off_the_event_loop(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The head member's parse for the BHS control id runs in a worker thread, not on the event
+    loop, so a large member cannot stall every other lane while it parses."""
+    import threading
+
+    await _enqueue(store, 2)
+    runner = _runner(store)
+    rec = _Recorder()
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
+    loop_thread = threading.get_ident()
+    parse_threads: list[int] = []
+    real_parse = wiring_runner.Message.parse
+
+    def _recording_parse(raw: str | bytes) -> Any:
+        parse_threads.append(threading.get_ident())
+        return real_parse(raw)
+
+    monkeypatch.setattr(wiring_runner.Message, "parse", _recording_parse)
+    head = await store.claim_next_fifo(DEST)
+    await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    assert len(rec.sent) == 1  # the control: the batch did go out, so the head was parsed
+    assert parse_threads and loop_thread not in parse_threads
