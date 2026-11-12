@@ -571,6 +571,12 @@ class RunnerNotRunningError(RuntimeError):
         self.name = name
 
 
+class _ConnectorRetired(Exception):
+    """Raised inside the single-row send path's ``try`` when a reload retired its connector before
+    the send (:meth:`RegistryRunner._connector_retired`). Its own arm only records it, so the hand
+    back runs after the ``try``, where a store fault cannot reach the internal-error arm."""
+
+
 # A delivery worker backs off this long after an *unexpected* error (e.g. the store being briefly
 # unavailable) before retrying, so a transient failure logs once and recovers instead of hot-looping.
 _WORKER_ERROR_BACKOFF_SECONDS = 1.0
@@ -7761,9 +7767,8 @@ class RegistryRunner:
         """Bring the outbound connectors/workers in line with ``new`` without tearing down a live
         worker (so its in-flight outbox batch keeps draining). A worker re-resolves its connector
         per item, so a changed connector is swapped in place; the old one is closed. A send already
-        in flight on it is left to end: one that fails once its connector is out of the lane is
-        released un-errored for the new one (:meth:`_connector_retired`, BACKLOG #5718), and one
-        that completed keeps its result. An outbound dropped by ``new`` is
+        in flight on it is not cancelled; :meth:`_connector_retired` (BACKLOG #5718) says how its
+        delivery path settles it. An outbound dropped by ``new`` is
         left running so rows already queued to it still drain. Connector builds here cannot fail —
         :meth:`_build_check` already validated them before any quiesce. Returns the lanes whose
         replaced connector failed to close (:meth:`_close_replaced`)."""
@@ -8165,8 +8170,8 @@ class RegistryRunner:
         raising would put the old graph back beside a connector built from the new one (engine PR
         2815). A cancellation still propagates.
 
-        A send in flight on ``replaced`` is neither awaited nor cancelled here; its delivery path
-        settles it (:meth:`_connector_retired`, BACKLOG #5718)."""
+        A send in flight on ``replaced`` is not cancelled here; its delivery path settles it
+        (:meth:`_connector_retired`, BACKLOG #5718)."""
         try:
             await replaced.aclose()
         except Exception as exc:  # noqa: BLE001 - a connector's close can fail in any way; logged
@@ -10066,6 +10071,7 @@ class RegistryRunner:
         # The payload handed to connector.send, for forget_payload once a transient failure
         # dead-letters the row at the retry cap. None until a live send is attempted.
         sent: str | None = None
+        retired = False  # a reload retired `connector` before the send (_connector_retired)
         try:
             if self._simulate.get(name, False):
                 # Shadow / parallel-run (#15): suppress the real egress entirely — no bytes/
@@ -10120,7 +10126,7 @@ class RegistryRunner:
                 # BACKLOG #5718: the reads above are awaits a reload can land in. A connector it took
                 # out of the lane since `connector` was read is not sent on.
                 if self._connector_retired(name, connector):
-                    return await self._release_retired(name, [item.id])
+                    raise _ConnectorRetired  # handed back after the try, out of the arms' reach
                 if consumes:
                     response = await connector.send(payload, metadata=metadata)
                 else:
@@ -10129,6 +10135,8 @@ class RegistryRunner:
                     response = await connector.send(payload)
                 if self._delivery_phase_timing:
                     self._delivery_phase_stats.record_send_ack(time.perf_counter_ns() - _send_t0)
+        except _ConnectorRetired:
+            retired = True
         except NegativeAckError as exc:
             # Partner rejection. AR/CR (permanent) → fail-fast: the partner will never
             # accept this message, so dead-letter it now rather than block the FIFO lane
@@ -10145,6 +10153,10 @@ class RegistryRunner:
             # would only be the first of the lane's whole queue. The "dead_letter" policy opts back
             # into the historical fail-fast dead-letter of just this row, for both.
             fault = self._lane_stopping_fault(exc)
+            if fault is not None and sent is not None and self._connector_retired(name, connector):
+                # BACKLOG #5718: a credential or configuration fault on a connector a reload
+                # retired is that connector's, and the reload may be its fix. The new one is tried.
+                return await self._release_retired(name, [item.id])
             if fault is not None:
                 await self._stop_lane_retaining(name, [item.id], exc, fault)
                 return _ItemOutcome.STOPPED, None
@@ -10162,8 +10174,6 @@ class RegistryRunner:
                     item.id,
                     item.message_id,
                 )
-            elif self._connector_retired(name, connector):
-                return await self._release_retired(name, [item.id])
             else:
                 failed = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
                 retry_until = failed.retry_at
@@ -10195,7 +10205,7 @@ class RegistryRunner:
             # per policy (the shipped cap is 100 attempts, then the row dead-letters into the
             # replayable DLQ — bounded, not discarded). One whose connector a reload took out of
             # the lane under it, such as a close that failed it, is the reload's (BACKLOG #5718).
-            if self._connector_retired(name, connector):
+            if sent is not None and self._connector_retired(name, connector):
                 return await self._release_retired(name, [item.id])
             failed = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
             retry_until = failed.retry_at
@@ -10210,7 +10220,10 @@ class RegistryRunner:
             # dead-letters this row and advances so a code bug can't wedge the lane forever.
             # STOP's mark_failed re-pends the row, or dead-letters it at a finite retry cap. Log
             # the exception TYPE only — the full detail goes to the secured store's last_error,
-            # never the general log (PHI).
+            # never the general log (PHI). A connector a reload retired can fail its send in any
+            # way as it closes, so that is the reload's first (BACKLOG #5718).
+            if sent is not None and self._connector_retired(name, connector):
+                return await self._release_retired(name, [item.id])
             if (
                 self._internal_error.get(name, self._internal_error_default)
                 is InternalErrorPolicy.STOP
@@ -10246,8 +10259,10 @@ class RegistryRunner:
             await self.store.dead_letter_now(item.id, f"internal error: {safe_exc(exc)}")
         else:
             # #46: a successful delivery means the lane is up — edge-trigger
-            # connection_restored if it had been marked down (no-op otherwise).
-            self._note_lane_healthy(name)
+            # connection_restored if it had been marked down (no-op otherwise). Not for a send
+            # that completed on a connector a reload retired: it says nothing of the new one.
+            if not self._connector_retired(name, connector):
+                self._note_lane_healthy(name)
             self._clear_store_read_faults(name)
             # ADR 0013: a capturing outbound returns a DeliveryResponse; persist the reply
             # AND mark the row done in ONE transaction (exactly-once capture). A non-capturing
@@ -10332,6 +10347,8 @@ class RegistryRunner:
             # neither phase, so there is nothing new to summarize).
             if self._delivery_phase_timing:
                 self._delivery_phase_stats.maybe_emit(stage="outbound")
+        if retired:
+            return await self._release_retired(name, [item.id])
         return _ItemOutcome.PROCESSED, retry_until
 
     async def _process_delivery_batch(
@@ -10484,6 +10501,7 @@ class RegistryRunner:
         if not self._may_send(name):
             return await self._refuse_claimed(name, ids)
         retry_until: float | None = None
+        retired = sending = False  # a reload retired `connector` (_connector_retired); the send ran
         connector = self._destinations.get(name)
         if connector is None:
             failure = self.outbound_failed(name)
@@ -10580,9 +10598,13 @@ class RegistryRunner:
             # refusals are written now or the members go back for a re-run to refuse again.
             # Synchronous, so nothing here can raise into the arms below; the members go back after
             # the try, through :meth:`_refuse_claimed`. A connector a reload took out of the lane in
-            # those awaits gates the send too (BACKLOG #5718): it is not sent on.
-            gated = not self._may_send(name) or self._connector_retired(name, connector)
+            # those awaits gates the send too (BACKLOG #5718): it is not sent on, and the members go
+            # back through :meth:`_release_retired`.
+            may_send = self._may_send(name)
+            retired = may_send and self._connector_retired(name, connector)
+            gated = not may_send or retired
             if kept and not gated and not self._simulate.get(name, False):  # shadow: no egress
+                sending = True
                 await connector.send(envelope)
         except NegativeAckError as exc:
             # #109 (ADR 0095), the batch twin of the single-row branch in
@@ -10595,6 +10617,9 @@ class RegistryRunner:
             # permanent one reaches here only from the send, so only a member's transient refusal,
             # which re-pends the batch, names the member (vault BACKLOG #5100).
             fault = self._lane_stopping_fault(exc)
+            if fault is not None and self._connector_retired(name, connector):
+                # BACKLOG #5718, as the single row: the reload may be this fault's fix.
+                return await self._release_retired(name, [it.id for it in items])
             if fault is not None:
                 # Refused members first: a store fault here then escapes before the stop, not
                 # after a stop and alert are already recorded, so #109 cannot loop on re-auth.
@@ -10615,8 +10640,6 @@ class RegistryRunner:
                     len(ids),
                     ids[0],
                 )
-            elif self._connector_retired(name, connector):
-                return await self._release_retired(name, [it.id for it in items])
             else:
                 failed = await self._mark_batch_failed_and_arm(
                     name, ids, _member_error(safe_exc(exc), current), retry
@@ -10637,8 +10660,9 @@ class RegistryRunner:
             self._note_retry_exhausted(name, _EngineCause.STORE_READ, failed, batch=True)
             await self._delivery_failure_alert_checks(name)
         except DeliveryError as exc:
-            if self._connector_retired(name, connector):  # BACKLOG #5718, as the single row
-                # Every member, the refused ones too, as the gated hand-back below.
+            # BACKLOG #5718, as the single row, for a fault the send raised rather than a member's
+            # own step. Every member goes back, as the gated hand-back below.
+            if sending and self._connector_retired(name, connector):
                 return await self._release_retired(name, [it.id for it in items])
             failed = await self._mark_batch_failed_and_arm(
                 name, ids, _member_error(safe_exc(exc), current), retry
@@ -10661,7 +10685,10 @@ class RegistryRunner:
             # replayable from the DLQ) so a code bug or a mis-typed feed can't wedge the lane.
             # A fault one member's own step raised (its re-attach, its frame check, or the head's
             # parse) names that member by its outbox id, never its content, in the log, the stored
-            # error and the alert (vault BACKLOG #5100).
+            # error and the alert (vault BACKLOG #5100). One the send of a connector a reload
+            # retired raised is the reload's (BACKLOG #5718), as the single row.
+            if sending and self._connector_retired(name, connector):
+                return await self._release_retired(name, [it.id for it in items])
             member = _batch_member(current)
             if (
                 self._internal_error.get(name, self._internal_error_default)
@@ -10702,9 +10729,12 @@ class RegistryRunner:
             if gated:
                 # Every member, the refused ones too: none was resolved, and a re-run refuses them
                 # again. No await since the gate read, so it still holds here.
+                if retired:
+                    return await self._release_retired(name, [it.id for it in items])
                 return await self._refuse_claimed(name, [it.id for it in items])
             if ids:  # nothing was sent when every member was refused
-                self._note_lane_healthy(name)
+                if not self._connector_retired(name, connector):  # as the single row
+                    self._note_lane_healthy(name)
                 self._clear_store_read_faults(name)
                 await self.store.mark_batch_done(ids)
         await self._dead_letter_refused(name, refused)
@@ -12558,8 +12588,8 @@ class RegistryRunner:
 
     async def _refuse_claimed(self, name: str, ids: list[str]) -> tuple[_ItemOutcome, float | None]:
         """Resolve claimed, unsent OUTBOUND rows of ``name`` that the lane gate
-        (:meth:`_lane_may_deliver`) has refused, or whose connector a reload retired
-        (:meth:`_release_retired`). None is sent here, dead-lettered or charged an attempt.
+        (:meth:`_lane_may_deliver`) has refused, and those :meth:`_release_retired` hands it
+        under a halt or on a demoted node. None is sent here, dead-lettered or charged an attempt.
 
         A leader hands them back through :meth:`_hand_back` and parks. A demoted node releases them
         and STOPs the lane for the new leader, as the send path's leadership check does and as the
@@ -12577,30 +12607,36 @@ class RegistryRunner:
         """Whether a reload has taken ``connector`` out of outbound ``name``'s lane since the
         delivery path read it: replaced it with a rebuild, or popped it for a park (BACKLOG #5718).
 
-        The reload closes it without waiting for a send in flight on it, and does not cancel
-        that send either: a send running on a thread would go on after a cancellation, and a resend
-        beside it would deliver twice. So the delivery path asks here instead. Before the send, a
-        retired connector is not sent on. After it, a send that failed is the reload's, often the
-        close itself failing it, and its rows go back un-charged (:meth:`_release_retired`). A send
-        that completed keeps its result, and so does a permanent refusal, which is the partner's
-        answer."""
+        The reload does not cancel a send in flight on it: a send running on a thread would go on
+        after a cancellation, and a resend beside it would deliver twice. Its close may fail that
+        send, and most connectors' closes do not wait for it. So the delivery path asks here. Before
+        the send, a retired connector is not sent on. After it, a transport fault, an internal error
+        or a credential or configuration fault from it is the reload's, the last because the reload
+        may be its fix, and the rows go back un-charged (:meth:`_release_retired`). A send that
+        completed keeps its result, and so does any other refusal, which is the partner's answer
+        about the message."""
         return self._destinations.get(name) is not connector
 
     async def _release_retired(
         self, name: str, ids: list[str]
     ) -> tuple[_ItemOutcome, float | None]:
-        """Hand claimed rows of ``name`` back un-errored, with no attempt spent, because a reload
-        retired the connector they were sent on (:meth:`_connector_retired`). The lane sends them
-        through the connector that replaced it, if one did. Resolved as :meth:`_refuse_claimed`
-        resolves rows the lane gate refused. The partner may have received a send that failed late,
-        so this can deliver one twice, which at-least-once allows."""
+        """Hand claimed rows of ``name`` back un-errored, with no attempt spent and their due time
+        kept, because a reload retired the connector they were meant for
+        (:meth:`_connector_retired`). The lane sends them through the connector that replaced it,
+        if one did, at once: the pooled dispatcher gets a retry due now, not a park. Under a halt or
+        on a demoted node they resolve as :meth:`_refuse_claimed` resolves gated rows. The partner
+        may have received a send that failed late, so this can deliver one twice, which
+        at-least-once allows."""
         log.info(
             "delivery worker %r: a reload retired the connector under %d claimed row(s); handed "
             "back un-errored (no attempt spent)",
             name,
             len(ids),
         )
-        return await self._refuse_claimed(name, ids)
+        if self._delivery_halted or not self._coordinator.is_leader():
+            return await self._refuse_claimed(name, ids)
+        await self.store.release_claimed(ids)
+        return _ItemOutcome.PROCESSED, time.time()
 
     async def _release_for_new_leader(self, name: str, ids: list[str]) -> None:
         """Release claimed, unsent OUTBOUND rows of ``name`` on a node that has lost leadership
@@ -12626,8 +12662,9 @@ class RegistryRunner:
 
         The deadline is a park for the pooled dispatcher only. A paused lane has ``pause_pending``
         set there and goes to PAUSED at its terminal transition, ignoring it. The per_lane worker
-        reads only the outcome and reaches its loop-top gates next; it meets this helper only through
-        the batch body's gates, so a halt there reschedules where its own per-item gate releases.
+        reads only the outcome and reaches its loop-top gates next; it meets this helper through at
+        least the batch body's gates and :meth:`_release_retired` under a halt, so a halt there
+        reschedules where its own per-item gate releases.
         Both hand the rows back unsent, and a worker halted at its loop top claims nothing until a
         restart, by which time the backoff has passed."""
         park_until = time.time() + _WORKER_ERROR_BACKOFF_SECONDS
