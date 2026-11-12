@@ -87,6 +87,12 @@ logger = logging.getLogger(__name__)
 # (mirrors MLLPSource/TcpSource; bounds shutdown).
 _CLIENT_SHUTDOWN_GRACE = 5.0
 
+
+class _PeerClosedBeforeReply(DeliveryError):
+    """The reply read hit end of stream before a whole interchange arrived. Its own type so a send
+    the engine's close cut can relabel exactly this error and nothing the partner sent (#5718)."""
+
+
 # Seconds one reply gets to drain to the sender before the connection is dropped. Same value, and the
 # same reasoning, as TcpSource's `_REPLY_DRAIN_GRACE` — see transports/tcp.py for why this is the
 # shutdown grace rather than a new per-connection knob, and why reusing `receive_timeout` would
@@ -333,12 +339,13 @@ class X12Destination(DestinationConnector):
             if need_reply:
                 try:
                     interchange = await asyncio.wait_for(self._read_reply(reader), self.timeout)
-                except DeliveryError as exc:
+                except _PeerClosedBeforeReply as exc:
                     # aclose() closed the socket under the read, which then reads as the PEER
                     # closing. Name the engine's own close, so the row's error and the alerts never
-                    # blame the partner. Only an end of stream is relabelled: a reply the partner
-                    # sent before the close, such as one over the size cap, keeps its own error.
-                    if self._closed and reader.at_eof():
+                    # blame the partner. Only this end-of-stream error is relabelled: a fault in a
+                    # reply the partner sent, such as one over the size cap, keeps its own error
+                    # even when the failing read drained the stream to the close's end.
+                    if self._closed:
                         raise self._closed_error(written=True) from exc
                     raise
                 # _check_ta1 returns the captured reply, raises on a TA1 reject/error, and returns None
@@ -504,7 +511,7 @@ class X12Destination(DestinationConnector):
         while True:
             chunk = await reader.read(4096)
             if not chunk:
-                raise DeliveryError("X12 peer closed before returning an interchange")
+                raise _PeerClosedBeforeReply("X12 peer closed before returning an interchange")
             try:
                 for interchange in decoder.feed(chunk):
                     return interchange

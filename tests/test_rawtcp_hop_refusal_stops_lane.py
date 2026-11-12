@@ -346,6 +346,61 @@ async def test_a_partner_fault_read_before_the_close_keeps_its_own_error() -> No
         await asyncio.wait_for(server.wait_closed(), 5)
 
 
+async def test_a_small_partner_fault_the_close_drains_keeps_its_own_error() -> None:
+    """The partner's fault keeps its own error even when the failing read consumes the whole reply
+    and the engine's close has already ended the stream, so the reader reads at its end. Only the
+    peer-closed error is relabelled; a reply under 4096 bytes, read in one chunk, once hid behind
+    the engine's close."""
+    reply = b"ISA*" + b"0" * 2048  # over the 1024-byte cap, under one 4096-byte read
+    eof_at_failure: list[bool] = []
+
+    async def oversize_peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.read(4096)
+        writer.write(reply)
+        await writer.drain()
+        try:
+            await reader.read(4096)
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(oversize_peer, LOOPBACK, 0)
+    port = int(server.sockets[0].getsockname()[1])
+    dest = X12Destination(
+        Destination(
+            name="OB_X12",
+            type=ConnectorType.X12,
+            settings={
+                "host": LOOPBACK,
+                "port": port,
+                "expect_reply": True,
+                "max_interchange_bytes": 1024,
+            },
+        )
+    )
+    real_read = dest._read_reply
+
+    async def read_after_close(reader: asyncio.StreamReader) -> bytes:
+        # Hold the whole reply in the buffer, then let the reload close the socket under the read,
+        # which ends the stream behind the buffered bytes.
+        reader.feed_data(await reader.readexactly(len(reply)))
+        await dest.aclose()
+        try:
+            return await real_read(reader)
+        finally:
+            eof_at_failure.append(reader.at_eof())
+
+    dest._read_reply = read_after_close  # type: ignore[method-assign]
+    try:
+        with pytest.raises(DeliveryError) as raised:
+            await asyncio.wait_for(dest._send_once(X12), 5)
+        assert eof_at_failure == [True], "the read did not end at the close's end of stream"
+        assert "exceeded max interchange size" in str(raised.value)
+        assert "is closed (stop/reload)" not in str(raised.value)
+    finally:
+        server.close()
+        await asyncio.wait_for(server.wait_closed(), 5)
+
+
 @pytest.mark.parametrize("persistent", [False, True], ids=["connect-per-send", "persistent"])
 async def test_aclose_during_the_dial_never_delivers_on_the_replaced_connector(
     persistent: bool,
