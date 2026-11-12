@@ -354,9 +354,9 @@ class TransitCipher(_UnmarkedPolicy):
         compares. Transit verifies an HMAC at a version from the key's ``min_decryption_version``
         up to its latest that the key still holds with an HMAC key, so a row made under a version
         below ``min_encryption_version`` still verifies. A version trimmed below
-        ``min_available_version`` is not held and is refused (``no such key version``); Vault keeps
-        ``min_available_version`` at or below ``min_decryption_version``, both in its ``trim`` call
-        and in its key config write, so no trimmed version lies inside that span. Read on
+        ``min_available_version`` is never inside that span: Vault keeps ``min_available_version``
+        at or below ``min_decryption_version``, both in its ``trim`` call and in its key config
+        write, so a trimmed version is refused as below ``min_decryption_version``. Read on
         2026-11-11 from Vault ``pathHMACVerify``, ``path_trim.go``, ``path_keys_config.go`` and
         ``keysutil.Policy.HMACKey`` at cbc874e2358f; OpenBao was not read for it.
 

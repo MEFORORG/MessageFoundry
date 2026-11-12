@@ -538,7 +538,7 @@ All against an in-process fake Transit client with key versions, never a real se
    at open, the pin check, and the one-row MAC checks behind the Transit attestation and keyed
    evidence all go through `_audit_row_mac`. An append still calls `generate_hmac` unpinned, and
    raises `CipherError` on a reply `transit_mac_version` does not accept, so it never writes a
-   malformed MAC; the audited action fails, and a genesis append on a fresh store refuses the open.
+   malformed MAC (`TransitCipher.audit_hmac`).
 2. **The policy floor that applies is `min_decryption_version`.** Vault's `pathHMACVerify` at
    commit cbc874e2358f, read on 2026-11-11, refuses a version above the latest (*"invalid HMAC:
    version is too new"*) or below `min_decryption_version`, and does not read

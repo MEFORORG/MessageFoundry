@@ -6995,7 +6995,8 @@ def verify_audit_rows(
     a Transit round trip, so K walks would cost K times N of them. Keyed on ``seq``, the chain's own
     coordinate, never on the row id, which can skip numbers.
 
-    **Constant-time, full-walk (ASVS 11.2.4)**: an in-heap row MAC is compared with
+    **Constant-time, full-walk (ASVS 11.2.4)**: a row MAC recomputed in the engine, under an
+    in-heap key or by a MAC provider that does not check a stored MAC itself, is compared with
     :func:`hmac.compare_digest` over :func:`audit_mac_bytes`. Under ``vault_transit`` the compare of
     a row MAC is Transit's own ``verify`` call, made inside Vault (:func:`_audit_row_mac`); the
     ``compare_digest`` the walk still runs there sets the stored hash beside itself, or beside

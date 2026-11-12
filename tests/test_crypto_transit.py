@@ -252,6 +252,9 @@ def test_audit_hmac_failure_is_type_only(monkeypatch: pytest.MonkeyPatch) -> Non
         "vault:v0:" + base64.b64encode(bytes(32)).decode("ascii"),
         "vault:v1:" + base64.b64encode(bytes(31)).decode("ascii"),
         "v1:" + base64.b64encode(bytes(32)).decode("ascii"),
+        # Non-zero pad bits: `validate=True` decodes it, the canonical re-encode refuses it.
+        "vault:v1:" + "A" * 42 + "B=",
+        "vault:v12345678901:" + base64.b64encode(bytes(32)).decode("ascii"),
     ],
 )
 def test_audit_hmac_refuses_a_reply_its_own_check_would_reject(
