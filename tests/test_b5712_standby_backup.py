@@ -72,12 +72,19 @@ async def test_an_activated_standby_backs_up_and_a_released_one_stops(
     engine = standby_engine
     runner = engine._backup_runner
     assert runner is not None
-    # Control: the gate reads the latch live, so the same runner backs up once the box is active.
+    # The latch alone, as an activation sets it before its reload, which may still fail and
+    # roll it back: no pass yet.
     engine._set_dr_active(True)
-    assert await runner.run_once(now=1.0) is not None
+    assert await runner.run_once(now=1.0) is None
+    # Control: once the activation's profile is applied, the same runner backs up.
+    assert await engine._dr_activate_profile() == {}
+    assert await runner.run_once(now=2.0) is not None
     assert len(await engine.store.list_audit(action="dr_backup")) == 1
+    # A release (or a rolled-back activation) puts the latch back, and the passes stop.
     engine._set_dr_active(False)
-    assert await runner.run_once(now=2.0) is None
+    assert await runner.run_once(now=3.0) is None
+    engine._set_dr_active(True)
+    assert await runner.run_once(now=4.0) is None
     assert len(await engine.store.list_audit(action="dr_backup")) == 1
 
 
@@ -92,10 +99,33 @@ async def test_the_scheduled_pass_is_not_due_on_a_passive_standby(tmp_path: Path
         config_dir=None,
         passive_standby=lambda: standby,
     )
+    day = 1_000_000.0
     try:
-        # 00:00 is always reached, and no pass has run today.
-        assert runner._backup_due(1_000_000.0) is False
+        # 00:00 is always reached, and no pass has run that day.
+        assert runner._backup_due(day) is False
+        # The day's slot passed while passive, so an activation later that day starts no pass
+        # during the takeover; the next day's slot runs.
         standby = False
-        assert runner._backup_due(1_000_000.0) is True
+        assert runner._backup_due(day + 60.0) is False
+        assert runner._backup_due(day + 86_400.0) is True
     finally:
         await store.close()
+
+
+async def test_a_boot_latched_active_backs_up(tmp_path: Path) -> None:
+    db = tmp_path / "e.db"
+    engine = Engine(
+        await MessageStore.open(db),
+        poll_interval=0.05,
+        store_settings=StoreSettings(path=str(db)),
+        backup_settings=_backup_settings(tmp_path),
+        dr_settings=DrSettings(enabled=True, activate=True),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        await engine.start()
+        runner = engine._backup_runner
+        assert runner is not None
+        assert await runner.run_once(now=1.0) is not None
+    finally:
+        await engine.stop()

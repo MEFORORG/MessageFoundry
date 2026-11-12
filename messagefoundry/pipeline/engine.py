@@ -841,6 +841,9 @@ class Engine:
         # and back False on POST /dr/release. A runner takes dr_threshold from _dr_run_threshold() when
         # it is built, and _set_dr_active hands a running one the new value on each flip (#3067).
         self._dr_active = bool(self._dr_settings.enabled and self._dr_settings.activate)
+        # Whether an activation's reload has completed, so the run-profile is applied and not only
+        # latched; :meth:`_dr_backup_paused` reads it. A boot latched active needs no reload.
+        self._dr_profile_applied = self._dr_active
         # This instance's environment values (DEV/PROD), shared with every runner the engine builds —
         # so env() references in a reloaded graph resolve against THIS environment (and a missing
         # value is refused here, on this engine, not on the box the graph was authored on). The
@@ -1125,6 +1128,13 @@ class Engine:
         """Whether this is a DR standby (``[dr].enabled``) that is not activated."""
         return self._dr_settings.enabled and not self._dr_active
 
+    def _dr_backup_paused(self) -> bool:
+        """Whether the backup runner must skip its pass (vault BACKLOG #5712; the reason is at
+        :class:`~messagefoundry.pipeline.dr_backup.BackupRunner`'s ``passive_standby``): on a
+        passive DR standby, and during an activation until its reload has completed. Applied
+        implies latched, since every flip of the latch to False clears it."""
+        return self._dr_settings.enabled and not self._dr_profile_applied
+
     @property
     def dr_active(self) -> bool:
         """Whether the engine is running under the DR run-profile this boot (#61, ADR 0048)."""
@@ -1192,6 +1202,8 @@ class Engine:
         the next reload does. A release hands the runner the passive standby's threshold, so that
         reload binds no listener (vault BACKLOG #3140)."""
         self._dr_active = active
+        if not active:
+            self._dr_profile_applied = False
         if self._registry_runner is not None:
             self._registry_runner.set_dr_threshold(
                 self._dr_run_threshold(), standby=self._dr_standby_threshold()
@@ -1289,6 +1301,9 @@ class Engine:
                         "failed too; POST /config/reload closes them"
                     )
             raise
+        # Only now may a backup pass run: the latch flipped before the reload, which can still
+        # fail and roll it back (vault BACKLOG #5712).
+        self._dr_profile_applied = True
         if not close_failures:
             return {}
         failure = _outbound_close_failure(close_failures)
@@ -1800,10 +1815,16 @@ class Engine:
     # --- reference sets (ADR 0006) -------------------------------------------
 
     def _make_reference_runner(self) -> ReferenceSyncRunner:
-        """Build the reference sync runner; its specs and its env() values are read **live** from the
-        current registry and the engine's applied values, so a reload's swapped declarations, and a
-        value it adds or rotates, are picked up without rebuilding it (vault BACKLOG #5698). The values
-        are the ones a start or a reload applied, :meth:`apply_start_env_values` included."""
+        """Build the reference sync runner; its specs and its env() values are read **live**, so a
+        reload's swapped declarations, and a value it adds or rotates, are picked up without
+        rebuilding it (vault BACKLOG #5698). Both come from the registry runner, which swaps and
+        rolls back its graph and its values together under its reload lock, so a sync never pairs a
+        new spec with the old values; with no registry runner, the engine's applied values."""
+
+        def env_values() -> Mapping[str, Any]:
+            rr = self._registry_runner
+            return rr.env_values if rr is not None else self._env_values
+
         return ReferenceSyncRunner(
             self.store,
             lambda: (
@@ -1812,7 +1833,7 @@ class Engine:
                 else []
             ),
             self._reference_settings or ReferenceSettings(),
-            env_values=lambda: self._env_values,
+            env_values=env_values,
             egress=self._egress_settings,
             alert_sink=self._alert_sink,
             # Track B Step 6: gate materialize-from-source on the leader; every node still converges its
@@ -2317,9 +2338,8 @@ class Engine:
                 alert_sink=self._alert_sink,
                 coordinator=self._coordinator,
                 hop_posture=self._hop_posture,
-                # A passive DR standby writes no dr_backup row; read live, so an activation starts
-                # the passes and a release stops them (vault BACKLOG #5712).
-                passive_standby=self._is_passive_dr_standby,
+                # Read at each pass (vault BACKLOG #5712).
+                passive_standby=self._dr_backup_paused,
             )
             self._backup_runner.start()
         # [cert_monitor] TLS-cert expiry monitor (Q5c) — a maintenance task like retention, independent

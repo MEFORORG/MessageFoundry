@@ -30,8 +30,11 @@ dropping the very clinical feeds DR exists to protect.
 1. an explicit **per-activation DBA attestation** (`dba_attests_restored=true`) — the engine cannot itself
    restore a DBA-managed DB, so activation must be a deliberate act; and
 2. a live **restore-provenance probe** (`Store.has_prior_backup_history()` — ≥ 1 `dr_backup` audit row):
-   the restored DB must carry backup history, which a passive DR standby (never the backup leader) lacks. A
-   mistaken attestation over a fresh DB still fails closed (defense in depth).
+   the restored DB must carry backup history, which a passive DR standby lacks. A
+   mistaken attestation over a fresh DB still fails closed (defense in depth). *Correction (vault BACKLOG
+   #5712):* this read "never the backup leader", which was false: a lone DR box always leads its own
+   coordinator, so with `[backup].enabled` it would have written its own rows. The engine now starts no
+   backup pass on a passive standby; the `messagefoundry backup` command is not gated.
 
 This is deliberately **weaker** than the SQLite default (which snapshot-verifies the whole store:
 `integrity_check` + per-table row counts). The **residual** #102 itself documents, and #223 tracks:
