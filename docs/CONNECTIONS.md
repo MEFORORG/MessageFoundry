@@ -315,7 +315,7 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > That holds on every start, a restart and a clustered node's start included. `messagefoundry
 > check`, dry-run and reload still fail as a whole in both cases, and so does a DR activation,
 > which is a reload. A reload with the cause fixed brings the lookup back, and so does a restart. A refused
-> `tls_ca_file` on a `FhirLookup()` is a separate check, and it still refuses the start (see
+> `tls_ca_file` on a `FhirLookup()` is a separate check, and it isolates the lookup the same way (see
 > *The engine checks the file at every start and reload*, below).
 >
 > **At the shipped default the ways across are:** keep the hop on **loopback**; load a CRL with
@@ -4158,7 +4158,7 @@ outbound(
 | What if `verify_tls = false`? | The data hop ignores it, since a verify-off hop trusts nothing. A token hop would still read it, but a connection that signs in through SMART or OAuth2 with `verify_tls = false` is refused at build, because the minted bearer would cross the unverified data hop ([why](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)). So that pairing now matters only over an `http://` data url. |
 | Does it cover SOAP mutual TLS? | Yes. The client-certificate opener verifies the server against the same file. |
 | Does it apply on a loopback hop? | Yes. Only the instance `[tls]` anchor exempts loopback. A connection's own CA does not. |
-| What if the file is missing? | The integrity check below refuses it, naming the connection and the path. At start that fails the connection's own lane, except on `FhirLookup()`, where it refuses the start. At a reload it refuses the reload, if the reload builds or keeps that lane running. `messagefoundry check` does not run that check. It builds every connection in one pass, and the build fails with an error that names the setting and, where the build knows it, the connection. So one missing file fails that whole pass. |
+| What if the file is missing? | The integrity check below refuses it, naming the connection and the path. At start that fails the connection's own lane, or, on `FhirLookup()`, that lookup only. At a reload it refuses the reload, if the reload builds or keeps that lane running. `messagefoundry check` does not run that check. It builds every connection in one pass, and the build fails with an error that names the setting and, where the build knows it, the connection. So one missing file fails that whole pass. |
 | What if it is blank? | On these six factories, and on `Email()` and `Direct()`, a blank literal is refused at load. A blank `env()` value is refused when it resolves, naming the setting, the connection and the environment key (vault BACKLOG #2370). |
 | When is it refused as unread? | At least on `Ftp(tls=False)`, which has no TLS, and on `DICOMweb(verify_tls=False)`, which has no token hop. An `Ftp(tls=env(...))` whose value is a false spelling is refused the same way once it resolves, at start, check and reload (vault BACKLOG #3234). One that resolves to `None` is FTPS and reads the CA. On the others, a token hop can still read it. |
 | What if it is unset? | The hop is built exactly as before, from the instance `[tls]` block or the OS store. |
@@ -4178,14 +4178,15 @@ factory that takes `tls_ca_file` for an outbound hop takes it: `Rest()`, `FHIR()
 checks.
 
 **When the check runs, and what a refusal stops.** This follows
-[ADR 0031](adr/0031-startup-connection-fault-isolation.md), as amended on 2026-10-06.
+[ADR 0031](adr/0031-startup-connection-fault-isolation.md), as amended on 2026-10-06 and, for a
+`FhirLookup()`, on 2026-11-11.
 
 | When | What a refused file stops |
 |---|---|
 | Start, for an outbound or an `Ftp()` poller | That connection only. It reads `failed`, and the rest of the graph comes up. Its status and its `connection_stopped` alert carry a fixed line naming the connection; the reason, which names the file and its SHA-256, is in the server log and the audit rows. |
 | An operator start (`POST /connections/{name}/start`), such as of an `auto_start = false` lane | That connection only. |
-| Start, for a `FhirLookup()` | The whole start. A lookup has no lane of its own to fail. |
-| A reload, for a lane it builds or keeps running, and for a `FhirLookup()` | The whole reload, before anything changes. |
+| Start, for a `FhirLookup()`, and the first load by reload of an engine started with no graph | That lookup only (vault BACKLOG #3582). It is recorded failed and alerted under `fhir_lookup:<name>`, every Handler call to it fails closed, and the rest of the graph comes up. Its record and its alert carry a fixed line; the reason is in the server log and the audit rows. |
+| A reload, for a lane it builds or keeps running, and for a `FhirLookup()` | The whole reload, before anything changes. A DR activation is a reload. It checks each `FhirLookup()` CA inside its preflight, which `[dr].takeover_timeout_seconds` bounds, and its reload runs that check again only if another reload changed the graph in between. The reload still loads each lookup's file as it builds the lookup, with no bound, as it loads a lane's. |
 | A reload, for an idle lane | Nothing. The reload does not read its CA. An idle lane is one below a DR threshold, an `auto_start = false` lane not running, an `Ftp()` poller outside its schedule window, or a lane its CA refused whose config has not changed. The reload leaves that last kind failed: fixing the file alone does not heal it on a reload. A config change, an operator start or a restart builds it, and checks it then. Only the pin, permission, path and private-key checks are skipped: a reload's build check still builds every deployed `MLLP()`, `Ftp()`, `Email()` and `Direct()`, which read the file as they are built, so a file they cannot load still refuses the reload. |
 
 | What the check finds | What happens |

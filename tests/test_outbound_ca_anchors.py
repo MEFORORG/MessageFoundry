@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import logging
 import ssl
 import textwrap
 from collections.abc import AsyncIterator, Callable
@@ -628,12 +629,46 @@ async def test_a_refused_lane_parked_and_unparked_is_checked_again(
         await engine.stop()
 
 
-async def test_the_registry_preflight_keeps_the_lookup_and_leaves_the_lanes(
+def _lookup_graph(cfg: Path, ca: Path, pin: str) -> None:
+    """``_two_outbound_graph`` with a healthy ``OUT``, beside a ``FhirLookup`` ``EPIC`` whose CA
+    carries ``pin``. No Handler calls the lookup, so the feed delivers whatever the lookup does."""
+    _two_outbound_graph(cfg, "File(directory=" + repr(str(cfg.parent / "out")) + ")")
+    (cfg.parent / "out").mkdir(exist_ok=True)
+    (cfg / "lookup.py").write_text(
+        "from messagefoundry import FhirLookup\n"
+        f"FhirLookup('EPIC', url='https://fhir.example.org/fhir', tls_ca_file={str(ca)!r}, "
+        f"tls_ca_pin={pin!r})\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.fixture
+def dials(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Every HTTP(S) connection attempt, refused before a socket opens, as in
+    ``tests/test_fhir_lookup_refusal_at_first_start.py``. A refused lookup must dial nothing."""
+    import http.client
+
+    seen: list[str] = []
+
+    def refuse(self: http.client.HTTPConnection) -> None:
+        seen.append(f"{self.host}:{self.port}")
+        raise OSError("dial refused by the test")
+
+    monkeypatch.setattr(http.client.HTTPConnection, "connect", refuse)
+    return seen
+
+
+#: How a lookup failed by its CA reads in its record and its alert (vault BACKLOG #3582).
+_REFUSED_LOOKUP = "TrustAnchorError: fhir lookup 'EPIC': its tls_ca_file was refused"
+
+
+async def test_the_registry_preflight_leaves_the_lookup_and_the_lanes_to_the_runner(
     store: MessageStore, tmp_path: Path, judged: None
 ) -> None:
-    """A ``FhirLookup`` has no lane to fail, so its refused CA still refuses the start and the
-    reload. An outbound's does not: the runner checks each lane it builds. ``lanes=True`` is the
-    control that the same graph does carry a refused lane CA."""
+    """Vault BACKLOG #3582: the registry preflight, which refuses the whole first load, no longer
+    reads a ``FhirLookup`` CA, as it never read a lane's: the runner checks each as it builds it.
+    ``lanes=True`` is the control that the same graphs do carry a refused lane CA and a refused
+    lookup CA. Red under: the lookup's spec collected with ``lanes=False``."""
     ca = _ca(tmp_path)
     cfg = tmp_path / "cfg"
     _two_outbound_graph(cfg, _dest("rest", ca, pin="00" * 32))
@@ -645,15 +680,450 @@ async def test_the_registry_preflight_keeps_the_lookup_and_leaves_the_lanes(
 
     wiring._active = Registry()
     lookup = tmp_path / "lookup"
-    _graph(lookup, _dest("rest", ca))
-    (lookup / "lookup.py").write_text(
-        "from messagefoundry import FhirLookup\n"
-        f"FhirLookup('EPIC', url='https://fhir.example.org/fhir', tls_ca_file={str(ca)!r}, "
-        f"tls_ca_pin={'00' * 32!r})\n",
+    _lookup_graph(lookup, ca, "00" * 32)
+    await preflight(load_config(lookup), {})
+    assert await _rows(store, "fhir_lookup:EPIC") == []  # not read, so no row
+    with pytest.raises(WiringError, match="fhir lookup 'EPIC' tls_ca_file"):
+        await preflight(load_config(lookup), {}, lanes=True)
+
+
+async def test_a_lookup_refused_by_its_ca_at_start_is_isolated_and_the_other_feeds_start(
+    store: MessageStore, tmp_path: Path, judged: None, dials: list[str]
+) -> None:
+    """Vault BACKLOG #3582, the CA half of #3008 step 1 (owner ruling R3: "Isolate it like a
+    lane"). A ``FhirLookup`` whose pin does not match no longer refuses the start. It is recorded
+    failed with a fixed line, alerted, audited, and refuses every read before anything is sent; the
+    rest of the graph starts, and nothing is dialled. Red under: the lookup check back in the
+    registry preflight (the start raises), or the start check removed (the lookup builds)."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _lookup_graph(cfg, ca, "00" * 32)
+    sink = _CountingSink()
+    from messagefoundry.config.fhir_lookup import FhirLookupError
+    from messagefoundry.pipeline import Engine
+
+    engine = Engine(
+        store,
+        registry_preflight=ta.make_registry_anchor_preflight(store, enforcing=True),
+        lane_anchor_check=ta.make_lane_anchor_check(store, enforcing=True),
+        egress_settings=EgressSettings(deny_by_default=False),
+        alert_sink=sink,
+    )
+    try:
+        runner = await _start_like_serve(engine, cfg)
+        assert runner.running
+        reason = runner.fhir_lookup_failed("EPIC")
+        assert reason is not None and reason.startswith(_REFUSED_LOOKUP), reason
+        # The fixed line names neither the file nor its digest: they are in the log and the rows.
+        assert ca.name not in reason and _sha(ca) not in reason
+        assert runner.degraded_fhir_lookups() == {"EPIC": reason}
+        assert sink.stopped == ["fhir_lookup:EPIC"]
+        assert "pin_mismatch" in {r["event"] for r in await _rows(store, "fhir_lookup:EPIC")}
+        # The rest of the graph is up.
+        assert not runner.degraded_outbound() and not runner.degraded_inbound()
+        assert {"OUT", "OB_OK"} <= set(runner._destinations)
+        with pytest.raises(FhirLookupError, match="failed to start and is isolated"):
+            await runner._fhir_lookup_executor.read("EPIC", "Patient/1")
+    finally:
+        await engine.stop()
+    assert dials == []
+
+
+async def test_a_reload_still_refuses_whole_on_a_refused_lookup_ca_and_heals_once_fixed(
+    store: MessageStore, tmp_path: Path, judged: None, dials: list[str]
+) -> None:
+    """ADR 0031 rule 2 is unchanged by vault BACKLOG #3582: a reload builds every lookup again, so
+    a lookup CA still refused refuses the whole reload, before anything changes, audited as a
+    trust-anchor refusal. A reload with the right pin brings the lookup back. Red under: the reload
+    check of the lookups removed (the refused reload goes through)."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _lookup_graph(cfg, ca, "00" * 32)
+    engine = _engine(store)
+    try:
+        runner = await _start_like_serve(engine, cfg)
+        assert runner.fhir_lookup_failed("EPIC") is not None
+        with pytest.raises(WiringError, match=_PIN_MISMATCH) as refused:
+            await engine.reload_detail(cfg)
+        assert isinstance(refused.value.__cause__, TrustAnchorError)
+        assert runner.fhir_lookup_failed("EPIC") is not None  # left as it was
+        assert {"OUT", "OB_OK"} <= set(runner._destinations)
+        lookup = cfg / "lookup.py"
+        lookup.write_text(
+            lookup.read_text(encoding="utf-8").replace("00" * 32, _sha(ca)), encoding="utf-8"
+        )
+        await engine.reload_detail(cfg)
+        assert runner.fhir_lookup_failed("EPIC") is None
+        assert runner.degraded_fhir_lookups() == {}
+    finally:
+        await engine.stop()
+    assert dials == []
+
+
+async def _read_refuses(runner: Any, name: str) -> None:
+    """A read on an isolated lookup refuses before anything is sent, so the ``dials`` control
+    that follows it would catch a lookup that was built and dialled anyway."""
+    from messagefoundry.config.fhir_lookup import FhirLookupError
+
+    with pytest.raises(FhirLookupError, match="failed to start and is isolated"):
+        await runner._fhir_lookup_executor.read(name, "Patient/1")
+
+
+def test_the_lookup_line_names_its_fault_and_a_passive_standby() -> None:
+    """Review round 2 of vault BACKLOG #3582. The fixed line calls a fault a refusal only when the
+    check named one, and on a passive DR standby it says the activation needs the lookup, as a
+    lane's line does (vault BACKLOG #3263). Red under: any ``ValueError`` read as a refused file."""
+    from messagefoundry.pipeline import wiring_runner as wr
+
+    refused = wr._fhir_lookup_anchor_line("EPIC", TrustAnchorError("pin"))
+    assert "its tls_ca_file was refused" in str(refused) and refused.fixed_text
+    setting = wr._fhir_lookup_anchor_line("EPIC", ta.AnchorSettingRefused("blank pin"))
+    assert "tls_ca_pin or tls_ca_file setting was refused" in str(setting)
+    defect = wr._fhir_lookup_anchor_line("EPIC", WiringError("a defect"))
+    assert "could not be checked" in str(defect) and "audit rows" not in str(defect)
+    store_line = wr._fhir_lookup_anchor_line("EPIC", ta.AnchorStoreUnavailable("down"))
+    assert "the store refused the trust-anchor audit" in str(store_line)
+    passive = wr._fhir_lookup_anchor_line("EPIC", TrustAnchorError("pin"), passive=True)
+    assert "POST /dr/activate needs it" in str(passive)
+
+
+async def test_a_missing_lookup_ca_is_isolated_at_start_and_refused_as_an_anchor_at_reload(
+    store: MessageStore, tmp_path: Path, judged: None, dials: list[str]
+) -> None:
+    """Review round 1 of vault BACKLOG #3582. A lookup CA that cannot be read is isolated at
+    start like a refused one. At a reload the lookup check runs before the build check, so the
+    refusal is a trust-anchor refusal, as it was when the registry preflight made it, and not the
+    build's ``invalid_config``. Red under: the reload check moved after the build check."""
+    gone = tmp_path / "gone.pem"
+    cfg = tmp_path / "cfg"
+    _lookup_graph(cfg, gone, "00" * 32)
+    engine = _engine(store)
+    try:
+        runner = await _start_like_serve(engine, cfg)
+        reason = runner.fhir_lookup_failed("EPIC")
+        assert reason is not None and reason.startswith(_REFUSED_LOOKUP), reason
+        assert {"OUT", "OB_OK"} <= set(runner._destinations)
+        await _read_refuses(runner, "EPIC")
+        with pytest.raises(WiringError, match="fhir lookup 'EPIC' tls_ca_file") as refused:
+            await engine.reload_detail(cfg)
+        assert isinstance(refused.value.__cause__, TrustAnchorError)
+    finally:
+        await engine.stop()
+    assert dials == []
+
+
+async def test_a_lookup_whose_ca_check_the_store_stopped_is_isolated_and_named_so(
+    store: MessageStore, tmp_path: Path, judged: None, dials: list[str]
+) -> None:
+    """Review round 1 of vault BACKLOG #3582: a check the store stopped is not a refused file,
+    but the lookup is still not built, as a lane is failed at start. Its line names the store,
+    and the other feeds start. Red under: the store fault reaching the start's backstop."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _lookup_graph(cfg, ca, _sha(ca))
+    check = ta.make_lane_anchor_check(store, enforcing=True)
+
+    async def stopped(direction: str, name: str, settings: Any) -> None:
+        if direction == "fhir_lookup":
+            raise ta.AnchorStoreUnavailable("the store refused the audit read")
+        await check(direction, name, settings)
+
+    from messagefoundry.pipeline import Engine
+
+    engine = Engine(
+        store,
+        registry_preflight=ta.make_registry_anchor_preflight(store, enforcing=True),
+        lane_anchor_check=stopped,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        runner = await _start_like_serve(engine, cfg)
+        reason = runner.fhir_lookup_failed("EPIC")
+        assert reason is not None and "the store refused the trust-anchor audit" in reason, reason
+        assert {"OUT", "OB_OK"} <= set(runner._destinations)
+        await _read_refuses(runner, "EPIC")
+        # A reload whose lookup check the store stopped is refused whole, as a store fault and
+        # not as a refused file (BACKLOG #3091).
+        with pytest.raises(WiringError) as refused:
+            await engine.reload_detail(cfg)
+        assert isinstance(refused.value.__cause__, ta.AnchorStoreUnavailable)
+    finally:
+        await engine.stop()
+    assert dials == []
+
+
+async def test_a_first_load_by_reload_isolates_a_lookup_its_ca_check_refuses(
+    store: MessageStore, tmp_path: Path, judged: None, dials: list[str]
+) -> None:
+    """Review finding 2 of vault BACKLOG #3582: an engine started with no graph takes its first
+    one by reload, and that load is the start. A lookup CA that cannot be read is met by the
+    lookup CA check before the build check, so the lookup is isolated with the fixed line, as at
+    any start, and the rest of the graph comes up. Red under: that check removed from the first
+    load, where the build check refuses the whole load as a bad config."""
+    gone = tmp_path / "gone.pem"
+    cfg = tmp_path / "cfg"
+    _lookup_graph(cfg, gone, "00" * 32)
+    engine = _engine(store)
+    try:
+        await engine.reload_detail(cfg)
+        runner = engine.registry_runner
+        reason = runner.fhir_lookup_failed("EPIC")
+        assert reason is not None and reason.startswith(_REFUSED_LOOKUP), reason
+        assert {"OUT", "OB_OK"} <= set(runner._destinations)
+        await _read_refuses(runner, "EPIC")
+    finally:
+        await engine.stop()
+    assert dials == []
+
+
+async def test_a_first_load_by_reload_checks_each_lookup_ca_once(
+    store: MessageStore, tmp_path: Path, judged: None, dials: list[str]
+) -> None:
+    """Review round 1 of the vault BACKLOG #3582 repair: the first load hands what its lookup
+    check found to the start, so each lookup CA is checked once, a refused pin writes its
+    ``auth.trust_anchor`` row once, and the lookup is isolated. Red under: the start checking
+    the lookup CAs again."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _lookup_graph(cfg, ca, "00" * 32)
+    check = ta.make_lane_anchor_check(store, enforcing=True)
+    reads: list[str] = []
+
+    async def counted(direction: str, name: str, settings: Any) -> None:
+        if direction == "fhir_lookup":
+            reads.append(name)
+        await check(direction, name, settings)
+
+    from messagefoundry.pipeline import Engine
+
+    engine = Engine(
+        store,
+        registry_preflight=ta.make_registry_anchor_preflight(store, enforcing=True),
+        lane_anchor_check=counted,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        await engine.reload_detail(cfg)
+        runner = engine.registry_runner
+        assert runner is not None
+        reason = runner.fhir_lookup_failed("EPIC")
+        assert reason is not None and reason.startswith(_REFUSED_LOOKUP), reason
+        assert reads == ["EPIC"], reads
+        events = [r["event"] for r in await _rows(store, "fhir_lookup:EPIC")]
+        assert events.count("pin_mismatch") == 1, events
+    finally:
+        await engine.stop()
+    assert dials == []
+
+
+async def test_a_first_load_warns_for_a_query_credential_on_a_lookup_it_isolated(
+    store: MessageStore, tmp_path: Path, judged: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Review round 1 of the vault BACKLOG #3582 repair: the first load's build check leaves out
+    a lookup its CA check refused, so the start logs that lookup's URL query-credential WARNING
+    (ASVS 14.2.1), which the build check would have logged. Red under: the start taking
+    ``warn_query_credentials=False`` for every lookup."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _lookup_graph(cfg, ca, "00" * 32)
+    lookup = cfg / "lookup.py"
+    lookup.write_text(
+        lookup.read_text(encoding="utf-8").replace(
+            "https://fhir.example.org/fhir", "https://fhir.example.org/fhir?api_key=SYNTHETIC-1"
+        ),
         encoding="utf-8",
     )
-    with pytest.raises(WiringError, match="fhir lookup 'EPIC' tls_ca_file"):
-        await preflight(load_config(lookup), {})
+    engine = _engine(store)
+    try:
+        with caplog.at_level(logging.WARNING):
+            await engine.reload_detail(cfg)
+        assert engine.registry_runner.fhir_lookup_failed("EPIC") is not None
+        warned = [
+            r.getMessage()
+            for r in caplog.records
+            if "carries a credential in its query string" in r.getMessage()
+        ]
+        assert any("EPIC" in line for line in warned), warned
+    finally:
+        await engine.stop()
+
+
+async def test_a_lookup_store_fault_does_not_hide_a_refused_lane_ca_at_reload(
+    store: MessageStore, tmp_path: Path, judged: None, dials: list[str]
+) -> None:
+    """Review finding 8 of vault BACKLOG #3582: a store fault in the reload's lookup CA check
+    refuses only once no lane CA is refused (BACKLOG #3091), so a lane CA refused by the same
+    reload refuses it as a trust anchor. Red under: the lookup check raising its store fault
+    before the lane check runs."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _two_outbound_graph(cfg, _dest("rest", ca, pin=_sha(ca)))
+    (cfg / "lookup.py").write_text(
+        "from messagefoundry import FhirLookup\n"
+        f"FhirLookup('EPIC', url='https://fhir.example.org/fhir', tls_ca_file={str(ca)!r}, "
+        f"tls_ca_pin={_sha(ca)!r})\n",
+        encoding="utf-8",
+    )
+    check = ta.make_lane_anchor_check(store, enforcing=True)
+    stopped = False
+
+    async def faulty(direction: str, name: str, settings: Any) -> None:
+        if stopped and direction == "fhir_lookup":
+            raise ta.AnchorStoreUnavailable("the store refused the audit read")
+        await check(direction, name, settings)
+
+    from messagefoundry.pipeline import Engine
+
+    engine = Engine(
+        store,
+        registry_preflight=ta.make_registry_anchor_preflight(store, enforcing=True),
+        lane_anchor_check=faulty,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        runner = await _start_like_serve(engine, cfg)
+        assert runner.fhir_lookup_failed("EPIC") is None and not runner.degraded_outbound()
+        feed = cfg / "feed.py"
+        feed.write_text(
+            feed.read_text(encoding="utf-8").replace(_sha(ca), "00" * 32), encoding="utf-8"
+        )
+        stopped = True
+        with pytest.raises(WiringError, match="outbound connection 'OUT'") as refused:
+            await engine.reload_detail(cfg)
+        assert isinstance(refused.value.__cause__, TrustAnchorError)
+        assert not isinstance(refused.value.__cause__, ta.AnchorStoreUnavailable)
+    finally:
+        await engine.stop()
+    assert dials == []
+
+
+def _stopped_lookup_check(store: MessageStore) -> tuple[Any, list[bool]]:
+    """A lane check whose ``FhirLookup`` calls the store stops once the flag it returns is set."""
+    check = ta.make_lane_anchor_check(store, enforcing=True)
+    stopped = [False]
+
+    async def faulty(direction: str, name: str, settings: Any) -> None:
+        if stopped[0] and direction == "fhir_lookup":
+            raise ta.AnchorStoreUnavailable("the store refused the audit read")
+        await check(direction, name, settings)
+
+    return faulty, stopped
+
+
+async def test_a_lookup_store_fault_refuses_a_reload_of_a_runner_not_running(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """Review round 2 of the vault BACKLOG #3582 repair: a runner not yet started runs no lane
+    check, so a store fault in its reload's lookup check refuses there, and the graph is not
+    swapped. Red under: that refusal deleted, which installs the new graph unchecked."""
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _lookup_graph(cfg, ca, _sha(ca))
+    faulty, stopped = _stopped_lookup_check(store)
+    first = load_config(cfg)
+    runner = RegistryRunner(
+        first,
+        store,
+        egress=EgressSettings(deny_by_default=False),
+        lane_anchor_check=faulty,
+    )
+    stopped[0] = True
+    with pytest.raises(WiringError) as refused:
+        await runner.reload(load_config(cfg))
+    assert isinstance(refused.value.__cause__, ta.AnchorStoreUnavailable)
+    assert runner.registry is first
+
+
+async def test_a_lookup_store_fault_outranks_a_build_failure_at_reload(
+    store: MessageStore, tmp_path: Path, judged: None, dials: list[str]
+) -> None:
+    """Review round 2 of the vault BACKLOG #3582 repair: a store outage in the reload's lookup
+    check refuses the reload as a store fault, not as the bad config a build failure would name,
+    as it did when that fault was raised before the build check. Red under: the build failure
+    raised as it is."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _lookup_graph(cfg, ca, _sha(ca))
+    faulty, stopped = _stopped_lookup_check(store)
+    from messagefoundry.pipeline import Engine
+
+    engine = Engine(
+        store,
+        registry_preflight=ta.make_registry_anchor_preflight(store, enforcing=True),
+        lane_anchor_check=faulty,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        await _start_like_serve(engine, cfg)
+        feed = cfg / "feed.py"
+        # A second outbound the build check refuses: its env() value does not resolve.
+        feed.write_text(
+            feed.read_text(encoding="utf-8")
+            + "from messagefoundry import env\n"
+            + "outbound('OB_BAD', File(directory=env('MEFOR_E5_UNSET_DIR')))\n",
+            encoding="utf-8",
+        )
+        stopped[0] = True
+        with pytest.raises(WiringError) as refused:
+            await engine.reload_detail(cfg)
+        assert isinstance(refused.value.__cause__, ta.AnchorStoreUnavailable), refused.value
+        assert refused.value.__context__ is None
+    finally:
+        await engine.stop()
+    assert dials == []
+
+
+async def test_a_reload_handed_a_pass_for_another_graph_checks_its_lookups(
+    store: MessageStore, tmp_path: Path, judged: None, dials: list[str]
+) -> None:
+    """Review round 2 of the vault BACKLOG #3582 repair: a DR activation's lookup pass skips the
+    reload's lookup CA check only for the graph and values it checked. A graph that changed in
+    between is checked again, so its refused CA refuses. Red under: ``covers`` ignoring the
+    graph."""
+    ca = _ca(tmp_path)
+    good = tmp_path / "good"
+    _lookup_graph(good, ca, _sha(ca))
+    bad = tmp_path / "bad"
+    _lookup_graph(bad, ca, "00" * 32)
+    engine = _engine(store)
+    try:
+        runner = await _start_like_serve(engine, good)
+        passed = await runner.refuse_on_fhir_lookup_anchors(runner.registry)
+        assert passed.covers(runner.registry, runner.env_values)
+        with pytest.raises(WiringError, match=_PIN_MISMATCH):
+            await runner.reload(load_config(bad), fhir_lookup_anchors=passed)
+        # The control: the same pass on the graph it checked skips the check and reloads.
+        await runner.reload(fhir_lookup_anchors=passed)
+    finally:
+        await engine.stop()
+    assert dials == []
+
+
+async def test_a_long_lookup_name_keeps_the_advice_in_its_record(
+    store: MessageStore, tmp_path: Path, judged: None, dials: list[str]
+) -> None:
+    """Review round 1 of vault BACKLOG #3582: the record keeps a fixed line to the anchor-line
+    limit, as a lane's does (vault BACKLOG #3498), so a long name does not cut the advice off.
+    Red under: the record taken at ``safe_exc``'s default limit."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _lookup_graph(cfg, ca, "00" * 32)
+    name = "EPIC_" + "X" * 90
+    lookup = cfg / "lookup.py"
+    lookup.write_text(
+        lookup.read_text(encoding="utf-8").replace("'EPIC'", repr(name)), encoding="utf-8"
+    )
+    engine = _engine(store)
+    try:
+        runner = await _start_like_serve(engine, cfg)
+        reason = runner.fhir_lookup_failed(name)
+        assert reason is not None and reason.endswith("audit rows say why"), reason
+        await _read_refuses(runner, name)
+    finally:
+        await engine.stop()
+    assert dials == []
 
 
 async def test_a_missing_outbound_ca_names_the_connection(

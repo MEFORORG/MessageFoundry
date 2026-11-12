@@ -692,7 +692,7 @@ async def test_a_reload_that_fails_after_the_threshold_is_set_puts_it_back(
     assert rr is not None
     seen: list[object] = []
 
-    async def failing_reload(registry: object = None) -> None:
+    async def failing_reload(registry: object = None, **_kw: Any) -> None:
         seen.append((rr.dr_threshold, rr.dr_standby))
         raise OSError("a listener could not bind")
 
@@ -1274,7 +1274,7 @@ async def test_a_reload_cancelled_with_no_hook_still_says_a_listener_may_have_bo
     assert coord is not None
     entered = asyncio.Event()
 
-    async def hung_reload(registry: object = None) -> None:
+    async def hung_reload(registry: object = None, **_kw: Any) -> None:
         entered.set()
         await asyncio.Event().wait()
 
@@ -1307,7 +1307,7 @@ async def test_a_step_4_abort_after_the_hook_names_the_hook_and_its_seed_marker(
     _spy_hook(coord, monkeypatch, hooks)
     real_reload = rr.reload
 
-    async def failing_reload(registry: object = None) -> None:
+    async def failing_reload(registry: object = None, **_kw: Any) -> None:
         raise OSError("a listener could not bind")
 
     monkeypatch.setattr(rr, "reload", failing_reload)
@@ -1338,7 +1338,7 @@ async def test_a_step_4_abort_with_no_hook_does_not_say_the_vip_moved(
     rr = engine.registry_runner
     assert rr is not None
 
-    async def failing_reload(registry: object = None) -> None:
+    async def failing_reload(registry: object = None, **_kw: Any) -> None:
         raise OSError("a listener could not bind")
 
     monkeypatch.setattr(rr, "reload", failing_reload)

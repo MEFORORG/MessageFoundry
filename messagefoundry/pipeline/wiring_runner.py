@@ -1668,6 +1668,23 @@ class _FusedTransformResult:
     ingress_wakes: tuple[str, ...]
 
 
+@dataclass(frozen=True, eq=False)
+class FhirLookupAnchorPass:
+    """What :meth:`RegistryRunner.refuse_on_fhir_lookup_anchors` returns when no lookup CA was
+    refused (vault BACKLOG #3582): the graph and the values it checked, and, when the caller
+    deferred it, the first store fault that stopped a check, which :meth:`RegistryRunner.reload`
+    raises only once every lane CA it checks has passed (BACKLOG #3091)."""
+
+    registry: Registry
+    env_values: Mapping[str, Any]
+    store_fault: AnchorStoreUnavailable | None
+
+    def covers(self, registry: Registry, env_values: Mapping[str, Any]) -> bool:
+        """Whether this pass checked ``registry`` under ``env_values``: the same objects, so a
+        graph or values that changed since, even to equal ones, is checked again."""
+        return self.registry is registry and self.env_values is env_values
+
+
 def _resolve_send_pace(settings: Mapping[str, Any]) -> float:
     """The resolved per-lane egress send-pacing interval in seconds (BACKLOG #82) from a connection's
     settings: ``send_min_interval_seconds`` coerced to a float, with ``None``/absent/``0`` → ``0.0`` (no
@@ -1876,7 +1893,9 @@ class RegistryRunner:
         # default system/no-op policy (byte-identical — the OS trust store verifies the peer).
         self._trust_anchor_policy = trust_anchor_policy or TrustAnchorPolicy()
         # vault BACKLOG #2371: the audited check of a dialling CA, awaited where a lane is built
-        # (:meth:`_check_lane_anchor`). None in a test or embedding that passes none: no check.
+        # (:meth:`_check_lane_anchor`), and since vault BACKLOG #3582 for each FhirLookup
+        # (:meth:`check_fhir_lookup_anchors`, :meth:`refuse_on_fhir_lookup_anchors`). None in a
+        # test or embedding that passes none: no check.
         self._lane_anchor_check = lane_anchor_check
         # The lanes whose last check refused their CA. A reload does not rebuild one of these unless
         # its config changed (:meth:`_keeps_anchor_failure`); an operator start checks it again.
@@ -2953,7 +2972,9 @@ class RegistryRunner:
         self,
         *,
         isolated: dict[str, Exception] | None = None,
+        refused: Mapping[str, Exception] | None = None,
         warn_query_credentials: bool = True,
+        warn_names: Collection[str] = (),
     ) -> FhirLookupExecutor | None:
         """Build the live FHIR-read executor from the current graph's ``FhirLookup`` specs, or ``None`` if
         the graph declares none (so ``fhir_lookup`` is unavailable and its runner is not activated). Mirrors
@@ -2968,12 +2989,18 @@ class RegistryRunner:
         it, a failure raises, as a reload's build does once its build check passed. A failure that no
         single lookup's build reproduces is graph-wide, and raises either way.
 
+        ``refused`` names each lookup whose CA check refused it (:meth:`check_fhir_lookup_anchors`,
+        vault BACKLOG #3582), with the fixed line to record. Such a lookup is never built, so no
+        hop is made for it, and it is isolated as one whose build failed. Pass it only with
+        ``isolated``.
+
         ``warn_query_credentials`` runs
         :func:`~messagefoundry.transports.egress.warn_url_query_credentials_before_build` once per
         lookup, before any build, so an ``env()`` URL carrying a query credential is recorded while
         its lookup is down (ASVS 14.2.1). A lookup whose warning step itself raises is degraded,
         with an ERROR line and no WARNING. A caller whose build check has already warned passes
-        False (vault BACKLOG #2910)."""
+        False (vault BACKLOG #2910). ``warn_names`` are warned for even then: lookups that build
+        check left out (:meth:`start`'s ``fhir_lookup_refused``, vault BACKLOG #3582)."""
         specs = self.registry.fhir_lookups
         if not specs:
             return None
@@ -3023,7 +3050,7 @@ class RegistryRunner:
             except Exception as exc:
                 log.error("FhirLookup %r settings failed to resolve", name, exc_info=True)
                 errors[name] = exc
-            if not warn_query_credentials:
+            if not warn_query_credentials and name not in warn_names:
                 continue
             try:
                 # The one pre-build step an outbound's start takes too (BACKLOG #4997). It reads
@@ -3042,6 +3069,11 @@ class RegistryRunner:
                 )
                 errors.setdefault(name, exc)
                 settled.pop(name, None)
+        for name, refusal in (refused or {}).items():
+            # Vault BACKLOG #3582: its CA was refused, so it is not built; isolated as below. An
+            # earlier error wins: a lookup whose settings did not resolve was never checked.
+            errors.setdefault(name, refusal)
+            settled.pop(name, None)
         if not errors:
             try:
                 return build(settled)  # a healthy graph builds once, as it always did
@@ -3062,12 +3094,109 @@ class RegistryRunner:
             except Exception as exc:
                 errors[name] = exc
         errors = {name: errors[name] for name in specs if name in errors}  # in graph order
-        failed = {name: safe_exc(err) for name, err in errors.items()}
+        failed = {name: _lookup_failure_reason(err) for name, err in errors.items()}
         survivors = {name: s for name, s in settled.items() if name not in errors}
         # Before the final build, so a graph-wide failure there still leaves each lookup's own
         # failure for the start's backstop to log.
         isolated.update(errors)
         return build(survivors, failed)
+
+    async def check_fhir_lookup_anchors(
+        self, registry: Registry | None = None, env_values: Mapping[str, Any] | None = None
+    ) -> dict[str, Exception]:
+        """Check each ``FhirLookup``'s CA at start, before the executor is built (vault BACKLOG
+        #3582, ADR 0031 as amended 2026-11-11). Returns ``{lookup: fixed line}`` for each one the
+        check failed, for :meth:`_build_fhir_lookup_executor`'s ``refused``, which isolates it as
+        a lookup that fails to build is isolated (vault BACKLOG #3008). ``auth.trust_anchors``,
+        module item 9, states the rule once. ``registry`` and ``env_values`` default to the
+        runner's own. An engine's first load by reload passes its own, on the runner it build
+        checks with, so the build check leaves out a lookup this check isolates
+        (:meth:`Engine._first_load`).
+
+        It is the lane check (:meth:`_check_lane_anchor` calls the same one), under the label
+        ``fhir_lookup:<name>``, so a pin, permission or path refusal writes its
+        ``auth.trust_anchor`` rows as a lane's does. A refusal's text names the CA's path and its
+        SHA-256, so it goes to the server log only, and the record, the alert and the error each
+        Handler call raises carry a fixed line (:func:`_fhir_lookup_anchor_line`). A check the
+        store stopped isolates the lookup too, as it fails a lane at start, and the next start
+        checks the file again. Broad on purpose, as a lane's isolation at start is: one lookup's
+        check costs that lookup only. A lookup whose settings do not resolve is not checked: its
+        build records why. Nothing here dials."""
+        refused: dict[str, Exception] = {}
+        if self._lane_anchor_check is None:
+            return refused
+        graph = self.registry if registry is None else registry
+        for name, settings in self._fhir_lookup_anchor_settings(graph, env_values):
+            try:
+                await self._lane_anchor_check("fhir_lookup", name, settings)
+            except Exception as exc:  # noqa: BLE001 - isolated per lookup, as a lane's check is
+                if isinstance(exc, (TrustAnchorError, AnchorSettingRefused)):
+                    log.warning("fhir lookup %r: trust anchor refused: %s", name, exc)
+                elif not isinstance(exc, AnchorStoreUnavailable):
+                    # The check logged a store fault itself; anything else is a defect. Its
+                    # traceback is logged once, by the record below, through the line's cause.
+                    log.error("fhir lookup %r: trust anchor check failed: %s", name, safe_exc(exc))
+                line = _fhir_lookup_anchor_line(name, exc, passive=self._dr_passive)
+                line.__cause__ = exc
+                refused[name] = line
+        return refused
+
+    def _fhir_lookup_anchor_settings(
+        self, registry: Registry, env_values: Mapping[str, Any] | None = None
+    ) -> Iterable[tuple[str, dict[str, Any]]]:
+        """``(name, resolved settings)`` for each ``FhirLookup`` in ``registry`` whose CA a check
+        reads, at start and before a reload (vault BACKLOG #3582), resolved against
+        ``env_values``, the runner's own by default. A lookup whose settings do not resolve is
+        skipped: its build, or a reload's build check, records why."""
+        values = self._env_values if env_values is None else env_values
+        for name, spec in registry.fhir_lookups.items():
+            try:
+                settings = _fhir_lookup_settings(spec, values, self._egress)
+            except Exception as exc:  # noqa: BLE001 - see the docstring
+                log.debug("fhir lookup %r: CA check skipped: %s", name, safe_exc(exc))
+            else:
+                yield name, settings
+
+    async def refuse_on_fhir_lookup_anchors(
+        self,
+        registry: Registry,
+        env_values: Mapping[str, Any] | None = None,
+        *,
+        defer_store_fault: bool = False,
+    ) -> FhirLookupAnchorPass:
+        """Check the CA of each ``FhirLookup`` ``registry`` declares, and refuse on the first one
+        refused, as a ``WiringError`` whose cause is the :class:`TrustAnchorError` (vault BACKLOG
+        #3582, ADR 0031 rule 2). ``env_values`` default to the runner's own. A reload builds every
+        lookup again, so :meth:`reload` runs it on the new graph before its build check, as the
+        engine's registry preflight did before this check moved here: a CA file the build could
+        not load is refused here first, as a trust anchor.
+
+        A check the store stopped refuses too, once no lookup's CA is refused (BACKLOG #3091).
+        ``defer_store_fault`` returns it on the :class:`FhirLookupAnchorPass` instead, for
+        :meth:`reload`, which raises it only once every lane CA it checks has passed, so a refused
+        lane CA refuses as one.
+
+        A DR activation runs it inside its bounded preflight (:meth:`Engine._dr_preflight`, vault
+        BACKLOG #3094), where a store fault stops the activation at its preflight, and hands the
+        pass to :meth:`reload`, which then runs no lookup CA check again while it re-applies the
+        graph that pass checked. A no-op with no lane check."""
+        values = self._env_values if env_values is None else env_values
+        if self._lane_anchor_check is None:
+            return FhirLookupAnchorPass(registry, values, None)
+        store_fault: AnchorStoreUnavailable | None = None
+        for name, settings in self._fhir_lookup_anchor_settings(registry, values):
+            try:
+                await self._lane_anchor_check("fhir_lookup", name, settings)
+            except AnchorStoreUnavailable as exc:
+                store_fault = store_fault or exc
+            except (TrustAnchorError, ValueError) as exc:
+                setting = _fhir_lookup_setting(name, _lane_anchor_fault(exc))
+                error = connection_anchor_failure(exc, setting=setting)
+                raise error from error.__cause__
+        if store_fault is not None and not defer_store_fault:
+            error = connection_anchor_failure(store_fault)
+            raise error from error.__cause__
+        return FhirLookupAnchorPass(registry, values, store_fault)
 
     def _record_fhir_lookup_failed(self, name: str, reason: str, exc: BaseException) -> None:
         """Log and alert a ``FhirLookup`` that failed to build at start, as :meth:`_record_failed`
@@ -4602,7 +4731,9 @@ class RegistryRunner:
         for lane in [k for k in self._anchor_refused if k not in lanes]:
             del self._anchor_refused[lane]
         if isinstance(self._lane_anchor_check, RetainsLanes):
-            self._lane_anchor_check.retain_lanes(lanes)
+            # A FhirLookup's CA takes the same check (vault BACKLOG #3582), so its memory stays.
+            lookups = {("fhir_lookup", n) for n in self.registry.fhir_lookups}
+            self._lane_anchor_check.retain_lanes(lanes | lookups)
 
     def _reload_anchor_lanes(
         self, old: Registry, new: Registry, old_inbound_names: Sequence[str]
@@ -6044,12 +6175,23 @@ class RegistryRunner:
         self._failed.pop(("outbound", name), None)
         self._spawn_worker(name)
 
-    async def start(self, *, warn_query_credentials: bool = True) -> None:
+    async def start(
+        self,
+        *,
+        warn_query_credentials: bool = True,
+        fhir_lookup_refused: Mapping[str, Exception] | None = None,
+    ) -> None:
         """Bring the graph up. ``warn_query_credentials=False`` is for a caller that has just run
         :meth:`build_check` on this graph, which logged the URL query-credential WARNING, at least
         ``Engine.reload_detail`` with no runner yet (vault BACKLOG #2910). It reaches only the
         builds this call makes. A later window open or operator start builds a lane this start left
-        unbuilt, and that build logs the WARNING."""
+        unbuilt, and that build logs the WARNING.
+
+        ``fhir_lookup_refused`` is what :meth:`check_fhir_lookup_anchors` returned for this graph
+        and these values, for a caller that ran it first, the first load by reload (vault BACKLOG
+        #3582). The start isolates those lookups and checks no lookup CA again. That caller's build
+        check left them out, so their query-credential WARNING is logged here whatever
+        ``warn_query_credentials`` says. ``None`` checks every lookup CA here."""
         async with self._reload_lock:
             if self._running:
                 return
@@ -6173,8 +6315,15 @@ class RegistryRunner:
                 # and the other feeds start. On every start, matching how a lane is isolated: a Manager
                 # decision under the owner's standing driver rules, 2026-10-11, not an owner ruling.
                 # A restart and a clustered node's start on promotion both come through here.
+                # Vault BACKLOG #3582: a lookup whose CA check refuses it is isolated the same way.
+                refused = fhir_lookup_refused
+                if refused is None:
+                    refused = await self.check_fhir_lookup_anchors()
                 self._fhir_lookup_executor = self._build_fhir_lookup_executor(
-                    isolated=fhir_lookup_isolated, warn_query_credentials=warn_query_credentials
+                    isolated=fhir_lookup_isolated,
+                    refused=refused,
+                    warn_query_credentials=warn_query_credentials,
+                    warn_names=() if fhir_lookup_refused is None else frozenset(refused),
                 )
                 # ADR 0057: compute the inline-fast-path eligibility now that the lookup executors are
                 # known (P-lookup needs both to be None). Default-OFF unless an inbound opted in.
@@ -8174,7 +8323,11 @@ class RegistryRunner:
         return stranded
 
     async def reload(
-        self, new_registry: Registry | None = None, env_values: Mapping[str, Any] | None = None
+        self,
+        new_registry: Registry | None = None,
+        env_values: Mapping[str, Any] | None = None,
+        *,
+        fhir_lookup_anchors: FhirLookupAnchorPass | None = None,
     ) -> tuple[tuple[str, str], ...]:
         """Atomically swap to ``new_registry`` on the running graph (whole-config swap).
 
@@ -8186,6 +8339,12 @@ class RegistryRunner:
         queued behind another one re-evaluates that one's graph rather than reverting it. A DR
         activation uses it to re-apply the running graph under a new threshold (vault BACKLOG
         #3067).
+
+        ``fhir_lookup_anchors`` is a lookup CA check the caller already ran
+        (:meth:`refuse_on_fhir_lookup_anchors`), as a DR activation does inside its bounded
+        preflight (vault BACKLOG #3094, #3582). Where it covers the graph and the values this
+        reload applies, no lookup CA check runs again here; otherwise, as with ``None``, they are
+        checked before the build check.
 
         Quiesce-and-swap, in this order: (0) build-check every new connector — a bad spec raises
         here, before anything is touched, so the running graph is left intact; (1) stop accepting new
@@ -8222,7 +8381,31 @@ class RegistryRunner:
             # Raises before any change on a bad connector. The check awaits a worker thread, so the
             # values go live only once it passes: a reader that takes no lock, such as a
             # connection test, never sees values the check then refuses (engine PR 2815).
-            await self.build_check_off_loop(new_registry, new_env_values, now=now)
+            # Vault BACKLOG #3582: before the build check, so a lookup CA the build could not load
+            # is refused as a trust anchor, as the registry preflight refused it. Not again for a
+            # graph a DR activation checked inside its bound (vault BACKLOG #3094).
+            lookups = fhir_lookup_anchors
+            applied_values = self._env_values if new_env_values is None else new_env_values
+            if lookups is None or not lookups.covers(new_registry, applied_values):
+                lookups = await self.refuse_on_fhir_lookup_anchors(
+                    new_registry, applied_values, defer_store_fault=True
+                )
+            try:
+                await self.build_check_off_loop(new_registry, new_env_values, now=now)
+            except WiringError:
+                if lookups.store_fault is None:
+                    raise
+                # The store fault outranks a build failure, as it did when it was raised before
+                # the build check, so a store outage never reads as a bad config. Raised outside
+                # the handler, so the build failure rides neither its cause nor its context.
+                build_refused = True
+            else:
+                build_refused = False
+            if lookups.store_fault is not None and (build_refused or not self._running):
+                # No lane check runs below when the build check refused or the graph is not
+                # running, so the store fault refuses here, before anything changes (BACKLOG #3091).
+                error = connection_anchor_failure(lookups.store_fault)
+                raise error from error.__cause__
             if new_env_values is not None:
                 self._env_values = new_env_values
             # What the clear below removes, so a reload that is refused or rolled back puts it
@@ -8254,6 +8437,11 @@ class RegistryRunner:
                 anchors_passed = await self._check_reload_lane_anchors(
                     old, new_registry, old_inbound_names
                 )
+                if lookups.store_fault is not None:
+                    # Vault BACKLOG #3582: a store fault in the lookup check refuses only once
+                    # no lane CA is refused, as a lane's own does (BACKLOG #3091).
+                    error = connection_anchor_failure(lookups.store_fault)
+                    raise error from error.__cause__
             except BaseException:
                 self._env_values = old_env_values
                 self._restore_dr_markers(cleared)
@@ -13586,6 +13774,60 @@ def _lane_anchor_line(
 #: The keys a lane's setting refusal names when the lane's CA is a ``tls_ca_file``: the check does
 #: not say which of the two it refused. :func:`_refused_setting_keys` picks the name for a lane.
 _SETTING_KEYS = "tls_ca_pin or tls_ca_file"
+
+
+def _fhir_lookup_anchor_line(
+    name: str, exc: BaseException, *, passive: bool = False
+) -> TrustAnchorError:
+    """The fixed line a ``FhirLookup``'s CA check failure is recorded and alerted as (vault
+    BACKLOG #3582), the lookup twin of :func:`_lane_anchor_line`. The failure's own text names the
+    CA's path and its SHA-256, so it goes to the server log only. A lookup has no operator start,
+    so the advice is a reload or a restart, which check the file again. Only a refusal the check
+    names is called one: an :class:`AnchorSettingRefused` is a setting, any other
+    :class:`TrustAnchorError` a file, and anything else a check that did not run. On a passive DR
+    standby the line says the activation needs it, as a lane's does (vault BACKLOG #3263)."""
+    fault = (
+        "setting"
+        if isinstance(exc, AnchorSettingRefused)
+        else "file"
+        if isinstance(exc, TrustAnchorError)
+        else "unchecked"
+    )
+    if fault == "setting":
+        what = f"{_SETTING_KEYS} setting was refused"
+        advice = "Fix the setting, then reload or restart; the server log says why"
+    elif fault == "file":
+        what = "tls_ca_file was refused"
+        rows = "the server log and the auth.trust_anchor audit rows say why"
+        advice = f"Fix the file, then reload or restart; {rows}"
+    elif isinstance(exc, AnchorStoreUnavailable):
+        what = "tls_ca_file could not be checked, because the store refused the trust-anchor audit"
+        advice = "Reload or restart once the store is back; the server log says why"
+    else:
+        what = "tls_ca_file could not be checked"
+        advice = "The server log says why; reload or restart once the cause is fixed"
+    where = " on this passive DR standby, and POST /dr/activate needs it" if passive else ""
+    return TrustAnchorError(
+        f"fhir lookup '{name}': its {what}{where}. {advice}",
+        setting=_fhir_lookup_setting(name, fault),
+        fixed_text=True,
+    )
+
+
+def _lookup_failure_reason(exc: BaseException) -> str:
+    """A failed ``FhirLookup``'s recorded reason. A fixed CA line is kept to
+    :data:`_ANCHOR_LINE_LIMIT`, as :meth:`RegistryRunner._record_failed` keeps a lane's, so a long
+    lookup name does not cut off its advice (vault BACKLOG #3498, #3582)."""
+    if isinstance(exc, TrustAnchorError) and exc.fixed_text:
+        return safe_exc(exc, limit=_ANCHOR_LINE_LIMIT)
+    return safe_exc(exc)
+
+
+def _fhir_lookup_setting(name: str, fault: str) -> str:
+    """A ``FhirLookup``'s refused setting as :attr:`TrustAnchorError.setting` names one, with no
+    path: the lookup twin of :func:`_lane_setting`. A lookup takes no ``odbc_params``, so its keys
+    are a lane's plain ones."""
+    return f"fhir lookup '{name}' {_SETTING_KEYS if fault == 'setting' else 'tls_ca_file'}"
 
 
 def _refused_setting_keys(settings: Mapping[str, Any]) -> str:
