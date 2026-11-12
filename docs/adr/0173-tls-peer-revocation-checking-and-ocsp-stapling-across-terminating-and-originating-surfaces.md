@@ -1225,8 +1225,9 @@ of the list above:
 | Vault Transit cipher: `store/crypto_transit.py`, which calls the key provider's `_build_client` | the Vault token, and message bodies sent to Vault to encrypt and decrypt | The key provider's row applies: it is the same client build (*code*) | None, as the key provider's row | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits. Its `https://` proxy leg is guarded too, since 2026-10-26 (vault BACKLOG #3561) |
 | Vault secret provider: `config/secretprovider_vault.py`, its own `_build_client`. `secrets_vault_client`, which `check-privileges` uses, is the same build | the Vault token out, connector credentials back | The same shape as the key provider, proxy leg included, with `MEFOR_SECRETS_VAULT_CA_FILE` as its anchor (*code*) | None, as the key provider's row | **Guarded by attestation, by owner ruling 2026-10-13; no CRL lever is built.** §12 holds the ruling and its limits. Its `https://` proxy leg is guarded too, since 2026-10-26 (vault BACKLOG #3561) |
 
-**The ODBC hops are a named gap by owner ruling, and the driver test has two recorded results.**
-*(Until 2026-11-11 this lead-in ended "and the driver test is still owed.")* BACKLOG #2194
+**The ODBC hops are a named gap by owner ruling, and the driver test has two recorded results;
+the run on the SQL Server test box is still owed.** *(Until 2026-11-11 this lead-in ended "and the
+driver test is still owed.")* BACKLOG #2194
 names three outcomes for a hop: a guard, a documented driver control, or an accepted gap. The owner
 ruled on 2026-10-05, in an AskUserQuestion answer to the batch 191 Manager. The record is R6 of the
 vault's `docs/security/ASVS-OWNER-RULINGS-2026-10-05.md`. The answer, verbatim, is
@@ -1246,7 +1247,7 @@ ruling:
   tested.** The ruling's "then test it" half has two recorded results. The test needs a SQL
   Server whose certificate can be revoked. A control connection to a certificate that is not
   revoked shows that a refusal comes from the revocation. The amendment of 2026-11-11 below
-  states what the runs measured, and that the run on the SQL Server test box is still owed.
+  states what the runs measured and which run is still owed.
   *(Until 2026-11-11 this bullet read: "**The drivers' own revocation behaviour is still
   unmeasured.** The ruling's "then test it" half is owed. It needs a SQL Server whose certificate
   can be revoked. A control connection to a certificate that is not revoked shows that a refusal
@@ -1258,8 +1259,9 @@ ruling:
   the ledger row's wording, not the owner's, so it is the owner's to decide when a result exists.
   *(Note 2026-11-11: two recorded results exist, in the amendment of that date below. That
   amendment does not change the grade. A Manager decided under the owner's delegation of
-  2026-11-11 that the five rows keep the grade R6 gives them, decision
-  d20261112T022118464-c27c39, which counts as the owner's ruling under CLAUDE.md section 5.)*
+  2026-11-11 that the five rows keep the grade R6 gives them, that R6's named gap stands as
+  named, and that #2194's guard and driver-control options are not reopened now: decision
+  d20261112T022118464-c27c39, logged 2026-11-12 UTC.)*
 
 *(Until 2026-10-11 this paragraph read: "**What is open on the five ODBC hops.** BACKLOG #2194 names
 three outcomes for a hop: a guard, a documented driver control, or an accepted gap. This note
@@ -1295,8 +1297,8 @@ chosen option gives for building no guard:
 **Amendment 2026-11-11 -- what the ODBC Driver 18 test measured (vault BACKLOG #3009).** This is a
 public summary of two private test records in the vault, each recording one run of the vault's
 ODBC revocation runbook that reached a result. Their contents beyond this summary are not repeated
-here. It changes no code. For the grade, the limit *What a result would mean for the grade is not
-ruled*, under the ruling above, holds.
+here. It changes no code. For the grade, see the limit *What a result would mean for the grade is
+not ruled*, under the ruling above, and its note of 2026-11-11.
 
 - **Where it ran.** Two runs with results, dated 2026-10-16 and 2026-10-17 in Central time. In
   UTC, the first run's legs ran from 02:22 to 02:25 and the second's from 05:18 to 05:19, both on
@@ -1308,12 +1310,12 @@ ruled*, under the ruling above, holds.
   stopped at Step 2, as designed, and changed nothing. Neither record says a run took place on the
   SQL Server test box. The run there is still owed, and BACKLOG #3009's step 2 stays open for it:
   a Manager decided so under the owner's delegation of 2026-11-11, decision
-  d20261112T022119877-2ccc8b.
+  d20261112T022119877-2ccc8b, logged 2026-11-12 UTC.
 - **Versions.** ODBC Driver 18 for SQL Server, 64-bit: `msodbcsql18.dll` ProductVersion 18.7,
   build 1, revision 1, reporting driver version `18.07.0001`. Windows Server 2022 Datacenter,
   build 20348, update revision 5256. SQL Server 2022 RTM, 16.0.1000.6. Both records list
-  messagefoundry 0.3.2 and pyodbc 5.3.0, and each says beside them that the engine's Python
-  supplied only pyodbc to the legs. The limit on strings below says what that leaves out.
+  messagefoundry 0.3.2 and pyodbc 5.3.0, and each says beside them "The engine's Python supplies
+  only pyodbc." The limit on strings below says what that leaves out.
 - **How the revocation was published.** In each run, a throwaway test root issued two server
   certificates and revoked one. An HTTP listener on the same machine served a signed CRL listing
   it. The other certificate was the control. SQL Server ran on each in turn. Before the legs,
@@ -1394,10 +1396,11 @@ does apply the pin, the exact match replaces the standard checks, the trust chai
 **Amendment 2026-10-17 -- decision: the store pins the SQL Server certificate under
 `Encrypt=strict` (vault BACKLOG #2223).** With `[store].ssl_root_cert` set on the secure posture,
 `connection_string` now sends `ServerCertificate=` together with `Encrypt=strict`, in place of
-`Encrypt=yes`, and both sit in the TLS tail, after every other part (*code*). *(**CORRECTED
-2026-11-11:** this sentence ended "and both stay inside the last-wins tail", tagged *code*. The
-code puts the tail last and does not make it win. Which occurrence of a repeated keyword a driver
-uses, and what guards against a second TLS keyword, is stated in the module docstring of
+`Encrypt=yes`, and both sit in the TLS tail, which follows every other part (*code*).
+*(**CORRECTED 2026-11-11:** this sentence ended "and both stay inside the last-wins tail", tagged
+*code*. The code places the tail last, and that is all it does with the position (*code*). Which
+occurrence of a repeated keyword a driver uses, how far that was measured, and what guards
+against a second TLS keyword are stated in the module docstring of
 `messagefoundry/odbc_dsn.py`.)* The reason: on the Driver 18.7 build tested on Windows, the
 `ServerCertificate` pin was enforced with `Encrypt=strict` and was not enforced with
 `Encrypt=yes`; no other `Encrypt` value was tested. Microsoft's page, quoted above, documents the
