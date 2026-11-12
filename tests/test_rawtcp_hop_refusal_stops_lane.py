@@ -394,6 +394,7 @@ async def test_a_small_partner_fault_the_close_drains_keeps_its_own_error() -> N
         with pytest.raises(DeliveryError) as raised:
             await asyncio.wait_for(dest._send_once(X12), 5)
         assert eof_at_failure == [True], "the read did not end at the close's end of stream"
+        assert type(raised.value) is DeliveryError
         assert "exceeded max interchange size" in str(raised.value)
         assert "is closed (stop/reload)" not in str(raised.value)
     finally:
