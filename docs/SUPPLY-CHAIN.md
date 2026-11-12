@@ -148,7 +148,7 @@ Facts the labels leave out:
   ([ADR 0201](adr/0201-a-messagefoundry-toolkit-distribution-carries-the-authoring-and-development-tooling-out-of-the-engine-wheel.md)).
 - **One approval per engine tag.** The toolkit, engine and harness uploads are steps of one
   `publish-pypi` job, so one approval of the `pypi` environment covers all three. The harness
-  upload runs only when the `PUBLISH_HARNESS` repository variable is set.
+  upload runs only when the `PUBLISH_HARNESS` variable is set.
 - **The draft.** The engine's GitHub release stays a draft until the harness wheel is on it
   too, and until every upload `publish-pypi` runs has succeeded. With `PUBLISH_HARNESS` unset,
   that is the toolkit and the engine only. A separate job publishes it last, so no
@@ -172,18 +172,20 @@ Facts the labels leave out:
   the build job (`release-harness` on an engine tag, `release-webconsole` on a console tag), which
   re-runs the jobs after it, so the upload asks for the `pypi` approval again, and reads the
   variable afresh in each, so it clears both. While the variable still reads `true`, a "Re-run
-  failed jobs" reuses the upload's outcome and is refused again. To finish it without the upload, remove any copy from the `pypi` environment, set the
-  repository variable to a value other than `true`, such as `false`, and re-run the publisher,
-  then set it back to `true` before the next release, or that release skips its upload too and
-  still goes public. A repository variable takes precedence over an organization variable of the
-  same name, so this changes the value for this repository only. Do not edit or delete an
+  failed jobs" reuses the upload's outcome and is refused again. To finish it without the upload, while no other release run that reads the variable is in
+  flight, remove any copy from the `pypi` environment, give the repository variable a value that
+  is not `true` in any letter case, such as `false`, and re-run the publisher. Once that re-run
+  has succeeded, and before the next release, restore the repository variable to its earlier
+  value, deleting it if the repository had none, or that release skips its upload too and still
+  goes public. A repository variable takes precedence over an organization variable of the same
+  name, so this changes the value for this repository only. Do not edit or delete an
   organization copy, which other repositories may read.
 
   GitHub allows a re-run only within 30 days of a run's first attempt, so past that no re-run
   finishes the release. When this refusal is what holds the draft, at least two routes are left:
   the publisher's own command run by hand, `gh release edit <tag> --draft=false --repo
-  MEFORORG/MessageFoundry`, which publishes the draft without that upload, as the remedy without
-  the upload would; and a new version under a new tag. Run by hand on a draft held for any other
+  MEFORORG/MessageFoundry`, which publishes the draft without that upload; and a new version
+  under a new tag. Run by hand on a draft held for any other
   reason, such as a failed build job or a refused approval, the same command publishes a release
   with an asset missing or a package not on PyPI.
 - **The provenance gate.** The tagged commit must be on `main`, and each required check's latest
