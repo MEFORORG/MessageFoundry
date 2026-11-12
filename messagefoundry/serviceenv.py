@@ -317,7 +317,8 @@ def read_service_env_posture(
 def _started_by_something_else(
     image: str, rest: Iterator[tuple[int, str]], keys: tuple[str, ...]
 ) -> ServiceEnvPosture:
-    """The engine was started by ``image``, which is neither NSSM nor a Python interpreter.
+    """The engine was started by ``image``, which is neither NSSM, a Python interpreter, nor
+    ``messagefoundry.exe``.
 
     A shell is the usual case, and then the engine is not a service. But an operator may also
     register NSSM to start a wrapper, such as ``cmd.exe``, that starts the engine. So the walk goes
@@ -334,8 +335,8 @@ def _started_by_something_else(
         ServiceEnvStatus.UNOBSERVABLE,
         keys_in_environment=keys,
         detail=(
-            f"nssm.exe (process {nssm}) is above {image}, which is not a Python interpreter, so "
-            "the engine cannot tell whether it runs as that service or was started from a shell "
+            f"nssm.exe (process {nssm}) is above {image}, which is neither a Python interpreter "
+            "nor messagefoundry.exe, so the engine cannot tell whether it runs as that service or was started from a shell "
             "inside it"
         ),
     )

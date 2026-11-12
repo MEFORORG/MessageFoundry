@@ -314,6 +314,25 @@ def test_the_messagefoundry_launcher_may_sit_between_nssm_and_the_engine() -> No
     assert service_env_refusal(read_service_env_posture(probe=probe, environ={})) is not None
 
 
+def test_a_console_script_launcher_under_nssm_names_only_the_unobservable_entry() -> None:
+    """docs/SECURITY-LOOSENING.md says a console-script launcher such as ``uvicorn.exe`` between
+    NSSM and the interpreter is neither a Python interpreter nor ``messagefoundry.exe``, so the
+    engine does not find its service and ``secret_in_service_environment`` is not named."""
+    probe = _Probe(
+        ancestors=[(300, "python.exe"), (250, "uvicorn.exe"), (100, "nssm.exe")],
+        services={100: "MessageFoundry"},
+        entries=[f"MEFOR_STORE_ENCRYPTION_KEY={_KEY_VALUE}"],
+    )
+    posture = read_service_env_posture(
+        probe=probe, environ={"MEFOR_STORE_ENCRYPTION_KEY": _KEY_VALUE}
+    )
+    assert posture.status is ServiceEnvStatus.UNOBSERVABLE
+    assert "is above uvicorn.exe" in posture.detail
+    assert probe.asked == []
+    assert service_env_refusal(posture) is None
+    assert _names(posture) == ["service_environment_unobservable"]
+
+
 def test_an_oidc_signing_key_path_is_not_a_secret_but_the_inline_key_is() -> None:
     path = _service(["MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=C:/keys/oidc.pem"])
     assert path.listed == ()
