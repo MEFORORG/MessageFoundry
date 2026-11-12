@@ -198,9 +198,7 @@ class _Pool:
 
 async def test_send_captures_out_params_pre_commit() -> None:
     cur = _SendCursor([([(0, 555)], [("return_value",), ("new_id",)])])
-    conn = _Conn(cur)
-    d = _dest()
-    d._pool = _Pool(conn)
+    d, conn = _send_dest(cur)
     resp = await d.send('{"mrn": "42"}')
     assert conn.committed and not conn.rolledback
     assert resp is not None and resp.outcome == "accepted"

@@ -1117,6 +1117,22 @@ async def test_probe_login_refusal_at_connect_is_a_credential_fault() -> None:
     assert ei.value.credential_fault
 
 
+async def test_probe_missing_sqlserver_extra_is_a_config_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The connection test reads the missing extra as ``send`` does, not as a retryable failure."""
+
+    def _no_extra() -> NoReturn:
+        raise database_module._DriverMissingError(
+            "DATABASE connector requires the 'sqlserver' extra"
+        )
+
+    monkeypatch.setattr(database_module, "_import_aioodbc", _no_extra)
+    with pytest.raises(NegativeAckError) as ei:
+        await _dest().test_connection()
+    assert ei.value.permanent and ei.value.config_fault
+
+
 async def test_lookup_pool_acquire_timeout_is_db_lookup_error() -> None:
     # The handler-callable lookup maps the same timeout onto its PHI-free DbLookupError type.
     from messagefoundry.config.db_lookup import DbLookupError
@@ -1957,14 +1973,9 @@ async def test_probe_failure_text_carries_no_value_from_a_driver_error_with_no_s
     Red mutation: restore ``safe_exc`` in either arm of ``_probe_db``. That stage reds.
     """
     failure = kind(_QUOTED_ARGUMENT)
-
-    class _RefusingPool(_FakePool):
-        async def acquire(self) -> _FakeConn:
-            raise failure
-
     dest = _dest()
     if stage == "connect":
-        dest._pool = _RefusingPool(_FakeConn(_FakeCursor()))
+        dest._pool = _RefusingPool(failure)
     else:
         dest._pool = _FakePool(_FakeConn(_FakeCursor(failure)))
     with pytest.raises(DeliveryError) as failed:

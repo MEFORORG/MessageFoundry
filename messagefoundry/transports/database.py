@@ -2563,9 +2563,7 @@ def _classify_db_error(sqlstate: str, message: str, *, connecting: bool = False)
     ``credential_fault``, and class ``IM`` (the ODBC driver manager: no such driver or DSN, or a
     driver it could not load) is a ``config_fault``. ``connecting`` says the error came from opening
     the connection, before the statement ran, so no message can be at fault: any other permanent
-    state there is a ``config_fault`` too. Two expected examples, neither measured here: unixODBC's
-    ``01000`` *Can't open lib* for a registered driver whose library is missing, and SQL Server's
-    *Cannot open database* (native error 4060) for a database the login cannot reach.
+    state there is a ``config_fault`` too.
 
     ``message`` is read for its SQLSTATE and native error number and is **never interpolated**
     (BACKLOG #1661). Driver text embeds the offending value on exactly the failures this connector
@@ -3619,24 +3617,40 @@ def _log_late_pool_close(what: str, closing: asyncio.Future[None]) -> None:
         )
 
 
+async def _connect(get_pool: Callable[[], Any], timeout: float) -> tuple[Any, Any]:
+    """The pool and a connection borrowed from it, with a failure to connect classified.
+
+    Opening the pool or a pooled connection logs in, so a refused login, a missing ODBC driver or
+    the missing ``sqlserver`` extra surfaces here (BACKLOG #5713). A driver error is classified as
+    a connect failure (:func:`_classify_db_error`), and the missing extra is a ``config_fault``.
+    Anything else propagates unchanged, the acquire timeout's :class:`DeliveryError` included."""
+    try:
+        pool = await get_pool()
+        return pool, await _acquire(pool, timeout)
+    except _DriverMissingError as exc:
+        raise NegativeAckError(str(exc), code="db", permanent=True, config_fault=True) from exc
+    except Exception as exc:
+        state = _sqlstate(exc)
+        if state is None:
+            raise
+        raise _classify_db_error(state, str(exc), connecting=True) from exc
+
+
 async def _probe_db(
     get_pool: Callable[[], Any], *, timeout: float = _DEFAULT_DB_ACQUIRE_TIMEOUT
 ) -> None:
     """Open the pool and run ``SELECT 1`` — a no-data, no-write reachability probe shared by the
     DATABASE source and destination's ``test_connection``. A driver error is mapped via
-    :func:`_classify_db_error` (transient vs permanent); a non-driver failure (e.g. an unreachable host
-    before any SQLSTATE) becomes a transient :class:`DeliveryError`. Triggers the connector's lazy pool;
+    :func:`_classify_db_error` (transient vs permanent, through :func:`_connect` at connect); any
+    other non-driver failure (e.g. an unreachable host before any SQLSTATE) becomes a transient
+    :class:`DeliveryError`. Triggers the connector's lazy pool;
     the caller closes it with ``aclose()``."""
     try:
-        pool = await get_pool()
-        conn = await _acquire(pool, timeout)
+        pool, conn = await _connect(get_pool, timeout)
+    except DeliveryError:
+        raise
     except Exception as exc:
-        state = _sqlstate(exc)
-        raise (
-            _classify_db_error(state, str(exc), connecting=True)
-            if state
-            else DeliveryError(f"DATABASE connect failed: {_safe_db_error(exc)}")
-        ) from exc
+        raise DeliveryError(f"DATABASE connect failed: {_safe_db_error(exc)}") from exc
     cur: Any = None
     try:
         cur = await conn.cursor()
@@ -3671,13 +3685,10 @@ def _json_default(value: Any) -> Any:
 async def _fetch_result_set(cur: Any) -> list[Any] | None:
     """The rows of ``cur``'s current result set, or ``None`` when the statement produced none.
 
-    "None" is read from ``cur.description``, which DB-API 2.0 sets to ``None`` for an operation
-    that returned no rows, and never from a failed fetch (BACKLOG #5714). pyodbc raises its
-    ``No results.  Previous SQL was not a query.`` from a fetch in exactly that state, so skipping
-    the fetch there keeps an ``INSERT`` or an ``EXEC`` reading as no result set. Any error from
-    the fetch itself is a driver error from the statement, a procedure's error, a deadlock or a
-    dropped link that surfaced when its result was read, and propagates so the caller's write is
-    rolled back rather than committed and recorded as delivered."""
+    "None" is read from ``cur.description`` (DB-API 2.0), never from a failed fetch (BACKLOG
+    #5714): pyodbc raises *No results* from a fetch in exactly that state. Any error from the
+    fetch is the statement's own, such as a deadlock or a procedure's error, and propagates so
+    the caller's write is rolled back rather than committed and recorded as delivered."""
     if cur.description is None:
         return None
     rows: list[Any] = await cur.fetchall()
@@ -3775,27 +3786,6 @@ class DatabaseDestination(DestinationConnector):
                 )
         return self._pool
 
-    async def _connect(self) -> tuple[Any, Any]:
-        """The pool and a connection borrowed from it, with a failure to connect classified.
-
-        Opening the pool or a pooled connection logs in, so a refused login, a missing ODBC driver
-        or the missing ``sqlserver`` extra surfaces here. Unclassified, that error reached the
-        delivery worker as an internal error, which dead-letters the row by default and logs in
-        again on the next (BACKLOG #5713). A driver error is classified as a connect failure
-        (:func:`_classify_db_error`), so a transient one retries and a permanent one stops the lane
-        and keeps the queue. Anything else propagates unchanged, the acquire timeout's
-        :class:`DeliveryError` included."""
-        try:
-            pool = await self._get_pool()
-            return pool, await _acquire(pool, self._acquire_timeout)
-        except _DriverMissingError as exc:
-            raise NegativeAckError(str(exc), code="db", permanent=True, config_fault=True) from exc
-        except Exception as exc:
-            state = _sqlstate(exc)
-            if state is None:
-                raise
-            raise _classify_db_error(state, str(exc), connecting=True) from exc
-
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None
     ) -> DeliveryResponse | None:  # metadata (#68): unused — no per-message header knob here
@@ -3816,7 +3806,7 @@ class DatabaseDestination(DestinationConnector):
         if self._cleartext_guard is not None:
             self._cleartext_guard.assert_send()
         params = _bind_params(payload, self._param_names)  # NegativeAckError(permanent) on bad data
-        pool, conn = await self._connect()
+        pool, conn = await _connect(self._get_pool, self._acquire_timeout)
         cur: Any = None
         discard = False
         try:
@@ -3862,9 +3852,8 @@ class DatabaseDestination(DestinationConnector):
         """Serialize the statement's RETURNING/OUTPUT result-set to a bounded JSON body (ADR 0013).
 
         A capture problem never un-succeeds the write: a missing result set / over-cap / an
-        unserializable value becomes ``no_reply`` / ``unparseable`` with an empty body. A driver error
-        from the fetch is not a capture problem and propagates (:func:`_fetch_result_set`), so
-        :meth:`send` rolls the write back and classifies it (BACKLOG #5714). Generated ids in a RETURNING are
+        unserializable value becomes ``no_reply`` / ``unparseable`` with an empty body. A driver
+        error from the fetch propagates (:func:`_fetch_result_set`). Generated ids in a RETURNING are
         only as stable as the write's idempotency — a non-idempotent INSERT re-derives a new id on a
         crash-re-send (the standing 'outbounds must be idempotent' requirement; see the connector docs).
 
@@ -3884,7 +3873,7 @@ class DatabaseDestination(DestinationConnector):
                 detail=f"result-set exceeded capture_max_rows={self._capture_max_rows}",
             )
         try:
-            cols = [d[0] for d in cur.description] if cur.description else []
+            cols = [d[0] for d in cur.description]
             data = [dict(zip(cols, tuple(row))) for row in rows]  # noqa: B905
             body = json.dumps(data, default=_json_default)
         except Exception as exc:  # noqa: BLE001 - an unserializable column type must NOT fail the write
@@ -3916,9 +3905,8 @@ class DatabaseDestination(DestinationConnector):
         ``capture_max_rows``/``capture_max_bytes`` like the single-set path.
 
         A capture problem never un-succeeds the write: it degrades to ``no_reply``/``unparseable``
-        with an empty body. A driver error from a fetch or from ``nextset()`` is not one: a proc's
-        error, a deadlock or a dropped link raised by a later statement in the batch surfaces there,
-        so it propagates and :meth:`send` rolls the write back (BACKLOG #5714)."""
+        with an empty body. A driver error from a fetch (:func:`_fetch_result_set`) or from
+        ``nextset()``, where a later statement's error surfaces, propagates (BACKLOG #5714)."""
         merged: list[dict[str, Any]] = []
         over_cap = False
         advance = getattr(cur, "nextset", None)
@@ -3926,7 +3914,7 @@ class DatabaseDestination(DestinationConnector):
             rows = await _fetch_result_set(cur)
             if rows and not over_cap:
                 try:
-                    cols = [d[0] for d in cur.description] if cur.description else []
+                    cols = [d[0] for d in cur.description]
                     merged.extend(dict(zip(cols, tuple(row))) for row in rows)  # noqa: B905
                 except Exception:  # noqa: BLE001 - malformed description → skip this set, keep the write
                     pass
