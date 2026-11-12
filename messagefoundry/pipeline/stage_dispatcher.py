@@ -1188,13 +1188,21 @@ class StageDispatcher:
             )
         except Exception as exc:  # noqa: BLE001 — a store error must not kill the claimer loop
             # Return the whole chunk to READY, release the reserved slots, back off this partition.
-            err_ns = time.perf_counter_ns() if self._claim_phase_timing else 0
+            # The end stamp rides the LANE EPISODE lever, the one that opened the episode in
+            # _assemble_chunk. Reading it on the claim lever instead left it zero when only the episode
+            # lever was on, so every drop booked a negative duration (BACKLOG #5699).
+            err_ns = time.perf_counter_ns() if self._lane_episode_timing else 0
             for lane in lanes:
                 st = self._states[lane]
                 # S_lane DROP (error path): the claim rendered no service — the same exclusion the claim
                 # timer already makes for a raised claim — but the lane WAS occupied for that interval,
                 # so it is booked as `dropped` (occupancy), never as `episode` (service).
-                self._end_claim(lane, st, err_ns, _LanePhase.READY)
+                # BACKLOG #5699: an operator pause that landed while the claim was in flight is honoured
+                # here exactly as on the empty-claim branch below. Readying the lane instead left
+                # pause_pending set on a claimable lane, so its next claim could deliver a head past
+                # the pause, and nothing re-fired on_lane_paused.
+                to = _LanePhase.PAUSED if st.pause_pending else _LanePhase.READY
+                self._end_claim(lane, st, err_ns, to)
             # BACKLOG #1844: on a backoff, with the running count (messagefoundry.log_backoff).
             claimer.faults = claimer.faults.record(
                 log,
@@ -1246,8 +1254,9 @@ class StageDispatcher:
                     stage=self._stage.value, claimers=len(self._claimers)
                 )
             # ONE clock read for every non-service release this dispatch pass books (they all end at the same
-            # instant — the claim has returned and this loop is await-free). Zero when the lever is off.
-            rel_ns = time.perf_counter_ns() if self._claim_phase_timing else 0
+            # instant — the claim has returned and this loop is await-free). Zero when the lever is off;
+            # the LANE EPISODE lever, which stamped the start these releases are measured from (#5699).
+            rel_ns = time.perf_counter_ns() if self._lane_episode_timing else 0
             # BACKLOG #1270: did THIS round-trip abort on a store lock timeout? An ATTEMPT-level fact, so
             # it is read once here and booked once below — never per lane. Booking it per lane is the
             # arithmetic half of #1270's first defect: at the default chunk one abort moved the operator

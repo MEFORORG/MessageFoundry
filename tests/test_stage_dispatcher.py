@@ -46,6 +46,7 @@ from typing import Any, cast
 import pytest
 
 from messagefoundry.config.models import RetryPolicy
+from messagefoundry.pipeline import stage_dispatcher
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.phase_timing import _DELIVERY_PHASE_EMIT_INTERVAL
 from messagefoundry.pipeline.stage_dispatcher import (
@@ -329,7 +330,14 @@ class RecordingStub:
 _EVERY_CLAIM = 10**9
 
 _CLAIM_SHIM_MODES = frozenset(
-    {"rearm_once", "empty_block_once", "lock_timeout_once", "head_skip_once", "empty"}
+    {
+        "rearm_once",
+        "empty_block_once",
+        "raise_block_once",
+        "lock_timeout_once",
+        "head_skip_once",
+        "empty",
+    }
 )
 
 
@@ -415,6 +423,9 @@ class _ClaimShim:
                 await (
                     self._block.wait()
                 )  # hold the lane in CLAIMING (T11 wake-during-CLAIMING window)
+            if self._mode == "raise_block_once":
+                # BACKLOG #5699: the claim RAISES after the hold, as a store error would, and moves no row.
+                raise RuntimeError("claim_fifo_heads: injected store fault")
             return ClaimedHeads(by_lane={}, rearm=frozenset())  # EMPTY
         self.real_claims += 1
         result = await self._real.claim_fifo_heads(stage, lanes, now, per_lane_limit=per_lane_limit)
@@ -2704,6 +2715,47 @@ async def test_pause_while_claiming_empty_routes_to_paused(store: Any) -> None:
         await _settle()
         assert d.phase(lane) == _LanePhase.PAUSED  # never dropped to a claimable IDLE
         assert stub.records == []  # nothing was dispatched (the claim was empty)
+        assert d.slots_free == 256  # the reserved slot was released on the way to PAUSED
+        assert d.busy_violations == 0
+    finally:
+        await d.stop()
+
+
+async def test_pause_while_claiming_then_claim_raises_routes_to_paused(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5699: the claim-ERROR edge honours a pause that landed while the claim was in flight,
+    exactly as the empty-claim edge above does. A _ClaimShim pins the lane in CLAIMING; pause_lane sets
+    pause_pending; the blocked claim then RAISES. The lane must reach PAUSED with its slot released and
+    on_lane_paused fired. Before the fix the error branch readied every lane, so the lane sat claimable
+    with pause_pending set and its next claim delivered the head past the pause."""
+    # No backoff after the raised claim, so a lane the error branch readied is claimed at once.
+    monkeypatch.setattr(stage_dispatcher, "_CLAIM_ERROR_BACKOFF_SECONDS", 0.0)
+    mc = ManualClock(1000.0)
+    stub = RecordingStub(store, mc.time)
+    lane = "IB_CLAIM_RAISE_PAUSE"
+    await _seed(store, lane, [100.0])
+    blocker = asyncio.Event()
+    shim = _ClaimShim(store, lane, mode="raise_block_once", block=blocker)
+    hits: list[str] = []
+    d = _make(shim, stub, set(), clock=mc, on_lane_paused=hits.append)
+    await d.start()
+    try:
+        d.mark_ready(lane)
+        assert await _wait_until(lambda: d.phase(lane) == _LanePhase.CLAIMING)
+        d.pause_lane(
+            lane
+        )  # lands during the (blocked) claim -> pause_pending, phase STILL CLAIMING
+        assert d.phase(lane) == _LanePhase.CLAIMING
+        assert hits == []
+        blocker.set()  # the claim RAISES -> the error branch must route the lane to PAUSED
+        assert await _wait_until(lambda: d.phase(lane) == _LanePhase.PAUSED)
+        assert hits == [lane]
+        assert d._states[lane].pause_pending is False
+        # The backoff is zero, so a readied lane would have been claimed and delivered by now.
+        await _settle()
+        assert d.phase(lane) == _LanePhase.PAUSED
+        assert stub.records == []  # nothing was delivered past the pause
         assert d.slots_free == 256  # the reserved slot was released on the way to PAUSED
         assert d.busy_violations == 0
     finally:

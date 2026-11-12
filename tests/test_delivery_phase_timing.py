@@ -800,6 +800,54 @@ async def test_empty_and_rearm_claims_are_never_booked(
         await disp.stop()
 
 
+class _RaisingThenRearmStore(_EpisodeStore):
+    """The first claim RAISES (a store error), the second rearms the lane, every later one is EMPTY."""
+
+    def __init__(self) -> None:
+        super().__init__(lanes=set(), rearm_lanes={_LANE})
+        self._raised = False
+
+    async def claim_fifo_heads(
+        self, stage: str, lanes: list[str], *, now: float | None = None, per_lane_limit: int = 1
+    ) -> ClaimedHeads:
+        if not self._raised:
+            self._raised = True
+            self.claim_calls += 1
+            raise RuntimeError("claim_fifo_heads: injected store fault")
+        return await super().claim_fifo_heads(stage, lanes, now=now, per_lane_limit=per_lane_limit)
+
+
+async def test_drops_are_non_negative_with_only_the_episode_lever_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5699: the claim-error and empty/rearm drops read their END stamp on the lane episode
+    lever, the lever that stamped the START in ``_assemble_chunk``. Before the fix they read it on the
+    claim-phase lever, so with only the episode lever on the end stamp was zero and every drop booked
+    a large negative duration into ``dropped``."""
+    from messagefoundry.pipeline import stage_dispatcher
+
+    monkeypatch.delenv(DELIVERY_PHASE_TIMING_ENV, raising=False)
+    monkeypatch.setenv(LANE_EPISODE_TIMING_ENV, "1")
+    monkeypatch.setattr(stage_dispatcher, "_CLAIM_ERROR_BACKOFF_SECONDS", 0.0)
+    store = _RaisingThenRearmStore()
+    disp = _episode_dispatcher(store, {_LANE})
+    assert disp._claim_phase_timing is False  # the condition the defect needs
+    assert disp._lane_episode_timing is True
+    drops: list[int] = []
+    monkeypatch.setattr(disp._lane_episode_stats, "record_dropped", drops.append)
+    await disp.start()
+    try:
+
+        async def _raised_rearmed_then_empty() -> bool:
+            return store.claim_calls >= 3
+
+        await _until(_raised_rearmed_then_empty)
+        assert len(drops) >= 3  # the raised claim, the rearm, and the empty claim each booked one
+        assert all(ns >= 0 for ns in drops), drops
+    finally:
+        await disp.stop()
+
+
 # --- (e) the stamp cannot be double-booked -----------------------------------------------------------
 
 
