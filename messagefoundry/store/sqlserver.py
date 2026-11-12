@@ -15894,11 +15894,11 @@ class SqlServerStore:
             try:
                 await cur.execute("SELECT builtin, id FROM roles WHERE id=?", (role_id,))
                 row = await cur.fetchone()
-                # BACKLOG #5725: the lookup compares in the database collation, so it also finds a
-                # case or trailing-space variant of the caller's id. That is not this role. The
-                # service's holder reads fold case, so they would find a case variant's holders,
-                # but not a trailing-space variant's, whose revocations a delete here would skip.
-                # The service refuses either variant before this; refused here too, as no such role.
+                # BACKLOG #5725: the lookup compares in the database collation, so it also finds at
+                # least a case or trailing-space variant of the caller's id. That is not this role.
+                # The service's holder reads fold case, so they would find a case variant's holders
+                # but miss at least a trailing-space variant's, whose revocations a delete here
+                # would skip. The service refuses any inexact id before this; refused here too.
                 if row is None or int(row[0]) != 0 or str(row[1]) != role_id:
                     await conn.rollback()
                     return False

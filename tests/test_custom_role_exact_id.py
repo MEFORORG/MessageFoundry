@@ -9,8 +9,11 @@ as the role would revoke sessions, write a ``role.deleted`` row and answer succe
 that removed nothing, and an edit would seal the stored row under another id.
 
 The instrument is the SQLite store with ``get_role`` and ``delete_custom_role`` replaced by
-versions that compare as SQL Server's do; the first test is the positive control that they really
-find the variants. The last test pins the service on a store that refuses the exact id.
+versions that fold case and trailing spaces, as SQL Server's default collation does at least; the
+first test is the positive control that they really find the variants. Its ``upsert_role`` stays
+SQLite's, so an edit the service let through would add a second row here rather than re-seal the
+stored one; the service's refusal is what both tests pin. The SQL Server live leg is not run by
+this file. The last test pins the service on a store that refuses the exact id.
 """
 
 from __future__ import annotations
@@ -60,24 +63,28 @@ async def _setup(
 ) -> tuple[MessageStore, AuthService, str, str, str]:
     """A store comparing as SQL Server's, a custom role, its holder, and the holder's token."""
     store = await MessageStore.open(":memory:")
-    _collated(store, monkeypatch)
-    service = AuthService(store, AuthSettings())
-    await service.initialize()
-    role = await service.create_custom_role(
-        display_name="Exact", description=None, permissions=["monitoring:read"], actor="admin"
-    )
-    user_id = await create_local_user_chosen(
-        service,
-        username="u",
-        password=PW,
-        display_name=None,
-        email=None,
-        roles=[role.id],
-        actor="test",
-    )
-    await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
-    out = await service.login("u", PW)
-    assert out.token is not None
+    try:
+        _collated(store, monkeypatch)
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        role = await service.create_custom_role(
+            display_name="Exact", description=None, permissions=["monitoring:read"], actor="admin"
+        )
+        user_id = await create_local_user_chosen(
+            service,
+            username="u",
+            password=PW,
+            display_name=None,
+            email=None,
+            roles=[role.id],
+            actor="test",
+        )
+        await service.set_channel_scope(user_id, [ALL_CHANNELS], actor="test")
+        out = await service.login("u", PW)
+        assert out.token is not None
+    except BaseException:
+        await store.close()  # the callers' finally starts only once this returns
+        raise
     return store, service, role.id, user_id, out.token
 
 
