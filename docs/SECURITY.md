@@ -2914,11 +2914,21 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   at release unless the edit is reverted, and then it can be released;
 - in a cluster, the release compares the digest with the disk of the node that handles the approve,
   which may not be the node that took it;
-- a start's `config_loaded` digest may name value-file bytes the start did not apply, where the
-  value file is in the `environments/` folder. A start resolves its environment values when the
-  engine is built, and its digest reads that folder later, in the load's snapshot. So an edit in
-  between is in the digest and not in the running values. A value file outside the config
-  directory is in no start digest, so a start records nothing about it;
+- a value file anywhere but the config directory's `environments/` folder is parsed as values from
+  no start snapshot, one inside the config directory under another `[environments].dir` included, so
+  no start digest names it as the values the start applied; at least one in `codesets/` can still be
+  loaded and folded, as a code-set table. With `serve`'s value provider, a value file in the
+  `environments/` folder is
+  parsed from the load's snapshot, the one the start's `config_loaded` digest folds, so that digest
+  names the value-file bytes the start applied (vault BACKLOG #2596). The digest folds every `.toml`
+  file the load could list and read in that folder, so it also names bytes the start never parsed:
+  another environment's value file, and in the default layout, where the start's value file is
+  outside the config directory, a same-named file left in that folder. Where the load could not read
+  the start's own value file in that folder, the start applies the values read when the engine was
+  built, which no digest names, and the digest names the file, or a folder holding it, as left out.
+  An embedded engine whose provider cannot read a snapshot, or whose start does not call
+  `Engine.apply_start_env_values`, resolves its values when the engine is built, so its digest may
+  name `environments/` bytes it did not apply;
 - a restart, a cluster convergence reload, a DR activation and a sandbox worker respawn check no
   approved digest. Whether a restart under dual control refuses an unapproved digest is an open
   owner question.

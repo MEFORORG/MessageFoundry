@@ -57,23 +57,25 @@ _log = logging.getLogger(__name__)
 
 
 class SnapshotEnvValuesProvider(ABC):
-    """An engine ``env_values_provider`` that can also read a reload's values from that reload's
-    config snapshot (vault BACKLOG #2596). A provider opts in by subclassing, never by having a
-    method of the right name. ``serve``'s provider is one."""
+    """An engine ``env_values_provider`` that can also read a load's values from that load's
+    config snapshot, a reload's and the managed app's start's alike (vault BACKLOG #2596). A
+    provider opts in by subclassing, never by having a method of the right name. ``serve``'s
+    provider is one."""
 
     __slots__ = ()
 
     @abstractmethod
     def __call__(self) -> Mapping[str, Any]:
-        """The values, read from disk: at start, and on a reload that read no snapshot."""
+        """The values, read from disk: when the engine is built, and on a reload that read no
+        snapshot."""
 
     @abstractmethod
     def from_snapshot(self, snapshot: ConfigSnapshot) -> Mapping[str, Any] | None:
         """The values, with a value file ``snapshot`` covers parsed from its bytes, or ``None``
         when the value file this provider reads is outside the snapshot
         (:meth:`~messagefoundry.config.snapshot.ConfigSnapshot.covers_environment_file`). On
-        ``None`` the engine calls the provider plainly and, on a released reload, checks the digest
-        again."""
+        ``None`` a reload calls the provider plainly and, when released, checks the digest again;
+        a start keeps the values it read when the engine was built."""
 
     @property
     def value_file(self) -> Path | None:
@@ -135,14 +137,8 @@ class EnvironmentValuesReader(SnapshotEnvValuesProvider):
                 snapshot=snapshot,
             )
         except NotInSnapshot:
-            # A path only, never a value. The engine reads this provider's value file into the
-            # snapshot, so this fires only where it could not, as when the snapshot was read
-            # without it. A WARNING: the release then rests on a second digest, which samples.
-            _log.warning(
-                "environment value file %s is outside the config snapshot; the reload reads it "
-                "from disk",
-                self.value_file,
-            )
+            # Quietly: a start's snapshot never holds a value file outside the config directory,
+            # so only a reload's caller, which read it into its own, warns (vault BACKLOG #2596).
             return None
 
 

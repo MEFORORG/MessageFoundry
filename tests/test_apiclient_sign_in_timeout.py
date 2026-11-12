@@ -9,8 +9,8 @@ client's 5 s default, and a lost reply then leaves the client holding a token th
 ``login``, ``reauth``, ``verify_mfa``, ``confirm_mfa`` and ``change_password`` now wait at least
 ``SIGN_IN_TIMEOUT_SECONDS`` for their reply, which matches the IDE's ``SIGN_IN_TIMEOUT_MS``, or
 the client's own timeout when that is longer; their other phases, and every other request, keep
-the client's own timeout. The engine's 120 s request deadline is longer than that read, so this
-makes the lost reply rarer, not impossible.
+the client's own timeout. Why that read outlasts the engine's request deadline is said once, on
+``SIGN_IN_TIMEOUT_SECONDS``.
 
 The transport is an ``httpx.MockTransport``: what is pinned is the timeout each request carries,
 read from ``request.extensions["timeout"]``, not what an engine does with it.
@@ -21,9 +21,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import httpx
-import pytest
 
-from messagefoundry.apiclient import ApiError, EngineClient
+from messagefoundry.api.request_timeout import DEFAULT_REQUEST_TIMEOUT_SECONDS
+from messagefoundry.apiclient import EngineClient
 from messagefoundry.apiclient.client import SIGN_IN_TIMEOUT_SECONDS
 
 _BASE = "http://127.0.0.1:8765"
@@ -123,31 +123,10 @@ def test_a_client_built_with_a_longer_timeout_keeps_it_on_the_queued_calls() -> 
         assert seen[path] == _every_phase(own), path
 
 
-def test_change_password_sends_no_password_over_a_cleartext_hop() -> None:
-    """RED when: ``change_password`` lets its two passwords reach the transport on a permitted
-    cleartext non-loopback hop. With no token held, ``_request`` has no bearer to refuse, so only
-    the entry-point refusal stops the body, as it does for ``login`` and ``reauth``."""
-    sent: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        sent.append(request)
-        return httpx.Response(200, json={})
-
-    client = EngineClient("http://engine.example.com:8765", allow_insecure=True)
-    client._http.close()
-    client._http = httpx.Client(base_url=client.base_url, transport=httpx.MockTransport(handler))
-    try:
-        with pytest.raises(ApiError, match="never a credential") as excinfo:
-            client.change_password("a-strong-test-passphrase", "another-strong-test-passphrase")
-        assert "a password" in str(excinfo.value)
-    finally:
-        client.close()
-    assert sent == [], "a password reached the transport before the refusal"
-
-
 def test_the_timeout_matches_the_ides_sign_in_timeout() -> None:
-    """At the default client timeout, the two clients of the same queue wait the same time; a
-    client built with a longer timeout waits that instead. The IDE's constant is read from its
+    """The two clients of the same queue wait the same time for the sign-in's reply. This pins the
+    IDE's constant only: the IDE has no client-wide timeout, so the Python client's floor for a
+    client built with a longer one has no IDE counterpart. The IDE's constant is read from its
     source, so a change on either side reds here."""
     source = Path(__file__).resolve().parents[1] / "ide" / "src" / "signInSession.ts"
     line = next(
@@ -155,6 +134,16 @@ def test_the_timeout_matches_the_ides_sign_in_timeout() -> None:
     )
     milliseconds = int(line.split("=", 1)[1].strip().rstrip(";").replace("_", ""))
     assert milliseconds == SIGN_IN_TIMEOUT_SECONDS * 1000
+
+
+def test_the_sign_in_read_outlasts_the_engines_request_deadline() -> None:
+    """RED when: ``SIGN_IN_TIMEOUT_SECONDS`` is less than 30 s above the engine's default request
+    deadline (vault BACKLOG #2950 step 1). At or below it, a sign-in still waiting in the
+    per-account queue outlasts the client while the engine goes on to finish; a hair above it, the
+    engine's 503 can still arrive after the read expires. 30 s is the margin ``cluster_stepdown``
+    takes over the same deadline. The client duplicates the deadline rather than importing it, as
+    ``cluster_stepdown`` does (ADR 0088); no test enforces that, so the order is pinned here."""
+    assert SIGN_IN_TIMEOUT_SECONDS - DEFAULT_REQUEST_TIMEOUT_SECONDS >= 30.0
 
 
 def test_confirm_mfa_sends_the_enrolment_code_only_when_given() -> None:

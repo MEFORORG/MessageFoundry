@@ -272,6 +272,33 @@ class ConfigSnapshot:
             return _VALUE_FILE_DIR
         return None
 
+    def left_out_environment_file(self, path: str | Path) -> bool:
+        """Whether this snapshot covers the value file ``path`` but could not read it, or its
+        folder, so it holds no bytes that can stand for it (:meth:`environment_file` raises then).
+        ``False`` for a path it does not cover."""
+        value_file = Path(path)
+        folder = self._folder_of(value_file)
+        return folder is not None and self._left_out(folder, value_file.name)
+
+    def holds_value_file_now(self, path: str | Path) -> bool:
+        """Whether the value file ``path`` holds now the bytes this snapshot read for it, read
+        again from disk; :meth:`environment_file` raises as it does for a file it cannot stand
+        for. A start that vets the file after its load calls it after that vet, so the bytes it
+        applies are those of the vetted file (vault BACKLOG #2596)."""
+        value_file = Path(path)
+        held = self.environment_file(value_file)
+        now = _read(value_file) if is_regular_file(value_file) else None
+        return held == now
+
+    def _left_out(self, folder: str, name: str) -> bool:
+        """Whether the value file ``<folder>/<name>``, or a folder holding it, is unreadable here."""
+        want = os.path.normcase(f"{folder}/{name}")
+        # A config directory the snapshot could not list ("." unreadable) holds the environments
+        # folder too, so it covers that folder's files (vault BACKLOG #5120). Never the value file
+        # held as @value-file, which is read by its own path wherever it sits.
+        covering = (folder, ".") if folder == _ENVIRONMENTS_DIR else (folder,)
+        return any(rel in covering or os.path.normcase(rel) == want for rel in self.unreadable)
+
     def _held_path(self, folder: str, name: str) -> Path:
         """Where this snapshot read the value file it holds as ``<folder>/<name>``."""
         if folder == _VALUE_FILE_DIR and self.value_file is not None:
@@ -287,19 +314,17 @@ class ConfigSnapshot:
         Raises :class:`NotInSnapshot` for a path the snapshot does not cover. Raises ``OSError``
         where the bytes cannot stand for the file now: the snapshot could not read it or its
         folder (for ``environments/``, the config directory too), read a file that is gone now,
-        or read no file by its name while one is there now, created since. The caller refuses
-        then; the values are read again on the next reload."""
+        or read no file by its name while one is there now, created since. A reload refuses then
+        and reads the values again on the next one. A start refuses on the last two; one its
+        snapshot could not read it does not ask about, and keeps the values read when the engine
+        was built (:meth:`left_out_environment_file`)."""
         value_file = Path(path)
         folder = self._folder_of(value_file)
         if folder is None:
             raise NotInSnapshot(f"{value_file} is not a value file the config snapshot read")
         prefix = f"{folder}/"
         want = os.path.normcase(prefix + value_file.name)
-        # A config directory the snapshot could not list ("." unreadable) holds the environments
-        # folder too, so it covers that folder's files (vault BACKLOG #5120). Never the value file
-        # held as @value-file, which is read by its own path wherever it sits.
-        covering = (folder, ".") if folder == _ENVIRONMENTS_DIR else (folder,)
-        if any(rel in covering or os.path.normcase(rel) == want for rel in self.unreadable):
+        if self._left_out(folder, value_file.name):
             raise OSError(errno.EACCES, "the config snapshot could not read this value file")
         # A regular file, following links, as a start judges it and as the snapshot read it
         # (is_regular_file): a folder or a dangling link by that name is no value file to either,

@@ -77,12 +77,13 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.tls_policy import HopPosture, StoreTlsRefused, current_hop_posture
 from messagefoundry.connection_events import check_connection_event_kind
+from messagefoundry.odbc_call_gate import UngatedConnectionError
 from messagefoundry.odbc_call_gate import abandon_one_shot as _abandon_one_shot
 from messagefoundry.odbc_call_gate import call_gate as _call_gate
 from messagefoundry.odbc_call_gate import close_one_shot as _close_one_shot
-from messagefoundry.odbc_call_gate import install_call_gate as _install_call_gate
 from messagefoundry.odbc_call_gate import raw_closer as _raw_closer
 from messagefoundry.odbc_call_gate import raw_cursor as _raw_cursor
+from messagefoundry.odbc_call_gate import require_call_gate as _require_call_gate
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
@@ -208,6 +209,7 @@ from messagefoundry.store.session_lineage import revoke_through_lineage
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
+    _RESOLVED_STATUSES,
     _SESSION_CAP_ORDER_SQL,
     _SESSION_CAP_RANK_NOT_AHEAD_SQL,
     _SESSION_INSERT,
@@ -306,6 +308,7 @@ from messagefoundry.store.store import (
     UserRecord,
     UserRow,
     WebAuthnCredential,
+    WorkerDeathOutcome,
     _alert_summary,
     _append_channel_scope,
     _connection_event_where,
@@ -514,11 +517,29 @@ def _drain_detached_close(fut: asyncio.Future[None]) -> None:
         )
 
 
+async def _discard_refused(conn: Any) -> None:
+    """Discard a borrowed pooled connection the call gate refused before its first call (BACKLOG
+    #2394). No call is running on it yet, so the discard's close frees nothing under one.
+
+    The discard is :func:`_detach_connection`, with no await in front of it, so the pool never
+    lends the connection again. A connection with no ``_conn`` cannot be detached that way: an
+    aioodbc that renamed ``_execute`` may have renamed that too. It is closed through its own
+    methods instead (:func:`~messagefoundry.odbc_call_gate.close_one_shot`), once: a cancellation
+    there, or a close that fails, can leave ``closed`` false, so the pool may lend it again, and
+    the next refusal must not start a second close beside the first."""
+    if getattr(conn, "_conn", None) is not None:
+        _detach_connection(conn)
+    elif not getattr(conn, "_mefor_refused", False):
+        conn._mefor_refused = True  # first, and await-free: the marker is what stops a second close
+        await _close_one_shot(conn, None)
+
+
 def _detach_connection(conn: Any) -> asyncio.Future[None] | None:
     """Take ``conn`` out of the pool for good, and start closing its raw handle off the event loop.
 
     The one detach sequence every discard uses (BACKLOG #1940, engine PR 1722 defect 5), at least:
-    the quarantine of a cancelled call (:meth:`SqlServerStore._release_dirty`, ADR 0159), the
+    the refusal of a borrowed connection the call gate cannot wrap (:func:`_discard_refused`), the
+    quarantine of a cancelled call (:meth:`SqlServerStore._release_dirty`, ADR 0159), the
     discard after a rollback that failed or ran past its bound
     (:meth:`SqlServerStore._rollback_or_discard`), whether of an audit append, a lease claim or
     another write, and the discards after a failed schema batch and a failed LOCK_TIMEOUT reset.
@@ -2100,6 +2121,7 @@ _SCHEMA: list[str] = [
         attempts INT NOT NULL DEFAULT 0, next_attempt_at FLOAT NOT NULL, last_error NVARCHAR(MAX) NULL,
         owner NVARCHAR(256) NULL, lease_expires_at FLOAT NULL,
         created_at FLOAT NOT NULL, updated_at FLOAT NOT NULL,
+        worker_deaths INT NOT NULL DEFAULT 0,
         CONSTRAINT fk_queue_message FOREIGN KEY (message_id) REFERENCES messages(id))""",
     # Store-once-deliver-many (L2b): the single shared copy of a body fanned out to N destinations.
     # SCHEMA PARITY here — SQLite implements the dedup/deref/GC; on SQL Server body_ref stays NULL today
@@ -2214,6 +2236,10 @@ _SCHEMA: list[str] = [
     # Store-once-deliver-many (L2b): body_ref on a pre-existing queue (NULL = body inline, byte-identical).
     """IF COL_LENGTH('queue','body_ref') IS NULL
         ALTER TABLE queue ADD body_ref NVARCHAR(64) NULL""",
+    # Vault BACKLOG #4607 step 6: the per-row worker-death count, 0 on an existing row (no death was
+    # counted before the column existed).
+    """IF COL_LENGTH('queue','worker_deaths') IS NULL
+        ALTER TABLE queue ADD worker_deaths INT NOT NULL DEFAULT 0""",
     # The body_ref index is created AFTER the ALTER above so a pre-existing queue (no body_ref) doesn't
     # reference a not-yet-added column. Separate batch (the ALTER must commit first on SQL Server).
     """IF INDEXPROPERTY(OBJECT_ID('queue'),'ix_queue_body_ref','IndexID') IS NULL
@@ -3199,7 +3225,9 @@ async def _assert_autocommit(conn: Any) -> None:
     setter goes through the ODBC driver, so it runs off the event loop, through the connection's
     own ``_execute`` like every other call on it. That is the path the call gate wraps, so a
     cancellation during the set cannot let the connection's close free the handle under it
-    (BACKLOG #2394). A connection with no gate, such as a stand-in, gets a plain thread."""
+    (BACKLOG #2394). A connection with no gate, such as a stand-in, gets a plain thread; the
+    store's own real connections never have none, since it refuses those
+    (:func:`~messagefoundry.odbc_call_gate.require_call_gate`)."""
     raw = getattr(conn, "_conn", None)
     if raw is None:
         return
@@ -3810,7 +3838,9 @@ class SqlServerStore:
         try:
             # BACKLOG #2049: a discard after a cancelled claim closes this cursor and connection;
             # the gate makes both wait for a claim statement still running on an executor thread.
-            _install_call_gate(conn)
+            # BACKLOG #2394: one the gate cannot wrap is refused here, before its first call, and
+            # the except arm below closes it, so no discard ever closes one beside a running call.
+            _require_call_gate(conn)
             raw = getattr(conn, "_conn", None)
             if raw is not None:
                 raw.timeout = self._settings.command_timeout  # seconds; 0 = no limit (STORE-3)
@@ -4620,7 +4650,8 @@ class SqlServerStore:
 
         async def _rcsi_on_after_a_peer() -> bool:
             """Re-read RCSI on FRESH connections after our ALTER failed: a concurrent opener's ALTER
-            may have killed our session yet turned RCSI on. Any failure to read counts as OFF."""
+            may have killed our session yet turned RCSI on. Any failure to read counts as OFF,
+            except a refused connection (BACKLOG #2394), which propagates."""
             for attempt in range(_RCSI_REREADS):
                 if attempt:
                     await asyncio.sleep(_RCSI_REREAD_DELAY_S)
@@ -4631,7 +4662,7 @@ class SqlServerStore:
                     pcur: Any = None
                     abandoned = False
                     try:
-                        _install_call_gate(probe)  # BACKLOG #2394, as on `conn` below
+                        _require_call_gate(probe)  # BACKLOG #2394, as on `conn` below
                         pcur = await probe.cursor()
                         await pcur.execute(
                             "SELECT is_read_committed_snapshot_on FROM sys.databases"
@@ -4645,6 +4676,8 @@ class SqlServerStore:
                     finally:
                         if not abandoned:
                             await _close_one_shot(probe, pcur)
+                except UngatedConnectionError:
+                    raise  # a refusal, not an unreadable state: the open must say why it failed
                 except Exception:  # noqa: BLE001 - an unreadable state is an unverified one
                     log.debug("RCSI re-read on %r failed", db, exc_info=True)
                     continue
@@ -4667,8 +4700,9 @@ class SqlServerStore:
         try:
             # BACKLOG #2394: a cancellation exits through `_abandon_one_shot`, so no handle is freed
             # under a statement still running on its executor thread. The probe connections of
-            # `_rcsi_on_after_a_peer` exit the same way.
-            _install_call_gate(conn)
+            # `_rcsi_on_after_a_peer` exit the same way. One the gate cannot wrap is refused before
+            # its first call, and the `finally` closes it while nothing runs on it.
+            _require_call_gate(conn)
             await _assert_autocommit(conn)
             # Standalone one-shot connection (NOT pooled), so the EF-6 pool-bleed race `_cursor`
             # guards against cannot arise; `_close_one_shot` still closes the cursor first.
@@ -5746,7 +5780,12 @@ class SqlServerStore:
         conn = await acquire_pooled(self._pool, timeout=timeout, backend="sqlserver", retune=retune)
         self._acquire_wait.record((perf_counter() - t0) * 1000.0)
         try:
-            _install_call_gate(conn)  # BACKLOG #2049: one pyodbc call at a time on this connection
+            # BACKLOG #2049: one pyodbc call at a time on this connection.
+            try:
+                _require_call_gate(conn)
+            except UngatedConnectionError:
+                await _discard_refused(conn)
+                raise
             raw = getattr(conn, "_conn", None)
             if raw is not None:
                 raw.timeout = self._settings.command_timeout  # seconds; 0 = no limit
@@ -5795,6 +5834,8 @@ class SqlServerStore:
         demotion for as long as the statement runs, which ADR 0159 rejected.
 
         The detach itself is :func:`_detach_connection`, shared with :meth:`_rollback_or_discard`.
+        A real connection that came through :meth:`_borrow` is gated here, because
+        :func:`_discard_refused` discarded any other before its first call (BACKLOG #2394).
         """
         closer = _detach_connection(conn)  # first: no await may come before the detach
         if closer is None:  # already detached, handed to a running call, or the executor refused
@@ -11600,8 +11641,12 @@ class SqlServerStore:
         now = time.time() if now is None else now
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
+                # UPDLOCK (a plain read takes no lock under RCSI): the DEAD branch's decline below
+                # reads the row this transaction then writes, so no writer moves it in between
+                # (ADR 0157 Amendment C).
                 await cur.execute(
-                    "SELECT message_id, destination_name, attempts FROM queue WHERE id=?",
+                    "SELECT message_id, destination_name, attempts, status"
+                    " FROM queue WITH (UPDLOCK, ROWLOCK) WHERE id=?",
                     (outbox_id,),
                 )
                 row = await cur.fetchone()
@@ -11612,6 +11657,13 @@ class SqlServerStore:
                 # max_attempts None = retry forever (never dead-letter here); a finite cap dead-letters
                 # once exhausted (mirrors the SQLite backend's mark_failed).
                 if retry.max_attempts is not None and attempts >= retry.max_attempts:
+                    if row[3] in _RESOLVED_STATUSES:
+                        # ADR 0157 Amendment C (vault BACKLOG #4607 step 6): a row already DONE,
+                        # DEAD or CANCELLED is left as it is. Read under the lock and kept out of
+                        # the UPDATE, so an empty OUTPUT rowset there is still the epoch fence
+                        # alone.
+                        await self._commit(conn)
+                        return FailOutcome()
                     status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
                 else:
                     # vault BACKLOG #2761: never overflows, so attempt 1025+ keeps the cap's pace.
@@ -12256,6 +12308,62 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
 
+    async def record_worker_death(
+        self, outbox_id: str, cap: int, error: str, now: float | None = None
+    ) -> WorkerDeathOutcome:
+        """See the base contract (vault BACKLOG #4607 step 6). The increment is neither terminal nor
+        a re-pend, so it carries no fence (ADR 0157 C1). It matches only an INFLIGHT or PENDING row
+        and takes its lock, so the dead-letter that follows at the cap cannot find the row resolved
+        and needs no status term (Amendment C); a miss there is the resolve fence alone, handled as
+        C3 says. Both statements read their match from an ``OUTPUT`` rowset, never
+        ``cursor.rowcount`` (Inc 3, as built)."""
+        error = safe_text(error)  # PHI chokepoint (#120): scrub first, then cipher last_error (H4)
+        now = time.time() if now is None else now
+        output, guard, guard_params = self._resolve_guard()  # ADR 0157 C1 — TERMINAL
+        async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                # Not updated_at: the in-flight watch measures a held row's age from its claim.
+                await cur.execute(
+                    "UPDATE queue SET worker_deaths = worker_deaths + 1"
+                    " OUTPUT inserted.worker_deaths, inserted.message_id, inserted.destination_name"
+                    " WHERE id=? AND status IN (?, ?)",
+                    (outbox_id, OutboxStatus.INFLIGHT.value, OutboxStatus.PENDING.value),
+                )
+                hit = await cur.fetchone()
+                if hit is None:
+                    await self._commit(conn)
+                    return WorkerDeathOutcome()
+                deaths, message_id, destination_name = int(hit[0]), hit[1], hit[2]
+                if deaths < cap:
+                    await self._commit(conn)
+                    return WorkerDeathOutcome(deaths=deaths)
+                await self._exec_terminal(
+                    cur,
+                    "record_worker_death",
+                    (outbox_id,),
+                    "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?,"
+                    " owner=NULL, lease_expires_at=NULL" + output + " WHERE id=?" + guard,
+                    (
+                        OutboxStatus.DEAD.value,
+                        now,
+                        self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                        now,
+                        outbox_id,
+                        *guard_params,
+                    ),
+                    checked=bool(guard),
+                )
+                await self._event(cur, message_id, "dead", destination_name, error, now)
+                await self._maybe_finalize(cur, message_id, now)
+                await self._commit(conn)
+                return WorkerDeathOutcome(deaths=deaths, dead=True)
+            except Exception:
+                await conn.rollback()
+                raise
+        # Reached only when _fence_scope swallowed a rejected dead-letter: the increment rolled back
+        # with it, and C3 re-pended the row for the successor.
+        return WorkerDeathOutcome()
+
     async def pending_depth(
         self, name: str, *, stage: str = Stage.OUTBOUND.value
     ) -> tuple[int, float | None]:
@@ -12401,8 +12509,9 @@ class SqlServerStore:
                         )
                     placeholders = ",".join("?" * len(replay_from))
                     await cur.execute(
-                        f"UPDATE queue SET status=?, attempts=0, next_attempt_at=?, last_error=NULL,"
-                        f" updated_at=? WHERE message_id=? AND status IN ({placeholders})"
+                        "UPDATE queue SET status=?, attempts=0, worker_deaths=0, next_attempt_at=?,"
+                        " last_error=NULL, updated_at=? WHERE message_id=?"
+                        f" AND status IN ({placeholders})"
                         f" AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER}",
                         (OutboxStatus.PENDING.value, now, now, message_id, *replay_from),
                     )
@@ -12974,8 +13083,8 @@ class SqlServerStore:
                         await self._commit(conn)
                         return 0
                     await cur.execute(
-                        f"UPDATE queue SET status=?, attempts=0, next_attempt_at=?, last_error=NULL,"
-                        f" updated_at=? WHERE {clause}",
+                        "UPDATE queue SET status=?, attempts=0, worker_deaths=0, next_attempt_at=?,"
+                        f" last_error=NULL, updated_at=? WHERE {clause}",
                         (OutboxStatus.PENDING.value, now, now, *params),
                     )
                     count = cur.rowcount

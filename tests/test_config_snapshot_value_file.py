@@ -902,3 +902,341 @@ def test_a_stat_fault_on_the_value_file_is_a_fault_to_a_start_too(
         )
     with pytest.raises(PermissionError):
         with_value_file(read_config_snapshot(cfg, strict=True), value_file, strict=True)
+
+
+# --- a start (step 6) ------------------------------------------------------------------------------
+
+
+def _in_config_layout(tmp_path: Path) -> tuple[Path, Path]:
+    """A config directory whose value file sits in its own ``environments/`` folder."""
+    cfg = tmp_path / "cfg"
+    _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
+    value_file = cfg / "environments" / "dev.toml"
+    value_file.parent.mkdir()
+    value_file.write_text(_APPROVED, encoding="utf-8")
+    return cfg, value_file
+
+
+def _managed_start(
+    tmp_path: Path,
+    cfg: Path,
+    value_file: Path,
+    base_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    edit: str | None = _UNREVIEWED,
+    during_load: Callable[[], Any] | None = None,
+    registry_guard: Callable[[Any], None] | None = None,
+    registry_preflight: Callable[[Any, Mapping[str, Any]], Any] | None = None,
+) -> Any:
+    """A managed app whose value file is rewritten to ``edit`` after the engine is built and
+    before its load reads the directory, with ``during_load`` (a context manager) around the
+    load."""
+    import contextlib
+
+    import messagefoundry.api.app as app_module
+    from messagefoundry.__main__ import _environment_values_reader
+    from messagefoundry.api import create_managed_app
+
+    def _edit_then_load(*args: Any, **kwargs: Any) -> Any:
+        if edit is not None:
+            value_file.write_text(edit, encoding="utf-8")
+        with during_load() if during_load is not None else contextlib.nullcontext():
+            return load_config(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "load_config", _edit_then_load)
+    provider = _environment_values_reader(
+        base_dir=base_dir, dir_name="environments", environment="dev"
+    )
+    return create_managed_app(
+        db_path=tmp_path / "start.db",
+        config_dir=cfg,
+        poll_interval=0.05,
+        allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
+        env_values_provider=provider,
+        registry_guard=registry_guard,
+        registry_preflight=registry_preflight,
+    )
+
+
+async def _start_with_edit(
+    tmp_path: Path,
+    cfg: Path,
+    value_file: Path,
+    base_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    **kwargs: Any,
+) -> tuple[dict[str, Any], dict[str, object] | None, list[dict[str, Any]], ConfigSnapshot | None]:
+    """One :func:`_managed_start` that serves. Returns the running values, the start's digest,
+    its ``config_loaded`` rows and the snapshot its graph ran."""
+    app = _managed_start(tmp_path, cfg, value_file, base_dir, monkeypatch, **kwargs)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        rr = engine.registry_runner
+        assert rr is not None and rr.running, "control: the graph is serving"
+        rows = [
+            json.loads(r["detail"]) for r in await engine.store.list_audit(action="config_loaded")
+        ]
+        return (
+            dict(rr.env_values),
+            engine.loaded_config_fingerprint,
+            rows,
+            rr.registry.config_snapshot,
+        )
+
+
+async def test_a_start_applies_the_environments_value_file_its_digest_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before, a start resolved its values from disk when the engine was built and its digest read
+    ``environments/`` later, in the load's snapshot, so an edit in between was named and not
+    applied. The start now parses the values from that snapshot, and its guard judges them."""
+    from messagefoundry.config.wiring import guarded_env_values
+
+    cfg, value_file = _in_config_layout(tmp_path)
+    built = config_fingerprint(cfg)
+    guarded: list[Mapping[str, Any] | None] = []
+    preflighted: list[Mapping[str, Any]] = []
+
+    async def _preflight(_registry: Any, values: Mapping[str, Any]) -> None:
+        preflighted.append(values)
+
+    values, loaded, rows, _snapshot = await _start_with_edit(
+        tmp_path,
+        cfg,
+        value_file,
+        cfg,
+        monkeypatch,
+        registry_guard=lambda _registry: guarded.append(guarded_env_values()),
+        registry_preflight=_preflight,
+    )
+    applied = config_fingerprint(cfg)
+    assert applied != built, "control: the digest folds the value file in environments/"
+    assert loaded is not None and loaded["fingerprint"] == applied
+    assert [row["fingerprint"] for row in rows] == [applied]
+    assert values == {"host": "unreviewed.example.invalid"}, "the values are the bytes it names"
+    assert [dict(g or {}) for g in guarded] == [values], "the guard judged them"
+    assert [dict(p) for p in preflighted] == [values], "and so did the preflight"
+
+
+async def test_a_value_file_created_between_the_build_and_the_load_is_applied_and_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The build read no file. The load's snapshot holds the one created since, so the start
+    applies it and its digest names it, rather than refusing."""
+    cfg, value_file = _in_config_layout(tmp_path)
+    value_file.unlink()
+    values, loaded, _rows, _snapshot = await _start_with_edit(
+        tmp_path, cfg, value_file, cfg, monkeypatch
+    )
+    assert values == {"host": "unreviewed.example.invalid"}
+    assert loaded is not None and loaded["fingerprint"] == config_fingerprint(cfg)
+
+
+async def test_a_value_file_malformed_between_the_build_and_the_load_refuses_the_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """As a reload refuses it. Before, the start ran on the values the build read, under a digest
+    naming bytes no value could be parsed from."""
+    cfg, value_file = _in_config_layout(tmp_path)
+    app = _managed_start(tmp_path, cfg, value_file, cfg, monkeypatch, edit="HOST = [\n")
+    with pytest.raises(WiringError, match="could not read environment values from") as caught:
+        async with app.router.lifespan_context(app):
+            pass
+    assert caught.value.__context__ is None and caught.value.__cause__ is None
+
+
+async def test_a_value_file_the_start_load_could_not_read_leaves_the_built_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A lock on the value file while the load reads it, as an antivirus scan takes, leaves it out
+    of the lenient start snapshot. The start goes on, as it did before step 6, on the values the
+    build read, and the digest names the file as left out rather than bytes it did not apply."""
+    import contextlib
+
+    from messagefoundry.config.fingerprint import UNREADABLE_FILES_KEY
+    from tests.test_config_fingerprint import _unreadable
+
+    cfg, value_file = _in_config_layout(tmp_path)
+    locked = {"on": False}
+    _unreadable(monkeypatch, value_file.name, when=locked)
+
+    @contextlib.contextmanager
+    def _locked() -> Any:
+        locked["on"] = True
+        try:
+            yield
+        finally:
+            locked["on"] = False
+
+    with caplog.at_level("WARNING", logger="messagefoundry"):
+        values, loaded, _rows, snapshot = await _start_with_edit(
+            tmp_path, cfg, value_file, cfg, monkeypatch, edit=None, during_load=_locked
+        )
+    assert snapshot is not None and snapshot.left_out_environment_file(value_file)
+    assert values == {"host": "approved.example.invalid"}, "the build's read stands"
+    assert loaded is not None and loaded[UNREADABLE_FILES_KEY] == ["environments/dev.toml"]
+    assert "could not be read into the start's config snapshot" in caplog.text
+
+
+async def test_a_start_leaves_a_value_file_outside_the_config_directory_out_of_its_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Unchanged by step 6: no start snapshot holds the default layout's value file, so no
+    published digest folds it, and the values the engine read when it was built stand. Nor does
+    the start log the WARNING a reload gives a value file it could not read into its snapshot,
+    which a reload still logs (the next test)."""
+    cfg, value_file = _layout(tmp_path)
+    before = config_fingerprint(cfg)
+    with caplog.at_level("WARNING", logger="messagefoundry"):
+        values, loaded, rows, snapshot = await _start_with_edit(
+            tmp_path, cfg, value_file, tmp_path, monkeypatch
+        )
+    assert value_file.read_text(encoding="utf-8") == _UNREVIEWED, "control: the edit landed"
+    assert loaded is not None and loaded["fingerprint"] == before == config_fingerprint(cfg)
+    assert [row["fingerprint"] for row in rows] == [before]
+    assert snapshot is not None and snapshot.value_file is None
+    assert not any(rel.startswith("@value-file/") for rel in snapshot.files)
+    assert values == {"host": "approved.example.invalid"}, "the build's read stands"
+    assert "outside the config snapshot" not in caplog.text
+
+
+async def test_a_reload_whose_snapshot_lacks_the_value_file_still_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The WARNING moved from the provider to the reload, so a start can parse quietly; a reload
+    that could not read the value file into its snapshot still says it reads it from disk."""
+    cfg, value_file = _layout(tmp_path)
+    engine = await _engine(tmp_path, cfg)
+
+    async def _without_value_file(path: Path) -> ConfigSnapshot:
+        return read_config_snapshot(path, strict=True)
+
+    monkeypatch.setattr(engine, "_reload_snapshot", _without_value_file)
+    try:
+        with caplog.at_level("WARNING", logger="messagefoundry"):
+            await engine.reload_detail(dry_run=True)
+    finally:
+        await engine.stop()
+    assert f"environment value file {value_file} is outside the config snapshot" in caplog.text
+
+
+def _after_load(act: Callable[[], None]) -> Callable[[], Any]:
+    """A ``during_load`` context that runs ``act`` once the load has read the directory."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _context() -> Any:
+        yield
+        act()
+
+    return _context
+
+
+async def _refused_start(app: Any) -> WiringError:
+    with pytest.raises(WiringError) as caught:
+        async with app.router.lifespan_context(app):
+            pass
+    return caught.value
+
+
+@pytest.mark.parametrize("change", ["edit", "remove"])
+async def test_a_value_file_changed_between_the_load_and_the_apply_refuses_the_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """The bytes the start applies must be those of the file its vet passed, read after it. An
+    edit after the load leaves the snapshot holding bytes the file no longer holds, so they are
+    refused rather than applied unvetted; a removal is refused as a reload refuses it."""
+    cfg, value_file = _in_config_layout(tmp_path)
+
+    def _change() -> None:
+        if change == "edit":
+            value_file.write_text(_UNREVIEWED, encoding="utf-8")
+        else:
+            value_file.unlink()
+
+    app = _managed_start(
+        tmp_path, cfg, value_file, cfg, monkeypatch, edit=None, during_load=_after_load(_change)
+    )
+    refusal = str(await _refused_start(app))
+    expected = "changed after the start's config load" if change == "edit" else "is gone"
+    assert expected in refusal, refusal
+
+
+async def test_the_start_vets_the_value_file_before_the_read_it_applies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The load reads environments/ before any vet, so the start vets the file and its folder and
+    only then reads the file the bytes it applies must match."""
+    from messagefoundry.config import wiring
+
+    cfg, value_file = _in_config_layout(tmp_path)
+    events: list[str] = []
+    real_vet = wiring.assert_trusted_start_paths
+    real_read = Path.read_bytes
+
+    def _vet(files: Any, *, lead: str = "", folders: Any = ()) -> None:
+        if value_file in list(files):
+            events.append("vet+folder" if list(folders) else "vet")
+        real_vet(files, lead=lead, folders=folders)
+
+    def _read(self: Path) -> bytes:
+        if self == value_file:
+            events.append("read")
+        return real_read(self)
+
+    monkeypatch.setattr(wiring, "assert_trusted_start_paths", _vet)
+    monkeypatch.setattr(Path, "read_bytes", _read)
+    values, *_ = await _start_with_edit(
+        tmp_path,
+        cfg,
+        value_file,
+        cfg,
+        monkeypatch,
+        edit=None,
+        during_load=_after_load(lambda: events.append("loaded")),
+        registry_guard=lambda _registry: events.append("guard"),
+    )
+    # Between the load and the guard, which judges the values the start applies.
+    assert events[events.index("loaded") + 1 : events.index("guard")] == ["vet+folder", "read"]
+    assert values == {"host": "approved.example.invalid"}
+
+
+async def test_a_start_whose_vet_refuses_the_folder_refuses_even_with_no_value_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The start vets the value file's folder as a reload does, so a folder the vet refuses
+    refuses the start even where no value file is there. The build's read vets no folder: the
+    control is that the same app starts with that vet passing."""
+    from messagefoundry.config import wiring
+
+    cfg, value_file = _in_config_layout(tmp_path)
+    value_file.unlink()
+    real_vet = wiring.assert_trusted_start_paths
+
+    def _vet(files: Any, *, lead: str = "", folders: Any = ()) -> None:
+        if value_file.parent in list(folders):
+            raise WiringError("refusing the folder for the test")
+        real_vet(files, lead=lead, folders=folders)
+
+    monkeypatch.setattr(wiring, "assert_trusted_start_paths", _vet)
+    app = _managed_start(tmp_path, cfg, value_file, cfg, monkeypatch, edit=None)
+    assert "refusing the folder for the test" in str(await _refused_start(app))
+    monkeypatch.setattr(wiring, "assert_trusted_start_paths", real_vet)
+    values, *_ = await _start_with_edit(tmp_path, cfg, value_file, cfg, monkeypatch, edit=None)
+    assert values == {}, "control: the same start, with the vet passing, serves"
+
+
+async def test_start_values_are_not_applied_once_a_runner_holds_the_graph(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A runner holds its own values, so a later call would split the engine's from the graph's."""
+    cfg, value_file = _in_config_layout(tmp_path)
+    app = _managed_start(tmp_path, cfg, value_file, cfg, monkeypatch, edit=None)
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        rr = engine.registry_runner
+        assert rr is not None
+        with pytest.raises(RuntimeError, match="before its graph runs"):
+            await engine.apply_start_env_values(rr.registry)

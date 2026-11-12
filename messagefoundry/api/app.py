@@ -11676,8 +11676,9 @@ _PAGING_REFUSAL_TEXT: Final[Mapping[str, str]] = {
 _UNREACHED_ALERT_SOURCE = "directory-reconciler-unreached"
 #: What it tells the operator. Short, and the consequence first, for the store's 200 characters.
 _UNREACHED_ALERT_TEXT: Final[str] = (
-    "This account's sessions are not revoked: {probes} of its directory probes running failed to "
-    "reach the directory. Check its entry, and any outage, referral or configuration alert."
+    "This account's sessions are not revoked: {probes} of up to its last {window} directory "
+    "probes, faults aside, failed to reach the directory. Check its entry, and any outage, "
+    "referral or configuration alert."
 )
 #: What one page for many such accounts says, on a pass that rolls them up
 #: (``AuthService._record_unreached_accounts`` decides when), so a flapping directory opens one
@@ -11685,11 +11686,12 @@ _UNREACHED_ALERT_TEXT: Final[str] = (
 #: pass, and says so: a later rollup updates the same open instance's text, so a count that read
 #: as a total would be replaced by a smaller one while more accounts stood (BACKLOG #3709). No
 #: process can say how many stand: each counts its own, and the instance is shared. ``probes``
-#: is the shortest run among those entering, in probes, not passes, which differ under a probe
-#: budget smaller than the estate.
+#: is the fewest failures among those entering, of up to each one's last ``window`` probes (its
+#: window can hold fewer, and a probe fault adds nothing to it, hence "faults aside"), counted in
+#: probes, not passes, which differ under a probe budget smaller than the estate.
 _UNREACHED_ROLLUP_TEXT: Final[str] = (
     "Accounts newly unreachable: {entering}. Their sessions are not revoked; each failed {probes}+ "
-    "directory probes running. Check the directory and the path to it. "
+    "of up to its last {window} probes, faults aside. Check the directory. "
     "auth.ad_reconcile_unreached rows name each."
 )
 
@@ -11900,19 +11902,21 @@ def _alert_paging_refusals(plan: ReconcilePlan, sink: AlertSink) -> None:
 
 def _alert_unreached_accounts(plan: ReconcilePlan, sink: AlertSink) -> None:
     """Page each account that has just entered the lasting unreachable state (BACKLOG #3100
-    closing step 2; ``AuthService._note_unreached_accounts`` says when one enters). That many of
-    its probes running failed to reach the directory, so the
-    reconciler has neither struck nor revoked it. Once per entry, like a paging refusal, and with
-    no inverse: an operator resolves it. The account name is in the source only, as for a paging
-    refusal. On a rolled-up pass (``plan.unreached_rollup``), one page under the bare source covers
-    those entering, naming none, and counting only them."""
+    closing step 2, #3709 closing step 6; ``AuthService._note_unreached_accounts`` says when one
+    enters). That many of up to its last ``plan.unreached_window`` probes failed to reach the
+    directory, so the reconciler has neither struck nor revoked it. Once per entry, like a paging
+    refusal, and with no inverse: an operator resolves it. The account name is in the source
+    only, as for a paging refusal. On a rolled-up pass (``plan.unreached_rollup``), one page under
+    the bare source covers those entering, naming none, and counting only them."""
     if plan.unreached_rollup:
         sink.ad_reconcile_aborted(
             _UNREACHED_ALERT_SOURCE,
             reason=UNREACHED_ACCOUNT,
             probed=plan.asked,
             detail=_UNREACHED_ROLLUP_TEXT.format(
-                entering=len(plan.unreached), probes=min(n for _u, _n, n in plan.unreached)
+                entering=len(plan.unreached),
+                probes=min(n for _u, _n, n in plan.unreached),
+                window=plan.unreached_window,
             ),
         )
         return
@@ -11921,7 +11925,7 @@ def _alert_unreached_accounts(plan: ReconcilePlan, sink: AlertSink) -> None:
             f"{_UNREACHED_ALERT_SOURCE}:{username}",
             reason=UNREACHED_ACCOUNT,
             probed=plan.asked,
-            detail=_UNREACHED_ALERT_TEXT.format(probes=probes),
+            detail=_UNREACHED_ALERT_TEXT.format(probes=probes, window=plan.unreached_window),
         )
 
 
@@ -12805,6 +12809,10 @@ def create_managed_app(
                 # still converged on (vault BACKLOG #3076). Never raises; a no-op on a single node.
                 await engine.seed_config_version()
                 loaded = load_config(config_dir)
+                # The values from the bytes the load read, as a reload parses them, so the guard,
+                # the preflight and the runner use what the config_loaded digest names (vault
+                # BACKLOG #2596, step 6). A refusal is a bad config, as the load's own is.
+                await engine.apply_start_env_values(loaded)
                 # Before the shard filter, as the reload path does inside the engine: the guard judges
                 # the whole graph.
                 engine.guard_registry(loaded)

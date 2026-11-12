@@ -218,6 +218,7 @@ from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
     _LAST_RECEIVED_SQL,
+    _RESOLVED_STATUSES,
     _SESSION_CAP_ORDER_SQL,
     AD_MAPS,
     AD_ROLE_MAP,
@@ -304,6 +305,7 @@ from messagefoundry.store.store import (
     UserRecord,
     UserRow,
     WebAuthnCredential,
+    WorkerDeathOutcome,
     _alert_summary,
     _dead_target_pairs,
     _finite_cutoff,  # backlog #106: keep-forever cutoff clamp
@@ -639,7 +641,8 @@ _SCHEMA: list[str] = [
         updated_at       DOUBLE PRECISION NOT NULL,
         seq              BIGSERIAL,
         owner            TEXT,
-        lease_expires_at DOUBLE PRECISION
+        lease_expires_at DOUBLE PRECISION,
+        worker_deaths    INTEGER NOT NULL DEFAULT 0
     )""",
     # Track B Step 2: additive multi-node row-lease columns. NULL while a row is pending/terminal; set
     # only while inflight (owner = the claiming store instance, lease_expires_at = claim time + TTL).
@@ -1357,7 +1360,9 @@ _SCHEMA.append(
 # only thing that sends a store marked by an earlier build through both once.
 # 9 (BACKLOG #1720): the same function builds ux_users_federated_subject, moved out of _SCHEMA. The
 # _SCHEMA edit moves the hash too; the bump is what the contract above ties the body to.
-_MIGRATION_REV = 9
+# 10 (vault BACKLOG #4607 step 6): the same function ADDs queue.worker_deaths. The queue CREATE
+# TABLE moved too; the bump is what ties the migration body to the hash.
+_MIGRATION_REV = 10
 
 # BACKLOG #1726: for the tracking view's newest-first page and its received_at filter. SQLite's plan
 # is pinned by a test; this backend's plan has not been measured. Built in _migrate_lease_columns with
@@ -2712,7 +2717,7 @@ class PostgresStore:
             for r in await conn.fetch(
                 "SELECT column_name FROM information_schema.columns"
                 " WHERE table_schema = current_schema() AND table_name='queue' AND column_name = ANY($1::text[])",
-                ["owner", "lease_expires_at", "body_ref"],
+                ["owner", "lease_expires_at", "body_ref", "worker_deaths"],
             )
         }
         if "owner" not in present:
@@ -2723,6 +2728,12 @@ class PostgresStore:
         # identical). shared_body is created by the _SCHEMA loop's CREATE TABLE IF NOT EXISTS.
         if "body_ref" not in present:
             await conn.execute("ALTER TABLE queue ADD COLUMN body_ref TEXT")
+        # Vault BACKLOG #4607 step 6: the per-row worker-death count. A constant DEFAULT, so on
+        # PostgreSQL 11+ the ADD rewrites no row; 0 on an existing row is right.
+        if "worker_deaths" not in present:
+            await conn.execute(
+                "ALTER TABLE queue ADD COLUMN worker_deaths INTEGER NOT NULL DEFAULT 0"
+            )
         # The deref index, created AFTER body_ref is guaranteed present (like ix_queue_lease above).
         await conn.execute(_BODY_REF_INDEX_DDL)
         # The reclaim sweep scans inflight rows by lease expiry (reclaim_expired_leases). Partial:
@@ -5729,6 +5740,56 @@ class PostgresStore:
             await self._after_fenced_write(exc)
             return
 
+    async def record_worker_death(
+        self, outbox_id: str, cap: int, error: str, now: float | None = None
+    ) -> WorkerDeathOutcome:
+        """See the base contract (vault BACKLOG #4607 step 6). The increment is neither terminal nor
+        a re-pend, so it carries no fence (ADR 0157 C1). It matches only an INFLIGHT or PENDING row
+        (a lease sweep may have re-pended the row before the death) and takes its lock, so the
+        dead-letter that follows at the cap cannot find the row resolved and needs no status term
+        (Amendment C); a miss there is the resolve fence alone, handled as C3 says."""
+        error = safe_text(error)  # PHI chokepoint (#120)
+        now = time.time() if now is None else now
+        guard, guard_args = self._resolve_guard(6)  # ADR 0157 C1 — TERMINAL
+        try:
+            async with self._timed_acquire() as conn, conn.transaction():
+                # Not updated_at: the in-flight watch measures a held row's age from its claim.
+                hit = await conn.fetchrow(
+                    "UPDATE queue SET worker_deaths = worker_deaths + 1"
+                    " WHERE id=$1 AND status IN ($2, $3)"
+                    " RETURNING worker_deaths, message_id, destination_name",
+                    outbox_id,
+                    OutboxStatus.INFLIGHT.value,
+                    OutboxStatus.PENDING.value,
+                )
+                if hit is None:
+                    return WorkerDeathOutcome()
+                deaths = int(hit["worker_deaths"])
+                if deaths < cap:
+                    return WorkerDeathOutcome(deaths=deaths)
+                await self._exec_terminal(
+                    conn,
+                    "record_worker_death",
+                    (outbox_id,),
+                    "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
+                    " owner=NULL, lease_expires_at=NULL WHERE id=$5" + guard,
+                    OutboxStatus.DEAD.value,
+                    now,
+                    self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                    now,
+                    outbox_id,
+                    *guard_args,
+                    checked=bool(guard),
+                )
+                await self._event(
+                    conn, hit["message_id"], "dead", hit["destination_name"], error, now
+                )
+                await self._maybe_finalize_message(conn, hit["message_id"], now)
+                return WorkerDeathOutcome(deaths=deaths, dead=True)
+        except _FencedWrite as exc:
+            await self._after_fenced_write(exc)
+            return WorkerDeathOutcome()
+
     async def mark_done(
         self, outbox_id: str, now: float | None = None, *, reply_dropped: str | None = None
     ) -> bool:
@@ -7061,12 +7122,19 @@ class PostgresStore:
         now = time.time() if now is None else now
         try:
             async with self._timed_acquire() as conn, conn.transaction():
-                row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
+                # FOR UPDATE: the DEAD branch's decline below reads the row this transaction then
+                # writes, so no writer moves it in between (ADR 0157 Amendment C).
+                row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1 FOR UPDATE", outbox_id)
                 if row is None:
                     return FailOutcome()
                 attempts = row["attempts"]
                 # max_attempts None = retry forever; a finite cap dead-letters once exhausted.
                 if retry.max_attempts is not None and attempts >= retry.max_attempts:
+                    if row["status"] in _RESOLVED_STATUSES:
+                        # ADR 0157 Amendment C (vault BACKLOG #4607 step 6): a row already DONE,
+                        # DEAD or CANCELLED is left as it is. Read under the lock and kept out of
+                        # the UPDATE, so a miss there is still the epoch fence alone.
+                        return FailOutcome()
                     status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
                 else:
                     # vault BACKLOG #2761: never overflows, so attempt 1025+ keeps the cap's pace.
@@ -7940,8 +8008,8 @@ class PostgresStore:
                     OutboxStatus.DONE.value,
                 )
             result = await conn.execute(
-                "UPDATE queue SET status=$1, attempts=0, next_attempt_at=$2, last_error=NULL,"
-                f" updated_at=$2 WHERE message_id=$3 AND status = ANY($4::text[])"
+                "UPDATE queue SET status=$1, attempts=0, worker_deaths=0, next_attempt_at=$2,"
+                f" last_error=NULL, updated_at=$2 WHERE message_id=$3 AND status = ANY($4::text[])"
                 f" AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER}",
                 OutboxStatus.PENDING.value,
                 now,
@@ -8399,8 +8467,8 @@ class PostgresStore:
                 await self._append_operator_audit(conn, written, audit, 0)
                 return 0
             result = await conn.execute(
-                "UPDATE queue SET status=$1, attempts=0, next_attempt_at=$2, last_error=NULL,"
-                " updated_at=$2 WHERE stage=$3 AND status=$4"
+                "UPDATE queue SET status=$1, attempts=0, worker_deaths=0, next_attempt_at=$2,"
+                " last_error=NULL, updated_at=$2 WHERE stage=$3 AND status=$4"
                 " AND ($5::text IS NULL OR channel_id=$5)"
                 f" AND ($6::text IS NULL OR destination_name=$6) AND ({_REPLAYABLE_BODY})"
                 f" AND {_NOT_PT_MARKER}",

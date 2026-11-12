@@ -790,18 +790,42 @@ def test_a_reconciler_knob_is_named_only_in_its_looser_direction(
         (
             "ad_session_recheck_seconds",
             600,
-            "probes running fail, at least 1200 s after its first such probe",
+            "last 5 probes fail, at least 1200 s after its first such probe",
         ),
         ("ad_session_recheck_max_users", 6, "the page about one account the directory keeps"),
+        ("ad_session_recheck_seconds", 600, "a failure bounded in time can end before it pages"),
+        ("ad_session_recheck_max_users", 6, "a failure bounded in time can end before it pages"),
     ],
 )
 def test_a_reconciler_loosening_names_the_delay_to_the_unreachable_account_page(
     field: str, value: int, words: str
 ) -> None:
     """BACKLOG #3709. The page about one account the directory keeps failing for counts that
-    account's own probes, so a longer interval or a smaller per-pass budget delays it too. The
-    loosening says so, as the ``ad_reconcile_outage_passes`` one already did."""
+    account's own probes, so a longer interval or a smaller per-pass budget spaces them further
+    apart: that changes which failures that vary over time raise the page, and when, and a
+    failure bounded in time can end before it pages.
+    The loosening says so."""
     assert words in dict(_pairs(auth=_ad(**{field: value})))[field]
+
+
+@pytest.mark.parametrize(("run", "window"), [(4, 7), (5, 9), (100, 199)])
+def test_the_outage_passes_loosening_names_the_unreachable_account_window(
+    run: int, window: int
+) -> None:
+    """BACKLOG #3709 closing step 6. The per-account page weighs ``run`` of the account's last
+    ``2 * run - 1`` probes, and the entry names that window for the configured value. It claims
+    no direction the value moves that page in, beyond what holds for every value and pattern.
+
+    RED when: the entry names a window other than ``2 * run - 1``, or claims an ordering such as
+    the page waiting longer or coming sooner."""
+    text = dict(_pairs(auth=_ad(ad_reconcile_outage_passes=run)))["ad_reconcile_outage_passes"]
+    assert f"at {run} of up to its last {window} probes" in text
+    assert "a pattern that pages at one value may never page at another" in text
+    # The outage page's own floor says "no sooner than", which holds; only the account's part is
+    # checked for an ordering claim.
+    account = text.split("The same count bounds one account", 1)[1]
+    for ordering in ("three probes", "sooner", "waits longer", "every pattern"):
+        assert ordering not in account
 
 
 @pytest.mark.parametrize(

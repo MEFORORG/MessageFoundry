@@ -1140,7 +1140,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "the cipher inventory expects, at least through a missing grant, so those cells were not "
         "read), 4 KEY_MISMATCH. Run it with the service's own key: a shell "
         "without it resolves keyless and reports KEY_MISMATCH. Under [store].cipher_provider = "
-        "'vault_transit' every value is one Transit request (BACKLOG #1719)",
+        "'vault_transit' values go to Transit in batches of up to BATCH_MAX_ITEMS "
+        "(store/crypto.py; BACKLOG #1719, #6706)",
     )
     cipher_audit.add_argument(
         "--service-config",
@@ -2499,9 +2500,9 @@ def _environment_values_reader(
 ) -> EnvironmentValuesReader:
     """``serve``'s ``env_values_provider``: :func:`_read_environment_values` over one value file.
 
-    The Engine calls it with no arguments at start, and with a reload's config snapshot on a
-    reload that read one, so a value file the snapshot covers is parsed from the bytes the reload's
-    digest names (vault BACKLOG #2596). ``supervise`` builds the same reader."""
+    The Engine calls it with no arguments when it is built, and with a config snapshot at a start
+    and on a reload that read one, so a value file the snapshot covers is parsed from the bytes
+    that load's digest names (vault BACKLOG #2596). ``supervise`` builds the same reader."""
     from messagefoundry.config.environments import EnvironmentValuesReader
 
     return EnvironmentValuesReader(
@@ -5593,7 +5594,9 @@ def _fleet_connection_key_file_refusal(
     (BACKLOG #3402). The supervisor judges the whole graph, before the engine-shard filter, and each
     engine shard then judges its own inbound connections and every outbound one at each load.
     Refusal only, so ``None`` under ``warn``, where each engine shard writes its own warning.
-    ``env_values`` reads the values as each engine shard reads them. It reads files, so the
+    ``env_values`` reads the values from disk, as each engine shard reads them when its engine is
+    built; a shard's start then applies a value file in ``environments/`` from its own load's
+    snapshot, so an edit in between is judged here on the earlier bytes. It reads files, so the
     supervisor calls it in a worker thread, as it does the rest of shard discovery."""
     if not enforcing:
         return None

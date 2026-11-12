@@ -17,19 +17,26 @@ consulted to *check* an envelope, never to *drive* one (BACKLOG #70's synchronou
 
 * The untrusted WSDL is parsed through :func:`~messagefoundry.parsing.xml.harden.parse_bytes`, so it gets
   the identical XXE / entity-expansion / external-DTD lockdown as every other body in the codec.
-* Envelope validation rides :func:`~messagefoundry.parsing.xml.schema.validate_against`, whose
-  ``xmlschema`` is built with remote fetching disabled (``allow="local"``, ``base_url=None``).
-* The **distinct** ``wsdl:import`` / ``xsd:import`` / ``xsd:include`` resolution path — which
-  ``xmlschema``'s ``allow="local"`` does **not** cover, because a ``wsdl:import`` is parsed by *this*
-  code before any schema is built — is locked to **no-network**: a remote ``location``/``schemaLocation``
-  is refused (:class:`~messagefoundry.parsing.xml.errors.WsdlSecurityError`), never dereferenced. A local
-  import is not fetched either (a pure codec does no I/O); validation against a type reachable only via an
-  unresolved import then fails closed through ``xmlschema``.
+* Envelope validation rides :func:`~messagefoundry.parsing.xml.schema.validate_against`. Each embedded
+  schema reaches it as text, so ``xmlschema`` opens no file for it, local or remote, beyond its bundled
+  copies of well-known namespaces (BACKLOG #5537).
+* The **distinct** ``wsdl:import`` resolution path is not ``xmlschema``'s to govern, because a
+  ``wsdl:import`` is read by *this* code before any schema is built. :func:`parse_wsdl` refuses a
+  ``location``/``schemaLocation``, even an empty one, on a ``wsdl:import`` / ``xsd:import`` /
+  ``xsd:include`` / ``xsd:redefine`` / ``xsd:override``, local or remote
+  (:class:`~messagefoundry.parsing.xml.errors.WsdlSecurityError`, BACKLOG #5539). What the guard let
+  through before, and what was opened, is recorded once, in ADR 0122's 2026-11-10 amendment. An
+  ``xsd:import`` naming only a ``namespace`` stays legal. A type reachable only through it resolves
+  to ``xmlschema``'s bundled copy where it bundles that namespace (XML-DSig, for one), and otherwise
+  fails closed through ``xmlschema``.
 
-**PHI (CLAUDE.md §9):** every failure names element **QNames** / reason **categories** / URI **schemes**
-only — never element content or a full URL. The PHI-bearing SOAP body goes only to the secured store.
+**PHI (CLAUDE.md §9):** every failure names element **QNames** / reason **categories**, and a refused
+location by its element and a well-known URI **scheme** or the kind of reference (``a local path``,
+``a network path``) — never element content or any other text of the location. The PHI-bearing SOAP
+body goes only to the secured store.
 
-Pure: no engine imports; no disk / network I/O.
+Pure: no engine imports and no network I/O. Parsing reads nothing from disk; validation reads only
+``xmlschema``'s bundled schema files.
 """
 
 from __future__ import annotations
@@ -153,14 +160,15 @@ def parse_wsdl(data: str | bytes) -> WsdlDefinition:
     """Parse a WSDL 1.1 document into a :class:`WsdlDefinition` (BACKLOG #69, ADR 0122).
 
     Rides :func:`~messagefoundry.parsing.xml.harden.parse_bytes` (XXE/DTD/no-network lockdown). Refuses a
-    remote ``wsdl:import`` / ``xsd:import`` / ``xsd:include``
-    (:class:`~messagefoundry.parsing.xml.errors.WsdlSecurityError` — the no-network seam). Raises
+    ``wsdl:import`` / ``xsd:import`` / ``xsd:include`` / ``xsd:redefine`` / ``xsd:override`` carrying any
+    location, local, remote or empty
+    (:class:`~messagefoundry.parsing.xml.errors.WsdlSecurityError`, BACKLOG #5539). Raises
     :class:`~messagefoundry.parsing.xml.errors.WsdlError` if the document is not a
     ``<wsdl:definitions>`` root, and :class:`RuntimeError` if the ``[xml]`` extra is absent."""
     root = parse_bytes(data)  # hardened parse; DOCTYPE refused
     if _clark(root) != f"{{{_WSDL_NS}}}definitions":
         raise WsdlError("not a WSDL 1.1 document (root is not {wsdl:}definitions)")
-    _refuse_remote_imports(root)
+    _refuse_imports(root)
     target_namespace = root.get("targetNamespace")
     schemas = _embedded_schemas(root)
     messages = _messages(root)
@@ -199,40 +207,64 @@ def _resolve_qname(prefixed: str | None, nsmap: Mapping[str | None, str]) -> str
     return f"{{{ns}}}{local}" if ns else local
 
 
-def _is_remote_location(location: str | None) -> bool:
-    """Whether an import ``location``/``schemaLocation`` points off-machine (a scheme like http/https/ftp/
-    file, or a network-path ``//host`` reference). A bare relative path is not remote (not fetched, but not
-    refused)."""
-    if not location:
-        return False
-    parts = urlsplit(location.strip())
-    return bool(parts.scheme) or bool(parts.netloc)
+#: At least these elements name another document to load, each with the attribute that names it. ADR
+#: 0122 requires a split contract to be inlined, so a location on any of them is refused, local or
+#: remote (BACKLOG #5539). ``xsd:override`` is XSD 1.1, in the same namespace; xmlschema honours it.
+_LOCATION_ATTRS = (
+    (f"{{{_WSDL_NS}}}import", "location", "wsdl:import"),
+    (f"{{{_XSD_NS}}}import", "schemaLocation", "xsd:import"),
+    (f"{{{_XSD_NS}}}include", "schemaLocation", "xsd:include"),
+    (f"{{{_XSD_NS}}}redefine", "schemaLocation", "xsd:redefine"),
+    (f"{{{_XSD_NS}}}override", "schemaLocation", "xsd:override"),
+)
 
 
-def _refuse_remote_imports(root: Any) -> None:
-    """Lock the WSDL-layer resolution seam to no-network (ADR 0122): refuse any ``wsdl:import`` /
-    ``xsd:import`` / ``xsd:include`` whose location is remote, so a crafted WSDL can't SSRF past the XSD
-    lockdown. PHI-safe: the error names the URI scheme only, never the full URL."""
-    for imp in root.iter(f"{{{_WSDL_NS}}}import"):
-        if _is_remote_location(imp.get("location")):
-            raise WsdlSecurityError(
-                f"refusing a remote wsdl:import (scheme {_scheme(imp.get('location'))!r}) — imports are "
-                "resolved no-network; inline the imported document locally"
-            )
-    for tag in (f"{{{_XSD_NS}}}import", f"{{{_XSD_NS}}}include", f"{{{_XSD_NS}}}redefine"):
-        for imp in root.iter(tag):
-            if _is_remote_location(imp.get("schemaLocation")):
+def _refuse_imports(root: Any) -> None:
+    """Refuse any ``wsdl:import`` / ``xsd:import`` / ``xsd:include`` / ``xsd:redefine`` /
+    ``xsd:override`` that carries a ``location``/``schemaLocation``, even an empty one (ADR 0122,
+    BACKLOG #5539).
+
+    Local locations are refused as well as remote ones; ADR 0122's 2026-11-10 amendment says why. An
+    ``xsd:import`` that names only a ``namespace`` stays legal; it loads nothing of the author's.
+    PHI-safe: the error names the element and :func:`_locator`'s description, never the location."""
+    for tag, attr, label in _LOCATION_ATTRS:
+        for elem in root.iter(tag):
+            location = elem.get(attr)
+            if location is not None:  # an empty one too: it resolves to the base, not to nothing
                 raise WsdlSecurityError(
-                    f"refusing a remote schema import (scheme "
-                    f"{_scheme(imp.get('schemaLocation'))!r}) — resolved no-network; inline it locally"
+                    f"refusing a {label} with a {attr} ({_locator(location)}): a WSDL's imported "
+                    "documents are never loaded, so inline the imported document"
                 )
 
 
-def _scheme(location: str | None) -> str:
-    """The URI scheme of a location (PHI-safe locator for an error) — ``""`` for a network-path ref."""
-    if not location:
-        return ""
-    return urlsplit(location.strip()).scheme
+#: Schemes an error may name. Any other "scheme" is the text before a colon, which can be anything.
+_NAMEABLE_SCHEMES = frozenset({"http", "https", "ftp", "ftps", "file"})
+
+
+def _locator(location: str) -> str:
+    """A PHI-safe description of a location for an error: a well-known URI scheme, or the kind of
+    reference. Never any other text from the location."""
+    text = location.strip()
+    if not text:
+        return "an empty location"
+    slashed = text.replace("\\", "/")
+    if slashed.lower().startswith(("//?/unc/", "//./unc/")):
+        return "a network path"
+    if slashed.startswith("//?/") and slashed[5:6] == ":" and slashed[4:5].isalpha():
+        return "a local path"
+    if slashed.startswith(("//./", "//?/")):
+        return "a device path"
+    if slashed.startswith("//"):
+        return "a network path"
+    if text[1:2] == ":" and text[:1].isalpha():  # a Windows drive, which urlsplit reads as a scheme
+        return "a local path"
+    try:
+        scheme = urlsplit(text).scheme
+    except ValueError:  # e.g. a bracketed host that is not an IP address
+        return "an unparseable location"
+    if not scheme:
+        return "a local path"
+    return f"scheme {scheme!r}" if scheme in _NAMEABLE_SCHEMES else "an unrecognised scheme"
 
 
 def _embedded_schemas(root: Any) -> dict[str, bytes]:
