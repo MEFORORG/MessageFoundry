@@ -463,9 +463,9 @@ def service_env_loosenings(posture: ServiceEnvPosture) -> list[tuple[str, str]]:
             (
                 "service_environment_unobservable",
                 "the engine could not tell whether it runs as a Windows service under NSSM, or "
-                f"could not read that service's environment lists ({posture.detail}). A store key "
-                "or another secret there is not read from them, and any local user may be "
-                "able to read it",
+                f"could not read that service's environment lists ({posture.detail}), so it "
+                "cannot say whether a store key or another secret is in them. Any local user may "
+                "be able to read one there",
             )
         )
     # Named only for a known service: a process whose service is unknown may be a shell, where

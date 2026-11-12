@@ -2607,8 +2607,7 @@ count is above `0` (vault BACKLOG #2613).
   environment.** It is named wherever the key came from, once the engine knows its service. The
   machine-wide environment is readable by every local user too. Under `serve` and `supervise` a
   key in the service's own lists refuses first, so there the entry normally means the
-  machine-wide environment. Where `secret_in_service_environment` names the same key, it is in
-  the service's lists.
+  machine-wide environment.
 - **`service_environment_unobservable`: the engine could not finish the reading.** The entry
   carries the reason: an ancestor process that could not be queried, an `nssm.exe` with no
   service, an `nssm.exe` above a process that is not Python, or a registry key it could not read.
@@ -2622,9 +2621,11 @@ count is above `0` (vault BACKLOG #2613).
 - **Where they are reported:** the serve-time loosening warning and `GET /security/posture`, each
   for the engine's own process. `supervise` logs one WARNING for each entry at start.
   `messagefoundry security show` is a separate process, so it reports none of them, and its scope
-  line says so. The reading is taken once, at start. `secret_in_service_environment` is the
-  exception: `serve` and `supervise` refuse before they report it, so only `GET
-  /security/posture` of an engine neither started reports it.
+  line says so. The reading is taken once per process: as `serve` or `supervise` starts, or at
+  the first reading an app built without them takes. `secret_in_service_environment` is the
+  exception: `serve` and `supervise` refuse before they report it, so only an app neither
+  started reports it, at least in `GET /security/posture` and in the loosenings its audit rows
+  record.
 - **How to clear them:** remove each named variable from the registry value the entry names, NSSM's
   list or the service's own `Environment` value, and from the machine-wide environment. Keep the
   store key in a DPAPI-protected key file. Let NSSM start the interpreter directly.

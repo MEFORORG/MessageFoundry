@@ -387,7 +387,7 @@ def test_an_unreadable_list_does_not_refuse_on_another_secret_in_the_environment
     assert _names(posture) == ["service_environment_unobservable"]
 
 
-def test_the_named_not_refused_entry_is_gone() -> None:
+def test_the_old_named_not_refused_entry_is_gone_and_only_the_refusals_twin_names_it() -> None:
     """Row step 4: the ``service_environment_secret`` loosening is removed. A secret-class name in
     the list refuses instead, and reaches the entries and the loosening registry only as the
     refusal's advisory twin, ``secret_in_service_environment``, for an engine no refusal ran in."""
@@ -590,6 +590,26 @@ _FLAG_REFUSAL = (
     "refusing to start: this engine runs as the Windows service 'MessageFoundry' and was started "
     "with no --service-config"
 )
+
+
+def _record_loosening_reads(monkeypatch: pytest.MonkeyPatch) -> list[ServiceEnvPosture]:
+    """Record every read of the service-environment loosenings, through either binding of the
+    function, so a refusing start can show it refused before it read them. That order is what
+    keeps ``secret_in_service_environment``, the refusal's advisory twin, out of ``serve`` and
+    ``supervise``."""
+    from messagefoundry.config import settings as settings_module
+
+    read: list[ServiceEnvPosture] = []
+
+    def recording(posture: ServiceEnvPosture) -> list[tuple[str, str]]:
+        read.append(posture)
+        return []
+
+    monkeypatch.setattr(serviceenv, "service_env_loosenings", recording)
+    monkeypatch.setattr(settings_module, "service_env_loosenings", recording)
+    return read
+
+
 #: Each refusal case says whether it passes --service-config. The store-key case passes one, so
 #: the flag refusal, which comes first, does not hide the key refusal it tests.
 _REFUSALS = pytest.mark.parametrize(
@@ -648,11 +668,10 @@ def test_serve_as_a_service_refuses(
     reason: str,
 ) -> None:
     service_config = settings_file if with_flag else None
+    read = _record_loosening_reads(monkeypatch)
     assert _serve(tmp_path, monkeypatch, posture, warn=warn, service_config=service_config) == 2
-    captured = capsys.readouterr()
-    assert reason in captured.err
-    # The refusal comes before the loosening list, so its advisory twin never prints here.
-    assert "secret_in_service_environment" not in captured.out + captured.err
+    assert reason in capsys.readouterr().err
+    assert not read
     # Before any side effect: nothing was minted or opened in the working directory.
     assert not any(tmp_path.iterdir()), sorted(p.name for p in tmp_path.iterdir())
 
@@ -724,15 +743,7 @@ def test_supervise_as_a_service_refuses_before_it_starts_an_engine_shard(
         service_config=settings_file if with_flag else None,
         project_root=str(tmp_path),
     )
-    # The refusal comes before supervise reads the loosening list, so the advisory twin of the
-    # refusal, ``secret_in_service_environment``, is never logged here.
-    read: list[ServiceEnvPosture] = []
-
-    def recording_loosenings(p: ServiceEnvPosture) -> list[tuple[str, str]]:
-        read.append(p)
-        return []
-
-    monkeypatch.setattr(serviceenv, "service_env_loosenings", recording_loosenings)
+    read = _record_loosening_reads(monkeypatch)
     rc = cli._supervise(args)
     err = capsys.readouterr().err
     assert rc == 2 and not spawned and not read
