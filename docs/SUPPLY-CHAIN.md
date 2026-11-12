@@ -157,16 +157,16 @@ Facts the labels leave out:
   the wheel first. Unset, the console upload is skipped and the console's release is still
   published once the `pypi` approval is given, as the engine's is with `PUBLISH_HARNESS` unset.
   With either variable set, its draft publisher reads it again when it runs and refuses to publish
-  the release while that run skipped the upload. On an engine tag the toolkit and engine are on
-  PyPI by then. The refusal's text names two causes and both remedies below, but not which cause
-  fired, and points here for the routes left past GitHub's re-run window. At least these two can
-  fire, alone or together:
+  the release while that run did not upload. On an engine tag the toolkit and engine are on
+  PyPI by then. The refusal's text names two causes, a remedy with the upload and one without,
+  but not which cause fired, and points here for the routes left past GitHub's re-run window. At
+  least these two can fire, alone or together:
   - The `pypi` environment holds its own copy of the variable, with a value other than `true`.
     Look at that environment's variables in the repository settings to see whether it holds one
-    now.
+    now; a copy removed since the run cannot be seen there.
   - The build job read the variable before it was set, or the upload read it while it was unset
     and it was set again before the publisher ran. Treat this as possible whenever the refusal
-    fires; the remedy below clears it either way, so it need not be told apart.
+    fires; the remedies below clear it either way, so it need not be told apart.
 
   To finish the release with the upload, remove any copy from the `pypi` environment, then re-run
   the build job (`release-harness` on an engine tag, `release-webconsole` on a console tag), which
