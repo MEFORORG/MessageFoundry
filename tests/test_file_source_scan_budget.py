@@ -8,8 +8,9 @@ to ``.error`` succeeded. A reject the move left in place (a locked file, an unwr
 read-only share under ``after_read = "leave"``) is examined again on a later scan, so rejects that
 sort early would spend the budget on each scan that examines them and hold back the healthy drops.
 
-Such a reject, and every other file a scan reads and leaves in place, charges a second budget of the
-same size instead, so the read and the pre-ingest scan stay bounded per tick (``_at_ceiling``).
+Such a reject, and at least the other arms that read a file and leave it in place, charge a second
+budget of the same size instead, which bounds those reads and pre-ingest scans per tick
+(``_at_ceiling``).
 
 Deliberately ASCII-only: pytest echoes a failing body to a cp1252 console on Windows.
 """
@@ -217,40 +218,48 @@ async def test_rejects_left_in_place_are_read_at_most_the_ceiling_per_scan(
     assert (inbox / _HEALTHY).exists(), "the healthy drop is deferred, not dropped"
 
 
-@pytest.mark.parametrize("arm", ["scan_hook_error", "handler_error"])
+@pytest.mark.parametrize("arm", ["scan_hook_error", "handler_error", "changed_during_read"])
 @pytest.mark.usefixtures("_no_scan_hook")
 async def test_other_files_left_in_place_after_a_read_are_bounded_too(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arm: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, arm: str
 ) -> None:
-    """A malfunctioning scan hook and a failing handler each leave a file in place after reading it,
-    and charge the same second budget: four such files against a budget of two, one scan, two reads.
+    """A malfunctioning scan hook, a failing handler and a file that changed during its read (#116)
+    each leave a file in place after reading it, and charge the second budget: four such files
+    against a budget of two, one scan, two reads, stopped on the second budget.
 
-    Mutation: drop the ``retried += 1`` on that arm. Red: the scan reads all four."""
+    Mutations: drop the ``retried += 1`` on that arm (red: the scan reads all four), or charge
+    ``disposed`` there instead (red: the stop is not logged as files read and left in place)."""
     _inbox, source, _sink, _handed = _setup(
         tmp_path, {}, _HL7, _HL7, False, cap=2, rejects=4, healthies=0
     )
-    attempts: list[str] = []
     if arm == "scan_hook_error":
 
-        def hook(_raw: bytes, name: str) -> None:
-            attempts.append(name)
+        def hook(_raw: bytes, _name: str) -> None:
             raise RuntimeError("scanner unreachable")
 
         set_scan_hook(hook)
-    else:
+    elif arm == "handler_error":
 
         async def handler(_raw: bytes) -> str | None:
-            attempts.append("handled")
             raise OSError("store unavailable")
 
         source._handler = handler
 
     await source._scan_once()  # the settle poll (BACKLOG #1811)
     reads = _record_reads(monkeypatch)
-    await source._scan_once()
+    if arm == "changed_during_read":
+        counted_read = file_mod._read_confined
+
+        def short_read(path: Path, *rest: Any, **kw: Any) -> Any:
+            raw, file_id = counted_read(path, *rest, **kw)
+            return raw[:-1], file_id  # fewer bytes than the stat: a partner still writing
+
+        monkeypatch.setattr(file_mod, "_read_confined", short_read)
+    with caplog.at_level(logging.INFO, logger="messagefoundry.transports.file"):
+        await source._scan_once()
 
     assert len(reads) == 2, f"the {arm} scan read only the ceiling of files it left in place"
-    assert len(attempts) == 2
+    assert "reached poll_max_files (2) this scan in files read and left in place" in caplog.text
 
 
 async def test_a_reject_archived_but_not_removed_still_spends_the_budget(

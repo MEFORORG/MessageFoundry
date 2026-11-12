@@ -1033,7 +1033,7 @@ def route(msg):
 | `sort` | in | `name` | process order: `name` or `mtime` |
 | `recursive` | in | `false` | also scan subdirectories |
 | `max_file_bytes` | in | `16 MiB` | route files larger than this to the error dir instead of reading them into memory (OOM guard). `None`/`0` = unlimited, and the connection logs a `WARNING` naming the setting each time it is built (BACKLOG #2749). |
-| `poll_max_files` | in | `500` | most files one scan will take. The rest stay in the drop directory and the next scan takes them — a **deferral, not a drop**: nothing is quarantined, errored, or left unaccounted for. See [*Per-tick poll ceilings*](#per-tick-poll-ceilings) for the number and when to raise it. `None`/`0` = unlimited. |
+| `poll_max_files` | in | `500` | most files one scan will take, and separately most files one scan will read and leave in place (a stuck reject, a scanner or handler failure). The rest stay in the drop directory for a later scan — a **deferral, not a drop**: nothing is quarantined, errored, or left unaccounted for. That many stuck files sorting first stall the scan; see [*Per-tick poll ceilings*](#per-tick-poll-ceilings) for that, the number and when to raise it. `None`/`0` = unlimited. |
 | `validate_directory` | both | `false` | validate the directory **at startup** (#114): a missing/unusable dir reports the connection **`failed`** (ADR 0031) instead of the default deferral to run time. **No mkdir** — a merely-missing dir fails. **In:** a `leave` source validates read-only (a read-only share passes); `move`/`delete` also require write. **Out:** the target must already exist and accept a write, and is then **never created** — not at start, not on write (a delivery into a vanished dir fails retryably instead), and not by `POST /connections/{name}/test`. Left off (the default) the outbound target is still created on first write, but the creation is now logged as a `WARNING`. |
 | `processed_subdir` / `error_subdir` | in | `.processed` / `.error` | where read/failed files go |
 | `filename` | out | `{MSH-10}.hl7` | output name (supports `{HL7-path}` placeholders). Resolved values are sanitized to a **single safe filename** — path separators/unsafe chars stripped, leading dots removed, trailing dots and spaces stripped, and `.`/`..`/reserved device names fall back — so a message field can never write outside the directory. The final name, `.gz` included, is capped at **200 UTF-8 bytes**; a longer one falls back to `message.hl7` (ADR 0204). **Out:** a deep `directory` lowers the cap to the room left under the platform path limit (logged once when the connection is built), and a directory with no room for the fallback, or a template whose fixed text is over the cap, is refused when the connection is built. |
@@ -1578,7 +1578,7 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `min_age_seconds` | in | `0.0` | **accepted but not honoured on a remote source today** — the connector never reads it. Only `File(...)` implements it; the settle gate on `poll_seconds` above, and the partner's own write-then-rename, are what guard against partial reads here. |
 | `after_read` | in | `move` | `move` (→ `processed_subdir`), `delete`, or `leave` (process **in place**, #142 — a durable dedup ledger keyed on a hash of the **full remote path** + size + the listed modification time where the server gives one ensures a left file is ingested once; see *Process-in-place* for what a server that lists no modification time misses) |
 | `max_file_bytes` | in | `16 MiB` | **charged twice, and the second charge is the one that binds.** Before the retrieve, against the size the **server reported** in its own directory listing — an over-size entry is moved to `error_subdir` without being read. Then **during** the retrieve, against the **bytes actually read**: the download streams in 1 MiB chunks and is cut off at the first byte past the budget, so a share that lists a small file and then delivers an arbitrarily large body is refused mid-transfer rather than buffered whole (BACKLOG #1191). Either refusal quarantines the file to `error_subdir` and logs it — never a silent drop, and never left in place to be re-pulled every poll. `None`/`0` = unlimited, in both charges, and the connection logs a `WARNING` naming the setting each time it is built (BACKLOG #2749). |
-| `poll_max_files` | in | `500` | most files one poll will take. The rest stay on the share and the next poll takes them — a **deferral, not a drop**. Identical in shape and reasoning to the `File(...)` row; see [*Per-tick poll ceilings*](#per-tick-poll-ceilings). `None`/`0` = unlimited. |
+| `poll_max_files` | in | `500` | most files one poll will take. The rest stay on the share and the next poll takes them — a **deferral, not a drop**. The same shape and reasoning as the `File(...)` row, except that no second budget bounds the files a poll reads and leaves in place; see [*Per-tick poll ceilings*](#per-tick-poll-ceilings). `None`/`0` = unlimited. |
 | `validate_directory` | both | `false` | validate `remote_dir` **at startup** (#114): unreachable/unusable reports the connection **`failed`** (ADR 0031) instead of deferring to run time. The probe is a **listing** — it never creates. **Out:** the upload dir is then never `ensure_dir`ed either, on send or by `POST /connections/{name}/test`. Instead every send first **lists** `remote_dir`, so the account needs list permission there even with `overwrite = true`, at one extra round trip per delivery. An upload into a vanished dir then fails **retryably** rather than dead-lettering on the partner's permanent no-such-dir; a credential refusal on that listing stops the lane. Left off (the default) the upload dir is still created on first send, but the creation is now logged as a `WARNING`. |
 | `processed_subdir` / `error_subdir` | in | `.processed` / `.error` | where read / failed files go |
 | `filename` | out | `{MSH-10}.hl7` | upload name (supports `{HL7-path}` placeholders, sanitized to a **single safe filename** exactly as `File(...)`) |
@@ -4836,20 +4836,24 @@ the database source the ceiling is charged at the **fetch**, so the rest of the 
 pulled out of the driver. One poll asks the driver for at most `poll_max_rows` plus the rows it had to
 step over, capped at 64 of those.
 
-**Files left for a retry do not spend the budget.** A locked or vanished file, a malfunctioning
+**Files left for a retry do not spend the ceiling.** A locked or vanished file, a malfunctioning
 pre-ingest scan hook, a handler failure, and a listing entry refused as an unsafe name all leave the
-item where it is. Charging those would let one permanently stuck item consume the whole ceiling on every
-tick and starve the healthy items behind it. Only an item the tick finished with — handed off, or
-quarantined to the error directory — charges. On `File(...)` a reject of which no copy reached the
-error directory does not charge (BACKLOG #5717).
+item where it is. Charging those would let each stuck item take, on every tick, a place a healthy item
+could have had. Only an item the tick finished with — handed off, or quarantined to the error
+directory — charges it. On `File(...)` a reject of which no copy reached the error directory does not
+charge it (BACKLOG #5717).
 
 **On `File(...)` a second budget of the same size bounds the files a tick reads and leaves in place**
 (BACKLOG #5717). At least a file that changed while it was read, a malfunctioning pre-ingest scan
 hook, a handler failure and a reject of which no copy reached the error directory each charge it. A
-tick stops when either budget is spent, so it reads to the end, and runs the pre-ingest scan on, at
-most twice `poll_max_files` files. A read that fails, such as on a locked or vanished file, charges
-neither. The cost: once `poll_max_files` files that stay in place sort ahead of the healthy drops, a
-tick stops before reaching those drops, so they wait until the stuck files leave.
+tick stops when either budget is spent. So a tick reads at most `poll_max_files` files it leaves in
+place and at most `poll_max_files` it finishes with, and runs the pre-ingest scan on no more. At least
+a file whose read raises, such as a locked or vanished one, charges neither budget; a read that fails
+partway is not bounded by either. **The cost is a stall.** Once `poll_max_files` files that stay in
+place sort ahead of the healthy drops, every tick stops before reaching those drops, and a WARNING
+says so. They wait until enough of the stuck files leave. Some never leave on their own: under
+`after_read = "leave"` on a share the engine cannot write, a reject can never reach the error
+directory, so the feed would stay stalled until someone removes the rejects from the share.
 
 **At least these gaps in the completion rule remain:** on `Sftp(...)`/`Ftp(...)` a quarantine whose
 move to the error directory fails still charges, and on `File(...)` a handed-off file whose move or
@@ -4859,11 +4863,11 @@ tick it is examined, which is the starvation this rule exists to prevent.
 
 **A database row that cannot become a body does not spend it either, and the two sources reach that
 by different routes.** A file source charges on **completion**, so it simply does not count an item it
-left in place. The database ceiling is charged at the **fetch**, for the memory reason above, so the
+left in place against the ceiling (`File(...)` counts it against its second budget, above). The database ceiling is charged at the **fetch**, for the memory reason above, so the
 row has to be decoded, and its body encoded in the configured `encoding` (BACKLOG #4921), under the
 open cursor and replaced from the same cursor — the shortfall is
 re-fetched, never the whole result set. Do not read this as parity of mechanism; what the two share is
-that a budget can only be charged by something that makes progress. Two bounds keep the replacement
+that the ceiling can only be charged by something that makes progress. Two bounds keep the replacement
 from becoming a log flood: a `body_column` that names no column `poll_statement` selects is **static**
 and is reported once per poll before any row is read, and everything else is per-row and capped at 64
 skips, after which the poll stops fetching and defers the rest. Each skipped row is logged and emits a

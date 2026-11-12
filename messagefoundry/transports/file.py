@@ -1065,7 +1065,7 @@ class FileSource(SourceConnector):
                     continue
             if not self._settled(path, before):
                 # BACKLOG #1811: first sighting, or the file changed since the last poll. Nothing is
-                # read, moved or charged against the per-tick budget, the same as #116's skip below.
+                # read or moved, so neither per-tick budget is charged (_at_ceiling).
                 continue
             try:
                 raw, read_sig, read_id = await self._run_fs(self._read_settled, path)
@@ -1099,8 +1099,9 @@ class FileSource(SourceConnector):
             self._refused.discard(str(path))  # read cleanly, so a later refusal warns again
             if before != read_sig or len(raw) != read_sig[0]:
                 # BACKLOG #116: a partner is still writing this file in place. Emitting what was read
-                # would pass a cut-off message as a complete one, so leave it for the next scan. Not
-                # charged against the per-tick budget: nothing was handed off and nothing moved.
+                # would pass a cut-off message as a complete one, so leave it for the next scan. Nothing
+                # was handed off or moved, so it charges only the second budget, the one bounding the
+                # files read and left in place (_at_ceiling, BACKLOG #5717).
                 logger.warning(
                     "file source %s: %s changed while it was read (%d bytes before, %d read, %d "
                     "after); not emitted, left in place for the next scan",
@@ -1313,25 +1314,23 @@ class FileSource(SourceConnector):
         No message was received, so there is no disposition to record and the count-and-log invariant is
         untouched.
 
-        **What charges the budget, and why the exceptions are not an oversight.** Only a file this scan
-        FINISHED with charges: one handed to the pipeline, or a reject (oversize, a failed gunzip, a
+        **What charges the first budget, ``disposed``, and why the exceptions are not an oversight.**
+        Only a file this scan FINISHED with charges it: one handed to the pipeline, or a reject (oversize, a failed gunzip, a
         content-vs-type mismatch, a scanner rejection) that :meth:`_quarantine` archived to ``.error``.
         Each of those is meant to leave the candidate set, so the next scan starts on new work. At
         least two still charge though the file stays: a handed-off file whose move or delete fails, and
         a reject archived as a copy whose original could not be removed. At least these arms leave a
-        file **in place** to be retried and deliberately do NOT charge: a file not yet settled (#1811)
-        or changed during the read (#116), a locked/vanished file, a malfunctioning scan hook, a handler
-        failure, a reject of which no copy was archived (BACKLOG #5717). If they did, a permanently stuck
-        file that sorts early would eat the whole budget on every scan and the healthy files behind it
-        would never be ingested. A budget can only be charged by something that makes progress.
+        file **in place** to be retried and deliberately do NOT charge it: a file not yet settled
+        (#1811) or changed during the read (#116), a locked/vanished file, a malfunctioning scan hook, a
+        handler failure, a reject of which no copy was archived (BACKLOG #5717). If they did, each stuck
+        file that sorts early would take, on every scan, a place a healthy file could have had.
 
-        **The second budget, ``retried``, bounds the work spent on files left in place** (BACKLOG
-        #5717). Each of those arms that runs after a completed read charges it: a file changed during
-        the read, a malfunctioning scan hook, a handler failure, a reject of which no copy was
-        archived. It is capped at ``poll_max_files`` too, so a scan reads to the end and scans at most
-        twice ``poll_max_files`` files. The cost: once that many files left in place sort ahead, the
-        files behind them wait, as they did before #5717 when such rejects charged the first budget.
-        A read that fails (a locked or vanished file) or is refused charges neither.
+        **The second budget, ``retried``, bounds the reads and scans of files left in place** (BACKLOG
+        #5717). It is the same size. At least these arms charge it: a file changed during the read, a
+        malfunctioning scan hook, a handler failure, and a reject of which no copy was archived, an
+        oversize file cut off at ``max_file_bytes`` included. A file not yet settled, a read refused
+        as unconfined and a read that raises charge neither budget. The bound this gives, and what it
+        costs, are stated once in ``docs/CONNECTIONS.md``, *Per-tick poll ceilings*.
 
         This bounds the INGEST, not the listing: ``_candidates`` still globs and sorts the whole
         directory, because picking the first N in name/mtime order requires seeing all of them. The
@@ -1340,14 +1339,24 @@ class FileSource(SourceConnector):
         cap = self.poll_max_files
         if cap is None or (disposed < cap and retried < cap):
             return False
-        logger.info(
-            "file source %s reached poll_max_files (%s) this scan, in files %s; %d candidate(s) left "
-            "for the next poll (deferred, not dropped)",
-            self.directory,
-            cap,
-            "finished with" if disposed >= cap else "read and left in place",
-            remaining,
-        )
+        if disposed >= cap:
+            logger.info(
+                "file source %s reached poll_max_files (%s) this scan; %d candidate(s) left for the "
+                "next poll (deferred, not dropped)",
+                self.directory,
+                cap,
+                remaining,
+            )
+        else:
+            # WARNING, not INFO: while that many stuck files sort ahead, every scan ends here and the
+            # drops behind them are never reached.
+            logger.warning(
+                "file source %s reached poll_max_files (%s) this scan in files read and left in "
+                "place; %d candidate(s) behind them left for the next poll (deferred, not dropped)",
+                self.directory,
+                cap,
+                remaining,
+            )
         return True
 
     def _file_key(self, path: Path, sig: _FileSig | None = None) -> str:
