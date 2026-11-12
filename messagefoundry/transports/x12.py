@@ -296,8 +296,8 @@ class X12Destination(DestinationConnector):
         finally:
             self._sending = False
 
-    def _closed_error(self) -> DeliveryError:
-        return closed_connector_error("X12", self.host, self.port)
+    def _closed_error(self, *, written: bool = False) -> DeliveryError:
+        return closed_connector_error("X12", self.host, self.port, written=written)
 
     async def _dial(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         """One connection attempt — a charged :class:`DeliveryError` on failure. Exactly one dial per
@@ -310,10 +310,13 @@ class X12Destination(DestinationConnector):
             raise DeliveryError(f"X12 connect to {self.host}:{self.port} failed: {exc}") from exc
 
     async def _send_once(self, payload: str) -> DeliveryResponse | None:
-        """Connect-per-send (``persistent=false``) — byte-identical wire behavior to the pre-#97 code,
-        with the close now bounded (#55) and the fail-loud serial-``send()`` assert in :meth:`send`.
-        Reads the returned interchange when capturing it, when a TA1 is contractually required, or for
-        the legacy ``expect_reply`` confirmation; fire-and-forget (none set) is byte-identical."""
+        """Connect-per-send (``persistent=false``) — the pre-#97 wire behavior, with the close now
+        bounded (#55) and the fail-loud serial-``send()`` assert in :meth:`send`. Reads the returned
+        interchange when capturing it, when a TA1 is contractually required, or for the legacy
+        ``expect_reply`` confirmation; fire-and-forget (none set) writes the same bytes. Since BACKLOG
+        #5718 a reload's ``aclose()`` closes this socket too: a send it cuts after the write fails
+        as a retryable, indeterminate delivery, and the retry on the replacement may deliver the
+        interchange twice, as on the persistent path."""
         need_reply = self.expect_reply or self.capture_response or self.ta1_required
         reader, writer = await self._dial()
         if self._closed:
@@ -328,7 +331,16 @@ class X12Destination(DestinationConnector):
             writer.write(encode_wire_body(payload, self.encoding, transport="X12"))
             await asyncio.wait_for(writer.drain(), self.timeout)
             if need_reply:
-                interchange = await asyncio.wait_for(self._read_reply(reader), self.timeout)
+                try:
+                    interchange = await asyncio.wait_for(self._read_reply(reader), self.timeout)
+                except DeliveryError as exc:
+                    # aclose() closed the socket under the read, which then reads as the PEER
+                    # closing. Name the engine's own close, so the row's error and the alerts never
+                    # blame the partner. Only an end of stream is relabelled: a reply the partner
+                    # sent before the close, such as one over the size cap, keeps its own error.
+                    if self._closed and reader.at_eof():
+                        raise self._closed_error(written=True) from exc
+                    raise
                 # _check_ta1 returns the captured reply, raises on a TA1 reject/error, and returns None
                 # for a non-capturing accept (a ta1_required-only outbound still fails fast on a reject).
                 if self.capture_response or self.ta1_required:
@@ -337,19 +349,12 @@ class X12Destination(DestinationConnector):
                         return response
         except TimeoutError as exc:
             if self._closed:
-                raise self._closed_error() from exc
+                raise self._closed_error(written=True) from exc
             raise DeliveryError("X12 timed out") from exc
         except OSError as exc:
             if self._closed:
-                raise self._closed_error() from exc
+                raise self._closed_error(written=True) from exc
             raise DeliveryError(f"X12 I/O error: {exc}") from exc
-        except DeliveryError as exc:
-            # aclose() closed the socket under the read, which then reads as the PEER closing. Name
-            # the engine's own close, so the row's error and the alerts never blame the partner. A
-            # TA1 reject is the partner's answer, read before any close, and stays as it is.
-            if self._closed and not isinstance(exc, NegativeAckError):
-                raise self._closed_error() from exc
-            raise
         finally:
             self._inflight = None
             await self._close_bounded(writer)
@@ -682,8 +687,8 @@ class X12Destination(DestinationConnector):
     async def aclose(self) -> None:
         """Close the cached persistent connection and any connect-per-send socket in flight (engine
         stop / reload swap — the runner calls this for every replaced/removed connector). Idempotent;
-        bounded; safe concurrently with an in-flight send (closing the socket under it makes that send
-        fail loud → charged → retried, on either path since BACKLOG #5718)."""
+        bounded; safe concurrently with an in-flight send: closing the socket under it makes that send
+        fail loud, charged and then retried, on either path since BACKLOG #5718."""
         self._closed = True
         conn = self._conn
         self._conn = None

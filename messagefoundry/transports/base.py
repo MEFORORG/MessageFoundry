@@ -1356,14 +1356,19 @@ def insecure_hop_refused(exc: Exception, *, connector: str) -> NegativeAckError:
     )
 
 
-def closed_connector_error(transport: str, host: str, port: int) -> DeliveryError:
+def closed_connector_error(
+    transport: str, host: str, port: int, *, written: bool = False
+) -> DeliveryError:
     """The retryable error of a send that reached an outbound ``aclose()`` already closed.
 
     A reload swaps the connector out and closes the old one, so a send still holding it retries on
     the replacement. It is a plain :class:`DeliveryError` on purpose: never a permanent or
-    configuration fault, because the replacement may deliver where the closed connector would not."""
+    configuration fault, because the replacement may deliver where the closed connector would not.
+    ``written`` says the close cut a send whose payload had already been written, so the partner may
+    hold it and the retry may deliver it twice."""
+    when = " after the payload was written (delivery indeterminate)" if written else ""
     return DeliveryError(
-        f"{transport} destination {host}:{port} is closed (stop/reload); "
+        f"{transport} destination {host}:{port} is closed (stop/reload){when}; "
         "delivery retries on the replacement connector"
     )
 

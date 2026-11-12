@@ -1239,10 +1239,6 @@ class MLLPDestination(DestinationConnector):
         reconnect-before-first-byte (uncharged) → write/drain/ACK-read (any failure after ``write()``
         is charged, names its phase, and discards the connection) → re-cache on a fully-successful
         transaction (including a NAK) unless the peer left extra bytes behind (desync guard)."""
-        if self._closed:
-            # aclose() already ran (engine stop / reload swap) — never re-establish a socket the
-            # lifecycle can no longer close. Fail loud; the retry lands on the replacement connector.
-            raise closed_connector_error("MLLP", self.host, self.port)
         conn = self._conn
         if conn is not None:
             reason = self._stale_reason(*conn)
@@ -1262,7 +1258,16 @@ class MLLPDestination(DestinationConnector):
                 await self._close_bounded(conn[1])
                 conn = None
         if conn is None:
+            # aclose() (engine stop / reload swap) may run during the stale socket's close above or
+            # during the dial below, and it cannot see a socket that is not cached yet. Never cache
+            # a socket the lifecycle can no longer close: fail loud, and the retry lands on the
+            # replacement connector. send() checks first, before the hop guard.
+            if self._closed:
+                raise closed_connector_error("MLLP", self.host, self.port)
             conn = await self._dial()
+            if self._closed:
+                await self._close_bounded(conn[1])
+                raise closed_connector_error("MLLP", self.host, self.port)
             self._established_at = time.monotonic()
         reader, writer = conn
         # Keep the in-flight connection visible in the cache slot so a concurrent aclose() (the
@@ -1367,10 +1372,6 @@ class MLLPDestination(DestinationConnector):
         reconnect, never a mis-parse). Reuse-time liveness → reconnect-before-first-byte (uncharged) →
         write/drain → re-cache on drain success; any failure after ``write()`` discards the connection
         (charged; the next send re-dials)."""
-        if self._closed:
-            # aclose() already ran (engine stop / reload swap) — never re-establish a socket the
-            # lifecycle can no longer close. Fail loud; the retry lands on the replacement connector.
-            raise closed_connector_error("MLLP", self.host, self.port)
         conn = self._conn
         if conn is not None:
             reason = self._stale_reason(*conn)
@@ -1389,7 +1390,16 @@ class MLLPDestination(DestinationConnector):
                 await self._close_bounded(conn[1])
                 conn = None
         if conn is None:
+            # aclose() (engine stop / reload swap) may run during the stale socket's close above or
+            # during the dial below, and it cannot see a socket that is not cached yet. Never cache
+            # a socket the lifecycle can no longer close: fail loud, and the retry lands on the
+            # replacement connector. send() checks first, before the hop guard.
+            if self._closed:
+                raise closed_connector_error("MLLP", self.host, self.port)
             conn = await self._dial()
+            if self._closed:
+                await self._close_bounded(conn[1])
+                raise closed_connector_error("MLLP", self.host, self.port)
             self._established_at = time.monotonic()
         _reader, writer = conn
         # Keep the in-flight connection visible so a concurrent aclose() (the documented reload race)

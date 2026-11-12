@@ -285,14 +285,63 @@ async def test_aclose_closes_a_connect_per_send_in_flight() -> None:
         await dest.aclose()
         with pytest.raises(DeliveryError) as raised:
             await asyncio.wait_for(asyncio.shield(send), 5)
-        # The engine closed the socket, so the error names that close and never blames the peer.
-        assert "is closed (stop/reload)" in str(raised.value)
+        # The engine closed the socket, so the error names that close and never blames the peer,
+        # and says the interchange may have landed.
+        assert "is closed (stop/reload) after the payload was written" in str(raised.value)
+        assert "delivery indeterminate" in str(raised.value)
         assert dest._inflight is None
     finally:
         # A failure above must not leave the send holding the socket the silent peer waits on, or
         # server.wait_closed() would wait out its bound and mask the real assertion.
         send.cancel()
         await asyncio.gather(send, return_exceptions=True)
+        server.close()
+        await asyncio.wait_for(server.wait_closed(), 5)
+
+
+async def test_a_partner_fault_read_before_the_close_keeps_its_own_error() -> None:
+    """Only the engine's own close is relabelled. A reply over the size cap, sent by the partner
+    before the reload closed the connector, keeps its own error: blaming the close would hide it."""
+    sent = asyncio.Event()
+
+    async def oversize_peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.read(4096)
+        writer.write(b"ISA*" + b"0" * 8192)
+        await writer.drain()
+        sent.set()
+        try:
+            await reader.read(4096)
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(oversize_peer, LOOPBACK, 0)
+    port = int(server.sockets[0].getsockname()[1])
+    dest = X12Destination(
+        Destination(
+            name="OB_X12",
+            type=ConnectorType.X12,
+            settings={
+                "host": LOOPBACK,
+                "port": port,
+                "expect_reply": True,
+                "max_interchange_bytes": 1024,
+            },
+        )
+    )
+    real_read = dest._read_reply
+
+    async def read_after_close(reader: asyncio.StreamReader) -> bytes:
+        # The partner's oversized reply is on the wire before the reload marks the connector closed.
+        await sent.wait()
+        dest._closed = True
+        return await real_read(reader)
+
+    dest._read_reply = read_after_close  # type: ignore[method-assign]
+    try:
+        with pytest.raises(DeliveryError) as raised:
+            await asyncio.wait_for(dest._send_once(X12), 5)
+        assert "is closed (stop/reload)" not in str(raised.value)
+    finally:
         server.close()
         await asyncio.wait_for(server.wait_closed(), 5)
 
@@ -340,6 +389,51 @@ async def test_aclose_during_the_dial_never_delivers_on_the_replaced_connector(
         assert got == [b""], "the interchange reached the replaced connector's peer"
         assert dest._conn is None
         assert dest._inflight is None
+    finally:
+        server.close()
+        await asyncio.wait_for(server.wait_closed(), 5)
+
+
+@pytest.mark.parametrize("no_ack", [False, True], ids=["ack", "no-ack"])
+async def test_aclose_during_an_mllp_persistent_dial_never_delivers(no_ack: bool) -> None:
+    """The MLLP twin of the X12 dial race. MLLP checked the close only at the top of its persistent
+    paths, which send() now reaches with no await in between, so the window that mattered, the
+    dial, was open: the send cached the new socket and delivered on the replaced connector."""
+    got: list[bytes] = []
+    peer_done = asyncio.Event()
+
+    async def peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            got.append(await reader.read(4096))
+        finally:
+            writer.close()
+            peer_done.set()
+
+    server = await asyncio.start_server(peer, LOOPBACK, 0)
+    port = int(server.sockets[0].getsockname()[1])
+    dest = MLLPDestination(
+        Destination(
+            name="OB_MLLP",
+            type=ConnectorType.MLLP,
+            settings={"host": LOOPBACK, "port": port, "persistent": True, "no_ack": no_ack},
+        )
+    )
+    real_dial = dest._dial
+
+    async def dial_then_reload() -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        conn = await real_dial()
+        await dest.aclose()  # the reload lands while the dial is still pending
+        return conn
+
+    dest._dial = dial_then_reload  # type: ignore[method-assign]
+    try:
+        with pytest.raises(DeliveryError) as raised:
+            await asyncio.wait_for(dest.send(RAW), 5)
+        assert not isinstance(raised.value, NegativeAckError)
+        assert "is closed (stop/reload)" in str(raised.value)
+        await asyncio.wait_for(peer_done.wait(), 5)
+        assert got == [b""], "the message reached the replaced connector's peer"
+        assert dest._conn is None
     finally:
         server.close()
         await asyncio.wait_for(server.wait_closed(), 5)
