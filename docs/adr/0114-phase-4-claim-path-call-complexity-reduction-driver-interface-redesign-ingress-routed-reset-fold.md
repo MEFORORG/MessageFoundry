@@ -503,6 +503,13 @@ version is dropped only by an explicit later `_SCHEMA` statement, one release af
 *(Note 2026-09-29, BACKLOG #1270: the first bump under this rule. `mefor_claim_fifo_heads_cid_v2` /
 `_dst_v2` add head-skip marker rows to the sole result set and are the procs the engine now calls.
 `_v1` stays deployed with its shipped bytes, and a later change drops it.)*
+*(Note 2026-11-12, BACKLOG #5721 and #5722: the `_v2` bodies were re-pinned IN PLACE, not bumped, because
+nothing has been deployed and the sole result set's shape did not change. #5721 makes every lane comparison in
+the shared claim body binary (`Latin1_General_100_BIN2`). #5722 drops the `dbo.` qualifier from the `_v2` head,
+so the procs deploy in the provisioning login's default schema, beside the tables; the startup gate looks for
+them, and the `{CALL}` addresses them, in the schema of the `queue` table the runtime login resolves. The `dbo.`
+names in the sections above describe `_v1`, which keeps its shipped bytes and its `dbo.` head.
+[`DEPLOY-SERVER-DB.md`](../DEPLOY-SERVER-DB.md) §1.1 is the operator's statement of where the procs live.)*
 **Downgrade** to a pre-0114 build leaves the version-named procs **orphaned and inert** (nothing calls or drops
 them; re-upgrade reclaims them via `CREATE OR ALTER`); mixed-vintage schema-marker thrash on restarts is
 pre-existing ADR 0064 behavior — applock-serialized and idempotent — recorded here so an operator seeing

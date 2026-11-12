@@ -1130,8 +1130,9 @@ does not stop the delete.
    on `main`. A holder's row or a map that is **Unverifiable is left untouched** (items 5, 15 and
    16). The store then decides from the references it read, never from a foreign-key error,
    because the backends differ: `user_roles.role_id` references `roles(id)` on all three, and
-   `ad_group_role_map.role_id` does on SQLite and PostgreSQL but not on SQL Server. Wherever an
-   Unverifiable row still names the role, on every backend, the role is **retired** instead: its permission set is
+   `ad_group_role_map.role_id` does on SQLite and PostgreSQL and, since BACKLOG #5725, on SQL Server
+   too, but there `WITH NOCHECK` and in the database collation, so it may still hold a row naming no
+   role exactly. Wherever an Unverifiable row still names the role, on every backend, the role is **retired** instead: its permission set is
    emptied and a new `retired` column, inside the role seal, is set, in one sealed write of the
    role row. A retired role grants nothing through any reference, the console lists it as retired,
    and its id cannot be reused because the row still exists. **The store's role writer

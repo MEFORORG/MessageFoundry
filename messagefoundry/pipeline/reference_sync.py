@@ -368,6 +368,8 @@ class ReferenceSyncRunner:
 
     ``specs`` is a *provider* (re-read each pass) so a config reload's new declarations are picked up;
     ``env_values`` resolves any :func:`~messagefoundry.config.wiring.env` refs in a source's settings.
+    It is a mapping, copied once, or a provider read at each set's sync, which is how the engine hands
+    in its values, so a reload that adds or rotates a value reaches the next sync (vault BACKLOG #5698).
     """
 
     def __init__(
@@ -376,7 +378,7 @@ class ReferenceSyncRunner:
         specs: Callable[[], Iterable[ReferenceSpec]],
         settings: ReferenceSettings,
         *,
-        env_values: Mapping[str, Any] | None = None,
+        env_values: Mapping[str, Any] | Callable[[], Mapping[str, Any]] | None = None,
         egress: EgressSettings,
         alert_sink: AlertSink | None = None,
         coordinator: ClusterCoordinator | None = None,
@@ -386,7 +388,11 @@ class ReferenceSyncRunner:
         self._store = store
         self._specs = specs
         self._settings = settings
-        self._env_values = dict(env_values or {})
+        if callable(env_values):
+            self._env_values: Callable[[], Mapping[str, Any]] = env_values
+        else:
+            fixed = dict(env_values or {})
+            self._env_values = lambda: fixed
         self._egress = egress
         # Handed to every DATABASE source load; see _load_database_source (vault BACKLOG #2354).
         self._hop_posture = hop_posture
@@ -575,7 +581,7 @@ class ReferenceSyncRunner:
             # The text already leads with "reference set '<name>': ", so it is not repeated.
             log.error("%s (not synced)", exc)
             raise
-        settings = resolve_env_settings(spec.source.settings, self._env_values)
+        settings = resolve_env_settings(spec.source.settings, self._env_values())
         kind = spec.source.kind
         if kind == "file":
             rows = await asyncio.to_thread(

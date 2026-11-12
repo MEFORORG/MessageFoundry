@@ -594,6 +594,50 @@ async def test_empty_start_then_reload_syncs_reference(tmp_path: Path) -> None:
         await eng.stop()
 
 
+async def test_reload_resyncs_reference_against_rotated_env_value(tmp_path: Path) -> None:
+    # Vault BACKLOG #5698: the reference runner is built once and kept across reloads, and it used
+    # to copy the engine's env() values when it was built. A reload that rotated the value a
+    # Reference source names then synced against the old value until a restart. Falsified by
+    # handing the runner a copy of self._env_values again in Engine._make_reference_runner.
+    from messagefoundry.pipeline import Engine
+
+    first = _csv(tmp_path / "first.csv", "key,value\nA,1\n")
+    second = _csv(tmp_path / "second.csv", "key,value\nB,2\n")
+    cfg, inbox = tmp_path / "cfg", tmp_path / "in"
+    cfg.mkdir()
+    inbox.mkdir()
+    (cfg / "cfg.py").write_text(
+        "from messagefoundry import inbound, outbound, router, handler, Send, File, Reference, "
+        "FileRef, env\n"
+        f"inbound('IB_T', File(directory={str(inbox)!r}, pattern='*.hl7', poll_seconds=0.05), "
+        "router='r')\n"
+        f"outbound('FILE-OUT_T', File(directory={str(tmp_path / 'out')!r}, filename='{{MSH-10}}.hl7'))\n"
+        "Reference('codes', source=FileRef(path=env('codes_csv')), refresh_seconds=3600)\n"
+        "@router('r')\n"
+        "def route(msg):\n"
+        "    return ['h']\n"
+        "@handler('h')\n"
+        "def handle(msg):\n"
+        "    return Send('FILE-OUT_T', msg)\n",
+        encoding="utf-8",
+    )
+    values = {"codes_csv": str(first)}
+    eng = await Engine.create(
+        tmp_path / "e.db",
+        poll_interval=0.05,
+        egress_settings=EgressSettings(deny_by_default=False),
+        env_values_provider=lambda: dict(values),
+    )
+    try:
+        await eng.reload(cfg)
+        assert eng.store.reference_view()["codes"] == {"A": "1"}
+        values["codes_csv"] = str(second)  # the value file now names another source
+        await eng.reload(cfg)
+        assert eng.store.reference_view()["codes"] == {"B": "2"}
+    finally:
+        await eng.stop()
+
+
 def test_reference_declaration_registers() -> None:
     from messagefoundry.config import wiring
 
