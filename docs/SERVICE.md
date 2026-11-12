@@ -326,8 +326,10 @@ variable the service needs in one call, or the ones you leave out are gone at th
 That includes the `MEFOR_SECRETS_DIRECTORY` entry the installer wrote: without it the engine reads
 no file in the secrets directory, and every secret moved there is missing, with no error naming
 the directory. Read the list first with `nssm get MessageFoundry AppEnvironmentExtra`.
-**No secret goes in that list:** `serve` and `supervise` refuse to start with one of the engine's
-own secret settings there, because any local user can read the list. Use the DPAPI key file for
+**No secret goes in that list:** any local user can read it. Where the engine could read the
+service's lists, `serve` and `supervise` refuse to start with one of the engine's own secret
+settings there. Where it knows the service but could not read them, they refuse only a store key
+found in their own environment, never another secret setting. Use the DPAPI key file for
 the store key, and the secrets directory for the rest (see
 [Protect the store encryption key at rest](#protect-the-store-encryption-key-at-rest-wp-11d)).
 
@@ -687,8 +689,8 @@ NSSM environment.
   access list it needs, and the rest of the rules are stated once, in
   [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). Move each
   of the engine's own secret settings other than the store key and its retired keys here from the
-  service's NSSM list, where `serve` and `supervise` refuse it once they have read that list (the
-  previous bullet links where that is stated);
+  service's NSSM list, where `serve` and `supervise` refuse it if the engine could read that
+  list, and not if it could not (the previous bullet links where that is stated);
   a `MEFOR_VALUE_*` value there is not refused.
 
 > **External vault / managed identity.** DPAPI is the built-in on-box option. The engine can also call

@@ -393,19 +393,28 @@ def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> N
 
 
 def test_the_missing_directory_hint_gives_each_route_with_its_condition() -> None:
-    """The installer refuses an existing directory the service does not name, so the hint must
-    not send every operator to it: one route re-adds the variable for a directory that exists, the
-    other runs the installer where none does. Pinned by its two conditioned routes, not their
-    full text."""
+    """The installer refuses an existing directory the service does not name, and it always
+    registers ``serve``, so the hint sends nobody to a re-run: one route re-adds the variable for
+    a directory that exists, reading the list first since ``nssm set`` replaces it whole, and the
+    other points, where none exists, to the SERVICE.md text on how the directory is made. Each
+    route is pinned with its condition, so swapped conditions fail."""
     refusal = service_env_refusal(_service(["MEFOR_STORE_PASSWORD=x"]))
     assert refusal is not None
     hint = refusal.split("set no MEFOR_SECRETS_DIRECTORY", 1)[1]
     routes = hint.split(". Where ")[1:]
     assert len(routes) == 2
     existing, absent = routes
-    assert "MEFOR_SECRETS_DIRECTORY" in existing and "AppEnvironmentExtra" in existing
-    assert "run install-service.ps1" not in existing
-    assert "run install-service.ps1" in absent and "MEFOR_SECRETS_DIRECTORY" not in absent
+    assert existing.startswith("install-service.ps1 already made the secrets directory, add ")
+    assert "MEFOR_SECRETS_DIRECTORY naming that existing path" in existing
+    assert "AppEnvironmentExtra" in existing
+    assert "read it first with `nssm get`" in existing
+    assert '"Start / stop / status"' in existing
+    assert absent.startswith("none exists yet, ")
+    assert '"The other secrets: a secrets directory"' in absent
+    assert '"Protect the store encryption key at rest"' in absent
+    assert "MEFOR_SECRETS_DIRECTORY" not in absent and "AppEnvironmentExtra" not in absent
+    # No route sends the operator to a re-run of the installer.
+    assert "install-service.ps1 again" not in hint and "original parameters" not in hint
 
 
 def test_a_store_key_and_another_secret_in_the_nssm_list_name_both_remedies() -> None:

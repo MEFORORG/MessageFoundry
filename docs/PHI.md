@@ -2892,7 +2892,9 @@ For operators standing up the engine (see also [SERVICE.md](SERVICE.md)):
       account on its own (see [SECURITY.md](SECURITY.md#provisioning-the-first-administrator-asvs-632)).
 - [ ] **Supply secrets via env**, never the TOML (`MEFOR_STORE_PASSWORD`,
       `MEFOR_AUTH_AD_BIND_PASSWORD`, future `MEFOR_STORE_ENCRYPTION_KEY`). Under the Windows
-      service, not through its NSSM list, where `serve` and `supervise` refuse them: see
+      service, not through its NSSM list. `serve` and `supervise` refuse them there where the
+      engine could read that list; where it could not, they refuse only a store key found in
+      their own environment: see
       [SERVICE.md](SERVICE.md#protect-the-store-encryption-key-at-rest-wp-11d).
 - [ ] **Never feed real PHI to `dryrun`/`generate`** or redirect their output to shared locations (§7).
 - [ ] **Treat the harness's real-feed files as PHI.** Before running `python -m harness.reconcile`
