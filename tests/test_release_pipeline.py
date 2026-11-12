@@ -4566,8 +4566,9 @@ _PUBLISHER_UPSTREAM: dict[str, frozenset[str]] = {
 
 
 def _variable_gated_jobs(jobs: dict, publisher: str) -> list[str]:
-    """The jobs among ``publisher`` and every job it waits on whose job-level `if:` a variable can
-    turn false. Step-level `if:`s are not read. A skipped need skips the job that needs it, so any
+    """The jobs among ``publisher`` and every job it waits on whose job-level `if:`
+    `_VARIABLE_GATE` matches, which is wider than a variable gate on purpose. Step-level `if:`s are
+    not read. A skipped need skips the job that needs it, so any
     one of them would leave the release a draft on a run that reads green. The walk must find at
     least the publisher's `_PUBLISHER_UPSTREAM` set, or an empty result would say nothing about
     those jobs."""

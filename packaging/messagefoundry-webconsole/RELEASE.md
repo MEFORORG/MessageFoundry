@@ -107,8 +107,8 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
       `publish-github-release-webconsole` then publishes it. With `PUBLISH_WEBCONSOLE` set, the job
       uploads the wheel first. Unset, the upload is skipped and the release is published once the
       `pypi` approval is given. Set, the publish refuses while the upload has not run.
-      [docs/SUPPLY-CHAIN.md](../../docs/SUPPLY-CHAIN.md), *One approval per engine tag*, says what
-      counts as set, and *The draft* says what to do on a refusal.
+      [docs/SUPPLY-CHAIN.md](../../docs/SUPPLY-CHAIN.md) says what counts as set, in its diagram's
+      *Legend*, and what to do on a refusal, in *The draft*.
 
 ## 7. Post-publish verification
 
