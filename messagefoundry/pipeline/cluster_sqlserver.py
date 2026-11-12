@@ -54,12 +54,14 @@ from typing import TYPE_CHECKING, Any
 
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import (
+    SIDE_STEP_CLAMPS,
     STOP_WRITE_TIMEOUT_SECONDS,
     ClusterMember,
     StepdownOutcome,
     StepdownReleaseUnconfirmed,
     acquire_leadership_lock,
     default_node_id,
+    heartbeat_lapsed,
     late_hold_pause_seconds,
     lease_release_unconfirmed,
     members_from_node_rows,
@@ -203,6 +205,9 @@ class SqlServerCoordinator:
         self._is_leader: bool = False
         # Monotonic time of the last CONFIRMED lease hold; the fence demotes when now - this > timeout.
         self._last_renew_ok: float | None = None
+        # The monotonic issue instant of the last heartbeat to return, the registration included.
+        # Mirrors DbCoordinator._last_beat_ok (BACKLOG #5710) -- read its comment there.
+        self._last_beat_ok: float | None = None
         # H1 fencing token: the leader epoch this node holds, or None when not a fenced leader. Bumped in
         # the DB only on a FRESH acquire (take-over of a free/expired/foreign lease), never on a renew —
         # see DbCoordinator. The engine pushes it into the store on promotion; the FIFO claim then fences
@@ -439,6 +444,7 @@ class SqlServerCoordinator:
                 raise
 
     async def _register(self) -> None:
+        issued_at = self._monotonic()
         now = time.time()
         # acquire_delay_seconds / promotable are static per-node config (ADR 0096): written on register
         # (incl. a restart's conflict-update) and never touched by the heartbeat.
@@ -469,18 +475,22 @@ class SqlServerCoordinator:
                 1 if self._promotable else 0,
             ),
         )
+        self._last_beat_ok = issued_at
 
     async def heartbeat_once(self) -> None:
         # Refresh last_seen (wall clock, like DbCoordinator) and fold the current is_leader flag — the
         # flag lags by one tick (the loop beats just after _maintain_leadership, BACKLOG #5710), or
         # longer while ticks skip a side pass that has not finished.
         # Zero extra writes. Under the renew clamp (BACKLOG #6472): it no longer delays the renew,
-        # but an unbounded one would starve the next beat and hold up stop().
+        # but an unbounded one would starve the next beat and hold up stop(). A beat that returns
+        # stamps its issue instant, as DbCoordinator.heartbeat_once does (BACKLOG #5710).
+        issued_at = self._monotonic()
         await self._store._execute_clamped(
             "UPDATE nodes SET last_seen=?, status=?, is_leader=? WHERE node_id=?",
             (time.time(), "active", 1 if self._is_leader else 0, self.node_id),
             timeout_clamp=self._renew_timeout,
         )
+        self._last_beat_ok = issued_at
 
     async def _heartbeat_loop(self) -> None:
         # The renew first and alone, the other two beside it, in lockstep with
@@ -495,6 +505,7 @@ class SqlServerCoordinator:
                 ("heartbeat_once", self.heartbeat_once),
                 ("config_version", self._refresh_config_version),
             ),
+            side_step_timeout=SIDE_STEP_CLAMPS * self._renew_timeout,
             node_id=self.node_id,
         )
 
@@ -503,6 +514,9 @@ class SqlServerCoordinator:
         # is made on a value that crossed an await, so a stepdown interleaving here would be undone by
         # this tick's own stale result. Mirrors DbCoordinator._maintain_leadership.
         async with self._leadership_lock:
+            # No claim while this node's own heartbeat has lapsed (BACKLOG #5710).
+            if self._stand_aside_on_lapse():
+                return
             # ADR 0157 Inc 0: read the baseline BEFORE the claim is issued, not after it returns. The
             # lease expiry it races is stamped on the DB clock inside this round trip, so a baseline
             # taken afterwards is later than the DB's own by the whole trip and the detection margin
@@ -654,7 +668,7 @@ class SqlServerCoordinator:
             self._check_fence()
 
     def _check_fence(self) -> None:
-        if not self._is_leader:
+        if not self._is_leader or self._stand_aside_on_lapse():
             return
         last = self._last_renew_ok
         if last is None:
@@ -671,6 +685,28 @@ class SqlServerCoordinator:
             )
             self._alert_leadership_lost("self-fenced")  # #145 (inverse → auto-resolves)
             self._fire_on_demote()  # ADR 0157 Inc 5
+
+    def _stand_aside_on_lapse(self) -> bool:
+        """Mirrors :meth:`DbCoordinator._stand_aside_on_lapse` (BACKLOG #5710); read its docstring
+        for why a node whose own heartbeat lapsed neither leads nor claims."""
+        now = self._monotonic()
+        last = self._last_beat_ok
+        if last is None or not heartbeat_lapsed(last, now, self._node_timeout_seconds):
+            return False
+        if self._is_leader:
+            self._is_leader = False
+            self._leader_epoch = None
+            log.warning(
+                "cluster: node %s stood down: its last heartbeat to land was issued %.1fs ago, past"
+                " node_timeout_seconds (%.1fs), so the cluster reads it as dead; not claiming the"
+                " lease until a heartbeat lands",
+                self.node_id,
+                now - last,
+                self._node_timeout_seconds,
+            )
+            self._alert_leadership_lost("heartbeat lapsed")
+            self._fire_on_demote()  # ADR 0157 Inc 5
+        return True
 
     async def step_down_leadership(
         self, *, sibling_acquire_delay_seconds: float

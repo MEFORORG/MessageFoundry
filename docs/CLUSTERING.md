@@ -122,7 +122,9 @@ cluster coordinates the parts that must not double-run or interleave:
   measured on the database's own clock, so node clock skew doesn't affect who may hold it); a standby
   acquires only once that lease has **expired**. A leader that cannot renew within
   `leader_fence_timeout_seconds` (< the TTL) **self-fences** — it stops *reporting itself* leader before
-  the lease can expire and a standby acquire it (the split-brain guard). Two caveats if you tune these
+  the lease can expire and a standby acquire it (the split-brain guard). A leader whose own heartbeat
+  has not landed for `node_timeout_seconds` stands down too, because its siblings already read it as
+  dead, and it claims nothing until a heartbeat lands ([BACKLOG #5710](BACKLOG.md)). Two caveats if you tune these
   down from the shipped `10 / 20 / 30`: the usable margin is smaller than `ttl - fence`, because the
   fence baseline is taken after the renew round trip returns while the expiry is stamped on the database
   clock at statement execution, and detection lands up to one fence tick late; and the config validator
