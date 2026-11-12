@@ -473,7 +473,7 @@ class BackupRunner:
         clock: Callable[[], float] = time.time,
         coordinator: ClusterCoordinator | None = None,
         hop_posture: HopPosture | None = None,
-        dr_standby: Callable[[], bool] | None = None,
+        passive_standby: Callable[[], bool] = lambda: False,
     ) -> None:
         self._store = store
         self._settings = settings
@@ -482,7 +482,7 @@ class BackupRunner:
         # probe reads any such row as proof the database was restored from a primary, so a
         # standby's own row would pass that probe on an unrestored database. It would also become
         # the latest anchor the restore-token check compares, and refuse a valid restore.
-        self._dr_standby = dr_standby
+        self._passive_standby = passive_standby
         # The store settings carry the KeyProvider seam (ADR 0019) — the archive's KEY SOURCE. Typed
         # loosely to avoid importing StoreSettings here; resolve_active_key takes it.
         self._store_settings = store_settings
@@ -586,10 +586,8 @@ class BackupRunner:
 
     def _may_back_up(self) -> bool:
         """Leader-gated, so a follower never backs up the shared destination (AC-12), and never on
-        a passive DR standby (vault BACKLOG #5712, see ``dr_standby``)."""
-        if not self._coordinator.is_leader():
-            return False
-        return self._dr_standby is None or not self._dr_standby()
+        a passive DR standby (vault BACKLOG #5712, see ``passive_standby``)."""
+        return self._coordinator.is_leader() and not self._passive_standby()
 
     # --- one pass ------------------------------------------------------------
 

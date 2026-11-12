@@ -90,7 +90,7 @@ async def test_the_scheduled_pass_is_not_due_on_a_passive_standby(tmp_path: Path
         _backup_settings(tmp_path, schedule_at="00:00"),
         store_settings=StoreSettings(path=str(db)),
         config_dir=None,
-        dr_standby=lambda: standby,
+        passive_standby=lambda: standby,
     )
     try:
         # 00:00 is always reached, and no pass has run today.

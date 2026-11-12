@@ -2319,7 +2319,7 @@ class Engine:
                 hop_posture=self._hop_posture,
                 # A passive DR standby writes no dr_backup row; read live, so an activation starts
                 # the passes and a release stops them (vault BACKLOG #5712).
-                dr_standby=self._is_passive_dr_standby,
+                passive_standby=self._is_passive_dr_standby,
             )
             self._backup_runner.start()
         # [cert_monitor] TLS-cert expiry monitor (Q5c) — a maintenance task like retention, independent
