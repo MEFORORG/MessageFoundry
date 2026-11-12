@@ -1951,7 +1951,12 @@ The Handler produces a **JSON-object** body; the connector binds its keys to the
 **Delivery semantics.** A committed statement is delivered. A **transient** DB failure (connection drop,
 deadlock, timeout — SQLSTATE class `08`/`40` or `HYTxx`) → `DeliveryError`, so the lane **retries**. A
 **permanent** failure (constraint / data / syntax) **and a payload that doesn't match the statement** →
-`NegativeAckError` → **dead-letter** (a retry can't fix it).
+`NegativeAckError` → **dead-letter** (a retry can't fix it). With `capture_response` or
+`capture_out_params` on, a driver error raised while the result is read or the next result set is
+reached (a deadlock, a procedure's own error, a dropped link) is the statement's failure: the write
+is rolled back and classified the same way, never committed. A statement that returns no result set
+is read from the cursor's `description`, not from a failed fetch, and still captures nothing
+(BACKLOG #5714).
 
 **Security.** Values are bound as **parameters** (never string-interpolated into SQL); the connection
 string checks every value (no connection-string injection; the SQL Server preset braces each one, and the generic dialect braces the driver name, and the password for the drivers it lists, and sends the rest plain, see [*Values*](#values-on-the-generic-dialect)); TLS is **on by default** and a

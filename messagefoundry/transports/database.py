@@ -3639,6 +3639,22 @@ def _json_default(value: Any) -> Any:
     )
 
 
+async def _fetch_result_set(cur: Any) -> list[Any] | None:
+    """The rows of ``cur``'s current result set, or ``None`` when the statement produced none.
+
+    "None" is read from ``cur.description``, which DB-API 2.0 sets to ``None`` for an operation
+    that returned no rows, and never from a failed fetch (BACKLOG #5714). pyodbc raises its
+    ``No results.  Previous SQL was not a query.`` from a fetch in exactly that state, so skipping
+    the fetch there keeps an ``INSERT`` or an ``EXEC`` reading as no result set. Any error from
+    the fetch itself is a driver error from the statement, a procedure's error, a deadlock or a
+    dropped link that surfaced when its result was read, and propagates so the caller's write is
+    rolled back rather than committed and recorded as delivered."""
+    if cur.description is None:
+        return None
+    rows: list[Any] = await cur.fetchall()
+    return rows
+
+
 class DatabaseDestination(DestinationConnector):
     """Execute one parameterized statement per payload against a SQL database (SQL Server today)."""
 
@@ -3759,8 +3775,9 @@ class DatabaseDestination(DestinationConnector):
             try:
                 await cur.execute(self._sql, params)
                 # Capture the RETURNING/OUTPUT rows from the SAME cursor BEFORE commit (re-run-stable:
-                # a separate post-commit SELECT could read changed state on a crash-replay). _capture
-                # never raises — a capture problem must not roll back an otherwise-successful write.
+                # a separate post-commit SELECT could read changed state on a crash-replay). A capture
+                # problem never rolls back the write, but a driver error reading the result is the
+                # statement's own failure and rolls it back like one (BACKLOG #5714).
                 captured = await self._capture(cur) if self.capture_response else None
                 await conn.commit()
             except Exception as exc:
@@ -3795,8 +3812,10 @@ class DatabaseDestination(DestinationConnector):
     async def _capture(self, cur: Any) -> DeliveryResponse:
         """Serialize the statement's RETURNING/OUTPUT result-set to a bounded JSON body (ADR 0013).
 
-        Never raises (capture must not un-succeed a committed write): a missing result set / over-cap
-        becomes ``no_reply`` / ``unparseable`` with an empty body. Generated ids in a RETURNING are
+        A capture problem never un-succeeds the write: a missing result set / over-cap / an
+        unserializable value becomes ``no_reply`` / ``unparseable`` with an empty body. A driver error
+        from the fetch is not a capture problem and propagates (:func:`_fetch_result_set`), so
+        :meth:`send` rolls the write back and classifies it (BACKLOG #5714). Generated ids in a RETURNING are
         only as stable as the write's idempotency — a non-idempotent INSERT re-derives a new id on a
         crash-re-send (the standing 'outbounds must be idempotent' requirement; see the connector docs).
 
@@ -3804,9 +3823,8 @@ class DatabaseDestination(DestinationConnector):
         which walks EVERY result set so a proc's OUT/return readback SELECT isn't dropped."""
         if self.capture_out_params:
             return await self._capture_merged(cur)
-        try:
-            rows = await cur.fetchall()
-        except Exception:  # noqa: BLE001 - statement produced no result set; capture nothing, keep the write
+        rows = await _fetch_result_set(cur)
+        if rows is None:
             return DeliveryResponse(body="", outcome="no_reply", detail="no result set")
         if not rows:
             return DeliveryResponse(body="", outcome="no_reply", detail="0 rows")
@@ -3848,35 +3866,32 @@ class DatabaseDestination(DestinationConnector):
         the atomicity caveat for a proc that COMMIT/ROLLBACKs internally). Bounded by
         ``capture_max_rows``/``capture_max_bytes`` like the single-set path.
 
-        Never raises (capture must not un-succeed a committed write): a problem degrades to
-        ``no_reply``/``unparseable`` with an empty body."""
+        A capture problem never un-succeeds the write: it degrades to ``no_reply``/``unparseable``
+        with an empty body. A driver error from a fetch or from ``nextset()`` is not one: a proc's
+        error, a deadlock or a dropped link raised by a later statement in the batch surfaces there,
+        so it propagates and :meth:`send` rolls the write back (BACKLOG #5714)."""
         merged: list[dict[str, Any]] = []
+        over_cap = False
         advance = getattr(cur, "nextset", None)
         while True:
-            try:
-                rows = await cur.fetchall()
-            except Exception:  # noqa: BLE001 - this set is not a query (INSERT/EXEC) → nothing to fetch
-                rows = []
-            if rows:
+            rows = await _fetch_result_set(cur)
+            if rows and not over_cap:
                 try:
                     cols = [d[0] for d in cur.description] if cur.description else []
                     merged.extend(dict(zip(cols, tuple(row))) for row in rows)  # noqa: B905
                 except Exception:  # noqa: BLE001 - malformed description → skip this set, keep the write
                     pass
-            if len(merged) > self._capture_max_rows:
-                return DeliveryResponse(
-                    body="",
-                    outcome="unparseable",
-                    detail=f"result-set exceeded capture_max_rows={self._capture_max_rows}",
-                )
-            if advance is None:
-                break  # a driver/cursor with no nextset() → single set only
-            try:
-                has_next = await advance()
-            except Exception:  # noqa: BLE001 - driver can't advance → stop with what we have
-                break
-            if not has_next:
-                break
+                over_cap = len(merged) > self._capture_max_rows
+            # Past the cap the walk still goes on, keeping no rows, so an error a later statement
+            # raises still reaches send() rather than being left unread under the commit.
+            if advance is None or not await advance():
+                break  # no nextset() (a single-set driver/cursor), or the last set
+        if over_cap:
+            return DeliveryResponse(
+                body="",
+                outcome="unparseable",
+                detail=f"result-set exceeded capture_max_rows={self._capture_max_rows}",
+            )
         if not merged:
             return DeliveryResponse(
                 body="", outcome="no_reply", detail="no OUT params / return value"
