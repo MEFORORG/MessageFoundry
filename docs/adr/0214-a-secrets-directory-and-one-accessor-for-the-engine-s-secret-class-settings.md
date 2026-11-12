@@ -157,11 +157,12 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
   name from `DIRECTORY_SETTING_NAMES` in the service's own environment lists now refuses `serve`
   and `supervise`, under every enforcement setting, as a store key there already did, and the
   refusal names this directory as the way in. The `service_environment_secret` loosening is
-  removed; an app built with `create_app(engine)`, where neither command runs, names what they
-  refuse as `secret_in_service_environment`. The other half, refusing such a secret found in the environment elsewhere, is not
-  built: one reaching the engine from the machine-wide environment, or from its own environment
-  when the service's lists could not be read, is neither refused nor named, since only a store
-  key's names are read there (vault BACKLOG #2595).
+  removed; an app built without either command, such as one built with `create_app(engine)`,
+  names what they refuse as `secret_in_service_environment`. The other half, refusing such a
+  secret found in the environment elsewhere, is not built: one reaching the engine from the
+  machine-wide environment, or from its own environment when the service's lists could not be
+  read, is neither refused nor named, since only a store key's names are read there (vault
+  BACKLOG #2595).
 - **2026-11-05, slice D built.** `[store].key_provider` no longer accepts the four external names
   ADR 0019 declared and nobody built, `aws_kms`, `azure_kv`, `gcp_kms` and `pkcs11`; each is now
   refused as an unknown name. Question 12 of the maintainer-internal decisions index answered yes

@@ -17,9 +17,9 @@ key, and the Service Control Manager's own ``Environment`` value on the service'
   says.** The same ruling covers it. Its protected alternative is the secrets directory
   ``MEFOR_SECRETS_DIRECTORY`` names (:mod:`messagefoundry.engine_secrets`, ADR 0214), and the
   refusal points there (vault BACKLOG #2595, slice B).
-* **Both refusals are ``serve``'s and ``supervise``'s.** An engine neither of them started, such
-  as an app built with ``create_app(engine)``, names what they refuse as the loosening
-  ``secret_in_service_environment`` instead.
+* **Both refusals are ``serve``'s and ``supervise``'s.** An API app neither of them started, such
+  as one built with ``create_app(engine)``, is not refused and names what they refuse as the
+  loosening ``secret_in_service_environment`` instead.
 * **A store key that reaches a Windows service through its environment is named** (key-custody
   slice S2a), wherever it came from, since the machine-wide environment is readable by every
   local user too.
@@ -464,7 +464,7 @@ def service_env_loosenings(posture: ServiceEnvPosture) -> list[tuple[str, str]]:
                 "service_environment_unobservable",
                 "the engine could not tell whether it runs as a Windows service under NSSM, or "
                 f"could not read that service's environment lists ({posture.detail}). A store key "
-                "or another secret there is neither refused nor named, and any local user may be "
+                "or another secret there is not read from them, and any local user may be "
                 "able to read it",
             )
         )
@@ -490,7 +490,8 @@ def service_env_loosenings(posture: ServiceEnvPosture) -> list[tuple[str, str]]:
         out.append(
             (
                 "secret_in_service_environment",
-                f"{refused}. `serve` and `supervise` refuse to start on this",
+                "`serve` and `supervise` refuse to start on what follows, and this engine is "
+                f"running without that refusal: {refused}",
             )
         )
     return out

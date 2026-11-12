@@ -2599,13 +2599,16 @@ count is above `0` (vault BACKLOG #2613).
   its lists, since the key most likely came from there; another secret in their own environment is
   not refused then.
 - **`secret_in_service_environment`: what `serve` and `supervise` refuse, in an engine neither
-  started.** An application that builds the API with `create_app(engine)` runs no such refusal,
-  so its posture names each case above that would refuse, with the refusal's own text. Clear it
-  the way the refusal says.
+  started.** An application that builds the API without them, for example with
+  `create_app(engine)`, runs no such refusal and is not refused, so its posture names each case
+  above that would refuse, with the refusal's own text. An engine embedded with no API has no
+  posture to name it in. Clear it the way the refusal says.
 - **`store_key_in_service_environment`: a store key reaches the service through its
   environment.** It is named wherever the key came from, once the engine knows its service. The
-  machine-wide environment is readable by every local user too. A key in the service's own
-  lists refuses first, so the entry normally means the machine-wide environment.
+  machine-wide environment is readable by every local user too. Under `serve` and `supervise` a
+  key in the service's own lists refuses first, so there the entry normally means the
+  machine-wide environment. Where `secret_in_service_environment` names the same key, it is in
+  the service's lists.
 - **`service_environment_unobservable`: the engine could not finish the reading.** The entry
   carries the reason: an ancestor process that could not be queried, an `nssm.exe` with no
   service, an `nssm.exe` above a process that is not Python, or a registry key it could not read.
@@ -2619,7 +2622,9 @@ count is above `0` (vault BACKLOG #2613).
 - **Where they are reported:** the serve-time loosening warning and `GET /security/posture`, each
   for the engine's own process. `supervise` logs one WARNING for each entry at start.
   `messagefoundry security show` is a separate process, so it reports none of them, and its scope
-  line says so. The reading is taken once, at start.
+  line says so. The reading is taken once, at start. `secret_in_service_environment` is the
+  exception: `serve` and `supervise` refuse before they report it, so only `GET
+  /security/posture` of an engine neither started reports it.
 - **How to clear them:** remove each named variable from the registry value the entry names, NSSM's
   list or the service's own `Environment` value, and from the machine-wide environment. Keep the
   store key in a DPAPI-protected key file. Let NSSM start the interpreter directly.
