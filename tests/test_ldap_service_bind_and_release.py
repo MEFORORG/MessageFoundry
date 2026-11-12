@@ -490,6 +490,9 @@ def test_a_user_or_decoy_bind_whose_open_fails_closes_its_socket(how: str) -> No
                 # second connect, whose release is under test, not the service account's.
                 assert len(dc.searches) == 1, f"the {branch} branch never searched"
             texts[branch] = str(err.value)
+    # Both branches recorded their second connect's socket, so the absence check below has a
+    # population to walk; the exact set is pinned by the next assertion.
+    assert len(second) >= 2, second
     # ldap3 sets conn.socket before the connect, so a failed open still holds one, still open.
     was_open = {branch: opened for branch, (_sock, opened) in second.items()}
     assert was_open == {"absent": True, "present": True}, was_open
