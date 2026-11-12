@@ -440,8 +440,8 @@ def test_a_user_or_decoy_bind_whose_open_fails_closes_its_socket(how: str) -> No
     stayed open until the object was collected. The two branches still answer alike. The refused
     port is held bound, exclusively where Windows offers it, and not listening while both branches
     run."""
-    second: dict[str, Any] = {}
-    open_at_end: dict[str, bool] = {}
+    # Per branch: the second connect's socket, and whether it was open as the open ended.
+    second: dict[str, tuple[Any, bool]] = {}
     texts: dict[str, str] = {}
     real = ldap3.Connection
 
@@ -460,10 +460,10 @@ def test_a_user_or_decoy_bind_whose_open_fails_closes_its_socket(how: str) -> No
                 try:
                     open_socket(*args, **kwargs)
                 finally:
-                    # Read as the open ends: the close under test then drops conn.socket.
-                    second[branch] = self.socket
-                    # Open as the open ends, so a socket read closed below closed after it.
-                    open_at_end[branch] = self.socket is not None and self.socket.fileno() != -1
+                    # Read as the open ends: the close under test then drops conn.socket, and a
+                    # socket open here and read closed below closed after it.
+                    sock = self.socket
+                    second[branch] = (sock, sock is not None and sock.fileno() != -1)
 
             self.strategy._open_socket = held_open
             if how == "wrap-refused":
@@ -491,9 +491,9 @@ def test_a_user_or_decoy_bind_whose_open_fails_closes_its_socket(how: str) -> No
                 assert len(dc.searches) == 1, f"the {branch} branch never searched"
             texts[branch] = str(err.value)
     # ldap3 sets conn.socket before the connect, so a failed open still holds one, still open.
-    assert sorted(second) == ["absent", "present"], "a branch never reached the second connect"
-    assert open_at_end == {"absent": True, "present": True}, open_at_end
-    left_open = [branch for branch, sock in second.items() if sock.fileno() != -1]
+    was_open = {branch: opened for branch, (_sock, opened) in second.items()}
+    assert was_open == {"absent": True, "present": True}, was_open
+    left_open = [branch for branch, (sock, _) in second.items() if sock.fileno() != -1]
     assert left_open == [], f"left its socket open: {left_open}"
     assert texts["absent"] == texts["present"], texts
     assert "synthetic-leak" not in texts["absent"]
