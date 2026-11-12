@@ -103,11 +103,12 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
 - [ ] Tag the release `webconsole-vA.B.C`, the console's own scheme (independent cadence). The
       `release-webconsole` job, and its engine floor gate, run only on that tag namespace.
 - [ ] Publish to **PyPI** via the gated Trusted-Publishing job. The console's GitHub release is a
-      draft until that upload succeeds; `publish-github-release-webconsole` then publishes it. With
-      `PUBLISH_WEBCONSOLE` unset, the upload is skipped and the release is published once the `pypi`
-      approval is given. Set, the publish refuses while the upload has not run, which is what a
-      "Re-run failed jobs" after setting it would do; re-run the `release-webconsole` job instead,
-      which re-runs the jobs after it.
+      draft at least until that job, `publish-pypi-webconsole`, succeeds;
+      `publish-github-release-webconsole` then publishes it. With `PUBLISH_WEBCONSOLE` set, the job
+      uploads the wheel first. Unset, the upload is skipped and the release is published once the
+      `pypi` approval is given. Set, the publish refuses while the upload has not run.
+      [docs/SUPPLY-CHAIN.md](../../docs/SUPPLY-CHAIN.md) says what counts as set, in its diagram's
+      *Legend*, and what to do on a refusal, in *The draft*.
 
 ## 7. Post-publish verification
 

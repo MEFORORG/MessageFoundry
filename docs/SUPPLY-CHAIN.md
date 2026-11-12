@@ -118,7 +118,9 @@ flowchart TB
 **Legend.** Rounded boxes are events and outside services. The cylinder is the `main` branch. Each
 group's title names the workflow its boxes belong to. The job boxes outside a group are in
 `release.yml` too. The merge checks group shows at least the checks that bear on the package. A
-dotted arrow is a publish step that runs when its repository variable is set.
+dotted arrow is a publish step that runs when its repository variable is set. Here and below, a
+variable counts as set only when its value is `true`, in any case, since Actions compares strings
+ignoring case; any other value, `1` included, reads as unset.
 
 Facts the labels leave out:
 
@@ -150,13 +152,35 @@ Facts the labels leave out:
 - **The draft.** The engine's GitHub release stays a draft until the harness wheel is on it
   too, and until every upload `publish-pypi` runs has succeeded. With `PUBLISH_HARNESS` unset,
   that is the toolkit and the engine only. A separate job publishes it last, so no
-  job adds an asset to a published release. The console's release is a draft too, until its wheel
-  is on PyPI. With `PUBLISH_WEBCONSOLE` unset, the console upload is skipped and the console's
-  release is still published, as the engine's is with `PUBLISH_HARNESS` unset. With either variable
-  set, its draft publisher reads it again when it runs and refuses to publish the release while
-  that run skipped the upload. A re-run that reused an earlier reading of the variable can still
-  skip the upload, and on an engine tag the toolkit and engine are on PyPI by then. The release
-  stays a draft until the build job is re-run, or the variable is unset and the publisher re-run.
+  job adds an asset to a published release. The console's release is a draft too, at least until
+  its `publish-pypi-webconsole` job has succeeded. With `PUBLISH_WEBCONSOLE` set, that job uploads
+  the wheel first. Unset, the console upload is skipped and the console's release is still
+  published once the `pypi` approval is given, as the engine's is with `PUBLISH_HARNESS` unset.
+  With either variable set, its draft publisher reads it again when it runs and refuses to publish
+  the release while that run skipped the upload. On an engine tag the toolkit and engine are on
+  PyPI by then. The refusal's own text omits part of the remedy, and it does not say which cause
+  fired. At least these two can, alone or together:
+  - The `pypi` environment holds its own copy of the variable, with a value other than `true`.
+    Look at that environment's variables in the repository settings to see whether it does.
+  - The build job read the variable before it was set, or the upload read it while it was unset
+    and it was set again before the publisher ran. Treat this as possible whenever the refusal
+    fires; the remedy below clears it either way, so it need not be told apart.
+
+  To finish the release with the upload, remove any copy from the `pypi` environment, then re-run
+  the build job (`release-harness` on an engine tag, `release-webconsole` on a console tag), which
+  re-runs the jobs after it and reads the variable afresh in each, so it clears both. A
+  "Re-run failed jobs" reuses the upload's skipped outcome and is refused again. To finish it
+  without the upload, remove any copy from the `pypi` environment, unset the variable and re-run
+  the publisher, then set it again before the next release, or that release skips its upload too
+  and still goes public.
+
+  GitHub allows a re-run only within 30 days of a run's first attempt, so past that no re-run
+  finishes the release. When this refusal is what holds the draft, at least two routes are left:
+  the publisher's own command run by hand, `gh release edit <tag> --draft=false --repo
+  MEFORORG/MessageFoundry`, which publishes the draft without that upload, as unsetting the
+  variable would; and a new version under a new tag. Run by hand on a draft held for any other
+  reason, such as a failed build job or a refused approval, the same command publishes a release
+  with an asset missing or a package not on PyPI.
 - **The provenance gate.** The tagged commit must be on `main`, and each required check's latest
   run on it must have passed. A red run after the merge blocks the tag even if the merge-queue run
   passed. To clear it, re-run the failed job on that commit, then re-run the release. A check
