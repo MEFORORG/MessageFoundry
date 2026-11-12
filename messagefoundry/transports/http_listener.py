@@ -1516,14 +1516,12 @@ class HttpSource(SourceConnector):
         self._client_tasks.discard(task)
         if task.cancelled():
             self._clients.discard(writer)
-            self._answering.discard(writer)
             writer.close()
             return
         exc = task.exception()
         if exc is not None:
             logger.error("HTTP client connection task failed: %s", safe_exc(exc))
             self._clients.discard(writer)
-            self._answering.discard(writer)
             writer.close()
 
     async def _start_tls(
@@ -1974,7 +1972,8 @@ class HttpSource(SourceConnector):
             peer_host, epoch = slot
         else:
             peer_host = _peer_host(writer)
-        # Register before anything else so stop() can always find + close this connection (H-2).
+        # Register before anything else so stop() can always find this connection (H-2): it closes
+        # one still reading and waits on the task of one answering, which closes its own writer.
         # Dropped only as the last step of the finally below, after the close and the `closed`
         # event, so a stop() that begins while this call is still closing waits for it.
         task = asyncio.current_task()
@@ -2149,7 +2148,9 @@ class HttpSource(SourceConnector):
             # Oversize / malformed / unsupported / unauthenticated — a synchronous 4xx + the ADR 0021
             # §7 pre-ingress connection_event (metadata only — never a body or field value). An
             # intake-auth refusal additionally writes its tamper-evident audit row here; it is a no-op
-            # for every other kind.
+            # for every other kind. Marked answering, as a request read in full is below, so a stop()
+            # during the event or audit write leaves the refusal its writer.
+            self._answering.add(writer)
             reason = _with_forwarded(exc.reason, exc)
             await self._emit_event(exc.kind, peer_host=peer_host, reason=reason)
             await self._audit_intake_refusal(exc, peer_host)
@@ -2160,8 +2161,13 @@ class HttpSource(SourceConnector):
                 ),
             )
             return True
+        # A stop() that ran while the last bytes sat in the reader's buffer closed this writer as
+        # still reading, so no answer could reach the peer: hand nothing on, and the sender resends
+        # a body that was never recorded or answered, as it would after a close one read earlier.
+        if writer.is_closing():
+            return False
         # Read in full, so stop() leaves this writer open for the answer (BACKLOG #5715). Dropped in
-        # `_on_client`'s finally, beside `_clients`.
+        # `_on_client`'s finally, beside `_clients`. Nothing awaits between the check above and here.
         self._answering.add(writer)
 
         # Health probe: GET/HEAD answer a static, non-PHI 200 WITHOUT an ingress row (ADR 0023 D2).
@@ -2239,7 +2245,12 @@ class HttpSource(SourceConnector):
         """
         resolver = self.sync_reply
         assert resolver is not None  # guarded by the caller, as _handler is above
-        reply = await resolver(message_id)
+        # A turn whose commit finished after stop() began would arm a drained rendezvous and answer
+        # `degraded`, a 504 by default, which D5 forbids on a demotion: it answers `shutting_down`.
+        if self._admission.stopping:
+            reply = InboundReply(ReplyOutcome.SHUTTING_DOWN)
+        else:
+            reply = await resolver(message_id)
         status, body, extra = self._reply_to_wire(reply, message_id)
         # No reply-derived bytes reach the log — only the outcome enum, the destination and timings.
         logger.debug(

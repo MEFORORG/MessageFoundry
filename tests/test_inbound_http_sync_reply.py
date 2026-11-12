@@ -392,6 +392,37 @@ async def test_a_request_mid_commit_at_stop_still_gets_its_202() -> None:
     assert data.startswith(b"HTTP/1.1 202 "), f"the committed request's 202 was lost: {data!r}"
 
 
+async def test_a_reply_turn_mid_commit_at_stop_answers_503_never_degraded() -> None:
+    # A reply_from turn whose commit finishes after stop() began must not arm the drained rendezvous
+    # and answer `degraded` (a 504 by default): ADR 0154 D5 never answers 504 on a demotion.
+    src = HttpSource(
+        Source(
+            type=ConnectorType.HTTP,
+            settings={"host": "127.0.0.1", "port": 0, "reply_from": "OB_PARTNER"},
+        )
+    )
+    blocked = asyncio.Event()
+    resolved: list[str] = []
+
+    async def handler(raw: bytes) -> IngressReceipt:
+        blocked.set()
+        await asyncio.sleep(0.2)  # the commit, still running when stop() begins
+        return IngressReceipt.accepted("msg-1")
+
+    async def resolver(message_id: str) -> InboundReply:
+        resolved.append(message_id)
+        return InboundReply(ReplyOutcome.DEGRADED)
+
+    src.sync_reply = resolver
+    src.reply_drain = lambda reason: None
+    data = await _post_then_stop(src, handler, blocked)
+    head, _, body = data.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.1 503 "), f"a stopping listener answered {data!r}"
+    assert b"\r\nRetry-After: 5" in head
+    assert _json.loads(body)["status"] == "shutting_down"
+    assert resolved == [], "a stopping listener armed the rendezvous"
+
+
 async def test_stop_stays_bounded_when_a_reply_turn_never_leaves(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
