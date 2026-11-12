@@ -157,10 +157,10 @@ Facts the labels leave out:
   the wheel first. Unset, the console upload is skipped and the console's release is still
   published once the `pypi` approval is given, as the engine's is with `PUBLISH_HARNESS` unset.
   With either variable set, its draft publisher reads it again when it runs and refuses to publish
-  the release while that run did not upload. On an engine tag the toolkit and engine are on
-  PyPI by then. The refusal's text names two causes, a remedy with the upload and one without,
-  but not which cause fired, and points here for the routes left past GitHub's re-run window. At
-  least these two can fire, alone or together:
+  the release unless that run's upload step succeeded. On an engine tag the toolkit and engine
+  are on PyPI by then. The refusal's text names two causes, a remedy with the upload and one
+  without, but not which cause fired, and points here for the routes left past GitHub's re-run
+  window. At least these two can fire, alone or together:
   - The `pypi` environment holds its own copy of the variable, with a value other than `true`.
     Look at that environment's variables in the repository settings to see whether it holds one
     now; a copy removed since the run cannot be seen there.
@@ -170,10 +170,9 @@ Facts the labels leave out:
 
   To finish the release with the upload, remove any copy from the `pypi` environment, then re-run
   the build job (`release-harness` on an engine tag, `release-webconsole` on a console tag), which
-  re-runs the jobs after it, the upload's `pypi` approval included, and reads the variable afresh
-  in each, so it clears both. While the variable still reads `true`, a "Re-run failed jobs"
-  reuses the upload's outcome and is refused again. To finish it
-  without the upload, remove any copy from the `pypi` environment, unset the variable and re-run
+  re-runs the jobs after it, so the upload asks for the `pypi` approval again, and reads the
+  variable afresh in each, so it clears both. While the variable still reads `true`, a "Re-run
+  failed jobs" reuses the upload's outcome and is refused again. To finish it without the upload, remove any copy from the `pypi` environment, unset the variable and re-run
   the publisher, then set it again before the next release, or that release skips its upload too
   and still goes public.
 

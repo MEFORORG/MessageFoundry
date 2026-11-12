@@ -77,8 +77,7 @@
 # not run. That last read covers at least a variable set after the build job read it, whether by
 # a re-run of failed jobs reusing the build job's output or while the upload waited for its
 # approval, and an environment copy that differs. docs/SUPPLY-CHAIN.md, *The draft*, says what to
-# do on a refusal, including past GitHub's re-run window. Unset, the upload step is skipped
-# and the release still goes public.
+# do on a refusal. Unset, the upload step is skipped and the release still goes public.
 #
 # THE HAND-OVER. Each build job records the digests once its last gate has passed, and its last
 # step uploads the files. Neither step has an `if:`, so any earlier failure skips both. In `release`
