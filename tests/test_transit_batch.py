@@ -547,6 +547,16 @@ def test_a_classifier_that_raises_on_a_batch_400_carries_no_body_out(
     assert isinstance(results[1], CipherError)
     leaked = base64.b64encode(b"value 0").decode("ascii")
     assert leaked not in "".join(traceback.format_exception(results[1]))
+    assert cipher._batch_alone is False  # an unclassified failure never turns batching off
+
+
+def test_an_empty_reference_on_every_result_is_asked_for_alone() -> None:
+    transit = _BatchTransit()
+    cipher = _cipher(transit)
+    items = _sealed(cipher, 3)
+    transit.tamper = lambda r: [{**x, "reference": ""} for x in r]
+    assert cipher.decrypt_many(items) == ["value 0", "value 1", "value 2"]
+    assert cipher.encrypt_many([("a", None), ("b", None)])[0].startswith("mfenc:v3:")
 
 
 def test_the_send_alone_state_outlives_one_call() -> None:

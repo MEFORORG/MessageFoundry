@@ -642,10 +642,13 @@ class CipherUnavailableError(CipherError):
     :class:`~messagefoundry.store.crypto_transit.TransitCipher` raises it from ``encrypt`` and
     ``decrypt`` when Transit could not be reached or answered that it could not serve the request,
     which :func:`~messagefoundry.store.keyprovider_vault.is_vault_unavailable` decides. Its batch
-    paths also give it for each value of a batch whose reply does not match the request: returned
-    by ``decrypt_many`` per value, raised by ``encrypt_many`` (BACKLOG #6706). Every other
-    Transit failure, a refused tag among them, stays plain :class:`CipherError`, so a value Transit
-    refused is never read as an outage.
+    paths also give it where no value was judged (BACKLOG #6706): for each value of a batch whose
+    reply does not match the request (returned by ``decrypt_many``, raised by ``encrypt_many``),
+    and, in ``decrypt_many``, for each value it never asked for once one value gave no verdict
+    (:func:`gave_no_verdict`). That covers a refusal such as a 403 too: the value asked for keeps
+    its own plain :class:`CipherError`, and the values after it, never asked for, get this class.
+    Every other Transit failure, a refused tag among them, stays plain :class:`CipherError`, so a
+    value Transit refused is never read as an outage.
 
     It lives here rather than beside the Transit cipher so that ``uploads.py``, a leaf that imports
     only this module, can tell it apart: the upload routes answer it 503 with ``Retry-After``, where

@@ -200,16 +200,18 @@ def _batches(costs: Sequence[int]) -> list[list[int]]:
     return runs
 
 
-#: :func:`_batch_replies`' answer for a reply of the right length, every result an object, that
-#: carries no ``reference`` at all: a Transit that does not echo it. Its order cannot be checked,
-#: so it is not used, and the batch's values are asked for alone, as before batching.
+#: :func:`_batch_replies`' answer for a reply of the right length, every result an object, none
+#: of which carries a ``reference`` other than an empty one: a Transit that does not echo it. Its
+#: order cannot be checked, so it is not used, and the batch's values are asked for alone, as
+#: before batching.
 UNECHOED = "unechoed"
 
 
 def _batch_replies(response: Any, sent: int) -> list[Mapping[str, Any]] | str | None:
     """Transit's ``batch_results``, when it is a list of ``sent`` objects whose ``reference`` is
     each one's own place in the request, as sent (BACKLOG #6706). :data:`UNECHOED` when it is
-    ``sent`` objects none of which carries a ``reference``. ``None`` for any other reply, which
+    ``sent`` objects none of which carries a non-empty ``reference``. ``None`` for any other
+    reply, which
     the caller reads as no verdict on any value of the batch. So a reply that drops, adds or
     reorders a result is never zipped onto the request."""
     data = response.get("data") if isinstance(response, dict) else None
@@ -218,7 +220,7 @@ def _batch_replies(response: Any, sent: int) -> list[Mapping[str, Any]] | str | 
         return None
     if not all(isinstance(reply, dict) for reply in replies):
         return None
-    if all("reference" not in reply for reply in replies):
+    if not any(reply.get("reference") for reply in replies):
         return UNECHOED
     if not all(reply.get("reference") == str(place) for place, reply in enumerate(replies)):
         return None
@@ -244,12 +246,13 @@ def _classify_batch_failure(exc: Exception) -> tuple[bool, bool]:
     only: Vault's 400 and 500 bodies to a batch are its whole ``batch_results``, other values'
     plaintext included, and hvac makes that body the error's message (BACKLOG #2085), so the
     caller keeps nothing of ``exc``. Runs inside the caller's handler, so a classifier that
-    raises is caught here and logged by type alone; it reads as a refusal that is not a 400."""
+    raises is caught here and logged by type alone. It then reads as a 400: the batch's values are
+    asked for alone, and an unknown failure never turns batching off for the cipher."""
     try:
         return is_vault_unavailable(exc), is_vault_bad_request(exc)
     except Exception as fault:  # noqa: BLE001 -- see the docstring
-        log.warning("Transit failure classifier raised %s; read as a refusal", type(fault).__name__)
-        return False, False
+        log.warning("Transit failure classifier raised %s; read as a 400", type(fault).__name__)
+        return False, True
 
 
 def _plaintext(value: object) -> str | None:
