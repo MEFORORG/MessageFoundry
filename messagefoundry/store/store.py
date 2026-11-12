@@ -18590,8 +18590,10 @@ class MessageStore:
         the intentional disclosure. (Under ``vault_transit`` each row MAC is a Transit round trip, so a
         broken chain now pays the same N round trips a healthy one already pays — accepted: the
         healthy-verify cost is the bound, and a tamper alarm must not be cheaper to provoke than a
-        clean pass. A row whose key version Transit refuses costs one more, the probe that tells the
-        refusal from an outage, BACKLOG #2337. There the compare of a row MAC is Transit's own
+        clean pass. A row whose verify fails costs more: at least the probe that tells a refused
+        key version from an outage (BACKLOG #2337), and, for a failure that is neither, the
+        fixed-input checks and the second ask ``TransitCipher._recheck_refused_row`` makes
+        (BACKLOG #2720). There the compare of a row MAC is Transit's own
         ``verify``, which Vault makes with Go's constant-time ``hmac.Equal``, BACKLOG #2720.)"""
         # The walk itself is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each
         # keyed row is checked under the key of its OWN range, so a rotation no longer reads as tampering.

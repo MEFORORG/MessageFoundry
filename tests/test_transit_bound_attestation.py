@@ -921,6 +921,88 @@ async def test_a_verify_failure_that_clears_on_the_second_ask_is_not_a_break(
     assert not any("could not run" in line for line in lines), lines
 
 
+def _scripted_cipher(row_failures: list[Exception | None], *, fixed_fails_after: int = -1) -> Any:
+    """A Transit cipher over :class:`_RotatingTransit` whose row verifies (any input but the
+    fixed probe's) raise the next of ``row_failures`` in turn, ``None`` passing through, and whose
+    fixed-input verify fails from its ``fixed_fails_after``-th call on (``-1``: never)."""
+    _needs_hvac()
+    from hvac.exceptions import Forbidden
+
+    from messagefoundry.store.crypto_transit import _VERSION_PROBE_INPUT, TransitCipher
+    from tests.test_crypto_transit import _FakeClient
+
+    transit = _RotatingTransit()
+    real_verify = transit.verify_signed_data
+    fixed_calls = [0]
+
+    def scripted(*, hash_input: str, **kw: Any) -> dict[str, Any]:
+        if hash_input == _VERSION_PROBE_INPUT:
+            fixed_calls[0] += 1
+            if 0 <= fixed_fails_after < fixed_calls[0]:
+                raise Forbidden("permission denied")
+        elif row_failures:
+            failure = row_failures.pop(0)
+            if failure is not None:
+                raise failure
+        return real_verify(hash_input=hash_input, **kw)
+
+    transit.verify_signed_data = scripted  # type: ignore[method-assign]
+    return TransitCipher(_FakeClient(transit), _KEY_NAME)
+
+
+def test_a_400_on_the_row_alone_at_the_latest_version_is_a_break() -> None:
+    """A 400 on one row's verify, at a version the key holds, while the fixed input verifies and
+    the row is refused again, is evidence about that row: ``False``, a break (BACKLOG #2720)."""
+    _needs_hvac()
+    from hvac.exceptions import InvalidRequest
+
+    cipher = _scripted_cipher([InvalidRequest("bad"), InvalidRequest("bad")])
+    assert cipher.verify_audit_hmac(b"row", cipher.audit_hmac(b"row")) is False
+
+
+def test_a_failed_fixed_input_verify_keeps_the_rows_failure_as_the_cause() -> None:
+    """When the fixed input fails too, the check could not run, and the error's cause is the
+    row's own failure, so a reader of the cause's class still tells an outage from a refusal."""
+    _needs_hvac()
+    from hvac.exceptions import UnexpectedError
+
+    from messagefoundry.store.crypto import AuditKeyVersionRefusedError
+
+    cipher = _scripted_cipher([UnexpectedError("gateway")], fixed_fails_after=0)
+    with pytest.raises(CipherError) as caught:
+        cipher.verify_audit_hmac(b"row", cipher.audit_hmac(b"row"))
+    assert not isinstance(caught.value, AuditKeyVersionRefusedError)
+    assert isinstance(caught.value.__cause__, UnexpectedError)
+
+
+def test_a_service_failure_between_the_two_asks_could_not_run() -> None:
+    """The fixed input verified after the first ask, the row's second ask is refused, and then the
+    fixed input fails: the service failed between the asks, so the check could not run, never a
+    break on a clean row."""
+    _needs_hvac()
+    from hvac.exceptions import Forbidden, UnexpectedError
+
+    cipher = _scripted_cipher(
+        [UnexpectedError("gateway"), Forbidden("expired")], fixed_fails_after=1
+    )
+    with pytest.raises(CipherError) as caught:
+        cipher.verify_audit_hmac(b"row", cipher.audit_hmac(b"row"))
+    assert isinstance(caught.value.__cause__, Forbidden)
+
+
+def test_a_refused_version_on_the_second_ask_keeps_its_label() -> None:
+    """A version Transit refuses on the second ask, after a failure that cleared, is labelled as
+    a refused version, as on the first ask."""
+    _needs_hvac()
+    from hvac.exceptions import UnexpectedError
+
+    from messagefoundry.store.crypto import AuditKeyVersionRefusedError
+
+    cipher = _scripted_cipher([UnexpectedError("gateway"), None])
+    with pytest.raises(AuditKeyVersionRefusedError):
+        cipher.verify_audit_hmac(b"row", _PLANTED)
+
+
 #: Vault's own text for an audit-MAC call refused for its version, as hvac carries it.
 _VERSION_400 = ("key version does not exist; latest key version is 2",)
 #: A proxy's or WAF's own 400 page: no Vault JSON at all.
@@ -974,7 +1056,8 @@ def test_a_verify_400_with_a_working_probe_is_a_refused_version() -> None:
 )
 def test_a_verify_400_the_probe_does_not_clear_is_a_plain_cipher_error(answer: Any) -> None:
     """A missing key also answers 400, and so may a refusal that has nothing to do with the version.
-    Neither may read as a planted version, or a clean chain would read as tampered."""
+    Neither may read as a planted version. Here every verify fails, the fixed-input one included,
+    so the check could not run rather than read as the row's."""
     from messagefoundry.store.crypto import AuditKeyVersionRefusedError
 
     assert not isinstance(_verify_refusal(answer), AuditKeyVersionRefusedError)

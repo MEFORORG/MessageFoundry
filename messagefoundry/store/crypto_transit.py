@@ -676,12 +676,13 @@ class TransitCipher(_UnmarkedPolicy):
         A failure of the verify call not read as a refused version, and not one
         :func:`is_vault_unavailable` reads as an outage, is checked once the handler has let go
         of the failed request (BACKLOG #2720): a verify over FIXED input must succeed
-        (:meth:`_fixed_input_verifies`), and then the row's own verify is asked once more. A second
-        failure that is not an outage is ``False``, a break at that row, as a forged MAC is; a
+        (:meth:`_fixed_input_verifies`), and then the row's own verify is asked once more
+        (:meth:`_recheck_refused_row`, which says how the second ask is read). Where that reads
+        the row as refused, the answer is ``False``, a break at that row, as a forged MAC is; a
         Vault that answers HTTP 413 past ``max_request_size`` to a planted oversize row is one
-        such case. An answer on the second ask is read as the first would have been. Every other
-        failure, a failed fixed-input verify among them, and a reply of an unexpected shape, raises
-        plain :class:`CipherError`, so the walk could not run and no tamper alert fires. Blocking."""
+        such case. Every other failure, a failed fixed-input verify among them, and a reply of an
+        unexpected shape, raises plain :class:`CipherError`, so the walk could not run and no
+        tamper alert fires. Blocking."""
         version = transit_mac_version(stored)
         if version is None:
             # Still one round trip, as a clean row costs, so a malformed row is not cheaper to
@@ -694,69 +695,92 @@ class TransitCipher(_UnmarkedPolicy):
                     "the cost-only audit HMAC beside a malformed stored MAC failed: %s", exc
                 )
             return False
-        refused: str | None = None
+        failed: Exception | None = None
         try:
             response: Any = self._transit_verify_call(self._audit_key, data, stored)
         except Exception as exc:
-            if self._refuses_only_version(exc, version):
-                # The same flow, labelled apart (BACKLOG #6707). A reply that runs out of memory or
-                # stack while it is read, such as a huge errors list, is not read as a refusal:
-                # escaping here, the error would make the walk "could not run" and drop the row's
-                # break and its alert.
-                unreadable: str | None = None
-                try:
-                    unverified = _names_no_version_reason(exc)
-                except (MemoryError, RecursionError) as read_exc:
-                    unverified, unreadable = True, type(read_exc).__name__
-                if unreadable is not None:  # logged once the handler has freed what it held
-                    log.warning(
-                        "could not read the 400 for audit key version %d (%s); labelled "
-                        "unconfirmed (key=%r)",
-                        version,
-                        unreadable,
-                        self._audit_key,
-                    )
-                if unverified:
-                    raise AuditKeyVersionUnverifiedError(version) from exc
-                raise AuditKeyVersionRefusedError(version) from exc
-            if self._is_outage(exc):
-                raise CipherError(
-                    f"Transit audit HMAC verify failed (key={self._audit_key!r}): "
-                    f"{vault_failure_text(exc)}"
-                ) from exc
+            settled = self._settled_verify_failure(exc, version)
+            if settled is not None:
+                raise settled from exc
             # Checked below, once this handler has let go of the failed request, which for a
-            # planted oversize row holds the whole upload (BACKLOG #2720).
-            refused = vault_failure_text(exc)
-        if refused is not None:
-            return self._recheck_refused_row(data, stored, refused)
+            # planted oversize row holds the whole upload (BACKLOG #2720). The traceback goes
+            # with it; the error itself stays as the cause of whatever is raised.
+            failed = exc.with_traceback(None)
+        if failed is not None:
+            return self._recheck_refused_row(data, stored, version, failed)
         return self._verify_answer(response)
 
-    def _recheck_refused_row(self, data: bytes, stored: str, refused: str) -> bool:
-        """:meth:`verify_audit_hmac` for a row whose verify failed with ``refused``, a failure that
-        is neither a refused version nor an outage (BACKLOG #2720). Raises :class:`CipherError`
-        unless a verify over fixed input succeeds. Then asks the row's own verify once more, so a
-        failure that cleared is not read as the row's: an answer is read as usual, an outage
-        raises :class:`CipherError`, and any other failure is ``False``, logged. Blocking."""
+    def _settled_verify_failure(self, exc: Exception, version: int) -> CipherError | None:
+        """The error an audit-MAC verify failure at ``version`` raises at once, or ``None`` for one
+        :meth:`_recheck_refused_row` must check: a refused version (:meth:`_refuses_only_version`)
+        is :class:`AuditKeyVersionRefusedError` or :class:`AuditKeyVersionUnverifiedError`, and an
+        outage (:meth:`_is_outage`) is plain :class:`CipherError`. Runs inside the caller's
+        handler. Blocking."""
+        if self._refuses_only_version(exc, version):
+            # The same flow, labelled apart (BACKLOG #6707). A reply that runs out of memory or
+            # stack while it is read, such as a huge errors list, is not read as a refusal:
+            # escaping here, the error would make the walk "could not run" and drop the row's
+            # break and its alert.
+            unreadable: str | None = None
+            try:
+                unverified = _names_no_version_reason(exc)
+            except (MemoryError, RecursionError) as read_exc:
+                unverified, unreadable = True, type(read_exc).__name__
+            if unreadable is not None:
+                log.warning(
+                    "could not read the 400 for audit key version %d (%s); labelled "
+                    "unconfirmed (key=%r)",
+                    version,
+                    unreadable,
+                    self._audit_key,
+                )
+            if unverified:
+                return AuditKeyVersionUnverifiedError(version)
+            return AuditKeyVersionRefusedError(version)
+        if self._is_outage(exc):
+            return self._verify_failed(exc)
+        return None
+
+    def _verify_failed(self, exc: Exception) -> CipherError:
+        """The could-not-run error for an audit-MAC verify that failed with ``exc``; the caller
+        raises it ``from exc``, so a reader of the cause's class still tells an outage from a
+        refusal."""
+        return CipherError(
+            f"Transit audit HMAC verify failed (key={self._audit_key!r}): {vault_failure_text(exc)}"
+        )
+
+    def _recheck_refused_row(
+        self, data: bytes, stored: str, version: int, failed: Exception
+    ) -> bool:
+        """:meth:`verify_audit_hmac` for a row whose verify at ``version`` failed with ``failed``,
+        which :meth:`_settled_verify_failure` left to this (BACKLOG #2720). Raises
+        :class:`CipherError` from ``failed`` unless a verify over fixed input succeeds. Then asks
+        the row's own verify once more, so a failure that cleared is not read as the row's: an
+        answer is read as usual, and a failure goes through :meth:`_settled_verify_failure` again.
+        A failure that leaves unsettled is ``False``, logged, only when a verify over fixed input
+        succeeds once more after it; otherwise it raises :class:`CipherError`, since the service
+        failed between the asks. Blocking."""
         if not self._fixed_input_verifies():
-            raise CipherError(
-                f"Transit audit HMAC verify failed (key={self._audit_key!r}): {refused}"
-            )
+            raise self._verify_failed(failed) from failed
+        again: Exception | None = None
         try:
             response: Any = self._transit_verify_call(self._audit_key, data, stored)
         except Exception as exc:
-            if self._is_outage(exc):
-                raise CipherError(
-                    f"Transit audit HMAC verify failed (key={self._audit_key!r}): "
-                    f"{vault_failure_text(exc)}"
-                ) from exc
-            log.warning(
-                "Transit refused the audit MAC verify of one row twice while a verify over fixed "
-                "input succeeded (key=%r): %s; read as a break at that row",
-                self._audit_key,
-                vault_failure_text(exc),
-            )
-            return False
-        return self._verify_answer(response)
+            settled = self._settled_verify_failure(exc, version)
+            if settled is not None:
+                raise settled from exc
+            again = exc.with_traceback(None)
+        if again is None:
+            return self._verify_answer(response)
+        if not self._fixed_input_verifies():
+            raise self._verify_failed(again) from again
+        log.warning(
+            "Transit refused the audit MAC verify of one row twice while a verify over fixed "
+            "input succeeded before and after (key=%r): %s; read as a break at that row",
+            self._audit_key,
+            vault_failure_text(again),
+        )
+        return False
 
     def _verify_answer(self, response: Any) -> bool:
         """Transit's ``valid`` from a ``verify`` reply; :class:`CipherError` for a reply of an
@@ -850,6 +874,11 @@ class TransitCipher(_UnmarkedPolicy):
         try:
             mac = self._probe_mac()
             if not isinstance(mac, str) or transit_mac_version(mac) is None:
+                log.warning(
+                    "an audit MAC verify failed, and the fixed-input probe answered no "
+                    "well-formed MAC (key=%r)",
+                    self._audit_key,
+                )
                 return False
             valid = self._transit_verify(self._audit_key, _VERSION_PROBE_BYTES, mac)
         except Exception as probe_exc:  # the fixed input fails too: the service, not the row
@@ -859,7 +888,14 @@ class TransitCipher(_UnmarkedPolicy):
                 vault_failure_text(probe_exc),
             )
             return False
-        return valid is True
+        if valid is not True:
+            log.warning(
+                "an audit MAC verify failed, and a verify over fixed input did not answer valid "
+                "(key=%r)",
+                self._audit_key,
+            )
+            return False
+        return True
 
     # --- The row seal backend (ADR 0217; TransitSealBackend in store/row_seal.py) -----------------
 
