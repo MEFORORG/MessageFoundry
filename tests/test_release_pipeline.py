@@ -3872,9 +3872,9 @@ _PROVENANCE_JOB = "tag-provenance"
 _PROVENANCE_CALL = "python scripts/release/tag_provenance.py"
 
 
-def _upstream(job_key: str) -> set[str]:
+def _upstream(job_key: str, jobs: dict | None = None) -> set[str]:
     """Every job ``job_key`` waits on, directly or through another job's ``needs:``."""
-    jobs = _jobs()
+    jobs = _jobs() if jobs is None else jobs
     seen: set[str] = set()
     todo = needs_of(jobs[job_key])
     while todo:
@@ -3946,6 +3946,18 @@ def test_every_job_that_can_publish_waits_on_the_provenance_gate() -> None:
 
 _PUBLISH_JOB = "publish-github-release"
 _CONSOLE_PUBLISH_JOB = "publish-github-release-webconsole"
+
+#: A job-level `if:` a variable can turn false. It reads the `vars` context, or the `needs` context,
+#: which is how a build job hands a variable on as an output. At least these spellings are seen:
+#: `vars.X`, `vars['X']`, `toJSON(vars)`, `needs.<job>.outputs.<name>`,
+#: `needs['<job>']['outputs']`, `toJSON(needs)`. Matching the bare context names is deliberately
+#: wide, so `needs.<job>.result` counts too: a false hit reddens a test, while a miss lets a
+#: skipped job leave every release a draft. Case is ignored, which only widens it.
+_VARIABLE_GATE = re.compile(r"\b(?:vars|needs)\b", flags=re.IGNORECASE)
+
+
+def _is_variable_gated(job: dict) -> bool:
+    return _VARIABLE_GATE.search(str(job.get("if") or "")) is not None
 
 
 def _gh_release_jobs(verbs: str) -> set[str]:
@@ -4033,7 +4045,7 @@ def test_the_console_release_is_a_draft_until_its_upload_job_succeeds() -> None:
     # The job itself is not gated on the variable: skipped, it would skip the publisher. The
     # upload step's gate is pinned by the draft-publisher tests below.
     upload = jobs["publish-pypi-webconsole"]
-    assert "vars." not in str(upload.get("if")), upload.get("if")
+    assert not _is_variable_gated(upload), upload.get("if")
     # The two draft publishers are one body, held here as the digest checks are.
     engine = _step_script_by_prefix("Publish the draft GitHub release", "the engine publish")
     console = _step_script_by_prefix("Publish the draft console GitHub release", "the console")
@@ -4534,6 +4546,91 @@ def test_the_engine_release_is_published_only_after_the_engine_is_on_pypi() -> N
     assert "publish-pypi" in _upstream(_PUBLISH_JOB), sorted(_upstream(_PUBLISH_JOB))
 
 
+#: The jobs each draft publisher must be found to wait on, the publisher itself excluded. A failure
+#: of the walk check is a release.yml topology change: update these sets, not the gate check.
+_PUBLISHER_UPSTREAM: dict[str, frozenset[str]] = {
+    _PUBLISH_JOB: frozenset(
+        {
+            "tag-provenance",
+            "sbom-linux",
+            "sbom-windows",
+            "release",
+            "release-harness",
+            "publish-pypi",
+        }
+    ),
+    _CONSOLE_PUBLISH_JOB: frozenset(
+        {"tag-provenance", "release-webconsole", "publish-pypi-webconsole"}
+    ),
+}
+
+
+def _variable_gated_jobs(jobs: dict, publisher: str) -> list[str]:
+    """The jobs among ``publisher`` and every job it waits on whose job-level `if:`
+    `_VARIABLE_GATE` matches, which is wider than a variable gate on purpose. Step-level `if:`s are
+    not read. A skipped need skips the job that needs it, so any
+    one of them would leave the release a draft on a run that reads green. The walk must find at
+    least the publisher's `_PUBLISHER_UPSTREAM` set, or an empty result would say nothing about
+    those jobs."""
+    upstream = _upstream(publisher, jobs)
+    expected = _PUBLISHER_UPSTREAM[publisher]
+    assert upstream >= expected, f"{publisher}'s upstream walk lacks {sorted(expected - upstream)}"
+    return sorted(key for key in upstream | {publisher} if _is_variable_gated(jobs[key]))
+
+
+@pytest.mark.parametrize(
+    ("condition", "gated"),
+    [
+        ("vars.PUBLISH_HARNESS == 'true'", True),
+        ("vars['PUBLISH_HARNESS'] == 'true'", True),
+        ('vars [ "PUBLISH_HARNESS" ]', True),
+        ("VARS.PUBLISH_HARNESS", True),
+        ("fromJSON(toJSON(vars)).PUBLISH_HARNESS == 'true'", True),
+        ("needs.release-harness.outputs.publish-harness == 'true'", True),
+        ("needs['release-webconsole'].outputs.publish-webconsole == 'true'", True),
+        ("needs['release-harness']['outputs']['publish-harness'] == 'true'", True),
+        ("needs.release-harness['outputs'].publish-harness == 'true'", True),
+        ("contains(needs.*.outputs.publish-harness, 'true')", True),
+        ("contains(toJSON(needs.release-harness), 'true')", True),
+        ("contains(toJSON(needs), 'publish-harness')", True),
+        ("github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')", False),
+        ("!startsWith(github.ref_name, 'webconsole-')", False),
+    ],
+)
+def test_the_variable_gate_pattern_sees_direct_and_indirect_spellings(
+    condition: str, gated: bool
+) -> None:
+    """At least these spellings of a direct or indirect variable gate are seen. Before vault BACKLOG
+    #2975's lint notes, the scan matched only the text `vars.`. The last two are negative controls."""
+    assert _is_variable_gated({"if": condition}) is gated, condition
+
+
+@pytest.mark.parametrize(
+    ("publisher", "target", "gate"),
+    [
+        (_PUBLISH_JOB, "release", "vars['PUBLISH_HARNESS'] == 'true'"),
+        (_PUBLISH_JOB, "publish-pypi", "needs.release-harness.outputs.publish-harness == 'true'"),
+        (_PUBLISH_JOB, _PUBLISH_JOB, "vars.PUBLISH_HARNESS == 'true'"),
+        (
+            _CONSOLE_PUBLISH_JOB,
+            "publish-pypi-webconsole",
+            "needs.release-webconsole.outputs.publish-webconsole == 'true'",
+        ),
+        (_CONSOLE_PUBLISH_JOB, "release-webconsole", "vars.PUBLISH_WEBCONSOLE == 'true'"),
+    ],
+)
+def test_the_variable_gate_scan_reaches_upstream_jobs_and_the_publisher(
+    publisher: str, target: str, gate: str
+) -> None:
+    """Positive control for `_variable_gated_jobs`: a gate added to the job-level `if:` of a job the
+    publisher waits on, or of the publisher itself, is absent from the walk's result before it is
+    planted and found after."""
+    jobs = copy.deepcopy(_jobs())
+    assert target not in _variable_gated_jobs(jobs, publisher), target
+    jobs[target]["if"] = f"{jobs[target].get('if') or 'true'} && {gate}"
+    assert target in _variable_gated_jobs(jobs, publisher), (target, jobs[target]["if"])
+
+
 def test_every_engine_tag_upload_runs_under_one_approval_before_the_release_is_public() -> None:
     """The harness used to publish from its own job, which `publish-github-release` could not wait
     on: that job was skipped while PUBLISH_HARNESS was unset, and a skipped need skips the job that
@@ -4547,7 +4644,7 @@ def test_every_engine_tag_upload_runs_under_one_approval_before_the_release_is_p
     Nothing runs release.yml before a tag, so this structural read is the only check before one.
 
     Mutation: move the harness publish back to its own job, gate a job upstream of
-    `publish-github-release` on `vars.`. Red here. Section (4) pins `publish-pypi`'s needs.
+    `publish-github-release` on a variable. Red here. Section (4) pins `publish-pypi`'s needs.
     """
     jobs = _jobs()
     engine_tag = {
@@ -4561,23 +4658,7 @@ def test_every_engine_tag_upload_runs_under_one_approval_before_the_release_is_p
     harness_if = str(_upload_step(jobs["publish-pypi"], "harness-dist/").get("if"))
     assert "needs.release-harness.outputs.publish-harness" in harness_if, harness_if
     assert jobs["release-harness"]["outputs"]["publish-harness"] == "${{ vars.PUBLISH_HARNESS }}"
-    # The walk must cover at least these jobs, or the empty-`gated` check below says nothing about
-    # them. A failure here is a release.yml topology change: update this set, not the gate check.
-    upstream = _upstream(_PUBLISH_JOB) | {_PUBLISH_JOB}
-    expected = {
-        "tag-provenance",
-        "sbom-linux",
-        "sbom-windows",
-        "release",
-        "release-harness",
-        "publish-pypi",
-        _PUBLISH_JOB,
-    }
-    assert len(upstream) >= len(expected), sorted(upstream)
-    assert upstream >= expected, (
-        f"{_PUBLISH_JOB}'s upstream walk lacks {sorted(expected - upstream)}"
-    )
-    gated = sorted(key for key in upstream if "vars." in str(jobs[key].get("if") or ""))
+    gated = _variable_gated_jobs(jobs, _PUBLISH_JOB)
     assert not gated, (
         f"job(s) {gated} upstream of {_PUBLISH_JOB} are gated on a variable; unset, they skip it"
     )
@@ -4594,20 +4675,7 @@ def test_an_unset_publish_webconsole_still_publishes_the_console_release() -> No
     job upstream of the console publisher on a variable. Red here.
     """
     jobs = _jobs()
-    # The walk must cover at least these jobs, or the empty-`gated` check below says nothing about
-    # them. A failure here is a release.yml topology change: update this set, not the gate check.
-    upstream = _upstream(_CONSOLE_PUBLISH_JOB) | {_CONSOLE_PUBLISH_JOB}
-    expected = {
-        "tag-provenance",
-        "release-webconsole",
-        "publish-pypi-webconsole",
-        _CONSOLE_PUBLISH_JOB,
-    }
-    assert len(upstream) >= len(expected), sorted(upstream)
-    assert upstream >= expected, (
-        f"{_CONSOLE_PUBLISH_JOB}'s upstream walk lacks {sorted(expected - upstream)}"
-    )
-    gated = sorted(key for key in upstream if "vars." in str(jobs[key].get("if") or ""))
+    gated = _variable_gated_jobs(jobs, _CONSOLE_PUBLISH_JOB)
     assert not gated, (
         f"job(s) {gated} upstream of {_CONSOLE_PUBLISH_JOB} are gated on a variable; unset, "
         "they skip it and the console release stays a draft"
