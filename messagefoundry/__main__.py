@@ -1140,7 +1140,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "the cipher inventory expects, at least through a missing grant, so those cells were not "
         "read), 4 KEY_MISMATCH. Run it with the service's own key: a shell "
         "without it resolves keyless and reports KEY_MISMATCH. Under [store].cipher_provider = "
-        "'vault_transit' every value is one Transit request (BACKLOG #1719)",
+        "'vault_transit' values go to Transit in batches of up to BATCH_MAX_ITEMS "
+        "(store/crypto.py; BACKLOG #1719, #6706)",
     )
     cipher_audit.add_argument(
         "--service-config",

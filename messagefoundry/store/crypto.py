@@ -641,9 +641,16 @@ class CipherUnavailableError(CipherError):
 
     :class:`~messagefoundry.store.crypto_transit.TransitCipher` raises it from ``encrypt`` and
     ``decrypt`` when Transit could not be reached or answered that it could not serve the request,
-    which :func:`~messagefoundry.store.keyprovider_vault.is_vault_unavailable` decides. Every other
-    Transit failure, a refused tag among them, stays plain :class:`CipherError`, so a value Transit
-    refused is never read as an outage.
+    which :func:`~messagefoundry.store.keyprovider_vault.is_vault_unavailable` decides. Its batch
+    paths also give it where no value was judged (BACKLOG #6706): for each value of a batch whose
+    reply does not match the request (returned by ``decrypt_many``, raised by ``encrypt_many``),
+    and, in ``decrypt_many``, for each value it never asked for once one value gave no verdict
+    (:func:`gave_no_verdict`). That covers a refusal such as a 403 too: the value asked for keeps
+    its own plain :class:`CipherError`, and the values after it, never asked for, get this class.
+    Every other Transit failure, a refused tag among them, stays plain :class:`CipherError`. A
+    reader that tells an outage from a value's failure by :func:`gave_no_verdict` still reads some
+    of those as an outage: one whose cause is an ``OSError`` or an ``hvac`` error other than a 400
+    (a 403, say). A refused tag, Vault's 400, is read as the value's.
 
     It lives here rather than beside the Transit cipher so that ``uploads.py``, a leaf that imports
     only this module, can tell it apart: the upload routes answer it 503 with ``Retry-After``, where
@@ -774,6 +781,115 @@ class Cipher(Protocol):
         """The Transit backend this cipher's store seals authority rows through, or ``None`` when
         its seals, if any, are keyed in-process from :meth:`authz_root` (ADR 0217, item 3.7)."""
         ...
+
+
+#: One value, and the AAD its cell binds, for a :class:`BatchCipher`.
+CipherItem = tuple[str, bytes | None]
+
+#: The most values one batch carries (BACKLOG #6706): one Transit ``batch_input`` request, or one
+#: batch a cipher-cell walk opens.
+BATCH_MAX_ITEMS = 128
+#: The most base64 characters, values and associated data together (:func:`batch_chars`), that
+#: a batch of more than one value carries (BACKLOG #6706). Kept under a common proxy body bound
+#: (nginx's 1 MiB default) and far under Vault's own 32 MiB, with room for the JSON around it. A
+#: value larger than this is a batch of its own, which Transit sends as a single request, as before.
+BATCH_MAX_CHARS = 512 * 1024
+
+
+def b64_chars(n: int) -> int:
+    """The length of the base64 text of ``n`` bytes."""
+    return 4 * ((n + 2) // 3)
+
+
+def batch_chars(stored: str, aad: bytes | None) -> int:
+    """What a sealed value counts against :data:`BATCH_MAX_CHARS`: itself and its AAD as base64."""
+    return len(stored) + (b64_chars(len(aad)) if aad is not None else 0)
+
+
+@runtime_checkable
+class BatchCipher(Protocol):
+    """A cipher that opens and seals several values per call to its key service (BACKLOG #6706).
+    Only :class:`~messagefoundry.store.crypto_transit.TransitCipher` is one. :func:`encrypt_many`
+    and the cipher-cell walk (``store/cipher_cells.py``) use the single-value methods of every
+    other cipher."""
+
+    def decrypt_many(self, items: Sequence[CipherItem]) -> list[str | CipherError]: ...
+
+    def encrypt_many(self, items: Sequence[CipherItem]) -> list[str]: ...
+
+
+def gave_no_verdict(error: CipherError) -> bool:
+    """Whether a failed decrypt was the key service failing rather than the value (BACKLOG #6706).
+
+    A :class:`CipherUnavailableError` is one whatever its cause. Otherwise the cause decides: the
+    Transit cipher raises :class:`CipherError` from the client's own error, an ``OSError`` for an
+    unreachable Vault (a ``requests`` connection error or timeout is one) and an ``hvac`` error for
+    a reply. Vault answers a value it cannot authenticate with HTTP 400, which ``hvac`` raises as
+    ``InvalidRequest``; any other ``hvac`` error (a token refused, a 5xx) is the service. At least
+    those shapes; a cause of any other kind counts as the value's. The cipher-cell walk and the
+    Transit batch path read it alike."""
+    if isinstance(error, CipherUnavailableError):
+        return True
+    cause = error.__cause__
+    if isinstance(cause, OSError):
+        return True
+    return (
+        cause is not None
+        and type(cause).__module__.split(".")[0] == "hvac"
+        and type(cause).__name__ != "InvalidRequest"
+    )
+
+
+#: The most exceptions :func:`detached` clears in one error's graph. Far past any real chain;
+#: reaching it is logged, never silent.
+_DETACH_LIMIT = 10_000
+
+
+def detached(error: CipherError) -> CipherError:
+    """``error``, with the traceback cleared on every exception reachable from it through
+    ``__cause__``, ``__context__`` and an exception group's ``exceptions``, each visited once,
+    for an error that is returned rather than raised (BACKLOG #6706). A traceback's frames,
+    through ``f_back``, reach the batch path's locals, which hold the other values' plaintext;
+    the errors' types, texts and links are kept. Past :data:`_DETACH_LIMIT` exceptions it stops
+    and logs a WARNING."""
+    seen: set[int] = set()
+    pending: list[BaseException] = [error]
+    while pending:
+        link = pending.pop()
+        if id(link) in seen:
+            continue
+        if len(seen) >= _DETACH_LIMIT:
+            _log.warning(
+                "an error's exception graph has more than %d links; the rest keep their tracebacks",
+                _DETACH_LIMIT,
+            )
+            break
+        seen.add(id(link))
+        link.__traceback__ = None
+        pending.extend(e for e in (link.__cause__, link.__context__) if e is not None)
+        if isinstance(link, BaseExceptionGroup):
+            pending.extend(link.exceptions)
+    return error
+
+
+def decrypt_or_error(cipher: Cipher, stored: str, aad: bytes | None) -> str | CipherError:
+    """``cipher.decrypt(stored, aad=aad)``, with its :class:`CipherError` returned, not raised,
+    and :func:`detached`."""
+    try:
+        return cipher.decrypt(stored, aad=aad)
+    except CipherError as exc:
+        return detached(exc)
+
+
+def encrypt_many(cipher: Cipher, items: Sequence[CipherItem]) -> list[str]:
+    """Each plaintext of ``items`` sealed under its own AAD, in order. Any failure raises, as
+    :meth:`Cipher.encrypt` does, so no value is returned for a batch that did not all seal."""
+    if isinstance(cipher, BatchCipher):
+        sealed = cipher.encrypt_many(items)
+        if len(sealed) != len(items):
+            raise CipherError(f"{type(cipher).__name__} sealed {len(sealed)} of {len(items)}")
+        return sealed
+    return [cipher.encrypt(plaintext, aad=aad) for plaintext, aad in items]
 
 
 def _fingerprint(key: bytes | bytearray) -> str:

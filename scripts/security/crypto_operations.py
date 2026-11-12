@@ -218,6 +218,9 @@ NOT_OPERATIONS: dict[str, str] = {
 METHOD_RULES: dict[str, str] = {
     "encrypt": "cipher",
     "decrypt": "cipher",
+    # Vault BACKLOG #6706: a BatchCipher opens or seals several values per call.
+    "encrypt_many": "cipher",
+    "decrypt_many": "cipher",
     "encrypt_data": "cipher",  # hvac Vault Transit
     "decrypt_data": "cipher",  # hvac Vault Transit
     "rewrap_data": "cipher",  # hvac Vault Transit

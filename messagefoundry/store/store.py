@@ -145,6 +145,7 @@ from messagefoundry.store.crypto import (
     cipher_info,
     cipher_meta_key,
     decrypt_json_cell,
+    encrypt_many,
     report_sealed_surface,
     reseal_rotation_fingerprints,
     rotation_fingerprint_cipher,
@@ -11782,21 +11783,24 @@ class MessageStore:
                 rows = list(await cur.fetchall())
                 if not rows:
                     break
+                # One batch per page, so a Transit cipher seals it in few requests (BACKLOG #6706).
+                sealed_values = encrypt_many(
+                    self._cipher,
+                    [
+                        (
+                            r["v"],
+                            aad_of(r)
+                            if aad_of is not None
+                            else cell_aad(table, column, *(r[c] for c in aad_cols)),
+                        )
+                        for r in rows
+                    ],
+                )
                 await self._db.executemany(
                     f"UPDATE {table} SET {column}=? WHERE {where_keys}",
                     [
-                        (
-                            self._cipher.encrypt(
-                                r["v"],
-                                aad=(
-                                    aad_of(r)
-                                    if aad_of is not None
-                                    else cell_aad(table, column, *(r[c] for c in aad_cols))
-                                ),
-                            ),
-                            *(r[c] for c in keys),
-                        )
-                        for r in rows
+                        (value, *(r[c] for c in keys))
+                        for value, r in zip(sealed_values, rows, strict=True)
                     ],
                 )
                 sealed += len(rows)
