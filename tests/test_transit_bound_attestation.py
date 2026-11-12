@@ -727,11 +727,13 @@ async def test_a_planted_unheld_key_version_on_the_genesis_row_opens_and_reads_a
     assert not ok and "seq=1," in str(msg), msg
 
 
-async def test_a_transit_outage_on_the_startup_walk_still_could_not_run(
+async def test_a_verify_failure_whose_fixed_input_probe_fails_on_the_startup_walk_could_not_run(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Transit unreachable is not evidence about any row: the walk could not run, and no tamper
-    alert fires."""
+    """An ``httpx.ConnectError`` is not one :func:`is_vault_unavailable` reads as an outage (that
+    branch is ``test_a_service_failure_of_the_verify_call_still_could_not_run``), so the row's
+    failed verify goes to the fixed-input check, whose ``hmac`` fails too: that is not evidence
+    about any row, so the walk could not run, and no tamper alert fires."""
     transit = _RotatingTransit()
     _use_fake(monkeypatch, transit)
     db = tmp_path / "outage.db"
@@ -751,12 +753,14 @@ async def test_a_transit_outage_on_the_startup_walk_still_could_not_run(
     assert any("could not run" in line for line in lines), lines
 
 
-async def test_a_transient_failure_of_the_verify_call_is_not_a_planted_version(
+async def test_a_verify_failure_whose_fixed_input_verify_fails_could_not_run(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A failure on every verify call, the fixed-input probe's included, while the latest version
-    still answers its ``hmac``, must not read as a refused key version or as the row's: it is a
-    check that could not run, so a clean row is never reported as tampered."""
+    """A failure on every verify call, the fixed-input check's included, while the latest version
+    still answers its ``hmac``, must not read as a refused key version or as the row's. The
+    ``httpx.ConnectError`` is not one :func:`is_vault_unavailable` reads as an outage, so this
+    reaches the fixed-input check, not the outage branch: a check that could not run, so a clean
+    row is never reported as tampered."""
     transit = _RotatingTransit()
     _use_fake(monkeypatch, transit)
     db = tmp_path / "transient.db"

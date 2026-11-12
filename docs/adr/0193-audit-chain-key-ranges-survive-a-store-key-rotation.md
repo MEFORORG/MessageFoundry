@@ -519,9 +519,10 @@ All against an in-process fake Transit client with key versions, never a real se
 - `test_a_planted_unheld_key_version_is_a_chain_break_on_the_startup_walk` and
   `test_a_planted_unheld_key_version_on_the_genesis_row_opens_and_reads_as_a_break` -- a planted
   version is a break at its row.
-- `test_a_transit_outage_on_the_startup_walk_still_could_not_run` and
-  `test_a_transient_failure_of_the_verify_call_is_not_a_planted_version` (renamed 2026-11-11) --
-  an outage is not a break.
+- `test_a_verify_failure_whose_fixed_input_probe_fails_on_the_startup_walk_could_not_run` and
+  `test_a_verify_failure_whose_fixed_input_verify_fails_could_not_run` (renamed 2026-11-11) -- a
+  verify failure whose fixed-input check fails too is not a break. An outage
+  `is_vault_unavailable` names is `test_a_service_failure_of_the_verify_call_still_could_not_run`.
 
 ## Amendment 2026-11-11 -- the walk checks each Transit row MAC with Transit's verify call
 
@@ -550,11 +551,12 @@ All against an in-process fake Transit client with key versions, never a real se
    reaches Transit to draw a 400. It still costs one round trip, an unpinned `generate_hmac` whose
    answer is discarded, so a malformed row is no cheaper to check than a clean one (the ASVS 11.2.4
    note on `verify_audit_chain`).
-4. **A refusal of the row is a break; an outage could not run.** A 400 on the verify call goes through
-   `_refuses_only_version` and `_names_no_version_reason` (2026-10-27 amendment, item 3, where
-   "a pinned call" now reads as this verify call), so it
-   raises `AuditKeyVersionRefusedError` or `AuditKeyVersionUnverifiedError` and is a break at that
-   row with the alert, or a plain `CipherError`, and the walk could not run. A failure of the
+4. **A refusal of the row is a break; an outage could not run.** A 400 on the verify call that
+   `_refuses_only_version` reads as a refused version (2026-10-27 amendment, item 3, where "a
+   pinned call" now reads as this verify call) raises `AuditKeyVersionRefusedError`, or
+   `AuditKeyVersionUnverifiedError` where `_names_no_version_reason` does not read it as Vault's
+   own refusal, and is a break at that row with the alert. An outage `is_vault_unavailable` names
+   raises a plain `CipherError`, and the walk could not run (`_settled_verify_failure`). A failure of the
    verify call that is neither a refused version nor an outage `is_vault_unavailable` names is
    checked by `_recheck_refused_row` once the handler has let go of it (BACKLOG #2720): a
    `generate_hmac` and a verify over fixed input must succeed, and then the row's own verify is

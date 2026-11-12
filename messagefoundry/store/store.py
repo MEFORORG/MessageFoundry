@@ -18587,13 +18587,11 @@ class MessageStore:
         total verify time is a function of the chain LENGTH, not of where a forgery sits. The reported
         message still names that row id: position is disclosed deliberately, in the operator-facing
         result, so an alert stays actionable — what the change removes is the *timing* side channel, not
-        the intentional disclosure. (Under ``vault_transit`` each row MAC is a Transit round trip, so a
-        broken chain now pays the same N round trips a healthy one already pays — accepted: the
-        healthy-verify cost is the bound, and a tamper alarm must not be cheaper to provoke than a
-        clean pass. A row whose verify fails costs more: at least the probe that tells a refused
-        key version from an outage (BACKLOG #2337), and, for a failure that is neither, the
-        fixed-input checks and the second ask ``TransitCipher._recheck_refused_row`` makes
-        (BACKLOG #2720). There the compare of a row MAC is Transit's own
+        the intentional disclosure. (Under ``vault_transit`` a broken chain pays the round trips a
+        healthy one already pays — accepted: the healthy-verify cost is the bound, and a tamper
+        alarm must not be cheaper to provoke than a clean pass. The Transit calls a walk makes per
+        row, a failed verify's included, are stated once in ``docs/CONNECTIONS.md`` Table A, the
+        Vault Transit bulk at-rest cipher row. There the compare of a row MAC is Transit's own
         ``verify``, which Vault makes with Go's constant-time ``hmac.Equal``, BACKLOG #2720.)"""
         # The walk itself is `verify_audit_rows`, shared by all three backends (BACKLOG #1904): each
         # keyed row is checked under the key of its OWN range, so a rotation no longer reads as tampering.
