@@ -840,23 +840,35 @@ def gave_no_verdict(error: CipherError) -> bool:
     )
 
 
-#: How many links of an error's ``__cause__``/``__context__`` chain :func:`detached` clears.
-_DETACH_DEPTH = 16
+#: The most exceptions :func:`detached` clears in one error's graph. Far past any real chain;
+#: reaching it is logged, never silent.
+_DETACH_LIMIT = 10_000
 
 
 def detached(error: CipherError) -> CipherError:
-    """``error``, with the traceback of it and of each error on its cause and context chain
-    cleared, for an error that is returned rather than raised (BACKLOG #6706). A traceback's
-    frames, through ``f_back``, reach the batch path's locals, which hold the other values'
-    plaintext; the error's type, text and chain are kept."""
+    """``error``, with the traceback cleared on every exception reachable from it through
+    ``__cause__``, ``__context__`` and an exception group's ``exceptions``, each visited once,
+    for an error that is returned rather than raised (BACKLOG #6706). A traceback's frames,
+    through ``f_back``, reach the batch path's locals, which hold the other values' plaintext;
+    the errors' types, texts and links are kept. Past :data:`_DETACH_LIMIT` exceptions it stops
+    and logs a WARNING."""
     seen: set[int] = set()
-    link: BaseException | None = error
-    for _ in range(_DETACH_DEPTH):
-        if link is None or id(link) in seen:
+    pending: list[BaseException] = [error]
+    while pending:
+        link = pending.pop()
+        if id(link) in seen:
+            continue
+        if len(seen) >= _DETACH_LIMIT:
+            _log.warning(
+                "an error's exception graph has more than %d links; the rest keep their tracebacks",
+                _DETACH_LIMIT,
+            )
             break
         seen.add(id(link))
         link.__traceback__ = None
-        link = link.__cause__ or link.__context__
+        pending.extend(e for e in (link.__cause__, link.__context__) if e is not None)
+        if isinstance(link, BaseExceptionGroup):
+            pending.extend(link.exceptions)
     return error
 
 

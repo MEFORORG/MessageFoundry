@@ -11,6 +11,7 @@ whole batch when one item fails. Synthetic data only."""
 from __future__ import annotations
 
 import base64
+import collections
 import json
 import os
 import traceback
@@ -43,6 +44,7 @@ from messagefoundry.store.crypto import (
     CipherUnavailableError,
     cell_aad,
     decrypt_or_error,
+    detached,
     encrypt_many,
 )
 from messagefoundry.store.crypto_transit import TransitCipher
@@ -605,22 +607,29 @@ def test_an_encrypt_batch_400_or_unread_failure_keeps_batching_on(
 
 
 def _frames_reach(error: BaseException, needle: str) -> bool:
-    """Whether any frame reachable from ``error``'s chain of tracebacks holds ``needle`` in a
-    local, as a string or inside a list, tuple or dict of strings."""
-    seen: set[int] = set()
-    link: BaseException | None = error
-    while link is not None and id(link) not in seen:
-        seen.add(id(link))
-        tb = link.__traceback__
+    """Whether any frame reachable from any traceback in ``error``'s whole exception graph
+    (``__cause__``, ``__context__`` and an exception group's members, breadth first) holds
+    ``needle`` in the repr of a local. Written apart from ``crypto.detached`` on purpose."""
+    queue: collections.deque[BaseException] = collections.deque([error])
+    visited: set[int] = set()
+    while queue:
+        node = queue.popleft()
+        if id(node) in visited:
+            continue
+        visited.add(id(node))
+        tb = node.__traceback__
         while tb is not None:
             frame: Any = tb.tb_frame
             while frame is not None:
-                for value in frame.f_locals.values():
-                    if needle in repr(value):
-                        return True
+                if any(needle in repr(value) for value in frame.f_locals.values()):
+                    return True
                 frame = frame.f_back
             tb = tb.tb_next
-        link = link.__cause__ or link.__context__
+        for linked in (node.__context__, node.__cause__):
+            if linked is not None:
+                queue.append(linked)
+        if isinstance(node, BaseExceptionGroup):
+            queue.extend(node.exceptions)
     return False
 
 
@@ -634,3 +643,50 @@ def test_no_returned_error_reaches_another_values_plaintext() -> None:
     error = results[3]
     assert isinstance(error, CipherError)
     assert not _frames_reach(error, "value 0")
+
+
+def test_a_context_apart_from_the_cause_keeps_no_traceback() -> None:
+    transit = _BatchTransit()
+    cipher = _cipher(transit)
+    items = _sealed(cipher, 4)
+    bad = items[3][0][len("mfenc:v3:") :]
+    real = transit.decrypt_data
+
+    def composite(**kw: Any) -> dict[str, Any]:
+        if kw.get("batch_input") is not None:
+            raise InvalidRequest("synthetic batch 400")
+        if kw.get("ciphertext") == bad:
+            # A cause and a different context, as urllib3 wraps a TLS failure: the context keeps
+            # the traceback whose frames reach the values already opened alone.
+            try:
+                raise ValueError("synthetic inner failure")
+            except ValueError:
+                raise InvalidRequest("synthetic refusal") from RuntimeError("synthetic cause")
+        return real(**kw)
+
+    transit.decrypt_data = composite  # type: ignore[method-assign]
+    results = cipher.decrypt_many(items)
+    assert results[:3] == ["value 0", "value 1", "value 2"]
+    error = results[3]
+    assert isinstance(error, CipherError)
+    inner = error.__cause__
+    assert inner is not None and isinstance(inner.__context__, ValueError)
+    assert inner.__cause__ is not inner.__context__
+    assert not _frames_reach(error, "value 0")
+
+
+def test_detached_clears_every_member_of_an_exception_group() -> None:
+    def raised(exc: Exception) -> Exception:
+        try:
+            raise exc
+        except Exception as caught:  # noqa: BLE001 -- builds a traceback for the test
+            return caught
+
+    secret = "value 0"  # a local the members' frames reach until they are detached
+    member = raised(ValueError("member"))
+    group = raised(ExceptionGroup("group", [member]))
+    error = CipherError("outer")
+    error.__context__ = group
+    assert _frames_reach(error, secret)
+    detached(error)
+    assert not _frames_reach(error, secret)
