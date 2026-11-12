@@ -181,6 +181,11 @@ _PARAM_RE = re.compile(r"(?<![:\w]):(\w+)")
 # deadlock (40001); plus the ODBC connect/operation timeouts.
 _TRANSIENT_PREFIXES = ("08", "40")
 _TRANSIENT_STATES = frozenset({"HYT00", "HYT01"})
+# BACKLOG #5713: permanent states that are the connection's fault, not the message's
+# (:func:`_classify_db_error`). Class 28 is "invalid authorization specification"; class IM is the
+# ODBC driver manager's own.
+_CREDENTIAL_PREFIXES = ("28",)
+_CONFIG_PREFIXES = ("IM",)
 
 
 def _weakened_tls_permitted(*, attested: bool, posture: HopPosture | None) -> bool:
@@ -2548,9 +2553,19 @@ def _driver_code(message: str) -> str | None:
     return str(found[-1]) if found else None
 
 
-def _classify_db_error(sqlstate: str, message: str) -> DeliveryError:
+def _classify_db_error(sqlstate: str, message: str, *, connecting: bool = False) -> DeliveryError:
     """Map a DB error's SQLSTATE to a transient :class:`DeliveryError` (retry) or a permanent
     :class:`NegativeAckError` (dead-letter), with **PHI-free** text.
+
+    A permanent error that is the connection's, not the message's, carries a fault marker so the
+    delivery worker stops the lane and keeps the queue (ADR 0095) rather than dead-letter every
+    queued row on the same refusal (BACKLOG #5713): SQLSTATE class ``28`` (the login refused) is a
+    ``credential_fault``, and class ``IM`` (the ODBC driver manager: no such driver or DSN, or a
+    driver it could not load) is a ``config_fault``. ``connecting`` says the error came from opening
+    the connection, before the statement ran, so no message can be at fault: any other permanent
+    state there is a ``config_fault`` too. Two expected examples, neither measured here: unixODBC's
+    ``01000`` *Can't open lib* for a registered driver whose library is missing, and SQL Server's
+    *Cannot open database* (native error 4060) for a database the login cannot reach.
 
     ``message`` is read for its SQLSTATE and native error number and is **never interpolated**
     (BACKLOG #1661). Driver text embeds the offending value on exactly the failures this connector
@@ -2563,6 +2578,20 @@ def _classify_db_error(sqlstate: str, message: str) -> DeliveryError:
     detail = f"[{sqlstate}]" + (f" driver error {code}" if code else "")
     if _is_transient(sqlstate):
         return DeliveryError(f"database transient error {detail}")
+    if sqlstate[:2] in _CREDENTIAL_PREFIXES:
+        return NegativeAckError(
+            f"database refused the login {detail}",
+            code=sqlstate,
+            permanent=True,
+            credential_fault=True,
+        )
+    if connecting or sqlstate[:2] in _CONFIG_PREFIXES:
+        return NegativeAckError(
+            f"database connection refused by its configuration {detail}",
+            code=sqlstate,
+            permanent=True,
+            config_fault=True,
+        )
     return NegativeAckError(
         f"database rejected the statement {detail}",
         code=sqlstate or "db",
@@ -3604,7 +3633,7 @@ async def _probe_db(
     except Exception as exc:
         state = _sqlstate(exc)
         raise (
-            _classify_db_error(state, str(exc))
+            _classify_db_error(state, str(exc), connecting=True)
             if state
             else DeliveryError(f"DATABASE connect failed: {_safe_db_error(exc)}")
         ) from exc
@@ -3746,6 +3775,27 @@ class DatabaseDestination(DestinationConnector):
                 )
         return self._pool
 
+    async def _connect(self) -> tuple[Any, Any]:
+        """The pool and a connection borrowed from it, with a failure to connect classified.
+
+        Opening the pool or a pooled connection logs in, so a refused login, a missing ODBC driver
+        or the missing ``sqlserver`` extra surfaces here. Unclassified, that error reached the
+        delivery worker as an internal error, which dead-letters the row by default and logs in
+        again on the next (BACKLOG #5713). A driver error is classified as a connect failure
+        (:func:`_classify_db_error`), so a transient one retries and a permanent one stops the lane
+        and keeps the queue. Anything else propagates unchanged, the acquire timeout's
+        :class:`DeliveryError` included."""
+        try:
+            pool = await self._get_pool()
+            return pool, await _acquire(pool, self._acquire_timeout)
+        except _DriverMissingError as exc:
+            raise NegativeAckError(str(exc), code="db", permanent=True, config_fault=True) from exc
+        except Exception as exc:
+            state = _sqlstate(exc)
+            if state is None:
+                raise
+            raise _classify_db_error(state, str(exc), connecting=True) from exc
+
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None
     ) -> DeliveryResponse | None:  # metadata (#68): unused — no per-message header knob here
@@ -3766,8 +3816,7 @@ class DatabaseDestination(DestinationConnector):
         if self._cleartext_guard is not None:
             self._cleartext_guard.assert_send()
         params = _bind_params(payload, self._param_names)  # NegativeAckError(permanent) on bad data
-        pool = await self._get_pool()
-        conn = await _acquire(pool, self._acquire_timeout)
+        pool, conn = await self._connect()
         cur: Any = None
         discard = False
         try:

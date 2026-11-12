@@ -1951,7 +1951,13 @@ The Handler produces a **JSON-object** body; the connector binds its keys to the
 **Delivery semantics.** A committed statement is delivered. A **transient** DB failure (connection drop,
 deadlock, timeout — SQLSTATE class `08`/`40` or `HYTxx`) → `DeliveryError`, so the lane **retries**. A
 **permanent** failure (constraint / data / syntax) **and a payload that doesn't match the statement** →
-`NegativeAckError` → **dead-letter** (a retry can't fix it). With `capture_response` or
+`NegativeAckError` → **dead-letter** (a retry can't fix it). A permanent failure that is the
+connection's, not the message's, stops the lane and keeps the queue under the default
+`credential_fault_policy` (ADR 0095) instead of dead-lettering every queued row on the same refusal
+(BACKLOG #5713): a refused login (SQLSTATE class `28`) is a credential fault, and a missing ODBC
+driver or DSN (class `IM`), a missing `sqlserver` extra, and any other permanent error raised while
+the connection is opened, before the statement runs, are configuration faults. A transient error
+while connecting (class `08`, a login timeout) still retries. With `capture_response` or
 `capture_out_params` on, a driver error raised while the result is read or the next result set is
 reached (a deadlock, a procedure's own error, a dropped link) is the statement's failure: the write
 is rolled back and classified the same way, never committed. A statement that returns no result set

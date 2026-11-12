@@ -1003,6 +1003,120 @@ async def test_send_pool_acquire_timeout_is_transient() -> None:
         await dest.send('{"mrn": "1", "val": "x"}')
 
 
+class _RefusingPool:
+    """A pool whose acquire fails the way the driver does when it logs in a new connection."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    async def acquire(self) -> NoReturn:
+        raise self._exc
+
+
+# pyodbc's shape for the connect-time refusals BACKLOG #5713 names, with synthetic names in them.
+_LOGIN_FAILED = _driver_exc(
+    "28000",
+    "[28000] [Microsoft][ODBC Driver 18 for SQL Server][SQL Server]Login failed for user "
+    "'svc_feed'. (18456) (SQLDriverConnect)",
+)
+_NO_DRIVER = _driver_exc(
+    "IM002",
+    "[IM002] [Microsoft][ODBC Driver Manager] Data source name not found and no default driver "
+    "specified (0) (SQLDriverConnect)",
+)
+
+
+def test_classify_db_error_marks_connection_faults() -> None:
+    """BACKLOG #5713: a refused login and a missing driver are the connection's fault, so each is
+    marked for the lane-stopping arm instead of reading as a per-message reject.
+
+    Red on the old code: every permanent state was a plain reject with neither marker."""
+    login = _classify_db_error("28000", str(_LOGIN_FAILED))
+    assert isinstance(login, NegativeAckError) and login.permanent
+    assert login.credential_fault and not login.config_fault
+    assert "svc_feed" not in str(login) and "[28000]" in str(login)  # #1661 still holds
+    no_driver = _classify_db_error("IM002", str(_NO_DRIVER))
+    assert isinstance(no_driver, NegativeAckError) and no_driver.permanent
+    assert no_driver.config_fault and not no_driver.credential_fault
+    # A statement's own permanent error keeps no marker: it is the message's fault.
+    plain = _classify_db_error("42000", "x")
+    assert isinstance(plain, NegativeAckError)
+    assert not plain.credential_fault and not plain.config_fault
+
+
+def test_classify_db_error_connecting_reads_every_permanent_state_as_config() -> None:
+    """Before the statement runs no message can be at fault, so a permanent connect state is the
+    connection's; a transient one still retries."""
+    cannot_open = _classify_db_error("42000", "Cannot open database (4060)", connecting=True)
+    assert isinstance(cannot_open, NegativeAckError) and cannot_open.config_fault
+    login = _classify_db_error("28000", "x", connecting=True)
+    assert isinstance(login, NegativeAckError) and login.credential_fault
+    assert type(_classify_db_error("08001", "x", connecting=True)) is DeliveryError
+
+
+async def test_send_login_refusal_is_a_credential_fault() -> None:
+    """Red on the old code: the pool's error escaped ``send`` unclassified, so the delivery worker
+    took its internal-error arm, which dead-letters the row by default and logs in again on the next."""
+    dest = _dest()
+    dest._pool = _RefusingPool(_LOGIN_FAILED)
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send('{"mrn": "1", "val": "x"}')
+    assert ei.value.permanent and ei.value.credential_fault
+    assert "svc_feed" not in str(ei.value)
+
+
+async def test_send_missing_odbc_driver_is_a_config_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _no_driver(*_a: Any, **_k: Any) -> NoReturn:
+        raise _NO_DRIVER
+
+    monkeypatch.setattr(database_module, "_make_pool", _no_driver)
+    dest = _dest()
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send('{"mrn": "1", "val": "x"}')
+    assert ei.value.permanent and ei.value.config_fault and not ei.value.credential_fault
+    assert dest._pool is None  # nothing cached: the next send tries the pool again
+
+
+async def test_send_missing_sqlserver_extra_is_a_config_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _no_extra() -> NoReturn:
+        raise database_module._DriverMissingError(
+            "DATABASE connector requires the 'sqlserver' extra"
+        )
+
+    monkeypatch.setattr(database_module, "_import_aioodbc", _no_extra)
+    dest = _dest()
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send('{"mrn": "1", "val": "x"}')
+    assert ei.value.permanent and ei.value.config_fault
+
+
+async def test_send_unreachable_server_at_connect_is_transient() -> None:
+    dest = _dest()
+    dest._pool = _RefusingPool(_driver_exc("08001", "[08001] TCP Provider: timeout (258)"))
+    with pytest.raises(DeliveryError) as ei:
+        await dest.send('{"mrn": "1", "val": "x"}')
+    assert not isinstance(ei.value, NegativeAckError)
+
+
+async def test_send_non_driver_error_at_connect_propagates() -> None:
+    dest = _dest()
+    dest._pool = _RefusingPool(ValueError("a real bug"))
+    with pytest.raises(ValueError):
+        await dest.send('{"mrn": "1", "val": "x"}')
+
+
+async def test_probe_login_refusal_at_connect_is_a_credential_fault() -> None:
+    dest = _dest()
+    dest._pool = _RefusingPool(_LOGIN_FAILED)
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.test_connection()
+    assert ei.value.credential_fault
+
+
 async def test_lookup_pool_acquire_timeout_is_db_lookup_error() -> None:
     # The handler-callable lookup maps the same timeout onto its PHI-free DbLookupError type.
     from messagefoundry.config.db_lookup import DbLookupError
