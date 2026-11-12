@@ -392,6 +392,21 @@ def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> N
     assert refusal is not None and "set no MEFOR_SECRETS_DIRECTORY" not in refusal
 
 
+def test_the_missing_directory_hint_gives_each_route_with_its_condition() -> None:
+    """The installer refuses an existing directory the service does not name, so the hint must
+    not send every operator to it: one route re-adds the variable for a directory that exists, the
+    other runs the installer where none does. Pinned by structure, not wording."""
+    refusal = service_env_refusal(_service(["MEFOR_STORE_PASSWORD=x"]))
+    assert refusal is not None
+    hint = refusal.split("set no MEFOR_SECRETS_DIRECTORY", 1)[1]
+    routes = [s for s in hint.split(". ") if s.startswith("Where ")]
+    assert len(routes) == 2
+    existing, absent = routes
+    assert "MEFOR_SECRETS_DIRECTORY" in existing and "AppEnvironmentExtra" in existing
+    assert "run install-service.ps1" not in existing
+    assert "run install-service.ps1" in absent and "MEFOR_SECRETS_DIRECTORY" not in absent
+
+
 def test_a_store_key_and_another_secret_in_the_nssm_list_name_both_remedies() -> None:
     posture = _service(
         [f"MEFOR_STORE_ENCRYPTION_KEY={_KEY_VALUE}", f"MEFOR_STORE_PASSWORD={_PASSWORD_VALUE}"]

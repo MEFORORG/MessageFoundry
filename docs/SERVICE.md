@@ -686,8 +686,9 @@ NSSM environment.
   with `-RemoveAccountAces` removes the account's entry there too. Which settings it supplies, the
   access list it needs, and the rest of the rules are stated once, in
   [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). Move each
-  of the engine's own secret settings other than the store key here from the service's NSSM
-  list, where `serve` and `supervise` refuse it (the previous bullet links where that is stated);
+  of the engine's own secret settings other than the store key and its retired keys here from the
+  service's NSSM list, where `serve` and `supervise` refuse it (the previous bullet links where
+  that is stated);
   a `MEFOR_VALUE_*` value there is not refused.
 
 > **External vault / managed identity.** DPAPI is the built-in on-box option. The engine can also call
