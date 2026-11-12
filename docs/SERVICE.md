@@ -329,7 +329,8 @@ the directory. Read the list first with `nssm get MessageFoundry AppEnvironmentE
 **No secret goes in that list:** any local user can read it. Where the engine could read the
 service's lists, `serve` and `supervise` refuse to start with one of the engine's own secret
 settings there. Where it knows the service but could not read them, they refuse only a store key
-found in their own environment, never another secret setting. Use the DPAPI key file for
+or retired store key found in their own environment, never another secret setting. Use the DPAPI
+key file for
 the store key, and the secrets directory for the rest (see
 [Protect the store encryption key at rest](#protect-the-store-encryption-key-at-rest-wp-11d)).
 

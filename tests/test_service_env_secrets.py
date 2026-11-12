@@ -408,6 +408,7 @@ def test_the_missing_directory_hint_gives_each_route_with_its_condition() -> Non
     assert "MEFOR_SECRETS_DIRECTORY naming that existing path" in existing
     assert "AppEnvironmentExtra" in existing
     assert "read it first with `nssm get`" in existing
+    assert "every entry but the names refused above" in existing
     assert '"Start / stop / status"' in existing
     assert absent.startswith("none exists yet, ")
     assert '"The other secrets: a secrets directory"' in absent

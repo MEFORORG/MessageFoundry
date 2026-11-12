@@ -429,7 +429,8 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                 "existing path back to the service's AppEnvironmentExtra, beside its other "
                 "entries, before any re-run of the installer, which refuses an existing directory "
                 "the service does not name. `nssm set` replaces that whole list, so read it first "
-                "with `nssm get` and pass every entry back: see docs/SERVICE.md, "
+                "with `nssm get`, running the service's own nssm.exe by its full path, and pass "
+                "back every entry but the names refused above: see docs/SERVICE.md, "
                 '"Start / stop / status". Where none exists yet, the bullet "The other secrets: '
                 'a secrets directory" under docs/SERVICE.md, "Protect the store encryption key at '
                 'rest", says how the directory is created'
