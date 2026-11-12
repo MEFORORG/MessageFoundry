@@ -193,8 +193,8 @@ holds. See *Consequences* for exactly what an operator sees change.
    for as long as the disk stays broken. And `resume_lane` only re-arms a PAUSED lane, so a later
    `start_outbound` could not lift a STOPPED one -- a PARKED lane's own timer unparks it.
    *(Note, BACKLOG #5700: `resume_lane` now re-arms a STOPPED lane too, so this second count no
-   longer holds; a STOPPED lane still waits for an operator, where a PARKED one unparks itself, and
-   the first count stands.)*
+   longer holds; a STOPPED lane still waits for something to re-arm it, at least a start, a reload
+   or a broadcast, where a PARKED one unparks itself, and the first count stands.)*
 
 ## Consequences
 

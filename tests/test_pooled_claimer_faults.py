@@ -295,9 +295,10 @@ async def test_an_operator_resume_re_arms_a_lane_still_stopped(
     await d.start()
     try:
         await _until(lambda: d.phase("P") is _LanePhase.STOPPED)
-        d.resume_lane("P")
+        assert d.resume_lane("P") is True  # the runner lifts the operator hold on this answer
         await _until(lambda: processed == ["P-1"])
         assert deaths == {"P": 3} and len(alerts.stopped) == 1  # the third death did not re-stop it
+        assert d.resume_lane("P") is False  # nothing left to re-arm: the hold must stay put
     finally:
         await d.stop()
 

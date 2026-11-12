@@ -754,8 +754,8 @@ async def _resume_all(d: StageDispatcher, lanes: list[str], *, rounds: int = 200
     ``paused()`` reads only the PAUSED phase. A lane paused while CLAIMING or PROCESSING carries
     ``pause_pending`` instead, and reads not paused. Resuming only the lanes ``paused()`` names misses
     it, and it lands in PAUSED later, where notify_work deliberately leaves it: a drain then never goes
-    quiet. So resume EVERY lane each round. resume_lane cancels a pending pause, re-arms a PAUSED lane,
-    and is a no-op on any other."""
+    quiet. So resume EVERY lane each round. resume_lane cancels a pending pause, re-arms a PAUSED or
+    STOPPED lane (#5700), and is a no-op on any other."""
     for _ in range(rounds):
         for x in lanes:
             d.resume_lane(x)
@@ -2145,7 +2145,7 @@ async def test_adr0070_3_streak_reset_scoping_sharp_edge(store: Any) -> None:
         await _wait_lane(d, lane, _LanePhase.STOPPED)
         assert d.infra_error_streak(lane) == 3
 
-        d.notify_work()  # STOPPED→READY reload resume — the ONLY reset path for a stopped lane
+        d.notify_work()  # STOPPED→READY reload resume (resume_lane is the other, since #5700)
         await _settle()
         assert d.infra_error_streak(lane) == 0  # reset on resume
         assert d.phase(lane) != _LanePhase.STOPPED

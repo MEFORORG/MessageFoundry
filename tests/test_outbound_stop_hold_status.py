@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.api.app import _outbound_down_detail
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore, Stage
 from tests.test_connection_scheduler import (
@@ -62,17 +63,17 @@ async def test_a_lane_a_credential_fault_stopped_reads_as_stopped(
         await runner.stop()
 
 
-async def test_a_pooled_lane_its_dispatcher_holds_stopped_reads_as_stopped(
+async def test_a_resend_into_a_held_lane_names_the_stop(
     store: MessageStore, tmp_path: Path
 ) -> None:
-    """A pooled lane at STOPPED with no operator hold recorded, as a leadership-loss STOP leaves
-    one, is not delivering either, so the reads say so."""
+    """The resend refusal for a STOP-held lane says to fix the cause first. Telling the operator only
+    to start it would, with a bad credential still configured, re-authenticate toward the lockout
+    the STOP protects against."""
     runner, _ = await _stopped_rig(store, tmp_path, "pooled")
     try:
-        runner._stop_held.discard(("outbound", _OB))
         assert runner._dispatchers[Stage.OUTBOUND].stopped(_OB)  # the control
-        assert not runner.outbound_running(_OB)
-        assert runner.outbound_status(_OB) == "stopped"
+        detail = _outbound_down_detail(runner, _OB)
+        assert "fix the cause" in detail and "start it before resending" not in detail
     finally:
         await runner.stop()
 

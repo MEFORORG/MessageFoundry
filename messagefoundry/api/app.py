@@ -741,11 +741,19 @@ def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
     a nicety. "start it before resending" is the right instruction for an operator-paused lane and the
     WRONG one for a halted engine, where the same door the message points at is refused until the
     application log is writable again — a 409 that sends an operator to a control that cannot help is
-    the compensating-control-on-a-false-premise shape (SDS-3.7)."""
+    the compensating-control-on-a-false-premise shape (SDS-3.7).
+
+    A lane a STOP holds down (BACKLOG #5701) is named too: a start with the cause unfixed would
+    re-authenticate toward the partner lockout a credential STOP protects against."""
     if rr.outbound_status(name) == "log_halted":
         return (
             f"outbound {name!r} is halted: this engine cannot write its application log, so nothing "
             "is being delivered anywhere — fix the log, then start the connection, then resend"
+        )
+    if rr.outbound_stop_held(name):
+        return (
+            f"outbound {name!r} was stopped by a fault that needs an operator, such as a credential "
+            "or configuration fault — fix the cause, then start the connection, then resend"
         )
     return f"outbound {name!r} is not running — start it before resending"
 
@@ -754,8 +762,8 @@ def _live_outbound_status(rr: RegistryRunner, name: str) -> str:
     """One outbound's live display state, gated on the runner's own ``running`` flag.
 
     ``outbound_status`` reports "running" for any lane ABSENT from ``_outbound_paused`` that no
-    STOP holds down (BACKLOG #5701) and never reads the graph flag, so ungated it answers "running" on a node whose graph is down -- the ADR 0157
-    demoted follower, where ``_stop_graph`` stops only the runner and the API keeps serving. Display
+    STOP holds down (BACKLOG #5701) and never reads the graph flag, so ungated it answers
+    "running" on a node whose graph is down -- the ADR 0157 demoted follower, where ``_stop_graph`` stops only the runner and the API keeps serving. Display
     reads of ``outbound_status`` go through here so the rows and graph nodes built from it cannot
     disagree (BACKLOG #1568 gated the standalone row; #1814 the traffic-edge row and
     ``/graph/edges``). The literal "draining" an edge row gives an outbound the live graph no longer
@@ -5664,8 +5672,8 @@ def create_app(
             #
             # `rr.running` gates the live state (`_live_outbound_status`, shared with the traffic-edge row
             # above and `/graph/edges` since #1814) because `outbound_status` reports "running" for any lane
-            # ABSENT from `_outbound_paused` that no STOP holds down — it never consults the graph flag (the same trap
-            # `/status` documents at its KPI split, which is why that block uses `outbound_running`).
+            # ABSENT from `_outbound_paused` that no STOP holds down — it never consults the graph
+            # flag (the same trap `/status` documents at its KPI split, which is why that block uses `outbound_running`).
             # Ungated, a node whose graph is down but whose API still serves — the ADR 0157 demoted
             # follower, where `_stop_graph` stops only the runner — would answer one `/connections` with
             # "stopped" inbound rows beside "running" outbound ones. Before #1568 no such row existed on
@@ -10175,8 +10183,8 @@ def create_app(
             # outbound_running (not outbound_status) so the running/stopped split gates on the engine
             # actually running AND the lane neither operator-paused nor STOP-held (#5701) — consistent
             # with inbound_running's actually-started semantics (outbound_status reports "running" for
-            # any non-paused, non-held lane even
-            # before start, which would over-count a built-but-not-started runner).
+            # any non-paused, non-held lane even before start, which would over-count a
+            # built-but-not-started runner).
             out_running = sum(1 for name in out_deployed if rr.outbound_running(name))
             conn_total = total + len(out_deployed)
             conn_running = running + out_running
