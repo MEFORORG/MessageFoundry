@@ -20,6 +20,7 @@ import pytest
 
 from messagefoundry.pipeline.cluster import DbCoordinator
 from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
+from tests._pool_lend import LendsItself
 
 _FENCE = 20.0
 
@@ -152,3 +153,52 @@ async def test_a_claim_returning_at_the_fence_still_promotes(
     assert coord.is_leader() is True
     assert coord.current_epoch() == 7
     assert coord._no_claim_until == 0.0
+
+
+class _LeasePool(LendsItself):
+    """The two lease statements a paused Postgres tick can send: the claim, which holds and runs
+    ``claim_seconds`` on the node's clock, and the pause's owner read, which reports ``owner``."""
+
+    def __init__(self, clock: _Clock) -> None:
+        self._clock = clock
+        self.owner = "A"
+        self.claim_seconds = 0.0
+        self.claims = 0
+        self.owner_reads = 0
+
+    async def fetchrow(self, sql: str, *args: object) -> dict[str, object]:
+        if "INSERT INTO leader_lease" in sql:
+            self.claims += 1
+            self._clock.t += self.claim_seconds
+            return {"owner": "A", "leader_epoch": 1}
+        assert "SELECT owner FROM leader_lease" in sql, sql
+        self.owner_reads += 1
+        return {"owner": self.owner}
+
+
+async def test_the_paused_tick_sends_no_claim_and_lifts_once_another_node_holds_the_row() -> None:
+    """End to end on Postgres: after a refused late hold the next tick sends only the owner read,
+    not the undelayed renew; once that read names a standby the pause lifts and the stale baseline
+    is cleared, so the node no longer reads as owning the row; and the tick after that claims."""
+    clock = _Clock()
+    pool = _LeasePool(clock)
+    coord = DbCoordinator(pool, "A", leader_fence_timeout_seconds=_FENCE, monotonic=clock)
+    pool.claim_seconds = _FENCE + 0.5
+    await coord._maintain_leadership()
+    assert (pool.claims, coord.is_leader()) == (1, False)
+
+    pool.claim_seconds = 0.0
+    clock.t += 10.0
+    await coord._maintain_leadership()
+    assert (pool.claims, pool.owner_reads) == (1, 1)
+    assert coord.may_own_lease_row() is True  # the row still names this node
+
+    pool.owner = "B"
+    clock.t += 10.0
+    await coord._maintain_leadership()
+    assert (pool.claims, pool.owner_reads) == (1, 2)
+    assert coord._no_claim_until == 0.0
+    assert coord.may_own_lease_row() is False
+
+    await coord._maintain_leadership()
+    assert pool.claims == 2

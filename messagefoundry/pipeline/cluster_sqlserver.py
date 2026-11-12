@@ -173,7 +173,8 @@ class SqlServerCoordinator:
         self._acquire_delay = acquire_delay_seconds
         self._promotable = promotable
         # ADR 0056 slice 1: monotonic instant before which this node declines to claim or renew, set by
-        # step_down_leadership(). Mirrors DbCoordinator._no_claim_until — read its comment there.
+        # step_down_leadership() and _refuse_late_hold (BACKLOG #5711). Mirrors
+        # DbCoordinator._no_claim_until — read its comment there.
         self._no_claim_until: float = 0.0
         # ADR 0056 slice 1: an owed lease-expiring write. Mirrors DbCoordinator._lease_release_owed —
         # read its comment there for why a retry needs it.
@@ -471,7 +472,8 @@ class SqlServerCoordinator:
 
     async def heartbeat_once(self) -> None:
         # Refresh last_seen (wall clock, like DbCoordinator) and fold the current is_leader flag — the
-        # flag lags by at most one tick (the loop beats just after _maintain_leadership, BACKLOG #5710).
+        # flag lags by one tick (the loop beats just after _maintain_leadership, BACKLOG #5710), or
+        # longer while ticks skip a side pass that has not finished.
         # Zero extra writes. Under the renew clamp (BACKLOG #6472): it no longer delays the renew,
         # but an unbounded one would starve the next beat and hold up stop().
         await self._store._execute_clamped(
@@ -579,7 +581,8 @@ class SqlServerCoordinator:
             # DB row — _maintain_leadership demotes a somehow-already-leader node; the fence is the backstop.
             return False
         if self._monotonic() < self._no_claim_until:
-            # JUST STEPPED DOWN (ADR 0056 slice 1): decline for a bounded window so a sibling wins the
+            # JUST STEPPED DOWN (ADR 0056 slice 1), or JUST REFUSED A LATE HOLD (BACKLOG #5711):
+            # decline for a bounded window so a sibling wins the
             # expired lease instead of this node renewing it straight back via the un-delayed t.owner = me
             # branch, and lift the pause once the row names another node (BACKLOG #1986). Mirrors
             # DbCoordinator._claim_or_renew_lease — read its comment there.
@@ -598,6 +601,7 @@ class SqlServerCoordinator:
                 )
             if current is not None and current["owner"] != self.node_id:
                 self._no_claim_until = 0.0
+                self._last_renew_ok = None  # BACKLOG #5711; DbCoordinator's lift says why
             return False
         # ADR 0157 Inc 0: the statement runs under the renew clamp, not [store].command_timeout.
         row = await self._store._fetchone_clamped(
@@ -693,7 +697,7 @@ class SqlServerCoordinator:
             arming = self.may_own_lease_row()
             prior_pause = self._no_claim_until
             if arming:
-                self._no_claim_until = self._monotonic() + pause
+                self._no_claim_until = max(self._no_claim_until, self._monotonic() + pause)
             was_leader, released_at, wrote, lease_released = await self._release_leadership(
                 force_write=arming
             )

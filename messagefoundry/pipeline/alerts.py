@@ -1020,7 +1020,8 @@ class AlertSink(Protocol):
         :meth:`leadership_acquired`. Emits **no** notification (a step-down needs no page); it exists so
         durable alert-state (ADR 0044) **auto-resolves** the matching open ``leadership_acquired`` instance
         (the open set then tracks the current leaders). ``node`` is the node id; ``role`` is ``"follower"``;
-        ``reason`` is a PHI-free cause (``"lease taken or expired"`` / ``"self-fenced"`` / ``"released"``).
+        ``reason`` is a PHI-free cause, at least ``"lease taken or expired"`` / ``"self-fenced"`` /
+        ``"released"`` / ``"lease claim returned past the fence timeout"`` (BACKLOG #5711).
         The default :class:`LoggingAlertSink` logs it; a state-less sink treats it as a no-op."""
         ...
 

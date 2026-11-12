@@ -1284,8 +1284,9 @@ class DbCoordinator:
         self._promotable = promotable
         # ADR 0056 slice 1: monotonic instant before which this node declines to claim or renew, set by
         # step_down_leadership() so a voluntarily-drained node does not immediately re-arm itself via the
-        # renew branch. 0.0 = no pause. Only a stepdown sets it, and only _claim_or_renew_lease clears
-        # it early, once the row names another node (BACKLOG #1986).
+        # renew branch. 0.0 = no pause. A stepdown and a refused late hold (_refuse_late_hold, BACKLOG
+        # #5711) set it, each only ever lengthening it, and only _claim_or_renew_lease clears it
+        # early, once the row names another node (BACKLOG #1986).
         self._no_claim_until: float = 0.0
         # ADR 0056 slice 1: a lease-expiring write did not return, so this node may still own a live
         # lease row it has already stopped claiming in memory. _release_leadership ARMS it before the
@@ -1682,8 +1683,9 @@ class DbCoordinator:
 
         The folded flag rides the EXISTING heartbeat UPDATE — zero extra writes. The loop beats just
         AFTER :meth:`_maintain_leadership` (BACKLOG #5710), so a tick's own acquire or loss is folded
-        in by its beat, and a fence or stepdown between beats by the next one; that lag of up to one
-        tick is fine for an observability endpoint
+        in by its beat, and a fence or stepdown between beats by the next one. That lag of up to one
+        tick, longer while ticks skip a side pass that has not finished, is fine for an
+        observability endpoint
         (and a clean :meth:`stop` clears the flag immediately, while a crash leaves it stale for the
         freshness filter in :meth:`cluster_members` to discard)."""
         await self._call_tick(
@@ -1855,13 +1857,15 @@ class DbCoordinator:
             # the backstop. At least one promotable node must exist or the cluster elects no leader.
             return False
         if self._monotonic() < self._no_claim_until:
-            # JUST STEPPED DOWN (ADR 0056 slice 1): decline for a bounded window so a sibling wins the
-            # expired lease instead of us renewing it straight back. Same shape as the check above —
-            # write no DB row, report not-held — and strictly stricter than the base predicate, so it
-            # can only delay a claim, never advance one.
+            # JUST STEPPED DOWN (ADR 0056 slice 1), or JUST REFUSED A LATE HOLD (BACKLOG #5711): decline
+            # for a bounded window so a sibling wins the expired lease instead of us renewing it
+            # straight back. Same shape as the check above — write no DB row, report not-held — and
+            # strictly stricter than the base predicate, so it can only delay a claim, never advance
+            # one.
             #
             # THE PAUSE LIFT (BACKLOG #1986), the one place it is described. The pause guards one arm:
-            # the undelayed `owner = me` renew of the row this node released. Once a read shows the row
+            # the undelayed `owner = me` renew of the row this node released, or, after a late hold,
+            # of the row it renewed but declined to lead on. Once a read shows the row
             # naming another node, that arm cannot match, so the pause is lifted. Without the lift, a
             # pause that includes the longest sibling delay would also bar this node from taking over
             # a successor that crashed inside it. After the lift only the ordinary predicate runs,
@@ -1886,6 +1890,11 @@ class DbCoordinator:
             )
             if row is not None and row["owner"] != self.node_id:
                 self._no_claim_until = 0.0
+                # The DB answered with another owner, as a claim answered that way does below, so a
+                # baseline a refused late hold left stamped no longer names a row this node owns
+                # (BACKLOG #5711). _lease_release_owed, a separate disjunct of may_own_lease_row, is
+                # left as it was.
+                self._last_renew_ok = None
             return False
         row = await self._call_tick(
             "fetchrow",
@@ -2069,7 +2078,9 @@ class DbCoordinator:
                 # The retry needs this as much as the first call does: the release expires
                 # `lease_expires_at` but leaves `owner` naming us, so a successful retry with no pause
                 # re-arms this node through the unfenced `owner = me` branch on its very next tick.
-                self._no_claim_until = self._monotonic() + pause
+                # The later of the two, so a refused late hold's longer pause (BACKLOG #5711) is
+                # never shortened here and left short by a release that does not return.
+                self._no_claim_until = max(self._no_claim_until, self._monotonic() + pause)
             was_leader, released_at, wrote, lease_released = await self._release_leadership(
                 force_write=arming
             )
@@ -2118,9 +2129,10 @@ class DbCoordinator:
 
         Three disjuncts. The gate reads True. An earlier write is owed
         (:attr:`_lease_release_owed`). Or ``_last_renew_ok`` is set: a hold was confirmed and nothing
-        has cleared it since. Two things clear the baseline: a release, and a claim the DB answered
+        has cleared it since. Three things clear the baseline: a release, a claim the DB answered
         with another owner's live lease (:meth:`_claim_or_renew_lease`), which clears the owed flag
-        too. So the last disjunct is the self-fence
+        too, and a paused tick's read of a row naming another owner (BACKLOG #5711), which does not.
+        So the last disjunct is the self-fence
         window, where :meth:`_check_fence` clears the gate but not the baseline and the row stays live
         on the DB clock for up to ``ttl - fence`` more. The same disjunct covers a refused late hold
         (:meth:`_refuse_late_hold`, BACKLOG #5711): the claim renewed the row, so this node owns it
