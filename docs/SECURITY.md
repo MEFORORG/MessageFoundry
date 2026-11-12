@@ -2416,13 +2416,21 @@ the same permission set on the same method reds CI until it is listed here.
 >   and no source. Whether the origin channel should be checked here is an open question (vault
 >   BACKLOG #4776 item 1).
 > - `POST /ui/alerts/{alert_id}/suspend` refuses with 400 a `minutes` value that does not parse as a
->   number or falls outside the suspend window's bounds, which the JSON route refuses with 422, and
->   re-renders the alerts page carrying the refusal. It refuses before it reads the alert, so for
->   such a value an alert id outside the scope, or an unknown one, gets the same 400; a valid window
->   reaches the alert-writes rule above. A blank or missing `minutes` is not refused: the route reads
->   it as 60 minutes, where the JSON route refuses it with 422. The page lists only the active
->   alerts in the caller's channel scope. It shows the alert rules only to a caller that also holds
->   `monitoring:read`, since the route itself needs only `monitoring:diagnose`.
+>   number, such as one of only whitespace, or that falls outside the suspend window's bounds, and
+>   re-renders the alerts page carrying the refusal. The JSON route refuses the same values with
+>   422. It refuses before it reads the alert, as the JSON route does, so for such a value an alert
+>   id outside the scope, or an unknown one, gets the same 400. A missing `minutes`, or an empty
+>   one, is not refused: `ui_suspend_alert` in `messagefoundry_webconsole/routes/monitoring_writes.py`
+>   reads it as 60 minutes, suspends the alert and writes `"minutes": 60.0` into the
+>   `alert_suspend` audit row, where the JSON route refuses it with 422. That contradicts the
+>   route's own BACKLOG #1744 comment, which says the 60-minute substitute was removed. It is an
+>   open defect, not yet filed. With a window it accepts, the route calls the JSON handler
+>   `suspend_alert` in-process, which reads the alert through the caller's scope: an alert outside
+>   the scope, or an unknown one, answers that handler's 404, with no state change and no audit
+>   row. The route's gate is `require_ui`, which writes no `auth.permission_granted` row. The page
+>   lists only the active alerts in the caller's channel scope. It shows the alert rules only to a
+>   caller that also holds `monitoring:read`, since the route itself needs only
+>   `monitoring:diagnose`.
 >
 > The console reaches the same rules, because its routes call these handlers in-process. That
 > covers at least `/ui/messages/search/layered`, the `/ui/statistics/reset*` routes, the four
@@ -2433,8 +2441,8 @@ the same permission set on the same method reds CI until it is listed here.
 > `POST /ui/messages/search/presets/{preset_id}/delete` swallows the 404 and redirects, so another
 > user's preset id looks like one already deleted. `/ui/connections/purge-confirm` checks the
 > purge rule itself, before any purge: a scoped caller gets its own 403 and denial row. The
-> `/ui/nav-status` alert bell is null without `monitoring:diagnose`. The `/ui` suspend refuses a
-> bad window before any scope read, as its own bullet above says.
+> `/ui/nav-status` alert bell is null without `monitoring:diagnose`. The `/ui` suspend's
+> differences are in its own bullet above.
 >
 > `tests/test_single_route_data_rules_doc_drift.py` executes the main facts of each bullet, with an
 > all-channels caller as the control. The security-event feed has no channel axis, so its control
@@ -5612,13 +5620,18 @@ and federated legs below ship off: `[auth].ad_enabled`, `[auth].kerberos_enabled
   `messagefoundry/auth/service.py`, the engine's only caller of `Store.create_session`, and stamps
   the absolute lifetime there from `[security].max_session_hours`. A rotation mints a new token for
   an existing row through `Store.rotate_session` instead. The store keeps only the token's hash.
-- **The web console, `apiclient` and the VS Code extension** hold the token (table above). The
+- **At least the web console, `apiclient` and the VS Code extension** hold the token (table
+  above), and so does `tee compare`, which takes a bearer token on its command line (`--token` in
+  `tee/__main__.py`). The
   extension signs in through `POST /auth/login` with a local account: `/auth/providers` reports
   `ad` as false, and the engine refuses `provider: "ad"`.
 - **LDAP (Active Directory)**, under `ad_enabled`, is the directory the Kerberos and OIDC legs
   resolve a principal against, and the bind the directory session reconciler uses. It accepts no
-  directory-password sign-in; that pathway is retired (BACKLOG #1137). The reconciler can revoke a
-  directory account's live sessions, and *Directory session reconciliation* below states when.
+  directory-password sign-in; that pathway is retired (BACKLOG #1137). It does bind a directory
+  account's own password on the step-up re-bind, `AuthService._reauth_ad`, which `POST /me/reauth`
+  and `POST /ui/reauth` reach through `AuthService.reauth`. A good re-bind stamps the session's
+  `reauth_at` and rotates the session. The reconciler can revoke a directory account's live
+  sessions, and *Directory session reconciliation* below states when.
 - **Kerberos (Windows SSO)** creates a directory session through `POST /auth/negotiate` and the
   console's `GET /ui/sso` when `kerberos_enabled` is set. The engine reads no ticket lifetime, so such
   a session's absolute lifetime is the engine's own flat cap, not the directory's (ADR 0079).

@@ -483,16 +483,27 @@ async def _measure_ui_suspend_refusal(k: _Callers) -> None:
         rows = [await store.get_alert_instance(i, allowed_channels=None) for i in ids.values()]
         return [row.suspended_until if row is not None else None for row in rows]
 
-    async def suspend_rows() -> int:
-        return len(await store.list_audit(action="alert_suspend", limit=500))
+    async def suspend_minutes() -> list[float]:
+        rows = await store.list_audit(action="alert_suspend", limit=500)
+        return sorted(json.loads(r["detail"])["minutes"] for r in rows)
 
-    before, rows_before = await suspended(), await suspend_rows()
+    async def granted() -> int:
+        return len(await store.list_audit(action="auth.permission_granted", limit=10_000))
+
+    # The JSON route refuses the same bad windows with 422, before it reads the alert: an
+    # out-of-scope id and an unknown one get the 422 too. A missing window is refused as well.
+    for alert_id in (ids["IB_B"], 999_999):
+        for body in ({"minutes": 0}, {}):
+            r = await k.c.post(f"/alerts/{alert_id}/suspend", json=body, headers=k.scoped)
+            assert r.status_code == 422, (alert_id, body, r.text)
+
+    before, rows_before = await suspended(), await suspend_minutes()
     async with _ui_sessions(k, "suspender", "scoped", "allchannels") as ui:
 
-        async def refuse(username: str, alert_id: int) -> httpx.Response:
+        async def post(username: str, alert_id: int, form: dict[str, str]) -> httpx.Response:
             return await ui[username].post(
                 f"/ui/alerts/{alert_id}/suspend",
-                data={"minutes": "0"},
+                data=form,
                 headers={"Sec-Fetch-Site": "same-origin"},
             )
 
@@ -501,11 +512,32 @@ async def _measure_ui_suspend_refusal(k: _Callers) -> None:
         pages: dict[tuple[str, int], str] = {}
         for alert_id in (ids["IB_A"], ids["IB_B"], 999_999):
             for username in ("suspender", "scoped", "allchannels"):
-                r = await refuse(username, alert_id)
+                r = await post(username, alert_id, {"minutes": "0"})
                 assert r.status_code == 400 and "suspend window" in r.text, (username, alert_id)
                 pages[username, alert_id] = r.text
+        # A window of only whitespace does not parse, so it is refused, not read as 60.
+        r = await post("suspender", ids["IB_A"], {"minutes": "  "})
+        assert r.status_code == 400 and "suspend window" in r.text, r.status_code
         # No refusal muted an alert or wrote a suspend audit row.
-        assert await suspended() == before and await suspend_rows() == rows_before
+        assert await suspended() == before and await suspend_minutes() == rows_before
+        # A valid window reaches the JSON handler, which reads the alert through the scope: an
+        # out-of-scope id and an unknown one answer its 404, with no state change and no audit
+        # row, and require_ui writes no admission row either.
+        granted_before = await granted()
+        for alert_id in (ids["IB_B"], ids["OB_X"], 999_999):
+            r = await post("suspender", alert_id, {"minutes": "5"})
+            assert r.status_code == 404, (alert_id, r.status_code)
+        assert await suspended() == before and await suspend_minutes() == rows_before
+        assert await granted() == granted_before
+        # The open defect the bullet names: an empty window and a missing one are read as 60
+        # minutes, and the audit row records 60 as if it were the request.
+        for alert_id, form in ((ids["IB_A"], {"minutes": ""}), (ids["IB_B"], {})):
+            r = await post("allchannels", alert_id, form)
+            assert r.status_code == 303, (form, r.status_code)
+        assert await suspend_minutes() == sorted([*rows_before, 60.0, 60.0])
+        after = dict(zip(ids, await suspended(), strict=True))
+        assert after["IB_A"] is not None and after["IB_B"] is not None
+        assert after["OB_X"] == dict(zip(ids, before, strict=True))["OB_X"]
         narrow = pages["suspender", ids["IB_A"]]
         # The list is the caller's scoped one, which leaves out the shared outbound IB_A feeds, and
         # without monitoring:read the rules are left out.
@@ -630,22 +662,30 @@ _RULES: dict[str, _Rule] = {
         ),
         _measure_ui_resend_done,
         # Vault BACKLOG #4776 item 1 is open: the route does not check the origin channel today.
-        # A caller without messages:resend does get a 403, from the gate, so the verb is pinned.
-        forbidden=("answers 403", "checks scope on the origin", "origin channel is checked"),
+        # "answers 403" is not forbidden here: the gate does answer 403 to a caller without
+        # messages:resend. The scope answer is the 404 the measurement executes.
+        forbidden=("checks scope on the origin", "origin channel is checked"),
     ),
     "ui-suspend-refusal": _Rule(
         ("POST /ui/alerts/{alert_id}/suspend",),
         (
             "400",
+            "only whitespace",
+            "422",
             "before it reads the alert",
             "unknown one",
+            "60 minutes",
+            "open defect",
+            "that handler's 404",
+            "`require_ui`, which writes no `auth.permission_granted` row",
             "channel scope",
             "`monitoring:read`",
             "`monitoring:diagnose`",
         ),
         _measure_ui_suspend_refusal,
-        # A valid window can 404 through the alert-writes rule, so only the refusal's 404 is wrong.
-        forbidden=("the same 404",),
+        # A valid window can 404 in the handler, so only the refusal's 404 is wrong. A whitespace
+        # window is refused, so "blank" would claim what only an empty one does.
+        forbidden=("the same 404", "blank"),
     ),
 }
 
