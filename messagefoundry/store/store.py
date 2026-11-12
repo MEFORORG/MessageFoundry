@@ -1218,6 +1218,30 @@ class FailOutcome:
     dead_messages: tuple[str, ...] = ()
 
 
+#: The queue statuses no worker-death write may leave (vault BACKLOG #4607 step 6): a row already
+#: resolved keeps its disposition. Every terminal status, so a late death never turns a DONE or a
+#: CANCELLED row DEAD, and never dead-letters a DEAD row twice.
+_RESOLVED_STATUSES: Final = (
+    OutboxStatus.DONE.value,
+    OutboxStatus.DEAD.value,
+    OutboxStatus.CANCELLED.value,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerDeathOutcome:
+    """What one ``record_worker_death`` call did (vault BACKLOG #4607 step 6).
+
+    ``deaths`` is the row's ``worker_deaths`` as this call's own increment left it, read inside the
+    same write, never the value a claim returned. It is 0 when the row was already resolved, so
+    nothing was counted. ``dead`` is True when this call dead-lettered the row at its cap. On
+    Postgres and SQL Server both are reset to the empty outcome when the H1 epoch fence rolled the
+    dead-letter back, increment included (ADR 0157 C3)."""
+
+    deaths: int = 0
+    dead: bool = False
+
+
 class ClaimAbortPhase(StrEnum):
     """WHICH statement of a claim transaction hit the lock timeout (BACKLOG #1270).
 
@@ -9957,7 +9981,8 @@ CREATE TABLE IF NOT EXISTS queue (
     next_attempt_at  REAL NOT NULL,
     last_error       TEXT,
     created_at       REAL NOT NULL,
-    updated_at       REAL NOT NULL
+    updated_at       REAL NOT NULL,
+    worker_deaths    INTEGER NOT NULL DEFAULT 0  -- passes that killed their worker (#4607 step 6)
 );
 -- Claim hot path (claim_ready), per stage:
 CREATE INDEX IF NOT EXISTS ix_queue_ready ON queue(stage, status, next_attempt_at);
@@ -12446,6 +12471,12 @@ class MessageStore:
         # the CREATE TABLE IF NOT EXISTS in _SCHEMA, so a reopened DB gains it without a separate step.
         if "body_ref" not in queue_cols:
             await db.execute("ALTER TABLE queue ADD COLUMN body_ref TEXT")
+        # Vault BACKLOG #4607 step 6: the per-row count of passes that killed their stage worker.
+        # 0 on an existing row is right: no death was counted before the column existed.
+        if "worker_deaths" not in queue_cols:
+            await db.execute(
+                "ALTER TABLE queue ADD COLUMN worker_deaths INTEGER NOT NULL DEFAULT 0"
+            )
         # The body_ref deref index lives here (not _SCHEMA) so it is created only AFTER the column is
         # guaranteed present — on a Step-A queue it'd otherwise reference a not-yet-added column.
         await db.execute("CREATE INDEX IF NOT EXISTS ix_queue_body_ref ON queue(body_ref)")
@@ -14518,6 +14549,54 @@ class MessageStore:
             return
         await self._run_grouped(_body)
 
+    async def record_worker_death(
+        self, outbox_id: str, cap: int, error: str, now: float | None = None
+    ) -> WorkerDeathOutcome:
+        """Count one death of the worker processing ``outbox_id``, and dead-letter the row once the
+        count reaches ``cap`` (vault BACKLOG #4607 step 6). See the base contract.
+
+        Two statements rather than one ``UPDATE ... RETURNING``, for the reason
+        :meth:`supersede_session` gives; the writer lock makes them one unit."""
+        error = safe_text(error)  # PHI chokepoint (#120)
+        now = time.time() if now is None else now
+
+        async def _body() -> WorkerDeathOutcome:
+            # Not updated_at: the in-flight watch measures a held row's age from its claim.
+            cur = await self._db.execute(
+                "UPDATE queue SET worker_deaths = worker_deaths + 1"
+                " WHERE id=? AND status IN (?, ?)",
+                (outbox_id, OutboxStatus.INFLIGHT.value, OutboxStatus.PENDING.value),
+            )
+            if cur.rowcount == 0:
+                raise _AbortMember(WorkerDeathOutcome())
+            cur = await self._db.execute(
+                "SELECT worker_deaths, message_id, destination_name FROM queue WHERE id=?",
+                (outbox_id,),
+            )
+            row = await cur.fetchone()
+            assert row is not None  # the increment matched it, under the writer lock
+            deaths = int(row["worker_deaths"])
+            if deaths < cap:
+                return WorkerDeathOutcome(deaths=deaths)
+            # No status term: the increment matched this row unresolved, under the writer lock.
+            await self._db.execute(
+                "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
+                " WHERE id=?",
+                (
+                    OutboxStatus.DEAD.value,
+                    now,
+                    self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                    now,
+                    outbox_id,
+                ),
+            )
+            await self._event(row["message_id"], "dead", row["destination_name"], error, now)
+            await self._maybe_finalize_message(row["message_id"], now)
+            return WorkerDeathOutcome(deaths=deaths, dead=True)
+
+        result = await self._run_grouped(_body)
+        return result if isinstance(result, WorkerDeathOutcome) else WorkerDeathOutcome()
+
     async def mark_done(
         self, outbox_id: str, now: float | None = None, *, reply_dropped: str | None = None
     ) -> bool:
@@ -15440,9 +15519,13 @@ class MessageStore:
             # DONE, DEAD or CANCELLED row back in the queue, and a row something else already re-pended
             # still takes this attempt's backoff, event and last_error. A miss is a terminal (or
             # vanished) row; it writes nothing, not even the 'failed' event, and still returns the
-            # retry time. It cannot strand a row, because it declines no INFLIGHT row. The DEAD branch
-            # carries no status term (C2).
+            # retry time. It cannot strand a row, because it declines no INFLIGHT row.
             retrying = status == OutboxStatus.PENDING.value
+            if not retrying and row["status"] in _RESOLVED_STATUSES:
+                # ADR 0157 Amendment C (vault BACKLOG #4607 step 6): the DEAD branch leaves a row
+                # already DONE, DEAD or CANCELLED as it is, so a late worker cannot turn a delivered
+                # row DEAD. Read under the writer lock, so the row cannot move before the UPDATE.
+                raise _AbortMember(None)
             cur = await self._db.execute(
                 "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
                 " WHERE id=?" + (" AND status IN (?, ?)" if retrying else ""),
@@ -15981,7 +16064,7 @@ class MessageStore:
                     (message_id, OutboxStatus.DONE.value),
                 )
             cur = await self._db.execute(
-                "UPDATE queue SET status=?, attempts=0, next_attempt_at=?,"
+                "UPDATE queue SET status=?, attempts=0, worker_deaths=0, next_attempt_at=?,"
                 f" last_error=NULL, updated_at=? WHERE message_id=? AND status IN ({placeholders})"
                 f" AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER}",
                 (OutboxStatus.PENDING.value, now, now, message_id, *replay_from),
@@ -16516,8 +16599,8 @@ class MessageStore:
                 return 0
             # All-or-nothing, matching the SQL Server backend's atomicity.
             upd = await self._db.execute(
-                f"UPDATE queue SET status=?, attempts=0, next_attempt_at=?, last_error=NULL,"
-                f" updated_at=? WHERE {clause}",
+                "UPDATE queue SET status=?, attempts=0, worker_deaths=0, next_attempt_at=?,"
+                f" last_error=NULL, updated_at=? WHERE {clause}",
                 (OutboxStatus.PENDING.value, now, now, *params),
             )
             for message_id in message_ids:

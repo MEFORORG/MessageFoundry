@@ -254,15 +254,27 @@ async def test_a_zero_multiplier_on_a_reset_row_does_not_raise(store: MessageSto
     ).retry_at == 108.0
 
 
-async def test_the_dead_branch_is_unchanged(store: MessageStore) -> None:
-    """C2 keeps a status term off terminal resolves, so the amendment does not touch the DEAD branch.
-    Pinned so a later edit that spreads the term to both branches has to change this test on purpose."""
+async def test_the_dead_branch_still_lands_on_a_pending_row(store: MessageStore) -> None:
+    """C2 keeps a status conjunct off terminal resolves, so Amendment A's term does not reach the
+    DEAD branch, and Amendment C's decline (vault BACKLOG #4607 step 6) spares an INFLIGHT or
+    PENDING row. Pinned so a later edit that spreads the retry term to both branches has to change
+    this test on purpose."""
     mid, (oid,) = await _claimed(store, "OB1")
     await store.mark_failed(oid, "boom", _RETRY, now=100.0)  # PENDING, not INFLIGHT, attempts 1
 
     assert (await store.mark_failed(oid, "boom", RetryPolicy(max_attempts=1), now=102.0)).dead == 1
 
     assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.DEAD.value
+
+
+async def test_the_dead_branch_leaves_a_done_row_done(store: MessageStore) -> None:
+    """ADR 0157 Amendment C: a late failure at the cap does not turn a delivered row DEAD."""
+    mid, (oid,) = await _claimed(store, "OB1")
+    await store.mark_done(oid, now=101.0)
+
+    assert (await store.mark_failed(oid, "late", RetryPolicy(max_attempts=1), now=102.0)).dead == 0
+
+    assert (await store.outbox_for(mid))[0]["status"] == OutboxStatus.DONE.value
 
 
 async def test_a_batch_retry_skips_only_a_terminal_member(store: MessageStore) -> None:

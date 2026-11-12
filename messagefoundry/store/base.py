@@ -139,6 +139,7 @@ from messagefoundry.store.store import (
     TotpUsable,
     UserRecord,
     WebAuthnCredential,
+    WorkerDeathOutcome,
     minting_open,
     note_audit_chain_read,
 )
@@ -953,7 +954,42 @@ class QueueStore(StoreLifecycle, Protocol):
         or another writer already re-pended still takes this attempt's backoff, ``failed`` event and
         ``last_error``. A row some other writer already made DONE, DEAD or CANCELLED is left exactly
         as it is, and no ``failed`` event is written. The call still returns the retry time on that
-        miss; an early wake claims nothing. The DEAD branch carries no status term (ADR 0157 C2)."""
+        miss; an early wake claims nothing. The DEAD branch leaves a row already DONE, DEAD or
+        CANCELLED as it is, and returns an empty outcome (ADR 0157 Amendment C, vault BACKLOG #4607
+        step 6). It still dead-letters a PENDING row, which C2's lease-sweep case needs."""
+        ...
+
+    async def record_worker_death(
+        self, outbox_id: str, cap: int, error: str, now: float | None = None
+    ) -> WorkerDeathOutcome:
+        """Count one death of the stage worker that was processing ``outbox_id``, and dead-letter
+        the row once its count reaches ``cap`` (vault BACKLOG #4607 step 6; owner ruling 2026-11-04,
+        "Yes, dead-letter it"). A death is a ``BaseException`` that is not an ``Exception``, ending
+        the worker; the runner decides that, and never counts a cancellation, ``GeneratorExit``,
+        ``KeyboardInterrupt`` or ``SystemExit``, nor a group none of whose members is a death.
+
+        One transaction. It raises the row's ``worker_deaths`` by one only while the row is
+        unresolved, ``inflight`` or ``pending`` (a Postgres lease sweep may have re-pended it before
+        the death), and reads the count that increment left. Nothing else writes that column but a
+        replay, which resets it with ``attempts``: no claim raises it, and no release, reschedule or
+        ``reset_stale_inflight`` lowers it. So a batch tail claimed beside a dying row is never
+        counted, and the count survives a restart. Below ``cap`` that is the whole write: the row
+        stays as a death leaves it, and ``updated_at`` is untouched. At ``cap`` or above the same
+        transaction dead-letters the row as :meth:`dead_letter_now` does, a ``dead`` event
+        written and its message finalized. A row already DONE, DEAD or CANCELLED is never
+        changed: the increment matches only an unresolved row and holds it locked until the
+        commit (ADR 0157 Amendment C). On Postgres and SQL Server that dead-letter takes the
+        fail-open resolve fence (ADR 0157 C1, C2); a fenced rejection rolls the whole transaction
+        back, increment included, and re-pends a row still in flight (C3). The count loses that
+        death and nothing raises it again, though the runner's ERROR line and the fence's WARNING
+        and ``fenced_writes`` count still record it. So a row whose dead-letter is fenced needs
+        more deaths than ``cap`` before a dead-letter lands.
+
+        "Every time" therefore means across passes that each claimed the row anew: after a restart,
+        or a Postgres lease reclaim. A per_lane worker is respawned, but its dying row stays in
+        flight, so it is not re-claimed in the same process unless a lease sweep re-pends it
+        (#4607 steps 1, 2 and 5 are not built). A resolved row is not counted, and the empty
+        :class:`WorkerDeathOutcome` comes back."""
         ...
 
     async def dead_letter_now(self, outbox_id: str, error: str, now: float | None = None) -> None:

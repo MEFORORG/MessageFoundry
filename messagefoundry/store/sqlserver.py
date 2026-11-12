@@ -208,6 +208,7 @@ from messagefoundry.store.session_lineage import revoke_through_lineage
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
+    _RESOLVED_STATUSES,
     _SESSION_CAP_ORDER_SQL,
     _SESSION_CAP_RANK_NOT_AHEAD_SQL,
     _SESSION_INSERT,
@@ -306,6 +307,7 @@ from messagefoundry.store.store import (
     UserRecord,
     UserRow,
     WebAuthnCredential,
+    WorkerDeathOutcome,
     _alert_summary,
     _append_channel_scope,
     _connection_event_where,
@@ -2100,6 +2102,7 @@ _SCHEMA: list[str] = [
         attempts INT NOT NULL DEFAULT 0, next_attempt_at FLOAT NOT NULL, last_error NVARCHAR(MAX) NULL,
         owner NVARCHAR(256) NULL, lease_expires_at FLOAT NULL,
         created_at FLOAT NOT NULL, updated_at FLOAT NOT NULL,
+        worker_deaths INT NOT NULL DEFAULT 0,
         CONSTRAINT fk_queue_message FOREIGN KEY (message_id) REFERENCES messages(id))""",
     # Store-once-deliver-many (L2b): the single shared copy of a body fanned out to N destinations.
     # SCHEMA PARITY here — SQLite implements the dedup/deref/GC; on SQL Server body_ref stays NULL today
@@ -2214,6 +2217,10 @@ _SCHEMA: list[str] = [
     # Store-once-deliver-many (L2b): body_ref on a pre-existing queue (NULL = body inline, byte-identical).
     """IF COL_LENGTH('queue','body_ref') IS NULL
         ALTER TABLE queue ADD body_ref NVARCHAR(64) NULL""",
+    # Vault BACKLOG #4607 step 6: the per-row worker-death count, 0 on an existing row (no death was
+    # counted before the column existed).
+    """IF COL_LENGTH('queue','worker_deaths') IS NULL
+        ALTER TABLE queue ADD worker_deaths INT NOT NULL DEFAULT 0""",
     # The body_ref index is created AFTER the ALTER above so a pre-existing queue (no body_ref) doesn't
     # reference a not-yet-added column. Separate batch (the ALTER must commit first on SQL Server).
     """IF INDEXPROPERTY(OBJECT_ID('queue'),'ix_queue_body_ref','IndexID') IS NULL
@@ -11600,8 +11607,12 @@ class SqlServerStore:
         now = time.time() if now is None else now
         async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
             try:
+                # UPDLOCK (a plain read takes no lock under RCSI): the DEAD branch's decline below
+                # reads the row this transaction then writes, so no writer moves it in between
+                # (ADR 0157 Amendment C).
                 await cur.execute(
-                    "SELECT message_id, destination_name, attempts FROM queue WHERE id=?",
+                    "SELECT message_id, destination_name, attempts, status"
+                    " FROM queue WITH (UPDLOCK, ROWLOCK) WHERE id=?",
                     (outbox_id,),
                 )
                 row = await cur.fetchone()
@@ -11612,6 +11623,13 @@ class SqlServerStore:
                 # max_attempts None = retry forever (never dead-letter here); a finite cap dead-letters
                 # once exhausted (mirrors the SQLite backend's mark_failed).
                 if retry.max_attempts is not None and attempts >= retry.max_attempts:
+                    if row[3] in _RESOLVED_STATUSES:
+                        # ADR 0157 Amendment C (vault BACKLOG #4607 step 6): a row already DONE,
+                        # DEAD or CANCELLED is left as it is. Read under the lock and kept out of
+                        # the UPDATE, so an empty OUTPUT rowset there is still the epoch fence
+                        # alone.
+                        await self._commit(conn)
+                        return FailOutcome()
                     status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
                 else:
                     # vault BACKLOG #2761: never overflows, so attempt 1025+ keeps the cap's pace.
@@ -12256,6 +12274,62 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
 
+    async def record_worker_death(
+        self, outbox_id: str, cap: int, error: str, now: float | None = None
+    ) -> WorkerDeathOutcome:
+        """See the base contract (vault BACKLOG #4607 step 6). The increment is neither terminal nor
+        a re-pend, so it carries no fence (ADR 0157 C1). It matches only an INFLIGHT or PENDING row
+        and takes its lock, so the dead-letter that follows at the cap cannot find the row resolved
+        and needs no status term (Amendment C); a miss there is the resolve fence alone, handled as
+        C3 says. Both statements read their match from an ``OUTPUT`` rowset, never
+        ``cursor.rowcount`` (Inc 3, as built)."""
+        error = safe_text(error)  # PHI chokepoint (#120): scrub first, then cipher last_error (H4)
+        now = time.time() if now is None else now
+        output, guard, guard_params = self._resolve_guard()  # ADR 0157 C1 — TERMINAL
+        async with self._fence_scope(), self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                # Not updated_at: the in-flight watch measures a held row's age from its claim.
+                await cur.execute(
+                    "UPDATE queue SET worker_deaths = worker_deaths + 1"
+                    " OUTPUT inserted.worker_deaths, inserted.message_id, inserted.destination_name"
+                    " WHERE id=? AND status IN (?, ?)",
+                    (outbox_id, OutboxStatus.INFLIGHT.value, OutboxStatus.PENDING.value),
+                )
+                hit = await cur.fetchone()
+                if hit is None:
+                    await self._commit(conn)
+                    return WorkerDeathOutcome()
+                deaths, message_id, destination_name = int(hit[0]), hit[1], hit[2]
+                if deaths < cap:
+                    await self._commit(conn)
+                    return WorkerDeathOutcome(deaths=deaths)
+                await self._exec_terminal(
+                    cur,
+                    "record_worker_death",
+                    (outbox_id,),
+                    "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?,"
+                    " owner=NULL, lease_expires_at=NULL" + output + " WHERE id=?" + guard,
+                    (
+                        OutboxStatus.DEAD.value,
+                        now,
+                        self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                        now,
+                        outbox_id,
+                        *guard_params,
+                    ),
+                    checked=bool(guard),
+                )
+                await self._event(cur, message_id, "dead", destination_name, error, now)
+                await self._maybe_finalize(cur, message_id, now)
+                await self._commit(conn)
+                return WorkerDeathOutcome(deaths=deaths, dead=True)
+            except Exception:
+                await conn.rollback()
+                raise
+        # Reached only when _fence_scope swallowed a rejected dead-letter: the increment rolled back
+        # with it, and C3 re-pended the row for the successor.
+        return WorkerDeathOutcome()
+
     async def pending_depth(
         self, name: str, *, stage: str = Stage.OUTBOUND.value
     ) -> tuple[int, float | None]:
@@ -12401,8 +12475,9 @@ class SqlServerStore:
                         )
                     placeholders = ",".join("?" * len(replay_from))
                     await cur.execute(
-                        f"UPDATE queue SET status=?, attempts=0, next_attempt_at=?, last_error=NULL,"
-                        f" updated_at=? WHERE message_id=? AND status IN ({placeholders})"
+                        "UPDATE queue SET status=?, attempts=0, worker_deaths=0, next_attempt_at=?,"
+                        " last_error=NULL, updated_at=? WHERE message_id=?"
+                        f" AND status IN ({placeholders})"
                         f" AND ({_REPLAYABLE_BODY}) AND {_NOT_PT_MARKER}",
                         (OutboxStatus.PENDING.value, now, now, message_id, *replay_from),
                     )
@@ -12974,8 +13049,8 @@ class SqlServerStore:
                         await self._commit(conn)
                         return 0
                     await cur.execute(
-                        f"UPDATE queue SET status=?, attempts=0, next_attempt_at=?, last_error=NULL,"
-                        f" updated_at=? WHERE {clause}",
+                        "UPDATE queue SET status=?, attempts=0, worker_deaths=0, next_attempt_at=?,"
+                        f" last_error=NULL, updated_at=? WHERE {clause}",
                         (OutboxStatus.PENDING.value, now, now, *params),
                     )
                     count = cur.rowcount
