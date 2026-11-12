@@ -262,13 +262,12 @@ version.
    The test sweeps all six documents `docs/README.md` lists under *Start here*, so an engine pin,
    console pin or *for engine* phrase added to any of them is held too. A `$V` line is held only in
    the two guides named above. Run the test after the bump.
-5. The console pairing prose. **Check the UI seam first** (below): if it moved, the same pull
-   request also moves the console version that paragraph names, or the pins below pair the new
-   engine with a console that refuses it. Then move the engine pin in the
+5. The console pairing prose. **Check the UI seam first** (below). Move the engine pin in the
    pairing install line of `README.md` and of `packaging/messagefoundry-webconsole/README.md` on
-   every bump: the same test holds both to `__version__`, so they cannot wait. Move by hand the
-   engine versions that prose names as sharing the console's seam, and the engine version in the
-   *Admin console* section of `docs/SERVICE.md`. No test holds those.
+   every bump: the same test holds both to `__version__`, so they cannot wait. The console pin
+   beside each stays, as *does not move* says. Move by hand the engine versions that prose names as
+   sharing the console's seam, and the engine version in the *Admin console* section of
+   `docs/SERVICE.md`. No test holds those.
 6. `CHANGELOG.md`: run `python scripts/release/changelog_fragments.py assemble`, then rename
    `[Unreleased]` to the version and add a fresh, empty `[Unreleased]` above it.
    [changelog.d/README.md](changelog.d/README.md), *At release*, gives the order. Then move the
@@ -291,8 +290,12 @@ What an engine bump does not move:
 the last console tag. The in-tree console moves with the engine seam, so comparing against it
 always reads unchanged. If the seam has moved, the published console refuses the new engine, so the
 release needs a console release beside it
-([docs/WEBCONSOLE-PACKAGE.md](docs/WEBCONSOLE-PACKAGE.md)). That release also moves the console
-version in the three files of item 5.
+([docs/WEBCONSOLE-PACKAGE.md](docs/WEBCONSOLE-PACKAGE.md)), or the pairing lines of item 5 pair the
+new engine with a console that refuses it. That console release bumps `__version__` in
+`messagefoundry_webconsole/__init__.py` and moves the `messagefoundry-webconsole==` pins in the same
+commit: the test in item 4 holds those pins to that `__version__`, so either change alone fails it.
+The console version in the *Admin console* section of `docs/SERVICE.md` moves by hand; no test
+holds it.
 
 ## PHI / safety
 

@@ -4566,10 +4566,11 @@ _PUBLISHER_UPSTREAM: dict[str, frozenset[str]] = {
 
 
 def _variable_gated_jobs(jobs: dict, publisher: str) -> list[str]:
-    """The jobs among ``publisher`` and every job it waits on whose `if:` a variable can turn false.
-    A skipped need skips the job that needs it, so any one of them would leave the release a draft
-    on a run that reads green. The walk must find at least the publisher's `_PUBLISHER_UPSTREAM`
-    set, or an empty result would say nothing about those jobs."""
+    """The jobs among ``publisher`` and every job it waits on whose job-level `if:` a variable can
+    turn false. Step-level `if:`s are not read. A skipped need skips the job that needs it, so any
+    one of them would leave the release a draft on a run that reads green. The walk must find at
+    least the publisher's `_PUBLISHER_UPSTREAM` set, or an empty result would say nothing about
+    those jobs."""
     upstream = _upstream(publisher, jobs)
     expected = _PUBLISHER_UPSTREAM[publisher]
     assert upstream >= expected, f"{publisher}'s upstream walk lacks {sorted(expected - upstream)}"
@@ -4620,9 +4621,9 @@ def test_the_variable_gate_pattern_sees_direct_and_indirect_spellings(
 def test_the_variable_gate_scan_reaches_upstream_jobs_and_the_publisher(
     publisher: str, target: str, gate: str
 ) -> None:
-    """Positive control for `_variable_gated_jobs`: a gate added to a job the publisher waits on, or
-    to the publisher itself, is absent from the walk's result before it is planted and found
-    after."""
+    """Positive control for `_variable_gated_jobs`: a gate added to the job-level `if:` of a job the
+    publisher waits on, or of the publisher itself, is absent from the walk's result before it is
+    planted and found after."""
     jobs = copy.deepcopy(_jobs())
     assert target not in _variable_gated_jobs(jobs, publisher), target
     jobs[target]["if"] = f"{jobs[target].get('if') or 'true'} && {gate}"
