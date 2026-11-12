@@ -82,7 +82,6 @@ from messagefoundry.controlchars import strip_control_chars
 from messagefoundry.secretscrub import credential_query_params
 from messagefoundry.transports.base import (
     ECH_UNSUPPORTED_DESTINATION_MSG,
-    INSECURE_HOP_REFUSED_CODE,
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
@@ -114,7 +113,6 @@ from messagefoundry.transports.signing import MessageSigner, signer_from_destina
 
 __all__ = [
     "DYNAMIC_HEADER_PREFIX",
-    "INSECURE_HOP_REFUSED_CODE",
     "ECH_HOP_WAYS_ACROSS",
     "InsecureHopGuard",
     "ProxyConfig",
