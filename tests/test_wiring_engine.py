@@ -366,15 +366,17 @@ async def test_per_connection_ops_take_reload_lock(store: MessageStore) -> None:
     # A running graph with the inbound unbound: the door refuses a runner that is not running
     # (BACKLOG #5702), and the lock is what is under test.
     await runner.start()
-    await runner.stop_inbound("mllp_in")
-    assert not runner.inbound_running("mllp_in")
-    await runner._reload_lock.acquire()
-    task = asyncio.ensure_future(runner.start_inbound("mllp_in"))
-    await asyncio.sleep(0.05)
-    assert not task.done()  # blocked on the lock held above
-    runner._reload_lock.release()
-    await asyncio.wait_for(task, timeout=2.0)
     try:
+        await runner.stop_inbound("mllp_in")
+        assert not runner.inbound_running("mllp_in")
+        await runner._reload_lock.acquire()
+        try:
+            task = asyncio.ensure_future(runner.start_inbound("mllp_in"))
+            await asyncio.sleep(0.05)
+            assert not task.done()  # blocked on the lock held above
+        finally:
+            runner._reload_lock.release()
+        await asyncio.wait_for(task, timeout=2.0)
         assert runner.inbound_running("mllp_in")
     finally:
         await runner.stop()

@@ -5,7 +5,7 @@
 A reload whose window is closed passes an engine park to the calendar (vault BACKLOG #3262), and a
 later reload that removes the schedule resumes the lane (``_resume_unscheduled_outbound``). Every
 engine shard ran the handoff, and the resume reached the pooled re-arm with no ownership test, so
-a shard that does not own the lane (ADR 0073) re-armed it on its own dispatcher and claimed beside
+an engine shard that does not own the lane (ADR 0073) re-armed it on its own dispatcher and claimed beside
 the owner: two claimers on one FIFO lane. The DR activation's reload is one way in; the park an
 ``auto_start = false`` lane leaves is another, and is the one driven here.
 
@@ -38,8 +38,9 @@ from tests.test_shard_lane_ownership import ADT, UNIVERSE, _pick_dest
 
 _WINDOW = _weekday_window()  # closed at _OUT_OF_WINDOW
 _SWEEP_SECONDS = 0.05
-# Three sweeps after the owner's lane delivered, which a lane re-armed beside it would use too.
-_TOP_UP_SECONDS = 3 * _SWEEP_SECONDS
+# Ten sweeps after the owner's lane delivered: a lane re-armed beside it, at the same moment,
+# claims and writes its row well inside this.
+_TOP_UP_SECONDS = 10 * _SWEEP_SECONDS
 
 
 def _delivered(outdir: Path) -> bool:
@@ -56,7 +57,7 @@ async def store(tmp_path: Path):
 def _registry(
     tmp_path: Path, dests: list[str], *, auto_start: bool, schedule: Schedule | None
 ) -> Registry:
-    """Shard ``a``'s view: one inbound on ``a``, the shared outbounds each writing to its own
+    """Engine shard ``a``'s view: one inbound on ``a``, the shared outbounds each writing to its own
     directory, every one with the given ``auto_start`` and ``schedule``."""
     inbox = tmp_path / "in_a"
     inbox.mkdir(exist_ok=True)
@@ -118,7 +119,10 @@ async def test_a_non_owner_does_not_resume_a_lane_its_handoff_took(
     )
     await runner.start()
     try:
-        assert {owned, foreign} <= runner._gate_parked  # the boot gate parked both, on every shard
+        assert {
+            owned,
+            foreign,
+        } <= runner._gate_parked  # the boot gate parked both, on every engine shard
         ids = {
             dest: await store.enqueue_message(
                 channel_id="in_a", raw=ADT, deliveries=[(dest, ADT)], now=_time.time()
@@ -130,7 +134,7 @@ async def test_a_non_owner_does_not_resume_a_lane_its_handoff_took(
         await runner.reload(_registry(tmp_path, dests, auto_start=True, schedule=_WINDOW))
         assert owned in runner._schedule_parked  # the control: the handoff ran
         assert foreign not in runner._schedule_parked
-        # The schedule goes: the owner resumes its lane, and this shard must not arm the other.
+        # The schedule goes: the owner resumes its lane, and this engine shard must not arm the other.
         await runner.reload(_registry(tmp_path, dests, auto_start=True, schedule=None))
         # The control: the resume path is live here, for the lane this engine shard owns.
         await _wait_until(lambda: _delivered(tmp_path / owned))

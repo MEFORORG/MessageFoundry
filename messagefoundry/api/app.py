@@ -5888,8 +5888,9 @@ def create_app(
                 raise HTTPException(409, str(exc)) from None
             except RunnerNotRunningError as exc:
                 # BACKLOG #5702: the graph is down, as on a demoted follower whose API still serves,
-                # so a start would bind a listener outside the engine lifecycle. 503, as no runner is.
-                raise HTTPException(503, str(exc)) from None
+                # so a start would bind a listener outside the engine lifecycle. 503, as no runner
+                # is, and audited below as every refused inbound start or restart is.
+                refused = HTTPException(503, str(exc))
             except TrustAnchorError as exc:
                 # vault BACKLOG #2371: an Ftp poller's CA was refused. The runner recorded it failed
                 # and logged why. Raised below, outside this handler, so the refusal, which names
@@ -5936,6 +5937,7 @@ def create_app(
             return {"name": name, "running": running}
         if rr is not None and side == "out":
             held = False
+            graph_down: RunnerNotRunningError | None = None
             try:
                 if action == "start":
                     await rr.start_outbound(name, hold_on_store_fault=True)
@@ -5965,7 +5967,19 @@ def create_app(
             except RunnerNotRunningError as exc:
                 # BACKLOG #5702: the graph is down, so a start would spawn a delivery worker outside
                 # the engine lifecycle and a stop would record a pause a later start inherits.
-                raise HTTPException(503, str(exc)) from None
+                graph_down = exc
+            if graph_down is not None:
+                await _record_refused_control_audit(
+                    engine,
+                    identity,
+                    name,
+                    action,
+                    role="destination",
+                    running=rr.outbound_running(name),
+                    store_fault=False,
+                    client=client,
+                )
+                raise HTTPException(503, str(graph_down))
             if held:
                 await _record_refused_control_audit(
                     engine,

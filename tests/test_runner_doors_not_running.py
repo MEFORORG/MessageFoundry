@@ -9,6 +9,7 @@ it, outside the engine lifecycle, and ``stop_outbound`` recorded a pause the nex
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -49,8 +50,10 @@ async def _demoted_runner(store: MessageStore, tmp_path: Path, claim_mode: str) 
         egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
-    assert runner.running and _IN in runner._sources  # the control: the graph really ran
-    await runner.stop(reason=TeardownReason.DEMOTE, budget_seconds=2.0)
+    try:
+        assert runner.running and _IN in runner._sources  # the control: the graph really ran
+    finally:
+        await runner.stop(reason=TeardownReason.DEMOTE, budget_seconds=2.0)
     assert not runner.running
     return runner
 
@@ -148,5 +151,37 @@ async def test_the_control_route_answers_503_on_a_downed_graph(tmp_path: Path) -
                 assert "graph is not running" in r.text
             assert (await c.post(f"/connections/{_IN}/stop")).status_code == 200
         assert rr._sources == {} and rr._workers == {} and rr._outbound_paused == set()
+        # Each refusal is audited as a refused control, which the accepted inbound stop is not.
+        details = [
+            json.loads(row["detail"] or "{}")
+            for row in await engine.store.list_audit(action="connection_control")
+        ]
+        refused = sorted((d["connection"], d["action"]) for d in details if d.get("refused"))
+        assert refused == sorted(
+            [(_IN, "start"), (_IN, "restart"), (_OUT, "start"), (_OUT, "stop"), (_OUT, "restart")]
+        )
     finally:
         await engine.stop()
+
+
+async def test_an_outbound_stop_still_pauses_a_lane_a_failed_teardown_left(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """A teardown that raised or was cancelled clears ``_running`` and can leave lanes delivering
+    (ADR 0157 D7). An operator's stop must still pause them; the next start tears them down."""
+    runner = RegistryRunner(
+        _unsharded_registry(tmp_path),
+        store,
+        claim_mode="pooled",
+        egress=EgressSettings(deny_by_default=False),
+    )
+    await runner.start()
+    try:
+        runner._running = False  # the residual state a raised teardown leaves behind
+        assert runner.has_residual_state  # the premise
+        await runner.stop_outbound(_OUT)
+        assert _OUT in runner._outbound_paused
+        with pytest.raises(RunnerNotRunningError):
+            await runner.start_outbound(_OUT)  # a start is still refused there
+    finally:
+        await runner.stop()

@@ -547,16 +547,20 @@ class RunnerNotRunningError(RuntimeError):
     Refused rather than acted on. The graph is down, at least before :meth:`RegistryRunner.start`
     and after a teardown, which includes the ADR 0157 demoted follower, whose ``_stop_graph`` stops
     the runner while the API keeps serving. A start there would bind a live listener or spawn a
-    delivery worker outside the engine lifecycle, so a node that is not the leader would take
-    traffic, and a stop would record a pause that a later promotion's start inherits. An inbound
-    stop is not refused: with the graph down it has nothing to unbind and records nothing. The API
-    maps this to 503, as it does a missing runner."""
+    delivery worker outside the engine lifecycle, and a stop would record a pause that a later
+    promotion's start inherits. The test is the runner's own flag, not leadership: a node that has
+    lost its lease but not yet stopped its graph still takes the controls until it does.
+
+    An inbound stop is not refused, and neither is an outbound stop while a teardown that raised or
+    was cancelled has left state behind (``has_residual_state``): either may still have a live
+    listener or lane to take down, and the next start tears that state down again, pause records
+    included. The API maps this to 503, as it does a missing runner."""
 
     def __init__(self, name: str) -> None:
         super().__init__(
-            f"connection {name!r}: this engine's graph is not running (stopped, or a standby or "
-            "demoted node), so it takes no connection control; issue it against the node that runs "
-            "the graph"
+            f"connection {name!r}: this engine's graph is not running (stopped, or a demoted "
+            "node), so it takes no connection control; issue it against the node that runs the "
+            "graph"
         )
         self.name = name
 
@@ -3260,10 +3264,11 @@ class RegistryRunner:
         configuration fault, the internal-error STOP policy, and a pooled T17 or claimer-death
         stop. Never raises.
 
-        **An operator is not the only thing that lifts it.** The record is cleared wherever the
-        lane is re-armed (:meth:`_schedule_holds`). Per_lane, that is a fresh delivery worker,
-        which at least an operator start, a reload and a full teardown spawn. Pooled, it is at
-        least an operator start (:meth:`_resume_pooled_lane`) and every ``notify_work`` broadcast
+        **An operator is not the only thing that lifts it.** A full teardown clears every record,
+        and otherwise the record goes where the lane is re-armed (:meth:`_schedule_holds`). Per_lane,
+        that is a fresh delivery worker, which at least an operator start and a reload spawn.
+        Pooled, it is at least an operator start (:meth:`_resume_pooled_lane`) and every
+        ``notify_work`` broadcast
         that finds the lane STOPPED (:meth:`_broadcast_to`): a reload, the engine's wake after a
         replay, resend, resubmit, upload or dead-letter replay of any message, a DR release drain,
         and a clustered leader's lease reclaim. None of those is an act on this lane, and the
@@ -4139,11 +4144,13 @@ class RegistryRunner:
         )
         return True
 
-    def _require_running(self, name: str) -> None:
+    def _require_running(self, name: str, *, residual_ok: bool = False) -> None:
         """Refuse a run-state control while the graph is not running (BACKLOG #5702), with
         :class:`RunnerNotRunningError`. Read under the reload lock, which :meth:`start` and every
-        teardown also hold, so the flag cannot change between this read and the act."""
-        if not self._running:
+        teardown also hold, so the flag cannot change between this read and the act.
+        ``residual_ok`` lets a stop through while a failed teardown left lanes behind; the error's
+        docstring says why."""
+        if not self._running and not (residual_ok and self.has_residual_state):
             raise RunnerNotRunningError(name)
 
     def _require_owned_destination(self, name: str) -> None:
@@ -4207,7 +4214,7 @@ class RegistryRunner:
         holding its rows, and a stop would turn the engine's park into an operator pause that the
         reload after a release could not lift (vault BACKLOG #3067)."""
         async with self._reload_lock:
-            self._require_running(name)
+            self._require_running(name, residual_ok=True)
             self._require_owned_destination(name)
             self._refuse_dr_parked(name)
             self._stop_outbound_unsafe(name)
@@ -5019,7 +5026,7 @@ class RegistryRunner:
 
     async def _resume_unscheduled_outbound(self, name: str) -> None:
         """Resume a lane the calendar parked, now that its schedule is gone. Left paused whenever
-        something other than the calendar also holds it down: an operator-required STOP, a #122 log
+        something other than the calendar also holds it down: a recorded STOP, a #122 log
         halt, ``deployed=False`` or ``auto_start=False``. The lane then stays as that state leaves
         it, and the ordinary recovery for that state brings it up. So does a refused CA the reload
         kept (vault BACKLOG #2371): resuming would read the CA again and alert a second time. An
@@ -5122,7 +5129,7 @@ class RegistryRunner:
             return
         active = schedule.is_active(self._schedule_clock())
         running = self.inbound_running(name) if kind == "inbound" else self.outbound_running(name)
-        # An operator-required STOP (at least a #109 credential fault, a #2083 configuration fault, or
+        # A recorded STOP (at least a #109 credential fault, a #2083 configuration fault, or
         # the internal-error STOP policy) outranks the calendar. The start branch must not re-arm it:
         # that re-tries a bad credential at every window open, which is the partner lockout the STOP
         # exists to prevent. The OUTBOUND park must
@@ -5305,8 +5312,8 @@ class RegistryRunner:
         self._stop_hold_logged.discard((kind, name))
 
     def _schedule_holds(self, name: str, kind: Direction) -> bool:
-        """Whether the scheduler must leave ``name``'s ``kind`` lane alone because an operator-required
-        STOP halted it. Logs once per hold.
+        """Whether the scheduler must leave ``name``'s ``kind`` lane alone because a recorded STOP
+        halted it (:meth:`outbound_stop_held` says what else clears it). Logs once per hold.
 
         The record alone decides, and it is not cross-checked against the lane's live state. That check
         was tried and it races: the STOP site records the hold before its lane reaches STOPPED (a pooled
@@ -5328,9 +5335,8 @@ class RegistryRunner:
         if key not in self._stop_hold_logged:
             self._stop_hold_logged.add(key)
             log.warning(
-                "schedule: %s connection %r is held by an operator-required STOP; the schedule "
-                "leaves it stopped until it is re-armed (fix the cause, then restart the "
-                "connection or reload)",
+                "schedule: %s connection %r is held by a STOP; the schedule leaves it stopped "
+                "until it is re-armed (fix the cause, then restart the connection or reload)",
                 kind,
                 name,
             )
