@@ -438,7 +438,8 @@ def test_a_user_or_decoy_bind_whose_open_fails_closes_its_socket(how: str) -> No
     a connect the directory refused. A failed open leaves the connection closed with its socket
     held, and ldap3's ``unbind`` does nothing on a closed connection, so before #3017 the socket
     stayed open until the object was collected. The two branches still answer alike. The refused
-    port is held bound and not listening for the whole test, so no other server can take it."""
+    port is held bound, exclusively where Windows offers it, and not listening while both branches
+    run."""
     second: dict[str, Any] = {}
     open_at_end: dict[str, bool] = {}
     texts: dict[str, str] = {}
@@ -461,7 +462,7 @@ def test_a_user_or_decoy_bind_whose_open_fails_closes_its_socket(how: str) -> No
                 finally:
                     # Read as the open ends: the close under test then drops conn.socket.
                     second[branch] = self.socket
-                    # Open here, so a closed socket below is the release's doing.
+                    # Open as the open ends, so a socket read closed below closed after it.
                     open_at_end[branch] = self.socket is not None and self.socket.fileno() != -1
 
             self.strategy._open_socket = held_open
@@ -472,6 +473,9 @@ def test_a_user_or_decoy_bind_whose_open_fails_closes_its_socket(how: str) -> No
                 self.server.port = dead
 
     with socket.socket() as held:
+        exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)  # Windows only
+        if exclusive is not None:
+            held.setsockopt(socket.SOL_SOCKET, exclusive, 1)
         held.bind(("127.0.0.1", 0))
         dead = int(held.getsockname()[1])
         for branch, search in (("absent", lambda _raw: [_done(0)]), ("present", _alice)):
@@ -488,7 +492,6 @@ def test_a_user_or_decoy_bind_whose_open_fails_closes_its_socket(how: str) -> No
             texts[branch] = str(err.value)
     # ldap3 sets conn.socket before the connect, so a failed open still holds one, still open.
     assert sorted(second) == ["absent", "present"], "a branch never reached the second connect"
-    assert all(sock is not None for sock in second.values()), second
     assert open_at_end == {"absent": True, "present": True}, open_at_end
     left_open = [branch for branch, sock in second.items() if sock.fileno() != -1]
     assert left_open == [], f"left its socket open: {left_open}"
@@ -497,10 +500,9 @@ def test_a_user_or_decoy_bind_whose_open_fails_closes_its_socket(how: str) -> No
 
 
 def test_a_block_that_raised_on_an_open_connection_is_unbound_and_not_closed_again() -> None:
-    """The control: on an open connection ldap3 2.9.1's unbind closes the socket and sets
-    ``conn.socket`` to None (``BaseStrategy._close_socket``), as this stand-in does, so nothing is
-    closed after it. A refusal raised after a bind that opened, such as a referral, still
-    unbinds."""
+    """The control: an unbind that sets ``conn.socket`` to None, as this stand-in does and as
+    ``ldap._end_release`` says ldap3's does once it sends its request, leaves nothing to close
+    after it. A refusal raised after a bind that opened, such as a referral, still unbinds."""
     calls: list[str] = []
     conn = SimpleNamespace(socket=object())
 
