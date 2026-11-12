@@ -10336,11 +10336,11 @@ class RegistryRunner:
         # BACKLOG #5706: asked again after the window, which can last up to max_wait_ms, and before
         # the missing-connector arm, which would spend an attempt on every member. Every member goes
         # back unsent, the head included: the per_lane worker passes it here with no further gate of
-        # its own, and the pooled adapter returns this outcome as its own. A demoted node skips it,
-        # so the leadership check below releases and stops the lane. The gate that guards the send
-        # itself is the one right before it.
-        if self._hand_back_due(name):
-            return _ItemOutcome.PROCESSED, await self._hand_back(name, ids)
+        # its own, and the pooled adapter returns this outcome as its own. A demoted node releases
+        # them and stops the lane instead. The gate that guards the send itself is the one right
+        # before it.
+        if not self._lane_may_deliver(name):
+            return await self._refuse_claimed(name, ids)
         retry_until: float | None = None
         connector = self._destinations.get(name)
         if connector is None:
@@ -12401,10 +12401,12 @@ class RegistryRunner:
         # BACKLOG #5709: the lane gate, the pause as well as the halt, is asked before the wait and
         # again after it, as the per_lane worker asks per item (#2771). A pause that lands with the
         # head in flight is past every dispatcher gate, so only this one stops the send.
+        # A demoted node is refused here too, so a halted or paused head never reaches the
+        # missing-connector arm, which would spend an attempt on it.
         if self._lane_may_deliver(lane):
             await self._pace_outbound(lane)
-        if self._hand_back_due(lane):
-            return LaneItemResult(LaneResultKind.RETRY, await self._hand_back(lane, [item.id]))
+        if not self._lane_may_deliver(lane):
+            return _to_lane_result(await self._refuse_claimed(lane, [item.id]))
         # #134 (ADR 0082): batch inside the pooled claim (decision #5) — the dispatcher claims one head
         # per lane as always; a batching lane's delivery body coalesces its own tail (claim_next_fifo)
         # into one BHS…BTS envelope, so per_lane and pooled share the exact batch body with NO change to
@@ -12413,14 +12415,6 @@ class RegistryRunner:
         if batch_cfg is not None:
             return _to_lane_result(await self._process_delivery_batch(lane, item, batch_cfg))
         return _to_lane_result(await self._process_delivery_item(lane, item))
-
-    def _hand_back_due(self, name: str) -> bool:
-        """Whether claimed, unsent rows of ``name`` go back through :meth:`_hand_back`: the lane gate
-        refuses them, and this node still leads. A demoted node leaves them to the send path's own
-        leadership check, which releases them and stops the lane for the new leader; a hand-back
-        there would reschedule rows a successor may already own and park instead of stopping.
-        Synchronous, so the allowed path awaits nothing extra."""
-        return not self._lane_may_deliver(name) and self._coordinator.is_leader()
 
     async def _refuse_claimed(self, name: str, ids: list[str]) -> tuple[_ItemOutcome, float | None]:
         """Resolve claimed, unsent OUTBOUND rows of ``name`` that the lane gate

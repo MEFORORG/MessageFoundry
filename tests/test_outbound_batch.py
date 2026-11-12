@@ -1136,3 +1136,30 @@ async def test_a_demotion_and_a_pause_before_every_member_is_refused_writes_no_r
     assert outcome is wiring_runner._ItemOutcome.STOPPED
     assert await _states(store, mids) == [QUEUED, QUEUED]  # released, not dead-lettered
     assert await _attempts(store, mids) == [0, 0]
+
+
+async def test_a_halt_mid_window_on_a_demoted_node_with_no_connector_spends_no_attempt(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The halt and a demotion land inside the window of a lane with no connector. The gate after
+    the window releases every member and STOPs the lane. Before the repair it let a demoted node
+    through to the missing-connector arm, which charged each member a failed attempt."""
+    mids = await _enqueue(store, 3)
+    runner = _runner(store)
+    rec = _Recorder()
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=60000))
+    del runner._destinations[DEST]
+    head = await store.claim_next_fifo(DEST)
+    real_claim = store.claim_next_fifo
+
+    async def _claim_then_halt_and_demote(name: str, *args: Any, **kwargs: Any) -> Any:
+        got = await real_claim(name, *args, **kwargs)
+        runner._log_write_stopped = True
+        _demote(runner, monkeypatch)
+        return got
+
+    monkeypatch.setattr(store, "claim_next_fifo", _claim_then_halt_and_demote)
+    outcome, _ = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    assert outcome is wiring_runner._ItemOutcome.STOPPED
+    assert await _states(store, mids) == [QUEUED] * 3
+    assert await _attempts(store, mids) == [0, 0, 0]

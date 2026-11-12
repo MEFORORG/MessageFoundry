@@ -461,8 +461,8 @@ async def test_a_paused_lane_is_refused_before_the_pacing_wait(
 async def test_a_demoted_node_with_a_paused_lane_releases_and_stops(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A node that lost leadership leaves the head to the send path's leadership check, which
-    releases it and STOPs the lane for the new leader, rather than handing it back and parking."""
+    """A node that lost leadership releases the head and STOPs the lane for the new leader, as the
+    send path's leadership check does, rather than handing it back and parking."""
     head = await _one_claimed_head(store)
     rec = _Recorder()
     runner = _paced_runner(store, rec)
@@ -474,3 +474,24 @@ async def test_a_demoted_node_with_a_paused_lane_releases_and_stops(
     assert result.kind is LaneResultKind.STOP  # stopped for the new leader, not parked
     again = await store.claim_next_fifo(DEST)  # released, not rescheduled: due at once
     assert again is not None and again.id == head.id
+
+
+async def test_a_halted_head_on_a_demoted_node_with_no_connector_spends_no_attempt(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The halt holds on a demoted node whose outbound has no connector (a reload, or one that
+    failed to start). The head is released and the lane STOPs, with no attempt spent. Before the
+    repair the gate let a demoted node through to the missing-connector arm, which charged the head
+    a failed attempt and, under a finite cap, could dead-letter it unsent; before the branch the
+    halt rescheduled it with none spent."""
+    head = await _one_claimed_head(store)
+    rec = _Recorder()
+    runner = _paced_runner(store, rec)
+    runner._retry[DEST] = RetryPolicy(max_attempts=1)  # one charged attempt would dead-letter it
+    del runner._destinations[DEST]
+    runner._log_write_stopped = True
+    monkeypatch.setattr(runner._coordinator, "is_leader", lambda: False)
+    result = await runner._dispatch_delivery(DEST, head)
+    assert result.kind is LaneResultKind.STOP
+    (row,) = await store.outbox_for(head.message_id)
+    assert (row["status"], row["attempts"], row["last_error"]) == ("pending", 0, None)
