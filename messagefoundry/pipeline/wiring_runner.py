@@ -2467,10 +2467,11 @@ class RegistryRunner:
 
     def _resume_pooled_lane(self, d: StageDispatcher, stage: Stage, name: str) -> None:
         """``d.resume_lane(name)``, lifting the operator hold only when it re-arms something.
-        resume_lane re-arms a PAUSED lane and ignores a STOPPED one, so a start on a lane still at
-        STOPPED leaves its hold in place. A PAUSED lane has nothing in flight, so no STOP can land
-        behind this read."""
-        rearms = d.paused(name)
+        resume_lane re-arms a PAUSED lane and, since BACKLOG #5700, a STOPPED one, so a start lifts
+        a STOP the operator never paused over. A lane still CLAIMING or PROCESSING is re-armed by
+        nothing here, so a hold a STOP site recorded before its lane reached STOPPED stays in place.
+        A PAUSED or STOPPED lane has nothing in flight, so no STOP can land behind this read."""
+        rearms = d.paused(name) or d.stopped(name)
         d.resume_lane(name)
         kind = _HOLD_DIRECTION.get(stage)
         if rearms and kind is not None:
@@ -5235,9 +5236,10 @@ class RegistryRunner:
         doors that call them (a door list is a completeness claim nobody can check, and a door can
         fail part way, as a reload that rolls back does): a fresh per_lane worker
         (:meth:`_spawn_worker`, :meth:`_ensure_inbound_workers`), a pooled broadcast that re-arms a
-        lane it found STOPPED (:meth:`_broadcast_to`), a pooled resume of a PAUSED lane
+        lane it found STOPPED (:meth:`_broadcast_to`), a pooled resume of a PAUSED or STOPPED lane
         (:meth:`_resume_pooled_lane`), and a full teardown. An operator start that re-arms nothing,
-        such as ``start_outbound`` on a pooled lane still at STOPPED, leaves the hold in place."""
+        such as ``start_outbound`` on a pooled lane still finishing the episode its STOP ends,
+        leaves the hold in place."""
         key = (kind, name)
         if key not in self._stop_held:
             return False
@@ -12393,8 +12395,8 @@ class RegistryRunner:
         # was never sent. A plain release_claimed leaves the head past-due, so the ~0.25 s sweep
         # re-readies it and the gate re-fires ~4x/s for as long as the disk stays broken; dating it
         # into the future collapses that to the backoff cadence. STOP would be worse than a park in
-        # one specific way — resume_lane only re-arms a PAUSED lane, so a later start_outbound could
-        # not lift a STOPPED one, while a PARKED lane's own timer unparks it. That is a leader's
+        # one specific way — a STOPPED lane waits for an operator's start (which re-arms it since
+        # BACKLOG #5700), while a PARKED lane's own timer unparks it. That is a leader's
         # disposition: a demoted node releases the head and STOPs the lane for the new leader, as
         # its leadership check always has (:meth:`_refuse_claimed`).
         if self._delivery_halted:

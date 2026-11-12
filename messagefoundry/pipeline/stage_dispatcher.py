@@ -691,7 +691,7 @@ class StageDispatcher:
             self._to_paused(key, st)
 
     def resume_lane(self, key: str) -> None:
-        """Operator RESUME for a paused lane (sync). Re-arm a fully-PAUSED lane from the head via
+        """Operator RESUME for a paused or STOPPED lane (sync). Re-arm a fully-PAUSED lane from the head via
         ``mark_ready`` AND request an immediate sweep, so a head that backed off while paused is
         re-evaluated promptly (never stranded until the next periodic sweep) — folds the low finding on a
         resumed-lane RETRY head. An unknown lane is a no-op.
@@ -708,6 +708,15 @@ class StageDispatcher:
             st.pause_pending = (
                 False  # cancel the not-yet-landed pause; the episode resumes normally
             )
+            return
+        if st.phase is _LanePhase.STOPPED:
+            # BACKLOG #5700: an operator start of a lane still at STOPPED (a credential,
+            # configuration or claimer-death STOP it never paused over) re-arms it, as the
+            # notify_work broadcast does and with the same fresh budgets. Ignoring it let the start
+            # report success while the lane stayed down. Operator intent overrides a content STOP,
+            # as pause_lane already lets it.
+            self._unpark(key, woken=True)
+            self._sweep_now.set()
             return
         if st.phase is not _LanePhase.PAUSED:
             return

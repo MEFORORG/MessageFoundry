@@ -278,6 +278,30 @@ async def test_an_operator_resume_of_a_stopped_lane_starts_a_fresh_death_budget(
         await d.stop()
 
 
+async def test_an_operator_resume_re_arms_a_lane_still_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5700: resume_lane on a lane still at STOPPED, with no pause first (the
+    start_outbound path for a lane that was never paused). It re-arms the lane, with a fresh death
+    budget, rather than ignoring it and leaving the lane down behind a start that reported success."""
+    _fast_respawn(monkeypatch)
+    gate = asyncio.Event()
+    gate.set()
+    processed: list[str] = []
+    store = _ScriptStore({"P": ["P-1"]})
+    alerts = _Alerts()
+    d = _dispatcher(store, {"P"}, processed, gate, alert_sink=alerts, infra_fault_stop_after=2)
+    deaths = _kill_on(d, monkeypatch, {"P": [True, True, True, False]})
+    await d.start()
+    try:
+        await _until(lambda: d.phase("P") is _LanePhase.STOPPED)
+        d.resume_lane("P")
+        await _until(lambda: processed == ["P-1"])
+        assert deaths == {"P": 3} and len(alerts.stopped) == 1  # the third death did not re-stop it
+    finally:
+        await d.stop()
+
+
 async def test_a_dispatch_that_survives_resets_the_lanes_claimer_death_streak(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
