@@ -2118,12 +2118,14 @@ class RegistryRunner:
         # so it reads as an operator pause that no reload lifts; this lets a reload that removes the
         # schedule resume the lane (#2069). Any later start or stop of the lane drops the entry.
         self._schedule_parked: set[str] = set()
-        # Lanes halted by a STOP that only an operator may lift, at least: a credential fault (#109),
-        # a connection configuration fault (#2083), the internal-error STOP policy, or a pooled
-        # dispatcher's own STOP (the ADR 0070 T17 infra-fault bound, the #2074 claimer-death bound;
-        # see _pooled_stop_hold). The scheduler reads this so a window close or open never undoes
-        # one (see _schedule_holds, which also names every path that clears a record). Keyed by
-        # direction for the reason _failed is. `_stop_hold_logged` keeps the scheduler's notice to once.
+        # Lanes halted by a STOP whose cause the calendar must not retry, at least: a credential fault
+        # (#109), a connection configuration fault (#2083), the internal-error STOP policy, or a
+        # pooled dispatcher's own STOP (the ADR 0070 T17 infra-fault bound, the #2074 claimer-death
+        # bound; see _pooled_stop_hold). The scheduler reads this so a window close or open never
+        # undoes one (see _schedule_holds, which also names every path that clears a record). Clearing
+        # is not operator-only: pooled, every notify_work broadcast that finds the lane STOPPED clears
+        # it (outbound_stop_held lists what sends one). Keyed by direction for the reason _failed is.
+        # `_stop_hold_logged` keeps the scheduler's notice to once.
         self._stop_held: set[tuple[Direction, str]] = set()
         self._stop_hold_logged: set[tuple[Direction, str]] = set()
         # ADR 0071 B5 thread-hop fusion. FROZEN intent read ONCE here; a /config/reload never re-reads it
@@ -3224,10 +3226,20 @@ class RegistryRunner:
         )
 
     def outbound_stop_held(self, name: str) -> bool:
-        """Whether outbound ``name`` is held down by a STOP only an operator may lift (BACKLOG
-        #5701), in either claim mode: the :attr:`_stop_held` record, written at least for a
-        credential or configuration fault, the internal-error STOP policy, and a pooled T17 or
-        claimer-death stop. Never raises.
+        """Whether outbound ``name`` is held down by a recorded STOP (BACKLOG #5701), in either
+        claim mode: the :attr:`_stop_held` record, written at least for a credential or
+        configuration fault, the internal-error STOP policy, and a pooled T17 or claimer-death
+        stop. Never raises.
+
+        **An operator is not the only thing that lifts it.** The record is cleared wherever the
+        lane is re-armed (:meth:`_schedule_holds`). Per_lane, that is a fresh delivery worker,
+        which at least an operator start, a reload and a full teardown spawn. Pooled, it is at
+        least an operator start (:meth:`_resume_pooled_lane`) and every ``notify_work`` broadcast
+        that finds the lane STOPPED (:meth:`_broadcast_to`): a reload, the engine's wake after a
+        replay, resend, resubmit, upload or dead-letter replay of any message, a DR release drain,
+        and a clustered leader's lease reclaim. None of those is an act on this lane, and the
+        reclaim is no operator's act at all, so a pooled credential STOP can re-arm, and
+        authenticate again, with nobody having fixed its cause.
 
         A pooled lane its dispatcher STOPPED with no record, as a leadership-loss STOP leaves it, is
         not one. Its node is giving up the graph, and reading that lane as down would let the
@@ -5159,9 +5171,11 @@ class RegistryRunner:
         self._record_failed(name, exc, kind="inbound")
 
     def _hold_for_operator(self, name: str, kind: Direction) -> None:
-        """Record that ``name``'s ``kind`` lane halted on a STOP only an operator may lift (at least a
-        #109 credential fault, a #2083 configuration fault, the internal-error STOP policy, or a pooled dispatcher's T17 or
-        claimer-death STOP via :meth:`_pooled_stop_hold`). Called at the STOP site as its last step
+        """Record that ``name``'s ``kind`` lane halted on a STOP whose cause the calendar must not
+        retry (at least a #109 credential fault, a #2083 configuration fault, the internal-error STOP
+        policy, or a pooled dispatcher's T17 or claimer-death STOP via :meth:`_pooled_stop_hold`).
+        The record does not wait for an operator: :meth:`_schedule_holds` names what clears it, a
+        pooled ``notify_work`` broadcast among them. Called at the STOP site as its last step
         before it returns STOPPED, so it sits AFTER the ``connection_stopped`` alert: an alert that
         raises means the site never returns STOPPED and the lane keeps running, so there is no STOP
         to hold. The scheduler reads it through :meth:`_schedule_holds`."""
@@ -5267,7 +5281,8 @@ class RegistryRunner:
         doors that call them (a door list is a completeness claim nobody can check, and a door can
         fail part way, as a reload that rolls back does): a fresh per_lane worker
         (:meth:`_spawn_worker`, :meth:`_ensure_inbound_workers`), a pooled broadcast that re-arms a
-        lane it found STOPPED (:meth:`_broadcast_to`), a pooled resume of a PAUSED or STOPPED lane
+        lane it found STOPPED (:meth:`_broadcast_to`, sent by more than an operator: see
+        :meth:`outbound_stop_held`), a pooled resume of a PAUSED or STOPPED lane
         (:meth:`_resume_pooled_lane`), and a full teardown. An operator start that re-arms nothing,
         such as ``start_outbound`` on a pooled lane still finishing the episode its STOP ends,
         leaves the hold in place."""

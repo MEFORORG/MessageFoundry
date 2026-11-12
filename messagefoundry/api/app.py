@@ -744,7 +744,10 @@ def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
     the compensating-control-on-a-false-premise shape (SDS-3.7).
 
     A lane a STOP holds down (BACKLOG #5701) is named too: a start with the cause unfixed would
-    re-authenticate toward the partner lockout a credential STOP protects against."""
+    re-authenticate toward the partner lockout a credential STOP protects against. The reason
+    describes the lane at this read only. It does not say the lane stays down until an operator
+    acts, because that is false in pooled mode: any ``notify_work`` broadcast re-arms a STOPPED lane
+    and drops its hold (:meth:`RegistryRunner.outbound_stop_held` lists what sends one)."""
     if rr.outbound_status(name) == "log_halted":
         return (
             f"outbound {name!r} is halted: this engine cannot write its application log, so nothing "
@@ -752,8 +755,8 @@ def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
         )
     if rr.outbound_stop_held(name):
         return (
-            f"outbound {name!r} was stopped by a fault that needs an operator, such as a credential "
-            "or configuration fault — fix the cause, then start the connection, then resend"
+            f"outbound {name!r} is stopped: a fault halted it, such as a credential or "
+            "configuration fault — fix the cause, then start the connection, then resend"
         )
     return f"outbound {name!r} is not running — start it before resending"
 

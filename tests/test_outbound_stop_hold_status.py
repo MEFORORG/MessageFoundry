@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""An outbound halted on a STOP only an operator may lift (BACKLOG #5700, #5701).
+"""An outbound halted on a recorded STOP, such as a credential fault (BACKLOG #5700, #5701).
 
 Each test starts a runner whose scheduled outbound has just STOPPED on a credential fault, in its
 window, through the rig in ``tests/test_connection_scheduler.py``. The status reads must say the

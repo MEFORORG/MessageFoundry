@@ -2287,7 +2287,7 @@ class StageDispatcher:
     def stopped(self, key: str) -> bool:
         """Whether ``key`` is in the STOPPED phase (a STOP not yet re-armed). The runner reads it before
         a :meth:`notify_work` broadcast, to know which lanes the broadcast is about to re-arm. The
-        outbound status reads do not read it: they read the runner's operator stop-hold record
+        outbound status reads do not read it: they read the runner's stop-hold record
         (``RegistryRunner.outbound_stop_held`` says why). False for an unknown lane."""
         st = self._states.get(key)
         return st is not None and st.phase is _LanePhase.STOPPED
