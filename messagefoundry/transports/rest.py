@@ -82,6 +82,7 @@ from messagefoundry.controlchars import strip_control_chars
 from messagefoundry.secretscrub import credential_query_params
 from messagefoundry.transports.base import (
     ECH_UNSUPPORTED_DESTINATION_MSG,
+    INSECURE_HOP_REFUSED_CODE,
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
@@ -112,6 +113,7 @@ from messagefoundry.transports.signing import MessageSigner, signer_from_destina
 
 __all__ = [
     "DYNAMIC_HEADER_PREFIX",
+    "INSECURE_HOP_REFUSED_CODE",
     "ECH_HOP_WAYS_ACROSS",
     "InsecureHopGuard",
     "ProxyConfig",
@@ -338,9 +340,6 @@ class HttpAuthError(ValueError):
 
 #: ``NegativeAckError.code`` of a send refused by :func:`auth_challenge_refused`.
 AUTH_CHALLENGE_REFUSED_CODE = "auth-challenge-refused"
-
-#: ``NegativeAckError.code`` of a send refused by :meth:`InsecureHopGuard.assert_delivery_url`.
-INSECURE_HOP_REFUSED_CODE = "insecure-hop-refused"
 
 #: The FIXED text the destination and ``FhirLookup`` arms report for a wire-time
 #: :class:`HttpAuthError`, after their own hop label. ``HttpAuthError``'s message quotes the peer's

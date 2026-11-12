@@ -91,6 +91,7 @@ __all__ = [
     "ledger_holds",
     "DeliveryError",
     "NegativeAckError",
+    "INSECURE_HOP_REFUSED_CODE",
     "SourceStartupError",
     "TestNotSupportedError",
     "DeliveryResponse",
@@ -1327,6 +1328,13 @@ class NegativeAckError(DeliveryError):
         self.permanent = permanent
         self.credential_fault = credential_fault
         self.config_fault = config_fault
+
+
+#: ``NegativeAckError.code`` of a delivery its send-time hop re-check refused: the HTTP family's
+#: ``InsecureHopGuard.assert_delivery_url`` (``transports/rest.py``) and the raw-TCP family's
+#: ``InsecureHopGuard.assert_delivery`` (``transports/mllp.py``). Defined here, beside the error,
+#: so both families raise the one code without either importing the other.
+INSECURE_HOP_REFUSED_CODE = "insecure-hop-refused"
 
 
 class TestNotSupportedError(Exception):

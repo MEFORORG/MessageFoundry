@@ -106,6 +106,7 @@ from messagefoundry.tls_handshake_failures import (
 )
 from messagefoundry.transports.admission import FrameClock, ListenerAdmission, PeerInfo, RefusalLog
 from messagefoundry.transports.base import (
+    INSECURE_HOP_REFUSED_CODE,
     INTAKE_AUDIT_ACTIONS,
     DeliveryError,
     DeliveryResponse,
@@ -537,6 +538,27 @@ class InsecureHopGuard:
             raise InsecureHopRefused(
                 f"{hop_name_prefix(self.connection)}{self.cell}: {self._detail()}"
             )
+
+    def assert_delivery(self, *, connector: str) -> None:
+        """:meth:`assert_send` for a delivery, with the refusal classified (BACKLOG #5719, #5718).
+
+        The raw :class:`~messagefoundry.config.tls_policy.InsecureHopRefused` is a ``ValueError``,
+        which the delivery worker would file as an internal error and, under the default policy,
+        dead-letter row by row. The guard keys on the connection's own host and the posture captured
+        when it was built, so every queued row would meet the same refusal until an operator changes
+        the connection and reloads: a permanent configuration fault, as the HTTP family's
+        ``assert_delivery_url`` raises (``transports/rest.py``). Under the default
+        ``credential_fault_policy`` the lane stops and the queue stays. The text names the
+        connection, the cell, the host and port, and no message content."""
+        try:
+            self.assert_send()
+        except InsecureHopRefused as exc:
+            raise NegativeAckError(
+                f"{connector} send refused: {exc}",
+                code=INSECURE_HOP_REFUSED_CODE,
+                permanent=True,
+                config_fault=True,
+            ) from exc
 
 
 def _set_tcp_nodelay(writer: asyncio.StreamWriter) -> None:
@@ -1087,8 +1109,9 @@ class MLLPDestination(DestinationConnector):
             if self._hop_guard is not None:
                 # Zero-I/O byte-crossing backstop (#200): assert the cleartext hop is still permitted
                 # before any payload byte leaves the box (defense in depth against a reload routing PHI
-                # around the construction-only gate).
-                self._hop_guard.assert_send()
+                # around the construction-only gate). A refusal is a lane-stopping configuration
+                # fault, never an internal error (BACKLOG #5719).
+                self._hop_guard.assert_delivery(connector="MLLP")
             payload = self._rewrite_for_wire(payload)
             # ADR 0205 rule 1: frame once, before any dial; the four paths below only write bytes.
             wire = frame_for_delivery(MLLP_CODEC, payload, self.encoding, transport="MLLP")
