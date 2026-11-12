@@ -326,8 +326,12 @@ variable the service needs in one call, or the ones you leave out are gone at th
 That includes the `MEFOR_SECRETS_DIRECTORY` entry the installer wrote: without it the engine reads
 no file in the secrets directory, and every secret moved there is missing, with no error naming
 the directory. Read the list first with `nssm get MessageFoundry AppEnvironmentExtra`.
-**The store key does not go in that list:** the engine refuses to start with it there, because any
-local user can read the list. Use the DPAPI key file (see
+**No secret goes in that list:** any local user can read it. Where the engine could read the
+service's lists, `serve` and `supervise` refuse to start with one of the engine's own secret
+settings there. Where it knows the service but could not read them, they refuse only a store key
+or retired store key found in their own environment, never another secret setting. Use the DPAPI
+key file for
+the store key, and the secrets directory for the rest (see
 [Protect the store encryption key at rest](#protect-the-store-encryption-key-at-rest-wp-11d)).
 
 **A `PYTHON*` variable in that list does nothing for the engine.** The service starts the
@@ -602,8 +606,8 @@ What counts as expected start-up code, and what each entry leaves open, is in
 
 PHI columns are AES-256-GCM-encrypted at rest when a key is configured (see [PHI.md](PHI.md) §3).
 The key is a base64 32-byte secret. Two ways to supply it. **Under the Windows service, use the
-DPAPI key file.** The engine refuses to start when the store key is in the service's NSSM
-environment.
+DPAPI key file.** `serve` and `supervise` refuse to start when the store key is in the service's
+NSSM environment.
 
 - **DPAPI-protected key file (Windows).** Keep the key in a file that Windows DPAPI binds to *this
   machine*, so a copied file is useless elsewhere and no plaintext key is in the environment:
@@ -634,8 +638,9 @@ environment.
   `encryption_key_file` at it, and run `messagefoundry rotate-key` with the prior key in
   `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` (see [PHI.md](PHI.md) §3). Delete the old file only after
   the rotation, once nothing still needs its key. Set that retired key in the shell that runs
-  `rotate-key`, never in the service's NSSM list: the engine refuses to start with it there. The
-  service's first start after a rotation needs no retired key ([PHI.md](PHI.md) §3, BACKLOG #3472).
+  `rotate-key`, never in the service's NSSM list: `serve` and `supervise` refuse to start with it
+  there. The service's first start after a rotation needs no retired key ([PHI.md](PHI.md) §3,
+  BACKLOG #3472).
   **CORRECTED 2026-10-01:** this said `protect-key` locks the file to the minting admin plus SYSTEM
   after writing it, and that a rotation writes the new key "to the file" (vault BACKLOG #2601).
 
@@ -649,16 +654,16 @@ environment.
   your own host.
   **CORRECTED 2026-10-01:** this read "readable by any local administrator".
 
-  **The engine refuses to start when the store key, or a retired one, is in that list**, or in
-  the service's own `Environment` registry value, whatever `[security].enforcement` says (vault
-  BACKLOG #2595). Move the key to the DPAPI key file above. A retired key belongs in the shell
-  that runs `messagefoundry rotate-key`, not in the service. Other engine secrets there are named,
-  not refused. What the engine reads, what it names and what it does not cover are in
-  [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#service_environment_secret-store_key_in_service_environment-and-service_environment_unobservable-secrets-in-the-windows-services-environment).
+  **`serve` and `supervise` refuse to start when the store key, or a retired one, is in that
+  list**, or in the service's own `Environment` registry value, whatever `[security].enforcement`
+  says (vault BACKLOG #2595). Move the key to the DPAPI key file above. A retired key belongs in
+  the shell that runs `messagefoundry rotate-key`, not in the service. What the engine reads, what
+  it refuses and what it does not cover are in
+  [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#store_key_in_service_environment-service_environment_unobservable-and-secret_in_service_environment-secrets-in-the-windows-services-environment).
 
 - **The other secrets: a secrets directory (any platform).** At least the engine's own secret
-  settings other than the store key, among them the database password, and every `MEFOR_VALUE_*`
-  value can each come from a file instead of the service's NSSM list. A variable an operator names
+  settings other than the store key and its retired keys, among them the database password, and
+  every `MEFOR_VALUE_*` value can each come from a file instead of the service's NSSM list. A variable an operator names
   as a `[secrets].provider = "env"` reference, and one a library reads for itself, are not read
   from it. **The installer creates it**, restricted, and adds `MEFOR_SECRETS_DIRECTORY=<its path>`
   to the service's NSSM list, keeping the entries already there; a path in the NSSM list is not a
@@ -683,9 +688,11 @@ environment.
   does not read it. `uninstall-service.ps1` leaves the directory and its files, names them, and
   with `-RemoveAccountAces` removes the account's entry there too. Which settings it supplies, the
   access list it needs, and the rest of the rules are stated once, in
-  [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). This is the
-  first part of the protected channel vault BACKLOG #2595 asks for, not the whole of it: a secret
-  left in the NSSM list is still named, not refused.
+  [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). Move each
+  of the engine's own secret settings other than the store key and its retired keys here from the
+  service's NSSM list, where `serve` and `supervise` refuse it if the engine could read that
+  list, and not if it could not (the previous bullet links where that is stated);
+  a `MEFOR_VALUE_*` value there is not refused.
 
 > **External vault / managed identity.** DPAPI is the built-in on-box option. The engine can also call
 > HashiCorp Vault itself. These surfaces are separate, and each needs the optional `[vault]` extra:

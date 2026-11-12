@@ -10358,10 +10358,12 @@ def security_loosenings(
 
     ``service_env`` is the third PROCESS observation (vault BACKLOG #2595, #2601), from
     :func:`messagefoundry.serviceenv.service_env_posture`: whether the engine runs under an NSSM
-    Windows service, which engine secrets that service's registry-held environment list names,
-    and whether a store key reaches it through its environment. A store key in that list refuses
-    the start, so this registry names only what does not refuse. ``None`` has the meaning it has
-    for ``remote_debug``.
+    Windows service, whether its registry-held environment lists could be read, and whether a
+    store key reaches it through its environment. An engine secret in those lists refuses the
+    start of ``serve`` and ``supervise``, which never reach this registry then; an engine neither
+    started names what they refuse here as ``secret_in_service_environment``, where it finds its
+    service. ``None`` has the
+    meaning it has for ``remote_debug``.
 
     The sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares

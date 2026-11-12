@@ -25,8 +25,9 @@ the readers of those settings go through. The design is ADR 0214.
   may sit here, and the listing passes over them: the ``host`` key provider reads them itself
   (:mod:`messagefoundry.store.custody_host`, vault BACKLOG #3411), checking each as a key file.
 
-**What this slice does not do**, at least: refuse a secret found in the environment (the NSSM
-reading in :mod:`messagefoundry.serviceenv` still names a non-key secret and does not refuse it);
+**What this slice does not do**, at least: refuse a secret found in the environment (slice B
+later made the NSSM reading in :mod:`messagefoundry.serviceenv` refuse one in the service's own
+lists, where it could read them);
 create the directory (the Windows service installer does, slice C, and names it to the service);
 wrap a file with DPAPI (a plain file restricted by
 its access list is the control, and whether a Windows file is also wrapped waits on a spike); and

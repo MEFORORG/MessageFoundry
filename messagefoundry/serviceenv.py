@@ -13,29 +13,34 @@ key, and the Service Control Manager's own ``Environment`` value on the service'
   says.** That is the owner's 2026-10-01 ruling on a secret in the environment: key-class names,
   and a Windows service's NSSM environment, are refused always. The store key has a protected
   alternative on Windows, the DPAPI key file, so the refusal leaves a way to start.
-* **Another engine secret there is named as a loosening, and not refused.** The same ruling
-  covers it. Its protected channel is the secrets directory ``MEFOR_SECRETS_DIRECTORY`` names
-  (:mod:`messagefoundry.engine_secrets`, ADR 0214), and the loosening points there. Refusing a
-  secret left in the list is later work (vault BACKLOG #2595, step 3).
+* **Another engine secret there refuses the start too, whatever ``[security].enforcement``
+  says.** The same ruling covers it. Its protected alternative is the secrets directory
+  ``MEFOR_SECRETS_DIRECTORY`` names (:mod:`messagefoundry.engine_secrets`, ADR 0214), and the
+  refusal points there (vault BACKLOG #2595, slice B).
+* **Both refusals are ``serve``'s and ``supervise``'s.** An API app neither of them started, such
+  as one built with ``create_app(engine)``, is not refused. Where it finds its service, it names
+  what they refuse as the loosening ``secret_in_service_environment`` instead.
 * **A store key that reaches a Windows service through its environment is named** (key-custody
   slice S2a), wherever it came from, since the machine-wide environment is readable by every
   local user too.
 
 **How the engine finds its own service.** Under NSSM the engine is a child of ``nssm.exe``, or a
 grandchild when a virtual environment's ``python.exe`` starts the base interpreter, or further
-down under ``supervise``. The reading walks up through Python interpreter processes only. When
-the first other process is ``nssm.exe``, it asks the Service Control Manager which service runs
-there. Any other process means the engine was started by something else, such as a shell, even
-when that shell itself runs under some other NSSM service.
+down under ``supervise``. The reading walks up through Python interpreter and
+``messagefoundry.exe`` processes only. When the first other process is ``nssm.exe``, it asks the
+Service Control Manager which service runs there. Any other process means the engine was started
+by something else, such as a shell, even when that shell itself runs under some other NSSM service.
 
 **What it does not cover**, at least: a service host other than NSSM, an ``nssm.exe`` renamed to
 something else, a launcher between NSSM and the interpreter that is not a Python interpreter or
 the ``messagefoundry`` launcher, and a connector secret an operator names through ``env()``,
 whose name the engine cannot know.
 
-**Not a refusal when the read fails.** An engine that cannot walk its ancestors, or cannot read
-its service's lists, reports ``service_environment_unobservable`` and starts. A store key there
-would then go unrefused, and the entry says so.
+**Not a refusal when the read fails, with one exception.** An engine that cannot walk its
+ancestors, or cannot read its service's lists, reports ``service_environment_unobservable`` and
+starts, and a secret in those lists goes unrefused. The exception: a known service whose lists
+could not be read refuses a store key in this process's environment, since it most likely came
+from them.
 """
 
 from __future__ import annotations
@@ -59,18 +64,23 @@ _log = logging.getLogger(__name__)
 #: store. In a Windows service's environment lists they refuse the start.
 KEY_CLASS_NAMES: tuple[str, ...] = _setting_names.KEY_CLASS_NAMES
 
-#: The engine's other environment-only secrets. In a Windows service's environment lists each is
-#: named as a loosening. Both lists come from the one list in :mod:`messagefoundry.engine_secrets`,
-#: which ``tests/test_service_env_secrets.py`` holds to the settings' own lists of
-#: environment-only secrets, so a secret added there is not missed here.
+#: The engine's other secret-class names, the ones the secrets directory supplies. In a Windows
+#: service's environment lists each refuses the start, as a key-class name does. Both lists come
+#: from the one list in :mod:`messagefoundry.engine_secrets`, which
+#: ``tests/test_service_env_secrets.py`` holds to the settings' own lists of environment-only
+#: secrets, so a secret added there is not missed here.
 #:
-#: WHY "LOOSENING" AND NOT "SECRET". The identifier names what happens to these names, because
+#: WHY "DIRECTORY" AND NOT "SECRET". The identifier names where these settings belong, because
 #: CodeQL's ``py/clear-text-logging-sensitive-data`` takes a value as a secret by the identifier
 #: it is bound to, such as one that says secret or password. These are names only, printed on
 #: purpose, so no identifier in this module says such a word. The test file pins that for this
 #: module only, against its own stand-in list of words; a caller that binds the printed lines to
 #: such a name brings the alert back.
-LOOSENING_CLASS_NAMES: tuple[str, ...] = _setting_names.DIRECTORY_SETTING_NAMES
+DIRECTORY_CLASS_NAMES: tuple[str, ...] = _setting_names.DIRECTORY_SETTING_NAMES
+
+#: ``engine_secrets.SECRETS_DIRECTORY_VARIABLE``, spelled out so no identifier here says the word
+#: the CodeQL note above is about; ``tests/test_service_env_secrets.py`` holds the two equal.
+_DIRECTORY_VARIABLE = "MEFOR_SECRETS_DIRECTORY"
 
 #: Names that take either the secret itself or a path to a file that holds it. Only the inline
 #: form is a secret, the rule ``settings._FILE_INLINE_PEM_KEYS`` applies to the config file.
@@ -129,10 +139,10 @@ class ServiceEnvPosture:
         return tuple(name for name in KEY_CLASS_NAMES if name in self.listed)
 
     @property
-    def listed_loosening_names(self) -> tuple[str, ...]:
+    def listed_directory_names(self) -> tuple[str, ...]:
         """The other engine secrets the service's environment lists set. Each comes from
-        :data:`LOOSENING_CLASS_NAMES`, never from the registry."""
-        return tuple(name for name in LOOSENING_CLASS_NAMES if name in self.listed)
+        :data:`DIRECTORY_CLASS_NAMES`, never from the registry."""
+        return tuple(name for name in DIRECTORY_CLASS_NAMES if name in self.listed)
 
     def named_with_source(self, names: Sequence[str]) -> str:
         """``names``, each with the registry value that sets it."""
@@ -307,7 +317,8 @@ def read_service_env_posture(
 def _started_by_something_else(
     image: str, rest: Iterator[tuple[int, str]], keys: tuple[str, ...]
 ) -> ServiceEnvPosture:
-    """The engine was started by ``image``, which is neither NSSM nor a Python interpreter.
+    """The engine was started by ``image``, which is neither NSSM, a Python interpreter, nor
+    ``messagefoundry.exe``.
 
     A shell is the usual case, and then the engine is not a service. But an operator may also
     register NSSM to start a wrapper, such as ``cmd.exe``, that starts the engine. So the walk goes
@@ -324,9 +335,9 @@ def _started_by_something_else(
         ServiceEnvStatus.UNOBSERVABLE,
         keys_in_environment=keys,
         detail=(
-            f"nssm.exe (process {nssm}) is above {image}, which is not a Python interpreter, so "
-            "the engine cannot tell whether it runs as that service or was started from a shell "
-            "inside it"
+            f"nssm.exe (process {nssm}) is above {image}, which is neither a Python interpreter "
+            "nor messagefoundry.exe, so the engine cannot tell whether it runs as that service "
+            "or was started from a shell inside it"
         ),
     )
 
@@ -362,30 +373,71 @@ def _where(posture: ServiceEnvPosture) -> str:
 def service_env_refusal(posture: ServiceEnvPosture) -> str | None:
     """Why ``serve`` or ``supervise`` must not start, whatever the enforcement setting, or None.
 
-    Only a key-class name in the service's environment lists refuses. The owner's 2026-10-01
-    ruling refuses it always, so ``[security].enforcement = "warn"`` does not reopen it."""
+    Every secret-class name in the service's environment lists refuses: a key-class name, and
+    each name the secrets directory supplies. The owner's 2026-10-01 ruling refuses them always,
+    so ``[security].enforcement = "warn"`` does not reopen it. A known service whose lists could
+    not be read refuses only on a store key in this process's environment, since only the store
+    key's names are read from it."""
+    found = _refusal_findings(posture)
+    if found is None:
+        return None
+    return f'{found}. [security].enforcement = "warn" does not change this refusal'
+
+
+def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
+    """What :func:`service_env_refusal` refuses on and the remedy, without its enforcement note,
+    which the ``secret_in_service_environment`` entry has no refusal to attach to."""
     keys = posture.listed_keys
-    if keys:
-        found = f"{posture.named_with_source(keys)} is set in {_where(posture)}"
+    others = posture.listed_directory_names
+    if keys or others:
+        found = f"{posture.named_with_source((*keys, *others))} is set in {_where(posture)}"
     elif posture.status is ServiceEnvStatus.UNOBSERVABLE and posture.service_name is not None:
         if not posture.keys_in_environment:
             return None
         # The service is known and its lists could not be read, so a store key in this process's
-        # environment most likely came from them. Refused, as a listed key would be.
+        # environment most likely came from them. Refused, as a listed key would be, and with the
+        # same remedy, so ``keys`` now names them.
+        keys = posture.keys_in_environment
         found = (
-            f"{', '.join(posture.keys_in_environment)} reaches this engine through its "
+            f"{', '.join(keys)} reaches this engine through its "
             f"environment, and {_where(posture)} could not be read ({posture.detail})"
         )
     else:
         return None
+    steps: list[str] = []
+    if keys:
+        steps.append(
+            "Keep the store key in a DPAPI-protected key file instead: `messagefoundry protect-key "
+            '--out <new path> --grant-account "NT SERVICE\\<service>"`, then set '
+            "[store].encryption_key_file. A retired key belongs in the shell that runs "
+            '`messagefoundry rotate-key`, not in the service. See docs/SERVICE.md, "Protect the '
+            'store encryption key at rest"'
+        )
+    if others:
+        steps.append(
+            f"Put {', '.join(others)} in the secrets directory MEFOR_SECRETS_DIRECTORY names, as "
+            "one restricted file per setting named as its variable. See docs/CONFIGURATION.md, "
+            '"The secrets directory"'
+        )
+        if _DIRECTORY_VARIABLE not in posture.listed:
+            # Two routes, because install-service.ps1 refuses an existing directory the service
+            # does not name: an operator whose later `nssm set` dropped the variable must not be
+            # sent to the installer, which would say to remove the directory holding the files.
+            steps.append(
+                f"The service's lists set no {_DIRECTORY_VARIABLE}. Where install-service.ps1 "
+                f"already made the secrets directory, add {_DIRECTORY_VARIABLE} naming that "
+                "existing path back to the service's AppEnvironmentExtra, beside its other "
+                "entries, before any re-run of the installer, which refuses an existing directory "
+                "the service does not name. `nssm set` replaces that whole list, so read it first "
+                "with `nssm get`, running the service's own nssm.exe by its full path, and pass "
+                "back every entry but the names refused above: see docs/SERVICE.md, "
+                '"Start / stop / status". Where none exists yet, the bullet "The other secrets: '
+                'a secrets directory" under docs/SERVICE.md, "Protect the store encryption key at '
+                'rest", says how the directory is created'
+            )
     return (
-        f"{found}. Any local user may be able to read that "
-        "key, and with it the store key. Remove it from the service's lists and keep the key in a "
-        "DPAPI-protected key file instead: `messagefoundry protect-key --out <new path> "
-        '--grant-account "NT SERVICE\\<service>"`, then set [store].encryption_key_file. A '
-        "retired key belongs in the shell that runs `messagefoundry rotate-key`, not in the "
-        'service. [security].enforcement = "warn" does not change this refusal. See '
-        'docs/SERVICE.md, "Protect the store encryption key at rest"'
+        f"{found}. Any local user may be able to read that key, and with it each value named. "
+        f"Remove each name from the service's lists. {'. '.join(steps)}"
     )
 
 
@@ -420,16 +472,19 @@ def missing_service_config_refusal(
 
 def service_env_loosenings(posture: ServiceEnvPosture) -> list[tuple[str, str]]:
     """The ``(name, plain-language risk)`` entries for ``posture``. One place for the wording, so
-    ``security_loosenings()`` and the ``supervise`` start-up lines cannot say different things."""
+    ``security_loosenings()`` and the ``supervise`` start-up lines cannot say different things.
+
+    A caller that refuses on :func:`service_env_refusal` checks it first, as ``serve`` and
+    ``supervise`` do, so ``secret_in_service_environment`` reaches only a caller that does not."""
     out: list[tuple[str, str]] = []
     if posture.status is ServiceEnvStatus.UNOBSERVABLE:
         out.append(
             (
                 "service_environment_unobservable",
                 "the engine could not tell whether it runs as a Windows service under NSSM, or "
-                f"could not read that service's environment lists ({posture.detail}). A store key "
-                "or another secret there is neither refused nor named, and any local user may be "
-                "able to read it",
+                f"could not read that service's environment lists ({posture.detail}), so it "
+                "cannot say whether a store key or another secret is in them. Any local user may "
+                "be able to read one there",
             )
         )
     # Named only for a known service: a process whose service is unknown may be a shell, where
@@ -445,16 +500,16 @@ def service_env_loosenings(posture: ServiceEnvPosture) -> list[tuple[str, str]]:
                 "with `messagefoundry protect-key`)",
             )
         )
-    named = posture.listed_loosening_names
-    if named:
+    # What `serve` and `supervise` refuse, named for an engine neither started, such as an app an
+    # embedder built with `create_app(engine)`: nothing refused that start, so the posture names
+    # it rather than going quiet. Those two refuse before they read this list, so it never
+    # reaches them.
+    refused = _refusal_findings(posture)
+    if refused is not None:
         out.append(
             (
-                "service_environment_secret",
-                f"{posture.named_with_source(named)} is set in {_where(posture)}. Any local "
-                "user may be able to read that key, and with it these secrets. Move each one to "
-                "the secrets directory MEFOR_SECRETS_DIRECTORY names, one restricted file per "
-                "setting (docs/CONFIGURATION.md, The secrets directory), and remove it from the "
-                "list. It is named here and not refused yet",
+                "secret_in_service_environment",
+                f"`serve` and `supervise` would refuse to start on this: {refused}",
             )
         )
     return out

@@ -348,7 +348,10 @@ CREATE SCHEMA mefor AUTHORIZATION mefor;         -- run by a DBA; the role owns 
 > umbrella role (`rds_superuser`, `cloudsqlsuperuser`, `azure_pg_admin`).
 >
 > **No managed identity.** Postgres has no managed-identity auth mode, so `[store].auth` is a static
-> role+password (supply it via `MEFOR_STORE_PASSWORD`, never the file) and
+> role+password (supply it as `MEFOR_STORE_PASSWORD`, never in the settings file; under a Windows
+> service, as the secrets-directory file of that name, never in the service's NSSM list;
+> [`SERVICE.md`](SERVICE.md#start--stop--status) says why, and when `serve` and `supervise`
+> refuse to start with it there) and
 > `[store].require_managed_identity` is unsatisfiable on this backend — see
 > [`CONFIGURATION.md`](CONFIGURATION.md). `[store].require_least_privilege` is the orthogonal control
 > and **does** apply here (§1.3).
