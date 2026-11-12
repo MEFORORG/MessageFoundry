@@ -456,3 +456,21 @@ async def test_a_paused_lane_is_refused_before_the_pacing_wait(
     assert rec.sent == []
     assert result.kind is LaneResultKind.RETRY
     assert probe.calls == []  # refused above the wait: no pacing for a send that will not happen
+
+
+async def test_a_demoted_node_with_a_paused_lane_releases_and_stops(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A node that lost leadership leaves the head to the send path's leadership check, which
+    releases it and STOPs the lane for the new leader, rather than handing it back and parking."""
+    head = await _one_claimed_head(store)
+    rec = _Recorder()
+    runner = _paced_runner(store, rec)
+    runner._outbound_paused.add(DEST)
+    runner._log_write_stopped = True  # the halt too: a hand-back here would reschedule
+    monkeypatch.setattr(runner._coordinator, "is_leader", lambda: False)
+    result = await runner._dispatch_delivery(DEST, head)
+    assert rec.sent == []
+    assert result.kind is LaneResultKind.STOP  # stopped for the new leader, not parked
+    again = await store.claim_next_fifo(DEST)  # released, not rescheduled: due at once
+    assert again is not None and again.id == head.id

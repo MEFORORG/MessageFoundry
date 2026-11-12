@@ -1044,3 +1044,27 @@ async def test_a_pause_that_lands_while_the_envelope_is_framed_sends_nothing(
     assert outcome is wiring_runner._ItemOutcome.PROCESSED and park_until is not None
     assert await _states(store, mids) == [QUEUED] * 3
     assert await _attempts(store, mids) == [0, 0, 0]
+
+
+async def test_a_pause_that_lands_before_every_member_is_refused_writes_no_refusal(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every member holds a frame byte, so none survives to an envelope, and the pause lands while
+    they hydrate. The members go back for a re-run to refuse rather than being dead-lettered under
+    the pause, as they would be had one member survived. The control is the frame-byte test above:
+    unpaused, the same bodies are dead-lettered."""
+    bodies = [_msg(n).replace("DOE", "DOE" + chr(0x0B)) for n in (1, 2)]
+    mids = await _enqueue_bodies(store, bodies)
+    runner = _runner(store)
+    rec = MllpRecorder(DEST)
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
+    real_hydrate = runner._hydrate_payload
+
+    async def _hydrate_then_pause(payload: str, message_id: str) -> str:
+        runner._outbound_paused.add(DEST)  # the operator pause lands while the members hydrate
+        return await real_hydrate(payload, message_id)
+
+    monkeypatch.setattr(runner, "_hydrate_payload", _hydrate_then_pause)
+    await run_one_batch(runner, DEST)
+    assert rec.sent == []
+    assert await _states(store, mids) == [QUEUED, QUEUED]  # handed back, not dead-lettered

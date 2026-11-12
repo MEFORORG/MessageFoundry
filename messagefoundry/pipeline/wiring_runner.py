@@ -9568,7 +9568,8 @@ class RegistryRunner:
 
     def _lane_may_deliver(self, name: str) -> bool:
         """The two conditions :meth:`_delivery_worker`'s loop-top gates refuse a claim on (the #122
-        halt and the pause), as one predicate for its per-item re-check (#2771). A new loop-top
+        halt and the pause), as one predicate for its per-item re-check (#2771), the pooled seam's
+        gates around its pacing wait (#5709) and the batch body's (#5706). A new loop-top
         gate belongs here as well, or a claimed batch keeps sending under it. The pause is
         :attr:`_outbound_paused`, which a schedule window or a DR park joins through the same
         outbound stop an operator's takes; nothing here reads either directly."""
@@ -10218,6 +10219,8 @@ class RegistryRunner:
         ``claim_next_fifo`` — the same H2 skip-and-complete single claim) until **either** ``cfg.max_count``
         rows are held **or** ``cfg.max_wait_ms`` has elapsed since the head's ingest time **or** a graceful
         stop signals a flush (ADR 0082 decision #4) — whichever comes first — then frame + ``send`` **once**
+        (an operator pause or the #122 halt also ends the window, and then every member is handed
+        back unsent rather than flushed; BACKLOG #5706)
         + complete all N in one store transaction. Mirrors the single-row disposition ladder over the whole
         batch: on success ``mark_batch_done`` all N; a transient/transport failure ``mark_batch_failed`` all
         N (re-claimed as the identical prefix); a permanent reject ``dead_letter_batch`` all N (decision #1).
@@ -10262,7 +10265,8 @@ class RegistryRunner:
             return await self._deliver_coalesced_batch(name, cfg, members)
         except Exception:
             # EXCEPT, never FINALLY. Every normal return below has already resolved all N (done /
-            # dead-lettered / re-pended failed) or released them (leadership lost), so a `finally`
+            # dead-lettered / re-pended failed) or handed them back (leadership lost, a pause, the
+            # #122 halt), so a `finally`
             # would re-pend rows that legitimately completed. ``reschedule_claimed`` being
             # ``status='inflight'``-guarded is what makes this safe over a PARTIALLY resolved set —
             # it is not a licence to run the re-pend unconditionally.
@@ -10335,6 +10339,14 @@ class RegistryRunner:
             except TimeoutError:
                 pass
         ids = [it.id for it in items]
+        # BACKLOG #5706: asked again after the window, which can last up to max_wait_ms, and before
+        # the missing-connector arm, which would spend an attempt on every member. Every member goes
+        # back unsent, the head included: the per_lane worker passes it here with no further gate of
+        # its own, and the pooled adapter returns this outcome as its own. A demoted node skips it,
+        # so the leadership check below releases and stops the lane. The gate that guards the send
+        # itself is the one right before it.
+        if self._hand_back_due(name):
+            return _ItemOutcome.PROCESSED, await self._hand_back(name, ids)
         retry_until: float | None = None
         connector = self._destinations.get(name)
         if connector is None:
@@ -10357,13 +10369,6 @@ class RegistryRunner:
                 len(ids),
             )
             return _ItemOutcome.STOPPED, None
-        # BACKLOG #5706: asked again after the window, which can last up to max_wait_ms, and below
-        # the leadership check, so a demoted node only releases. Every member goes back unsent, the
-        # head included: the per_lane worker passes it here with no further gate of its own, and the
-        # pooled adapter returns this outcome as its own. It saves the hydration reads; the gate
-        # that guards the send itself is the one just above it.
-        if not self._lane_may_deliver(name):
-            return _ItemOutcome.PROCESSED, await self._hand_back(name, ids)
         # Frame + send inside ONE try so a FRAMING error (an unparseable / non-HL7 head member — MLLP is
         # payload-agnostic, ADR 0004, so a non-hl7v2 feed can reach here) routes to the internal-error
         # policy below (dead-letter / STOP) instead of stranding every claimed row INFLIGHT forever with
@@ -10449,9 +10454,13 @@ class RegistryRunner:
                 # BACKLOG #5706: the lane gate once more, right before the send, since hydration and
                 # the two thread hops above are awaits a pause or the halt can land in. Synchronous,
                 # so nothing here can raise into the arms below; the hand-back runs after the try.
-                gated = not self._lane_may_deliver(name)
+                gated = self._hand_back_due(name)
                 if not gated and not self._simulate.get(name, False):  # shadow suppresses egress
                     await connector.send(envelope)
+            else:
+                # Every member was refused: nothing to send, but the same gate decides whether the
+                # refusals are written now or the members go back for a re-run to refuse again.
+                gated = self._hand_back_due(name)
         except NegativeAckError as exc:
             # #109 (ADR 0095), the batch twin of the single-row branch in
             # :meth:`_process_delivery_item`, which carries the reasoning. A bad credential is not a
@@ -12405,7 +12414,7 @@ class RegistryRunner:
         # head in flight is past every dispatcher gate, so only this one stops the send.
         if self._lane_may_deliver(lane):
             await self._pace_outbound(lane)
-        if not self._lane_may_deliver(lane):
+        if self._hand_back_due(lane):
             return LaneItemResult(LaneResultKind.RETRY, await self._hand_back(lane, [item.id]))
         # #134 (ADR 0082): batch inside the pooled claim (decision #5) — the dispatcher claims one head
         # per lane as always; a batching lane's delivery body coalesces its own tail (claim_next_fifo)
@@ -12416,10 +12425,17 @@ class RegistryRunner:
             return _to_lane_result(await self._process_delivery_batch(lane, item, batch_cfg))
         return _to_lane_result(await self._process_delivery_item(lane, item))
 
+    def _hand_back_due(self, name: str) -> bool:
+        """Whether claimed, unsent rows of ``name`` go back through :meth:`_hand_back`: the lane gate
+        refuses them, and this node still leads. A demoted node leaves them to the send path's own
+        leadership check, which releases them and stops the lane for the new leader; a hand-back
+        there would reschedule rows a successor may already own and park instead of stopping.
+        Synchronous, so the allowed path awaits nothing extra."""
+        return not self._lane_may_deliver(name) and self._coordinator.is_leader()
+
     async def _hand_back(self, name: str, ids: list[str]) -> float:
-        """Hand claimed, unsent OUTBOUND rows back once :meth:`_lane_may_deliver` has refused
-        ``name``, and return the park deadline. The caller asks the gate, synchronously, so the
-        allowed path awaits nothing extra.
+        """Hand claimed, unsent OUTBOUND rows back once :meth:`_hand_back_due` has said so for
+        ``name``, and return the park deadline.
 
         The #122 halt (ADR 0189) RESCHEDULES them to the deadline, for the reason
         :meth:`_dispatch_delivery` gives: the head is then not due, so the sweep does not re-ready
