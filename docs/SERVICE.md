@@ -650,7 +650,8 @@ environment.
   your own host.
   **CORRECTED 2026-10-01:** this read "readable by any local administrator".
 
-  **The engine refuses to start when the store key, or a retired one, is in that list**, or in
+  **`serve` and `supervise` refuse to start when the store key, or a retired one, is in that
+  list**, or in
   the service's own `Environment` registry value, whatever `[security].enforcement` says (vault
   BACKLOG #2595). Move the key to the DPAPI key file above. A retired key belongs in the shell
   that runs `messagefoundry rotate-key`, not in the service. What the engine reads, what it

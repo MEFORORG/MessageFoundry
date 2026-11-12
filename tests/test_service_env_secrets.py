@@ -93,6 +93,18 @@ def _names(posture: ServiceEnvPosture) -> list[str]:
     return [name for name, _risk in service_env_loosenings(posture)]
 
 
+_ENFORCEMENT_NOTE = '[security].enforcement = "warn" does not change this refusal'
+
+
+def _assert_twin_of(refusal: str, twin: str) -> None:
+    """``twin`` carries the refusal's finding and remedy, and drops its last sentence, the
+    enforcement note, since the engine it is named in ran no refusal for the note to be about."""
+    body, _sep, note = refusal.rpartition(". ")
+    assert note == _ENFORCEMENT_NOTE
+    assert twin.endswith(body)
+    assert _ENFORCEMENT_NOTE not in twin
+
+
 # --- the reading -----------------------------------------------------------------------------------
 
 
@@ -345,13 +357,9 @@ def test_every_other_secret_class_name_in_the_nssm_list_refuses(name: str) -> No
     assert "protect-key" not in refusal
     assert "set no MEFOR_SECRETS_DIRECTORY" in refusal
     # `serve` refuses before it reads the loosenings; an engine it did not start names it there.
-    assert service_env_loosenings(posture) == [
-        (
-            "secret_in_service_environment",
-            "`serve` and `supervise` refuse to start on what follows, and this engine is running "
-            f"without that refusal: {refusal}",
-        )
-    ]
+    [(entry, twin)] = service_env_loosenings(posture)
+    assert entry == "secret_in_service_environment"
+    _assert_twin_of(refusal, twin)
 
 
 def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> None:
@@ -416,12 +424,12 @@ def test_every_posture_serve_refuses_is_named_where_serve_did_not_run(
 ) -> None:
     """An engine ``serve`` did not start, such as an embedder's ``create_app(engine)``, ran no
     refusal. The removed ``service_environment_secret`` entry used to name a listed secret there,
-    so the loosening registry names each posture the refusal refuses, with the refusal's own
-    text, rather than going quiet."""
+    so the loosening registry names each posture the refusal refuses, with the refusal's finding
+    and remedy, rather than going quiet."""
     refusal = service_env_refusal(posture)
     assert refusal is not None
     entries = dict(_registry_entries(posture))
-    assert entries["secret_in_service_environment"].endswith(f"without that refusal: {refusal}")
+    _assert_twin_of(refusal, entries["secret_in_service_environment"])
 
 
 async def test_an_embedded_app_names_a_listed_secret_in_its_posture(

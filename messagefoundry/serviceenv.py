@@ -377,6 +377,15 @@ def service_env_refusal(posture: ServiceEnvPosture) -> str | None:
     so ``[security].enforcement = "warn"`` does not reopen it. A known service whose lists could
     not be read refuses only on a store key in this process's environment, since only the store
     key's names are read from it."""
+    found = _refusal_findings(posture)
+    if found is None:
+        return None
+    return f'{found}. [security].enforcement = "warn" does not change this refusal'
+
+
+def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
+    """What :func:`service_env_refusal` refuses on and the remedy, without its enforcement note,
+    which the ``secret_in_service_environment`` entry has no refusal to attach to."""
     keys = posture.listed_keys
     others = posture.listed_directory_names
     if keys or others:
@@ -417,8 +426,7 @@ def service_env_refusal(posture: ServiceEnvPosture) -> str | None:
             )
     return (
         f"{found}. Any local user may be able to read that key, and with it each value named. "
-        f"Remove each name from the service's lists. {'. '.join(steps)}. "
-        '[security].enforcement = "warn" does not change this refusal'
+        f"Remove each name from the service's lists. {'. '.join(steps)}"
     )
 
 
@@ -485,13 +493,12 @@ def service_env_loosenings(posture: ServiceEnvPosture) -> list[tuple[str, str]]:
     # embedder built with `create_app(engine)`: nothing refused that start, so the posture names
     # it rather than going quiet. Those two refuse before they read this list, so it never
     # reaches them.
-    refused = service_env_refusal(posture)
+    refused = _refusal_findings(posture)
     if refused is not None:
         out.append(
             (
                 "secret_in_service_environment",
-                "`serve` and `supervise` refuse to start on what follows, and this engine is "
-                f"running without that refusal: {refused}",
+                f"`serve` and `supervise` would refuse to start on this: {refused}",
             )
         )
     return out

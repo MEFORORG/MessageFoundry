@@ -2600,9 +2600,15 @@ count is above `0` (vault BACKLOG #2613).
   not refused then.
 - **`secret_in_service_environment`: what `serve` and `supervise` refuse, in an engine neither
   started.** An application that builds the API without them, for example with
-  `create_app(engine)`, runs no such refusal and is not refused, so its posture names each case
-  above that would refuse, with the refusal's own text. An engine embedded with no API has no
-  posture to name it in. Clear it the way the refusal says.
+  `create_app(engine)`, runs no such refusal and is not refused. It is named, with the refusal's
+  finding and remedy, only where `service_env_refusal` in `messagefoundry/serviceenv.py` would refuse: the
+  engine found its service, which needs NSSM to start a Python interpreter or `messagefoundry.exe`
+  (`_is_engine_launcher`), and either a secret is in that service's lists or the lists could not
+  be read and a store key is in the engine's own environment. A console-script launcher such as
+  `uvicorn.exe` or `hypercorn.exe` between NSSM and the interpreter fails that test, so the
+  reading is `service_environment_unobservable` with no service and this entry is not named. It
+  is reported only in that application's process, at least in `GET /security/posture`. An engine
+  embedded with no API has no posture to name it in. Clear it the way the refusal says.
 - **`store_key_in_service_environment`: a store key reaches the service through its
   environment.** It is named wherever the key came from, once the engine knows its service. The
   machine-wide environment is readable by every local user too. Under `serve` and `supervise` a
@@ -2622,10 +2628,7 @@ count is above `0` (vault BACKLOG #2613).
   for the engine's own process. `supervise` logs one WARNING for each entry at start.
   `messagefoundry security show` is a separate process, so it reports none of them, and its scope
   line says so. The reading is taken once per process: as `serve` or `supervise` starts, or at
-  the first reading an app built without them takes. `secret_in_service_environment` is the
-  exception: `serve` and `supervise` refuse before they report it, so only an app neither
-  started reports it, at least in `GET /security/posture` and in the loosenings its audit rows
-  record.
+  the first reading an app built without them takes.
 - **How to clear them:** remove each named variable from the registry value the entry names, NSSM's
   list or the service's own `Environment` value, and from the machine-wide environment. Keep the
   store key in a DPAPI-protected key file. Let NSSM start the interpreter directly.
