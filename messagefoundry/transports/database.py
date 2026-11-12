@@ -58,7 +58,7 @@ import os
 import re
 import sys
 import weakref
-from collections.abc import Callable, Coroutine, Generator, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Generator, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -186,6 +186,10 @@ _TRANSIENT_STATES = frozenset({"HYT00", "HYT01"})
 # ODBC driver manager's own.
 _CREDENTIAL_PREFIXES = ("28",)
 _CONFIG_PREFIXES = ("IM",)
+# Class 01 is a warning, raised as an error only by a driver manager that could not load a driver.
+_CONNECT_CONFIG_PREFIXES = ("01",)
+# A driver with no SQLMoreResults: nextset() cannot advance, which is no failure of the write.
+_NO_NEXTSET_STATES = frozenset({"IM001", "HYC00"})
 
 
 def _weakened_tls_permitted(*, attested: bool, posture: HopPosture | None) -> bool:
@@ -2561,9 +2565,13 @@ def _classify_db_error(sqlstate: str, message: str, *, connecting: bool = False)
     delivery worker stops the lane and keeps the queue (ADR 0095) rather than dead-letter every
     queued row on the same refusal (BACKLOG #5713): SQLSTATE class ``28`` (the login refused) is a
     ``credential_fault``, and class ``IM`` (the ODBC driver manager: no such driver or DSN, or a
-    driver it could not load) is a ``config_fault``. ``connecting`` says the error came from opening
-    the connection, before the statement ran, so no message can be at fault: any other permanent
-    state there is a ``config_fault`` too.
+    driver it could not load) is a ``config_fault``.
+
+    ``connecting`` says the error came from opening the connection, before the statement ran, so
+    no message can be at fault. There class ``01`` is a ``config_fault`` too: unixODBC reports a
+    registered driver whose library is missing as ``01000``. Any other permanent state there is
+    retried, never a per-message reject. A server in recovery or failing over may refuse a login
+    under ``42000`` or ``HY000``, and stopping the lane on that would need an operator to resume it.
 
     ``message`` is read for its SQLSTATE and native error number and is **never interpolated**
     (BACKLOG #1661). Driver text embeds the offending value on exactly the failures this connector
@@ -2583,13 +2591,17 @@ def _classify_db_error(sqlstate: str, message: str, *, connecting: bool = False)
             permanent=True,
             credential_fault=True,
         )
-    if connecting or sqlstate[:2] in _CONFIG_PREFIXES:
+    if sqlstate[:2] in _CONFIG_PREFIXES or (
+        connecting and sqlstate[:2] in _CONNECT_CONFIG_PREFIXES
+    ):
         return NegativeAckError(
             f"database connection refused by its configuration {detail}",
             code=sqlstate,
             permanent=True,
             config_fault=True,
         )
+    if connecting:
+        return DeliveryError(f"database connect failed {detail}")
     return NegativeAckError(
         f"database rejected the statement {detail}",
         code=sqlstate or "db",
@@ -3630,7 +3642,7 @@ async def _connect(get_pool: Callable[[], Any], timeout: float) -> tuple[Any, An
     except _DriverMissingError as exc:
         raise NegativeAckError(str(exc), code="db", permanent=True, config_fault=True) from exc
     except Exception as exc:
-        state = _sqlstate(exc)
+        state = _log_sqlstate(exc)  # never a codec name read as a SQLSTATE
         if state is None:
             raise
         raise _classify_db_error(state, str(exc), connecting=True) from exc
@@ -3686,13 +3698,40 @@ async def _fetch_result_set(cur: Any) -> list[Any] | None:
     """The rows of ``cur``'s current result set, or ``None`` when the statement produced none.
 
     "None" is read from ``cur.description`` (DB-API 2.0), never from a failed fetch (BACKLOG
-    #5714): pyodbc raises *No results* from a fetch in exactly that state. Any error from the
-    fetch is the statement's own, such as a deadlock or a procedure's error, and propagates so
-    the caller's write is rolled back rather than committed and recorded as delivered."""
+    #5714): pyodbc raises *No results* from a fetch in exactly that state. A driver error from the
+    fetch, one carrying a SQLSTATE, is the statement's own, such as a deadlock or a procedure's
+    error, and propagates so the caller's write is rolled back rather than committed and recorded
+    as delivered. An error with none is the client failing to read what it was sent, such as
+    pyodbc's *ODBC SQL type -155 is not yet supported* or a decode error, and is raised as
+    :class:`_ResultUnreadable`, a capture problem that leaves the write alone."""
     if cur.description is None:
         return None
-    rows: list[Any] = await cur.fetchall()
+    try:
+        rows: list[Any] = await cur.fetchall()
+    except Exception as exc:
+        if _log_sqlstate(exc) is not None:
+            raise
+        raise _ResultUnreadable(type(exc).__name__) from exc
     return rows
+
+
+class _ResultUnreadable(Exception):
+    """A result set the client could not read, named by the error type alone (never its text)."""
+
+
+async def _next_result_set(advance: Callable[[], Awaitable[Any]]) -> bool:
+    """Whether ``nextset()`` reached another result set (BACKLOG #5714).
+
+    A driver error there is a later statement's own failure and propagates, as from a fetch. A
+    driver with no ``SQLMoreResults`` (:data:`_NO_NEXTSET_STATES`), or a client error with no
+    SQLSTATE, ends the walk with what was read, as before."""
+    try:
+        return bool(await advance())
+    except Exception as exc:
+        state = _log_sqlstate(exc)
+        if state is None or state in _NO_NEXTSET_STATES:
+            return False
+        raise
 
 
 class DatabaseDestination(DestinationConnector):
@@ -3861,7 +3900,12 @@ class DatabaseDestination(DestinationConnector):
         which walks EVERY result set so a proc's OUT/return readback SELECT isn't dropped."""
         if self.capture_out_params:
             return await self._capture_merged(cur)
-        rows = await _fetch_result_set(cur)
+        try:
+            rows = await _fetch_result_set(cur)
+        except _ResultUnreadable as exc:
+            return DeliveryResponse(
+                body="", outcome="unparseable", detail=f"result-set not readable ({exc})"
+            )
         if rows is None:
             return DeliveryResponse(body="", outcome="no_reply", detail="no result set")
         if not rows:
@@ -3906,29 +3950,32 @@ class DatabaseDestination(DestinationConnector):
 
         A capture problem never un-succeeds the write: it degrades to ``no_reply``/``unparseable``
         with an empty body. A driver error from a fetch (:func:`_fetch_result_set`) or from
-        ``nextset()``, where a later statement's error surfaces, propagates (BACKLOG #5714)."""
+        ``nextset()`` (:func:`_next_result_set`), where a later statement's error surfaces,
+        propagates (BACKLOG #5714)."""
         merged: list[dict[str, Any]] = []
-        over_cap = False
+        spoiled: str | None = None  # why the capture is unparseable, once it is
         advance = getattr(cur, "nextset", None)
         while True:
-            rows = await _fetch_result_set(cur)
-            if rows and not over_cap:
+            if spoiled is None:
                 try:
-                    cols = [d[0] for d in cur.description]
-                    merged.extend(dict(zip(cols, tuple(row))) for row in rows)  # noqa: B905
-                except Exception:  # noqa: BLE001 - malformed description → skip this set, keep the write
-                    pass
-                over_cap = len(merged) > self._capture_max_rows
-            # Past the cap the walk still goes on, keeping no rows, so an error a later statement
-            # raises still reaches send() rather than being left unread under the commit.
-            if advance is None or not await advance():
+                    rows = await _fetch_result_set(cur)
+                except _ResultUnreadable as exc:
+                    spoiled, rows = f"result-set not readable ({exc})", None
+                if rows:
+                    try:
+                        cols = [d[0] for d in cur.description]
+                        merged.extend(dict(zip(cols, tuple(row))) for row in rows)  # noqa: B905
+                    except Exception:  # noqa: BLE001 - malformed description → skip this set, keep the write
+                        pass
+                    if len(merged) > self._capture_max_rows:
+                        spoiled = f"result-set exceeded capture_max_rows={self._capture_max_rows}"
+            # Once spoiled the walk still advances, fetching nothing (nextset() discards the rows in
+            # the driver), so an error a later statement raises still reaches send() rather than
+            # being left unread under the commit.
+            if advance is None or not await _next_result_set(advance):
                 break  # no nextset() (a single-set driver/cursor), or the last set
-        if over_cap:
-            return DeliveryResponse(
-                body="",
-                outcome="unparseable",
-                detail=f"result-set exceeded capture_max_rows={self._capture_max_rows}",
-            )
+        if spoiled is not None:
+            return DeliveryResponse(body="", outcome="unparseable", detail=spoiled)
         if not merged:
             return DeliveryResponse(
                 body="", outcome="no_reply", detail="no OUT params / return value"

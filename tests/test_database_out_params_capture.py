@@ -9,6 +9,7 @@ are unit-tested without a real SQL Server.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -209,10 +210,15 @@ async def test_send_captures_out_params_pre_commit() -> None:
 
 # --- BACKLOG #5714: a driver error reading the result is the write's failure -------------
 
+
 # pyodbc's shape: ``args == (sqlstate, message)``. 40001 is SQL Server's deadlock victim, 42000 a
 # RAISERROR from a later statement in the proc's batch.
-_DEADLOCK = Exception("40001", "[40001] deadlock victim (1205) (SQLFetch)")
-_PROC_ERROR = Exception("42000", "[42000] proc failed (50000) (SQLMoreResults)")
+def _deadlock() -> Exception:
+    return Exception("40001", "[40001] deadlock victim (1205) (SQLFetch)")
+
+
+def _proc_error() -> Exception:
+    return Exception("42000", "[42000] proc failed (50000) (SQLMoreResults)")
 
 
 class _FaultCursor(_SendCursor):
@@ -224,19 +230,25 @@ class _FaultCursor(_SendCursor):
         *,
         fetch_raises_on: int | None = None,
         nextset_raises_on: int | None = None,
+        fetch_error: Callable[[], Exception] = _deadlock,
+        nextset_error: Callable[[], Exception] = _proc_error,
     ) -> None:
         super().__init__(sets)
         self._fetch_raises_on = fetch_raises_on
         self._nextset_raises_on = nextset_raises_on
+        self._fetch_error = fetch_error
+        self._nextset_error = nextset_error
+        self.fetched: list[int] = []
 
     async def fetchall(self) -> list[tuple[Any, ...]]:
+        self.fetched.append(self._i)
         if self._i == self._fetch_raises_on:
-            raise _DEADLOCK
+            raise self._fetch_error()
         return await super().fetchall()
 
     async def nextset(self) -> bool:
         if self._i == self._nextset_raises_on:
-            raise _PROC_ERROR
+            raise self._nextset_error()
         return await super().nextset()
 
 
@@ -287,6 +299,42 @@ async def test_over_cap_walks_every_set_before_reporting_unparseable() -> None:
     resp = await d.send('{"mrn": "42"}')
     assert resp is not None and resp.outcome == "unparseable" and resp.body == ""
     assert cur._i == 2  # the walk reached the last set
+    assert cur.fetched == [0, 1]  # past the cap nextset() alone discards the rows
+    assert conn.committed
+
+
+def _unsupported_type() -> Exception:
+    # pyodbc's own client-side error puts the message first, so it carries no SQLSTATE.
+    return Exception("ODBC SQL type -155 is not yet supported.  column-index=0  type=-155", "HY106")
+
+
+async def test_a_result_the_client_cannot_read_is_a_capture_problem() -> None:
+    """A fetch error with no SQLSTATE is the client failing to read what it was sent, not the
+    statement's failure: the capture is unparseable and the write still commits."""
+    cur = _FaultCursor(
+        [([(1,)], [("id",)]), ([(0,)], [("status",)])],
+        fetch_raises_on=0,
+        fetch_error=_unsupported_type,
+    )
+    d, conn = _send_dest(cur)
+    resp = await d.send('{"mrn": "42"}')
+    assert resp is not None and resp.outcome == "unparseable" and resp.body == ""
+    assert resp.detail == "result-set not readable (Exception)"
+    assert cur._i == 1 and cur.fetched == [0]  # walked on to the last set, fetching nothing
+    assert conn.committed and not conn.rolledback
+
+
+@pytest.mark.parametrize("state", ["IM001", "HYC00"])
+async def test_a_driver_that_cannot_advance_keeps_what_it_read(state: str) -> None:
+    """A driver with no SQLMoreResults ends the walk with what was read, as before."""
+    cur = _FaultCursor(
+        [([(7,)], [("status",)]), ([(0,)], [("x",)])],
+        nextset_raises_on=0,
+        nextset_error=lambda: Exception(state, f"[{state}] not supported (0) (SQLMoreResults)"),
+    )
+    d, conn = _send_dest(cur)
+    resp = await d.send('{"mrn": "42"}')
+    assert resp is not None and resp.outcome == "accepted" and '"status": 7' in resp.body
     assert conn.committed
 
 

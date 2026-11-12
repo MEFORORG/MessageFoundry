@@ -1014,16 +1014,20 @@ class _RefusingPool:
 
 
 # pyodbc's shape for the connect-time refusals BACKLOG #5713 names, with synthetic names in them.
-_LOGIN_FAILED = _driver_exc(
-    "28000",
-    "[28000] [Microsoft][ODBC Driver 18 for SQL Server][SQL Server]Login failed for user "
-    "'svc_feed'. (18456) (SQLDriverConnect)",
-)
-_NO_DRIVER = _driver_exc(
-    "IM002",
-    "[IM002] [Microsoft][ODBC Driver Manager] Data source name not found and no default driver "
-    "specified (0) (SQLDriverConnect)",
-)
+def _login_failed() -> Exception:
+    return _driver_exc(
+        "28000",
+        "[28000] [Microsoft][ODBC Driver 18 for SQL Server][SQL Server]Login failed for user "
+        "'svc_feed'. (18456) (SQLDriverConnect)",
+    )
+
+
+def _no_driver() -> Exception:
+    return _driver_exc(
+        "IM002",
+        "[IM002] [Microsoft][ODBC Driver Manager] Data source name not found and no default driver "
+        "specified (0) (SQLDriverConnect)",
+    )
 
 
 def test_classify_db_error_marks_connection_faults() -> None:
@@ -1031,11 +1035,11 @@ def test_classify_db_error_marks_connection_faults() -> None:
     marked for the lane-stopping arm instead of reading as a per-message reject.
 
     Red on the old code: every permanent state was a plain reject with neither marker."""
-    login = _classify_db_error("28000", str(_LOGIN_FAILED))
+    login = _classify_db_error("28000", str(_login_failed()))
     assert isinstance(login, NegativeAckError) and login.permanent
     assert login.credential_fault and not login.config_fault
     assert "svc_feed" not in str(login) and "[28000]" in str(login)  # #1661 still holds
-    no_driver = _classify_db_error("IM002", str(_NO_DRIVER))
+    no_driver = _classify_db_error("IM002", str(_no_driver()))
     assert isinstance(no_driver, NegativeAckError) and no_driver.permanent
     assert no_driver.config_fault and not no_driver.credential_fault
     # A statement's own permanent error keeps no marker: it is the message's fault.
@@ -1044,21 +1048,35 @@ def test_classify_db_error_marks_connection_faults() -> None:
     assert not plain.credential_fault and not plain.config_fault
 
 
-def test_classify_db_error_connecting_reads_every_permanent_state_as_config() -> None:
-    """Before the statement runs no message can be at fault, so a permanent connect state is the
-    connection's; a transient one still retries."""
-    cannot_open = _classify_db_error("42000", "Cannot open database (4060)", connecting=True)
-    assert isinstance(cannot_open, NegativeAckError) and cannot_open.config_fault
+def test_classify_db_error_connecting_is_never_a_per_message_reject() -> None:
+    """Before the statement runs no message can be at fault. unixODBC's missing driver library
+    (``01000``) is a config fault there; any other permanent state retries, since a server in
+    recovery or failing over may refuse a login under 42000 or HY000."""
     login = _classify_db_error("28000", "x", connecting=True)
     assert isinstance(login, NegativeAckError) and login.credential_fault
-    assert type(_classify_db_error("08001", "x", connecting=True)) is DeliveryError
+    no_lib = _classify_db_error("01000", "Can't open lib (0) (SQLDriverConnect)", connecting=True)
+    assert isinstance(no_lib, NegativeAckError) and no_lib.config_fault
+    for state in ("42000", "HY000", "08001"):
+        assert type(_classify_db_error(state, "x", connecting=True)) is DeliveryError
+    # Off the connect path class 01 keeps its old reading.
+    plain = _classify_db_error("01000", "x")
+    assert isinstance(plain, NegativeAckError) and not plain.config_fault
+
+
+async def test_connect_codec_error_is_not_read_as_a_sqlstate() -> None:
+    """``UnicodeEncodeError``'s first argument is the codec name, five alphanumerics for
+    ``ascii``; it propagates as itself rather than as a configuration refusal."""
+    dest = _dest()
+    dest._pool = _RefusingPool(UnicodeEncodeError("ascii", "x", 0, 1, "bad"))
+    with pytest.raises(UnicodeEncodeError):
+        await dest.send('{"mrn": "1", "val": "x"}')
 
 
 async def test_send_login_refusal_is_a_credential_fault() -> None:
     """Red on the old code: the pool's error escaped ``send`` unclassified, so the delivery worker
     took its internal-error arm, which dead-letters the row by default and logs in again on the next."""
     dest = _dest()
-    dest._pool = _RefusingPool(_LOGIN_FAILED)
+    dest._pool = _RefusingPool(_login_failed())
     with pytest.raises(NegativeAckError) as ei:
         await dest.send('{"mrn": "1", "val": "x"}')
     assert ei.value.permanent and ei.value.credential_fault
@@ -1068,10 +1086,10 @@ async def test_send_login_refusal_is_a_credential_fault() -> None:
 async def test_send_missing_odbc_driver_is_a_config_fault(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def _no_driver(*_a: Any, **_k: Any) -> NoReturn:
-        raise _NO_DRIVER
+    async def _refuse_pool(*_a: Any, **_k: Any) -> NoReturn:
+        raise _no_driver()
 
-    monkeypatch.setattr(database_module, "_make_pool", _no_driver)
+    monkeypatch.setattr(database_module, "_make_pool", _refuse_pool)
     dest = _dest()
     with pytest.raises(NegativeAckError) as ei:
         await dest.send('{"mrn": "1", "val": "x"}')
@@ -1111,7 +1129,7 @@ async def test_send_non_driver_error_at_connect_propagates() -> None:
 
 async def test_probe_login_refusal_at_connect_is_a_credential_fault() -> None:
     dest = _dest()
-    dest._pool = _RefusingPool(_LOGIN_FAILED)
+    dest._pool = _RefusingPool(_login_failed())
     with pytest.raises(NegativeAckError) as ei:
         await dest.test_connection()
     assert ei.value.credential_fault
