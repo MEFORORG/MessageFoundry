@@ -1567,9 +1567,12 @@ class _SyncHandoffPool:
 # absolute bytes, and the DDL lint tests pin the proc render. Every STEP's comments live here with
 # the text they document.
 
+#: The binary collation every claim lane comparison pins (BACKLOG #5721; see _fifo_heads_steps).
+_LANE_BIN: Final[str] = " COLLATE Latin1_General_100_BIN2"
+
 
 def _fifo_heads_steps(
-    *, lane_col: str, lane_source: str, epoch_guard: str, head_skip_markers: bool = True
+    *, lane_col: str, lane_source: str, epoch_guard: str, v1_bytes: bool = False
 ) -> str:
     """The shared claim body (ADR 0066 §3.2 probe-then-claim, #285 inversion). ``lane_col`` is the
     code-controlled lane-column literal (``channel_id``/``destination_name``); ``lane_source`` the
@@ -1577,11 +1580,36 @@ def _fifo_heads_steps(
     the OPENJSON decode on the proc); ``epoch_guard`` the H1 fence predicate applied to the STEP-3
     probe AND the STEP-5 UPDATE (spliced-or-empty on the batch, fixed-nullable on the proc).
 
-    ``head_skip_markers=False`` renders the body WITHOUT the BACKLOG #1270 marker arm, byte for byte
-    the body the ``_v1`` procs shipped. Only :func:`_claim_proc_body` passes it, and only for a name
-    in ``_RETAINED_CLAIM_PROCS``; everything this build CALLS has the arm."""
+    LANE NAMES COMPARE BINARY (BACKLOG #5721). A connection name is case-sensitive everywhere else
+    in the engine: the registry is a dict, and SQLite and Postgres compare it exactly. The queue's
+    lane columns carry no COLLATE, so under a case-insensitive database collation ``IB_A`` and
+    ``ib_a`` would match each other's rows: the batch then inserted one queue row into ``@heads``
+    under both lanes (a primary-key violation), while the proc's DISTINCT lane decode merged the
+    two names. Every lane comparison here therefore pins ``Latin1_General_100_BIN2``. The
+    discovery and probe keep a ``COLLATE DATABASE_DEFAULT`` equality beside the binary one so the
+    lane-column seek on ``ix_queue_fifo_*_seq`` survives; the binary conjunct is the residual that
+    decides. ``@heads.lane`` is declared binary, so its column-to-column comparisons need no
+    COLLATE, and the marker arm re-labels it to the database default to stay UNION-compatible with
+    the claimed rows' lane column.
+
+    ``v1_bytes=True`` renders the body byte for byte as the ``_v1`` procs shipped: no BACKLOG #1270
+    marker arm and no #5721 binary lane comparisons. Only :func:`_claim_proc_body` passes it, and
+    only for a name in ``_RETAINED_CLAIM_PROCS``; everything this build CALLS is rendered without
+    it."""
+    if v1_bytes:
+        heads_lane, partition = "", "l.lane"
+        discover = f"{lane_col} = l.lane"
+        probe = f"qq.{lane_col} = L.lane"
+    else:
+        heads_lane, partition = _LANE_BIN, f"l.lane{_LANE_BIN}"
+        discover = (
+            f"{lane_col} = l.lane COLLATE DATABASE_DEFAULT AND {lane_col}{_LANE_BIN} = l.lane"
+        )
+        probe = (
+            f"qq.{lane_col} = L.lane COLLATE DATABASE_DEFAULT AND qq.{lane_col}{_LANE_BIN} = L.lane"
+        )
     return (
-        " DECLARE @heads TABLE (lane NVARCHAR(256) NOT NULL,"
+        f" DECLARE @heads TABLE (lane NVARCHAR(256){heads_lane} NOT NULL,"
         " id NVARCHAR(64) NOT NULL PRIMARY KEY,"
         " seq BIGINT NOT NULL, rn INT NOT NULL, due BIT NOT NULL);"
         " DECLARE @locked TABLE (id NVARCHAR(64) NOT NULL PRIMARY KEY);"
@@ -1596,11 +1624,11 @@ def _fifo_heads_steps(
         # index seek per lane on ix_queue_fifo_in_seq / ix_queue_fifo_out_seq.
         " INSERT INTO @heads (lane, id, seq, rn, due)"
         " SELECT l.lane, h.id, h.seq,"
-        " ROW_NUMBER() OVER (PARTITION BY l.lane ORDER BY h.seq),"
+        f" ROW_NUMBER() OVER (PARTITION BY {partition} ORDER BY h.seq),"
         " IIF(h.next_attempt_at <= @now, 1, 0)"
         f" FROM {lane_source} AS l(lane)"
         " CROSS APPLY (SELECT TOP (@k) id, seq, next_attempt_at FROM queue"
-        f" WHERE stage = @stage AND {lane_col} = l.lane AND status = @pending"
+        f" WHERE stage = @stage AND {discover} AND status = @pending"
         " ORDER BY seq) AS h;"
         # STEP 2: contiguous-DUE cutoff. A not-due row truncates AT itself; a not-due HEAD
         # empties the lane (head-of-line preserved).
@@ -1623,7 +1651,7 @@ def _fifo_heads_steps(
         " INSERT INTO @locked (id)"
         " SELECT h.id FROM (SELECT lane, MAX(seq) AS maxseq FROM @heads GROUP BY lane) AS L"
         " CROSS APPLY (SELECT qq.id FROM queue qq WITH (UPDLOCK, ROWLOCK, READPAST)"
-        f" WHERE qq.stage = @stage AND qq.{lane_col} = L.lane AND qq.status = @pending"
+        f" WHERE qq.stage = @stage AND {probe} AND qq.status = @pending"
         f" AND qq.seq <= L.maxseq{epoch_guard}) AS h;"
         # STEP 4: head-pinned contiguity — keep, per lane, the longest prefix anchored at rn=1
         # whose EVERY member is locked; rn=1 missing drops the whole lane => EMPTY, never seq N+1.
@@ -1648,12 +1676,15 @@ def _fifo_heads_steps(
         " SELECT kp.id AS keep_id, c.id, c.message_id, c.channel_id, c.destination_name,"
         " c.handler_name, c.payload, c.attempts, c.seq, c.created_at"
         " FROM @keep kp LEFT JOIN @claimed c ON c.id = kp.id"
-        + (_head_skip_marker_arm(lane_col, epoch_guard) if head_skip_markers else ";")
+        + (";" if v1_bytes else _head_skip_marker_arm(lane_col, epoch_guard))
     )
 
 
 def _head_skip_marker_arm(lane_col: str, epoch_guard: str) -> str:
     """The sole result set's BACKLOG #1270 arm, appended by :func:`_fifo_heads_steps`."""
+    # The binary @heads.lane would conflict with the claimed rows' lane column under UNION ALL
+    # (two different implicit collations); the explicit label resolves it (BACKLOG #5721).
+    lane = "h.lane COLLATE DATABASE_DEFAULT"
     return (
         # BACKLOG #1270, the head-of-line skip: one marker row per lane whose DUE head (rn=1; STEP 2
         # already removed a not-due head) the STEP-3 probe could not lock. STEP 4 emptied that lane,
@@ -1661,7 +1692,7 @@ def _head_skip_marker_arm(lane_col: str, epoch_guard: str) -> str:
         # marker, with the lane in its own lane column. The epoch guard keeps a fenced ex-leader,
         # whose probe declines every row, from reporting its whole chunk as skipped.
         " UNION ALL SELECT NULL, NULL, NULL,"
-        + (" h.lane, NULL," if lane_col == "channel_id" else " NULL, h.lane,")
+        + (f" {lane}, NULL," if lane_col == "channel_id" else f" NULL, {lane},")
         + " NULL, NULL, NULL, NULL, NULL FROM @heads h"
         " WHERE h.rn = 1 AND NOT EXISTS (SELECT 1 FROM @locked k WHERE k.id = h.id)"
         f"{epoch_guard};"
@@ -1689,14 +1720,20 @@ _RETAINED_CLAIM_PROCS: Final[tuple[tuple[str, str], ...]] = (
     ("mefor_claim_fifo_heads_cid_v1", "channel_id"),
     ("mefor_claim_fifo_heads_dst_v1", "destination_name"),
 )
-#: Retained names whose body predates the BACKLOG #1270 marker arm.
-_PRE_MARKER_CLAIM_PROCS: Final[frozenset[str]] = frozenset(n for n, _ in _RETAINED_CLAIM_PROCS)
+#: Retained names whose body is frozen at the bytes they shipped with (before BACKLOG #1270).
+_V1_CLAIM_PROCS: Final[frozenset[str]] = frozenset(n for n, _ in _RETAINED_CLAIM_PROCS)
 
 # The OPENJSON lane decode (compat >= 130): one NVARCHAR(MAX) JSON-array parameter, so no delimiter
 # contract is ever imposed on connection names (lane names are data, never concatenated into SQL).
 # The explicit CAST keeps the `{lane_col} = l.lane` predicate seek-clean against the NVARCHAR(256)
-# column; DISTINCT is belt-and-suspenders under the caller's preserved request-order dedupe.
+# column; DISTINCT is belt-and-suspenders under the caller's preserved request-order dedupe. The
+# DISTINCT is binary, as the caller's dedupe is: under the database collation it would merge two
+# lane names that differ only in case (BACKLOG #5721).
 _CLAIM_PROC_LANE_SOURCE = (
+    f"(SELECT DISTINCT CAST(j.[value] AS NVARCHAR(256)){_LANE_BIN} FROM OPENJSON(@lanes) AS j)"
+)
+#: The lane decode the retained ``_v1`` bodies shipped with, before BACKLOG #5721.
+_CLAIM_PROC_LANE_SOURCE_V1: Final[str] = (
     "(SELECT DISTINCT CAST(j.[value] AS NVARCHAR(256)) FROM OPENJSON(@lanes) AS j)"
 )
 # The H1 epoch fence in its fixed nullable form, on BOTH sites (STEP-3 probe and STEP-5 UPDATE):
@@ -1784,6 +1821,7 @@ def _claim_proc_body(proc_name: str, lane_col: str) -> str:
     reset authority on every non-clean path). SET NOCOUNT *is* exit-restored at proc exit — a real,
     honestly-stated delta from the batch (the outbound post-proc H2 statements may emit rowcount
     DONE tokens; harmless for the execute/fetchone consumers — ADR 0114 §3)."""
+    v1 = proc_name in _V1_CLAIM_PROCS
     return (
         f"{_CLAIM_PROC_HEAD}{proc_name}"
         " @now FLOAT, @stage NVARCHAR(16), @k INT,"
@@ -1797,10 +1835,10 @@ def _claim_proc_body(proc_name: str, lane_col: str) -> str:
         " SET LOCK_TIMEOUT 0;"
         + _fifo_heads_steps(
             lane_col=lane_col,
-            lane_source=_CLAIM_PROC_LANE_SOURCE,
+            lane_source=_CLAIM_PROC_LANE_SOURCE_V1 if v1 else _CLAIM_PROC_LANE_SOURCE,
             epoch_guard=_CLAIM_PROC_EPOCH_GUARD,
-            # Keyed on the name: a retained pre-#1270 version renders the bytes it shipped with.
-            head_skip_markers=proc_name not in _PRE_MARKER_CLAIM_PROCS,
+            # Keyed on the name: a retained _v1 renders the bytes it shipped with.
+            v1_bytes=v1,
         )
         + " IF @fold_reset = 1 SET LOCK_TIMEOUT -1;"
     )

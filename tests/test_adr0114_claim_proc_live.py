@@ -164,6 +164,32 @@ async def test_live_differential_proc_vs_batch(proc_store: SqlServerStore) -> No
     await proc_store.release_claimed(ids)
 
 
+async def test_case_variant_lanes_claim_apart_on_both_paths(proc_store: SqlServerStore) -> None:
+    """BACKLOG #5721: two lanes whose names differ only in case are two lanes on BOTH dispatch paths.
+    Under a case-insensitive database collation the batch used to fail on the @heads primary key and
+    the proc merged the two names. Each lane must claim its own head, and the paths must agree."""
+    lanes = ["IB_CASE_LANE", "ib_case_lane"]
+    mids = {
+        lane: await proc_store.enqueue_ingress(channel_id=lane, raw=f"MSH|^~\\&|CASE|{lane}")
+        for lane in lanes
+    }
+    assert proc_store.claim_proc_effective
+    via_proc = await _claim_until(proc_store, Stage.INGRESS.value, lanes)
+    assert {lane: [i.message_id for i in items] for lane, items in via_proc.by_lane.items()} == {
+        lane: [mid] for lane, mid in mids.items()
+    }, "the proc path must claim each case-variant lane's own head"
+    await proc_store.release_claimed([i.id for items in via_proc.by_lane.values() for i in items])
+    proc_store._claim_proc_effective = False  # force the batch path (same store, same rows)
+    try:
+        via_batch = await _claim_until(proc_store, Stage.INGRESS.value, lanes)
+    finally:
+        proc_store._claim_proc_effective = True
+    assert {lane: [i.message_id for i in items] for lane, items in via_batch.by_lane.items()} == {
+        lane: [mid] for lane, mid in mids.items()
+    }, "the batch path must claim each case-variant lane's own head"
+    await proc_store.release_claimed([i.id for items in via_batch.by_lane.values() for i in items])
+
+
 async def test_ac7_tampered_body_degrades_next_open(proc_store: SqlServerStore) -> None:
     # Hand-edit one proc body out-of-band, then re-open: the gate must degrade loudly (the
     # OBJECT_DEFINITION hash mismatch), and the tampered store must still claim on the batch.

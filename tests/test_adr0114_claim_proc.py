@@ -631,9 +631,13 @@ def test_ac9_result_processing_is_one_shared_path_after_the_pin_clear() -> None:
 # hash re-applies the DDL; the startup gate's expected hashes follow automatically). BACKLOG #1270
 # added the head-skip marker arm as NEW _v2 procs, which are the ones this build calls; the retained
 # _v1 bodies are pinned separately below at the exact hashes they shipped with.
+# RE-PINNED IN PLACE for BACKLOG #5721 (binary lane comparisons), under the existing _v2 names: the
+# sole result set's shape is unchanged, so an older build calling _v2 still parses every row, and no
+# deployed database holds _v2 (MessageFoundry has never been deployed). Measured substitution-only:
+# reverting the collation clauses reproduces the previous pins.
 _GOLDEN_PROC_BODY_SHA256 = {
-    "mefor_claim_fifo_heads_cid_v2": "4c2b233268f7d2f0117dfa0136dcecffad6a116fc40dec11a2f5504306424ecf",
-    "mefor_claim_fifo_heads_dst_v2": "79d6fc09e4d05bb751c016a63c25c706ed09f723a777d393ffd03f0484f36cbb",
+    "mefor_claim_fifo_heads_cid_v2": "a3e95d082eb8add25bccc2f45516a2e9553f8d5ffde3b35cfde4b9a991f37c79",
+    "mefor_claim_fifo_heads_dst_v2": "1db40ff807c5612d1e31f954f2fe36a7a5835670de3bd0fa6b057fd72b0aaaf9",
 }
 # The retained _v1 bodies, pinned at their origin/main values (before BACKLOG #1270). ADR 0114: a
 # newer build's _v2 never touches _v1, because an older build sharing the store mid-upgrade still
