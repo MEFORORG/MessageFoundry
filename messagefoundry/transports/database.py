@@ -181,15 +181,18 @@ _PARAM_RE = re.compile(r"(?<![:\w]):(\w+)")
 # deadlock (40001); plus the ODBC connect/operation timeouts.
 _TRANSIENT_PREFIXES = ("08", "40")
 _TRANSIENT_STATES = frozenset({"HYT00", "HYT01"})
-# BACKLOG #5713: permanent states that are the connection's fault, not the message's
+# BACKLOG #5713: connect-time states that are the connection's fault, not the message's
 # (:func:`_classify_db_error`). Class 28 is "invalid authorization specification"; class IM is the
-# ODBC driver manager's own.
+# ODBC driver manager's own; 01000 is how unixODBC reports a driver library it could not load.
 _CREDENTIAL_PREFIXES = ("28",)
 _CONFIG_PREFIXES = ("IM",)
-# Class 01 is a warning, raised as an error only by a driver manager that could not load a driver.
-_CONNECT_CONFIG_PREFIXES = ("01",)
-# A driver with no SQLMoreResults: nextset() cannot advance, which is no failure of the write.
-_NO_NEXTSET_STATES = frozenset({"IM001", "HYC00"})
+_CONFIG_STATES = frozenset({"01000"})
+# BACKLOG #5714: nextset() states that end the walk rather than fail the write. IM001 and HYC00
+# are a driver with no SQLMoreResults; HY007 is what pyodbc's own source records the SQL Server
+# driver returning after a batch of successful statements.
+_NO_NEXTSET_STATES = frozenset({"IM001", "HYC00", "HY007"})
+# A fetch state that is the client failing to convert a value, not the statement failing.
+_CLIENT_FETCH_STATES = frozenset({"07006"})
 
 
 def _weakened_tls_permitted(*, attested: bool, posture: HopPosture | None) -> bool:
@@ -2561,16 +2564,12 @@ def _classify_db_error(sqlstate: str, message: str, *, connecting: bool = False)
     """Map a DB error's SQLSTATE to a transient :class:`DeliveryError` (retry) or a permanent
     :class:`NegativeAckError` (dead-letter), with **PHI-free** text.
 
-    A permanent error that is the connection's, not the message's, carries a fault marker so the
-    delivery worker stops the lane and keeps the queue (ADR 0095) rather than dead-letter every
-    queued row on the same refusal (BACKLOG #5713): SQLSTATE class ``28`` (the login refused) is a
-    ``credential_fault``, and class ``IM`` (the ODBC driver manager: no such driver or DSN, or a
-    driver it could not load) is a ``config_fault``.
-
     ``connecting`` says the error came from opening the connection, before the statement ran, so
-    no message can be at fault. There class ``01`` is a ``config_fault`` too: unixODBC reports a
-    registered driver whose library is missing as ``01000``. Any other permanent state there is
-    retried, never a per-message reject. A server in recovery or failing over may refuse a login
+    no message can be at fault (BACKLOG #5713). There a refused login (class ``28``) is a
+    ``credential_fault`` and a missing driver or DSN (class ``IM``, or unixODBC's ``01000``) a
+    ``config_fault``, so the delivery worker stops the lane and keeps the queue (ADR 0095) rather
+    than dead-letter every queued row on the same refusal. Any other permanent state there is
+    retried, never a per-message reject: a server in recovery or failing over may refuse a login
     under ``42000`` or ``HY000``, and stopping the lane on that would need an operator to resume it.
 
     ``message`` is read for its SQLSTATE and native error number and is **never interpolated**
@@ -2584,23 +2583,21 @@ def _classify_db_error(sqlstate: str, message: str, *, connecting: bool = False)
     detail = f"[{sqlstate}]" + (f" driver error {code}" if code else "")
     if _is_transient(sqlstate):
         return DeliveryError(f"database transient error {detail}")
-    if sqlstate[:2] in _CREDENTIAL_PREFIXES:
-        return NegativeAckError(
-            f"database refused the login {detail}",
-            code=sqlstate,
-            permanent=True,
-            credential_fault=True,
-        )
-    if sqlstate[:2] in _CONFIG_PREFIXES or (
-        connecting and sqlstate[:2] in _CONNECT_CONFIG_PREFIXES
-    ):
-        return NegativeAckError(
-            f"database connection refused by its configuration {detail}",
-            code=sqlstate,
-            permanent=True,
-            config_fault=True,
-        )
     if connecting:
+        if sqlstate[:2] in _CREDENTIAL_PREFIXES:
+            return NegativeAckError(
+                f"database refused the login {detail}",
+                code=sqlstate,
+                permanent=True,
+                credential_fault=True,
+            )
+        if sqlstate[:2] in _CONFIG_PREFIXES or sqlstate in _CONFIG_STATES:
+            return NegativeAckError(
+                f"database connection refused by its configuration {detail}",
+                code=sqlstate,
+                permanent=True,
+                config_fault=True,
+            )
         return DeliveryError(f"database connect failed {detail}")
     return NegativeAckError(
         f"database rejected the statement {detail}",
@@ -3635,16 +3632,19 @@ async def _connect(get_pool: Callable[[], Any], timeout: float) -> tuple[Any, An
     Opening the pool or a pooled connection logs in, so a refused login, a missing ODBC driver or
     the missing ``sqlserver`` extra surfaces here (BACKLOG #5713). A driver error is classified as
     a connect failure (:func:`_classify_db_error`), and the missing extra is a ``config_fault``.
-    Anything else propagates unchanged, the acquire timeout's :class:`DeliveryError` included."""
+    Any other failure, with no SQLSTATE, is a transient :class:`DeliveryError`, as the acquire
+    timeout already is: nothing has run, so no message can be at fault."""
     try:
         pool = await get_pool()
         return pool, await _acquire(pool, timeout)
+    except DeliveryError:
+        raise
     except _DriverMissingError as exc:
         raise NegativeAckError(str(exc), code="db", permanent=True, config_fault=True) from exc
     except Exception as exc:
         state = _log_sqlstate(exc)  # never a codec name read as a SQLSTATE
         if state is None:
-            raise
+            raise DeliveryError(f"DATABASE connect failed: {_safe_db_error(exc)}") from exc
         raise _classify_db_error(state, str(exc), connecting=True) from exc
 
 
@@ -3657,12 +3657,7 @@ async def _probe_db(
     other non-driver failure (e.g. an unreachable host before any SQLSTATE) becomes a transient
     :class:`DeliveryError`. Triggers the connector's lazy pool;
     the caller closes it with ``aclose()``."""
-    try:
-        pool, conn = await _connect(get_pool, timeout)
-    except DeliveryError:
-        raise
-    except Exception as exc:
-        raise DeliveryError(f"DATABASE connect failed: {_safe_db_error(exc)}") from exc
+    pool, conn = await _connect(get_pool, timeout)
     cur: Any = None
     try:
         cur = await conn.cursor()
@@ -3701,7 +3696,8 @@ async def _fetch_result_set(cur: Any) -> list[Any] | None:
     #5714): pyodbc raises *No results* from a fetch in exactly that state. A driver error from the
     fetch, one carrying a SQLSTATE, is the statement's own, such as a deadlock or a procedure's
     error, and propagates so the caller's write is rolled back rather than committed and recorded
-    as delivered. An error with none is the client failing to read what it was sent, such as
+    as delivered. An error with none, or with a client conversion state
+    (:data:`_CLIENT_FETCH_STATES`), is the client failing to read what it was sent, such as
     pyodbc's *ODBC SQL type -155 is not yet supported* or a decode error, and is raised as
     :class:`_ResultUnreadable`, a capture problem that leaves the write alone."""
     if cur.description is None:
@@ -3709,9 +3705,12 @@ async def _fetch_result_set(cur: Any) -> list[Any] | None:
     try:
         rows: list[Any] = await cur.fetchall()
     except Exception as exc:
-        if _log_sqlstate(exc) is not None:
-            raise
-        raise _ResultUnreadable(type(exc).__name__) from exc
+        state = _log_sqlstate(exc)
+        if state is None:
+            raise _ResultUnreadable(type(exc).__name__) from exc
+        if state in _CLIENT_FETCH_STATES:
+            raise _ResultUnreadable(f"{type(exc).__name__} [{state}]") from exc
+        raise
     return rows
 
 
@@ -3723,13 +3722,21 @@ async def _next_result_set(advance: Callable[[], Awaitable[Any]]) -> bool:
     """Whether ``nextset()`` reached another result set (BACKLOG #5714).
 
     A driver error there is a later statement's own failure and propagates, as from a fetch. A
-    driver with no ``SQLMoreResults`` (:data:`_NO_NEXTSET_STATES`), or a client error with no
-    SQLSTATE, ends the walk with what was read, as before."""
+    state in :data:`_NO_NEXTSET_STATES`, or a client error with no SQLSTATE, ends the walk with
+    what was read, as before, and is logged by state or type alone."""
     try:
         return bool(await advance())
     except Exception as exc:
         state = _log_sqlstate(exc)
-        if state is None or state in _NO_NEXTSET_STATES:
+        if state in _NO_NEXTSET_STATES:
+            logger.debug("DATABASE: nextset() ended the capture walk with [%s]", state)
+            return False
+        if state is None:
+            logger.warning(
+                "DATABASE: nextset() failed in the client (%s); the capture keeps the result "
+                "sets read so far",
+                type(exc).__name__,
+            )
             return False
         raise
 

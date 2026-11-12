@@ -324,9 +324,24 @@ async def test_a_result_the_client_cannot_read_is_a_capture_problem() -> None:
     assert conn.committed and not conn.rolledback
 
 
-@pytest.mark.parametrize("state", ["IM001", "HYC00"])
+async def test_a_client_conversion_state_on_fetch_is_a_capture_problem() -> None:
+    """07006 is the client failing to convert a value it was sent, not the statement failing."""
+    cur = _FaultCursor(
+        [([(1,)], [("id",)])],
+        fetch_raises_on=0,
+        fetch_error=lambda: Exception("07006", "[07006] restricted data type (0) (SQLGetData)"),
+    )
+    d, conn = _send_dest(cur)
+    resp = await d.send('{"mrn": "42"}')
+    assert resp is not None and resp.outcome == "unparseable"
+    assert resp.detail == "result-set not readable (Exception [07006])"
+    assert conn.committed and not conn.rolledback
+
+
+@pytest.mark.parametrize("state", ["IM001", "HYC00", "HY007"])
 async def test_a_driver_that_cannot_advance_keeps_what_it_read(state: str) -> None:
-    """A driver with no SQLMoreResults ends the walk with what was read, as before."""
+    """A driver with no SQLMoreResults, or SQL Server's spurious HY007 after a successful batch,
+    ends the walk with what was read, as before."""
     cur = _FaultCursor(
         [([(7,)], [("status",)]), ([(0,)], [("x",)])],
         nextset_raises_on=0,

@@ -1035,17 +1035,19 @@ def test_classify_db_error_marks_connection_faults() -> None:
     marked for the lane-stopping arm instead of reading as a per-message reject.
 
     Red on the old code: every permanent state was a plain reject with neither marker."""
-    login = _classify_db_error("28000", str(_login_failed()))
+    login = _classify_db_error("28000", str(_login_failed()), connecting=True)
     assert isinstance(login, NegativeAckError) and login.permanent
     assert login.credential_fault and not login.config_fault
     assert "svc_feed" not in str(login) and "[28000]" in str(login)  # #1661 still holds
-    no_driver = _classify_db_error("IM002", str(_no_driver()))
+    no_driver = _classify_db_error("IM002", str(_no_driver()), connecting=True)
     assert isinstance(no_driver, NegativeAckError) and no_driver.permanent
     assert no_driver.config_fault and not no_driver.credential_fault
-    # A statement's own permanent error keeps no marker: it is the message's fault.
-    plain = _classify_db_error("42000", "x")
-    assert isinstance(plain, NegativeAckError)
-    assert not plain.credential_fault and not plain.config_fault
+    # Off the connect path a permanent state is the statement's own and keeps no marker, so an
+    # IM001 one message's parameter shape raises dead-letters that message, not the lane.
+    for state in ("42000", "28000", "IM001", "01000"):
+        plain = _classify_db_error(state, "x")
+        assert isinstance(plain, NegativeAckError) and plain.permanent
+        assert not plain.credential_fault and not plain.config_fault
 
 
 def test_classify_db_error_connecting_is_never_a_per_message_reject() -> None:
@@ -1056,20 +1058,20 @@ def test_classify_db_error_connecting_is_never_a_per_message_reject() -> None:
     assert isinstance(login, NegativeAckError) and login.credential_fault
     no_lib = _classify_db_error("01000", "Can't open lib (0) (SQLDriverConnect)", connecting=True)
     assert isinstance(no_lib, NegativeAckError) and no_lib.config_fault
-    for state in ("42000", "HY000", "08001"):
+    # Only 01000 of class 01: an invalid connection-string attribute (01S00) is retried.
+    for state in ("42000", "HY000", "08001", "01S00"):
         assert type(_classify_db_error(state, "x", connecting=True)) is DeliveryError
-    # Off the connect path class 01 keeps its old reading.
-    plain = _classify_db_error("01000", "x")
-    assert isinstance(plain, NegativeAckError) and not plain.config_fault
 
 
 async def test_connect_codec_error_is_not_read_as_a_sqlstate() -> None:
     """``UnicodeEncodeError``'s first argument is the codec name, five alphanumerics for
-    ``ascii``; it propagates as itself rather than as a configuration refusal."""
+    ``ascii``; it is retried as a connect failure, never read as SQLSTATE ``ascii``."""
     dest = _dest()
     dest._pool = _RefusingPool(UnicodeEncodeError("ascii", "x", 0, 1, "bad"))
-    with pytest.raises(UnicodeEncodeError):
+    with pytest.raises(DeliveryError) as ei:
         await dest.send('{"mrn": "1", "val": "x"}')
+    assert not isinstance(ei.value, NegativeAckError)
+    assert "[ascii]" not in str(ei.value)
 
 
 async def test_send_login_refusal_is_a_credential_fault() -> None:
@@ -1120,11 +1122,14 @@ async def test_send_unreachable_server_at_connect_is_transient() -> None:
     assert not isinstance(ei.value, NegativeAckError)
 
 
-async def test_send_non_driver_error_at_connect_propagates() -> None:
+async def test_send_non_driver_error_at_connect_is_transient() -> None:
+    """Nothing has run, so no message is at fault: retried, as the probe already did, rather than
+    the internal-error arm, which dead-letters the row by default."""
     dest = _dest()
-    dest._pool = _RefusingPool(ValueError("a real bug"))
-    with pytest.raises(ValueError):
+    dest._pool = _RefusingPool(RuntimeError("cannot schedule new futures after shutdown"))
+    with pytest.raises(DeliveryError) as ei:
         await dest.send('{"mrn": "1", "val": "x"}')
+    assert not isinstance(ei.value, NegativeAckError)
 
 
 async def test_probe_login_refusal_at_connect_is_a_credential_fault() -> None:

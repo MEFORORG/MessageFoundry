@@ -43,6 +43,7 @@ from messagefoundry.pipeline.wiring_runner import (
     check_mllp_tls_exposure,
     check_tcp_tls_exposure,
 )
+from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.database import (
     DatabaseDestination,
     DatabaseLookupExecutor,
@@ -213,9 +214,12 @@ def test_destination_carries_its_build_posture_to_send_time(
 
     # Through send() itself, outside the scope: the tripwire passes on the captured warn posture and
     # the call reaches the pool. Were send() to read the ambient posture (None here), it would refuse.
+    # A connect failure with no SQLSTATE comes back as a transient DeliveryError (BACKLOG #5713),
+    # so the stop is read from its cause.
     monkeypatch.setattr(dest, "_get_pool", _no_pool)
-    with active_hop_posture(None), pytest.raises(_StopBeforeDial):
+    with active_hop_posture(None), pytest.raises(DeliveryError) as reached:
         asyncio.run(dest.send('{"x": 1}'))
+    assert isinstance(reached.value.__cause__, _StopBeforeDial)
 
 
 def test_assert_send_hop_noop_when_not_weakened() -> None:
