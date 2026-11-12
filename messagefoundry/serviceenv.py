@@ -421,9 +421,9 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         )
         if _DIRECTORY_VARIABLE not in posture.listed:
             steps.append(
-                f"The service's lists set no {_DIRECTORY_VARIABLE}, so add "
-                "it with the directory's path, or run install-service.ps1 again, which creates "
-                "the directory and adds it"
+                f"The service's lists set no {_DIRECTORY_VARIABLE}, so run install-service.ps1 "
+                "again (or `messagefoundry service install`), which creates the directory and "
+                "adds it to AppEnvironmentExtra"
             )
     return (
         f"{found}. Any local user may be able to read that key, and with it each value named. "
