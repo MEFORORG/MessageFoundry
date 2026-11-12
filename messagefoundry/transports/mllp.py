@@ -114,6 +114,7 @@ from messagefoundry.transports.base import (
     InboundHandler,
     NegativeAckError,
     SourceConnector,
+    closed_connector_error,
     float_setting,
     hold_and_retry,
     insecure_hop_refused,
@@ -1096,6 +1097,11 @@ class MLLPDestination(DestinationConnector):
                 "MLLPDestination.send() called concurrently on one instance — the delivery worker "
                 "must be the lane's single serial sender (per-lane FIFO invariant, ADR 0067)"
             )
+        # A send that reaches a connector aclose() already closed (a reload swapped it out) retries on
+        # the replacement. Checked before the hop guard, whose refusal now stops the lane, so a stale
+        # guard on a replaced connector never stops a lane its replacement would deliver on (#5719).
+        if self._closed:
+            raise closed_connector_error("MLLP", self.host, self.port)
         self._sending = True
         try:
             if self._hop_guard is not None:
@@ -1236,10 +1242,7 @@ class MLLPDestination(DestinationConnector):
         if self._closed:
             # aclose() already ran (engine stop / reload swap) — never re-establish a socket the
             # lifecycle can no longer close. Fail loud; the retry lands on the replacement connector.
-            raise DeliveryError(
-                f"MLLP destination {self.host}:{self.port} is closed (stop/reload); "
-                "delivery retries on the replacement connector"
-            )
+            raise closed_connector_error("MLLP", self.host, self.port)
         conn = self._conn
         if conn is not None:
             reason = self._stale_reason(*conn)
@@ -1367,10 +1370,7 @@ class MLLPDestination(DestinationConnector):
         if self._closed:
             # aclose() already ran (engine stop / reload swap) — never re-establish a socket the
             # lifecycle can no longer close. Fail loud; the retry lands on the replacement connector.
-            raise DeliveryError(
-                f"MLLP destination {self.host}:{self.port} is closed (stop/reload); "
-                "delivery retries on the replacement connector"
-            )
+            raise closed_connector_error("MLLP", self.host, self.port)
         conn = self._conn
         if conn is not None:
             reason = self._stale_reason(*conn)

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A raw-TCP outbound's send-time hop refusal stops the lane and keeps the queue.
+"""An MLLP or X12 outbound's send-time hop refusal stops the lane and keeps the queue.
 
 BACKLOG #5719 (MLLP) and #5718 (X12). The send-time backstop, ``InsecureHopGuard.assert_send``, raised a bare
 ``InsecureHopRefused``, a ``ValueError``. The delivery worker files an unclassified exception as an
@@ -221,17 +221,37 @@ async def test_a_send_time_refusal_stops_the_lane_and_keeps_the_row(
 # --- BACKLOG #5718: the reload half, X12 ----------------------------------------------------------
 
 
-@pytest.mark.parametrize("persistent", [False, True], ids=["connect-per-send", "persistent"])
-async def test_a_closed_x12_connector_retries_before_its_guard_can_stop_the_lane(
-    persistent: bool,
+def _mllp_with(persistent: bool) -> MLLPDestination:
+    dest = MLLPDestination(
+        Destination(
+            name="OB_MLLP",
+            type=ConnectorType.MLLP,
+            settings={"host": LOOPBACK, "port": 5000, "persistent": persistent},
+        )
+    )
+    dest._hop_guard = _refusing_guard("OB_MLLP")
+    return dest
+
+
+@pytest.mark.parametrize(
+    ("build", "payload"),
+    [
+        pytest.param(lambda: _x12(persistent=False), X12, id="x12-connect-per-send"),
+        pytest.param(lambda: _x12(persistent=True), X12, id="x12-persistent"),
+        pytest.param(lambda: _mllp_with(False), RAW, id="mllp-connect-per-send"),
+        pytest.param(lambda: _mllp_with(True), RAW, id="mllp-persistent"),
+    ],
+)
+async def test_a_closed_connector_retries_before_its_guard_can_stop_the_lane(
+    build: Callable[[], DestinationConnector], payload: str
 ) -> None:
     """A reload swaps the connector out and closes it. A send that still reaches the old one is a
     retry on the replacement, never the old guard's lane-stopping refusal: the replacement may
-    deliver where the stale one refuses."""
-    dest = _x12(persistent=persistent)
+    deliver where the stale one refuses (BACKLOG #5718 for X12, #5719 for MLLP)."""
+    dest = build()
     await dest.aclose()
     with pytest.raises(DeliveryError) as raised:
-        await dest.send(X12)
+        await dest.send(payload)
     assert not isinstance(raised.value, NegativeAckError)
     assert "is closed (stop/reload)" in str(raised.value)
 
@@ -259,12 +279,66 @@ async def test_aclose_closes_a_connect_per_send_in_flight() -> None:
             settings={"host": LOOPBACK, "port": port, "expect_reply": True, "timeout_seconds": 30},
         )
     )
+    send = asyncio.create_task(dest.send(X12))
     try:
-        send = asyncio.create_task(dest.send(X12))
         await asyncio.wait_for(received.wait(), 5)
         await dest.aclose()
-        with pytest.raises(DeliveryError):
-            await asyncio.wait_for(send, 5)
+        with pytest.raises(DeliveryError) as raised:
+            await asyncio.wait_for(asyncio.shield(send), 5)
+        # The engine closed the socket, so the error names that close and never blames the peer.
+        assert "is closed (stop/reload)" in str(raised.value)
+        assert dest._inflight is None
+    finally:
+        # A failure above must not leave the send holding the socket the silent peer waits on, or
+        # server.wait_closed() would wait out its bound and mask the real assertion.
+        send.cancel()
+        await asyncio.gather(send, return_exceptions=True)
+        server.close()
+        await asyncio.wait_for(server.wait_closed(), 5)
+
+
+@pytest.mark.parametrize("persistent", [False, True], ids=["connect-per-send", "persistent"])
+async def test_aclose_during_the_dial_never_delivers_on_the_replaced_connector(
+    persistent: bool,
+) -> None:
+    """aclose() cannot see a socket that is still being dialed. The send must notice the close once
+    the dial returns, close the new socket and retry on the replacement, never write the
+    interchange to the replaced connector's peer (BACKLOG #5718)."""
+    got: list[bytes] = []
+    peer_done = asyncio.Event()
+
+    async def peer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            got.append(await reader.read(4096))
+        finally:
+            writer.close()
+            peer_done.set()
+
+    server = await asyncio.start_server(peer, LOOPBACK, 0)
+    port = int(server.sockets[0].getsockname()[1])
+    dest = X12Destination(
+        Destination(
+            name="OB_X12",
+            type=ConnectorType.X12,
+            settings={"host": LOOPBACK, "port": port, "persistent": persistent},
+        )
+    )
+    real_dial = dest._dial
+
+    async def dial_then_reload() -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        conn = await real_dial()
+        await dest.aclose()  # the reload lands while the dial is still pending
+        return conn
+
+    dest._dial = dial_then_reload  # type: ignore[method-assign]
+    try:
+        with pytest.raises(DeliveryError) as raised:
+            await asyncio.wait_for(dest.send(X12), 5)
+        assert not isinstance(raised.value, NegativeAckError)
+        assert "is closed (stop/reload)" in str(raised.value)
+        await asyncio.wait_for(peer_done.wait(), 5)
+        assert got == [b""], "the interchange reached the replaced connector's peer"
+        assert dest._conn is None
         assert dest._inflight is None
     finally:
         server.close()

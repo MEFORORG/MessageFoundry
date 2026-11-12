@@ -55,6 +55,7 @@ from messagefoundry.transports.base import (
     InboundHandler,
     NegativeAckError,
     SourceConnector,
+    closed_connector_error,
     encode_wire_body,
     float_setting,
     owes_hl7_reply,
@@ -296,10 +297,7 @@ class X12Destination(DestinationConnector):
             self._sending = False
 
     def _closed_error(self) -> DeliveryError:
-        return DeliveryError(
-            f"X12 destination {self.host}:{self.port} is closed (stop/reload); "
-            "delivery retries on the replacement connector"
-        )
+        return closed_connector_error("X12", self.host, self.port)
 
     async def _dial(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         """One connection attempt — a charged :class:`DeliveryError` on failure. Exactly one dial per
@@ -338,9 +336,20 @@ class X12Destination(DestinationConnector):
                     if self.capture_response:
                         return response
         except TimeoutError as exc:
+            if self._closed:
+                raise self._closed_error() from exc
             raise DeliveryError("X12 timed out") from exc
         except OSError as exc:
+            if self._closed:
+                raise self._closed_error() from exc
             raise DeliveryError(f"X12 I/O error: {exc}") from exc
+        except DeliveryError as exc:
+            # aclose() closed the socket under the read, which then reads as the PEER closing. Name
+            # the engine's own close, so the row's error and the alerts never blame the partner. A
+            # TA1 reject is the partner's answer, read before any close, and stays as it is.
+            if self._closed and not isinstance(exc, NegativeAckError):
+                raise self._closed_error() from exc
+            raise
         finally:
             self._inflight = None
             await self._close_bounded(writer)
@@ -369,7 +378,15 @@ class X12Destination(DestinationConnector):
                 await self._close_bounded(conn[1])
                 conn = None
         if conn is None:
+            # aclose() may run during the stale socket's close above or during the dial below, and it
+            # cannot see a socket that is not cached yet. Without these checks the send would cache
+            # the new socket and deliver on the replaced connector (BACKLOG #5718).
+            if self._closed:
+                raise self._closed_error()
             conn = await self._dial()
+            if self._closed:
+                await self._close_bounded(conn[1])
+                raise self._closed_error()
             self._established_at = time.monotonic()
         reader, writer = conn
         # Keep the in-flight connection visible so a concurrent aclose() (the reload race) closes it
