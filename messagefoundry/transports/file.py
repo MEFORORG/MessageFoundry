@@ -1082,13 +1082,13 @@ class FileSource(SourceConnector):
                     safe_name(path.name),
                     self.max_file_bytes,
                 )
-                archived = await self._run_fs(self._move, path, self.error_dir, exc.file_id)
-                if archived:  # a failed move is logged by _move; nothing to record
-                    await self._emit_event(
-                        "file_oversize",
-                        reason=f"{exc} exceeds max_file_bytes {self.max_file_bytes}",
-                    )
-                disposed += 1
+                if await self._quarantine(
+                    path,
+                    exc.file_id,
+                    "file_oversize",
+                    f"{exc} exceeds max_file_bytes {self.max_file_bytes}",
+                ):
+                    disposed += 1
                 continue
             except OSError as exc:
                 self._log_unreadable(path, exc)
@@ -1131,12 +1131,10 @@ class FileSource(SourceConnector):
                         safe_name(path.name),
                         safe_exc(exc, file_name=path.name),
                     )
-                    archived = await self._run_fs(self._move, path, self.error_dir, read_id)
-                    if archived:  # a failed move is logged by _move; nothing to record
-                        await self._emit_event(
-                            "file_decompress_failed", reason=safe_exc(exc, file_name=path.name)
-                        )
-                    disposed += 1
+                    if await self._quarantine(
+                        path, read_id, "file_decompress_failed", safe_exc(exc, file_name=path.name)
+                    ):
+                        disposed += 1
                     continue
             if not _content_matches_declared(self.content_type, raw):
                 # Content doesn't match the declared content_type (a PDF on a json inbound, a non-ISA
@@ -1156,13 +1154,13 @@ class FileSource(SourceConnector):
                     safe_name(path.name),
                     declared,
                 )
-                archived = await self._run_fs(self._move, path, self.error_dir, read_id)
-                if archived:  # a failed move is logged by _move; nothing to record
-                    await self._emit_event(
-                        "file_content_mismatch",
-                        reason=f"does not match declared content type {declared}",
-                    )
-                disposed += 1
+                if await self._quarantine(
+                    path,
+                    read_id,
+                    "file_content_mismatch",
+                    f"does not match declared content type {declared}",
+                ):
+                    disposed += 1
                 continue
             try:
                 # The scan hook operates on already-read bytes (it may itself dial an AV/ICAP service),
@@ -1178,12 +1176,10 @@ class FileSource(SourceConnector):
                     safe_name(path.name),
                     safe_exc(exc, file_name=path.name),
                 )
-                archived = await self._run_fs(self._move, path, self.error_dir, read_id)
-                if archived:  # a failed move is logged by _move; nothing to record
-                    await self._emit_event(
-                        "file_scan_rejected", reason=safe_exc(exc, file_name=path.name)
-                    )
-                disposed += 1
+                if await self._quarantine(
+                    path, read_id, "file_scan_rejected", safe_exc(exc, file_name=path.name)
+                ):
+                    disposed += 1
                 continue
             except Exception as exc:  # noqa: BLE001 - operator scan hook: any failure fails closed
                 # The scan hook MALFUNCTIONED (AV/ICAP unreachable, a plugin bug) — NOT a content
@@ -1244,6 +1240,21 @@ class FileSource(SourceConnector):
             with self._store_call():
                 await self.processed_ledger.prune()
 
+    async def _quarantine(
+        self, path: Path, read_id: _FileId | None, kind: str, reason: str
+    ) -> bool:
+        """Move a rejected file to ``.error`` and record the event; return whether it was archived,
+        which is what charges the per-tick budget (:meth:`_at_ceiling`, BACKLOG #5717).
+
+        A file the move left in place (a locked file, an unwritable ``.error``, a read-only share under
+        ``leave``) is logged by :meth:`_move`, records no event, and is examined again next scan. It
+        charges nothing: charging it would let a stuck reject that sorts early spend the whole budget on
+        every scan, and the healthy drops behind it would never be ingested."""
+        if not await self._run_fs(self._move, path, self.error_dir, read_id):
+            return False
+        await self._emit_event(kind, reason=reason)
+        return True
+
     async def _emit_event(self, kind: str, *, reason: str | None = None) -> None:
         """Record a quarantine in the connection-event log (BACKLOG #1621), **fail-soft**.
 
@@ -1285,14 +1296,14 @@ class FileSource(SourceConnector):
         untouched.
 
         **What charges the budget, and why the exceptions are not an oversight.** Only a file this scan
-        FINISHED with charges: one handed to the pipeline, or one quarantined to ``.error`` (oversize,
-        a failed gunzip, a content-vs-type mismatch, a scanner rejection). Each of those leaves the
-        candidate set, so the next scan starts on new work. The arms that leave a file **in place** to be
-        retried — a file not yet settled (#1811) or changed during the read (#116), a locked/vanished
-        file, a malfunctioning scan hook, a handler failure — deliberately do
-        NOT charge. If they did, a permanently stuck file that sorts early would eat the whole budget on
-        every scan and the healthy files behind it would never be ingested. A budget can only be charged
-        by something that makes progress.
+        FINISHED with charges: one handed to the pipeline, or one :meth:`_quarantine` archived to
+        ``.error`` (oversize, a failed gunzip, a content-vs-type mismatch, a scanner rejection). Each of
+        those leaves the candidate set, so the next scan starts on new work. The arms that leave a file
+        **in place** to be retried — a file not yet settled (#1811) or changed during the read (#116), a
+        locked/vanished file, a malfunctioning scan hook, a handler failure, a reject whose move to
+        ``.error`` failed (BACKLOG #5717) — deliberately do NOT charge. If they did, a permanently stuck
+        file that sorts early would eat the whole budget on every scan and the healthy files behind it
+        would never be ingested. A budget can only be charged by something that makes progress.
 
         This bounds the INGEST, not the listing: ``_candidates`` still globs and sorts the whole
         directory, because picking the first N in name/mtime order requires seeing all of them. The
