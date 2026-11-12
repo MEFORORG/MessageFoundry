@@ -422,16 +422,16 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         if _DIRECTORY_VARIABLE not in posture.listed:
             # Two routes, because install-service.ps1 refuses an existing directory the service
             # does not name: an operator whose later `nssm set` dropped the variable must not be
-            # sent to the installer, which would tell them to remove the directory holding the files.
+            # sent to the installer, which would say to remove the directory holding the files.
             steps.append(
                 f"The service's lists set no {_DIRECTORY_VARIABLE}. Where install-service.ps1 "
                 f"already made the secrets directory, add {_DIRECTORY_VARIABLE} naming that "
-                "existing path back to the service's AppEnvironmentExtra, keeping the entries "
-                "already there, since `nssm set ... AppEnvironmentExtra` replaces the whole list; "
-                "the installer refuses an existing directory the service does not name. Where "
-                "none exists yet, run install-service.ps1 again with the service's original "
-                "parameters, which creates it and tries to add it to AppEnvironmentExtra, with a "
-                "warning when that write fails"
+                "existing path back to the service's AppEnvironmentExtra, beside its other "
+                "entries, before any re-run of the installer, which refuses an existing directory "
+                "the service does not name. Where none exists yet, run install-service.ps1 again "
+                "with the service's original parameters: it creates the directory and tries to "
+                "name it in AppEnvironmentExtra, warning when that write fails. See "
+                'docs/SERVICE.md, "Protect the store encryption key at rest"'
             )
     return (
         f"{found}. Any local user may be able to read that key, and with it each value named. "

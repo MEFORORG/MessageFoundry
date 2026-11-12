@@ -27,7 +27,7 @@ the readers of those settings go through. The design is ADR 0214.
 
 **What this slice does not do**, at least: refuse a secret found in the environment (slice B
 later made the NSSM reading in :mod:`messagefoundry.serviceenv` refuse one in the service's own
-lists);
+lists, where it could read them);
 create the directory (the Windows service installer does, slice C, and names it to the service);
 wrap a file with DPAPI (a plain file restricted by
 its access list is the control, and whether a Windows file is also wrapped waits on a spike); and

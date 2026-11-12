@@ -659,8 +659,8 @@ NSSM environment.
   [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#store_key_in_service_environment-service_environment_unobservable-and-secret_in_service_environment-secrets-in-the-windows-services-environment).
 
 - **The other secrets: a secrets directory (any platform).** At least the engine's own secret
-  settings other than the store key, among them the database password, and every `MEFOR_VALUE_*`
-  value can each come from a file instead of the service's NSSM list. A variable an operator names
+  settings other than the store key and its retired keys, among them the database password, and
+  every `MEFOR_VALUE_*` value can each come from a file instead of the service's NSSM list. A variable an operator names
   as a `[secrets].provider = "env"` reference, and one a library reads for itself, are not read
   from it. **The installer creates it**, restricted, and adds `MEFOR_SECRETS_DIRECTORY=<its path>`
   to the service's NSSM list, keeping the entries already there; a path in the NSSM list is not a
@@ -687,8 +687,8 @@ NSSM environment.
   access list it needs, and the rest of the rules are stated once, in
   [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). Move each
   of the engine's own secret settings other than the store key and its retired keys here from the
-  service's NSSM list, where `serve` and `supervise` refuse it (the previous bullet links where
-  that is stated);
+  service's NSSM list, where `serve` and `supervise` refuse it once they have read that list (the
+  previous bullet links where that is stated);
   a `MEFOR_VALUE_*` value there is not refused.
 
 > **External vault / managed identity.** DPAPI is the built-in on-box option. The engine can also call
