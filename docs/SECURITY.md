@@ -8053,8 +8053,10 @@ walk checks every row the same way, so a rotation does not read as a chain break
 hold. Transit refuses it with HTTP 400 while it still answers under the latest version. The walk
 then reports a break at that row and keeps going. `audit-verify` names the row and exits 1. With
 `[integrity].audit_verify_on_start` on, the startup check also raises its `audit-chain` alert.
-Other failures still stop the walk as a check that could not run. Those include at least an
-outage, a dropped connection, and a row too large for one request.
+So is a row whose own request Transit refuses while a verify over fixed input still succeeds,
+such as a row too large for one request (`TransitCipher._refuses_only_this_row`). Other failures
+still stop the walk as a check that could not run. Those include at least an outage and a dropped
+connection.
 
 **Retiring an old version of the audit key breaks the chain.** Transit's verify also refuses a
 version below the key's `min_decryption_version`, or one trimmed away. Every audit row sealed under

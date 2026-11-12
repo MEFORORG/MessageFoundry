@@ -550,12 +550,16 @@ All against an in-process fake Transit client with key versions, never a real se
    reaches Transit to draw a 400. It still costs one round trip, an unpinned `generate_hmac` whose
    answer is discarded, so a malformed row is no cheaper to check than a clean one (the ASVS 11.2.4
    note on `verify_audit_chain`).
-4. **Refusals and outages are classified as before.** A 400 on the verify call goes through
+4. **A refusal of the row is a break; an outage could not run.** A 400 on the verify call goes through
    `_refuses_only_version` and `_names_no_version_reason` (2026-10-27 amendment, item 3, where
    "a pinned call" now reads as this verify call), so it
    raises `AuditKeyVersionRefusedError` or `AuditKeyVersionUnverifiedError` and is a break at that
-   row with the alert, or a plain `CipherError`, and the walk could not run. Transit's
-   `valid: false` is a break. A `valid` that is not a bool is a `CipherError`.
+   row with the alert, or a plain `CipherError`, and the walk could not run. A failure of the
+   verify call that is neither of those is a break at that row when `_refuses_only_this_row`
+   reads it as Transit refusing the row's own request: not an outage `is_vault_unavailable`
+   names, while a `generate_hmac` and a verify over fixed input succeed. A planted row past
+   `max_request_size` (HTTP 413) is one such case (BACKLOG #2720). Transit's `valid: false` is a
+   break. A `valid` that is not a bool is a `CipherError`.
 5. **A range row's handover tag is not moved.** `_audit_tag_ok` still regenerates the tag under
    the outgoing key and compares it.
 6. **The in-process key paths are unchanged.** A plain MAC provider, an in-heap key and the keyless
