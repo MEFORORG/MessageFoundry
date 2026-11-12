@@ -236,17 +236,17 @@ async def test_a_late_hold_with_no_promotable_sibling_does_not_pause(
 
 
 @pytest.mark.parametrize(("_name", "make"), _WITH_MEMBERS, ids=_IDS)
-async def test_a_late_hold_pause_waits_out_the_longest_sibling_delay(
+async def test_a_late_hold_pause_does_not_wait_out_a_sibling_delay(
     _name: str, make: Callable[[_Clock, list[dict[str, object]]], Any]
 ) -> None:
-    """With a promotable sibling the pause is the TTL plus the stepdown pause for the longest
-    sibling delay, so this node's undelayed renew arm cannot take the row back from a delayed
-    sibling still waiting. Before the fix the delay was not read and the pause was 50 s."""
+    """With a promotable sibling the pause is the TTL plus two heartbeats, and a sibling's
+    acquire delay is not added: waiting out a DR node's delay after one slow claim would leave the
+    cluster leaderless that long and then hand the lease to the least-preferred node."""
     clock = _Clock()
-    coord = make(clock, [_node("A"), _node("B", delay=25.0), _node("C", delay=5.0)])
+    coord = make(clock, [_node("A"), _node("B", delay=600.0)])
     _claim_taking(coord, clock, _FENCE + 0.5)
     await coord._maintain_leadership()
-    assert coord._no_claim_until == clock.t + 30.0 + 2 * 10.0 + 25.0
+    assert coord._no_claim_until == clock.t + 30.0 + 2 * 10.0
 
 
 class _LeasePool(LendsItself):

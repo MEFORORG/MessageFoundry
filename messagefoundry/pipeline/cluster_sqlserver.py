@@ -681,8 +681,6 @@ class SqlServerCoordinator:
     def _check_fence(self) -> None:
         if not self._is_leader:
             return
-        if self._stand_down_if_lapsed():  # demotes on a lapsed heartbeat
-            return
         last = self._last_renew_ok
         if last is None:
             return  # defensive: _is_leader is only set alongside _last_renew_ok
@@ -698,6 +696,8 @@ class SqlServerCoordinator:
             )
             self._alert_leadership_lost("self-fenced")  # #145 (inverse → auto-resolves)
             self._fire_on_demote()  # ADR 0157 Inc 5
+            return
+        self._stand_down_if_lapsed()
 
     def _stand_down_if_lapsed(self) -> bool:
         """Mirrors :meth:`DbCoordinator._stand_down_if_lapsed` (BACKLOG #5710); read its docstring

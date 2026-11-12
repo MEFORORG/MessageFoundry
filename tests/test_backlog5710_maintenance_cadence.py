@@ -94,30 +94,43 @@ async def test_a_hung_heartbeat_does_not_stop_the_renews(
 
 
 @pytest.mark.parametrize(("_name", "make", "refresh"), _COORDINATORS, ids=_ids())
-async def test_the_renew_runs_first_and_the_others_follow_it(
+async def test_the_heartbeat_does_not_wait_for_a_lease_step_that_never_ends(
     _name: str, make: Callable[[float], Any], refresh: str
 ) -> None:
-    """The first statement of the first tick is the renew, and the heartbeat and refresh follow in
-    that order. Before the fix the heartbeat ran first."""
-    coord = make(60.0)
-    calls: list[str] = []
+    """The heartbeat has its own ticker, so beats keep landing while a lease step hangs, for
+    example a late hold's membership read after a claim past the fence, or a claim whose COMMIT
+    never returns. The refresh waits for the lease step. Before the fix the heartbeat ran before
+    the renew in the same tick; in review round 1 it was kicked from the lease loop, and a hung
+    lease step stopped it."""
+    coord = make(0.01)
+    beats = 0
+    refreshes = 0
+    never = asyncio.Event()
 
-    async def claim() -> None:
-        calls.append("renew")
+    async def hung_claim() -> None:
+        await never.wait()
 
     async def beat() -> None:
-        calls.append("heartbeat")
+        nonlocal beats
+        beats += 1
 
     async def read() -> int:
-        calls.append("refresh")
-        coord._stop.set()
+        nonlocal refreshes
+        refreshes += 1
         return 0
 
-    coord._maintain_leadership = claim
+    coord._maintain_leadership = hung_claim
     coord.heartbeat_once = beat
     setattr(coord, refresh, read)
-    await asyncio.wait_for(coord._heartbeat_loop(), timeout=5.0)
-    assert calls == ["renew", "heartbeat", "refresh"]
+    task = asyncio.create_task(coord._heartbeat_loop())
+    try:
+        await _wait_until(lambda: beats >= 5)
+    finally:
+        coord._stop.set()
+        task.cancel()
+        await asyncio.wait({task}, timeout=5.0)
+    assert task.done()
+    assert refreshes == 0
 
 
 async def test_ticks_are_paced_from_their_start_not_their_end() -> None:

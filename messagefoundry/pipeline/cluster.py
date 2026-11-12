@@ -572,13 +572,15 @@ async def run_maintenance_loop(
     counts against its clamp, so on a pool with no connection to spare a slow side statement can
     still fail a renew. They no longer add their own duration to the gap.
 
-    **The heartbeat has a lane of its own, started with the tick.** A node whose own heartbeat
-    lapsed stops leading (:func:`heartbeat_lapsed`), so the heartbeat cannot wait on the lease
-    step or on the config-version refresh, or a slow one of those would push ``last_seen`` toward
-    ``node_timeout_seconds`` the way the old serial loop pushed the renew toward the fence. Its
-    lane starts as each tick starts, beside the renew, so beats are issued ``interval`` apart
-    while each lands within its tick. The refresh runs in a second lane once the lease step
-    returns.
+    **The heartbeat has a lane and a ticker of its own.** A node whose own heartbeat lapsed stops
+    leading (:func:`heartbeat_lapsed`), so the heartbeat cannot wait on the lease step or on the
+    config-version refresh, or a slow one of those would push ``last_seen`` toward
+    ``node_timeout_seconds`` the way the old serial loop pushed the renew toward the fence. A lease
+    step can run long: a refused late hold reads the membership after a claim that was already
+    past the fence, and a claim whose COMMIT never returns never ends. So a separate task kicks the
+    heartbeat lane every ``interval``, from the loop's start, whatever the lease step is doing; beats
+    are issued ``interval`` apart while each lands within its interval. The refresh runs in a second
+    lane, kicked once each lease step returns.
 
     **At most one pass per lane at a time, and none lost.** A tick whose lane is still running
     starts no second pass there, so a stalled statement cannot pile passes up on the pool. It logs
@@ -604,24 +606,34 @@ async def run_maintenance_loop(
     loop = asyncio.get_running_loop()
     beat = _SideLane((heartbeat_step,), node_id, side_step_timeout, stop)
     side = _SideLane(side_steps, node_id, side_step_timeout, stop)
-    try:
+
+    async def every_interval(body: Callable[[], Awaitable[None]]) -> None:
         while not stop.is_set():
-            # The next tick is due one interval after this one STARTED, so a slow tick shortens the
+            # The next run is due one interval after this one STARTED, so a slow run shortens the
             # wait rather than adding to it.
             due = loop.time() + interval
-            beat.kick()
-            await _run_maintenance_steps((lease_step,), node_id)
-            side.kick()
+            await body()
             try:
                 await asyncio.wait_for(stop.wait(), timeout=max(0.0, due - loop.time()))
             except TimeoutError:
                 continue
+
+    async def kick_beat() -> None:
+        beat.kick()
+
+    async def lease_tick() -> None:
+        await _run_maintenance_steps((lease_step,), node_id)
+        side.kick()
+
+    ticker = asyncio.create_task(every_interval(kick_beat))
+    try:
+        await every_interval(lease_tick)
     finally:
-        running = [lane.task for lane in (beat, side) if lane.task is not None]
+        ticker.cancel()
+        running = [ticker, *(lane.task for lane in (beat, side) if lane.task is not None)]
         for task in running:
             task.cancel()
-        if running:
-            await asyncio.wait(running)
+        await asyncio.wait(running)
 
 
 class StepdownOutcome(NamedTuple):
@@ -787,16 +799,21 @@ def late_hold_pause_seconds(
     two-leader window, so skipping the pause costs no fencing.
 
     Otherwise the refused claim renewed the row to the DB clock's then-now plus the TTL, so the row
-    stays this node's for up to a TTL, and a sibling can take it only after that plus its own
-    ``acquire_delay_seconds``. The pause is that TTL plus :func:`stepdown_pause_seconds` with the
-    longest such delay, as a stepdown's is, so this node's undelayed renew arm cannot take the row
-    back from a delayed sibling still waiting. It lifts early once a read shows another node holding
-    the row. An unread membership counts as a sibling with no delay: the pause only ever delays this
-    node's own claim."""
+    stays this node's for up to a TTL, and a sibling can take it only after that. The pause is that
+    TTL plus :func:`stepdown_pause_seconds` with no sibling delay, two heartbeats, for the reason
+    that pause has them: a sibling looks at the expired row once per interval at an unrelated phase.
+    It lifts early once a read shows another node holding the row. An unread membership counts as a
+    sibling: the pause only ever delays this node's own claim.
+
+    **The sibling delays are deliberately not waited out**, unlike a stepdown's. A stepdown is an
+    operator's request to hand over; this is an automatic reaction to one slow claim, and waiting
+    out a DR node's ``acquire_delay_seconds`` (up to an hour) would leave the cluster leaderless
+    that long and then hand the lease to the node the operator ranked last (ADR 0096). A sibling
+    whose delay exceeds the two heartbeats can therefore lose the row back to this node's
+    undelayed renew arm when the pause ends, which keeps the preferred node leading."""
     if members is not None and not has_promotable_sibling(members, node_id):
         return 0.0
-    delay = 0.0 if members is None else longest_promotable_sibling_delay(members, node_id)
-    return lease_ttl_seconds + stepdown_pause_seconds(heartbeat_seconds, delay)
+    return lease_ttl_seconds + stepdown_pause_seconds(heartbeat_seconds, 0.0)
 
 
 async def read_members_or_none(
@@ -2158,11 +2175,10 @@ class DbCoordinator:
 
     def _check_fence(self) -> None:
         """Demote (self-fence) if we are leader but haven't confirmed a lease hold within the fence
-        timeout, or if our own heartbeat has lapsed (:meth:`_stand_down_if_lapsed`). Pure in-memory;
-        called by the watchdog (and directly by tests)."""
+        timeout, or else if our own heartbeat has lapsed (:meth:`_stand_down_if_lapsed`); the fence
+        first, so a node that is both logs and alerts the self-fence. Pure in-memory; called by the
+        watchdog (and directly by tests)."""
         if not self._is_leader:
-            return
-        if self._stand_down_if_lapsed():  # demotes on a lapsed heartbeat
             return
         last = self._last_renew_ok
         if last is None:
@@ -2180,6 +2196,8 @@ class DbCoordinator:
             )
             self._alert_leadership_lost("self-fenced")  # #145 (inverse → auto-resolves)
             self._fire_on_demote()  # ADR 0157 Inc 5
+            return
+        self._stand_down_if_lapsed()
 
     def _stand_down_if_lapsed(self) -> bool:
         """Whether this node's own heartbeat has lapsed (:func:`heartbeat_lapsed`), demoting it first
