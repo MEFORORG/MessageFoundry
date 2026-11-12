@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import logging
 import ssl
 import textwrap
 from collections.abc import AsyncIterator, Callable
@@ -875,26 +876,76 @@ async def test_a_first_load_by_reload_isolates_a_lookup_its_ca_check_refuses(
     assert dials == []
 
 
-async def test_a_first_load_by_reload_audits_a_refused_lookup_ca_once(
+async def test_a_first_load_by_reload_checks_each_lookup_ca_once(
     store: MessageStore, tmp_path: Path, judged: None, dials: list[str]
 ) -> None:
-    """Review finding 2 of vault BACKLOG #3582: the first load's lookup check and the start's
-    share one lane check, so a refused pin writes its ``auth.trust_anchor`` row once, and the
-    lookup is isolated. Red under: the checker handed a lane check of its own."""
+    """Review round 1 of the vault BACKLOG #3582 repair: the first load hands what its lookup
+    check found to the start, so each lookup CA is checked once, a refused pin writes its
+    ``auth.trust_anchor`` row once, and the lookup is isolated. Red under: the start checking
+    the lookup CAs again."""
     ca = _ca(tmp_path)
     cfg = tmp_path / "cfg"
     _lookup_graph(cfg, ca, "00" * 32)
-    engine = _engine(store)
+    check = ta.make_lane_anchor_check(store, enforcing=True)
+    reads: list[str] = []
+
+    async def counted(direction: str, name: str, settings: Any) -> None:
+        if direction == "fhir_lookup":
+            reads.append(name)
+        await check(direction, name, settings)
+
+    from messagefoundry.pipeline import Engine
+
+    engine = Engine(
+        store,
+        registry_preflight=ta.make_registry_anchor_preflight(store, enforcing=True),
+        lane_anchor_check=counted,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
     try:
         await engine.reload_detail(cfg)
         runner = engine.registry_runner
+        assert runner is not None
         reason = runner.fhir_lookup_failed("EPIC")
         assert reason is not None and reason.startswith(_REFUSED_LOOKUP), reason
+        assert reads == ["EPIC"], reads
         events = [r["event"] for r in await _rows(store, "fhir_lookup:EPIC")]
         assert events.count("pin_mismatch") == 1, events
     finally:
         await engine.stop()
     assert dials == []
+
+
+async def test_a_first_load_warns_for_a_query_credential_on_a_lookup_it_isolated(
+    store: MessageStore, tmp_path: Path, judged: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Review round 1 of the vault BACKLOG #3582 repair: the first load's build check leaves out
+    a lookup its CA check refused, so the start logs that lookup's URL query-credential WARNING
+    (ASVS 14.2.1), which the build check would have logged. Red under: the start taking
+    ``warn_query_credentials=False`` for every lookup."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _lookup_graph(cfg, ca, "00" * 32)
+    lookup = cfg / "lookup.py"
+    lookup.write_text(
+        lookup.read_text(encoding="utf-8").replace(
+            "https://fhir.example.org/fhir", "https://fhir.example.org/fhir?api_key=SYNTHETIC-1"
+        ),
+        encoding="utf-8",
+    )
+    engine = _engine(store)
+    try:
+        with caplog.at_level(logging.WARNING):
+            await engine.reload_detail(cfg)
+        assert engine.registry_runner.fhir_lookup_failed("EPIC") is not None
+        warned = [
+            r.getMessage()
+            for r in caplog.records
+            if "carries a credential in its query string" in r.getMessage()
+        ]
+        assert any("EPIC" in line for line in warned), warned
+    finally:
+        await engine.stop()
 
 
 async def test_a_lookup_store_fault_does_not_hide_a_refused_lane_ca_at_reload(

@@ -1216,8 +1216,10 @@ class Engine:
                 lookups = await self._dr_preflight(rr.registry)
             self._set_dr_active(True)
             if rr is not None:
-                # The lookup CAs the preflight read inside its bound are not read again unbounded
+                # The lookup CA check the preflight ran inside its bound is not run again here
                 # (vault BACKLOG #3094, #3582), unless a reload landed first and changed the graph.
+                # The reload's build check and executor build still load each lookup CA file,
+                # with no bound, as a lane's build loads its own.
                 close_failures = await rr.reload(fhir_lookup_anchors=lookups)
         except BaseException:
             # A refused reload (BACKLOG #2034: a settings trust anchor, say) applied no DR profile,
@@ -1266,7 +1268,7 @@ class Engine:
         under the coordinator's lock, so with no bound a share that stops answering held every
         later activate and release too. A timeout cancels them and raises ``TimeoutError``, which
         the caller rolls back like any refusal. Returns the lookup check's pass, ``None`` with no
-        runner, which the caller hands to the reload so it reads no lookup CA again. The reload
+        runner, which the caller hands to the reload so it runs no lookup CA check again. The reload
         that follows is not bounded here, and still reads each lane CA it checks with no bound.
         Cancelling it partway rolls back a takeover the VIP has already moved for, and the runner
         gives each lane's first build its own isolation (ADR 0048, the vault BACKLOG #3263
@@ -1529,7 +1531,7 @@ class Engine:
             env_values=self._env_values,
             coordinator=self._coordinator,
             # The first load checks each FhirLookup CA on it (vault BACKLOG #3582), through the
-            # check the started runner uses, so the two share its memory of the last verdict.
+            # check the started runner later uses, so the two share its memory of the last verdict.
             lane_anchor_check=self._lane_anchor_check,
         )
 
@@ -1568,8 +1570,8 @@ class Engine:
         checker = self._check_runner(registry)
         # Vault BACKLOG #3582: this load is the start, so a lookup its CA check fails is isolated,
         # as at any start, and a CA the build could not load is met as a trust anchor first. The
-        # build check leaves such a lookup out; the start below checks it again and isolates it.
-        # The same lane check, so a repeated refusal writes no second audit row.
+        # build check leaves such a lookup out, and the start below is handed what this check
+        # found, so it isolates the lookup and runs no lookup CA check again.
         refused = await checker.check_fhir_lookup_anchors(registry, env_values)
         checked = registry
         if refused:
@@ -1583,8 +1585,9 @@ class Engine:
         previous_env_values, self._env_values = self._env_values, env_values
         try:
             runner = self.add_registry(registry)
-            # That check warned for this graph, so this start does not (vault BACKLOG #2910).
-            await runner.start(warn_query_credentials=False)
+            # That check warned for this graph, so this start does not (vault BACKLOG #2910),
+            # except for a lookup it left out, which the start warns for (vault BACKLOG #3582).
+            await runner.start(warn_query_credentials=False, fhir_lookup_refused=refused)
         except Exception:
             # Don't leave a half-started runner: a later reload would take the "runner exists"
             # path and no-op the start, wedging intake. Clear it so a retry re-enters cleanly.

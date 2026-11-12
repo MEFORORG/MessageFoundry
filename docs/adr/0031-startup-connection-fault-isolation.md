@@ -411,9 +411,11 @@ convergence still refuse whole (rule 2): a reload builds every lookup again, so 
 build check the runner checks each lookup's CA (`RegistryRunner.refuse_on_fhir_lookup_anchors`),
 and a refusal refuses the reload before anything changes, audited as a trust-anchor refusal. A DR
 activation runs that check inside its preflight instead, which `[dr].takeover_timeout_seconds`
-bounds (vault BACKLOG #3094), and hands the result to its reload, which reads no lookup CA again
-unless another reload changed the graph in between. A check the store stopped refuses a reload
-only once no lookup or lane CA is refused (BACKLOG #3091). An engine started with no graph takes
+bounds (vault BACKLOG #3094), and hands the result to its reload, which runs no lookup CA check
+again unless another reload changed the graph in between. The reload still loads each
+lookup's file as it builds the lookup, with no bound, as it loads a lane's. In a reload, a check the store stopped
+refuses only once no lookup or lane CA is refused (BACKLOG #3091). In a DR activation's
+preflight it refuses there, as the preflight's other checks do. An engine started with no graph takes
 its first one by reload, and that load is a start: it checks each lookup before its build check,
 which leaves out one the check refused, so that lookup is isolated as at any other start. On a passive DR standby the lookup's line says that `POST /dr/activate` needs it. A reload with the cause fixed builds the lookup again, and so does a
 restart. Rule 3, the inbound listener CA, is untouched.

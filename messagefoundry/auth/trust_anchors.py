@@ -99,9 +99,11 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
      connector, and those that read the file as they are built refuse one they cannot load.
    * A reload builds every ``FhirLookup`` again, so before its build check the runner checks
      each one the new graph declares, idle or not, and a refusal refuses the whole reload. A DR
-     activation checks them inside its bounded preflight instead, and its reload reads them
-     again only if another reload changed the graph in between. A check the store stopped
-     refuses the reload only once no lookup or lane CA is refused (BACKLOG #3091).
+     activation checks them inside its bounded preflight instead, and its reload checks them
+     again only if another reload changed the graph in between. Its build still loads each
+     lookup's file, with no bound, as a lane's build loads its own. In a reload, a check the
+     store stopped refuses only once no lookup or lane CA is refused (BACKLOG #3091). In a
+     DR activation's preflight it refuses there, as the preflight's other checks do.
 
    **Not covered: the checked bytes are not the loaded bytes here.** These hops build their
    context from the path, with ``cafile=``, after the check. So a file swapped between the check

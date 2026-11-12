@@ -1484,3 +1484,33 @@ async def test_a_dr_activation_a_lookup_ca_refuses_stops_at_its_preflight(
     assert "stopped at its preflight" in str(caught.value), str(caught.value)
     assert reads == [False], reads
     assert dr_engine.dr_active is False
+
+
+async def test_a_dr_activation_a_lookup_store_fault_stops_at_its_preflight(
+    dr_engine: Engine, tmp_path: Path, judged: None
+) -> None:
+    """Review round 1 of the vault BACKLOG #3582 repair: a store fault in the preflight's lookup
+    CA check stops the activation at its preflight, before the profile is latched, and its abort
+    does not say a bind failed. Red under: the preflight deferring that fault to the reload."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _lookup_graph(cfg, ca, _sha(ca))
+    check = dr_engine._lane_anchor_check
+    assert check is not None
+    stopped = False
+
+    async def faulty(direction: str, name: str, settings: Any) -> None:
+        if stopped and direction == "fhir_lookup":
+            raise ta.AnchorStoreUnavailable("the store refused the audit read")
+        await check(direction, name, settings)
+
+    dr_engine._lane_anchor_check = faulty
+    dr_engine.add_registry(load_config(cfg))
+    await dr_engine.start()
+    stopped = True
+    with pytest.raises(DrActivationError) as caught:
+        await _coordinator(dr_engine).activate(actor="alice")
+    assert caught.value.kind == "profile"
+    assert "stopped at its preflight" in str(caught.value), str(caught.value)
+    assert "could not bind" not in str(caught.value)
+    assert dr_engine.dr_active is False
