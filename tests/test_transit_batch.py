@@ -26,6 +26,7 @@ import requests
 from cryptography.exceptions import InvalidTag
 from hvac.exceptions import (  # type: ignore[import-untyped]
     Forbidden,
+    InternalServerError,
     InvalidRequest,
     UnexpectedError,
 )
@@ -248,7 +249,7 @@ def test_a_batch_transit_could_not_serve_fails_every_value_as_an_outage() -> Non
     results = cipher.decrypt_many(items)
     assert transit.decrypt_requests == 1  # no value-by-value retry against a service that is down
     assert all(isinstance(r, CipherUnavailableError) for r in results)
-    assert all(isinstance(r, CipherError) and isinstance(r.__cause__, OSError) for r in results)
+    assert all(isinstance(r, CipherError) and r.__cause__ is None for r in results)
 
 
 async def test_an_outage_ends_the_audit_walk_after_one_request(tmp_path: Path) -> None:
@@ -374,7 +375,6 @@ def test_later_batches_are_not_sent_once_transit_cannot_serve() -> None:
     assert transit.decrypt_requests == 1  # three runs, one request
     assert len(results) == len(items)
     assert all(isinstance(r, CipherUnavailableError) for r in results)
-    assert all(isinstance(r, CipherError) and isinstance(r.__cause__, OSError) for r in results)
 
 
 def test_a_batch_refusal_other_than_a_400_fails_every_value_and_sends_no_more() -> None:
@@ -389,7 +389,8 @@ def test_a_batch_refusal_other_than_a_400_fails_every_value_and_sends_no_more() 
     transit.decrypt_data = forbidden  # type: ignore[method-assign]
     transit.decrypt_requests = 0
     results = cipher.decrypt_many(items)
-    assert transit.decrypt_requests == 1  # not one request per value, and no later batch
+    # The batch, then the first value alone, which is refused too: no verdict, so no more.
+    assert transit.decrypt_requests == 2
     assert all(isinstance(r, CipherError) and isinstance(r.__cause__, Forbidden) for r in results)
 
 
@@ -449,3 +450,39 @@ def test_an_encrypt_batch_transit_could_not_serve_raises() -> None:
     with pytest.raises(CipherUnavailableError):
         encrypt_many(cipher, [("a", None), ("b", None)])
     assert transit.encrypt_requests == 1
+
+
+def test_a_batch_500_body_never_rides_an_error() -> None:
+    transit = _BatchTransit()
+    cipher = _cipher(transit)
+    items = _sealed(cipher, 4)
+    body = json.dumps({"data": {"batch_results": [{"plaintext": "dmFsdWUgMA=="}]}})
+
+    def internal(**_: Any) -> dict[str, Any]:
+        raise InternalServerError(body)
+
+    transit.decrypt_data = internal  # type: ignore[method-assign]
+    results = cipher.decrypt_many(items)
+    assert all(isinstance(r, CipherUnavailableError) for r in results)
+    for r in results:
+        assert isinstance(r, BaseException)
+        assert "dmFsdWUgMA==" not in "".join(traceback.format_exception(r))
+
+
+def test_a_refused_decrypt_batch_asks_alone_and_stops_batching() -> None:
+    transit = _BatchTransit()
+    cipher = _cipher(transit)
+    items = _sealed(cipher, crypto.BATCH_MAX_ITEMS + 2)
+    real = transit.decrypt_data
+    batches = 0
+
+    def too_large(**kw: Any) -> dict[str, Any]:
+        nonlocal batches
+        if kw.get("batch_input") is not None:
+            batches += 1
+            raise UnexpectedError("413 Request Entity Too Large")
+        return real(**kw)
+
+    transit.decrypt_data = too_large  # type: ignore[method-assign]
+    assert cipher.decrypt_many(items) == [f"value {i}" for i in range(len(items))]
+    assert batches == 1  # the second run went value by value without a batch first

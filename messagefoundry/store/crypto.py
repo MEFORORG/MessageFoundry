@@ -641,8 +641,9 @@ class CipherUnavailableError(CipherError):
 
     :class:`~messagefoundry.store.crypto_transit.TransitCipher` raises it from ``encrypt`` and
     ``decrypt`` when Transit could not be reached or answered that it could not serve the request,
-    which :func:`~messagefoundry.store.keyprovider_vault.is_vault_unavailable` decides, and for
-    each value of a batch whose reply does not match the request (BACKLOG #6706). Every other
+    which :func:`~messagefoundry.store.keyprovider_vault.is_vault_unavailable` decides. Its batch
+    paths also give it for each value of a batch whose reply does not match the request: returned
+    by ``decrypt_many`` per value, raised by ``encrypt_many`` (BACKLOG #6706). Every other
     Transit failure, a refused tag among them, stays plain :class:`CipherError`, so a value Transit
     refused is never read as an outage.
 
@@ -810,6 +811,28 @@ class BatchCipher(Protocol):
     def decrypt_many(self, items: Sequence[CipherItem]) -> list[str | CipherError]: ...
 
     def encrypt_many(self, items: Sequence[CipherItem]) -> list[str]: ...
+
+
+def gave_no_verdict(error: CipherError) -> bool:
+    """Whether a failed decrypt was the key service failing rather than the value (BACKLOG #6706).
+
+    A :class:`CipherUnavailableError` is one whatever its cause. Otherwise the cause decides: the
+    Transit cipher raises :class:`CipherError` from the client's own error, an ``OSError`` for an
+    unreachable Vault (a ``requests`` connection error or timeout is one) and an ``hvac`` error for
+    a reply. Vault answers a value it cannot authenticate with HTTP 400, which ``hvac`` raises as
+    ``InvalidRequest``; any other ``hvac`` error (a token refused, a 5xx) is the service. At least
+    those shapes; a cause of any other kind counts as the value's. The cipher-cell walk and the
+    Transit batch path read it alike."""
+    if isinstance(error, CipherUnavailableError):
+        return True
+    cause = error.__cause__
+    if isinstance(cause, OSError):
+        return True
+    return (
+        cause is not None
+        and type(cause).__module__.split(".")[0] == "hvac"
+        and type(cause).__name__ != "InvalidRequest"
+    )
 
 
 def decrypt_or_error(cipher: Cipher, stored: str, aad: bytes | None) -> str | CipherError:

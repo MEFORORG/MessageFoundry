@@ -53,6 +53,7 @@ from messagefoundry.store.crypto import (
     batch_chars,
     cell_aad,
     decrypt_or_error,
+    gave_no_verdict,
 )
 from messagefoundry.store.queue_tag import QUEUE_TAG_COLUMNS, QueueTagError, queue_row_aad
 from messagefoundry.store.store import MessageStore, _sqlite_readonly_uri
@@ -495,25 +496,9 @@ def read_cipher_cells(
                 break
 
 
-def _is_outage(error: CipherError) -> bool:
-    """Whether a failed decrypt was the key service failing rather than the value. The Transit
-    cipher raises :class:`CipherError` for both, from the client's own error: an ``OSError`` for
-    an unreachable Vault (a ``requests`` connection error or timeout is one), and an ``hvac``
-    error for a reply. Vault answers a value it cannot authenticate with HTTP 400, which ``hvac``
-    raises as ``InvalidRequest``; any other ``hvac`` error (a sealed Vault, a token refused, a
-    5xx) is the service. At least those shapes; a cause of any other kind counts as the value's.
-    A :class:`CipherUnavailableError` is one whatever its cause: it says the service gave no
-    verdict on the value, which is how a batch fails the values it was not answered for."""
-    if isinstance(error, CipherUnavailableError):
-        return True
-    cause = error.__cause__
-    if isinstance(cause, OSError):
-        return True
-    return (
-        cause is not None
-        and type(cause).__module__.split(".")[0] == "hvac"
-        and type(cause).__name__ != "InvalidRequest"
-    )
+#: Whether a failed decrypt was the key service failing rather than the value; shared with the
+#: Transit batch path so the two never disagree (BACKLOG #6706).
+_is_outage = gave_no_verdict
 
 
 def _failed(
@@ -582,10 +567,8 @@ def _decrypt_values(cipher: Cipher, items: list[CipherItem]) -> list[str | Ciphe
         if len(opened) == len(items):
             return opened
         # No verdict on any value, so the walk stops on it as an outage rather than read one.
-        short = CipherUnavailableError(
-            f"{type(cipher).__name__} answered {len(opened)} of {len(items)} values"
-        )
-        return [CipherUnavailableError(str(short)) for _ in items]
+        short = f"{type(cipher).__name__} answered {len(opened)} of {len(items)} values"
+        return [CipherUnavailableError(short) for _ in items]
     return [decrypt_or_error(cipher, stored, aad) for stored, aad in items]
 
 
