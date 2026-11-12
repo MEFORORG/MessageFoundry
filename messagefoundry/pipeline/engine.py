@@ -577,8 +577,8 @@ class Engine:
         # awaits for each lane it builds, at start, at an operator start and before a reload. Since
         # vault BACKLOG #3582 the runner awaits it for each FhirLookup too, at start, before a
         # reload and inside a DR activation's bounded preflight. `serve` passes it; None = no
-        # check. The throwaway checker (_check_runner) carries it for a first load's lookup check;
-        # a dry run's build check never awaits it.
+        # check. Not handed to a dry-run checker, which builds nothing live; a first load's
+        # throwaway checker carries it for its lookup check (_check_runner).
         self._lane_anchor_check = lane_anchor_check
         # An optional async check run first on EVERY real reload, whoever starts it: the reload route,
         # a held reload a second approver releases, cluster convergence, and the DR profile reload.
@@ -1496,11 +1496,15 @@ class Engine:
             held += (await self.store.pending_depth(name))[0]
         return held
 
-    def _check_runner(self, registry: Registry) -> RegistryRunner:
+    def _check_runner(
+        self, registry: Registry, *, lane_anchor_check: LaneAnchorCheck | None = None
+    ) -> RegistryRunner:
         """A throwaway runner for a build check of ``registry``, carrying the same bind host,
         egress, posture and env values a real reload would, and never installed or started: a dry
         run checks with it when no runner is live, and the first load checks with it before
-        :meth:`add_registry` installs the runner it starts."""
+        :meth:`add_registry` installs the runner it starts. Only the first load passes
+        ``lane_anchor_check``, for its FhirLookup CA check (vault BACKLOG #3582): that check
+        writes audit rows, which a dry run never does."""
         return RegistryRunner(
             registry,
             self.store,
@@ -1530,9 +1534,7 @@ class Engine:
             simulate_all=self._shadow_settings.simulate_all_egress,
             env_values=self._env_values,
             coordinator=self._coordinator,
-            # The first load checks each FhirLookup CA on it (vault BACKLOG #3582), through the
-            # check the started runner later uses, so the two share its memory of the last verdict.
-            lane_anchor_check=self._lane_anchor_check,
+            lane_anchor_check=lane_anchor_check,
         )
 
     def _refuse_shard_universe_change(self, registry: Registry) -> None:
@@ -1567,9 +1569,9 @@ class Engine:
         # so it runs on a runner that is not installed yet: installed first, a concurrent reload
         # could take it, unstarted, as the live runner in that window. Nothing yields between
         # add_registry below and the start taking the runner's reload lock.
-        checker = self._check_runner(registry)
-        # Vault BACKLOG #3582: this load is the start, so a lookup its CA check fails is isolated,
-        # as at any start, and a CA the build could not load is met as a trust anchor first. The
+        checker = self._check_runner(registry, lane_anchor_check=self._lane_anchor_check)
+        # Vault BACKLOG #3582: a lookup its CA check fails is isolated, as at a start, and a CA
+        # the build could not load is met as a trust anchor first. The
         # build check leaves such a lookup out, and the start below is handed what this check
         # found, so it isolates the lookup and runs no lookup CA check again.
         refused = await checker.check_fhir_lookup_anchors(registry, env_values)

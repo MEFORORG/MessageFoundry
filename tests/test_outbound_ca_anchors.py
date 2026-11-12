@@ -997,6 +997,110 @@ async def test_a_lookup_store_fault_does_not_hide_a_refused_lane_ca_at_reload(
     assert dials == []
 
 
+def _stopped_lookup_check(store: MessageStore) -> tuple[Any, list[bool]]:
+    """A lane check whose ``FhirLookup`` calls the store stops once the flag it returns is set."""
+    check = ta.make_lane_anchor_check(store, enforcing=True)
+    stopped = [False]
+
+    async def faulty(direction: str, name: str, settings: Any) -> None:
+        if stopped[0] and direction == "fhir_lookup":
+            raise ta.AnchorStoreUnavailable("the store refused the audit read")
+        await check(direction, name, settings)
+
+    return faulty, stopped
+
+
+async def test_a_lookup_store_fault_refuses_a_reload_of_a_runner_not_running(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """Review round 2 of the vault BACKLOG #3582 repair: a runner not yet started runs no lane
+    check, so a store fault in its reload's lookup check refuses there, and the graph is not
+    swapped. Red under: that refusal deleted, which installs the new graph unchecked."""
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _lookup_graph(cfg, ca, _sha(ca))
+    faulty, stopped = _stopped_lookup_check(store)
+    first = load_config(cfg)
+    runner = RegistryRunner(
+        first,
+        store,
+        egress=EgressSettings(deny_by_default=False),
+        lane_anchor_check=faulty,
+    )
+    stopped[0] = True
+    with pytest.raises(WiringError) as refused:
+        await runner.reload(load_config(cfg))
+    assert isinstance(refused.value.__cause__, ta.AnchorStoreUnavailable)
+    assert runner.registry is first
+
+
+async def test_a_lookup_store_fault_outranks_a_build_failure_at_reload(
+    store: MessageStore, tmp_path: Path, judged: None, dials: list[str]
+) -> None:
+    """Review round 2 of the vault BACKLOG #3582 repair: a store outage in the reload's lookup
+    check refuses the reload as a store fault, not as the bad config a build failure would name,
+    as it did when that fault was raised before the build check. Red under: the build failure
+    raised as it is."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _lookup_graph(cfg, ca, _sha(ca))
+    faulty, stopped = _stopped_lookup_check(store)
+    from messagefoundry.pipeline import Engine
+
+    engine = Engine(
+        store,
+        registry_preflight=ta.make_registry_anchor_preflight(store, enforcing=True),
+        lane_anchor_check=faulty,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        await _start_like_serve(engine, cfg)
+        feed = cfg / "feed.py"
+        # A second outbound the build check refuses: its env() value does not resolve.
+        feed.write_text(
+            feed.read_text(encoding="utf-8")
+            + "from messagefoundry import env\n"
+            + "outbound('OB_BAD', File(directory=env('MEFOR_E5_UNSET_DIR')))\n",
+            encoding="utf-8",
+        )
+        stopped[0] = True
+        with pytest.raises(WiringError) as refused:
+            await engine.reload_detail(cfg)
+        assert isinstance(refused.value.__cause__, ta.AnchorStoreUnavailable), refused.value
+        assert refused.value.__context__ is None
+    finally:
+        await engine.stop()
+    assert dials == []
+
+
+async def test_a_reload_handed_a_pass_for_another_graph_checks_its_lookups(
+    store: MessageStore, tmp_path: Path, judged: None, dials: list[str]
+) -> None:
+    """Review round 2 of the vault BACKLOG #3582 repair: a DR activation's lookup pass skips the
+    reload's lookup CA check only for the graph and values it checked. A graph that changed in
+    between is checked again, so its refused CA refuses. Red under: ``covers`` ignoring the
+    graph."""
+    ca = _ca(tmp_path)
+    good = tmp_path / "good"
+    _lookup_graph(good, ca, _sha(ca))
+    bad = tmp_path / "bad"
+    _lookup_graph(bad, ca, "00" * 32)
+    engine = _engine(store)
+    try:
+        runner = await _start_like_serve(engine, good)
+        passed = await runner.refuse_on_fhir_lookup_anchors(runner.registry)
+        assert passed.covers(runner.registry, runner.env_values)
+        with pytest.raises(WiringError, match=_PIN_MISMATCH):
+            await runner.reload(load_config(bad), fhir_lookup_anchors=passed)
+        # The control: the same pass on the graph it checked skips the check and reloads.
+        await runner.reload(fhir_lookup_anchors=passed)
+    finally:
+        await engine.stop()
+    assert dials == []
+
+
 async def test_a_long_lookup_name_keeps_the_advice_in_its_record(
     store: MessageStore, tmp_path: Path, judged: None, dials: list[str]
 ) -> None:

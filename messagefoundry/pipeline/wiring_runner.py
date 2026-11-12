@@ -8329,10 +8329,20 @@ class RegistryRunner:
                 lookups = await self.refuse_on_fhir_lookup_anchors(
                     new_registry, applied_values, defer_store_fault=True
                 )
-            await self.build_check_off_loop(new_registry, new_env_values, now=now)
-            if lookups.store_fault is not None and not self._running:
-                # No lane check runs below on a graph that is not running, so the store fault
-                # refuses here, before anything changes (BACKLOG #3091).
+            try:
+                await self.build_check_off_loop(new_registry, new_env_values, now=now)
+            except WiringError:
+                if lookups.store_fault is None:
+                    raise
+                # The store fault outranks a build failure, as it did when it was raised before
+                # the build check, so a store outage never reads as a bad config. Raised outside
+                # the handler, so the build failure rides neither its cause nor its context.
+                build_refused = True
+            else:
+                build_refused = False
+            if lookups.store_fault is not None and (build_refused or not self._running):
+                # No lane check runs below when the build check refused or the graph is not
+                # running, so the store fault refuses here, before anything changes (BACKLOG #3091).
                 error = connection_anchor_failure(lookups.store_fault)
                 raise error from error.__cause__
             if new_env_values is not None:

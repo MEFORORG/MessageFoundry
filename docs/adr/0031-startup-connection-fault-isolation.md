@@ -414,10 +414,12 @@ activation runs that check inside its preflight instead, which `[dr].takeover_ti
 bounds (vault BACKLOG #3094), and hands the result to its reload, which runs no lookup CA check
 again unless another reload changed the graph in between. The reload still loads each
 lookup's file as it builds the lookup, with no bound, as it loads a lane's. In a reload, a check the store stopped
-refuses only once no lookup or lane CA is refused (BACKLOG #3091). In a DR activation's
+refuses only once no lookup or lane CA is refused, and ahead of a build-check failure
+(BACKLOG #3091). In a DR activation's
 preflight it refuses there, as the preflight's other checks do. An engine started with no graph takes
-its first one by reload, and that load is a start: it checks each lookup before its build check,
-which leaves out one the check refused, so that lookup is isolated as at any other start. On a passive DR standby the lookup's line says that `POST /dr/activate` needs it. A reload with the cause fixed builds the lookup again, and so does a
+its first one by reload. That load checks each lookup CA before its build check, which leaves
+out a lookup the check refused, so that lookup is isolated as at a start. Any other lookup
+fault its build check meets still refuses that whole load. On a passive DR standby the lookup's line says that `POST /dr/activate` needs it. A reload with the cause fixed builds the lookup again, and so does a
 restart. Rule 3, the inbound listener CA, is untouched.
 
 **Consequences.** A start with a broken lookup CA comes up with that lookup failed, where before

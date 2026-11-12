@@ -85,8 +85,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
      audit row, and the rest of the graph comes up.
    * A ``FhirLookup`` is checked as the runner builds the lookup executor at start, through the
      same lane check under its own label (vault BACKLOG #3582). An engine started with no graph
-     takes its first one by reload, and that load is the start: it checks each lookup before
-     its build check, which leaves out one the check refused. A refusal fails that lookup only,
+     takes its first one by reload. That load checks each lookup CA before its build check,
+     which leaves out one the check refused, so that one is isolated as at a start. A refusal fails that lookup only,
      with the audit row, as a lookup that fails to build is isolated (vault BACKLOG #3008): it is
      recorded failed and alerted, every Handler call to it fails closed, and the rest of the graph
      comes up. Nothing is dialled for it.
@@ -102,7 +102,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
      activation checks them inside its bounded preflight instead, and its reload checks them
      again only if another reload changed the graph in between. Its build still loads each
      lookup's file, with no bound, as a lane's build loads its own. In a reload, a check the
-     store stopped refuses only once no lookup or lane CA is refused (BACKLOG #3091). In a
+     store stopped refuses only once no lookup or lane CA is refused, and ahead of a
+     build-check failure (BACKLOG #3091). In a
      DR activation's preflight it refuses there, as the preflight's other checks do.
 
    **Not covered: the checked bytes are not the loaded bytes here.** These hops build their
