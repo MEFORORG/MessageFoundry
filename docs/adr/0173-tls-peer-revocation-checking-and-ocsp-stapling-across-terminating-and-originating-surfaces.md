@@ -1246,18 +1246,20 @@ ruling:
   tested.** The ruling's "then test it" half has two recorded results. The test needs a SQL
   Server whose certificate can be revoked. A control connection to a certificate that is not
   revoked shows that a refusal comes from the revocation. The amendment of 2026-11-11 below
-  states what the runs measured. *(Until 2026-11-11 this bullet read: "**The drivers' own
-  revocation behaviour is still unmeasured.** The ruling's "then test it" half is owed. It needs a SQL Server whose certificate can be revoked. A
-  control connection to a certificate that is not revoked shows that a refusal comes from the
-  revocation. Until #3009 runs, nothing here says whether Driver 18 checks revocation.")*
+  states what the runs measured, and that the run on the SQL Server test box is still owed.
+  *(Until 2026-11-11 this bullet read: "**The drivers' own revocation behaviour is still
+  unmeasured.** The ruling's "then test it" half is owed. It needs a SQL Server whose certificate
+  can be revoked. A control connection to a certificate that is not revoked shows that a refusal
+  comes from the revocation. Until #3009 runs, nothing here says whether Driver 18 checks
+  revocation.")*
 - **What a result would mean for the grade is not ruled.** If Driver 18 checks, the text can say
   under what conditions. If it does not, R6 does not say whether the gap stands or the owner's
   other two options come back. BACKLOG #3009's third closing step says the gap stands. That is
   the ledger row's wording, not the owner's, so it is the owner's to decide when a result exists.
-  *(Note 2026-11-11: two recorded results exist, in the amendment of that date below. The owner
-  has not ruled on what they mean for the grade, and that amendment does not change the grade:
-  the five rows keep the grade R6 gives them, as Manager decision d20261112T022118464-c27c39
-  keeps it.)*
+  *(Note 2026-11-11: two recorded results exist, in the amendment of that date below. That
+  amendment does not change the grade. A Manager decided under the owner's delegation of
+  2026-11-11 that the five rows keep the grade R6 gives them, decision
+  d20261112T022118464-c27c39, which counts as the owner's ruling under CLAUDE.md section 5.)*
 
 *(Until 2026-10-11 this paragraph read: "**What is open on the five ODBC hops.** BACKLOG #2194 names
 three outcomes for a hop: a guard, a documented driver control, or an accepted gap. This note
@@ -1303,9 +1305,10 @@ ruled*, under the ruling above, holds.
   run's record says it ran inside a virtual machine, after a revert to checkpoint
   `post-3009-clean-2026-10-16`, a tightening of folder permissions and a new checkpoint,
   `post-3009-acl-2026-10-17`, and does not say which machine that is. An earlier scripted run
-  stopped at Step 2, as designed, and changed nothing. No record says a run took place on the SQL
-  Server test box. The run there is still owed, by Manager decision d20261112T022119877-2ccc8b,
-  made under the owner's delegation.
+  stopped at Step 2, as designed, and changed nothing. Neither record says a run took place on the
+  SQL Server test box. The run there is still owed, and BACKLOG #3009's step 2 stays open for it:
+  a Manager decided so under the owner's delegation of 2026-11-11, decision
+  d20261112T022119877-2ccc8b.
 - **Versions.** ODBC Driver 18 for SQL Server, 64-bit: `msodbcsql18.dll` ProductVersion 18.7,
   build 1, revision 1, reporting driver version `18.07.0001`. Windows Server 2022 Datacenter,
   build 20348, update revision 5256. SQL Server 2022 RTM, 16.0.1000.6. Both records list
@@ -1393,12 +1396,10 @@ does apply the pin, the exact match replaces the standard checks, the trust chai
 `connection_string` now sends `ServerCertificate=` together with `Encrypt=strict`, in place of
 `Encrypt=yes`, and both sit in the TLS tail, after every other part (*code*). *(**CORRECTED
 2026-11-11:** this sentence ended "and both stay inside the last-wins tail", tagged *code*. The
-code puts the tail last and does not make it win. The module docstring of
-`messagefoundry/odbc_dsn.py` says Microsoft's ODBC reference for `SQLDriverConnect` has a driver
-use the first occurrence of a repeated keyword, that Microsoft's SQL Server driver has not been
-measured either way, and that the position is not the guard against a second TLS keyword.)* The
-reason: on the Driver 18.7 build
-tested on Windows, the `ServerCertificate` pin was enforced with `Encrypt=strict` and was not enforced with
+code puts the tail last and does not make it win. Which occurrence of a repeated keyword a driver
+uses, and what guards against a second TLS keyword, is stated in the module docstring of
+`messagefoundry/odbc_dsn.py`.)* The reason: on the Driver 18.7 build tested on Windows, the
+`ServerCertificate` pin was enforced with `Encrypt=strict` and was not enforced with
 `Encrypt=yes`; no other `Encrypt` value was tested. Microsoft's page, quoted above, documents the
 keyword for strict encryption (*documentation*). The decision rests on a private test record, vault
 BACKLOG #3009, and its contents are not repeated here. Four consequences follow, and they are
