@@ -59,11 +59,11 @@ from messagefoundry.pipeline.cluster import (
     StepdownOutcome,
     StepdownReleaseUnconfirmed,
     acquire_leadership_lock,
-    claim_returned_late,
     default_node_id,
     lease_release_unconfirmed,
     members_from_node_rows,
     note_stamp_fault,
+    past_fence,
     paused_read_budget_seconds,
     rows_affected,
     run_maintenance_loop,
@@ -515,7 +515,7 @@ class SqlServerCoordinator:
             held = await self._claim_or_renew_lease()
             if held:
                 self._last_renew_ok = issued_at  # stamp for the fence watchdog
-                if claim_returned_late(issued_at, self._monotonic(), self._fence_timeout):
+                if past_fence(issued_at, self._monotonic(), self._fence_timeout):
                     # BACKLOG #5711: the clamp bounds the borrow and statement but not the COMMIT
                     # (SqlServerStore._fetchone_clamped), so a claim can return past the fence. The
                     # row is ours, so the baseline stays for may_own_lease_row; fence, never promote.
@@ -645,7 +645,7 @@ class SqlServerCoordinator:
         last = self._last_renew_ok
         if last is None:
             return  # defensive: _is_leader is only set alongside _last_renew_ok
-        if self._monotonic() - last > self._fence_timeout:
+        if past_fence(last, self._monotonic(), self._fence_timeout):
             self._is_leader = False
             self._leader_epoch = None  # fenced: drop the now-stale token (H1)
             log.warning(

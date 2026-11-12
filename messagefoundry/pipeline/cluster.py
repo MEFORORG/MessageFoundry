@@ -640,11 +640,12 @@ def lease_release_unconfirmed(node_id: str) -> str:
     )
 
 
-def claim_returned_late(issued_at: float, now: float, fence_timeout_seconds: float) -> bool:
-    """Whether a lease claim issued at ``issued_at`` returned past the fence timeout, by the same
-    strict test the fence watchdog applies to that baseline (BACKLOG #5711). Shared by both
-    coordinators so the two cannot drift from each other or from ``_check_fence``."""
-    return now - issued_at > fence_timeout_seconds
+def past_fence(baseline: float, now: float, fence_timeout_seconds: float) -> bool:
+    """Whether more than the fence timeout has passed since ``baseline``, a lease claim's issue
+    instant on the node's monotonic clock. The one test both coordinators' fence watchdogs apply,
+    and since BACKLOG #5711 their ticks too, to a claim that held but returned late, so the tick
+    and the watchdog cannot disagree about when a baseline has expired."""
+    return now - baseline > fence_timeout_seconds
 
 
 def fence_tick_seconds(fence_timeout_seconds: float) -> float:
@@ -1728,7 +1729,7 @@ class DbCoordinator:
             held = await self._claim_or_renew_lease()
             if held:
                 self._last_renew_ok = issued_at
-                if claim_returned_late(issued_at, self._monotonic(), self._fence_timeout):
+                if past_fence(issued_at, self._monotonic(), self._fence_timeout):
                     # BACKLOG #5711, in lockstep with SqlServerCoordinator. The row is ours, so the
                     # baseline stays stamped for may_own_lease_row, but it is already past the
                     # fence: fence now rather than promote on it.
@@ -1917,7 +1918,7 @@ class DbCoordinator:
         last = self._last_renew_ok
         if last is None:
             return  # leader is only set alongside _last_renew_ok; defensive no-op
-        if self._monotonic() - last > self._fence_timeout:
+        if past_fence(last, self._monotonic(), self._fence_timeout):
             self._is_leader = False
             # Drop the held epoch on self-fence too: a fenced node must not present a (now-stale) token.
             self._leader_epoch = None
