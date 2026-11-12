@@ -514,10 +514,10 @@ async def test_credential_fault_stop_is_not_resumed_by_the_next_window(
 async def test_the_window_open_does_not_start_a_paused_lane_a_stop_holds(
     store: MessageStore, tmp_path: Path, claim_mode: str
 ) -> None:
-    # The start refusal, which the test above never reaches: a STOPPED outbound still reads as
-    # running, so its window open has nothing to start. An operator pause of the held lane makes it
-    # read as not running. A pause is not a start, so the hold stands, and the window open must not
-    # resume the lane (pooled: the pause turned STOPPED into PAUSED, which a resume re-arms).
+    # The start refusal over an operator pause of the held lane. A STOPPED outbound reads as not
+    # running too (BACKLOG #5701), so the test above reaches the refusal as well; here the lane is
+    # paused. A pause is not a start, so the hold stands, and the window open must not resume the
+    # lane (pooled: the pause turned STOPPED into PAUSED, which a resume re-arms).
     schedule = _weekday_window()
     clock = _Clock(_IN_WINDOW)
     runner, faulty = await _start_credential_fault_rig(store, tmp_path, claim_mode, clock, schedule)

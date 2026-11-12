@@ -3212,9 +3212,33 @@ class RegistryRunner:
         **False for every lane while :attr:`_delivery_halted`**, whatever the pause set says. A lane a
         door never gated (or one an unguarded path brought up) is not in ``_outbound_paused`` and was
         reporting as actively delivering while the claim gate refused every row — the console's own
-        running/stopped split reading the opposite of what the engine does."""
+        running/stopped split reading the opposite of what the engine does.
+
+        **False for a lane a STOP holds down** (:meth:`_outbound_stopped`, BACKLOG #5701), for the
+        same reason: it is not in ``_outbound_paused`` either, and delivers nothing until an operator
+        start or a reload re-arms it."""
         self._validate_outbound(name)
-        return self._running and not self._delivery_halted and name not in self._outbound_paused
+        return (
+            self._running
+            and not self._delivery_halted
+            and name not in self._outbound_paused
+            and not self._outbound_stopped(name)
+        )
+
+    def _outbound_stopped(self, name: str) -> bool:
+        """Whether outbound ``name``'s lane is halted by a STOP rather than a pause (BACKLOG #5701):
+        one only an operator may lift (:attr:`_stop_held`: at least a credential or configuration
+        fault, the internal-error STOP policy, or a pooled T17 or claimer-death stop), or a pooled
+        lane its dispatcher holds STOPPED without such a record, as a leadership-loss STOP leaves it.
+
+        The hold is recorded at the STOP site a little before a pooled lane reaches STOPPED, so this
+        reads True while the episode the STOP ends is still finishing; the lane is not delivering
+        then either. The record is cleared where the lane is re-armed (:meth:`_schedule_holds` names
+        those primitives), so it does not outlive the STOP."""
+        if ("outbound", name) in self._stop_held:
+            return True
+        d = self._dispatchers.get(Stage.OUTBOUND)
+        return d is not None and d.stopped(name)
 
     def outbound_quiesced(self, name: str) -> bool:
         """Whether a PAUSED outbound has fully DRAINED to zero in-flight — the PURGE precondition. True
@@ -3229,10 +3253,11 @@ class RegistryRunner:
 
     def outbound_status(self, name: str) -> str:
         """Delivery status for one outbound: 'log_halted' (#122 — this process cannot write its
-        application log, so NO lane delivers), 'running' (not paused), 'stopping' (paused, an
-        in-flight head still resolving — the quiescence Event not yet set), or 'stopped' (paused AND
-        quiesced — zero in-flight, safe to purge). A name not in ``_outbound_paused`` → 'running' (the
-        status-plumbing caller already special-cases failed/filtered; a real unknown 404s on control).
+        application log, so NO lane delivers), 'running' (not paused and not STOP-held), 'stopping'
+        (paused, an in-flight head still resolving — the quiescence Event not yet set), or 'stopped'
+        (paused AND quiesced — zero in-flight, safe to purge — or held down by a STOP). A name not in
+        ``_outbound_paused`` and not STOP-held → 'running' (the status-plumbing caller already
+        special-cases failed/filtered; a real unknown 404s on control).
 
         **'log_halted' is FIRST and process-wide, because the halt is (ADR 0189).** The cause is a
         root-logger handler set with no per-connection attribution to narrow it with, so while
@@ -3245,11 +3270,15 @@ class RegistryRunner:
 
         Purge-eligibility is unaffected and deliberately separate: :meth:`outbound_quiesced` still
         answers off the pause set, so a halted-and-quiesced lane stays purgeable (the API surfaces
-        that as its own ``paused`` field, never collapsed into this string)."""
+        that as its own ``paused`` field, never collapsed into this string).
+
+        **A lane a STOP holds down reads 'stopped'** (:meth:`_outbound_stopped`, BACKLOG #5701), not
+        'running': it delivers nothing until an operator start or a reload re-arms it. A paused lane
+        is read first, so a pause over a STOP still reports its own quiescence."""
         if self._delivery_halted:
             return "log_halted"
         if name not in self._outbound_paused:
-            return "running"
+            return "stopped" if self._outbound_stopped(name) else "running"
         return "stopped" if self.outbound_quiesced(name) else "stopping"
 
     def outbound_waiting_for_reply(self, name: str) -> bool:

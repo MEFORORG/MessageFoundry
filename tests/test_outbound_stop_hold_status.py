@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
-from messagefoundry.store import MessageStore
+from messagefoundry.store import MessageStore, Stage
 from tests.test_connection_scheduler import (
     _IN_WINDOW,
     _Clock,
@@ -45,6 +45,36 @@ async def _stopped_rig(
     good = _CollectingDestination()
     runner._destinations[_OB] = good  # type: ignore[assignment]  # the operator fixed the credential
     return runner, good
+
+
+@pytest.mark.parametrize("claim_mode", ["per_lane", "pooled"])
+async def test_a_lane_a_credential_fault_stopped_reads_as_stopped(
+    store: MessageStore, tmp_path: Path, claim_mode: str
+) -> None:
+    """BACKLOG #5701. Before the fix both reads saw only the halt latch and the pause set, so a
+    lane the STOP had taken down read as running while it delivered nothing."""
+    runner, _ = await _stopped_rig(store, tmp_path, claim_mode)
+    try:
+        assert ("outbound", _OB) in runner._stop_held  # the control: the STOP really held it
+        assert not runner.outbound_running(_OB)
+        assert runner.outbound_status(_OB) == "stopped"
+    finally:
+        await runner.stop()
+
+
+async def test_a_pooled_lane_its_dispatcher_holds_stopped_reads_as_stopped(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """A pooled lane at STOPPED with no operator hold recorded, as a leadership-loss STOP leaves
+    one, is not delivering either, so the reads say so."""
+    runner, _ = await _stopped_rig(store, tmp_path, "pooled")
+    try:
+        runner._stop_held.discard(("outbound", _OB))
+        assert runner._dispatchers[Stage.OUTBOUND].stopped(_OB)  # the control
+        assert not runner.outbound_running(_OB)
+        assert runner.outbound_status(_OB) == "stopped"
+    finally:
+        await runner.stop()
 
 
 @pytest.mark.parametrize("claim_mode", ["per_lane", "pooled"])

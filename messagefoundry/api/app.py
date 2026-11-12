@@ -753,8 +753,8 @@ def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
 def _live_outbound_status(rr: RegistryRunner, name: str) -> str:
     """One outbound's live display state, gated on the runner's own ``running`` flag.
 
-    ``outbound_status`` reports "running" for any lane merely ABSENT from ``_outbound_paused`` and never
-    reads the graph flag, so ungated it answers "running" on a node whose graph is down -- the ADR 0157
+    ``outbound_status`` reports "running" for any lane ABSENT from ``_outbound_paused`` that no STOP
+    holds down (BACKLOG #5701) and never reads the graph flag, so ungated it answers "running" on a node whose graph is down -- the ADR 0157
     demoted follower, where ``_stop_graph`` stops only the runner and the API keeps serving. Display
     reads of ``outbound_status`` go through here so the rows and graph nodes built from it cannot
     disagree (BACKLOG #1568 gated the standalone row; #1814 the traffic-edge row and
