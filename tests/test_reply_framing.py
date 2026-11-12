@@ -26,11 +26,13 @@ import io
 import logging
 import pickle
 import socket
+import ssl
 import sys
 import threading
 import unicodedata
 import urllib.request
-from collections.abc import Iterator
+from collections import Counter
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import NamedTuple
 
@@ -1388,7 +1390,14 @@ def test_a_proxy_handler_may_sit_on_a_strict_opener() -> None:
 
 #: Names of the calls that make an opener or a connection with the stock response class.
 _STOCK_OPENER_CALLS = frozenset(
-    {"build_opener", "urlopen", "OpenerDirector", "HTTPConnection", "HTTPSConnection"}
+    {
+        "build_opener",
+        "urlopen",
+        "urlretrieve",
+        "OpenerDirector",
+        "HTTPConnection",
+        "HTTPSConnection",
+    }
 )
 
 #: Import origins that share a name above but build no urllib opener or ``http.client``
@@ -1480,44 +1489,250 @@ def _call_origins(func: ast.expr, bindings: _Bindings) -> set[tuple[str, bool]]:
     return {(f"{root}.{tail}" if tail else root, imported) for root, imported in roots}
 
 
-def _stock_calls(tree: ast.AST) -> list[tuple[int, str]]:
-    """``(line, origin)`` for each call whose origin ends in a stock name.
+def _is_stock(origin: str, imported: bool, names: frozenset[str] = _STOCK_OPENER_CALLS) -> bool:
+    """Any part of ``origin`` is one of ``names``, and no allow-listed import gave it."""
+    if imported and any(
+        origin == entry or origin.startswith(entry + ".") for entry in _NOT_STOCK_OPENERS
+    ):
+        return False
+    return not names.isdisjoint(origin.split("."))
+
+
+def _name_chain(node: ast.expr) -> Iterator[ast.expr]:
+    """The ``Name``/``Attribute``/``getattr`` nodes :func:`_call_origins` reads to resolve ``node``,
+    and nothing under them, so a call inside a receiver, as in ``urlopen(u).read``, is still
+    judged on its own."""
+    while True:
+        yield node
+        if isinstance(node, ast.Attribute):
+            node = node.value
+        elif target := _getattr_target(node):
+            node = target[0]
+        else:
+            return
+
+
+def _stock_calls(tree: ast.AST, module: str | None = None) -> list[tuple[int, str]]:
+    """``(line, origin)`` for each call, and each other use of a name as a value, whose origin
+    names a stock name in any part, and for each class with such a base, or with a base naming a
+    class ``_SANCTIONED_STOCK_SITES`` lets stand, whose origin reads ``class Name(base origin)``.
+    A value naming a sanctioned class counts too, outside ``module``, the file under
+    ``messagefoundry/`` that defines that class.
 
     The import decides, not the spelling: ``from http.client import HTTPConnection as C`` then
     ``C(host)`` is a stock call, and starlette's ``HTTPConnection`` under its own name is not. An
-    origin outside urllib and ``http.client`` that ends in a stock name is still an offence unless
+    origin outside urllib and ``http.client`` that names a stock name is still an offence unless
     ``_NOT_STOCK_OPENERS`` names it, because urllib3's connections, for one, read a reply head with
     ``http.client``'s class too. The allow-list clears only an origin an import gave, never a
-    spelling.
+    spelling. Any part counts, so ``urllib.request.OpenerDirector.add_handler(opener, handler)``,
+    which skips a subclass's own ``add_handler``, is an offence too. A value counts, so a stock
+    class held in a variable, handed to ``do_open``, set as a pool's ``ConnectionCls`` or put in
+    the bases ``type`` is called with is an offence; a name in an annotation is not, though a call
+    inside one is. A base is resolved the way a call's target is, so a subclass of
+    ``urllib.request.OpenerDirector`` is found under any alias or dotted spelling. So is a class
+    statement built on a sanctioned class, and outside the module that defines it, a value naming
+    one, such as a ``type`` call's bases, since that sanction's check sees only the class itself.
 
-    At least these pass unseen: a stock class held in a variable first, as in
-    ``C = http.client.HTTPConnection`` then ``C(host)``, which a planted control pins; and a stock
-    name re-exported under another name by a second module and imported from there, which a scan
-    of one file at a time cannot see and no planted control pins."""
+    At least these pass unseen: a stock class reached by ``getattr`` with a name that is not a
+    constant; a stock name re-exported under another name by a second module and imported from
+    there, which a scan of one file at a time cannot see; a urllib3 or requests constructor, such
+    as ``urllib3.PoolManager`` or ``requests.Session``, that builds a stock connection inside the
+    library; a stock handler driven directly, as in ``urllib.request.HTTPSHandler().https_open``,
+    since engine code builds stock handlers to hand to build_strict_opener; a value naming a
+    sanctioned class inside the module that defines it; and a handler added to a sanctioned opener
+    by ``super`` or by editing its handler tables, which ``_ConfinedOpener`` itself refuses when it
+    opens. No planted control pins these."""
     bindings = _bindings(tree)
+    elsewhere = frozenset(name for name, home in _SANCTIONED_CLASSES.items() if home != module)
     found: list[tuple[int, str]] = []
+    judged: set[int] = set()  # names a call, a base or an annotation already accounts for
+    for node in ast.walk(tree):
+        annotations: list[ast.expr | None] = []
+        if isinstance(node, (ast.arg, ast.AnnAssign)):
+            annotations.append(node.annotation)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            annotations.append(node.returns)
+        judged.update(
+            id(n)
+            for a in annotations
+            if a is not None
+            for n in ast.walk(a)
+            if isinstance(n, (ast.Name, ast.Attribute))
+        )
+    # ast.walk is breadth-first, so an outer name is judged before the names inside it. A set, so
+    # one use whose root resolves two ways is reported once per origin; sorted only so a failure
+    # lists them in a stable order.
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
-            # sorted only so a failure lists a call's origins in a stable order.
-            for origin, imported in sorted(_call_origins(node.func, bindings)):
-                if origin.rpartition(".")[2] in _STOCK_OPENER_CALLS and not (
-                    imported and origin in _NOT_STOCK_OPENERS
-                ):
-                    found.append((node.lineno, origin))
+            judged.update(id(n) for n in _name_chain(node.func))
+            calls = {o for o, i in _call_origins(node.func, bindings) if _is_stock(o, i)}
+            found.extend((node.lineno, origin) for origin in sorted(calls))
+        elif isinstance(node, ast.ClassDef):
+            judged.update(id(n) for base in node.bases for n in _name_chain(base))
+            names = _STOCK_OPENER_CALLS | frozenset(_SANCTIONED_CLASSES)
+            bases = {
+                origin
+                for base in node.bases
+                for origin, imported in _call_origins(base, bindings)
+                if _is_stock(origin, imported, names)
+            }
+            found.extend((node.lineno, f"class {node.name}({origin})") for origin in sorted(bases))
+        elif (
+            isinstance(node, (ast.Name, ast.Attribute))
+            and isinstance(node.ctx, ast.Load)
+            and id(node) not in judged
+        ):
+            judged.update(id(n) for n in _name_chain(node))
+            names = _STOCK_OPENER_CALLS | elsewhere
+            values = {o for o, i in _call_origins(node, bindings) if _is_stock(o, i, names)}
+            found.extend((node.lineno, origin) for origin in sorted(values))
     return found
+
+
+def _strict_opener_is_strict() -> None:
+    """build_strict_opener's own call: it hands build_opener the strict http and https handlers."""
+    _assert_strict(build_strict_opener())
+
+
+def _strict_connections_read_strictly() -> None:
+    """The strict connections: each one's response_class is StrictHTTPResponse, so each reads a
+    reply head the way build_strict_opener's handlers do."""
+    from messagefoundry.transports import bounded_read
+
+    connections: list[type] = [
+        bounded_read._StrictHTTPConnection,  # noqa: SLF001
+        bounded_read._StrictHTTPSConnection,  # noqa: SLF001
+    ]
+    try:
+        from messagefoundry.transports import strict_requests
+    except ModuleNotFoundError as exc:
+        # Without the [vault] extra nothing can build its connections, so there is nothing to read.
+        if exc.name not in ("requests", "urllib3"):
+            raise
+    else:
+        pools = strict_requests._narrowed_pool_classes(  # noqa: SLF001
+            ssl.create_default_context, connector="probe", judge_proxy_leg=lambda _c, _h: None
+        )
+        connections += [
+            strict_requests._StrictHeadHTTPConnection,  # noqa: SLF001
+            strict_requests._StrictHeadHTTPSConnection,  # noqa: SLF001
+            pools["https"].ConnectionCls,  # NarrowedHTTPSConnection
+        ]
+    for connection in connections:
+        assert getattr(connection, "response_class", None) is StrictHTTPResponse, connection
+
+
+def _schema_opener_is_confined() -> None:
+    """xmlschema's opener in parsing/xml/schema.py, which parsing/ cannot build with
+    build_strict_opener from transports/, and which build_opener would fill with urllib's default
+    handlers. The _ConfinedOpener docstring lists the refusals that keep it from opening an http
+    or https URL or reading a reply head; this checks each. That such a URL is refused is also
+    ``tests/test_xml_schema_lockdown.py::test_a_non_file_url_reaching_the_opener_is_a_refused_resource``.
+    """
+    from messagefoundry.parsing.xml.schema import _ConfinedFiles, _ConfinedOpener, _ResourceRefused
+
+    files = _ConfinedFiles(())
+    opener = _ConfinedOpener(files)
+    assert _opener_handlers(opener) == [files]
+    assert {n for n in dir(files) if n.endswith("_open")} == {"file_open", "unknown_open"}
+    with pytest.raises(TypeError, match="no other"):
+        opener.add_handler(urllib.request.HTTPHandler())
+    assert _opener_handlers(opener) == [files]
+
+    class _WithHttps(_ConfinedFiles):
+        def https_open(self, req: urllib.request.Request) -> None:
+            raise AssertionError("never reached")
+
+    with pytest.raises(TypeError, match="no subclass"):
+        _ConfinedOpener(_WithHttps(()))
+    # A non-file scheme is refused before any handler runs.
+    with pytest.raises(_ResourceRefused, match="scheme is not file"):
+        opener.open("https://127.0.0.1:9/x.xsd")
+    # A file URL meets the handler checks; the file is never reached, so it need not exist.
+    file_url = "file:///nonexistent-5537/x.xsd"
+    # A handler that skips add_handler's refusal, as super(_ConfinedOpener, o).add_handler does.
+    urllib.request.OpenerDirector.add_handler(opener, urllib.request.HTTPSHandler())
+    with pytest.raises(TypeError, match="besides its confined-file handler"):
+        opener.open(file_url)
+    # Or one placed straight in a handler table add_handler fills.
+    for table in ("handle_error", "process_request", "process_response"):
+        tampered = _ConfinedOpener(_ConfinedFiles(()))
+        vars(tampered)[table].setdefault("https", []).append(urllib.request.HTTPSHandler())
+        with pytest.raises(TypeError, match="besides its confined-file handler"):
+            tampered.open(file_url)
+
+    def never(*args: object) -> None:
+        raise AssertionError("an injected open method ran")
+
+    # An https_open set on the one handler, which the tables carry in under "https", is not called
+    # through the opener's own open().
+    injected = _ConfinedFiles(())
+    injected.https_open = never  # type: ignore[attr-defined]
+    carrying = _ConfinedOpener(injected)
+    assert vars(carrying)["handle_open"]["https"] == [injected]
+    with pytest.raises(_ResourceRefused, match="scheme is not file"):
+        carrying.open("https://127.0.0.1:9/x.xsd")
+    # A default_open on it, which would run before file_open for a file URL, is refused too.
+    defaulted = _ConfinedFiles(())
+    defaulted.default_open = never  # type: ignore[attr-defined]
+    with pytest.raises(TypeError, match="open method it does not define"):
+        _ConfinedOpener(defaulted).open(file_url)
+
+
+#: ``(module under messagefoundry/, origin as _stock_calls reports it) -> the check it rests on``,
+#: whose docstring says why it may stand. Each must be found exactly once, and the scan runs each
+#: check.
+_SANCTIONED_STOCK_SITES: dict[tuple[str, str], Callable[[], None]] = {
+    ("transports/bounded_read.py", "urllib.request.build_opener"): _strict_opener_is_strict,
+    (
+        "transports/bounded_read.py",
+        "class _StrictHTTPConnection(http.client.HTTPConnection)",
+    ): _strict_connections_read_strictly,
+    (
+        "transports/bounded_read.py",
+        "class _StrictHTTPSConnection(http.client.HTTPSConnection)",
+    ): _strict_connections_read_strictly,
+    (
+        "transports/strict_requests.py",
+        "class _StrictHeadHTTPConnection(urllib3.connection.HTTPConnection)",
+    ): _strict_connections_read_strictly,
+    (
+        "transports/strict_requests.py",
+        "class _StrictHeadHTTPSConnection(urllib3.connection.HTTPSConnection)",
+    ): _strict_connections_read_strictly,
+    (
+        "transports/strict_requests.py",
+        "class NarrowedHTTPSConnection(_StrictHeadHTTPSConnection)",
+    ): _strict_connections_read_strictly,
+    (
+        "parsing/xml/schema.py",
+        "class _ConfinedOpener(urllib.request.OpenerDirector)",
+    ): _schema_opener_is_confined,
+}
+
+#: ``class -> the module defining it`` for each sanctioned ``class Name(...)`` site. A base naming
+#: one is reported, and so is a value naming one outside that module.
+_SANCTIONED_CLASSES = {
+    origin.removeprefix("class ").partition("(")[0]: module
+    for module, origin in _SANCTIONED_STOCK_SITES
+    if origin.startswith("class ")
+}
 
 
 def test_no_engine_module_builds_a_stock_opener() -> None:
     """A source scan, because some openers (the SOAP mutual-TLS one, at least) need key material to
-    build. Every urllib opener in the engine must come from build_strict_opener. Calls are found in
-    the syntax tree, so a docstring that names one is not a call, and each call is judged by where
-    its import says it came from (``_stock_calls``)."""
+    build. Every urllib opener and ``http.client`` connection in the engine must come from
+    build_strict_opener, except the sites ``_SANCTIONED_STOCK_SITES`` names. Calls and class
+    bases are found in the syntax tree, so a docstring that names one is neither, and each is judged
+    by where its import says it came from (``_stock_calls``). Each sanctioned site's check runs
+    here, the ``transports/strict_requests.py`` ones only where the ``[vault]`` extra is installed,
+    since nothing can build those connections without it."""
     for entry in _NOT_STOCK_OPENERS:
         module, _, name = entry.rpartition(".")
         assert hasattr(importlib.import_module(module), name), f"{entry} is not an import origin"
     root = Path(__file__).resolve().parents[1] / "messagefoundry"
     stock: list[str] = []
-    control = 0
+    sanctioned: Counter[tuple[str, str]] = Counter()
     for path in root.rglob("*.py"):
         # utf-8-sig: a byte-order mark would otherwise fail the parse for a reason unrelated to
         # openers.
@@ -1526,15 +1741,19 @@ def test_no_engine_module_builds_a_stock_opener() -> None:
         # import still spells the stock name in the import itself. NFKC is how the parser reads
         # an identifier, so a look-alike spelling is not skipped either.
         normalized = unicodedata.normalize("NFKC", text)
-        if not any(name in normalized for name in _STOCK_OPENER_CALLS):
+        if not any(name in normalized for name in _STOCK_OPENER_CALLS | set(_SANCTIONED_CLASSES)):
             continue
         rel = path.relative_to(root).as_posix()
-        for lineno, origin in _stock_calls(ast.parse(text)):
-            if rel == "transports/bounded_read.py" and origin == "urllib.request.build_opener":
-                control += 1  # the one sanctioned call, inside build_strict_opener
+        for lineno, origin in _stock_calls(ast.parse(text), rel):
+            if (rel, origin) in _SANCTIONED_STOCK_SITES:
+                sanctioned[rel, origin] += 1
             else:
                 stock.append(f"{rel}:{lineno} {origin}")
-    assert control == 1, "the scan did not find build_strict_opener's own call"
+    # Exactly once each: a second site under the same name is not the one sanctioned, and a site
+    # the scan no longer finds means the scan stopped seeing it, or the sanction is stale.
+    assert sanctioned == dict.fromkeys(_SANCTIONED_STOCK_SITES, 1), sanctioned
+    for check in set(_SANCTIONED_STOCK_SITES.values()):
+        check()
     assert stock == [], (
         "build the opener with build_strict_opener; if an import gave the origin and it is another "
         "library's class that builds no urllib opener or http.client connection, add that absolute "
@@ -1605,16 +1824,143 @@ def test_no_engine_module_builds_a_stock_opener() -> None:
             id="strict-opener",
         ),
         pytest.param(
+            "import urllib.request\nclass O(urllib.request.OpenerDirector): pass\nO()",
+            True,
+            id="subclass-of-a-stock-class",
+        ),
+        pytest.param(
+            "from urllib.request import OpenerDirector as D\nclass O(D): pass",
+            True,
+            id="aliased-base",
+        ),
+        pytest.param(
+            "from urllib import request as r\nclass O(object, r.OpenerDirector): pass",
+            True,
+            id="second-base-submodule-alias",
+        ),
+        pytest.param(
+            "import http.client as h\ndef f():\n    class C(h.HTTPSConnection): pass",
+            True,
+            id="nested-subclass-of-a-connection",
+        ),
+        pytest.param(
+            "import urllib.request as ur\nclass O(getattr(ur, 'OpenerDirector')): pass",
+            True,
+            id="getattr-base",
+        ),
+        pytest.param(
+            "import urllib3\nclass C(urllib3.connection.HTTPConnection): pass",
+            True,
+            id="other-library-base",
+        ),
+        pytest.param(
+            "from starlette.requests import HTTPConnection\nclass R(HTTPConnection): pass",
+            False,
+            id="starlette-base",
+        ),
+        pytest.param(
+            "from starlette.requests import HTTPConnection\nHTTPConnection.url_for(c, 'n')",
+            False,
+            id="starlette-attribute",
+        ),
+        pytest.param(
+            "import urllib.request\nurllib.request.OpenerDirector.add_handler(o, h)",
+            True,
+            id="unbound-stock-method",
+        ),
+        pytest.param(
+            "from messagefoundry.parsing.xml.schema import _ConfinedOpener as Q\nclass W(Q): pass",
+            True,
+            id="subclass-of-a-sanctioned-class",
+        ),
+        pytest.param(
+            "from messagefoundry.transports import bounded_read as b\n"
+            "class L(b._StrictHTTPSConnection): pass",
+            True,
+            id="subclass-of-a-sanctioned-connection",
+        ),
+        pytest.param(
+            "import urllib.request\nclass H(urllib.request.BaseHandler): pass",
+            False,
+            id="handler-base",
+        ),
+        pytest.param(
             "import urllib.request\ndef f(o: urllib.request.OpenerDirector): return o.open('u')",
             False,
             id="annotation-not-a-call",
         ),
-        # A gap _stock_calls names. If it starts to read as an offence, the guard got wider: move
-        # it up and correct that docstring.
         pytest.param(
             "import http.client\nC = http.client.HTTPConnection\nC('h')",
+            True,
+            id="class-held-in-a-variable",
+        ),
+        pytest.param(
+            "import urllib.request\nO = type('O', (urllib.request.OpenerDirector,), {})",
+            True,
+            id="type-call-with-a-stock-base",
+        ),
+        pytest.param(
+            "import http.client\ndef https_open(self, req):\n"
+            "    return self.do_open(http.client.HTTPSConnection, req)",
+            True,
+            id="stock-class-handed-to-do-open",
+        ),
+        pytest.param(
+            "import urllib3\nclass P(urllib3.HTTPSConnectionPool):\n"
+            "    ConnectionCls = urllib3.connection.HTTPSConnection",
+            True,
+            id="stock-connection-as-a-pool-class",
+        ),
+        pytest.param(
+            "import urllib.request\ndata = urllib.request.urlopen(u).read()",
+            True,
+            id="chained-call-on-a-stock-call",
+        ),
+        pytest.param(
+            "import urllib.request\nurllib.request.build_opener(h).open(r)",
+            True,
+            id="chained-open-on-a-stock-opener",
+        ),
+        pytest.param(
+            "import urllib.request\nstatus = urllib.request.urlopen(u).status",
+            True,
+            id="attribute-of-a-stock-call",
+        ),
+        pytest.param(
+            "import urllib.request\nfrom typing import Annotated\n"
+            "def f(x: Annotated[int, urllib.request.build_opener()]): ...",
+            True,
+            id="call-inside-an-annotation",
+        ),
+        pytest.param(
+            "import http.client, six\n"
+            "class X(six.with_metaclass(M, http.client.HTTPConnection)): ...",
+            True,
+            id="stock-class-inside-a-base-call",
+        ),
+        pytest.param(
+            "import urllib.request\nurllib.request.urlretrieve(u, f)", True, id="urlretrieve"
+        ),
+        pytest.param(
+            "from messagefoundry.parsing.xml.schema import _ConfinedOpener\nQ = _ConfinedOpener",
+            True,
+            id="sanctioned-class-held-in-a-variable",
+        ),
+        pytest.param(
+            "from messagefoundry.transports import bounded_read as b\n"
+            "L = type('L', (b._StrictHTTPSConnection,), {})",
+            True,
+            id="type-call-with-a-sanctioned-base",
+        ),
+        pytest.param(
+            "import http.client\nx: http.client.HTTPConnection | None = None",
             False,
-            id="gap-class-held-in-a-variable",
+            id="variable-annotation-not-a-value",
+        ),
+        pytest.param(
+            "import http.client\ndef f() -> http.client.HTTPConnection: ...",
+            False,
+            id="return-annotation-not-a-value",
         ),
     ],
 )
@@ -1625,3 +1971,24 @@ def test_the_stock_opener_guard_judges_the_import_not_the_spelling(
     neighbouring shapes that build no stock opener do not (BACKLOG #3360)."""
     found = _stock_calls(ast.parse(source))
     assert bool(found) is offending, found
+
+
+def test_a_site_whose_root_resolves_two_ways_is_reported_once() -> None:
+    """The exactly-once count on a sanctioned site would otherwise read a shadowed root, such as a
+    parameter named ``urllib``, as a second site."""
+    source = (
+        "import urllib.request\nclass O(urllib.request.OpenerDirector): pass\n"
+        "def f(urllib):\n    urllib.request.urlopen('u')\n"
+    )
+    assert _stock_calls(ast.parse(source)) == [
+        (2, "class O(urllib.request.OpenerDirector)"),
+        (4, "urllib.request.urlopen"),
+    ]
+
+
+def test_a_sanctioned_class_is_a_value_only_inside_its_own_module() -> None:
+    """Its own module hands it to do_open or a pool, which is how it is used; anywhere else a value
+    naming it can build a subclass its sanction's check never sees."""
+    tree = ast.parse("class _ConfinedOpener: ...\nQ = _ConfinedOpener\n")
+    assert _stock_calls(tree, "parsing/xml/schema.py") == []
+    assert _stock_calls(tree, "parsing/xml/other.py") == [(2, "_ConfinedOpener")]
