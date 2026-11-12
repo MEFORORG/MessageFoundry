@@ -515,34 +515,28 @@ def _drain_detached_close(fut: asyncio.Future[None]) -> None:
         )
 
 
-async def _gate_or_discard(conn: Any) -> None:
-    """Gate a borrowed pooled connection before its first call, or discard it and raise
-    :class:`~messagefoundry.odbc_call_gate.UngatedConnectionError` (BACKLOG #2394). No call is
-    running on it yet, so the discard's close frees nothing under one, and the pool never lends it
-    again.
+async def _discard_refused(conn: Any) -> None:
+    """Discard a borrowed pooled connection the call gate refused before its first call (BACKLOG
+    #2394). No call is running on it yet, so the discard's close frees nothing under one.
 
-    The discard is :func:`_detach_connection`, with no await in front of it. A connection with no
-    ``_conn`` cannot be detached that way: an aioodbc that renamed ``_execute`` may have renamed
-    that too. It is closed through its own ``close`` instead, best effort, so the pool's
-    ``closed`` check drops it."""
-    try:
-        _require_call_gate(conn)
-    except UngatedConnectionError:
-        if getattr(conn, "_conn", None) is not None:
-            _detach_connection(conn)
-        else:
-            try:
-                await conn.close()
-            except Exception:  # noqa: BLE001 - the refusal is the outcome that must propagate
-                log.warning("sqlserver: closing a refused connection failed", exc_info=True)
-        raise
+    The discard is :func:`_detach_connection`, with no await in front of it, so the pool never
+    lends the connection again. A connection with no ``_conn`` cannot be detached that way: an
+    aioodbc that renamed ``_execute`` may have renamed that too. It is closed through its own
+    methods instead (:func:`~messagefoundry.odbc_call_gate.close_one_shot`), once: a cancellation
+    there, or a close that fails, can leave ``closed`` false, so the pool may lend it again, and
+    the next refusal must not start a second close beside the first."""
+    if getattr(conn, "_conn", None) is not None:
+        _detach_connection(conn)
+    elif not getattr(conn, "_mefor_refused", False):
+        conn._mefor_refused = True  # first, and await-free: the marker is what stops a second close
+        await _close_one_shot(conn, None)
 
 
 def _detach_connection(conn: Any) -> asyncio.Future[None] | None:
     """Take ``conn`` out of the pool for good, and start closing its raw handle off the event loop.
 
     The one detach sequence every discard uses (BACKLOG #1940, engine PR 1722 defect 5), at least:
-    the refusal of a borrowed connection the call gate cannot wrap (:func:`_gate_or_discard`), the
+    the refusal of a borrowed connection the call gate cannot wrap (:func:`_discard_refused`), the
     quarantine of a cancelled call (:meth:`SqlServerStore._release_dirty`, ADR 0159), the
     discard after a rollback that failed or ran past its bound
     (:meth:`SqlServerStore._rollback_or_discard`), whether of an audit append, a lease claim or
@@ -5779,9 +5773,12 @@ class SqlServerStore:
         conn = await acquire_pooled(self._pool, timeout=timeout, backend="sqlserver", retune=retune)
         self._acquire_wait.record((perf_counter() - t0) * 1000.0)
         try:
-            await _gate_or_discard(
-                conn
-            )  # BACKLOG #2049: one pyodbc call at a time on this connection
+            # BACKLOG #2049: one pyodbc call at a time on this connection.
+            try:
+                _require_call_gate(conn)
+            except UngatedConnectionError:
+                await _discard_refused(conn)
+                raise
             raw = getattr(conn, "_conn", None)
             if raw is not None:
                 raw.timeout = self._settings.command_timeout  # seconds; 0 = no limit
@@ -5831,7 +5828,7 @@ class SqlServerStore:
 
         The detach itself is :func:`_detach_connection`, shared with :meth:`_rollback_or_discard`.
         A real connection that came through :meth:`_borrow` is gated here, because
-        :func:`_gate_or_discard` refused any other before its first call (BACKLOG #2394).
+        :func:`_discard_refused` discarded any other before its first call (BACKLOG #2394).
         """
         closer = _detach_connection(conn)  # first: no await may come before the detach
         if closer is None:  # already detached, handed to a running call, or the executor refused

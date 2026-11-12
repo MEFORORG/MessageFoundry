@@ -7,8 +7,8 @@
   their cursor first. Where the connection and its cursor both carry their driver handles, a
   cancellation during that close lets it finish and closes each handle once, on a gated or an
   ungated connection. A connection or cursor without its handle is closed through its own methods
-  instead, and a cancellation can cut that short. A real connection the gate cannot wrap is now
-  refused; the entry for that refusal says how. On a gated connection, neither
+  instead, and a cancellation can cut that short. A real connection of the SQL Server store's that the gate cannot
+  wrap is now refused; the entry for that refusal says how. On a gated connection, neither
   cancellation waits for the driver call. The cluster coordinator's table setup now uses the store's cursor helper. Its cursor
   closes before the connection returns to the pool, and goes to the gate on a cancellation. The gate
   moved to the leaf module `messagefoundry.odbc_call_gate`, and the one-shot connection exits live

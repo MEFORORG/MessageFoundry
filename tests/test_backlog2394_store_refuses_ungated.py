@@ -207,9 +207,10 @@ class _RenamedHandleConn(_RealAioConn):
         return self._handle is None
 
     async def close(self) -> None:
-        raw, self._handle = self._handle, None
-        if raw is not None:
-            await self._loop.run_in_executor(self._executor, raw.close)
+        # As aioodbc 0.5.0's close: the handle is cleared only once the close has returned.
+        if self._handle is not None:
+            await self._loop.run_in_executor(self._executor, self._handle.close)
+            self._handle = None
 
 
 async def test_a_refused_borrow_with_a_renamed_handle_is_closed_through_its_own_close(
@@ -225,6 +226,29 @@ async def test_a_refused_borrow_with_a_renamed_handle_is_closed_through_its_own_
             raise AssertionError("the body ran on an ungated connection")
     assert conn.closed and pool.free == [], "the refused connection is lendable again"
     assert raw.closed and not raw.cursors, rig.log
+
+
+async def test_a_refused_renamed_handle_relent_mid_close_is_not_closed_twice(rig: _Rig) -> None:
+    """Round 2 of this step's review: a cancellation during that close put the connection back
+    on the free list still open, and the next borrow's refusal started a second close beside it."""
+    raw = rig.raw(block_conn_close=True)
+    conn = _RenamedHandleConn(raw, rig.executor)
+    pool = Pool(conn)
+    store = bare_store(pool)
+
+    async def borrow() -> None:
+        async with store._acquire():
+            raise AssertionError("the body ran on an ungated connection")
+
+    task = await cancel_once_started(rig.started, borrow())
+    await cancelled_at_once(task)
+    assert pool.free == [conn], "the arm is vacuous: the pool did not get the connection back"
+    with pytest.raises(UngatedConnectionError):
+        await borrow()
+    assert "conn.close" not in rig.log, "the second refusal closed it beside the first close"
+    rig.release.set()
+    await wait_for_entry(rig.log, "conn.close")
+    assert rig.log.count("conn.close:start") == 1 and rig.log.count("conn.close") == 1, rig.log
 
 
 # --- the claim connection ------------------------------------------------------------------------
@@ -367,6 +391,8 @@ def _direct_calls(func: ast.AST) -> list[str]:
                 names.append(target.attr)  # `self._connect_claim_conn()` reads as its method
                 if isinstance(target.value, ast.Name):
                     names.append(f"{target.value.id}.{target.attr}")
+                elif isinstance(target.value, ast.Attribute):  # `self._pool.acquire()`
+                    names.append(f"{target.value.attr}.{target.attr}")
             elif isinstance(target, ast.Name):
                 names.append(target.id)
         pending.extend(ast.iter_child_nodes(node))
@@ -375,23 +401,31 @@ def _direct_calls(func: ast.AST) -> list[str]:
 
 def test_every_store_connect_requires_the_gate() -> None:
     """The refusal holds only while every way a real connection enters the store requires the
-    gate. A new ``aioodbc.connect`` in a function that does not, or a second pooled borrow beside
-    ``_borrow``, fails here rather than run ungated."""
-    tree = ast.parse(Path(sqlserver.__file__).read_text(encoding="utf-8"))
-    funcs = {
-        node.name: _direct_calls(node)
+    gate. At least a new ``aioodbc.connect`` in a function that does not, or a pooled borrow
+    outside ``_borrow`` through ``acquire_pooled`` or ``_pool.acquire``, fails here rather than run
+    ungated. It does not check that the gate comes before the first call."""
+    source = Path(sqlserver.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    assert "from aioodbc import" not in source  # every connect reads as `aioodbc.connect`
+    defs = [
+        (node.name, _direct_calls(node))
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    connects = sorted(name for name, calls in funcs.items() if "aioodbc.connect" in calls)
+    ]
+    names = [name for name, _ in defs]
+    funcs = dict(defs)
+    connects = sorted(name for name, calls in defs if "aioodbc.connect" in calls)
+    borrows = sorted(n for n, calls in defs if {"acquire_pooled", "_pool.acquire"} & set(calls))
     # The control: the pin sees the three connect sites this step gated, so it is not vacuous.
     assert connects == ["_connect_claim_conn", "_ensure_database_options", "_rcsi_on_after_a_peer"]
+    for name in [*connects, "_open_claim_holder", "_borrow"]:
+        assert names.count(name) == 1, f"{name} is defined twice, so the pin reads only one"
     for name in connects:
         if name == "_connect_claim_conn":  # a seam the tests replace; its one caller gates
             continue
         assert "_require_call_gate" in funcs[name], name
-    claim_openers = [n for n, calls in funcs.items() if "_connect_claim_conn" in calls]
+    claim_openers = [n for n, calls in defs if "_connect_claim_conn" in calls]
     assert claim_openers == ["_open_claim_holder"]
     assert "_require_call_gate" in funcs["_open_claim_holder"]
-    assert [n for n, calls in funcs.items() if "acquire_pooled" in calls] == ["_borrow"]
-    assert "_gate_or_discard" in funcs["_borrow"]
+    assert borrows == ["_borrow"]
+    assert "_require_call_gate" in funcs["_borrow"]

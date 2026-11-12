@@ -666,11 +666,14 @@ the next reader does not re-derive the wrong precedent from the same comment.
 
   **NOTE 2026-11-11 (BACKLOG #2394 step 2): the SQL Server store's ungated residual above is
   closed by refusal.** The store's pooled borrow, its claim connection and its two open-time
-  connections each run `require_call_gate` before the first pyodbc call, and discard a real
+  connections each run `require_call_gate` before the store makes its first pyodbc call on the
+  connection, and discard a real
   aioodbc connection the gate cannot wrap while nothing runs on it. So a real connection that
   enters the store through those four sites reaches its exits, the quarantine and `_cursor`
-  included, gated. That holds only while they are the store's only ways in: a source pin fails
-  when an `aioodbc.connect` appears in a function that does not require the gate. The DATABASE
+  included, gated. That holds only while they are the store's only ways in that run a call (the
+  pool warm-up borrows and releases with no call). A source pin catches at least a new
+  `aioodbc.connect` in a function that does not require the gate, and a pooled borrow outside
+  `_borrow`; it does not check that the gate comes before the first call. The DATABASE
   connector's ungated borrow is unchanged. Pinned offline by
   `tests/test_backlog2394_store_refuses_ungated.py`.
 
