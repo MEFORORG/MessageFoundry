@@ -60,6 +60,7 @@ from messagefoundry.pipeline.cluster import (
     StepdownReleaseUnconfirmed,
     acquire_leadership_lock,
     default_node_id,
+    late_hold_pause_seconds,
     lease_release_unconfirmed,
     members_from_node_rows,
     note_stamp_fault,
@@ -518,7 +519,8 @@ class SqlServerCoordinator:
                 if past_fence(issued_at, self._monotonic(), self._fence_timeout):
                     # BACKLOG #5711: the clamp bounds the borrow and statement but not the COMMIT
                     # (SqlServerStore._fetchone_clamped), so a claim can return past the fence. The
-                    # row is ours, so the baseline stays for may_own_lease_row; fence, never promote.
+                    # row is ours, so the baseline stays for may_own_lease_row; demote and pause,
+                    # never promote.
                     self._refuse_late_hold(issued_at)
                     return
                 if not self._is_leader:
@@ -535,16 +537,24 @@ class SqlServerCoordinator:
                 self._fire_on_demote()  # ADR 0157 Inc 5
 
     def _refuse_late_hold(self, issued_at: float) -> None:
-        """Mirrors :meth:`DbCoordinator._refuse_late_hold` (BACKLOG #5711); read its docstring."""
+        """Mirrors :meth:`DbCoordinator._refuse_late_hold` (BACKLOG #5711); read its docstring for
+        why it demotes unconditionally and why it pauses this node's claims."""
+        now = self._monotonic()
+        pause = late_hold_pause_seconds(self._lease_ttl, self._heartbeat_seconds)
+        self._no_claim_until = max(self._no_claim_until, now + pause)
+        self._leader_epoch = None
         log.warning(
             "cluster: node %s lease claim returned %.1fs after it was issued, past the %.1fs fence "
-            "timeout; not acting on it",
+            "timeout; not leading on it, and not claiming for %.1fs so a standby can take the lease",
             self.node_id,
-            self._monotonic() - issued_at,
+            now - issued_at,
             self._fence_timeout,
+            pause,
         )
-        self._check_fence()
-        self._leader_epoch = None
+        if self._is_leader:
+            self._is_leader = False
+            self._alert_leadership_lost("lease claim returned past the fence timeout")
+            self._fire_on_demote()  # ADR 0157 Inc 5
 
     async def _claim_or_renew_lease(self) -> bool:
         """Atomically acquire (fresh / expired) or renew (already ours) the single leadership lease, all

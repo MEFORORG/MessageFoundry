@@ -98,6 +98,48 @@ async def test_a_late_renew_fences_a_leader_at_once(
 
 
 @pytest.mark.parametrize(("_name", "make"), _COORDINATORS, ids=_IDS)
+async def test_a_late_hold_after_the_watchdog_fenced_raises_no_second_edge(
+    _name: str, make: Callable[[_Clock], Any]
+) -> None:
+    """The usual order: the watchdog fences the leader while its renew is in flight, then the renew
+    returns held. The node stays demoted, and neither an acquire edge nor a second demotion fires."""
+    clock = _Clock()
+    coord = make(clock)
+    _claim_taking(coord, clock, 0.1)
+    await coord._maintain_leadership()
+    edges: list[str] = []
+    coord.set_on_demote(lambda: edges.append("demote"))
+    coord._alert_leadership_acquired = lambda: edges.append("acquire")
+
+    async def claim() -> bool:
+        clock.t += _FENCE + 0.5
+        coord._check_fence()  # the watchdog's tick, while the claim is still in flight
+        coord._leader_epoch = 7
+        return True
+
+    coord._claim_or_renew_lease = claim
+    await coord._maintain_leadership()
+    assert coord.is_leader() is False
+    assert coord.current_epoch() is None
+    assert edges == ["demote"]
+
+
+@pytest.mark.parametrize(("_name", "make"), _COORDINATORS, ids=_IDS)
+async def test_a_late_hold_pauses_this_nodes_claims_past_the_ttl(
+    _name: str, make: Callable[[_Clock], Any]
+) -> None:
+    """Without the pause, the undelayed renew arm would renew the row on every tick, so a node
+    whose claims keep returning late would hold it for ever without leading, and no standby could
+    take it. The pause outlasts the TTL the refused claim stamped; it lifts early once a read
+    shows another owner, as the stepdown pause does."""
+    clock = _Clock()
+    coord = make(clock)
+    _claim_taking(coord, clock, _FENCE + 0.5)
+    await coord._maintain_leadership()
+    assert coord._no_claim_until == clock.t + 30.0 + 2 * 10.0  # TTL + two heartbeats, defaults
+
+
+@pytest.mark.parametrize(("_name", "make"), _COORDINATORS, ids=_IDS)
 async def test_a_claim_returning_at_the_fence_still_promotes(
     _name: str, make: Callable[[_Clock], Any]
 ) -> None:
@@ -109,3 +151,4 @@ async def test_a_claim_returning_at_the_fence_still_promotes(
     await coord._maintain_leadership()
     assert coord.is_leader() is True
     assert coord.current_epoch() == 7
+    assert coord._no_claim_until == 0.0

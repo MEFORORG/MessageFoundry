@@ -47,7 +47,7 @@ async def _wait_until(predicate: Callable[[], bool], timeout: float = 5.0) -> No
 
 @pytest.mark.parametrize(("_name", "make", "refresh"), _COORDINATORS, ids=_ids())
 async def test_a_hung_heartbeat_does_not_stop_the_renews(
-    _name: str, make: Callable[[float], Any], refresh: str
+    _name: str, make: Callable[[float], Any], refresh: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A heartbeat that never returns used to hold the whole tick, so no renew ran behind it and a
     leader self-fenced over a statement that is not the lease. Before the fix this timed out with
@@ -82,6 +82,8 @@ async def test_a_hung_heartbeat_does_not_stop_the_renews(
         await _wait_until(lambda: claims >= 5)
         # The hung pass is still running, so no tick started a second one beside it.
         assert beats_started == 1
+        # And each skipped tick says so, so a pass that never ends is visible.
+        assert "the previous pass is still running" in caplog.text
     finally:
         coord._stop.set()
         await asyncio.wait_for(task, timeout=5.0)

@@ -286,11 +286,13 @@ async def test_a_heartbeat_cancelled_in_flight_unwinds_within_the_release_bound(
     # release's timeout: the loop waits for the side pass it cancelled (BACKLOG #5710).
     await asyncio.wait({heartbeat}, timeout=renew + _SLACK)
     assert heartbeat.done(), "the cancelled heartbeat is still waiting on its connection's release"
-    # And it finished CANCELLED. The stand-in's release raises TimeoutError over the cancel, as
-    # asyncpg's does; without _call_within restoring the cancel, the side pass logs that as a failed
-    # heartbeat and goes on to send its refresh after stop() had cancelled it.
-    assert heartbeat.cancelled(), "the cancel was swallowed by the release's TimeoutError"
-    assert _only_stop_writes(server.sent[hung_at:]), "the cancelled loop sent another statement"
+    # The loop task ends cancelled whatever the side pass did, since its finally only waits for that
+    # pass. The stand-in's release raises TimeoutError over the cancel, as asyncpg's does; without
+    # _call_within restoring the cancel, the side pass logs that as a failed heartbeat and goes on to
+    # send its refresh after stop() had cancelled it, which the statement check catches (BACKLOG
+    # #5710). The loop waited for the pass, so anything it sent is already recorded.
+    assert heartbeat.cancelled()
+    assert _only_stop_writes(server.sent[hung_at:]), "the cancel was swallowed: another statement"
     assert renew in pool.release_timeouts
     assert None not in pool.acquire_timeouts, "a statement borrowed with no timeout"
     assert None not in pool.release_timeouts, "a statement released with no timeout"
@@ -319,8 +321,9 @@ async def test_a_cancel_survives_a_release_that_raises_over_it(server: _Server) 
 
     await _timed(a.stop())
 
-    assert heartbeat.done() and heartbeat.cancelled(), "the cancel was swallowed"
-    assert _only_stop_writes(server.sent[hung_at:]), "the cancelled loop sent another statement"
+    # The loop task ends cancelled whatever its side pass did; the statement check is the guard.
+    assert heartbeat.done() and heartbeat.cancelled()
+    assert _only_stop_writes(server.sent[hung_at:]), "the cancel was swallowed: another statement"
 
 
 def _only_stop_writes(sent: list[str]) -> bool:
