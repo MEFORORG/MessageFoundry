@@ -8300,7 +8300,7 @@ class RegistryRunner:
             lookups = fhir_lookup_anchors
             applied_values = self._env_values if new_env_values is None else new_env_values
             if lookups is None or not lookups.covers(new_registry, applied_values):
-                lookups = await self.refuse_on_fhir_lookup_anchors(new_registry, new_env_values)
+                lookups = await self.refuse_on_fhir_lookup_anchors(new_registry, applied_values)
             await self.build_check_off_loop(new_registry, new_env_values, now=now)
             if lookups.store_fault is not None and not self._running:
                 # No lane check runs below on a graph that is not running, so the store fault
