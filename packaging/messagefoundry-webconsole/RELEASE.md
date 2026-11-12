@@ -104,11 +104,11 @@ but fired by the console's **own** `webconsole-v*` tag, since it is not lockstep
       `release-webconsole` job, and its engine floor gate, run only on that tag namespace.
 - [ ] Publish to **PyPI** via the gated Trusted-Publishing job. The console's GitHub release is a
       draft at least until that job, `publish-pypi-webconsole`, succeeds;
-      `publish-github-release-webconsole` then publishes it. With `PUBLISH_WEBCONSOLE` set to
-      `true` (any case), the job uploads the wheel first. With it unset or any other value, the
-      upload is skipped and the release is published once the `pypi` approval is given. Set, the
-      publish refuses while the upload has not run; [docs/SUPPLY-CHAIN.md](../../docs/SUPPLY-CHAIN.md),
-      *The draft*, says what to do then.
+      `publish-github-release-webconsole` then publishes it. With `PUBLISH_WEBCONSOLE` set, the job
+      uploads the wheel first. Unset, the upload is skipped and the release is published once the
+      `pypi` approval is given. Set, the publish refuses while the upload has not run.
+      [docs/SUPPLY-CHAIN.md](../../docs/SUPPLY-CHAIN.md), *One approval per engine tag*, says what
+      counts as set, and *The draft* says what to do on a refusal.
 
 ## 7. Post-publish verification
 
