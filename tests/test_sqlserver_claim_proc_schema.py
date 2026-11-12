@@ -84,10 +84,15 @@ def test_retained_v1_procs_keep_their_dbo_head_and_its_matching_guard() -> None:
         assert "OBJECT_SCHEMA_NAME" not in ddl
 
 
-async def test_the_call_refuses_an_effective_flag_with_no_recorded_schema() -> None:
-    """The gate sets the schema with the effective flag; one without the other must not quietly run
-    the batch under a gauge that reports the proc path."""
+async def test_an_effective_flag_with_no_recorded_schema_runs_the_batch_and_reports_it() -> None:
+    """The gate sets the schema with the effective flag. One without the other must neither CALL a
+    proc in no schema nor fail the claim (ADR 0114: never a lane outage), and the gauge must report
+    the path that actually runs, not the flag."""
     store = _proc_store(proc=True, effective=True)
     store._claim_proc_schema = None
-    with pytest.raises(RuntimeError, match="recorded no schema"):
-        await _drive_proc("ingress", ["lane-0"], store=store)
+    store._claim_proc_head_forms = {}  # the bare rig skips __init__
+    assert store.claim_proc_effective is False
+    status = store.claim_proc_status()
+    assert status is not None and status.effective is False
+    ops, _, _ = await _drive_proc("ingress", ["lane-0"], store=store)
+    assert ops[0][1].startswith("SET NOCOUNT ON;"), "no recorded schema runs the shipped batch"

@@ -1571,6 +1571,15 @@ class _SyncHandoffPool:
 _LANE_BIN: Final[str] = " COLLATE Latin1_General_100_BIN2"
 
 
+def _lane_eq(col: str, lane: str) -> str:
+    """A lane column equal to a binary-labelled ``lane`` reference, exactly (BACKLOG #5721).
+
+    The first conjunct compares in the database collation so the lane-column seek survives; the
+    binary second conjunct is the residual that decides. A bare ``col = lane`` would compare binary
+    too, but converts the column and loses the seek."""
+    return f"{col} = {lane} COLLATE DATABASE_DEFAULT AND {col}{_LANE_BIN} = {lane}"
+
+
 def _fifo_heads_steps(
     *, lane_col: str, lane_source: str, epoch_guard: str, v1_bytes: bool = False
 ) -> str:
@@ -1602,12 +1611,8 @@ def _fifo_heads_steps(
         probe = f"qq.{lane_col} = L.lane"
     else:
         heads_lane, partition = _LANE_BIN, f"l.lane{_LANE_BIN}"
-        discover = (
-            f"{lane_col} = l.lane COLLATE DATABASE_DEFAULT AND {lane_col}{_LANE_BIN} = l.lane"
-        )
-        probe = (
-            f"qq.{lane_col} = L.lane COLLATE DATABASE_DEFAULT AND qq.{lane_col}{_LANE_BIN} = L.lane"
-        )
+        discover = _lane_eq(lane_col, "l.lane")
+        probe = _lane_eq(f"qq.{lane_col}", "L.lane")
     return (
         f" DECLARE @heads TABLE (lane NVARCHAR(256){heads_lane} NOT NULL,"
         " id NVARCHAR(64) NOT NULL PRIMARY KEY,"
@@ -1728,10 +1733,8 @@ _V1_CLAIM_PROCS: Final[frozenset[str]] = frozenset(n for n, _ in _RETAINED_CLAIM
 # The explicit CAST types the decoded lane as the NVARCHAR(256) lane column is typed; DISTINCT is
 # belt-and-suspenders under the caller's preserved request-order dedupe. The DISTINCT is binary, as
 # the caller's dedupe is: under the database collation it would merge two lane names that differ
-# only in case (BACKLOG #5721). That makes l.lane explicitly binary, so the discovery's seekable
-# conjunct must re-label it COLLATE DATABASE_DEFAULT (_fifo_heads_steps): a bare
-# `{lane_col} = l.lane` would compare binary, which is correct but converts the column and loses the
-# seek.
+# only in case (BACKLOG #5721). That makes l.lane explicitly binary, so the discovery compares
+# through _lane_eq, which keeps the seek.
 _CLAIM_PROC_LANE_SOURCE = (
     f"(SELECT DISTINCT CAST(j.[value] AS NVARCHAR(256)){_LANE_BIN} FROM OPENJSON(@lanes) AS j)"
 )
@@ -3639,7 +3642,15 @@ class SqlServerStore:
         ``fifo_claim_proc`` flag was ON at open AND the startup gate verified both deployed proc
         bodies + compat >= 130. False when the flag is off or the gate degraded (see
         :attr:`claim_proc_degraded_reason`)."""
-        return self._claim_proc_effective
+        return self._claim_proc_live
+
+    @property
+    def _claim_proc_live(self) -> bool:
+        """The one predicate every reader of "the proc path is on" uses: the gate passed AND
+        recorded the schema the CALL names (BACKLOG #5722). The gate sets both together; requiring
+        both keeps the gauge, the status, the prepared-gate supersession and the dispatch from ever
+        disagreeing, and a flag set without a schema runs the batch rather than a CALL to nowhere."""
+        return self._claim_proc_effective and self._claim_proc_schema is not None
 
     @property
     def claim_proc_degraded_reason(self) -> str | None:
@@ -3875,7 +3886,7 @@ class SqlServerStore:
                 " would evict the retained cursor's one-slot prepare cache every call) — logging"
                 " and no-op'ing per ADR 0114 AC-13"
             )
-        elif self._claim_proc_effective:
+        elif self._claim_proc_live:
             # §5 compose-or-compete: the retained handle competes with the proc's RPC for the
             # same bytes — if A is green, B is retired, not stacked (recorded superseded-for-now).
             reason = (
@@ -6056,7 +6067,7 @@ class SqlServerStore:
         if not self._fifo_claim_proc:
             return None
         return ClaimProcStatus(
-            effective=self._claim_proc_effective,
+            effective=self._claim_proc_live,
             degraded_reason=self._claim_proc_degraded_reason,
             head_forms=dict(self._claim_proc_head_forms),
         )
@@ -11097,7 +11108,12 @@ class SqlServerStore:
         # C without a third variant); everything after cur.execute — the drain, the kept==claimed
         # adjudication, the H2 loop, _commit, the 1222 translation, and the shielded finally-guard
         # — is the same code on both paths (AC-9). The gate degraded => the shipped batch, loudly.
-        use_proc = self._fifo_claim_proc and self._claim_proc_effective
+        # The CALL names the schema the gate verified the procs in (BACKLOG #5722); None keeps the
+        # claim on the batch, and _claim_proc_live is the same predicate the gauge reports.
+        proc_schema = (
+            self._claim_proc_schema if self._fifo_claim_proc and self._claim_proc_live else None
+        )
+        use_proc = proc_schema is not None
         # ADR 0114 sub-lever B (fifo_claim_prepared): the non-DDL fallback lane — the SAME stable
         # encoding as the proc (one JSON lanes parameter, fixed-nullable fence) as a client-side
         # batch with the trailing reset INSIDE the text, executed on a store-owned dedicated
@@ -11120,15 +11136,9 @@ class SqlServerStore:
             and fold
         )
         args: tuple[Any, ...]
-        if use_proc:
+        if proc_schema is not None:
             proc_name = _CLAIM_PROC_CID if lane_col == "channel_id" else _CLAIM_PROC_DST
-            # The CALL names the schema the gate verified the procs in (BACKLOG #5722). A passing
-            # gate sets it together with _claim_proc_effective, so the two cannot disagree; one
-            # without the other is a defect, raised rather than run on a path the gauge misreports.
-            schema = self._claim_proc_schema
-            if schema is None:
-                raise RuntimeError("fifo_claim_proc is effective but the gate recorded no schema")
-            sql = f"{{CALL {schema}.{proc_name} (?,?,?,?,?,?,?,?,?)}}"
+            sql = f"{{CALL {proc_schema}.{proc_name} (?,?,?,?,?,?,?,?,?)}}"
             args = (
                 now,
                 stage,
@@ -11531,9 +11541,12 @@ class SqlServerStore:
         ``DISTINCT`` in the recursive member of a recursive CTE, so the loose-index-scan emulation the
         other dialects use (anchor ``MIN(lane)`` + recurse ``MIN(lane) WHERE lane > prev``) is invalid
         here (error 467) and has no legal recursive rewrite. This plain derived-table + ``CROSS APPLY``
-        form is O(pending rows at ``stage``) rather than O(distinct lanes) — an index-only, ordered,
-        ``TOP``-bounded stream-distinct that is ~free at idle; a true skip-scan is a later perf concern
-        (SQL Server has no native skip-scan operator).
+        form is O(pending rows at ``stage``) rather than O(distinct lanes) — an index-only read that
+        is ~free at idle; a true skip-scan is a later perf concern (SQL Server has no native
+        skip-scan operator). The binary DISTINCT below cannot ride the index's database-collation
+        order, so it is a hash aggregate (memory scales with distinct lanes, not rows) plus a sort
+        of the distinct lanes, and the ``@after`` cursor filters rather than seeks; the rows read
+        are the same pending rows the ordered stream-distinct read.
 
         Unlike :meth:`claim_fifo_heads`, this is a pure RCSI snapshot read with NO locking hints, so it
         can never WAIT on a row lock — it needs no ``SET LOCK_TIMEOUT 0`` never-block guard (ADR 0066
@@ -11554,8 +11567,7 @@ class SqlServerStore:
             f" WHERE stage = @stage AND status = @pending"
             f" AND (@after IS NULL OR {lane_col}{_LANE_BIN} > @after)) d"
             " CROSS APPLY (SELECT TOP (1) next_attempt_at FROM queue"
-            f" WHERE stage = @stage AND {lane_col} = d.lane COLLATE DATABASE_DEFAULT"
-            f" AND {lane_col}{_LANE_BIN} = d.lane AND status = @pending"
+            f" WHERE stage = @stage AND {_lane_eq(lane_col, 'd.lane')} AND status = @pending"
             " ORDER BY seq) h"
             " ORDER BY d.lane;"
         )
