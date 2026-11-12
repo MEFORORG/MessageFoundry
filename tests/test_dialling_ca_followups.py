@@ -49,6 +49,7 @@ from messagefoundry.config.wiring import (
     WiringError,
     build_inbound_connection,
     env,
+    load_config,
 )
 from messagefoundry.pipeline import Engine, wiring_runner
 from messagefoundry.pipeline.dr import DrActivationError
@@ -62,6 +63,7 @@ from tests.test_outbound_ca_anchors import (
     _ca,
     _CountingSink,
     _day_schedule,
+    _lookup_graph,
     _outbound_registry,
     _real_ca,
     _sha,
@@ -222,8 +224,9 @@ async def test_a_dr_activation_its_preflight_refuses_names_no_path(
     dr_engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The other arm of step 4: the trust-anchor preflight refuses before any reload. The
-    refusal is raised the way ``make_registry_anchor_preflight`` raises a listener's or a
-    ``FhirLookup``'s. Red under the same mutation as the test above.
+    refusal is raised the way ``make_registry_anchor_preflight`` raises a listener's, and the way
+    the runner's lookup check raises a ``FhirLookup``'s (vault BACKLOG #3582). Red under the same
+    mutation as the test above.
 
     The abort is raised outside the handler that caught the refusal, as the connection-start
     route raises its 409, so the refusal is not left on the abort for a later reader of the
@@ -1414,3 +1417,70 @@ async def test_a_passive_line_keeps_its_store_fault_class(
         assert runner.failed_on_store_fault("inbound", _IB)
     finally:
         await runner.stop()
+
+
+# --- vault BACKLOG #3582: a DR activation reads each FhirLookup CA once, inside its bound ---------
+
+
+def _count_lookup_reads(engine: Engine, reads: list[bool]) -> None:
+    """Wrap the engine's lane check so each ``FhirLookup`` CA read records whether the DR profile
+    was latched on then. The activation latches it after its preflight and before its reload, so
+    ``False`` is a read inside the bounded preflight and ``True`` one in the reload."""
+    check = engine._lane_anchor_check
+    assert check is not None
+
+    async def counted(direction: str, name: str, settings: Any) -> None:
+        if direction == "fhir_lookup":
+            reads.append(engine.dr_active)
+        await check(direction, name, settings)
+
+    engine._lane_anchor_check = counted
+
+
+async def test_a_dr_activation_reads_each_lookup_ca_once_inside_its_bound(
+    dr_engine: Engine, tmp_path: Path, judged: None
+) -> None:
+    """Review finding 1 of vault BACKLOG #3582: the activation's bounded preflight reads each
+    lookup CA, and its reload, which has no bound, does not read it again (vault BACKLOG #3094).
+    Red under: the reload not handed the preflight's pass, which reads it a second time with the
+    profile latched on."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _lookup_graph(cfg, ca, _sha(ca))
+    reads: list[bool] = []
+    _count_lookup_reads(dr_engine, reads)
+    dr_engine.add_registry(load_config(cfg))
+    await dr_engine.start()
+    assert reads == [False]  # the start's own check
+    reads.clear()
+    result = await _coordinator(dr_engine).activate(actor="alice")
+    assert result.active and dr_engine.dr_active
+    assert reads == [False], reads
+
+
+async def test_a_dr_activation_a_lookup_ca_refuses_stops_at_its_preflight(
+    dr_engine: Engine, tmp_path: Path, judged: None
+) -> None:
+    """Review finding 7 of vault BACKLOG #3582: the lookup check inside ``Engine._dr_preflight``
+    is what refuses a lookup CA on an activation, inside the bound, before the profile is latched
+    and before any reload. The start isolated the lookup, and the activation still refuses whole
+    (ADR 0031 rule 2). Red under: that check deleted from the preflight, which leaves the reload's
+    unbounded check to refuse, after the profile was latched on."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _lookup_graph(cfg, ca, _WRONG_PIN)
+    reads: list[bool] = []
+    _count_lookup_reads(dr_engine, reads)
+    dr_engine.add_registry(load_config(cfg))
+    await dr_engine.start()
+    runner = dr_engine.registry_runner
+    assert runner is not None
+    reason = runner.fhir_lookup_failed("EPIC")
+    assert reason is not None and "POST /dr/activate needs it" in reason, reason
+    reads.clear()
+    with pytest.raises(DrActivationError) as caught:
+        await _coordinator(dr_engine).activate(actor="alice")
+    assert caught.value.kind == "profile"
+    assert "stopped at its preflight" in str(caught.value), str(caught.value)
+    assert reads == [False], reads
+    assert dr_engine.dr_active is False

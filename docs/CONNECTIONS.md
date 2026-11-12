@@ -4178,14 +4178,15 @@ factory that takes `tls_ca_file` for an outbound hop takes it: `Rest()`, `FHIR()
 checks.
 
 **When the check runs, and what a refusal stops.** This follows
-[ADR 0031](adr/0031-startup-connection-fault-isolation.md), as amended on 2026-10-06.
+[ADR 0031](adr/0031-startup-connection-fault-isolation.md), as amended on 2026-10-06 and, for a
+`FhirLookup()`, on 2026-11-11.
 
 | When | What a refused file stops |
 |---|---|
 | Start, for an outbound or an `Ftp()` poller | That connection only. It reads `failed`, and the rest of the graph comes up. Its status and its `connection_stopped` alert carry a fixed line naming the connection; the reason, which names the file and its SHA-256, is in the server log and the audit rows. |
 | An operator start (`POST /connections/{name}/start`), such as of an `auto_start = false` lane | That connection only. |
-| Start, for a `FhirLookup()` | That lookup only (vault BACKLOG #3582). It is recorded failed and alerted under `fhir_lookup:<name>`, every Handler call to it fails closed, and the rest of the graph comes up. Its record and its alert carry a fixed line; the reason is in the server log and the audit rows. |
-| A reload, for a lane it builds or keeps running, and for a `FhirLookup()` | The whole reload, before anything changes. A DR activation is a reload. |
+| Start, for a `FhirLookup()`, a first load by reload of an engine started with no graph included | That lookup only (vault BACKLOG #3582). It is recorded failed and alerted under `fhir_lookup:<name>`, every Handler call to it fails closed, and the rest of the graph comes up. Its record and its alert carry a fixed line; the reason is in the server log and the audit rows. |
+| A reload, for a lane it builds or keeps running, and for a `FhirLookup()` | The whole reload, before anything changes. A DR activation is a reload. It checks each `FhirLookup()` CA inside its preflight, which `[dr].takeover_timeout_seconds` bounds, and its reload reads them again only if another reload changed the graph in between. |
 | A reload, for an idle lane | Nothing. The reload does not read its CA. An idle lane is one below a DR threshold, an `auto_start = false` lane not running, an `Ftp()` poller outside its schedule window, or a lane its CA refused whose config has not changed. The reload leaves that last kind failed: fixing the file alone does not heal it on a reload. A config change, an operator start or a restart builds it, and checks it then. Only the pin, permission, path and private-key checks are skipped: a reload's build check still builds every deployed `MLLP()`, `Ftp()`, `Email()` and `Direct()`, which read the file as they are built, so a file they cannot load still refuses the reload. |
 
 | What the check finds | What happens |

@@ -1547,9 +1547,9 @@ async def test_every_reload_route_refuses_a_swapped_settings_anchor(
         real_reload = rr.reload
         applied: list[object] = []
 
-        async def counting(registry: Any = None, env_values: Any = None) -> Any:
+        async def counting(registry: Any = None, env_values: Any = None, **kw: Any) -> Any:
             applied.append(registry)
-            return await real_reload(registry, env_values)
+            return await real_reload(registry, env_values, **kw)
 
         # Counted at the runner, not by registry identity: the DR route re-applies the graph it
         # already holds (vault BACKLOG #3067), so its registry object never changes.
@@ -1613,7 +1613,7 @@ async def test_the_dr_profile_reload_without_a_config_dir_refuses_too(
     try:
         rr = engine.add_registry(load_config(cfg))
 
-        async def spy(registry: object = None) -> None:
+        async def spy(registry: object = None, **_kw: Any) -> None:
             reloaded.append(registry)
 
         monkeypatch.setattr(rr, "reload", spy)

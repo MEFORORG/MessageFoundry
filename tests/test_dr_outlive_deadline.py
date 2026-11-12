@@ -421,7 +421,7 @@ async def test_the_engine_puts_its_dr_latch_back_when_the_profile_reload_is_canc
     assert rr is not None
     entered = asyncio.Event()
 
-    async def hung_reload(_registry: Registry | None = None) -> None:
+    async def hung_reload(_registry: Registry | None = None, **_kw: Any) -> None:
         entered.set()
         await asyncio.Event().wait()
 

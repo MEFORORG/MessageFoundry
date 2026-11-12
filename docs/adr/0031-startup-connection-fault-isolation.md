@@ -396,7 +396,7 @@ permission or path check still stopped every feed from starting.
 
 **Decision.** The registry preflight no longer reads a `FhirLookup` CA. At start, the runner
 checks each lookup's CA with the same lane check, under the label `fhir_lookup:<name>`, before it
-builds the executor (`RegistryRunner._check_fhir_lookup_anchors`). A lookup the check fails is not
+builds the executor (`RegistryRunner.check_fhir_lookup_anchors`). A lookup the check fails is not
 built, so nothing is dialled for it, and it is isolated as #3008 isolates a lookup that fails to
 build: recorded failed, named in `/status` as `fhir_lookups_failed`, logged at ERROR and alerted as
 `connection_stopped` under `fhir_lookup:<name>`, and every read on it raises `FhirLookupError`
@@ -410,9 +410,12 @@ still fails closed: the lookup is never built. A reload, a DR activation and a f
 convergence still refuse whole (rule 2): a reload builds every lookup again, so before its
 build check the runner checks each lookup's CA (`RegistryRunner.refuse_on_fhir_lookup_anchors`),
 and a refusal refuses the reload before anything changes, audited as a trust-anchor refusal. A DR
-activation also runs that check inside its preflight, which `[dr].takeover_timeout_seconds` bounds
-(vault BACKLOG #3094), and its reload then reads each lookup CA again with no bound, as it reads a
-lane's. On a passive DR standby the lookup's line says that `POST /dr/activate` needs it. A reload with the cause fixed builds the lookup again, and so does a
+activation runs that check inside its preflight instead, which `[dr].takeover_timeout_seconds`
+bounds (vault BACKLOG #3094), and hands the result to its reload, which reads no lookup CA again
+unless another reload changed the graph in between. A check the store stopped refuses a reload
+only once no lookup or lane CA is refused (BACKLOG #3091). An engine started with no graph takes
+its first one by reload, and that load is a start: it checks each lookup before its build check,
+which leaves out one the check refused, so that lookup is isolated as at any other start. On a passive DR standby the lookup's line says that `POST /dr/activate` needs it. A reload with the cause fixed builds the lookup again, and so does a
 restart. Rule 3, the inbound listener CA, is untouched.
 
 **Consequences.** A start with a broken lookup CA comes up with that lookup failed, where before

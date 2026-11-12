@@ -84,7 +84,9 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
      operator start (:func:`make_lane_anchor_check`). A refusal fails that lane only, with the
      audit row, and the rest of the graph comes up.
    * A ``FhirLookup`` is checked as the runner builds the lookup executor at start, through the
-     same lane check under its own label (vault BACKLOG #3582). A refusal fails that lookup only,
+     same lane check under its own label (vault BACKLOG #3582). An engine started with no graph
+     takes its first one by reload, and that load is the start: it checks each lookup before
+     its build check, which leaves out one the check refused. A refusal fails that lookup only,
      with the audit row, as a lookup that fails to build is isolated (vault BACKLOG #3008): it is
      recorded failed and alerted, every Handler call to it fails closed, and the rest of the graph
      comes up. Nothing is dialled for it.
@@ -97,8 +99,9 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
      connector, and those that read the file as they are built refuse one they cannot load.
    * A reload builds every ``FhirLookup`` again, so before its build check the runner checks
      each one the new graph declares, idle or not, and a refusal refuses the whole reload. A DR
-     activation also checks them inside its bounded preflight, then again, unbounded, in its
-     reload, as it reads a lane's CA there.
+     activation checks them inside its bounded preflight instead, and its reload reads them
+     again only if another reload changed the graph in between. A check the store stopped
+     refuses the reload only once no lookup or lane CA is refused (BACKLOG #3091).
 
    **Not covered: the checked bytes are not the loaded bytes here.** These hops build their
    context from the path, with ``cafile=``, after the check. So a file swapped between the check

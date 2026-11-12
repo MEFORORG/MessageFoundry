@@ -101,6 +101,7 @@ from messagefoundry.pipeline.sharding import join_shard_names, owned_destination
 from messagefoundry.pipeline.state_convergence import StateConvergenceRunner
 from messagefoundry.pipeline.update_check import UpdateCheckResult, UpdateCheckRunner
 from messagefoundry.pipeline.wiring_runner import (
+    FhirLookupAnchorPass,
     RegistryRunner,
     TeardownReason,
     check_pt_backend_supported,
@@ -573,8 +574,11 @@ class Engine:
         # no preflight. A DR activation runs it too, over the running graph (_dr_preflight).
         self._registry_preflight = registry_preflight
         # vault BACKLOG #2371, ADR 0031 as amended 2026-10-06: the dialling-CA check the runner
-        # awaits for each lane it builds, at start, at an operator start and before a reload. `serve`
-        # passes it; None = no check. Not handed to a dry-run checker, which builds nothing live.
+        # awaits for each lane it builds, at start, at an operator start and before a reload. Since
+        # vault BACKLOG #3582 the runner awaits it for each FhirLookup too, at start, before a
+        # reload and inside a DR activation's bounded preflight. `serve` passes it; None = no
+        # check. The throwaway checker (_check_runner) carries it for a first load's lookup check;
+        # a dry run's build check never awaits it.
         self._lane_anchor_check = lane_anchor_check
         # An optional async check run first on EVERY real reload, whoever starts it: the reload route,
         # a held reload a second approver releases, cluster convergence, and the DR profile reload.
@@ -1207,11 +1211,14 @@ class Engine:
         # DR decision is never a cluster-wide config bump.
         close_failures: tuple[tuple[str, str], ...] = ()
         try:
+            lookups: FhirLookupAnchorPass | None = None
             if rr is not None:
-                await self._dr_preflight(rr.registry)
+                lookups = await self._dr_preflight(rr.registry)
             self._set_dr_active(True)
             if rr is not None:
-                close_failures = await rr.reload()
+                # The lookup CAs the preflight read inside its bound are not read again unbounded
+                # (vault BACKLOG #3094, #3582), unless a reload landed first and changed the graph.
+                close_failures = await rr.reload(fhir_lookup_anchors=lookups)
         except BaseException:
             # A refused reload (BACKLOG #2034: a settings trust anchor, say) applied no DR profile,
             # so the latch and the runner's threshold go back too. Left set, the next operator
@@ -1250,14 +1257,17 @@ class Engine:
         failure = _outbound_close_failure(close_failures)
         return {failure.step: failure.detail}
 
-    async def _dr_preflight(self, registry: Registry) -> None:
+    async def _dr_preflight(self, registry: Registry) -> FhirLookupAnchorPass | None:
         """The settings and registry preflights a DR activation runs before its reload, bounded by
-        ``[dr].takeover_timeout_seconds`` (vault BACKLOG #3094, item 3).
+        ``[dr].takeover_timeout_seconds`` (vault BACKLOG #3094, item 3), and the runner's check
+        of each ``FhirLookup`` CA, under the same bound (vault BACKLOG #3582).
 
         They read trust-anchor files, which may sit on a share at the failed site, and they run
         under the coordinator's lock, so with no bound a share that stops answering held every
         later activate and release too. A timeout cancels them and raises ``TimeoutError``, which
-        the caller rolls back like any refusal. The reload that follows is not bounded here.
+        the caller rolls back like any refusal. Returns the lookup check's pass, ``None`` with no
+        runner, which the caller hands to the reload so it reads no lookup CA again. The reload
+        that follows is not bounded here, and still reads each lane CA it checks with no bound.
         Cancelling it partway rolls back a takeover the VIP has already moved for, and the runner
         gives each lane's first build its own isolation (ADR 0048, the vault BACKLOG #3263
         amendment).
@@ -1275,6 +1285,7 @@ class Engine:
             coord.note_profile_preflight(True)
         timeout = self._dr_settings.takeover_timeout_seconds
         bound = asyncio.timeout(timeout)
+        lookups: FhirLookupAnchorPass | None = None
         try:
             async with bound:
                 await self.preflight_settings()
@@ -1283,7 +1294,7 @@ class Engine:
                 if rr is not None:
                     # Vault BACKLOG #3582: the FhirLookup CAs moved out of the registry preflight
                     # into the runner, and are read here so they stay under this bound.
-                    await rr.refuse_on_fhir_lookup_anchors(registry)
+                    lookups = await rr.refuse_on_fhir_lookup_anchors(registry)
         except TimeoutError as exc:
             if not bound.expired():
                 raise  # a TimeoutError from inside the preflight is its own error
@@ -1292,6 +1303,7 @@ class Engine:
             ) from exc
         if coord is not None:
             coord.note_profile_preflight(False)
+        return lookups
 
     async def _dr_config_drift(self) -> dict[str, object]:
         """The provenance fields a DR activation records: the activated graph's digest, and whether
@@ -1516,6 +1528,9 @@ class Engine:
             simulate_all=self._shadow_settings.simulate_all_egress,
             env_values=self._env_values,
             coordinator=self._coordinator,
+            # The first load checks each FhirLookup CA on it (vault BACKLOG #3582), through the
+            # check the started runner uses, so the two share its memory of the last verdict.
+            lane_anchor_check=self._lane_anchor_check,
         )
 
     def _refuse_shard_universe_change(self, registry: Registry) -> None:
@@ -1550,7 +1565,17 @@ class Engine:
         # so it runs on a runner that is not installed yet: installed first, a concurrent reload
         # could take it, unstarted, as the live runner in that window. Nothing yields between
         # add_registry below and the start taking the runner's reload lock.
-        await self._check_runner(registry).build_check_off_loop(registry, env_values)
+        checker = self._check_runner(registry)
+        # Vault BACKLOG #3582: this load is the start, so a lookup its CA check fails is isolated,
+        # as at any start, and a CA the build could not load is met as a trust anchor first. The
+        # build check leaves such a lookup out; the start below checks it again and isolates it.
+        # The same lane check, so a repeated refusal writes no second audit row.
+        refused = await checker.check_fhir_lookup_anchors(registry, env_values)
+        checked = registry
+        if refused:
+            kept = {n: s for n, s in registry.fhir_lookups.items() if n not in refused}
+            checked = replace(registry, fhir_lookups=kept)
+        await checker.build_check_off_loop(checked, env_values)
         # A stop that began during the check found no runner to stop, so none may start now
         # (engine PR 2815, Lander hold 6698688363 item 4). Nothing yields from here to add_registry.
         if self._stopping:

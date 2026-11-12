@@ -851,6 +851,101 @@ async def test_a_lookup_whose_ca_check_the_store_stopped_is_isolated_and_named_s
     assert dials == []
 
 
+async def test_a_first_load_by_reload_isolates_a_lookup_its_ca_check_refuses(
+    store: MessageStore, tmp_path: Path, judged: None, dials: list[str]
+) -> None:
+    """Review finding 2 of vault BACKLOG #3582: an engine started with no graph takes its first
+    one by reload, and that load is the start. A lookup CA that cannot be read is met by the
+    lookup CA check before the build check, so the lookup is isolated with the fixed line, as at
+    any start, and the rest of the graph comes up. Red under: that check removed from the first
+    load, where the build check refuses the whole load as a bad config."""
+    gone = tmp_path / "gone.pem"
+    cfg = tmp_path / "cfg"
+    _lookup_graph(cfg, gone, "00" * 32)
+    engine = _engine(store)
+    try:
+        await engine.reload_detail(cfg)
+        runner = engine.registry_runner
+        reason = runner.fhir_lookup_failed("EPIC")
+        assert reason is not None and reason.startswith(_REFUSED_LOOKUP), reason
+        assert {"OUT", "OB_OK"} <= set(runner._destinations)
+        await _read_refuses(runner, "EPIC")
+    finally:
+        await engine.stop()
+    assert dials == []
+
+
+async def test_a_first_load_by_reload_audits_a_refused_lookup_ca_once(
+    store: MessageStore, tmp_path: Path, judged: None, dials: list[str]
+) -> None:
+    """Review finding 2 of vault BACKLOG #3582: the first load's lookup check and the start's
+    share one lane check, so a refused pin writes its ``auth.trust_anchor`` row once, and the
+    lookup is isolated. Red under: the checker handed a lane check of its own."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _lookup_graph(cfg, ca, "00" * 32)
+    engine = _engine(store)
+    try:
+        await engine.reload_detail(cfg)
+        runner = engine.registry_runner
+        reason = runner.fhir_lookup_failed("EPIC")
+        assert reason is not None and reason.startswith(_REFUSED_LOOKUP), reason
+        events = [r["event"] for r in await _rows(store, "fhir_lookup:EPIC")]
+        assert events.count("pin_mismatch") == 1, events
+    finally:
+        await engine.stop()
+    assert dials == []
+
+
+async def test_a_lookup_store_fault_does_not_hide_a_refused_lane_ca_at_reload(
+    store: MessageStore, tmp_path: Path, judged: None, dials: list[str]
+) -> None:
+    """Review finding 8 of vault BACKLOG #3582: a store fault in the reload's lookup CA check
+    refuses only once no lane CA is refused (BACKLOG #3091), so a lane CA refused by the same
+    reload refuses it as a trust anchor. Red under: the lookup check raising its store fault
+    before the lane check runs."""
+    ca = _ca(tmp_path)
+    cfg = tmp_path / "cfg"
+    _two_outbound_graph(cfg, _dest("rest", ca, pin=_sha(ca)))
+    (cfg / "lookup.py").write_text(
+        "from messagefoundry import FhirLookup\n"
+        f"FhirLookup('EPIC', url='https://fhir.example.org/fhir', tls_ca_file={str(ca)!r}, "
+        f"tls_ca_pin={_sha(ca)!r})\n",
+        encoding="utf-8",
+    )
+    check = ta.make_lane_anchor_check(store, enforcing=True)
+    stopped = False
+
+    async def faulty(direction: str, name: str, settings: Any) -> None:
+        if stopped and direction == "fhir_lookup":
+            raise ta.AnchorStoreUnavailable("the store refused the audit read")
+        await check(direction, name, settings)
+
+    from messagefoundry.pipeline import Engine
+
+    engine = Engine(
+        store,
+        registry_preflight=ta.make_registry_anchor_preflight(store, enforcing=True),
+        lane_anchor_check=faulty,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        runner = await _start_like_serve(engine, cfg)
+        assert runner.fhir_lookup_failed("EPIC") is None and not runner.degraded_outbound()
+        feed = cfg / "feed.py"
+        feed.write_text(
+            feed.read_text(encoding="utf-8").replace(_sha(ca), "00" * 32), encoding="utf-8"
+        )
+        stopped = True
+        with pytest.raises(WiringError, match="outbound connection 'OUT'") as refused:
+            await engine.reload_detail(cfg)
+        assert isinstance(refused.value.__cause__, TrustAnchorError)
+        assert not isinstance(refused.value.__cause__, ta.AnchorStoreUnavailable)
+    finally:
+        await engine.stop()
+    assert dials == []
+
+
 async def test_a_long_lookup_name_keeps_the_advice_in_its_record(
     store: MessageStore, tmp_path: Path, judged: None, dials: list[str]
 ) -> None:
