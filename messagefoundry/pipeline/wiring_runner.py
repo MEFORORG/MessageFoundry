@@ -10335,12 +10335,6 @@ class RegistryRunner:
             except TimeoutError:
                 pass
         ids = [it.id for it in items]
-        # BACKLOG #5706: asked again after the window, which can last up to max_wait_ms, as both
-        # callers ask it before the pacing wait and after it. Every member goes back unsent, the head
-        # included: the per_lane worker passes it here with no further gate of its own, and the
-        # pooled adapter returns this outcome as its own.
-        if (park_until := await self._hand_back_unsent(name, ids)) is not None:
-            return _ItemOutcome.PROCESSED, park_until
         retry_until: float | None = None
         connector = self._destinations.get(name)
         if connector is None:
@@ -10363,6 +10357,13 @@ class RegistryRunner:
                 len(ids),
             )
             return _ItemOutcome.STOPPED, None
+        # BACKLOG #5706: asked again after the window, which can last up to max_wait_ms, and below
+        # the leadership check, so a demoted node only releases. Every member goes back unsent, the
+        # head included: the per_lane worker passes it here with no further gate of its own, and the
+        # pooled adapter returns this outcome as its own. It saves the hydration reads; the gate
+        # that guards the send itself is the one just above it.
+        if not self._lane_may_deliver(name):
+            return _ItemOutcome.PROCESSED, await self._hand_back(name, ids)
         # Frame + send inside ONE try so a FRAMING error (an unparseable / non-HL7 head member — MLLP is
         # payload-agnostic, ADR 0004, so a non-hl7v2 feed can reach here) routes to the internal-error
         # policy below (dead-letter / STOP) instead of stranding every claimed row INFLIGHT forever with
@@ -10374,6 +10375,8 @@ class RegistryRunner:
         # by id and never by content, and names none when the fault is the batch's (vault BACKLOG
         # #5100).
         current: str | None = None
+        # Set by the gate right before the send; the rows are handed back after the try.
+        gated = False
         try:
             # #149 (ADR 0105 Phase 1b): re-attach each member's detached document VERBATIM before framing
             # the envelope, so a batched streaming feed delivers full inline documents (never a raw
@@ -10443,7 +10446,11 @@ class RegistryRunner:
                 envelope = await asyncio.to_thread(
                     encode_batch, members, control_id=control_id, timestamp=timestamp
                 )
-                if not self._simulate.get(name, False):  # shadow suppresses the real egress
+                # BACKLOG #5706: the lane gate once more, right before the send, since hydration and
+                # the two thread hops above are awaits a pause or the halt can land in. Synchronous,
+                # so nothing here can raise into the arms below; the hand-back runs after the try.
+                gated = not self._lane_may_deliver(name)
+                if not gated and not self._simulate.get(name, False):  # shadow suppresses egress
                     await connector.send(envelope)
         except NegativeAckError as exc:
             # #109 (ADR 0095), the batch twin of the single-row branch in
@@ -10555,6 +10562,10 @@ class RegistryRunner:
                 ids, _member_error(f"internal error: {safe_exc(exc)}", current)
             )
         else:
+            if gated:
+                # Every member, the refused ones too: none was resolved, and a re-run refuses them
+                # again. No await since the gate read, so it still holds here.
+                return _ItemOutcome.PROCESSED, await self._hand_back(name, [it.id for it in items])
             if ids:  # nothing was sent when every member was refused
                 self._note_lane_healthy(name)
                 self._clear_store_read_faults(name)
@@ -12394,8 +12405,8 @@ class RegistryRunner:
         # head in flight is past every dispatcher gate, so only this one stops the send.
         if self._lane_may_deliver(lane):
             await self._pace_outbound(lane)
-        if (park_until := await self._hand_back_unsent(lane, [item.id])) is not None:
-            return LaneItemResult(LaneResultKind.RETRY, park_until)
+        if not self._lane_may_deliver(lane):
+            return LaneItemResult(LaneResultKind.RETRY, await self._hand_back(lane, [item.id]))
         # #134 (ADR 0082): batch inside the pooled claim (decision #5) — the dispatcher claims one head
         # per lane as always; a batching lane's delivery body coalesces its own tail (claim_next_fifo)
         # into one BHS…BTS envelope, so per_lane and pooled share the exact batch body with NO change to
@@ -12405,9 +12416,10 @@ class RegistryRunner:
             return _to_lane_result(await self._process_delivery_batch(lane, item, batch_cfg))
         return _to_lane_result(await self._process_delivery_item(lane, item))
 
-    async def _hand_back_unsent(self, name: str, ids: list[str]) -> float | None:
-        """Hand claimed, unsent OUTBOUND rows back when :meth:`_lane_may_deliver` refuses ``name``,
-        and return the park deadline; ``None``, writing nothing, when the lane may deliver.
+    async def _hand_back(self, name: str, ids: list[str]) -> float:
+        """Hand claimed, unsent OUTBOUND rows back once :meth:`_lane_may_deliver` has refused
+        ``name``, and return the park deadline. The caller asks the gate, synchronously, so the
+        allowed path awaits nothing extra.
 
         The #122 halt (ADR 0189) RESCHEDULES them to the deadline, for the reason
         :meth:`_dispatch_delivery` gives: the head is then not due, so the sweep does not re-ready
@@ -12418,11 +12430,9 @@ class RegistryRunner:
         The deadline is a park for the pooled dispatcher only. A paused lane has ``pause_pending``
         set there and goes to PAUSED at its terminal transition, ignoring it. The per_lane worker
         reads only the outcome and reaches its loop-top gates next; it meets this helper only through
-        the batch body's post-window gate, so a halt there reschedules where its own per-item gate
-        releases. Both hand the rows back unsent, and a worker halted at its loop top claims nothing
-        until a restart, by which time the backoff has passed."""
-        if self._lane_may_deliver(name):
-            return None
+        the batch body's gates, so a halt there reschedules where its own per-item gate releases.
+        Both hand the rows back unsent, and a worker halted at its loop top claims nothing until a
+        restart, by which time the backoff has passed."""
         park_until = time.time() + _WORKER_ERROR_BACKOFF_SECONDS
         if self._delivery_halted:
             await self.store.reschedule_claimed(ids, park_until)

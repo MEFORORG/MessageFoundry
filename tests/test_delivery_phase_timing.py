@@ -838,10 +838,10 @@ async def test_drops_are_non_negative_with_only_the_episode_lever_on(
     await disp.start()
     try:
 
-        async def _raised_rearmed_then_empty() -> bool:
-            return store.claim_calls >= 3
+        async def _three_drops_booked() -> bool:
+            return len(drops) >= 3  # the drops themselves: claim_calls moves before a claim returns
 
-        await _until(_raised_rearmed_then_empty)
+        await _until(_three_drops_booked)
         assert len(drops) >= 3  # the raised claim, the rearm, and the empty claim each booked one
         assert all(ns >= 0 for ns in drops), drops
     finally:

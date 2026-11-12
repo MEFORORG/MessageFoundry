@@ -1017,3 +1017,30 @@ async def test_the_batch_head_is_parsed_off_the_event_loop(
     await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
     assert len(rec.sent) == 1  # the control: the batch did go out, so the head was parsed
     assert parse_threads and loop_thread not in parse_threads
+
+
+async def test_a_pause_that_lands_while_the_envelope_is_framed_sends_nothing(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pause lands after the window has closed, while the envelope is being framed, which is an
+    await in a thread. The gate right before the send stops it, and every member goes back unsent."""
+    mids = await _enqueue(store, 3)
+    runner = _runner(store)
+    rec = _Recorder()
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
+    real_encode = wiring_runner.encode_batch
+    framed: list[int] = []
+
+    def _encode_then_pause(*args: Any, **kwargs: Any) -> str:
+        framed.append(1)
+        runner._outbound_paused.add(DEST)  # the operator pause lands mid-framing
+        return real_encode(*args, **kwargs)
+
+    monkeypatch.setattr(wiring_runner, "encode_batch", _encode_then_pause)
+    head = await store.claim_next_fifo(DEST)
+    outcome, park_until = await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    assert framed == [1]  # the control: the window closed and framing really ran
+    assert rec.sent == []
+    assert outcome is wiring_runner._ItemOutcome.PROCESSED and park_until is not None
+    assert await _states(store, mids) == [QUEUED] * 3
+    assert await _attempts(store, mids) == [0, 0, 0]

@@ -1881,9 +1881,9 @@ class StageDispatcher:
         a drop, and move the lane to ``to``. READY uses ``woken``, defaulting to the lane's own
         ``ready_woken``; STOPPED raises ``connection_stopped`` with ``detail``.
 
-        READY on a lane with ``pause_pending`` lands the pause instead (BACKLOG #5699): a pause that
-        arrived while the lane was CLAIMING must never leave it claimable, whichever release path
-        ends the claim. A READY lane with ``pause_pending`` would deliver its next head past it.
+        READY or IDLE on a lane with ``pause_pending`` lands the pause instead (BACKLOG #5699): a
+        pause that arrived while the lane was CLAIMING must never leave it claimable, whichever
+        release path ends the claim. Such a lane would deliver its next head past the pause.
 
         BACKLOG #2075. The slot goes back FIRST, and at most once per reservation. If the bookkeeping
         after it raises, the lane is left CLAIMING with its slot already returned, and the claimer
@@ -1892,7 +1892,7 @@ class StageDispatcher:
         itself raised after the lane had already left CLAIMING, because nothing would come back."""
         self._release_lane_slot(st)
         self._drop_lane_episode(st, end_ns)
-        if to is _LanePhase.READY and st.pause_pending:
+        if to in (_LanePhase.READY, _LanePhase.IDLE) and st.pause_pending:
             to = _LanePhase.PAUSED
         if to is _LanePhase.READY:
             self._to_ready(lane, woken=st.ready_woken if woken is None else woken)
