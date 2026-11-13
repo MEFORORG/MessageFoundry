@@ -2726,7 +2726,10 @@ secret. Each file in that directory holds one setting and is named exactly as it
 - **The engine refuses, at every `[security].enforcement` setting,** a directory or a file in it
   that a known broad group (at least Everyone, Authenticated Users and the local Users group; on
   POSIX, a group or other read or write bit) can read or change, a directory in which such a
-  group may delete a file (Windows `FILE_DELETE_CHILD`), and a link on Windows. It also
+  group may delete a file (Windows `FILE_DELETE_CHILD`), and a link, on every platform. On POSIX
+  it also refuses a directory or file owned by an account other than the engine's own or root,
+  and one held in a directory that such an account owns or that a group or other may write
+  without the sticky bit, since any account that may write it may replace what it holds. It also
   refuses a relative path, a file that is not a regular file, a file named for no setting above
   (an `env()` file name is letters, digits and underscores after the prefix), two `env()` files
   whose names differ only in case, an empty file, one that is not UTF-8, and one over 64 KiB. A
@@ -2737,11 +2740,12 @@ secret. Each file in that directory holds one setting and is named exactly as it
   `messagefoundry connection upsert` and `remove`, at least. A command that loads the settings and
   not the `env()` values does not check them. A refusal names the setting's file and never its value; a file
   named for no setting is cited by its position, never spelled, since its name may be a value.
-- **The access check is a list of known broad groups.** It does not refuse one named account that
-  can write the directory, the way the config-directory checks do, and it does not read the
-  folders above the directory: a broad group that can write one of those could replace the
-  directory. Restrict the directory, and the folders above it, as below rather than relying on
-  the check.
+- **The access check is a list of known broad groups.** On Windows it does not refuse one named
+  account that can write the directory, the way the config-directory checks do, and it does not
+  read the folder that holds the directory. On POSIX it reads that one folder, as the rule above
+  says. On no platform does it read the folders above that: an account that can write one of
+  those could replace the directory. Restrict the directory, and the folders above it, as below
+  rather than relying on the check.
 - **The store key is not read from here.** A file named `MEFOR_STORE_ENCRYPTION_KEY` or
   `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` is refused. Keep the key in a DPAPI-protected key file,
   [`[store].encryption_key_file`](#store).
@@ -2760,17 +2764,20 @@ default; where to put it is the platform's choice (ADR 0214, slice C).
   except as the Vault Agent route below says. Make each grant inheritable by files (`(OI)` in
   `icacls` terms): a file an administrator creates in the directory then gets the service account's
   read, where a grant that is not inheritable leaves the new file unreadable to the engine.
-- **POSIX.** Make it mode `0700` and each file `0600`, owned by the engine's account.
+- **POSIX.** Make it mode `0700` and each file `0600`, owned by the engine's account, as real
+  files and directories rather than links. Keep it in a folder owned by root or the engine's
+  account that no group or other account may write, unless that folder has the sticky bit.
 - **A container.** Mount a host directory read-only, as `docker/compose.yaml` shows for
   `/run/mefor/secrets`, and own it as the TLS directory there is owned: uid 10001, the directory
   `0700` and each file `0600`. The engine refuses a directory or file whose mode has a group or
-  other read or write bit, and a bind mount keeps the host's modes, so a mode the runtime sets on
-  a path it creates for you passes only when it has no such bit.
+  other read or write bit, or that another account owns, and a bind mount keeps the host's modes
+  and owners, so a mode the runtime sets on a path it creates for you passes only when it has no
+  such bit. A Kubernetes Secret volume serves each file as a link, so it is refused here.
 - **systemd credentials.** A unit can point the variable at its credentials directory with
   `Environment=MEFOR_SECRETS_DIRECTORY=%d` and one `LoadCredential=` per setting, the credential
   named as the variable. That is not measured here; Linux is not a supported v1 deployment target
-  ([SYSTEM-REQUIREMENTS.md](SYSTEM-REQUIREMENTS.md)). Check the directory's and files' modes
-  against the rule above before you rely on it.
+  ([SYSTEM-REQUIREMENTS.md](SYSTEM-REQUIREMENTS.md)). Check the directory's and files' modes and
+  owners against the rule above before you rely on it.
 
 **A Vault token in this directory** (BACKLOG #2851). The Vault clients never read
 `~/.vault-token`, and no setting names a token file: the token is the file named

@@ -248,12 +248,11 @@ class SecretsDirectory:
         # does not follow a link, so it may run before the access check.
         if not os.path.lexists(path):
             raise SecretsDirectoryError(f"{what} {_REMOVED}")
-        # The access check before anything that follows a link: on Windows it refuses a link
-        # without following it, and following one would open whatever it names as the engine's
-        # account, a UNC share included. A link swapped in after this check is still followed by
-        # the stat and the open below; reading through one handle opened without following would
-        # close that, and is not done here. On POSIX the access check itself follows a link and
-        # judges the file behind it, so this order changes nothing there.
+        # The access check before anything that follows a link: it refuses a link without
+        # following it, on every platform, and following one would open whatever it names as the
+        # engine's account, a UNC share included. A link swapped in after this check is still
+        # followed by the stat and the open below; reading through one handle opened without
+        # following would close that, and is not done here.
         _check(path, what)
         # A FIFO or a device named for a setting would block the read for good.
         problem = _not_a_regular_file(path)
@@ -283,8 +282,8 @@ def open_secrets_directory(environ: Mapping[str, str] | None = None) -> SecretsD
 
     ``environ`` defaults to this process's environment. Raises :class:`SecretsDirectoryError` when
     the directory is named and cannot be used: at least a relative path, a path that is not a
-    directory, a link on Windows, a directory a known broad group can read or change, or a file in
-    it whose name is not a setting the directory supplies."""
+    directory, a link, a directory a known broad group can read or change, or a file in it whose
+    name is not a setting the directory supplies."""
     environ = os.environ if environ is None else environ
     raw = environ.get(SECRETS_DIRECTORY_VARIABLE, "").strip()
     if not raw:
@@ -305,7 +304,7 @@ def open_secrets_directory(environ: Mapping[str, str] | None = None) -> SecretsD
     # The directory first: a group that can add a file to it can supply a setting, whatever the
     # access list of the file it adds.
     _check(path, what, directory=True)
-    if not path.is_dir():  # at least a link to something else, on POSIX
+    if not path.is_dir():  # what the access check passed is not a directory after all
         raise SecretsDirectoryError(unusable)
     try:
         entries = sorted(os.listdir(path))

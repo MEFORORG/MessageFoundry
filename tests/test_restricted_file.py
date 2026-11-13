@@ -510,6 +510,66 @@ def test_the_posix_check_is_the_group_and_other_read_and_write_bits() -> None:
     assert restricted_file._posix_access_problem(stat.S_IFREG | 0o711) is None
 
 
+_ENGINE_UID = 10001
+_OTHER_UID = 10002
+_KEY = stat.S_IFREG | 0o600
+_HOLDER = stat.S_IFDIR | 0o700
+
+
+def _posix_key(
+    mode: int = _KEY,
+    uid: int = _ENGINE_UID,
+    parent_mode: int = _HOLDER,
+    parent_uid: int = _ENGINE_UID,
+) -> str | None:
+    return restricted_file._posix_key_file_problem(mode, uid, parent_mode, parent_uid, _ENGINE_UID)
+
+
+def test_the_posix_key_file_decision_passes_an_owner_only_file_in_an_owner_only_directory() -> None:
+    """The control for the refusals below (vault BACKLOG #5636)."""
+    assert _posix_key() is None
+    assert _posix_key(uid=0, parent_uid=0) is None  # root owns what it can reach anyway
+    assert _posix_key(parent_mode=stat.S_IFDIR | 0o755) is None  # read and search change nothing
+    # A sticky directory that others may write still lets nobody else delete or rename the file.
+    assert _posix_key(parent_mode=stat.S_IFDIR | 0o1777, parent_uid=0) is None
+
+
+def test_the_posix_key_file_decision_refuses_a_link() -> None:
+    assert "it is a link" in str(_posix_key(mode=stat.S_IFLNK | 0o777))
+    # The link is refused whoever owns it and wherever it is.
+    assert "it is a link" in str(_posix_key(mode=stat.S_IFLNK | 0o600, uid=0))
+
+
+def test_the_posix_key_file_decision_refuses_a_file_another_account_owns() -> None:
+    problem = str(_posix_key(uid=_OTHER_UID))
+    assert f"owned by uid {_OTHER_UID}" in problem and f"(uid {_ENGINE_UID})" in problem
+
+
+def test_the_posix_key_file_decision_still_refuses_a_group_or_other_bit() -> None:
+    assert "0640" in str(_posix_key(mode=stat.S_IFREG | 0o640))
+    assert "0604" in str(_posix_key(mode=stat.S_IFREG | 0o604))
+
+
+def test_the_posix_key_file_decision_refuses_a_directory_another_account_owns() -> None:
+    problem = str(_posix_key(parent_uid=_OTHER_UID))
+    assert "the directory that holds it" in problem and f"uid {_OTHER_UID}" in problem
+
+
+@pytest.mark.parametrize("mode", [0o770, 0o730, 0o707, 0o703, 0o777, 0o2775])
+def test_the_posix_key_file_decision_refuses_a_directory_a_group_or_other_may_write(
+    mode: int,
+) -> None:
+    problem = str(_posix_key(parent_mode=stat.S_IFDIR | mode))
+    assert f"has mode {mode:04o} with no sticky bit" in problem
+
+
+def test_the_directory_that_holds_a_path_is_read_through_the_kernel_for_dot_names() -> None:
+    assert restricted_file._posix_parent(Path("a") / "b.key") == Path("a")
+    assert restricted_file._posix_parent(Path("b.key")) == Path(".")
+    assert restricted_file._posix_parent(Path(".")) == Path("..")
+    assert restricted_file._posix_parent(Path("a") / "..") == Path("a") / ".." / ".."
+
+
 # --- the Windows arm, for real --------------------------------------------------------------------
 
 
@@ -1108,6 +1168,65 @@ def test_a_name_that_is_a_link_is_refused_and_nothing_is_created_behind_it(tmp_p
     with pytest.raises(FileExistsError):
         write_restricted_file(link, b"KEY-MATERIAL-STAND-IN")
     assert not target.exists()
+
+
+@posix_only
+def test_posix_refuses_a_restricted_key_reached_through_a_link(tmp_path: Path) -> None:
+    """Vault BACKLOG #5636: the check followed the link and judged the file behind it."""
+    key = tmp_path / "real.key"
+    write_restricted_file(key, b"KEY-MATERIAL-STAND-IN")
+    assert broad_access_problem(key) is None  # the control: the file itself passes
+    link = tmp_path / "linked.key"
+    os.symlink(key, link)
+    assert "it is a link" in str(broad_access_problem(link))
+
+
+@posix_only
+def test_posix_refuses_a_restricted_key_in_a_directory_others_may_write(tmp_path: Path) -> None:
+    holder = tmp_path / "holder"
+    holder.mkdir(mode=0o700)
+    key = holder / "store.key"
+    write_restricted_file(key, b"KEY-MATERIAL-STAND-IN")
+    assert broad_access_problem(key) is None  # the control
+    holder.chmod(0o777)
+    assert "with no sticky bit" in str(broad_access_problem(key))
+    holder.chmod(0o1777)  # the sticky bit keeps others from deleting or renaming the file
+    assert broad_access_problem(key) is None
+    holder.chmod(0o770)
+    assert "has mode 0770" in str(broad_access_problem(key))
+
+
+@posix_only
+def test_posix_refuses_a_restricted_key_another_account_owns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another account is stood in for by the engine's: no test may chown a file away."""
+    real = os.geteuid()
+    if real == 0:
+        pytest.skip("root is an allowed owner, so a root-owned stand-in proves nothing")
+    key = tmp_path / "store.key"
+    write_restricted_file(key, b"KEY-MATERIAL-STAND-IN")
+    assert broad_access_problem(key) is None  # the control: the engine's own account owns it
+    monkeypatch.setattr(os, "geteuid", lambda: real + 1)
+    assert f"owned by uid {real}" in str(broad_access_problem(key))
+
+
+@posix_only
+def test_posix_refuses_a_key_whose_directory_cannot_be_examined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = tmp_path / "store.key"
+    write_restricted_file(key, b"KEY-MATERIAL-STAND-IN")
+    assert broad_access_problem(key) is None  # the control
+    real_stat = os.stat
+
+    def refuse_the_holder(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if Path(path) == tmp_path:
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", refuse_the_holder)
+    assert "the directory that holds it could not be examined" in str(broad_access_problem(key))
 
 
 def test_a_missing_file_is_a_read_problem_not_a_pass(tmp_path: Path) -> None:

@@ -464,6 +464,57 @@ def _posix_access_problem(mode: int) -> str | None:
     return None
 
 
+#: The account besides the engine's own that may own a POSIX key file or the directory holding it.
+#: Root reaches every file on the host whatever the owner, so its ownership adds no account.
+_POSIX_ROOT_UID = 0
+
+
+def _posix_key_file_problem(
+    mode: int, uid: int, parent_mode: int, parent_uid: int, euid: int
+) -> str | None:
+    """Why a POSIX key file is open beyond the account ``euid``, or ``None`` (vault BACKLOG #5636).
+
+    ``mode`` and ``uid`` are the file's own, read without following a link; ``parent_mode`` and
+    ``parent_uid`` are the directory that holds it. Refused, in this order: a link, since the file
+    behind it was not judged; a file another account owns, since its owner may change its mode or
+    replace it at will; a group or other read or write bit (:func:`_posix_access_problem`); a
+    directory another account owns; and a directory with a group or other write bit and no sticky
+    bit, since every account that may write it may also delete the file and put another in its
+    place. The engine's own account and root are the owners allowed. Kept free of I/O so the
+    decision is testable on every platform."""
+    if stat.S_ISLNK(mode):
+        return "it is a link, so the file behind it was not examined"
+    # The same owner rule as the config-source guard (config/wiring.py, _enforce_posix_paths).
+    allowed = (euid, _POSIX_ROOT_UID)
+    if uid not in allowed:
+        return (
+            f"it is owned by uid {uid}, neither the account the engine runs as (uid {euid}) nor "
+            "root, so its owner can change its mode or replace it"
+        )
+    problem = _posix_access_problem(mode)
+    if problem is not None:
+        return problem
+    if parent_uid not in allowed:
+        return (
+            f"the directory that holds it is owned by uid {parent_uid}, neither the account the "
+            f"engine runs as (uid {euid}) nor root, so that account can replace it"
+        )
+    # Write and search on a directory let an account delete or rename any entry in it, unless the
+    # sticky bit limits that to the entry's owner, the directory's owner and root.
+    if parent_mode & 0o022 and not parent_mode & stat.S_ISVTX:
+        return (
+            f"the directory that holds it has mode {stat.S_IMODE(parent_mode):04o} with no sticky "
+            "bit, so accounts other than its owner can delete it and put another file in its place"
+        )
+    return None
+
+
+def _posix_parent(path: Path) -> Path:
+    """The directory that holds ``path``. ``Path.parent`` is lexical, so for a path ending in
+    ``..``, or one with no name such as ``.``, the directory above is reached through the kernel."""
+    return path / ".." if path.name in {"", ".."} else path.parent
+
+
 #: The extended attribute that holds a Linux file's POSIX access control list.
 POSIX_ACL_XATTR = "system.posix_acl_access"
 
@@ -579,14 +630,17 @@ def broad_access_problem(path: Path, *, directory: bool = False) -> str | None:
     over. The groups are at least Everyone, Authenticated Users and the local Users group; the
     whole list is :func:`_is_broad_group`, and it is a list of known groups, not a proof that only
     the intended accounts can reach the file. An application package or capability SID
-    (:func:`_is_package_sid`) is reported the same way. POSIX: a group or other read or write bit.
-    A file whose access cannot be read is reported as a problem, and so is, on Windows, a path that is
-    itself a link, because a link carries its own access list and the file behind it was not read.
+    (:func:`_is_package_sid`) is reported the same way. POSIX (:func:`_posix_key_file_problem`): a
+    file owned by an account other than the engine's own or root, a group or other read or write
+    bit, and a directory holding it that such an account owns or that a group or other may write
+    with no sticky bit. Only the directory that holds ``path`` is read, not the ones above it. A file
+    whose access cannot be read is reported as a problem, and so is a path that is itself a link, on
+    every platform, because the file behind it was not judged.
 
     The answer names accounts and modes only, never the path or the file's contents."""
     try:
-        # lstat on Windows, so a link is seen as itself; stat on POSIX, so the file behind it is.
-        status = os.lstat(path) if sys.platform == "win32" else os.stat(path)
+        # lstat, so a link is seen as itself and refused rather than followed.
+        status = os.lstat(path)
     except OSError as exc:
         return f"it could not be examined ({exc.strerror or type(exc).__name__})"
     if sys.platform == "win32":
@@ -598,7 +652,17 @@ def broad_access_problem(path: Path, *, directory: bool = False) -> str | None:
             _win32_config_source_probes().read_path(path),
             _DIRECTORY_REACH_MASK if directory else _REACH_MASK,
         )
-    return _posix_access_problem(status.st_mode)
+    try:
+        # stat, so a linked directory is judged by the directory the file is actually in.
+        parent = os.stat(_posix_parent(path))
+    except OSError as exc:
+        return (
+            "the directory that holds it could not be examined "
+            f"({exc.strerror or type(exc).__name__})"
+        )
+    return _posix_key_file_problem(
+        status.st_mode, status.st_uid, parent.st_mode, parent.st_uid, os.geteuid()
+    )
 
 
 # --- the exact check, through an open handle (Windows) --------------------------------------------

@@ -73,9 +73,9 @@ def _absent(path: str) -> bool:
     """Whether nothing is at ``path``. Only a missing name counts: a file whose status cannot be
     read is not absent, and :func:`broad_access_problem` reports it as a problem."""
     try:
-        # The same call broad_access_problem makes: lstat on Windows, stat on POSIX, so a dangling
-        # link is missing on POSIX, as the loader that follows it finds it.
-        os.lstat(path) if sys.platform == "win32" else os.stat(path)
+        # The same call broad_access_problem makes: lstat, on every platform. So a link, dangling
+        # or not, is present, and the access check refuses it as a link (vault BACKLOG #5636).
+        os.lstat(path)
     except FileNotFoundError as exc:
         # Windows also reports a share or network path it cannot reach as FileNotFoundError. That
         # is a file nobody examined, not a missing one, so it goes to the access check, which
@@ -92,7 +92,9 @@ def key_file_problem(path: str, *, what: str, remedy: str, absent_ok: bool = Fal
     """Why the engine may not use the key file at ``path``, or ``None`` when it may.
 
     A known broad group or an application package must not be able to read or change the file
-    (:func:`~messagefoundry.restricted_file.broad_access_problem`). ``what`` names the file for
+    (:func:`~messagefoundry.restricted_file.broad_access_problem`). On POSIX that check also
+    refuses a link, a file another account owns, and a directory holding it that another account
+    owns or that a group or other may write with no sticky bit. ``what`` names the file for
     the operator and ``remedy`` says what to do about it; the reason never carries the file's
     contents. With ``absent_ok``, a missing file passes: the loader that opens it refuses it and
     says why, which is the fault the operator needs to hear about. It prints and logs nothing:
