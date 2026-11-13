@@ -379,8 +379,9 @@ class AlertSink(Protocol):
     ) -> None:
         """An **application-log sink** failed a write (BACKLOG #122, ADR 0162). ``name`` labels the sink
         (``"stdout"`` / ``"file"``); ``stage`` is ``"rolled"`` (stage 1 — the broken file was renamed
-        aside and a fresh one opened, nothing stopped) or ``"unwritable"`` (stage 2 — the replacement
-        failed too); ``reason`` is a ``safe_exc``-scrubbed cause; ``stopped`` is how many connections
+        aside and a fresh one opened, nothing stopped), ``"unwritable"`` (stage 2 — the replacement
+        failed too) or ``"stood-down"`` (a stage-2 halt that stopped nothing once it held the reload
+        lock, sent on the same sink label to correct the stage-2 page, BACKLOG #5704); ``reason`` is a ``safe_exc``-scrubbed cause; ``stopped`` is how many connections
         the fail-closed stop halted (None when nothing was stopped).
 
         **This alert is the operator's channel of last resort, and that is the point:** the sink it
