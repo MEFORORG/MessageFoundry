@@ -2025,6 +2025,22 @@ def test_cli_says_nobody_was_told_when_the_account_had_no_address(
     assert recorder.events == []
 
 
+def _undelivered_rows(db: Path, key: str) -> list[tuple[str, dict[str, str]]]:
+    """The ``auth.security_notice_undelivered`` rows in the keyed store, as (actor, detail)."""
+    from messagefoundry.pipeline.security_notify import SECURITY_NOTICE_UNDELIVERED_ACTION
+
+    async def read() -> list[tuple[str, dict[str, str]]]:
+        cipher = make_cipher(key)
+        store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
+        try:
+            rows = await store.list_audit(limit=50, action=SECURITY_NOTICE_UNDELIVERED_ACTION)
+            return [(str(r["actor"]), json.loads(str(r["detail"]))) for r in rows]
+        finally:
+            await store.close()
+
+    return asyncio.run(read())
+
+
 def test_cli_sends_through_the_real_notifier_before_it_exits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2052,16 +2068,16 @@ def test_cli_sends_through_the_real_notifier_before_it_exits(
     argv += ["--email", "operator@example.invalid"]
     assert main([*argv, "--db", str(db), "--json"]) == 0
     assert sent == [(["holder@example.invalid"], _SUBJECTS[FIRST_ADMINISTRATOR_TAKEOVER])]
+    # BACKLOG #5634's control: a notice that was sent leaves no undelivered row.
+    assert _undelivered_rows(db, key) == []
 
 
 def test_cli_records_a_takeover_notice_whose_send_failed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BACKLOG #5634: the provision row says ``dispatched``, which is never a delivery receipt, so
-    a send that then fails must leave its own undelivered row, with the recipient as actor. Before
+    a send that then fails must leave its own undelivered row, with the account as actor. Before
     the fix the offline notifier had no audit sink, and the failure reached stderr only."""
-    from messagefoundry.pipeline.security_notify import SECURITY_NOTICE_UNDELIVERED_ACTION
-
     monkeypatch.chdir(tmp_path)
     key = _key_in_this_shell(monkeypatch)
     db = tmp_path / "p.db"
@@ -2081,21 +2097,16 @@ def test_cli_records_a_takeover_notice_whose_send_failed(
     argv += ["--email", "operator@example.invalid"]
     assert main([*argv, "--db", str(db), "--json"]) == 0
 
-    async def read() -> tuple[dict[str, object], list[tuple[str, dict[str, str]]]]:
+    async def read() -> dict[str, object]:
         cipher = make_cipher(key)
         store = await MessageStore.open(db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
         try:
-            rows = await store.list_audit(limit=50, action=SECURITY_NOTICE_UNDELIVERED_ACTION)
-            return (
-                await _provision_audit(store),
-                [(str(r["actor"]), json.loads(str(r["detail"]))) for r in rows],
-            )
+            return await _provision_audit(store)
         finally:
             await store.close()
 
-    provisioned, undelivered = asyncio.run(read())
-    assert provisioned["holder_notice"] == HOLDER_NOTICE_DISPATCHED
-    assert undelivered == [
+    assert asyncio.run(read())["holder_notice"] == HOLDER_NOTICE_DISPATCHED
+    assert _undelivered_rows(db, key) == [
         ("site-admin", {"notice": "first_administrator_takeover", "reason": "send_failed"})
     ]
 

@@ -8453,8 +8453,7 @@ def _close_late_store(opened: asyncio.Future[Store]) -> None:
         return
     if (exc := opened.exception()) is not None:
         logging.getLogger(__name__).warning(
-            "a store reopen for an offline alert or notice failed after its bound (%s)",
-            type(exc).__name__,
+            "the alert's store reopen failed after its bound (%s)", type(exc).__name__
         )
         return
     _hold_late(asyncio.ensure_future(opened.result().close()), _log_late_close)
@@ -8464,22 +8463,33 @@ def _log_late_close(closing: asyncio.Future[None]) -> None:
     """``on_late`` for the alert's store close, and for a late store's: name a failure's class."""
     if not closing.cancelled() and (exc := closing.exception()) is not None:
         logging.getLogger(__name__).warning(
-            "a store reopened for an offline alert or notice did not close cleanly (%s)",
-            type(exc).__name__,
+            "the alert's store did not close cleanly (%s)", type(exc).__name__
         )
+
+
+#: How long ``admin-reset-totp`` waits for the record of a notice whose send failed: the store's
+#: reopen, the one write and the close, together (BACKLOG #5634). They run on their own loop in a
+#: daemon thread, so a synchronous hop inside the open, such as the key provider's, is inside the
+#: bound too. A record still running at the bound is not waited for: it may land later, or not.
+_OFFLINE_NOTICE_RECORD_SECONDS = 10.0
 
 
 class _ReopeningNoticeAudit:
     """A :class:`NoticeAuditSink` that opens a store only to write the row, for a command whose own
     store has closed before its notice is drained, as ``admin-reset-totp``'s has (BACKLOG #5634).
 
-    A notice that is sent opens nothing. The open and the close are each bounded by
-    :data:`_OFFLINE_ALERT_REOPEN_SECONDS`, as the alert step bounds its reopen. The write between
-    them is not: a store that opens and then blocks the write holds the command's report up for its
-    driver's own timeout. A failed open or write raises into
-    :meth:`SecurityEventNotifier._record_undelivered`, which logs it by class and swallows it: the
-    notice was best effort, and so is its record. A failed close is logged here and raises nothing,
-    so it never reports a committed row as missed."""
+    A notice that is sent opens nothing. The reopen, the write and the close run on their own
+    event loop in a daemon thread, as :func:`_run_offline_alert_step` runs the alert step, and the
+    command waits for them for at most :data:`_OFFLINE_NOTICE_RECORD_SECONDS` in all. Nothing inside
+    the command's own loop could bound them: the open's key-provider hop is synchronous, and a
+    worker-thread call still running would hold that loop's executor shutdown. A daemon thread
+    holds neither the loop nor the process's exit.
+
+    A failed open or write, a thread that cannot start, and the bound passing each raise into
+    :meth:`SecurityEventNotifier._record_undelivered`, which logs the class and swallows it: the
+    notice was best effort, and so is its record. After the bound the record may still land. A
+    failed close is logged in the thread and raises nothing, so it never reports a committed row as
+    missed."""
 
     def __init__(self, opener: Callable[[], Awaitable[Store]]) -> None:
         self._opener = opener
@@ -8494,21 +8504,51 @@ class _ReopeningNoticeAudit:
         client: str | None = None,
         now: float | None = None,
     ) -> None:
-        store = await _within(self._opener(), _OFFLINE_ALERT_REOPEN_SECONDS, _close_late_store)
-        try:
-            await store.record_audit(
-                action, actor=actor, channel_id=channel_id, detail=detail, client=client, now=now
-            )
-        finally:
+        import asyncio
+        import threading
+        import time
+
+        from messagefoundry.last_resort import run_guarded
+
+        done = threading.Event()
+        failure: list[Exception] = []
+
+        async def write() -> None:
+            store = await self._opener()
             try:
-                await _within(store.close(), _OFFLINE_ALERT_REOPEN_SECONDS, _log_late_close)
-            except Exception as exc:  # noqa: BLE001 - the row, or the write's own error, stands
-                # Caught here rather than raised: after a committed row it would log a miss that
-                # did not happen, and after a failed write it would replace that write's error.
-                logging.getLogger(__name__).warning(
-                    "a store reopened for an offline notice did not close cleanly (%s)",
-                    type(exc).__name__,
+                await store.record_audit(
+                    action,
+                    actor=actor,
+                    channel_id=channel_id,
+                    detail=detail,
+                    client=client,
+                    now=now,
                 )
+            finally:
+                try:
+                    await store.close()
+                except Exception as exc:  # noqa: BLE001 - the row, or the write's own error, stands
+                    logging.getLogger(__name__).warning(
+                        "a store reopened for an offline notice did not close cleanly (%s)",
+                        type(exc).__name__,
+                    )
+
+        def run() -> None:
+            try:
+                run_guarded(write())
+            except Exception as exc:  # noqa: BLE001 - handed to the waiting loop, which raises it
+                failure.append(exc)
+            finally:
+                done.set()
+
+        threading.Thread(target=run, name="offline-notice-record", daemon=True).start()
+        deadline = time.monotonic() + _OFFLINE_NOTICE_RECORD_SECONDS
+        while not done.is_set():
+            if time.monotonic() >= deadline:
+                raise TimeoutError
+            await asyncio.sleep(0.05)
+        if failure:
+            raise failure[0]
 
 
 async def _raise_offline_administrator_granted(
@@ -9763,7 +9803,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         _safe_print(
             "Queued a takeover notice to the account's earlier notification address. Delivery is "
             "best effort: a failed send shows as a WARNING above, for example when this shell lacks "
-            "the SMTP password the service runs with."
+            "the SMTP password the service runs with, and is recorded in the audit log as "
+            "auth.security_notice_undelivered."
         )
     elif outcome.holder_notice == HOLDER_NOTICE_NO_CHANNEL:
         _safe_print(

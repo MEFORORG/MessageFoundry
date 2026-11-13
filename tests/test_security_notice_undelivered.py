@@ -298,12 +298,15 @@ async def test_a_full_queue_does_not_wait_on_the_audit_write(store: MessageStore
 # --- BACKLOG #5634: the offline commands record a notice whose send failed --------------------
 
 
+@pytest.mark.parametrize("send_fails", [True, False])
 def test_admin_reset_totp_records_a_notice_whose_send_failed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, send_fails: bool
 ) -> None:
     """``admin-reset-totp`` sends its notice after the swap's store has closed, so the notice opens
     the store again for its record. Before the fix the notifier had no audit sink at all, and a
-    sink pointing at the swap's closed store would have failed and been swallowed."""
+    sink pointing at the swap's closed store would have failed and been swallowed. The control: a
+    notice that is sent leaves no undelivered row."""
+    sent: list[object] = []
     import base64
     import time
 
@@ -323,10 +326,12 @@ def test_admin_reset_totp_records_a_notice_whose_send_failed(
     monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol)
     monkeypatch.setattr(cli, "_show_on_terminal", lambda _text: None)
 
-    def boom(**_: Any) -> None:
-        raise OSError("relay down")
+    def send(**kwargs: Any) -> None:
+        if send_fails:
+            raise OSError("relay down")
+        sent.append(kwargs["recipients"])
 
-    monkeypatch.setattr(_SEND, boom)
+    monkeypatch.setattr(_SEND, send)
     cfg = tmp_path / "service.toml"
     cfg.write_text(
         '[alerts]\nemail_smtp_host = "smtp.example.invalid"\nemail_from = "mefor@example.invalid"\n',
@@ -335,6 +340,10 @@ def test_admin_reset_totp_records_a_notice_whose_send_failed(
     argv = ["admin-reset-totp", "--username", _ADMIN, "--db", str(db)]
     assert cli.main([*argv, "--service-config", str(cfg), "--json"]) == 0
 
+    if not send_fails:
+        assert sent == [["admin@example.invalid"]]
+        assert _with_store(db, _undelivered) == []
+        return
     assert _with_store(db, _undelivered) == [
         (
             SECURITY_NOTICE_UNDELIVERED_ACTION,
@@ -390,14 +399,16 @@ async def test_the_reopening_sink_opens_nothing_for_a_sent_notice_and_survives_a
 
 
 async def test_the_reopening_sink_keeps_a_committed_row_when_the_close_fails(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A close that fails after the row committed must not log the row as missed."""
+    """A close that fails after the row committed must not log the row as missed. The sink runs
+    the write on its own loop in a thread, so the stand-in store records in memory."""
+    written: list[tuple[str, str | None]] = []
     from messagefoundry.__main__ import _ReopeningNoticeAudit
 
     class _BadClose:
         async def record_audit(self, action: str, **kw: Any) -> None:
-            await store.record_audit(action, **kw)
+            written.append((action, kw.get("actor")))
 
         async def close(self) -> None:
             raise OSError("close failed")
@@ -418,9 +429,42 @@ async def test_the_reopening_sink_keeps_a_committed_row_when_the_close_fails(
     notifier.start()
     await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="amy", email="amy@x.test"))
     await notifier.aclose()
-    assert [(a, actor) for a, actor, _ in await _undelivered(store)] == [
-        (SECURITY_NOTICE_UNDELIVERED_ACTION, "amy")
-    ]
+    assert written == [(SECURITY_NOTICE_UNDELIVERED_ACTION, "amy")]
     messages = [r.getMessage() for r in caplog.records]
     assert not any("could not be recorded" in m for m in messages)
     assert "a store reopened for an offline notice did not close cleanly (OSError)" in messages
+
+
+async def test_the_reopening_sink_bounds_a_reopen_that_blocks_its_thread(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The bound covers a synchronous hop inside the open, such as a key provider's, which no
+    timeout inside the command's own loop could cut short."""
+    import time
+
+    import messagefoundry.__main__ as cli
+
+    monkeypatch.setattr(cli, "_OFFLINE_NOTICE_RECORD_SECONDS", 0.3)
+
+    async def stuck() -> MessageStore:
+        time.sleep(2.0)  # blocks the record's own loop, as a synchronous key hop would
+        raise OSError("never opened")
+
+    def boom(**_: Any) -> None:
+        raise OSError("relay down")
+
+    monkeypatch.setattr(_SEND, boom)
+    notifier = SecurityEventNotifier(
+        host="smtp.example.org",
+        port=25,
+        sender="mf@example.org",
+        audit=cli._ReopeningNoticeAudit(stuck),
+    )
+    notifier.start()
+    await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="amy", email="amy@x.test"))
+    began = time.monotonic()
+    await notifier.aclose()
+    assert time.monotonic() - began < 1.5
+    assert [
+        r.getMessage() for r in caplog.records if "could not be recorded" in r.getMessage()
+    ] == ["an undelivered security notice could not be recorded in the audit log (TimeoutError)"]
