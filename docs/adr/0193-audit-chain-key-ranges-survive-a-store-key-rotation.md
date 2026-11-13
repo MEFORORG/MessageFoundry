@@ -12,7 +12,8 @@
   row MAC with Transit's verify call. It supersedes the 2026-10-27 amendment's item 2 and its
   *Why regenerating pinned stands in for Transit's verify call*, and closes that amendment's edge.
   **Amended 2026-11-13** (BACKLOG #8222): see *Amendment 2026-11-13*, which changes how the
-  2026-11-11 amendment's items 4 and 5 read a timeout on one row's verify and a malformed reply to
+  2026-11-11 amendment's items 4 and 5 read a timeout on both asks of one row's verify and a
+  malformed reply to
   a handover tag.
 - **Date:** 2026-09-23
 - **Related:** BACKLOG #1904 (the defect), #1905 (keyless chain after `provision-admin`), #190 (the
@@ -597,14 +598,17 @@ Item 1's append refusal is pinned in `tests/test_crypto_transit.py`:
 
 - `test_audit_hmac_refuses_a_reply_its_own_check_would_reject`.
 
-## Amendment 2026-11-13 -- a timeout on one row's verify could not run; a malformed handover reply is a mismatch
+## Amendment 2026-11-13 -- a timeout on both asks of a row's verify could not run; a malformed handover reply is a mismatch
 
-- **Status:** Accepted -- built with the change (BACKLOG #8222 items 1 and 5; owner ruling
-  2026-11-13, "Fix forward", on engine PR 2903).
+- **Status:** Accepted -- built with the change (BACKLOG #8222 items 1 and 5). The owner ruling
+  of 2026-11-13, "Fix forward", on engine PR 2903 (comment 6840783854) ruled that a 504 or 408 on
+  one row's verify reads as could not run. Reading that only when both asks time out is a Manager
+  decision, not the owner's words. The ruling left the store-open path to the build, so the
+  open's reading in item 2 is the build's choice.
 - **Supersedes:** in the 2026-11-11 amendment, item 4's reading of a persistent 408 or 504 as a
   break, and, at store open, the refused open engine PR 2903 made of a malformed handover reply.
 
-1. **A persistent 408 or 504 on one row's verify could not run.** Under item 4 above, a failure on
+1. **A 408 or 504 on both asks of one row's verify could not run.** Under item 4 above, a failure on
    both asks while the fixed input verified was a break, a persistent 504 among them. hvac raises a
    408, a 413 and a 504 as one class, `UnexpectedError`, with no status, so the store's Vault client
    (`keyprovider_vault._build_client`) now records each failed reply's status on hvac's error

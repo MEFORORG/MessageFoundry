@@ -1077,8 +1077,8 @@ def test_a_timeout_on_one_rows_verify_could_not_run_though_the_fixed_input_verif
     ],
 )
 def test_a_timeout_on_only_one_ask_is_still_a_break(first: int, second: int) -> None:
-    """Only a 408 or 504 on both asks reads as a check that could not run; a timeout on one ask
-    beside any other failure on the other keeps item 4's reading, a break (BACKLOG #8222)."""
+    """A timeout on one ask beside a 400 or a 413 on the other, while the fixed input verifies,
+    is a break: only a 408 or 504 on both asks reads as could not run (BACKLOG #8222)."""
     cipher = _scripted_cipher([_status_error(first), _status_error(second)])
     assert cipher.verify_audit_hmac(b"row", cipher.audit_hmac(b"row")) is False
 

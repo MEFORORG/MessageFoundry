@@ -767,8 +767,8 @@ class TransitCipher(_UnmarkedPolicy):
         A failure that leaves unsettled is ``False``, logged, only when a verify over fixed input
         succeeds once more after it, unless both asks failed with an HTTP 408 or 504
         (:func:`is_vault_timeout_reply`); otherwise it raises :class:`CipherError`, since the
-        service failed between the asks or timed out on both (BACKLOG #8222, owner ruling
-        2026-11-13). Blocking."""
+        service failed between the asks or timed out on both (BACKLOG #8222: owner ruling
+        2026-11-13 on a row's timeout, read as both asks by a Manager decision). Blocking."""
         if not self._fixed_input_verifies():
             raise self._verify_failed(failed) from failed
         again: Exception | None = None
