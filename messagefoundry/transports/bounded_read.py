@@ -474,13 +474,22 @@ def reply_framing_fault(reader: object) -> str | None:
       first; section 6.3 calls this an unrecoverable error. Identical repeats are allowed.
     * A ``Content-Length`` that is all digits but that ``http.client`` could not parse, so it left
       the length unset and would read to close. Past 4300 digits :func:`int` refuses the string.
+    * A ``Content-Encoding`` naming any coding but ``identity``, across every field (BACKLOG
+      #5910). The stdlib sends ``Accept-Encoding: identity`` and ``http.client`` decodes no content
+      coding, so a ``gzip`` body from a peer, a proxy or an operator-set request header would be
+      decoded as text with ``errors="replace"``. A SOAP Fault or a STOW-RS ``FailedSOPSequence``
+      inside a 2xx would then go unseen and the message read as delivered. The same rule, parsed
+      the same way, refuses it on the Vault hop in ``strict_requests``. An operator-supplied
+      ``Accept-Encoding`` request header is not overridden: a reply it brings back coded is refused
+      here instead.
 
     A reply to ``HEAD`` is not checked: ``http.client`` returns no body for it whatever the headers
     say. A ``204``, a ``304`` and any ``1xx`` have no body either, and ``http.client`` sets
     ``length = 0`` for them, so a ``Content-Length`` there frames nothing; a ``304`` routinely
     carries its representation's length. But ``http.client`` tests ``chunked`` before ``length``,
     so ``Transfer-Encoding`` on one of those statuses would still make it read a chunked body that
-    section 6.3 says does not exist. That one header is refused there, and nothing else is checked.
+    section 6.3 says does not exist. That one header is refused there, and nothing else is checked:
+    a ``304`` routinely carries its representation's ``Content-Encoding`` too.
 
     A reader with no parsed headers, such as a binary file handle, has no framing to refuse and
     returns ``None``.
@@ -504,6 +513,14 @@ def reply_framing_fault(reader: object) -> str | None:
     status = getattr(reader, "status", None)
     if isinstance(status, int) and _status_has_no_body(status):
         return "Transfer-Encoding on a response that has no body" if te_fields else None
+    # BACKLOG #5910: parsed as strict_requests._read_body parses it, so the two hops agree.
+    content_codings = {
+        c.strip(" \t").lower()
+        for field in (get_all("Content-Encoding") or [])
+        for c in str(field).split(",")
+    }
+    if content_codings - {"", "identity"}:
+        return "a content coding other than identity, which the engine does not decode"
     if te_fields:
         if getattr(reader, "version", None) == 10:
             return "Transfer-Encoding on an HTTP/1.0 response"

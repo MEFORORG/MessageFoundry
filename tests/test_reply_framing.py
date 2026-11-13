@@ -1992,3 +1992,163 @@ def test_a_sanctioned_class_is_a_value_only_inside_its_own_module() -> None:
     tree = ast.parse("class _ConfinedOpener: ...\nQ = _ConfinedOpener\n")
     assert _stock_calls(tree, "parsing/xml/schema.py") == []
     assert _stock_calls(tree, "parsing/xml/other.py") == [(2, "_ConfinedOpener")]
+
+
+# --- a content-coded reply body is refused, not read as text (BACKLOG #5910) ----------------------
+#
+# urllib asks for no content coding, and http.client decodes none. A peer, a proxy or an operator
+# header that brings back a gzip body would have its compressed bytes decoded as text with
+# errors="replace", so a SOAP Fault or a STOW-RS FailedSOPSequence inside a 2xx went unseen and the
+# message read as delivered. reply_framing_fault refuses any coding but identity, by the rule
+# strict_requests._read_body applies to the Vault hop.
+
+_SOAP_FAULT = (
+    b'<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body>'
+    b"<soap:Fault><faultcode>soap:Client</faultcode><faultstring>rejected</faultstring>"
+    b"</soap:Fault></soap:Body></soap:Envelope>"
+)
+_STOW_FAILED = b'{"00081198": {"vr": "SQ", "Value": [{"00081197": {"vr": "US", "Value": [272]}}]}}'
+_CODED_REASON = "a content coding other than identity, which the engine does not decode"
+
+
+def _coded(status: bytes, coding: bytes, body: bytes) -> bytes:
+    import gzip
+
+    data = gzip.compress(body, mtime=0)
+    return (
+        b"HTTP/1.1 " + status + b"\r\nContent-Encoding: " + coding + b"\r\n"
+        b"Content-Length: %d\r\n\r\n" % len(data) + data
+    )
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        pytest.param([b"gzip"], id="gzip"),
+        pytest.param([b"GZIP"], id="gzip-upper-case"),
+        pytest.param([b"identity, gzip"], id="identity-then-gzip"),
+        pytest.param([b"identity", b"deflate"], id="second-field-deflate"),
+        pytest.param([b"br"], id="br"),
+        pytest.param([b"x-SECRETcoding"], id="unknown-coding"),
+    ],
+)
+def test_a_content_coding_other_than_identity_is_refused(fields: list[bytes]) -> None:
+    head = b"".join(b"Content-Encoding: " + f + b"\r\n" for f in fields)
+    resp = _wire(_OK + head + b"Content-Length: 5\r\n\r\nhello")
+    assert reply_framing_fault(resp) == _CODED_REASON
+    with pytest.raises(AmbiguousFramingError) as raised:
+        read_bounded(resp, connector="c")
+    _assert_framing_refusal(raised.value)
+    # Fixed text only: the header value never reaches the error.
+    assert "SECRET" not in str(raised.value)
+    assert raised.value.reason == _CODED_REASON
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        pytest.param(b"", id="absent"),
+        pytest.param(b"Content-Encoding: identity\r\n", id="identity"),
+        pytest.param(b"Content-Encoding: IDENTITY\r\n", id="identity-upper-case"),
+        pytest.param(b"Content-Encoding: \r\n", id="empty"),
+        pytest.param(b"Content-Encoding: identity, identity\r\n", id="identity-twice"),
+    ],
+)
+def test_an_identity_or_absent_content_coding_still_reads(head: bytes) -> None:
+    assert read_bounded(_wire(_OK + head + b"Content-Length: 5\r\n\r\nhello"), connector="c") == (
+        b"hello"
+    )
+
+
+def test_a_content_coding_on_a_chunked_reply_is_refused() -> None:
+    raw = _OK + b"Content-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n" + _CHUNKS
+    assert reply_framing_fault(_wire(raw)) == _CODED_REASON
+
+
+def test_a_content_coding_on_a_bodyless_reply_or_head_is_not_refused() -> None:
+    """A 304 routinely carries its representation's Content-Encoding, and no body is read for it,
+    nor for a reply to HEAD. The control: the same head on a 200 GET is refused."""
+    head = b"Content-Encoding: gzip\r\nContent-Length: 5\r\n\r\nhello"
+    assert read_bounded(_wire(b"HTTP/1.1 304 Not Modified\r\n" + head), connector="c") == b""
+    assert read_bounded(_wire(_OK + head, method="HEAD"), connector="c") == b""
+    assert reply_framing_fault(_wire(_OK + head)) == _CODED_REASON
+
+
+def test_a_gzipped_soap_fault_in_a_2xx_is_not_recorded_as_delivered() -> None:
+    raw = _coded(b"200 OK", b"gzip", _SOAP_FAULT)
+    with _serve(raw) as url, pytest.raises(DeliveryError) as raised:
+        asyncio.run(_soap(url).send("<soap:Envelope/>"))
+    _assert_captured_2xx_refusal(raised.value)
+    assert "content coding other than identity" in str(raised.value)
+
+
+def test_a_gzipped_soap_500_still_ends_not_delivered(caplog: pytest.LogCaptureFixture) -> None:
+    raw = _coded(b"500 Internal Server Error", b"gzip", _SOAP_FAULT)
+    with (
+        _serve(raw) as url,
+        caplog.at_level(logging.WARNING),
+        pytest.raises(DeliveryError) as raised,
+    ):
+        asyncio.run(_soap(url).send("<soap:Envelope/>"))
+    assert type(raised.value) is DeliveryError
+    assert "HTTP 500" in str(raised.value)
+    assert "could not read whole" in caplog.text
+
+
+def test_a_gzipped_rest_reply_in_a_2xx_is_refused() -> None:
+    raw = _coded(b"200 OK", b"gzip", b'{"status": "rejected"}')
+    with _serve(raw) as url, pytest.raises(DeliveryError) as raised:
+        asyncio.run(_rest(url).send('{"a": 1}'))
+    _assert_captured_2xx_refusal(raised.value)
+
+
+def test_a_gzipped_stowrs_failure_in_a_2xx_is_not_recorded_as_delivered() -> None:
+    from messagefoundry.config.wiring import DICOMweb
+    from messagefoundry.parsing import RawMessage
+    from messagefoundry.transports.dicomweb import DicomWebDestination
+
+    payload = RawMessage.from_bytes(b"\x00" * 128 + b"DICM" + b"synthetic", "dicom").encode()
+    raw = _coded(b"200 OK", b"gzip", _STOW_FAILED)
+    with _serve(raw) as url:
+        dest = build_destination(
+            Destination(
+                name="OB_DCMWEB",
+                type=ConnectorType.DICOMWEB,
+                settings=DICOMweb(url=url).settings,
+            ),
+            egress=EgressSettings(deny_by_default=False),
+        )
+        assert isinstance(dest, DicomWebDestination)
+        with pytest.raises(DeliveryError) as raised:
+            asyncio.run(dest.send(payload))
+    _assert_captured_2xx_refusal(raised.value)
+
+
+def test_a_gzipped_stowrs_failure_is_seen_without_the_coding() -> None:
+    """The control for the test above: the same failure sent plain is caught by its own rule, so
+    the refusal there is the content coding and not some other fault in the fixture."""
+    from messagefoundry.config.wiring import DICOMweb
+    from messagefoundry.parsing import RawMessage
+
+    payload = RawMessage.from_bytes(b"\x00" * 128 + b"DICM" + b"synthetic", "dicom").encode()
+    raw = _OK + b"Content-Length: %d\r\n\r\n" % len(_STOW_FAILED) + _STOW_FAILED
+    with _serve(raw) as url:
+        dest = build_destination(
+            Destination(
+                name="OB_DCMWEB",
+                type=ConnectorType.DICOMWEB,
+                settings=DICOMweb(url=url).settings,
+            ),
+            egress=EgressSettings(deny_by_default=False),
+        )
+        with pytest.raises(NegativeAckError) as raised:
+            asyncio.run(dest.send(payload))
+    assert raised.value.code == "failed-sop"
+
+
+def test_oidc_jwks_fetch_refuses_a_content_coded_reply() -> None:
+    from messagefoundry.auth.oidc_http import jwks_fetcher
+
+    raw = _coded(b"200 OK", b"gzip", _TOKEN_JSON)
+    with _serve(raw) as url, pytest.raises(IdpReplyUnusableError, match="ambiguously"):
+        jwks_fetcher(url, urllib.request.build_opener())()
