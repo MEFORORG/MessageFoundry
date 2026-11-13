@@ -220,15 +220,17 @@ def _random_head(rng: random.Random) -> str:
 
 def test_the_head_separators_match_the_parser_over_random_heads() -> None:
     rng = random.Random(5919)
-    heads = [_random_head(rng) for _ in range(5000)]
+    heads = [_random_head(rng) for _ in range(10000)]
     readings = {h: _parser_reading(h) for h in heads}
-    for head in heads:
-        if not _has_a_short_later_header(head):
-            assert _batch_reading(head) == readings[head], repr(head)
-    # Positive control for the generator: separators read after leading whitespace, and a
-    # non-MSH lead.
-    assert any(h[:1].isspace() and len(readings[h]) == 5 for h in heads)
-    assert any(not h.lstrip().startswith("MSH") for h in heads)
+    compared = [h for h in heads if not _has_a_short_later_header(h)]
+    for head in compared:
+        assert _batch_reading(head) == readings[head], repr(head)
+    # Positive controls for the generator, over the heads compared: enough MSH-led heads whose
+    # separators are read (the header-only path), one after leading whitespace, and a non-MSH lead.
+    read = [h for h in compared if len(readings[h]) == 5 and h.lstrip().startswith("MSH")]
+    assert len(read) >= 500, len(read)
+    assert any(h[:1].isspace() for h in read)
+    assert any(not h.lstrip().startswith("MSH") for h in compared)
 
 
 @pytest.mark.parametrize(

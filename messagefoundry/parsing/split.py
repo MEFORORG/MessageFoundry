@@ -320,8 +320,8 @@ def _head_separators(norm: str) -> tuple[str, str, str, str, str]:
     For a head that opens with ``MSH`` after whitespace, with MSH-1 and four encoding characters,
     they are read from that line's first few characters alone, through the parser's own window
     (:func:`~messagefoundry.parsing._builtin_hl7._first_line_head`) and separator read (BACKLOG
-    #5919): a full parse of a large hydrated head to read eight characters split every segment of
-    it. Every other head, such as an ``FHS``/``BHS``-led one, one led by a byte order mark, a
+    #5919): a full parse of a large hydrated head to read eight characters copied the whole head
+    at least twice. Every other head, such as an ``FHS``/``BHS``-led one, one led by a byte order mark, a
     non-HL7 one or one whose MSH-2 is short, is parsed as before, so it frames or raises exactly as
     it did, ``ValueError`` and its message included.
 
@@ -329,9 +329,8 @@ def _head_separators(norm: str) -> tuple[str, str, str, str, str]:
     budget (:func:`~messagefoundry.parsing.peek.enforce_expansion_budget`, ASVS 1.3.3), run on
     ``norm`` itself, the text encode_batch frames: a head a parse refuses for its escapes raises
     the same ``HL7PeekError`` here, whatever its caller checked. On the delivery path that text is
-    the hydrated head, whose stored payload the caller and the document re-attach have each
-    parsed already, and the re-attach refuses a document holding the escape character, so this is
-    a second check of the same budget there, not the only one. What else a parse checks in the
+    the hydrated head, and the caller's own parse of the head's stored payload checks the same
+    budget first, so there this is a second check, not the only one. What else a parse checks in the
     rest of the head is not checked: at least a later header line too short to read."""
     line = _first_line_head(norm)
     # _extract_separators fills a short MSH-2 with defaults, where _encoding_chars refuses one, so
