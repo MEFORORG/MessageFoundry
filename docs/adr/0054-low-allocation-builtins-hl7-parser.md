@@ -299,6 +299,27 @@ What that costs, stated so nobody reads the record as more than it is:
   built-in parser reads field 2 to the end of that line and writes it back as it came. A header
   ending in that separator (`MSH|^~\&|`) now keeps an empty field 3, so a rewrite keeps its
   trailing separator too. No case in the record has either shape.
+- **`Message` now agrees with `Peek` on a fieldless line (BACKLOG #5917).** python-hl7's
+  `segments()` matcher skips a line with no field separator, such as a bare `PID`, so `Peek.field`,
+  `extract_field` and an occurrence-1 whole-field write never counted it. Its tolerant iteration,
+  which the `Message` reads, presence check, `count_segments` and later-occurrence writes mirrored,
+  did count it. The built-in parser's occurrence scan, `segment_index`, now skips a fieldless
+  line, and at least the `Message` reads, presence check, writes, `count_segments`, group member
+  occurrences and the `Peek` reads apply that skip, so `Message` and `Peek` number occurrences
+  alike and a write lands on the segment a read names. Code that numbers occurrences from
+  `segments()` or from encoded lines does not, for example `actions.copy_segment` at the time of
+  this change. Group spans and `split_by_obr` stay positional on purpose, so a fieldless `OBR`
+  still opens a group and a split part, and a group edit never reaches into the next order. The
+  cost: `len(groups())` can exceed `count_segments("OBR")`, and a group's `ordinal` is then not
+  the occurrence `field` reads. A line with even one empty field (`PID|`) is not fieldless, so
+  it is an occurrence to `Message` and `Peek` alike. On a body with a bare `PID` before a
+  populated one, a `Message` read at occurrence 1 now returns the populated segment where python-hl7's `Message`
+  would have returned the empty bare line. `segments()` stays positional and still lists the bare
+  line; `delete_segments` still removes it. The blank-line `IndexError` on the raising paths
+  (`raise_if_blank_segment_scan`) is unchanged; it turns on an empty line, not a fieldless one.
+  One case in the record, `adv:empty-fields`, carries a fieldless line, a lone bare `EVN` that no
+  mutation writes to. Its recorded answers still hold, because python-hl7 already read that
+  line's fields as `None`; only its count would now be 0, and the record holds no count.
 
 ### Other things that moved with it
 
