@@ -2119,14 +2119,19 @@ with materially different PHI profiles, so they get their own rows; stream 4 is 
 #2351. It is row 15 now, and what this paragraph said about it lives in that row. The VS Code extension also calls `console.warn` at four sites at least, in `ide/src/testBench.ts`, `testBenchWebview.ts` and `webviewMessaging.ts`. The ones read for this row write fixed sentences, some with a panel name or an error type added. The webview discard warning prints one fixed phrase per panel and names nothing the message chose, not even its kind (BACKLOG #1123). That output has no row, and where the editor keeps it was not checked. `GET /metrics` (Prometheus gauges/counters) and the `/ws/stats`
 WebSocket are **live telemetry, not log records** — neither retains a per-event record. The standalone
 **`tee` MLLP relay** is a separate application shipped in this repo with its own SQLite store and its own
-logging (`relay_log` — direction/leg/control id/type/size/outcome/ack code + a 500-char detail
-in which each character below U+0020 except tab is replaced with a space (DEL and C1 controls pass
-unchanged), never a body, but able to carry at least partner ACK text or a
-transport error string that names a patient; and `relay_capture`, whose `raw` column holds the **full message** and is written only when
+logging (`relay_log` — direction/leg/control id/type/size/outcome/ack code + a detail, never a
+body; and `relay_capture`, whose `raw` column holds the **full message** and is written only when
 `--capture-bodies` is passed). Its process logging is a bare `logging.basicConfig` to stderr with **none**
 of the filters above. It is **out of scope for this section** — but treat **every** tee DB,
 capture on or off, as a PHI-at-rest location on the terms of
-[§2](#2-where-phi-lives--data-at-rest-inventory), because of that detail. Its `purge` scrubs deleted bodies from the DB and `-wal`
+[§2](#2-where-phi-lives--data-at-rest-inventory), because of that detail. **This is the one
+statement of what the detail holds.** It can carry at least the partner's MSA-3 ACK text or a
+transport error string, and either can name a patient. The store cuts it to 500 characters, then
+escapes every character of the engine's log alphabet with a copy of
+`messagefoundry/controlchars.py`'s `scrub_control_chars` (`tee/controlchars.py`, kept
+byte-identical by a test), so at least C0, DEL, C1 and bidirectional controls are stored as
+backslash escapes; tab is kept. The relay's own process log writes the same detail unescaped
+(open item). Its `purge` scrubs deleted bodies from the DB and `-wal`
 files, at file level only; [TEE-RELAY.md, Purge](TEE-RELAY.md#purge) states what the scrub
 does and does not reach, and where `VACUUM`'s temp copy may go. On POSIX the `-wal` and `-shm`
 files take the DB file's mode. That mode is `0600` only when the store's `0600` pre-create of a

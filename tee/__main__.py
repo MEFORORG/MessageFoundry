@@ -276,8 +276,8 @@ def _build_parser() -> argparse.ArgumentParser:
     purge.add_argument(
         "--captures-only",
         action="store_true",
-        help="drop only the captured message bodies, keep the NAK/leg log; not a PHI purge, since a"
-        " log row's detail can name a patient",
+        help="drop only the captured message bodies; keep the NAK/leg log, whose detail can still"
+        " name a patient",
     )
     purge.add_argument(
         "--scrub-only",

@@ -10,6 +10,8 @@ import os
 import pickle
 import sqlite3
 import stat
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -962,3 +964,53 @@ async def test_a_db_without_the_record_owes_one_scrub(
         assert "VACUUM" not in ran  # owed once only
     finally:
         await store.close()
+
+
+def test_the_vendored_controlchars_stays_byte_identical_to_the_engine() -> None:
+    # tee imports no messagefoundry module, so it carries a copy; this keeps the copy honest.
+    root = Path(__file__).resolve().parents[1]
+    engine = (root / "messagefoundry" / "controlchars.py").read_bytes()
+    assert (root / "tee" / "controlchars.py").read_bytes() == engine
+
+
+async def test_detail_escapes_c0_del_c1_and_bidi_controls_and_keeps_tab(tmp_path: Path) -> None:
+    store = await _open(tmp_path)
+    try:
+        await _record(
+            store, outcome="nak", ack_code="AE", detail="a\x00\x1b[31m\x7f\u0080\u202e\tb"
+        )
+        naks = await store.recent_naks()
+        detail = naks[0].detail
+        assert detail is not None
+        assert detail.isascii()
+        assert "\t" in detail  # tab is kept
+        assert not any(ord(ch) < 0x20 and ch != "\t" for ch in detail)
+        assert "\\u0080" in detail and "\\u202e" in detail  # stored as backslash escapes
+    finally:
+        await store.close()
+
+
+def test_naks_output_survives_a_strict_cp1252_stdout(tmp_path: Path) -> None:
+    # A partner's UTF-8 smart quote, decoded as latin-1 by the ACK reader, arrives as U+0080 and
+    # U+0099. Unescaped, `tee naks > file` on a cp1252 console encoding raised UnicodeEncodeError.
+    db_path = tmp_path / "tee.db"
+
+    async def seed() -> None:
+        store = await RelayStore.open(str(db_path))
+        try:
+            await _record(store, outcome="nak", ack_code="AE", detail="don\u00e2\u0080\u0099t")
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    env = {**os.environ, "PYTHONIOENCODING": "cp1252:strict", "PYTHONUTF8": "0"}
+    result = subprocess.run(
+        [sys.executable, "-m", "tee", "naks", "--db", str(db_path)],
+        capture_output=True,
+        env=env,
+        cwd=Path(__file__).resolve().parents[1],
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    assert b"control_id=" in result.stdout

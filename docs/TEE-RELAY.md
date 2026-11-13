@@ -118,8 +118,9 @@ fail-closed), `--connect-timeout` / `--send-timeout`, `--max-frame-bytes` (frame
 ## The SQLite log
 
 The relay's only store is SQLite. It records **one row per forwarding leg** (`corepoint` / `mefor`) with
-the outcome, the ACK code, the control id (MSH-10), the message type (MSH-9), the size, and a bounded,
-control-char-scrubbed `detail` (the MSA-3 reason or an error string). **Message bodies are never logged**;
+the outcome, the ACK code, the control id (MSH-10), the message type (MSH-9), the size, and a
+`detail` (the MSA-3 reason or an error string), stored as [PHI.md section 7, the tee relay
+paragraph](PHI.md#7-logging--phi-redaction) says. **Message bodies are never logged**;
 they are persisted only to a separate `relay_capture` table, and only when `--capture-bodies` is set.
 
 `python -m tee naks` prints the recent NAKs (`AE`/`AR`/`CE`/`CR`) and transport errors — the otherwise-
@@ -129,9 +130,10 @@ invisible record of anything a downstream rejected for a message Epic was told `
 
 `python -m tee export` writes the log as **JSON** — a `summary` (counts by leg / outcome / ACK code,
 NAK count, distinct messages, time range) plus the matching `rows`. It never holds the captured
-message bodies, but it is **not PHI-safe**: a row's `detail` can carry at least the partner's
-MSA-3 ACK text or a transport error string, written verbatim apart from a 500-character cap and
-each character below U+0020 except tab, which becomes a space (DEL and C1 controls pass unchanged), and either can name a patient. `python -m tee naks` prints the same detail. Treat an export as PHI, and check it before you hand it to a reviewer or an AI session.
+message bodies, but it is **not PHI-safe**: a row's `detail`, stored as [PHI.md section 7, the
+tee relay paragraph](PHI.md#7-logging--phi-redaction) says, can name a patient. The JSON escapes
+every non-ASCII character as `\uXXXX`, so search an export with that in mind.
+`python -m tee naks` prints the same detail. Treat an export as PHI, and check it before you hand it to a reviewer or an AI session.
 Default is stdout; use
 `--out FILE` to write a file. Narrow it with `--since` / `--before` (an age like `24h`/`7d` or a UTC date
 `YYYY-MM-DD`), `--naks-only`, and `--limit N`.
