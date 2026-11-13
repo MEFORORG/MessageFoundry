@@ -177,6 +177,10 @@ _EXEMPT: dict[tuple[str, str], str] = {
     ("messagefoundry/parsing/sniff.py", "nontext_upload_reason"): "compare",
     # importer-droppable leads, harness-mirrored
     ("messagefoundry/spreadsheet.py", "_LEADING_NOISE"): "range",
+    # the anonymizer's trim set (BACKLOG #5632, #5654): whitespace plus C0 and DEL, what a
+    # consumer drops around a value. The file is held byte-identical with tee/anon/surrogates.py,
+    # and the tee cannot import messagefoundry, so it cannot use controlchars.
+    ("messagefoundry_toolkit/anon/surrogates.py", "_TRIM_CHARS"): "compare",
 }
 
 

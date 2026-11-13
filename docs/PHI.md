@@ -2419,11 +2419,12 @@ Properties of the anonymizer:
   part as written, so one code written two ways gets two unrelated surrogates. The split on
   whitespace and escaped delimiters applies only to a part that holds an escape character: free
   text such as `Call 971234 today` keeps the code, while `Call 971234 today\.br\` loses the whole
-  part, text included, to digits. Each escape body in such a part is also read as written, in
-  three positions only: whole, without its first character, and without its first three when it
-  opens with a dot. So a code that is the whole rest of a body that decodes to nothing, such as
-  `\Z971234\` or `\.sp971234\`, is found. A body is never split, so a code elsewhere in one
-  passes, such as `\Z971234 x\`, `\ZZ971234\` or `\.ti+971234\`. With no site prefix loaded it matches nothing, and
+  part, text included, to digits. Each escape body in such a part, the text after an escape
+  character up to the next one or to the end of the part, is also read as written, split at every
+  character that is not a digit, since a raw viewer shows that text and a site code is digits
+  only. So `\Z971234\`, `\Z-971234\`, `\.Z971234\` and `\.sp971234 x\` are found, and so is a
+  well-formed hex escape whose digits hold a code, such as `\X971234\`, which the scrub then
+  replaces although it decodes to other bytes. With no site prefix loaded it matches nothing, and
   `python -m tee anonymize-captures` prints a warning saying so (vault BACKLOG #3516).
 - **Fail-closed contract.** A message with **no parseable MSH / malformed** is **REFUSED** (raises
   `AnonError`) — it never emits an un-scrubbed body. So is a message holding a line no rule can

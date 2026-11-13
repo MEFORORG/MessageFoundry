@@ -83,6 +83,13 @@ _ESCAPED_SITE_CODES = pytest.mark.parametrize(
         "X\\Z971234\\Y",
         "\\.sp971234\\",
         "\\971234\\",
+        "\\Z-971234\\",
+        "\\.Z971234\\",
+        "\\.sp971234 x\\",
+        "\\Z971234 x\\",
+        "\\ZZ971234\\",
+        "\\.ti+971234\\",
+        "x\\Z971234",
     ],
     ids=[
         "component-escape",
@@ -108,6 +115,13 @@ _ESCAPED_SITE_CODES = pytest.mark.parametrize(
         "z-escape-body-inside",
         "out-of-range-spacing-command",
         "bare-escape-body",
+        "z-body-dash",
+        "dotted-unknown-command",
+        "spacing-command-then-text",
+        "z-body-then-text",
+        "two-letter-opener",
+        "signed-spacing-command",
+        "unclosed-tail",
     ],
 )
 

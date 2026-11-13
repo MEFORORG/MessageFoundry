@@ -481,19 +481,21 @@ def _reads_as_site_code(part: str, seps: Seps, field_sep: str) -> bool:
     no escape character is read only whole, so a site-code run inside a longer value, such as
     ``Call 971234 today``, reads as no site code. A part that holds one is also read split on
     whitespace and on escaped delimiters, so ``Call 971234 today\\.br\\`` reads as a site code,
-    and :func:`scrub_site_codes` then replaces the whole part. Each escape body as written, the
-    text between an escape character and the next, is read in three positions only: whole,
-    without its first character, and without its first three when it opens with a dot. So a
-    site code that is the whole rest of a body that decodes to nothing, such as ``\\Z971234\\``
-    or ``\\.sp971234\\``, is found: a raw viewer, or a receiver that defines the escape, shows
-    it. A body is never split, so a code elsewhere in one passes, such as ``\\Z971234 x\\``,
-    ``\\ZZ971234\\`` or ``\\.ti+971234\\``."""
+    and :func:`scrub_site_codes` then replaces the whole part. Each escape body is also read as
+    written, split at every character that is not a digit: a raw viewer, or a receiver that
+    defines the escape, shows the body's text, and a site code is digits only. docs/PHI.md
+    section 9, *Field-anchored site-code scrub*, states the rule and its consequences."""
     forms = [trim(part), *decoded_readings(part, seps, field_sep, resplit=True)]
     if seps.escape and seps.escape in part:
-        # The odd pieces are the escape bodies; the text around them is already read decoded.
+        # Every piece after an opening escape character is a body: the odd pieces of the split,
+        # an unclosed tail among them. The text around them is already read decoded.
         for body in part.split(seps.escape)[1::2]:
-            forms += (body, body[1:], body[3:] if body.startswith(".") else body)
-    return any(SITE_CODE_RE.fullmatch(trim(form)) for form in forms)
+            forms += _NON_DIGITS.split(body)
+    return any(SITE_CODE_RE.fullmatch(form) for form in forms)
+
+
+#: What splits an escape body read as written: any run of characters that are not ASCII digits.
+_NON_DIGITS: re.Pattern[str] = re.compile(r"[^0-9]+")
 
 
 def scrub_site_codes(value: str, keyer: Keyer, seps: Seps, field_sep: str = "|") -> str:
