@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.12.3"
+$GateVersion = "2026.11.12.4"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -607,16 +607,27 @@ function Resolve-ShellIndirection([string]$Token, [string]$Prefix) {
 # capture changes. A lone or mismatched quote is left alone too: that is a value with a space in it,
 # which the readers already truncate, and guessing the rest of it would be a confident wrong path.
 #
-# ONE VERDICT MOVES THE OTHER WAY, and it is parity rather than a hole: from a governed cwd,
+# VERDICTS ALSO MOVE THE OTHER WAY, AT LEAST THESE, and each is parity rather than a hole: from a governed cwd,
 # `git --git-dir='<ungoverned>/.git' config core.hooksPath x` used to deny on the quote-tainted token
 # and now allows, exactly as its double-quoted spelling always has. The write lands in the ungoverned
-# repository either way.
+# repository either way. Under rule 3, `git -C '<ungoverned>' reset --hard` from a governed cwd used
+# to deny, because the quote-tainted path resolved as a relative directory under that cwd, and now
+# allows as its double-quoted twin does. Neither command touches a governed tree.
 function Remove-OuterQuotePair([string]$Value) {
     if ($Value.Length -ge 3 -and ($Value[0] -eq [char]"'" -or $Value[0] -eq [char]'"') -and
         $Value[$Value.Length - 1] -eq $Value[0]) {
         return $Value.Substring(1, $Value.Length - 2)
     }
     $Value
+}
+
+# A RAW `-C` capture, read as git reads it. git takes an EMPTY `-C` as the current directory, and on
+# the RAW line `-C ''` is truly empty, so it is read as `.`; until then it named a directory called
+# two apostrophes and rules 3b, 3c and 3d allowed it while `-C ""` denied. Raw captures only: on SCAN an
+# empty pair can also be a blanked span with a space in it, which is why Remove-OuterQuotePair keeps it.
+function ConvertFrom-RawDashCValue([string]$Value) {
+    if ($Value -ceq "''") { return '.' }
+    Remove-OuterQuotePair $Value
 }
 
 function Get-ChdirTargetRaw([string]$Text) {
@@ -760,7 +771,7 @@ function Get-OwnInvocationWindow([string]$Scan, [int]$At, [switch]$SeparatorInTo
             $last = $sepBefore[$sepBefore.Count - 1]
             $start = $last.Index + $last.Length
         }
-        if ($SeparatorInToken -and $own.Length -gt 0 -and ';&|('.Contains([string]$own.Value[0])) {
+        if ($SeparatorInToken -and $own.Length -gt 0 -and ';&|(`'.Contains([string]$own.Value[0])) {
             $start = $own.Index + 1
         }
     }
@@ -795,6 +806,10 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
                                    [switch]$ExplicitFirst, [string]$CarriedGitDir = "",
                                    [switch]$RepositoryOnly, [switch]$OwnWindow, [string]$DashCText = "") {
     <#
+    UPDATED BY BACKLOG #5643 AND #5655: rules 3 and 3d now ALSO call this with -OwnWindow, on a second
+    reading added after their unchanged three-argument call; see that switch below. The paragraph that
+    follows describes the three-argument call, and is otherwise as written.
+
     THREE OPT-IN SWITCHES, ALL DEFAULT OFF. Rules 3 and 3d call this with three positional arguments
     and are therefore byte-identical to before; only rule 3c opts in. That is deliberate blast-radius
     control: #1065 has already killed two rewrites, and both died the same way -- the replacement turned
@@ -905,9 +920,9 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     } elseif ($AllTargets) {
         # [regex]::Matches is case-SENSITIVE by default, which is the same reading `-cmatch` gives, so
         # this changes WHICH MATCHES ARE KEPT and nothing about which text matches.
-        $dashCs = @([regex]::Matches($Line, $dashCPattern) | ForEach-Object { Remove-OuterQuotePair $_.Groups[1].Value })
+        $dashCs = @([regex]::Matches($Line, $dashCPattern) | ForEach-Object { ConvertFrom-RawDashCValue $_.Groups[1].Value })
     } elseif ($Line -cmatch $dashCPattern) {
-        $dashCs = @(Remove-OuterQuotePair $Matches[1])
+        $dashCs = @(ConvertFrom-RawDashCValue $Matches[1])
     }
     # COLLECTED SEPARATELY RATHER THAN PUSHED STRAIGHT INTO $out (BACKLOG #1379 class one). These
     # used to land in $out here, ahead of everything, and the caller takes the first candidate git
@@ -4552,6 +4567,7 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
     foreach ($seg in (Get-ScannableSegments $cmd (Get-HostConvention $tool))) {
         if ($root) { break }
         if ($seg.Scan -cnotmatch $gitInvocation) { continue }
+        $segMap = $null ; $segMapRead = $false
         foreach ($vm in @([regex]::Matches($seg.Scan, $verbHunt))) {
             $vGroup = $vm.Groups['verb']
             $vIdx = $vGroup.Index
@@ -4561,12 +4577,15 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
             $invCands = @(Get-GitTargetCandidatesRaw $seg.Raw $seg.Scan.Substring(0, $inv.Own.Index) $cwdRaw `
                               -OwnWindow -DashCText $inv.CmdWin)
             # Rule 3b reads the text from the verb on, so a verb spelled inside an earlier path or
-            # command is never mistaken for this one.
-            $invocations += [pscustomobject]@{
-                Verb   = $vGroup.Value
-                Text   = $seg.Scan.Substring($vIdx)
-                Target = $(if ($invCands.Count -gt 0) { $invCands[0] } else { "" })
-            }
+            # command is never mistaken for this one. RAW text where the map can be built, because the
+            # scan blanks a quoted destination such as 'feat(x)' and class A then finds no branch; the
+            # scan text only where it cannot. The target is ROOTED against the session cwd, because
+            # Test-WorktreeHijack hands it to `git -C`, which would resolve a relative one against this
+            # hook process's cwd instead.
+            if (-not $segMapRead) { $segMap = Get-ScanRawIndexMap $seg ; $segMapRead = $true }
+            $invText = $(if ($null -ne $segMap) { $seg.Raw.Substring($segMap[$vIdx]) } else { $seg.Scan.Substring($vIdx) })
+            $invTarget = $(if ($invCands.Count -gt 0) { Get-FullPathRaw $invCands[0] $cwdRaw } else { "" })
+            $invocations += [pscustomobject]@{ Verb = $vGroup.Value ; Text = $invText ; Target = $invTarget }
             foreach ($c in $invCands) {
                 $hit = Test-Governed (Get-ComparablePath $c $cwdRaw)
                 if ($hit) { $root = $hit ; $verb = $vGroup.Value ; $verbLine = $seg.Raw ; $targetRaw = $c ; break }
@@ -4714,17 +4733,22 @@ worktree gate blocked it." The primary's HEAD belongs to the user, not to a sess
         # session cwd goes down too: 3b's class B needs to tell "another session's worktree" from "the
         # one I am standing in", and reading a script-scope variable inside the function would hide that
         # dependency from the reader of the call site.
+        # ROOTED AGAINST THE SESSION CWD FIRST (review of BACKLOG #5655). Test-WorktreeHijack hands the
+        # target to `git -C`, which resolves a relative one against THIS HOOK PROCESS's cwd, so `git -C
+        # ../<wt> switch <b>` or `git -C '' switch <b>` was judged against the wrong directory. A path that
+        # cannot be rooted is passed on as it was.
+        $targetRooted = Get-FullPathRaw $targetRaw $cwdRaw
+        if ($targetRooted) { $targetRaw = $targetRooted }
         Test-WorktreeHijack $verb $verbLine $targetRaw $cwdRaw
         # THEN EVERY INVOCATION, each with its own verb, text and target (BACKLOG #5655). The call above
         # is the pre-change one, unchanged and first, so its verdict cannot move; it judged only the
         # first verb-bearing segment, so `git -C <ungoverned> clean -fd ; git switch <branch>` in
         # another session's worktree was allowed. Each call denies and exits, or returns.
         # An exact repeat is skipped: each call can spawn several git processes.
-        $judged = @{}
+        # ORDINAL: a PowerShell hashtable folds case, so `switch FOO` and `switch foo` would collide.
+        $judged = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
         foreach ($iv in $invocations) {
-            $ivKey = "$($iv.Verb)`0$($iv.Target)`0$($iv.Text)"
-            if (-not $iv.Target -or $judged.ContainsKey($ivKey)) { continue }
-            $judged[$ivKey] = $true
+            if (-not $iv.Target -or -not $judged.Add("$($iv.Verb)`0$($iv.Target)`0$($iv.Text)")) { continue }
             Test-WorktreeHijack $iv.Verb $iv.Text $iv.Target $cwdRaw
         }
         exit 0

@@ -250,3 +250,39 @@ def test_rule_3_and_3b_controls_stay_allowed(
     cmd = template.format(p=rig.primary.as_posix(), o=rig.outside.as_posix())
     cwd = {"outside": rig.outside, "primary": rig.primary, "wt": rig.wt}[where]
     assert _allowed(rig, cmd, cwd)
+
+
+# ------------------------------------------------------------------ review round one, same rows
+
+
+@pytest.mark.parametrize("quote", ["''", '""'])
+def test_an_empty_dash_C_is_the_cwd_under_either_quote(rig: SimpleNamespace, quote: str) -> None:
+    """git reads an empty `-C` as the current directory; `-C ''` allowed under 3c before this round."""
+    reason = _reason(rig, f"git -C {quote} config core.hooksPath /nope", rig.primary)
+    assert "SHARED git configur" in reason, reason
+
+
+def test_an_empty_single_quoted_dash_C_in_a_linked_worktree_is_rule_3bs(
+    rig: SimpleNamespace,
+) -> None:
+    assert "LINKED WORKTREE" in _reason(rig, f"git -C '' switch {rig.other}", rig.wt)
+
+
+def test_a_backtick_substitution_does_not_borrow_the_outer_dash_C(rig: SimpleNamespace) -> None:
+    cmd = f"echo -C {rig.outside.as_posix()} `git reset --hard`"
+    assert "SHARED PRIMARY" in _reason(rig, cmd, rig.primary)
+
+
+def test_a_later_invocations_quoted_destination_is_read_raw(rig: SimpleNamespace) -> None:
+    subprocess.run(
+        ["git", "-C", str(rig.primary), "branch", "feat(x)"], check=True, capture_output=True
+    )
+    cmd = f"git -C {rig.outside.as_posix()} clean -fd ; git switch 'feat(x)'"
+    assert "LINKED WORKTREE" in _reason(rig, cmd, rig.wt)
+
+
+def test_a_later_invocations_relative_dash_C_is_rooted_at_the_session_cwd(
+    rig: SimpleNamespace,
+) -> None:
+    cmd = f"git -C {rig.outside.as_posix()} status ; git -C ../Primary-wt switch {rig.other}"
+    assert "LINKED WORKTREE" in _reason(rig, cmd, rig.outside)
