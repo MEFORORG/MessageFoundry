@@ -2759,3 +2759,31 @@ async def test_a_gated_inbound_does_not_respawn_a_stop_ended_worker(
     finally:
         runner._log_write_stopped = False
         await runner.stop()
+
+
+@pytest.mark.parametrize("stage", [Stage.INGRESS, Stage.ROUTED])
+async def test_with_no_halt_an_operator_restart_leaves_a_pooled_stopped_lane_as_main_does(
+    store: MessageStore, tmp_path: Path, stage: Stage
+) -> None:
+    # BACKLOG #5704 control: the halt is a claim gate now, so an inbound restart touches no lane
+    # phase. That must not change what a restart does with NO halt in effect. On origin/main an
+    # operator restart of an inbound does not re-arm a pooled STOPPED internal lane either: the
+    # rebind gate returns early for an unhalted inbound, and `_ensure_inbound_workers` is a no-op
+    # under pooled. Measured on both trees: the lane and its hold stand.
+    outdir, logdir = tmp_path / "out", tmp_path / "logs"
+    outdir.mkdir()
+    logdir.mkdir()
+    runner = _e2e_runner(store, outdir, logdir, "pooled")
+    await runner.start()
+    try:
+        dispatcher = runner._dispatchers[stage]
+        dispatcher._to_stopped(INBOUND, dispatcher._states[INBOUND], "poison")
+        runner._hold_for_operator(INBOUND, "inbound")
+        assert not runner._log_write_stopped and INBOUND not in runner._log_halted
+
+        await runner.restart_inbound(INBOUND, operator=True)
+
+        assert dispatcher.stopped(INBOUND)
+        assert ("inbound", INBOUND) in runner._stop_held
+    finally:
+        await runner.stop()
