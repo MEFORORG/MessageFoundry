@@ -11,6 +11,8 @@ from the wrong place, so the gate judged a different path from the one the shell
 * BACKLOG #5643 -- rule 3d sliced the raw line at its FIRST `worktree remove|move` and judged one
   invocation, resolving a relative victim from the line's first `-C`, so a quoted mention, a second
   invocation or another command's `-C` let a governed linked worktree be removed or moved.
+* BACKLOG #5655 -- rule 3 let any earlier or quoted `-C` on a line decide where a later command ran,
+  and rule 3b judged only the first verb-bearing segment.
 
 Each deny row was measured ALLOW on the gate before its fix, and each has an ALLOW control beside it
 so a gate that denied everything could not pass.
@@ -192,3 +194,59 @@ def test_rule_3d_controls_stay_allowed(rig: SimpleNamespace, template: str) -> N
         wt2=rig.wt2.as_posix(), o=rig.outside.as_posix(), o2=rig.outside2.as_posix()
     )
     assert _allowed(rig, cmd, rig.tmp)
+
+
+# ------------------------------------------------------------------ BACKLOG #5655, rules 3 and 3b
+#
+# Rule 3 read `-C` off the WHOLE raw line and set its inferred-target flag the same way, so any
+# earlier or quoted `-C` decided where a later command ran; rule 3b judged only the first
+# verb-bearing segment. Each deny row below was measured ALLOW before.
+
+
+def test_an_earlier_commands_dash_C_does_not_move_a_later_reset_off_the_primary(
+    rig: SimpleNamespace,
+) -> None:
+    cmd = f"git -C {rig.outside.as_posix()} status && git reset --hard"
+    assert "SHARED PRIMARY" in _reason(rig, cmd, rig.primary)
+
+
+def test_an_earlier_dash_C_does_not_suppress_the_chdir_fallback(rig: SimpleNamespace) -> None:
+    cmd = f"git -C {rig.outside.as_posix()} status ; cd {rig.primary.as_posix()} ; git reset --hard"
+    assert "SHARED PRIMARY" in _reason(rig, cmd, rig.outside)
+
+
+def test_a_quoted_dash_C_does_not_suppress_the_chdir_fallback(rig: SimpleNamespace) -> None:
+    cmd = f"git commit -m 'x -C y' ; cd {rig.primary.as_posix()} ; git reset --hard"
+    assert "SHARED PRIMARY" in _reason(rig, cmd, rig.outside)
+
+
+@pytest.mark.parametrize("sep", [" ; ", "\n"])
+def test_rule_3b_judges_a_later_invocation(rig: SimpleNamespace, sep: str) -> None:
+    cmd = f"git -C {rig.outside.as_posix()} clean -fd{sep}git switch {rig.other}"
+    assert "LINKED WORKTREE" in _reason(rig, cmd, rig.wt)
+
+
+def test_rule_3b_judges_a_later_invocations_own_dash_C(rig: SimpleNamespace) -> None:
+    cmd = (
+        f"git -C {rig.outside.as_posix()} status ; git -C {rig.wt.as_posix()} checkout {rig.other}"
+    )
+    assert "LINKED WORKTREE" in _reason(rig, cmd, rig.outside)
+
+
+@pytest.mark.parametrize(
+    ("template", "where"),
+    [
+        ("cd {p} && git -C {o} rebase main", "outside"),
+        ("git -C {o} status && git -C {o} reset --hard", "primary"),
+        ("git -C {o} status ; git reset --hard", "wt"),
+        ("git status ; git reset --hard", "outside"),
+        ("git -C {o} status ; git switch -c brand-new", "wt"),
+    ],
+)
+def test_rule_3_and_3b_controls_stay_allowed(
+    rig: SimpleNamespace, template: str, where: str
+) -> None:
+    """An invocation's OWN `-C` still decides, and a session's own worktree is still its own."""
+    cmd = template.format(p=rig.primary.as_posix(), o=rig.outside.as_posix())
+    cwd = {"outside": rig.outside, "primary": rig.primary, "wt": rig.wt}[where]
+    assert _allowed(rig, cmd, cwd)

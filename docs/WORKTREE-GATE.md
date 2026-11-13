@@ -137,6 +137,11 @@ judged, with its victim resolved against that invocation's own `-C` tokens as we
 line's first one. Until BACKLOG #5643 only the first match on the raw line was judged, so a quoted
 mention before the real command, or a second command, let a governed worktree be removed.
 
+**Rules 3 and 3b judge every invocation too.** A `-C` belongs to the git command it is written on, so
+`git -C <elsewhere> status && git reset --hard` run in the primary is refused, and a `-C` on another
+command or inside a quoted message no longer stops the `cd <primary>` reading. Rule 3b is handed every
+invocation on the line, not only the first one carrying a verb. Both closed under BACKLOG #5655.
+
 This list is not the whole rule set. The hook itself,
 [`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1), is the source of record.
 

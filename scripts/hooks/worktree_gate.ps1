@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.12.2"
+$GateVersion = "2026.11.12.3"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -4449,7 +4449,9 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
         $at = [regex]::Match($seg.Raw, $gitInvocation)
         $segPrefix = $(if ($at.Success) { $seg.Raw.Substring(0, $at.Index) } else { "" })
 
-        if ($seg.Raw -cnotmatch '(?:^|\s)-C\s+"?([^"\s]+)"?') { $anyInferredTarget = $true }
+        # THE PATTERN IS THE SHARED ONE, not an inline copy of it (BACKLOG #5655). This reading of the RAW
+        # line is kept as it was; the per-invocation pass after this loop ADDS a scan-side reading.
+        if ($seg.Raw -cnotmatch (Get-GitDashCPattern)) { $anyInferredTarget = $true }
 
         # Path parsing runs on the RAW line, never on the blanked scan string: the blanking that stops a
         # commit message supplying a verb would also erase the path. Deny if ANY candidate is governed --
@@ -4495,23 +4497,12 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
         # resolver residual rule 3c already lists applies, such as a token value containing a space. A
         # GIT_DIR set by an earlier tool call is invisible.
         if (-not $headRoot) {
-            $gitTokens = @([regex]::Matches($seg.Scan, $gitInvocation))
             foreach ($vm in @([regex]::Matches($seg.Scan, "\bgit(\.exe)?\b[^|;&]*?\s(?<verb>$verbs)(?=\s|$)"))) {
                 $vGroup = $vm.Groups['verb']
                 $vIdx = $vGroup.Index
                 if (-not (Test-VerbMovesHead $vGroup.Value $seg.Scan.Substring($vIdx + $vGroup.Length))) { continue }
-                $own = $null
-                foreach ($g in $gitTokens) { if ($g.Index -le $vIdx) { $own = $g } else { break } }
-                $ownStart = 0
-                if ($own) {
-                    $sepBefore = [regex]::Matches($seg.Scan.Substring(0, $own.Index), '[;&|(){}]')
-                    if ($sepBefore.Count -gt 0) {
-                        $last = $sepBefore[$sepBefore.Count - 1]
-                        $ownStart = $last.Index + $last.Length
-                    }
-                }
-                if ($ownStart -gt $vIdx) { $ownStart = $vIdx }
-                $ownRepoToken = ($seg.Scan.Substring($ownStart, $vIdx - $ownStart) -match '(?:^|\s)(--git-dir[=\s]|GIT_DIR=)')
+                # The shared window, without -SeparatorInToken, so this is the inline copy it replaced.
+                $ownRepoToken = ((Get-OwnInvocationWindow $seg.Scan $vIdx).CmdWin -match '(?:^|\s)(--git-dir[=\s]|GIT_DIR=)')
                 $carriedHead = Resolve-CarriedGitDir ($seg.Prior + $seg.Scan.Substring(0, $vIdx))
                 if (-not ($ownRepoToken -or $carriedHead)) { continue }
                 foreach ($c in @(Get-GitTargetCandidatesRaw $seg.Raw $segPrefix $cwdRaw -RepositoryOnly -ExplicitFirst:$ownRepoToken -CarriedGitDir $carriedHead)) {
@@ -4523,6 +4514,56 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
         }
     }
     if (-not $verb) { exit 0 }
+
+    # =================================================================================================
+    # EVERY INVOCATION, EACH FROM ITS OWN WINDOW (BACKLOG #5655). The loop above keys on the FIRST verb
+    # of each segment and reads `-C` off the WHOLE RAW line, so a `-C` belonging to another command, or
+    # sitting inside a quoted commit message, decided where a later command ran. Measured ALLOW before
+    # this pass, every one moving a governed tree:
+    #     git -C <ungoverned> status && git reset --hard        from the primary
+    #     git -C <ungoverned> status ; cd <primary> ; git reset --hard           from an ungoverned cwd
+    #     git commit -m 'x -C y' ; cd <primary> ; git reset --hard               from an ungoverned cwd
+    # The first is the resolver reading the earlier command's `-C`. The other two are $anyInferredTarget
+    # staying false, because the line carried a `-C` somewhere, so the in-text fallback never ran.
+    #
+    # ADDED AFTER THE LOOP ABOVE, which is unchanged, so no deny it made is lost. Each invocation's
+    # window comes from Get-OwnInvocationWindow, the helper rule 3c uses, read off SCAN. A window with no
+    # `-C` of its own marks the target INFERRED. The candidates come from the resolver's opt-in
+    # -OwnWindow reading, which folds the invocation's own `-C` tokens over the single chdir before it
+    # and otherwise falls back to the cwd. Every invocation is also queued for rule 3b below, which
+    # judged only the first verb-bearing segment.
+    #
+    # WHAT THIS DOES NOT COVER, read as "at least the following". A chdir the scan prefix cannot follow
+    # (two of them, a subshell, `cd -`) falls back to the cwd; the in-text fallback still catches an
+    # absolute primary path there, but not a relative one. Every resolver residual rule 3d lists
+    # applies, such as a quoted `-C` value containing a space, which yields no candidate at all.
+    # =================================================================================================
+    $invocations = @()
+    foreach ($seg in (Get-ScannableSegments $cmd (Get-HostConvention $tool))) {
+        if ($root) { break }
+        if ($seg.Scan -cnotmatch $gitInvocation) { continue }
+        foreach ($vm in @([regex]::Matches($seg.Scan, "\bgit(\.exe)?\b[^|;&]*?\s(?<verb>$verbs)(?=\s|$)"))) {
+            $vGroup = $vm.Groups['verb']
+            $vIdx = $vGroup.Index
+            $inv = Get-OwnInvocationWindow $seg.Scan $vIdx -SeparatorInToken
+            if (-not $inv.Own) { continue }
+            if ($inv.CmdWin -cnotmatch '(?:^|\s)-C\s') { $anyInferredTarget = $true }
+            $invCands = @(Get-GitTargetCandidatesRaw $seg.Raw $seg.Scan.Substring(0, $inv.Own.Index) $cwdRaw `
+                              -OwnWindow -DashCText $inv.CmdWin)
+            # Rule 3b reads the text from the verb on, so a verb spelled inside an earlier path or
+            # command is never mistaken for this one.
+            $invocations += [pscustomobject]@{
+                Verb   = $vGroup.Value
+                Text   = $seg.Scan.Substring($vIdx)
+                Target = $(if ($invCands.Count -gt 0) { $invCands[0] } else { "" })
+            }
+            foreach ($c in $invCands) {
+                $hit = Test-Governed (Get-ComparablePath $c $cwdRaw)
+                if ($hit) { $root = $hit ; $verb = $vGroup.Value ; $verbLine = $seg.Raw ; $targetRaw = $c ; break }
+            }
+            if ($root) { break }
+        }
+    }
 
     # `cd <primary>; git checkout ...` and `pushd` defeat both of the above, so also treat any command
     # that NAMES a governed primary as targeting it -- but only where the target was inferred.
@@ -4664,6 +4705,13 @@ worktree gate blocked it." The primary's HEAD belongs to the user, not to a sess
         # one I am standing in", and reading a script-scope variable inside the function would hide that
         # dependency from the reader of the call site.
         Test-WorktreeHijack $verb $verbLine $targetRaw $cwdRaw
+        # THEN EVERY INVOCATION, each with its own verb, text and target (BACKLOG #5655). The call above
+        # is the pre-change one, unchanged and first, so its verdict cannot move; it judged only the
+        # first verb-bearing segment, so `git -C <ungoverned> clean -fd ; git switch <branch>` in
+        # another session's worktree was allowed. Each call denies and exits, or returns.
+        foreach ($iv in $invocations) {
+            if ($iv.Target) { Test-WorktreeHijack $iv.Verb $iv.Text $iv.Target $cwdRaw }
+        }
         exit 0
     }
 
