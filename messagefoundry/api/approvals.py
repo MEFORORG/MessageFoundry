@@ -586,6 +586,9 @@ class ApprovalGate:
         # moves one, so neither takes this life's claims for leftovers, whatever the clocks say.
         with _GATES_LOCK:
             self._claimed_here = _CLAIMED_HERE.setdefault(store, set())
+        # The put-off reconcile also leaves rows claimed since this gate was built, as on main: a
+        # sibling engine shard under the same default owner may be running one.
+        self._born = clock()
         self._owner_lock = asyncio.Lock()
         # With no resolver the requester's permissions cannot be re-read, so approve() refuses every
         # release (fail closed) rather than executing on authority it could not check.
@@ -686,8 +689,9 @@ class ApprovalGate:
         An embedded app can start before its engine holds its graph, when the owner is not known.
         This runs on each queue list until it completes, so the engine shard's leftover rows
         surface as ``interrupted`` once its name is known, or once a claim fixes the default. It
-        never moves a row a gate in this process claimed, so a claim this process made is never
-        taken for a leftover. A failure or a cancel leaves
+        never moves a row a gate in this process claimed, nor a row claimed since this gate was
+        built, so a claim made since, here or by a sibling under the same owner, is never taken
+        for a leftover. A failure or a cancel leaves
         it owed for the next list; a failure is logged."""
         if not self._reconcile_owed:
             return
@@ -698,7 +702,7 @@ class ApprovalGate:
             if not self._reconcile_owed:
                 return
             try:
-                await self._reconcile(owner)
+                await self._reconcile(owner, claimed_before=self._born)
             except Exception:  # noqa: BLE001 - a failed reconcile fails nothing else
                 log.exception(
                     "approval gate: the reconcile put off until the claim owner was known "
@@ -785,11 +789,12 @@ class ApprovalGate:
                 "until it is"
             )
             return RestartReconciliation((), (), ())
-        return await self._reconcile(me)
+        return await self._reconcile(me, claimed_before=None)
 
-    async def _reconcile(self, me: str) -> RestartReconciliation:
+    async def _reconcile(self, me: str, *, claimed_before: float | None) -> RestartReconciliation:
         """The body of :meth:`reconcile_after_restart` under owner ``me``. A row a gate in this
-        process claimed is left alone: it is this life's."""
+        process claimed is left alone: it is this life's. With ``claimed_before``, so is a row
+        claimed at or after that time, as main's put-off reconcile does."""
         interrupted: list[str] = []
         unsettled: list[str] = []
         # Filtered in SQL, so other owners' stranded rows cannot push ours past the read's cap.
@@ -802,6 +807,8 @@ class ApprovalGate:
             # found 'executing' after a claim here is always seen here.
             if self._claimed_in_process(row.id):
                 continue  # claimed by this process, so not a leftover
+            if claimed_before is not None and (row.decided_at or 0.0) >= claimed_before:
+                continue  # claimed since this gate was built, perhaps by a sibling still running
             approval_id = row.id
             detail = _audit_detail(_stranded_fields(row, "engine_restart"))
             try:
@@ -1701,6 +1708,10 @@ class ApprovalGate:
             ),
             client=client,  # ADR 0150: the approver's address, matching this row's actor
         )
+        # Noted before the claim's write is even created, and never forgotten: a claim whose
+        # outcome this process never recorded is still this life's, not a leftover for a sibling
+        # app's start.
+        self._note_claim(approval_id)
         claim = asyncio.ensure_future(
             self._store.decide_pending_approval(
                 approval_id,
@@ -1715,9 +1726,6 @@ class ApprovalGate:
         # (BACKLOG #1562). A claim that did not land is untracked in the `finally`; a write handed
         # the release (handed_off) untracks it when that write ends, even after the caller has gone.
         self._releasing[approval_id] += 1
-        # Noted before the claim is written, and never forgotten: a claim whose outcome this
-        # process never recorded is still this life's, not a leftover for a sibling app's start.
-        self._note_claim(approval_id)
         claimed = handed_off = False
         try:
             claimed = await _outlive_caller(claim)
