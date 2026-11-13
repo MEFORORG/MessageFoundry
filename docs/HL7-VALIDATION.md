@@ -8,7 +8,7 @@ compose.
 | Tier | Engine | When | Checks | On failure |
 |---|---|---|---|---|
 | 1. Tolerant peek | The built-in parser ([parsing/peek.py](../messagefoundry/parsing/peek.py), ADR 0054) | Always (hot path) | Parse + fast field access; size/segment caps; MSH present | Unparseable / oversized → `ERROR` (NAK), never crashes the connection |
-| 2. Strict structural | `hl7apy` ([parsing/validate.py](../messagefoundry/parsing/validate.py)) | Opt-in per inbound (`strict=True`) | Version-aware **structure**: segment cardinality, required segments and fields, MSH-12 version. Not field content: it parses at hl7apy's TOLERANT level, so datatypes, lengths and table values pass | Non-conformant → synchronous NAK at the listener, `AR` (Tier 2 below has the codes) |
+| 2. Strict structural | `hl7apy` ([parsing/validate.py](../messagefoundry/parsing/validate.py)) | Opt-in per inbound (`strict=True`) | Version-aware **structure**: segment cardinality, required segments and fields, MSH-12 version, no line it cannot place (Z-segments are listed, not refused). Not field content: it parses at hl7apy's TOLERANT level, so datatypes, lengths and table values pass | Non-conformant → synchronous NAK at the listener, `AR` (Tier 2 below has the codes) |
 | 3. Business consistency | `parsing/consistency.py` (this WP) | In a Router/Handler | **Cross-field** coherence the schema can't express | Handler decides: `FILTERED` or `ERROR`/dead-letter |
 
 ## Tier 1 — tolerant peek (always on)
@@ -63,6 +63,18 @@ object tree on a worker thread the timeout cannot stop, and the 16 MiB cap, chec
 is what bounds it. A streaming inbound (`stream_threshold_bytes`) validates only the header of a body at or over its
 threshold, so a large-document feed keeps working; set the threshold at or below 16 MiB on a strict
 streaming inbound.
+
+**A line strict validation cannot place is refused** (BACKLOG #5920). `hl7apy` drops, while grouping,
+any line it cannot fit into the message structure, and validates only what it kept; the tolerant
+parser forwards every line. So strict validation refuses an unknown segment (`FOO`), a known segment
+the structure has no place for (`ORC` in `ADT^A01`), and a line that is not a segment at all. The
+error names only the three-character segment ID and its line number, counting non-empty lines from
+1 (a whitespace-only line counts, and is refused, since the tolerant parser keeps it), and an
+unrecognised line is reported as `unrecognised line N`, never quoted.
+
+**Z-segments are tolerated, unvalidated, and listed.** A Z-segment (`Z` plus exactly two letters or
+digits) does not fail strict validation; it is listed in `ValidationResult.unvalidated_segments` as
+`ZXX at line N`, and it is forwarded without any check.
 
 Strict validation surfaces a single conformance error (not a full report) — a full report of a PHI
 message would be a data leak. See [parsing/validate.py](../messagefoundry/parsing/validate.py).
