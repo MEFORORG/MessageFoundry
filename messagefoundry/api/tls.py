@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import ssl
+import sys
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -666,7 +667,7 @@ def ensure_api_tls_material(
         return str(cert_path), str(key_path)
     events = replacements if replacements is not None else []
     try:
-        state_dir.mkdir(parents=True, exist_ok=True)
+        _make_state_dir(state_dir)
         with _generated_pair_lock(state_dir):
             _settle_under_the_lock(api, cert_path, key_path, events, renew=renew)
     except OSError as exc:
@@ -685,6 +686,19 @@ def ensure_api_tls_material(
             "at an unknown date" if current is None else log_timestamp(current.not_after_iso),
         )
     return str(cert_path), str(key_path)
+
+
+def _make_state_dir(state_dir: Path) -> None:
+    """Make the state dir if it is missing. On POSIX the directory this creates is owner-only
+    whatever the umask, because the key-file check refuses the generated key in a directory a group
+    or other account may write (vault BACKLOG #5636); a missing parent above it gets the umask's
+    mode. On Windows no mode is passed, so the directory inherits its parent's access list, which a
+    mode would replace with a protected one. An existing directory is left as it is, and the
+    generated-key gate in ``serve`` and ``supervise`` judges it."""
+    if sys.platform == "win32":
+        state_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 
 
 def _settle_under_the_lock(

@@ -1397,6 +1397,85 @@ def _serve(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str) -> int:
 
 
 @pytest.mark.parametrize(("platform", "mode"), [("linux", 0o700), ("win32", None)])
+def test_the_engine_asks_for_an_owner_only_state_dir_on_posix_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str, mode: int | None
+) -> None:
+    """The seam, on every platform (vault BACKLOG #5636). Windows passes no mode, so the directory
+    inherits its parent's access list. The real create runs without a mode."""
+    from messagefoundry.api import tls as tls_mod
+
+    seen: list[object] = []
+    real_mkdir = Path.mkdir
+
+    def record(self: Path, **kwargs: Any) -> None:
+        seen.append(kwargs.pop("mode", None))
+        real_mkdir(self, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", record)
+    monkeypatch.setattr(sys, "platform", platform)
+    tls_mod._make_state_dir(tmp_path / "store")
+    monkeypatch.undo()
+    assert seen == [mode] and (tmp_path / "store").is_dir()
+
+
+def _serve_with_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, store_dir: Path, toml: str
+) -> int:
+    """``serve`` with its store in ``store_dir`` and its settings file in ``tmp_path``, whose
+    folder the start-path guard requires owner-only."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "messagefoundry.toml").write_text(toml, encoding="utf-8")
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    argv = ["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]
+    return main([*argv, "--db", str(store_dir / "messagefoundry.db")])
+
+
+@posix_only
+def test_serve_under_umask_002_makes_its_store_dir_owner_only_and_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #5636. A store directory the engine creates itself is owner-only, so the
+    key-file check passes the key it mints there, under umask 002 as under any other."""
+    from messagefoundry.api.tls import _generated_pair
+
+    store_dir = tmp_path / "store"
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    old = os.umask(0o002)
+    try:
+        assert _serve_with_store(tmp_path, monkeypatch, store_dir, PHI_GATE_PROVISIONS_TOML) == 0
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(store_dir.stat().st_mode) == 0o700
+    _cert, key = _generated_pair(store_dir)
+    assert broad_access_problem(key) is None
+    assert "is not restricted" not in capsys.readouterr().err
+
+
+@posix_only
+def test_serve_reports_an_existing_store_dir_a_group_may_write_by_enforcement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Vault BACKLOG #5636. A store directory that existed already keeps its mode, and the
+    generated-key gate reports it: enforce refuses with exit 2, warn warns and starts. The remedy
+    names the directory and the command."""
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    store_dir.chmod(0o775)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    assert _serve_with_store(tmp_path, monkeypatch, store_dir, PHI_GATE_PROVISIONS_TOML) == 2
+    err = capsys.readouterr().err
+    assert "the directory that holds it has mode 0775 with no sticky bit" in err
+    assert f"chmod 0700 {store_dir}" in err and "refusing to start" in err
+    assert stat.S_IMODE(store_dir.stat().st_mode) == 0o775  # never changed by the engine
+
+    warn = 'security.enforcement = "warn"\n' + PHI_GATE_PROVISIONS_TOML
+    assert _serve_with_store(tmp_path, monkeypatch, store_dir, warn) == 0
+    err = capsys.readouterr().err
+    assert "warning: the generated TLS private key" in err and "mode 0775" in err
+
+
+@pytest.mark.parametrize(("platform", "mode"), [("linux", 0o700), ("win32", None)])
 def test_cert_commands_ask_for_an_owner_only_out_dir_on_posix_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str, mode: int | None
 ) -> None:

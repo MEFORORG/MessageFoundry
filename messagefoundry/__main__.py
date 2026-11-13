@@ -7973,11 +7973,13 @@ def _generated_tls_key_gate(settings: ServiceSettings, state_dir: Path, *, enfor
         what=f"the generated TLS private key {plan.key_file}",
         remedy=(
             "Restrict it to the account the engine runs as, or delete it and its certificate so "
-            "the next start mints a new pair. Where the refusal names the directory that holds it, "
-            "restrict that directory (POSIX: mode 0700, owned by the engine's account) or delete it "
-            "too, and the next start makes it again (at 0700 on POSIX). If the volume itself widens "
-            "the file "
-            "on every mount, set [api].tls_cert_file to a certificate of your own"
+            "the next start mints a new pair. "
+            "Where the refusal names the directory that holds it, that is the store's directory: "
+            f"restrict it with chmod 0700 {state_dir}, owned by the account the engine runs as, "
+            "or point [store].path at a directory that does not exist yet, which the engine then "
+            "creates at 0700 on POSIX. "
+            "If the volume itself widens the file on every mount, "
+            "set [api].tls_cert_file to a certificate of your own"
         ),
         enforcing=enforcing,
     )

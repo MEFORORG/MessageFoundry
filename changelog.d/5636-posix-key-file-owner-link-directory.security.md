@@ -2,20 +2,17 @@
   an account other than the engine's own or root, and one held in a directory that such an account
   owns or that a group or other account may write without the sticky bit.** Before, it judged the
   mode bits of the file a link named, so a mode `0600` key another account owned, or one in a
-  directory others could replace it in, would have passed. On POSIX the check applies to at least
-  the generated and the operator's API TLS key and each connection's key file, which `serve` and
-  `supervise` judge, and to the secrets directory and its files. The engine now mints its own
-  TLS key into `api-generated-key.d`, a directory beside the store that it creates at `0700` on
-  POSIX, so its key check passes in a store directory a group may write, such as one made under
-  umask `002`; that group can still replace the certificate, lock and store beside it. The
-  certificate stays beside the store. `cert self-signed` and `cert import` create `--out-dir` at
-  `0700` on POSIX, so other local accounts can no longer read the public certificate files in a
-  directory they create; copy a certificate out for a client that runs as another account. An
-  existing `--out-dir` keeps its mode. On POSIX the engine refuses to mint into an
-  `api-generated-key.d` that is a link, or that another account owns or a group or other may write. On Windows both directories inherit their parent's access list, as before.
-  Only the last part of a path is read without following a link; a link above it is followed. A link is now judged
-  as itself, so a dangling link to a key is refused rather than passed as a missing file. Only the
-  directory that holds the file is read, not the ones above it. The shipped manifests
+  directory others could replace it in, would have passed. The check applies at least to the
+  generated and the operator's API TLS key and each connection's key file, which `serve` and
+  `supervise` judge, and to the secrets directory and its files. A dangling link to a key is now
+  refused rather than passed as a missing file. Only the last part of a path is read without
+  following a link, and only the directory that holds the file is read, not the ones above it.
+  The engine creates a store directory that does not exist yet at `0700` on POSIX, and the
+  `cert self-signed` and `cert import` commands do the same for `--out-dir`, so other local
+  accounts can no longer read the public certificate files in a directory those commands create.
+  An existing directory keeps its mode; how the engine reports a store directory a group may
+  write, and what to do about it, is in [PHI.md](../docs/PHI.md), *Key files*. On Windows these
+  directories inherit their parent's access list, as before. The shipped manifests
   `docker/k8s/statefulset.yaml` and `docker/k8s/ha-postgres.yaml` add a `tls-dir` initContainer
   that makes `/etc/mefor/tls/engine` at `0700` as uid 10001, and `copy-tls` copies the API pair
   there, because the kubelet makes the `emptyDir`'s root and sets its mode. (`BACKLOG #5636`,
