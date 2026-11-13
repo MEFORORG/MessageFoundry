@@ -20,7 +20,7 @@ import pytest
 
 from messagefoundry.parsing import validate
 from messagefoundry.parsing.peek import normalize
-from messagefoundry.parsing.validate import _dropped_lines, _tolerant_parse
+from messagefoundry.parsing.validate import _dropped_lines, _split_lines, _tolerant_parse
 from messagefoundry_toolkit.generators import (
     _core,
     all_types,  # noqa: F401  (registers every built-in type)
@@ -53,8 +53,12 @@ def test_the_baseline_message_is_conformant_and_lists_nothing() -> None:
         ),
         pytest.param(
             "PRT|1",
-            "segment PRT at line 3 has no place in this message's structure",
-            id="segment-of-a-later-version",
+            "unknown segment at line 3",
+            id="segment-of-a-later-version-prints-no-id",
+        ),
+        pytest.param("ZOE", "unknown segment at line 3", id="bare-z-id-without-separator"),
+        pytest.param(
+            "BHS", "segment BHS at line 3 has no place in this message's structure", id="bare-bhs"
         ),
         pytest.param("hello world", "unrecognised line 3", id="non-hl7-text"),
         pytest.param("zxx|1", "unrecognised line 3", id="lowercase-z-is-not-a-z-segment"),
@@ -69,18 +73,54 @@ def test_a_dropped_line_is_refused(extra: str, error: str) -> None:
     assert result.errors == [error]
 
 
-@pytest.mark.parametrize("z", ["ZXX|1", "Z01|1|2", "ZPI"])
+@pytest.mark.parametrize("z", ["ZXX|1", "Z01|1|2", "ZPI|"])
 def test_a_z_segment_is_tolerated_and_listed(z: str) -> None:
     result = validate(_adt(_MSH, _EVN, z, _PID, _PV1))
     assert result.ok, result.errors
-    assert result.unvalidated_segments == (f"{z[:3]} at line 3",)
+    assert result.unvalidated_segments == ((z[:3], 3),)
+
+
+_ADT_INSURANCE = (
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|N1|P|2.5.1\rEVN|A01|20260101\r" + _PID + "\r" + _PV1
+)
+_ORU = "MSH|^~\\&|A|B|C|D|20260101||ORU^R01^ORU_R01|N1|P|2.5.1\r" + _PID
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param(
+            _ADT_INSURANCE + "\rIN1|1|PLAN^Plan|INS1\rZIN|1\rIN2|1", id="inside-adt-insurance"
+        ),
+        pytest.param(
+            _ORU + "\rZPI|1\rOBR|1|X||PANEL^Panel\rOBX|1|ST|A||v||||||F", id="after-oru-pid"
+        ),
+        pytest.param(
+            _ORU + "\rOBR|1|X||PANEL^Panel\rOBX|1|ST|A||v||||||F\rZOB|1\rOBX|2|ST|B||v||||||F",
+            id="between-obxs",
+        ),
+    ],
+)
+def test_a_z_segment_inside_a_group_does_not_break_the_grouping(message: str) -> None:
+    result = validate(message)
+    assert result.ok, result.errors
+    assert len(result.unvalidated_segments) == 1
+
+
+def test_a_message_type_hl7apy_has_no_structure_for_is_refused() -> None:
+    """hl7apy builds an empty tree for ZZZ^Z01 and its validator passes it: nothing was checked."""
+    result = validate("MSH|^~\\&|A|B|C|D|20260101||ZZZ^Z01|N1|P|2.5.1\r" + _EVN)
+    assert not result.ok
+    assert result.errors == [
+        "no segment could be validated: hl7apy has no structure for this message type"
+    ]
 
 
 def test_z_segments_do_not_mask_a_refusal() -> None:
     result = validate(_adt(_MSH, "ZAA|1", _EVN, _PID, "FOO|1", _PV1, "ZBB|1", "BAR|1"))
     assert not result.ok
     assert result.errors == ["unknown segment at line 5 (and 1 more)"]
-    assert result.unvalidated_segments == ("ZAA at line 2", "ZBB at line 7")
+    assert result.unvalidated_segments == (("ZAA", 2), ("ZBB", 7))
 
 
 def test_empty_lines_are_not_counted() -> None:
@@ -130,7 +170,7 @@ def test_an_earlier_hl7apy_error_is_not_joined_by_a_dropped_line_error() -> None
 
 
 def test_the_generated_valid_corpus_drops_no_line() -> None:
-    """No false 'no place' refusal on any shipped generator's message, two seeds per trigger.
+    """No false refusal on any shipped generator's message, two message indexes per trigger.
 
     Read straight from the tree comparison, so a type whose message hl7apy refuses for another
     reason (the two-block ADT structures, RDE's known mis-grouping) is checked too.
@@ -138,12 +178,14 @@ def test_the_generated_valid_corpus_drops_no_line() -> None:
     count = 0
     for code in _core.message_codes():
         for trigger in _core.triggers_for(code):
-            for seed in (1, 2):
-                norm = normalize(_core.generate_message(code, trigger, seed)).strip("\r")
-                assert _dropped_lines(norm, _tolerant_parse(norm)) == ([], []), (
+            for index in (1, 2):
+                norm = normalize(_core.generate_message(code, trigger, index)).strip("\r")
+                lines = _split_lines(norm)
+                parsed = _tolerant_parse(lines.strict_text)
+                assert (_dropped_lines(lines, parsed), lines.z_segments) == ([], []), (
                     code,
                     trigger,
-                    seed,
+                    index,
                 )
                 count += 1
     assert count > 50  # a positive control: the corpus was actually generated
