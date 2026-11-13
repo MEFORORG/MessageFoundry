@@ -9,6 +9,8 @@
   ASVS 16.4.3 is the re-score's question, and G15's *"a gate whose predicate is a config key rather
   than the verb is not rule 4"* is the objection it must answer. **Amendment A is accepted**
   (owner ruling 2026-10-08, recorded on engine PR 2183); it changes decision 2's wording.
+  **Amendment B** (2026-11-13) records a code change that makes the UDP delivery bullets too
+  strong; it changes no decision.
 - **Date:** 2026-09-27
 - **Related:** BACKLOG #1966 (this build) and #1199 (the 16.4.3 research that named the spool as the
   missing durability half) · [ADR 0080](0080-offbox-forwarding-tls-defaults.md) (native TLS-syslog) ·
@@ -235,18 +237,22 @@ millisecond on a Windows host. For a name it is one `gethostname` call.
 ## Amendment B (2026-11-13) -- UDP now counts a send that fails on this host (BACKLOG #5923)
 
 This amendment records a code change. It changes no decision above, and the decision text stays
-as written. Two bullets under *Delivery: best effort, not at least once* no longer match the code:
+as written. At least these statements above no longer match the code:
 
 - **"UDP detects nothing" is now too strong.** The UDP arm uses the same failure-tracking handler
-  as TCP and TLS, so a `sendto` that fails on this host, such as a down interface or no route, is
-  now counted as a failed send. With a spool the record stays on disk and the listener backs off,
-  as on TCP and TLS; without one it is counted in `unsent`. What UDP still cannot detect is a
-  datagram that leaves this host and never reaches the collector, including every datagram to a
-  collector that is down, so delivery over UDP stays unconfirmed.
+  as TCP and TLS, so a `sendto` that returns an error, such as no route to the collector, is now
+  counted as a failed send and handled as on TCP and TLS. Not every loss on this host is detected:
+  a datagram the kernel drops after `sendto` reported success is not. On Linux that can include a
+  full local transmit queue or a neighbour address that never resolves (reasoned from the kernel,
+  not measured). Nor is a datagram that leaves this host and never reaches the collector, which
+  includes every datagram to a collector that is down. Delivery over UDP stays unconfirmed.
 - **A send error that is not a network error is now undeliverable on UDP too**, not only on TCP
   and TLS. So is a datagram too large to send (`EMSGSIZE`), which fails the same way on every
-  retry. Each is dropped, counted in `undeliverable`, and reported at ERROR, never counted as sent.
+  retry. Neither is ever counted as sent.
+- **With a spool, a UDP collector whose name lookup fails for a temporary reason at start is now
+  deferred**, as a TCP or TLS collector that is not reachable yet is, instead of the process
+  running with no forwarder. A name that does not exist is still permanent.
 
-On every arm a failed send is now reported in one throttled ERROR line naming the error type and
-number, with no record content, instead of the standard library's traceback to stderr.
-[`docs/CONFIGURATION.md`](../CONFIGURATION.md) `[logging]` is the operator-facing statement.
+On every arm the standard library's traceback to stderr on a failed send is gone; a throttled
+ERROR line with no record content reports failures instead. What each case counts and reports is
+stated once, for operators, in [`docs/CONFIGURATION.md`](../CONFIGURATION.md) `[logging]`.
