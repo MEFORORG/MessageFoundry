@@ -663,8 +663,8 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         self._tls_verify = tls_verify
         self._tls_ca_file = tls_ca_file
         self._trust_anchor_policy = trust_anchor_policy
-        # BACKLOG #2383: where a dropped or failed notice is recorded. None writes no row, which is
-        # how an offline command builds it; the API lifespan passes the store.
+        # BACKLOG #2383: where a dropped or failed notice is recorded. None writes no row. The API
+        # lifespan passes the store, and so do the offline commands (BACKLOG #5634).
         self._audit = audit
         # The queue-full records still being written, held so the loop keeps them alive and so
         # aclose() can wait for them.

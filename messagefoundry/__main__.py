@@ -106,7 +106,7 @@ if TYPE_CHECKING:
     from messagefoundry.config.wiring import Registry
     from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
     from messagefoundry.pipeline.security_notify import SecurityEventNotifier
-    from messagefoundry.store.base import AdminStore, Store
+    from messagefoundry.store.base import AdminStore, AuditStore, Store
     from messagefoundry.store.custody_host import MintedCustody
     from messagefoundry.store.store import UserRecord
 
@@ -8113,9 +8113,18 @@ def _keyless_store_gate(settings: ServiceSettings) -> str | None:
 
 
 def _offline_security_notifier(
-    settings: ServiceSettings, posture: HopPosture | None = None
+    settings: ServiceSettings,
+    posture: HopPosture | None = None,
+    *,
+    audit: AuditStore | None = None,
 ) -> SecurityEventNotifier | None:
     """The per-user security notifier ``serve`` would wire, built for an offline command (#2019).
+
+    ``audit`` is where a notice that never left is recorded, as
+    ``auth.security_notice_undelivered`` with the recipient as actor (BACKLOG #5634), as the API
+    lifespan records it. Pass the command's store, and keep it open until the notifier's
+    :meth:`~SecurityEventNotifier.aclose` returns: the failed send is recorded during that drain,
+    and a row written to a closed store fails and is swallowed. ``None`` records nothing.
 
     ``posture`` is the caller's instance posture, for the Vault hop a ``[secrets]`` read can dial
     (vault BACKLOG #2983). ``None`` counts as enforcing there. The SMTP login's revocation guard
@@ -8170,6 +8179,7 @@ def _offline_security_notifier(
             alerts,
             secret_provider=resolve_secret_provider(settings.secrets, posture=posture),
             trust_anchor_policy=settings.tls.policy(),
+            audit=audit,
             # BACKLOG #2193: the SMTP login's revocation guard. A refusal is caught below, as
             # every build failure here is: the notice is dropped and the recovery goes on. A caller
             # with no posture, such as admin-reset-totp at warn (BACKLOG #2532), gets the instance's
@@ -9470,8 +9480,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # not owe. Attached, not passed to the build (#2081). The [alerts] notifier for the
             # administrator_granted alert is built on every run, below (vault BACKLOG #3849 B5).
             existing = await store.get_user_by_username(username)
+            # BACKLOG #5634: the store is the audit sink, so a send that fails during the drain
+            # below writes its undelivered row; the store closes only after that drain.
             security_notifier = (
-                _offline_security_notifier(settings, posture) if existing is not None else None
+                _offline_security_notifier(settings, posture, audit=store)
+                if existing is not None
+                else None
             )
             service.attach_security_notifier(security_notifier)
             if security_notifier is not None:
@@ -10418,16 +10432,37 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         address = (user.notify_email or "").strip()
         if not address:
             return "no_address"
-        notifier = _offline_security_notifier(settings, posture)
-        if notifier is None:
+        if not (settings.alerts.email_smtp_host and settings.alerts.email_from):
+            # The notifier's own first check, made here so a site with no relay opens no store.
             return "no_channel"
-        notifier.start()
+        # BACKLOG #5634: a send that fails is recorded in the store, during aclose()'s drain, so
+        # the notice runs inside a store's lifetime. run()'s store is closed by now, and a row
+        # written to a closed store would fail and be swallowed. A store that does not reopen
+        # costs the record, never the notice.
+        audit: Store | None
         try:
-            queued = await notifier.notify(
-                SecurityEvent(event_type=MFA_ENABLED, username=user.username, email=address)
+            audit = await opened()
+        except Exception as exc:  # noqa: BLE001 - the notice is best effort; it still goes out
+            print(
+                f"WARNING: the store could not be reopened for the notice ({type(exc).__name__}), "
+                "so a failed send of it is not recorded in the audit log.",
+                file=sys.stderr,
             )
+            audit = None
+        try:
+            notifier = _offline_security_notifier(settings, posture, audit=audit)
+            if notifier is None:
+                return "no_channel"
+            notifier.start()
+            try:
+                queued = await notifier.notify(
+                    SecurityEvent(event_type=MFA_ENABLED, username=user.username, email=address)
+                )
+            finally:
+                await notifier.aclose()
         finally:
-            await notifier.aclose()
+            if audit is not None:
+                await audit.close()
         # What the notifier said it took (vault BACKLOG #3120), never a forecast.
         return "dispatched" if queued else "no_channel"
 

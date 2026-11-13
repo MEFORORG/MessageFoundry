@@ -2795,8 +2795,9 @@ class ProvisionedAdministrator:
 
 # BACKLOG #2019: the three outcomes of the notice a repair owes the account's earlier holder. They are
 # recorded on the `auth.first_administrator_provisioned` audit row and returned to the CLI.
-#: The notice was handed to the notifier. NOT a delivery receipt: the send is best-effort and a failed
-#: one is only logged.
+#: The notice was handed to the notifier. NOT a delivery receipt: the send is best-effort, and a failed
+#: one is logged and, where the notifier has an audit sink, recorded afterwards as its own
+#: ``auth.security_notice_undelivered`` row (BACKLOG #5634).
 HOLDER_NOTICE_DISPATCHED = "dispatched"
 #: The account had no notification address before the repair, so there was nobody to tell.
 HOLDER_NOTICE_NO_PRIOR_ADDRESS = "no_prior_address"

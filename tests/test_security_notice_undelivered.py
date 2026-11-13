@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -291,4 +292,53 @@ async def test_a_full_queue_does_not_wait_on_the_audit_write(store: MessageStore
     await notifier.aclose()  # waits for the queue-full record
     assert [(a, actor) for a, actor, _ in await _undelivered(store)] == [
         (SECURITY_NOTICE_UNDELIVERED_ACTION, "ben")
+    ]
+
+
+# --- BACKLOG #5634: the offline commands record a notice whose send failed --------------------
+
+
+def test_admin_reset_totp_records_a_notice_whose_send_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``admin-reset-totp`` sends its notice after the swap's store has closed, so the notice opens
+    the store again for its record. Before the fix the notifier had no audit sink at all, and a
+    sink pointing at the swap's closed store would have failed and been swallowed."""
+    import base64
+    import time
+
+    import messagefoundry.__main__ as cli
+    from messagefoundry.auth import totp
+    from tests.test_admin_reset_totp import _ADMIN, _seed, _with_store
+
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "reset.db"
+    _seed(db, email="admin@example.invalid")
+    new_secret = base64.b32encode(b"undelivered-notice-new").decode("ascii")
+
+    def enrol(**_kwargs: object) -> tuple[str, str, float]:
+        at = time.time()
+        return totp.new_enrolment(new_secret), totp.totp(new_secret, now=at), at
+
+    monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol)
+    monkeypatch.setattr(cli, "_show_on_terminal", lambda _text: None)
+
+    def boom(**_: Any) -> None:
+        raise OSError("relay down")
+
+    monkeypatch.setattr(_SEND, boom)
+    cfg = tmp_path / "service.toml"
+    cfg.write_text(
+        '[alerts]\nemail_smtp_host = "smtp.example.invalid"\nemail_from = "mefor@example.invalid"\n',
+        encoding="utf-8",
+    )
+    argv = ["admin-reset-totp", "--username", _ADMIN, "--db", str(db)]
+    assert cli.main([*argv, "--service-config", str(cfg), "--json"]) == 0
+
+    assert _with_store(db, _undelivered) == [
+        (
+            SECURITY_NOTICE_UNDELIVERED_ACTION,
+            _ADMIN,
+            {"notice": "mfa_enabled", "reason": "send_failed"},
+        )
     ]
