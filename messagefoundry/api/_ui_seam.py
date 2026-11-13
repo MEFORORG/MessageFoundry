@@ -886,14 +886,14 @@ from typing import Any
 #: BACKLOG #5931: ``POST /ui/account/mfa/verify`` gains a dependency ahead of its confirm gate.
 #: It sends an empty code to the re-auth before the gate can spend a held grant. The route's
 #: recorded gate chain grew. Re-derived with ``--write``, from ``4b5769ef2c675677`` to
-#: ``b65e12c47151e17e``.
+#: ``1482720110f6b9eb``.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "b65e12c47151e17e"
+ENGINE_UI_SEAM: str = "1482720110f6b9eb"
 
 
 @dataclass(frozen=True, slots=True)

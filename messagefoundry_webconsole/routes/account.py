@@ -20,7 +20,7 @@ from messagefoundry.api.auth_models import (
     NotifyEmailRequest,
     PasswordChangeRequest,
 )
-from messagefoundry.api.security import client_ip, get_auth, pending_credential_deadline_for
+from messagefoundry.api.security import client_ip, pending_credential_deadline_for
 from messagefoundry.auth import AuthProvider, Identity
 from messagefoundry.auth import webauthn as webauthn_mod
 from messagefoundry.auth.service import (
@@ -120,7 +120,9 @@ async def _refuse_pending_confirm(
     # A copy of the pending refusal require_ui_reauth_only_action keeps in a closure, for the verify
     # gate's action and re-auth target: a pending session on an account that HAS a factor goes to
     # the re-auth, which the base records as an auth.mfa_denied row before the admin-write charge.
-    # test_the_empty_code_check_runs_the_verify_gates_own_base pins this copy to the gate.
+    # test_the_empty_code_check_runs_the_verify_gates_own_base pins only the ARGUMENTS of this copy
+    # and of _confirm_gate_base to the gate's. A change to refuse_pending's logic, or a step the gate
+    # adds between its base and its spend, must be mirrored here by hand.
     token = session_token(request)
     if not await auth.factor_binding_is_blocked(token, STEP_UP_ACTION_MFA_CONFIRM):
         return None
@@ -135,29 +137,28 @@ def _confirm_gate_base() -> Callable[[Request], Awaitable[Identity]]:
     )
 
 
-async def _empty_code_goes_to_reauth(request: Request) -> None:
+async def _empty_code_goes_to_reauth(
+    request: Request, auth: AuthService = Depends(_service)
+) -> None:
     """Send a code-less post to ``/ui/account/mfa/verify`` to the gate's own re-auth, before the
     gate can spend a grant.
 
     The Continue button posts no code. With the confirm grant already held (another tab, or Back),
-    the gate would spend it and ``""`` would be checked. That writes a false ``auth.mfa_failed``
-    row, draws the attempt budget and owes a second re-auth (BACKLOG #5931). Declared ahead of the
-    gate, so it runs first.
+    the gate would spend it and ``""`` would be checked, writing a false ``auth.mfa_failed`` row
+    and drawing the attempt budget (BACKLOG #5931). Declared ahead of the gate, so it runs first.
 
-    An empty code still passes the gate's base, so at least sign-in, must-change, the pending
-    refusal with its audit row and the admin-write charge still apply. It records the new-address
-    signal as the gate would. It then goes to the re-auth with no grant spent and no code checked.
-    A post with a code, with no session cookie, or under the opt-out, where there is no grant to
-    spend, returns at once and the gate answers as before. Starlette caches the body, so the route
-    reads it again."""
-    if not session_token(request):
-        return
-    assert_same_origin(request)
-    auth = get_auth(request)
-    if auth is None or not auth.action_step_up_required:
+    A post with no session cookie, under the opt-out (no grant to spend), or with a code returns
+    at once, and the gate answers as before. Otherwise the origin is checked and the gate's base
+    runs, so at least sign-in, must-change, the pending refusal with its audit row and the
+    admin-write charge still apply. The new-address signal is recorded as the gate would. The post
+    then goes to the re-auth with no grant spent and no code checked. That re-auth is still asked
+    for when a grant was held, and mints a fresh grant over it. Starlette caches the body, so the
+    route reads it again."""
+    if not session_token(request) or not auth.action_step_up_required:
         return
     if dict(await _form_pairs(request)).get("code", "").strip():
         return
+    assert_same_origin(request)
     await _confirm_gate_base()(request)
     await auth.flag_new_client_ip(session_token(request), client_ip(request), path=request.url.path)
     raise _reauth_redirect(request, "/ui/account/mfa/confirm")

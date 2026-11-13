@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Awaitable, Callable
 from uuid import uuid4
 
 import httpx
@@ -24,16 +25,18 @@ from _ui_clients import (
     enrolment_code_for,
     held_totp_code,
 )
+from fastapi import Request
 
 from messagefoundry.api import create_app
 from messagefoundry.api.auth_routes import _DIRECTORY_DEMOTED_DETAIL, _DIRECTORY_UNCONFIRMED_DETAIL
 from messagefoundry.auth import Role, totp
-from messagefoundry.auth.identity import AuthProvider
+from messagefoundry.auth.identity import AuthProvider, Identity
 from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.service import AuthService, DirectoryRefusal, Elevation
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry_webconsole.routes import account as account_routes
 from messagefoundry_webconsole.routes.core import (
     _DIRECTORY_DEMOTED_ERROR,
     _DIRECTORY_UNCONFIRMED_ERROR,
@@ -1130,10 +1133,20 @@ async def test_an_empty_verify_code_still_meets_the_gates_pending_refusal(
                 await c.post("/ui/mfa", data={"code": totp.totp(secret, now=t1)})
             ).status_code == 303
         calls = _spy_admin_write(service, monkeypatch)
+        # The control: without it the gate itself gives the same answer, so count the copy's runs.
+        built: list[int] = []
+        real_base = account_routes._confirm_gate_base
+
+        def counting_base() -> Callable[[Request], Awaitable[Identity]]:
+            built.append(1)
+            return real_base()
+
+        monkeypatch.setattr(account_routes, "_confirm_gate_base", counting_base)
         r = await c.post(path, data={"code": ""}, headers=SAME_ORIGIN)
         assert r.status_code == 303
         assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/confirm"
 
+    assert built == [1], "the empty code did not take the pre-gate path"
     assert len(calls) == (0 if pending else 1), f"allow_admin_write calls: {calls}"
     assert await _denials_for(engine, path) == (1 if pending else 0)
 

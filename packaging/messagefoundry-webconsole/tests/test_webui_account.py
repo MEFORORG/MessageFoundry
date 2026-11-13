@@ -380,7 +380,7 @@ async def test_empty_code_continue_with_a_held_grant_spends_nothing(
 
     RED when: the empty code reaches the confirm gate or ``confirm_mfa_enrollment``. The gate would
     spend the held grant, the check of ``""`` would write a false ``auth.mfa_failed`` row and draw
-    the per-actor attempt budget, and the operator would owe a second re-auth."""
+    the per-actor attempt budget. A real code posted after the empty ones still finds the grant."""
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     uid = await _uid(service, "op")
