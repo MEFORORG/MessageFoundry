@@ -3193,11 +3193,14 @@ the relay can still refuse a `sender` or recipient at send time.
 chains directly to a supplied anchor, or is a self-signed correspondent cert pinned as its own anchor. Full
 multi-level path building is deferred. On top of issuance, construction refuses at least:
 
-- an issuing `trust_anchor` that is **not a CA** (no `basicConstraints` asserting `CA=true`), or whose
-  `keyUsage` does not assert `keyCertSign`. A recipient cert pinned as its own anchor (the same certificate)
-  is exempt from both, because it issues nothing else;
+- a `recipient_cert` whose every issuing `trust_anchor` is **not a CA** (no `basicConstraints` asserting
+  `CA=true`, or a `keyUsage` that does not assert `keyCertSign`) or has extensions that cannot be read. An
+  issuing anchor that fails this is skipped, and the recipient is accepted when another issuing anchor in
+  the file passes. A **pinned** correspondent is exempt: an anchor with the same subject and the same public
+  key as the `recipient_cert` (the same cert, or an older copy of a renewed one), because it issues nothing
+  else. A pinned correspondent's validity is judged on the `recipient_cert` alone;
 - a `recipient_cert` that is itself a CA certificate (`basicConstraints` asserting `CA=true`), unless it is
-  pinned as its own anchor;
+  pinned;
 - a `recipient_cert` whose `keyUsage` does not assert `keyEncipherment`, or whose `extendedKeyUsage`
   lists neither `emailProtection` nor `anyExtendedKeyUsage`. Each is checked **only where the cert carries
   it**: a cert with neither extension is accepted;

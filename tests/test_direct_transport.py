@@ -1187,8 +1187,8 @@ def test_a_weak_anchor_is_refused_even_when_another_anchor_issues_the_recipient(
 ) -> None:
     """The discriminating case for WHERE the anchor check sits.
 
-    The issuance loop returns on the first anchor that verifies, so a floor applied inside it would
-    leave a weak sibling anchor unexamined and still trusted for every future recipient. This bundles
+    The issuance loop skips every anchor that does not issue the recipient, so a floor applied
+    inside it would leave a weak sibling anchor unexamined and still trusted. This bundles
     the real (2048) anchor with a weak one and requires a refusal even though the real one matches.
     """
     weak = _weak_pki(tmp_path)
@@ -2010,6 +2010,37 @@ def test_a_renewed_pinned_self_signed_recipient_checked_against_its_old_copy_con
     assert old != renewed
     files = _files(tmp_path, "renewed_pin", recipient_cert=renewed, trust_anchor=old)
     DirectDestination(_dest(pki, **files))
+
+
+async def test_an_expired_old_pinned_copy_does_not_stop_a_valid_renewed_pin(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any], tmp_path: Path
+) -> None:
+    # The old pinned copy, still the trust_anchor, has expired; the renewed recipient is valid.
+    # A pinned correspondent's validity is the recipient cert's alone, so the send delivers.
+    _install_fake(monkeypatch)
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "recipient@hisp.example")])
+    now = datetime.datetime.now(datetime.UTC)
+
+    def self_signed(start: datetime.timedelta, end: datetime.timedelta) -> x509.Certificate:
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(name)
+            .issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now + start)
+            .not_valid_after(now + end)
+        )
+        return _with_san(builder, "recipient@hisp.example").sign(key, hashes.SHA256())
+
+    old = self_signed(datetime.timedelta(days=-400), datetime.timedelta(days=-1))
+    renewed = self_signed(datetime.timedelta(days=-1), datetime.timedelta(days=365))
+    files = _files(tmp_path, "expired_pin", recipient_cert=renewed, trust_anchor=old)
+    d = DirectDestination(_dest(pki, **files))
+    await d.send(_SYNTHETIC_HL7)
+    [smtp] = _FakeSMTP.instances
+    assert len(smtp.sent) == 1
 
 
 def test_a_pinned_self_signed_recipient_asserting_ca_constructs(

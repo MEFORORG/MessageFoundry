@@ -922,7 +922,10 @@ class DirectDestination(DestinationConnector):
         )
         if problem is not None:
             raise ValueError(f"{problem}; refusing to encrypt PHI to it")
-        return tuple(issuers)
+        # A pinned correspondent's validity is the recipient cert's alone (Manager decision, batch
+        # 224): the pinned anchor may be the OLD copy of a renewed cert, and its expiry must not
+        # stop a lane whose recipient cert is valid. The recipient stands in as its own anchor.
+        return (self._recipient_cert,) if pinned else tuple(issuers)
 
     def _probe_build(self) -> None:
         """Build one S/MIME message from a fixed synthetic body, so a build fault fails at
