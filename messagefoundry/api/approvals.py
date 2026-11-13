@@ -195,18 +195,19 @@ DEFAULT_CLAIM_OWNER = "engine"
 
 #: Every gate in this process (BACKLOG #1562). A release any of them is running is live here: no
 #: reconcile moves it and the interrupt route refuses it, so a second app over the same engine
-#: never takes the first app's live releases for leftovers. Approval ids are unique, so gates over
-#: different stores cannot collide here. The lock keeps a gate built on another thread from
-#: changing the set while it is read.
+#: never takes the first app's live releases for leftovers. Keyed by approval id alone: guard()
+#: mints uuid4 ids, so gates over different stores share none unless a store holds another's rows,
+#: and then the shared id is refused, not moved. The lock keeps a gate built on another thread
+#: from changing the set while it is copied; each gate is asked by membership, never iterated.
 _GATES: weakref.WeakSet[ApprovalGate] = weakref.WeakSet()
 _GATES_LOCK = threading.Lock()
 
 
-def _releasing_in_process() -> frozenset[str]:
-    """The approval ids a gate in this process is running a release of now."""
+def _releasing_in_process(approval_id: str) -> bool:
+    """Whether a gate in this process is running the release of ``approval_id`` now."""
     with _GATES_LOCK:
         gates = list(_GATES)
-    return frozenset(approval_id for gate in gates for approval_id in gate._releasing)
+    return any(approval_id in gate._releasing for gate in gates)
 
 
 #: Whether cluster node ``node_id`` heartbeats (BACKLOG #1562): ``True`` for a fresh heartbeat,
@@ -771,14 +772,15 @@ class ApprovalGate:
         or after that time: it is this life's."""
         interrupted: list[str] = []
         unsettled: list[str] = []
-        live = _releasing_in_process()
         # Filtered in SQL, so other owners' stranded rows cannot push ours past the read's cap.
         # A row that fails its seal is reported and left as it is: the store would refuse the move
         # anyway, and nothing re-seals it (BACKLOG #2592).
         for row in await self._verified_rows(
             await self._store.list_executing_approvals(claim_owner=me)
         ):
-            if row.id in live:
+            # Asked after the read: a release is tracked from before its claim, so a row the read
+            # found 'executing' while a gate here runs it is always seen here.
+            if _releasing_in_process(row.id):
                 continue  # still running in this process, so not a leftover
             if claimed_before is not None and (row.decided_at or 0.0) >= claimed_before:
                 continue  # claimed by this process since it started, so not a leftover
@@ -2762,7 +2764,7 @@ class ApprovalGate:
     ) -> OwnerLiveness:
         """What :meth:`interrupt_stranded` judges of ``row``'s owner (its docstring has the
         tiers). ``heartbeats`` caches each node's verdict across one listing."""
-        if row.id in _releasing_in_process():
+        if _releasing_in_process(row.id):
             return "releasing_here"
         prefix, _, node_id = (row.claim_owner or "").partition(":")
         if prefix != "node" or not node_id:

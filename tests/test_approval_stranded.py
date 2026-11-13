@@ -294,6 +294,7 @@ async def test_a_second_app_leaves_the_first_apps_live_release_executing(engine:
                         attest_owner_stopped=True,
                     )
                 assert refused.value.status == 409
+                assert "is running this release now" in refused.value.detail
                 assert str((await _row(engine, live))["status"]) == "executing"
         finally:
             leave.set()
@@ -571,7 +572,7 @@ async def test_an_outcome_whose_row_was_interrupted_elsewhere(
     )
     await entered.wait()
     # Another process's operator interrupts it. That process sees none of this one's releases.
-    monkeypatch.setattr(approvals_module, "_releasing_in_process", frozenset)
+    monkeypatch.setattr(approvals_module, "_releasing_in_process", lambda _id: False)
     elsewhere = _gate(engine, owner="shard:other")
     await elsewhere.interrupt_stranded(
         approval_id, actor="operator", actor_user_id="operator-id", attest_owner_stopped=True
