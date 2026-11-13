@@ -351,6 +351,50 @@ def test_frame_reader_frames_each_corrupted_isa_through_its_own_iea(
     assert _frames_of(data, chunk) == [pieces[p] for p in parts if p in pieces]
 
 
+def test_frame_reader_does_not_cut_a_suspect_inside_the_next_isa_in_small_reads() -> None:
+    # A suspect whose +105 terminator is "S" could close an IEA segment on the "S" of the next real
+    # ISA while only "IS" of it had arrived, losing that interchange in small reads only.
+    head = bytearray(b"ISA" + b"x" * 102 + b"S")
+    head[6:7] = b"y"  # fails the structural check
+    suspect = bytes(head) + b"IEA*1*000000001~"
+    real = interchange().encode("utf-8")
+    for chunk in (4096, 1):
+        assert _frames_of(suspect + real, chunk) == [suspect, real]
+
+
+def test_split_keeps_a_malformed_interchanges_whitespace_terminator() -> None:
+    bad = _corrupt(interchange(term="\n"))
+    assert split(bad + interchange(control="000000002")) == [bad, interchange(control="000000002")]
+
+
+def test_split_and_reader_stay_linear_over_many_malformed_interchanges() -> None:
+    # Each malformed interchange used to restart the search for the next passing ISA, so k of them
+    # in one buffer cost about k * k structural checks. Count the checks rather than time the run.
+    from messagefoundry.parsing.x12 import delimiters
+
+    bad = _corrupt(interchange())
+    calls = 0
+    original = delimiters.isa_separators_line_up
+
+    def counting(buf: Any, isa_at: int) -> bool:
+        nonlocal calls
+        calls += 1
+        return original(buf, isa_at)
+
+    import messagefoundry.parsing.x12.interchange as interchange_mod
+
+    for k in (50, 200):
+        calls = 0
+        mp = pytest.MonkeyPatch()
+        mp.setattr(interchange_mod, "isa_separators_line_up", counting)
+        try:
+            assert len(split(bad * k)) == k
+            assert len(list(X12FrameReader().feed((bad * k).encode()))) == k
+        finally:
+            mp.undo()
+        assert calls < 10 * k, (k, calls)
+
+
 def test_frame_reader_clear_resets_the_trailer_allowance() -> None:
     reader = X12FrameReader()
     assert list(reader.feed(interchange().encode("utf-8"))) != []
@@ -574,7 +618,7 @@ class _CountingBuffer(bytearray):
         assert end is None or isinstance(end, int)
         stop = len(self) if end is None else end
         idx = super().find(sub, start, stop)
-        self.scanned += (stop if idx == -1 else idx + len(sub)) - start
+        self.scanned += max(0, (stop if idx == -1 else idx + len(sub)) - start)
         return idx
 
 
