@@ -1261,7 +1261,8 @@ def _add_two_box_cacert_arg(parser: argparse.ArgumentParser) -> None:
         help="the certificate PEM (or its issuer) that verifies the engine box's https /stats poll. "
         "The engine box must serve a pair whose names cover --engine-host: export "
         "MEFOR_HARNESS_TLS_CERT_FILE / MEFOR_HARNESS_TLS_KEY_FILE there, because the pair it mints "
-        "otherwise names only loopback. Default: this box's trust store. Not with --insecure",
+        "otherwise names only loopback. Default: this box's trust store, or for a loopback "
+        "--engine-host this run's own harness certificate. Not with --insecure",
     )
 
 
@@ -1582,6 +1583,8 @@ def _run_shardcert_driver(argv: list[str]) -> int:
                     "delivering": report.delivering,
                     "routing": report.routing,
                     "count_balance_ok": report.count_balance_ok,
+                    # Carries any fallback the driver took for an older engine half's payload.
+                    "notes": report.notes,
                     "acked_not_delivered": report.acked_not_delivered,
                     "lane_inversions": report.lane_inversions,
                     "lanes_observed": report.lanes_observed,
@@ -2140,7 +2143,8 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
         "--insecure",
         action="store_true",
         help="allow the REMOTE /stats poller plaintext http to an engine box that GENUINELY serves "
-        "plaintext http. It does not make a TLS-serving engine answer http, and it carries no credential",
+        "plaintext http. Without it each rung's poll is https, signed in with the engine box's rig "
+        "credential. It does not make a TLS-serving engine answer http, and it carries no credential",
     )
     parser.add_argument(
         "--engine-report-timeout",

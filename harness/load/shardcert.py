@@ -2905,11 +2905,13 @@ def _count_balance(acked: int, delivering: int, sink_received: int, *, killed: b
     return sink_received >= expected if killed else sink_received == expected
 
 
-def _balance_word(ok: bool, sink_received: int, expected: int) -> str:
-    """``OK``, or which way the balance missed: a SURPLUS is a duplicate or a late, uncounted ACK,
-    not a lost copy."""
+def _balance_word(ok: bool, sink_received: int, expected: int, delivering: int) -> str:
+    """``OK``, ``UNCHECKED`` where no fan-out is known, or which way the balance missed: a SURPLUS
+    is a duplicate or a late, uncounted ACK, not a lost copy."""
     if ok:
         return "OK"
+    if delivering < 1:
+        return "UNCHECKED"
     return "SURPLUS" if sink_received > expected else "LOSS"
 
 
@@ -2983,7 +2985,12 @@ class ShardCertDriverReport:
             f"  routing={self.routing} fanout(delivering)={self.delivering}  "
             f"S={self.sink_received} (expect A*delivering={self.acked * self.delivering}"
             f"{'' if self.killed_shard is None else ' or more, across the kill'}) -> "
-            f"{_balance_word(self.count_balance_ok, self.sink_received, self.acked * self.delivering)}",
+            + _balance_word(
+                self.count_balance_ok,
+                self.sink_received,
+                self.acked * self.delivering,
+                self.delivering,
+            ),
             f"  acked_not_delivered={self.acked_not_delivered} (0 = no acknowledged loss)",
             f"  lane_inversions={self.lane_inversions} lanes_observed={self.lanes_observed} "
             f"lane_repeats(dups)={self.lane_repeats}",
@@ -3436,6 +3443,8 @@ async def _teardown_step(label: str, step: Awaitable[object]) -> None:
     still runs and the failure is not lost either. The class and escaped text only."""
     try:
         await step
+    # Broad on purpose, and logged: a teardown step that fails in any way must not stop the next
+    # one from closing its socket or listener, and the run's own outcome is already decided.
     except Exception as exc:
         _log.warning(
             "shardcert teardown: %s failed: %s: %s",
@@ -3470,7 +3479,8 @@ async def run_shardcert_driver(
     The lanes per engine shard + sink port band are learned from SHARDS_READY (default ``lanes=1`` /
     ``sink_ports=1`` so an older engine's payload still drives), so the driver's connection set matches
     the served graph exactly. So are the fan-out ``delivering`` and ``routing`` that the verdict's
-    count balance needs; an older payload without them reads as fan-out 1, with a note.
+    count balance needs; an older payload without them reads as fan-out 1 on a no-kill run and 0
+    (an unchecked balance, which fails) on a kill run, with a note.
 
     The drain poll is https with the remote rig session unless ``allow_insecure``; ``cacert`` is the
     engine box's certificate PEM (see :func:`_remote_engine_poller`)."""

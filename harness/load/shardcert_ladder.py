@@ -97,6 +97,7 @@ from harness.load.shardcert import (
     run_shardcert_engine,
     rung_fidelity,
 )
+from messagefoundry.terminal_text import escape_for_terminal
 
 log = logging.getLogger(__name__)
 
@@ -3557,7 +3558,7 @@ async def run_drive_ladder(
             # posting a fabricated collapse. LADDER_STOP is polled only BETWEEN rungs; this is per-rung.
             rung_coord.post(RUNG_ABORTED, {"reason": "drive_aborted", "detail": str(exc)})
             notes.append(
-                f"{rung.run_suffix}: drive aborted ({exc}) — posted LADDER_STOP + RUNG_ABORTED, setup-abort"
+                f"{rung.run_suffix}: drive aborted ({escape_for_terminal(str(exc), single_line=True)}) — posted LADDER_STOP + RUNG_ABORTED, setup-abort"
             )
             climb_aborted = True
             stopped = True
@@ -3665,7 +3666,7 @@ async def run_drive_ladder(
             soak_aborted = True
             soak_coord.post(RUNG_ABORTED, {"reason": "soak_drive_aborted", "detail": str(exc)})
             notes.append(
-                f"soak: drive aborted ({exc}) — soak ABORTED (setup-degraded, not a bench result)"
+                f"soak: drive aborted ({escape_for_terminal(str(exc), single_line=True)}) — soak ABORTED (setup-degraded, not a bench result)"
             )
 
     if stopped and not climb_aborted:

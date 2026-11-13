@@ -623,7 +623,8 @@ async def test_driver_defaults_an_older_payload_to_fanout_one_with_a_note(
 ) -> None:
     """An engine half that predates the keys sends neither. The driver reads that as fan-out 1 and
     says so, rather than guessing ``dests``. On a no-kill run at a real fan-out above 1 the sink
-    then holds more copies than 1 per message, so the strict balance fails closed."""
+    then holds more copies than 1 per message, so the strict balance fails closed (pinned by the
+    report below at the real fan-out's sink count)."""
     _install_fakes(monkeypatch)
     coord = FileDropCoord(tmp_path, run_id="old")
     _post_ready(coord, drop=("delivering", "routing", "handlers", "dests"))
@@ -633,6 +634,10 @@ async def test_driver_defaults_an_older_payload_to_fanout_one_with_a_note(
     assert report.delivering == 1
     assert report.routing == BROADCAST
     assert any("older engine half" in n for n in report.notes), report.notes
+    # At the assumed fan-out of 1, a run that really delivered all 4 copies of 10 messages fails.
+    assumed = _driver_report(delivering=report.delivering, sink_received=40)
+    assert not assumed.ok
+    assert "-> SURPLUS" in assumed.render()
 
 
 async def test_driver_kill_run_without_the_fanout_fails_the_balance(
@@ -649,8 +654,10 @@ async def test_driver_kill_run_without_the_fanout_fails_the_balance(
     assert report.delivering == 0
     assert not report.count_balance_ok
     assert any("cannot be checked" in n for n in report.notes), report.notes
-    # The same report with a real fan-out and every copy delivered would balance.
-    assert _driver_report(killed_shard="a", lane_repeats=0).ok
+    # Even a sink holding every copy cannot balance against an unknown fan-out, and says so.
+    unknown = _driver_report(killed_shard="a", delivering=0, sink_received=40)
+    assert not unknown.ok
+    assert "-> UNCHECKED" in unknown.render()
 
 
 async def test_drive_ladder_threads_cacert_and_aborts_on_a_sign_in_refusal(
@@ -665,7 +672,8 @@ async def test_drive_ladder_threads_cacert_and_aborts_on_a_sign_in_refusal(
 
     async def refusing_drive(**kwargs: Any) -> Any:
         seen.append(kwargs)
-        raise sc.RemoteEngineSignInError("could not sign in to the engine box's API: refused")
+        # The engine's own reply text can ride the refusal; it must not reach the terminal raw.
+        raise sc.RemoteEngineSignInError("could not sign in: \x1b]0;forged\x07refused")
 
     monkeypatch.setattr(ladder, "run_shardcert_drive", refusing_drive)
     coord = FileDropCoord(tmp_path, run_id="lad")
@@ -684,6 +692,9 @@ async def test_drive_ladder_threads_cacert_and_aborts_on_a_sign_in_refusal(
     assert [kw["cacert"] for kw in seen] == ["engine-box.pem"]
     assert report.exit_code == 2
     assert coord.read(LADDER_STOP) is not None
+    rendered = report.render()
+    assert "refused" in rendered
+    assert "\x1b" not in rendered and "\x07" not in rendered
 
 
 # --- BACKLOG #5640 / #5977 (https and session half): the two-box drain poll ------------------------
@@ -839,22 +850,39 @@ def test_shardcert_driver_cli_threads_cacert_and_reports_a_sign_in_refusal(
     assert "could not sign in to the engine box's API" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("sub", ["shardcert-driver", "shardcert-drive"])
-def test_two_box_cli_refuses_insecure_with_cacert(sub: str, tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("sub", "extra"),
+    [
+        ("shardcert-driver", []),
+        ("shardcert-drive", []),
+        ("shardcert-drive-ladder", ["--rate-ladder", "10,20"]),
+    ],
+)
+@pytest.mark.parametrize("cacert", ["x.pem", ""])
+def test_two_box_cli_refuses_insecure_with_cacert(
+    sub: str,
+    extra: list[str],
+    cacert: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     with pytest.raises(SystemExit) as exc:
         hmain.main(
             [
                 sub,
                 "--engine-host",
                 "10.0.0.5",
+                *extra,
                 "--insecure",
                 "--cacert",
-                "x.pem",
+                cacert,
                 "--coord-dir",
                 str(tmp_path),
             ]
         )
     assert exc.value.code == 2
+    # The named refusal, not argparse's unknown-argument error.
+    assert "do not combine" in capsys.readouterr().err
 
 
 def test_shardcert_drive_cli_threads_cacert(
