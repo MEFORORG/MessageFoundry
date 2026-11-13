@@ -170,10 +170,18 @@ jobs:
           # It needs the action's FILES on disk, which this checkout still provides.
           persist-credentials: false
 
+      # THE COMMENT ARM RUNS ONLY ON A PULL REQUEST'S COMMENTS (BACKLOG #5645). GitHub delivers
+      # `issue_comment` for comments on plain issues AND on pull requests, and only the second carries
+      # `github.event.issue.pull_request`. Without that test, a `recheck` or sign comment on a plain
+      # issue ran the action against an issue number, with this job's write-scoped token. The
+      # `pull_request_target` arm is unchanged, and on `merge_group` the step still skips (the `on:`
+      # note above says why that green is accepted). tests/test_merge_gate_controls.py evaluates this
+      # condition per event and fails against the form without the pull-request test.
       - name: CLA Assistant
         if: >-
-          (github.event.comment.body == 'recheck' ||
-           github.event.comment.body == 'I have read the CLA and I agree to its terms.') ||
+          (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+           (github.event.comment.body == 'recheck' ||
+            github.event.comment.body == 'I have read the CLA and I agree to its terms.')) ||
           github.event_name == 'pull_request_target'
         uses: ./.github/actions/cla-assistant-lite # vendored ca4a40a7d1004f18d9960b404b97e5f30a505a08 (v2.6.1); upstream archived, see .github/actions/cla-assistant-lite/README.md
         env:

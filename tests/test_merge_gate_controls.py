@@ -47,6 +47,7 @@ import shlex
 import subprocess
 import sys
 import tomllib
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -163,7 +164,9 @@ _DEFAULT_CONTEXT: dict[str, str] = {
 }
 
 
-def _evaluate(condition: str, results: list[str], context: dict[str, str] | None = None) -> bool:
+def _evaluate(
+    condition: str, results: list[str], context: Mapping[str, object] | None = None
+) -> bool:
     """Evaluate one step's `if` against a synthetic results vector.
 
     EVALUATED, NOT PATTERN-MATCHED, AND THE DIFFERENCE IS LOAD-BEARING. The previous reader pulled
@@ -181,6 +184,11 @@ def _evaluate(condition: str, results: list[str], context: dict[str, str] | None
     need's result (`needs['test-shard2'].result` -> `need_test_shard2`), the `changes` job's `code`
     output, the event name, and `==` / `!=` between those and a quoted literal. A name `context` does
     not supply raises rather than defaulting.
+
+    BACKLOG #5645 widened it again, for the CLA step's `if`: quoted literals are lifted out into
+    names before translating, so the sign text's spaces and period cannot trip the whitelist; the
+    comment body and `github.event.issue.pull_request` are two more names; and the expression is
+    joined onto one line, because a folded YAML scalar can break after a top-level `||`.
     """
     expr = re.sub(
         r"contains\(\s*needs\.\*\.result\s*,\s*'([a-z]+)'\s*\)",
@@ -192,19 +200,32 @@ def _evaluate(condition: str, results: list[str], context: dict[str, str] | None
         lambda m: "need_" + m.group(1).replace("-", "_"),
         expr,
     )
-    expr = expr.replace("needs.changes.outputs.code", "code").replace("github.event_name", "event")
+    literals: dict[str, str] = {}
+
+    def lift(match: re.Match[str]) -> str:
+        name = f"lit_{len(literals)}"
+        literals[name] = match.group(1)
+        return name
+
+    expr = re.sub(r"'([^']*)'", lift, expr)
+    expr = (
+        expr.replace("needs.changes.outputs.code", "code")
+        .replace("github.event.comment.body", "body")
+        .replace("github.event.issue.pull_request", "issue_pr")
+        .replace("github.event_name", "event")
+    )
     expr = expr.replace("&&", " and ").replace("||", " or ")
-    expr = re.sub(r"!(?!=)", " not ", expr)
+    expr = " ".join(re.sub(r"!(?!=)", " not ", expr).split())
     # Whitelist BEFORE evaluating. The input is this repository's own workflow, so this is not a
     # trust boundary -- it is a guard against grading an expression that grew syntax this function
     # does not model.
-    if not re.fullmatch(r"[\s()'a-z0-9_=!]+", expr):
+    if not re.fullmatch(r"[\s()a-z0-9_=!]+", expr):
         raise AssertionError(
             f"the roll-up condition uses syntax this reader does not model: {condition!r}. Teach "
             "_evaluate the new form rather than loosening this check -- an unmodelled operator "
             "silently changes what the gate is graded against."
         )
-    names = dict(_DEFAULT_CONTEXT if context is None else context)
+    names = {**(_DEFAULT_CONTEXT if context is None else context), **literals}
     try:
         return bool(eval(expr, {"__builtins__": {}}, {"results": results, **names}))  # noqa: S307
     except NameError as exc:
@@ -1329,6 +1350,63 @@ def test_the_cla_allowlist_is_an_enumeration_and_not_a_glob() -> None:
         "the CLA allowlist emptied; every maintainer push would need a signature"
     )
     assert "*" not in allowlist, f"the CLA allowlist contains a glob: {allowlist!r}"
+
+
+_CLA_SIGN_TEXT = "I have read the CLA and I agree to its terms."
+
+# The form cla.yml shipped before BACKLOG #5645: the comment arm had no event or pull-request test.
+_CLA_CONDITION_BEFORE_5645 = (
+    "(github.event.comment.body == 'recheck' ||\n"
+    f" github.event.comment.body == '{_CLA_SIGN_TEXT}') ||\n"
+    "github.event_name == 'pull_request_target'"
+)
+
+
+def _cla_step_runs(condition: str, event: str, body: str | None, on_pull_request: bool) -> bool:
+    """Evaluate the CLA step's `if` for one synthetic event, through `_evaluate`.
+
+    `body` is None when the event carries no comment. `github.event.issue.pull_request` is an
+    object only on a pull request's comments, and absent on a plain issue's.
+    """
+    issue_pr = {"url": "synthetic"} if on_pull_request else None
+    return _evaluate(condition, [], {"event": event, "body": body, "issue_pr": issue_pr})
+
+
+@functools.cache
+def _cla_step_condition() -> str:
+    steps = jobs_of("cla.yml")["cla"]["steps"]
+    candidates = [s for s in steps if "allowlist" in (s.get("with") or {})]
+    assert len(candidates) == 1, f"expected ONE CLA action step in cla.yml, found {len(candidates)}"
+    return str(candidates[0]["if"])
+
+
+@pytest.mark.parametrize("body", ["recheck", _CLA_SIGN_TEXT])
+def test_the_cla_step_ignores_a_sign_or_recheck_comment_on_a_plain_issue(body: str) -> None:
+    """BACKLOG #5645. `issue_comment` fires for plain issues too. The step must run on a pull
+    request's comment and must NOT run on the same text posted on a plain issue.
+
+    THE ASYMMETRY: the same evaluator, given the pre-fix condition, reports that it DID run on the
+    plain issue, so a green here is the condition's work and not an evaluator that never fires.
+    """
+    condition = _cla_step_condition()
+    assert not _cla_step_runs(condition, "issue_comment", body, on_pull_request=False), (
+        f"the CLA step runs on a {body!r} comment posted on a plain issue; its comment arm must "
+        "require github.event.issue.pull_request"
+    )
+    assert _cla_step_runs(condition, "issue_comment", body, on_pull_request=True), (
+        f"the CLA step no longer runs on a {body!r} comment on a pull request, so nobody can sign"
+    )
+    assert _cla_step_runs(_CLA_CONDITION_BEFORE_5645, "issue_comment", body, on_pull_request=False)
+
+
+def test_the_cla_step_keeps_its_pull_request_target_arm_and_merge_group_skip() -> None:
+    """The arms the #5645 tightening must not move: the step runs on every `pull_request_target`
+    run, skips on `merge_group` (the accepted residual cla.yml's `on:` note records), and ignores
+    a pull request comment that is neither the sign text nor `recheck`."""
+    condition = _cla_step_condition()
+    assert _cla_step_runs(condition, "pull_request_target", None, on_pull_request=False)
+    assert not _cla_step_runs(condition, "merge_group", None, on_pull_request=False)
+    assert not _cla_step_runs(condition, "issue_comment", "looks good", on_pull_request=True)
 
 
 # ===================================================================================================
