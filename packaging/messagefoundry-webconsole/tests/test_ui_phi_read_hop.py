@@ -26,7 +26,7 @@ from __future__ import annotations
 import re
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 import httpx
 import pytest
@@ -303,9 +303,13 @@ async def test_a_non_phi_console_route_is_untouched_by_the_refusal(
 # criteria re-render does reach its handler, and is not exercised here either.
 
 #: The search criterion the content arms send. ``JANE`` is a substring of the seeded PID-5, so the
-#: ALLOW arm has a match to render; it is not :data:`NEEDLE`, so finding NEEDLE in a response means a
-#: body or summary left, never that the criterion was echoed.
+#: ALLOW arm has a match to render.
 CONTENT_TERM = "JANE"
+
+#: A second synthetic message with no :data:`CONTENT_TERM` in it, uploaded beside :data:`ADT`, so an
+#: unfiltered browse renders ``2 of 2`` and a filter that ran renders ``1 of 2``: a filter whose
+#: criteria were dropped cannot pass the filter's ALLOW arm.
+ADT_OTHER = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A04|MSG2|P|2.5.1\rPID|1||200^^^H^MR||ROE^RICH\r"
 
 SAME_ORIGIN = {"Sec-Fetch-Site": "same-origin"}
 
@@ -330,11 +334,12 @@ async def _save_preset(c: httpx.AsyncClient) -> str:
 
 
 async def _upload(c: httpx.AsyncClient) -> str:
-    """Upload :data:`ADT` as a log file and return its file id, read off the listing's browse link.
+    """Upload :data:`ADT` and :data:`ADT_OTHER` as one log file and return its file id, read off
+    the listing's browse link.
     Uploading is a write with no hop refusal, so it works on both postures."""
     up = await c.post(
         "/ui/uploaded-logs/upload",
-        files={"file": ("acme.hl7", ADT, "application/octet-stream")},
+        files={"file": ("acme.hl7", ADT + ADT_OTHER, "application/octet-stream")},
         headers=SAME_ORIGIN,
         follow_redirects=False,
     )
@@ -394,27 +399,42 @@ class _Guarded(NamedTuple):
     #: The text the ALLOW arm must render, so a 200 that ran nothing does not pass. Anchored with
     #: ``\b`` so ``11 match(es)`` is not read as one.
     served: str
-    #: Which read the handler decrypts through, spied on so a refusal that lands after the decrypt
-    #: fails: ``store`` is ``Store.search_messages``, ``upload`` is ``UploadStore.read_bytes``.
-    decrypt: str
+    #: Every decrypting read the handler makes, as ``(owner, method)``, spied on so a refusal that
+    #: lands after any of them fails. ``store`` is the engine's store instance, ``upload`` the
+    #: ``UploadStore`` class.
+    decrypts: tuple[tuple[Literal["store", "upload"], str], ...]
+
+
+#: The message search decrypts candidate bodies; the layered run first decrypts each preset's
+#: criteria; the browse pair first decrypts the file's sidecar (``_authorized_upload_meta``), then
+#: the file.
+_SEARCH_READS: tuple[tuple[Literal["store", "upload"], str], ...] = (("store", "search_messages"),)
+_LAYERED_READS: tuple[tuple[Literal["store", "upload"], str], ...] = (
+    ("store", "get_search_preset"),
+    ("store", "search_messages"),
+)
+_UPLOAD_READS: tuple[tuple[Literal["store", "upload"], str], ...] = (
+    ("upload", "get_meta"),
+    ("upload", "read_bytes"),
+)
 
 
 #: Every route whose hop refusal is the handler's own call.
 HANDLER_GUARDED_ROUTES: dict[tuple[str, str], _Guarded] = {
     ("GET", "/ui/messages/search"): _Guarded(
-        _field_path_search, _refused_in_place, r"\b1 match\(es\)", "store"
+        _field_path_search, _refused_in_place, r"\b1 match\(es\)", _SEARCH_READS
     ),
     ("POST", "/ui/messages/search/run"): _Guarded(
-        _content_search, _refused_in_place, r"\b1 match\(es\)", "store"
+        _content_search, _refused_in_place, r"\b1 match\(es\)", _SEARCH_READS
     ),
     ("GET", "/ui/messages/search/layered"): _Guarded(
-        _layered_search, _refused_in_place, r"\b1 match\(es\)", "store"
+        _layered_search, _refused_in_place, r"\b1 match\(es\)", _LAYERED_READS
     ),
     ("GET", "/ui/uploaded-logs/file/{file_id}"): _Guarded(
-        _browse_upload, _refused_to_listing, r"\b1 of 1 message\(s\)", "upload"
+        _browse_upload, _refused_to_listing, r"\b2 of 2 message\(s\)", _UPLOAD_READS
     ),
     ("POST", "/ui/uploaded-logs/file/{file_id}/filter"): _Guarded(
-        _filter_upload, _refused_to_listing, r"\b1 of 1 message\(s\)", "upload"
+        _filter_upload, _refused_to_listing, r"\b1 of 2 message\(s\)", _UPLOAD_READS
     ),
 }
 
@@ -463,16 +483,16 @@ async def _run_guarded(
     method, template = route
     spec = HANDLER_GUARDED_ROUTES[route]
     reads = 0
-    owner: Any = engine.store if spec.decrypt == "store" else UploadStore
-    name = "search_messages" if spec.decrypt == "store" else "read_bytes"
-    real = getattr(owner, name)
 
-    # One spy fits both: patched on the instance, ``real`` is bound and ``args`` carries no self;
-    # patched on the class, ``real`` is the plain function and ``args`` starts with self.
-    async def spy(*args: Any, **kwargs: Any) -> Any:
-        nonlocal reads
-        reads += 1
-        return await real(*args, **kwargs)
+    def spy_on(real: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+        # One spy fits both owners: patched on the instance, ``real`` is bound and ``args`` carries
+        # no self; patched on the class, ``real`` is the plain function and ``args`` starts with self.
+        async def spy(*args: Any, **kwargs: Any) -> Any:
+            nonlocal reads
+            reads += 1
+            return await real(*args, **kwargs)
+
+        return spy
 
     async with _client(
         engine, service, secure_hop=secure_hop, uploads_dir=tmp_path / "uploads"
@@ -480,11 +500,12 @@ async def _run_guarded(
         await _login(c)
         kwargs = await spec.setup(c)
         path = template.format(**kwargs.pop("path_args", {}))
-        monkeypatch.setattr(owner, name, spy)
-        try:
+        # A context of its own, so leaving it undoes the spies and nothing the caller patched.
+        with monkeypatch.context() as m:
+            for owner_key, name in spec.decrypts:
+                owner: Any = engine.store if owner_key == "store" else UploadStore
+                m.setattr(owner, name, spy_on(getattr(owner, name)))
             r = await c.request(method, path, follow_redirects=False, **kwargs)
-        finally:
-            monkeypatch.undo()
     return r, reads
 
 
