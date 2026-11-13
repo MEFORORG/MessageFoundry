@@ -27,7 +27,6 @@ import pytest
 from messagefoundry import log_spool
 from messagefoundry.log_spool import SPOOL_FORMAT_VERSION, LogSpool, SpoolEntry, SpoolUnavailable
 from messagefoundry.logging_setup import (
-    _DETERMINISTIC_UDP_SEND_ERRNOS,
     SyslogForward,
     _build_queued_forwarder,
     _build_syslog_handler,
@@ -1401,9 +1400,9 @@ def test_a_failed_udp_send_with_no_spool_is_counted_as_unsent() -> None:
 def test_an_oversized_udp_datagram_is_undeliverable_so_replay_does_not_wedge(
     spool_dir: Path,
 ) -> None:
-    """EMSGSIZE is deterministic: the same entry fails the same way on every retry. Marked as a
-    network failure it would hold every later spooled entry behind it for good, so it is dropped as
-    undeliverable and the next entry is sent."""
+    """On EMSGSIZE a retry resends the same entry as the same datagram. Marked as a network
+    failure it would hold every later spooled entry behind it while the size limit stands, so it is
+    dropped as undeliverable and the next entry is sent."""
     spool = LogSpool(spool_dir, max_bytes=1_000_000)
     spool.open()
     target, fwd = _udp_forwarder(spool)
@@ -1421,63 +1420,63 @@ def test_an_oversized_udp_datagram_is_undeliverable_so_replay_does_not_wedge(
         fwd.close()
 
 
-class _FailsFirstDatagramSocket(_FailingDatagramSocket):
-    """A UDP socket whose first ``sendto`` raises ``error`` and whose later ones deliver."""
+class _DeliveringDatagramSocket:
+    """A UDP socket whose every ``sendto`` delivers, recording what it was handed."""
+
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
 
     def sendto(self, data: bytes, _address: Any) -> int:
         self.sent.append(data)
-        if len(self.sent) == 1:
-            raise self.error
         return len(data)
 
-
-_DETERMINISTIC_NAMES = (
-    "EACCES",
-    "EADDRNOTAVAIL",
-    "EAFNOSUPPORT",
-    "EINVAL",
-    "WSAEACCES",
-    "WSAEADDRNOTAVAIL",
-    "WSAEAFNOSUPPORT",
-    "WSAEINVAL",
-)
+    def close(self) -> None:
+        pass
 
 
-def _deterministic_codes() -> set[int]:
-    return {getattr(errno, n) for n in _DETERMINISTIC_NAMES if hasattr(errno, n)}
-
-
-# The union, so an errno added to the production set gets a case without editing this list.
-@pytest.mark.parametrize("error", sorted(_deterministic_codes() | _DETERMINISTIC_UDP_SEND_ERRNOS))
-def test_a_deterministic_udp_send_error_is_undeliverable_so_replay_does_not_wedge(
-    spool_dir: Path, error: int
+def test_a_udp_collector_every_send_to_which_fails_with_eacces_keeps_the_spool(
+    spool_dir: Path,
 ) -> None:
-    """A UDP send error that fails the same way on every retry, ``EACCES`` from a broadcast address
-    without ``SO_BROADCAST`` for one, wedges the spool head exactly as ``EMSGSIZE`` did if read as a
-    network failure. It is dropped as undeliverable, and the later entry still delivers."""
+    """``EACCES`` on UDP belongs to the destination or the route, not the record: a firewall or
+    endpoint-security block surfaces on Windows as ``WSAEACCES``, errno 13, and on Linux a
+    ``prohibit`` route raises it. Every send to that collector fails alike, so nothing good waits
+    behind the head, and the block can clear. The spool keeps every entry while it holds, and
+    delivers them in order once sends succeed; dropping them would lose the log evidence."""
     spool = LogSpool(spool_dir, max_bytes=1_000_000)
     spool.open()
     target, fwd = _udp_forwarder(spool)
     try:
-        assert spool.append(SpoolEntry(level="WARNING", line="bad"))
-        assert spool.append(SpoolEntry(level="WARNING", line="next"))
-        sock = _FailsFirstDatagramSocket(OSError(error, "deterministic"))
-        _swap_socket(target, sock)
+        assert spool.append(SpoolEntry(level="WARNING", line="first"))
+        assert spool.append(SpoolEntry(level="WARNING", line="second"))
+        blocked = _FailingDatagramSocket(OSError(errno.EACCES, "permission denied"))
+        _swap_socket(target, blocked)
+        for _ in range(3):  # each retry fails alike; none drops an entry
+            fwd._listener._retry_at = 0.0
+            fwd._listener._replay()
+        assert len(blocked.sent) == 3  # only the head was tried, once per retry
+        assert spool.pending
+        assert fwd._listener.send_failing is True
+        assert fwd._listener.send_failures == 3
+        assert fwd._listener.undeliverable == 0
+
+        delivering = _DeliveringDatagramSocket()
+        target.socket = delivering
+        fwd._listener._retry_at = 0.0
         fwd._listener._replay()
-        assert len(sock.sent) == 2 and b"next" in sock.sent[1]  # delivered past the bad head
-        assert fwd._listener.undeliverable == 1
-        assert fwd._listener.send_failures == 0
-        assert fwd._listener.send_failing is False
+        assert len(delivering.sent) == 2
+        assert b"first" in delivering.sent[0] and b"second" in delivering.sent[1]
         assert not spool.pending
+        assert fwd._listener.send_failing is False
+        assert fwd._listener.undeliverable == 0
     finally:
         fwd.close()
 
 
-def test_a_deterministic_udp_errno_on_a_stream_arm_still_reconnects_and_retries(
+def test_eacces_on_a_stream_arm_reconnects_and_retries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The deterministic set is read only for a datagram socket: on TCP the same errno keeps the
-    reconnect-and-retry path, so the record is a failed send, not an undeliverable one."""
+    """On TCP a send error such as ``EACCES`` keeps the reconnect-and-retry path, so the record is
+    a failed send, not an undeliverable one, and the socket is dropped for a reconnect."""
 
     def _no_connect(self: Any) -> None:
         self.socket = None  # no real connect, so nothing to leak and no refused-SYN wait
@@ -1504,9 +1503,10 @@ def test_a_deterministic_udp_errno_on_a_stream_arm_still_reconnects_and_retries(
         handler.close()
 
 
-def test_a_lookup_error_whose_code_matches_a_deterministic_errno_is_retried() -> None:
+def test_a_udp_lookup_error_is_a_failed_send_and_is_retried() -> None:
     """A ``socket.gaierror`` carries a lookup code from another namespace; on Windows
-    ``EAI_FAMILY`` is 10047, the Winsock ``EAFNOSUPPORT``. It is never read as deterministic."""
+    ``EAI_FAMILY`` is 10047, the Winsock ``EAFNOSUPPORT``. It is a failed send, kept for a retry,
+    never an undeliverable record."""
     handler = _TimeoutSysLogHandler(
         address=("127.0.0.1", 9), socktype=socket.SOCK_DGRAM, defer_connect=True
     )

@@ -243,21 +243,23 @@ its statements no longer match the code; where they disagree, this amendment hol
 - **"UDP detects nothing" is now too strong.** The UDP arm uses the same failure-tracking handler
   as TCP and TLS, so a `sendto` that raises a network error on this host, such as `ENETUNREACH`,
   is now counted as a failed send: spooled with a spool, counted as unsent without one, as on TCP
-  and TLS. A datagram too large to send (`EMSGSIZE`), and at least the other deterministic UDP
-  send errors the next bullet names, are not among these; that bullet covers them. Unlike a stream socket, the UDP socket is kept, not reset. Not every loss on this host is detected:
+  and TLS. A datagram too large to send (`EMSGSIZE`) is not one of these; the next bullet covers
+  it. Unlike a stream socket, the UDP socket is kept, not reset. Not every loss on this host is detected:
   a datagram the kernel drops after `sendto` reported success is not. On Linux that can include a
   full local transmit queue or a neighbour address that never resolves (reasoned from the kernel,
   not measured). Nor is a datagram that leaves this host and never reaches the collector, which
   includes every datagram to a collector that is down. Delivery over UDP stays unconfirmed.
 - **A send error that is not a network error is now undeliverable on UDP too**, not only on TCP
-  and TLS. So is a UDP send error read as one that fails the same way on every retry: at least a datagram too
-  large to send (`EMSGSIZE`), `EACCES` (a broadcast address without `SO_BROADCAST`),
-  `EADDRNOTAVAIL`, `EAFNOSUPPORT` and `EINVAL`, under their POSIX or Winsock values. A network error
-  that may clear, such as `ENETUNREACH`, `EHOSTUNREACH` or `ECONNREFUSED`, stays retryable. The
-  reading can be wrong for a route that comes and goes; `docs/CONFIGURATION.md` says what that
-  costs. None of these is ever counted as sent: each is counted in `undeliverable`, is not kept for a
-  retry, and never sets `send_failing`. A copy already in the spool for another reason, such as
-  backoff or the drain deadline, is dropped the same way when replay reaches it.
+  and TLS. So is a datagram too large to send (`EMSGSIZE`): a retry resends the same record as
+  the same datagram, so kept at the spool head it would hold every later entry behind it while
+  the size limit stands. Neither is ever counted as sent: each is counted in `undeliverable`, is
+  not kept for a retry, and never sets `send_failing`. A copy already in the spool for another
+  reason, such as backoff or the drain deadline, is dropped the same way when replay reaches it.
+  `EMSGSIZE` is the only send errno read this way. Every other one, at least `EACCES` (a
+  firewall or endpoint-security block on Windows surfaces as `WSAEACCES`, errno 13), is a failed
+  send and is kept for a retry: such an error belongs to the destination or the route, so every
+  record to that collector fails alike, nothing good waits behind the head, and the error can
+  clear. Dropping those records would turn spool retention into a loss of log evidence.
 - **With a spool, a UDP collector whose name lookup fails for a temporary reason at start is now
   deferred**, as a TCP or TLS collector that is not reachable yet is, instead of the process
   running with no forwarder. A name that does not exist is still permanent.
