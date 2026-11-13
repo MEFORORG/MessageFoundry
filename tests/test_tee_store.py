@@ -5,11 +5,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import pickle
 import sqlite3
 import stat
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -332,13 +334,58 @@ def test_purge_cli_reports_a_busy_checkpoint_as_an_error(
     assert "purged " not in captured.out
 
 
-async def test_secure_delete_is_on_and_vacuum_temp_stays_in_memory(tmp_path: Path) -> None:
+async def test_secure_delete_is_on(tmp_path: Path) -> None:
     store = await _open(tmp_path)
     try:
-        for pragma, want in (("secure_delete", 1), ("temp_store", 2)):  # 2 is MEMORY
-            async with store._db.execute(f"PRAGMA {pragma}") as cur:  # noqa: SLF001
-                row = await cur.fetchone()
-            assert row is not None and int(row[0]) == want, pragma
+        async with store._db.execute("PRAGMA secure_delete") as cur:  # noqa: SLF001
+            row = await cur.fetchone()
+        assert row is not None and int(row[0]) == 1
+    finally:
+        await store.close()
+
+
+async def test_first_checkpoint_alone_scrubs_a_body_already_in_the_main_file(
+    tmp_path: Path,
+) -> None:
+    # The premise that lets a failed reclaim (VACUUM, second checkpoint) be a warning: delete plus
+    # commit plus the first TRUNCATE checkpoint already leaves no purged bytes, because
+    # secure_delete zeroed them. The body is checkpointed into the main file first, as a long-running
+    # relay's auto-checkpoint would, so the residue under test is in the DB file, not the -wal.
+    db_path = tmp_path / "tee.db"
+    store = await RelayStore.open(str(db_path))
+    try:
+        await store.record_capture(direction="corepoint_copy", control_id="C5637", raw=_MARKER_BODY)
+        assert await store._checkpoint_truncate()  # noqa: SLF001
+        assert _MARKER in db_path.read_bytes()  # positive control: the body is in the main file
+        await store._db.execute("DELETE FROM relay_capture WHERE 1")  # noqa: SLF001
+        await store._db.commit()  # noqa: SLF001
+        assert await store._checkpoint_truncate()  # noqa: SLF001
+        assert _MARKER not in _on_disk(db_path)
+    finally:
+        await store.close()
+
+
+async def test_a_failed_reclaim_is_logged_and_the_purge_still_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = await _open(tmp_path)
+    try:
+        await store.record_capture(direction="corepoint_copy", control_id="C", raw=_MARKER_BODY)
+        real_execute = store._db.execute  # noqa: SLF001
+
+        def failing_vacuum(sql: str, *args: Any) -> Any:
+            if sql == "VACUUM":
+                raise sqlite3.OperationalError("out of memory")
+            return real_execute(sql, *args)
+
+        monkeypatch.setattr(store._db, "execute", failing_vacuum)  # noqa: SLF001
+        with caplog.at_level(logging.WARNING, logger="tee.store"):
+            assert await store.purge(captures_only=True) == (0, 1)
+        assert "VACUUM failed: out of memory" in caplog.text
+        monkeypatch.undo()
+        async with store._db.execute("PRAGMA temp_store") as cur:  # noqa: SLF001
+            row = await cur.fetchone()
+        assert row is not None and int(row[0]) == 0  # restored to DEFAULT after the reclaim
     finally:
         await store.close()
 

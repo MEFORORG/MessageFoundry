@@ -15,7 +15,9 @@ on a protected volume (the file is ``chmod 0600`` best-effort on open).
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+import sqlite3
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -25,6 +27,8 @@ from typing import Any
 import aiosqlite
 
 __all__ = ["RelayStore", "NakRow", "CaptureRow", "PurgeIncompleteError"]
+
+_log = logging.getLogger(__name__)
 
 # Bound the stored detail (an MSA-3 reason or an error string) so a hostile/huge field can't bloat the
 # log, and scrub control characters that could corrupt a terminal when an operator reads it back.
@@ -68,19 +72,19 @@ _CHECKPOINT_ATTEMPTS = 50
 
 
 class PurgeIncompleteError(RuntimeError):
-    """The rows were deleted and committed, but the TRUNCATE checkpoint that copies the WAL back
-    into the main file stayed busy, so purged bodies may still sit in the -wal file. Re-run purge
-    once nothing holds a read transaction open on the database."""
+    """The rows were deleted and committed, but the TRUNCATE checkpoint that writes the zeroed
+    pages back stayed busy, so purged bodies may still sit in the main DB file or its -wal file."""
 
     def __init__(self, log_rows: int, capture_rows: int) -> None:
         self.log_rows = log_rows
         self.capture_rows = capture_rows
         super().__init__(
             f"purge deleted {log_rows} log row(s) and {capture_rows} capture row(s), but the WAL"
-            " checkpoint stayed busy, so purged bytes may remain in the -wal file. Another"
-            " connection holds a read transaction open, or another writer or checkpoint is"
-            " running. Re-run purge once it finishes; the re-run deletes nothing new and repeats"
-            " the scrub."
+            " checkpoint stayed busy, so purged bytes may remain in the DB file or its -wal file."
+            " Causes include at least another connection holding a read transaction open, or"
+            " another writer or checkpoint running. Re-running purge once it finishes completes"
+            " the scrub, but it deletes again under its own arguments: with no --before, or a"
+            " relative one, it also deletes rows recorded since this run."
         )
 
     def __reduce__(self) -> tuple[type[PurgeIncompleteError], tuple[int, int]]:
@@ -231,9 +235,6 @@ class RelayStore:
         # Zero freed content instead of only unlinking it, so a deleted capture body leaves no
         # readable bytes in a free page. Per-connection, so set on the store's one connection.
         await db.execute("PRAGMA secure_delete=ON")
-        # VACUUM builds its rebuilt copy in a temp file, by default in the OS temp directory, off
-        # the protected volume this DB is meant to live on; keep that copy in memory instead.
-        await db.execute("PRAGMA temp_store=MEMORY")
         await db.executescript(_SCHEMA)
         await db.commit()
         if path != ":memory:":
@@ -371,6 +372,23 @@ class RelayStore:
         finally:
             await self._pragma(f"busy_timeout={_BUSY_TIMEOUT_MS}")
 
+    async def _reclaim(self) -> None:
+        """VACUUM and checkpoint after the scrub, to shrink the files. The rebuilt pages hold
+        surviving rows only, so a failure here leaves no purged bytes: it is logged, not raised."""
+        # VACUUM builds its rebuilt copy in a temp file, by default in the OS temp directory, off
+        # the protected volume this DB is meant to live on; keep that copy in memory for the call.
+        # This holds only where SQLite was not compiled with SQLITE_TEMP_STORE=0.
+        await self._pragma("temp_store=MEMORY")
+        try:
+            await self._db.execute("VACUUM")
+        except sqlite3.Error as exc:  # e.g. out of memory, or a writer past busy_timeout
+            _log.warning("purge scrubbed the deleted rows, but VACUUM failed: %s", exc)
+            return
+        finally:
+            await self._pragma("temp_store=DEFAULT")
+        if not await self._checkpoint_truncate():
+            _log.warning("purge scrubbed the deleted rows, but the -wal was not truncated (busy)")
+
     async def _pragma(self, setting: str) -> None:
         # Close the cursor: aiosqlite keeps an unclosed one's statement in progress, which makes a
         # later VACUUM fail ("SQL statements in progress") or a journal-mode change silently refuse.
@@ -392,9 +410,8 @@ class RelayStore:
         into the main file and empties the -wal, then ``VACUUM`` and a second TRUNCATE checkpoint to
         reclaim the space. The first checkpoint is the scrub, so it raises
         :class:`PurgeIncompleteError` if it stays busy, because returning the counts then would read
-        as a clean purge that did not happen. The second only reclaims disk: what ``VACUUM`` writes
-        holds surviving rows alone, so a busy second checkpoint leaves no purged bytes and is not
-        an error.
+        as a clean purge that did not happen. The reclaim step after it only shrinks the files, so
+        its failure is logged as a warning (see :meth:`_reclaim`).
         """
         async with self._lock:
             # NB: a bare `DELETE FROM t` (no WHERE) hits SQLite's truncate optimization, which makes
@@ -418,9 +435,7 @@ class RelayStore:
             await self._db.commit()
             if not await self._checkpoint_truncate():
                 raise PurgeIncompleteError(log_n, cap_n)
-            # Reclaim disk; the rebuilt pages hold surviving rows only (see the docstring).
-            await self._db.execute("VACUUM")
-            await self._checkpoint_truncate()
+            await self._reclaim()
         return (log_n, cap_n)
 
     async def export(
