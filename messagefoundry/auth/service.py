@@ -12116,7 +12116,7 @@ class AuthService:
         says the sessions MAY stay live: a refusal such as a lost connection can come after the
         revoke committed."""
         if reconciled is None:
-            after, later = f"a committed {change}", ""
+            after = f"a committed {change}"
         else:
             what = {
                 "roles": "its role write committed",
@@ -12124,22 +12124,13 @@ class AuthService:
                 "nothing": "it committed no change",
             }[reconciled]
             after = f"the directory reconciler's {change} revocation ({what})"
-            # A pass plans a role revocation from a difference between the stored roles and the
-            # directory's, so once its role write is stored no pass plans it again.
-            later = (
-                "; a later reconcile pass plans the revocation again only if it probes the account"
-                " and the directory still calls for it"
-                if reconciled == "nothing"
-                else "; no later reconcile pass plans it again once that role write is stored"
-            )
         _log.error(
             "auth: the session revoke of account %s after %s was given up on after %d attempt(s),"
-            " the last refused by the store (%s); the sessions it would have ended may stay live%s",
+            " the last refused by the store (%s); the sessions it would have ended may stay live",
             user_id,
             after,
             attempts,
             type(refused).__name__,
-            later,
             exc_info=refused,
         )
         detail: dict[str, object] = {

@@ -1023,17 +1023,16 @@ always runs, since the first one's error may be the row's; so there a SQL Server
 recorded after the second wait. One it gives up on ends the pass, and its miss row counts the
 pass's later revocations as `accounts_not_attempted`, and its `committed` says what the
 revocation committed first: its role write, a role write that may have landed, or nothing. A
-refusal that reads as a defect is not re-run and is unrecorded, so it is raised after the attempt
-that met it, save that the reconciler's attempt without the row still runs once after a defect on
-its first: at least a store whose tables, columns or grants are not what the statement needs, and
-SQLite's `ProgrammingError`. A SQL syntax
+refusal that reads as a defect, at least a store whose tables, columns or grants are not what the
+statement needs, and SQLite's `ProgrammingError`, is not re-run and is unrecorded, so it is raised
+after the attempt that met it, save that the reconciler's attempt without the row still runs once
+after a defect on its first. A SQL syntax
 error is not always one: SQLite's, and SQL Server's generic 42000, are run again and recorded like a
 fault, while PostgreSQL's, in SQLSTATE class 42, is raised at once. A revoke the service gives up on is logged at ERROR
 and writes one `auth.sessions_revoke_failed` row naming the account, the change, the attempts and
 the error class. A role edit or map save stops at that account, and its row counts the accounts it
-did not reach as `accounts_not_attempted`; the request still fails, the change stands, and the account's other sessions stay
-live until they lapse. The change's own audit row is not written then, so this row is its record.
-Its write is soft, as above: on a store that refuses it too, the ERROR line is the only trace. A
+did not reach as `accounts_not_attempted`; on a request, the request still fails, the change
+stands, and the sessions the revoke would have ended may stay live. The row's write is soft, as above: on a store that refuses it too, the ERROR line is the only trace. A
 cancellation, such as the request deadline, skips both the retry and the row (vault BACKLOG #3802).
 
 **Delegated identity & admin device posture (#193 sibling; ASVS 13.2.1 / 13.3.2 / 8.4.2 — the delegation
