@@ -124,6 +124,8 @@ async def test_the_lifespan_builds_both_notifiers_and_the_auth_service_off_the_l
     loop_thread = threading.get_ident()
     try:
         async with app.router.lifespan_context(app):
+            # What the startup built, taken before teardown can call a spy again.
+            built = dict(seen.threads)
             # start() stays on the loop: the notifier built in the thread is the one running.
             assert seen.notifier is not None and seen.notifier._task is not None
             assert seen.security_notifier is not None
@@ -132,14 +134,14 @@ async def test_the_lifespan_builds_both_notifiers_and_the_auth_service_off_the_l
         assert seen.security_notifier._task is None, "the security notifier was not drained"
     finally:
         await _close_leftovers(seen)
-    # The spies record their thread only while the lifespan builds, so these read the same
-    # record after it exits. They sit at the test's top level, where the vacuous-absence lint
+    # These read the startup snapshot at the test's top level, where the vacuous-absence lint
     # (tests/test_vacuous_absence_assert_lint.py) reads a guard; inside the try it reads none.
     # The control: every spy ran, so an absent entry cannot pass as off the loop.
-    assert set(seen.threads) == {"notifier_from_settings", _SECURITY, _AUTH}
+    expected = {"notifier_from_settings", _SECURITY, _AUTH}
+    assert set(built) == expected
     # Implied by the line above at runtime; it is the count the lint reads as the guard.
-    assert len(seen.threads) >= 3
-    on_loop = sorted(name for name, ident in seen.threads.items() if ident == loop_thread)
+    assert len(built) >= len(expected)
+    on_loop = sorted(name for name, ident in built.items() if ident == loop_thread)
     assert not on_loop, f"built on the event loop's thread: {on_loop}"
 
 
