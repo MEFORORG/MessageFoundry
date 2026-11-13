@@ -324,8 +324,11 @@ every fixed element-separator position holds the separator, and the element, com
 delimiters, plus the repetition separator from 00501, are mutually distinct. It never reads element
 data. An `ISA` that fails it, such as a trigram in noise, padded "VISA" text, or a corrupted header, is
 framed through its own `IEA` or up to the next `ISA` that passes, whichever comes first. The walk of
-an `ISA` that passes ends at its `IEA` or at a later passing `ISA` that opens a segment, so an
-interchange with no `IEA` cannot swallow the next one. `split` returns every run as an element, and an
+an `ISA` that passes ends at its `IEA` or at a later passing `ISA` that opens a segment, meaning only
+the walk's own terminator and whitespace come before it, so an interchange with no `IEA` does not
+swallow the next one. A later `ISA` behind anything else, at least a BOM, is not found that way.
+`X12Peek` and `X12Message` still parse a frame cut there; `check_integrity` reports its missing `SE`,
+`GE` or `IEA`. `split` returns every run as an element, and an
 `ISA` that passes but that `discover_delimiters` refuses, for a delimiter in its element data (BACKLOG
 #5536), is one such element, framed whole, so the parse of it still refuses it. `split` no longer
 raises for the whole buffer. The reader still discards a run that does not open with `ISA`.

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterator
+from typing import Any, overload
 
 from messagefoundry.parsing.x12.delimiters import (
     _LEADING_NOISE,
@@ -47,9 +48,7 @@ __all__ = ["split", "X12FrameReader", "check_integrity"]
 # built from it, so the static ReDoS scan in tests/test_security_static.py can read the pattern;
 # test_iea_segment_whitespace_matches_the_shared_set in tests/test_x12_parsing.py keeps the two equal.
 _IEA_SEGMENT = re.compile(rb"[ \t\r\n\x0b\x0c]*IEA")
-# The same for a segment that opens another ISA, which ends an open walk if that ISA passes (BACKLOG
-# #5921). test_isa_segment_whitespace_matches_the_shared_set keeps its class equal to the shared set.
-_ISA_SEGMENT = re.compile(rb"[ \t\r\n\x0b\x0c]*ISA")
+_SEGMENT_WHITESPACE_BYTES = _SEGMENT_WHITESPACE.encode("ascii")
 #: Line-end bytes a sender may put after an interchange's closing terminator, such as a newline after
 #: ``IEA*...~``. Up to :data:`_FRAME_TAIL_MAX` of them directly after a completed interchange are its
 #: ending, however reads split them (vault BACKLOG #2938). The cap keeps a peer from trickling them
@@ -67,27 +66,31 @@ def split(raw: str) -> list[str]:
     """Split a complete buffer into its ``ISA…IEA`` interchange substrings (verbatim).
 
     Inter-interchange whitespace/BOM is skipped. Nothing else is dropped: every other run of data
-    becomes an element, which the caller can dead-letter if it does not parse (BACKLOG #5921). An
-    ``ISA`` *passes* when it is whole and :func:`isa_separators_line_up` accepts it.
+    becomes an element (BACKLOG #5921). An ``ISA`` *passes* when it is whole and
+    :func:`isa_separators_line_up` accepts it.
 
     * An ``ISA`` that passes is walked from past its fixed-width header to its ``IEA`` (read with
-      the terminator at its +105), and returned with that ``IEA`` segment's terminator. This holds
-      even where :func:`discover_delimiters` refuses it, for a delimiter inside ISA element data
-      (BACKLOG #5536): the element is the whole interchange, never cut at a forged segment, so the
-      parse of it refuses it. The walk also ends at a later passing ``ISA`` that opens a segment, so
-      an interchange with no ``IEA`` cannot swallow the next one.
+      the terminator at its +105), and returned verbatim through that ``IEA`` segment's terminator.
+      This holds even where :func:`discover_delimiters` refuses it, for a delimiter inside ISA
+      element data (BACKLOG #5536): the element is the whole interchange, never cut at a forged
+      segment, so the parse of it refuses it. If a later passing ``ISA`` opens a segment first
+      (after this interchange's terminator and any whitespace), the element ends there instead,
+      verbatim, so an interchange with no ``IEA`` does not swallow the next one. A passing
+      interchange that reaches the end of the buffer with neither is the final element.
     * An ``ISA`` that fails, or one too short to hold a header, is a malformed interchange. It ends
       at its own ``IEA``, read the same way, or at the next ``ISA`` that passes, wherever that is,
       whichever comes first.
     * A run that does not open with ``ISA`` is returned as its own element and ends at the next
       ``ISA`` that passes, so a trigram in it ("VISA", "ISAAC") does not end it.
-    * An element that ends at a later ``ISA`` rather than its own ``IEA`` loses the whitespace/BOM
-      before that ``ISA``. A passing interchange whose walk reaches the end of the buffer is returned
-      as the final (malformed) element.
+    * A malformed or non-ISA element that ends at a later ``ISA`` loses the whitespace/BOM before
+      that ``ISA``.
 
-    A buffer with no ``ISA`` at all returns its data as one element, and an empty or
-    whitespace/BOM-only buffer returns ``[]``. :class:`X12FrameReader` frames an ``ISA`` the same way,
-    but it discards a run that does not open with ``ISA``, so the two can differ after one."""
+    An element is not checked beyond that. A malformed one does not parse, but one cut at a later
+    ``ISA`` before its ``IEA`` may: :func:`check_integrity` reports its missing trailers, and
+    X12Peek and X12Message do not. A buffer with no ``ISA`` at all returns its data as one element,
+    and an empty or whitespace/BOM-only buffer returns ``[]``. :class:`X12FrameReader` frames an
+    ``ISA`` the same way, but it discards a run that does not open with ``ISA``, and it keeps the
+    whitespace before a later ``ISA`` in a malformed frame, so the two can differ there."""
     out: list[str] = []
     pos = 0
     n = len(raw)
@@ -95,24 +98,32 @@ def split(raw: str) -> list[str]:
     # it failed, so it stays the answer while the search would start at or before it: reusing it keeps
     # a run of many malformed interchanges linear. Only a run that does not pass needs it.
     good = -1
+    # An ISA a passing walk ended at, already checked, so a run of interchanges with no IEA is not
+    # checked twice.
+    passed = -1
     while pos < n:
         start = skip_leading_noise(raw, pos)
         if start == n:
             break
-        if _isa_complete_str(raw, start):
-            end, at_iea = _walk_str(raw, start)
+        if start == passed or _isa_complete_str(raw, start):
+            end, at_iea = _passing_end_str(raw, start)
             if end is None:
                 # Unterminated final interchange — surface it, don't lose it.
                 out.append(raw[start:])
                 break
+            if not at_iea:
+                passed = end
+            # Kept verbatim, as the reader frames it, whether it ends at its IEA or at a later ISA.
+            out.append(raw[start:end])
+            pos = end
+            continue
+        if good <= start:
+            good = _next_isa_str(raw, start + 1)
+        if raw.startswith("ISA", start):
+            # A malformed header: bound it by the next ISA that passes so it cannot swallow that one.
+            end, at_iea = _malformed_end_str(raw, start, good)
         else:
-            if good <= start:
-                good = _next_isa_str(raw, start + 1)
-            if raw.startswith("ISA", start):
-                # A malformed header: bound it by the next ISA that passes so it cannot swallow that one.
-                end, at_iea = _malformed_end_str(raw, start, good)
-            else:
-                end, at_iea = good, False  # non-ISA data — surface it
+            end, at_iea = good, False  # non-ISA data — surface it
         # Ended at its own IEA it is kept verbatim, its terminator too, even a whitespace one.
         out.append(raw[start:end] if at_iea else raw[start:end].rstrip(_LEADING_NOISE))
         pos = end
@@ -149,18 +160,50 @@ def _malformed_end_str(raw: str, isa: int, bound: int) -> tuple[int, bool]:
     otherwise ``bound``."""
     if isa + ISA_SEGMENT_LEN > bound:
         return bound, False
-    end, _ = _walk_str(raw, isa, bound)
-    return (bound, False) if end is None else (end, True)
+    end, at_iea = _walk_str(raw, isa, bound)
+    return (bound, False) if end is None else (end, at_iea)
+
+
+def _passing_end_str(raw: str, isa: int) -> tuple[int | None, bool]:
+    """Where the interchange at the passing ``isa`` ends, and whether that is its own ``IEA``: just
+    past its ``IEA`` segment, or at a later passing ``ISA`` that opens a segment if that comes first
+    (False), or None if neither is in ``raw``. The same rule as :meth:`X12FrameReader._bound`."""
+    iea_end, _ = _walk_str(raw, isa)
+    term = _terminator_str(raw, isa)
+    stop = len(raw) if iea_end is None else iea_end
+    i = raw.find("ISA", isa + _SEGMENT_TERM_OFFSET + len(term), stop)
+    while i != -1:
+        if _isa_complete_str(raw, i) and _opens_segment(
+            raw, i, isa + _SEGMENT_TERM_OFFSET, term, _SEGMENT_WHITESPACE
+        ):
+            return i, False
+        i = raw.find("ISA", i + 1, stop)
+    return iea_end, iea_end is not None
+
+
+@overload
+def _opens_segment(buf: str, i: int, lo: int, terminator: str, whitespace: str) -> bool: ...
+@overload
+def _opens_segment(
+    buf: bytes | bytearray, i: int, lo: int, terminator: bytes, whitespace: bytes
+) -> bool: ...
+def _opens_segment(buf: Any, i: int, lo: int, terminator: Any, whitespace: Any) -> bool:
+    """Whether position ``i`` of ``buf`` opens a segment: ``terminator`` then only whitespace comes
+    before it, with that terminator at or after ``lo``. Only the whitespace run before ``i`` is
+    searched, so checking many candidates stays linear."""
+    j = i
+    while j > lo and buf[j - 1 : j] in whitespace:
+        j -= 1
+    found: int = buf.rfind(terminator, max(lo, j - len(terminator)), i)
+    return found != -1
 
 
 def _walk_str(raw: str, isa: int, bound: int | None = None) -> tuple[int | None, bool]:
     """Walk the segments of the interchange at ``isa``, read with the terminator at its +105, from
     past its fixed-width header (so the ISA is never searched) up to ``bound`` (the end of ``raw``
     by default). Returns the index just past the terminator that closes its ``IEA`` segment and
-    True; or, with no ``bound``, where a segment holding a passing ``ISA`` begins, past its
-    whitespace, and False; or None and False if neither is complete before ``bound``. A tag is
-    matched only at a segment boundary, in a segment whose terminator has been found. A ``bound``
-    is the next passing ``ISA``, so no passing ``ISA`` lies before it and none is looked for."""
+    True, or None and False if that is not complete before ``bound``. ``IEA`` is matched only at a
+    segment boundary."""
     terminator = _terminator_str(raw, isa)
     if not terminator:
         return None, False
@@ -170,13 +213,8 @@ def _walk_str(raw: str, isa: int, bound: int | None = None) -> tuple[int | None,
         idx = raw.find(terminator, seg_start, end)
         if idx == -1:
             return None, False
-        segment = raw[seg_start:idx].lstrip(_SEGMENT_WHITESPACE)
-        if segment[:3] == "IEA":
+        if raw[seg_start:idx].lstrip(_SEGMENT_WHITESPACE)[:3] == "IEA":
             return idx + len(terminator), True
-        if bound is None and segment[:3] == "ISA":
-            next_isa = idx - len(segment)
-            if _isa_complete_str(raw, next_isa):
-                return next_isa, False
         seg_start = idx + len(terminator)
 
 
@@ -189,7 +227,9 @@ class X12FrameReader:
     header) is framed through its own ``IEA`` or up to the next ``ISA`` that passes, whichever comes
     first, so it cannot swallow that interchange and is not dropped either (BACKLOG #5921). An
     interchange whose ``ISA`` passes is framed through its ``IEA`` or up to a later passing ``ISA``
-    that opens a segment, so one with no ``IEA`` cannot swallow the next either. This reader refuses
+    that opens a segment (only its terminator and whitespace before it), so one with no ``IEA``
+    does not swallow a next one that follows it that way. Such a cut frame still parses;
+    :func:`check_integrity` reports its missing trailers. This reader refuses
     no frame for its content. At least the shared ingress guards (the charset decode, the NUL check
     and the size bound) and a Router or Handler that peeks or parses the frame may refuse it later.
     ``max_interchange_bytes`` caps a
@@ -214,6 +254,10 @@ class X12FrameReader:
         self._suspect = False
         self._probe = 0
         self._dropped = 0
+        # Where a passing walk's search for a later ISA picks up, from the front of ``_buf``, which
+        # its ISA holds until the frame is taken. See :meth:`_bound`.
+        self._walk_probe = 0
+        self._walk_opens = -1
         #: Line-end bytes the last completed interchange may still take as its ending; 0 once any
         #: other byte has followed it. See :data:`_FRAME_TAIL_BYTES`.
         self._tail_left = 0
@@ -280,7 +324,7 @@ class X12FrameReader:
         if not self._suspect and self._seg_start == 0 and not isa_separators_line_up(buf, 0):
             self._suspect = True
             self._probe = max(self._probe, self._dropped + 1)
-        bound, confirmed = self._bound() if self._suspect else (len(buf), False)
+        bound, confirmed = self._bound(None) if self._suspect else (len(buf), False)
         if len(buf) < ISA_SEGMENT_LEN or (
             buf[_SEGMENT_TERM_OFFSET : _SEGMENT_TERM_OFFSET + 1] == b"\r"
             and len(buf) < ISA_SEGMENT_LEN + 1
@@ -295,9 +339,14 @@ class X12FrameReader:
             # The walk starts past the ISA's own terminator. The ISA is fixed-width, so a terminator
             # byte inside its element data (a "~IEA" in ISA06) must not end a segment there: that
             # cut the frame at the ISA and dropped the real body as noise (BACKLOG #5536). Such an
-            # ISA is framed whole here. The codec refuses it only where something parses it, a
-            # Router or Handler that peeks or parses; this reader does not.
+            # ISA is framed whole here. This reader does not refuse it; at least the shared ingress
+            # guards and anything that peeks or parses the frame may.
             self._seg_start = self._scan = _SEGMENT_TERM_OFFSET + len(terminator)
+            self._walk_probe, self._walk_opens = self._seg_start, -1
+        if not self._suspect:
+            # A passing walk ends at a later passing ISA that opens a segment, so an interchange with
+            # no IEA does not swallow the next one (BACKLOG #5921). split ends its walk the same way.
+            bound, confirmed = self._bound(terminator)
         # Walk the segments, resuming where the last feed stopped. The ISA stays at the front of the
         # buffer until its frame is taken or the buffer is cleared, and both reset the resume points,
         # so they always describe this interchange. Each byte is searched about once in total.
@@ -312,18 +361,6 @@ class X12FrameReader:
                 return None  # IEA not complete yet
             if _IEA_SEGMENT.match(buf, self._seg_start, idx):
                 return self._take(idx + len(terminator))
-            # A segment that opens an ISA that passes is the next interchange: this one has no IEA,
-            # and walking on would swallow that one (BACKLOG #5921). split ends its walk the same way.
-            # Its header may still be arriving: this segment is then searched again on a later feed,
-            # at most one header's worth of reads, and only bytes before that ISA count to the cap.
-            if (opened := _ISA_SEGMENT.match(buf, self._seg_start, idx)) is not None:
-                next_isa = opened.end() - 3
-                if len(buf) < next_isa + ISA_SEGMENT_LEN:
-                    self._scan = self._seg_start
-                    self._check_cap(next_isa)
-                    return None
-                if isa_separators_line_up(buf, next_isa):
-                    return self._take(next_isa)
             self._seg_start = self._scan = idx + len(terminator)
 
     def _take(self, end: int) -> bytes:
@@ -345,13 +382,35 @@ class X12FrameReader:
         self._tail_left = _FRAME_TAIL_MAX - len(buf) if tail else 0
         return frame
 
-    def _bound(self) -> tuple[int, bool]:
-        """How far a suspect's walk may search: the first later ``ISA`` in ``_buf`` whose separator
+    def _bound(self, terminator: bytes | None) -> tuple[int, bool]:
+        """How far the walk may search: the first later ``ISA`` in ``_buf`` whose separator
         positions that have arrived pass :func:`isa_separators_line_up`, and whether all of them
-        have arrived. While there is none it is ``len(_buf)`` less a trailing ``I`` or ``IS`` held
-        back as the possible start of one, and False. A candidate that fails is passed at once; one
-        still arriving is searched again on the next feed, so each byte is searched about once."""
-        buf, base = self._buf, self._dropped
+        have arrived. For a passing walk, ``terminator`` is its terminator, and a candidate counts
+        only where it opens a segment: after that terminator and any whitespace. A suspect's
+        (``None``) counts anywhere. While there is none it is ``len(_buf)``, less, for a suspect, a
+        trailing ``I`` or ``IS`` held back as the possible start of one, and False. A candidate that
+        fails is passed at once; one still arriving is searched again on the next feed, so each byte
+        is searched about once."""
+        buf = self._buf
+        if terminator is not None:
+            # A passing walk's search is its own: a candidate it passes for not opening a segment
+            # may still bound a later frame, so it never moves the suspects' :attr:`_probe`.
+            while (i := buf.find(b"ISA", self._walk_probe)) != -1:
+                # A candidate still arriving is met again on each feed. The bytes before it are
+                # fixed, so whether it opens a segment is decided once: the whitespace run before it
+                # may be long, and rescanning it per feed would block the loop.
+                if isa_separators_line_up(buf, i) and (
+                    i == self._walk_opens
+                    or _opens_segment(
+                        buf, i, _SEGMENT_TERM_OFFSET, terminator, _SEGMENT_WHITESPACE_BYTES
+                    )
+                ):
+                    self._walk_probe = self._walk_opens = i
+                    return i, len(buf) >= i + ISA_SEGMENT_LEN
+                self._walk_probe = i + 1
+            self._walk_probe = max(self._walk_probe, len(buf) - 2)
+            return len(buf), False
+        base = self._dropped
         while (i := buf.find(b"ISA", self._probe - base)) != -1:
             if isa_separators_line_up(buf, i):
                 self._probe = base + i
@@ -414,7 +473,8 @@ def check_integrity(raw: str) -> list[str]:
     """Structural integrity tie-out for one interchange (a pure helper, opt-in).
 
     Returns a list of human-readable problems (empty when the interchange ties out): the control-number
-    pairs ISA13==IEA02, GS06==GE02, ST02==SE02, and the counts GE01==#ST, IEA01==#GS. This is *not*
+    pairs ISA13==IEA02, GS06==GE02, ST02==SE02, the counts GE01==#ST, IEA01==#GS, and an ST, GS or
+    ISA left without its SE, GE or IEA. This is *not*
     implementation-guide validation (deferred) — just the envelope self-consistency a receiver can cheaply
     confirm. Raises :class:`X12PeekError` only if the interchange header itself is unparseable."""
     isa = find_isa_start(raw)
@@ -464,4 +524,12 @@ def check_integrity(raw: str) -> list[str]:
                 if get(fields, 1) != str(st_in_group):
                     problems.append(f"GE01 {get(fields, 1)!r} != actual ST count {st_in_group}")
             current_gs = None
+    # A frame cut at a later ISA before its trailers still parses, so report what never closed
+    # (BACKLOG #5921). The values are control numbers, never message content.
+    if current_st is not None:
+        problems.append(f"ST02 {get(current_st, 2)!r} has no SE")
+    if current_gs is not None:
+        problems.append(f"GS06 {get(current_gs, 6)!r} has no GE")
+    if iea_seg is None:
+        problems.append("no IEA segment")
     return problems
