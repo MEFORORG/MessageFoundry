@@ -7,8 +7,10 @@ start tag with no close after it rescanned to the end of the reply. A partner re
 tags then cost the square of its length, and on the 2xx path that cost ran on the event loop.
 
 Three things are pinned here: what the new extraction reads, its time grows linearly, and the 2xx
-classification runs in the worker thread. The old patterns are kept below, verbatim, as the positive
-control for the second, and inside the reference for the first.
+classification runs in the worker thread. BACKLOG #5913 adds a fourth at the end of the file: the
+WS-* envelope wrap and the body-secret substitution run in that same worker hop, before the POST.
+The old patterns are kept below, verbatim, as the positive control for the second, and inside the
+reference for the first.
 
 The new extraction is NOT the old one everywhere. The old patterns read the first faultcode anywhere
 in the reply, else the first Value, the Header included, and an empty ``<faultcode/>`` took the next element's text as its
@@ -28,6 +30,7 @@ import random
 import re
 import threading
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 
@@ -571,13 +574,13 @@ class _Opener:
         return _Resp(self._body)
 
 
-def _dest(*, capture_response: bool) -> SoapDestination:
+def _dest(*, capture_response: bool, **settings: Any) -> SoapDestination:
     d = build_destination(
         Destination(
             name="OB_SOAP",
             type=ConnectorType.SOAP,
             settings=Soap(
-                url="https://api.example.com/svc", capture_response=capture_response
+                url="https://api.example.com/svc", capture_response=capture_response, **settings
             ).settings,
         ),
         egress=EgressSettings(deny_by_default=False),
@@ -587,6 +590,18 @@ def _dest(*, capture_response: bool) -> SoapDestination:
 
 
 _SECRET = "an-echoed-credential"
+
+
+def _counting_hops(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    hops: list[object] = []
+    to_thread = asyncio.to_thread
+
+    async def counting_to_thread[T](func: Callable[..., T], /, *args: object) -> T:
+        hops.append(func)
+        return await to_thread(func, *args)
+
+    monkeypatch.setattr(asyncio, "to_thread", counting_to_thread)
+    return hops
 
 
 @pytest.mark.parametrize("capture_response", [False, True], ids=["raising", "capturing"])
@@ -601,14 +616,7 @@ async def test_a_2xx_reply_is_classified_off_the_event_loop(
     count. The thread ids alone cannot see that one, since the pool may hand both hops to the same
     idle worker."""
     threads: dict[str, list[int]] = {"post": [], "classify": [], "scrub": []}
-    hops: list[object] = []
-    to_thread = asyncio.to_thread
-
-    async def counting_to_thread[T](func: Callable[..., T], /, *args: object) -> T:
-        hops.append(func)
-        return await to_thread(func, *args)
-
-    monkeypatch.setattr(asyncio, "to_thread", counting_to_thread)
+    hops = _counting_hops(monkeypatch)
 
     def classify(status: int, body: str) -> DeliveryError | None:
         threads["classify"].append(threading.get_ident())
@@ -646,3 +654,99 @@ async def test_a_2xx_reply_is_classified_off_the_event_loop(
     assert worker != threading.get_ident()
     assert threads["classify"] == [worker]
     assert set(threads["scrub"]) <= {worker}
+
+
+# --- the envelope wrap and the body secrets run in the same hop, before the POST ----------------
+
+
+def _ws_dest() -> SoapDestination:
+    dest = _dest(
+        capture_response=True,
+        soap_version="1.2",
+        ws_addressing=True,
+        ws_security=True,
+        soap_action="urn:Submit",
+    )
+    dest._body_secrets = (("{{TOKEN}}", _SECRET),)
+    dest._opener = _Opener(b"<ok/>")  # type: ignore[assignment]
+    return dest
+
+
+async def test_the_envelope_and_the_body_secrets_are_applied_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5913: the WS-* wrap, with its SAX fragment gate and its Timestamp read, and the
+    body-secret substitution run in the same ``to_thread`` hop as the POST, in the order wrap,
+    secrets, POST.
+
+    Mutation: wrap, or substitute, in ``send`` before the hop, as before #5913. Red: that recorded
+    thread is the loop's. Mutation: a hop of its own for either. Red: the hop count. Mutation:
+    substitute before wrapping, or read the clock in ``send``. Red: the recorded order."""
+    hops = _counting_hops(monkeypatch)
+    dest = _ws_dest()
+    calls: list[tuple[str, int]] = []
+    sent: list[str] = []
+    wrap, apply, post, now = dest._wrap_envelope, dest._apply_body_secrets, dest._post, dest._now_fn
+    hop = dest._post_and_classify
+
+    def recording_wrap(fragment: str) -> str:
+        calls.append(("wrap", threading.get_ident()))
+        return wrap(fragment)
+
+    def recording_now() -> float:
+        calls.append(("clock", threading.get_ident()))
+        return now()
+
+    def recording_apply(payload: str) -> str:
+        calls.append(("secrets", threading.get_ident()))
+        return apply(payload)
+
+    def recording_post(payload: str) -> tuple[str, int, dict[str, str]]:
+        calls.append(("post", threading.get_ident()))
+        sent.append(payload)
+        return post(payload)
+
+    monkeypatch.setattr(dest, "_wrap_envelope", recording_wrap)
+    monkeypatch.setattr(dest, "_apply_body_secrets", recording_apply)
+    monkeypatch.setattr(dest, "_post", recording_post)
+    monkeypatch.setattr(dest, "_now_fn", recording_now)
+    response = await dest.send("<op>{{TOKEN}}</op>")
+    assert response is not None and response.outcome == "accepted"
+    assert hops == [hop], f"one to_thread hop, of _post_and_classify, not {hops}"
+    assert [name for name, _ in calls] == ["wrap", "clock", "secrets", "post"]
+    workers = {ident for _, ident in calls}
+    assert len(workers) == 1 and threading.get_ident() not in workers
+    (wire,) = sent
+    assert "<soap:Envelope" in wire and "<wsu:Timestamp" in wire
+    assert f"<soap:Body><op>{_SECRET}</op></soap:Body>" in wire
+    assert "{{TOKEN}}" not in wire
+
+
+@pytest.mark.parametrize(
+    ("fragment", "error", "match"),
+    [
+        ("<op>{{TOKEN}}", ValueError, "not well-formed"),
+        ("<op/>", NegativeAckError, "must appear exactly once"),
+    ],
+    ids=["fragment-gate", "body-secret-gate"],
+)
+async def test_a_refused_body_posts_nothing_from_the_worker_thread(
+    fragment: str, error: type[Exception], match: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fragment gate and the body-secret count gate still refuse before a byte crosses, now
+    from inside the one hop, and the refusal reaches the caller with the type it had before #5913.
+    The fragment gate's bare ValueError is that earlier type, kept rather than reclassified here."""
+    hops = _counting_hops(monkeypatch)
+    dest = _ws_dest()
+    posted: list[str] = []
+
+    def recording_post(payload: str) -> tuple[str, int, dict[str, str]]:
+        posted.append(payload)
+        return "", 200, {}
+
+    hop = dest._post_and_classify
+    monkeypatch.setattr(dest, "_post", recording_post)
+    with pytest.raises(error, match=match):
+        await dest.send(fragment)
+    assert not posted, "nothing is POSTed before the gates pass"
+    assert hops == [hop], f"one to_thread hop, of _post_and_classify, not {hops}"
