@@ -191,7 +191,10 @@ class _WindowsProbe:
 
         # Walked one step at a time, so the reader's stop ends the walk. parent() drops a parent
         # whose process id was reused by a later process.
-        proc = psutil.Process()
+        try:
+            proc = psutil.Process()
+        except psutil.Error as exc:
+            raise OSError(f"this process could not be queried: {exc}") from exc
         while True:
             try:
                 parent = proc.parent()
@@ -371,6 +374,13 @@ def _where(posture: ServiceEnvPosture) -> str:
     )
 
 
+class ServiceEnvironmentRefused(Exception):  # noqa: N818 - a refusal, not an error condition
+    """An API app factory refused to build on :func:`service_env_refusal`'s finding.
+
+    Not a ``RuntimeError``, so a handler written for another build failure, such as the absent
+    web console ``create_app(serve_ui=True)`` reports, does not catch this refusal with it."""
+
+
 def service_env_refusal(posture: ServiceEnvPosture) -> str | None:
     """Why ``serve``, ``supervise`` or an API app factory must not start, whatever the enforcement
     setting, or None.
@@ -511,7 +521,8 @@ def service_env_loosenings(posture: ServiceEnvPosture) -> list[tuple[str, str]]:
         out.append(
             (
                 "secret_in_service_environment",
-                f"`serve` and `supervise` would refuse to start on this: {refused}",
+                "`serve`, `supervise` and the API app factories would refuse to start on this: "
+                f"{refused}",
             )
         )
     return out

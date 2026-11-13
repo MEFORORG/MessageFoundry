@@ -42,6 +42,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.serviceenv import (
     DIRECTORY_CLASS_NAMES,
     KEY_CLASS_NAMES,
+    ServiceEnvironmentRefused,
     ServiceEnvPosture,
     ServiceEnvStatus,
     missing_service_config_refusal,
@@ -488,6 +489,13 @@ def test_every_posture_serve_refuses_is_named_where_serve_did_not_run(
     _assert_twin_of(refusal, entries["secret_in_service_environment"])
 
 
+def _values_in_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Put the synthetic values in this process's environment, so a check that a message or a
+    response never carries one can fail where the code reads ``os.environ``."""
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", _KEY_VALUE)
+    monkeypatch.setenv("MEFOR_STORE_PASSWORD", _PASSWORD_VALUE)
+
+
 def _build_embedded(factory: str, tmp_path: Path) -> object:
     """Build an app the way an embedder does, with neither ``serve`` nor ``supervise``."""
     from messagefoundry.api.app import create_app, create_managed_app
@@ -514,8 +522,9 @@ def test_an_embedded_app_refuses_where_serve_would(
     finding, as it is built. The message is the refusal's, value-free."""
     refusal = service_env_refusal(posture)
     assert refusal is not None
+    _values_in_the_environment(monkeypatch)
     monkeypatch.setattr("messagefoundry.api.app.service_env_posture", lambda: posture)
-    with pytest.raises(RuntimeError) as raised:
+    with pytest.raises(ServiceEnvironmentRefused) as raised:
         _build_embedded(factory, tmp_path)
     assert str(raised.value) == f"{factory}: refusing to start: {refusal}"
     assert _KEY_VALUE not in str(raised.value)
@@ -532,6 +541,7 @@ async def test_an_app_built_around_an_engine_refuses_a_listed_secret(
     from messagefoundry.pipeline import Engine
 
     listed = _service([f"MEFOR_STORE_PASSWORD={_PASSWORD_VALUE}"])
+    _values_in_the_environment(monkeypatch)
     monkeypatch.setattr("messagefoundry.api.app.service_env_posture", lambda: listed)
     engine = await Engine.create(
         tmp_path / "embedded.db",
@@ -539,7 +549,7 @@ async def test_an_app_built_around_an_engine_refuses_a_listed_secret(
         egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
-        with pytest.raises(RuntimeError) as raised:
+        with pytest.raises(ServiceEnvironmentRefused) as raised:
             create_app(engine, allow_no_auth=True)
     finally:
         await engine.stop()
@@ -558,6 +568,7 @@ async def test_an_embedded_app_names_a_key_from_elsewhere_in_its_posture(
     from tests.test_api_security_posture import _service as _auth_service
 
     elsewhere = _service([], MEFOR_STORE_ENCRYPTION_KEY=_KEY_VALUE)
+    _values_in_the_environment(monkeypatch)
     monkeypatch.setattr("messagefoundry.api.app.service_env_posture", lambda: elsewhere)
     engine = await Engine.create(
         tmp_path / "embedded.db",

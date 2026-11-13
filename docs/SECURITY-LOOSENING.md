@@ -2613,10 +2613,12 @@ count is above `0` (vault BACKLOG #2613).
   console-script launcher such as `uvicorn.exe` or `hypercorn.exe` between NSSM and the
   interpreter is neither a Python interpreter nor `messagefoundry.exe`, so the engine does not
   find its service there and this entry is not named. The reading is taken once per process, and
-  at least `serve`, `supervise` and both factories refuse on it before the engine serves, so the
+  at least `serve`, `supervise` and both factories refuse on it before they serve the API, so the
   entry reaches a caller that reads the loosenings itself, through `security_loosenings` with a
-  service reading. An engine embedded with no API has no posture to name it in. Clear it the way
-  the refusal says.
+  service reading. A factory refuses the app, not the engine: an engine the caller built, and
+  perhaps started, before `create_app(engine)` has already opened its store, and an engine
+  embedded with no API is not refused and has no posture to name it in. Clear it the way the
+  refusal says.
 - **`store_key_in_service_environment`: a store key reaches the service through its
   environment.** It is named wherever the key came from, once the engine knows its service. The
   machine-wide environment is readable by every local user too. Under `serve` and `supervise` a

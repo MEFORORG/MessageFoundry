@@ -519,6 +519,7 @@ from messagefoundry.remotedebug import (
 )
 from messagefoundry.service_status import query_service_state
 from messagefoundry.serviceenv import (
+    ServiceEnvironmentRefused,
     ServiceEnvPosture,
     service_env_posture,
     service_env_refusal,
@@ -4528,7 +4529,7 @@ def _refuse_a_secret_in_the_service_environment(caller: str) -> None:
     ``service_env_posture`` says what the reading covers, and when it cannot read the lists."""
     refused = service_env_refusal(service_env_posture())
     if refused is not None:
-        raise RuntimeError(f"{caller}: refusing to start: {refused}")
+        raise ServiceEnvironmentRefused(f"{caller}: refusing to start: {refused}")
 
 
 def create_app(
@@ -12374,6 +12375,8 @@ def create_managed_app(
     start: the trust-anchor preflight refuses it, or, if that passes, the first one is raised
     marked ``unaudited``.
     """
+    # The remote-debugging guard goes in before the reading, as create_app installs it.
+    install_remote_debug_guard()
     _refuse_a_secret_in_the_service_environment("create_managed_app")
     if store_settings is None:
         if db_path is None:
