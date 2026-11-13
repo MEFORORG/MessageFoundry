@@ -111,6 +111,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -447,7 +448,8 @@ class _UnmarkedPolicy:
             _log.debug("cipher refusal hook raised; the refusal itself still stands")
 
     def _pass_unmarked(self, stored: str, aad: bytes | None, allow_unmarked: bool) -> str:
-        """Return an unmarked ``stored`` when policy permits it, else raise :class:`CipherError`."""
+        """Return an unmarked ``stored`` when policy permits it, else raise
+        :class:`UnmarkedCipherError`."""
         if not stored or allow_unmarked or self._allow_unmarked:
             return stored
         table, column = aad_cell_name(aad)
@@ -465,13 +467,47 @@ class _UnmarkedPolicy:
         else:
             cause = "a stripped marker or a planted row"
             fix = "set [store].allow_unmarked_ciphertext to accept unmarked values"
-        _log.warning(
-            "refused an unmarked value in cipher column %s.%s: %s; %s", table, column, cause, fix
-        )
+        if (table, column) not in _ROW_TAGGED_CELLS or _first_unmarked_in_interval(table, column):
+            # A tagged message or preset cell logs once per column per interval: a list over a
+            # keyless run's rows meets one in every row, this names no row, and the cell-tag
+            # layer audits each row and logs once per column per interval (BACKLOG #5650). Every
+            # other column, an upload among them, logs on every refusal.
+            _log.warning(
+                "refused an unmarked value in cipher column %s.%s: %s; %s",
+                table,
+                column,
+                cause,
+                fix,
+            )
         self.report_unmarked(table, column)
-        raise CipherError(
+        raise UnmarkedCipherError(
             f"refused an unmarked value in cipher column {table}.{column} ({cause}); {fix}"
         )
+
+
+#: The cells :mod:`messagefoundry.store.cell_tag` binds to a row tag, whose unmarked-value WARNING
+#: is throttled per column. Named here because cell_tag imports this module;
+#: ``tests/test_cell_tag.py`` asserts the two lists agree.
+_ROW_TAGGED_CELLS: frozenset[tuple[str, str]] = frozenset(
+    {("messages", c) for c in ("raw", "error", "summary", "metadata")}
+    | {("search_presets", "criteria")}
+)
+#: How long the unmarked-value WARNING for one tagged cell column is logged once per process.
+_UNMARKED_LOG_INTERVAL_S = 3600.0
+_unmarked_logged: dict[tuple[str, str], float] = {}
+_unmarked_lock = threading.Lock()
+
+
+def _first_unmarked_in_interval(table: str, column: str) -> bool:
+    """Whether the unmarked-value WARNING for ``table.column`` has not been logged within the
+    interval; records it. The refusal itself, and its hook, are never throttled here."""
+    key, now = (table, column), time.monotonic()
+    with _unmarked_lock:
+        last = _unmarked_logged.get(key)
+        if last is not None and now - last < _UNMARKED_LOG_INTERVAL_S:
+            return False
+        _unmarked_logged[key] = now
+    return True
 
 
 def allows_unmarked(cipher: Cipher) -> bool:
@@ -646,8 +682,18 @@ class UnauthenticatedCipherError(CipherError):
     :class:`AesGcmCipher` raises it, and only it can mean the cell was sealed for another place:
     wrong associated data, or a key that is not supplied. Bad base64 and a verified plaintext that is
     not UTF-8 stay plain :class:`CipherError`, since they are a corrupt row, so
-    :func:`~messagefoundry.store.cell_tag.open_tagged_cell` never reads them as tag drift. The Vault
-    Transit cipher does not raise it; ``open_tagged_cell`` never reads a Transit failure as drift."""
+    :func:`~messagefoundry.store.cell_tag.open_tagged_cell` never reads them as tag drift.
+
+    The Vault Transit cipher gives it where Vault's reason for refusing a value is wholly the AEAD's
+    own authentication failure (BACKLOG #5650): ``decrypt`` raises it for an HTTP 400 that says so,
+    and ``decrypt_many`` returns it for a batch result whose per-value ``error`` says so, read only
+    from a 2xx batch reply: a batch Vault refuses is asked for value by value through ``decrypt``,
+    and its body is never read. Only the single ``decrypt`` reaches
+    :func:`~messagefoundry.store.cell_tag.open_tagged_cell`; for the batch, read only by the
+    cipher-cell walk, the per-value text changes only the error's class, and so the class name a
+    reason line renders, never containment, audit or alert. Its other failures include at least an outage
+    (:class:`CipherUnavailableError`), a refused unmarked value (:class:`UnmarkedCipherError`), and
+    a key-version refusal, a 403 and a 404, which are plain :class:`CipherError`."""
 
 
 class CipherUnavailableError(CipherError):
@@ -662,7 +708,9 @@ class CipherUnavailableError(CipherError):
     and, in ``decrypt_many``, for each value it never asked for once one value gave no verdict
     (:func:`gave_no_verdict`). That covers a refusal such as a 403 too: the value asked for keeps
     its own plain :class:`CipherError`, and the values after it, never asked for, get this class.
-    Every other Transit failure, a refused tag among them, stays plain :class:`CipherError`. A
+    Every other Transit failure stays a :class:`CipherError` of another class: at least a refused
+    AEAD tag as :class:`UnauthenticatedCipherError` (BACKLOG #5650), a refused unmarked value as
+    :class:`UnmarkedCipherError`, and plain :class:`CipherError` for others. A
     reader that tells an outage from a value's failure by :func:`gave_no_verdict` still reads some
     of those as an outage: one whose cause is an ``OSError`` or an ``hvac`` error other than a 400
     (a 403, say). A refused tag, Vault's 400, is read as the value's.
@@ -671,6 +719,18 @@ class CipherUnavailableError(CipherError):
     only this module, can tell it apart: the upload routes answer it 503 with ``Retry-After``, where
     a refused value answers 423. Still a :class:`CipherError`, so every other caller handles it as
     it did before."""
+
+
+class UnmarkedCipherError(CipherError):
+    """A keyed cipher refused a non-blank unmarked value in a covered column: a stripped marker or
+    a planted row (BACKLOG #1169). Raised by the unmarked-value seam, which has already fired the
+    refusal hook, so a reader that contains it raises no second alert (BACKLOG #5650). The seam
+    logs a WARNING for every refusal, except in a tagged message or preset cell, where it logs once
+    per column per interval, and the cell-tag layer audits each row and logs once per column per
+    interval. Its own class, so
+    :func:`~messagefoundry.store.cell_tag.open_tagged_cell` can tell it from a key or format
+    problem without reading its text. The name keeps the ``CipherError`` token, as
+    :class:`UnauthenticatedCipherError`'s does."""
 
 
 class AuditVerifyTimedOutError(CipherError):

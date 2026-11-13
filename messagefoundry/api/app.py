@@ -9745,9 +9745,10 @@ def create_app(
                     preset_id=preset_id, owner_user_id=identity.user_id
                 )
             except CellTagError:
-                # BACKLOG #2593: the criteria fail their owner tag (alerted and audited) or are
-                # corrupt (logged); the store refused. The caller's own preset exists, so a refusal,
-                # never a 500. Caught before CipherError, which it subclasses.
+                # BACKLOG #2593: the criteria fail their owner tag (alerted and audited), hold an
+                # unmarked value (audited; the cipher alerted, BACKLOG #5650) or are corrupt
+                # (logged); the store refused. The caller's own preset exists, so a refusal, never
+                # a 500. Caught before CipherError, which it subclasses.
                 refusal = HTTPException(
                     423, f"preset {preset_id} failed its integrity check and cannot be used"
                 )
@@ -9762,12 +9763,13 @@ def create_app(
                     headers={"Retry-After": str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)},
                 )
             except CipherError as exc:
-                # BACKLOG #5523: a key or format problem the cipher raises as is, for example an
-                # unmarked value planted in a keyed store, or a value Vault Transit refused. It
-                # answered 500. The type name only: the text is the cipher's, not this route's.
-                # ERROR: under Transit a cell planted across owners lands here, not in the
-                # CellTagError arm, so it is neither audited nor alerted and this is the engine's
-                # only record of it. The outage above is a WARNING: it says nothing about the cell.
+                # BACKLOG #5523: a key or format problem the cipher raises as is, for example a
+                # retired key that is not supplied, or a Vault Transit refusal other than the
+                # value's AEAD tag (a key-version refusal, a 403). It answered 500. The type name
+                # only: the text is the cipher's, not this route's. ERROR: it is neither audited
+                # nor alerted, so this is the engine's only record of it. Transit's AEAD refusal of
+                # a cell planted across owners is a CellTagError above (BACKLOG #5650). The outage
+                # above is a WARNING: it says nothing about the cell.
                 _log.error("layered search refused preset %s: %s", preset_id, type(exc).__name__)
                 refusal = HTTPException(
                     423,
