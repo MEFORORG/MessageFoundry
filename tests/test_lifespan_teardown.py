@@ -658,9 +658,14 @@ async def test_control_is_stopped_before_the_first_drain_runs(
         pass
     # The control: the callback was wired when the teardown began, so the removal cleared it.
     assert seen[0] == ("the alert control callback's removal", True)
-    wired = [label for label, cb_wired in seen[1:] if cb_wired]
+    # Both drains ran after the removal; the floor is the guard the vacuous-absence lint can read.
+    after_removal = seen[1:]
+    assert {"the store-reading tasks", "the long-operations drain"} <= {
+        label for label, _ in after_removal
+    }
+    assert len(after_removal) >= 2, f"the drains did not run after the callback's removal: {seen}"
+    wired = [label for label, cb_wired in after_removal if cb_wired]
     assert wired == [], f"steps ran with the control callback still wired: {wired}"
-    assert {"the store-reading tasks", "the long-operations drain"} <= {label for label, _ in seen}
 
 
 async def test_the_notifier_close_cancels_a_control_task_still_running() -> None:
