@@ -642,6 +642,10 @@ function Get-ChdirTargetRaw([string]$Text) {
 # window, so `-C "a b"` reads as `a` to the first and as nothing to the second.
 function Get-GitDashCPattern { '(?:^|\s)-C\s+"?([^"\s]+)"?' }
 
+# A bare `-C` FLAG, value or not: the count a reader compares its readable values against, and the
+# presence test rules 3 and 3c ask of a window. One spelling, beside the value pattern above.
+function Get-GitDashCPresencePattern { '(?:^|\s)-C\s' }
+
 # git applies repeated `-C` cumulatively: each relative one is rooted in the directory the previous one
 # named. The resolver's $postC and rule 3c's window fold both walk that fold, so it is written once.
 function Get-DashCFold([string]$Base, [string[]]$DashCs) {
@@ -727,7 +731,7 @@ function Test-WindowChdirUsable([string]$Followed, [string]$ChdirWin, [string]$C
 function Get-WindowFoldRaw([string]$WindowChdir, [string]$WindowScan) {
     $windowCs = @([regex]::Matches($WindowScan, (Get-GitDashCPattern)) | ForEach-Object { $_.Groups[1].Value })
     if ($windowCs.Count -eq 0) { return "" }
-    if ($windowCs.Count -ne [regex]::Matches($WindowScan, '(?:^|\s)-C\s').Count) { return "" }
+    if ($windowCs.Count -ne [regex]::Matches($WindowScan, (Get-GitDashCPresencePattern)).Count) { return "" }
     foreach ($wc in $windowCs) { if (-not (Test-ShellLiteralPath $wc)) { return "" } }
     Get-DashCFold $WindowChdir $windowCs
 }
@@ -895,7 +899,7 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     $dashCs = @()
     if ($OwnWindow) {
         $winHits = @([regex]::Matches($DashCText, $dashCPattern))
-        if ($winHits.Count -ne [regex]::Matches($DashCText, '(?:^|\s)-C\s').Count) { return }
+        if ($winHits.Count -ne [regex]::Matches($DashCText, (Get-GitDashCPresencePattern)).Count) { return }
         $dashCs = @($winHits | ForEach-Object { Remove-OuterQuotePair $_.Groups[1].Value })
         foreach ($wc in $dashCs) { if ($wc -match '[''"]') { return } }
     } elseif ($AllTargets) {
@@ -912,7 +916,9 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     # assembly moved to the bottom and this branch only gathers.
     $dashCOut = @()
     if ($dashCs.Count -gt 0) {
-        foreach ($dashC in $dashCs) {
+        # git applies repeated `-C` cumulatively, so an invocation's own window stands in the fold.
+        if ($OwnWindow) { $dashCOut = @(Get-DashCFold $cd $dashCs) }
+        else { foreach ($dashC in $dashCs) {
             if ($cd -and -not [System.IO.Path]::IsPathRooted($dashC)) {
                 # Join, never replace. The result stays RAW and possibly relative (`../Unrelated/.`); the
                 # caller roots it with Get-FullPathRaw against the session cwd, which is the same base the
@@ -921,9 +927,7 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
             } else {
                 $dashCOut += $dashC
             }
-        }
-        # git applies repeated `-C` cumulatively, so the invocation stands in the fold, not in each.
-        if ($OwnWindow) { $dashCOut = @(Get-DashCFold $cd $dashCs) }
+        } }
         $emitBase = [bool]$BaseFallback
     } else {
         $emitBase = $true
@@ -3486,11 +3490,11 @@ if ($tool -in @("Bash", "PowerShell")) {
         $ownInv = Get-OwnInvocationWindow $seg.Scan $dis.Index
         $gitTokens = @($ownInv.GitTokens)
         $own = $ownInv.Own
-        $ownEnd =$(if ($own) { [Math]::Min($own.Index + $own.Length, $dis.Index) } else { 0 })
+        $ownEnd = $(if ($own) { [Math]::Min($own.Index + $own.Length, $dis.Index) } else { 0 })
         $ownWin = $(if ($ownEnd -lt $dis.Index) { $seg.Scan.Substring($ownEnd, $dis.Index - $ownEnd) } else { "" })
         # `-cmatch`: case-SENSITIVE, the same reading the resolver gives. git's lowercase `-c name=value`
         # is a config override and not a path, and reading it as one is how a real `-C` got shadowed once.
-        $ownDashC = ($ownWin -cmatch '(?:^|\s)-C\s')
+        $ownDashC = ($ownWin -cmatch (Get-GitDashCPresencePattern))
 
         # DOES THE DISARMING INVOCATION CARRY ITS OWN REPOSITORY TOKEN? Same question -AllTargets asks
         # about `-C`, and it has to be asked for the same reason: a `--git-dir` that is not this
@@ -4106,9 +4110,13 @@ What to do instead:
             }
         }
         $govWt = $null
+        $triedAbs = @()
         foreach ($tryBase in $bases) {
             $victimAbs = Get-FullPathRaw $victimRaw $tryBase
             if (-not $victimAbs) { $victimAbs = $victimRaw }
+            # An absolute victim resolves the same against both bases; ask git about it once.
+            if ($triedAbs -ccontains $victimAbs) { continue }
+            $triedAbs += $victimAbs
 
             $victimCommon = "$(& git -C $victimAbs rev-parse --git-common-dir 2>$null)".Trim()
             if ($LASTEXITCODE -ne 0 -or -not $victimCommon) { continue }
@@ -4420,6 +4428,8 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
     # whitespace or end-of-string, and list `cherry-pick` before `merge` so the alternation prefers it.
     # `[^|;&]*?` keeps the scan inside one command, so `git log | grep reset` is not a false positive.
     $verbs = 'cherry-pick|checkout|switch|reset|restore|stash|clean|rebase|merge|revert|am|apply'
+    # The verb hunt, spelled once for the three loops below that read it.
+    $verbHunt = "\bgit(\.exe)?\b[^|;&]*?\s(?<verb>$verbs)(?=\s|$)"
 
     # Scan SEGMENT BY SEGMENT (Get-ScannableSegments): per line, with quoted spans blanked, plus the
     # contents of any interpreter argument recursed into, then the same again per LOGICAL line where a
@@ -4441,7 +4451,7 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
     foreach ($seg in (Get-ScannableSegments $cmd (Get-HostConvention $tool))) {
         # Match a git invocation however it is spelled: git, git.exe, or an absolute path to either.
         if ($seg.Scan -cnotmatch $gitInvocation) { continue }
-        if ($seg.Scan -cnotmatch "\bgit(\.exe)?\b[^|;&]*?\s(?<verb>$verbs)(?=\s|$)") { continue }
+        if ($seg.Scan -cnotmatch $verbHunt) { continue }
         $segVerb = $Matches['verb']
 
         # Everything BEFORE the git invocation on this line. A `cd` is honoured only from here -- reading
@@ -4497,7 +4507,7 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
         # resolver residual rule 3c already lists applies, such as a token value containing a space. A
         # GIT_DIR set by an earlier tool call is invisible.
         if (-not $headRoot) {
-            foreach ($vm in @([regex]::Matches($seg.Scan, "\bgit(\.exe)?\b[^|;&]*?\s(?<verb>$verbs)(?=\s|$)"))) {
+            foreach ($vm in @([regex]::Matches($seg.Scan, $verbHunt))) {
                 $vGroup = $vm.Groups['verb']
                 $vIdx = $vGroup.Index
                 if (-not (Test-VerbMovesHead $vGroup.Value $seg.Scan.Substring($vIdx + $vGroup.Length))) { continue }
@@ -4542,12 +4552,12 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
     foreach ($seg in (Get-ScannableSegments $cmd (Get-HostConvention $tool))) {
         if ($root) { break }
         if ($seg.Scan -cnotmatch $gitInvocation) { continue }
-        foreach ($vm in @([regex]::Matches($seg.Scan, "\bgit(\.exe)?\b[^|;&]*?\s(?<verb>$verbs)(?=\s|$)"))) {
+        foreach ($vm in @([regex]::Matches($seg.Scan, $verbHunt))) {
             $vGroup = $vm.Groups['verb']
             $vIdx = $vGroup.Index
             $inv = Get-OwnInvocationWindow $seg.Scan $vIdx -SeparatorInToken
             if (-not $inv.Own) { continue }
-            if ($inv.CmdWin -cnotmatch '(?:^|\s)-C\s') { $anyInferredTarget = $true }
+            if ($inv.CmdWin -cnotmatch (Get-GitDashCPresencePattern)) { $anyInferredTarget = $true }
             $invCands = @(Get-GitTargetCandidatesRaw $seg.Raw $seg.Scan.Substring(0, $inv.Own.Index) $cwdRaw `
                               -OwnWindow -DashCText $inv.CmdWin)
             # Rule 3b reads the text from the verb on, so a verb spelled inside an earlier path or
@@ -4709,8 +4719,13 @@ worktree gate blocked it." The primary's HEAD belongs to the user, not to a sess
         # is the pre-change one, unchanged and first, so its verdict cannot move; it judged only the
         # first verb-bearing segment, so `git -C <ungoverned> clean -fd ; git switch <branch>` in
         # another session's worktree was allowed. Each call denies and exits, or returns.
+        # An exact repeat is skipped: each call can spawn several git processes.
+        $judged = @{}
         foreach ($iv in $invocations) {
-            if ($iv.Target) { Test-WorktreeHijack $iv.Verb $iv.Text $iv.Target $cwdRaw }
+            $ivKey = "$($iv.Verb)`0$($iv.Target)`0$($iv.Text)"
+            if (-not $iv.Target -or $judged.ContainsKey($ivKey)) { continue }
+            $judged[$ivKey] = $true
+            Test-WorktreeHijack $iv.Verb $iv.Text $iv.Target $cwdRaw
         }
         exit 0
     }
