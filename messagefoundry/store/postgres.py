@@ -157,8 +157,6 @@ from messagefoundry.store.document_strip import (
     StripCursor,
     StripResult,
     StripUpdate,
-    locked_whole,
-    log_row_write_skip,
     run_strip_pass,
 )
 from messagefoundry.store.gcm_bound import (
@@ -11783,40 +11781,22 @@ class PostgresStore:
             )
 
         async def write(updates: Sequence[StripUpdate]) -> list[StripUpdate]:
-            # The guard is document_strip's (its module docstring states what it covers).
+            # The compare-and-swap guard, and its limit, are document_strip's: its module docstring
+            # states both. A failure rolls back the whole batch.
             landed: list[StripUpdate] = []
             async with self._timed_acquire() as conn, conn.transaction():
-                # Statements here read committed data only, so the in-flight NOT EXISTS alone could
-                # pass for a row a replay re-pends before this transaction commits. The batch locks
-                # its message rows, then their queue rows, skipping any another writer holds, and
-                # writes only the messages it locked whole; document_strip states what that covers.
-                ids = [u.message_id for u in updates]
-                held = [r["id"] for r in await conn.fetch(_PG_STRIP_LOCK_MESSAGES, ids)]
-                locked = [
-                    (r["id"], r["message_id"]) for r in await conn.fetch(_PG_STRIP_LOCK_QUEUE, held)
-                ]
-                census = [
-                    (r["id"], r["message_id"]) for r in await conn.fetch(_PG_STRIP_QUEUE_ROWS, held)
-                ]
-                for u in locked_whole(updates, held, locked, census):
-                    try:
-                        # A savepoint per row, so one row's failure skips only that row.
-                        async with conn.transaction():
-                            tag = await conn.execute(
-                                "UPDATE messages SET raw=$1, documents_pruned=$2"
-                                " WHERE id=$3 AND documents_pruned IS NULL AND raw=$4"
-                                " AND NOT EXISTS (SELECT 1 FROM queue q"
-                                " WHERE q.message_id = messages.id"
-                                " AND q.status = ANY($5::text[]))",
-                                u.new_cell,
-                                stamp,
-                                u.message_id,
-                                u.stored,
-                                inflight,
-                            )
-                    except Exception as exc:  # asyncpg is an optional import here
-                        log_row_write_skip(u.message_id, exc)
-                        continue
+                for u in updates:
+                    tag = await conn.execute(
+                        "UPDATE messages SET raw=$1, documents_pruned=$2"
+                        " WHERE id=$3 AND documents_pruned IS NULL AND raw=$4"
+                        " AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id = messages.id"
+                        " AND q.status = ANY($5::text[]))",
+                        u.new_cell,
+                        stamp,
+                        u.message_id,
+                        u.stored,
+                        inflight,
+                    )
                     if _rowcount(tag) == 1:
                         landed.append(u)
             return landed
@@ -12228,20 +12208,6 @@ class PostgresStore:
         else:
             return  # only terminal non-dead non-outbound rows (shouldn't occur) — leave as-is
         await conn.execute("UPDATE messages SET status=$1 WHERE id=$2", status, message_id)
-
-
-#: The embedded-document strip's write locks, taken in this order inside its batch transaction
-#: (BACKLOG #5651): the message rows first, then their queue rows, each skipping a row another
-#: writer holds rather than waiting on it, then a census of every queue row of the locked messages,
-#: so a message with a skipped queue row is left out of the write.
-_PG_STRIP_LOCK_MESSAGES: Final = (
-    "SELECT id FROM messages WHERE id = ANY($1::text[]) ORDER BY id FOR NO KEY UPDATE SKIP LOCKED"
-)
-_PG_STRIP_LOCK_QUEUE: Final = (
-    "SELECT id, message_id FROM queue WHERE message_id = ANY($1::text[])"
-    " ORDER BY id FOR SHARE SKIP LOCKED"
-)
-_PG_STRIP_QUEUE_ROWS: Final = "SELECT id, message_id FROM queue WHERE message_id = ANY($1::text[])"
 
 
 def _rowcount(command_tag: str) -> int:

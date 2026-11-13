@@ -26,31 +26,25 @@ byte, to the stored cell the batch read, AND with no queue row ``pending``/``inf
 in-flight guard the read applied. A body purge that emptied ``raw``, a key rotation that re-sealed it,
 or another strip that pruned it, committed between the read and the write, therefore fails the guard:
 the row is left as the other writer left it, and the strip never writes old content back over it. It
-counts a row only when its own guarded update changed it.
+counts a row only when its own guarded update changed it. This compare-and-swap is the strip's only
+protection against a concurrent writer; it takes no row locks.
 
-The in-flight half needs locks on the server backends, whose statements read committed data or a
-row version only. Before its updates, in the same transaction, each server write locks the batch's
-message rows and then their existing queue rows, and never waits for either: PostgreSQL with
-``FOR NO KEY UPDATE SKIP LOCKED`` then ``FOR SHARE SKIP LOCKED``, SQL Server with
-``UPDLOCK, ROWLOCK, READPAST`` on the clustered rows of both tables. A message whose row, or any of
-whose queue rows, another writer holds is left out of the batch's write and stripped on a later
-pass. So a replay or a body purge holding the rows is skipped rather than waited on, and the strip
-never deadlocks with either. A replay that re-pends a queue row the batch holds waits for the batch
-to commit, and then replays the stripped body, as any later replay of a stripped message does.
-SQLite's single writer serializes the two already. The locks cover queue rows that exist when the
-batch writes. The server locks are not measured on a live server, and the SQL Server lock depends on
-its plan reaching the clustered queue rows.
+**Its limit.** The queue check is a ``NOT EXISTS`` inside each UPDATE statement, so it sees what was
+committed when that statement ran. On PostgreSQL and SQL Server, a replay that re-pends one of the
+message's queue rows after that statement and before the batch commits can still have the message
+stripped, and the replay then re-processes the stripped body. SQLite's single writer cannot
+interleave them.
 
-A row that fails on its own, in its decrypt, its strip, its encrypt or its guarded update, is
-logged and skipped, so one row that always fails cannot stop the strip. A batch whose transform or
-write fails as a whole is logged and passed over, and the scan goes on past it. A strip call ends
-early, flagged ``ended_early`` with what its batches committed, only when a batch read fails or when
-:data:`OUTAGE_ROWS` rows in a row of one batch get no verdict from the key service (a
-:class:`~messagefoundry.store.crypto.CipherError` that
-:func:`~messagefoundry.store.crypto.gave_no_verdict` reads as the service failing). The retention
-pass then skips the rest of its strip phase. An early end is logged at WARNING, not counted as work
-for the pass's audit row, so a key-service outage does not also send that row through the failing
-service.
+A row that fails on its own, in its decrypt, its strip or its encrypt, is logged and skipped. A
+batch whose transform or write raises is rolled back whole, counts nothing, is logged (its type at
+WARNING, its traceback at DEBUG), and the keyset moves past it; its rows are tried again on the next
+pass. A row the key service gives no verdict on (a :class:`~messagefoundry.store.crypto.CipherError`
+that :func:`~messagefoundry.store.crypto.gave_no_verdict` reads as the service failing) is skipped
+like any unreadable row. A strip call ends early, flagged ``ended_early`` with what its batches
+committed, only when a batch read fails or when every row of a batch that reached the key service
+got no verdict from it. The retention pass then skips the rest of its strip phase. An early end is
+logged at WARNING and is not counted as work for the pass's audit row, so a key-service outage does
+not also send that row through the failing service.
 """
 
 from __future__ import annotations
@@ -58,7 +52,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
-from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -70,13 +64,11 @@ if TYPE_CHECKING:
     from messagefoundry.store.crypto import Cipher
 
 __all__ = [
-    "OUTAGE_ROWS",
     "STRIP_BATCH_ROWS",
+    "StripBatch",
     "StripResult",
     "StripUpdate",
     "cutoff_for",
-    "locked_whole",
-    "log_row_write_skip",
     "log_unreadable_skips",
     "run_strip_pass",
     "transform_strip_batch",
@@ -88,10 +80,6 @@ log = logging.getLogger(__name__)
 #: number of bodies a pass holds in memory at once, whatever the store's size; it is a row count, not
 #: a byte budget. Not ``Final``: :func:`run_strip_pass` reads it per batch, so a test may shrink it.
 STRIP_BATCH_ROWS = 200
-
-#: How many consecutive rows of one batch must get no verdict from the key service before the call
-#: treats it as an outage and ends early. One such row alone is skipped (BACKLOG #5651).
-OUTAGE_ROWS = 3
 
 
 @dataclass(frozen=True)
@@ -185,16 +173,14 @@ async def run_strip_pass(
 ) -> StripResult:
     """One ``strip_embedded_documents`` call, the same on every backend (BACKLOG #5651): keyset
     batches of :data:`STRIP_BATCH_ROWS` from ``fetch``, each transformed in a worker thread by
-    :func:`transform_strip_batch` with no connection held, and written back by ``write``. Only the
-    rows ``write`` reports changed are counted.
+    :func:`transform_strip_batch` with no connection held, and written back by ``write`` in one
+    transaction. Only the rows ``write`` reports changed are counted. The module docstring states
+    how a failed row, a failed batch and an outage are handled.
 
-    Each batch commits on its own. A batch whose transform or write raises an :class:`Exception`
-    is logged at WARNING, naming the error's type, never its text, and the scan goes on past it. A
-    key-service outage, or a failed batch read, ends the call there: it logs a WARNING with what
-    committed and returns that, flagged ``ended_early``. A cancellation, or a failure of ``report``
-    itself, is re-raised after a WARNING with the committed counts, which no audit row then records.
-    The refused cells and unreadable rows a batch's transform found are audited and logged once that
-    transform returns; a transform that raises loses its own.
+    A cancellation, or a failure of ``report`` itself, is re-raised after a WARNING with the
+    committed counts, which no audit row then records. The refused cells and unreadable rows a
+    batch's transform found are audited and logged once that transform returns, even when that
+    batch's write then fails.
 
     The scan is bounded by the loosest finite cutoff (the global one or the largest override; a
     keep-forever ``-inf`` never widens it), and the precise per-connection cutoff is re-checked per
@@ -223,7 +209,7 @@ async def run_strip_pass(
                 break
             after = (rows[-1]["received_at"], rows[-1]["id"])
             try:
-                updates, refused, skipped = await asyncio.to_thread(
+                batch = await asyncio.to_thread(
                     transform_strip_batch,
                     cipher,
                     rows,
@@ -233,25 +219,28 @@ async def run_strip_pass(
                     min_bytes=min_bytes,
                     content_types=content_types,
                 )
-                failures.extend(refused)
-                unreadable.extend(skipped)
-                for done in await write(updates) if updates else ():
+                failures.extend(batch.refused)
+                unreadable.extend(batch.unreadable)
+                if batch.outage:
+                    # Every row that reached the key service got no verdict: an outage, which
+                    # every later batch would meet too. End the call.
+                    ended_early = True
+                    _log_early_end("the key service gave no verdict", None, documents, messages)
+                    break
+                for done in await write(batch.updates) if batch.updates else ():
                     messages += 1
                     documents += done.documents
                     reclaimed += done.reclaimed
             except Exception as exc:
-                if isinstance(exc, CipherError) and gave_no_verdict(exc):
-                    # Every later batch would meet the same outage: end the call.
-                    ended_early = True
-                    _log_early_end("the key service gave no verdict", exc, documents, messages)
-                    break
-                # The cursor has already moved past this batch, so no row in it can stall the
-                # strip for good; it is tried again on the next pass. The type only: a server
-                # error's text can quote stored values.
+                # The batch rolled back whole and counts nothing. The cursor has already moved past
+                # it, so it cannot stall the strip; its rows are tried again on the next pass. The
+                # type at WARNING (a server error's text can quote stored values), the traceback
+                # at DEBUG, for diagnosis.
                 log.warning(
                     "document strip passed over a batch that failed (%s); it goes on past it",
                     type(exc).__name__,
                 )
+                log.debug("document strip batch failure", exc_info=True)
             if len(rows) < limit:
                 break
         reported = True
@@ -285,38 +274,27 @@ async def run_strip_pass(
     )
 
 
-def locked_whole(
-    updates: Sequence[StripUpdate],
-    held_messages: Iterable[str],
-    locked_queue: Iterable[tuple[Any, str]],
-    queue_census: Iterable[tuple[Any, str]],
-) -> list[StripUpdate]:
-    """The updates a server write may apply: those whose message row it locked, and every one of
-    whose queue rows, ``(queue id, message id)`` pairs from the census, it locked too. A message
-    with a row another writer holds is left for a later pass (BACKLOG #5651)."""
-    held = set(held_messages)
-    locked = {queue_id for queue_id, _ in locked_queue}
-    blocked = {message_id for queue_id, message_id in queue_census if queue_id not in locked}
-    return [u for u in updates if u.message_id in held and u.message_id not in blocked]
-
-
-def log_row_write_skip(message_id: str, exc: BaseException) -> None:
-    """Log one guarded update that failed on its own and was skipped: the message id and the
-    error's type, never its text, which on a server can quote stored values."""
-    log.warning(
-        "document strip skipped message %s: its write failed (%s)", message_id, type(exc).__name__
-    )
-
-
-def _log_early_end(why: str, exc: BaseException, documents: int, messages: int) -> None:
+def _log_early_end(why: str, exc: BaseException | None, documents: int, messages: int) -> None:
     log.warning(
         "document strip ended early: %s (%s); it had stripped and committed %d documents in %d "
         "messages before it",
         why,
-        type(exc).__name__,
+        type(exc).__name__ if exc is not None else "no error raised",
         documents,
         messages,
     )
+
+
+@dataclass(frozen=True)
+class StripBatch:
+    """What :func:`transform_strip_batch` made of one batch: the guarded write-backs it needs, the
+    refused cells, the ids of rows whose HL7 delimiters could not be read, and whether every row
+    that reached the key service got no verdict from it (``outage``)."""
+
+    updates: list[StripUpdate]
+    refused: list[CellTagError]
+    unreadable: list[object]
+    outage: bool
 
 
 def transform_strip_batch(
@@ -328,36 +306,30 @@ def transform_strip_batch(
     connection_cutoffs: Mapping[str, float] | None,
     min_bytes: int,
     content_types: Mapping[str, str],
-) -> tuple[list[StripUpdate], list[CellTagError], list[object]]:
+) -> StripBatch:
     """Decrypt, strip and re-seal one batch of candidate rows (each with ``id``, ``channel_id``,
-    ``raw`` and ``received_at``), returning the guarded write-backs it needs, the refused cells and
-    the ids of the rows whose HL7 delimiters could not be read. Synchronous and free of
-    any store connection, so a backend runs it through ``asyncio.to_thread`` with no pooled
-    connection held (BACKLOG #5651).
+    ``raw`` and ``received_at``). Synchronous and free of any store connection, so a backend runs it
+    through ``asyncio.to_thread`` with no pooled connection held (BACKLOG #5651).
 
     The per-connection cutoff is re-checked here (:func:`cutoff_for`), so a row past the loose scan
     bound but not past its own tighter or keep-forever cutoff is left intact. A row whose body is
-    refused or cannot be decrypted is contained: a :class:`CellTagError` is returned, detached, for
-    the caller to audit on the loop, any other :class:`CipherError` is logged with the message id
-    and the error's text, and the row is left exactly as found (BACKLOG #1169, #2593). A row whose
-    strip or encrypt raises any other :class:`Exception` is logged with the message id and the
-    error's type only, and skipped. A :class:`CipherError`
-    that :func:`~messagefoundry.store.crypto.gave_no_verdict` reads as the key service failing is
-    skipped the same way, unless it is the :data:`OUTAGE_ROWS`-th such row with no verdict of any
-    kind between them: that one is raised, and :func:`run_strip_pass` ends the call early. Any
-    verdict, a refusal, another cipher error or a successful open, resets that count. A row whose HL7 delimiters cannot be
-    read is returned for :func:`log_unreadable_skips`. A body holding no embedded document needs no
-    write."""
+    refused or cannot be decrypted is contained, and left exactly as found (BACKLOG #1169, #2593):
+    a :class:`CellTagError` is returned, detached, for the caller to audit on the loop; any other
+    :class:`CipherError`, a no-verdict one included, is logged with the message id and the error's
+    text. A row whose strip or encrypt raises is logged with the message id and the error's type
+    only, and skipped. A row whose HL7 delimiters cannot be read is returned for
+    :func:`log_unreadable_skips`. A body holding no embedded document needs no write."""
     updates: list[StripUpdate] = []
     failures: list[CellTagError] = []
     unreadable: list[object] = []
-    no_verdict = 0  # consecutive rows the key service gave no verdict on
+    asked = no_verdict = 0  # rows that reached the key service, and those it gave no verdict on
     for row in rows:
         message_id = row["id"]
         channel_id = row["channel_id"]
         if row["received_at"] >= cutoff_for(channel_id, older_than, connection_cutoffs):
             continue  # not past its own (per-connection) window
         stored = row["raw"]
+        asked += 1
         try:
             raw = open_message_cell(
                 cipher, "raw", stored, message_id=message_id, channel_id=channel_id
@@ -366,27 +338,18 @@ def transform_strip_batch(
             # The read already logged and alerted it, once per hour; the caller audits it. It is
             # returned, not raised, so its traceback is cleared: its frames would keep this batch's
             # bodies alive until the end of the pass (BACKLOG #6706).
-            no_verdict = 0  # a verdict, if a refusal
             detached(exc)
             failures.append(exc)
             continue
         except CipherError as exc:
             if gave_no_verdict(exc):
-                # The key service may have failed rather than this value. Several rows in a row
-                # mean an outage: stop, rather than time out once per row. One alone may be this
-                # row's own fault, and must not stop every later pass at it.
                 no_verdict += 1
-                if no_verdict >= OUTAGE_ROWS:
-                    raise
-            else:
-                no_verdict = 0  # the service answered: this value is the fault
             log.warning(
                 "document strip skipped message %s: its body could not be read: %s",
                 message_id,
                 exc,
             )
             continue
-        no_verdict = 0
         assert raw is not None  # raw is NOT NULL
         try:
             new_raw, n_docs, n_bytes = strip_documents(
@@ -404,10 +367,8 @@ def transform_strip_batch(
         except Exception as exc:
             if isinstance(exc, CipherError) and gave_no_verdict(exc):
                 no_verdict += 1
-                if no_verdict >= OUTAGE_ROWS:
-                    raise
-            # One row's own failure skips that row, so it cannot stall the strip. The type only:
-            # an error raised over a body may quote it.
+            # One row's own failure skips that row. The type only: an error raised over a body
+            # may quote it.
             log.warning(
                 "document strip skipped message %s: it could not be stripped (%s)",
                 message_id,
@@ -415,4 +376,4 @@ def transform_strip_batch(
             )
             continue
         updates.append(StripUpdate(message_id, stored, new_cell, n_docs, n_bytes))
-    return updates, failures, unreadable
+    return StripBatch(updates, failures, unreadable, outage=asked > 0 and no_verdict == asked)

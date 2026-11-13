@@ -583,7 +583,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/store/cell_tag.py": frozenset({"messagefoundry.store.crypto"}),
     # BACKLOG #5651: the embedded-document strip's shared batch transform opens each candidate's raw
     # cell through cell_tag and re-seals the stripped body through the store cipher, under the row's
-    # tag. It imports store.crypto only for the Cipher type and CipherError. No key of its own.
+    # tag. From store.crypto it takes at least the Cipher type, CipherError, gave_no_verdict (to tell
+    # a key-service outage from a bad value) and detached (to clear a returned error's traceback).
+    # No key of its own.
     "messagefoundry/store/document_strip.py": frozenset({"messagefoundry.store.crypto"}),
     # ADR 0064: hashlib = the sha256 CONTENT hash of the shipped schema-DDL batch, stored in the
     # schema_meta marker so a current DB's open can skip the batch + the exclusive schema lock.

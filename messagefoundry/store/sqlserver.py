@@ -146,8 +146,6 @@ from messagefoundry.store.document_strip import (
     StripCursor,
     StripResult,
     StripUpdate,
-    locked_whole,
-    log_row_write_skip,
     run_strip_pass,
 )
 from messagefoundry.store.gcm_bound import (
@@ -851,22 +849,6 @@ _MSSQL_USER_RESEAL: Final = (
     " password_generated=?, session_epoch=?, cred_digest=?, enrolment_code_digest=?,"
     " enrolment_code_expires_at=?, enrolment_code_issuer=?, authz_seal=?"
     " OUTPUT inserted.id WHERE id=? AND authz_seal=?"
-)
-#: The embedded-document strip's write locks, taken in this order inside its batch transaction
-#: (BACKLOG #5651): the message rows first, then their queue rows, each skipping (READPAST) a row
-#: another writer holds rather than waiting on it. ``q.status`` is not in ``ix_queue_message``, so
-#: the queue read reaches, and update-locks, the clustered rows a replay updates. The census then
-#: lists every queue row of those messages without waiting (NOLOCK, which also sees an uncommitted
-#: insert, so it errs toward leaving a message out). ``{marks}`` is only ``?`` placeholders.
-_MSSQL_STRIP_LOCK_MESSAGES: Final = (
-    "SELECT m.id FROM messages m WITH (UPDLOCK, ROWLOCK, READPAST) WHERE m.id IN ({marks})"
-)
-_MSSQL_STRIP_LOCK_QUEUE: Final = (
-    "SELECT q.id, q.message_id, q.status FROM queue q WITH (UPDLOCK, ROWLOCK, READPAST)"
-    " WHERE q.message_id IN ({marks})"
-)
-_MSSQL_STRIP_QUEUE_ROWS: Final = (
-    "SELECT q.id, q.message_id FROM queue q WITH (NOLOCK) WHERE q.message_id IN ({marks})"
 )
 # The approval statements (BACKLOG #2592); store.py's twins state the contract. The writes are used
 # only by `_write_approval`.
@@ -10273,7 +10255,8 @@ class SqlServerStore:
             )
 
         async def write(updates: Sequence[StripUpdate]) -> list[StripUpdate]:
-            # The guard is document_strip's (its module docstring states what it covers). The raw
+            # The compare-and-swap guard, and its limit, are document_strip's: its module docstring
+            # states both. A failure rolls back the whole batch. The raw
             # comparison pins a binary collation, and appends a sentinel to both
             # sides because = ignores trailing spaces. Whether a row landed is read from OUTPUT,
             # which a session's SET NOCOUNT ON cannot hide, unlike rowcount. The comparand is cast
@@ -10284,38 +10267,17 @@ class SqlServerStore:
             async with self._acquire() as conn:
                 try:
                     async with self._cursor(conn) as cur:
-                        # The in-flight NOT EXISTS alone may read a row version (RCSI), so it could
-                        # pass for a row a replay re-pends before this transaction commits. The
-                        # batch takes update locks, held to the commit, on its message rows and
-                        # then on their clustered queue rows (q.status is outside the message_id
-                        # index, so the read reaches them), skipping with READPAST any row
-                        # another writer holds, and writes only the messages it locked whole.
-                        # document_strip states what that covers.
-                        ids = tuple(u.message_id for u in updates)
-                        marks = ", ".join("?" * len(ids))
-                        await cur.execute(_MSSQL_STRIP_LOCK_MESSAGES.format(marks=marks), ids)
-                        held = [r[0] for r in await cur.fetchall()]
-                        await cur.execute(_MSSQL_STRIP_LOCK_QUEUE.format(marks=marks), ids)
-                        locked = [(r[0], r[1]) for r in await cur.fetchall()]
-                        await cur.execute(_MSSQL_STRIP_QUEUE_ROWS.format(marks=marks), ids)
-                        census = [(r[0], r[1]) for r in await cur.fetchall()]
-                        for u in locked_whole(updates, held, locked, census):
-                            try:
-                                await cur.execute(
-                                    "UPDATE messages SET raw=?, documents_pruned=?"
-                                    " OUTPUT inserted.id"
-                                    " WHERE id=? AND documents_pruned IS NULL"
-                                    " AND (raw + N'|') COLLATE Latin1_General_100_BIN2"
-                                    " = (CAST(? AS NVARCHAR(MAX)) + N'|')"
-                                    " AND NOT EXISTS (SELECT 1 FROM queue q"
-                                    " WHERE q.message_id=messages.id AND q.status IN (?, ?))",
-                                    (u.new_cell, stamp, u.message_id, u.stored, *inflight),
-                                )
-                                wrote = bool(await cur.fetchall())
-                            except Exception as exc:  # one row's failure skips only that row
-                                log_row_write_skip(u.message_id, exc)
-                                continue
-                            if wrote:
+                        for u in updates:
+                            await cur.execute(
+                                "UPDATE messages SET raw=?, documents_pruned=? OUTPUT inserted.id"
+                                " WHERE id=? AND documents_pruned IS NULL"
+                                " AND (raw + N'|') COLLATE Latin1_General_100_BIN2"
+                                " = (CAST(? AS NVARCHAR(MAX)) + N'|')"
+                                " AND NOT EXISTS (SELECT 1 FROM queue q"
+                                " WHERE q.message_id=messages.id AND q.status IN (?, ?))",
+                                (u.new_cell, stamp, u.message_id, u.stored, *inflight),
+                            )
+                            if await cur.fetchall():
                                 landed.append(u)
                     await self._commit(conn)
                 except Exception:
