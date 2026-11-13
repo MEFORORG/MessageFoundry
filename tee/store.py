@@ -205,9 +205,9 @@ def _secure_file(path: str) -> None:
     creates and which can hold message data when body capture is on).
 
     On POSIX a sibling SQLite re-creates later, after this one-time chmod, takes the main file's
-    mode whatever the umask (the unix VFS copies it), so it is 0600 whenever the main file is: a
-    new file is created 0600, and an existing one is 0600 only if this chmod succeeds, which is
-    not reported when it fails. test_wal_siblings_recreated_after_open_inherit_owner_only_mode
+    mode whatever the umask (the unix VFS copies it), so it is 0600 whenever the main file is,
+    which holds only when _precreate_secure's 0600 create or this best-effort chmod succeeds;
+    neither reports a failure. test_wal_siblings_recreated_after_open_inherit_owner_only_mode
     pins the inheritance. On Windows chmod sets only
     the read-only bit, so none of the three files is restricted to the owner here; that half is
     open (BACKLOG #5637) and the protected-volume advice below is the only control there today."""
@@ -451,11 +451,12 @@ class RelayStore:
 
         In WAL mode a delete writes new pages to the -wal file and leaves the old frames, body
         bytes included, on disk until a checkpoint, so once the delete commits, a run that deleted
-        any capture body runs :meth:`_scrub`, which raises :class:`PurgeIncompleteError` with the
-        deleted counts if the scrub does not finish. Returning the counts then would read as a clean
-        purge that did not happen. A run that deleted no capture body skips the scrub: relay_log
-        rows hold no bodies, and a routine sweep should not rewrite the DB or contend with a
-        reader for nothing. :meth:`scrub` runs the scrub alone, to recover.
+        any row runs :meth:`_scrub`, which raises :class:`PurgeIncompleteError` with the deleted
+        counts if the scrub does not finish. Returning the counts then would read as a clean purge
+        that did not happen. relay_log rows count too: their ``detail`` keeps the partner's MSA-3
+        text, which can name a patient. A run that deleted no row skips the scrub, since it freed
+        nothing to scrub, and a routine sweep should not rewrite the DB or contend with a reader
+        for nothing. :meth:`scrub` runs the scrub alone, to recover.
         """
         async with self._lock:
             # NB: a bare `DELETE FROM t` (no WHERE) hits SQLite's truncate optimization, which makes
@@ -477,7 +478,7 @@ class RelayStore:
             cap_n = cap.rowcount
             log_n = 0 if log is None else log.rowcount
             await self._db.commit()
-            if cap_n:
+            if log_n or cap_n:
                 await self._scrub(log_n, cap_n)
         return (log_n, cap_n)
 

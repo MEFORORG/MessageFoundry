@@ -171,17 +171,18 @@ consequences follow from it:
 ### Purge
 
 `python -m tee purge` clears the log DB. It reclaims disk (`VACUUM`) only when a run deletes a
-captured body, and `--scrub-only`, below, reclaims it on demand. With no `--before` it purges
+row, and `--scrub-only`, below, reclaims it on demand. With no `--before` it purges
 **everything**; `--before <age|date>` deletes only older rows (retention); `--captures-only` drops just
 the captured bodies (the PHI-bearing table) and keeps the NAK/leg log. It **prompts for confirmation**
 (or refuses, in a non-interactive shell) unless you pass `-y`.
 
-The DB runs in WAL mode, so a deleted body stays in the DB file or its `-wal` file until a
-checkpoint writes the zeroed pages back. When a run deletes at least one captured body, purge
-then scrubs: a `TRUNCATE` checkpoint, `VACUUM`, and a second checkpoint. `VACUUM` is part of the
-scrub. A B-tree rebalance can leave a stale copy of a deleted row in a page's unused space, and
-only the rebuild removes it. A run that deletes no captured body, such as a sweep with nothing old
-enough or one that removes only log rows, skips the scrub. Log rows hold no bodies.
+The DB runs in WAL mode, so a deleted row stays in the DB file or its `-wal` file until a
+checkpoint writes the zeroed pages back. When a run deletes at least one row, purge then scrubs:
+a `TRUNCATE` checkpoint, `VACUUM`, and a second checkpoint. That includes a run that deletes only
+log rows. A log row holds no message body, but its detail keeps the partner's ACK text, which can
+name a patient. `VACUUM` is part of the scrub. A B-tree rebalance can leave a stale copy of a
+deleted row in a page's unused space, and only the rebuild removes it. A run that deletes no row,
+such as a sweep with nothing old enough, skips the scrub.
 
 **The scrub is file-level only.** A checkpoint frees the `-wal` file's blocks and `VACUUM` shrinks
 the DB file, but neither overwrites the freed blocks. So the bytes can stay readable on the raw

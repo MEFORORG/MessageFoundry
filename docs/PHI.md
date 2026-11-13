@@ -2127,8 +2127,8 @@ of the filters above. It is **out of scope for this section** — but treat a
 [§2](#2-where-phi-lives--data-at-rest-inventory). Its `purge` scrubs deleted bodies from the DB and `-wal`
 files, at file level only; [TEE-RELAY.md, Purge](TEE-RELAY.md#purge) states what the scrub
 does and does not reach, and where `VACUUM`'s temp copy may go. On POSIX the `-wal` and `-shm`
-files take the DB file's mode. That is `0600` for a DB the store created. For an existing DB it is
-`0600` only if the store's best-effort `chmod` on open succeeds, and a failure is not reported. On
+files take the DB file's mode. That mode is `0600` only when the store's `0600` pre-create of a
+new DB, or its best-effort `chmod` on open, succeeds; neither reports a failure. On
 Windows nothing restricts the three files to the owner yet (BACKLOG #5637, open half), so place a
 capture DB on a protected volume.
 

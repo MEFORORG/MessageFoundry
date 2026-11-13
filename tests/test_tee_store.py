@@ -494,12 +494,12 @@ def _count_checkpoints(store: RelayStore, monkeypatch: pytest.MonkeyPatch) -> li
 
 @pytest.mark.usefixtures("fast_checkpoint_poll")
 @pytest.mark.parametrize("seed_old_log_row", [False, True], ids=["zero-delete", "log-rows-only"])
-async def test_a_purge_that_deleted_no_capture_body_skips_the_scrub(
+async def test_only_a_purge_that_deleted_no_row_skips_the_scrub(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, seed_old_log_row: bool
 ) -> None:
-    # A routine sweep that removes no body (nothing old enough, or log rows only) must not VACUUM
-    # or contend with a reader. The control: with the same reader pinning the WAL, scrub() fails,
-    # so a purge that had run the scrub would have raised.
+    # A sweep that deleted no row must not VACUUM or contend with a reader. One that deleted only
+    # log rows still scrubs, because a log row's detail keeps partner ACK text. The control: with
+    # the same reader pinning the WAL, scrub() fails, so a purge that ran the scrub raises.
     db_path = tmp_path / "tee.db"
     store = await RelayStore.open(str(db_path))
     peer: sqlite3.Connection | None = None
@@ -515,8 +515,13 @@ async def test_a_purge_that_deleted_no_capture_body_skips_the_scrub(
         peer.execute("BEGIN")
         peer.execute("SELECT COUNT(*) FROM relay_capture").fetchall()  # pins the WAL
         checkpoints = _count_checkpoints(store, monkeypatch)
-        expected = (1, 0) if seed_old_log_row else (0, 0)
-        assert await store.purge(before=5000.0) == expected
+        if seed_old_log_row:
+            with pytest.raises(PurgeIncompleteError) as excinfo:
+                await store.purge(before=5000.0)
+            assert (excinfo.value.log_rows, excinfo.value.capture_rows) == (1, 0)
+            assert checkpoints == [False]  # the scrub ran and stopped at the busy checkpoint
+            return
+        assert await store.purge(before=5000.0) == (0, 0)
         assert checkpoints == []  # the scrub never ran
         with pytest.raises(PurgeIncompleteError):  # control: the reader really pins the WAL
             await store.scrub()
