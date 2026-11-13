@@ -3203,8 +3203,7 @@ instead, no outcome row is written alone, and it pages `audit_write_failed`, as 
 
 A row claimed before the column existed has no owner, and the first process to start treats it as its
 own. Two plain `serve` processes over one store would share the `engine` owner; that layout is
-unsupported anyway. For the same reason, build one app per engine: a second app over the same
-engine runs the reconcile again and would take the first one's live releases for leftovers.
+unsupported anyway.
 
 An app embedded around an engine (`create_app(engine=...)`) can start before its engine holds its
 graph, when the engine shard's name is not known yet. Its start then puts the reconcile off, and
