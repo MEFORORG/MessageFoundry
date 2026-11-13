@@ -424,7 +424,8 @@ async def test_a_partial_restore_settles_the_row_by_the_live_graph(
     # A reload between the concurrent path's prepare and its apply can restore only one of the two.
     # Apply settles by the graph live now, never by the stale prep. The inbound back without its
     # handler dead-letters the row as a missing handler (replayable) and the lane keeps running, as
-    # main's CONTINUE policy did when the live inbound lookup raised in this race; the stale
+    # the runner before BACKLOG #5708 did under the default CONTINUE policy, when the live inbound
+    # lookup raised in this race (under STOP it stopped the lane, as a Handler fault); the stale
     # inbound_gone would have reverted the row and stopped a lane no later reload re-arms. The
     # converse, a stale missing_handler whose inbound a reload has since dropped, reverts the row
     # with its feed, inbound first, as on entry to prepare.
@@ -464,7 +465,7 @@ async def test_a_partial_restore_settles_the_row_by_the_live_graph(
 
 
 async def test_a_partial_restore_between_prepare_and_apply_keeps_the_batch_running(
-    store: MessageStore,
+    store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
     # The same race through the concurrent batch path, the one path that applies a prep after an
     # await. Sibling S2's prepare sees its feed dropped (inbound_gone); a reload then restores the
@@ -503,9 +504,10 @@ async def test_a_partial_restore_between_prepare_and_apply_keeps_the_batch_runni
 
     async def prepare(name: str, item: OutboxItem, **kwargs: Any) -> _RoutedPrep:
         if item.handler_name == HANDLER:
-            prep = await real_prepare(name, item, **kwargs)
-            s1_prepared.set()
-            return prep
+            try:
+                return await real_prepare(name, item, **kwargs)
+            finally:
+                s1_prepared.set()  # a raise in S1 fails the test rather than hanging S2
         await s1_prepared.wait()  # S1 has run under the full graph; now the feed is dropped
         runner.registry = Registry()
         prep = await real_prepare(name, item, **kwargs)
@@ -525,6 +527,8 @@ async def test_a_partial_restore_between_prepare_and_apply_keeps_the_batch_runni
         )
         rows = [(r["handler_name"], r["status"]) for r in await cur.fetchall()]
     assert rows == [("h_two", OutboxStatus.DEAD.value)], "S1 not handed off, or S2 not dead"
+    # As a missing handler, not through the internal-error policy, which CONTINUE also dead-letters.
+    assert "handler 'h_two'" in caplog.text and "is missing; dead-lettering" in caplog.text
 
 
 async def test_a_reload_during_an_unreadable_read_reverts_rather_than_dead_letters(

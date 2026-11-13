@@ -1604,14 +1604,15 @@ class _RoutedPrep:
     per-lane writer) is what lets a message's sibling routed rows overlap their transforms concurrently
     while every store handoff stays serial and in ascending claim order — so per-destination outbound
     FIFO (``ORDER BY seq``, ADR 0059; correct only under one serial writer per lane) is preserved.
-    Exactly one field is populated: ``missing_handler`` (the row's handler is gone → dead-letter on
-    apply), ``tag_failure`` (the loopback metadata read failed its tag → dead-letter on apply),
+    Exactly one field is populated: ``missing_handler`` (prepare found the row's handler gone),
+    ``tag_failure`` (the loopback metadata read failed its tag → dead-letter on apply),
     ``unreadable`` (the loopback's correlation could not be read → dead-letter on apply),
-    ``inbound_gone`` (a reload dropped the inbound → revert and STOP on apply), ``error``
+    ``inbound_gone`` (prepare found the inbound gone), ``error``
     (the handler raised → internal-error policy on apply), or ``outcome`` (the
     transform produced deliveries/state/meta to hand off). ``missing_handler`` and ``inbound_gone``
     record what prepare saw; apply re-decides both from the live graph, which a reload may have
-    changed since (BACKLOG #5708). A handler raise is captured here rather than
+    changed since (BACKLOG #5708): a missing inbound reverts the row and STOPs the lane, a missing
+    handler dead-letters it, and both present re-prepares it. A handler raise is captured here rather than
     raised so a concurrent ``gather`` never cancels a sibling (ADR 0057 policy is applied on the serial
     apply, in claim order)."""
 
@@ -1622,8 +1623,8 @@ class _RoutedPrep:
     tag_failure: CellTagError | None = None
     #: The loopback's correlation could not be read from the row → dead-letter on apply (#5708).
     unreadable: _UnreadableLoopbackRow | None = None
-    #: A reload dropped the inbound while the loopback read awaited → revert retry-forever and STOP
-    #: on apply, as :meth:`RegistryRunner._process_routed_item` does for a missing inbound (#5708).
+    #: Prepare found the inbound gone, on entry or after the loopback read awaited (#5708). Apply
+    #: re-decides it from the live graph, as the class docstring says.
     inbound_gone: bool = False
 
     def __post_init__(self) -> None:
@@ -11942,9 +11943,9 @@ class RegistryRunner:
 
     def _dropped_by_reload(self, name: str, item: OutboxItem) -> _RoutedPrep | None:
         """How to settle a routed row whose inbound or handler the LIVE graph no longer has, or
-        ``None`` when it has both (BACKLOG #5708). Called on entry to prepare, after the loopback
-        reads, which await, and again at apply, so each settles by the graph live at that moment
-        rather than one a reload has swapped out since the caller's own checks. The dispositions are the
+        ``None`` when it has both (BACKLOG #5708). Called at least before any await, after the
+        loopback reads, which await, and again at apply, so each settles by the graph live at that
+        moment rather than one a reload has swapped out since the caller's own checks. The dispositions are the
         ones :meth:`_process_routed_item` gives the same two cases before any await: a missing
         inbound reverts the row retry-forever and stops the lane, and a missing handler
         dead-letters it. Neither is a Handler fault, so neither reaches the internal-error policy."""
