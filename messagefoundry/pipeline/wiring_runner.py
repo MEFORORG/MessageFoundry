@@ -9795,7 +9795,9 @@ class RegistryRunner:
         re-pend in :meth:`~messagefoundry.pipeline.stage_dispatcher.StageDispatcher._run_lane`.
         Returns how the hold ended. Only ``STOPPED``, the runner stopping with the rows still held,
         makes the caller return rather than claim again; every other end leaves the rows INFLIGHT
-        and the worker loops on, as it did before step 2 after one failed write.
+        and the worker loops on, as it did before step 2 after one failed write. The one exception
+        is the transform worker's retry of a voided STOP's tail release (BACKLOG #5708), which was
+        returning anyway: it goes on only on ``LANDED``, and returns on every other end.
 
         The claim is its own committed transaction, so a fault in the handoff that follows leaves the
         claimed row INFLIGHT. Every claim path selects ``status='pending'``, so a worker that went on
@@ -9920,7 +9922,8 @@ class RegistryRunner:
         Without this the tail stayed INFLIGHT, invisible to every claim, and a worker re-armed by an
         operator ``start_*`` / ``restart_*`` (or an alert rule's auto-restart) drained newer rows past
         it until the next start. A failure here logs and leaves the rows for the reload-time backstop
-        (:meth:`_recover_stopped_worker_residue`) or the next start.
+        (:meth:`_recover_stopped_worker_residue`) or the next start, unless the caller re-pends them
+        itself, as the transform worker does for a voided STOP.
 
         Returns whether the tail is free: True with nothing to release or once the release lands,
         False when it was skipped on a node that lost leadership or failed. A worker that would
@@ -9935,8 +9938,9 @@ class RegistryRunner:
             await self.store.release_claimed(list(ids))
         except Exception:  # noqa: BLE001 — a stopping worker must not raise out of its return
             log.warning(
-                "%s worker %r: release_claimed failed for %d claimed row(s) on stop; they stay "
-                "INFLIGHT for the reload-time backstop or the next start",
+                "%s worker %r: release_claimed failed for %d claimed row(s) on stop; unless the "
+                "worker re-pends them itself, they stay INFLIGHT for the reload-time backstop or "
+                "the next start",
                 worker,
                 name,
                 len(ids),

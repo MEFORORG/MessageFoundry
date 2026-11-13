@@ -805,6 +805,7 @@ async def test_a_per_lane_release_fault_in_the_restore_window_does_not_take_the_
                 return faults["reschedule_claimed"] >= 3
 
             assert await _until(holding), "the worker did not retry the failed tail release"
+            await asyncio.sleep(0.2)  # well past the revert's backoff, so a claim could succeed
             assert calls == [], "a row was transformed past rows still in flight"
             statuses = [await _routed_status(store, m) for m in message_ids]
             assert statuses == [

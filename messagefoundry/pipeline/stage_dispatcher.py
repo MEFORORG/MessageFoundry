@@ -103,7 +103,8 @@ class HoldResult(Enum):
     caller returns. Every other end sends no further retry of that write, leaves its rows
     INFLIGHT, and lets the caller go on as it did before step 2 after its one failed write: a
     per-lane worker loops, a pooled serializer runs its terminal transition, after at most one
-    tail release (``_run_lane`` says when)."""
+    tail release (``_run_lane`` says when). The per-lane transform worker's retry of a voided
+    STOP's tail release is the exception: it loops only on ``LANDED`` (BACKLOG #5708)."""
 
     LANDED = auto()  # the write landed
     STOPPED = auto()  # the engine is stopping: the rows stay INFLIGHT for the next start
@@ -1571,11 +1572,13 @@ class StageDispatcher:
             # Only with every claimed row re-pended: a READY lane's next claim would pass any still
             # in flight. Not asked otherwise, so the runner's record stays for its next item to clear.
             # A STOP has no head re-pend, so `unlanded` is the tail, whose release _land_while_holding
-            # already retried. It ends unlanded only when it must not go on (BACKLOG #5708): SUPERSEDED
-            # means another node has led since the claim, and its recovery may have re-claimed these
-            # rows, and EXHAUSTED means the store refused the release up to the stop policy's bound, the
-            # one that STOPs a T17 lane. Both leave the rows INFLIGHT, so the lane stays down even when
-            # a reload restored its inbound, until a store recovery re-pends them, at least the next start.
+            # already retried. It ends unlanded at least on SUPERSEDED, where this node may no longer
+            # hold the lease it claimed under, so another node may have led and re-claimed these rows,
+            # and on EXHAUSTED, the stop policy's bound that also STOPs a T17 lane (BACKLOG #5708). The
+            # rows stay INFLIGHT, so the lane stays STOPPED even when a reload restored its inbound:
+            # re-arming it here would claim past them at once. This does not keep it down. A later
+            # notify_work or resume_lane re-arms a STOPPED lane without checking for rows in flight,
+            # as it does after any STOP or T17 bound that left rows unlanded.
             if not unlanded and self._stop_voided(lane):
                 self._to_ready(lane, woken=True)  # as the reload's notify_work would have
             else:
