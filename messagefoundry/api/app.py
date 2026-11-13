@@ -12555,9 +12555,14 @@ def create_managed_app(
                 "the start. Until then a rule that sent only by email uses the other transports, "
                 "or the log when there are none."
             )
+        # BACKLOG #5908: built in a worker thread, since the factory blocks on at least the SMTP
+        # password read through the secret provider (a Vault read, under [secrets]). Nothing of
+        # this lifespan's is running yet, but a blocked loop cannot take uvicorn's stop signal.
+        # start() stays on the loop below.
         try:
             notifier = (
-                notifier_from_settings(
+                await asyncio.to_thread(
+                    notifier_from_settings,
                     notifier_alerts,
                     secret_provider=secret_provider,
                     # #323 layer 3: the instance [tls] internal-CA policy reaches the alerts SMTP
@@ -13092,8 +13097,16 @@ def create_managed_app(
                 # at startup by the serve gate (messagefoundry/__main__.py), which checks these SAME two
                 # conditions — not here. This task is owned by the lifespan (started here, drained + closed
                 # in the finally below, before engine.stop() closes the store it records in).
+                # BACKLOG #5908: this factory and the AuthService constructor below run in a worker
+                # thread, so the event loop already running the store and the alert notifier is not
+                # blocked. The factory blocks as the alert notifier's does, above. The constructor
+                # does at least these: resolves the directory secrets, loads the LDAPS and OIDC CA
+                # and CRL files, and checks a CA file's access control, which runs icacls on Windows. A raise from either reaches the teardown below, as it did when
+                # they ran inline. A cancel does too, while the thread runs on to its own end: the
+                # work was never cancellable midway, and inline it held the loop instead.
                 if auth_settings.notify_security_events and alerts_settings is not None:
-                    security_notifier = security_notifier_from_settings(
+                    security_notifier = await asyncio.to_thread(
+                        security_notifier_from_settings,
                         alerts_settings,
                         secret_provider=secret_provider,
                         trust_anchor_policy=tls_settings.policy() if tls_settings else None,
@@ -13101,45 +13114,51 @@ def create_managed_app(
                         # BACKLOG #2193: the SMTP login's revocation guard, as on the alerts sink.
                         posture=_hop_posture,
                     )
-                auth = AuthService(
-                    store,
-                    auth_settings,
-                    security_notifier=security_notifier,
-                    secret_provider=secret_provider,
-                    # #285 (ASVS 6.7.1): pass the enforcement dial so the OIDC anchor's construction-site
-                    # preflight in build_idp_opener honors [security].enforcement — warn+audit (via the
-                    # central run_anchor_preflight above) rather than refusing at enforce-only. Central
-                    # preflight already ran before any listener bound; this keeps the seam consistent.
-                    enforcing=trust_anchors_enforcing,
-                    # Thread the derived instance posture to the hops this service builds out of the
-                    # connector-construction gate: the OIDC legs' revocation guard (BACKLOG #1887)
-                    # and the LDAPS AD bind's (BACKLOG #2193). CORRECTED 2026-10-28: this said the
-                    # plain ldap:// refusal read it; that refusal holds at every posture (#3533).
-                    hop_posture=_hop_posture,
-                    # BACKLOG #2592: an authority row that fails its integrity seal is denied and
-                    # raises integrity_drift on the same sink the cipher refusal uses.
-                    integrity_alert=authority_seal_alert(notifier or LoggingAlertSink()),
-                    # Vault BACKLOG #3229: a directory role change that leaves no enabled
-                    # Administrator is applied, and raises no_enabled_administrator here.
-                    admin_loss_alert=no_enabled_administrator_alert(notifier or LoggingAlertSink()),
-                    # Vault BACKLOG #3141: a reconcile pass that newly grants Administrator raises
-                    # administrator_granted here, as a directory sign-in does in its route.
-                    admin_grant_alert=administrator_granted_alert(
-                        notifier or LoggingAlertSink(), granted_by=DIRECTORY_GRANTED_BY
-                    ),
-                    # BACKLOG #3965: the step-up return audit budget's all-callers backstop pages
-                    # audit_write_failed here when it stops a row, at most once a window.
-                    step_up_return_audit_alert=step_up_return_audit_alert(
-                        notifier or LoggingAlertSink()
-                    ),
-                    # BACKLOG #2221: a directory sign-in's role-sync row refused twice pages
-                    # audit_write_failed here.
-                    sign_in_audit_alert=directory_sign_in_audit_alert(
-                        notifier or LoggingAlertSink()
-                    ),
-                    # BACKLOG #3937: the relying party a passkey must be under to count as a way
-                    # past the sign-in lock at the factor-drop gates; None counts none.
-                    way_past_rp_id=configured_rp_id(public_origin),
+                # A lambda rather than to_thread(AuthService, ...), so the call stays an AuthService
+                # call the census tests find, with its keywords. EVERY ARGUMENT BELOW IS EVALUATED IN
+                # THE WORKER THREAD: anything that needs the running loop (get_running_loop,
+                # create_task) is bound above, on the loop, and passed in by name.
+                alert_sink = notifier or LoggingAlertSink()
+                auth = await asyncio.to_thread(
+                    lambda: AuthService(
+                        store,
+                        auth_settings,
+                        security_notifier=security_notifier,
+                        secret_provider=secret_provider,
+                        # #285 (ASVS 6.7.1): pass the enforcement dial so the OIDC anchor's
+                        # construction-site preflight in build_idp_opener honors
+                        # [security].enforcement — warn+audit (via the central run_anchor_preflight
+                        # above) rather than refusing at enforce-only. Central preflight already ran
+                        # before any listener bound; this keeps the seam consistent.
+                        enforcing=trust_anchors_enforcing,
+                        # Thread the derived instance posture to the hops this service builds out of
+                        # the connector-construction gate: the OIDC legs' revocation guard (BACKLOG
+                        # #1887) and the LDAPS AD bind's (BACKLOG #2193). CORRECTED 2026-10-28: this
+                        # said the plain ldap:// refusal read it; that refusal holds at every
+                        # posture (#3533).
+                        hop_posture=_hop_posture,
+                        # BACKLOG #2592: an authority row that fails its integrity seal is denied
+                        # and raises integrity_drift on the same sink the cipher refusal uses.
+                        integrity_alert=authority_seal_alert(alert_sink),
+                        # Vault BACKLOG #3229: a directory role change that leaves no enabled
+                        # Administrator is applied, and raises no_enabled_administrator here.
+                        admin_loss_alert=no_enabled_administrator_alert(alert_sink),
+                        # Vault BACKLOG #3141: a reconcile pass that newly grants Administrator
+                        # raises administrator_granted here, as a directory sign-in does in its
+                        # route.
+                        admin_grant_alert=administrator_granted_alert(
+                            alert_sink, granted_by=DIRECTORY_GRANTED_BY
+                        ),
+                        # BACKLOG #3965: the step-up return audit budget's all-callers backstop
+                        # pages audit_write_failed here when it stops a row, at most once a window.
+                        step_up_return_audit_alert=step_up_return_audit_alert(alert_sink),
+                        # BACKLOG #2221: a directory sign-in's role-sync row refused twice pages
+                        # audit_write_failed here.
+                        sign_in_audit_alert=directory_sign_in_audit_alert(alert_sink),
+                        # BACKLOG #3937: the relying party a passkey must be under to count as a way
+                        # past the sign-in lock at the factor-drop gates; None counts none.
+                        way_past_rp_id=configured_rp_id(public_origin),
+                    )
                 )
                 # Started only once the service is built, so a constructor refusal starts no task.
                 if security_notifier is not None:
