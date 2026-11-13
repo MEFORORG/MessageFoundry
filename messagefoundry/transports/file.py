@@ -37,6 +37,7 @@ import traceback
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
+from operator import itemgetter
 from pathlib import Path
 from typing import Any, BinaryIO, ClassVar, Literal, NamedTuple, Self, TypeVar
 
@@ -1125,8 +1126,12 @@ class FileSource(SourceConnector):
             self._prune_settle(listed)
             self._refused.intersection_update(listed)
             self._prune_stuck(listed)
+        if self._stuck_full_logged and len(self._stuck) < SETTLE_SEEN_MAX:
+            self._stuck_full_logged = False  # drained: a memory that fills again is logged again
         disposed = 0  # files this tick finished with — the per-tick ceiling's budget (_at_ceiling)
-        due: list[Path] = []  # BACKLOG #5717: stuck rejects due a retry, examined after the pass
+        due: list[
+            tuple[float, Path]
+        ] = []  # BACKLOG #5717: (since, path) due a retry, after the pass
         stopped = False
         for position, path in enumerate(candidates):
             if self._stop.is_set():
@@ -1139,13 +1144,14 @@ class FileSource(SourceConnector):
                 stopped = True
                 break
             if step is _Step.DUE:
-                if len(due) < STUCK_RETRIES_PER_SCAN_MAX:  # no scan retries more
-                    due.append(path)
+                due.append((self._stuck[str(path)][0].since, path))
             elif step is not _Step.FREE:
                 disposed += 1
                 newly_recorded += step is _Step.RECORDED
         if due and not stopped:
-            for path in due[: self._retry_allowance(disposed)]:
+            # Oldest failure first, so a retried reject cannot keep the slots from those behind it.
+            due.sort(key=itemgetter(0))
+            for _since, path in due[: self._retry_allowance(disposed)]:
                 if self._stop.is_set():
                     break
                 step = await self._examine(path, retry=True)
@@ -1374,8 +1380,8 @@ class FileSource(SourceConnector):
         """Move a rejected file to ``.error``, record the event when a copy was archived, and remember
         the file as stuck when it stays for a lasting reason (BACKLOG #5717).
 
-        The caller charges the per-tick budget whatever happened here, so a scan still reads at most
-        ``poll_max_files`` files that end in a reject. Before #5717 a reject that could not be moved
+        In the fresh pass the caller charges the per-tick budget whatever happened here; in the retry
+        pass the retry allowance counts it instead (:meth:`_retry_allowance`). Before #5717 a reject that could not be moved
         was read and charged again on later scans, so enough of them sorting first could spend the
         whole budget each time and hold back the healthy drops behind them. Remembered here, it is
         skipped unread and uncharged until it changes or falls due a retry (:meth:`_stuck_step`).
@@ -1432,13 +1438,14 @@ class FileSource(SourceConnector):
 
     def _retry_allowance(self, disposed: int) -> int:
         """How many due stuck rejects this scan's retry pass may examine (BACKLOG #5717): the
-        budget the fresh pass left, or a tenth of ``poll_max_files`` held back for retries if that is
-        more, and never more than ``STUCK_RETRIES_PER_SCAN_MAX``. With no ``poll_max_files`` it is
-        that constant alone. A retry over the allowance stays due for a later scan."""
+        budget the fresh pass left, or a tenth of ``poll_max_files`` held back for retries (at least
+        one) if that is more, and never more than ``STUCK_RETRIES_PER_SCAN_MAX``. With no
+        ``poll_max_files`` it is that constant alone. A retry over the allowance stays due for a later
+        scan."""
         cap = self.poll_max_files
         if cap is None:
             return STUCK_RETRIES_PER_SCAN_MAX
-        return min(STUCK_RETRIES_PER_SCAN_MAX, max(cap // 10, cap - disposed))
+        return min(STUCK_RETRIES_PER_SCAN_MAX, max(1, cap // 10, cap - disposed))
 
     async def _emit_event(self, kind: str, *, reason: str | None = None) -> None:
         """Record a quarantine in the connection-event log (BACKLOG #1621), **fail-soft**.
@@ -1925,8 +1932,9 @@ class FileSource(SourceConnector):
         self, path: Path, dest_dir: Path, read_id: _FileId | None = None, *, stamp: bool = False
     ) -> bool:
         """Archive ``path`` into ``dest_dir`` under a name claimed ATOMICALLY (BACKLOG #1046). Returns
-        whether a copy now sits in ``dest_dir``. A quarantine is recorded only then (BACKLOG #1621): a
-        file that could not be archived at all is logged here and examined again next scan.
+        whether a copy now sits in ``dest_dir``. The archive after a hand-off calls this; a
+        quarantine calls :meth:`_archive_to`, which also says whether the original stays, and records
+        the quarantine only when a copy was archived (BACKLOG #1621, #5717).
 
         Only a file :meth:`_pinned` passes is moved, and only if it is the file that was read
         (``read_id``, BACKLOG #2535). On POSIX the claim and the unlink name it relative to its checked

@@ -4901,9 +4901,10 @@ the error directory fails still charges, although the file stays where it was. A
 be quarantined would therefore spend the budget on every tick, which is the starvation this rule exists
 to prevent. On `File(...)` under `after_read` `move` or `delete` (BACKLOG #5717) the gap is
 narrowed, not closed. When the move failed for a reason that looks lasting, such as access denied,
-the source remembers the file and skips it unread and uncharged, at least until its size,
-modification time or file identity changes. After `STUCK_RETRY_SECONDS` it examines the file again in
-full: it is read and judged afresh, and a file that now passes, for example because a scanner no
+the source remembers the file and skips it unread and uncharged until its size, modification time or
+file identity changes or `STUCK_RETRY_SECONDS` pass, whichever comes first. Once they pass, it
+examines the file again in full, oldest failure first, as soon as a scan's retry allowance reaches
+it: it is read and judged afresh, and a file that now passes, for example because a scanner no
 longer rejects it, is ingested. A file that was copied into the error directory but whose original
 could not be removed is examined the same way, so each retry may write another copy and record
 another event. Retries run after every other candidate in the scan and count against

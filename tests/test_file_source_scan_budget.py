@@ -429,7 +429,7 @@ async def test_due_retries_are_capped_per_scan(
         (500, 100, 100),  # the leftover is larger, but the constant caps it
         (500, 470, 50),
         (200, 150, 50),  # the leftover beats a tenth
-        (9, 9, 0),  # under ten nothing is held back
+        (9, 9, 1),  # under ten, one slot is still held back
         (9, 6, 3),  # so retries use only the leftover
     ],
 )
@@ -445,21 +445,43 @@ def test_the_retry_allowance(
     assert rig.source._retry_allowance(disposed) == allowed
 
 
-async def test_a_retry_deferred_past_the_allowance_survives_pruning(
+async def test_retries_go_oldest_first_and_a_deferred_one_survives_pruning(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A due reject the allowance leaves for later is still listed, so pruning keeps it however many
-    scans it waits."""
-    rig = _Rig(tmp_path, monkeypatch, cap=1)
-    rig.drop("a.hl7", _PDF)
+    """With the budget spent, the one retry slot goes to the oldest failure, and a due reject the
+    allowance leaves for later is still listed, so pruning keeps it. The control: a remembered
+    reject that is no longer listed is pruned in the same run, so pruning is live.
+
+    Mutation: drop the ``due.sort`` in ``_scan_once``. Red: a0, which sorts first, is retried first.
+    Mutation: let ``_prune_stuck`` drop an entry that is due. Red: a0 is forgotten."""
+    rig = _Rig(tmp_path, monkeypatch, cap=10)
+    for name in ("a0.hl7", "a1.hl7", "c.hl7"):
+        rig.drop(name, _PDF)
     await rig.scan()
     await rig.scan()
-    _age_stuck(rig)
+    assert len(rig.source._stuck) == 3
+    rig.source.poll_max_files = 1
     for n in range(5):
         rig.drop(f"b{n}.hl7", _HL7)
-    for _ in range(6):  # each scan spends its budget of one on a healthy drop
-        await rig.scan()
-    assert len(rig.source._stuck) == 1
+    await rig.scan()  # the healthy drops settle; nothing is due yet
+    stuck = rig.source._stuck
+    retry = file_mod.STUCK_RETRY_SECONDS
+    for name, age in (("a0.hl7", retry), ("a1.hl7", 2 * retry)):
+        key = str(rig.inbox / name)
+        seen, missed = stuck[key]
+        stuck[key] = (seen._replace(since=seen.since - age), missed)
+    (rig.inbox / "c.hl7").unlink()
+
+    assert await rig.scan() == ["b0.hl7", "a1.hl7"], "one slot, to the oldest failure"
+    a0_key = str(rig.inbox / "a0.hl7")
+    for n in range(1, 4):
+        assert a0_key in stuck, "deferred and still listed, so kept"
+        if n == 1:
+            assert await rig.scan() == ["b1.hl7", "a0.hl7"]
+        else:
+            await rig.scan()
+    assert str(rig.inbox / "c.hl7") not in stuck, "the control: an unlisted entry is pruned"
+    assert a0_key in stuck and str(rig.inbox / "a1.hl7") in stuck
 
 
 async def test_a_failed_listing_does_not_wipe_the_stuck_memory(
@@ -497,21 +519,40 @@ async def test_a_missing_error_directory_is_a_lasting_failure(
     assert len(rig.source._stuck) == 1
 
 
-async def test_a_full_memory_is_logged_once(
+async def test_a_full_memory_is_logged_once_and_again_after_it_drains(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    monkeypatch.setattr(file_mod, "SETTLE_SEEN_MAX", 1)
+    """Several rejects meet the full memory and it is logged once. Once it drains and fills again it
+    is logged a second time, which is also the control: the count can reach two.
+
+    Mutation: drop the ``_stuck_full_logged`` guard. Red: the first count is above one.
+    Mutation: never reset the flag. Red: the second count stays at one."""
+    monkeypatch.setattr(file_mod, "SETTLE_SEEN_MAX", 1)  # bounds the settle map too
     rig = _Rig(tmp_path, monkeypatch, cap=10)
     for n in range(3):
         rig.drop(f"a{n}.hl7", _PDF)
-    await rig.scan()
-    await rig.scan()
-    await rig.scan()
+
+    def full_logs() -> int:
+        text = "memory of rejects that cannot be moved is full"
+        return sum(text in r.message for r in caplog.records)
+
+    def overflow_reads() -> int:
+        return sum(name in ("a1.hl7", "a2.hl7") for name in rig.reads)
+
+    for _ in range(20):
+        await rig.scan()
+        if overflow_reads() >= 3:
+            break
+    assert overflow_reads() >= 3, "several rejects met the full memory"
     assert len(rig.source._stuck) == 1
-    full = [
-        r for r in caplog.records if "memory of rejects that cannot be moved is full" in r.message
-    ]
-    assert len(full) == 1
+    assert full_logs() == 1
+
+    (rig.inbox / "a0.hl7").unlink()  # drains once pruning forgets it
+    for _ in range(20):
+        await rig.scan()
+        if full_logs() == 2:
+            break
+    assert full_logs() == 2
 
 
 def test_lasting_reads_the_engines_own_refusals() -> None:
