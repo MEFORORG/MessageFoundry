@@ -1507,7 +1507,8 @@ def test_a_failed_send_during_the_shutdown_drain_does_not_deadlock() -> None:
     fwd = _build_queued_forwarder(target, fmt="text", spool=None)
     # On the root logger, as configure_logging puts it, so a report the failed send raises comes
     # back through this queue handler, as it does in a running engine.
-    logging.getLogger().addHandler(fwd)
+    root = logging.getLogger()
+    root.addHandler(fwd)
     fwd.handle(logging.makeLogRecord({"msg": "one", "levelname": "WARNING"}))
     done: list[bool] = []
 
@@ -1523,6 +1524,7 @@ def test_a_failed_send_during_the_shutdown_drain_does_not_deadlock() -> None:
     started = time.monotonic()
     closer.start()
     closer.join(30.0)
+    root.removeHandler(fwd)
     assert done == [True], "close() under the queue handler's lock did not return"
     # Not just "returned": a listener parked on the lock would return only after the join gave up
     # (about 11 s here), and would be left running.
@@ -1558,16 +1560,17 @@ class _ReportSeen(logging.Handler):
 
 
 @pytest.mark.timeout(60)  # a regression parks the listener for the whole join; fail it, not hang
+@pytest.mark.parametrize("when", ["before_close", "during_close"])
 @pytest.mark.parametrize("error", [errno.EMSGSIZE, errno.ENETUNREACH])
 def test_a_send_report_raised_while_shutdown_holds_the_lock_does_not_park_the_listener(
-    error: int,
+    error: int, when: str
 ) -> None:
     """What ``logging.shutdown`` does while a send is in flight: hold the queue handler's lock,
-    then close it. The send then fails, and the listener reports it, EMSGSIZE as undeliverable and
-    a network error as a failed send, before or after the drain deadline is set. That report comes
-    back to this queue handler through the root logger, and must not wait on the lock shutdown
-    holds, or close() returns only once the join gives up (about 11 s) with the listener running.
-    """
+    then close it. The send then fails, before close() starts or during its join, and the listener
+    reports it, EMSGSIZE as undeliverable and a network error as a failed send. That report comes
+    back to this queue handler through the root logger. It must not wait on the lock shutdown
+    holds, or close() returns only once the join gives up (about 11 s) with the listener running;
+    and arriving while close() runs, it is not a record the full queue dropped."""
     gate = threading.Event()
     target = _build_syslog_handler(SyslogForward(host="127.0.0.1", port=9, protocol="udp"))
     gated = _GatedDatagramSocket(OSError(error, "failed"), gate)
@@ -1577,25 +1580,32 @@ def test_a_send_report_raised_while_shutdown_holds_the_lock_does_not_park_the_li
     seen = _ReportSeen(reported)
     root = logging.getLogger()
     # The witness goes on root ahead of the queue handler, so it sees the report before the report
-    # reaches the queue handler's lock.
+    # reaches the queue handler.
     root.addHandler(seen)
     root.addHandler(fwd)
+    opener = threading.Timer(0.2, gate.set)
     try:
         fwd.handle(logging.makeLogRecord({"msg": "one", "levelname": "WARNING"}))
         assert gated.entered.wait(10.0), "the listener never sent the record"
         fwd.acquire()
         try:
-            gate.set()  # the send fails now, with shutdown's lock held
-            # The report runs before close() sets the drain deadline: the window the deadline
-            # guard on the failed-send report cannot cover.
-            assert reported.wait(10.0), "the listener never reported the failed send"
+            if when == "before_close":
+                gate.set()  # the send fails now, with shutdown's lock held
+                assert reported.wait(10.0), "the listener never reported the failed send"
+            else:
+                opener.start()  # the send fails while close() is in its join
             started = time.monotonic()
             fwd.close()
             elapsed = time.monotonic() - started
         finally:
             fwd.release()
     finally:
+        opener.cancel()
+        gate.set()
+        fwd.close()  # a no-op once closed; stops the listener when an assert above failed
         root.removeHandler(fwd)
         root.removeHandler(seen)
+    assert reported.is_set(), "the listener never reported the failed send"
     assert fwd._listener._thread is None, "the listener did not stop cleanly"
     assert elapsed < 1.0, f"close() took {elapsed:.1f}s"
+    assert fwd.dropped == 0, "the listener's own report was counted as a queue-full drop"

@@ -1118,10 +1118,9 @@ class LogForwarderInfo(BaseModel):
     is counted (BACKLOG #5923), so the engine cannot see a record lost on the wire.
     ``delivery_confirmed`` is then ``False``, and a forwarder with no fault seen reads
     ``unconfirmed``. A send that raises a network error, such as ``ENETUNREACH``, sets
-    ``send_failing``; it reaches ``lost`` only where nothing kept the record, as ``unsent`` with no
-    spool or as ``spool_dropped`` when the spool refused it, and a spool that took the record holds
-    it unsent. A datagram too large to send (``EMSGSIZE``) never sets
-    ``send_failing``: it is dropped as undeliverable, never spooled, and counted in
+    ``send_failing``. It reaches ``lost`` at least as ``unsent`` with no spool, or as
+    ``spool_dropped`` when the spool refused it; a spool that took the record holds it unsent. A datagram too large to send (``EMSGSIZE``) never sets
+    ``send_failing``: it is dropped as undeliverable, is not kept for a retry, and is counted in
     ``undeliverable``, so in ``lost``.
 
     **Counts and fixed words only**: never a record, a collector address or an error text."""

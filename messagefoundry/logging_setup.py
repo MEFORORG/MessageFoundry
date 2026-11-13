@@ -1502,14 +1502,12 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
             now = time.monotonic()
             last = self._last_send_failure_report
             # Throttled for the same reason as the report above. The count is a running total, so
-            # failures inside the window are in the next report's figure rather than lost. Not
-            # during the shutdown drain: the queue handler has stopped accepting by then, so the
-            # report could not reach the collector. (It could not park this thread either: the
-            # queue handler's handle() takes no lock, BACKLOG #5923.) ERROR, not WARNING, so it
+            # failures inside the window are in the next report's figure rather than lost. During
+            # the shutdown drain too: the line then reaches the local sinks only, and close()
+            # counts nothing a failed send cost. It cannot park this thread, because the queue
+            # handler's handle() takes no lock (BACKLOG #5923). ERROR, not WARNING, so it
             # survives [logging].level = "ERROR", as the stdlib's stderr traceback did.
-            if self._drain_deadline is None and (
-                last is None or now - last >= _FORWARD_DROP_REPORT_INTERVAL
-            ):
+            if last is None or now - last >= _FORWARD_DROP_REPORT_INTERVAL:
                 self._last_send_failure_report = now
                 _log.error(
                     "off-box log forwarding: a send to the collector failed (%s; %d failed "
@@ -1802,9 +1800,13 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
         lane is full. Its drop is counted and reported exactly as a general record's is, and the
         report reads the same whichever lane dropped (BACKLOG #1131)."""
         if not self._accepting:
-            if getattr(self._reporting, "active", False):
-                # close()'s own report, arriving at the handler it is closing. It was never going
-                # to the collector, and counting it would log a false "queue is full" drop.
+            if (
+                getattr(self._reporting, "active", False)
+                or threading.current_thread() is self._listener._thread
+            ):
+                # close()'s own report, or one the listener logged during the drain (BACKLOG
+                # #5923), arriving at the handler it is closing. Neither was going to the
+                # collector, and counting it would log a false "queue is full" drop.
                 return
             self._count_drop()
             return

@@ -235,7 +235,7 @@ that is this host through.
 an IP-literal collector it is now also one local socket call, measured at well under a
 millisecond on a Windows host. For a name it is one `gethostname` call.
 
-## Amendment B (2026-11-13) -- UDP now counts a send that returns an error on this host (BACKLOG #5923)
+## Amendment B (2026-11-13) -- UDP now counts a send that raises an error on this host (BACKLOG #5923)
 
 This amendment records a code change. Decision 1's text is left as written, so at least these of
 its statements no longer match the code; where they disagree, this amendment holds:
@@ -251,14 +251,15 @@ its statements no longer match the code; where they disagree, this amendment hol
   includes every datagram to a collector that is down. Delivery over UDP stays unconfirmed.
 - **A send error that is not a network error is now undeliverable on UDP too**, not only on TCP
   and TLS. So is a datagram too large to send (`EMSGSIZE`), which fails the same way on every
-  retry. Neither is ever counted as sent: each is counted in `undeliverable`, is never spooled,
-  and never sets `send_failing`.
+  retry. Neither is ever counted as sent: each is counted in `undeliverable`, is not kept for a
+  retry, and never sets `send_failing`. A copy already in the spool for another reason, such as
+  backoff or the drain deadline, is dropped the same way when replay reaches it.
 - **With a spool, a UDP collector whose name lookup fails for a temporary reason at start is now
   deferred**, as a TCP or TLS collector that is not reachable yet is, instead of the process
   running with no forwarder. A name that does not exist is still permanent.
 
-On every arm the standard library's traceback to stderr on a failed send is gone. Outside the
-shutdown drain, a throttled ERROR line with no record content reports network send errors
-instead; a network send error during the drain gets no line. An undeliverable record gets its
-own throttled ERROR line, during the drain too. The counts each case moves are stated for
+On every arm the standard library's traceback to stderr on a failed send is gone. A throttled
+ERROR line with no record content reports network send errors instead, and an undeliverable
+record gets its own. Both are logged during the shutdown drain too, when they reach only the
+local sinks. The counts each case moves are stated for
 operators in [`docs/CONFIGURATION.md`](../CONFIGURATION.md) `[logging]`.
