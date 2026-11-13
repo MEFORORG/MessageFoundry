@@ -549,15 +549,17 @@ class ShardLaneOwnershipError(RuntimeError):
 
 class RunnerNotRunningError(RuntimeError):
     """A run-state CONTROL (at least an inbound start or restart, an outbound start, stop or
-    restart) targeted a runner whose graph is not running (BACKLOG #5702).
+    restart) targeted a runner whose graph is not running (BACKLOG #5702). Its subclass
+    :class:`RunnerLeaseLostError` covers one case where the graph still runs; see below.
 
-    Refused rather than acted on. The graph is down, at least before :meth:`RegistryRunner.start`
-    and after a teardown, which includes the ADR 0157 demoted follower, whose ``_stop_graph`` stops
-    the runner while the API keeps serving. A start there would bind a live listener or spawn a
-    delivery worker outside the engine lifecycle, and a stop would record a pause that a later
-    promotion's start inherits. The runner's own flag is not the whole test: a node that has lost
-    its lease but not yet stopped its graph still reads running, so the start and restart doors
-    also ask the coordinator and raise :class:`RunnerLeaseLostError` there (BACKLOG #5906).
+    Refused rather than acted on. This class itself is raised while the graph is not running, at
+    least before :meth:`RegistryRunner.start` and after a teardown, which includes the ADR 0157
+    demoted follower, whose ``_stop_graph`` stops the runner while the API keeps serving. A start
+    there would bind a live listener or spawn a delivery worker outside the engine lifecycle, and a
+    stop would record a pause that a later promotion's start inherits. The runner's own flag is not
+    the whole test: a node that has lost its lease but not yet stopped its graph still reads
+    running, so the start and restart doors also ask the coordinator and raise
+    :class:`RunnerLeaseLostError` there (BACKLOG #5906).
 
     An inbound stop is not refused, and neither is an outbound stop while a teardown that raised or
     was cancelled has left state behind (``has_residual_state``), or on a node that lost its lease:
@@ -4318,8 +4320,16 @@ class RegistryRunner:
 
         Only the ``_running`` read is fixed by the lock. The lease read is point in time: the
         coordinator's own task can drop the lease without the lock, during the awaits a start makes
-        after this check. This door is not the fence there; at least a source's ``leader_gate``,
-        the store's epoch fence and ``_stop_graph`` itself are."""
+        after this check. This door is not the fence there. What backs it includes at least the
+        ``leader_gate`` a poll source reads at each tick (its contract is
+        :meth:`~messagefoundry.transports.base.SourceConnector.start`), the L1 pre-send leadership
+        re-check (in :meth:`_process_delivery_item`, and :meth:`_may_send` on the coalesced-batch
+        path), and ``Engine._stop_graph`` itself. The store's H1 leader-epoch fence (ADR 0157; its
+        scope is :meth:`~messagefoundry.pipeline.cluster.ClusterCoordinator.current_epoch`) does
+        not fire on this node's claims before at least a successor's acquire bumps the epoch, and
+        it does not cover intake, the ingress commit a listener makes. A listen source does not read
+        ``leader_gate``, so a listener a start brings up after the lease drops keeps taking messages
+        until ``Engine._stop_graph`` stops it, whether or not a successor has acquired."""
         if not self._running and not (stop and self.has_residual_state):
             raise RunnerNotRunningError(name)
         if not stop and not self._coordinator.is_leader():
