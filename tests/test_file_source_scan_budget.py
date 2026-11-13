@@ -259,8 +259,8 @@ async def test_an_archived_copy_whose_original_cannot_be_removed_is_retried_in_f
     assert rig.reads == ["a.hl7"]
 
     _age_stuck(rig)
-    await rig.scan()  # the retry settles
-    await rig.scan()  # and is read and judged again
+    await rig.scan()  # the retry is read and judged again
+    await rig.scan()  # and remembered again, not due
     assert archives == ["a.hl7", "a.hl7"]
     assert events == ["file_content_mismatch", "file_content_mismatch"]
     assert rig.reads == ["a.hl7", "a.hl7"]
@@ -325,16 +325,16 @@ def _sink(rig: _Rig) -> list[str]:
 def _age_stuck(rig: _Rig) -> None:
     """Make every remembered reject due its retry."""
     stuck = rig.source._stuck
-    for key, ((mark, since), missed) in list(stuck.items()):
-        stuck[key] = ((mark, since - file_mod.STUCK_RETRY_SECONDS), missed)
+    for key, (seen, missed) in list(stuck.items()):
+        stuck[key] = (seen._replace(since=seen.since - file_mod.STUCK_RETRY_SECONDS), missed)
 
 
 async def test_a_due_retry_takes_the_whole_path_and_is_quarantined_once_the_move_works(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A cause fixed outside the file (an ``.error`` made writable again) is picked up without a
-    restart: once ``STUCK_RETRY_SECONDS`` pass the reject settles, is read and judged afresh, and is
-    moved.
+    restart: once ``STUCK_RETRY_SECONDS`` pass the reject is read and judged afresh on the first scan
+    that reaches it, and is moved.
 
     Mutation: drop the time test from ``_stuck_step``. Red: the reject is never read again."""
     rig = _Rig(tmp_path, monkeypatch, cap=10)
@@ -346,9 +346,7 @@ async def test_a_due_retry_takes_the_whole_path_and_is_quarantined_once_the_move
 
     rig.fail_errno = None
     _age_stuck(rig)
-    assert await rig.scan() == [], "the retried file settles first"
-    assert len(rig.source._stuck) == 1, "still remembered, and still due"
-    assert await rig.scan() == ["a.hl7"]
+    assert await rig.scan() == ["a.hl7"], "unchanged since its move failed, so already settled"
     assert (rig.inbox / ".error" / "a.hl7").exists()
     assert events == ["file_content_mismatch"]
     assert rig.source._stuck == {}
@@ -376,7 +374,6 @@ async def test_a_retry_that_now_passes_the_verdict_is_ingested(
 
     verdicts["reject"] = False
     _age_stuck(rig)
-    await rig.scan()
     assert await rig.scan() == ["a.hl7"]
     assert rig.handed_off == [_HL7]
     assert (rig.inbox / ".processed" / "a.hl7").exists()
@@ -397,8 +394,8 @@ async def test_due_retries_run_after_the_fresh_pass(
     await rig.scan()
     assert len(rig.source._stuck) == 3
     rig.drop("b_healthy.hl7", _HL7)
+    await rig.scan()  # the healthy drop settles
     _age_stuck(rig)
-    assert await rig.scan() == [], "the healthy drop and the retries all settle"
     assert await rig.scan() == ["b_healthy.hl7", "a_reject0.hl7", "a_reject1.hl7", "a_reject2.hl7"]
     assert rig.handed_off == [_HL7]
     assert len(rig.source._stuck) == 3, "still stuck, so remembered again"
@@ -418,10 +415,9 @@ async def test_due_retries_are_capped_per_scan(
     await rig.scan()
     assert len(rig.source._stuck) == 4
     _age_stuck(rig)
-    await rig.scan()  # a0 and a1 settle; a2 and a3 wait, still due
-    assert await rig.scan() == ["a0.hl7", "a1.hl7"]
-    await rig.scan()  # a2 and a3 settle
+    assert await rig.scan() == ["a0.hl7", "a1.hl7"], "a2 and a3 wait, still due"
     assert await rig.scan() == ["a2.hl7", "a3.hl7"]
+    assert await rig.scan() == []
     assert len(rig.source._stuck) == 4
 
 

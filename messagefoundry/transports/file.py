@@ -38,7 +38,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import Any, BinaryIO, ClassVar, Literal, Self, TypeVar
+from typing import Any, BinaryIO, ClassVar, Literal, NamedTuple, Self, TypeVar
 
 from messagefoundry.config.models import (
     ConnectorType,
@@ -109,8 +109,11 @@ _FileId = tuple[int, int]
 _FileMark = tuple[int, int, int, int]
 
 
-#: ``(mark, monotonic time the move last failed)``: one stuck reject's memory (BACKLOG #5717).
-_StuckSeen = tuple[_FileMark, float]
+class _StuckSeen(NamedTuple):
+    """One stuck reject's memory (BACKLOG #5717)."""
+
+    mark: _FileMark
+    since: float  # monotonic time its move last failed
 
 
 class _Step(enum.Enum):
@@ -828,7 +831,7 @@ class FileSource(SourceConnector):
         # the scans in a row that did not list each. Under move and delete only. See _stuck_step.
         # Bounded like _refused, and pruned like the settle map. In memory only and never logged.
         self._stuck: dict[str, tuple[_StuckSeen, int]] = {}
-        self._stuck_full_logged = False
+        self._stuck_full_logged = False  # the full memory is logged once per source
         # The connection, as the `.processed` age sweep names it in a log line (BACKLOG #1188).
         self._label = config.name or str(self.directory)
         # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
@@ -1158,8 +1161,9 @@ class FileSource(SourceConnector):
     async def _examine(self, path: Path, *, retry: bool) -> _Step:
         """Take one candidate as far as it goes this scan, and say what that cost (:class:`_Step`).
         ``retry`` is a remembered stuck reject due a retry (BACKLOG #5717), which :meth:`_scan_once`
-        examines after every other candidate and which takes the whole path again: it settles, is
-        read and judged afresh, and is charged through the arm it ends in."""
+        examines after every other candidate and which takes the whole path again: it is read and
+        judged afresh, and a retry that now passes is ingested. A retry is counted against
+        :meth:`_retry_allowance`, not the per-tick ceiling."""
         # One stat serves the leave-mode key, the settle gate and the before-read side of the #116
         # partial-write check, so the key recorded below describes the bytes actually read. The size
         # cap is NOT charged here: it is charged on the handle the read opens (BACKLOG #2507).
@@ -1185,14 +1189,14 @@ class FileSource(SourceConnector):
                 already = await self._leave_already_ingested(forms)
             if already:
                 return _Step.FREE
-        if not self._settled(path, before):
+        if retry and key in self._stuck:
+            # Unchanged since its move failed at least STUCK_RETRY_SECONDS ago, so it is settled.
+            # Judged afresh below, and remembered again if it is still stuck.
+            del self._stuck[key]
+        elif not self._settled(path, before):
             # BACKLOG #1811: first sighting, or the file changed since the last poll. Nothing is
-            # read, moved or charged against the per-tick budget, the same as #116's skip below. A
-            # retried stuck reject stays remembered, so it is due again on the next scan.
+            # read, moved or charged against the per-tick budget, the same as #116's skip below.
             return _Step.FREE
-        if retry:
-            # Settled: judged afresh below, and remembered again if it is still stuck.
-            self._stuck.pop(key, None)
         try:
             raw, read_sig, read_id = await self._run_fs(self._read_settled, path)
         except _Unconfined:
@@ -1381,8 +1385,8 @@ class FileSource(SourceConnector):
         ``move`` and ``delete`` remember. ``leave`` keeps examining such a file as it always has: there a read-only share is
         expected, and nothing here changes it. A failure that may clear by itself
         (:func:`_lasting`) is not remembered either, so a later scan reads the file and tries again.
-        A copy archived whose original could not be removed is remembered too, so a retry may archive
-        a second copy and record a second event."""
+        A copy archived whose original could not be removed is remembered too, so each retry may
+        archive another copy and record another event."""
         archived, stays = await self._run_fs(self._archive_to, path, self.error_dir, read_id)
         if archived:
             await self._emit_event(kind, reason=reason)
@@ -1399,8 +1403,7 @@ class FileSource(SourceConnector):
                     SETTLE_SEEN_MAX,
                 )
             return
-        self._stuck_full_logged = False
-        self._stuck[key] = ((mark, time.monotonic()), 0)
+        self._stuck[key] = (_StuckSeen(mark, time.monotonic()), 0)
         logger.warning(
             "file source %s: rejected file %s stays in place; it is not read again until it changes "
             "or %.0f seconds pass",
@@ -1415,7 +1418,7 @@ class FileSource(SourceConnector):
         is skipped unread and uncharged, or, once ``STUCK_RETRY_SECONDS`` have passed, deferred to
         the scan's retry pass (``DUE``). In the retry pass (``retry``) it is examined as usual and
         :meth:`_examine` forgets it once it has settled."""
-        (seen, since), _missed = self._stuck[key]
+        seen, since = self._stuck[key][0]
         if seen != mark:
             del self._stuck[key]
             return None
