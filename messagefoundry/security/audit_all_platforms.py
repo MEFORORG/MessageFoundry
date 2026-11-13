@@ -183,13 +183,14 @@ def _kinds(lines: list[str]) -> list[str]:
         body = _body(line)
         head = body.lstrip()
         continues = body.endswith("\\") and not head.startswith("#")
+        text = (body.strip("\\") if continues else body).lstrip()
         if not continued:
-            start = (body.strip("\\") if continues else body).lstrip()
-            in_requirement = is_requirement_line(start)
-            kind = "requirement" if in_requirement else "option" if start[:1] == "-" else "other"
-            continues = continues and bool(start)
+            in_requirement = is_requirement_line(text)
+            kind = "requirement" if in_requirement else "option" if text[:1] == "-" else "other"
+            continues = continues and bool(text)
         else:
-            kind = "continued" if in_requirement and head[:1] not in ("", "-", "#") else "joined"
+            continuing = in_requirement and text and head[:1] not in ("-", "#")
+            kind = "continued" if continuing else "joined"
         kinds.append(kind)
         continued = continues
     return kinds
@@ -514,8 +515,9 @@ def _drop(
         if kind in _STARTS:
             head = _body(line).lstrip()
             name = _pin_name(head) if kind == "requirement" else None
-            dropping = name is not None and name in names
-            if dropping and name is not None:
+            dropping = False
+            if name is not None and name in names:
+                dropping = True
                 dropped.append((name, head.removesuffix("\\").rstrip()))
         if not dropping:
             out.append(line)
@@ -602,7 +604,9 @@ _PIP_AUDIT_TEXT_OPTIONS = frozenset(
 _PIP_AUDIT_OPTIONS = _PIP_AUDIT_FLAGS | _PIP_AUDIT_FIXED_VALUE_OPTIONS | _PIP_AUDIT_TEXT_OPTIONS
 
 
-#: The short forms of those that take a value, with the long form each stands for.
+#: The short forms of those that take a value, with the long form each stands for. After the lock,
+#: ``_opens_the_gate`` refuses ``-r`` and ``--requirement`` before these tables are read. Both stay
+#: listed as pip-audit declares them, and ``_names_own_option`` reads every long option.
 _PIP_AUDIT_SHORT_VALUE_OPTIONS = {
     "-r": "--requirement",
     "-o": "--output",
@@ -735,17 +739,23 @@ def _distinct_count(requirements: Sequence[str]) -> int:
 
     pip-audit 2.10.1's ``_collect_preresolved_deps`` audits a name once and passes over a second
     requirement with the same name and specifier, which a lock that pinned one version under two
-    markers holds once they are stripped; a second with another specifier fails the audit. So this
-    counts canonical names, or the whole string where none starts it, which counts one where a lock
-    spells one name two ways, and pip-audit audits each spelling.
+    markers holds once they are stripped; a second with another specifier fails the audit. It
+    compares the name as written, not as PEP 503 folds it. So this counts names as written, and a
+    requirement that starts with a URL, which names no package before its ``:``, by its whole text.
     """
-    return len({_pin_name(r.lstrip()) or r for r in requirements})
+    return len(
+        {
+            m[0] if (m := _NAME.match(r)) and r[m.end() : m.end() + 1] != ":" else r
+            for r in requirements
+        }
+    )
 
 
 def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | None = None) -> int:
     # The lock's own text reaches stdout, which on a cp1252 console raised a traceback quoting a
-    # character it could not encode (vault BACKLOG #3786 R5).
-    harden_console_streams()
+    # character it could not encode (vault BACKLOG #3786 R5). UTF-8 keeps every character of an
+    # un-gated pin and of the lock's path, as console_streams says a tool printing paths needs.
+    harden_console_streams(encoding="utf-8")
     words = list(sys.argv[1:] if argv is None else argv)
     parser = _UnquotingParser(words, description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument(
@@ -866,7 +876,7 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | No
     stripped = [e for e in stripped if (name := _pin_name(e)) is None or name not in private]
     print(
         f"{lock}: {_distinct_count(read)} pinned requirements audited, {len(stripped)} "
-        "un-gated from a marker the host would have evaluated:"
+        "requirement lines un-gated from a marker the host would have evaluated:"
     )
     for entry in stripped:
         print(f"  {entry}")

@@ -192,7 +192,7 @@ def test_the_committed_lock_is_install_checked_then_the_stripped_copy_audited(
     assert audit[-2:] == ["--ignore-vuln", "PYSEC-0"]
     assert audited == STRIPPED
     out = capsys.readouterr().out
-    assert "3 pinned requirements audited, 2 un-gated" in out
+    assert "3 pinned requirements audited, 2 requirement lines un-gated" in out
     assert "colorama==0.4.6 ; sys_platform == 'win32'" in out
 
 
@@ -475,7 +475,7 @@ def test_a_bare_vcs_scheme_is_no_url_so_its_marker_is_stripped(
     out = capsys.readouterr().out
     # Was the lock's own first line, marker and all, with "0 un-gated".
     assert (status, copies) == (0, [[f"{url} {digest}", f"bar==2 {digest}"]])
-    assert "2 pinned requirements audited, 1 un-gated" in out
+    assert "2 pinned requirements audited, 1 requirement lines un-gated" in out
     assert f"  {url} ; sys_platform=='zz'\n" in out
 
 
@@ -954,7 +954,8 @@ def test_an_include_after_a_backslash_line_is_refused_as_an_option(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """R2: a ``-r`` after a line holding only a backslash was classed as continuing that line, so
-    it escaped the option-line refusal, and pip-audit with ``--disable-pip`` passes over it."""
+    it escaped the option-line refusal and was refused only by the copy's count check; pip-audit
+    with ``--disable-pip`` would pass over it."""
     src = tmp_path / "x.lock"
     src.write_text(f"\\\n-r other.txt\n{_EVIL}\n", encoding="utf-8")
     ran, run = _recorder(0)
@@ -987,7 +988,37 @@ def test_identical_pins_are_counted_once_as_pip_audit_audits_them(
     assert printed == [2]
 
 
-def test_a_lock_character_stdout_cannot_encode_is_escaped_not_raised(
+@pytest.mark.parametrize(
+    "head",
+    [
+        # pip-audit keys on the name as written, so it audits both spellings.
+        f"Foo_Bar==1 --hash=sha256:{_DIGEST}\nfoo-bar==1 --hash=sha256:{_DIGEST}\n",
+        # A URL names no package before its ":".
+        f"https://h/a-1.0-py3-none-any.whl --hash=sha256:{_DIGEST}\n"
+        f"https://h/b-1.0-py3-none-any.whl --hash=sha256:{_DIGEST}\n",
+    ],
+    ids=["two-spellings", "two-urls"],
+)
+def test_requirements_pip_audit_keeps_apart_are_counted_apart(
+    head: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    status, _, printed, read, _ = _counted_and_read(tmp_path, capsys, head)
+    assert status == 0
+    assert printed == [len(reqs) for reqs in read] == [3]
+
+
+def test_a_line_of_backslashes_inside_a_requirement_adds_nothing(tmp_path: Path) -> None:
+    """pip joins it into nothing, so it is no line a marker could hide on."""
+    lock = f"foo==1 ; os_name == 'nt' \\\n\\\n    --hash=sha256:{_DIGEST}\n{_EVIL}\n"
+    status, seen = _seen_by(tmp_path, [], lock)
+    assert status == 0
+    assert seen[-1][1] == f"foo==1 \\\n\\\n    --hash=sha256:{_DIGEST}\n{_EVIL}\n"
+
+
+_HAN = "\N{CJK UNIFIED IDEOGRAPH-4E2D}"
+
+
+def test_a_lock_character_stdout_cannot_encode_does_not_raise(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """R5: the summary went to stdout with ``strict`` errors, so a lock character a cp1252 console
@@ -996,11 +1027,11 @@ def test_a_lock_character_stdout_cannot_encode_is_escaped_not_raised(
     out = io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
     monkeypatch.setattr(sys, "stdout", out)
     src = tmp_path / "x.lock"
-    src.write_text(f"foo==1 ; sys_platform == '中' --hash=sha256:{_DIGEST}\n", encoding="utf-8")
+    src.write_text(f"foo==1 ; sys_platform == '{_HAN}' --hash=sha256:{_DIGEST}\n", encoding="utf-8")
     ran, run = _recorder(0)
     assert main([str(src)], run=run) == 0
     out.flush()
-    assert "foo==1 ; sys_platform == '?'" in raw.getvalue().decode("cp1252")
+    assert f"foo==1 ; sys_platform == '{_HAN}'" in raw.getvalue().decode("utf-8")
     assert len(ran) == 2
 
 
@@ -1034,7 +1065,7 @@ def test_a_private_pin_the_adopter_names_is_left_out_of_the_audit_alone(
     out = capsys.readouterr().out
     assert "not audited, named by --skip-private: idna==3.20" in out
     # Neither counted nor listed as audited.
-    assert "2 pinned requirements audited, 2 un-gated" in out
+    assert "2 pinned requirements audited, 2 requirement lines un-gated" in out
 
 
 @pytest.mark.parametrize(
@@ -1287,7 +1318,7 @@ def test_a_word_after_the_lock_that_pip_audit_would_quote_is_refused_unquoted(
         "--requirement=other.txt",
     ],
 )
-def test_a_dry_run_fix_help_or_version_word_is_refused_after_the_lock(
+def test_a_word_that_can_pass_unaudited_pins_is_refused_after_the_lock(
     word: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Each word listed here, put third after the lock, is refused with exit 2 and a refusal that
