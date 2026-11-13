@@ -31,6 +31,7 @@ from messagefoundry.redaction import (
     safe_name,
     safe_text,
 )
+from messagefoundry.support import redact as support_redact
 from tests._cpu_clock import CPU_SAMPLE_FLOOR_SECONDS
 from tests.test_log_redaction_secret_domain import PCT_STARTED
 
@@ -2134,9 +2135,9 @@ _MALFORMED_END_TAGS = {
 #: Malformed end tags whose remainder stays, as it did before #5925. An element only a malformed end
 #: tag would close is still read as prose when its text opens with whitespace or punctuation, since
 #: counting that tag as a close made the first stage scrub a widened trigger away
-#: (``test_an_end_tag_scrub_redacts_at_least_what_main_did`` found it). And a remainder with a label
-#: character near it stays, at least ``=``, ``:``, ``(`` and ``@``, so a label another reader needs
-#: is never the text the scrub takes.
+#: (an earlier head's review found it). And in a text with punctuation anywhere, at least ``=``,
+#: ``:``, ``(`` and ``@``, every remainder stays, so a label another reader needs is never the text
+#: the scrub takes.
 _KEPT_END_TAG_REMAINDERS = {
     "space-led-content": "<family> Smith</family Johnathan>",
     "punctuation-led-content": "<given>(Smith)</given Johnathan>",
@@ -2246,7 +2247,7 @@ def test_an_end_tag_keeps_its_name_and_whitespace(text: str, want: str) -> None:
 
 # The XML element pass as it stood before #5925, at origin/main 8c13c9ae03, vendored so the arms below
 # compare against the walk itself rather than a switch in the code under test. Only the end-tag
-# remainder and ``_XML_PHI_END`` differ from the shipped walk; the helpers it calls are unchanged.
+# remainder handling differs from the shipped walk; the patterns and helpers it uses are the same.
 _PRE_5925_END_TAG_REST = re.compile(r"[^<>]*+>?")
 _PRE_5925_PHI_END = re.compile(
     r"</(?:[A-Za-z_][\w.-]*+:)?(family|given|name|birthDate|address|identifier|telecom)\s*+>"
@@ -2321,14 +2322,19 @@ def _pre_5925_redact_xml_elements(text: str) -> str:
 
 
 def _end_tag_readings(text: str) -> tuple[str, ...]:
-    """``text`` by every log path :func:`_every_log_path` names, through :func:`redact` then the
-    credential filter, and through :func:`safe_text` at its default limit and a short one, where a
-    scrub that changes the length moves the cut."""
+    """``text`` by every log path :func:`_every_log_path` names, and through :func:`redact` then the
+    credential filter.
+
+    **No reading at a short limit, and that is a stated exception.** A scrub changes the length, so
+    :func:`safe_text` at a limit cuts its output somewhere else, and text the old cut dropped can
+    print. That text is :func:`redact` output either way, since the limit cuts after redaction, so it
+    is only text the redactor keeps; the limit is a length bound, not a redaction."""
+    once = _through_the_log_filter_chain(text)
     return (
         *_every_log_path(text).values(),
         secretscrub.scrub_credentials(redact(text)),
-        _through_the_log_filter_chain(safe_text(text)),
-        _through_the_log_filter_chain(safe_text(text, limit=60)),
+        # The support bundle re-reads a written log line with its own sweeps.
+        support_redact.redact_log_text(once),
     )
 
 
@@ -2380,6 +2386,12 @@ def test_an_end_tag_scrub_regression_redacts_what_main_did(
         ),
         # A separator only an MSH header declares.
         ("MSH*$~\\#*A\n<name>Kplm7</family:Qwerty12$Kplm7*x", "Qwerty12"),
+        # A JSON bare value whose key sat further back than a 256-character window.
+        ('"name": kplm7' + " w" * 150 + " <family></family zqxa> vornb7", "vornb7"),
+        # A leaf key whose value two log handlers joined across the line.
+        ('"family":\nkplm7' + " w" * 150 + " <given></given zqxa> vornb7", "vornb7"),
+        # A base64 token glued to a tag name by ``/``, split under the support bundle's floor.
+        ("<family>Smith</QUJDREVGR0hJS0xN/TU9QUVJTVFVWV1hZWgabcdefghij", "TU9QUVJTVFVWV1hZWg"),
     ],
 )
 def test_an_end_tag_scrub_takes_no_punctuation_a_reader_needs(
@@ -2395,9 +2407,8 @@ def test_an_end_tag_scrub_takes_no_punctuation_a_reader_needs(
 
 def test_every_widened_trigger_keeps_an_end_tag_remainder() -> None:
     """THE DRIFT PIN for the widened stage. The first stage must not scrub a trigger the widened stage
-    needs, and :data:`redaction._END_TAG_LABEL_SHAPE` carries no stage switch, so every text
-    :func:`redaction._needs_widened_stage` fires on must hold a match of it. Each sample fires one
-    arm of the screen; a new arm whose anchor is a bare word fails here until the word is added."""
+    needs, and :func:`redaction._end_tag_rest_kept` has no stage switch, so it must keep on every
+    text :func:`redaction._needs_widened_stage` fires on. Each sample fires one arm of the screen."""
     samples = (
         '"name": x',
         "'address': x",
@@ -2409,16 +2420,31 @@ def test_every_widened_trigger_keeps_an_end_tag_remainder() -> None:
     )
     for sample in samples:
         assert redaction._needs_widened_stage(sample), sample
-        assert redaction._END_TAG_LABEL_SHAPE.search(sample), sample
-    words = "|".join(word.lower() for word in redaction._DICOM_LABEL_WORDS)
-    assert all(word in redaction._END_TAG_LABEL_SHAPE.pattern for word in words.split("|"))
+        assert redaction._end_tag_rest_kept(sample), sample
 
 
-def test_a_credential_elsewhere_keeps_no_other_end_tag_remainder() -> None:
-    """The decision is per end tag: a credential far from one does not keep its remainder."""
+@pytest.mark.parametrize(
+    "text", ["Bearer abcdef123456", "MyPassword secret", "nonnumeric port", "mrn 1234567"]
+)
+def test_an_anchor_word_keeps_the_remainder(text: str) -> None:
+    """A word some pass or filter reads with no punctuation keeps every remainder, read from the
+    patterns' own sources (``_ANCHOR_WORDS``), so a word added there is honoured here."""
+    assert redaction._end_tag_rest_kept(text)
+    assert not redaction._end_tag_rest_kept("retry 3 of 5 after 200 ms <family> Smith")
+
+
+def test_a_bracketless_end_tag_in_a_nested_element_spares_the_lines_after_it() -> None:
+    """Only the remainder's own line changes, so a later line is not read as the outer element's."""
+    out = redact("<name><given>Smith</given zqxa\nretry 3 of 5 after 200 ms")
+    assert out == "<name><given>[redacted]</given [redacted]\nretry 3 of 5 after 200 ms"
+
+
+def test_a_credential_anywhere_keeps_every_end_tag_remainder() -> None:
+    """A STATED RESIDUAL, as before #5925: punctuation anywhere in the text keeps every remainder,
+    however far from the end tag, since no window held (``_end_tag_rest_kept`` says why)."""
     text = "<family>Smith</family Johnathan>" + " " * 300 + "token=<abc123def456>"
     out = redact(text)
-    assert "Johnathan" not in out, out
+    assert "Johnathan" in out, out
     assert "abc123def456" not in secretscrub.scrub_credentials(out)
 
 
@@ -2445,7 +2471,7 @@ _DIFF_SEPARATORS = (
 
 def _diff_text(rand: random.Random) -> str:
     """A vocabulary element, a malformed end tag, then labels, values and separators after it, with
-    a label and value sometimes past the window :func:`redaction._end_tag_rest_kept` reads."""
+    a label and value sometimes far past it."""
     parts = []
     if rand.random() < 0.4:  # a label, quote or brace opened before the element
         parts.append(rand.choice(_DIFF_LABELS) + rand.choice(('"', "'", "{", "[", "", " ")))
@@ -2513,15 +2539,16 @@ def test_an_end_tag_scrub_redacts_at_least_what_main_did(monkeypatch: pytest.Mon
 
     **The control is a scrub that never keeps a remainder.** It takes labels the credential filters
     and the widened stage read and leaves their values, so the corpus can produce the leak this arm
-    asserts absent. Measured at 3,000 trials: 0 here and 172 on the control at the same count, with
-    156 values the shipped walk scrubs that the old one left. 125,000 trials over this seed and four
+    asserts absent. Measured at 3,000 trials: 0 here and 173 on the control at the same count, with
+    62 values the shipped walk scrubs that the old one left. 125,000 trials over this seed and four
     others, run by hand, also found 0 leaks and 0 texts that stopped being a fixed point. These are
     measurements of this corpus, not a proof for every input.
 
     **The corpus grew with each leak class a review found** that the one before could not produce:
     a scrub that took an HL7 separator, seen only on the two-handler path; a label, quote or brace
-    opened BEFORE the element; a second malformed end tag after a label; and a cut that moved
-    because the scrub changed the length, seen only through :func:`safe_text` at a short limit."""
+    opened BEFORE the element; and a second malformed end tag after a label. Each review's leaks
+    are also pinned as single inputs above. A cut that moves because the scrub changed the length is
+    the stated exception :func:`_end_tag_readings` names."""
     leaks, gains, unsettled = _end_tag_differential(3_000, monkeypatch)
     control, _, _ = _end_tag_differential(500, monkeypatch, kept=lambda *_, **__: False)
     assert control, "the never-keep control leaked nothing, so the corpus cannot produce the leak"

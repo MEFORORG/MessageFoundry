@@ -76,7 +76,6 @@ import re
 import traceback
 import weakref
 from abc import ABCMeta
-from bisect import bisect_left
 from collections import ChainMap, OrderedDict, UserDict, defaultdict, deque
 from collections.abc import Callable, MappingView
 from datetime import UTC, datetime
@@ -1558,25 +1557,12 @@ _XML_END_TAG_REST = re.compile(r"[^<>]*+>?")
 #: well-formed XML never has), and the ``>`` if there is one (BACKLOG #5925). So a bracketless tag
 #: loses at most the rest of its own line.
 _XML_END_TAG_PARTS = re.compile(r"([ \t]*+)([^<>\r\n]*+)(>?)")
-#: How far before an end tag's remainder, and past the span a kept one copies,
-#: :func:`_end_tag_rest_kept` looks for a label, in characters.
-_END_TAG_LABEL_WINDOW = 256
-#: Anything near an end tag that keeps its remainder as it stands: every character but a word
-#: character, whitespace and the ``<``, ``>`` and ``/`` of tags, and the words a label is read by
-#: without one. A label, a credential shape, a quote, a bracket or a separator another reader needs
-#: is punctuation, so a scrub only ever runs where the text near it is words and tags.
-#:
-#: **Why so wide.** A narrower list of label characters lost values main kept out of view, at least
-#: these: a JSON ``"name":`` key BEFORE the end tag, whose bare value the placeholder's ``[`` then
-#: ended; the closing quote of a quoted credential that opened before it; a closing brace; and an HL7
-#: separator, whose loss left a token a later field run no longer read, so the tag name in it, which
-#: the walk keeps, printed on the second log handler's pass. The words are the anchors that carry no
-#: punctuation: a ``Bearer`` scheme, the credential backstop's opener, and every word
-#: :func:`_needs_widened_stage` screens on (``mrn``, :data:`_DICOM_LABEL_WORDS`), so the first stage
-#: never scrubs a trigger the widened stage needs (``tests/test_redaction.py`` pins that).
-_END_TAG_LABEL_SHAPE = re.compile(
-    r"[^\w\s</>]|(?i:bearer|nonnumeric|mrn|patient|medicalrecordlocator|responsibleperson)"
-)
+#: A character that keeps every end tag's remainder in a text as it stands: anything but a word
+#: character, whitespace and the ``<``, ``>`` and ``/`` of tags (:func:`_end_tag_rest_kept`).
+_END_TAG_PUNCTUATION = re.compile(r"[^\w\s</>]")
+#: The letter runs of a text, lower-cased, that :func:`_end_tag_rest_kept` checks against
+#: :data:`_ANCHOR_WORDS`.
+_LETTER_RUN = re.compile(r"[a-z]+")
 #: One part of a start tag after its name: whitespace, the tag's end, an attribute and the opening of
 #: its quoted value (the value itself is read by :data:`_XML_ATTR_VALUE`), or anything else.
 #:
@@ -1661,24 +1647,33 @@ def _xml_text(chunk: str, policy: int) -> str:
     return f"{chunk[:lead]}{_REDACTED}{chunk[len(chunk.rstrip()) :]}"
 
 
-def _end_tag_rest_kept(hits: list[int], start: int, end: int) -> bool:
-    """Whether the end-tag remainder from ``start`` to ``end`` (the span a kept one copies) stays as
-    it stands (BACKLOG #5925): an :data:`_END_TAG_LABEL_SHAPE` match starts within
-    :data:`_END_TAG_LABEL_WINDOW` characters of it, either side, ``hits`` being where each match in
-    the text starts. The window crosses ``<`` and line breaks, since a reader's label or value can
-    sit across either.
+def _end_tag_rest_kept(text: str) -> bool:
+    """Whether every malformed end tag's remainder in ``text`` stays as it stands, as before #5925:
+    ``text`` holds any :data:`_END_TAG_PUNCTUATION`, or a letter run that is, or holds, a word some
+    pass or filter reads literally (:data:`_ANCHOR_WORDS`).
 
-    **Hits are found once per call, not once per end tag.** A window searched per tag cost about
-    0.26 s on a 64 KiB run of ``</a b``, against 0.05 s before #5925, on the event loop."""
-    i = bisect_left(hits, start - _END_TAG_LABEL_WINDOW)
-    return i < len(hits) and hits[i] < end + _END_TAG_LABEL_WINDOW
+    **The whole text, because no window held.** A scrub replaces text another reader may need, and
+    every reader here reads by punctuation or by a literal word. Review of a head that looked 256
+    characters either side found values main kept out of view that the window missed, at least
+    these: a JSON bare value whose ``"name":`` key sat further back, which the placeholder's ``[``
+    ended; a leaf key whose value two log handlers joined across a line; and a base64 token glued to
+    a tag name by ``/``, which the scrub split under the support bundle's length floor. A text of
+    words and tags alone has none of those readers, so only there is the remainder scrubbed. That is
+    narrow, and the residual is everything else: a quote, ``=`` or ``:`` anywhere keeps every
+    remainder, as before #5925."""
+    if _END_TAG_PUNCTUATION.search(text) is not None:
+        return True
+    return any(
+        run in _ANCHOR_WORDS or any(word in run for word in _LONG_ANCHOR_WORDS)
+        for run in set(_LETTER_RUN.findall(text.lower()))
+    )
 
 
 def _scrub_xml_element(
-    text: str, match: re.Match[str], last_close: dict[str, int], kept: Callable[[int, int], bool]
+    text: str, match: re.Match[str], last_close: dict[str, int], kept: Callable[[], bool]
 ) -> tuple[str, int]:
-    """``(replacement, end)`` for the vocabulary element starting at ``match``; ``kept(start, end)``
-    says whether an end tag's remainder over that span stays (:func:`_end_tag_rest_kept`)."""
+    """``(replacement, end)`` for the vocabulary element starting at ``match``; ``kept()`` says
+    whether end-tag remainders stay as they stand (:func:`_end_tag_rest_kept`)."""
     out = [match.group()]
     policy = _VALUE_TOP if match.group(2) in _PHI_VALUE_KEYS else _LEAF
     pos, how, attributed = _walk_xml_tag(text, match.end(), policy, out)
@@ -1707,9 +1702,10 @@ def _scrub_xml_element(
             rest = _XML_END_TAG_REST.match(text, tag.end())
             pos = rest.end() if rest is not None else tag.end()
             parts = _XML_END_TAG_PARTS.match(text, tag.end())
-            if parts is not None and parts.group(2) and not kept(parts.start(2), pos):
-                pos = parts.end()
-                out.append(f"{parts.group(1)}{_REDACTED}{parts.group(3)}")
+            if parts is not None and parts.group(2) and not kept():
+                # Only the remainder's own line changes: what follows it is copied as before
+                # #5925, so every later line reads as it did.
+                out.append(f"{parts.group(1)}{_REDACTED}{parts.group(3)}{text[parts.end() : pos]}")
             else:  # as before #5925: the remainder, to the next ``<`` or ``>``, as it stands
                 out.append(text[tag.end() : pos])
             if open_names.get(qname):
@@ -1746,19 +1742,17 @@ def _redact_xml_elements(text: str) -> str:
     with whitespace) or ``<family>(Van`` (opening with punctuation) reads as prose, and the fragment
     before the cut survives. A closed element is always scrubbed, whatever its text opens with.
 
-    **Text after an end tag's name is scrubbed, but only where the text near it is words and tags**
-    (BACKLOG #5925). A scrub could take a label and leave its value: ``</family {"name": "<Zqxa"}``
-    lost the ``"name":`` key only the widened stage reads, and ``</family password: <secret>`` the
-    label the credential filters after this module read. So each end tag decides for itself
-    (:func:`_end_tag_rest_kept`): where anything but words and tags (:data:`_END_TAG_LABEL_SHAPE`)
-    sits within a window either side of its remainder, the remainder stays as it stood before #5925.
-    The decision is local, so a credential elsewhere in the text keeps no other end tag's
-    remainder. A kept remainder is the residual: ``</family Zqxa> id=7`` keeps ``Zqxa``, as it did
-    before #5925. ``test_an_end_tag_scrub_redacts_at_least_what_main_did`` compares this against
-    the walk as it stood before #5925, through :func:`redact`, the log paths and the credential
-    filter; it measures the generated inputs it runs, and is not a proof. An element only a
-    malformed end tag would close is still read as prose, as before #5925: ``<family>
-    Smith</family Johnathan>`` keeps ``Johnathan``."""
+    **Text after an end tag's name is scrubbed, but only in a text of words and tags** (BACKLOG
+    #5925). A scrub could take a label and leave its value: ``</family {"name": "<Zqxa"}`` lost the
+    ``"name":`` key only the widened stage reads, and ``</family password: <secret>`` the label the
+    credential filters after this module read. So a text with punctuation or a literal anchor word
+    anywhere keeps every remainder as it stood before #5925 (:func:`_end_tag_rest_kept`), and that
+    is the residual: ``<family>Smith</family Zqxa> id=7`` keeps ``Zqxa``, and so does
+    ``<family value="Doe"/>`` beside it. ``test_an_end_tag_scrub_redacts_at_least_what_main_did``
+    compares this against the walk as it stood before #5925, through :func:`redact`, the log paths
+    and the credential filter; it measures the generated inputs it runs, and is not a proof. An
+    element only a malformed end tag would close is still read as prose, as before #5925:
+    ``<family> Smith</family Johnathan>`` keeps ``Johnathan``."""
     if "<" not in text:
         return text
     out: list[str] = []
@@ -1766,13 +1760,13 @@ def _redact_xml_elements(text: str) -> str:
     #: Where the LAST end tag of each vocabulary name starts, built on the first match: whether an
     #: element closes anywhere later is then one lookup, not a search to the end of the text.
     last_close: dict[str, int] | None = None
-    #: Where each :data:`_END_TAG_LABEL_SHAPE` match starts, found on the first malformed end tag.
-    hits: list[list[int]] = []
+    #: Whether remainders stay, decided on the first malformed end tag: well-formed XML has none.
+    decided: list[bool] = []
 
-    def kept(start: int, end: int) -> bool:
-        if not hits:
-            hits.append([hit.start() for hit in _END_TAG_LABEL_SHAPE.finditer(text)])
-        return _end_tag_rest_kept(hits[0], start, end)
+    def kept() -> bool:
+        if not decided:
+            decided.append(_end_tag_rest_kept(text))
+        return decided[0]
 
     while (match := _XML_PHI_ELEMENT.search(text, pos)) is not None:
         if last_close is None:
@@ -2076,11 +2070,11 @@ _GLUED_WORD = re.compile(r"[A-Za-z0-9]++")
 #: an unquoted label's last character.
 _GLUED_HINT = re.compile(r"""["'<]|[:=#)]\Z|(?i:mrn)\Z""")
 _SHAPE = str.maketrans(ascii_uppercase + ascii_lowercase + digits, "X" * 26 + "x" * 26 + "0" * 10)
-#: Every prefix of every word that a pass here, or a filter after it, reads literally, lower-cased.
-#: Taken from the patterns' own sources, so a word added there is refused here; the regex syntax they
+#: Every word that a pass here, or a filter after it, reads literally, lower-cased, and below, every
+#: prefix of one. Taken from the patterns' own sources, so a word added there is refused here; the regex syntax they
 #: also carry in (``za`` from ``[A-Za-z]``) only refuses more.
-_ANCHOR_PREFIXES = frozenset(
-    word[:end]
+_ANCHOR_WORDS = frozenset(
+    word
     for source in (
         _DICOM_PHI_LABEL.pattern,
         _CREDENTIAL_AHEAD.pattern,
@@ -2093,7 +2087,12 @@ _ANCHOR_PREFIXES = frozenset(
         "basic digest",
     )
     for word in re.findall(r"[a-z]{2,}", source.lower())
-    for end in range(1, len(word) + 1)
+)
+#: The anchor words long enough that one inside a longer letter run is still read as itself, as a
+#: camel-case label such as ``MyPassword`` is (:func:`_end_tag_rest_kept`).
+_LONG_ANCHOR_WORDS = tuple(word for word in _ANCHOR_WORDS if len(word) >= 4)
+_ANCHOR_PREFIXES = frozenset(
+    word[:end] for word in _ANCHOR_WORDS for end in range(1, len(word) + 1)
 )
 #: Every prefix of a word some pass reads with no word boundary before it, so a caller's text glued
 #: after a masked word could complete it: at least the segment ids :data:`_MSH_DELIMITERS` sniffs,
