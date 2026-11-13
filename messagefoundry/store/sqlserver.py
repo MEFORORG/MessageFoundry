@@ -16550,19 +16550,17 @@ class SqlServerStore:
         change: Callable[[SessionRecord], SessionRecord],
         *,
         landed: Callable[[Any], Awaitable[None]] | None = None,
-        account_lock: _AccountRowHints = "HOLDLOCK, ROWLOCK",
         after_commit: bool = False,
     ) -> SessionRecord | None:
         """:meth:`_write_session` in a transaction of its own, committed before it returns.
-        It takes the session's account row under ``account_lock`` first, the lock order
+        It takes the session's account row under ``UPDLOCK, ROWLOCK`` first, the lock order
         :meth:`rotate_session` states: the rewrite sets ``user_id``, so the session key's check
         can read the account row, and a sweep or a user delete holding that row while it waits on
-        the session row would otherwise deadlock with it (BACKLOG #4974, #2733). Shared by
-        default, as ``create_session``'s unguarded read is: a stamp writes no account row, so
-        stamps of one account do not wait on each other or on an account writer's ``UPDLOCK``
-        read, and a writer that converts to an X lock or a delete still waits for the stamp. The
-        account is read unlocked: ``user_id`` never changes, and a session already gone locks
-        nothing.
+        the session row would otherwise deadlock with it (BACKLOG #4974, #2733). Not shared: a
+        passkey enrolment for a session holds the account row under ``UPDLOCK`` and that session's
+        row, then converts the account row to X, so a stamp holding it shared while it waited on
+        the session row would close a cycle. The account is read unlocked: ``user_id`` never
+        changes, and a session already gone locks nothing.
         ``landed`` runs on the same cursor, in the same transaction, only when the write landed.
         ``after_commit`` borrows through :meth:`_acquire_after_commit`; only ``rotate_session``
         passes it."""
@@ -16572,7 +16570,7 @@ class SqlServerStore:
                 await cur.execute("SELECT user_id FROM sessions WHERE token_hash=?", (token_hash,))
                 owners = await cur.fetchall()
                 if owners:
-                    await _hold_account_row(cur, str(owners[0][0]), account_lock)
+                    await self._lock_account_row(cur, str(owners[0][0]))
                 updated = await self._write_session(cur, token_hash, change)
                 if updated is not None and landed is not None:
                     await landed(cur)
@@ -16678,7 +16676,6 @@ class SqlServerStore:
         rotated = await self._write_session_txn(
             token_hash,
             lambda s: replace(s, token_hash=new_token_hash),
-            account_lock="UPDLOCK, ROWLOCK",
             landed=_link,
             after_commit=True,
         )

@@ -270,8 +270,8 @@ _SESSION_REWRITES = ("rotate_session", "mark_session_reauthed", "mark_session_mf
 async def test_sqlserver_session_rewrites_lock_the_account_row_before_the_session_row(
     owner: str | None, call: str
 ) -> None:
-    """BACKLOG #4974 and #2733: each rewrite takes its account's ``users`` row, the re-key under
-    ``UPDLOCK`` and a stamp shared, before it reads its session row under ``UPDLOCK``, the order every whole-account
+    """BACKLOG #4974 and #2733: each rewrite takes its account's ``users`` row under ``UPDLOCK,
+    ROWLOCK`` before it reads its session row under the same hint, the order every whole-account
     sweep and the user delete take them in. The rewrite sets ``user_id``, so the session key's
     check reads the account row, and a rewrite holding its session row while a sweep or a delete
     held the account row would deadlock with it; a re-key could also be met mid-move. Where the
@@ -300,8 +300,7 @@ async def test_sqlserver_session_rewrites_lock_the_account_row_before_the_sessio
         assert not [sql for sql in statements if sql.startswith("SELECT id FROM users")]
         assert _reads_session_row(statements[1])
     else:
-        lock = _ACCOUNT_LOCK if call == "rotate_session" else _ACCOUNT_SHARE
-        assert seen[1] == (lock, (owner,))
+        assert seen[1] == (_ACCOUNT_LOCK, (owner,))
         assert statements[2].startswith("SELECT * FROM sessions WITH (UPDLOCK, ROWLOCK)")
 
 
