@@ -392,6 +392,7 @@ from messagefoundry.store.store import (
     roles_if_held,
     roll_audit_key_range,
     rotation_reseal,
+    run_open_cleanup,
     scope_if_source,
     scope_withdrawal,
     seal_approval_async,
@@ -3502,6 +3503,9 @@ class SqlServerStore:
     # BACKLOG #1780: set by open(read_only=True), which then writes nothing at open. A class
     # default so a store built without __init__ (the protocol-level tests do) reads False.
     _read_only: bool = False
+    # ADR 0196: set when open() failed to bind this store's salt into the cipher. That cipher may
+    # already count for another store, so close() must not settle its reserve here (BACKLOG #5720).
+    _cipher_foreign: bool = False
     backend = StoreBackend.SQLSERVER
     # H1 fence state (ADR 0157). Class defaults so a store built via object.__new__ (several offline
     # suites) reads as unfenced, and its SQL stays character-identical, instead of raising.
@@ -4286,7 +4290,11 @@ class SqlServerStore:
                 # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
                 # reserved next and every value sealed after it land under this store's own data
                 # sub-key. A read-only handle seals nothing; every stored value names its own salt.
-                await bind_store_salt(store._cipher, store._ensure_store_salt)
+                try:
+                    await bind_store_salt(store._cipher, store._ensure_store_salt)
+                except BaseException:
+                    store._cipher_foreign = True  # close() must not settle it here (BACKLOG #5720)
+                    raise
                 # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the
                 # first block BEFORE anything on this handle encrypts — the at-rest migration below
                 # included, since on a store that is having a key enabled for the first time it is
@@ -4307,22 +4315,29 @@ class SqlServerStore:
                 # ADR 0005 read-through cache warm-up
                 await store._load_state_cache_noting(folded)
                 await store._load_reference_cache()  # ADR 0006 reference-snapshot read cache
-        except Exception:
-            # Don't leak the pool if first-open initialization fails (M-6). The executor is released
-            # in a finally, same as close() above: wait_closed() cannot complete while the pool is
-            # wedged, so releasing the executor only on the success path would leak its threads in
-            # exactly the case this except exists for.
-            try:
+        except BaseException as exc:
+            # Don't leak the pool if first-open initialization fails (M-6), a cancel included, and
+            # settle the invocation block this open reserved rather than forfeit it: close() does
+            # both (BACKLOG #5720). close() releases the executor in a finally: wait_closed() cannot
+            # complete while the pool is wedged, so releasing the executor only on the success path
+            # would leak its threads in exactly the case this except exists for. The fallback below
+            # releases it if close() raised before reaching that finally.
+            async def _cleanup() -> None:
                 try:
-                    pool.close()
-                    await pool.wait_closed()
+                    await store.close()
+                except Exception as cleanup:
+                    # Logged by class, so it never replaces the open's own error (vault BACKLOG
+                    # #3054).
+                    log.warning(
+                        "closing the pool after a failed open also failed (%s)",
+                        type(cleanup).__name__,
+                    )
                 finally:
-                    executor.shutdown(wait=False)
-            except Exception as cleanup:
-                # Logged by class, so it never replaces the open's own error (vault BACKLOG #3054).
-                log.warning(
-                    "closing the pool after a failed open also failed (%s)", type(cleanup).__name__
-                )
+                    if store._pool_executor is not None:
+                        store._pool_executor.shutdown(wait=False)
+                        store._pool_executor = None
+
+            await run_open_cleanup(exc, _cleanup)
             raise
         return store
 
@@ -5767,7 +5782,8 @@ class SqlServerStore:
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
         try:
-            if not self._read_only:  # #1780: a read-only handle reserved nothing to settle
+            # #1780: a read-only handle reserved nothing to settle; #5720: nor is a foreign one ours.
+            if not self._cipher_foreign and not self._read_only:
                 await self.checkpoint_cipher_invocations(settle=True)
         except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
             log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)

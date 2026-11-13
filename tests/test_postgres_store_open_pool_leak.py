@@ -17,6 +17,7 @@ no real Postgres server involved.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 import types
@@ -166,3 +167,116 @@ async def test_a_read_only_open_writes_nothing_and_loads_no_cache(
     assert seen == ["ensure read_only=True", "audit read_only=True"]
     assert store._read_only is True
     assert pool.closed == 0
+
+
+def _keyed_open_steps(monkeypatch: pytest.MonkeyPatch, settles: list[bool]) -> None:
+    """Stand the writable open's at-open steps down to no-ops, recording each invocation checkpoint
+    by its ``settle`` flag, so a test can fail exactly one later step (BACKLOG #5720)."""
+
+    async def _noop(*_args: object, **_kwargs: object) -> Any:
+        return None
+
+    async def _checkpoint(self: PostgresStore, *, settle: bool = False) -> None:
+        settles.append(settle)
+
+    monkeypatch.setattr(PostgresStore, "_ensure_schema", _noop)
+    monkeypatch.setattr("messagefoundry.store.postgres.check_open_store_pin", _noop)
+    monkeypatch.setattr("messagefoundry.store.postgres.bind_store_salt", _noop)
+    monkeypatch.setattr(PostgresStore, "checkpoint_cipher_invocations", _checkpoint)
+
+
+async def test_a_cancelled_open_closes_the_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #5720: a cancel is a ``BaseException``, so the ``except Exception`` cleanup let it
+    pass and the pool stayed open. Red before the fix: ``pool.closed`` is 0."""
+    pool = _FakePool()
+    _install_fake_asyncpg(monkeypatch, pool)
+
+    async def _cancelled(self: PostgresStore, **_kwargs: object) -> bool:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(PostgresStore, "_ensure_schema", _cancelled)
+
+    with pytest.raises(asyncio.CancelledError):
+        await PostgresStore.open(_settings())
+
+    assert pool.closed == 1
+
+
+async def test_a_failed_keyed_open_settles_the_block_it_reserved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720: the open reserves a block of AES-GCM invocations and then fails. Its cleanup
+    closed the pool without settling, so the whole block was charged to the key for nothing. Red
+    before the fix: ``settles`` is ``[False]``, the reserve and no settlement."""
+    pool = _FakePool()
+    _install_fake_asyncpg(monkeypatch, pool)
+    settles: list[bool] = []
+    _keyed_open_steps(monkeypatch, settles)
+
+    async def _boom(self: PostgresStore) -> None:
+        raise RuntimeError("at-rest sweep boom")
+
+    monkeypatch.setattr(PostgresStore, "_encrypt_existing_rows", _boom)
+
+    with pytest.raises(RuntimeError, match="at-rest sweep boom"):
+        await PostgresStore.open(_settings())
+
+    assert settles == [False, True]
+    assert pool.closed == 1
+
+
+async def test_an_open_whose_salt_bind_failed_settles_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720, the guard on the settlement: a cipher whose bind to this store's salt failed
+    may already count for another store, so settling it here would write that store's reserve
+    into this one. The SQLite open already refuses that; the server backends now do the same."""
+    pool = _FakePool()
+    _install_fake_asyncpg(monkeypatch, pool)
+    settles: list[bool] = []
+    _keyed_open_steps(monkeypatch, settles)
+
+    async def _foreign(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("salt bind boom")
+
+    monkeypatch.setattr("messagefoundry.store.postgres.bind_store_salt", _foreign)
+
+    with pytest.raises(RuntimeError, match="salt bind boom"):
+        await PostgresStore.open(_settings())
+
+    assert settles == []
+    assert pool.closed == 1
+
+
+async def test_a_cancel_during_the_cleanup_still_closes_the_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720: a second cancel landing while the failed open cleans up must not cut the
+    cleanup short. The settle is the slow step here; the pool still closes, and the caller sees
+    the cancel."""
+    pool = _FakePool()
+    _install_fake_asyncpg(monkeypatch, pool)
+    settles: list[bool] = []
+    _keyed_open_steps(monkeypatch, settles)
+    settling = asyncio.Event()
+
+    async def _slow_checkpoint(self: PostgresStore, *, settle: bool = False) -> None:
+        settles.append(settle)
+        if settle:
+            settling.set()
+            await asyncio.sleep(0.2)
+
+    async def _boom(self: PostgresStore) -> None:
+        raise RuntimeError("at-rest sweep boom")
+
+    monkeypatch.setattr(PostgresStore, "checkpoint_cipher_invocations", _slow_checkpoint)
+    monkeypatch.setattr(PostgresStore, "_encrypt_existing_rows", _boom)
+
+    task = asyncio.create_task(PostgresStore.open(_settings()))
+    await asyncio.wait_for(settling.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert settles == [False, True]
+    assert pool.closed == 1

@@ -24,6 +24,7 @@ that probe FAILS the open when it cannot verify RCSI, and this test is about wha
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 import types
@@ -198,4 +199,98 @@ async def test_open_shuts_down_the_executor_when_create_pool_itself_fails(
     with pytest.raises(RuntimeError, match="connect boom"):
         await SqlServerStore.open(_settings())
 
+    assert fake_executor.shutdown_calls == [False]
+
+
+def _keyed_open_steps(monkeypatch: pytest.MonkeyPatch, settles: list[bool]) -> _FakeExecutor:
+    """Stand the writable open's at-open steps down to no-ops, recording each invocation checkpoint
+    by its ``settle`` flag, so a test can fail exactly one later step (BACKLOG #5720)."""
+
+    async def _noop(*_args: object, **_kwargs: object) -> Any:
+        return None
+
+    async def _checkpoint(self: SqlServerStore, *, settle: bool = False) -> None:
+        settles.append(settle)
+
+    monkeypatch.setattr(SqlServerStore, "_ensure_schema", _noop)
+    monkeypatch.setattr(SqlServerStore, "_report_state_key_collation", _noop)
+    monkeypatch.setattr(sqlserver_module, "check_open_store_pin", _noop)
+    monkeypatch.setattr(sqlserver_module, "bind_store_salt", _noop)
+    monkeypatch.setattr(SqlServerStore, "checkpoint_cipher_invocations", _checkpoint)
+    fake_executor = _FakeExecutor()
+    monkeypatch.setattr(
+        sqlserver_module, "_build_pool_executor", lambda settings, maxsize=None: fake_executor
+    )
+    return fake_executor
+
+
+async def test_a_cancelled_open_closes_the_pool_and_the_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720: a cancel is a ``BaseException``, so the ``except Exception`` cleanup let it
+    pass and both the pool and its executor's threads stayed. Red before the fix."""
+    pool = _FakePool()
+    _install_fake_aioodbc(monkeypatch, pool)
+
+    async def _cancelled(self: SqlServerStore, **_kwargs: object) -> bool:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(SqlServerStore, "_ensure_schema", _cancelled)
+    fake_executor = _FakeExecutor()
+    monkeypatch.setattr(
+        sqlserver_module, "_build_pool_executor", lambda settings, maxsize=None: fake_executor
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await SqlServerStore.open(_settings())
+
+    assert pool.closed == 1
+    assert fake_executor.shutdown_calls == [False]
+
+
+async def test_a_failed_keyed_open_settles_the_block_it_reserved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720: the open reserves a block of AES-GCM invocations and then fails. Its cleanup
+    closed the pool without settling, so the whole block was charged to the key for nothing. Red
+    before the fix: ``settles`` is ``[False]``, the reserve and no settlement."""
+    pool = _FakePool()
+    _install_fake_aioodbc(monkeypatch, pool)
+    settles: list[bool] = []
+    fake_executor = _keyed_open_steps(monkeypatch, settles)
+
+    async def _boom(self: SqlServerStore) -> None:
+        raise RuntimeError("at-rest sweep boom")
+
+    monkeypatch.setattr(SqlServerStore, "_encrypt_existing_rows", _boom)
+
+    with pytest.raises(RuntimeError, match="at-rest sweep boom"):
+        await SqlServerStore.open(_settings())
+
+    assert settles == [False, True]
+    assert pool.closed == 1
+    assert fake_executor.shutdown_calls == [False]
+
+
+async def test_an_open_whose_salt_bind_failed_settles_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720, the guard on the settlement: a cipher whose bind to this store's salt failed
+    may already count for another store, so settling it here would write that store's reserve
+    into this one."""
+    pool = _FakePool()
+    _install_fake_aioodbc(monkeypatch, pool)
+    settles: list[bool] = []
+    fake_executor = _keyed_open_steps(monkeypatch, settles)
+
+    async def _foreign(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("salt bind boom")
+
+    monkeypatch.setattr(sqlserver_module, "bind_store_salt", _foreign)
+
+    with pytest.raises(RuntimeError, match="salt bind boom"):
+        await SqlServerStore.open(_settings())
+
+    assert settles == []
+    assert pool.closed == 1
     assert fake_executor.shutdown_calls == [False]

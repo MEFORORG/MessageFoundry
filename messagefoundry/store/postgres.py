@@ -384,6 +384,7 @@ from messagefoundry.store.store import (
     roles_if_held,
     roll_audit_key_range,
     rotation_reseal,
+    run_open_cleanup,
     scope_if_source,
     scope_withdrawal,
     seal_approval_async,
@@ -2079,6 +2080,9 @@ class PostgresStore:
     # BACKLOG #1780: set by open(read_only=True), which then writes nothing at open. A class
     # default so a store built without __init__ (the protocol-level tests do) reads False.
     _read_only: bool = False
+    # ADR 0196: set when open() failed to bind this store's salt into the cipher. That cipher may
+    # already count for another store, so close() must not settle its reserve here (BACKLOG #5720).
+    _cipher_foreign: bool = False
     backend = StoreBackend.POSTGRES
 
     #: Every (table, column) the store cipher covers — raw bodies plus the PHI-bearing nullable text
@@ -2226,7 +2230,11 @@ class PostgresStore:
                 # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
                 # reserved next and every value sealed after it land under this store's own data
                 # sub-key. A read-only handle seals nothing; every stored value names its own salt.
-                await bind_store_salt(store._cipher, store._ensure_store_salt)
+                try:
+                    await bind_store_salt(store._cipher, store._ensure_store_salt)
+                except BaseException:
+                    store._cipher_foreign = True  # close() must not settle it here (BACKLOG #5720)
+                    raise
                 # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the
                 # first block BEFORE anything on this handle encrypts — the at-rest migration below
                 # included, since on a store that is having a key enabled for the first time it is
@@ -2250,15 +2258,21 @@ class PostgresStore:
                 await (
                     store._load_reference_cache()
                 )  # populate the reference-snapshot read cache (ADR 0006)
-        except Exception:
-            # Don't leak the pool if first-open initialization fails (M-6). A cleanup that fails is
-            # logged by class, so it never replaces the open's own error (vault BACKLOG #3054).
-            try:
-                await pool.close()
-            except Exception as cleanup:
-                log.warning(
-                    "closing the pool after a failed open also failed (%s)", type(cleanup).__name__
-                )
+        except BaseException as exc:
+            # Don't leak the pool if first-open initialization fails (M-6), a cancel included, and
+            # settle the invocation block this open reserved rather than forfeit it: close() does
+            # both (BACKLOG #5720). A cleanup that fails is logged by class, so it never replaces
+            # the open's own error (vault BACKLOG #3054).
+            async def _cleanup() -> None:
+                try:
+                    await store.close()
+                except Exception as cleanup:
+                    log.warning(
+                        "closing the pool after a failed open also failed (%s)",
+                        type(cleanup).__name__,
+                    )
+
+            await run_open_cleanup(exc, _cleanup)
             raise
         return store
 
@@ -2895,7 +2909,8 @@ class PostgresStore:
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
         try:
-            if not self._read_only:  # #1780: a read-only handle reserved nothing to settle
+            # #1780: a read-only handle reserved nothing to settle; #5720: nor is a foreign one ours.
+            if not self._cipher_foreign and not self._read_only:
                 await self.checkpoint_cipher_invocations(settle=True)
         except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
             log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)

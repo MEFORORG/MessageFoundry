@@ -8102,6 +8102,63 @@ async def _await_connection_worker_exit(
         delay = 0.001 if delay == 0.0 else min(delay * 2.0, 0.05)
 
 
+#: Upper bound on :func:`run_open_cleanup`. The cleanup settles the invocation reserve and closes a
+#: pool, each sub-second when healthy; this only keeps a wedged close from holding a cancelled
+#: caller forever, the way an unshielded await could not.
+_OPEN_CLEANUP_TIMEOUT: Final[float] = 30.0
+
+#: Every cleanup :func:`run_open_cleanup` started, kept referenced until it finishes, so the loop
+#: cannot collect one it stopped waiting for.
+_OPEN_CLEANUPS: set[asyncio.Task[None]] = set()
+
+
+def _report_open_cleanup(task: asyncio.Task[None]) -> None:
+    """Drop a finished cleanup, and log by class only how it failed, if it did (vault #3054)."""
+    _OPEN_CLEANUPS.discard(task)
+    if task.cancelled():
+        log.warning("the cleanup after a failed store open was cancelled before it finished")
+    elif (failure := task.exception()) is not None:
+        log.warning("the cleanup after a failed store open failed (%s)", type(failure).__name__)
+
+
+async def run_open_cleanup(
+    failure: BaseException,
+    cleanup: Callable[[], Awaitable[None]],
+    *,
+    timeout: float = _OPEN_CLEANUP_TIMEOUT,
+) -> None:
+    """Run a failed store open's ``cleanup`` to completion, whatever reaches the caller meanwhile.
+
+    Shared by the three backends' ``open`` (BACKLOG #5720). The cleanup runs as its own task and
+    is waited on with :func:`asyncio.wait`, which never cancels what it waits on, so a cancel
+    delivered to the caller while it runs cannot cut a settlement or a pool close short. Such a
+    cancel is raised once the cleanup is done, chained to the open's own ``failure``, unless that
+    failure is itself a cancel; otherwise this returns, and the caller re-raises ``failure``.
+
+    The cleanup's own failure is logged by class only, so it never replaces the open's error
+    (vault BACKLOG #3054). Past ``timeout`` the cleanup is left running and logged."""
+    task: asyncio.Task[None] = asyncio.ensure_future(cleanup())
+    _OPEN_CLEANUPS.add(task)
+    task.add_done_callback(_report_open_cleanup)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    cancelled = False
+    while not task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            log.warning(
+                "the cleanup after a failed store open did not finish within %.0fs; left running",
+                timeout,
+            )
+            break
+        try:
+            await asyncio.wait({task}, timeout=remaining)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled and not isinstance(failure, asyncio.CancelledError):
+        raise asyncio.CancelledError from failure
+
+
 async def _close_snapshot_connection(conn: aiosqlite.Connection, role: str) -> None:
     """Close one of :meth:`MessageStore.snapshot_to`'s own connections and wait out its worker thread.
 
@@ -11283,26 +11340,38 @@ class MessageStore:
             if store._group_commit is not None:
                 store._group_commit.start()  # spin the committer coroutine (needs the running loop)
             return store
-        except BaseException:
+        except BaseException as exc:
             # Close the store when one was constructed — it owns the read pool's connections too,
             # each with its own worker thread — then the writer either way. `Connection.close` is
             # idempotent (it returns immediately once the connection is gone), so the second call
             # after a successful `store.close()` is a no-op. Both are best-effort: a failure while
             # cleaning up must never replace the error the caller needs to see.
-            if store is not None:
+            opened = store
+
+            async def _cleanup() -> None:
                 try:
-                    await store.close()
-                except Exception:  # noqa: BLE001 — cleanup must never mask the real failure
-                    log.warning("error closing a partially-opened store", exc_info=True)
-            try:
-                await db.close()
-                # `close` returns before the worker thread it stops has left `threading.enumerate()`
-                # (see :func:`_await_connection_worker_exit`). A failed open is the shortest path
-                # there is — one PRAGMA, then straight out — so the caller most often wins that race
-                # here, and the caller of a raising `open` is entitled to find nothing left behind.
-                await _await_connection_worker_exit(db)
-            except Exception:  # noqa: BLE001 — cleanup must never mask the real failure
-                log.warning("error closing the connection after a failed store open", exc_info=True)
+                    if opened is not None:
+                        try:
+                            await opened.close()
+                        except Exception:  # noqa: BLE001 — cleanup must never mask the real failure
+                            log.warning("error closing a partially-opened store", exc_info=True)
+                finally:
+                    try:
+                        await db.close()
+                        # `close` returns before the worker thread it stops has left
+                        # `threading.enumerate()` (see :func:`_await_connection_worker_exit`). A
+                        # failed open is the shortest path there is — one PRAGMA, then straight out
+                        # — so the caller most often wins that race here, and the caller of a
+                        # raising `open` is entitled to find nothing left behind.
+                        await _await_connection_worker_exit(db)
+                    except Exception:  # noqa: BLE001 — cleanup must never mask the real failure
+                        log.warning(
+                            "error closing the connection after a failed store open", exc_info=True
+                        )
+
+            # BACKLOG #5720: run to completion, so a cancel landing mid-cleanup cannot leave the
+            # writer's non-daemon worker thread behind. That cancel is raised once it is done.
+            await run_open_cleanup(exc, _cleanup)
             raise
 
     @classmethod
@@ -11417,10 +11486,13 @@ class MessageStore:
                 conn = await aiosqlite.connect(uri, uri=True)
             else:
                 conn = await aiosqlite.connect(path)
+            # Tracked BEFORE its first statement, so close() reaches it if a PRAGMA below raises:
+            # its worker thread is non-daemon, and an untracked one outlives the store (BACKLOG
+            # #5720). It joins the pool only once both PRAGMAs hold.
+            self._read_conns.append(conn)
             conn.row_factory = aiosqlite.Row
             await conn.execute("PRAGMA query_only=ON")  # defence in depth: a read conn never writes
             await conn.execute("PRAGMA busy_timeout=5000")
-            self._read_conns.append(conn)
             pool.put_nowait(conn)
         self._read_pool = pool
 
