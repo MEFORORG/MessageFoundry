@@ -3,12 +3,12 @@
 """BACKLOG #5908: the managed lifespan builds its two notifiers and the AuthService in a worker
 thread, so their blocking work does not stall the event loop during startup.
 
-The alert notifier's and the security notifier's factories read the SMTP password through the
-secret provider, a Vault read under [secrets]. The AuthService constructor resolves the directory
+The two notifier factories read at least the SMTP password through the secret provider, a Vault
+read under [secrets]. The AuthService constructor does at least these: resolves the directory
 secrets, loads the LDAPS and OIDC CA and CRL files, and checks a CA file's access control, which
 runs icacls on Windows. Each spy records the thread it ran on; the loop's own thread is the one
 this test runs on. A failure raised in the worker thread must still unwind what the lifespan
-opened, so the store and the alert notifier close as they did when the constructor ran inline.
+opened, so the store and the alert notifier close as they did when the build ran inline.
 """
 
 from __future__ import annotations
@@ -26,33 +26,49 @@ from messagefoundry.config.settings import AlertsSettings, AuthSettings, EgressS
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 from messagefoundry.store import open_store
 
+_SECURITY = "security_notifier_from_settings"
+_AUTH = "AuthService"
+
 
 class _Seen:
     def __init__(self) -> None:
         self.threads: dict[str, int] = {}
         self.store: Any = None
         self.store_closed = False
-        self.notifier: NotifierAlertSink | None = None
+        self.notifier: Any = None
+        # Set only by a close of a STARTED sink, so a never-started one cannot pass as drained.
+        self.notifier_drained = False
 
 
 def _app(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, seen: _Seen, *, auth_raises: bool = False
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, seen: _Seen, *, raises_in: str = ""
 ) -> Any:
+    def _probe(name: str) -> None:
+        seen.threads[name] = threading.get_ident()
+        if raises_in == name:
+            raise RuntimeError(f"PROBE: deliberate failure in {name}")
+
     def _notifier(*_args: Any, **_kwargs: Any) -> NotifierAlertSink:
         seen.threads["notifier_from_settings"] = threading.get_ident()
-        sink = NotifierAlertSink([])
+        sink: Any = NotifierAlertSink([])
+        real_aclose = sink.aclose
+
+        async def _aclose() -> None:
+            if sink._task is not None:
+                seen.notifier_drained = True
+            await real_aclose()
+
+        sink.aclose = _aclose
         seen.notifier = sink
         return sink
 
     def _security_notifier(*_args: Any, **_kwargs: Any) -> None:
-        seen.threads["security_notifier_from_settings"] = threading.get_ident()
+        _probe(_SECURITY)
         return None
 
     class _SpyAuthService(AuthService):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
-            seen.threads["AuthService"] = threading.get_ident()
-            if auth_raises:
-                raise RuntimeError("PROBE: deliberate AuthService constructor failure")
+            _probe(_AUTH)
             super().__init__(*args, **kwargs)
 
     async def _open(*args: Any, **kwargs: Any) -> Any:
@@ -81,47 +97,51 @@ def _app(
     )
 
 
+async def _close_leftovers(seen: _Seen) -> None:
+    # Red, the lifespan left these open; close them so the test process can still exit.
+    if seen.notifier is not None and seen.notifier._task is not None:
+        await seen.notifier.aclose()
+    if seen.store is not None and not seen.store_closed:
+        await seen.store.close()
+
+
 async def test_the_lifespan_builds_both_notifiers_and_the_auth_service_off_the_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     seen = _Seen()
     app = _app(tmp_path, monkeypatch, seen)
     loop_thread = threading.get_ident()
-    async with app.router.lifespan_context(app):
-        # The control: every spy ran, so an absent entry cannot pass as off the loop.
-        assert set(seen.threads) == {
-            "notifier_from_settings",
-            "security_notifier_from_settings",
-            "AuthService",
-        }
-        on_loop = sorted(name for name, ident in seen.threads.items() if ident == loop_thread)
-        assert not on_loop, f"built on the event loop's thread: {on_loop}"
-        # start() stays on the loop: the notifier built in the thread is the one running.
-        assert seen.notifier is not None and seen.notifier._task is not None
-    assert seen.store_closed
+    try:
+        async with app.router.lifespan_context(app):
+            # The control: every spy ran, so an absent entry cannot pass as off the loop.
+            assert set(seen.threads) == {"notifier_from_settings", _SECURITY, _AUTH}
+            on_loop = sorted(name for name, ident in seen.threads.items() if ident == loop_thread)
+            assert not on_loop, f"built on the event loop's thread: {on_loop}"
+            # start() stays on the loop: the notifier built in the thread is the one running.
+            assert seen.notifier is not None and seen.notifier._task is not None
+        assert seen.store_closed
+    finally:
+        await _close_leftovers(seen)
 
 
-async def test_a_raise_in_the_threaded_auth_service_constructor_closes_the_store_and_notifier(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("raises_in", [_SECURITY, _AUTH])
+async def test_a_raise_in_a_threaded_build_closes_the_store_and_notifier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raises_in: str
 ) -> None:
     seen = _Seen()
-    app = _app(tmp_path, monkeypatch, seen, auth_raises=True)
+    app = _app(tmp_path, monkeypatch, seen, raises_in=raises_in)
     try:
-        with pytest.raises(RuntimeError, match="PROBE: deliberate AuthService constructor"):
+        with pytest.raises(RuntimeError, match=f"PROBE: deliberate failure in {raises_in}"):
             async with app.router.lifespan_context(app):
                 pytest.fail("startup should have failed")
-        # The control: the probe ran, after the store opened.
-        assert "AuthService" in seen.threads
+        # The controls: the probe ran in a worker thread, after the store opened.
+        assert seen.threads[raises_in] != threading.get_ident()
         assert seen.store is not None
         assert seen.store_closed, "the store was left open"
-        assert seen.notifier is not None and seen.notifier._task is None, (
-            "the alert notifier's drain task was left running"
-        )
+        assert seen.notifier_drained, "the alert notifier was never started and drained"
+        assert seen.notifier._task is None, "the alert notifier's drain task was left running"
     finally:
-        if seen.notifier is not None and seen.notifier._task is not None:
-            await seen.notifier.aclose()
-        if seen.store is not None and not seen.store_closed:
-            await seen.store.close()
+        await _close_leftovers(seen)
 
 
 async def test_a_value_error_from_the_threaded_notifier_factory_still_refuses_the_start(

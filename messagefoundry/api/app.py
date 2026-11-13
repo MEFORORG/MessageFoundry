@@ -12530,8 +12530,10 @@ def create_managed_app(
                 "the start. Until then a rule that sent only by email uses the other transports, "
                 "or the log when there are none."
             )
-        # BACKLOG #5908: built in a worker thread, since the factory reads the SMTP password through
-        # the secret provider (a Vault read, under [secrets]). start() stays on the loop below.
+        # BACKLOG #5908: built in a worker thread, since the factory blocks on at least the SMTP
+        # password read through the secret provider (a Vault read, under [secrets]). Nothing of
+        # this lifespan's is running yet, but a blocked loop cannot take uvicorn's stop signal.
+        # start() stays on the loop below.
         try:
             notifier = (
                 await asyncio.to_thread(
@@ -13072,10 +13074,12 @@ def create_managed_app(
                 # in the finally below, before engine.stop() closes the store it records in).
                 # BACKLOG #5908: this factory and the AuthService constructor below run in a worker
                 # thread, so the event loop already running the store and the alert notifier is not
-                # blocked. The factory reads the SMTP password through the secret provider. The
-                # constructor resolves the directory secrets, loads the LDAPS and OIDC CA and CRL
-                # files, and checks a CA file's access control, which runs icacls on Windows. A
-                # raise from either reaches the teardown below, as it did when they ran inline.
+                # blocked. The factory reads at least the SMTP password through the secret provider.
+                # The constructor does at least these: resolves the directory secrets, loads the
+                # LDAPS and OIDC CA and CRL files, and checks a CA file's access control, which runs
+                # icacls on Windows. A raise from either reaches the teardown below, as it did when
+                # they ran inline. A cancel does too, while the thread runs on to its own end: the
+                # work was never cancellable midway, and inline it held the loop instead.
                 if auth_settings.notify_security_events and alerts_settings is not None:
                     security_notifier = await asyncio.to_thread(
                         security_notifier_from_settings,
@@ -13087,7 +13091,10 @@ def create_managed_app(
                         posture=_hop_posture,
                     )
                 # A lambda rather than to_thread(AuthService, ...), so the call stays an AuthService
-                # call the census tests find, with its keywords.
+                # call the census tests find, with its keywords. EVERY ARGUMENT BELOW IS EVALUATED IN
+                # THE WORKER THREAD: anything that needs the running loop (get_running_loop,
+                # create_task) is bound above, on the loop, and passed in by name.
+                alert_sink = notifier or LoggingAlertSink()
                 auth = await asyncio.to_thread(
                     lambda: AuthService(
                         store,
@@ -13108,28 +13115,22 @@ def create_managed_app(
                         hop_posture=_hop_posture,
                         # BACKLOG #2592: an authority row that fails its integrity seal is denied
                         # and raises integrity_drift on the same sink the cipher refusal uses.
-                        integrity_alert=authority_seal_alert(notifier or LoggingAlertSink()),
+                        integrity_alert=authority_seal_alert(alert_sink),
                         # Vault BACKLOG #3229: a directory role change that leaves no enabled
                         # Administrator is applied, and raises no_enabled_administrator here.
-                        admin_loss_alert=no_enabled_administrator_alert(
-                            notifier or LoggingAlertSink()
-                        ),
+                        admin_loss_alert=no_enabled_administrator_alert(alert_sink),
                         # Vault BACKLOG #3141: a reconcile pass that newly grants Administrator
                         # raises administrator_granted here, as a directory sign-in does in its
                         # route.
                         admin_grant_alert=administrator_granted_alert(
-                            notifier or LoggingAlertSink(), granted_by=DIRECTORY_GRANTED_BY
+                            alert_sink, granted_by=DIRECTORY_GRANTED_BY
                         ),
                         # BACKLOG #3965: the step-up return audit budget's all-callers backstop
                         # pages audit_write_failed here when it stops a row, at most once a window.
-                        step_up_return_audit_alert=step_up_return_audit_alert(
-                            notifier or LoggingAlertSink()
-                        ),
+                        step_up_return_audit_alert=step_up_return_audit_alert(alert_sink),
                         # BACKLOG #2221: a directory sign-in's role-sync row refused twice pages
                         # audit_write_failed here.
-                        sign_in_audit_alert=directory_sign_in_audit_alert(
-                            notifier or LoggingAlertSink()
-                        ),
+                        sign_in_audit_alert=directory_sign_in_audit_alert(alert_sink),
                         # BACKLOG #3937: the relying party a passkey must be under to count as a way
                         # past the sign-in lock at the factor-drop gates; None counts none.
                         way_past_rp_id=configured_rp_id(public_origin),
