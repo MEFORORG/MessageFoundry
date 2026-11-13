@@ -205,26 +205,33 @@ async def test_both_tcp_send_paths_refuse_before_any_dial(
 # --- rule 2: a leaf write never emits a raw control character -----------------------------------
 
 
-# The rule 2 probes copy a component: copy_field reads its decoded value and writes it back as data,
-# so the write has to hex-escape the control again. convert_case no longer exercises that, because
-# it keeps an escape as sent and never hands escape_leaf a decoded control (BACKLOG #5928).
+def _write_back_decoded(msg: Message, src: str, dst: str) -> None:
+    """The AC-5 edits that hand the leaf escaper a decoded control (ADR 0205, AC-5 note of
+    2026-11-13): ``copy_field`` from a component, then a component write of the decoded read back
+    onto ``src`` itself, which rule 2 governs whatever an action's design."""
+    actions.copy_field(msg, src, dst)
+    msg.set(src, msg.field(src) or "")
 
 
 def test_P2_a_hex_escaped_frame_byte_survives_a_component_edit_escaped() -> None:
     msg = Message.parse(MSH + CR + "PID|1||111^^^MRN||doe" + HEX_EB_SB + "x^jane" + CR)
-    actions.copy_field(msg, "PID-5.1", "PID-5.3")
+    actions.convert_case(msg, "PID-5.1", "upper")
+    assert _pid5(msg) == "DOE" + HEX_EB_SB + "X^jane"
+    _write_back_decoded(msg, "PID-5.1", "PID-5.3")
     encoded = msg.encode()
     assert SB not in encoded and EB not in encoded
-    assert _pid5(msg) == "doe" + HEX_EB_SB + "x^jane^doe" + HEX_EB_SB + "x"
+    assert _pid5(msg) == "DOE" + HEX_EB_SB + "X^jane^DOE" + HEX_EB_SB + "X"
     # The read side still decodes it, so the round trip is faithful rather than lossy.
-    assert msg.field("PID-5.3") == "doe" + EB + SB + "x"
+    assert msg.field("PID-5.1") == msg.field("PID-5.3") == "DOE" + EB + SB + "X"
 
 
 def test_P2_a_hex_escaped_nul_does_not_re_enter_raw() -> None:
     msg = Message.parse(MSH + CR + "PID|1||111||doe" + BS + "X00" + BS + "^jane" + CR)
-    actions.copy_field(msg, "PID-5.1", "PID-5.3")
+    actions.convert_case(msg, "PID-5.1", "upper")
     assert NUL not in msg.encode()
-    assert msg.field("PID-5.3") == "doe" + NUL
+    _write_back_decoded(msg, "PID-5.1", "PID-5.3")
+    assert NUL not in msg.encode()
+    assert msg.field("PID-5.1") == msg.field("PID-5.3") == "DOE" + NUL
 
 
 def test_P2_control_a_decoded_cr_is_still_refused() -> None:
@@ -234,13 +241,11 @@ def test_P2_control_a_decoded_cr_is_still_refused() -> None:
     actions.convert_case(msg, "PID-5.1", "upper")
     assert _pid5(msg) == "DOE" + BS + "X0D" + BS + "EVN^jane"
     assert [line[:3] for line in msg.encode().split(CR) if line] == ["MSH", "PID"]
-    # The control: a decoded CR written back as data is still refused, by a component write and by
-    # replace_literal when a match would write its new text, and the message is left unchanged.
+    # The control (ADR 0205, AC-6 note): a CR written back as data is still refused and the message
+    # is left unchanged, whether the CR is literal or decoded from the message's own \X0D\.
     before = msg.encode()
     with pytest.raises(ValueError, match="segment separator"):
         msg.set("PID-5.1", "doe" + CR + "EVN")
-    # A CR decoded from the message itself, not only a literal one: copy_field reads the \X0D\ in
-    # PID-5.1 as a CR and writes it back as data, so that write refuses it too.
     assert msg.field("PID-5.1") == "DOE" + CR + "EVN"
     with pytest.raises(ValueError, match="segment separator"):
         actions.copy_field(msg, "PID-5.1", "PID-5.3")
@@ -261,8 +266,8 @@ def test_P10_mllp_in_edit_mllp_out_is_one_frame() -> None:
     )
     assert len(_frames(MLLP_CODEC, MLLP_CODEC.frame(Message.parse(body).encode()))) == 1
     msg = Message.parse(body)
-    actions.copy_field(msg, "PID-18.1", "PID-19.1")
-    assert msg.field("PID-19.1") == "last" + EB + SB
+    _write_back_decoded(msg, "PID-18.1", "PID-19.1")
+    assert msg.field("PID-18.1") == msg.field("PID-19.1") == "last" + EB + SB
     assert len(_frames(MLLP_CODEC, MLLP_CODEC.frame(msg.encode()))) == 1
 
 

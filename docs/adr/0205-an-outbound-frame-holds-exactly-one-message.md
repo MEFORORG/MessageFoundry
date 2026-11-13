@@ -195,12 +195,14 @@ separators raw).
   -> `tests/test_one_frame_one_message.py::test_P2_a_hex_escaped_frame_byte_survives_a_component_edit_escaped`,
   `tests/test_one_frame_one_message.py::test_P2_a_hex_escaped_nul_does_not_re_enter_raw`,
   `tests/test_one_frame_one_message.py::test_P10_mllp_in_edit_mllp_out_is_one_frame`
-  *(Note 2026-11-13, vault BACKLOG #5928: the three probes now edit with `copy_field` from a
-  component, which reads the decoded value and writes it back as data, so the write passes the
-  decoded control through the leaf escaper. They used `convert_case`, which now keeps an escape
-  as sent and never hands the escaper a decoded control, so a change that stopped it hex-escaping
-  controls passed them. With `copy_field`, that change turns all three red. The criterion is
-  unchanged.)*
+  *(Note 2026-11-13, vault BACKLOG #5928: `convert_case` keeps an escape as sent, so it does not
+  hand the leaf escaper a control decoded from one. The first two probes still check that it
+  keeps the hex escape. Each probe then writes the decoded value back as data twice: with
+  `copy_field` from the escaped component into another one, and with a component `msg.set` of the
+  decoded read onto the component that arrived with the escape. The second write does not depend
+  on how any action is built. With escaping of controls removed from `escape_leaf`, all three
+  probes fail, measured on 2026-11-13; their new bodies were not re-measured against `ed2b60bf89`.
+  The criterion is unchanged.)*
 - **AC-6** -- WHEN a leaf write holds a C0 character or DEL other than TAB, THE SYSTEM SHALL write it
   as a hex escape in all three leaf escapers, and SHALL keep refusing CR and LF.
   -> `tests/test_one_frame_one_message.py::test_every_leaf_escaper_hex_escapes_c0_and_del_except_tab`,
