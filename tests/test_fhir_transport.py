@@ -43,6 +43,7 @@ from messagefoundry.transports.fhir import (
     _classify_fhir,
     _resolve_read_url,
 )
+from messagefoundry.transports.rest import MAX_OUTBOUND_HEADER_VALUE_LEN, MAX_OUTBOUND_URL_LEN
 
 BASE = "https://fhir.example.org/fhir"
 PATIENT = as_json(PATIENT_R4B)  # id "synthetic-001", no meta.versionId
@@ -302,6 +303,96 @@ def test_clean_conditional_query_still_constructs() -> None:  # #1241
     """Positive control for the screen: it must admit what it is not screening for."""
     d = _dest(conditional="if-none-exist", conditional_query="identifier=http://h|123")
     assert d.conditional_query == "identifier=http://h|123"
+
+
+# BACKLOG #5911: a static conditional_query its sink can never send is the connection's fault, so
+# it fails construction instead of dead-lettering every message on the lane.
+
+# A URL-form query whose shortest URL, a one-letter resourceType, is exactly at the limit.
+_AT_LIMIT_QUERY = "a=" + "x" * (MAX_OUTBOUND_URL_LEN - len(BASE) - len("/X?") - 2)
+_OVER_HEADER_LIMIT_QUERY = "a=" + "x" * (MAX_OUTBOUND_HEADER_VALUE_LEN - 1)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "identifier=sys|a b",  # a space: http.client refuses it in the request line
+        "identifier=sys|\u00e9",  # non-ASCII, though Latin-1
+        "identifier=sys|\u2603",  # non-Latin-1
+        "identifier=sys|a\u00a0b",  # a non-ASCII space
+    ],
+)
+def test_url_form_conditional_query_refused_at_construction(value: str) -> None:
+    with pytest.raises(ValueError, match="conditional_query") as ei:
+        _dest(conditional="conditional-update", conditional_query=value)
+    assert value not in str(ei.value)
+
+
+def test_url_form_oversized_conditional_query_refused_at_construction() -> None:
+    with pytest.raises(ValueError, match=f"over the {MAX_OUTBOUND_URL_LEN}-char limit"):
+        _dest(conditional="conditional-update", conditional_query=_AT_LIMIT_QUERY + "x")
+
+
+def test_url_form_query_at_the_lower_bound_constructs() -> None:
+    d = _dest(conditional="conditional-update", conditional_query=_AT_LIMIT_QUERY)
+    assert len(f"{BASE}/X?{_AT_LIMIT_QUERY}") == MAX_OUTBOUND_URL_LEN
+    assert d.conditional_query == _AT_LIMIT_QUERY
+
+
+def test_url_form_long_resource_type_stays_a_per_message_refusal() -> None:
+    # The construction check is a lower bound only: a long resourceType that pushes a legal query
+    # over the limit is the message's fault, and stays a permanent per-message refusal.
+    dest = _dest(conditional="conditional-update", conditional_query=_AT_LIMIT_QUERY)
+    dest._opener = _FakeOpener()  # type: ignore[assignment]
+    body = json.dumps({"resourceType": "Patientt", "id": "p-1"})
+    with pytest.raises(NegativeAckError) as ei:
+        dest._exchange(body, dest._resolve_request(body), {})
+    assert ei.value.permanent is True
+    assert ei.value.code == "MF-URI-LEN"
+    assert not ei.value.config_fault
+
+
+@pytest.mark.parametrize("value", ["identifier=sys|a b", "identifier=sys|\u00e9"])
+def test_header_form_admits_a_space_and_latin_1(value: str) -> None:
+    # The If-None-Exist header is Latin-1 and a space is legal in a header value.
+    dest = _dest(conditional="if-none-exist", conditional_query=value)
+    assert dest._resolve_request(PATIENT).headers == {"If-None-Exist": value}
+
+
+def test_header_form_non_latin_1_refused_at_construction() -> None:
+    with pytest.raises(ValueError, match="Latin-1") as ei:
+        _dest(conditional="if-none-exist", conditional_query="identifier=sys|\u2603")
+    assert ei.value.__context__ is None  # no UnicodeEncodeError carrying the value
+
+
+def test_header_form_oversized_conditional_query_refused_at_construction() -> None:
+    with pytest.raises(ValueError, match="If-None-Exist header limit"):
+        _dest(conditional="if-none-exist", conditional_query=_OVER_HEADER_LIMIT_QUERY)
+
+
+def test_if_none_exist_overflow_at_send_is_not_charged_to_the_message() -> None:
+    # The value is the connector's own, so past construction (here forced) an overflow is not a
+    # permanent per-message refusal.
+    dest = _dest(conditional="if-none-exist", conditional_query="a=b")
+    dest._opener = _FakeOpener()  # type: ignore[assignment]
+    dest.conditional_query = _OVER_HEADER_LIMIT_QUERY
+    request = dest._resolve_request(PATIENT)
+    with pytest.raises(DeliveryError) as ei:
+        dest._exchange(PATIENT, request, dict(request.headers))
+    assert not isinstance(ei.value, NegativeAckError)
+    assert dest._opener.requests == []  # type: ignore[attr-defined]
+
+
+def test_handler_header_overflow_beside_if_none_exist_stays_permanent() -> None:
+    # Only the connector's own name leaves the message-derived set.
+    dest = _dest(conditional="if-none-exist", conditional_query="a=b")
+    dest._opener = _FakeOpener()  # type: ignore[assignment]
+    request = dest._resolve_request(PATIENT)
+    big = "x" * (MAX_OUTBOUND_HEADER_VALUE_LEN + 1)
+    with pytest.raises(NegativeAckError) as ei:
+        dest._exchange(PATIENT, request, {"X-Big": big, **request.headers})
+    assert ei.value.permanent is True
+    assert dest._opener.requests == []  # type: ignore[attr-defined]
 
 
 def test_base_url_control_char_is_refused_at_construction() -> None:  # #1241
