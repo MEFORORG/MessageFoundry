@@ -315,28 +315,7 @@ async def test_edit_resend_direct_redirects_to_origin(engine: Engine, tmp_path: 
     # outbound and lands back on the ORIGIN (which now carries the new outbound row). The shared engine
     # handler validates `to` against the registry + running state, so this path needs a started
     # pipeline with OB2 registered.
-    for d in ("in", "o2"):
-        (tmp_path / d).mkdir(exist_ok=True)
-    reg = Registry()
-    reg.add_inbound(
-        InboundConnection(
-            "in1",
-            ConnectionSpec(
-                ConnectorType.FILE,
-                {"directory": str(tmp_path / "in"), "pattern": "*.hl7", "poll_seconds": 0.05},
-            ),
-            router="r",
-        )
-    )
-    reg.add_outbound(
-        OutboundConnection(
-            "OB2", ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / "o2")})
-        )
-    )
-    reg.add_router("r", lambda m: ["h"])
-    reg.add_handler("h", lambda m: Send("OB2", m))
-    engine.add_registry(reg)
-    await engine.start()
+    await _started_direct_engine(engine, tmp_path)
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     mid = await _seed(engine)
@@ -380,6 +359,140 @@ async def test_edit_resend_direct_missing_to_rejects_generic(engine: Engine) -> 
         assert "choose an outbound connection" in r.text
         assert 'value="direct" checked' in r.text  # the direct radio stays selected
         assert '"input"' not in r.text  # never a pydantic structured echo
+
+
+# BACKLOG #5930. A browser submits a textarea's line breaks as CRLF whatever the rendered text held,
+# so the editor renders the original's terminator style as an allowlisted hidden field and the route
+# restores it before resubmitting. The re-route of an HL7 body is already CR-normalised by the
+# ingress guards, so these aim at the DIRECT path, which writes the edited body as given, and at an
+# LF-only payload that is not HL7.
+
+#: A synthetic JSON body whose lines end in LF only.
+_LF_JSON = '{\n  "id": "1",\n  "kind": "test"\n}\n'
+_LF_JSON_EDITED = '{\n  "id": "2",\n  "kind": "test"\n}\n'
+
+
+async def _started_direct_engine(engine: Engine, tmp_path: Path) -> None:
+    for d in ("in", "o2"):
+        (tmp_path / d).mkdir(exist_ok=True)
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "in1",
+            ConnectionSpec(
+                ConnectorType.FILE,
+                {"directory": str(tmp_path / "in"), "pattern": "*.hl7", "poll_seconds": 0.05},
+            ),
+            router="r",
+        )
+    )
+    reg.add_outbound(
+        OutboundConnection(
+            "OB2", ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / "o2")})
+        )
+    )
+    reg.add_router("r", lambda m: ["h"])
+    reg.add_handler("h", lambda m: Send("OB2", m))
+    engine.add_registry(reg)
+    await engine.start()
+
+
+async def _direct_resend_body(
+    engine: Engine, tmp_path: Path, *, original: str, form: dict[str, str]
+) -> str:
+    """POST ``form`` to the direct edit-resend of a message seeded with ``original``, and return the
+    body the new message row stored."""
+    await _started_direct_engine(engine, tmp_path)
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed(engine, raw=original)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        await _mint_action(c, f"/ui/messages/{mid}/edit")
+        r = await c.post(
+            f"/ui/messages/{mid}/edit-resend",
+            data={"idempotency_key": "k1", "mode": "direct", "to": "OB2", **form},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 303
+    [rec] = [a for a in await engine.store.list_audit() if a["action"] == "message_edit_resend"]
+    child = await engine.store.get_message(json.loads(str(rec["detail"]))["new_message_id"])
+    assert child is not None
+    return str(child["raw"])
+
+
+async def test_edit_page_renders_the_original_terminator_style(engine: Engine) -> None:
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    cr_mid = await _seed(engine)
+    lf_mid = await _seed(engine, raw=_LF_JSON, control_id="J1")
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        pages = []
+        for mid in (cr_mid, lf_mid):
+            await _mint_action(c, f"/ui/messages/{mid}/edit")  # the grant is bound to one path
+            r = await c.get(f"/ui/messages/{mid}/edit")
+            assert r.status_code == 200
+            pages.append(r.text)
+        cr_page, lf_page = pages
+    assert 'name="eol" value="cr"' in cr_page
+    assert 'name="eol" value="lf"' in lf_page
+
+
+async def test_direct_edit_resend_restores_cr_terminators(engine: Engine, tmp_path: Path) -> None:
+    submitted = EDITED.replace("\r", "\r\n")  # what the browser sends for the CR original
+    stored = await _direct_resend_body(
+        engine, tmp_path, original=ADT, form={"raw": submitted, "eol": "cr"}
+    )
+    assert stored == EDITED
+
+
+async def test_direct_edit_resend_restores_lf_terminators_of_a_non_hl7_body(
+    engine: Engine, tmp_path: Path
+) -> None:
+    submitted = _LF_JSON_EDITED.replace("\n", "\r\n")
+    stored = await _direct_resend_body(
+        engine, tmp_path, original=_LF_JSON, form={"raw": submitted, "eol": "lf"}
+    )
+    assert stored == _LF_JSON_EDITED
+
+
+async def test_direct_edit_resend_keeps_crlf_terminators(engine: Engine, tmp_path: Path) -> None:
+    crlf = EDITED.replace("\r", "\r\n")
+    stored = await _direct_resend_body(
+        engine, tmp_path, original=ADT.replace("\r", "\r\n"), form={"raw": crlf, "eol": "crlf"}
+    )
+    assert stored == crlf
+
+
+def test_terminator_style_is_named_only_for_a_single_style() -> None:
+    from messagefoundry_webconsole.pages.messages import _eol_style, restore_eol
+
+    assert [_eol_style(s) for s in ("a\rb\r", "a\nb", "a\r\nb\r\n")] == ["cr", "lf", "crlf"]
+    # No break, or a mix, names no style: there is nothing single to restore.
+    assert _eol_style("MSH|^~\\&|S") is None
+    assert _eol_style("a\rb\nc") is None
+    assert _eol_style("a\r\nb\rc") is None
+    assert restore_eol("a\r\nb\rc\n", "cr") == "a\rb\rc\r"
+    assert restore_eol("a\r\nb\rc\n", "crlf") == "a\r\nb\r\nc\r\n"
+    assert restore_eol("a\r\nb", "nel") is None
+
+
+async def test_edit_resend_refuses_an_unlisted_terminator_style(engine: Engine) -> None:
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        await _mint_action(c, f"/ui/messages/{mid}/edit")
+        r = await c.post(
+            f"/ui/messages/{mid}/edit-resend",
+            data={"raw": EDITED, "idempotency_key": "k1", "mode": "reroute", "eol": "nel"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 400
+        assert "invalid input" in r.text
+    assert await engine.store.count_messages(allowed_channels=None) == 1  # nothing resubmitted
 
 
 async def test_edit_resend_phi_safe_reject_no_pydantic_echo(engine: Engine) -> None:

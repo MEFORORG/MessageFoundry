@@ -1582,12 +1582,21 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def _resubmit_form(request: Request) -> dict[str, str]:
         """The urlencoded resubmit form, parsed once per request and kept in the ASGI scope for the
         gate's repeat check and the route alike. Stdlib, because the engine has no
-        python-multipart dependency, so ``request.form()`` would fail."""
+        python-multipart dependency, so ``request.form()`` would fail.
+
+        The submitted body's line breaks are rewritten here to the original's terminator style, the
+        ``eol`` field the editor rendered (BACKLOG #5930), so the repeat key and the spend key both
+        hash the body that is resubmitted. An ``eol`` that ``pages.restore_eol`` does not know
+        leaves the body as sent, and the route refuses it."""
         cache = request.scope.setdefault("mf_2625", {})
         cached = cache.get("form")
         if isinstance(cached, dict):
             return cached
         form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
+        if "eol" in form and "raw" in form:
+            restored = pages.restore_eol(form["raw"], form["eol"])
+            if restored is not None:
+                form["raw"] = restored
         cache["form"] = form
         return form
 
@@ -1663,6 +1672,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 status_code=400,
             )
 
+        if form.get("eol", "") not in ("", *pages.EDIT_EOL_TERMINATORS):
+            # Only the editor's fixed set restores terminators (BACKLOG #5930); anything else
+            # is refused rather than resubmitted with line breaks nobody chose.
+            return await _reject("invalid input")
         if mode == "direct" and not to:
             return await _reject(
                 "choose an outbound connection for a direct send, or re-route instead"

@@ -10,6 +10,8 @@ markup.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, TypedDict
 from urllib.parse import urlencode
 
@@ -26,6 +28,7 @@ from ._common import _pager, _refilled_field_value, _reveal_cell, _seg
 from .approvals import approvals_link
 
 __all__ = [
+    "EDIT_EOL_TERMINATORS",
     "dead_letter_pending",
     "dead_letters",
     "message_detail",
@@ -35,6 +38,7 @@ __all__ = [
     "message_resend_unknown",
     "message_search",
     "messages",
+    "restore_eol",
     "parse_tree_page",
     "parse_tree_too_large",
     "parse_tree_unavailable",
@@ -51,6 +55,36 @@ RESEND_TAIL_WARNING = (
     "A resend is queued at the END of the destination lane. It may therefore be delivered after "
     "newer messages for the same partner that are already queued to that lane."
 )
+
+
+#: The segment terminator styles the edit-and-resubmit form may ask the route to restore (BACKLOG
+#: #5930). A browser submits every line break in a ``<textarea>`` as CRLF, whatever the rendered text
+#: held, so a CR-terminated HL7 body or an LF-only payload would come back with its terminators
+#: changed. The editor renders the original's style as the hidden ``eol`` field, and the route
+#: rewrites the submitted line breaks to it. Only these keys are accepted; the route refuses any
+#: other value.
+EDIT_EOL_TERMINATORS: Mapping[str, str] = MappingProxyType({"cr": "\r", "lf": "\n", "crlf": "\r\n"})
+
+
+def _eol_style(raw: str) -> str | None:
+    """The one terminator style ``raw`` uses, or None when it has no line break or mixes styles.
+
+    None renders no ``eol`` field, so the route resubmits the line breaks as the browser sent them:
+    a mixed body has no single style to restore, and guessing one would rewrite its bytes."""
+    crlf = raw.count("\r\n")
+    counts = {"crlf": crlf, "cr": raw.count("\r") - crlf, "lf": raw.count("\n") - crlf}
+    used = [style for style, n in counts.items() if n]
+    return used[0] if len(used) == 1 else None
+
+
+def restore_eol(raw: str, eol: str) -> str | None:
+    """``raw`` with every line break, of any style, rewritten to the ``eol`` style, or None when
+    ``eol`` is not a key of :data:`EDIT_EOL_TERMINATORS` (the route refuses that)."""
+    terminator = EDIT_EOL_TERMINATORS.get(eol)
+    if terminator is None:
+        return None
+    lf = raw.replace("\r\n", "\n").replace("\r", "\n")
+    return lf if terminator == "\n" else lf.replace("\n", terminator)
 
 
 class _MsgFilterValues(TypedDict):
@@ -742,9 +776,12 @@ def message_edit(
 
     The edited body is attacker-influenced HL7 rendered as escaped ``<textarea>`` text (never markup);
     ``idempotency_key`` is a fresh per-open token so a double-submit of this form is an idempotent no-op.
-    ``original`` is the stored body from the engine's audited body fetch (BACKLOG #2345).
+    ``original`` is the stored body from the engine's audited body fetch (BACKLOG #2345). Its
+    terminator style rides in the hidden ``eol`` field, for the route to restore (BACKLOG #5930).
     """
     shown = original if raw_value is None else raw_value
+    eol = _eol_style(original)
+    eol_field = el("input", type="hidden", name="eol", value=eol) if eol is not None else Markup("")
     is_direct = mode == "direct"
     err = el("p", text(error), class_="banner") if error else Markup("")
     # data-original carries the PRISTINE copy for the client-side Revert; the badge/Revert/Resubmit
@@ -813,6 +850,7 @@ def message_edit(
     form = el(
         "form",
         el("input", type="hidden", name="idempotency_key", value=idempotency_key),
+        eol_field,
         dest,
         editor,
         el(
