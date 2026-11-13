@@ -6945,6 +6945,27 @@ def _audit_tag_ok(epoch: AuditEpoch, secret: tuple[bytes | None, AuditMacFn | No
     return hmac.compare_digest(audit_mac_bytes(epoch.handover), audit_mac_bytes(expected))
 
 
+def _handover_tag_ok(
+    epoch: AuditEpoch, secret: tuple[bytes | None, AuditMacFn | None], seq: object
+) -> bool:
+    """:func:`_audit_tag_ok` for the range row at ``seq``, in the chain walk and at store open
+    alike. A provider reply that is a non-empty string but no well-formed MAC
+    (:class:`~messagefoundry.store.crypto.AuditMacMalformedError`) is logged and read as a tag that
+    does not match, as a forged tag is: a break in the walk, and at open a logged ERROR on a store
+    that opens with its ranges untrusted, so ``audit-verify`` can still report the break (BACKLOG
+    #8222). Any other provider failure propagates."""
+    try:
+        return _audit_tag_ok(epoch, secret)
+    except AuditMacMalformedError as exc:
+        log.warning(
+            "the MAC provider answered the handover tag of the audit key-range row at seq=%s with "
+            "no well-formed MAC; read as a tag that does not match: %s",
+            seq,
+            exc,
+        )
+        return False
+
+
 #: Why a keyed process reports a chain with no genesis row at sequence number 1.
 _AUDIT_NO_GENESIS: Final = (
     "the chain does not open with a genesis row naming its key; a store that holds a key requires "
@@ -7254,21 +7275,7 @@ def verify_audit_rows(
                 )
             )
         out_secret = _audit_secret_for(outgoing, mac_keys, mac_fn)
-        tag_ok = True
-        if out_secret is not None:
-            # A reply that is no well-formed MAC is a tag that does not match, a break here, never
-            # a walk that could not run (BACKLOG #8222). The store open does not catch it.
-            try:
-                tag_ok = _audit_tag_ok(epoch, out_secret)
-            except AuditMacMalformedError as exc:
-                log.warning(
-                    "the MAC provider answered the handover tag of the audit key-range row at "
-                    "seq=%d with no well-formed MAC; read as a break at that row: %s",
-                    pos,
-                    exc,
-                )
-                tag_ok = False
-        if not tag_ok:
+        if out_secret is not None and not _handover_tag_ok(epoch, out_secret, pos):
             breaks.append(
                 (
                     pos,
@@ -7574,7 +7581,7 @@ async def settle_audit_ranges(
                 problem = f"the audit key-range row at seq={seq} {refusal}"  # BACKLOG #3420
                 break
             out_secret = _audit_secret_for(current, keys, host._audit_mac_fn)
-            if out_secret is not None and not _audit_tag_ok(parsed, out_secret):
+            if out_secret is not None and not _handover_tag_ok(parsed, out_secret, seq):
                 problem = (
                     f"the audit key-range row at seq={seq} is not authorised by the key it closes"
                 )

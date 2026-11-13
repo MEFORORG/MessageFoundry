@@ -678,9 +678,9 @@ class AuditMacMalformedError(CipherError):
     well-formed MAC, such as a Transit reply naming no key version (BACKLOG #8222).
 
     Its caller decides what that means. Appending a row refuses it, so no malformed MAC is written.
-    The chain walk's check of a range row's handover tag reads it as a tag that does not match, a
-    break at that row, as it read such a reply before engine PR 2903; the store open does not
-    catch it, so the open fails."""
+    The check of a range row's handover tag, in the chain walk and at store open, reads it as a tag
+    that does not match, as it read such a reply before engine PR 2903: a break in the walk, and a
+    logged ERROR on a store that opens with its ranges untrusted."""
 
 
 class AuditKeyVersionRefusedError(CipherError):

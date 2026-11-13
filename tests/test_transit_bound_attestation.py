@@ -1042,10 +1042,10 @@ def _status_error(status: int) -> Exception:
 def test_a_timeout_on_one_rows_verify_could_not_run_though_the_fixed_input_verifies(
     status: int,
 ) -> None:
-    """A 504 or 408 on one row's verify, though the verify over fixed input would succeed, is the
-    service timing out, not Transit refusing that row: the check could not run at once, with no
-    fixed-input check or second ask, never a break (BACKLOG #8222 item 1, owner ruling
-    2026-11-13). Before this a persistent one read as a break."""
+    """A 504 or 408 on both asks of one row's verify, while the verify over fixed input succeeds,
+    is the service timing out, not Transit refusing that row: the check could not run, never a
+    break (BACKLOG #8222 item 1, owner ruling 2026-11-13). Before this it read as a break."""
+    _needs_hvac()
     from hvac.exceptions import UnexpectedError
 
     from messagefoundry.store.crypto import AuditKeyVersionRefusedError
@@ -1063,8 +1063,15 @@ def test_a_timeout_on_one_rows_verify_could_not_run_though_the_fixed_input_verif
         cipher.verify_audit_hmac(b"row", cipher.audit_hmac(b"row"))
     assert not isinstance(caught.value, AuditKeyVersionRefusedError)
     assert isinstance(caught.value.__cause__, UnexpectedError)
-    assert rechecked == [], "a timeout must settle on the first ask"
+    assert rechecked, "the fixed input was checked between the asks"
     assert real_fixed(), "the control: the fixed input verifies"
+
+
+def test_a_timeout_that_clears_on_the_second_ask_is_not_a_break() -> None:
+    """A 504 on the first ask that clears on the second is read as the second answer: a clean row
+    stays clean, and the check does not fail (BACKLOG #8222)."""
+    cipher = _scripted_cipher([_status_error(504), None])
+    assert cipher.verify_audit_hmac(b"row", cipher.audit_hmac(b"row")) is True
 
 
 def test_a_504_hvac_could_not_parse_still_reads_as_a_timeout() -> None:
@@ -1283,6 +1290,68 @@ def test_an_empty_or_non_text_transit_reply_to_a_handover_tag_still_could_not_ru
     with pytest.raises(CipherError) as caught:
         _malformed_handover_walk(reply)
     assert not isinstance(caught.value, AuditMacMalformedError)
+
+
+class _MalformedHandoverTransit(_RotatingTransit):
+    """``_RotatingTransit`` that answers the ``hmac`` of a handover tag, and nothing else, with a
+    non-empty string naming no key version."""
+
+    def generate_hmac(self, *, hash_input: str, **kw: Any) -> dict[str, Any]:
+        from messagefoundry.store.store import _AUDIT_HANDOVER_INFO
+
+        if base64.b64decode(hash_input).startswith(_AUDIT_HANDOVER_INFO):
+            return {"data": {"hmac": "vault:not-a-version"}}
+        return super().generate_hmac(hash_input=hash_input, **kw)
+
+
+async def test_a_malformed_handover_reply_at_open_opens_the_store_with_a_logged_break(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A planted range row closing the Transit range, whose handover tag Transit answers with no
+    well-formed MAC, is read at open as a tag that does not match: a logged ERROR on a store that
+    opens, so ``audit-verify`` still reports the break. Engine PR 2903 refused the open, which
+    left no walk to report it (BACKLOG #8222 item 5)."""
+    _needs_hvac()
+    from messagefoundry.store.crypto import audit_key_id, generate_key
+    from messagefoundry.store.store import (
+        AUDIT_KEY_EPOCH_ACTION,
+        AUDIT_TRANSIT_KEY_ID,
+        audit_range_closing,
+        audit_scheme_for,
+    )
+    from tests.audit_chain_cases import _mac_key, epoch_record
+
+    _use_fake(monkeypatch, _MalformedHandoverTransit())
+    db = tmp_path / "handover.db"
+    store = await _transit_store(db)
+    try:
+        await store.record_audit("test.before", actor="cli:tester")
+    finally:
+        await store.close()
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = [dict(r) for r in con.execute("SELECT * FROM audit_log ORDER BY seq")]
+    finally:
+        con.close()
+    b_id = audit_key_id(_mac_key(generate_key()))
+    closes = audit_range_closing(rows, key_id=AUDIT_TRANSIT_KEY_ID, from_seq=1, prev_hash="")
+    seq = len(rows) + 1
+    detail = epoch_record(b_id, closes, "vault:v1:planted", audit_scheme_for(b_id))
+    _dml(
+        db,
+        "INSERT INTO audit_log (seq, ts, actor, action, detail, row_hash) VALUES (?, ?, ?, ?, ?, ?)",
+        (seq, time.time(), "cli:tester", AUDIT_KEY_EPOCH_ACTION, detail, "0" * 64),
+    )
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.store.store"):
+        store = await _transit_store(db)
+    try:
+        ok, msg = await store.verify_audit_chain()
+    finally:
+        await store.close()
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any(f"seq={seq} is not authorised by the key it closes" in m for m in errors), errors
+    assert not ok and f"seq={seq}," in str(msg), msg
 
 
 #: Vault's own text for an audit-MAC call refused for its version, as hvac carries it.

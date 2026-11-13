@@ -635,8 +635,8 @@ class TransitCipher(_UnmarkedPolicy):
         # does not accept would be written as a row :meth:`verify_audit_hmac` reads as a break
         # (BACKLOG #2720), so the append fails loudly here instead.
         if not isinstance(mac, str) or transit_mac_version(mac) is None:
-            # A non-empty string is its own subclass, which the walk's handover-tag check reads as
-            # a mismatch (BACKLOG #8222); an empty or non-string reply stays plain.
+            # A non-empty string is its own subclass, which the handover-tag check reads as a
+            # mismatch (BACKLOG #8222); an empty or non-string reply stays plain.
             error = AuditMacMalformedError if isinstance(mac, str) and mac else CipherError
             raise error(
                 f"Transit returned an audit HMAC that is not a well-formed Transit MAC "
@@ -680,14 +680,14 @@ class TransitCipher(_UnmarkedPolicy):
         ``errors`` value, before it raises any ``InvalidRequest``, is not read as a refusal either.
 
         A failure of the verify call not read as a refused version, and not an outage
-        (:meth:`_is_outage`: one :func:`is_vault_unavailable` reads as one, or an HTTP 408 or
-        504), is checked once the handler has let go
+        (:meth:`_is_outage`), is checked once the handler has let go
         of the failed request (BACKLOG #2720): a verify over FIXED input must succeed
         (:meth:`_fixed_input_verifies`), and then the row's own verify is asked once more
         (:meth:`_recheck_refused_row`, which says how the second ask is read). Where that reads
         the row as refused, the answer is ``False``, a break at that row, as a forged MAC is; a
         Vault that answers HTTP 413 past ``max_request_size`` to a planted oversize row is one
-        such case. Every other failure, a failed fixed-input verify among them, and a reply of an
+        such case; an HTTP 408 or 504 on the second ask is not (BACKLOG #8222). Every other
+        failure, a failed fixed-input verify among them, and a reply of an
         unexpected shape, raises plain :class:`CipherError`, so the walk could not run and no
         tamper alert fires. Blocking."""
         version = transit_mac_version(stored)
@@ -765,8 +765,11 @@ class TransitCipher(_UnmarkedPolicy):
         the row's own verify once more, so a failure that cleared is not read as the row's: an
         answer is read as usual, and a failure goes through :meth:`_settled_verify_failure` again.
         A failure that leaves unsettled is ``False``, logged, only when a verify over fixed input
-        succeeds once more after it; otherwise it raises :class:`CipherError`, since the service
-        failed between the asks. Blocking."""
+        succeeds once more after it and it is not an HTTP 408 or 504
+        (:func:`is_vault_timeout_reply`); otherwise it raises :class:`CipherError`, since the
+        service failed between the asks or timed out on the row. A timeout that cleared on the
+        second ask is read as that answer, so a passing blip is not a walk that could not run
+        (BACKLOG #8222, owner ruling 2026-11-13). Blocking."""
         if not self._fixed_input_verifies():
             raise self._verify_failed(failed) from failed
         again: Exception | None = None
@@ -779,7 +782,7 @@ class TransitCipher(_UnmarkedPolicy):
             again = exc.with_traceback(None)
         if again is None:
             return self._verify_answer(response)
-        if not self._fixed_input_verifies():
+        if is_vault_timeout_reply(again) or not self._fixed_input_verifies():
             raise self._verify_failed(again) from again
         log.warning(
             "Transit refused the audit MAC verify of one row twice while a verify over fixed "
@@ -861,13 +864,11 @@ class TransitCipher(_UnmarkedPolicy):
         return isinstance(answered, str) and not answered.startswith(f"vault:v{key_version}:")
 
     def _is_outage(self, exc: Exception) -> bool:
-        """Whether an audit-MAC verify failure is an outage: one :func:`is_vault_unavailable`
-        reads as one, or an HTTP 408 or 504 (:func:`is_vault_timeout_reply`, BACKLOG #8222), which
-        on one row's verify is the service timing out, so the walk could not run. Runs inside the
-        caller's handler, so a classifier that raises is logged by type alone and read as an
-        outage, the reading that keeps a failure a walk that could not run."""
+        """:func:`is_vault_unavailable` for an audit-MAC verify failure. Runs inside the caller's
+        handler, so a classifier that raises is logged by type alone and read as an outage, the
+        reading that keeps a failure a walk that could not run."""
         try:
-            return is_vault_unavailable(exc) or is_vault_timeout_reply(exc)
+            return is_vault_unavailable(exc)
         except Exception as fault:  # noqa: BLE001 -- see the docstring
             log.warning(
                 "Transit failure classifier raised %s; read as an outage", type(fault).__name__
