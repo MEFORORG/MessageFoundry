@@ -152,6 +152,7 @@ __all__ = [
     "MalformedReplyHeadError",
     "NoRedirectHandler",
     "ProxyCredentialsRefusedError",
+    "ProxyTunnelRefusedError",
     "ResponseTooLargeError",
     "StrictHTTPHandler",
     "StrictHTTPResponse",
@@ -708,9 +709,11 @@ class StrictHTTPResponse(http.client.HTTPResponse):
     the response's stream, and never calls ``begin``. A guard that ``begin`` put on would miss that
     head. Built here, it covers both reads with no copy of ``_tunnel``.
 
-    **Only the bare-CR check reaches a** ``CONNECT`` **reply.** ``_tunnel`` keeps the raw header
-    lines and parses none, so :func:`reply_framing_fault` never sees that head. At least a header
-    line with no colon, and a control character in a value, still open the tunnel.
+    **Of the framing checks, only the bare-CR check reaches a** ``CONNECT`` **reply.** ``_tunnel``
+    keeps the raw header lines and parses none, so :func:`reply_framing_fault` never sees that
+    head. At least a header line with no colon, and a control character in a value, still open the
+    tunnel. The ``CONNECT`` reply's status is also recorded, as :attr:`status_read`, which
+    ``_StrictHTTPSConnection._tunnel`` reads to type a refused tunnel (BACKLOG #2989).
     """
 
     def __init__(
@@ -722,6 +725,16 @@ class StrictHTTPResponse(http.client.HTTPResponse):
     ) -> None:
         super().__init__(sock, debuglevel=debuglevel, method=method, url=url)
         self.fp = cast("Any", _BareCRGuard(self.fp))
+        #: The status code this response read off its status line, or ``None`` before one is read.
+        #: :class:`_StrictHTTPSConnection` reads it for a ``CONNECT`` reply, which never sets
+        #: ``status`` because ``begin`` never runs on it.
+        self.status_read: int | None = None
+
+    def _read_status(self) -> tuple[str, int, str]:
+        # http.client's own name for the status-line read; typeshed does not declare it.
+        version, status, reason = super()._read_status()  # type: ignore[misc]
+        self.status_read = status
+        return version, status, reason
 
     def begin(self) -> None:
         try:
@@ -738,8 +751,55 @@ class _StrictHTTPConnection(http.client.HTTPConnection):
     response_class = StrictHTTPResponse
 
 
+class ProxyTunnelRefusedError(OSError):
+    """A web proxy answered the ``CONNECT`` for an ``https`` target with a status other than 200.
+
+    ``http.client`` raises that as a bare ``OSError`` that carries the status only in its text.
+    :class:`_StrictHTTPSConnection` raises this subclass in its place, with the text unchanged and
+    the status code the reply's own status line gave, so a caller reads ``status`` rather than the
+    text (BACKLOG #2989). It is still an ``OSError``, so ``urllib`` wraps it in a ``URLError`` and
+    a caller that catches ``OSError`` catches it; a check for the exact type does not."""
+
+    def __init__(self, message: str, *, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+    def __reduce__(self) -> tuple[object, ...]:
+        # As AmbiguousFramingError: the keyword-only status travels with the constructor.
+        return (functools.partial(type(self), status=self.status), self.args, self.__dict__)
+
+
 class _StrictHTTPSConnection(http.client.HTTPSConnection):
     response_class = StrictHTTPResponse
+
+    def _tunnel(self) -> None:
+        # The reply to CONNECT is built from response_class inside _tunnel and never returned, so
+        # the one built here is kept to read its status after _tunnel refuses the tunnel.
+        replies: list[StrictHTTPResponse] = []
+        own = vars(self)
+        prior = own.get("response_class")
+        response_class = prior if prior is not None else type(self).response_class
+
+        def reply(sock: socket.socket, *args: Any, **kwargs: Any) -> StrictHTTPResponse:
+            built = response_class(sock, *args, **kwargs)
+            replies.append(built)
+            return built
+
+        own["response_class"] = reply
+        try:
+            super()._tunnel()  # type: ignore[misc]
+        except OSError as exc:
+            status = getattr(replies[-1], "status_read", None) if replies else None
+            # _tunnel's own refusal of a status is a bare OSError with no errno. A socket error
+            # while reading the head carries an errno or is a subclass, and keeps its own type.
+            if status is None or status == 200 or type(exc) is not OSError or exc.errno is not None:
+                raise
+            raise ProxyTunnelRefusedError(str(exc), status=status) from exc
+        finally:
+            if prior is None:
+                own.pop("response_class", None)
+            else:
+                own["response_class"] = prior
 
 
 class StrictHTTPHandler(urllib.request.HTTPHandler):

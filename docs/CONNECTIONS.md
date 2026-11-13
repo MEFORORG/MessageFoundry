@@ -2343,8 +2343,8 @@ Two limits follow from this:
   neither judged. Oracle's ODBC driver documents `DBQ` for its target, and `DBQ` is refused. The
   engine cannot see which keyword a driver reads, so it accepts only the drivers on
   [the generic driver allowlist](#the-generic-driver-allowlist), each documented to read
-  `SERVER`, and refuses every other name when the connection is built (BACKLOG #5041). Until
-  then any name built, with a WARNING and an advisory line (BACKLOG #5163). That section says
+  `SERVER`, and refuses every other name when the connection is built (BACKLOG #5041). Before
+  BACKLOG #5041 landed, any name built, with a WARNING and an advisory line (BACKLOG #5163). That section says
   what the list rests on and what it cannot see.
 - **psqlODBC takes libpq options through `pqopt`, which is refused.** That covers at least a CA
   file path, a client certificate and key, and a connect timeout. With `SSLmode=verify-full`,
@@ -2375,10 +2375,20 @@ Two limits follow from this:
   ends the walk and is left to libpq.
 
   The default file is `root.crt`. On Windows it is under `postgresql` in the roaming
-  application-data folder. Elsewhere it is under `~/.postgresql`. The engine finds this home as
-  libpq 15 and later do. Another libpq version may read a different home. With libpq 16 and
-  later, `PGSSLROOTCERT=system` names no file, so the engine reads nothing. The check reads the
-  environment of the process that builds. So `messagefoundry check` judges its own machine's file.
+  application-data folder, which the engine asks the shell for as libpq does, through the ANSI
+  call. Where that call returns a `?` past the drive, which it writes for a character the code
+  page cannot hold, the engine cannot say which file libpq reads, so it refuses the build; set
+  `PGSSLROOTCERT` to a local path. Best-fit maps other such characters to other characters, and
+  the engine checks that path like any other; one mapped to a character no Windows name holds,
+  at least `*` for a fullwidth asterisk, refuses the build. Elsewhere it is under `.postgresql`
+  in `HOME`, which libpq 15 and later read (or the password-file home when `HOME` is unset or
+  empty), and in the password-file home, which libpq 14 and older read. The engine cannot tell
+  which libpq the driver loads, so when the two differ it checks both and refuses on either.
+  With `PGSSLROOTCERT=system` the engine checks no root-certificate file: libpq 16 and later
+  load at least OpenSSL's default CA file and directory, which `SSL_CERT_FILE` and
+  `SSL_CERT_DIR` can redirect, and an older libpq opens a file named `system` in its working
+  directory; none of these is checked. The check reads the environment of the process that
+  builds. So `messagefoundry check` judges its own machine's file.
   The check runs at build, not at each connect. No ACL check covers the file.
 
 ##### Values on the generic dialect
@@ -5012,7 +5022,7 @@ reading this page already applies to a file the scan never opened.
 | REST destination | `timeout_seconds` 30 s — the **only** timeout (no separate connect timeout on the HTTP family) | the `urllib` response is context-managed and closed per request | HTTP status is classified transient vs permanent; redirects are never followed. A Digest challenge the engine will not answer, on the delivery or the token hop (`auth-challenge-refused`, ADR 0095 Amendment B; on an `https://` token endpoint, a Digest proxy's 407 to the `CONNECT`), and a send-time hop refusal (`insecure-hop-refused`) are configuration faults: under the default `credential_fault_policy` the lane stops and the queue stays. A 2xx reply body that is over the bound, cut short or misframed is never sent again; the *A 2xx reply over the byte bound* table under REST says whether it is delivered or refused | `RetryPolicy`; the finite `retry_max_attempts` default is what a synchronous feed needs — **keep it and set a short `timeout_seconds`** |
 | SOAP destination | `timeout_seconds` 30 s | as REST | as REST | as REST |
 | FHIR destination + `fhir_lookup` | `timeout_seconds` 30 s on both (the lookup carries its own per-connection value), plus the same 30 s Handler-side result bridge (`pipeline/wiring_runner.py::_LOOKUP_RESULT_TIMEOUT_SECONDS`) that releases the transform worker without cancelling the in-flight request | as REST; the lookup runs on the thread executor and returns the connection immediately | the destination as REST, configuration faults and the 2xx reply rule included; a lookup failure, a refused Digest challenge among them, raises into the Handler and fails the message — never a silent empty result | destination: `RetryPolicy`. `fhir_lookup`: **single-shot, no retry** |
-| DICOMweb STOW-RS destination | `timeout_seconds` 30 s | as REST | STOW-RS status classified transient vs permanent; the two configuration faults and the 2xx reply rule as REST (a web proxy's Digest challenge only, since DICOMweb has no origin Digest), and some 2xx replies that do not confirm the store are a permanent refusal; which ones is *Status classification* under DICOMweb | `RetryPolicy` |
+| DICOMweb STOW-RS destination | `timeout_seconds` 30 s | as REST | STOW-RS status classified transient vs permanent; the two configuration faults and the 2xx reply rule as REST, on the delivery hop only (a web proxy's Digest challenge only, since DICOMweb has no origin Digest and no token hop), and some 2xx replies that do not confirm the store are a permanent refusal; which ones is *Status classification* under DICOMweb | `RetryPolicy` |
 | DICOM C-STORE SCP (inbound) | `timeout_seconds` 30 s applied to **all three** pynetdicom timers (ACSE, DIMSE, network) and to the off-loop commit future, and as a fixed deadline on the association request, on each later read, and on each whole send ([DICOM.md](DICOM.md) section 3) | on the timers, the association is released by pynetdicom; a read deadline ends the association by closing the connection, not by a release; the AE is shut down cooperatively on stop | an over-cap object fails the DIMSE operation before the durable commit | n/a — the modality re-sends |
 | DICOM C-STORE SCU / C-ECHO | `timeout_seconds` 30 s on the three AE timers, `connect_timeout` 10 s on the association request | the association is released after each C-STORE, off the event loop | out-of-resources → transient; hard refusal → permanent; the third end with no response in a row of one object over 32 MiB → permanent (`unanswered-over-ceiling`, vault BACKLOG #4908) | `RetryPolicy`, except that permanent class, which dead-letters whatever the policy says |
 | EMAIL (SMTP) destination | `timeout_seconds` 30 s passed to the `smtplib` constructor (covers connect and each command) | the SMTP session is closed per send | SMTP errors classified transient vs permanent | `RetryPolicy` |

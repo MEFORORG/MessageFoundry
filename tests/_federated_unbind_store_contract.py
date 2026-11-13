@@ -427,8 +427,9 @@ async def _hold_then_race(
     with its locks; start ``second``; require that ``second`` really waits on ``first``'s server
     session; then release ``first`` and return both results, ``first``'s first.
 
-    ``attr`` names a write helper called ``(handle, key, change)``: ``_write_user`` or
-    ``_write_session``. Only the first call for ``key`` pauses. With ``pause_before``, the pause
+    ``attr`` names a helper called ``(handle, key, ...)``: ``_write_user``, ``_write_session``, or
+    SQL Server's ``_delete_user_rows``. Only the first call for ``key`` pauses. With
+    ``pause_before``, the pause
     comes inside that call instead, just before the handle runs the first statement starting with
     that text, so ``first`` holds what the helper's locked read took and has written nothing yet.
     The race is hooked, not timed: without the probe a pass could come from a ``second`` that never
@@ -459,12 +460,12 @@ async def _hold_then_race(
                 await _hold(self._handle)
             return await self._handle.execute(sql, *args)
 
-    async def _paused_write(handle: Any, written_key: str, change: Any) -> Any:
+    async def _paused_write(handle: Any, written_key: str, *rest: Any) -> Any:
         if written_key != key or holder:
-            return await real_write(handle, written_key, change)
+            return await real_write(handle, written_key, *rest)
         if pause_before is not None:
-            return await real_write(_PausingHandle(handle), written_key, change)
-        written = await real_write(handle, written_key, change)
+            return await real_write(_PausingHandle(handle), written_key, *rest)
+        written = await real_write(handle, written_key, *rest)
         await _hold(handle)
         return written
 

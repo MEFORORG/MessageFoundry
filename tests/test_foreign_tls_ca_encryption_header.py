@@ -280,7 +280,7 @@ def _no_libpq_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.delenv("PGSSLROOTCERT", raising=False)
     home = tmp_path / "libpq-home"
     home.mkdir()
-    monkeypatch.setattr(database, "_libpq_home", lambda: str(home))
+    monkeypatch.setattr(database, "_libpq_homes", lambda: [("", str(home))])
     return home
 
 
@@ -490,7 +490,68 @@ def test_libpqs_home_falls_back_to_the_password_file_for_an_empty_home(
 
     monkeypatch.setenv("HOME", "")
     expected = os.path.join(pwd.getpwuid(os.geteuid()).pw_dir, ".postgresql")
-    assert database._libpq_home() == expected
+    assert database._libpq_homes() == [("", expected)]
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="libpq reads HOME and the password file off Windows"
+)
+def test_libpqs_homes_name_home_and_the_password_file_home_when_they_differ(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """libpq 15 and later read ``HOME``; libpq 14 and older read the password-file home only
+    (vault BACKLOG #8153 item 1). The control: the same directory is named once, unlabelled."""
+    import pwd
+
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: types.SimpleNamespace(pw_dir="/pw"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert sorted(database._libpq_homes()) == sorted(
+        [
+            (" in HOME", os.path.join(str(tmp_path), ".postgresql")),
+            (" in the password-file home", os.path.join("/pw", ".postgresql")),
+        ]
+    )
+    for same in ("/pw", "/pw/"):  # a trailing separator names the same directory
+        monkeypatch.setenv("HOME", same)
+        assert database._libpq_homes() == [("", os.path.join("/pw", ".postgresql"))]
+
+    def no_entry(uid: int) -> Any:
+        raise KeyError(uid)
+
+    # No password-file entry: libpq 14 and older name no home, libpq 15 and later read HOME.
+    monkeypatch.setattr(pwd, "getpwuid", no_entry)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert database._libpq_homes() == [("", os.path.join(str(tmp_path), ".postgresql"))]
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="libpq reads HOME and the password file off Windows"
+)
+@pytest.mark.parametrize("encrypted", ["HOME", "the password-file home"])
+def test_libpqs_root_certificate_is_refused_in_either_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, encrypted: str
+) -> None:
+    """The check reads ``root.crt`` in both homes and refuses on either, since it cannot tell
+    which libpq psqlODBC loads (vault BACKLOG #3090 step 3, #8153 step 2). Red on the
+    password-file case before both were read: the check read ``HOME`` alone and built, while a
+    libpq 14 would load the encrypted file. The control: both clean builds."""
+    import pwd
+
+    monkeypatch.delenv("PGSSLROOTCERT", raising=False)
+    env_home, password_home = tmp_path / "env-home", tmp_path / "password-home"
+    for home in (env_home, password_home):
+        (home / ".postgresql").mkdir(parents=True)
+        _write(home / ".postgresql", _certificate(), "root.crt")
+    monkeypatch.setenv("HOME", str(env_home))
+    monkeypatch.setattr(
+        pwd, "getpwuid", lambda uid: types.SimpleNamespace(pw_dir=str(password_home))
+    )
+    assert "SSLmode=verify-full;" in _build_psql()
+    bad = env_home if encrypted == "HOME" else password_home
+    _write(bad / ".postgresql", _headered(_certificate()), "root.crt")
+    with pytest.raises(ValueError, match=f"default root certificate in {encrypted}") as refused:
+        _build_psql()
+    assert ENCRYPTION_HEADER_SCOPE in str(refused.value)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="the shell folder is read on Windows only")
@@ -498,12 +559,133 @@ def test_libpqs_home_on_windows_is_the_shell_roaming_folder(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """libpq asks the shell, so an unset ``APPDATA`` does not hide the default file."""
+    import ctypes
+
+    buf = ctypes.create_unicode_buffer(260)  # the wide folder, to know what ANSI should name
+    shell32 = vars(ctypes)["WinDLL"]("shell32")  # vars(): WinDLL is typed for win32 only
+    assert shell32.SHGetFolderPathW(None, 0x1A, None, 0, buf) == 0
+    wide = buf.value
     monkeypatch.delenv("APPDATA", raising=False)
-    home = database._libpq_home()
-    assert home is not None and home.endswith(os.sep + "postgresql")
+    homes = database._libpq_homes()
+    try:
+        wide.encode("mbcs", "strict")
+    except UnicodeEncodeError:
+        pytest.skip("the profile folder is outside the ANSI code page, so ANSI may name no home")
+    assert homes == [("", os.path.join(wide, "postgresql"))]
 
 
-def _refuse_lookup() -> tuple[str, str] | None:
+class _FakeShell32:
+    """A ``shell32`` whose ANSI folder call writes ``folder`` and whose wide export is absent."""
+
+    def __init__(self, folder: bytes) -> None:
+        def call(owner: object, csidl: int, token: object, flags: int, buf: Any) -> int:
+            buf.value = folder
+            return 0
+
+        self.SHGetFolderPathA = call
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="shell32 is loaded on Windows only")
+def test_libpqs_windows_home_comes_from_the_ansi_shell_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """psqlODBC's libpq is built without ``UNICODE``, so it calls ``SHGetFolderPathA`` and opens
+    the ANSI path it gets back; the engine asks the same export and decodes in the ANSI code page
+    (vault BACKLOG #8153 item 18). Red while the engine asked ``SHGetFolderPathW``: the fake has
+    no wide export, so the lookup raised."""
+    import ctypes
+
+    for folder in ("C:\\Users\\synthetic\\AppData\\Roaming", "C:\\Users\\syntheti\u00e9"):
+        try:
+            encoded = folder.encode("mbcs", "strict")
+        except UnicodeEncodeError:  # a host code page with no e-acute: only the ASCII case runs
+            continue
+        monkeypatch.setattr(ctypes, "WinDLL", lambda name, encoded=encoded: _FakeShell32(encoded))
+        assert database._windows_roaming_appdata() == folder
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the shell folder is read on Windows only")
+@pytest.mark.parametrize("folder", ["C:\\Users\\????", "C:\\X\\?\\..\\Y"], ids=["plain", "dot-dot"])
+def test_a_shell_folder_the_code_page_could_not_hold_refuses_the_build(
+    monkeypatch: pytest.MonkeyPatch, folder: str
+) -> None:
+    """The ANSI call writes ``?`` for a character its code page cannot hold, so the engine
+    cannot say which file libpq reads there, and the build is refused. ``?\\..`` is the case
+    that shows why: Windows drops the ``?`` component before the filesystem sees it, so the path
+    still resolves. Red while such a folder named no home: the build passed with nothing read."""
+    monkeypatch.delenv("PGSSLROOTCERT", raising=False)
+    monkeypatch.setattr(database, "_windows_roaming_appdata", lambda: folder)
+    with pytest.raises(ValueError, match="cannot hold the roaming folder's name") as refused:
+        _build_psql()
+    message = str(refused.value)
+    assert _CONNECTION in message and "set PGSSLROOTCERT to a local path" in message
+    assert folder not in message  # the cause is named, never the path, which holds a user name
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the shell folder is read on Windows only")
+@pytest.mark.parametrize(
+    "folder",
+    ["\\??\\C:\\x", "\\??\\UNC\\host\\share\\x", "\\\\?\\C:\\x"],
+    ids=["nt", "nt-unc", "win32"],
+)
+def test_a_device_prefixed_shell_folder_is_refused(
+    monkeypatch: pytest.MonkeyPatch, folder: str
+) -> None:
+    """A device-prefixed folder is refused, as on main: ``\\??\\`` by the ``?`` rule, since
+    ``splitdrive`` reads no drive there, and ``\\\\?\\`` by the host check. Red while the ``?``
+    rule named no home for ``\\??\\``: the build passed with nothing read."""
+    monkeypatch.delenv("PGSSLROOTCERT", raising=False)
+    monkeypatch.setattr(database, "_windows_roaming_appdata", lambda: folder)
+    with pytest.raises(ValueError, match="cannot hold|must be a plain local path on this host"):
+        _build_psql()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="shell32 is loaded on Windows only")
+def test_libpqs_windows_root_certificate_is_refused_through_the_shell_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The positive control for the Windows home: a shell folder, through the ANSI call and the
+    drive's own ``:``, names ``postgresql\\root.crt`` there, and an encrypted one is refused. Red
+    whenever the Windows lookup names no home, such as a screen that trips on the drive."""
+    import ctypes
+
+    try:
+        encoded = str(tmp_path).encode("mbcs", "strict")
+    except UnicodeEncodeError:
+        pytest.skip("the runner's temporary folder is outside the ANSI code page")
+    monkeypatch.delenv("PGSSLROOTCERT", raising=False)
+    real_windll = vars(ctypes)["WinDLL"]
+
+    def shell32_only(name: str, *args: Any, **kwargs: Any) -> Any:
+        # The check's walk loads kernel32 too; only shell32 is faked.
+        return _FakeShell32(encoded) if name == "shell32" else real_windll(name, *args, **kwargs)
+
+    monkeypatch.setattr(ctypes, "WinDLL", shell32_only)
+    (tmp_path / "postgresql").mkdir()
+    _write(tmp_path / "postgresql", _certificate(), "root.crt")
+    assert "SSLmode=verify-full;" in _build_psql()
+    _write(tmp_path / "postgresql", _headered(_certificate()), "root.crt")
+    with pytest.raises(ValueError, match="DATABASE libpq's default root certificate:") as refused:
+        _build_psql()
+    assert ENCRYPTION_HEADER_SCOPE in str(refused.value)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="pwd is imported off Windows only")
+def test_a_missing_pwd_module_is_a_valueerror_from_the_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The password-file home is read whatever ``HOME`` says, so a ``pwd`` that cannot be
+    imported is an ``OSError`` the build refuses as a ``ValueError``. Red before the import was
+    caught: its ``ModuleNotFoundError`` escaped the builder as itself."""
+    monkeypatch.delenv("PGSSLROOTCERT", raising=False)
+    monkeypatch.setitem(sys.modules, "pwd", None)
+    with pytest.raises(OSError, match="password file could not be read"):
+        database._libpq_homes()
+    with pytest.raises(ValueError, match="set PGSSLROOTCERT to a local path"):
+        _build_psql()
+
+
+def _refuse_lookup() -> list[tuple[str, str]]:
     raise AssertionError("the root certificate was looked up")
 
 
@@ -521,7 +703,7 @@ def test_libpqs_root_certificate_is_not_looked_up_when_psqlodbc_sends_disable(
     """With no ``SSLmode`` psqlODBC sends ``disable`` to libpq (``DEFAULT_SSLMODE`` in its
     ``dlg_specific.h``), so libpq attempts no TLS and loads no root certificate. Red before the
     check keyed on the build's own ``sslmode``: an unset mode looked the file up."""
-    monkeypatch.setattr(database, "_libpq_root_cert", _refuse_lookup)
+    monkeypatch.setattr(database, "_libpq_root_certs", _refuse_lookup)
     assert _build_generic("PostgreSQL Unicode", params).startswith("DRIVER={PostgreSQL Unicode};")
 
 
@@ -706,13 +888,13 @@ def test_libpqs_home_for_an_empty_password_file_home_is_the_root(
 
     monkeypatch.setenv("HOME", "")
     monkeypatch.setattr(pwd, "getpwuid", lambda uid: types.SimpleNamespace(pw_dir=""))
-    assert database._libpq_home() == os.path.join(os.sep, ".postgresql")
+    assert database._libpq_homes() == [("", os.path.join(os.sep, ".postgresql"))]
 
     def no_entry(uid: int) -> Any:
         raise KeyError(uid)
 
     monkeypatch.setattr(pwd, "getpwuid", no_entry)
-    assert database._libpq_home() is None
+    assert database._libpq_homes() == []
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the shell folder is read on Windows only")
@@ -723,9 +905,9 @@ def test_libpqs_home_for_an_empty_shell_folder_is_the_root(
     drive (``pqGetHomeDirectory``, libpq 17). Red when an empty folder gave ``None``. The
     control: a failed shell call names no home, as libpq names none."""
     monkeypatch.setattr(database, "_windows_roaming_appdata", lambda: "")
-    assert database._libpq_home() == os.path.join(os.sep, "postgresql")
+    assert database._libpq_homes() == [("", os.path.join(os.sep, "postgresql"))]
     monkeypatch.setattr(database, "_windows_roaming_appdata", lambda: None)
-    assert database._libpq_home() is None
+    assert database._libpq_homes() == []
 
 
 def test_a_libpq_home_the_engine_cannot_name_refuses_the_build(
@@ -735,30 +917,45 @@ def test_a_libpq_home_the_engine_cannot_name_refuses_the_build(
     ``OSError`` out of the builder, and never a check that read nothing."""
     monkeypatch.delenv("PGSSLROOTCERT", raising=False)
 
-    def unnamed() -> str | None:
+    def unnamed() -> list[tuple[str, str]]:
         raise OSError("synthetic: shell32 did not load")
 
-    monkeypatch.setattr(database, "_libpq_home", unnamed)
+    monkeypatch.setattr(database, "_libpq_homes", unnamed)
     with pytest.raises(ValueError, match="root certificate: set PGSSLROOTCERT to a local path"):
         _build_psql()
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="shell32 is loaded on Windows only")
-@pytest.mark.parametrize("failure", ["load", "export"])
+@pytest.mark.parametrize("failure", ["load", "export", "import", "call"])
 def test_a_shell32_failure_is_an_oserror_the_build_refuses(
     monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
     """Red before the load was caught: ``WinDLL``'s ``OSError`` and a missing export's
-    ``AttributeError`` escaped the builder as themselves."""
+    ``AttributeError`` escaped the builder as themselves. Red before the import was caught too
+    (vault BACKLOG #8153 item 18): ``ctypes``' ``ModuleNotFoundError`` escaped. A
+    ``ctypes.ArgumentError`` from the call is refused the same way."""
     import ctypes
+
+    def refuse(*args: Any) -> int:
+        raise ctypes.ArgumentError("synthetic: the call could not be made")
 
     def broken(name: str, *args: Any, **kwargs: Any) -> object:
         if failure == "load":
             raise OSError("synthetic: shell32 did not load")
-        return object()  # no SHGetFolderPathW on it
+        if failure == "call":
+            return types.SimpleNamespace(SHGetFolderPathA=refuse)
+        return object()  # no SHGetFolderPathA on it
 
-    monkeypatch.setattr(ctypes, "WinDLL", broken)
-    with pytest.raises(OSError, match="SHGetFolderPathW could not be loaded"):
+    if failure == "import":
+        monkeypatch.setitem(sys.modules, "ctypes", None)
+    else:
+        monkeypatch.setattr(ctypes, "WinDLL", broken)
+    expected = (
+        "ctypes could not be loaded"
+        if failure == "import"
+        else "SHGetFolderPathA could not be loaded from shell32 or called"
+    )
+    with pytest.raises(OSError, match=expected):
         database._windows_roaming_appdata()
     monkeypatch.delenv("PGSSLROOTCERT", raising=False)
     with pytest.raises(ValueError, match="set PGSSLROOTCERT to a local path"):

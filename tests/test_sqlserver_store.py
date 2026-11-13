@@ -1195,8 +1195,8 @@ async def test_bind_sweep_and_unbound_guard_store_contract(store) -> None:
 
 async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
     """BACKLOG #2738 on the real SQL Server backend: ``delete_user`` takes the account's ``users``
-    row with ``UPDLOCK, ROWLOCK`` before its sessions (#2733), as the bind does, so the two cannot
-    deadlock.
+    row before its sessions (#2733), under ``XLOCK, ROWLOCK``, as the bind takes it first, so the
+    two cannot deadlock.
 
     The shared body is the one the Postgres suite runs. The probe reads ``sys.dm_exec_requests``: a
     request whose ``blocking_session_id`` is the bind's session."""
@@ -1244,7 +1244,9 @@ async def test_rotation_racing_a_sweep_is_swept(store) -> None:
     await _assert_rotation_waits_for_a_bind(store, **_lock_wait_probes(store))
 
 
-async def test_the_user_keys_are_trusted_and_an_upgrade_removes_their_orphans(store) -> None:
+async def test_the_user_keys_are_trusted_and_an_upgrade_removes_their_orphans(
+    store, caplog: pytest.LogCaptureFixture
+) -> None:
     """BACKLOG #2733 on the real SQL Server backend: the three ``users(id)`` keys are trusted, and a
     store an earlier batch left with untrusted keys over orphaned rows is repaired by the next full
     run. The plant is what that batch could leave: each key dropped and re-added ``WITH NOCHECK``,
@@ -1314,10 +1316,19 @@ async def test_the_user_keys_are_trusted_and_an_upgrade_removes_their_orphans(st
     for table in keys:
         assert await _rows(table) == {"kept", "ghost"}, table
 
-    assert await store._ensure_schema() is True  # pre-marker DB: the full batch really ran
+    with caplog.at_level("WARNING", logger="messagefoundry.store.sqlserver"):
+        assert await store._ensure_schema() is True  # pre-marker DB: the full batch really ran
     assert await _untrusted() == dict.fromkeys(keys.values(), False)
     for table in keys:
         assert await _rows(table) == {"kept"}, table
+    # One line per table, with its count and no account id (BACKLOG #2733).
+    swept = [r.getMessage() for r in caplog.records if "naming an account" in r.getMessage()]
+    assert sorted(swept) == sorted(
+        f"sqlserver: deleted 1 {table} row(s) naming an account that does not exist, before"
+        " trusting the table's user key"
+        for table in keys
+    ), swept
+    caplog.clear()
     # Trusted keys refuse every later orphan, here a session and a role grant.
     async with store._pool.acquire() as conn:
         cur = await conn.cursor()
@@ -1337,9 +1348,11 @@ async def test_the_user_keys_are_trusted_and_an_upgrade_removes_their_orphans(st
         await cur.execute("DELETE FROM schema_meta")
         await conn.commit()
         await cur.close()
-    assert await store._ensure_schema() is True
+    with caplog.at_level("WARNING", logger="messagefoundry.store.sqlserver"):
+        assert await store._ensure_schema() is True
     for table in keys:
         assert await _rows(table) == {"kept"}, table
+    assert not [r for r in caplog.records if "naming an account" in r.getMessage()]
 
 
 async def test_a_session_for_a_missing_account_is_refused(store) -> None:
@@ -1348,6 +1361,114 @@ async def test_a_session_for_a_missing_account_is_refused(store) -> None:
     from tests._webauthn_store_contract import assert_a_session_for_a_missing_account_is_refused
 
     await assert_a_session_for_a_missing_account_is_refused(store)
+
+
+async def _race_a_held_user_delete(
+    store: Any,
+    account: str,
+    step: Callable[[], Awaitable[Any]],
+    seed: Callable[[], Awaitable[Any]] | None = None,
+) -> Any:
+    """Create ``account`` and run ``seed``; hold ``delete_user(account)`` right after it takes the
+    account row, before it deletes any row keyed to it; start ``step``; require that ``step``
+    really queues behind the delete's server session; release the delete, which must complete;
+    return ``step``'s result, or the exception it raised (BACKLOG #2733). ``_hold_then_race``
+    hooks and probes the race, as the lock-order tests above use it."""
+    from tests._federated_unbind_store_contract import _hold_then_race
+
+    async def _step_or_its_refusal() -> Any:
+        try:
+            return await step()
+        except Exception as exc:  # noqa: BLE001 - returned for the caller to classify
+            return exc
+
+    await store.create_user(
+        user_id=account,
+        username=account,
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
+        audits=(),
+    )
+    if seed is not None:
+        await seed()
+    _, outcome = await _hold_then_race(
+        store,
+        attr="_delete_user_rows",
+        key=account,
+        first=("delete_user", lambda: store.delete_user(account)),  # completes, no 547
+        second=("the step", _step_or_its_refusal),
+        pause_before="DELETE FROM user_roles",
+        **_lock_wait_probes(store),
+    )
+    assert await store.get_user(account) is None
+    return outcome
+
+
+async def test_a_sign_in_inside_a_user_delete_waits_and_is_refused(store) -> None:
+    """BACKLOG #2733: a sign-in started while ``delete_user`` holds the account row waits for the
+    delete, then is refused by the session key for the missing account, and the delete completes.
+    The delete took the row under ``UPDLOCK``, which the sign-in's ``HOLDLOCK`` read shares, so a
+    session could commit inside the delete, and one that committed after the delete's sessions
+    delete failed its last statement with error 547. On that code the sign-in here finishes while
+    the delete is held, and this test fails on the probe."""
+    from messagefoundry.auth.service import _is_integrity_refusal
+
+    account = "del-sign-in"
+    outcome = await _race_a_held_user_delete(
+        store,
+        account,
+        lambda: store.create_session(token_hash="d" * 64, user_id=account, expires_at=9e9, now=2.0),
+    )
+    assert isinstance(outcome, Exception) and _is_integrity_refusal(outcome), outcome
+    assert await store.get_session("d" * 64) is None
+
+
+@pytest.mark.parametrize(
+    "write", ["remember_login_address", "reset_login_addresses", "mark_session_mfa_verified"]
+)
+async def test_writes_keyed_to_an_account_queue_behind_its_delete(store, write: str) -> None:
+    """BACKLOG #2733: the delete holds the account row under ``XLOCK`` before any row keyed to it,
+    so each write of such a row must take the account row first, or it can hold its own row while
+    its key check waits on the delete, which waits on that row: a deadlock the server ends. The
+    sign-in address writes and the session stamps take the account row first; each here queues
+    behind a held delete and then finds the account gone, and the delete completes."""
+    from messagefoundry.auth.service import _is_integrity_refusal
+
+    account = f"del-{write}"
+    token = "s" * 64
+    steps: dict[str, Callable[[], Awaitable[Any]]] = {
+        "remember_login_address": lambda: store.remember_login_address(
+            account, "10.0.0.2", now=3.0
+        ),
+        "reset_login_addresses": lambda: store.reset_login_addresses(account),
+        "mark_session_mfa_verified": lambda: store.mark_session_mfa_verified(token, now=3.0),
+    }
+
+    async def _seed() -> None:
+        await store.remember_login_address(account, "10.0.0.1", now=2.0)
+        await store.create_session(token_hash=token, user_id=account, expires_at=9e9, now=2.0)
+
+    real_write = store._write_session
+    written: list[Any] = []
+
+    async def _spy(cur: Any, token_hash: str, change: Any) -> Any:
+        written.append(await real_write(cur, token_hash, change))
+        return written[-1]
+
+    store._write_session = _spy
+    try:
+        outcome = await _race_a_held_user_delete(store, account, steps[write], seed=_seed)
+    finally:
+        del store._write_session
+    if write == "mark_session_mfa_verified":
+        # The session went with the account, so the stamp found no row and wrote nothing.
+        assert outcome is None and written == [None], (outcome, written)
+    else:
+        assert isinstance(outcome, Exception) and _is_integrity_refusal(outcome), outcome
+    assert await store.list_known_login_addresses(account, since=0.0) == []
+    assert await store.get_session(token) is None
 
 
 async def test_directory_binding_column_is_unconstrained_and_username_is_not(store) -> None:
