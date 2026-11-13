@@ -1563,9 +1563,11 @@ def _libpq_homes() -> list[tuple[str, str]]:
         if appdata is None:
             return []
         if "?" in os.path.splitdrive(appdata)[1]:
+            # The refusal names the cause, never the path, which holds the account's name.
+            logger.debug("libpq's roaming folder holds a substituted '?': %s", appdata)
             raise _UnholdableShellFolder(
-                f"the ANSI code page cannot hold the roaming folder's name ({appdata}), so the "
-                "folder libpq reads could not be checked"
+                "the ANSI code page cannot hold the roaming folder's name, so the folder libpq "
+                "reads could not be checked"
             )
         return [("", os.path.join(appdata or os.sep, "postgresql"))]
     try:

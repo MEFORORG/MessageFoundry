@@ -619,6 +619,7 @@ def test_a_shell_folder_the_code_page_could_not_hold_refuses_the_build(
         _build_psql()
     message = str(refused.value)
     assert _CONNECTION in message and "set PGSSLROOTCERT to a local path" in message
+    assert folder not in message  # the cause is named, never the path, which holds a user name
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the shell folder is read on Windows only")
