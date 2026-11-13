@@ -315,9 +315,9 @@ def _names_aead_failure(exc: Exception) -> bool:
     return isinstance(errors, list) and bool(errors) and all(map(_is_aead_failure_text, errors))
 
 
-def _transit_failure(op: str, key: str, exc: Exception, *, decrypting: bool = False) -> CipherError:
+def _transit_failure(op: str, key: str, exc: Exception) -> CipherError:
     """The error an ``encrypt`` or ``decrypt`` raises for ``exc``: :class:`CipherUnavailableError`
-    where Transit gave no verdict on the value (BACKLOG #3734); for a ``decrypt`` (``decrypting``),
+    where Transit gave no verdict on the value (BACKLOG #3734); for a ``decrypt``,
     :class:`UnauthenticatedCipherError` where Vault refused the value's AEAD tag
     (:func:`_names_aead_failure`, BACKLOG #5650); else plain :class:`CipherError`. The audit HMAC
     keeps plain :class:`CipherError`; this split is for the data key alone, and the tag refusal for
@@ -331,7 +331,7 @@ def _transit_failure(op: str, key: str, exc: Exception, *, decrypting: bool = Fa
     tell."""
     try:
         unavailable = is_vault_unavailable(exc)
-        unauthenticated = decrypting and not unavailable and _names_aead_failure(exc)
+        unauthenticated = op == "decrypt" and not unavailable and _names_aead_failure(exc)
     except Exception as fault:  # noqa: BLE001 -- see the docstring; the caller raises CipherError
         log.warning("Transit failure classifier raised %s; read as a refusal", type(fault).__name__)
         unavailable = unauthenticated = False
@@ -423,7 +423,7 @@ class TransitCipher(_UnmarkedPolicy):
             # closed: the first is UnauthenticatedCipherError (BACKLOG #5650), the second
             # CipherUnavailableError (BACKLOG #3734). Type-only: a Transit error can echo
             # ciphertext, and we never surface key material.
-            raise _transit_failure("decrypt", self._key, exc, decrypting=True) from exc
+            raise _transit_failure("decrypt", self._key, exc) from exc
         # Refused OUTSIDE the handler: a UnicodeDecodeError's .object is the decrypted plaintext, so
         # chaining it would put the PHI this cipher protects on the error (BACKLOG #2085).
         plaintext = _plaintext(plaintext_b64)

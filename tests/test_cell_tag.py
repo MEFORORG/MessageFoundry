@@ -14,6 +14,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import base64
+import logging
 import pathlib
 import sqlite3
 from typing import Any
@@ -423,7 +424,7 @@ def test_a_cipher_that_cannot_name_its_keys_still_reports_its_own_tag_refusal(
 
 
 def test_a_planted_unmarked_cell_is_drift_with_the_ciphers_alert_alone(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #5650. A non-blank unmarked value in a keyed store's tagged cell is refused by the
     cipher, which fires its own refusal hook. ``open_tagged_cell`` used to re-raise that as a plain
@@ -433,6 +434,7 @@ def test_a_planted_unmarked_cell_is_drift_with_the_ciphers_alert_alone(
 
     Control: the blank value every purge writes still reads as itself."""
     monkeypatch.setattr(cell_tag, "_reported", {})
+    caplog.set_level(logging.WARNING, logger=cell_tag.__name__)
     cipher = make_cipher(generate_key(), write_v2=True)
     assert isinstance(cipher, AesGcmCipher)
     tagged: list[str] = []
@@ -454,11 +456,30 @@ def test_a_planted_unmarked_cell_is_drift_with_the_ciphers_alert_alone(
         assert isinstance(planted.value.__cause__, UnmarkedCipherError)
         assert "PLANTED" not in str(planted.value)
         assert unmarked == [("messages", "raw")] and not tagged  # one alert: the cipher's
+    # The cipher's WARNING names only the cell; this one names the row, once per interval.
+    named = [r for r in caplog.records if r.name == cell_tag.__name__ and "um1" in r.getMessage()]
+    assert len(named) == 1 and "PLANTED" not in named[0].getMessage()
 
 
-async def test_a_planted_unmarked_cell_is_audited_and_dead_lettered() -> None:
+async def test_an_unmarked_report_never_mutes_a_moved_cells_audit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5650: both are drift, so a memo keyed on drift alone would let a planted unmarked
+    value's audit row mute the audit of the same cell swapped for another row's ciphertext."""
+    monkeypatch.setattr(cell_tag, "_reported_audit", {})
+    sink = _DeadLetterSink()
+    await report_cell_tag_failure(sink, UnmarkedCellError("messages", "raw", "mu1", "A"))
+    await report_cell_tag_failure(sink, CellTagError("messages", "raw", "mu1", "A"))
+    assert sink.audits == [MESSAGE_TAG_FAILED_ACTION] * 2
+
+
+async def test_a_planted_unmarked_cell_is_audited_and_dead_lettered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """BACKLOG #5650: the containment the plain ``CipherError`` skipped. A handoff dead-letters the
     row and writes the tag-failed audit row, once."""
+    for memo in ("_reported", "_reported_audit"):  # leave no entry for a later test
+        monkeypatch.setattr(cell_tag, memo, {})
     cipher = make_cipher(generate_key(), write_v2=True)
 
     async def handoff(self: _DeadLetterSink, *, routed_id: str) -> bool:
@@ -470,13 +491,17 @@ async def test_a_planted_unmarked_cell_is_audited_and_dead_lettered() -> None:
     assert sink.dead == ["r-um2"] and sink.audits == [MESSAGE_TAG_FAILED_ACTION]
 
 
-def test_transit_names_only_its_aead_refusal_unauthenticated() -> None:
+def test_transit_names_only_its_aead_refusal_unauthenticated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """BACKLOG #5650: the Transit cipher's decrypt raises ``UnauthenticatedCipherError`` for Vault's
     400 whose one reason is the AEAD's authentication failure, so ``open_tagged_cell`` reads a cell
     planted across rows as drift. Controls: every other 400 (a key-version refusal, a malformed
     ciphertext, a reason list that also holds another reason), a 403, a 404 and an outage keep
     their own error; and encrypt never raises it."""
     pytest.importorskip("hvac")
+    for memo in ("_reported", "_reported_audit"):  # leave no entry for a later test
+        monkeypatch.setattr(cell_tag, memo, {})
     import requests
     from hvac.exceptions import (  # type: ignore[import-untyped]
         Forbidden,

@@ -195,8 +195,8 @@ class CellTagError(CipherError):
     #: store's writers. Only drift writes the tag-failed audit row and raises the
     #: ``integrity_drift`` alert.
     drift: ClassVar[bool] = True
-    #: Whether the cipher already alerted and logged the refusal this error wraps, so
-    #: :func:`open_tagged_cell` raises no second alert and logs no second WARNING.
+    #: Whether the cipher already alerted on the refusal this error wraps, so
+    #: :func:`open_tagged_cell` raises no second alert; it still logs the row's WARNING.
     cipher_alerted: ClassVar[bool] = False
 
     def __init__(self, table: str, column: str, row_id: str, channel_id: str | None) -> None:
@@ -236,21 +236,22 @@ class CorruptCellError(CellTagError):
 
 class UnmarkedCellError(CellTagError):
     """A non-blank unmarked value in a tagged cell of a keyed store, which the cipher refused
-    (:class:`~messagefoundry.store.crypto.UnmarkedCipherError`): a stripped marker or a planted row
-    (BACKLOG #5650). The store's writers never write one, so, like a cell sealed for another row,
-    it is a change made outside them.
+    (:class:`~messagefoundry.store.crypto.UnmarkedCipherError`), BACKLOG #5650. A keyed writer
+    never writes one. It is at least a stripped marker, a planted row, or a value a keyless run of
+    an already keyed store wrote; nothing here tells those apart.
 
     It counts as drift, so it writes the tag-failed audit row and is contained as drift is: a list
     withholds the row, a handoff dead-letters it. Its alert is the cipher's own unmarked-value
     refusal, already raised when the cipher refused it, so :func:`open_tagged_cell` raises no
-    second, ``integrity_drift``, alert for it and logs no second WARNING."""
+    second, ``integrity_drift``, alert for it. The cipher's WARNING names only the cell, so this
+    one is still logged, once per interval, naming the row."""
 
     cipher_alerted = True
 
     def _describe(self) -> str:
         return (
             f"integrity: the {self.table}.{self.column} cell of row {self.row_ref} holds an"
-            " unmarked value, which the store's writers never write"
+            " unmarked value, which a keyed writer does not write"
         )
 
 
@@ -265,8 +266,8 @@ def _tag_failure_kind(cipher: Cipher, stored: str, exc: CipherError) -> type[Cel
         return None
     # Only a tag that failed under every held key can mean the cell was sealed elsewhere. A cipher
     # that cannot name its keys (Vault Transit) still says when the value's own tag failed: its
-    # UnauthenticatedCipherError is Transit's AEAD refusal, and nothing else it raises is a corrupt
-    # row it can vouch for, so it keeps its own error there.
+    # UnauthenticatedCipherError is Transit's AEAD refusal. Its other errors are not told apart by
+    # class, a corrupt row among them, so they keep their own error.
     if isinstance(exc, UnauthenticatedCipherError):
         return CellTagError
     return CorruptCellError if callable(getattr(cipher, "holds_key_for", None)) else None
@@ -307,8 +308,7 @@ def open_tagged_cell(
         if kind is None:
             raise
         err = kind(table, column, row_id, channel_id)
-        if not err.cipher_alerted:
-            _alert(cipher, err)
+        _alert(cipher, err)
         raise err from exc
 
 
@@ -372,7 +372,7 @@ def withhold_message_cells(
 _REPORT_INTERVAL_S: Final = 3600.0
 #: The most cells remembered; the oldest is forgotten first.
 _REPORTED_MAX: Final = 4096
-type _Key = tuple[str, str, str, bool]
+type _Key = tuple[str, str, str, str]
 type _Memo = dict[_Key, float]
 _reported: _Memo = {}
 _reported_audit: _Memo = {}
@@ -382,7 +382,8 @@ _reported_lock = threading.Lock()
 
 
 def _memo_key(err: CellTagError) -> _Key:
-    return (err.table, err.column, err.row_ref, err.drift)  # a corrupt read never mutes drift
+    # By class, not only by drift: a corrupt or unmarked read never mutes a moved cell (BACKLOG #5650).
+    return (err.table, err.column, err.row_ref, type(err).__name__)
 
 
 def _is_recent(memo: _Memo, key: _Key, now: float) -> bool:
@@ -408,11 +409,11 @@ def _first_in_interval(memo: _Memo, err: CellTagError) -> bool:
 
 
 def _alert(cipher: object, err: CellTagError) -> None:
-    """Log a WARNING and, for drift, raise ``integrity_drift`` through the cipher's tag-failure hook,
-    once per cell per interval. Never raises."""
+    """Log a WARNING and, for drift the cipher did not already alert on, raise ``integrity_drift``
+    through the cipher's tag-failure hook, once per cell per interval. Never raises."""
     if not _first_in_interval(_reported, err):
         return
-    if not err.drift:
+    if not err.drift or err.cipher_alerted:
         _log.warning("%s; the read was refused", err)
         return
     reason = f"a {err.table}.{err.column} cell failed its integrity tag (row {err.row_ref})"
