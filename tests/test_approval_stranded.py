@@ -302,6 +302,26 @@ async def test_a_second_app_leaves_the_first_apps_live_release_executing(engine:
     assert str((await _row(engine, live))["status"]) == "approved"
 
 
+async def test_a_second_app_leaves_an_unsettled_claim_of_this_life(engine: Engine) -> None:
+    """Residual 5: a claim this process made after its first gate was built, that no gate runs
+    and that never settled (both settle writes failed, say), is not left over from an earlier
+    life. A second app's start leaves it 'executing' rather than record an engine_restart that
+    never happened. Control: a row claimed before the first gate still moves."""
+    before = await _stranded(engine, "engine")
+    first = create_app(engine, approvals=ON)
+    async with first.router.lifespan_context(first):
+        assert str((await _row(engine, before))["status"]) == "interrupted"
+        earlier = await _stranded(engine, "engine")  # claimed before the first gate was built
+        this_life = await _claimed_directly(
+            engine.store, claim_owner="engine", claimed_at=time.time() + 1.0
+        )
+        second = create_app(engine, approvals=ON)
+        async with second.router.lifespan_context(second):
+            assert str((await _row(engine, this_life))["status"]) == "executing"
+            assert str((await _row(engine, earlier))["status"]) == "interrupted"
+    assert await _audit(engine, "approval.interrupted", this_life) == []
+
+
 # --- GET /approvals/executing and the three tiers (residuals 1 and 4) ------------------------------
 
 
