@@ -11711,6 +11711,7 @@ class RegistryRunner:
                         # as the worker it would have spawned does. Only with the tail released:
                         # otherwise the next claim would pass rows still in flight.
                         claimed = []
+                        woken = False  # the next claim follows no wait (B11 accounting)
                         continue
                     return
                 # #1844: resolved. Cleared BEFORE the buildup check, whose store reads can raise, so
@@ -11998,7 +11999,9 @@ class RegistryRunner:
         if name not in self._transform_gone_stops:
             return False
         self._transform_gone_stops.discard(name)
-        if name not in self.registry.inbound:
+        # Not on a node that has lost leadership either: the successor drains the lane, as
+        # _release_tail_on_stop already decides for the per-lane worker.
+        if name not in self.registry.inbound or not self._coordinator.is_leader():
             return False
         log.info("transform lane %r: inbound redeployed while its lane stopped; continuing", name)
         return True

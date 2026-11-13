@@ -687,12 +687,15 @@ async def test_a_reload_that_restores_the_inbound_while_its_lane_stops_keeps_it_
         await runner.stop()
 
 
+@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
 async def test_a_restore_does_not_keep_a_worker_draining_past_a_tail_it_could_not_release(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, claim_mode: str
 ) -> None:
     # The same race with a batch tail whose release fails: those rows stay in flight, and only a
-    # worker that returns has them recovered by the reload-time backstop. A worker that kept
-    # draining would claim the newer row past them, so it must stop, restore or not.
+    # worker that returns has them recovered by the reload-time backstop. A worker or a pooled lane
+    # that kept draining would claim the newer row past them, so it must stop, restore or not.
+    # infra_fault_stop_after=1 ends the pooled serializer's retry of the release at its first
+    # failure; the per-lane worker makes one attempt anyway.
     calls: list[str] = []
     full = _registry(calls)
     message_ids = []
@@ -712,8 +715,9 @@ async def test_a_restore_does_not_keep_a_worker_draining_past_a_tail_it_could_no
         full,
         store,
         poll_interval=0.02,
-        claim_mode="per_lane",
+        claim_mode=claim_mode,
         fifo_claim_batch=3,
+        infra_fault_stop_after=1,
         egress=EgressSettings(deny_by_default=False),
     )
     race = _Race(monkeypatch, store, runner, full, restore="mark_failed")
