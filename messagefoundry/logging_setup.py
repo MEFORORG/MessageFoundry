@@ -842,15 +842,19 @@ _EAI_NO_SUCH_NAME = frozenset(
 )
 
 
-#: UDP send errnos that fail the same way on every retry, so a spooled entry that hits one is dropped
-#: as undeliverable like ``EMSGSIZE`` rather than retried, which would wedge the spool head (BACKLOG
-#: #5923). At least: ``EACCES`` (a broadcast address without ``SO_BROADCAST``), ``EADDRNOTAVAIL``,
-#: ``EAFNOSUPPORT`` and ``EINVAL``, each under its POSIX value and, on Windows, its Winsock value,
-#: which is what a socket error carries there. A network error that may clear, ``ENETUNREACH``,
-#: ``EHOSTUNREACH`` or ``ECONNREFUSED`` say, is not here and stays retryable. Read only for a
-#: datagram socket; a stream arm's errors keep the reconnect-and-retry path.
+#: UDP send errnos read as deterministic, so a spooled entry that hits one is dropped as
+#: undeliverable like ``EMSGSIZE`` rather than retried, which would wedge the spool head (BACKLOG
+#: #5923). Not every deterministic errno is here; at least these are: ``EACCES`` (a broadcast
+#: address without ``SO_BROADCAST``), ``EADDRNOTAVAIL``, ``EAFNOSUPPORT`` and ``EINVAL``, each under
+#: its POSIX value and, on Windows, its Winsock value, which is what a socket error carries there.
+#: Any errno not listed, ``ENETUNREACH``, ``EHOSTUNREACH``, ``ECONNREFUSED``, ``EPERM`` or
+#: ``ENOBUFS`` say, stays retryable. The cost: on Linux a ``prohibit`` route raises ``EACCES`` and a
+#: ``blackhole`` route ``EINVAL``, and either can be installed and removed at run time, so a record
+#: sent while one is present is dropped, not kept (reasoned from the kernel, not measured). Read
+#: only for a datagram socket, and never for a ``socket.gaierror``, whose errno is a lookup code from
+#: another namespace; a stream arm's errors keep the reconnect-and-retry path.
 _DETERMINISTIC_UDP_SEND_ERRNOS = frozenset(
-    code
+    getattr(errno, name)
     for name in (
         "EACCES",
         "EADDRNOTAVAIL",
@@ -861,7 +865,7 @@ _DETERMINISTIC_UDP_SEND_ERRNOS = frozenset(
         "WSAEAFNOSUPPORT",
         "WSAEINVAL",
     )
-    if (code := getattr(errno, name, None)) is not None
+    if hasattr(errno, name)
 )
 
 
@@ -1014,7 +1018,11 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         if exc is not None and (
             not isinstance(exc, OSError)
             or exc.errno == errno.EMSGSIZE
-            or (self.socktype == socket.SOCK_DGRAM and exc.errno in _DETERMINISTIC_UDP_SEND_ERRNOS)
+            or (
+                self.socktype == socket.SOCK_DGRAM
+                and not isinstance(exc, socket.gaierror)
+                and exc.errno in _DETERMINISTIC_UDP_SEND_ERRNOS
+            )
         ):
             # Not the network's fault, or deterministic, so no reconnect; but never counted as
             # sent (BACKLOG #1966, #5923).
@@ -1410,7 +1418,8 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         #: it rises by one per audit row too, so close() publishes it only through
         #: :func:`_published_counts`.
         self.spooled_at_stop = 0
-        #: Records a non-network send error made undeliverable (BACKLOG #1966). Never "sent".
+        #: Records a send error a retry is read as unable to fix made undeliverable (BACKLOG #1966,
+        #: #5923). Never "sent".
         self.undeliverable = 0
         self._last_undeliverable_report: float | None = None
         #: When :meth:`_send` last reported a failed network send (BACKLOG #5923).
@@ -2084,7 +2093,7 @@ class ForwarderStatus:
     #: can see there is at least a ``sendto`` that raises on this host (BACKLOG #5923), and queue
     #: and spool losses. A network error such as ``ENETUNREACH`` sets ``send_failing``; a datagram
     #: too large to send (``EMSGSIZE``), or a UDP send error that fails the same way on every retry
-    #: (at least those in ``_DETERMINISTIC_UDP_SEND_ERRNOS``), is counted in ``undeliverable`` and
+    #: (those in ``_DETERMINISTIC_UDP_SEND_ERRNOS``), is counted in ``undeliverable`` and
     #: never sets ``send_failing``.
     delivery_confirmed: bool = True
     #: Whether the last send hit a network error. Also true from a deferred start, where the
@@ -2101,7 +2110,7 @@ class ForwarderStatus:
     queue_dropped: int = 0
     #: Records a network error cost, with no spool to keep them.
     unsent: int = 0
-    #: Records dropped for a send error that was not a network error.
+    #: Records dropped for a send error a retry is read as unable to fix.
     undeliverable: int = 0
     #: Records the on-disk spool refused: full, or the write failed.
     spool_dropped: int = 0

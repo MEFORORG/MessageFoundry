@@ -250,11 +250,12 @@ its statements no longer match the code; where they disagree, this amendment hol
   not measured). Nor is a datagram that leaves this host and never reaches the collector, which
   includes every datagram to a collector that is down. Delivery over UDP stays unconfirmed.
 - **A send error that is not a network error is now undeliverable on UDP too**, not only on TCP
-  and TLS. So is a UDP send error that fails the same way on every retry: at least a datagram too
+  and TLS. So is a UDP send error read as one that fails the same way on every retry: at least a datagram too
   large to send (`EMSGSIZE`), `EACCES` (a broadcast address without `SO_BROADCAST`),
   `EADDRNOTAVAIL`, `EAFNOSUPPORT` and `EINVAL`, under their POSIX or Winsock values. A network error
-  that may clear, such as `ENETUNREACH`, `EHOSTUNREACH` or `ECONNREFUSED`, stays retryable. None of
-  these is ever counted as sent: each is counted in `undeliverable`, is not kept for a
+  that may clear, such as `ENETUNREACH`, `EHOSTUNREACH` or `ECONNREFUSED`, stays retryable. The
+  reading can be wrong for a route that comes and goes; `docs/CONFIGURATION.md` says what that
+  costs. None of these is ever counted as sent: each is counted in `undeliverable`, is not kept for a
   retry, and never sets `send_failing`. A copy already in the spool for another reason, such as
   backoff or the drain deadline, is dropped the same way when replay reaches it.
 - **With a spool, a UDP collector whose name lookup fails for a temporary reason at start is now
@@ -264,5 +265,6 @@ its statements no longer match the code; where they disagree, this amendment hol
 On every arm the standard library's traceback to stderr on a failed send is gone. A throttled
 ERROR line with no record content reports network send errors instead, and an undeliverable
 record gets its own. Both are logged during the shutdown drain too, unless the throttle holds
-one back, when they reach only the local sinks; the running count carries what the throttle held. The counts each case moves are stated for
+one back, when they reach only the local sinks. A line the throttle holds during the drain is never
+written, because no later report follows and `close()` counts nothing a failed send cost. The counts each case moves are stated for
 operators in [`docs/CONFIGURATION.md`](../CONFIGURATION.md) `[logging]`.

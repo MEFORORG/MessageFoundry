@@ -1120,7 +1120,8 @@ class LogForwarderInfo(BaseModel):
     ``unconfirmed``. A send that raises a network error, such as ``ENETUNREACH``, sets
     ``send_failing``. It reaches ``lost`` at least as ``unsent`` with no spool, or as
     ``spool_dropped`` when the spool refused it; a spool that took the record holds it unsent.
-    A datagram too large to send (``EMSGSIZE``) never sets ``send_failing``: it is dropped as
+    A UDP send error a retry is read as unable to fix, at least a datagram too large to send
+    (``EMSGSIZE``), never sets ``send_failing``: it is dropped as
     undeliverable, is not kept for a retry, and is counted in ``undeliverable``, so in ``lost``.
 
     **Counts and fixed words only**: never a record, a collector address or an error text."""
@@ -1134,7 +1135,7 @@ class LogForwarderInfo(BaseModel):
     queued: int = 0  # on the hand-off queue now, both lanes, capped at the smaller lane bound
     queue_dropped: int = 0  # dropped because their lane of the hand-off queue was full
     unsent: int = 0  # a network error cost them, with no spool to keep them
-    undeliverable: int = 0  # dropped for a send error that was not a network error
+    undeliverable: int = 0  # dropped for a send error a retry is read as unable to fix
     spool_dropped: int = 0  # the on-disk spool was full or refused the write
     spool_skipped: int = 0  # spooled records found torn, malformed or gone
     spool_read_errors: int = 0  # spool reads that failed; those records are held, not lost

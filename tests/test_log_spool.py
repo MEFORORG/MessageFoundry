@@ -1420,39 +1420,96 @@ def test_an_oversized_udp_datagram_is_undeliverable_so_replay_does_not_wedge(
         fwd.close()
 
 
-@pytest.mark.parametrize(
-    "error",
-    sorted(
-        {errno.EACCES, errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT, errno.EINVAL}
-        | {
-            code
-            for name in ("WSAEACCES", "WSAEADDRNOTAVAIL", "WSAEAFNOSUPPORT", "WSAEINVAL")
-            if (code := getattr(errno, name, None)) is not None
-        }
-    ),
+class _FailsFirstDatagramSocket(_FailingDatagramSocket):
+    """A UDP socket whose first ``sendto`` raises ``error`` and whose later ones deliver."""
+
+    def sendto(self, data: bytes, _address: Any) -> int:
+        self.sent.append(data)
+        if len(self.sent) == 1:
+            raise self.error
+        return len(data)
+
+
+_DETERMINISTIC_NAMES = (
+    "EACCES",
+    "EADDRNOTAVAIL",
+    "EAFNOSUPPORT",
+    "EINVAL",
+    "WSAEACCES",
+    "WSAEADDRNOTAVAIL",
+    "WSAEAFNOSUPPORT",
+    "WSAEINVAL",
 )
+
+
+def _deterministic_codes() -> set[int]:
+    return {getattr(errno, n) for n in _DETERMINISTIC_NAMES if hasattr(errno, n)}
+
+
+@pytest.mark.parametrize("error", sorted(_deterministic_codes()))
 def test_a_deterministic_udp_send_error_is_undeliverable_so_replay_does_not_wedge(
     spool_dir: Path, error: int
 ) -> None:
     """A UDP send error that fails the same way on every retry, ``EACCES`` from a broadcast address
     without ``SO_BROADCAST`` for one, wedges the spool head exactly as ``EMSGSIZE`` did if read as a
-    network failure. It is dropped as undeliverable, and the later entries still deliver."""
+    network failure. It is dropped as undeliverable, and the later entry still delivers."""
     spool = LogSpool(spool_dir, max_bytes=1_000_000)
     spool.open()
     target, fwd = _udp_forwarder(spool)
     try:
         assert spool.append(SpoolEntry(level="WARNING", line="bad"))
         assert spool.append(SpoolEntry(level="WARNING", line="next"))
-        failing = _FailingDatagramSocket(OSError(error, "deterministic"))
-        _swap_socket(target, failing)
+        sock = _FailsFirstDatagramSocket(OSError(error, "deterministic"))
+        _swap_socket(target, sock)
         fwd._listener._replay()
-        assert len(failing.sent) == 2  # the second entry was tried: nothing wedged
-        assert fwd._listener.undeliverable == 2
+        assert len(sock.sent) == 2 and b"next" in sock.sent[1]  # delivered past the bad head
+        assert fwd._listener.undeliverable == 1
         assert fwd._listener.send_failures == 0
         assert fwd._listener.send_failing is False
         assert not spool.pending
     finally:
         fwd.close()
+
+
+def test_a_deterministic_udp_errno_on_a_stream_arm_still_reconnects_and_retries() -> None:
+    """The deterministic set is read only for a datagram socket: on TCP the same errno keeps the
+    reconnect-and-retry path, so the record is a failed send, not an undeliverable one."""
+    handler = _TimeoutSysLogHandler(
+        address=("127.0.0.1", 9), socktype=socket.SOCK_STREAM, defer_connect=True
+    )
+    try:
+
+        class _Refusing:
+            def sendall(self, _data: bytes) -> None:
+                raise OSError(errno.EACCES, "denied")
+
+            def close(self) -> None:
+                pass
+
+        handler.socket = _Refusing()
+        handler.emit(logging.makeLogRecord({"msg": "one", "levelname": "WARNING"}))
+        assert handler.send_failed is True
+        assert handler.send_error is False
+        assert handler.socket is None  # dropped for a reconnect
+    finally:
+        handler.close()
+
+
+def test_a_lookup_error_whose_code_matches_a_deterministic_errno_is_retried() -> None:
+    """A ``socket.gaierror`` carries a lookup code from another namespace; on Windows
+    ``EAI_FAMILY`` is 10047, the Winsock ``EAFNOSUPPORT``. It is never read as deterministic."""
+    handler = _TimeoutSysLogHandler(
+        address=("127.0.0.1", 9), socktype=socket.SOCK_DGRAM, defer_connect=True
+    )
+    try:
+        handler.socket = _FailingDatagramSocket(
+            socket.gaierror(getattr(errno, "WSAEAFNOSUPPORT", errno.EAFNOSUPPORT), "lookup")
+        )
+        handler.emit(logging.makeLogRecord({"msg": "one", "levelname": "WARNING"}))
+        assert handler.send_failed is True
+        assert handler.send_error is False
+    finally:
+        handler.close()
 
 
 @pytest.mark.parametrize("error", [errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ECONNREFUSED])
