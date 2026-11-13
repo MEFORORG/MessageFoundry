@@ -2410,7 +2410,10 @@ Properties of the anonymizer:
   in one, such as a name, passes. The kept positions are
   CX positions whatever the field's type, so an overlay that points an EI field such as `OBR-3` at `id` blanks EI.2, the namespace id.
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
-  loose string search. With no site prefix loaded it matches nothing, and
+  loose string search. A component or subcomponent is a site code when it is one whole as
+  written, decoded from its escape sequences, or decoded and split again on the delimiters, so a
+  code joined to `\S\` or written with a hex escape is replaced, escapes and all, by digits of the
+  same width (BACKLOG #5632). With no site prefix loaded it matches nothing, and
   `python -m tee anonymize-captures` prints a warning saying so (vault BACKLOG #3516).
 - **Fail-closed contract.** A message with **no parseable MSH / malformed** is **REFUSED** (raises
   `AnonError`) — it never emits an un-scrubbed body. So is a message holding a line no rule can
@@ -2431,7 +2434,7 @@ both are described below:
 | The leak-check refuses when | Where it looks |
 | --- | --- |
 | The message has no parseable MSH, or its structure cannot be parsed (`AnonError`) | The whole message |
-| A known partner, vendor or site token, or a routable IP address, survives | The whole message |
+| A known partner, vendor or site token, or a routable IP address, survives. An IPv6 address counts unless it is unspecified, loopback, link-local, unique-local, multicast or in the documentation range `2001:db8::/32`; an IPv4-mapped one counts when its IPv4 part is routable (BACKLOG #5654) | The whole message |
 | The header's `MSH-12` version is made of digits and dots, and one run of digits is longer than 32 (`AnonError`, raised by the anonymizer before the leak-check runs) | The header |
 | A dashed SSN (`NNN-NN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
 | A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
@@ -2457,8 +2460,12 @@ reading the first one where a component has several. An escape can pair across t
 separator in the first reading and not in the second, so the check takes both. The shape
 detectors read each unmapped value as written, then each of its components decoded whole and each
 of its subcomponents decoded on its own. The MRN-typed check reads the id type as written,
-decoded whole, and as its first subcomponent decoded. The token scan reads the whole message as
-written, then decoded a subcomponent at a time, then decoded a component at a time. The escape
+decoded whole, and as each of its subcomponents, as written and decoded, each stripped of
+surrounding spaces, so `X&MR` and `MR\X20\` count (BACKLOG #5654). The check for a shape cut
+across fields reads each line as written and with each field decoded a subcomponent and a
+component at a time, and counts a cut only where two fields meet (BACKLOG #5533 item 8). The
+token scan reads the whole message as written, then decoded a subcomponent at a time, then
+decoded a component at a time. The escape
 character is the one the message's own `MSH-2` declares. Each sequence decodes as the engine's
 own parser reads it: `\F\`, `\S\`, `\T\`, `\R\` and `\E\` become that message's own
 delimiters, `\H\` and `\N\` become `_`, and a hex escape `\Xhh\` becomes the character with
@@ -2473,8 +2480,8 @@ still pass:
 - No part wider than a component is decoded, as neither engine reader decodes one, so a shape
   whose parts sit in different components is not joined, and an escape character with no closing
   one in a component never pairs with a sequence in the next.
-- The site-code check does not decode, so a site code written with an escape sequence passes it.
-- The check for a shape cut across fields by the field separator does not decode.
+- The site-code check and the scrub read no part wider than a component either, so a site code
+  whose escape pairs across a component separator passes both (BACKLOG #5632).
 - A hex escape decodes one byte to one character. A non-ASCII character a UTF-8 sender wrote as
   several hex pairs reads as several characters, so a token holding it is not found in that form.
 
