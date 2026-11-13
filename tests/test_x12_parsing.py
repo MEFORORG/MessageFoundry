@@ -743,6 +743,88 @@ def test_message_set_rejects_delimiter_injection() -> None:
         msg.set("NM1-03", "BAD~VALUE")  # segment terminator would inject a segment
 
 
+# --- a component path in a repeating element (BACKLOG #5922) -----------------
+# ZZ1 is a made-up segment: these tests are about the codec's separators, not any guide's layout.
+
+
+def _repeating(
+    *, el: str = "*", comp: str = ":", term: str = "~", rep: str = "^", between: str = "", **kw: str
+) -> str:
+    """An interchange with one ``ZZ1`` whose element 1 is ``A:B`` and ``C:D`` joined by ``between``
+    (the repetition separator ``rep`` unless given)."""
+    body = el.join(["ZZ1", comp.join(["A", "B"]) + (between or rep) + comp.join(["C", "D"])])
+    return (
+        isa(el=el, comp=comp, term=term, rep=rep, **kw)
+        + el.join(["GS", "HS", "A", "B", "20240101", "1200", "1", "X", "005010X279A1"])
+        + term
+        + el.join(["ST", "270", "0001"])
+        + term
+        + body
+        + term
+        + el.join(["SE", "3", "0001"])
+        + term
+        + el.join(["GE", "1", "1"])
+        + term
+        + el.join(["IEA", "1", "000000001"])
+        + term
+    )
+
+
+_REPEATING_DELIMS = [
+    pytest.param({}, id="default-delimiters"),
+    pytest.param({"el": "|", "comp": "^", "term": "'", "rep": "~"}, id="custom-delimiters"),
+]
+
+
+@pytest.mark.parametrize("delims", _REPEATING_DELIMS)
+def test_a_component_read_addresses_the_first_repetition(delims: dict[str, str]) -> None:
+    msg = X12Message.parse(_repeating(**delims))
+    rep, comp = msg.delimiters.repetition, msg.delimiters.component
+    assert rep is not None
+    assert msg["ZZ1-01"] == f"A{comp}B{rep}C{comp}D"  # a whole element is still the raw element
+    assert msg["ZZ1-01.1"] == "A"
+    assert msg["ZZ1-01.2"] == "B"  # not "B" fused with the next repetition's "C"
+    assert msg["ZZ1-01.3"] is None  # the first repetition has two components
+
+
+@pytest.mark.parametrize("delims", _REPEATING_DELIMS)
+def test_a_component_write_keeps_the_later_repetitions(delims: dict[str, str]) -> None:
+    msg = X12Message.parse(_repeating(**delims))
+    rep, comp = msg.delimiters.repetition, msg.delimiters.component
+    msg["ZZ1-01.2"] = "X"
+    assert msg["ZZ1-01"] == f"A{comp}X{rep}C{comp}D"
+    msg["ZZ1-01.3"] = "E"  # extending the first repetition leaves the second alone
+    assert msg["ZZ1-01"] == f"A{comp}X{comp}E{rep}C{comp}D"
+    reparsed = X12Message.parse(msg.encode())
+    assert reparsed["ZZ1-01.2"] == "X"
+    assert reparsed["ZZ1-01"] == f"A{comp}X{comp}E{rep}C{comp}D"
+
+
+def test_a_component_write_into_an_empty_first_repetition() -> None:
+    msg = X12Message.parse(_repeating().replace("ZZ1*A:B^", "ZZ1*^"))
+    assert msg["ZZ1-01"] == "^C:D"
+    assert msg["ZZ1-01.1"] is None
+    msg["ZZ1-01.2"] = "Y"
+    assert msg["ZZ1-01"] == ":Y^C:D"
+
+
+def test_before_00501_the_caret_is_data_so_a_component_spans_it() -> None:
+    # Before 00501 ISA-11 is the standards identifier, so "^" is an ordinary character.
+    msg = X12Message.parse(_repeating(rep="U", version="00401", between="^"))
+    assert msg.delimiters.repetition is None
+    assert msg["ZZ1-01.2"] == "B^C"
+    msg["ZZ1-01.2"] = "X^Y"
+    assert msg["ZZ1-01"] == "A:X^Y:D"
+
+
+def test_an_isa_component_read_is_unchanged_by_the_repetition_split() -> None:
+    # ISA-11 holds the repetition separator itself from 00501; a component read there still
+    # returns it rather than splitting it away.
+    msg = X12Message.parse(_repeating())
+    assert msg["ISA-11"] == "^"
+    assert msg["ISA-11.1"] == "^"
+
+
 def test_an_isa_write_keeps_the_fixed_width_and_re_peeks() -> None:
     # vault BACKLOG #2785: a short ISA-06 used to shrink the 106-char header, and X12Peek refused it.
     msg = X12Message.parse(interchange())
