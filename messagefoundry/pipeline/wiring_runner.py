@@ -2250,11 +2250,6 @@ class RegistryRunner:
         # Per-inbound rather than one process-wide flag because the RE-ARM is per-connection: a
         # restart of inbound A must not silently re-arm B's processing while B's listener stays down.
         self._log_halted: set[str] = set()
-        # Bumped by every #122 halt as it latches, and by every start and teardown (BACKLOG #5704).
-        # A halt waits for the reload lock before it stops anything, and it stops nothing if this
-        # moved meanwhile: a newer halt owns the break, or a stop or start has replaced the run it
-        # latched in, and pausing lanes into that run would make the next start come up paused.
-        self._log_halt_epoch = 0
         # The DELIVERY tier's counterpart is :attr:`_delivery_halted`, a derived read below rather
         # than a field here — see that property for why the tier links to the process latch instead
         # of restating it.
@@ -5855,61 +5850,57 @@ class RegistryRunner:
         un-errored rather than dead-lettering them. Fix the disk, reload, and the backlog drains."""
         if self._log_write_stopped:
             return  # latched: one halt per break
-        # THE LATCH IS THE SOURCE-SIDE HALF (BACKLOG #5704), set before any await. The stop below
-        # waits for the reload lock, and a reload holding it has unbound every listener and rebinds
-        # them. Its rebind gate, :meth:`_resume_inbound_processing`, refuses while this latch is set,
-        # so it cannot rebind a listener over the internal stages this halt is about to shut down.
         self._log_write_stopped = True
-        self._log_halt_epoch += 1
-        epoch = self._log_halt_epoch
+        # THE SOURCE-SIDE HALF (BACKLOG #5704): the internal stages go down NOW, with the latch and
+        # before any await, rather than once the stop below holds the reload lock. A reload holding
+        # that lock has unbound every listener and rebinds each through its gate,
+        # :meth:`_resume_inbound_processing`, which refuses an inbound in `_log_halted`. Marked only
+        # under the lock, the set was empty while that reload ran, so it would have rebound every
+        # listener, and the stop below, reading its bound list before the lock, would have left them
+        # bound and ACKing into halted lanes. Sync and await-free, so it needs no lock: a reload
+        # mid-flight re-applies `_log_halted` to its dispatchers, and the gate also refuses, while
+        # this latch is set, an inbound that reload adds. Marking here also stops the router and
+        # transform work that would otherwise run unlogged for as long as the halt waits.
+        self._halt_inbound_processing(self.registry.inbound)
         detail = f"application log sink {sink!r} is unwritable ({reason})"
-        inbounds = [name for name in self.registry.inbound if name in self._sources]
-        outbounds = [
-            name
-            for name in self.registry.outbound
-            if self._owns_destination(name) and name not in self._outbound_paused
-        ]
+        inbounds, outbounds = self._log_halt_lanes()
         # Alert BEFORE stopping, and through the NOTIFIER rather than a log line: the sink this is
         # about is the one that just broke, so a log line may never land. If the stop itself wedges,
-        # the operator has already been told why the engine is going quiet.
-        self._alert_sink.log_write_failed(
-            sink,
-            stage="unwritable",
-            reason=reason,
-            stopped=len(inbounds) + len(outbounds),
-        )
+        # the operator has already been told why the engine is going quiet. Guarded, because a sink
+        # that raised here would abort the halt with its latch already set, and every later event
+        # would return on that latch with the listeners still bound.
+        try:
+            self._alert_sink.log_write_failed(
+                sink,
+                stage="unwritable",
+                reason=reason,
+                stopped=len(inbounds) + len(outbounds),
+            )
+        except Exception:
+            log.exception("alert sink raised on log_write_failed for sink %r", sink)
         async with self._reload_lock:
-            if epoch != self._log_halt_epoch or not self._log_write_stopped:
-                # Something ran while this waited for the lock (BACKLOG #5704). A stop or a start
-                # has replaced the run this latched in: a start probes the log itself, and lanes
-                # paused into a stopped run would come back paused at the next start. A newer halt
-                # latched, and it alone stops this break, once. Or a recovery probe re-validated the
-                # log by writing to it and cleared the latch, so the log works and stopping now would
-                # halt a healthy engine. The page above has gone out; nothing else happens.
-                log.warning(
-                    "log-failure halt for sink %r stood down: a stop, a start, a newer halt or a "
-                    "log re-validation ran while it waited for the reload lock",
-                    sink,
-                )
+            if not self._running and not (
+                self._sources or self._workers or self._destinations or self._dispatchers
+            ):
+                # A stop finished while this waited (BACKLOG #5704): nothing is left to stop, and
+                # lanes paused into `_outbound_paused` now would be replayed by the next start, which
+                # would bring delivery up paused for a halt from the run that stop ended. That start
+                # probes the log itself and resets the internal-stage marks. A teardown that left
+                # state behind (it raised, or was cancelled) is not this case: the halt still runs.
                 return
-            # Both lists again, now the lock is held (BACKLOG #5704). The ones above only sized the
-            # page. A reload that held the lock may have removed a connection, or parked an outbound
-            # (`_gate_parked` / `_schedule_parked`), and stopping that lane again here would turn its
-            # engine park into an operator pause that no later reload lifts.
-            inbounds = [name for name in self.registry.inbound if name in self._sources]
-            outbounds = [
-                name
-                for name in self.registry.outbound
-                if self._owns_destination(name) and name not in self._outbound_paused
-            ]
-            # THE INTERNAL STAGES FIRST, and they are not an afterthought — they are the half that
-            # makes this an enforcement. See :meth:`_halt_inbound_processing`.
-            #
-            # EVERY REGISTRY INBOUND, deliberately wider than `inbounds` above (which is the BOUND
-            # ones, for the alert count and the per-connection stop): an inbound whose listener never
-            # bound — isolated by ADR 0031, stopped by an operator, outside its active window — still
-            # has router/transform workers draining whatever is already in its lanes. Halting only
-            # the bound ones would leave exactly those backlogs processing unlogged.
+            # What to stop is read again now the lock is held (BACKLOG #5704): the lists above only
+            # sized the page. A reload that held the lock may have removed a connection, or engine-
+            # parked an outbound (`_gate_parked` / `_schedule_parked`), and stopping that lane again
+            # would turn its park into an operator pause that no later reload lifts. A second halt
+            # of the same break reads both empty, so it stops and alerts nothing again.
+            inbounds, outbounds = self._log_halt_lanes()
+            # THE INTERNAL STAGES, again, for the graph as it stands now: a reload that held the lock
+            # may have added an inbound it did not bind. EVERY REGISTRY INBOUND, deliberately wider
+            # than `inbounds` (the BOUND ones, for the per-connection stop): an inbound whose
+            # listener never bound — isolated by ADR 0031, stopped by an operator, outside its
+            # active window — still has router/transform workers draining whatever is already in
+            # its lanes. Halting only the bound ones would leave exactly those backlogs processing
+            # unlogged. See :meth:`_halt_inbound_processing`.
             self._halt_inbound_processing(self.registry.inbound)
             for name in inbounds:
                 try:
@@ -5929,14 +5920,27 @@ class RegistryRunner:
             except Exception:
                 log.exception("alert sink raised on connection_stopped for %r", name)
 
+    def _log_halt_lanes(self) -> tuple[list[str], list[str]]:
+        """The bound inbounds and the running owned outbounds a #122 halt stops, as
+        ``(inbounds, outbounds)``. One reading, used before the halt waits for the reload lock (to
+        size its page) and again once it holds it (to choose what it stops), so the two cannot drift
+        apart in what they select (BACKLOG #5704)."""
+        inbounds = [name for name in self.registry.inbound if name in self._sources]
+        outbounds = [
+            name
+            for name in self.registry.outbound
+            if self._owns_destination(name) and name not in self._outbound_paused
+        ]
+        return inbounds, outbounds
+
     def _pause_delivery_lanes(self, names: Iterable[str]) -> None:
         """Pause these outbound lanes for a #122 log-failure halt. Sync and await-free.
 
         The one place that knows HOW the halt takes the DELIVERY tier down, for the same reason
         :meth:`_pause_internal_lanes` owns the internal one: two halts need exactly this loop and a
         third copy is how they drift. The callers choose the lanes rather than this method selecting
-        them — :meth:`_stop_all_for_log_failure` has to build its list before the loop anyway (it
-        alerts first, and the alert carries the count), and
+        them — :meth:`_stop_all_for_log_failure` reads its list with :meth:`_log_halt_lanes` once it
+        holds the reload lock, and
         :meth:`_park_delivery_for_log_failure` takes every owned lane.
 
         Routes through :meth:`_stop_outbound_unsafe`, so a paused lane reads as an OPERATOR pause
@@ -5971,7 +5975,9 @@ class RegistryRunner:
 
     def _halt_inbound_processing(self, names: Iterable[str]) -> None:
         """Shut down the INTERNAL stages — router, transform, and a loopback's response re-ingress —
-        for these inbounds. Sync + await-free; callers hold the reload lock.
+        for these inbounds. Sync + await-free. Callers hold the reload lock, except the halt's own
+        first call, made as it latches (BACKLOG #5704), which needs none because it does not await:
+        a reload mid-flight re-applies :attr:`_log_halted` to its dispatchers.
 
         **This is the half of "refuse to process" that stopping the listener does not cover, and its
         absence was measured rather than reasoned about.** The router/transform workers are
@@ -6190,12 +6196,10 @@ class RegistryRunner:
         application log behind it, and neither latch could ever fire again.
 
         **It also refuses an inbound that is not halted YET while the latch is set** (BACKLOG
-        #5704). The halt latches before it waits for the reload lock, and fills :attr:`_log_halted`
-        only once it holds it. A reload holding the lock in that window has unbound every listener
-        and rebinds them through here, so a gate that read :attr:`_log_halted` alone let it rebind
-        each one over internal stages the halt was about to shut down, and the halt, which read its
-        bound list before the lock, left them bound and ACKing into halted lanes. The same holds for
-        an inbound a reload adds after a halt. A refused inbound is halted here, so its own workers
+        #5704). The halt marks every inbound of the graph it sees as it latches, but a reload that
+        holds the reload lock meanwhile may add one, and so may any reload after the halt. Read from
+        :attr:`_log_halted` alone, the gate would bind that inbound and leave its stages running
+        with no application log behind them. A refused inbound is halted here, so its own workers
         stop at their gate whether or not a halt is still to come."""
         halted = name in self._log_halted
         if not halted and not self._log_write_stopped:
@@ -6379,9 +6383,6 @@ class RegistryRunner:
                 # enters it.
                 await self._teardown_unsafe(TeardownReason.SHUTDOWN)
             self._stop.clear()
-            # This start probes the log itself below, so a halt still waiting for the lock from an
-            # earlier run stands down (BACKLOG #5704; see _log_halt_epoch).
-            self._log_halt_epoch += 1
             if self._dr_threshold is None:
                 # As in reload: with the profile off the threshold parks no outbound, and a
                 # marker left by a run under it would otherwise refuse doors until the next reload
@@ -7124,12 +7125,6 @@ class RegistryRunner:
             await self._teardown_body(demote, budget)
         finally:
             self._running = False
-            # A halt waiting for the reload lock stands down rather than pause lanes into a run this
-            # teardown ended (BACKLOG #5704; see _log_halt_epoch). At the END, not the start: the
-            # body cancels the halt tasks that exist when it begins, so the halt this must reach is
-            # one an escalation queued before the guard was unsubscribed, which latches at one of
-            # the body's awaits.
-            self._log_halt_epoch += 1
 
     async def _teardown_body(self, demote: bool, budget: float) -> None:
         """The teardown sequence itself. Split out ONLY so the ``finally`` above contains no await —

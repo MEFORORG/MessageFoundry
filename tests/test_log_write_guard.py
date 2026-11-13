@@ -669,7 +669,6 @@ async def test_a_halt_that_latches_during_a_stop_pauses_nothing_into_the_next_ru
     await halts[0]
 
     assert runner._outbound_paused == set(), "the halt paused a lane into the next run"
-    assert runner._log_halted == set()
     assert sink.stopped == []
     assert len(sink.log_failures) == 1  # the halt's one page, sent before it waited
 
@@ -686,6 +685,8 @@ async def test_a_halt_keeps_an_engine_park_a_reload_made_while_it_waited(
     await runner._reload_lock.acquire()
     try:
         halt = await _halt_waiting_on_the_lock(runner)
+        # The internal stages went down as the halt latched, not once it holds the lock.
+        assert INBOUND in runner._log_halted
         runner._park_outbound_lane(OUTBOUND)  # the reload's gate, under its lock
         runner._gate_parked.add(OUTBOUND)
     finally:
@@ -696,10 +697,11 @@ async def test_a_halt_keeps_an_engine_park_a_reload_made_while_it_waited(
     assert sorted(name for name, _ in sink.stopped) == [INBOUND]
 
 
-async def test_a_halt_superseded_by_a_newer_one_does_not_halt_twice(store: MessageStore) -> None:
+async def test_two_halts_of_one_break_stop_and_alert_once(store: MessageStore) -> None:
     # BACKLOG #5704. A recovery probe can clear the latch while a halt waits for the lock, and the
-    # log can break again, so a second halt latches and waits behind the first. One break is one
-    # stop: the newer halt stops the connections once, and the older one stands down.
+    # log can break again, so a second halt latches and waits behind the first. Each sends its
+    # page, but the connections are stopped and alerted once: the second reads what to stop once
+    # it holds the lock, and finds nothing left running.
     sink = _RecordingSink()
     runner, source = _graph(store, sink)
     await runner._reload_lock.acquire()
@@ -714,27 +716,6 @@ async def test_a_halt_superseded_by_a_newer_one_does_not_halt_twice(store: Messa
     assert source.stopped is True and OUTBOUND in runner._outbound_paused
     assert sorted(name for name, _ in sink.stopped) == [INBOUND, OUTBOUND]
     assert len(sink.log_failures) == 2  # one page per break
-
-
-async def test_a_halt_whose_latch_was_cleared_while_it_waited_stops_nothing(
-    store: MessageStore,
-) -> None:
-    # BACKLOG #5704. A recovery probe that ran while the halt waited (a reload's rebind or un-park
-    # gate) wrote to the log and cleared the latch. The log works, so stopping now would halt a
-    # healthy engine.
-    sink = _RecordingSink()
-    runner, source = _graph(store, sink)
-    await runner._reload_lock.acquire()
-    try:
-        halt = await _halt_waiting_on_the_lock(runner)
-        runner._log_write_stopped = False
-    finally:
-        runner._reload_lock.release()
-    await halt
-
-    assert source.stopped is False
-    assert runner._outbound_paused == set() and runner._log_halted == set()
-    assert sink.stopped == []
 
 
 async def test_the_escalation_bridges_from_a_worker_thread_onto_the_engine_loop(
