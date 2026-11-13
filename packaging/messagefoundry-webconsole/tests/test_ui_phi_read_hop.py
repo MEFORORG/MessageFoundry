@@ -39,6 +39,8 @@ from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AiSettings, AuthSettings, StoreSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.uploads import UploadStore
+from messagefoundry_webconsole.routes.uploaded_logs import BROWSE_HOP_REFUSED_CODE
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms -- satisfies the ASVS policy (WP-3)
 ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
@@ -48,14 +50,15 @@ ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE
 NEEDLE = "DOE^JANE"
 
 
-async def _service(engine: Engine) -> AuthService:
+async def _service(engine: Engine, *, write_floor: bool = True) -> AuthService:
     # require_mfa=False for the same reason the sibling /ui suites pin it: these tests exercise the
     # hop refusal, not MFA enrollment, and an unenrolled session would otherwise divert to /ui/account.
-    # admin_write_min_interval_seconds=0: an upload arm sends two writes back to back, and the
-    # write-pacing floor would answer the second 429, a gate these tests are not about.
-    service = AuthService(
-        engine.store, AuthSettings(require_mfa=False, admin_write_min_interval_seconds=0)
-    )
+    # write_floor=False only for the handler-guarded arms: an upload arm sends two writes back to
+    # back, and the write-pacing floor would answer the second 429, a gate those arms are not about.
+    settings = AuthSettings(require_mfa=False)
+    if not write_floor:
+        settings = AuthSettings(require_mfa=False, admin_write_min_interval_seconds=0)
+    service = AuthService(engine.store, settings)
     await service.initialize()
     return service
 
@@ -295,8 +298,9 @@ async def test_a_non_phi_console_route_is_untouched_by_the_refusal(
 # is the handler's own ``enforce_phi_read_hop`` call, which the gate walk below cannot see, so each
 # gets a REFUSE and an ALLOW arm here, differing ONLY in ``phi_read_hop_secure``.
 #
-# Their short-circuit renders (the bare search form, a refused filter, the no-preset layered 400)
-# never reach those handlers and are not exercised here.
+# The search routes' short-circuit renders (the bare form, a refused filter, the no-preset layered
+# 400) never reach those handlers and are not exercised here. The uploaded-logs filter's refused-
+# criteria re-render does reach its handler, and is not exercised here either.
 
 #: The search criterion the content arms send. ``JANE`` is a substring of the seeded PID-5, so the
 #: ALLOW arm has a match to render; it is not :data:`NEEDLE`, so finding NEEDLE in a response means a
@@ -378,7 +382,10 @@ def _refused_in_place(r: httpx.Response) -> bool:
 def _refused_to_listing(r: httpx.Response) -> bool:
     """The uploaded-logs pages turn the handler's 403 into a 303 to the listing with a fixed code
     (``routes/uploaded_logs.py``, ``_BROWSE_CODES``), the only 403 that handler raises."""
-    return r.status_code == 303 and r.headers.get("location", "").endswith("?e=browse_hop_refused")
+    return (r.status_code, r.headers.get("location")) == (
+        303,
+        f"/ui/uploaded-logs?e={BROWSE_HOP_REFUSED_CODE}",
+    )
 
 
 class _Guarded(NamedTuple):
@@ -387,32 +394,34 @@ class _Guarded(NamedTuple):
     #: The text the ALLOW arm must render, so a 200 that ran nothing does not pass. Anchored with
     #: ``\b`` so ``11 match(es)`` is not read as one.
     served: str
-    #: The audit action the handler writes only AFTER it decrypts.
-    audit_action: str
+    #: Which read the handler decrypts through, spied on so a refusal that lands after the decrypt
+    #: fails: ``store`` is ``Store.search_messages``, ``upload`` is ``UploadStore.read_bytes``.
+    decrypt: str
 
 
 #: Every route whose hop refusal is the handler's own call.
 HANDLER_GUARDED_ROUTES: dict[tuple[str, str], _Guarded] = {
     ("GET", "/ui/messages/search"): _Guarded(
-        _field_path_search, _refused_in_place, r"\b1 match\(es\)", "message_search"
+        _field_path_search, _refused_in_place, r"\b1 match\(es\)", "store"
     ),
     ("POST", "/ui/messages/search/run"): _Guarded(
-        _content_search, _refused_in_place, r"\b1 match\(es\)", "message_search"
+        _content_search, _refused_in_place, r"\b1 match\(es\)", "store"
     ),
     ("GET", "/ui/messages/search/layered"): _Guarded(
-        _layered_search, _refused_in_place, r"\b1 match\(es\)", "preset.layered_search"
+        _layered_search, _refused_in_place, r"\b1 match\(es\)", "store"
     ),
     ("GET", "/ui/uploaded-logs/file/{file_id}"): _Guarded(
-        _browse_upload, _refused_to_listing, r"\b1 of 1 message\(s\)", "upload.browse"
+        _browse_upload, _refused_to_listing, r"\b1 of 1 message\(s\)", "upload"
     ),
     ("POST", "/ui/uploaded-logs/file/{file_id}/filter"): _Guarded(
-        _filter_upload, _refused_to_listing, r"\b1 of 1 message\(s\)", "upload.browse"
+        _filter_upload, _refused_to_listing, r"\b1 of 1 message\(s\)", "upload"
     ),
 }
 
 #: Every other in-scope route whose gate does NOT pass ``phi=True``, each with why it is not a PHI
-#: read this file must refuse. :func:`test_every_message_route_is_classified` fails on a route in
-#: neither set, so a new route cannot escape this file by being left off a hand-kept list.
+#: read this file must refuse. :func:`test_every_message_route_is_classified` fails on an in-scope
+#: route in neither set, so a new one there cannot escape this file by being left off a hand-kept
+#: list. A route outside that test's scope can; its docstring names the scope.
 NOT_PHI_READ_ROUTES: dict[tuple[str, str], str] = {
     ("POST", "/ui/messages/search/presets"): "saves a preset, then 303s to the bare form",
     ("POST", "/ui/messages/search/presets/{preset_id}/delete"): "deletes a preset, then 303s",
@@ -434,72 +443,97 @@ NOT_PHI_READ_ROUTES: dict[tuple[str, str], str] = {
 
 
 async def _run_guarded(
-    engine: Engine, tmp_path: Path, route: tuple[str, str], *, secure_hop: bool
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    route: tuple[str, str],
+    *,
+    secure_hop: bool,
 ) -> tuple[httpx.Response, int]:
     """Seed a message, log in on a FRESH client (so the step-up window is fresh), build the route's
     request, and send it. Both arms below go through here, so ``secure_hop`` is the only thing that
-    can differ between them. Returns the response and how many audit rows the request itself wrote.
+    can differ between them. Returns the response and how many decrypting reads the REQUEST itself
+    made (the setup's reads are not counted).
 
     ``follow_redirects=False`` so a 303 to ``/ui/reauth`` is seen as the 303 it is: a stale step-up
     is a different gate, never a pass."""
-    service = await _service(engine)
+    service = await _service(engine, write_floor=False)
     await _add(service, "op", Role.OPERATOR)
     await _seed(engine)
     method, template = route
     spec = HANDLER_GUARDED_ROUTES[route]
+    reads = 0
+    owner: Any = engine.store if spec.decrypt == "store" else UploadStore
+    name = "search_messages" if spec.decrypt == "store" else "read_bytes"
+    real = getattr(owner, name)
+
+    # One spy fits both: patched on the instance, ``real`` is bound and ``args`` carries no self;
+    # patched on the class, ``real`` is the plain function and ``args`` starts with self.
+    async def spy(*args: Any, **kwargs: Any) -> Any:
+        nonlocal reads
+        reads += 1
+        return await real(*args, **kwargs)
+
     async with _client(
         engine, service, secure_hop=secure_hop, uploads_dir=tmp_path / "uploads"
     ) as c:
         await _login(c)
         kwargs = await spec.setup(c)
         path = template.format(**kwargs.pop("path_args", {}))
-        r = await c.request(method, path, follow_redirects=False, **kwargs)
-    written = len(await engine.store.list_audit(action=spec.audit_action, limit=100))
-    return r, written
+        monkeypatch.setattr(owner, name, spy)
+        try:
+            r = await c.request(method, path, follow_redirects=False, **kwargs)
+        finally:
+            monkeypatch.undo()
+    return r, reads
 
 
 @pytest.mark.parametrize("route", list(HANDLER_GUARDED_ROUTES), ids=" ".join)
 async def test_an_unproven_serve_hop_refuses_the_handler_guarded_routes(
-    engine: Engine, tmp_path: Path, route: tuple[str, str]
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: tuple[str, str]
 ) -> None:
-    """The REFUSE arm: the hop refusal, with no body in it, and no read audit row written --
-    the handlers write their read audit row only after they decrypt, so a refusal moved below the
-    decrypt fails here."""
-    r, written = await _run_guarded(engine, tmp_path, route, secure_hop=False)
+    """The REFUSE arm: the hop refusal, and no decrypting read behind it.
+
+    The read spy is the instrument here, not :data:`NEEDLE`: these pages render metadata and
+    summaries only, even when served, so a needle check could not fail. A refusal moved below the
+    decrypt fails the spy."""
+    r, reads = await _run_guarded(engine, tmp_path, monkeypatch, route, secure_hop=False)
     assert HANDLER_GUARDED_ROUTES[route].refused(r), f"{route} was not refused: {r.status_code}"
-    assert NEEDLE not in r.text, f"{route} leaked the body on its refusal"
-    assert written == 0, f"{route} wrote its read audit row, so it decrypted before refusing"
+    assert reads == 0, f"{route} decrypted {reads} time(s) before refusing"
 
 
 @pytest.mark.parametrize("route", list(HANDLER_GUARDED_ROUTES), ids=" ".join)
 async def test_a_proven_serve_hop_still_serves_the_handler_guarded_routes(
-    engine: Engine, tmp_path: Path, route: tuple[str, str]
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: tuple[str, str]
 ) -> None:
     """The ALLOW arm, built the same way. A served 200 that ran the search, not merely a non-403:
     a redirect to ``/ui/reauth`` would mean the arm never reached the handler at all."""
-    r, written = await _run_guarded(engine, tmp_path, route, secure_hop=True)
+    r, reads = await _run_guarded(engine, tmp_path, monkeypatch, route, secure_hop=True)
     assert r.status_code == 200, f"{route} was not served over a PROVEN hop: {r.status_code}"
-    assert not HANDLER_GUARDED_ROUTES[route].refused(r), r.text
     assert re.search(HANDLER_GUARDED_ROUTES[route].served, r.text), f"{route} served no result"
-    # The positive control for the REFUSE arm's zero: a served read does write its audit row.
-    assert written >= 1, f"{route} wrote no audit row, so the REFUSE arm's zero proves nothing"
+    # The positive control for the REFUSE arm's zero: the spy sees a served read.
+    assert reads >= 1, f"{route} made no decrypting read, so the REFUSE arm's zero proves nothing"
 
 
-def _gate_passes_phi(call: object, seen: frozenset[int] = frozenset()) -> bool:
+def _gate_passes_phi(call: object) -> bool:
     """Whether a dependency is, or wraps, a ``require_ui`` gate built with ``phi=True``.
 
     Read from the closures, as ``test_every_phi_page_has_a_reauth_continuation`` in
-    ``test_webui_oidc.py`` does, so no marker is needed in product code. Any closure cell holding a
-    function is followed, which is how a step-up factory's ``base`` gate is found."""
+    ``test_webui_oidc.py`` does, so no marker is needed in product code. Only a ``base`` cell is
+    followed, which is where the step-up factories keep their ``require_ui`` gate; a hook closing
+    over some other gate is not read as this one's."""
     code = getattr(call, "__code__", None)
-    if code is None or id(call) in seen:
+    if code is None:
         return False
-    closure = getattr(call, "__closure__", None) or ()
-    cells = dict(zip(code.co_freevars, (c.cell_contents for c in closure), strict=True))
+    cells: dict[str, object] = {}
+    for var, cell in zip(code.co_freevars, getattr(call, "__closure__", None) or (), strict=True):
+        try:
+            cells[var] = cell.cell_contents
+        except ValueError:  # an empty cell: a name the factory never bound
+            continue
     if getattr(call, "__qualname__", "") == "require_ui.<locals>.dependency":
         return bool(cells.get("phi"))
-    seen = seen | {id(call)}
-    return any(callable(v) and _gate_passes_phi(v, seen) for v in cells.values())
+    return "base" in cells and _gate_passes_phi(cells["base"])
 
 
 def _route_passes_phi(dependant: Any) -> bool:
@@ -528,7 +562,8 @@ async def test_every_phi_gated_route_is_refused_over_an_unproven_hop(engine: Eng
 
     The refusal runs in the gate, before the route body, so a placeholder id reaches it as well as a
     real one; that is what lets a route nobody listed by hand be exercised. The ALLOW arm shows only
-    that the hop refusal did not fire: a placeholder id is then a 404 or a 422, and serving the page
+    that the hop refusal did not fire: a placeholder request then gets whatever the route answers
+    next (at least a 404, a 422, a 303 to ``/ui/reauth`` or a same-origin 403), and serving the page
     is the seeded tests' job above. An ADMINISTRATOR holds every permission, so the permission loop,
     which runs before the hop guard, never answers in its place."""
     service = await _service(engine)
@@ -550,9 +585,10 @@ async def test_every_phi_gated_route_is_refused_over_an_unproven_hop(engine: Eng
 
 
 async def test_every_message_route_is_classified(engine: Engine) -> None:
-    """Derived from the LIVE route table, so a route added later cannot silently escape this file.
+    """Derived from the LIVE route table, so a route added later in scope cannot silently escape
+    this file.
 
-    In scope: every mounted ``/ui/messages*``, ``/ui/dead-letters*`` and ``/ui/uploaded-logs/file*``
+    In scope, and only these: every mounted ``/ui/messages*``, ``/ui/dead-letters*`` and ``/ui/uploaded-logs/file*``
     route, and every route the search module registers wherever its path. Each one whose gate passes
     ``phi=True`` is covered by the walk above; each other one must be in
     :data:`HANDLER_GUARDED_ROUTES` or named with a reason in :data:`NOT_PHI_READ_ROUTES`. A new one
