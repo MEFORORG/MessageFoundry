@@ -451,24 +451,32 @@ def test_the_empty_code_check_runs_the_verify_gates_own_base(engine: Engine) -> 
 
 
 async def test_an_empty_code_from_a_dead_cookie_gets_the_gates_login_redirect(
-    engine: Engine,
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A cookie that signs nothing in gets the gate's login redirect for an empty code exactly as
-    for a real one, never the origin 403: the session is resolved before the body or the origin
-    (the console's sign-in-before-body order, BACKLOG #5931).
+    for a real one, never the origin 403, and the check reads no body for it: the session is
+    resolved before the body or the origin (the console's sign-in-before-body order, BACKLOG
+    #5931).
 
-    RED when: the empty-code check reads the body or checks the origin before the session."""
+    RED when: the empty-code check checks the origin before the session (a 403), or reads the body
+    before it (the form parser is called)."""
     service = await _service(engine)
-    await _add(service, "op", Role.OPERATOR)
+    parsed: list[str] = []
+    form_pairs = account_routes._form_pairs
+
+    async def counting_form_pairs(request: object) -> list[tuple[str, str]]:
+        parsed.append("body")
+        return await form_pairs(request)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(account_routes, "_form_pairs", counting_form_pairs)
     async with _client(engine, service) as c:
         c.cookies.set("mf_session", "not-a-session-token")
-        answers = []
         for data in ({"code": "123456"}, {"code": ""}, {}):
             r = await c.post("/ui/account/mfa/verify", data=data, extensions=HEADERLESS)
-            answers.append((r.status_code, r.headers.get("location")))
-        assert answers[0][0] == 303 and answers[0][1] is not None
-        assert answers[0][1].startswith("/ui/login")
-        assert answers[1] == answers[0] and answers[2] == answers[0]
+            assert r.status_code == 303, data
+            # "expired" names a presented cookie that resolved to nothing, not an absent one.
+            assert r.headers["location"] == "/ui/login?e=expired", data
+    assert parsed == []
 
 
 async def test_an_empty_code_from_a_must_change_session_gets_its_confinement(

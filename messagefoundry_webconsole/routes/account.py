@@ -150,10 +150,11 @@ async def _empty_code_goes_to_reauth(
     A post under the opt-out (no grant to spend), or whose cookie signs nothing in, returns at once
     and the gate answers as before; the session is resolved before the body is read, the console's
     sign-in-before-body order. A post with a code returns too, before the base, so the gate's base
-    runs once and charges the admin-write budget once. Otherwise the gate's base runs first, so
-    sign-in, must-change, the pending refusal with its audit row, the origin check and the
-    admin-write charge apply in the gate's order, and then the route's own origin check. The
-    new-address signal is recorded as the gate would. The post then goes to the re-auth with no
+    runs once and charges the admin-write budget once. Otherwise the gate's base runs, so at least
+    sign-in, must-change, the origin check, the pending refusal with its audit row and the
+    admin-write charge apply, in the order :func:`require_ui` gives them, before anything here
+    can refuse. The route's own inline origin check is repeated after it, as the route repeats it;
+    the base has already checked the origin, so it refuses nothing new. The new-address signal is recorded as the gate would. The post then goes to the re-auth with no
     grant spent and no code checked. That re-auth is still asked for when a grant was held, and
     mints a fresh grant over it. Starlette caches the body, so the route reads it again."""
     if not auth.action_step_up_required:
