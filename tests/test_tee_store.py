@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 import pickle
 import sqlite3
@@ -301,9 +300,9 @@ async def test_purge_refuses_to_report_clean_when_checkpoint_is_busy(tmp_path: P
 
 
 def test_purge_incomplete_error_round_trips_through_pickle() -> None:
-    err = pickle.loads(pickle.dumps(PurgeIncompleteError(2, 3)))
-    assert (err.log_rows, err.capture_rows) == (2, 3)
-    assert str(err) == str(PurgeIncompleteError(2, 3))
+    err = pickle.loads(pickle.dumps(PurgeIncompleteError(2, 3, "busy")))
+    assert (err.log_rows, err.capture_rows, err.reason) == (2, 3, "busy")
+    assert str(err) == str(PurgeIncompleteError(2, 3, "busy"))
 
 
 @pytest.mark.usefixtures("fast_checkpoint_poll")
@@ -365,27 +364,86 @@ async def test_first_checkpoint_alone_scrubs_a_body_already_in_the_main_file(
         await store.close()
 
 
-async def test_a_failed_reclaim_is_logged_and_the_purge_still_reports(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+def _spy_execute(
+    store: RelayStore, monkeypatch: pytest.MonkeyPatch, fail_on: str, error: BaseException
+) -> list[str]:
+    """Make the store connection raise ``error`` on the SQL ``fail_on``; return the SQL it ran."""
+    real_execute = store._db.execute  # noqa: SLF001
+    ran: list[str] = []
+
+    def execute(sql: str, *args: Any) -> Any:
+        ran.append(sql)
+        if sql == fail_on:
+            raise error
+        return real_execute(sql, *args)
+
+    monkeypatch.setattr(store._db, "execute", execute)  # noqa: SLF001
+    return ran
+
+
+@pytest.mark.parametrize(
+    "error", [sqlite3.OperationalError("disk I/O error"), MemoryError()], ids=["sqlite", "nomem"]
+)
+async def test_a_failed_vacuum_raises_after_still_running_the_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: BaseException
+) -> None:
+    # VACUUM is part of the scrub (stale cell copies), so its failure is not a clean purge. CPython
+    # raises MemoryError, not an sqlite3.Error, for SQLITE_NOMEM, so both must map.
+    store = await _open(tmp_path)
+    try:
+        await store.record_capture(direction="corepoint_copy", control_id="C", raw=_MARKER_BODY)
+        ran = _spy_execute(store, monkeypatch, "VACUUM", error)
+        with pytest.raises(PurgeIncompleteError) as excinfo:
+            await store.purge(captures_only=True)
+        assert (excinfo.value.log_rows, excinfo.value.capture_rows) == (0, 1)
+        assert excinfo.value.reason.startswith(f"VACUUM failed: {type(error).__name__}")
+        after_vacuum = ran[ran.index("VACUUM") + 1 :]
+        assert any("wal_checkpoint" in sql for sql in after_vacuum)  # it truncates spilled frames
+        monkeypatch.undo()
+        async with store._db.execute("PRAGMA temp_store") as cur:  # noqa: SLF001
+            row = await cur.fetchone()
+        assert row is not None and int(row[0]) == 0  # restored to DEFAULT after the failure
+    finally:
+        await store.close()
+
+
+async def test_an_sqlite_error_from_the_checkpoint_becomes_purge_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = await _open(tmp_path)
     try:
         await store.record_capture(direction="corepoint_copy", control_id="C", raw=_MARKER_BODY)
-        real_execute = store._db.execute  # noqa: SLF001
+        _spy_execute(
+            store,
+            monkeypatch,
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+            sqlite3.OperationalError("disk I/O error"),
+        )
+        with pytest.raises(PurgeIncompleteError) as excinfo:
+            await store.purge(captures_only=True)
+        assert excinfo.value.capture_rows == 1
+        assert excinfo.value.reason == "OperationalError: disk I/O error"
+        assert isinstance(excinfo.value.__cause__, sqlite3.OperationalError)
+    finally:
+        await store.close()
 
-        def failing_vacuum(sql: str, *args: Any) -> Any:
-            if sql == "VACUUM":
-                raise sqlite3.OperationalError("out of memory")
-            return real_execute(sql, *args)
 
-        monkeypatch.setattr(store._db, "execute", failing_vacuum)  # noqa: SLF001
-        with caplog.at_level(logging.WARNING, logger="tee.store"):
-            assert await store.purge(captures_only=True) == (0, 1)
-        assert "VACUUM failed: out of memory" in caplog.text
-        monkeypatch.undo()
-        async with store._db.execute("PRAGMA temp_store") as cur:  # noqa: SLF001
-            row = await cur.fetchone()
-        assert row is not None and int(row[0]) == 0  # restored to DEFAULT after the reclaim
+async def test_a_busy_checkpoint_after_vacuum_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # After VACUUM the old pages, stale cells included, stay in the main file until this checkpoint.
+    store = await _open(tmp_path)
+    try:
+        await store.record_capture(direction="corepoint_copy", control_id="C", raw=_MARKER_BODY)
+        results = iter([True, False])
+
+        async def checkpoint() -> bool:
+            return next(results)
+
+        monkeypatch.setattr(store, "_checkpoint_truncate", checkpoint)
+        with pytest.raises(PurgeIncompleteError) as excinfo:
+            await store.purge(captures_only=True)
+        assert excinfo.value.reason == "the WAL checkpoint after VACUUM stayed busy"
     finally:
         await store.close()
 

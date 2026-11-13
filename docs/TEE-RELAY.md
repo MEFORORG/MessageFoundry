@@ -175,15 +175,24 @@ consequences follow from it:
 the captured bodies (the PHI-bearing table) and keeps the NAK/leg log. It **prompts for confirmation**
 (or refuses, in a non-interactive shell) unless you pass `-y`.
 
-The DB runs in WAL mode, where deleted rows stay readable on disk until a checkpoint writes the
-zeroed pages back into the DB file. Purge therefore deletes and commits, runs a `TRUNCATE`
-checkpoint, then `VACUUM` and a second checkpoint to shrink the files. If the first checkpoint
-cannot finish within about 5 s, for at least the reason that another connection holds a read
-transaction open or another writer or checkpoint runs, purge prints `error: ...` with the counts it
-already deleted and exits 1. The rows are gone then, but their bytes may still be in the DB file or
-its `-wal` file. Re-running purge completes the scrub, and deletes again under its own arguments:
-with no `--before`, or a relative one, that includes rows recorded since. A failed `VACUUM` or
-second checkpoint leaves no purged bytes; purge logs it as a warning and still reports the counts.
+The DB runs in WAL mode. A deleted row stays readable on disk until a checkpoint writes the
+zeroed pages back. Purge therefore deletes and commits, then runs a `TRUNCATE` checkpoint. It then
+runs `VACUUM` and a second checkpoint. Both are part of the scrub, not only a disk reclaim. A
+B-tree rebalance can leave a stale copy of a deleted row in a page's unused space. Only the
+`VACUUM` rebuild removes it.
+
+If any of those steps fails after the delete, purge prints `error: ...` and exits 1. The error
+names the counts it deleted and the step that failed. Failures include at least these:
+
+* a checkpoint that cannot finish within about 5 s, because another connection holds a read
+  transaction open or another writer or checkpoint runs;
+* a failed `VACUUM`, for example out of memory, since `VACUUM` builds its copy in memory;
+* an SQLite error from a checkpoint.
+
+The rows are gone then, but their bytes may still be in the DB file or its `-wal` file. Re-running
+purge completes the scrub. It also deletes again under its own arguments. With no `--before`, or a
+relative one, that includes rows recorded since the first run. To scrub without deleting newer
+rows, re-run with an absolute `--before` date.
 
 ```bash
 python -m tee purge --db ./tee.db --before 7d -y          # retention sweep
