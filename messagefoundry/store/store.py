@@ -7074,7 +7074,9 @@ def verify_audit_rows(
     ``None`` when Transit did not verify it, and decides nothing. A break does not end the walk:
     it runs on, and the first divergent position is reported after it. A MAC call that raises
     anything but :class:`~messagefoundry.store.crypto.AuditKeyVersionRefusedError` ends the walk
-    with that error, so the walk could not run. A structural break is
+    with that error, so the walk could not run, except that a range row's handover-tag MAC
+    raising :class:`~messagefoundry.store.crypto.AuditMacMalformedError` is a logged break at that
+    row (BACKLOG #8222). A structural break is
     reported at its own position, with the reason."""
     # The row AT seq 1, not the row that sorts first, which is the rule the open applies too
     # (``load_audit_chain``). A row added below the genesis row must not change what the chain is:
@@ -7258,7 +7260,13 @@ def verify_audit_rows(
             # a walk that could not run (BACKLOG #8222). The store open does not catch it.
             try:
                 tag_ok = _audit_tag_ok(epoch, out_secret)
-            except AuditMacMalformedError:
+            except AuditMacMalformedError as exc:
+                log.warning(
+                    "the MAC provider answered the handover tag of the audit key-range row at "
+                    "seq=%d with no well-formed MAC; read as a break at that row: %s",
+                    pos,
+                    exc,
+                )
                 tag_ok = False
         if not tag_ok:
             breaks.append(

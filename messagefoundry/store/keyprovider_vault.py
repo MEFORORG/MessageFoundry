@@ -327,15 +327,12 @@ def _record_reply_status(client: Any) -> None:
 
 
 def is_vault_timeout_reply(exc: BaseException) -> bool:
-    """Whether ``exc`` is hvac's ``UnexpectedError`` for a reply of HTTP 408 or 504, a gateway or
-    server that timed out, by the status :func:`_record_reply_status` recorded (BACKLOG #8222).
-    ``False`` for an error with no recorded status, and without the ``[vault]`` extra."""
-    try:
-        from hvac.exceptions import UnexpectedError  # noqa: PLC0415
-    except ImportError:
-        return False
-    status = getattr(exc, _REPLY_STATUS_ATTR, None)
-    return isinstance(exc, UnexpectedError) and status in _TIMEOUT_STATUSES
+    """Whether ``exc`` was raised for a reply of HTTP 408 or 504, a gateway or server that timed
+    out, by the status :func:`_record_reply_status` recorded (BACKLOG #8222). Any class: hvac
+    raises ``UnexpectedError`` for those statuses, or ``TypeError`` or ``AttributeError`` where it
+    cannot read a JSON body's ``errors``, and the status is recorded on whichever it raised.
+    ``False`` for an error with no recorded status."""
+    return getattr(exc, _REPLY_STATUS_ATTR, None) in _TIMEOUT_STATUSES
 
 
 def is_vault_forbidden(exc: BaseException) -> bool:

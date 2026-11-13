@@ -1042,18 +1042,51 @@ def _status_error(status: int) -> Exception:
 def test_a_timeout_on_one_rows_verify_could_not_run_though_the_fixed_input_verifies(
     status: int,
 ) -> None:
-    """A 504 or 408 on one row's verify, on both asks, while the verify over fixed input succeeds,
-    is the service timing out, not Transit refusing that row: the check could not run, never a
-    break (BACKLOG #8222 item 1, owner ruling 2026-11-13). Before this it read as a break."""
+    """A 504 or 408 on one row's verify, though the verify over fixed input would succeed, is the
+    service timing out, not Transit refusing that row: the check could not run at once, with no
+    fixed-input check or second ask, never a break (BACKLOG #8222 item 1, owner ruling
+    2026-11-13). Before this a persistent one read as a break."""
     from hvac.exceptions import UnexpectedError
 
     from messagefoundry.store.crypto import AuditKeyVersionRefusedError
 
     cipher = _scripted_cipher([_status_error(status), _status_error(status)])
+    rechecked: list[bool] = []
+    real_fixed = cipher._fixed_input_verifies
+
+    def counted() -> bool:
+        rechecked.append(True)
+        return bool(real_fixed())
+
+    cipher._fixed_input_verifies = counted
     with pytest.raises(CipherError) as caught:
         cipher.verify_audit_hmac(b"row", cipher.audit_hmac(b"row"))
     assert not isinstance(caught.value, AuditKeyVersionRefusedError)
     assert isinstance(caught.value.__cause__, UnexpectedError)
+    assert rechecked == [], "a timeout must settle on the first ask"
+    assert real_fixed(), "the control: the fixed input verifies"
+
+
+def test_a_504_hvac_could_not_parse_still_reads_as_a_timeout() -> None:
+    """hvac raises ``TypeError`` or ``AttributeError``, not ``UnexpectedError``, for a 504 whose
+    JSON ``errors`` it cannot join; the recorded status still makes it a timeout (BACKLOG #8222)."""
+    _needs_hvac()
+    import requests
+
+    from messagefoundry.store import keyprovider_vault
+    from messagefoundry.store.keyprovider_vault import is_vault_timeout_reply
+
+    client = keyprovider_vault._build_client(
+        "https://vault.example.test:8200", "s.synthetic-token", revocation_attested=True
+    )
+    for body in (b'{"errors":[{"message":"upstream timed out"}]}', b"null", b"[]"):
+        reply = requests.Response()
+        reply.status_code = 504
+        reply.headers["Content-Type"] = "application/json"
+        reply._content = body
+        with pytest.raises(Exception) as caught:
+            client.adapter._raise_for_error("POST", "https://vault.example.test:8200/v1/x", reply)
+        assert is_vault_timeout_reply(caught.value), (body, type(caught.value))
 
 
 def test_a_413_on_one_rows_verify_is_still_a_break() -> None:
@@ -1066,8 +1099,9 @@ def test_a_413_on_one_rows_verify_is_still_a_break() -> None:
 async def test_a_persistent_504_on_one_rows_verify_could_not_run_on_the_startup_walk(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The startup walk over a clean chain whose one row's verify answers 504 every time, while
-    the fixed input verifies: no tamper alert, and the walk could not run (BACKLOG #8222 item 1)."""
+    """The startup walk over a clean chain whose last row's verify answers 504 every time, while
+    the fixed input and every other row verify: no tamper alert, and the walk could not run
+    (BACKLOG #8222 item 1)."""
     _needs_hvac()
     from messagefoundry.store.crypto_transit import _VERSION_PROBE_INPUT
 
@@ -1077,18 +1111,59 @@ async def test_a_persistent_504_on_one_rows_verify_could_not_run_on_the_startup_
     try:
         await store.record_audit("test.clean", actor="cli:tester")
         real_verify = transit.verify_signed_data
+        last_mac = _dml_last_row_hash(tmp_path / "timeout.db")
+        others: list[str] = []
 
-        def timing_out(*, hash_input: str, **kw: Any) -> dict[str, Any]:
-            if hash_input == _VERSION_PROBE_INPUT:
-                return real_verify(hash_input=hash_input, **kw)
-            raise _status_error(504)
+        def timing_out(*, hash_input: str, hmac: str, **kw: Any) -> dict[str, Any]:
+            if hash_input != _VERSION_PROBE_INPUT and hmac == last_mac:
+                raise _status_error(504)
+            if hash_input != _VERSION_PROBE_INPUT:
+                others.append(hmac)
+            return real_verify(hash_input=hash_input, hmac=hmac, **kw)
 
         monkeypatch.setattr(transit, "verify_signed_data", timing_out)
         sink, lines = await _walk_on_start(store, caplog)
     finally:
         await store.close()
+    assert others, "the control: the rows before the last one verified"
     assert sink.events == []
     assert any("could not run" in line for line in lines), lines
+
+
+def _dml_last_row_hash(db: Path) -> str:
+    """The stored MAC of the newest audit row, read directly from the SQLite file."""
+    with sqlite3.connect(db) as conn:
+        row = conn.execute("SELECT row_hash FROM audit_log ORDER BY seq DESC LIMIT 1").fetchone()
+    assert row is not None and isinstance(row[0], str)
+    return row[0]
+
+
+def test_a_504_through_the_store_clients_request_path_reads_as_a_timeout() -> None:
+    """A Transit ``verify`` call made through the store's real hvac client, whose session answers
+    504, raises an error that reads as a timeout: hvac's request path goes through the recorded
+    ``_raise_for_error`` (BACKLOG #8222)."""
+    _needs_hvac()
+    import requests
+
+    from messagefoundry.store import keyprovider_vault
+    from messagefoundry.store.keyprovider_vault import is_vault_timeout_reply
+
+    client = keyprovider_vault._build_client(
+        "https://vault.example.test:8200", "s.synthetic-token", revocation_attested=True
+    )
+
+    def answer_504(*_a: Any, **_kw: Any) -> requests.Response:
+        reply = requests.Response()
+        reply.status_code = 504
+        reply._content = b"<html>gateway timeout</html>"
+        return reply
+
+    client.adapter.session.request = answer_504
+    with pytest.raises(Exception) as caught:
+        client.secrets.transit.verify_signed_data(
+            name=_KEY_NAME, hash_input="cm93", hmac="vault:v1:AAAA", hash_algorithm="sha2-256"
+        )
+    assert is_vault_timeout_reply(caught.value), type(caught.value)
 
 
 def test_the_store_vault_client_records_the_reply_status_on_hvacs_error() -> None:

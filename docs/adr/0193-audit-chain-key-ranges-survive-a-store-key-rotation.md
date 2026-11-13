@@ -598,15 +598,17 @@ changes two readings of the 2026-11-11 amendment.
    so a persistent 504 on one row, while the fixed input verified, was a break. hvac raises a 408,
    a 413 and a 504 as one class, `UnexpectedError`, with no status, so the store's Vault client
    (`keyprovider_vault._build_client`) now records each failed reply's status on hvac's error
-   (`_record_reply_status`). `TransitCipher._is_outage` reads a 408 or 504 as an outage
-   (`is_vault_timeout_reply`), so the walk could not run and no tamper alert fires. Every other
+   (`_record_reply_status`), whichever class hvac raised, `TypeError` or `AttributeError` for a
+   JSON body it cannot read among them. `TransitCipher._is_outage` reads a 408 or 504 as an
+   outage (`is_vault_timeout_reply`) on the first ask, so the walk could not run and no tamper
+   alert fires. Every other
    status hvac raises as `UnexpectedError`, a 413 among them, and an error with no recorded status,
    still go to `_recheck_refused_row` as item 4 says, so a planted oversize row stays a break.
 2. **A malformed reply to a handover tag is a break in the walk.** Item 1 above makes
    `audit_hmac` raise for a reply `transit_mac_version` does not accept. For a non-empty string it
    now raises the subclass `AuditMacMalformedError`, and the walk's handover-tag check
-   (`verify_audit_rows`) reads it as a tag that does not match: a break at that range row, as before
-   engine PR 2903. An empty or non-string reply is still a plain `CipherError`, and the walk could
+   (`verify_audit_rows`) logs it and reads it as a tag that does not match: a break at that range
+   row, as before engine PR 2903. An empty or non-string reply is still a plain `CipherError`, and the walk could
    not run. The store open (`settle_audit_ranges`) still lets the subclass propagate, so the open
    fails, as since engine PR 2903.
 
@@ -615,5 +617,7 @@ Evidence, in `tests/test_transit_bound_attestation.py`:
 `test_a_413_on_one_rows_verify_is_still_a_break`,
 `test_a_persistent_504_on_one_rows_verify_could_not_run_on_the_startup_walk`,
 `test_the_store_vault_client_records_the_reply_status_on_hvacs_error`,
+`test_a_504_hvac_could_not_parse_still_reads_as_a_timeout`,
+`test_a_504_through_the_store_clients_request_path_reads_as_a_timeout`,
 `test_a_malformed_transit_reply_to_a_handover_tag_is_a_break_in_the_walk` and
 `test_an_empty_or_non_text_transit_reply_to_a_handover_tag_still_could_not_run`.
