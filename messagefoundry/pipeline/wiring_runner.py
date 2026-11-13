@@ -1609,7 +1609,9 @@ class _RoutedPrep:
     ``unreadable`` (the loopback's correlation could not be read → dead-letter on apply),
     ``inbound_gone`` (a reload dropped the inbound → revert and STOP on apply), ``error``
     (the handler raised → internal-error policy on apply), or ``outcome`` (the
-    transform produced deliveries/state/meta to hand off). A handler raise is captured here rather than
+    transform produced deliveries/state/meta to hand off). ``missing_handler`` and ``inbound_gone``
+    record what prepare saw; apply re-decides both from the live graph, which a reload may have
+    changed since (BACKLOG #5708). A handler raise is captured here rather than
     raised so a concurrent ``gather`` never cancels a sibling (ADR 0057 policy is applied on the serial
     apply, in claim order)."""
 
@@ -11940,8 +11942,9 @@ class RegistryRunner:
 
     def _dropped_by_reload(self, name: str, item: OutboxItem) -> _RoutedPrep | None:
         """How to settle a routed row whose inbound or handler the LIVE graph no longer has, or
-        ``None`` when it has both (BACKLOG #5708). Called after the loopback reads, which await, so a
-        reload can have swapped the graph since the caller's own checks. The dispositions are the
+        ``None`` when it has both (BACKLOG #5708). Called on entry to prepare, after the loopback
+        reads, which await, and again at apply, so each settles by the graph live at that moment
+        rather than one a reload has swapped out since the caller's own checks. The dispositions are the
         ones :meth:`_process_routed_item` gives the same two cases before any await: a missing
         inbound reverts the row retry-forever and stops the lane, and a missing handler
         dead-letters it. Neither is a Handler fault, so neither reaches the internal-error policy."""

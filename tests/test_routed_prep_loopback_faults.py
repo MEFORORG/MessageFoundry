@@ -416,7 +416,10 @@ async def test_a_stale_settle_decision_runs_the_row_under_the_restored_graph(
 
 @pytest.mark.parametrize("stale", ["inbound_gone", "missing_handler"])
 async def test_a_partial_restore_settles_the_row_by_the_live_graph(
-    store: MessageStore, caplog: pytest.LogCaptureFixture, stale: str
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    stale: str,
 ) -> None:
     # A reload between the concurrent path's prepare and its apply can restore only one of the two.
     # Apply settles by the graph live now, never by the stale prep. The inbound back without its
@@ -430,6 +433,14 @@ async def test_a_partial_restore_settles_the_row_by_the_live_graph(
         _registry(calls), store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
     )
     item = await _routed_item(store)
+    policies: list[Any] = []
+    real_mark_failed = store.mark_failed
+
+    async def mark_failed(item_id: str, reason: str, policy: Any) -> FailOutcome:
+        policies.append(policy)
+        return await real_mark_failed(item_id, reason, policy)
+
+    monkeypatch.setattr(store, "mark_failed", mark_failed)
     if stale == "inbound_gone":
         prep = _RoutedPrep(inbound_gone=True)
         runner.registry = _swapped_graph("handler")  # the inbound came back, the handler did not
@@ -444,10 +455,76 @@ async def test_a_partial_restore_settles_the_row_by_the_live_graph(
     if stale == "inbound_gone":
         assert outcome == (_ItemOutcome.PROCESSED, None), "a live inbound's lane was stopped"
         assert status == OutboxStatus.DEAD.value
+        assert policies == []
         assert "is missing; dead-lettering" in caplog.text
     else:
         assert outcome == (_ItemOutcome.STOPPED, None)
         assert status == OutboxStatus.PENDING.value, "a reload alone dead-lettered an ACKed row"
+        assert len(policies) == 1 and policies[0].max_attempts is None  # retry-forever
+
+
+async def test_a_partial_restore_between_prepare_and_apply_keeps_the_batch_running(
+    store: MessageStore,
+) -> None:
+    # The same race through the concurrent batch path, the one path that applies a prep after an
+    # await. Sibling S2's prepare sees its feed dropped (inbound_gone); a reload then restores the
+    # inbound and S1's handler but not S2's before the serial apply. S1 hands off, S2 dead-letters
+    # as a missing handler, and the batch does not stop the lane.
+    calls: list[str] = []
+
+    def graph(*, with_h2: bool) -> Registry:
+        reg = Registry()
+        reg.add_inbound(build_inbound_connection(LOOP, Loopback(), router="route_loop"))
+        reg.add_router("route_loop", lambda msg: [HANDLER, "h_two"])
+        reg.add_handler(HANDLER, lambda msg: calls.append(HANDLER))
+        if with_h2:
+            reg.add_handler("h_two", lambda msg: calls.append("h_two"))
+        return reg
+
+    runner = RegistryRunner(
+        graph(with_h2=True), store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
+    runner._transform_concurrency = 2
+    message_id = await store.enqueue_ingress(channel_id=LOOP, raw=RAW)
+    ingress = await store.claim_next_fifo(LOOP, stage=Stage.INGRESS.value)
+    assert ingress is not None
+    await store.route_handoff(
+        ingress_id=ingress.id,
+        message_id=message_id,
+        channel_id=LOOP,
+        handlers=[(HANDLER, RAW), ("h_two", RAW)],
+        disposition=MessageStatus.ROUTED,
+    )
+    items = await store.claim_next_fifo_batch(LOOP, stage=Stage.ROUTED.value, limit=2)
+    assert [it.handler_name for it in items] == [HANDLER, "h_two"]
+
+    real_prepare = runner._prepare_routed
+    s1_prepared = asyncio.Event()
+
+    async def prepare(name: str, item: OutboxItem, **kwargs: Any) -> _RoutedPrep:
+        if item.handler_name == HANDLER:
+            prep = await real_prepare(name, item, **kwargs)
+            s1_prepared.set()
+            return prep
+        await s1_prepared.wait()  # S1 has run under the full graph; now the feed is dropped
+        runner.registry = Registry()
+        prep = await real_prepare(name, item, **kwargs)
+        runner.registry = graph(with_h2=False)  # the reload restores all but S2's handler
+        return prep
+
+    runner._prepare_routed = prepare  # type: ignore[method-assign]
+
+    stopped = await runner._process_routed_batch(LOOP, items)
+
+    assert stopped is False, "a partial restore stopped a lane the restoring reload found alive"
+    assert calls == [HANDLER]
+    async with store._read() as db:
+        cur = await db.execute(
+            "SELECT handler_name, status FROM queue WHERE message_id=? AND stage=?",
+            (message_id, Stage.ROUTED.value),
+        )
+        rows = [(r["handler_name"], r["status"]) for r in await cur.fetchall()]
+    assert rows == [("h_two", OutboxStatus.DEAD.value)], "S1 not handed off, or S2 not dead"
 
 
 async def test_a_reload_during_an_unreadable_read_reverts_rather_than_dead_letters(
