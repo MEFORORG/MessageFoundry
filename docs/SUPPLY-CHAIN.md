@@ -391,8 +391,8 @@ is **CycloneDX** (native VEX support); an SPDX rendering can be produced on requ
 `contributor-assistant/github-action`, vendored on 2026-08-29 because GitHub archived the upstream
 repository and no maintained fork exists. It is **not a released artifact**: `.github/` is outside
 the sdist's `only-include`, so no wheel, sdist or engine deployment carries it. It runs in CI, on
-`pull_request_target` and on an `issue_comment` whose body is exactly `recheck` or the sign-off
-sentence. `cla.yml` is also triggered by `merge_group`, where the step's `if:` skips the bundle
+`pull_request_target` and on an `issue_comment` posted on a pull request whose body is `recheck` or
+the sign-off sentence, compared ignoring case. `cla.yml` is also triggered by `merge_group`, where the step's `if:` skips the bundle
 rather than running it.
 
 Every audit lane above is ecosystem-scoped — `pip-audit` reads Python locks, `npm-audit` reads
