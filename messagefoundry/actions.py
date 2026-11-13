@@ -200,7 +200,10 @@ def substring_field(msg: Message, path: str, start: int, end: int | None = None)
         leaf = _Leaf(raw, seps)
         lo, hi, _step = slice(start, end).indices(leaf.total)
         hi = max(lo, hi)
-        # The cut removes text; an escape outside the slice that decodes to nothing stays.
+        # The cut removes text; an escape outside the slice that decodes to nothing stays, unless
+        # nothing is left for it to apply to.
+        if lo == hi:
+            return ""
         return leaf.zero_width(0, lo) + leaf.span(lo, hi) + leaf.zero_width(hi, leaf.total + 1)
 
     _edit_value(msg, path, cut, whole_value=True)
@@ -214,14 +217,14 @@ def pad_field(
     ``side="left"`` right-justifies (e.g. zero-pad an MRN); ``side="right"`` left-justifies. ``width``
     counts the **decoded** value, so an escape sequence counts as the characters it decodes to, and
     ``fill`` is written as data: a ``fill`` of ``^`` pads with an escaped ``^``, never a new
-    component. A value already ``>= width`` is left unchanged. A no-op on an absent field, once the
-    arguments pass. Raises :class:`ValueError` on an unknown ``side`` (fail loud rather than silently
-    leaving the value) or a ``fill`` holding a CR or LF, whether or not the field is present; and on
-    field 1 or 2 of ``MSH``, ``BHS`` or ``FHS`` and a field or component holding a component,
-    repetition or subcomponent separator, as :func:`substring_field` does."""
+    component. A value already ``>= width`` is left unchanged. A no-op on an absent field. Raises
+    :class:`ValueError` on an unknown ``side`` (fail loud rather than silently leaving the value),
+    whether or not the field is present; and, once the value is read, on a ``fill`` holding a CR or
+    LF that padding would write, on field 1 or 2 of ``MSH``, ``BHS`` or ``FHS``, and on a field or
+    component holding a component, repetition or subcomponent separator, as :func:`substring_field`
+    does."""
     if side not in ("left", "right"):
         raise ValueError(f"pad_field side must be 'left' or 'right', got {side!r}")
-    _refuse_crlf(fill)
 
     def pad(raw: str, seps: _Seps) -> str:
         leaf = _Leaf(raw, seps)
@@ -249,11 +252,13 @@ def replace_literal(msg: Message, path: str, old: str, new: str) -> None:
     separator matches only an escaped one inside a leaf, never across two leaves, and text inside an
     escape sequence is never matched as if it were data. ``new`` is written as data, as
     :meth:`~messagefoundry.parsing.message.Message.set_data` writes it (ADR 0206), so a ``new``
-    holding ``^`` cannot create a component. A no-op on an absent field. Raises :class:`ValueError`
-    on a ``new`` holding a CR or LF, on field 1 or 2 of ``MSH``, ``BHS`` or ``FHS``, and on a match
-    that cuts an escape such as ``\\.sp2\\`` so that a bare CR or LF would remain. An escape that
-    decodes to nothing, such as ``\\.fi\\``, is kept even inside a match, just before ``new``."""
-    _refuse_crlf(new)
+    holding ``^`` cannot create a component. ``old`` is decoded text too, so to replace a line break
+    sent as ``\\.br\\``, pass ``"\\r"``, never the escape's spelling. A no-op on an absent field or
+    when nothing matches. Raises :class:`ValueError` on field 1 or 2 of ``MSH``, ``BHS`` or ``FHS``,
+    on a ``new`` holding a CR or LF once a match would write it, and on a match that cuts an escape
+    such as ``\\.sp2\\`` so that a bare CR or LF would remain. An escape that decodes to nothing,
+    such as ``\\.fi\\``, is kept even inside a match, just before ``new``, unless the leaf is left
+    empty."""
     _edit_value(msg, path, lambda raw, seps: _replace_leaf(raw, old, new, seps), whole_value=False)
 
 
@@ -452,6 +457,8 @@ def _edit_value(
                 f"cannot transform {path} as one value: it holds the separator {held[0]!r}; "
                 "address one component or subcomponent instead"
             )
+        if not _builtin_hl7.unescape(value, seps):
+            return  # decodes to nothing, so a read of it is None: nothing to cut or pad
         edited = edit(value, seps)
     else:
         edited = _map_leaves(value, splitters, lambda leaf: edit(leaf, seps))
@@ -618,4 +625,6 @@ def _replace_leaf(raw: str, old: str, new: str, seps: _Seps) -> str:
         prev = found + len(old)
     out.append(leaf.span(prev, leaf.total))
     out.append(leaf.zero_width(leaf.total, leaf.total + 1))
+    if not new and old and len(starts) * len(old) == leaf.total:
+        return ""  # every character went, so the escapes that decode to nothing go with them
     return "".join(out)

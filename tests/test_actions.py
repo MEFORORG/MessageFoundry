@@ -426,6 +426,28 @@ def test_substring_field_keeps_a_zero_width_escape_outside_the_slice() -> None:
     assert m["PID-5"] == "\\C2842\\b\\.fi\\"
 
 
+def test_an_edit_that_removes_all_text_leaves_the_field_empty() -> None:
+    m = _with_pid("doe", pid4="\\.fi\\abc")
+    replace_literal(m, "PID-4", "abc", "")
+    assert m["PID-4"] is None
+    m = _with_pid("doe", pid4="\\.fi\\abc")
+    substring_field(m, "PID-4", 0, 0)
+    assert m["PID-4"] is None
+
+
+def test_replace_literal_crlf_in_new_raises_only_on_a_match() -> None:
+    m = _with_pid("doe")
+    replace_literal(m, "PID-5.1", "zzz", "a\rb")  # nothing matches: a no-op, as before
+    replace_literal(m, "ZZZ-1", "x", "a\rb")  # absent segment: a no-op, as before
+    assert m["PID-5"] == "doe"
+
+
+def test_replace_literal_replaces_a_decoded_line_break() -> None:
+    m = _with_pid("line one\\.br\\line two")
+    replace_literal(m, "PID-5.1", "\r", " ")
+    assert m["PID-5"] == "line one line two"
+
+
 def test_substring_field_refuses_a_cut_that_leaves_a_bare_cr() -> None:
     m = _with_pid("\\.sp2\\z")
     with pytest.raises(ValueError, match="CR/LF"):
