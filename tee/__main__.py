@@ -466,6 +466,10 @@ async def _scrub_only(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    if not os.path.isfile(args.db):
+        # RelayStore.open would create it, and a scrub of a new empty file would read as success.
+        print(f"error: {args.db} does not exist; nothing to scrub", file=sys.stderr)
+        return 2
     store = await RelayStore.open(args.db)
     try:
         await store.scrub()

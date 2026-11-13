@@ -170,7 +170,8 @@ consequences follow from it:
 
 ### Purge
 
-`python -m tee purge` clears the log DB and reclaims disk (`VACUUM`). With no `--before` it purges
+`python -m tee purge` clears the log DB. It reclaims disk (`VACUUM`) only when a run deletes a
+captured body, and `--scrub-only`, below, reclaims it on demand. With no `--before` it purges
 **everything**; `--before <age|date>` deletes only older rows (retention); `--captures-only` drops just
 the captured bodies (the PHI-bearing table) and keeps the NAK/leg log. It **prompts for confirmation**
 (or refuses, in a non-interactive shell) unless you pass `-y`.
@@ -207,7 +208,7 @@ before the commit, such as the delete itself timing out, deletes nothing. Any ot
 as Ctrl-C, ends purge with a traceback and no counts.
 
 To finish an unfinished scrub, run `python -m tee purge --db ./tee.db --scrub-only` once the cause
-is gone. It deletes nothing and needs no `-y`. It exits 1 with `error: ...` if the scrub still
+is gone. It deletes nothing and needs no `-y`, and it refuses a `--db` path that does not exist. It exits 1 with `error: ...` if the scrub still
 does not finish, and prints `scrubbed <db>` when it does.
 
 ```bash

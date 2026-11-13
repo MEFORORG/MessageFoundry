@@ -419,7 +419,7 @@ async def test_an_sqlite_error_from_the_checkpoint_becomes_purge_incomplete(
         with pytest.raises(PurgeIncompleteError) as excinfo:
             await store.purge(captures_only=True)
         assert excinfo.value.capture_rows == 1
-        assert excinfo.value.reason == "OperationalError: disk I/O error"
+        assert excinfo.value.reason == "the WAL checkpoint failed: OperationalError: disk I/O error"
         assert isinstance(excinfo.value.__cause__, sqlite3.OperationalError)
     finally:
         await store.close()
@@ -549,7 +549,7 @@ async def test_a_vacuum_failure_is_kept_when_the_checkpoint_after_it_also_fails(
             await store.purge(captures_only=True)
         assert excinfo.value.reason == (
             "VACUUM failed: OperationalError: database or disk is full;"
-            " then the WAL checkpoint failed: OperationalError: disk I/O error"
+            " then the WAL checkpoint after VACUUM failed: OperationalError: disk I/O error"
         )
         assert str(excinfo.value.__cause__) == "database or disk is full"
     finally:
@@ -582,3 +582,30 @@ def test_scrub_only_cli_deletes_nothing_and_reports_a_busy_scrub(
         peer.close()
     assert "error: deleted 0 log row(s) and 0 capture row(s)" in capsys.readouterr().err
     assert tee_main(["purge", "--db", str(db_path), "--scrub-only", "--captures-only"]) == 2
+    missing = tmp_path / "typo.db"
+    assert tee_main(["purge", "--db", str(missing), "--scrub-only"]) == 2
+    assert not missing.exists()  # refused, not created and reported as scrubbed
+    assert "--db <the same DB> --scrub-only" in str(PurgeIncompleteError(0, 1, "busy"))
+
+
+async def test_each_truncate_checkpoint_is_preceded_by_a_passive_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # PASSIVE copies the bulk of the WAL without the writer lock, so the TRUNCATE that follows holds
+    # it only for what is left: a shorter stall for the live relay's writes.
+    store = await _open(tmp_path)
+    try:
+        await store.record_capture(direction="corepoint_copy", control_id="C", raw=_MARKER_BODY)
+        ran = _spy_execute(store, monkeypatch, fail_on="", error=RuntimeError())
+        await store.purge(captures_only=True)
+        checkpoints = [sql for sql in ran if "wal_checkpoint" in sql]
+        assert (
+            checkpoints
+            == [
+                "PRAGMA wal_checkpoint(PASSIVE)",
+                "PRAGMA wal_checkpoint(TRUNCATE)",
+            ]
+            * 2
+        )
+    finally:
+        await store.close()

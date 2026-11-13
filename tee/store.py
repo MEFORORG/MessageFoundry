@@ -60,9 +60,12 @@ CREATE INDEX IF NOT EXISTS ix_capture_at ON relay_capture(at);
 # An ACK code that means the partner rejected the message (vs AA/CA accepted). Used to flag NAK rows.
 _NAK_CODES = ("AE", "AR", "CE", "CR")
 
-# A TRUNCATE checkpoint takes the writer lock and then waits for readers while holding it, so a long
-# busy wait would stall the live relay's writes for as long. Purge instead polls with no busy wait,
-# which releases the lock between tries, for about the store's usual 5 s busy_timeout in all.
+# A TRUNCATE checkpoint takes the writer lock, copies the WAL back and waits for readers while
+# holding it, so a long busy wait would stall the live relay's writes for as long. Purge instead
+# polls with no busy wait, which releases the lock between tries, for about the store's usual 5 s
+# busy_timeout in all, and runs a PASSIVE checkpoint first, which copies the bulk of the WAL
+# without blocking writers. VACUUM itself still holds the writer lock for its whole rebuild, as it
+# always has, so a purge that scrubs a large DB can still stall a live relay's writes past its 5 s.
 _BUSY_TIMEOUT_MS = 5000
 _CHECKPOINT_POLL_SECONDS = 0.1
 _CHECKPOINT_ATTEMPTS = 50
@@ -80,8 +83,8 @@ class PurgeIncompleteError(RuntimeError):
         super().__init__(
             f"deleted {log_rows} log row(s) and {capture_rows} capture row(s), but the scrub did"
             f" not finish ({reason}), so purged bytes may remain in the DB file or its -wal file."
-            " Run `python -m tee purge --scrub-only` once the cause is gone; docs/TEE-RELAY.md,"
-            " Purge, says more."
+            " Run `python -m tee purge --db <the same DB> --scrub-only` once the cause is gone;"
+            " docs/TEE-RELAY.md, Purge, says more."
         )
 
     def __reduce__(self) -> tuple[type[PurgeIncompleteError], tuple[int, int, str]]:
@@ -367,6 +370,7 @@ class RelayStore:
         copied back and truncated. Polls with busy_timeout at 0 (see ``_CHECKPOINT_ATTEMPTS``)."""
         await self._pragma("busy_timeout=0")
         try:
+            await self._pragma("wal_checkpoint(PASSIVE)")  # the bulk copy, without the writer lock
             for attempt in range(_CHECKPOINT_ATTEMPTS):
                 async with self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)") as cur:
                     row = await cur.fetchone()
@@ -400,35 +404,29 @@ class RelayStore:
         # would fail every purge with out of memory. docs/TEE-RELAY.md, Purge, says how an operator
         # points that directory at a protected volume.
         try:
-            if not await self._checkpoint_truncate():
-                raise PurgeIncompleteError(log_rows, capture_rows, "the WAL checkpoint stayed busy")
-            vacuum_error: sqlite3.Error | MemoryError | None = None
-            try:
-                async with self._db.execute("VACUUM"):
-                    pass
-            except (sqlite3.Error, MemoryError) as exc:
-                vacuum_error = exc
-            try:
-                truncated = await self._checkpoint_truncate()
-            except (sqlite3.Error, MemoryError) as exc:
-                if vacuum_error is None:
-                    raise
-                raise PurgeIncompleteError(
-                    log_rows,
-                    capture_rows,
-                    f"VACUUM failed: {_describe(vacuum_error)}; then the WAL checkpoint failed:"
-                    f" {_describe(exc)}",
-                ) from vacuum_error
-            if vacuum_error is not None:
-                raise PurgeIncompleteError(
-                    log_rows, capture_rows, f"VACUUM failed: {_describe(vacuum_error)}"
-                ) from vacuum_error
-            if not truncated:
-                raise PurgeIncompleteError(
-                    log_rows, capture_rows, "the WAL checkpoint after VACUUM stayed busy"
-                )
+            scrubbed = await self._checkpoint_truncate()
         except (sqlite3.Error, MemoryError) as exc:
-            raise PurgeIncompleteError(log_rows, capture_rows, _describe(exc)) from exc
+            raise PurgeIncompleteError(
+                log_rows, capture_rows, f"the WAL checkpoint failed: {_describe(exc)}"
+            ) from exc
+        if not scrubbed:
+            raise PurgeIncompleteError(log_rows, capture_rows, "the WAL checkpoint stayed busy")
+        failures: list[str] = []
+        cause: BaseException | None = None
+        try:
+            async with self._db.execute("VACUUM"):
+                pass
+        except (sqlite3.Error, MemoryError) as exc:
+            failures.append(f"VACUUM failed: {_describe(exc)}")
+            cause = exc
+        try:  # runs even after a failed VACUUM, to truncate the frames it spilled
+            if not await self._checkpoint_truncate():
+                failures.append("the WAL checkpoint after VACUUM stayed busy")
+        except (sqlite3.Error, MemoryError) as exc:
+            failures.append(f"the WAL checkpoint after VACUUM failed: {_describe(exc)}")
+            cause = cause or exc
+        if failures:
+            raise PurgeIncompleteError(log_rows, capture_rows, "; then ".join(failures)) from cause
 
     async def scrub(self) -> None:
         """Run the scrub alone, deleting nothing: the recovery step after a purge whose scrub did
