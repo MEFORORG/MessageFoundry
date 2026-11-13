@@ -190,16 +190,12 @@ leave a stale copy of a deleted row in a page's unused space. Only the rebuild r
 
 **When purge scrubs, and what finishes an unfinished scrub.** This is the one statement of it;
 the code's docstrings link here. A run that deletes rows records that a scrub is owed, in the
-same transaction as the delete, and `purge --scrub-only` records it before it starts. A scrub
-that finishes clears only what was owed when it started, so a purge that ran at the same time
-keeps its own record. So any later `purge`, even one that deletes nothing, or `purge
---scrub-only`, finishes an unfinished scrub, or exits 1 if it still cannot. A run that deletes
-nothing also scrubs, at least, when the DB has free pages or its `-wal` file is not empty;
-SQLite reuses the `-wal` without shrinking it, so a sweep beside a running relay usually scrubs.
-Such a scrub, with nothing deleted and nothing owed, logs a warning if it cannot finish and the
-run still exits 0, since it removed nothing. A run skips the scrub only when it deletes nothing,
-no scrub is owed, and neither of those holds.
-`--scrub-only` always attempts the whole scrub.
+same transaction as the delete, and only a scrub that finishes marks it done. A scrub marks done
+only what was owed when it started, so a purge that ran at the same time keeps its own record. A
+DB from before this record existed counts as owing one scrub. So any later `purge`, even one that
+deletes nothing, or `purge --scrub-only`, finishes an unfinished scrub, or exits 1 if it still
+cannot. A run that deletes nothing and owes nothing skips the scrub. `--scrub-only` always attempts
+the whole scrub; when nothing was owed, a failed attempt leaves nothing owed.
 
 **The scrub is file-level only.** A checkpoint frees the `-wal` file's blocks and `VACUUM` shrinks
 the DB file, but neither overwrites the freed blocks. So the bytes can stay readable on the raw

@@ -61,13 +61,14 @@ CREATE TABLE IF NOT EXISTS relay_capture (
 );
 CREATE INDEX IF NOT EXISTS ix_capture_at ON relay_capture(at);
 
--- One row: the scrub-pending record. A scrub is owed while generation > scrubbed_through.
+-- At most one row: the scrub-pending record. A scrub is owed while generation > scrubbed_through,
+-- or while the row is missing (a DB from before the record existed owes one scrub). Open never
+-- writes the row, so it needs no writer lock once the table exists.
 CREATE TABLE IF NOT EXISTS scrub_state (
     id               INTEGER PRIMARY KEY CHECK (id = 1),
     generation       INTEGER NOT NULL,
     scrubbed_through INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO scrub_state (id, generation, scrubbed_through) VALUES (1, 0, 0);
 """
 
 # An ACK code that means the partner rejected the message (vs AA/CA accepted). Used to flag NAK rows.
@@ -75,12 +76,19 @@ _NAK_CODES = ("AE", "AR", "CE", "CR")
 
 _log = logging.getLogger(__name__)
 
-# The scrub_state row is the scrub-pending record. Each delete (and each --scrub-only start)
-# increments generation in its own transaction, so the record is durable exactly when the delete is.
-# A scrub notes the generation it started from and, once its final checkpoint succeeds, raises
-# scrubbed_through to that value, never lowers it. generation only grows, so a purge that ran at the
-# same time, having raised generation past it, stays owed.
-_BUMP_GENERATION = "UPDATE scrub_state SET generation = generation + 1 WHERE id = 1"
+# The scrub_state row is the scrub-pending record. Each delete increments generation in its own
+# transaction, so the record is durable exactly when the delete is. A scrub notes the generation it
+# started from and, once its final checkpoint succeeds, raises scrubbed_through to that value, never
+# lowers it. generation only grows, so a purge that ran at the same time, having raised generation
+# past it, stays owed. Both writes are upserts, because open does not create the row.
+_BUMP_GENERATION = (
+    "INSERT INTO scrub_state (id, generation, scrubbed_through) VALUES (1, 1, 0)"
+    " ON CONFLICT(id) DO UPDATE SET generation = generation + 1"
+)
+_RECORD_SCRUBBED = (
+    "INSERT INTO scrub_state (id, generation, scrubbed_through) VALUES (1, ?, ?)"
+    " ON CONFLICT(id) DO UPDATE SET scrubbed_through = MAX(scrubbed_through, excluded.scrubbed_through)"
+)
 
 # A TRUNCATE checkpoint takes the writer lock, copies the WAL back and waits for readers while
 # holding it, so a long busy wait would stall the live relay's writes for as long. Purge instead
@@ -225,8 +233,9 @@ def _precreate_secure(path: str) -> None:
 
 
 def _secure_file(path: str) -> None:
-    """Best-effort owner-only permissions on the DB file **and its WAL/SHM siblings** (which WAL mode
-    creates and which can hold message data when body capture is on).
+    """Best-effort owner-only permissions on the DB file **and its WAL/SHM siblings**, which WAL mode
+    creates. The -wal can hold any recent page, so relay_log detail always and message bodies when
+    body capture is on.
 
     On POSIX a sibling SQLite re-creates later, after this one-time chmod, takes the main file's
     mode whatever the umask (the unix VFS copies it), so it is 0600 whenever the main file is,
@@ -475,27 +484,16 @@ class RelayStore:
         try:
             async with (
                 self._immediate_txn(),
-                self._db.execute(
-                    "UPDATE scrub_state SET scrubbed_through = ? WHERE id = 1 AND scrubbed_through < ?",
-                    (started_from, started_from),
-                ) as cur,
+                self._db.execute(_RECORD_SCRUBBED, (started_from, started_from)),
             ):
-                recorded = cur.rowcount > 0
+                pass
         except (sqlite3.Error, MemoryError) as exc:
             _log.warning("tee store: the scrub finished but recording it failed: %s", exc)
-            return
-        if not recorded:
-            return
-        # The record is one more WAL frame. Truncate it too, best effort, so a later sweep's residue
-        # hint is not set by it alone; a failure only costs that later sweep a scrub.
-        try:
-            await self._checkpoint_truncate()
-        except (sqlite3.Error, MemoryError) as exc:
-            _log.warning("tee store: checkpoint after recording the scrub failed: %s", exc)
 
     @contextlib.asynccontextmanager
     async def _immediate_txn(self) -> AsyncIterator[None]:
-        """One write transaction: BEGIN IMMEDIATE, then commit, or roll back on any exception.
+        """One write transaction: BEGIN IMMEDIATE, then commit, or roll back if the body or the
+        commit raises.
 
         A transaction left open by an earlier failure is rolled back first, never committed, so a
         half-done write cannot become durable through a later commit."""
@@ -505,10 +503,13 @@ class RelayStore:
             pass
         try:
             yield
+            await self._db.commit()
         except BaseException:
-            await self._db.rollback()
+            try:
+                await self._db.rollback()
+            except sqlite3.Error as exc:
+                _log.warning("tee store: rollback after a failed write failed: %s", exc)
             raise
-        await self._db.commit()
 
     async def _generation(self) -> int:
         async with self._db.execute("SELECT generation FROM scrub_state WHERE id = 1") as cur:
@@ -516,24 +517,20 @@ class RelayStore:
         return 0 if row is None else int(row[0])
 
     async def _owed(self) -> bool:
+        """Whether a scrub is owed: generation is past scrubbed_through, or there is no record yet,
+        which a DB from before the record existed reads as one scrub owed."""
         async with self._db.execute(
             "SELECT generation > scrubbed_through FROM scrub_state WHERE id = 1"
         ) as cur:
             row = await cur.fetchone()
-        return row is not None and bool(row[0])
+        return row is None or bool(row[0])
 
     async def scrub(self) -> None:
-        """Attempt the scrub alone, deleting nothing (``purge --scrub-only``). It records a
-        scrub as owed before it starts, so a failure leaves that record for the next run. Raises
+        """Attempt the scrub alone, deleting nothing (``purge --scrub-only``). It writes no record
+        before it starts: an owed scrub's record already exists and stays until a scrub finishes,
+        and a scrub that was not owed creates no obligation by failing. Raises
         :class:`PurgeIncompleteError` (with zero counts) as :meth:`_scrub` says."""
         async with self._lock:
-            try:
-                async with self._immediate_txn(), self._db.execute(_BUMP_GENERATION):
-                    pass
-            except (sqlite3.Error, MemoryError) as exc:
-                raise PurgeIncompleteError(
-                    0, 0, f"recording the scrub as owed failed: {_describe(exc)}"
-                ) from exc
             await self._scrub(0, 0)
 
     async def _pragma(self, setting: str) -> None:
@@ -558,7 +555,7 @@ class RelayStore:
         that did not happen. relay_log rows count too: their ``detail`` can carry partner ACK text
         that names a patient. When a run scrubs, and what finishes an unfinished scrub, is stated
         once in docs/TEE-RELAY.md, Purge; the mechanism is the ``scrub_state`` row
-        (``_BUMP_GENERATION``) and the :meth:`_has_residue` hint.
+        (``_BUMP_GENERATION``).
         """
         async with self._lock:
             # The delete and its scrub-pending record are one transaction: a failure in either rolls
@@ -593,41 +590,13 @@ class RelayStore:
                         pass
             try:
                 owed = bool(log_n or cap_n) or await self._owed()
-                hinted = not owed and await self._has_residue()
             except (sqlite3.Error, MemoryError) as exc:
                 raise PurgeIncompleteError(
                     log_n, cap_n, f"reading the scrub-pending record failed: {_describe(exc)}"
                 ) from exc
             if owed:
                 await self._scrub(log_n, cap_n)
-            elif hinted:
-                # Nothing deleted and nothing owed: only the residue hint asked for this scrub, so
-                # one that cannot finish leaves no purged bytes of this run's and is no failure.
-                try:
-                    await self._scrub(0, 0)
-                except PurgeIncompleteError as exc:
-                    _log.warning(
-                        "tee purge deleted nothing and owed no scrub; the scrub the residue hint"
-                        " started did not finish (%s)",
-                        exc.reason,
-                    )
         return (log_n, cap_n)
-
-    async def _has_residue(self) -> bool:
-        """A secondary hint, beside the scrub-pending record, that bytes may remain: the DB has
-        free pages, or the -wal is not empty. It can be wrong both ways: an unfinished scrub can
-        leave neither, which the record covers, and a live relay's writes leave the -wal
-        non-empty (SQLite reuses it without shrinking it), so a sweep beside one scrubs."""
-        async with self._db.execute("PRAGMA freelist_count") as cur:
-            row = await cur.fetchone()
-        if row is not None and int(row[0]) > 0:
-            return True
-        if self._path == ":memory:":
-            return False
-        try:
-            return os.path.getsize(self._path + "-wal") > 0
-        except FileNotFoundError:
-            return False
 
     async def export(
         self,
