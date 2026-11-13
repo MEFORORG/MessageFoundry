@@ -883,6 +883,10 @@ from typing import Any
 #: render such a row by reading ``username`` and ``roles`` off it, and raise; the digest refuses it
 #: at mount instead. Re-derived with ``--write``, from ``f44b72b2102da33e`` to ``4b5769ef2c675677``.
 #:
+#: BACKLOG #5930: the console's edit-resend form parser ``_resubmit_form`` now restores the
+#: original's line endings, and the snapshot records that closure's body hash. No engine surface
+#: changed. Re-derived with ``--write``, from ``4b5769ef2c675677`` to ``266d8008d8704431``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders

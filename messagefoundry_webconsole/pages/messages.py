@@ -22,6 +22,7 @@ from messagefoundry.api.models import (
     MessageSearchResults,
 )
 from messagefoundry.parsing import normalize
+from messagefoundry.parsing.peek import starts_with_msh
 from messagefoundry.parsing.tree import TreeNode
 
 from .._html import Markup, el, page, rows_table, text
@@ -71,16 +72,16 @@ def _eol_style(raw: str) -> str | None:
     """The terminator style to restore ``raw``'s line breaks to, or None for none.
 
     A body that mixes styles takes the one most of its breaks use, which rewrites the fewest of
-    them; the browser's CRLF would rewrite every one. A tie names none. A body with no line break
-    is CR when it is HL7 (it starts with MSH), since an added segment must end in CR; otherwise
-    there is no style to restore and None renders no ``eol`` field."""
+    them; the browser's CRLF would rewrite every one. A tie takes CR, then LF, HL7's terminator
+    first. A body with no line break is CR when it is HL7 (it opens with MSH), since an added
+    segment must end in CR; otherwise there is no style to restore and None renders no ``eol``
+    field."""
     crlf = raw.count("\r\n")
-    counts = {"crlf": crlf, "cr": raw.count("\r") - crlf, "lf": raw.count("\n") - crlf}
-    top = max(counts.values())
-    if top == 0:
-        return "cr" if raw.startswith("MSH") else None
-    used = [style for style, n in counts.items() if n == top]
-    return used[0] if len(used) == 1 else None
+    counts = {"cr": raw.count("\r") - crlf, "lf": raw.count("\n") - crlf, "crlf": crlf}
+    style, top = max(counts.items(), key=lambda kv: kv[1])  # the first of a tie, in that order
+    if top:
+        return style
+    return "cr" if starts_with_msh(raw) else None
 
 
 def restore_eol(raw: str, eol: str) -> str | None:

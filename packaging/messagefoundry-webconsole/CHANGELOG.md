@@ -239,6 +239,14 @@ this line.**
 
 ### Fixed
 
+- **Edit and resubmit keeps the original's line endings.** A browser submits a textarea's line
+  breaks as CRLF, so a direct send of a CR-terminated HL7 body, or a resend of an LF-only payload,
+  changed its terminators. The editor now carries the original's style in a hidden `eol` field
+  (`cr`, `lf` or `crlf`; the style most breaks use, CR first on a tie, and CR for a one-line HL7
+  body), and the route rewrites the submitted breaks to it before resubmitting. An `eol` outside
+  that set is refused with the generic "invalid input". A body that starts with a line break keeps
+  it. The seam digest moved because the route's form parser changed. (BACKLOG #5930)
+
 - **The flag toggle's "Flag change not confirmed" page keys on the refusal's type.** The console
   gave that page for any 503 the engine's flag handler raised, relying on a comment that the
   handler had no other. The handler raises no other today, so nothing an operator sees changes; a

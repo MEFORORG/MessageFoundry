@@ -1672,7 +1672,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 status_code=400,
             )
 
-        if form.get("eol", "") not in ("", *pages.EDIT_EOL_TERMINATORS):
+        if "eol" in form and form["eol"] not in pages.EDIT_EOL_TERMINATORS:
             # Only the editor's fixed set restores terminators (BACKLOG #5930); anything else
             # is refused rather than resubmitted with line breaks nobody chose.
             return await _reject("invalid input")

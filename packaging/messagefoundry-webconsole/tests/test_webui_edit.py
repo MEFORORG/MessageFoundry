@@ -469,12 +469,14 @@ def test_terminator_style_chosen_for_each_original() -> None:
     from messagefoundry_webconsole.pages.messages import _eol_style, restore_eol
 
     assert [_eol_style(s) for s in ("a\rb\r", "a\nb", "a\r\nb\r\n")] == ["cr", "lf", "crlf"]
-    # A mix takes the style most breaks use; a tie names none.
+    # A mix takes the style most breaks use; a tie takes CR, then LF.
     assert _eol_style("a\rb\rc\r\n") == "cr"
     assert _eol_style("a\nb\nc\r\n") == "lf"
-    assert _eol_style("a\rb\nc") is None
+    assert _eol_style("a\rb\nc") == "cr"
+    assert _eol_style("a\nb\r\nc") == "lf"
     # No break: CR for an HL7 body, whose added segments must end in CR; otherwise none.
     assert _eol_style("MSH|^~\\&|S") == "cr"
+    assert _eol_style(" MSH|^~\\&|S") == "cr"  # the parser's own MSH test
     assert _eol_style('{"id": 1}') is None
     assert restore_eol("a\r\nb\rc\n", "cr") == "a\rb\rc\r"
     assert restore_eol("a\r\nb\rc\n", "lf") == "a\nb\nc\n"
@@ -485,7 +487,7 @@ def test_terminator_style_chosen_for_each_original() -> None:
 async def test_edit_page_renders_no_terminator_field_without_a_style(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
-    mid = await _seed(engine, raw="a\rb\nc", control_id="T1")  # a tie: no style to restore
+    mid = await _seed(engine, raw='{"id": 1}', control_id="T1")  # one line, not HL7: no style
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
         await _mint_action(c, f"/ui/messages/{mid}/edit")
@@ -507,21 +509,33 @@ async def test_edit_page_keeps_a_leading_line_break(engine: Engine) -> None:
     assert ">\n\n{" in r.text  # the spare LF, then the body's own leading LF
 
 
-async def test_edit_resend_refuses_an_unlisted_terminator_style(engine: Engine) -> None:
+async def test_edit_resend_refuses_an_unlisted_terminator_style(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # On a started direct path, so without the refusal this submit would deliver (the control
+    # below shows the same form with a listed style does).
+    await _started_direct_engine(engine, tmp_path)
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     mid = await _seed(engine)
+    form = {"raw": EDITED, "idempotency_key": "k1", "mode": "direct", "to": "OB2"}
+    same_origin = {"Sec-Fetch-Site": "same-origin"}
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
         await _mint_action(c, f"/ui/messages/{mid}/edit")
         r = await c.post(
-            f"/ui/messages/{mid}/edit-resend",
-            data={"raw": EDITED, "idempotency_key": "k1", "mode": "reroute", "eol": "nel"},
-            headers={"Sec-Fetch-Site": "same-origin"},
+            f"/ui/messages/{mid}/edit-resend", data={**form, "eol": "nel"}, headers=same_origin
         )
         assert r.status_code == 400
         assert "invalid input" in r.text
-    assert await engine.store.count_messages(allowed_channels=None) == 1  # nothing resubmitted
+        assert await engine.store.count_messages(allowed_channels=None) == 1  # nothing resubmitted
+        # The refusal spent no proof: the same grant carries the listed style through.
+        r = await c.post(
+            f"/ui/messages/{mid}/edit-resend", data={**form, "eol": "cr"}, headers=same_origin
+        )
+        assert r.status_code == 303
+        assert r.headers["location"] == f"/ui/messages/{mid}"
+    assert await engine.store.count_messages(allowed_channels=None) == 2
 
 
 async def test_edit_resend_phi_safe_reject_no_pydantic_echo(engine: Engine) -> None:
