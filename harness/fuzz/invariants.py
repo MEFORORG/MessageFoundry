@@ -16,6 +16,9 @@ acknowledgements, at two strengths, because the engine gives two different guara
   batch the store must grow by at least the number of acknowledgements of either kind. That lower
   bound holds under unrelated traffic, which only adds rows.
 
+**Only HL7 v2 over MLLP is judged.** ``build_transport`` builds the MLLP transport alone and refuses
+every other driver kind as a setup error; :mod:`harness.fuzz.transport` says why.
+
 The MLLP transport reads every reply frame until the engine closes, so a case carrying two frames is
 counted twice, not once with a surplus row that would hide a missing one later.
 
@@ -115,9 +118,9 @@ class Judgement:
     problem: str = ""
 
 
-def judge(exchange: Exchange, *, expected: int | None) -> Judgement:
+def judge(exchange: Exchange, *, expected: int) -> Judgement:
     """Hold an exchange to the reply invariant: one acknowledgement per complete frame sent, then a
-    clean close. ``expected`` is that frame count, or None for a transport that cannot say."""
+    clean close. ``expected`` is that frame count."""
     acks: list[Ack] = []
     for reply in exchange.replies:
         ack, problem = _read_ack(reply)
@@ -127,7 +130,7 @@ def judge(exchange: Exchange, *, expected: int | None) -> Judgement:
         acks.append(ack)
     if exchange.outcome not in (REPLY, CLOSED):
         return Judgement(tuple(acks), f"{exchange.outcome}: {exchange.detail}")
-    if expected is not None and len(acks) != expected:
+    if len(acks) != expected:
         return Judgement(
             tuple(acks),
             f"{expected} complete frame(s) sent but {len(acks)} acknowledgement(s) came back",
