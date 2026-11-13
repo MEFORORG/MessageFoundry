@@ -7609,7 +7609,7 @@ store it holds open, so a takeover notice whose `auth.first_administrator_provis
 `holder_notice: dispatched` and whose send failed gets its own undelivered row too, except in at
 least these cases: that write fails, or the run is interrupted mid-send. The command's own result
 says so as well: `holder_notice_send_failed` in `--json`, and a WARNING line in text. Both say
-the notifier recorded the notice as undelivered, that is, its send raised, so delivery is
+the notifier requested to record the notice as undelivered, that is, its send raised, so delivery is
 unconfirmed; a send can raise after the relay has queued the mail. That row can
 come before the provision row in the chain, because the notice is sent while the provision runs.
 `admin-reset-totp` has closed its store by the time the notice is sent, so it opens the store
@@ -7627,10 +7627,11 @@ again for the row, and only when a send failed. **Still open, at least:**
 - `admin-reset-totp` loses the record of a failed notice in at least these cases: its reopen of
   the store fails, or the write fails. The run being interrupted can lose it too. The command waits
   for the reopen and the write together for at most `_OFFLINE_NOTICE_RECORD_SECONDS` in
-  `messagefoundry/__main__.py`, and then logs a miss by class only. While the command still runs,
-  a record past that limit may land or fail, and what it does is logged when it does, unless the
-  wait was interrupted rather than timed out. The close comes after the answer, so a slow close
-  never costs the row or reports it missed. A committed row is reported missed only where the
+  `messagefoundry/__main__.py`, and then logs that the outcome is unknown. While the command
+  still runs, a record past that limit may land or fail, and what it does is logged when it does,
+  unless the wait was interrupted rather than timed out. A failed write is answered before the
+  close, and the close comes after any answer, so a slow close never costs the row or reports it
+  missed. A committed row is reported missed only where the
   write itself raised, which can happen after a server-side COMMIT. The reopen and the write run
   on their own loop in a daemon thread, so the limit covers a synchronous key-provider hop inside
   the open too. A record still running at the time limit is not guaranteed either way: the process

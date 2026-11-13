@@ -8470,7 +8470,8 @@ def _log_late_close(closing: asyncio.Future[None]) -> None:
 #: How long ``admin-reset-totp`` waits for the record of a notice whose send failed: the store's
 #: reopen and the one write, together (BACKLOG #5634). They run on their own loop in a daemon
 #: thread, so a synchronous hop inside the open, such as the key provider's, is inside the bound
-#: too. The command stops waiting at the bound; the record may still land later, or not.
+#: too. At the bound the command logs that the record's outcome is unknown and stops waiting; the
+#: record may still land later, or not.
 _OFFLINE_NOTICE_RECORD_SECONDS = 10.0
 
 
@@ -8480,21 +8481,22 @@ class _ReopeningNoticeAudit:
 
     A notice that is sent opens nothing. The reopen, the write and the close run on their own
     event loop in a daemon thread, as :func:`_run_offline_alert_step` runs the alert step. The
-    command waits for at most :data:`_OFFLINE_NOTICE_RECORD_SECONDS` for the row to commit, and no
-    longer than that: the close and the thread loop's teardown come after the answer, not before
-    it. Nothing inside the command's own loop could bound the wait: the open's key-provider hop is
+    command waits for at most :data:`_OFFLINE_NOTICE_RECORD_SECONDS` for the answer, and no longer
+    than that: the write's answer, a commit or a failure, is given before the close, and the close
+    and the thread loop's teardown come after it. A failed open is answered as it fails. Nothing inside the command's own loop could bound the wait: the open's key-provider hop is
     synchronous, and a worker-thread call still running would hold that loop's executor shutdown.
 
     A record still running at the time limit is not guaranteed either way: the process exit may
     wait for it, or it may be lost with no log line.
 
-    The row counts as written only when the write returned. Anything else is a miss, whatever ended
-    the thread, and raises into :meth:`SecurityEventNotifier._record_undelivered`, which logs the
-    class and swallows it: the notice was best effort, and so is its record. A committed row is
-    reported as missed only where ``record_audit`` raised, which can happen after a server-side
-    COMMIT; a failed close is logged in the thread and raises nothing. An
-    outcome that arrives after the bound has passed is logged when it does, by class only. One
-    whose wait was cancelled instead, by an interrupt, is not logged."""
+    The row counts as written only when the write returned. A failed open or write, whatever its
+    class, is a miss, and raises into :meth:`SecurityEventNotifier._record_undelivered`, which
+    logs the class and swallows it: the notice was best effort, and so is its record. A committed
+    row is reported as missed only where ``record_audit`` raised, which can happen after a
+    server-side COMMIT; a failed close is logged in the thread and raises nothing. At the bound the
+    outcome is unknown, not a miss, so it is logged as still running, and this returns without
+    raising. What the record then does is logged when it does, by class only. One whose wait was
+    cancelled instead, by an interrupt, is not logged."""
 
     def __init__(self, opener: Callable[[], Awaitable[Store]]) -> None:
         self._opener = opener
@@ -8539,8 +8541,17 @@ class _ReopeningNoticeAudit:
                     type(failure[0]).__name__ if failure else "no answer",
                 )
 
+        def missed(exc: BaseException) -> None:
+            if not failure:
+                failure.append(exc)
+            answer(recorded=False)
+
         async def write() -> None:
-            store = await self._opener()
+            try:
+                store = await self._opener()
+            except BaseException as exc:
+                missed(exc)
+                raise
             try:
                 await store.record_audit(
                     action,
@@ -8551,6 +8562,10 @@ class _ReopeningNoticeAudit:
                     now=now,
                 )
                 answer(recorded=True)
+            except BaseException as exc:
+                # Answered before the close, so a slow close cannot turn this miss into a timeout.
+                missed(exc)
+                raise
             finally:
                 try:
                     await store.close()
@@ -8564,7 +8579,8 @@ class _ReopeningNoticeAudit:
             try:
                 run_guarded(write())
             except BaseException as exc:  # noqa: BLE001 - any class is a miss, read by the waiter
-                failure.append(exc)
+                if not failure:
+                    failure.append(exc)
             finally:
                 # A no-op once the write answered; otherwise the record is a miss.
                 answer(recorded=False)
@@ -8574,9 +8590,15 @@ class _ReopeningNoticeAudit:
         while not answered.is_set():
             if time.monotonic() >= deadline:
                 with lock:
-                    if not answered.is_set():
+                    still_running = not answered.is_set()
+                    if still_running:
                         state["late"] = True
-                        raise TimeoutError
+                if still_running:
+                    log.warning(
+                        "the record of an undelivered security notice is still running after its "
+                        "bound, so whether it lands is unknown"
+                    )
+                    return
                 break
             await asyncio.sleep(0.05)
         if state["recorded"]:
@@ -9852,10 +9874,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 "store": store_path,
                 # BACKLOG #2019: null on a fresh create; see ProvisionedAdministrator.holder_notice.
                 "holder_notice": outcome.holder_notice,
-                # BACKLOG #5634: true when the notifier recorded a notice this run dispatched as
+                # BACKLOG #5634: true when the notifier requested to record a notice this run dispatched as
                 # undelivered, because its send raised. Delivery is then unconfirmed,
                 # not disproved: a send can raise after the relay queued the mail. False when it
-                # recorded none, which is not a delivery receipt; null when no notice was
+                # requested none, which is not a delivery receipt; null when no notice was
                 # dispatched. `holder_notice` keeps what the audit row records.
                 "holder_notice_send_failed": holder_send_failed,
                 # ADR 0197 Amendment A (N-A): whether TOTP was enrolled. Never the secret or codes.

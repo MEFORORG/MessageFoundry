@@ -36,6 +36,11 @@ from messagefoundry.store.base import AuditStore
 from messagefoundry.store.store import MessageStore
 
 _SEND = "messagefoundry.pipeline.security_notify.send_plain_email"
+#: What the reopening sink logs when its bound passes with the record still running (BACKLOG #5634).
+_STILL_RUNNING = (
+    "the record of an undelivered security notice is still running after its bound, so whether "
+    "it lands is unknown"
+)
 
 
 @pytest.fixture
@@ -465,9 +470,9 @@ async def test_the_reopening_sink_bounds_a_reopen_that_blocks_its_thread(
     began = time.monotonic()
     await notifier.aclose()
     assert time.monotonic() - began < 1.5
-    assert [
-        r.getMessage() for r in caplog.records if "could not be recorded" in r.getMessage()
-    ] == ["an undelivered security notice could not be recorded in the audit log (TimeoutError)"]
+    # Unknown, not a miss: the record is still running (BACKLOG #5634).
+    assert _STILL_RUNNING in [r.getMessage() for r in caplog.records]
+    assert _misses(caplog) == []
 
 
 def _failing_send(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -543,8 +548,8 @@ async def test_the_reopening_sink_does_not_wait_for_the_close_of_a_committed_row
 async def test_the_reopening_sink_logs_an_outcome_that_lands_after_its_bound(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The bound passing is logged as a miss, and what the record then did is logged when it does,
-    so the class of a late failure is not lost (finding 3 of the review)."""
+    """The bound passing is logged as an unknown outcome, and what the record then did is logged
+    when it does, so the class of a late failure is not lost."""
     import time
 
     import messagefoundry.__main__ as cli
@@ -561,7 +566,36 @@ async def test_the_reopening_sink_logs_an_outcome_that_lands_after_its_bound(
     deadline = time.monotonic() + 5.0
     while late not in [r.getMessage() for r in caplog.records] and time.monotonic() < deadline:
         await asyncio.sleep(0.05)
+    assert _STILL_RUNNING in [r.getMessage() for r in caplog.records]
+    assert _misses(caplog) == [late]
+
+
+async def test_the_reopening_sink_answers_a_failed_write_before_a_slow_close(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A write that fails is answered before the close, so a close slower than the bound cannot
+    turn it into an unknown outcome, and the miss keeps its own class."""
+    import time
+
+    import messagefoundry.__main__ as cli
+
+    monkeypatch.setattr(cli, "_OFFLINE_NOTICE_RECORD_SECONDS", 0.3)
+
+    class _Refusing:
+        async def record_audit(self, action: str, **_kw: Any) -> None:
+            raise OSError("append refused")
+
+        async def close(self) -> None:
+            time.sleep(1.0)  # blocks the record's own loop, past the bound
+
+    async def opener() -> Any:
+        return _Refusing()
+
+    _failing_send(monkeypatch)
+    began = time.monotonic()
+    await _one_failed_notice(cli._ReopeningNoticeAudit(opener))
+    assert time.monotonic() - began < 0.9
     assert _misses(caplog) == [
-        "an undelivered security notice could not be recorded in the audit log (TimeoutError)",
-        late,
+        "an undelivered security notice could not be recorded in the audit log (OSError)"
     ]
+    assert _STILL_RUNNING not in [r.getMessage() for r in caplog.records]
