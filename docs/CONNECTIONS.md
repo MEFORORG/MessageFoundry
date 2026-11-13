@@ -2370,9 +2370,9 @@ Two limits follow from this:
   under `.postgresql` in `HOME`, which libpq 15 and later read (or the
   password-file home when `HOME` is unset or empty), and in the password-file home, which libpq
   14 and older read. The engine cannot tell which libpq the driver loads, so when the two differ
-  it checks both and refuses on either. With libpq 16 and later, `PGSSLROOTCERT=system` names no
-  file, so the engine reads nothing. An older libpq opens a file named `system` in its working
-  directory, and the engine does not check it. The check reads the environment of the process
+  it checks both and refuses on either. With `PGSSLROOTCERT=system` the engine checks no
+  root-certificate file: libpq 16 and later load OpenSSL's default CA file, and an older libpq
+  opens a file named `system` in its working directory, and neither is checked. The check reads the environment of the process
   that builds. So `messagefoundry check` judges its own machine's file.
   The check runs at build, not at each connect. No ACL check covers the file.
 

@@ -618,6 +618,25 @@ def test_a_shell_folder_the_code_page_could_not_hold_names_no_libpq_home(
     assert "SSLmode=verify-full;" in _build_psql()
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="the shell folder is read on Windows only")
+@pytest.mark.parametrize(
+    "folder",
+    ["\\??\\C:\\x", "\\??\\UNC\\host\\share\\x", "\\\\?\\C:\\x"],
+    ids=["nt", "nt-unc", "win32"],
+)
+def test_a_device_prefixed_shell_folder_is_refused_not_cleared(
+    monkeypatch: pytest.MonkeyPatch, folder: str
+) -> None:
+    """A device prefix holds a ``?`` the ANSI call did not substitute, and can name another
+    host, so the folder is named and the host check refuses it, as on main. Red while the ``?``
+    rule ran first: the folder named no home and the build passed with nothing read."""
+    monkeypatch.delenv("PGSSLROOTCERT", raising=False)
+    monkeypatch.setattr(database, "_windows_roaming_appdata", lambda: folder)
+    assert database._libpq_homes() == [("", os.path.join(folder, "postgresql"))]
+    with pytest.raises(ValueError, match="must be a plain local path on this host"):
+        _build_psql()
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="shell32 is loaded on Windows only")
 def test_libpqs_windows_root_certificate_is_refused_through_the_shell_call(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path

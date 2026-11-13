@@ -1512,11 +1512,14 @@ def _libpq_root_certs() -> list[tuple[str, str]]:
     """The ``(setting, path)`` of each root certificate the installed libpq could read from the
     engine's environment when no ``sslrootcert`` is given, which the generic dialect never gives
     (BACKLOG #3090, step 3), for the caller to refuse on any of them: ``PGSSLROOTCERT`` when it
-    is set and not empty, else ``root.crt`` in each of :func:`_libpq_homes`. Empty for ``system``,
-    libpq 16's name for the platform's own store, which is no file, and when no home can be named,
-    where libpq reads no default either. A libpq older than 16 reads ``system`` as a file in its
-    working directory, and that file is not read here. Raises ``OSError`` when a home cannot be
-    named (:func:`_libpq_homes`)."""
+    is set and not empty, else ``root.crt`` in each of :func:`_libpq_homes`.
+
+    Empty for ``system``: the engine then checks no root-certificate file. libpq 16 and later load
+    OpenSSL's default CA file for it, and a libpq older than 16 opens a file named ``system`` in
+    its working directory; neither is checked. Empty too when libpq names no home, as when the
+    effective user has no password-file entry and ``HOME`` is unset: libpq then reads no default
+    file. Raises ``OSError`` when the engine cannot ask which home libpq names, as when ``pwd``,
+    ``ctypes`` or the shell call cannot be loaded or made (:func:`_libpq_homes`)."""
     named = os.environ.get("PGSSLROOTCERT")
     if named:
         # Not "DATABASE PGSSLROOTCERT": the log redaction scrubs two adjacent ALL-CAPS tokens.
@@ -1537,7 +1540,8 @@ def _libpq_homes() -> list[tuple[str, str]]:
     password-file home alone, as libpq 14 and older find it (``pqGetHomeDirectory``). When the two
     differ, both are named, so a check of one cannot clear a file libpq loads from the other.
     Empty when no directory can be named, as libpq then reads no default file, and on Windows
-    when the shell's ANSI folder holds a ``?`` past the drive: the ANSI call writes ``?`` for a
+    when the shell's ANSI folder holds a ``?`` past the drive and no device prefix (a prefixed
+    folder is named, for the host check to refuse): the ANSI call writes ``?`` for a
     character its code page cannot hold and has no best fit for, and libpq's open of that path
     finds no file. Best-fit maps other such characters to other characters, and that path is
     named and checked like any other; one mapped to a character no Windows name holds, at least
@@ -1553,7 +1557,9 @@ def _libpq_homes() -> list[tuple[str, str]]:
             return []
         # The ANSI call writes "?" for a character its code page cannot hold and has no best fit
         # for, and Windows answers a "?" in a name as an invalid name, so libpq opens no file.
-        if "?" in os.path.splitdrive(appdata)[1]:
+        # A device prefix (\\?\ or \??\) holds a "?" too and can name another host, so it is
+        # named, and the caller's host check refuses it.
+        if not is_remote_spelling(appdata) and "?" in os.path.splitdrive(appdata)[1]:
             logger.debug("libpq's shell folder holds a substituted '?', so no file is read there")
             return []
         return [("", os.path.join(appdata or os.sep, "postgresql"))]
