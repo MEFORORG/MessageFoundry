@@ -44,7 +44,9 @@ read. This repository's own distributions
 
 NOT SWEPT, at least: npm manifests (``ide/package.json``, ``ci/npm-tools/package.json``), and tools
 a workflow or script installs by command line (a ``pipx install`` or ``uv tool install``), hatch
-environment tables, and any requirements file. An invented name there passes this gate. ``npm audit``
+environment tables, any requirements file, a ``uv.toml``, a ``setup.py`` (its ``setup_requires`` runs
+under a setuptools backend), and a hatch custom builder target
+(``[tool.hatch.build.targets.custom]``), which runs in-tree code that can return build requirements. An invented name there passes this gate. ``npm audit``
 answers known advisories, the npm counterpart of pip-audit, and so has pip-audit's blindness to a
 freshly registered name. The npm boundary is pinned by a named test in
 ``tests/test_new_dependency_check.py``; none of these is a check this gate performs.
@@ -151,7 +153,8 @@ ALLOWLIST: dict[str, str] = {}
 # built from this tree, so "did a model invent this name" is not a question to ask of it, and a sibling
 # not yet uploaded, or first uploaded in a recent release, would read as absent or "freshly
 # registered" and red the gate on every pull request. Matched by exact PEP 503 name only, so a
-# near-miss of one of these names is fetched and vetted like any other.
+# near-miss of one of these names is fetched and vetted like any other. ``main`` applies it only to a
+# name declared solely in packaging/*/pyproject.toml; declared anywhere else, it is vetted.
 #
 # WHAT THIS EXCLUSION GIVES UP, stated so nobody reads it as covered: release.yml does not upload every
 # one of these on every release (the harness and the web console are each behind their own switch), so
@@ -421,7 +424,8 @@ def declared_distributions(pyproject_text: str) -> dict[str, str]:
     read is a name that enters the tree unvetted:
 
     * ``[build-system].requires`` -- the build backend, run by PEP 517 build isolation inside the
-      release build jobs, which hold ``id-token: write``.
+      release build jobs. release.yml's ``release`` job, which builds the engine and toolkit wheels,
+      holds ``id-token: write``; the web console and harness build jobs do not.
     * ``[project].dependencies`` -- the runtime closure.
     * every ``[project.optional-dependencies]`` extra -- exactly where a niche, plausible-sounding,
       hallucination-prone name lands.
@@ -497,6 +501,7 @@ def vet(
     now: datetime,
     min_age_days: int = DEFAULT_MIN_AGE_DAYS,
     allowlist: dict[str, str] | None = None,
+    first_party: dict[str, str] | None = None,
 ) -> tuple[list[Finding], int]:
     """Vet every declared distribution. Returns (findings, number examined).
 
@@ -505,7 +510,8 @@ def vet(
     allowlisted or FIRST_PARTY name is skipped and not counted.
     """
     allowed = allowlist if allowlist is not None else ALLOWLIST
-    skipped = {normalize(k) for k in allowed} | {normalize(k) for k in FIRST_PARTY}
+    own = first_party if first_party is not None else FIRST_PARTY
+    skipped = {normalize(k) for k in allowed} | {normalize(k) for k in own}
     findings: list[Finding] = []
     examined = 0
 
@@ -781,6 +787,8 @@ def main(argv: list[str] | None = None) -> int:
     declared: dict[str, str] = {}
     declared_in: dict[str, Path] = {}
     unnameable: list[Finding] = []
+    outside_packaging: set[str] = set()
+    packaging_dir = (_ROOT / "packaging").resolve()
     for path in files:
         # A file that cannot be read or parsed is "could not see" (2), never "failed vetting" (1),
         # which is what a traceback would exit with.
@@ -805,10 +813,17 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
+        sibling_file = path.resolve().is_relative_to(packaging_dir)
         for name, spec in names.items():
             declared.setdefault(name, spec)
             declared_in.setdefault(name, path)
+            if not sibling_file:
+                outside_packaging.add(name)
         unnameable.extend(problems)
+    # The exclusion exists for one packaging wheel naming a sibling. A first-party name declared
+    # anywhere else -- a root extra an end user installs from PyPI, say -- is vetted like any other,
+    # because there the name may be unclaimed and existence is exactly the question.
+    first_party = {k: v for k, v in FIRST_PARTY.items() if normalize(k) not in outside_packaging}
     # Named before PyPI is asked anything, so an unreachable PyPI cannot hide them.
     for finding in unnameable:
         _print_finding(finding)
@@ -821,6 +836,7 @@ def main(argv: list[str] | None = None) -> int:
             functools.partial(_http_fetch, budget=RetryBudget()),
             now=datetime.now(UTC),
             min_age_days=args.min_age_days,
+            first_party=first_party,
         )
     except UnreadableReply as exc:
         print(

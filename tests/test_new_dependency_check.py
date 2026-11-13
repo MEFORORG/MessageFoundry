@@ -896,7 +896,7 @@ def test_the_include_group_table_is_still_skipped_without_a_finding() -> None:
 
 
 def test_build_system_requires_is_swept() -> None:
-    """S28-09: a build backend runs in release.yml's build jobs, which hold `id-token: write`."""
+    """S28-09: a build backend runs in release.yml's build jobs, `release` (id-token) among them."""
     declared = declared_distributions(
         '[build-system]\nrequires = ["hatchling==1.33.0", "hatch-vcs-hallucinated>=1"]\n'
     )
@@ -992,6 +992,27 @@ def test_first_party_names_are_excluded_with_a_reason_and_not_counted() -> None:
         now=_NOW,
     )
     assert (findings, examined) == ([], 0)
+
+
+def test_a_first_party_name_outside_packaging_is_vetted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exclusion is for sibling wheels. A root extra an end user installs from PyPI is not one."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n'
+        '[project.optional-dependencies]\nconsole = ["messagefoundry-webconsole>=0.5"]\n',
+        encoding="utf-8",
+    )
+    sub = tmp_path / "packaging" / "messagefoundry-harness"
+    sub.mkdir(parents=True)
+    (sub / "pyproject.toml").write_text(
+        '[project]\nname = "messagefoundry-harness"\ndependencies = ["messagefoundry-toolkit==1"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(_gate, "_ROOT", tmp_path)
+    asked = _stub_registry(monkeypatch, absent=frozenset({"messagefoundry-webconsole"}))
+    assert main([]) == 1
+    assert sorted(asked) == ["fastapi", "messagefoundry-webconsole"], "the sibling stays excluded"
 
 
 def test_a_near_miss_of_a_first_party_name_is_still_vetted() -> None:
