@@ -45,16 +45,22 @@ def test_the_baseline_message_is_conformant_and_lists_nothing() -> None:
 @pytest.mark.parametrize(
     ("extra", "error"),
     [
-        pytest.param("FOO|1", "segment FOO at line 3 is not an HL7 segment", id="unknown-segment"),
+        pytest.param("FOO|1", "unknown segment at line 3", id="unknown-segment"),
         pytest.param(
             "ORC|NW|ORD1",
-            "segment ORC at line 3 has no place in this message structure",
+            "segment ORC at line 3 has no place in this message's structure",
             id="misplaced-known-segment",
+        ),
+        pytest.param(
+            "PRT|1",
+            "segment PRT at line 3 has no place in this message's structure",
+            id="segment-of-a-later-version",
         ),
         pytest.param("hello world", "unrecognised line 3", id="non-hl7-text"),
         pytest.param("zxx|1", "unrecognised line 3", id="lowercase-z-is-not-a-z-segment"),
         pytest.param("ZXXX|1", "unrecognised line 3", id="four-character-id"),
         pytest.param("FO|1", "unrecognised line 3", id="two-character-id"),
+        pytest.param("   ", "unrecognised line 3", id="whitespace-only-line"),
     ],
 )
 def test_a_dropped_line_is_refused(extra: str, error: str) -> None:
@@ -73,29 +79,46 @@ def test_a_z_segment_is_tolerated_and_listed(z: str) -> None:
 def test_z_segments_do_not_mask_a_refusal() -> None:
     result = validate(_adt(_MSH, "ZAA|1", _EVN, _PID, "FOO|1", _PV1, "ZBB|1", "BAR|1"))
     assert not result.ok
-    assert result.errors == ["segment FOO at line 5 is not an HL7 segment (and 1 more)"]
+    assert result.errors == ["unknown segment at line 5 (and 1 more)"]
     assert result.unvalidated_segments == ("ZAA at line 2", "ZBB at line 7")
 
 
 def test_empty_lines_are_not_counted() -> None:
     result = validate(_adt(_MSH, "", _EVN, "", _PID, "FOO|1", _PV1))
-    assert result.errors == ["segment FOO at line 4 is not an HL7 segment"]
+    assert result.errors == ["unknown segment at line 4"]
 
 
-def test_a_whitespace_only_line_is_refused() -> None:
-    """The tolerant parser keeps a whitespace-only line (peek.drop_blank_segments), so it counts."""
-    result = validate(_adt(_MSH, _EVN, "   ", _PID, _PV1))
+@pytest.mark.parametrize("tail", ["   ", "\t", " "])
+def test_trailing_whitespace_the_tolerant_parser_strips_is_not_refused(tail: str) -> None:
+    result = validate(_adt(_MSH, _EVN, _PID, _PV1, tail))
+    assert result.ok, result.errors
+
+
+def test_a_line_hl7apy_reads_by_its_first_three_characters_is_still_compared() -> None:
+    """hl7apy files ``PIDX|`` as a PID; the tolerant parser forwards it as ``PIDX``, with no PID."""
+    # hl7apy skips four characters, then the separator, so PID-3 lands where hl7apy wants it.
+    result = validate(_adt(_MSH, _EVN, "PIDX|a|100001^^^HOSP^MR|b|DOE^JANE", _PV1))
+    assert not result.ok
     assert result.errors == ["unrecognised line 3"]
 
 
-def test_the_error_never_echoes_the_dropped_line() -> None:
-    """A dropped line can carry PHI, so the refusal names its position only."""
-    secret = "Jane Q Doe 555-12-3456 1970-01-01"
-    for line in (secret, f"FOO|{secret}", f"ORC|{secret}", f"Z1|{secret}"):
-        result = validate(_adt(_MSH, _EVN, line, _PID, _PV1))
-        assert not result.ok, line
-        assert all(secret not in error for error in result.errors), result.errors
-        assert all("Jane" not in error and "Doe" not in error for error in result.errors)
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Jane Q Doe 555-12-3456",
+        "FOO|Jane Q Doe 555-12-3456",
+        "ORC|Jane Q Doe 555-12-3456",
+        "Z1|Jane Q Doe 555-12-3456",
+        "KIM|F",  # a wrapped name fragment that looks like a segment ID
+        "DOE|JANE",
+    ],
+)
+def test_the_error_never_echoes_the_dropped_line(line: str) -> None:
+    """A dropped line can carry PHI, so the refusal names an ID only when HL7 defines it."""
+    result = validate(_adt(_MSH, _EVN, line, _PID, _PV1))
+    assert not result.ok, line
+    for fragment in ("Jane", "Doe", "555", "KIM", "DOE", "JANE"):
+        assert all(fragment not in error for error in result.errors), result.errors
 
 
 def test_an_earlier_hl7apy_error_is_not_joined_by_a_dropped_line_error() -> None:

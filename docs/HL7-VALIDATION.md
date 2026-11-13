@@ -65,16 +65,16 @@ threshold, so a large-document feed keeps working; set the threshold at or below
 streaming inbound.
 
 **A line strict validation cannot place is refused** (BACKLOG #5920). `hl7apy` drops, while grouping,
-any line it cannot fit into the message structure, and validates only what it kept; the tolerant
-parser forwards every line. So strict validation refuses an unknown segment (`FOO`), a known segment
+any line it cannot fit into the message structure, and validates only what it kept, while the
+tolerant parser forwards that line. So strict validation refuses an unknown segment, a known segment
 the structure has no place for (`ORC` in `ADT^A01`), and a line that is not a segment at all. The
-error names only the three-character segment ID and its line number, counting non-empty lines from
-1 (a whitespace-only line counts, and is refused, since the tolerant parser keeps it), and an
-unrecognised line is reported as `unrecognised line N`, never quoted.
+error never quotes the line: it names the segment's position and, only for an ID HL7 defines, the
+ID. The exact wording is in the module docstring of
+[parsing/validate.py](../messagefoundry/parsing/validate.py).
 
-**Z-segments are tolerated, unvalidated, and listed.** A Z-segment (`Z` plus exactly two letters or
-digits) does not fail strict validation; it is listed in `ValidationResult.unvalidated_segments` as
-`ZXX at line N`, and it is forwarded without any check.
+**Z-segments are tolerated, unvalidated, and listed.** A Z-segment does not fail strict validation.
+It is forwarded without any check, and listed in `ValidationResult.unvalidated_segments` for a
+caller of `validate()`; no engine surface (log, API, web console) shows that list yet.
 
 Strict validation surfaces a single conformance error (not a full report) — a full report of a PHI
 message would be a data leak. See [parsing/validate.py](../messagefoundry/parsing/validate.py).
