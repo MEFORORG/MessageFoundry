@@ -5,7 +5,8 @@
   is now the `reply-misframed` refusal where the body is needed, and is dropped with a
   `reply_dropped` event where it is not. A SOAP or FHIR delivery that reads a coded non-2xx body
   logs a WARNING and classifies on the status alone; REST and DICOMweb do not read a non-2xx
-  body. Other reads that check reply framing, at least the OIDC token and JWKS reads,
-  `fhir_lookup` and the token endpoints, refuse a coded body with their own error. The replies
-  the coding check skips are listed on `reply_framing_fault`; they include at least a `204`, a
-  `Content-Length: 0` reply and a reply to `HEAD`. (`BACKLOG #5910`)
+  body. Other reads that check reply framing refuse a coded body too, at least the OIDC token
+  and JWKS reads and `fhir_lookup` with their own error, and the SMART and OAuth2 token reads
+  with the shared misframed-reply error. The replies the coding check skips are listed on
+  `reply_framing_fault`; they include at least a `204`, a `Content-Length: 0` reply and a reply to
+  `HEAD`. (`BACKLOG #5910`)

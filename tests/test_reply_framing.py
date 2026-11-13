@@ -2131,7 +2131,7 @@ def test_a_zero_length_coded_2xx_is_not_refused() -> None:
 
 
 def test_an_empty_chunked_coded_2xx_is_still_refused() -> None:
-    """Only a declared length of zero is exempt: a chunked body's emptiness is known only after
+    """A declared length of zero is exempt, but a chunked body's emptiness is known only after
     the read, and docs/CONNECTIONS.md says so."""
     raw = _OK + b"Content-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
     assert reply_framing_fault(_wire(raw)) == _CODED_REASON

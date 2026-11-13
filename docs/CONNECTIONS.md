@@ -1821,9 +1821,11 @@ that a connection reset cuts off, is a separate case, and the lane still retries
 a 2xx body whose `Content-Encoding` names anything but `identity`, such as `gzip`, counts as
 misframed and follows the same table: dropped with a `reply_dropped` event where the table says
 delivered, refused with `reply-misframed` where it says permanent refusal. The replies the
-coding check skips are listed on `reply_framing_fault` in `transports/bounded_read.py`; among 2xx
+coding check skips are listed on `reply_framing_fault` in
+[`bounded_read.py`](../messagefoundry/transports/bounded_read.py); among 2xx
 replies they include at least a `204` and a `Content-Length: 0` reply, neither of which has coded
-bytes to misread. An empty chunked or close-framed body labelled with a coding is still refused.
+bytes to misread. An empty chunked or close-framed body labelled with a coding still counts as
+misframed, because its emptiness is known only after the read.
 ADR 0095 Amendment B.1 does not record this case; BACKLOG #5910 added it.
 
 **Security.** Redirects are **refused** (a 3xx can't divert PHI to another host — ASVS 15.3.2), the URL
