@@ -888,17 +888,17 @@ SITES: dict[str, Site] = {
         "A name from listing the sslcapath folder the operator configured, joined to judge the "
         "entry before the driver is given that folder.",
     ),
-    "messagefoundry/transports/database.py::_libpq_home": Site(
-        2,
+    "messagefoundry/transports/database.py::_libpq_homes": Site(
+        3,
         INTERNAL,
-        "The fixed names `postgresql` and `.postgresql` under the engine process's own home: the "
-        "roaming application-data folder the Windows shell names, else $HOME, else the effective "
+        "The fixed names `postgresql` and `.postgresql` under the engine process's own homes: the "
+        "roaming application-data folder the Windows shell names, else $HOME and the effective "
         "user's password-file home, with `os.sep` for an empty one. No message or peer input.",
     ),
-    "messagefoundry/transports/database.py::_libpq_root_cert": Site(
+    "messagefoundry/transports/database.py::_libpq_root_certs": Site(
         1,
         INTERNAL,
-        "The fixed name `root.crt` under the libpq default home `_libpq_home` names. A set "
+        "The fixed name `root.crt` under each libpq default home `_libpq_homes` names. A set "
         "$PGSSLROOTCERT is returned unjoined. No message or peer input.",
     ),
     "messagefoundry/transports/file.py::FileDestination._write": Site(
