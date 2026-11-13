@@ -263,6 +263,9 @@ _LINEAGE_SIGN_IN_SLACK_SECONDS: Final = 120.0
 
 #: What ``AuthService._apply_reconcile_revocation`` did with one planned revocation (BACKLOG #3085).
 _RevocationApplied = Literal["skipped", "quiet", "reported"]
+#: What a reconciler revocation committed before its revoke, for a revoke miss's record (vault
+#: BACKLOG #3023): its role write, a role write whose outcome is unknown, or nothing.
+_ReconcileCommitted = Literal["roles", "roles_unconfirmed", "nothing"]
 
 
 def _is_held_write_error(exc: BaseException) -> bool:
@@ -3372,9 +3375,10 @@ _REMINDER_MARK_PAGE: Final = 50
 #: One action for both, and the same detail, so the row cannot tell the two apart either.
 SESSION_REVOKE_MISSED_ACTION: Final = "auth.session_revoke_missed"
 #: Vault BACKLOG #3023: the row :meth:`AuthService._revoke_after_commit` writes when the store refused
-#: the whole-account revoke that follows a committed change on every attempt. The change stands; the
-#: account's other sessions stay live until they lapse, and this row is what says so. Not the row
-#: above, which records a self-service revoke that named no session.
+#: the whole-account revoke that follows a committed change on every attempt, or the directory
+#: reconciler's revoke (its ``committed`` says what that revocation committed first). What committed
+#: stands; the sessions the revoke would have ended may stay live, and this row is what says so. Not
+#: the row above, which records a self-service revoke that named no session.
 SESSIONS_REVOKE_FAILED_ACTION: Final = "auth.sessions_revoke_failed"
 #: How many times that revoke runs at most, the pause before each re-run (times its number), and
 #: the seconds after the first attempt past which none is re-run. The revoke is safe to repeat: it
@@ -10021,9 +10025,8 @@ class AuthService:
         commits with the write (step 7), rolls the rename back and is logged rather than raised.
         The login path leaves it off, so there a refused write still fails the sign-in, as it always
         has. It also lets a store fault on the ``held`` re-read skip the rename rather than raise
-        (BACKLOG #3070; the reason is at that read), and a ``RowSealError`` at the write be logged,
-        reported and paged rather than raised (vault BACKLOG #3069 note T2; the reason is at that
-        arm).
+        (BACKLOG #3070; the reason is at that read), and a seal refusal at the write be logged and
+        reported rather than raised (vault BACKLOG #3069 note T2; the reason is at that arm).
 
         **ONE implementation for two callers, deliberately.** The login path
         (:meth:`_upsert_ad_user`) and the ADR 0079 reconciler pass both reach a renamed account and
@@ -10334,26 +10337,38 @@ class AuthService:
             # append's own error is raised or logged with its own chain, not this wrapper's.
             refused = exc.cause
             written = False
-        except RowSealError as exc:
-            # The row verified at the pre-read above, then failed its seal at the write, so the
-            # store's write helper refused it and wrote nothing (vault BACKLOG #3069 note T2). A
-            # sign-in raises it. The reconciler takes the rule the refused row below takes: a raise
-            # would cost the pass what it costs there, so it logs, pages and goes on. It is
-            # reported as the loader reports a failing record, too, since the pre-read verified it
-            # and so reported nothing.
+        except (RowSealError, RowSealUnverifiableError, TransitSealUnavailableError) as exc:
+            # The store's write helper refused the write over the row's seal, and wrote nothing
+            # (vault BACKLOG #3069 note T2): the row verified at the pre-read above, then failed
+            # its seal at the write (Forged), or Vault transit could not verify it (Unverifiable)
+            # or did not answer (Outage). A sign-in raises it. On the reconciler a raise would
+            # cost the pass what the refused row below says it costs, so it logs and goes on, and
+            # the answer is reported as an admin read reports the same answer for a record: the
+            # seal-failure report, which pages ``integrity_drift``, the store's Unverifiable page,
+            # or its Outage page. No audit write was refused, so ``audit_write_failed`` is not
+            # paged. A later pass that probes the account tries the rename again.
             if not audit_soft:
                 raise
             _log.error(
-                "directory reconcile: account %s (%s, renaming to %s) failed its integrity check "
-                "at the rename's write, so nothing was written and nobody was told; the pass goes "
-                "on (vault BACKLOG #3069)",
+                "directory reconcile: account %s (%s, renaming to %s): %s at the rename's write, "
+                "so nothing was written and nobody was told; the pass goes on, and a later pass "
+                "that probes the account tries again (vault BACKLOG #3069)",
                 user_id,
                 scrub_log_argument(before.username),
                 scrub_log_argument(new_username),
+                "its record failed its integrity check"
+                if isinstance(exc, RowSealError)
+                else "Vault transit could not verify its record's integrity seal"
+                if isinstance(exc, RowSealUnverifiableError)
+                else "Vault transit did not answer for its record's integrity seal",
                 exc_info=exc,
             )
-            self._note_refused_reconciler_row("auth.ad_username_refreshed")
-            await self._user_seal_failed(user_id)
+            if isinstance(exc, RowSealError):
+                await self._user_seal_failed(user_id)
+            elif isinstance(exc, RowSealUnverifiableError):
+                await self._user_seal_unverifiable(user_id, exc)
+            else:
+                self._user_seal_outage("rename")
             return
         except Exception as exc:
             # THE RESIDUAL RACE, absorbed here because the store's in-statement guard cannot close it
@@ -11132,7 +11147,12 @@ class AuthService:
         return _RowWrite(result, True, retried=True, held=held, refused=None)
 
     async def _revoke_with_row(
-        self, revocation: reconcile.SessionRevocation, *, maps_held: bool, not_attempted: int
+        self,
+        revocation: reconcile.SessionRevocation,
+        *,
+        maps_held: bool,
+        not_attempted: int,
+        committed: _ReconcileCommitted,
     ) -> _RowWrite[int]:
         """End the account's sessions with their ``auth.ad_session_revoked`` row, through
         :meth:`_write_with_row`; ``result`` is how many ended. The row commits in the revoke's own
@@ -11153,7 +11173,8 @@ class AuthService:
         so a store refusal of it is run again within that method's attempts and budget, counting
         the attempt with the row, and one given up on writes its ``auth.sessions_revoke_failed``
         row. ``not_attempted`` is how many revocations of this pass come after this one, which a
-        raise here leaves unapplied; that row records it."""
+        raise here leaves unapplied, and ``committed`` what the revocation committed before this
+        revoke; that row records both."""
 
         def row(count: int) -> AuditAppend:
             # The detail is a literal here, where the audit scope census reads it (vault BACKLOG
@@ -11210,6 +11231,7 @@ class AuthService:
                     change=f"ad_reconcile_{revocation.reason}",
                     not_attempted=not_attempted,
                     first_attempt_at=started_at,
+                    reconciled=committed,
                 )
             return ended.count
 
@@ -11394,6 +11416,7 @@ class AuthService:
         # #3085): only the first of them writes and counts a change, and a write that finds the
         # roles moved since this read writes nothing and counts none.
         roles_changed = False
+        committed: _ReconcileCommitted = "nothing"
         pending: Exception | None = None
         # ADR 0217 (b), owner ruling 2026-11-10: on a pass where a map did not verify, the plan's
         # target roles come from a map read as empty, so no role is written from them; the
@@ -11427,8 +11450,13 @@ class AuthService:
                     exc_info=exc,
                 )
                 roles_changed, pending = True, exc
+                committed = "roles_unconfirmed"
             else:
                 roles_changed, pending = roles.result, roles.held
+                # Only a first write that landed is known to have committed: a retried one may
+                # count a write read back as refused, or another writer's.
+                if roles_changed:
+                    committed = "roles" if not roles.retried else "roles_unconfirmed"
             if not roles_changed:
                 # The roles moved after the read above, or the row went. The writer that moved
                 # them, a second reconciler or a directory sign-in, owns that change and its report;
@@ -11470,7 +11498,7 @@ class AuthService:
         revoke_error: Exception | None = None
         try:
             ended = await self._revoke_with_row(
-                revocation, maps_held=maps_held, not_attempted=not_attempted
+                revocation, maps_held=maps_held, not_attempted=not_attempted, committed=committed
             )
         except Exception as exc:  # noqa: BLE001 -- raised below, after the notice
             revoke_error = exc
@@ -12012,6 +12040,7 @@ class AuthService:
         client: str | None = None,
         not_attempted: int = 0,
         first_attempt_at: float | None = None,
+        reconciled: _ReconcileCommitted | None = None,
     ) -> RevokeResult:
         """Revoke every session of ``user_id`` after a ``change`` that has already committed, such
         as a password change, a disable or a role change (vault BACKLOG #3023).
@@ -12019,7 +12048,8 @@ class AuthService:
         ``first_attempt_at`` is for a caller that made the first attempt itself, with its audit row
         (:meth:`_revoke_with_row`): the event loop's clock when that attempt began. It counts
         toward :data:`_POST_COMMIT_REVOKE_ATTEMPTS`, and the budget runs from it. This call's own
-        attempt always runs, as a first attempt does.
+        attempt always runs, as a first attempt does. ``reconciled`` is that caller's too: what its
+        revocation committed before the revoke, for the miss record (:meth:`_record_revoke_miss`).
 
         Nothing undoes the change if this fails, so a store refusal (``_session_write_errors``) is
         run again while :data:`_POST_COMMIT_REVOKE_ATTEMPTS` and
@@ -12058,6 +12088,7 @@ class AuthService:
                         actor=actor,
                         client=client,
                         not_attempted=not_attempted,
+                        reconciled=reconciled,
                     )
                     raise
 
@@ -12071,16 +12102,40 @@ class AuthService:
         actor: str | None,
         client: str | None,
         not_attempted: int,
+        reconciled: _ReconcileCommitted | None = None,
     ) -> None:
         """The ERROR line, then the :data:`SESSIONS_REVOKE_FAILED_ACTION` row, for a revoke
         :meth:`_revoke_after_commit` gave up on. The line comes first, so a refused row still
-        leaves a trace."""
+        leaves a trace.
+
+        ``reconciled`` is None for a revoke after a committed ``change``. The directory reconciler
+        passes what its revocation committed first, since a disable or an absence commits nothing
+        and a role write may or may not have landed; the row records it as ``committed``. The line
+        says the sessions MAY stay live: a refusal such as a lost connection can come after the
+        revoke committed."""
+        if reconciled is None:
+            after, later = f"a committed {change}", ""
+        else:
+            after = (
+                f"the directory reconciler's {change} revocation, "
+                + {
+                    "roles": "whose role write committed",
+                    "roles_unconfirmed": "whose role write may have committed",
+                    "nothing": "which committed no change",
+                }[reconciled]
+            )
+            later = (
+                "; a later reconcile pass plans the revocation again only if it probes the account"
+                " and the directory still calls for it"
+            )
         _log.error(
-            "auth: the session revoke after a committed %s was refused by the store %d time(s) (%s);"
-            " the account's other sessions stay live until they lapse",
-            change,
+            "auth: the session revoke of account %s after %s was given up on after %d attempt(s),"
+            " the last refused by the store (%s); the sessions it would have ended may stay live%s",
+            user_id,
+            after,
             attempts,
             type(refused).__name__,
+            later,
             exc_info=refused,
         )
         detail: dict[str, object] = {
@@ -12089,6 +12144,8 @@ class AuthService:
             "attempts": attempts,
             "error": type(refused).__name__,
         }
+        if reconciled is not None:
+            detail["committed"] = reconciled
         if not_attempted:
             detail["accounts_not_attempted"] = not_attempted
         await write_audit_soft(
@@ -12678,10 +12735,10 @@ class AuthService:
         return _SealCheck(failed=True)
 
     async def _user_seal_unverifiable(
-        self, user_id: str, exc: TransitSealUnverifiableError
+        self, user_id: str, exc: TransitSealUnverifiableError | RowSealUnverifiableError
     ) -> None:
-        """Report an account whose record Vault transit could not verify on an admin read (ADR 0217
-        (a)): a page through the store's :class:`~messagefoundry.store.row_seal.SealPager` under the
+        """Report an account whose record Vault transit could not verify on an admin read, or at
+        a directory rename's write (ADR 0217 (a); vault BACKLOG #3069 note T2): a page through the store's :class:`~messagefoundry.store.row_seal.SealPager` under the
         row's capped Unverifiable subject, then a WARNING and a soft
         :data:`AUTHORITY_SEAL_UNVERIFIABLE_ACTION` row carrying the triage versions. Throttled per
         account on a key of its own, so it never holds back the account's Forged report."""
@@ -12711,15 +12768,15 @@ class AuthService:
             defects=AUDIT_WRITE_DEFECTS,
         )
 
-    def _user_seal_outage(self) -> None:
-        """Page a Vault transit Outage met checking an account's record on an admin read under the
-        shared ``authority-seal-transit`` subject (ADR 0217, *The four answers*), with no audit row:
-        an Outage records no seal failure."""
+    def _user_seal_outage(self, refused: str = "read") -> None:
+        """Page a Vault transit Outage met checking an account's record on an admin read, or on the
+        ``refused`` operation named, under the shared ``authority-seal-transit`` subject (ADR 0217,
+        *The four answers*), with no audit row: an Outage records no seal failure."""
         pager = getattr(self._store, "seal_pager", None)
         if callable(pager):
             pager().outage(
                 f"a {USER_KIND} record's integrity seal could not be made or checked through Vault"
-                " transit; the read was refused"
+                f" transit; the {refused} was refused"
             )
 
     async def identity_for_checked_user(self, user: VerifiedUser) -> Identity:

@@ -60,6 +60,7 @@ from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import (
     _UNANSWERED_OUTCOMES,
     AUTHORITY_SEAL_FAILED_ACTION,
+    AUTHORITY_SEAL_UNVERIFIABLE_ACTION,
     SESSIONS_REVOKE_FAILED_ACTION,
     AuthService,
     DirectoryObjectIdMissing,
@@ -71,7 +72,11 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.base import StoreAcquireTimeout
 from messagefoundry.store.crypto import CipherError, generate_key, make_cipher
-from messagefoundry.store.row_seal import RowSealError
+from messagefoundry.store.row_seal import (
+    RowSealError,
+    RowSealUnverifiableError,
+    TransitSealUnavailableError,
+)
 from messagefoundry.store.store import (
     _REVOKE_CARRY,
     SCOPE_SOURCE_AD,
@@ -6736,9 +6741,12 @@ async def test_the_login_path_rename_still_fails_on_a_refused_audit_write(
         await store.close()
 
 
-def _seal_refusing_rename(store: MessageStore, refused_id: str) -> list[str]:
-    """Make ``set_user_username`` raise ``RowSealError`` for ``refused_id`` alone, as the store's
-    write helper does for a row that fails its seal at the write. Returns the ids it refused."""
+def _seal_refusing_rename(
+    store: MessageStore, refused_id: str, refusal: Callable[[str], Exception]
+) -> list[str]:
+    """Make ``set_user_username`` raise ``refusal(user_id)`` for ``refused_id`` alone, as the
+    store's write helper does for a row whose seal does not hold at the write. Returns the ids it
+    refused."""
     real = store.set_user_username
     refused: list[str] = []
 
@@ -6752,7 +6760,7 @@ def _seal_refusing_rename(store: MessageStore, refused_id: str) -> list[str]:
     ) -> bool:
         if user_id == refused_id:
             refused.append(user_id)
-            raise RowSealError("user", user_id)
+            raise refusal(user_id)
         return await real(
             user_id, username, expected_username=expected_username, now=now, audits=audits
         )
@@ -6761,18 +6769,53 @@ def _seal_refusing_rename(store: MessageStore, refused_id: str) -> list[str]:
     return refused
 
 
-async def test_a_rename_whose_row_fails_its_seal_at_the_write_does_not_end_the_pass(
+#: The three answers the store's write helper refuses a rename's write with (ADR 0217 (c) step 1),
+#: the phrase the ERROR line names it by, and the audit row its report writes (an Outage writes
+#: none).
+_SEAL_REFUSALS = [
+    pytest.param(
+        lambda uid: RowSealError("user", uid),
+        "its record failed its integrity check",
+        AUTHORITY_SEAL_FAILED_ACTION,
+        id="forged",
+    ),
+    pytest.param(
+        lambda uid: RowSealUnverifiableError("user", uid),
+        "could not verify",
+        AUTHORITY_SEAL_UNVERIFIABLE_ACTION,
+        id="unverifiable",
+    ),
+    pytest.param(
+        lambda _uid: TransitSealUnavailableError(),
+        "did not answer",
+        None,
+        id="outage",
+    ),
+]
+
+
+@pytest.mark.parametrize(("refusal", "phrase", "reported"), _SEAL_REFUSALS)
+async def test_a_rename_whose_seal_is_refused_at_the_write_does_not_end_the_pass(
     caplog: pytest.LogCaptureFixture,
+    refusal: Callable[[str], Exception],
+    phrase: str,
+    reported: str | None,
 ) -> None:
-    """Vault BACKLOG #3069 note T2. The store refuses the first rename's write with
-    ``RowSealError``: the reconciler logs it at ERROR, reports the failing record, pages it with
-    the pass's refused rows, and goes on, so the second account's rename still applies. Called the
-    way the login path calls it, the same refusal is raised."""
+    """Vault BACKLOG #3069 note T2. The store refuses the first rename's write over its seal:
+    Forged, Unverifiable or Outage. The reconciler logs it at ERROR, reports it as an admin read
+    reports the same answer, and goes on, so the second account's rename still applies. No audit
+    write was refused, so the pass pages no ``audit_write_failed``. Forged pages
+    ``integrity_drift`` through the integrity alert; Unverifiable and Outage page through the
+    store's seal pager. Called the way the login path calls it, each refusal is raised."""
     store, service, notifier = await _two_renamed_accounts()
     try:
+        alerts: list[str] = []
+        service._integrity_alert = alerts.append
+        pages: list[str] = []
+        store.seal_pager().arm(lambda subject, reason: pages.append(subject))
         jdoe = await store.get_user_by_username("jdoe")
         assert jdoe is not None
-        refused = _seal_refusing_rename(store, jdoe.id)
+        refused = _seal_refusing_rename(store, jdoe.id, refusal)
         with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
             plan = await service.reconcile_directory_sessions()
         assert refused == [jdoe.id], "the seal refusal was not reached"
@@ -6782,15 +6825,19 @@ async def test_a_rename_whose_row_fails_its_seal_at_the_write_does_not_end_the_p
         )
         still = await store.get_user(jdoe.id)
         assert still is not None and still.username == "jdoe"
-        assert plan.audit_refused == ("auth.ad_username_refreshed",), "the refusal was not paged"
-        assert _logged_at_error(
-            caplog, f"account {jdoe.id} (jdoe, renaming to jdoe-new)", "integrity check"
-        )
-        assert len(await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)) == 1
+        assert plan.audit_refused == (), "a refusal no audit write met paged audit_write_failed"
+        assert _logged_at_error(caplog, f"account {jdoe.id} (jdoe, renaming to jdoe-new)", phrase)
+        if reported is None:
+            assert pages and not alerts, "the Outage did not page through the seal pager"
+        else:
+            assert len(await store.list_audit(action=reported)) == 1
+            assert alerts if reported == AUTHORITY_SEAL_FAILED_ACTION else pages, (
+                "the seal refusal did not page"
+            )
         told = [e.username for e in notifier.sent if e.event_type == USERNAME_CHANGED]
         assert told == ["asmith-new"]
 
-        with pytest.raises(RowSealError):
+        with pytest.raises(type(refusal(jdoe.id))):
             await service._refresh_cached_username(
                 user_id=jdoe.id,
                 old_username="jdoe",
@@ -6876,17 +6923,24 @@ async def test_a_reconciler_revoke_refused_twice_lands_on_its_third_attempt(
 
 
 async def test_a_reconciler_revoke_refused_every_time_is_recorded_and_raised(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Refused on every attempt, the revoke is given up on after the attempts the post-commit
-    revoke allows, its ``auth.sessions_revoke_failed`` row counts the revocation it left, and the
-    pass raises, as a failed revoke always did."""
+    revoke allows, its ``auth.sessions_revoke_failed`` row says the revocation committed nothing
+    and counts the revocation it left, and the pass raises, as a failed revoke always did. The
+    ERROR line names the account by id and claims no committed change."""
     monkeypatch.setattr(service_module, "_POST_COMMIT_REVOKE_BACKOFF_SECONDS", 0.0)
     store, service, hashes = await _two_absent_accounts()
     try:
         calls = _refusing_revokes(store, None)
-        with pytest.raises(StoreAcquireTimeout):
+        with (
+            caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"),
+            pytest.raises(StoreAcquireTimeout),
+        ):
             await service.reconcile_directory_sessions()
+        assert _logged_at_error(
+            caplog, f"account {calls[0]} after", "which committed no change", "may stay live"
+        )
         assert len(calls) == service_module._POST_COMMIT_REVOKE_ATTEMPTS
         assert set(calls) == {calls[0]}, "the pass went on to the next account"
         assert await _live_sessions(store, hashes) == hashes
@@ -6897,6 +6951,7 @@ async def test_a_reconciler_revoke_refused_every_time_is_recorded_and_raised(
             "change": "ad_reconcile_directory_absent",
             "attempts": service_module._POST_COMMIT_REVOKE_ATTEMPTS,
             "error": "StoreAcquireTimeout",
+            "committed": "nothing",
             "accounts_not_attempted": 1,
         }
     finally:
@@ -7501,7 +7556,9 @@ async def test_the_rowless_revoke_retry_shares_one_deferred_seal_report_scope(
         revocation = reconcile.SessionRevocation(
             user.id, user.username, reason="directory_disabled"
         )
-        ended = await service._revoke_with_row(revocation, maps_held=True, not_attempted=0)
+        ended = await service._revoke_with_row(
+            revocation, maps_held=True, not_attempted=0, committed="nothing"
+        )
         assert ended.retried
         assert len(carries) == 2
         assert carries[0] is not None and carries[0] is carries[1], (
@@ -8074,10 +8131,10 @@ async def test_a_refused_read_back_counts_as_written_and_its_row_says_so(
         await store.close()
 
 
-async def test_a_revoke_that_fails_twice_after_a_committed_role_change_still_tells_the_user(
+async def test_a_revoke_given_up_on_after_a_committed_role_change_still_tells_the_user(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BACKLOG #3018 step 4. The roles committed, then the revoke and its retry both raise: the
+    """BACKLOG #3018 step 4. The roles committed, then every attempt at the revoke raises: the
     user is still told of the role change before the revoke's error is raised, as the sign-in
     does."""
     store, _, service, _ = await _scoped_service(_GRP_A)
@@ -8133,8 +8190,8 @@ async def test_an_unclassified_error_in_the_revoke_row_still_ends_the_sessions(
 async def test_a_held_role_error_is_raised_first_when_the_revoke_then_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BACKLOG #3018 step 4. A defect in the role write's row is held, then the revoke and its
-    retry both raise: the user is still told, and the held defect is raised first, with the
+    """BACKLOG #3018 step 4. A defect in the role write's row is held, then every attempt at the
+    revoke raises: the user is still told, and the held defect is raised first, with the
     revoke's error named in its notes rather than dropped."""
     store, _, service, _ = await _scoped_service(_GRP_A)
     try:

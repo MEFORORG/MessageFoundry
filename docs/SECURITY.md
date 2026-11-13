@@ -1021,9 +1021,12 @@ into the request deadline. The directory reconciler's revoke counts its attempts
 its first attempt carries its `auth.ad_session_revoked` row and its second, without the row,
 always runs, since the first one's error may be the row's; so there a SQL Server pool wait is
 recorded after the second wait. One it gives up on ends the pass, and its miss row counts the
-pass's later revocations as `accounts_not_attempted`. A refusal
-that reads as a defect is raised at once, unretried and unrecorded: at least a store whose tables,
-columns or grants are not what the statement needs, and SQLite's `ProgrammingError`. A SQL syntax
+pass's later revocations as `accounts_not_attempted`, and its `committed` says what the
+revocation committed first: its role write, a role write that may have landed, or nothing. A
+refusal that reads as a defect is not re-run and is unrecorded, so it is raised after the attempt
+that met it, save that the reconciler's attempt without the row still runs once after a defect on
+its first: at least a store whose tables, columns or grants are not what the statement needs, and
+SQLite's `ProgrammingError`. A SQL syntax
 error is not always one: SQLite's, and SQL Server's generic 42000, are run again and recorded like a
 fault, while PostgreSQL's, in SQLSTATE class 42, is raised at once. A revoke the service gives up on is logged at ERROR
 and writes one `auth.sessions_revoke_failed` row naming the account, the change, the attempts and
