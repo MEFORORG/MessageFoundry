@@ -205,7 +205,7 @@ def _check_credential_token_url_egress(
             use="the connection's client credential settings",
             error=WiringError,
         )
-        if not _http_egress_allowed(token_url, allowed_http):
+        if not http_egress_allowed(token_url, allowed_http):
             host = url_host_label(token_url)
             log.warning(
                 "egress denied: %s %s host %r not in [egress].allowed_http",
@@ -455,7 +455,7 @@ def check_fhir_lookup_allowed(
     if egress.allowed_http:
         url = str(settings.get("url", ""))
         refuse_url_credentials(url, f"FhirLookup {name!r} 'url'", error=WiringError)
-        if not _http_egress_allowed(
+        if not http_egress_allowed(
             url, egress.allowed_http
         ):  # same host[:port] matching as the FHIR outbound
             host = url_host_label(url)
@@ -686,7 +686,7 @@ def check_egress_allowed(
         # (the same key Rest()/FHIR() use), so the host gate reads it unchanged (ADR 0025 §6.4).
         url = str(dest.settings.get("url", ""))
         refuse_url_credentials(url, f"outbound {dest.name!r} 'url'", error=WiringError)
-        if not _http_egress_allowed(url, egress.allowed_http):
+        if not http_egress_allowed(url, egress.allowed_http):
             host = url_host_label(url)
             log.warning(
                 "egress denied: outbound %r %s host %r not in [egress].allowed_http",
@@ -885,9 +885,10 @@ def _canonical_host(text: str) -> _CanonicalHost | None:
     compares lowercased. Canonical equivalence only,
     never looser: an IPv4-mapped IPv6 address is not the IPv4 address, a trailing-dot name is not
     the dotless one, and shorthand IPv4 such as ``127.1`` is a name, since :mod:`ipaddress` reads
-    only the dotted quad. A ``%`` zone id gets ``None``: :mod:`ipaddress` reads ``fe80::1%eth0``
-    as ``fe80::1`` with a scope, and a URL's zone id is still percent-encoded where it is read, so
-    either way the zone would be dropped from the comparison and not from the dial."""
+    only the dotted quad. A ``%`` zone id gets ``None``. :mod:`ipaddress` compares the zone, but a
+    URL's zone is compared as written and dialled decoded: ``urlsplit`` reads ``[::1%31]`` as the
+    host ``::1%31``, which an entry ``[::1%31]`` names, and ``urllib.request`` decodes it to
+    ``::11`` before it dials, so the entry would admit a host it does not name."""
     if not text or "%" in text:
         return None
     try:
@@ -949,8 +950,9 @@ def _database_refusal(
     ``dialect`` setting. The host and port are read by
     :func:`~messagefoundry.transports.db_endpoint.database_dial_endpoint`, which says what each
     dialect's connection string sends. A host no entry names is refused as unlisted, before its
-    port is read. Once the host is listed, a port the reading cannot settle is refused, whatever
-    the entries for that host say, and so is a driver or ``server`` the SQL Server preset refuses
+    port is read, and so is a host holding a ``:``, an IPv6 literal included. Once the host is
+    listed, a port the reading cannot settle is refused, whatever the entries for that host say,
+    and so is a driver or ``server`` the SQL Server preset refuses
     (BACKLOG #4873); both arrive as the reading's ``conflict``. An entry that pins a port admits
     only that port, compared as a number on both sides. A connection whose port the engine cannot
     read matches an entry that names no port, and never one that pins one."""
@@ -958,7 +960,8 @@ def _database_refusal(
         dialect = str(settings.get("dialect", "sqlserver"))
     endpoint = database_dial_endpoint(settings, dialect=dialect)
     host, port = endpoint.host, endpoint.port
-    pins = _allowed_ports_for(host, allowed)
+    # Unverified driver reads fail closed; docs/CONNECTIONS.md says why (BACKLOG #5915).
+    pins = [] if ":" in host else _allowed_ports_for(host, allowed)
     if not pins:
         return f"server {host!r} is not in the [egress].allowed_db allowlist"
     if endpoint.conflict is not None:
@@ -994,7 +997,7 @@ def _dir_egress_allowed(directory: str, allowed: list[str]) -> bool:
     return False
 
 
-def _http_egress_allowed(url: str, allowed: list[str]) -> bool:
+def http_egress_allowed(url: str, allowed: list[str]) -> bool:
     """True if ``url``'s host (and port, when an allow entry pins one) is on the allowlist — the same
     ``host`` / ``host:port`` matching as MLLP.
 

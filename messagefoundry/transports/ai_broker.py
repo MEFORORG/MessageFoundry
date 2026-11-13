@@ -71,7 +71,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.controlchars import has_control_char, has_lone_surrogate
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.transports.bounded_read import EgressReplyError, read_bounded_text
-from messagefoundry.transports.egress import _http_egress_allowed
+from messagefoundry.transports.egress import http_egress_allowed
 
 # Reuse rest.py's hardened, TLS-verifying, no-redirect opener + URL redaction (no new HTTP plumbing) —
 # exactly as smart.py / fhir.py / soap.py do. No import cycle: rest.py never imports this module.
@@ -165,7 +165,7 @@ def endpoint_host_allowed(url: str, allowed: list[str]) -> bool:
     (BACKLOG #5915). Applied FAIL-CLOSED by the caller: an empty ``allowed`` matches nothing, and
     so does a URL with no host, or one whose port or authority ``urlsplit`` cannot read; this never
     raises, as the egress matcher never does (BACKLOG #1793)."""
-    return _http_egress_allowed(url, allowed)
+    return http_egress_allowed(url, allowed)
 
 
 def _endpoint_opener(

@@ -185,13 +185,13 @@ async def test_the_allowlist_is_asked_once_for_the_base_url_and_never_per_read(
     This records a finding, not a rule. A per-read egress check would be a gain, and this test
     should then change to say what that check is asked."""
     asked: list[str] = []
-    real = egress._http_egress_allowed
+    real = egress.http_egress_allowed
 
     def recording(url: str, allowed: list[str]) -> bool:
         asked.append(url)
         return real(url, allowed)
 
-    monkeypatch.setattr(egress, "_http_egress_allowed", recording)
+    monkeypatch.setattr(egress, "http_egress_allowed", recording)
     ex, opener = _executor(EgressSettings(deny_by_default=True, allowed_http=[HOST]))
     assert asked == [BASE]  # at construction, for the configured base
     await ex.read("epic", "Patient/a.b")
@@ -201,9 +201,9 @@ async def test_the_allowlist_is_asked_once_for_the_base_url_and_never_per_read(
 
 @pytest.mark.parametrize("path", ["", "/", "/Patient", "/Patient/a.b", "/Patient/.", "/Patient/.."])
 def test_the_allowlist_cannot_tell_one_path_from_another(path: str) -> None:
-    assert egress._http_egress_allowed(f"{BASE}{path}", [HOST]) is True
+    assert egress.http_egress_allowed(f"{BASE}{path}", [HOST]) is True
     # The control: the same matcher does refuse, on the one thing it reads.
-    assert egress._http_egress_allowed(f"https://other.example.org/fhir{path}", [HOST]) is False
+    assert egress.http_egress_allowed(f"https://other.example.org/fhir{path}", [HOST]) is False
 
 
 # --- 4. what RFC 3986 section 5.2.4 does to those paths ----------------------

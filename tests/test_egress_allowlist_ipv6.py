@@ -4,8 +4,8 @@
 IP literals by their canonical form (BACKLOG #5915).
 
 The shipped matcher split every entry at its first colon and compared lowercased host text, so
-every IPv6 entry, ``[::1]:6432`` included, matched nothing, and ``0:0:0:0:0:0:0:1`` could not
-match ``[::1]``. (``[egress].allowed_ech_sidecar`` has its own parse, ``pinned_host_port``, and was
+no IPv6 entry, ``[::1]:6432`` included, could match an IPv6 host: the host it read held no colon,
+and ``[::1]:6432`` matched only a host spelled ``[``. (``[egress].allowed_ech_sidecar`` has its own parse, ``pinned_host_port``, and was
 never read here.) It is a security matcher, so the change is canonical equivalence only: each case
 under "never equated" stays a refusal.
 
@@ -15,7 +15,11 @@ and the AI broker's ``endpoint_host_allowed``; the rest run on the arm they name
 
 from __future__ import annotations
 
+import ipaddress
+import urllib.parse
+import urllib.request
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 
@@ -69,8 +73,9 @@ def test_bracketed_entry_still_pins_its_port(match: Match) -> None:
 
 
 def test_the_shipped_first_colon_split_no_longer_matches() -> None:
-    # The old parse read `[` as the host of `[::1]:8123` and `:1]:8123` as its port, so it admitted
-    # a host spelled `[` on any port the entry's text did not name. Egress only: no URL has that host.
+    # The old parse read `[` as the host of `[::1]:8123` and `:1]:8123` as its port, so the one
+    # thing that entry matched was a host spelled `[` with the port text `:1]:8123`, never ::1.
+    # Egress only: no URL has that host.
     assert host_port_allowed("[", ":1]:8123", ["[::1]:8123"]) is False
     assert host_port_allowed("[", None, ["[::1]"]) is False
 
@@ -158,44 +163,53 @@ def test_zone_id_in_the_host_matches_nothing() -> None:
     ("host", "entry"), [("fe80::1%eth0", "[fe80::1%eth0]"), ("::1%31", "[::1%31]:8443")]
 )
 def test_the_same_zone_on_both_sides_matches_nothing(host: str, entry: str) -> None:
-    # ipaddress would read both sides as one scoped address, so only the `%` refusal stops this.
-    # A URL's zone stays percent-encoded where it is read and is decoded before the dial, so
+    # ipaddress reads both sides as one scoped address, so only the `%` refusal stops this. A URL's
+    # zone stays percent-encoded where it is read and urllib.request decodes it before the dial, so
     # `[::1%31]` would be compared as one host and dialled as `::11`.
     assert host_port_allowed(host, 8443, [entry]) is False
-    assert endpoint_host_allowed("https://[::1%31]:8443/x", ["[::1%31]:8443"]) is False
+    assert endpoint_host_allowed(f"https://[{host}]:8443/x", [entry]) is False
 
 
-# --- the DATABASE arm reads the same parse ------------------------------------------------------
+def test_a_percent_encoded_zone_is_dialled_as_another_address() -> None:
+    # Why a `%` is refused rather than compared: the zone is compared encoded and dialled decoded.
+    url = "https://[::1%31]:8443/x"
+    read = urllib.parse.urlsplit(url).hostname
+    assert read is not None
+    assert ipaddress.ip_address(read) == ipaddress.ip_address("::1%31")
+    assert urllib.request.Request(url).host == "[::11]:8443"
 
 
-def _check_db(server: str, entry: str) -> None:
-    settings = Database(
-        statement="INSERT INTO t (a) VALUES (:a)",
-        dialect="generic",
-        odbc_driver="PostgreSQL Unicode",
-        server=server,
-        odbc_params={"PORT": "6432"},
-    ).settings
-    dest = Destination(name="OB_DB_V6", type=ConnectorType.DATABASE, settings=settings)
+# --- the DATABASE arm reads the same parse, and lists no IPv6 server ----------------------------
+
+_UNLISTED = r"is not in the \[egress\]\.allowed_db allowlist$"
+
+
+_DIALECTS: dict[str, dict[str, Any]] = {
+    "generic": {
+        "dialect": "generic",
+        "odbc_driver": "PostgreSQL Unicode",
+        "odbc_params": {"PORT": "6432"},
+    },
+    "sqlserver": {"port": 6432},
+}
+
+
+def _check_db(server: str, entry: str, *, dialect: str = "generic") -> None:
+    db = Database(statement="INSERT INTO t (a) VALUES (:a)", server=server, **_DIALECTS[dialect])
+    dest = Destination(name="OB_DB_V6", type=ConnectorType.DATABASE, settings=db.settings)
     check_egress_allowed(dest, EgressSettings(allowed_db=[entry]))
 
 
-@pytest.mark.parametrize("server", ["::1", "0:0:0:0:0:0:0:1"])
-@pytest.mark.parametrize("entry", ["[::1]:6432", "[::1]"])
-def test_database_ipv6_server_matches_its_bracketed_entry(server: str, entry: str) -> None:
-    _check_db(server, entry)
+@pytest.mark.parametrize("dialect", _DIALECTS)
+@pytest.mark.parametrize("server", ["::1", "0:0:0:0:0:0:0:1", "fe80::1:443", "[::1]"])
+@pytest.mark.parametrize("entry", ["[::1]:6432", "[::1]", "::1"])
+def test_database_ipv6_server_is_unlisted(server: str, entry: str, dialect: str) -> None:
+    # Unbracketed or bracketed: the SQL Server preset would send `SERVER=::1,6432` or
+    # `SERVER=[::1],6432`, and how a driver reads either is unverified, so it matches nothing.
+    with pytest.raises(WiringError, match=_UNLISTED):
+        _check_db(server, entry, dialect=dialect)
 
 
-def test_database_bracketed_server_is_unlisted() -> None:
-    with pytest.raises(WiringError, match=r"is not in the \[egress\]\.allowed_db allowlist$"):
-        _check_db("[::1]", "[::1]")
-
-
-def test_database_ipv6_server_off_the_pin_is_refused() -> None:
-    with pytest.raises(WiringError, match="at port 6432"):
-        _check_db("::1", "[::1]:5432")
-
-
-def test_database_ipv6_server_against_an_unbracketed_entry_is_unlisted() -> None:
-    with pytest.raises(WiringError, match=r"is not in the \[egress\]\.allowed_db allowlist$"):
-        _check_db("::1", "::1")
+@pytest.mark.parametrize("dialect", _DIALECTS)
+def test_database_named_server_still_matches_its_entry(dialect: str) -> None:
+    _check_db("db.example.org", "DB.Example.Org:6432", dialect=dialect)
