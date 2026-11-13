@@ -30,7 +30,11 @@ it never breaks hl7apy's grouping, and listed in :attr:`ValidationResult.unvalid
 A refusal names at most a three-character segment ID the message's HL7 version defines, and the
 segment's 1-based position counting as the tolerant parser does (empty lines skipped), never the
 line's text: ``segment ORC at line N ...``, ``unknown segment at line N`` or ``unrecognised line
-N``. A kept segment that hl7apy reorders is not checked here.
+N``. Where the structure has HL7's "any HL7 segment" slot, which hl7apy's tables spell
+``ANYHL7SEGMENT`` and its grouping never fills (MFN_M01 and QVR_Q17 among others), a dropped
+segment whose ID the message's version defines is not refused, and passes unvalidated; an ID the
+version does not define is still refused. Segment order is not checked: hl7apy keeps each segment
+where the message has it, so a message with its segments out of order passes.
 
 It is slower and far stricter than :mod:`~messagefoundry.parsing.peek`, so it runs only when
 a channel sets ``validation.strict = true`` and is kept off the routing hot path.
@@ -314,6 +318,14 @@ def _split_lines(norm: str) -> _Lines:
     return _Lines(segments, z_segments, "\r".join(kept_lines))
 
 
+def _holds_any_segment(ref: _Reference) -> bool:
+    """True if ``ref`` has the "any HL7 segment" slot at any group depth (module docstring)."""
+    return any(
+        name == "ANYHL7SEGMENT" or (marker == "GRP" and _holds_any_segment(sub))
+        for name, sub, _cardinality, marker in ref[1]
+    )
+
+
 def _dropped_lines(lines: _Lines, message: Any) -> list[str]:
     """Refusals for the segments in ``lines`` that ``message``'s hl7apy tree lacks.
 
@@ -321,7 +333,8 @@ def _dropped_lines(lines: _Lines, message: Any) -> list[str]:
     version defines it: any other, such as ``KIM``, is likely a wrapped field, so it reads
     ``unknown segment``, the rule ``docs/PHI.md`` sets for the anonymization report. Which
     occurrence of a repeated ID was dropped is not knowable from the tree, so the later ones are
-    named; the count per ID is exact.
+    named; the count per ID is exact. In a structure with an "any HL7 segment" slot, a defined ID
+    is not refused, as the module docstring says.
     """
     import hl7apy
 
@@ -338,9 +351,12 @@ def _dropped_lines(lines: _Lines, message: Any) -> list[str]:
         elif _SEGMENT_ID.fullmatch(name) is None:
             refusals.append(f"unrecognised line {number}")
         elif name in defined:
-            refusals.append(
-                f"segment {name} at line {number} has no place in this message's structure"
-            )
+            # Read only once a defined segment was dropped; _references caches the table.
+            ref = _references(message.name, message.classname, message.version)[0]
+            if not _holds_any_segment(ref):
+                refusals.append(
+                    f"segment {name} at line {number} has no place in this message's structure"
+                )
         else:
             refusals.append(f"unknown segment at line {number}")
     return refusals
@@ -476,6 +492,12 @@ def validate(
         try:
             refusals = _dropped_lines(lines, message)
         except Exception as exc:  # defensive, and closed: an unread tree is not a validated one
+            logger.warning(
+                "dropped-segment check could not compare the tree for %s v%s",
+                getattr(message, "name", None),
+                version,
+                exc_info=True,
+            )
             refusals = [
                 f"could not compare the parsed tree with the message ({type(exc).__name__})"
             ]

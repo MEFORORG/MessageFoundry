@@ -26,6 +26,9 @@ from messagefoundry_toolkit.generators import (
     all_types,  # noqa: F401  (registers every built-in type)
 )
 
+# By module path: the package re-exports the function under the module's own name.
+validate_module = importlib.import_module("messagefoundry.parsing.validate")
+
 _MSH = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|N1|P|2.5.1"
 _EVN = "EVN|A01|20260101"
 _PID = "PID|1||100001^^^HOSP^MR||DOE^JANE||19700101|F"
@@ -116,6 +119,56 @@ def test_a_message_type_hl7apy_has_no_structure_for_is_refused() -> None:
     ]
 
 
+_MFN_M01 = (
+    "MSH|^~\\&|A|B|C|D|20260101||MFN^M01^MFN_M01|N1|P|2.5.1\r"
+    "MFI|LOC^Location||UPD|||NE\rMFE|MAD|1||LOC1^Loc|CE"
+)
+_QVR_Q17 = "MSH|^~\\&|A|B|C|D|20260101||QVR^Q17^QVR_Q17|N1|P|2.5.1\rQPD|Q17^Query|T1"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param(_MFN_M01 + "\rLOC|LOC1^Loc||C", id="mfn-m01-with-loc"),
+        pytest.param(_QVR_Q17 + "\rPID|1\rRCP|I", id="qvr-q17-with-pid"),
+    ],
+)
+def test_a_defined_segment_in_an_any_hl7_segment_slot_is_not_refused(message: str) -> None:
+    """hl7apy marks the "any HL7 segment" slot ANYHL7SEGMENT and its grouping never fills it."""
+    result = validate(message)
+    assert result.ok, result.errors
+
+
+@pytest.mark.parametrize(
+    ("extra", "error"),
+    [
+        pytest.param("FOO|1", "unknown segment at line 4", id="undefined-id"),
+        pytest.param("PRT|1", "unknown segment at line 4", id="id-of-a-later-version"),
+        pytest.param("hello world", "unrecognised line 4", id="non-hl7-text"),
+    ],
+)
+def test_a_wildcard_message_still_refuses_what_its_version_does_not_define(
+    extra: str, error: str
+) -> None:
+    result = validate(_MFN_M01 + "\r" + extra)
+    assert not result.ok
+    assert result.errors == [error]
+
+
+def test_a_comparison_that_raises_is_logged_and_refused(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def boom(*_args: object) -> list[str]:
+        raise RuntimeError("synthetic")
+
+    monkeypatch.setattr(validate_module, "_dropped_lines", boom)
+    with caplog.at_level("WARNING", logger=validate_module.logger.name):
+        result = validate(_adt(_MSH, _EVN, _PID, _PV1))
+    assert not result.ok
+    assert result.errors == ["could not compare the parsed tree with the message (RuntimeError)"]
+    assert any(record.exc_info for record in caplog.records)
+
+
 def test_z_segments_do_not_mask_a_refusal() -> None:
     result = validate(_adt(_MSH, "ZAA|1", _EVN, _PID, "FOO|1", _PV1, "ZBB|1", "BAR|1"))
     assert not result.ok
@@ -128,7 +181,7 @@ def test_empty_lines_are_not_counted() -> None:
     assert result.errors == ["unknown segment at line 4"]
 
 
-@pytest.mark.parametrize("tail", ["   ", "\t", " "])
+@pytest.mark.parametrize("tail", ["   ", "\t", "\xa0"])
 def test_trailing_whitespace_the_tolerant_parser_strips_is_not_refused(tail: str) -> None:
     result = validate(_adt(_MSH, _EVN, _PID, _PV1, tail))
     assert result.ok, result.errors
@@ -198,6 +251,4 @@ def test_the_docs_state_the_z_segment_position() -> None:
     doc = (_ROOT / "docs" / "HL7-VALIDATION.md").read_text(encoding="utf-8")
     assert "**Z-segments are tolerated, unvalidated, and listed.**" in doc
     assert "unvalidated_segments" in doc
-    # By module path: the package re-exports the function under the module's own name.
-    module = importlib.import_module("messagefoundry.parsing.validate")
-    assert "unvalidated_segments" in (module.__doc__ or "")
+    assert "unvalidated_segments" in (validate_module.__doc__ or "")

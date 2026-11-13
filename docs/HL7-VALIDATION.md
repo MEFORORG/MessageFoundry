@@ -68,8 +68,16 @@ streaming inbound.
 any line it cannot fit into the message structure, and validates only what it kept, while the
 tolerant parser forwards that line. So strict validation refuses an unknown segment, a known segment
 the structure has no place for (`ORC` in `ADT^A01`), a line that is not a segment at all, and a
-message type `hl7apy` has no structure for. The error never quotes the line. The exact rule and
-wording are in the module docstring of [parsing/validate.py](../messagefoundry/parsing/validate.py).
+message type `hl7apy` has no structure for. So a Z message type (`ZZZ^Z01`) needs
+`validation.strict = false`. This refusal never quotes the line; a parse error `hl7apy` raises
+itself can still name a line's first three characters (`Invalid name for Segment: XXX`). The exact
+rule and wording are in the module docstring of
+[parsing/validate.py](../messagefoundry/parsing/validate.py).
+
+**A message structure with an "any HL7 segment" slot accepts any defined segment, unvalidated.**
+`hl7apy` marks that slot (`MFN_M01`, `QVR_Q17` and others) but never fills it, so in such a message
+a segment the message's HL7 version defines is not refused and passes unvalidated, wherever it
+sits. A segment ID the version does not define is still refused.
 
 **Z-segments are tolerated, unvalidated, and listed.** A Z-segment is left out of what strict
 validation checks, is forwarded without any check, and is listed in
