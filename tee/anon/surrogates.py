@@ -684,7 +684,7 @@ def decoded_readings(part: str, seps: Seps, field_sep: str, *, resplit: bool) ->
     for the detectors that must fail closed on any of them (BACKLOG #5632, #5654): the part
     decoded (:func:`unescape`), and decoded with ``\\H\\`` and ``\\N\\`` dropped, as a display
     that shows highlighting rather than a character reads it, each stripped of surrounding
-    whitespace, C0 control characters and DEL (:func:`trim`). Empty when ``part`` holds no
+    the characters :func:`trim` takes off. Empty when ``part`` holds no
     escape character, since then the only reading is the part as written.
 
     With ``resplit`` each reading is also split again on the message's delimiters, its field
@@ -710,20 +710,24 @@ def decoded_readings(part: str, seps: Seps, field_sep: str, *, resplit: bool) ->
 
 
 #: What surrounds a reading without being part of it, as a regular-expression class body:
-#: whitespace, every C0 control character and DEL. A consumer trims, drops or stops at them, so a
-#: value padded or split by one, such as ``971234\\X00\\``, reads as the value alone (BACKLOG
+#: whitespace, every C0 and C1 control character, DEL and the soft hyphen U+00AD. A consumer
+#: trims, drops or stops at them, and a one-byte hex escape reaches each, so a value padded or
+#: split by one, such as ``971234\\X00\\`` or ``971234\\X9C\\``, reads as the value alone (BACKLOG
 #: #5632, #5654).
-_TRIM_CLASS = "\\s\\x00-\\x1f\\x7f"
+_TRIM_CLASS = "\\s\\x00-\\x1f\\x7f-\\x9f\\xad"
 #: The same characters as a set for ``str.strip``, which runs in linear time where an end-anchored
 #: regular expression backtracks over a long run of them inside the text. Every character
 #: ``str.isspace`` takes is below U+3001.
 _TRIM_CHARS = "".join(
-    chr(code) for code in range(0x3001) if chr(code).isspace() or code < 0x20 or code == 0x7F
+    chr(code)
+    for code in range(0x3001)
+    if chr(code).isspace() or code < 0x20 or 0x7F <= code <= 0x9F or code == 0xAD
 )
 
 
 def trim(text: str) -> str:
-    """``text`` without the whitespace, C0 control characters and DEL at either end."""
+    """``text`` without the whitespace, C0 and C1 control characters, DEL and soft hyphen at
+    either end."""
     return text.strip(_TRIM_CHARS)
 
 

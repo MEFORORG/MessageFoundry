@@ -88,6 +88,8 @@ def test_an_mr_subcomponent_outside_cx_5_is_no_hit(leak: ModuleType, value: str)
         "12345^M\\X52\\",
         "12345^MR\\X00\\",
         "M1^^^H^MR\\X7F\\",
+        "M1^^^H^MR\\X9C\\",
+        "M1^^^H^MR\\XAD\\",
         "12345^MR&L",
         "12345^^^MR&L",
         "12345^MRN&ISO",
@@ -102,6 +104,8 @@ def test_an_mr_subcomponent_outside_cx_5_is_no_hit(leak: ModuleType, value: str)
         "second-escaped",
         "nul-padded",
         "del-padded-cx-5",
+        "c1-padded-cx-5",
+        "soft-hyphen-padded-cx-5",
         "second-first-sub",
         "fourth-first-sub",
         "mrn-first-sub",
@@ -227,10 +231,8 @@ _RESERVED_V4 = ".".join(["240", "0", "0", "1"])
 )
 def test_a_routable_ipv6_address_is_a_hit(leak: ModuleType, written: str) -> None:
     report = leak.leak_report(_zpd(written), rules=DEFAULT_RULES)
-    assert leak.IPV6_REASON in report.hits, report.hits
+    assert f"unmapped {leak.IPV6_REASON} in ZPD-4" in report.structural_hits, report.hits
     assert not any(_GLOBAL in hit for hit in report.hits)
-    # A bare-string call reads it too: the token scan covers the whole text.
-    assert leak.IPV6_REASON in leak.leak_check(_zpd(written))
 
 
 @_NO_SCANNER
@@ -268,7 +270,24 @@ def test_a_routable_ipv6_address_is_a_hit(leak: ModuleType, written: str) -> Non
 )
 def test_an_allowed_or_non_address_is_no_ipv6_hit(leak: ModuleType, written: str) -> None:
     report = leak.leak_report(_zpd(written), rules=DEFAULT_RULES)
-    assert leak.IPV6_REASON not in report.hits, report.hits
+    assert not any(leak.IPV6_REASON in hit for hit in report.hits), report.hits
+
+
+@_NO_SCANNER
+@pytest.mark.parametrize("anon", [engine_anon, tee_anon], ids=["engine", "tee"])
+def test_a_surrogate_is_never_refused_as_an_ipv6_address(anon: ModuleType) -> None:
+    """``_fake_like`` writes a capital for each letter of an id, so a mapped PID-3 that holds
+    ``::`` can come out as a hex word joined to ``::``. The IPv6 check reads only unmapped
+    fields, so no salt makes the anonymizer refuse its own output."""
+    raw = f"{_HEAD.split(chr(13))[0]}\rPID|1||SYS::1234^^^H^MR||X^Y"
+    for n in range(300):
+        anon.anonymize_checked(raw, salt=f"b224-ipv6-salt-{n:04d}-0123456789abcdef")
+
+
+@_LEAKS
+def test_an_ipv6_address_in_a_mapped_field_is_not_read(leak: ModuleType) -> None:
+    text = f"{_HEAD.split(chr(13))[0]}\rPID|1||{_GLOBAL}^^^H^MR||X^Y"
+    assert not any(leak.IPV6_REASON in hit for hit in leak.structural_phi_hits(text, {"PID-3"}))
 
 
 _FULL = ":".join(["4000", "a1", "0", "0", "0", "0", "0", "5"])

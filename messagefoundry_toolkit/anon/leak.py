@@ -94,6 +94,16 @@ def _scanner() -> ModuleType:
     )
 
 
+def _ipv4_allow_list() -> re.Pattern[str] | None:
+    """The publish guard's own IPv4 allow list, which the structural IPv6 check uses to judge an
+    IPv4-mapped address (BACKLOG #5654), or None when the guard cannot be loaded."""
+    try:
+        allowed: re.Pattern[str] = _scanner()._ALLOWED_IP
+    except LeakCheckUnavailable:
+        return None
+    return allowed
+
+
 # --- structural PHI-shape detection over UNMAPPED fields (BACKLOG #331) ----------------------------
 # EVERYTHING from here to the end of this block is held BYTE-IDENTICAL with tee/anon/leak.py (the
 # structural walk depends only on read_message_seps, which the parity test pins byte-for-byte). The
@@ -242,20 +252,12 @@ def _judge_ipv6_texts(texts: Iterable[str], ipv4_is_routable: Callable[[str], bo
     return False if parsed else None
 
 
-def _with_ipv6(
-    scan: Callable[[str], list[str]], ipv4_allowed: re.Pattern[str]
-) -> Callable[[str], list[str]]:
-    """``scan``, the token scan, with :data:`IPV6_REASON` added when :func:`_has_routable_ipv6`
-    finds an address. ``ipv4_allowed`` is the publish guard's own IPv4 allow list, which judges
-    the IPv4 part of an IPv4-mapped address."""
-
-    def scan_with_ipv6(body: str) -> list[str]:
-        hits = scan(body)
-        if _has_routable_ipv6(body, lambda ip: ipv4_allowed.match(ip) is None):
-            hits.append(IPV6_REASON)
-        return hits
-
-    return scan_with_ipv6
+def _ipv4_is_routable(ip: str) -> bool:
+    """True if the dotted IPv4 ``ip`` is outside the publish guard's own IPv4 allow list
+    (:func:`_ipv4_allow_list`), so an IPv4-mapped IPv6 address is judged as the guard judges its
+    IPv4 part. With no allow list reachable, every address counts, failing closed."""
+    allowed = _ipv4_allow_list()
+    return allowed is None or allowed.match(ip) is None
 
 
 #: HL7 CX id-type codes that mark a component as a medical-record number.
@@ -813,7 +815,10 @@ def _structural_reasons(value: str, seps: Seps, field_sep: str) -> list[str]:
 
     Each shape is looked for in the value as written and in each of its parts decoded
     (:func:`_decoded_parts`), so a shape written with HL7 escape sequences, such as
-    ``123\\X2D\\45\\X2D\\6789``, is found too (BACKLOG #5532)."""
+    ``123\\X2D\\45\\X2D\\6789``, is found too (BACKLOG #5532). A routable IPv6 address is looked
+    for the same way (:func:`_has_routable_ipv6`). It is read here, in a field no rule rewrote, and
+    not over the whole message, so a surrogate the anonymizer wrote, such as an id whose letters
+    came out as hex beside a ``::``, is never refused as one (BACKLOG #5654)."""
     reasons: list[str] = []
     forms = [value, *_decoded_parts(value, seps, field_sep)]
     for pattern, reason in _SPLITTABLE_SHAPES:
@@ -821,6 +826,8 @@ def _structural_reasons(value: str, seps: Seps, field_sep: str) -> list[str]:
             reasons.append(reason)
     if _has_mrn_typed_identifier(value, seps, field_sep):
         reasons.append("unmapped MRN-typed identifier")
+    if any(_has_routable_ipv6(form, _ipv4_is_routable) for form in forms):
+        reasons.append(f"unmapped {IPV6_REASON}")
     return reasons
 
 
@@ -1024,14 +1031,9 @@ def leak_report(
     have rewritten MSH-12. Left out, the version is read from ``text`` (BACKLOG #3004).
     """
     scanner = _scanner()
-    # Over the text as written and decoded, so an escaped token is found too (BACKLOG #5532), with
-    # the IPv6 check the guard does not run (BACKLOG #5654).
+    # Over the text as written and decoded, so an escaped token is found too (BACKLOG #5532).
     token_hits = _merged_token_hits(
-        _with_ipv6(
-            lambda body: [str(h) for h in scanner.scan_text(body, include_estate=True)],
-            scanner._ALLOWED_IP,
-        ),
-        text,
+        lambda body: [str(h) for h in scanner.scan_text(body, include_estate=True)], text
     )
     # The rules scope this check too: a field the DATE kind filled is not a site code (#2330).
     if message_has_site_code(text, rules or ()):

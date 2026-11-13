@@ -90,6 +90,8 @@ _ESCAPED_SITE_CODES = pytest.mark.parametrize(
         "\\ZZ971234\\",
         "\\.ti+971234\\",
         "x\\Z971234",
+        "971234\\X9C\\",
+        "971234\\XAD\\",
     ],
     ids=[
         "component-escape",
@@ -122,6 +124,8 @@ _ESCAPED_SITE_CODES = pytest.mark.parametrize(
         "two-letter-opener",
         "signed-spacing-command",
         "unclosed-tail",
+        "c1-padded",
+        "soft-hyphen-padded",
     ],
 )
 
