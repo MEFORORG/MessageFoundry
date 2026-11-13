@@ -529,7 +529,14 @@ def test_a_refused_proxy_digest_on_the_token_hop_is_a_delivery_error() -> None:
     req = urllib.request.Request("http://127.0.0.1:9/token")
     refused = HttpAuthError("the web proxy's HTTP Digest challenge names algorithm 'MD5'")
     with pytest.raises(DeliveryError, match="will not answer it") as refused_ei:
-        request_token(_Opener(refused), req, timeout=1, endpoint="tok", connector="c")  # type: ignore[arg-type]
+        request_token(
+            _Opener(refused),  # type: ignore[arg-type]
+            req,
+            timeout=1,
+            endpoint="tok",
+            connector="c",
+            digest_proxy=True,
+        )
     # The peer's algorithm token stays on the cause, off the stored last_error text.
     assert "MD5" not in str(refused_ei.value)
     assert refused_ei.value.__cause__ is refused
@@ -540,6 +547,7 @@ def test_a_refused_proxy_digest_on_the_token_hop_is_a_delivery_error() -> None:
             timeout=1,
             endpoint="tok",
             connector="c",
+            digest_proxy=True,
         )
     assert not isinstance(ei.value, DeliveryError)
 
