@@ -105,7 +105,7 @@ if TYPE_CHECKING:
     from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.config.wiring import Registry
     from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
-    from messagefoundry.pipeline.security_notify import SecurityEventNotifier
+    from messagefoundry.pipeline.security_notify import NoticeAuditSink, SecurityEventNotifier
     from messagefoundry.store.base import AdminStore, Store
     from messagefoundry.store.custody_host import MintedCustody
     from messagefoundry.store.store import UserRecord
@@ -8113,9 +8113,20 @@ def _keyless_store_gate(settings: ServiceSettings) -> str | None:
 
 
 def _offline_security_notifier(
-    settings: ServiceSettings, posture: HopPosture | None = None
+    settings: ServiceSettings,
+    posture: HopPosture | None = None,
+    *,
+    audit: NoticeAuditSink | None = None,
 ) -> SecurityEventNotifier | None:
     """The per-user security notifier ``serve`` would wire, built for an offline command (#2019).
+
+    ``audit`` is where a notice that never left is recorded, as
+    ``auth.security_notice_undelivered`` with the recipient as actor (BACKLOG #5634), as the API
+    lifespan records it. A send can fail, and be recorded, as soon as the notifier is started and
+    fed, and at the latest during its :meth:`~SecurityEventNotifier.aclose` drain, so a store passed
+    here must stay open until ``aclose`` returns: a row written to a closed store fails and is
+    swallowed. A command whose store is already closed passes :class:`_ReopeningNoticeAudit`
+    instead. ``None`` records nothing.
 
     ``posture`` is the caller's instance posture, for the Vault hop a ``[secrets]`` read can dial
     (vault BACKLOG #2983). ``None`` counts as enforcing there. The SMTP login's revocation guard
@@ -8170,6 +8181,7 @@ def _offline_security_notifier(
             alerts,
             secret_provider=resolve_secret_provider(settings.secrets, posture=posture),
             trust_anchor_policy=settings.tls.policy(),
+            audit=audit,
             # BACKLOG #2193: the SMTP login's revocation guard. A refusal is caught below, as
             # every build failure here is: the notice is dropped and the recovery goes on. A caller
             # with no posture, such as admin-reset-totp at warn (BACKLOG #2532), gets the instance's
@@ -8452,6 +8464,180 @@ def _log_late_close(closing: asyncio.Future[None]) -> None:
     if not closing.cancelled() and (exc := closing.exception()) is not None:
         logging.getLogger(__name__).warning(
             "the alert's store did not close cleanly (%s)", type(exc).__name__
+        )
+
+
+#: How long ``admin-reset-totp`` waits for the record of a notice whose send failed: the store's
+#: reopen and the one write, together (BACKLOG #5634). They run on their own loop in a daemon
+#: thread, so a synchronous hop inside the open, such as the key provider's, is inside the bound
+#: too. At the bound the command logs that the record's outcome is unknown and stops waiting; the
+#: record may still land later, or not.
+_OFFLINE_NOTICE_RECORD_SECONDS = 10.0
+
+
+class _ReopeningNoticeAudit:
+    """A :class:`NoticeAuditSink` that opens a store only to write the row, for a command whose own
+    store has closed before its notice is drained, as ``admin-reset-totp``'s has (BACKLOG #5634).
+
+    A notice that is sent opens nothing. The reopen, the write and the close run on their own
+    event loop in a daemon thread, as :func:`_run_offline_alert_step` runs the alert step. The
+    command waits for at most :data:`_OFFLINE_NOTICE_RECORD_SECONDS` for the answer, and no longer
+    than that: the write's answer, a commit or a failure, is given before the close, and the close
+    and the thread loop's teardown come after it. A failed open is answered as it fails. Nothing inside the command's own loop could bound the wait: the open's key-provider hop is
+    synchronous, and a worker-thread call still running would hold that loop's executor shutdown.
+
+    A record still running at the time limit is not guaranteed either way: the process exit may
+    wait for it, or it may be lost with no log line.
+
+    The row counts as written only when the write returned. A failed open or write, whatever its
+    class, is a miss, and raises into :meth:`SecurityEventNotifier._record_undelivered`, which
+    logs the class and swallows it: the notice was best effort, and so is its record. A committed
+    row is reported as missed only where ``record_audit`` raised, which can happen after a
+    server-side COMMIT; a failed close is logged in the thread and raises nothing. At the bound the
+    outcome is unknown, not a miss, so it is logged as still running, and this returns without
+    raising. What the record then does is logged when it does, by class only. One whose wait was
+    cancelled instead, by an interrupt, is not logged."""
+
+    def __init__(self, opener: Callable[[], Awaitable[Store]]) -> None:
+        self._opener = opener
+
+    async def record_audit(
+        self,
+        action: str,
+        *,
+        actor: str | None = None,
+        channel_id: str | None = None,
+        detail: str | None = None,
+        client: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        import asyncio
+        import threading
+        import time
+
+        from messagefoundry.last_resort import run_guarded
+
+        log = logging.getLogger(__name__)
+        # The answer, set inside the coroutine the moment it is known, so the waiter never waits for
+        # the close or the loop's teardown. `lock` orders it against the waiter giving up, so a late
+        # outcome is logged exactly when nobody is waiting for it.
+        lock = threading.Lock()
+        answered = threading.Event()
+        state = {"recorded": False, "late": False}
+        failure: list[BaseException] = []
+
+        def answer(*, recorded: bool) -> None:
+            with lock:
+                if answered.is_set():
+                    return
+                state["recorded"] = recorded
+                answered.set()
+                late = state["late"]
+            if late and recorded:
+                log.warning("an undelivered security notice was recorded after its bound")
+            elif late:
+                log.warning(
+                    "an undelivered security notice could not be recorded after its bound (%s)",
+                    type(failure[0]).__name__ if failure else "no answer",
+                )
+
+        def missed(exc: BaseException) -> None:
+            if not failure:
+                failure.append(exc)
+            answer(recorded=False)
+
+        async def write() -> None:
+            try:
+                store = await self._opener()
+            except BaseException as exc:
+                missed(exc)
+                raise
+            try:
+                await store.record_audit(
+                    action,
+                    actor=actor,
+                    channel_id=channel_id,
+                    detail=detail,
+                    client=client,
+                    now=now,
+                )
+                answer(recorded=True)
+            except BaseException as exc:
+                # Answered before the close, so a slow close cannot turn this miss into a timeout.
+                missed(exc)
+                raise
+            finally:
+                try:
+                    await store.close()
+                except Exception as exc:  # noqa: BLE001 - the row, or the write's own error, stands
+                    log.warning(
+                        "a store reopened for an offline notice did not close cleanly (%s)",
+                        type(exc).__name__,
+                    )
+
+        def run() -> None:
+            try:
+                run_guarded(write())
+            except BaseException as exc:  # noqa: BLE001 - any class is a miss, read by the waiter
+                if not failure:
+                    failure.append(exc)
+            finally:
+                # A no-op once the write answered; otherwise the record is a miss.
+                answer(recorded=False)
+
+        threading.Thread(target=run, name="offline-notice-record", daemon=True).start()
+        deadline = time.monotonic() + _OFFLINE_NOTICE_RECORD_SECONDS
+        while not answered.is_set():
+            if time.monotonic() >= deadline:
+                with lock:
+                    still_running = not answered.is_set()
+                    if still_running:
+                        state["late"] = True
+                if still_running:
+                    log.warning(
+                        "the record of an undelivered security notice is still running after its "
+                        "bound, so whether it lands is unknown"
+                    )
+                    return
+                break
+            await asyncio.sleep(0.05)
+        if state["recorded"]:
+            return
+        cause = failure[0] if failure else None
+        if isinstance(cause, Exception):
+            raise cause
+        raise RuntimeError(
+            "the record ended without writing"
+            + ("" if cause is None else f" ({type(cause).__name__})")
+        )
+
+
+class _CountingNoticeAudit:
+    """A :class:`NoticeAuditSink` that forwards to ``inner`` and counts the undelivered records the
+    notifier asked for, so ``provision-admin`` can say that delivery of a notice it reported as
+    dispatched is unconfirmed (BACKLOG #5634). For a dispatched notice the notifier records only a
+    send that raised, so a count above zero is one, whether or not the forwarded write then
+    succeeded. A send can raise after the relay queued the mail, so it is not proof the notice
+    never left. A count of zero is not a delivery receipt: at least a drain ended by an interrupt
+    asks for no record."""
+
+    def __init__(self, inner: NoticeAuditSink) -> None:
+        self._inner = inner
+        self.undelivered = 0
+
+    async def record_audit(
+        self,
+        action: str,
+        *,
+        actor: str | None = None,
+        channel_id: str | None = None,
+        detail: str | None = None,
+        client: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        self.undelivered += 1
+        await self._inner.record_audit(
+            action, actor=actor, channel_id=channel_id, detail=detail, client=client, now=now
         )
 
 
@@ -9418,6 +9604,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # A create batch that failed before its commit (PR 2804 hold 17): no write started, so its
     # error is never read as a refused write.
     batch_failed = False
+    # The takeover notice's audit sink, which counts what the notifier could not deliver (#5634).
+    notice_audit: list[_CountingNoticeAudit] = []
 
     async def run() -> tuple[ProvisionedAdministrator, str]:
         nonlocal write_started, kept_key, batch_failed
@@ -9470,8 +9658,14 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # not owe. Attached, not passed to the build (#2081). The [alerts] notifier for the
             # administrator_granted alert is built on every run, below (vault BACKLOG #3849 B5).
             existing = await store.get_user_by_username(username)
+            # BACKLOG #5634: the store is the audit sink, so a send that fails, while the service
+            # runs or in the drain below, writes its undelivered row. The store closes only after
+            # that drain. Counted, so the result can say a dispatched notice was not delivered.
+            notice_audit.append(_CountingNoticeAudit(store))
             security_notifier = (
-                _offline_security_notifier(settings, posture) if existing is not None else None
+                _offline_security_notifier(settings, posture, audit=notice_audit[0])
+                if existing is not None
+                else None
             )
             service.attach_security_notifier(security_notifier)
             if security_notifier is not None:
@@ -9624,6 +9818,15 @@ def _provision_admin(args: argparse.Namespace) -> int:
             )
         return refused_write(exc)
 
+    # BACKLOG #5634: the notifier drained before run() returned, so its count is final here. None
+    # unless a notice was dispatched. False is not a delivery receipt: it says only that the
+    # notifier recorded no undelivered notice, and at least a drain ended by an interrupt records none.
+    holder_send_failed: bool | None = (
+        bool(notice_audit) and notice_audit[0].undelivered > 0
+        if outcome.holder_notice == HOLDER_NOTICE_DISPATCHED
+        else None
+    )
+
     # True only once issued codes actually reached the console; ``recovery_codes_shown`` says so to
     # a caller reading only the --json body. The account is written either way.
     codes_shown = bool(outcome.recovery_codes) and _show_recovery_codes_once(
@@ -9671,6 +9874,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 "store": store_path,
                 # BACKLOG #2019: null on a fresh create; see ProvisionedAdministrator.holder_notice.
                 "holder_notice": outcome.holder_notice,
+                # BACKLOG #5634: true when the notifier requested to record a notice this run dispatched as
+                # undelivered, because its send raised. Delivery is then unconfirmed,
+                # not disproved: a send can raise after the relay queued the mail. False when it
+                # requested none, which is not a delivery receipt; null when no notice was
+                # dispatched. `holder_notice` keeps what the audit row records.
+                "holder_notice_send_failed": holder_send_failed,
                 # ADR 0197 Amendment A (N-A): whether TOTP was enrolled. Never the secret or codes.
                 "totp_enrolled": totp_secret is not None,
                 # True only when recovery codes were issued AND reached the console; false with
@@ -9698,11 +9907,18 @@ def _provision_admin(args: argparse.Namespace) -> int:
     _safe_print(
         f"Sign in as {outcome.username!r} once the engine is running; it creates no account itself."
     )
-    if outcome.holder_notice == HOLDER_NOTICE_DISPATCHED:
+    if outcome.holder_notice == HOLDER_NOTICE_DISPATCHED and holder_send_failed:
         _safe_print(
-            "Queued a takeover notice to the account's earlier notification address. Delivery is "
-            "best effort: a failed send shows as a WARNING above, for example when this shell lacks "
-            "the SMTP password the service runs with."
+            "WARNING: the send of a takeover notice to the account's earlier notification address "
+            "raised, so whether its earlier holder was told of this takeover is unconfirmed; a "
+            "WARNING above says why, for example when this shell lacks the SMTP password the "
+            "service runs with. Unless that write failed too, an auth.security_notice_undelivered "
+            "audit row records it."
+        )
+    elif outcome.holder_notice == HOLDER_NOTICE_DISPATCHED:
+        _safe_print(
+            "Queued a takeover notice to the account's earlier notification address, and no failed "
+            "send of it was reported before this command finished. Delivery is best effort."
         )
     elif outcome.holder_notice == HOLDER_NOTICE_NO_CHANNEL:
         _safe_print(
@@ -10418,7 +10634,12 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         address = (user.notify_email or "").strip()
         if not address:
             return "no_address"
-        notifier = _offline_security_notifier(settings, posture)
+        # BACKLOG #5634: a send that fails is recorded as undelivered. run()'s store is closed by
+        # now, and a row written to it would fail and be swallowed, so the sink opens the store
+        # again for that one write. A notice that is sent opens nothing.
+        notifier = _offline_security_notifier(
+            settings, posture, audit=_ReopeningNoticeAudit(opened)
+        )
         if notifier is None:
             return "no_channel"
         notifier.start()
@@ -13270,8 +13491,9 @@ def _warn_on_an_unrevoked_store_hop(settings: ServiceSettings) -> None:
     Called just before each open, and so BEFORE it: the WARNING is logged even when that open then
     refuses for its key, its cipher or its driver, and no connection is made. ``serve`` runs the
     guard inside the open, after the cipher, so it logs nothing in that case. Only a refusal of the
-    command's input or arguments, before this call, logs nothing. A command that opens twice, as
-    ``admin-reset-totp`` does, logs it once per open. Only a verifying PostgreSQL hop has that guard. A weakened one is refused by the
+    command's input or arguments, before this call, logs nothing. A command that opens more than once,
+    as ``admin-reset-totp`` does (twice, and a third time to record a notice whose send failed,
+    BACKLOG #5634), logs it once per open. Only a verifying PostgreSQL hop has that guard. A weakened one is refused by the
     open before the guard would run, so it is skipped here. A context that cannot be built is
     skipped too: the open builds the same context and reports the error itself. At a non-enforcing
     posture the guard warns or allows and does not refuse."""

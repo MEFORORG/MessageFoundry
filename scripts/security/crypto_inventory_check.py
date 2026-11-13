@@ -1104,7 +1104,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.config.tls_probe",
             "tls_context:via messagefoundry.logging_setup",
             # BACKLOG #2532: at warn a store-opening command runs the PostgreSQL store's revocation
-            # guard at least once per open (admin-reset-totp opens twice and runs it twice), on the
+            # guard at least once per open (admin-reset-totp opens twice, and a third time to
+            # record a notice whose send failed (BACKLOG #5634), and runs it once per open), on the
             # verifying context the store's own builder makes (the pinned CA or
             # the system trust store, plus any CRL), so it logs serve's WARNING. It builds that
             # context and handshakes nothing; the store's open builds its own again.

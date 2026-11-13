@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Final
+from typing import Final, Protocol
 
 from messagefoundry.auth.audit_visibility import LOCK_NOTICE_UNDELIVERED_ACTION
 from messagefoundry.auth.notifications import (
@@ -66,7 +66,6 @@ from messagefoundry.pipeline.alert_sinks import (
     _refuse_off_allowlist_smtp_host,
     send_plain_email,
 )
-from messagefoundry.store.base import AuditStore
 from messagefoundry.transports.email import checked_sender
 
 log = logging.getLogger(__name__)
@@ -78,6 +77,23 @@ SECURITY_NOTICE_UNDELIVERED_ACTION: Final = "auth.security_notice_undelivered"
 #: How many queue-full records may be in flight at once. Past it a drop goes unrecorded, so the
 #: overload that filled the queue cannot also grow tasks and store writers without bound.
 _MAX_RECORDING: Final = 64
+
+
+class NoticeAuditSink(Protocol):
+    """Where :class:`SecurityEventNotifier` records a notice that never left: the one call it makes,
+    a structural subset of the store's ``AuditStore``, so a store satisfies it as it is. An offline
+    command may pass a sink that opens its store only for the write (BACKLOG #5634)."""
+
+    async def record_audit(
+        self,
+        action: str,
+        *,
+        actor: str | None = None,
+        channel_id: str | None = None,
+        detail: str | None = None,
+        client: str | None = None,
+        now: float | None = None,
+    ) -> None: ...
 
 
 _SUBJECTS = {
@@ -627,7 +643,7 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         tls_verify: bool = True,
         tls_ca_file: str | None = None,
         trust_anchor_policy: TrustAnchorPolicy | None = None,
-        audit: AuditStore | None = None,
+        audit: NoticeAuditSink | None = None,
         posture: HopPosture | None = None,
         revocation_attested: bool = False,
         revocation_attested_reason: str | None = None,
@@ -663,8 +679,9 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         self._tls_verify = tls_verify
         self._tls_ca_file = tls_ca_file
         self._trust_anchor_policy = trust_anchor_policy
-        # BACKLOG #2383: where a dropped or failed notice is recorded. None writes no row, which is
-        # how an offline command builds it; the API lifespan passes the store.
+        # BACKLOG #2383: where a dropped or failed notice is recorded. None writes no row. The API
+        # lifespan passes the store. Of the offline commands, provision-admin passes its store and
+        # admin-reset-totp a sink that reopens the store for the write (BACKLOG #5634).
         self._audit = audit
         # The queue-full records still being written, held so the loop keeps them alive and so
         # aclose() can wait for them.
@@ -854,7 +871,7 @@ def security_notifier_from_settings(
     *,
     secret_provider: SecretProvider | None = None,
     trust_anchor_policy: TrustAnchorPolicy | None = None,
-    audit: AuditStore | None = None,
+    audit: NoticeAuditSink | None = None,
     posture: HopPosture | None = None,
 ) -> SecurityEventNotifier | None:
     """Build the per-user security notifier from ``[alerts]`` SMTP settings, or ``None`` when no SMTP
