@@ -127,6 +127,11 @@ for the checkouts named in its allowlist:
    A governed checkout whose `remove.ps1` predates `-Path` gets a line saying so. A `move` gets
    its own text: there is no checked route for a move.
 
+**How rules 3 to 3d read a path.** A path given to `cd`, `-C`, `--work-tree`, `GIT_WORK_TREE`,
+`--git-dir` or `GIT_DIR` is read the same whether it is bare, double-quoted or single-quoted. Until
+BACKLOG #5642 a single-quoted path kept its quotes, named nothing, and was allowed. A quoted path that
+contains a space is still truncated at the space; that residual is listed in the hook beside rule 3d.
+
 This list is not the whole rule set. The hook itself,
 [`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1), is the source of record.
 

@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.10.22.1"
+$GateVersion = "2026.11.12.1"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -591,6 +591,34 @@ function Resolve-ShellIndirection([string]$Token, [string]$Prefix) {
 # behaviour it had. The UNQUOTED spacey spelling IS followed, because the capture class here admits
 # spaces and stops at the separator -- unlike the `-C` reader's `[^"\s]+`, which is a different
 # residual this file already records. A caller reading RAW text is unaffected by any of it.
+# ONE OUTER QUOTE PAIR, STRIPPED AT ONE PLACE (BACKLOG #5642). The resolver's readers below spell their
+# quote as `"?`, so a DOUBLE-quoted value came back bare while a SINGLE-quoted one came back with its
+# quotes in it: `git -C '<governed>' reset --hard` resolved to a path that names nothing and rules 3,
+# 3b, 3c and 3d all allowed it, while the double-quoted spelling of the same command denied. The shell
+# hands git the same path for both, so the gate reads them alike.
+#
+# WHY HERE AND NOT IN THE PATTERNS. Adding a `'` alternative to each regex is a second spelling of one
+# fact per reader, and two spellings drifting apart is the #1229 defect this file records. So every
+# reader keeps its pattern and passes its capture through this one helper.
+#
+# A PAIR WITH NOTHING INSIDE IS LEFT ALONE, and that keeps this a no-op on SCAN text. Remove-QuotedSpans
+# unmasks a quoted bare word and leaves only an EMPTY pair (`''`, `""`) for a span it blanked, so a
+# caller handing this a scan-string capture gets back exactly what it passed in. Only a raw-line
+# capture changes. A lone or mismatched quote is left alone too: that is a value with a space in it,
+# which the readers already truncate, and guessing the rest of it would be a confident wrong path.
+#
+# ONE VERDICT MOVES THE OTHER WAY, and it is parity rather than a hole: from a governed cwd,
+# `git --git-dir='<ungoverned>/.git' config core.hooksPath x` used to deny on the quote-tainted token
+# and now allows, exactly as its double-quoted spelling always has. The write lands in the ungoverned
+# repository either way.
+function Remove-OuterQuotePair([string]$Value) {
+    if ($Value.Length -ge 3 -and ($Value[0] -eq [char]"'" -or $Value[0] -eq [char]'"') -and
+        $Value[$Value.Length - 1] -eq $Value[0]) {
+        return $Value.Substring(1, $Value.Length - 2)
+    }
+    $Value
+}
+
 function Get-ChdirTargetRaw([string]$Text) {
     if (-not $Text) { return "" }
     if ($Text -match '(?:^|\s)(?:popd|cd\s+-(?:\s|$))') { return "" }
@@ -606,7 +634,7 @@ function Get-ChdirTargetRaw([string]$Text) {
         "(?:^|\s)(?:$chdirComposeVerbs)\s+`"?([^`"&|;]+?)`"?\s*(?:&&|;|\||`$)",
         [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
     if ($cds.Count -ne 1) { return "" }
-    $cds[0].Groups[1].Value.Trim()
+    Remove-OuterQuotePair $cds[0].Groups[1].Value.Trim()
 }
 
 # git's global `-C <path>`, as the resolver and rule 3c's window fold both spell it. One spelling of the
@@ -805,9 +833,9 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     if ($AllTargets) {
         # [regex]::Matches is case-SENSITIVE by default, which is the same reading `-cmatch` gives, so
         # this changes WHICH MATCHES ARE KEPT and nothing about which text matches.
-        $dashCs = @([regex]::Matches($Line, $dashCPattern) | ForEach-Object { $_.Groups[1].Value })
+        $dashCs = @([regex]::Matches($Line, $dashCPattern) | ForEach-Object { Remove-OuterQuotePair $_.Groups[1].Value })
     } elseif ($Line -cmatch $dashCPattern) {
-        $dashCs = @($Matches[1])
+        $dashCs = @(Remove-OuterQuotePair $Matches[1])
     }
     # COLLECTED SEPARATELY RATHER THAN PUSHED STRAIGHT INTO $out (BACKLOG #1379 class one). These
     # used to land in $out here, ahead of everything, and the caller takes the first candidate git
@@ -893,7 +921,7 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     # ===================================================================================================
     $promoted = @()
     foreach ($pat in @('(?:^|\s)--git-dir[=\s]+"?([^"\s]+)"?', '(?:^|\s)GIT_DIR="?([^"\s]+)"?')) {
-        $hits = @([regex]::Matches($Line, $pat) | ForEach-Object { $_.Groups[1].Value })
+        $hits = @([regex]::Matches($Line, $pat) | ForEach-Object { Remove-OuterQuotePair $_.Groups[1].Value })
         [array]::Reverse($hits)
         foreach ($hit in $hits) {
             # $postC, NOT $cd: a relative `--git-dir` resolves against the post-`-C` directory. With no
@@ -933,6 +961,10 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     # nothing, and a HEAD move through it was allowed. Widening the shared patterns would also move
     # rule 3c's verdicts, in both directions, so the quote-tolerant read is confined to this switch,
     # whose every consequence is a new DENY.
+    # SUPERSEDED FOR THE SHARED READERS BY BACKLOG #5642, and left as written so the history reads: the
+    # shared patterns above now pass their captures through Remove-OuterQuotePair, which also strips a
+    # single-quoted pair. The one rule 3c verdict that moved toward ALLOW is named at that helper.
+    # This switch keeps its own quote-tolerant patterns; with the strip they now read the same token.
     if ($RepositoryOnly) {
         $repo = @()
         if ($ExplicitFirst) {
@@ -951,8 +983,8 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     }
 
     $explicit = @()
-    if ($Line -cmatch '(?:^|\s)--work-tree[=\s]+"?([^"\s]+)"?') { $explicit += $Matches[1]; $explicit += $CwdRaw }
-    if ($Line -cmatch '(?:^|\s)GIT_WORK_TREE="?([^"\s]+)"?')    { $explicit += $Matches[1]; $explicit += $CwdRaw }
+    if ($Line -cmatch '(?:^|\s)--work-tree[=\s]+"?([^"\s]+)"?') { $explicit += (Remove-OuterQuotePair $Matches[1]); $explicit += $CwdRaw }
+    if ($Line -cmatch '(?:^|\s)GIT_WORK_TREE="?([^"\s]+)"?')    { $explicit += (Remove-OuterQuotePair $Matches[1]); $explicit += $CwdRaw }
 
     # THE SWITCH IS OPT-IN AND DEFAULT-OFF, so rules 3 and 3d keep the exact list they had: the `-C`
     # candidates, then the base, then the explicit WORKING-TREE tokens. Only rule 3c opts in. Same
