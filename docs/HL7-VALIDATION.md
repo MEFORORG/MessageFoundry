@@ -8,7 +8,7 @@ compose.
 | Tier | Engine | When | Checks | On failure |
 |---|---|---|---|---|
 | 1. Tolerant peek | The built-in parser ([parsing/peek.py](../messagefoundry/parsing/peek.py), ADR 0054) | Always (hot path) | Parse + fast field access; size/segment caps; MSH present | Unparseable / oversized → `ERROR` (NAK), never crashes the connection |
-| 2. Strict structural | `hl7apy` ([parsing/validate.py](../messagefoundry/parsing/validate.py)) | Opt-in per inbound (`strict=True`) | Version-aware **structure**: segment cardinality, required segments and fields, MSH-12 version. Not field content: it parses at hl7apy's TOLERANT level, so datatypes, lengths and table values pass | Non-conformant → synchronous NAK at the listener, `AR` (Tier 2 below has the codes) |
+| 2. Strict structural | `hl7apy` ([parsing/validate.py](../messagefoundry/parsing/validate.py)) | Opt-in per inbound (`strict=True`) | Version-aware **structure**: segment cardinality, required segments and fields, MSH-12 version, no line it cannot place (Z-segments are listed, not refused). Not field content: it parses at hl7apy's TOLERANT level, so datatypes, lengths and table values pass | Non-conformant → synchronous NAK at the listener, `AR` (Tier 2 below has the codes) |
 | 3. Business consistency | `parsing/consistency.py` (this WP) | In a Router/Handler | **Cross-field** coherence the schema can't express | Handler decides: `FILTERED` or `ERROR`/dead-letter |
 
 ## Tier 1 — tolerant peek (always on)
@@ -63,6 +63,43 @@ object tree on a worker thread the timeout cannot stop, and the 16 MiB cap, chec
 is what bounds it. A streaming inbound (`stream_threshold_bytes`) validates only the header of a body at or over its
 threshold, so a large-document feed keeps working; set the threshold at or below 16 MiB on a strict
 streaming inbound.
+
+**A line strict validation cannot place is refused** (BACKLOG #5920). `hl7apy` drops, while grouping,
+any line it cannot fit into the message structure, and validates only what it kept, while the
+tolerant parser forwards that line. So strict validation refuses an unknown segment, a known segment
+the structure has no place for (`ORC` in `ADT^A01`), a line that is not a segment at all, and a
+message type `hl7apy` has no structure for. So a Z message type (`ZZZ^Z01`) needs
+`validation.strict = false`, unless its MSH-9.3 names a structure `hl7apy` knows, which is then
+what it is validated against. This refusal never quotes the line. A parse error `hl7apy` raises
+itself can quote message text: at least a line's first three characters (`Invalid name for
+Segment: XXX`) and a whole unsupported MSH-12 value. Segment order is not checked as such, so an
+out-of-order message may pass. The exact rule and wording are in the module docstring of
+[parsing/validate.py](../messagefoundry/parsing/validate.py).
+
+**A defined segment in a message whose structure has an "any HL7 segment" slot is not refused by
+the comparison.** `hl7apy`'s table for the message's version marks that slot (in 2.5.1 at least
+`MFN_M01` and `QVR_Q17`; which structures carry it varies by version) but its grouping never fills
+it. So in such a message the comparison does not refuse a segment that version defines, followed
+by a field separator, in any number and wherever it sits, and lists it in `unvalidated_segments`
+with its position, as it lists a Z-segment, though only when the comparison runs: a message
+`hl7apy` parsed but an earlier check refused lists its Z-segments alone, and a size, segment-cap
+or parse refusal lists nothing. A dropped segment ID the version does not define is still
+refused, and so is a dropped bare defined ID with no field separator (a lone `ORC` line in
+`MFN_M01`); a bare line `hl7apy` placed is not. Every dropped segment is refused where MSH-9.3
+borrows a slot-bearing structure under another message code (`ADT^A01^MFN_M01`); a structure
+borrowed under the same message code (`MFN^M02^MFN_M01`) still gets the exemption, since MSH-9.2
+is not compared. Where the slot is required and its group is present, `hl7apy`'s own check
+refuses at least some such messages, since the slot is never filled (`Missing required child ...
+ANYHL7SEGMENT`; `MFN_M03` for one), but not where the slot is one alternative of a choice: a
+`PRR_PC5` order with its `OBR` passes. Where the slot sits inside a nested group (at least the
+care-plan structures `PRR_PC5` and `PPV_PCA`), a segment placed there can still break `hl7apy`'s
+grouping of what follows, so such a message is not certain to pass unvalidated: `hl7apy` may
+refuse it for a segment it misplaced.
+
+**Z-segments are tolerated, unvalidated, and listed.** A Z-segment is left out of what strict
+validation checks, is forwarded without any check, and is listed in
+`ValidationResult.unvalidated_segments` for a caller of `validate()`; no engine surface (log, API,
+web console) shows that list yet.
 
 Strict validation surfaces a single conformance error (not a full report) — a full report of a PHI
 message would be a data leak. See [parsing/validate.py](../messagefoundry/parsing/validate.py).
