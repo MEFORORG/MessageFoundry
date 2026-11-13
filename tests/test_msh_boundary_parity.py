@@ -142,7 +142,7 @@ def test_the_corpus_reaches_every_answer() -> None:
     assert {len(_old_split_batch(text)) for text in CORPUS} >= {1, 2, 3}
 
 
-def test_the_ingress_reading_is_unchanged() -> None:
+def test_the_ingress_reading_matches_its_copy() -> None:
     # check_decoded hands it normalized text; the raw strings are read too, so a change that only
     # shows on an LF the guard is never given would still fail here.
     normalized = [normalize(text) for text in CORPUS]
@@ -155,7 +155,7 @@ def test_the_ingress_reading_is_unchanged() -> None:
         )
 
 
-def test_the_delivery_reading_is_unchanged() -> None:
+def test_the_delivery_reading_matches_its_copy() -> None:
     assert (
         _disagreements(split._sends_more_than_one_message, _old_sends_more_than_one_message, CORPUS)
         == []
@@ -163,7 +163,7 @@ def test_the_delivery_reading_is_unchanged() -> None:
 
 
 @pytest.mark.parametrize("encoding", ["utf-8", "latin-1", "cp1252", "ascii", "utf-16", "nope"])
-def test_the_whole_file_byte_scan_is_unchanged(encoding: str) -> None:
+def test_the_whole_file_byte_scan_matches_its_copy(encoding: str) -> None:
     assert [
         body
         for body in BODIES
@@ -171,12 +171,12 @@ def test_the_whole_file_byte_scan_is_unchanged(encoding: str) -> None:
     ] == []
 
 
-def test_the_batch_split_is_unchanged() -> None:
+def test_the_batch_split_matches_its_copy() -> None:
     assert [text for text in CORPUS if split.split_batch(text) != _old_split_batch(text)] == []
     assert [body for body in BODIES if split.split_batch(body) != _old_split_batch(body)] == []
 
 
-#: The earliest boundary each multi-spelling ``_Boundary`` names, written as one plain regex.
+#: The earliest boundary each ``_Boundary`` names, written out again here as a plain regex.
 _EARLIEST_OUTBOUND = re.compile(r"[\r\n]" + BOM + r"*MSH")
 _EARLIEST_NORMALIZED = re.compile(r"\r" + BOM + r"*MSH")
 _EARLIEST_RAW_BYTES = re.compile(rb"[\r\n][\xef\xbb\xbf]*MSH")

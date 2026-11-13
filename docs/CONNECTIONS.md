@@ -1702,7 +1702,8 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   rule 5). **Two File-source behaviours do *not* carry over:** opt-in gzip `decompress` (ADR 0123, local
   `File(...)` only), and `min_age_seconds` (above).
 - **One message per body on a listener.** An MLLP, TCP or HTTP inbound, and any other source that does
-  not split, refuses an HL7 v2 body holding more than one `MSH` segment: it records `ERROR`, and a
+  not split, refuses an HL7 v2 body holding more than one `MSH` segment, a later line whose `MSH`
+  follows a run of byte order marks counting as one too: it records `ERROR`, and a
   listener with an ACK channel answers `AR` with MSA-3 `more than one MSH in body` (ADR 0206 rule 5). A
   sender with a batch sends one message per frame or request, or drops the file where a `File(...)` or
   remote-file source splits it. That includes the shipped helper: `samples/send_mllp.py` sends a whole
