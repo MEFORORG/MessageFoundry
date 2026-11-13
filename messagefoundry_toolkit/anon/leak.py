@@ -19,8 +19,9 @@ already-pseudonymized field is never re-flagged:
   nobody thought to map is **recorded** (carried into the :class:`LeakError` on a refusal, and exposed
   via ``on_report``) rather than passing unrecorded; and
 * **high-precision structural PHI-shape detectors** over those unmapped values (dashed SSN,
-  punctuated NANP phone, an ``MR``/``MRN`` id type in a whole component or in CX.5, and a line
-  whose segment id is malformed), plus a dashed SSN or punctuated phone that the message's own field separator cut
+  punctuated NANP phone, an ``MR``/``MRN`` id type in a whole component, its first subcomponent
+  or any subcomponent of CX.5, a routable IPv6 address, and a line whose segment id is
+  malformed), plus a dashed SSN or punctuated phone that the message's own field separator cut
   across fields, when at least one of them is unmapped (BACKLOG #3465) — narrow by design to
   avoid the mass false-positives a broad digit-run search would produce on HL7 bodies (ADR 0030
   §5). A name, an undashed number or a date in an unmapped field
@@ -61,6 +62,7 @@ from .surrogates import (
     COMPONENT_KEEPING_KINDS,
     Seps,
     decoded_readings,
+    dropped,
     message_has_site_code,
     read_message_seps,
     trim,
@@ -794,9 +796,10 @@ def _has_mrn_typed_identifier(value: str, seps: Seps, field_sep: str) -> bool:
 def _is_mrn_type(comp: str, seps: Seps, field_sep: str, *, subcomponents: bool) -> bool:
     """True if ``comp`` is ``MR`` or ``MRN`` as written or decoded whole, as a ``Message`` component
     read decodes it, or as its first subcomponent, as ``Peek`` reads a component that has them,
-    each reading trimmed (:func:`.surrogates.trim`) and never split again. With
-    ``subcomponents``, any one of its subcomponents counts the same way, since a ``Message``
-    subcomponent read can read any of them (BACKLOG #5654)."""
+    each reading also with its invisible characters dropped (:func:`.surrogates.dropped`), each
+    trimmed (:func:`.surrogates.trim`), and never split again. With ``subcomponents``, any one of
+    its subcomponents counts the same way, since a ``Message`` subcomponent read can read any of
+    them (BACKLOG #5654)."""
     leaves = comp.split(seps.subcomponent)
     if len(leaves) == 1:
         parts: tuple[str, ...] = (comp,)
@@ -805,7 +808,11 @@ def _is_mrn_type(comp: str, seps: Seps, field_sep: str, *, subcomponents: bool) 
     forms = [
         form
         for part in parts
-        for form in (part, *decoded_readings(part, seps, field_sep, resplit=False))
+        for form in (
+            part,
+            dropped(part),
+            *decoded_readings(part, seps, field_sep, resplit=False),
+        )
     ]
     return any(trim(form).upper() in _MRN_TYPES for form in forms)
 
@@ -874,8 +881,9 @@ def past_first_component_hits(
     leave as captured. Reasons name the shape and the field address only, never a value.
 
     A rule maps its field, so :func:`structural_phi_hits` never scans it. Two kinds of field
-    are scanned here, each repetition with its component 1 left out, for the dashed SSN and the
-    punctuated phone, as written and decoded as :func:`_structural_reasons` reads a value:
+    are scanned here, each repetition with its component 1 left out, for the dashed SSN, the
+    punctuated phone and a routable IPv6 address (BACKLOG #5654), as written and decoded as
+    :func:`_structural_reasons` reads a value:
 
     * a default field a retarget points at a different kind (:func:`.rules.retargeted_defaults`,
       BACKLOG #3493). Its hits read :data:`RETARGET_RESIDUE`, unless its default kind is one
@@ -887,8 +895,10 @@ def past_first_component_hits(
     The MRN-typed shape needs a component 1, so it never fires here, which is right: the id
     there is the surrogate. The other kinds add no hit on a retargeted field: ``name``,
     ``address`` and ``provider`` write values from fixed pools, and
-    ``tests/test_anon_overlay_retarget_warning.py`` pins that no pool value has one of these
-    shapes; ``phone`` and ``dob`` write one component; ``date`` writes component 1 and keeps after
+    ``tests/test_anon_overlay_retarget_warning.py`` pins that no pool value has the SSN or phone
+    shape. Nothing pins that no pool value reads as an IPv6 address, so a pool value written as
+    a hex word beside ``::`` would make a retarget refuse its own output. ``phone`` and ``dob``
+    write one component; ``date`` writes component 1 and keeps after
     it only a known TS.2 precision code.
 
     The walk names a segment by every rule's path, so a segment only these rules name keeps its
@@ -1176,8 +1186,9 @@ def refusal_advice(
 #: What the structural detectors look for in an unmapped field, and what they let through. Stated once
 #: here so the run summary cannot drift from the detectors above (docs/PHI.md section 9 is the long form).
 UNMAPPED_SCOPE_NOTE = (
-    "Beyond the partner-token and IP scan of the whole message, the leak-check looks in these "
-    "fields only for a dashed SSN, a punctuated phone number and an MR/MRN-typed identifier. A "
+    "Beyond the partner-token and IPv4 scan of the whole message, the leak-check looks in these "
+    "fields only for a dashed SSN, a punctuated phone number, an MR/MRN-typed identifier and a "
+    "routable IPv6 address. A "
     "name, an undashed number or a date in one of them passes, so review this list before you "
     "share the dataset."
 )

@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import random
 import re
+import unicodedata
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -476,16 +477,18 @@ def surrogate_field_recorded(
 
 def _reads_as_site_code(part: str, seps: Seps, field_sep: str) -> bool:
     """True if ``part``, one component or one subcomponent, is a site code on any reading a
-    consumer can take (BACKLOG #5632): as written, trimmed or not, or any of
-    :func:`decoded_readings`. Each reading must be a site code whole, by ``fullmatch``. A part with
-    no escape character is read only whole, so a site-code run inside a longer value, such as
-    ``Call 971234 today``, reads as no site code. A part that holds one is also read split on
+    consumer can take (BACKLOG #5632): as written, trimmed, with its invisible characters dropped
+    (:func:`dropped`), split at each invisible character, or any of :func:`decoded_readings`.
+    Each reading must be a site code whole, by ``fullmatch``. A part with no escape character is
+    not split on whitespace, so a site-code run inside a longer value, such as ``Call 971234
+    today``, reads as no site code. A part that holds one is also read split on
     whitespace and on escaped delimiters, so ``Call 971234 today\\.br\\`` reads as a site code,
     and :func:`scrub_site_codes` then replaces the whole part. Each escape body is also read as
     written, split at every character that is not a digit: a raw viewer, or a receiver that
     defines the escape, shows the body's text, and a site code is digits only. docs/PHI.md
     section 9, *Field-anchored site-code scrub*, states the rule and its consequences."""
-    forms = [trim(part), *decoded_readings(part, seps, field_sep, resplit=True)]
+    forms = [trim(part), trim(dropped(part)), *map(trim, _split_at_invisible(part))]
+    forms += decoded_readings(part, seps, field_sep, resplit=True)
     if seps.escape and seps.escape in part:
         # Every piece after an opening escape character is a body: the odd pieces of the split,
         # an unclosed tail among them. The text around them is already read decoded.
@@ -683,18 +686,19 @@ def decoded_readings(part: str, seps: Seps, field_sep: str, *, resplit: bool) ->
     """The decoded readings a consumer can take of ``part``, one component or one subcomponent,
     for the detectors that must fail closed on any of them (BACKLOG #5632, #5654): the part
     decoded (:func:`unescape`), and decoded with ``\\H\\`` and ``\\N\\`` dropped, as a display
-    that shows highlighting rather than a character reads it, each stripped of surrounding
-    the characters :func:`trim` takes off. Empty when ``part`` holds no
-    escape character, since then the only reading is the part as written.
+    that shows highlighting rather than a character reads it; each of those with its invisible
+    characters dropped (:func:`dropped`); and each trimmed (:func:`trim`). Empty when ``part``
+    holds no escape character: :func:`_reads_as_site_code` and the MRN-typed check read the part
+    as written themselves.
 
     With ``resplit`` each reading is also split again on the message's delimiters, its field
-    separator, its escape character and those characters, and each piece is a reading too: a
-    consumer that unescapes the part sees an escaped delimiter as a real one, drops or stops at a
-    control character such as ``\\X00\\``, and :func:`unescape` writes a break command such as
-    ``\\.br\\`` as a space where the engine writes a line break. The
-    site-code check takes it, since a site code is digits only, so a word split out of free text
-    is no false hit. The MRN-typed check does not: a split-out word ``MR`` or ``Mr`` in ordinary
-    text, such as ``PET\\T\\MR`` or ``MR BRAIN W\\T\\WO``, would refuse the message."""
+    separator, its escape character, whitespace and every invisible character, and each piece is
+    a reading too: a consumer that unescapes the part sees an escaped delimiter as a real one,
+    stops at a control character such as ``\\X00\\``, and :func:`unescape` writes a break
+    command such as ``\\.br\\`` as a space where the engine writes a line break. The site-code
+    check takes it, since a site code is digits only, so a word split out of free text is no
+    false hit. The MRN-typed check does not: a split-out word ``MR`` or ``Mr`` in ordinary text,
+    such as ``PET\\T\\MR`` or ``MR BRAIN W\\T\\WO``, would refuse the message."""
     escape = seps.escape
     if not escape or escape not in part:
         return []
@@ -704,31 +708,65 @@ def decoded_readings(part: str, seps: Seps, field_sep: str, *, resplit: bool) ->
     for decoded in dict.fromkeys(
         (unescape(part, seps, field_sep), unescape(shown, seps, field_sep))
     ):
-        pieces = re.split(f"[{breaks}{_TRIM_CLASS}]", decoded) if resplit else []
-        forms.extend(trim(form) for form in (decoded, *pieces))
+        candidates = [decoded, dropped(decoded)]
+        if resplit:
+            # An invisible character becomes a space first, so the one class splits on it too.
+            spaced = "".join(" " if _is_invisible(c) else c for c in decoded)
+            candidates += re.split(f"[{breaks}{_TRIM_CLASS}]", spaced)
+        forms.extend(trim(form) for form in candidates)
     return list(dict.fromkeys(forms))
 
 
-#: What surrounds a reading without being part of it, as a regular-expression class body:
-#: whitespace, every C0 and C1 control character, DEL and the soft hyphen U+00AD. A consumer
-#: trims, drops or stops at them, and a one-byte hex escape reaches each, so a value padded or
-#: split by one, such as ``971234\\X00\\`` or ``971234\\X9C\\``, reads as the value alone (BACKLOG
-#: #5632, #5654).
-_TRIM_CLASS = "\\s\\x00-\\x1f\\x7f-\\x9f\\xad"
-#: The same characters as a set for ``str.strip``, which runs in linear time where an end-anchored
-#: regular expression backtracks over a long run of them inside the text. Every character
-#: ``str.isspace`` takes is below U+3001.
-_TRIM_CHARS = "".join(
-    chr(code)
-    for code in range(0x3001)
-    if chr(code).isspace() or code < 0x20 or 0x7F <= code <= 0x9F or code == 0xAD
-)
+#: The Unicode categories of a character that takes up no place in what a consumer shows: Cc, every
+#: C0 and C1 control character and DEL, and Cf, the format characters, among them the soft hyphen
+#: U+00AD, the zero-width space U+200B and the byte-order mark U+FEFF. A consumer drops, trims or
+#: stops at them, and a one-byte hex escape reaches the controls, so a value padded, split or
+#: interleaved with one, such as ``971234\\X00\\``, ``97\\XAD\\1234`` or ``MR`` with a U+200B, reads
+#: as the value without it (BACKLOG #5632, #5654).
+_INVISIBLE_CATEGORIES = frozenset({"Cc", "Cf"})
+#: The split class besides the delimiters: whitespace, which :func:`decoded_readings` maps every
+#: invisible character to before it splits.
+_TRIM_CLASS = "\\s"
+
+
+def _is_invisible(char: str) -> bool:
+    """True if ``char`` is in :data:`_INVISIBLE_CATEGORIES`."""
+    return unicodedata.category(char) in _INVISIBLE_CATEGORIES
+
+
+def _is_blank(char: str) -> bool:
+    """True if ``char`` is whitespace or invisible: what :func:`trim` takes off."""
+    return char.isspace() or _is_invisible(char)
+
+
+def dropped(text: str) -> str:
+    """``text`` with every invisible character (:data:`_INVISIBLE_CATEGORIES`) removed, as a
+    consumer that drops them reads it."""
+    return "".join(c for c in text if not _is_invisible(c))
 
 
 def trim(text: str) -> str:
-    """``text`` without the whitespace, C0 and C1 control characters, DEL and soft hyphen at
-    either end."""
-    return text.strip(_TRIM_CHARS)
+    """``text`` without the whitespace and invisible characters at either end. It walks in from
+    each end once, so a long run of them inside the text costs nothing extra."""
+    start, end = 0, len(text)
+    while start < end and _is_blank(text[start]):
+        start += 1
+    while end > start and _is_blank(text[end - 1]):
+        end -= 1
+    return text[start:end]
+
+
+def _split_at_invisible(text: str) -> list[str]:
+    """``text`` split at each invisible character, as a consumer that stops at one reads each
+    piece. Whitespace does not split it."""
+    pieces: list[str] = []
+    start = 0
+    for at, char in enumerate(text):
+        if _is_invisible(char):
+            pieces.append(text[start:at])
+            start = at + 1
+    pieces.append(text[start:])
+    return pieces
 
 
 def _unescape_field(field: str, seps: Seps, field_sep: str, *, by_component: bool) -> str:

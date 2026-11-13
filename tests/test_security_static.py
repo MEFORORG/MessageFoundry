@@ -704,7 +704,8 @@ _UNSCANNABLE_RE_PATTERNS = {
     #
     # BACKLOG #5632, #5654 -- the decoded-reading re-split in ``decoded_readings``. Unresolvable BY
     # CONSTRUCTION: its class is the delimiter set the message declares in MSH-1/MSH-2, read at
-    # runtime and passed through ``re.escape``, plus the fixed whitespace, C0 and DEL class. It is a
+    # runtime and passed through ``re.escape``, plus ``\s``, which every invisible character is
+    # mapped to before the split. It is a
     # single character class used only by ``re.split``, with no quantifier at all, so it is linear.
     "messagefoundry_toolkit/anon/surrogates.py": (
         "f'(?:{alt})\\\\d{{4}}'",
