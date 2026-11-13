@@ -669,12 +669,14 @@ def test_anchored_store_path_with_no_root_is_unchanged(tmp_path: Path) -> None:
     assert anchored_store_path("mf.db", None, cwd=tmp_path) == "mf.db"
 
 
-def test_anchored_store_path_leaves_a_path_naming_no_file_alone(tmp_path: Path) -> None:
+def test_the_in_memory_sentinel_is_never_joined_under_the_root(tmp_path: Path) -> None:
     from messagefoundry.config.anchor import anchored_store_path
 
-    # Joined, `:memory:` would become a file (an NTFS stream on Windows) and "" the root itself.
-    assert anchored_store_path(":memory:", tmp_path / "repo", cwd=tmp_path) == ":memory:"
-    assert anchored_store_path("", tmp_path / "repo", cwd=tmp_path) == ""
+    # Joined, `:memory:` would become a durable file (an NTFS stream on Windows). The guard sits in
+    # anchor_under_root, so serve's and supervise's pre-load --db join keeps it too.
+    root = tmp_path / "repo"
+    assert anchored_store_path(":memory:", root, cwd=tmp_path) == ":memory:"
+    assert anchor_under_root(":memory:", root, cwd=tmp_path) == ":memory:"
 
 
 def test_anchored_store_path_keeps_a_drive_relative_path_under_the_root(
@@ -704,19 +706,20 @@ def _names(output: str, path: Path) -> bool:
 
 
 @pytest.mark.parametrize(
-    ("argv", "via_db"),
+    ("argv", "via_db", "code"),
     [
-        pytest.param(["admin-unlock", "--username", "site-admin"], False, id="admin-unlock"),
-        pytest.param(["audit-verify"], False, id="audit-verify"),
-        pytest.param(["audit-anchor"], False, id="audit-anchor"),
-        pytest.param(["rotate-key"], False, id="rotate-key"),
-        pytest.param(["backup", "--destination", "BACKUP_DIR"], False, id="backup"),
-        pytest.param(["cipher-audit"], False, id="cipher-audit"),
-        pytest.param(["check-privileges"], False, id="check-privileges"),
+        pytest.param(["admin-unlock", "--username", "site-admin"], False, 2, id="admin-unlock"),
+        pytest.param(["audit-verify"], False, 2, id="audit-verify"),
+        pytest.param(["audit-anchor"], False, 2, id="audit-anchor"),
+        pytest.param(["rotate-key"], False, 2, id="rotate-key"),
+        pytest.param(["backup", "--destination", "BACKUP_DIR"], False, 2, id="backup"),
+        pytest.param(["cipher-audit"], False, 2, id="cipher-audit"),
+        # A SQLite store has no server principal to probe, so this one reports and exits 0.
+        pytest.param(["check-privileges"], False, 0, id="check-privileges"),
         # A relative --db merges into [store].path before the anchor, so two commands suffice to
         # pin that it is anchored too: one through the shared host gate, one with its own guards.
-        pytest.param(["admin-unlock", "--username", "site-admin"], True, id="admin-unlock-db"),
-        pytest.param(["rotate-key"], True, id="rotate-key-db"),
+        pytest.param(["admin-unlock", "--username", "site-admin"], True, 2, id="admin-unlock-db"),
+        pytest.param(["rotate-key"], True, 2, id="rotate-key-db"),
     ],
 )
 def test_offline_store_command_names_the_store_under_the_root(
@@ -725,6 +728,7 @@ def test_offline_store_command_names_the_store_under_the_root(
     capsys: pytest.CaptureFixture[str],
     argv: list[str],
     via_db: bool,
+    code: int,
 ) -> None:
     """With no store yet, every one of these refuses or reports naming the path it tested. That
     path must be the root's, for a file-set relative [store].path and for a relative --db alike
@@ -739,8 +743,9 @@ def test_offline_store_command_names_the_store_under_the_root(
     argv = [*argv, "--service-config", str(svc)]
     if via_db:
         argv += ["--db", "mf.db"]
-    main(argv)
+    rc = main(argv)
     out = capsys.readouterr()
+    assert rc == code, out.out + out.err
     assert _names(out.out + out.err, root / "mf.db"), out.out + out.err
     assert not (Path.cwd() / "mf.db").exists()
 

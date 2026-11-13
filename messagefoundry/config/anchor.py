@@ -98,8 +98,11 @@ def anchor_under_root(value: str | None, root: Path | None, *, cwd: Path) -> str
     leading separators so the member stays under ``root`` (root-honoring, never an escape) — mirroring
     the loud-not-silent stance of :func:`resolve_values_base_dir` for the root itself.
     """
-    if value is None or root is None:
-        return value  # no root: keep today's exact string (CWD-relative downstream, unchanged)
+    if value is None or root is None or value == ":memory:":
+        # No root: keep today's exact string (CWD-relative downstream, unchanged). SQLite's
+        # `:memory:` names no file; joined, it would become one under the root (an NTFS stream on
+        # Windows), a durable store where an in-memory one was asked for.
+        return value
     p = Path(value)
     if p.is_absolute():
         return value  # explicit absolute path bypasses the root (preserve the exact string)
@@ -126,30 +129,31 @@ def anchored_store_path(store_path: str, root: Path | None, *, cwd: Path) -> str
 
     The rule ``serve`` and at least the offline store commands apply to ``[store].path`` after the
     settings load (BACKLOG #5926, #5927), so a command run away from the root names the store serve
-    opens: a relative path, whether it came from ``--db`` or the settings file, follows the root, an
+    opens, where both see the same root (:func:`anchor_settings_store_path` says where they do
+    not): a relative path, whether it came from ``--db`` or the settings file, follows the root, an
     absolute one stays put (AC-1/AC-7), and with no root the string is returned unchanged, to
     resolve against the working directory as it always has. The join is :func:`anchor_under_root`'s,
-    so a drive-relative path warns and stays under the root, as every other bundle member does.
-
-    SQLite's ``:memory:`` sentinel and an empty path name no file, so they are returned unchanged:
-    joined, the first would become a file (an NTFS stream on Windows) and the second the root
-    directory itself, which an existence guard would then pass.
+    so a leading-slash drive-relative path warns and stays under the root, as every other bundle
+    member does, and SQLite's ``:memory:`` sentinel is returned unchanged.
 
     It is not backend-gated, because ``serve`` is not: a server backend never opens this path, but
     the generated TLS pair's state dir is derived from it (``generated_state_dir``), and a gated
     copy would name a different pair from the one serve uses.
     """
-    if store_path in ("", ":memory:"):
-        return store_path
     # A str in is a str out (only None maps to None); the `or` only narrows the type.
     return anchor_under_root(store_path, root, cwd=cwd) or store_path
 
 
 def anchor_settings_store_path(settings: ServiceSettings | None, *, cwd: Path) -> None:
-    """Apply :func:`anchored_store_path` to loaded settings in place, under the root the MERGED
-    ``[environments].base_dir`` names, so ``--project-root`` and a file- or env-set ``base_dir``
-    anchor alike. ``None`` (a command that tolerates a settings file it could not load, such as
-    ``support-bundle``) is a no-op.
+    """Apply :func:`anchored_store_path` to loaded settings in place, under the root the loaded
+    ``[environments].base_dir`` names. ``None`` (a command that tolerates a settings file it could
+    not load, such as ``support-bundle``) is a no-op.
+
+    What it does NOT cover: only ``serve`` and ``supervise`` take ``--project-root``. An offline
+    command sees the base_dir the settings file or the environment sets, and nothing else, so it
+    names the store serve opens only where serve's root comes from the same place, or where the
+    path is absolute. A service started with ``--project-root`` and a relative ``[store].path`` in
+    a file with no base_dir, or a different one, is not matched; pass an absolute ``--db``.
 
     Call it straight after the load and BEFORE any guard that tests the path, an existence check
     or a refusal, or the guard tests a different file from the one the command then opens."""
