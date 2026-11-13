@@ -420,6 +420,7 @@ async def test_the_grant_is_judged_on_the_roles_read_at_apply_time_not_the_plans
         *,
         watermark: _AuditWatermark | None,
         maps_held: bool = True,
+        not_attempted: int = 0,
     ) -> _RevocationApplied:
         await rig.store.set_user_roles(
             revocation.user_id,
@@ -427,7 +428,9 @@ async def test_the_grant_is_judged_on_the_roles_read_at_apply_time_not_the_plans
             assigned_by="ad-sync",
             audits=(),
         )
-        return await real(revocation, watermark=watermark, maps_held=maps_held)
+        return await real(
+            revocation, watermark=watermark, maps_held=maps_held, not_attempted=not_attempted
+        )
 
     monkeypatch.setattr(rig.service, "_apply_reconcile_revocation", a_sign_in_lands_first)
 

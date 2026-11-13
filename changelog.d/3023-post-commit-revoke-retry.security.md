@@ -5,6 +5,8 @@
   a lost connection, is now run again within a bounded budget, and one the service gives up on is
   logged at ERROR and written as an `auth.sessions_revoke_failed` row naming the account and the
   change; before, the request failed with the change committed, the other sessions live and nothing
-  recorded. A custom-role delete, which revokes before it deletes, the directory reconciler's
-  demotion and a cancellation are not covered. [SECURITY.md](../docs/SECURITY.md) states the
-  attempts and the budget. (`vault BACKLOG #3023`)
+  recorded. The directory reconciler's revoke gets the same attempts, budget and row, counting its
+  first attempt, which carries its `auth.ad_session_revoked` row, and the row counts the
+  revocations of the pass it did not reach. A custom-role delete, which revokes before it deletes,
+  and a cancellation are not covered. [SECURITY.md](../docs/SECURITY.md) states the attempts and
+  the budget. (`vault BACKLOG #3023`)
