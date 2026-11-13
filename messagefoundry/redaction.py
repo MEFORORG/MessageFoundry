@@ -1554,22 +1554,29 @@ _XML_TAG = re.compile(r"<(/?)((?:[A-Za-z_][\w.-]*+:)?([A-Za-z_][\w.-]*+))")
 #: The rest of an end tag, up to its ``>``: the span a KEPT remainder copies as it stands.
 _XML_END_TAG_REST = re.compile(r"[^<>]*+>?")
 #: The rest of an end tag split for a scrub: the whitespace XML allows after the name (its S
-#: production), anything else (which well-formed XML never has), and the ``>`` if there is one
-#: (BACKLOG #5925). The whitespace crosses a line break only where it runs to a ``>``, and the text
-#: ends at the next ``<`` or line break, so a bracketless tag loses at most the rest of its own line.
-_XML_END_TAG_PARTS = re.compile(r"([ \t]*+(?:[\r\n][ \t\r\n]*+(?=>))?)([^<>\r\n]*+)(>?)")
-#: How far past an end tag's kept span :func:`_end_tag_rest_kept` looks for a label, in characters.
+#: production) on the tag's own line, anything else up to the next ``<``, ``>`` or line break (which
+#: well-formed XML never has), and the ``>`` if there is one (BACKLOG #5925). So a bracketless tag
+#: loses at most the rest of its own line.
+_XML_END_TAG_PARTS = re.compile(r"([ \t]*+)([^<>\r\n]*+)(>?)")
+#: How far before an end tag's remainder, and past the span a kept one copies,
+#: :func:`_end_tag_rest_kept` looks for a label, in characters.
 _END_TAG_LABEL_WINDOW = 256
-#: What makes an end tag's remainder stay as it stands: a character a label or a credential shape
-#: carries (a key's ``:`` or ``=``, a userinfo ``@``, a DICOM tag's ``(``, a percent escape), a
-#: default HL7 separator, or a credential word read without one. It is deliberately wider than any
-#: one reader's pattern, so a label another pass or the credential filters read is never the text the
-#: scrub takes. The separators are there because a field run is read over a whole token: a scrub
-#: that took one left a token a later pass no longer read as a run, and the tag name in it, which
-#: the walk keeps, then stayed in view (``test_an_end_tag_scrub_redacts_at_least_what_main_did``
-#: found it on a record through two log handlers). A separator an MSH header declares counts too
-#: (:func:`_end_tag_label_pattern`).
-_END_TAG_LABEL_SHAPE = r"[:=@(%|^~&{}]|(?i:bearer|nonnumeric)"
+#: Anything near an end tag that keeps its remainder as it stands: every character but a word
+#: character, whitespace and the ``<``, ``>`` and ``/`` of tags, and the words a label is read by
+#: without one. A label, a credential shape, a quote, a bracket or a separator another reader needs
+#: is punctuation, so a scrub only ever runs where the text near it is words and tags.
+#:
+#: **Why so wide.** A narrower list of label characters lost values main kept out of view, at least
+#: these: a JSON ``"name":`` key BEFORE the end tag, whose bare value the placeholder's ``[`` then
+#: ended; the closing quote of a quoted credential that opened before it; a closing brace; and an HL7
+#: separator, whose loss left a token a later field run no longer read, so the tag name in it, which
+#: the walk keeps, printed on the second log handler's pass. The words are the anchors that carry no
+#: punctuation: a ``Bearer`` scheme, the credential backstop's opener, and every word
+#: :func:`_needs_widened_stage` screens on (``mrn``, :data:`_DICOM_LABEL_WORDS`), so the first stage
+#: never scrubs a trigger the widened stage needs (``tests/test_redaction.py`` pins that).
+_END_TAG_LABEL_SHAPE = re.compile(
+    r"[^\w\s</>]|(?i:bearer|nonnumeric|mrn|patient|medicalrecordlocator|responsibleperson)"
+)
 #: One part of a start tag after its name: whitespace, the tag's end, an attribute and the opening of
 #: its quoted value (the value itself is read by :data:`_XML_ATTR_VALUE`), or anything else.
 #:
@@ -1654,39 +1661,24 @@ def _xml_text(chunk: str, policy: int) -> str:
     return f"{chunk[:lead]}{_REDACTED}{chunk[len(chunk.rstrip()) :]}"
 
 
-@lru_cache(maxsize=16)
-def _end_tag_label_pattern(delimiters: frozenset[str]) -> re.Pattern[str]:
-    """:data:`_END_TAG_LABEL_SHAPE` with the separators a text's MSH headers declare added."""
-    extra = "".join(re.escape(delimiter) for delimiter in sorted(delimiters))
-    return re.compile(_END_TAG_LABEL_SHAPE.format(extra))
+def _end_tag_rest_kept(hits: list[int], start: int, end: int) -> bool:
+    """Whether the end-tag remainder from ``start`` to ``end`` (the span a kept one copies) stays as
+    it stands (BACKLOG #5925): an :data:`_END_TAG_LABEL_SHAPE` match starts within
+    :data:`_END_TAG_LABEL_WINDOW` characters of it, either side, ``hits`` being where each match in
+    the text starts. The window crosses ``<`` and line breaks, since a reader's label or value can
+    sit across either.
 
-
-def _end_tag_rest_kept(text: str, start: int, hits: list[int], *, widened_trigger: bool) -> bool:
-    """Whether the end-tag remainder starting at ``start`` stays as it stands (BACKLOG #5925): a label
-    shape (``hits``, where each :func:`_end_tag_label_pattern` match in ``text`` starts) begins in the
-    remainder or in the :data:`_END_TAG_LABEL_WINDOW` characters past the span a kept one copies, or,
-    where ``widened_trigger`` says the text holds a :func:`_needs_widened_stage` trigger (first stage
-    only), that window holds one. The window crosses ``<`` and line breaks, since a reader's value can
-    sit after either.
-
-    **Hits are found once per call, not once per end tag.** A window searched per tag cost about 0.26 s
-    on a 64 KiB run of ``</a b`` against 0.05 s before #5925, on the event loop. A match that starts
-    in the window and runs past its end counts, which keeps more than a search of the window would.
-    The widened screen runs per window only when the whole text has a trigger: a scrub inserts only the
-    placeholder, so it cannot take a trigger away from a text that has none."""
-    rest = _XML_END_TAG_REST.match(text, start)
-    end = (rest.end() if rest is not None else start) + _END_TAG_LABEL_WINDOW
-    i = bisect_left(hits, start)
-    if i < len(hits) and hits[i] < end:
-        return True
-    return widened_trigger and _needs_widened_stage(text[start:end])
+    **Hits are found once per call, not once per end tag.** A window searched per tag cost about
+    0.26 s on a 64 KiB run of ``</a b``, against 0.05 s before #5925, on the event loop."""
+    i = bisect_left(hits, start - _END_TAG_LABEL_WINDOW)
+    return i < len(hits) and hits[i] < end + _END_TAG_LABEL_WINDOW
 
 
 def _scrub_xml_element(
-    text: str, match: re.Match[str], last_close: dict[str, int], kept: Callable[[int], bool]
+    text: str, match: re.Match[str], last_close: dict[str, int], kept: Callable[[int, int], bool]
 ) -> tuple[str, int]:
-    """``(replacement, end)`` for the vocabulary element starting at ``match``; ``kept(start)`` says
-    whether an end tag's remainder starting there stays (:func:`_end_tag_rest_kept`)."""
+    """``(replacement, end)`` for the vocabulary element starting at ``match``; ``kept(start, end)``
+    says whether an end tag's remainder over that span stays (:func:`_end_tag_rest_kept`)."""
     out = [match.group()]
     policy = _VALUE_TOP if match.group(2) in _PHI_VALUE_KEYS else _LEAF
     pos, how, attributed = _walk_xml_tag(text, match.end(), policy, out)
@@ -1712,13 +1704,13 @@ def _scrub_xml_element(
         qname = tag.group(2)
         if tag.group(1):  # an end tag: close back to the element it names, if it is open at all
             out.append(tag.group())
+            rest = _XML_END_TAG_REST.match(text, tag.end())
+            pos = rest.end() if rest is not None else tag.end()
             parts = _XML_END_TAG_PARTS.match(text, tag.end())
-            if parts is not None and parts.group(2) and not kept(parts.start(2)):
+            if parts is not None and parts.group(2) and not kept(parts.start(2), pos):
                 pos = parts.end()
                 out.append(f"{parts.group(1)}{_REDACTED}{parts.group(3)}")
             else:  # as before #5925: the remainder, to the next ``<`` or ``>``, as it stands
-                rest = _XML_END_TAG_REST.match(text, tag.end())
-                pos = rest.end() if rest is not None else tag.end()
                 out.append(text[tag.end() : pos])
             if open_names.get(qname):
                 while stack:
@@ -1739,7 +1731,7 @@ def _scrub_xml_element(
     return "".join(out), pos
 
 
-def _redact_xml_elements(text: str, *, widened: bool) -> str:
+def _redact_xml_elements(text: str) -> str:
     """Scrub the content and attribute values of every vocabulary element in an XML payload -- FHIR's
     ``<family value="..."/>``, a text-content ``<family>...</family>``, with or without a namespace
     prefix -- keeping every tag name, and inside ``<identifier>``/``<telecom>`` keeping everything but
@@ -1754,19 +1746,19 @@ def _redact_xml_elements(text: str, *, widened: bool) -> str:
     with whitespace) or ``<family>(Van`` (opening with punctuation) reads as prose, and the fragment
     before the cut survives. A closed element is always scrubbed, whatever its text opens with.
 
-    **Text after an end tag's name is scrubbed, but not where it could hold a label another reader
-    needs** (BACKLOG #5925). A scrub could take the label and leave its value: ``</family {"name":
-    "<Zqxa"}`` lost the ``"name":`` key only the widened stage reads, and ``</family password:
-    <secret>`` the label the credential filters after this module read. So each end tag decides for
-    itself (:func:`_end_tag_rest_kept`): where its remainder, or a window past it, holds a character
-    or word a label carries, the remainder stays as it stood before #5925; only a remainder with none
-    of those near it is scrubbed. The decision is local, so a credential elsewhere in the text keeps
-    no other end tag's remainder. A kept remainder is the residual: ``</family Zqxa> id=7``
-    keeps ``Zqxa``, as it did before #5925. ``test_an_end_tag_scrub_redacts_at_least_what_main_did``
-    compares this against the walk as it stood before #5925, through :func:`redact` and the log
-    filter chain; it measures the generated inputs it runs, and is not a proof. An element only a
-    malformed end tag would close is still read as prose, as before #5925: ``<family> Smith</family
-    Johnathan>`` keeps both names."""
+    **Text after an end tag's name is scrubbed, but only where the text near it is words and tags**
+    (BACKLOG #5925). A scrub could take a label and leave its value: ``</family {"name": "<Zqxa"}``
+    lost the ``"name":`` key only the widened stage reads, and ``</family password: <secret>`` the
+    label the credential filters after this module read. So each end tag decides for itself
+    (:func:`_end_tag_rest_kept`): where anything but words and tags (:data:`_END_TAG_LABEL_SHAPE`)
+    sits within a window either side of its remainder, the remainder stays as it stood before #5925.
+    The decision is local, so a credential elsewhere in the text keeps no other end tag's
+    remainder. A kept remainder is the residual: ``</family Zqxa> id=7`` keeps ``Zqxa``, as it did
+    before #5925. ``test_an_end_tag_scrub_redacts_at_least_what_main_did`` compares this against
+    the walk as it stood before #5925, through :func:`redact`, the log paths and the credential
+    filter; it measures the generated inputs it runs, and is not a proof. An element only a
+    malformed end tag would close is still read as prose, as before #5925: ``<family>
+    Smith</family Johnathan>`` keeps ``Johnathan``."""
     if "<" not in text:
         return text
     out: list[str] = []
@@ -1774,16 +1766,13 @@ def _redact_xml_elements(text: str, *, widened: bool) -> str:
     #: Where the LAST end tag of each vocabulary name starts, built on the first match: whether an
     #: element closes anywhere later is then one lookup, not a search to the end of the text.
     last_close: dict[str, int] | None = None
-    #: The label-shape starts and the widened screen, read on the first malformed end tag only.
-    labels: list[tuple[list[int], bool]] = []
+    #: Where each :data:`_END_TAG_LABEL_SHAPE` match starts, found on the first malformed end tag.
+    hits: list[list[int]] = []
 
-    def kept(start: int) -> bool:
-        if not labels:
-            pattern = _end_tag_label_pattern(_sniff_delimiters(text))
-            hits = [hit.start() for hit in pattern.finditer(text)]
-            labels.append((hits, not widened and _needs_widened_stage(text)))
-        hits, trigger = labels[0]
-        return _end_tag_rest_kept(text, start, hits, widened_trigger=trigger)
+    def kept(start: int, end: int) -> bool:
+        if not hits:
+            hits.append([hit.start() for hit in _END_TAG_LABEL_SHAPE.finditer(text)])
+        return _end_tag_rest_kept(hits[0], start, end)
 
     while (match := _XML_PHI_ELEMENT.search(text, pos)) is not None:
         if last_close is None:
@@ -1809,7 +1798,7 @@ def _redact_structured(text: str, *, widened: bool) -> str:
     body = _redact_json_fields(body, widened=widened)
     body = _redact_dicom_tags(body, widened=widened)
     body = _redact_dicom_labels(body, widened=widened)
-    return _redact_xml_elements(body, widened=widened) + tail
+    return _redact_xml_elements(body) + tail
 
 
 def redact(text: str) -> str:
