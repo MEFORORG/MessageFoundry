@@ -241,21 +241,24 @@ This amendment records a code change. Decision 1's text is left as written, so a
 its statements no longer match the code; where they disagree, this amendment holds:
 
 - **"UDP detects nothing" is now too strong.** The UDP arm uses the same failure-tracking handler
-  as TCP and TLS, so a `sendto` that returns an error, such as no route to the collector, is now
-  counted as a failed send: spooled with a spool, counted as unsent without one, as on TCP and
-  TLS. Unlike a stream socket, the UDP socket is kept, not reset. Not every loss on this host is detected:
+  as TCP and TLS, so a `sendto` that raises a network error on this host, such as `ENETUNREACH`,
+  is now counted as a failed send: spooled with a spool, counted as unsent without one, as on TCP
+  and TLS. A datagram too large to send (`EMSGSIZE`) is not one of these; the next bullet covers
+  it. Unlike a stream socket, the UDP socket is kept, not reset. Not every loss on this host is detected:
   a datagram the kernel drops after `sendto` reported success is not. On Linux that can include a
   full local transmit queue or a neighbour address that never resolves (reasoned from the kernel,
   not measured). Nor is a datagram that leaves this host and never reaches the collector, which
   includes every datagram to a collector that is down. Delivery over UDP stays unconfirmed.
 - **A send error that is not a network error is now undeliverable on UDP too**, not only on TCP
   and TLS. So is a datagram too large to send (`EMSGSIZE`), which fails the same way on every
-  retry. Neither is ever counted as sent.
+  retry. Neither is ever counted as sent: each is counted in `undeliverable`, is never spooled,
+  and never sets `send_failing`.
 - **With a spool, a UDP collector whose name lookup fails for a temporary reason at start is now
   deferred**, as a TCP or TLS collector that is not reachable yet is, instead of the process
   running with no forwarder. A name that does not exist is still permanent.
 
 On every arm the standard library's traceback to stderr on a failed send is gone. Outside the
-shutdown drain, a throttled ERROR line with no record content reports failed sends instead; a
-send that fails during the drain gets no line. The counts each case moves are stated for
+shutdown drain, a throttled ERROR line with no record content reports network send errors
+instead; a network send error during the drain gets no line. An undeliverable record gets its
+own throttled ERROR line, during the drain too. The counts each case moves are stated for
 operators in [`docs/CONFIGURATION.md`](../CONFIGURATION.md) `[logging]`.

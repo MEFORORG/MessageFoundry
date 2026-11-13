@@ -1114,11 +1114,15 @@ class LogForwarderInfo(BaseModel):
     :class:`~messagefoundry.logging_setup.ForwarderStatus`. Under engine shards each process has
     its own forwarder, and this is the one that answered.
 
-    **A UDP forwarder is never ``healthy``.** Over UDP only a send that fails on this host is counted
-    (BACKLOG #5923), so the engine cannot see a record lost on the wire. ``delivery_confirmed`` is
-    then ``False``, and a forwarder with no fault seen reads ``unconfirmed``. A local send failure
-    raises ``send_failing``; it reaches ``lost`` only where nothing kept the record (no spool, or a
-    datagram too large to send), and a spool that took it holds it unsent.
+    **A UDP forwarder is never ``healthy``.** Over UDP only a send that raises an error on this host
+    is counted (BACKLOG #5923), so the engine cannot see a record lost on the wire.
+    ``delivery_confirmed`` is then ``False``, and a forwarder with no fault seen reads
+    ``unconfirmed``. A send that raises a network error, such as ``ENETUNREACH``, sets
+    ``send_failing``; it reaches ``lost`` only where nothing kept the record, as ``unsent`` with no
+    spool or as ``spool_dropped`` when the spool refused it, and a spool that took the record holds
+    it unsent. A datagram too large to send (``EMSGSIZE``) never sets
+    ``send_failing``: it is dropped as undeliverable, never spooled, and counted in
+    ``undeliverable``, so in ``lost``.
 
     **Counts and fixed words only**: never a record, a collector address or an error text."""
 

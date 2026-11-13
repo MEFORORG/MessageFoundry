@@ -1368,8 +1368,8 @@ def test_the_udp_arm_is_the_flagged_handler_so_the_listener_reads_its_failures()
 def test_a_failed_udp_send_keeps_the_spooled_record_instead_of_deleting_it(
     spool_dir: Path,
 ) -> None:
-    """A local ``sendto`` failure (no route, a down interface) must not read as delivered: replay
-    would then advance past the entry and delete spooled log evidence that never left."""
+    """A ``sendto`` that raises a network error (``ENETUNREACH`` here) must not read as delivered:
+    replay would then advance past the entry and delete spooled log evidence that never left."""
     spool = LogSpool(spool_dir, max_bytes=1_000_000)
     spool.open()
     target, fwd = _udp_forwarder(spool)
@@ -1470,10 +1470,8 @@ def test_handle_error_logs_nothing_itself(
     capsys: pytest.CaptureFixture[str],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """``handleError`` runs under the target's lock. A log call from there would take the queue
-    handler's lock in the opposite order to ``logging.shutdown``, which holds that lock across
-    ``close``, and a failed send during the shutdown drain would deadlock the process at exit. It
-    only records the cause; the listener reports after the send returns."""
+    """``handleError`` runs under the target's lock, mid-send, so it logs nothing. It only
+    records the cause; the listener reports after the send returns, throttled."""
     monkeypatch.setattr(logging, "raiseExceptions", True)
 
     def _failing(self: Any) -> None:
@@ -1530,3 +1528,74 @@ def test_a_failed_send_during_the_shutdown_drain_does_not_deadlock() -> None:
     # (about 11 s here), and would be left running.
     assert fwd._listener._thread is None, "the listener did not stop cleanly"
     assert time.monotonic() - started < 5.0
+
+
+class _GatedDatagramSocket(_FailingDatagramSocket):
+    """A UDP socket whose ``sendto`` waits for ``gate`` before raising, so the send is in flight
+    when the test's shutdown takes the queue handler's lock."""
+
+    def __init__(self, error: OSError, gate: threading.Event) -> None:
+        super().__init__(error)
+        self.gate = gate
+        self.entered = threading.Event()
+
+    def sendto(self, data: bytes, _address: Any) -> int:
+        self.entered.set()
+        self.gate.wait(10.0)
+        return super().sendto(data, _address)
+
+
+class _ReportSeen(logging.Handler):
+    """Sets ``event`` when the forwarder's own send report reaches the root logger."""
+
+    def __init__(self, event: threading.Event) -> None:
+        super().__init__(logging.ERROR)
+        self.event = event
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.getMessage().startswith("off-box log forwarding"):
+            self.event.set()
+
+
+@pytest.mark.timeout(60)  # a regression parks the listener for the whole join; fail it, not hang
+@pytest.mark.parametrize("error", [errno.EMSGSIZE, errno.ENETUNREACH])
+def test_a_send_report_raised_while_shutdown_holds_the_lock_does_not_park_the_listener(
+    error: int,
+) -> None:
+    """What ``logging.shutdown`` does while a send is in flight: hold the queue handler's lock,
+    then close it. The send then fails, and the listener reports it, EMSGSIZE as undeliverable and
+    a network error as a failed send, before or after the drain deadline is set. That report comes
+    back to this queue handler through the root logger, and must not wait on the lock shutdown
+    holds, or close() returns only once the join gives up (about 11 s) with the listener running.
+    """
+    gate = threading.Event()
+    target = _build_syslog_handler(SyslogForward(host="127.0.0.1", port=9, protocol="udp"))
+    gated = _GatedDatagramSocket(OSError(error, "failed"), gate)
+    _swap_socket(target, gated)
+    fwd = _build_queued_forwarder(target, fmt="text", spool=None)
+    reported = threading.Event()
+    seen = _ReportSeen(reported)
+    root = logging.getLogger()
+    # The witness goes on root ahead of the queue handler, so it sees the report before the report
+    # reaches the queue handler's lock.
+    root.addHandler(seen)
+    root.addHandler(fwd)
+    try:
+        fwd.handle(logging.makeLogRecord({"msg": "one", "levelname": "WARNING"}))
+        assert gated.entered.wait(10.0), "the listener never sent the record"
+        fwd.acquire()
+        try:
+            gate.set()  # the send fails now, with shutdown's lock held
+            # The report runs before close() sets the drain deadline: the window the deadline
+            # guard on the failed-send report cannot cover.
+            assert reported.wait(10.0), "the listener never reported the failed send"
+            started = time.monotonic()
+            fwd.close()
+            elapsed = time.monotonic() - started
+        finally:
+            fwd.release()
+    finally:
+        root.removeHandler(fwd)
+        root.removeHandler(seen)
+    assert fwd._listener._thread is None, "the listener did not stop cleanly"
+    assert elapsed < 1.0, f"close() took {elapsed:.1f}s"

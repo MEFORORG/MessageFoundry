@@ -7816,7 +7816,7 @@ which can skip numbers. All the pairs are checked in one walk of the chain, whic
 copy they came from.** A pair is only as authentic as the collector's record of it, and a forwarder
 hop that drops lines loses witnesses. The forwarder counts some losses on `GET /status` and in
 `log_forward_failed`, at least what its queue and spool drop and, over TCP or TLS, what a failed
-send costs, and over UDP what a send that fails on this host costs (BACKLOG #5923). At least these are counted nowhere there: a datagram lost over UDP, bytes a TCP
+send costs, and over UDP what a send that raises an error on this host costs (BACKLOG #5923). At least these are counted nowhere there: a UDP datagram lost after its send returned, bytes a TCP
 collector's reset loses after a send returned, and, with no spool configured or with the spool
 full, records still queued at the shutdown drain deadline, which only a log line reports. With a
 spool that has room they are kept and sent after the next start, and a log line gives a floor on
@@ -7862,7 +7862,7 @@ to the forwarded stream as to stdout (see [PHI.md §7](PHI.md#7-logging--phi-red
   default), a record the collector does not take is kept on disk and sent in order when it answers,
   so an outage no longer loses evidence up to the cap. It is **best effort, not at least once**: after
   a collector reset the first send on the dead connection can be lost, a restart can resend up to one
-  segment (12.5 MB at the default cap), and over UDP only a send that fails on this host is detected
+  segment (12.5 MB at the default cap), and over UDP only a send that raises an error on this host is detected
   (a datagram to a collector that is down is not; ADR 0200, BACKLOG #5923). With a spool, a collector down at
   start is retried rather than skipped. The spool is fed after the PHI, credential and
   control-character filters, so it holds only filtered text. It is plaintext, PL-1 like the app log.

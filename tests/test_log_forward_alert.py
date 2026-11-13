@@ -184,8 +184,8 @@ def test_a_healthy_forwarder_reads_healthy() -> None:
 
 
 def test_a_udp_forwarder_is_never_called_healthy(monkeypatch: pytest.MonkeyPatch) -> None:
-    # UDP sees only a send that fails on this host, so "no fault seen" is not "the collector has
-    # the records".
+    # UDP sees only a send that raises an error on this host, so "no fault seen" is not "the
+    # collector has the records".
     udp = SyslogForward(host="collector.invalid", port=514)
     assert udp.protocol == "udp"  # the default, which is why the reading must be honest
     built = _Collector()

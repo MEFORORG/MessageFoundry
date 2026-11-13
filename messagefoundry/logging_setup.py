@@ -979,8 +979,7 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         **It never calls the stdlib** ``handleError`` (BACKLOG #5923), which writes a traceback, the
         call stack and the record's message and arguments to stderr on every failed send, outside
         every log control, unless the process-wide ``logging.raiseExceptions`` is off. It logs
-        nothing itself: it runs under this handler's lock, and a log call from here would take the
-        queue handler's lock in the opposite order to ``logging.shutdown``. It leaves
+        nothing itself, since it runs under this handler's lock, mid-send. It leaves
         :attr:`send_error_cause` for :meth:`_ForwardQueueListener._send`, which reports once the
         send has returned, throttled and with no record content.
         """
@@ -1203,10 +1202,12 @@ def _build_syslog_handler(
     it behind :class:`_ForwardQueueHandler`, which is what keeps the send off the caller's thread.
 
     **The UDP arm is a** :class:`_TimeoutSysLogHandler` **too** (BACKLOG #5923), with no timeout.
-    The plain stdlib handler carried no failure flag, so the listener counted a local ``sendto``
-    failure (no route, a down interface) as delivered, and with a spool behind it replay deleted
-    the spooled entry unsent. The spool is kept on UDP: it holds what the drain deadline spooled
-    at stop. A datagram to a collector that is down still raises nothing, which no flag can see.
+    The plain stdlib handler carried no failure flag, so the listener counted a ``sendto`` that
+    raised on this host (``ENETUNREACH``, for example) as delivered, and with a spool behind it
+    replay deleted the spooled entry unsent. The spool is kept on UDP: it holds at least what the
+    drain deadline spooled at stop and what a network send error left unsent. A datagram to a
+    collector that is down still raises nothing, which no flag can see, and neither does one this
+    host drops after ``sendto`` returned.
 
     ``defer_connect`` (BACKLOG #1966, set when a spool is behind the handler) absorbs a failed
     startup connect instead of raising it: the handler is returned unconnected, carrying the error
@@ -1228,9 +1229,10 @@ def _build_syslog_handler(
             timeout=_FORWARD_TCP_TIMEOUT,
             defer_connect=defer_connect,
         )
-    # A UDP createSocket connects nothing, so only a lookup can fail here. With a spool, a lookup
-    # that failed for a temporary reason is deferred as on the stream arms; a name that does not
-    # exist still raises (is_permanent_connect_error).
+    # A UDP createSocket connects nothing, but it can still raise an OSError, at least for a failed
+    # name lookup. Without a spool every such error raises. With one, every such error is deferred
+    # as on the stream arms except a name that does not exist (EAI_NONAME, or 11001 on Windows),
+    # which still raises (is_permanent_connect_error).
     return _TimeoutSysLogHandler(
         address=(forward.host, forward.port),
         socktype=socket.SOCK_DGRAM,
@@ -1501,10 +1503,10 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
             last = self._last_send_failure_report
             # Throttled for the same reason as the report above. The count is a running total, so
             # failures inside the window are in the next report's figure rather than lost. Not
-            # during the shutdown drain: logging.shutdown holds the queue handler's lock across
-            # close(), so a report then would park this thread until the join gave up on it.
-            # ERROR, not WARNING, so it survives [logging].level = "ERROR", as the stdlib's stderr
-            # traceback did.
+            # during the shutdown drain: the queue handler has stopped accepting by then, so the
+            # report could not reach the collector. (It could not park this thread either: the
+            # queue handler's handle() takes no lock, BACKLOG #5923.) ERROR, not WARNING, so it
+            # survives [logging].level = "ERROR", as the stdlib's stderr traceback did.
             if self._drain_deadline is None and (
                 last is None or now - last >= _FORWARD_DROP_REPORT_INTERVAL
             ):
@@ -1766,6 +1768,23 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
         """The handlers on the far side of the queue — the syslog forwarder itself."""
         return tuple(self._listener.handlers)
 
+    def handle(self, record: logging.LogRecord) -> bool:
+        """``Handler.handle`` without the handler lock (BACKLOG #5923).
+
+        ``logging.shutdown`` holds this handler's lock across :meth:`close`, which joins the
+        listener thread. A report the listener logs during that join (a failed or undeliverable
+        send) reaches this handler through the root logger, and under the stdlib ``handle`` it
+        would wait on that lock until the join gave up, leaving the listener running and the tail
+        unsent. Nothing here needs the lock: the filters run outside it in the stdlib too,
+        ``put_nowait`` is thread-safe, and the drop counters carry their own lock."""
+        rv = self.filter(record)
+        if isinstance(rv, logging.LogRecord):
+            record = rv
+        if rv:
+            self.emit(record)
+        # bool, as typeshed declares it; the stdlib returns the record, and no caller here reads it.
+        return bool(rv)
+
     def enqueue(self, record: logging.LogRecord) -> None:
         """Hand ``record`` to the listener, or **count and report** it when the queue is full.
 
@@ -2026,8 +2045,9 @@ class ForwarderStatus:
     #: Whether a send that does not reach the collector is visible here at all. ``False`` over
     #: UDP, where a datagram to a dead collector raises nothing: ``send_failing``, ``unsent`` and
     #: so ``lost`` can then stay at zero while every record is lost on the wire. What the engine
-    #: can see there is what fails on this host (BACKLOG #5923): at least a ``sendto`` error (no
-    #: route, a down interface), a datagram too large to send, and queue and spool losses.
+    #: can see there is at least a ``sendto`` that raises on this host (BACKLOG #5923), and queue
+    #: and spool losses. A network error such as ``ENETUNREACH`` sets ``send_failing``; a datagram
+    #: too large to send (``EMSGSIZE``) is counted in ``undeliverable`` and never sets ``send_failing``.
     delivery_confirmed: bool = True
     #: Whether the last send hit a network error. Also true from a deferred start, where the
     #: connect failed, until the first good send. A spool keeps the records while it has room.
