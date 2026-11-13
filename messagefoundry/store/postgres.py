@@ -11781,11 +11781,17 @@ class PostgresStore:
             )
 
         async def write(updates: Sequence[StripUpdate]) -> list[StripUpdate]:
-            # Each row is written only while it is unpruned, holds the exact stored cell the batch
-            # read and is not in flight, so a purge, key rotation or replay committed in between
-            # wins.
+            # The guard is document_strip's (its module docstring states what it covers).
             landed: list[StripUpdate] = []
             async with self._timed_acquire() as conn, conn.transaction():
+                # Statements here read committed data only, so the in-flight NOT EXISTS alone could
+                # pass for a row a replay re-pends before this transaction commits. FOR SHARE on the
+                # batch's queue rows makes such a replay wait for the commit (document_strip says
+                # why that suffices).
+                await conn.execute(
+                    "SELECT 1 FROM queue WHERE message_id = ANY($1::text[]) ORDER BY id FOR SHARE",
+                    [u.message_id for u in updates],
+                )
                 for u in updates:
                     tag = await conn.execute(
                         "UPDATE messages SET raw=$1, documents_pruned=$2"

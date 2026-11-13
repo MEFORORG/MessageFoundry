@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import sqlite3
+import sys
 import threading
 from collections.abc import AsyncIterator, Callable
 from typing import Any
@@ -39,6 +40,8 @@ from messagefoundry.parsing import binary
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.retention import RetentionRunner
 from messagefoundry.store import MessageStore, document_strip
+from messagefoundry.store.cell_tag import CellTagError
+from messagefoundry.store.crypto import CipherUnavailableError, IdentityCipher
 from messagefoundry.store.document_strip import StripResult
 from messagefoundry.store.store import OutboxStatus
 
@@ -533,6 +536,83 @@ async def test_a_pass_that_fails_part_way_logs_what_it_had_committed(
     [record] = [r for r in caplog.records if "failed part way" in r.getMessage()]
     assert "1 documents in 1 messages" in record.getMessage()
     assert DOC.decode()[:20] not in record.getMessage()
+
+
+async def test_a_failed_audit_of_refused_cells_still_logs_what_was_committed(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5651: when auditing the refused cells, the pass's last step, raises after its
+    batches committed, the part-way WARNING still names what was stripped, and the error
+    propagates."""
+    mid = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=0.0, control="C-AUD")
+
+    async def broken_report(*_args: Any) -> None:
+        raise RuntimeError("synthetic audit failure")
+
+    backend = sys.modules[type(store).__module__]
+    monkeypatch.setattr(backend, "report_cell_tag_failures", broken_report)
+
+    with (
+        caplog.at_level(logging.WARNING, logger="messagefoundry.store.document_strip"),
+        pytest.raises(RuntimeError, match="synthetic audit"),
+    ):
+        await store.strip_embedded_documents(
+            older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+        )
+
+    assert binary.is_document_tombstone((await _get(store, mid))["raw"])
+    [record] = [r for r in caplog.records if "failed part way" in r.getMessage()]
+    assert "1 documents in 1 messages" in record.getMessage()
+
+
+async def test_a_key_service_outage_stops_the_pass(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5651: a decrypt the key service gave no verdict on ends the pass at the first row,
+    rather than failing, and timing out, once per row."""
+    for i in range(3):
+        await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=float(i), control=f"C-O{i}")
+    calls: list[str] = []
+
+    def unavailable(*_args: Any, message_id: str, **_kwargs: Any) -> str:
+        calls.append(message_id)
+        raise CipherUnavailableError("synthetic: the key service is unreachable")
+
+    monkeypatch.setattr(document_strip, "open_message_cell", unavailable)
+
+    with pytest.raises(CipherUnavailableError):
+        await store.strip_embedded_documents(
+            older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+        )
+
+    assert len(calls) == 1
+
+
+def test_a_refused_cell_is_returned_with_its_traceback_cleared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5651: a refused cell's error is returned, not raised, so its traceback is cleared;
+    its frames would otherwise keep the batch's bodies alive until the pass ends."""
+
+    def refused(*_args: Any, message_id: str, channel_id: str, **_kwargs: Any) -> str:
+        raise CellTagError("messages", "raw", message_id, channel_id)
+
+    monkeypatch.setattr(document_strip, "open_message_cell", refused)
+    rows = [{"id": "M-1", "channel_id": "IB", "raw": "sealed", "received_at": 0.0}]
+
+    updates, failures, unreadable = document_strip.transform_strip_batch(
+        IdentityCipher(),
+        rows,
+        now=PRUNED_AT,
+        older_than=1.0,
+        connection_cutoffs=None,
+        min_bytes=0,
+        content_types={},
+    )
+
+    assert (updates, unreadable) == ([], [])
+    [failure] = failures
+    assert failure.__traceback__ is None
 
 
 # --- AC-5: one audit row per pass via the runner, recording counts -------------

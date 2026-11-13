@@ -10255,9 +10255,8 @@ class SqlServerStore:
             )
 
         async def write(updates: Sequence[StripUpdate]) -> list[StripUpdate]:
-            # Each row is written only while it is unpruned, holds the exact stored cell the batch
-            # read and is not in flight, so a purge, key rotation or replay committed in between
-            # wins. The raw comparison pins a binary collation, and appends a sentinel to both
+            # The guard is document_strip's (its module docstring states what it covers). The raw
+            # comparison pins a binary collation, and appends a sentinel to both
             # sides because = ignores trailing spaces. Whether a row landed is read from OUTPUT,
             # which a session's SET NOCOUNT ON cannot hide, unlike rowcount. The comparand is cast
             # to NVARCHAR(MAX): a long string may bind as ntext, which supports neither + nor =.
@@ -10267,6 +10266,17 @@ class SqlServerStore:
             async with self._acquire() as conn:
                 try:
                     async with self._cursor(conn) as cur:
+                        # The in-flight NOT EXISTS alone reads committed data only, so it could
+                        # pass for a row a replay re-pends before this transaction commits. Update
+                        # locks, held to the commit, on the batch's queue rows make such a replay
+                        # wait for it (document_strip says why that suffices).
+                        marks = ", ".join("?" * len(updates))
+                        await cur.execute(
+                            "SELECT q.id FROM queue q WITH (UPDLOCK, HOLDLOCK)"
+                            f" WHERE q.message_id IN ({marks})",
+                            tuple(u.message_id for u in updates),
+                        )
+                        await cur.fetchall()
                         for u in updates:
                             await cur.execute(
                                 "UPDATE messages SET raw=?, documents_pruned=? OUTPUT inserted.id"

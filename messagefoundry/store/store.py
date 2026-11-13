@@ -21136,9 +21136,8 @@ class MessageStore:
                 return [dict(r) for r in await cur.fetchall()]
 
         async def write(updates: Sequence[StripUpdate]) -> list[StripUpdate]:
-            # Each row is written only while it is unpruned, holds the exact stored cell the batch
-            # read and is not in flight, so a purge, key rotation or replay committed in between
-            # wins.
+            # The guard is document_strip's (its module docstring states what it covers); SQLite's
+            # single writer holds the in-flight half without a lock.
             landed: list[StripUpdate] = []
             async with _writer_txn(self._db, self._lock):
                 for u in updates:
