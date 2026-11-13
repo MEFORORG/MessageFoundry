@@ -29,6 +29,7 @@ from messagefoundry.store.crypto import (
     AesGcmCipher,
     CipherError,
     CipherUnavailableError,
+    UnauthenticatedCipherError,
     generate_key,
     make_cipher,
 )
@@ -430,13 +431,16 @@ async def test_a_blanked_criteria_cell_answers_423_rather_than_widening(
     assert raised[-1].__context__ is None and raised[-1].__cause__ is None
 
 
-async def test_a_plain_cipher_error_on_the_criteria_answers_423_not_500(
+async def test_a_planted_unmarked_criteria_cell_is_an_audited_integrity_refusal(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #5523: ``open_tagged_cell`` re-raises a cipher error that is not a tag failure, here
-    the refusal of an unmarked value planted in a keyed store. It escaped as a 500. It is a 423 now,
-    naming no cipher detail and chaining nothing. A blanked cell in the same keyed store, which the
-    cipher passes through unopened, is refused too."""
+    """BACKLOG #5523, then #5650: an unmarked value planted in a keyed store's criteria cell escaped
+    as a 500, then answered 423 through the route's plain ``CipherError`` arm, unaudited. Since
+    #5650 ``open_tagged_cell`` raises ``UnmarkedCellError`` for it, so it takes the integrity arm:
+    a 423 naming no cipher detail, chaining nothing, and the tag-failed audit row. The route's
+    plain-refusal ERROR does not fire; the cipher's own refusal is its alert. A blanked cell in the
+    same keyed store, which the cipher passes through unopened, is refused too."""
+
     import sqlite3
 
     pytest.importorskip("psutil")
@@ -466,15 +470,16 @@ async def test_a_plain_cipher_error_on_the_criteria_answers_423_not_500(
             caplog.set_level(logging.WARNING, logger="messagefoundry.api.app")
             r = await c.get("/search/layered", params={"presets": pid}, headers=h)
             assert r.status_code == 423, r.text
-            opened = f"preset {pid} cannot be opened with the store's keys"
-            assert r.json()["detail"].startswith(opened)
+            assert r.json()["detail"] == (
+                f"preset {pid} failed its integrity check and cannot be used"
+            )
             assert "unmarked" not in r.text and "MRN999" not in r.text
             assert raised[-1].__context__ is None and raised[-1].__cause__ is None
-            logged = _layered_refusal_log(caplog)
-            assert [
-                rec.levelno for rec in logged if f"refused preset {pid}: " in rec.getMessage()
-            ] == [logging.ERROR]
-            assert all("MRN999" not in rec.getMessage() for rec in logged)
+            logged = [rec for rec in caplog.records if rec.name == "messagefoundry.api.app"]
+            assert not [rec for rec in logged if f"refused preset {pid}: " in rec.getMessage()]
+            assert all("MRN999" not in rec.getMessage() for rec in caplog.records)
+            audits = await store.list_audit(action=PRESET_TAG_FAILED_ACTION)
+            assert len(audits) == 1 and pid[:12] in (audits[0]["detail"] or ""), audits
 
             side.execute("UPDATE search_presets SET criteria='' WHERE id=?", (pid,))
             side.commit()
@@ -553,11 +558,12 @@ async def test_a_key_service_outage_on_the_criteria_answers_503_with_retry_after
 async def test_a_transit_refusal_on_the_criteria_is_logged_at_error(
     engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #5523: under Vault Transit a criteria cell planted across owners is refused as a
-    plain ``CipherError``, not a ``CellTagError``, so it writes no integrity audit row and raises
-    no alert, and its log record is the engine's only record of it. It is a 423, logged at ERROR
-    with the type name alone: no exception object, cipher text or criteria. The cipher raises the
-    error by hand, so this pins the route's arm, not how ``TransitCipher`` classifies a refusal."""
+    """BACKLOG #5523: a Transit refusal that is not the value's AEAD tag, a key-version refusal say,
+    stays a plain ``CipherError``, not a ``CellTagError``, so it writes no integrity audit row and
+    raises no alert, and its log record is the engine's only record of it. It is a 423, logged at
+    ERROR with the type name alone: no exception object, cipher text or criteria. The cipher raises
+    the error by hand, so this pins the route's arm, not how ``TransitCipher`` classifies a
+    refusal. Transit's AEAD refusal takes the integrity arm (BACKLOG #5650; the next test)."""
     refusal = CipherError("Transit decrypt refused (key='mf-store-secret'): MRN999")
     r, raised, pid = await _layered_with_decrypt_raising(engine, monkeypatch, caplog, refusal)
     assert r.status_code == 423, r.text
@@ -569,6 +575,33 @@ async def test_a_transit_refusal_on_the_criteria_is_logged_at_error(
     assert [(rec.levelno, rec.getMessage()) for rec in _layered_refusal_log(caplog)] == [
         (logging.ERROR, f"layered search refused preset {pid}: CipherError")
     ]
+
+
+async def test_a_transit_tag_refusal_on_the_criteria_is_an_audited_integrity_refusal(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5650: under Vault Transit, a criteria cell planted across owners fails its AEAD tag
+    inside Transit, which the cipher now raises as ``UnauthenticatedCipherError``. Before, a cipher
+    with no ``holds_key_for`` kept every error as is, so the route answered through its plain arm,
+    unaudited and unalerted. Now it is a ``CellTagError``: the integrity 423, chaining nothing, and
+    the tag-failed audit row. The decrypt is patched, as above, on a cipher with no
+    ``holds_key_for``, which is Transit's shape."""
+    refusal = UnauthenticatedCipherError("Transit decrypt failed (key='mf-store-secret'): MRN999")
+    # Transit only ever decrypts a marked value; the keyless cipher stands in, so it says so too.
+    assert isinstance(engine.store, MessageStore)
+    monkeypatch.setattr(engine.store._cipher, "is_encrypted", lambda _stored: True)
+    r, raised, pid = await _layered_with_decrypt_raising(engine, monkeypatch, caplog, refusal)
+    assert r.status_code == 423, r.text
+    assert r.json()["detail"] == f"preset {pid} failed its integrity check and cannot be used"
+    assert "mf-store-secret" not in r.text and "MRN999" not in r.text
+    assert raised[-1].__context__ is None and raised[-1].__cause__ is None
+    assert not [
+        rec
+        for rec in caplog.records
+        if rec.name == "messagefoundry.api.app" and "refused preset" in rec.getMessage()
+    ]
+    audits = await engine.store.list_audit(action=PRESET_TAG_FAILED_ACTION)
+    assert len(audits) == 1 and pid[:12] in (audits[0]["detail"] or ""), audits
 
 
 async def test_layered_search_feeds_the_summary_access_audit(engine: Engine) -> None:

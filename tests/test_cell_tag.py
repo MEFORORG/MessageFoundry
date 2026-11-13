@@ -29,6 +29,7 @@ from messagefoundry.store.cell_tag import (
     PRESET_TAG_FAILED_ACTION,
     CellTagError,
     CorruptCellError,
+    UnmarkedCellError,
     dead_letter_on_cell_tag,
     dead_letters_on_cell_tag,
     message_cell_aad,
@@ -44,7 +45,9 @@ from messagefoundry.store.cipher_cells import SQLITE_CIPHER_CELLS
 from messagefoundry.store.crypto import (
     AesGcmCipher,
     CipherError,
+    CipherUnavailableError,
     UnauthenticatedCipherError,
+    UnmarkedCipherError,
     aad_cell_name,
     cell_aad,
     generate_key,
@@ -354,38 +357,218 @@ async def test_the_handoff_wrapper_requires_a_keyword_only_routed_id() -> None:
 
 
 class _NoKeyringView:
-    """A cipher that, like Vault Transit, cannot say which keys it holds."""
+    """A cipher that, like Vault Transit, cannot say which keys it holds. ``fail``, when set, is
+    raised by every decrypt in place of the inner cipher's answer."""
 
     def __init__(self, inner: AesGcmCipher) -> None:
         self._inner = inner
         self.encrypts = True
+        self.fail: CipherError | None = None
 
     def decrypt(self, stored: str, *, aad: bytes | None = None) -> str:
+        if self.fail is not None:
+            raise self.fail
         return self._inner.decrypt(stored, aad=aad)
 
     def is_encrypted(self, stored: str) -> bool:
         return self._inner.is_encrypted(stored)
 
+    def report_tag_failure(self, table: str, reason: str) -> None:
+        self._inner.report_tag_failure(table, reason)
 
-def test_a_cipher_that_cannot_name_its_keys_keeps_its_own_error() -> None:
-    """Under such a cipher a failed open may be an unreachable provider, so it is not reported as an
-    integrity failure: the read still refuses, with the cipher's own error and no alert."""
+
+def test_a_cipher_that_cannot_name_its_keys_still_reports_its_own_tag_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5650. Such a cipher cannot say it holds the key a marker names, but its own
+    ``UnauthenticatedCipherError`` says the value's tag failed, which is what Vault Transit now
+    raises for its AEAD refusal. So a moved cell is a ``CellTagError``, alerted, as under a keyring.
+    Before, it kept the cipher's own error and raised no alert.
+
+    Control: an outage (``CipherUnavailableError``) and a key or format problem (plain
+    ``CipherError``) on the same cipher keep their own error, and raise no alert."""
+    monkeypatch.setattr(cell_tag, "_reported", {})  # an earlier report must not mute this one
     inner = make_cipher(generate_key(), write_v2=True)
     assert isinstance(inner, AesGcmCipher)
     seen: list[str] = []
     inner.set_tag_failure_hook(lambda table, reason: seen.append(reason))
     sealed = inner.encrypt("SYNTH", aad=message_cell_aad("raw", message_id="nk1", channel_id="A"))
-    with pytest.raises(CipherError) as refused:
+    view = _NoKeyringView(inner)
+    for kept in (
+        CipherUnavailableError("Transit decrypt failed (key='k'): ConnectionError"),
+        CipherError("Transit decrypt failed (key='k'): InvalidRequest"),
+    ):
+        view.fail = kept
+        with pytest.raises(CipherError) as refused:
+            open_message_cell(
+                view,  # type: ignore[arg-type]
+                "raw",
+                sealed,
+                message_id="nk1",
+                channel_id="B",
+            )
+        assert refused.value is kept and not seen
+    view.fail = None
+    with pytest.raises(CellTagError) as moved:
         open_message_cell(
-            _NoKeyringView(inner),  # type: ignore[arg-type]
+            view,  # type: ignore[arg-type]
             "raw",
             sealed,
             message_id="nk1",
             channel_id="B",
         )
-    assert not isinstance(refused.value, CellTagError) and not seen
-    with pytest.raises(CellTagError):  # control: the keyring itself names it a tag failure
-        open_message_cell(inner, "raw", sealed, message_id="nk1", channel_id="B")
+    assert moved.value.drift and not isinstance(moved.value, CorruptCellError)
+    assert isinstance(moved.value.__cause__, UnauthenticatedCipherError)
+    assert len(seen) == 1 and "nk1" in seen[0]
+
+
+def test_a_planted_unmarked_cell_is_drift_with_the_ciphers_alert_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5650. A non-blank unmarked value in a keyed store's tagged cell is refused by the
+    cipher, which fires its own refusal hook. ``open_tagged_cell`` used to re-raise that as a plain
+    ``CipherError``, so a list, a scope check or a handoff that contains only ``CellTagError``
+    escaped it. It is an ``UnmarkedCellError`` now: drift, so it is audited and contained, and no
+    second, ``integrity_drift``, alert fires. Under the Transit cipher too, which shares the seam.
+
+    Control: the blank value every purge writes still reads as itself."""
+    monkeypatch.setattr(cell_tag, "_reported", {})
+    cipher = make_cipher(generate_key(), write_v2=True)
+    assert isinstance(cipher, AesGcmCipher)
+    tagged: list[str] = []
+    unmarked: list[tuple[str, str]] = []
+    cipher.set_tag_failure_hook(lambda table, reason: tagged.append(reason))
+    cipher.set_refusal_hook(lambda table, column: unmarked.append((table, column)))
+    assert open_message_cell(cipher, "raw", "", message_id="um0", channel_id="A") == ""
+    for opener in (cipher, _NoKeyringView(cipher)):
+        unmarked.clear()
+        with pytest.raises(UnmarkedCellError, match="unmarked") as planted:
+            open_message_cell(
+                opener,  # type: ignore[arg-type]
+                "raw",
+                "MSH|^~\\&|PLANTED",
+                message_id="um1",
+                channel_id="A",
+            )
+        assert planted.value.drift and isinstance(planted.value, CellTagError)
+        assert isinstance(planted.value.__cause__, UnmarkedCipherError)
+        assert "PLANTED" not in str(planted.value)
+        assert unmarked == [("messages", "raw")] and not tagged  # one alert: the cipher's
+
+
+async def test_a_planted_unmarked_cell_is_audited_and_dead_lettered() -> None:
+    """BACKLOG #5650: the containment the plain ``CipherError`` skipped. A handoff dead-letters the
+    row and writes the tag-failed audit row, once."""
+    cipher = make_cipher(generate_key(), write_v2=True)
+
+    async def handoff(self: _DeadLetterSink, *, routed_id: str) -> bool:
+        open_message_cell(cipher, "raw", "PLANTED-UM2", message_id="um2", channel_id="A")
+        return True
+
+    sink = _DeadLetterSink()
+    assert await dead_letters_on_cell_tag(handoff)(sink, routed_id="r-um2") is False
+    assert sink.dead == ["r-um2"] and sink.audits == [MESSAGE_TAG_FAILED_ACTION]
+
+
+def test_transit_names_only_its_aead_refusal_unauthenticated() -> None:
+    """BACKLOG #5650: the Transit cipher's decrypt raises ``UnauthenticatedCipherError`` for Vault's
+    400 whose one reason is the AEAD's authentication failure, so ``open_tagged_cell`` reads a cell
+    planted across rows as drift. Controls: every other 400 (a key-version refusal, a malformed
+    ciphertext, a reason list that also holds another reason), a 403, a 404 and an outage keep
+    their own error; and encrypt never raises it."""
+    pytest.importorskip("hvac")
+    import requests
+    from hvac.exceptions import (  # type: ignore[import-untyped]
+        Forbidden,
+        InvalidPath,
+        InvalidRequest,
+    )
+
+    from messagefoundry.store.crypto_transit import TransitCipher
+
+    def raising(exc: Exception) -> Any:
+        def call(**_kw: Any) -> Any:
+            raise exc
+
+        return call
+
+    class _Transit:
+        def __init__(self) -> None:
+            self.decrypt_data: Any = None
+            self.encrypt_data: Any = None
+
+    class _Client:
+        def __init__(self, transit: _Transit) -> None:
+            self.secrets = type("S", (), {"transit": transit})()
+
+    transit = _Transit()
+    cipher = TransitCipher(_Client(transit), "mefor-store")
+    stored = "mfenc:v3:vault:v1:AAAA"
+    aead = "cipher: message authentication failed"
+    tag_refusals = [
+        InvalidRequest(errors=[aead]),
+        InvalidRequest(errors=["ChaCha20Poly1305: message authentication failed "]),
+        # A proxy that adds a charset leaves the JSON in the body, unparsed by hvac.
+        InvalidRequest(f'{{"errors":["{aead}"]}}', text=f'{{"errors":["{aead}"]}}'),
+    ]
+    for exc in tag_refusals:
+        transit.decrypt_data = raising(exc)
+        with pytest.raises(UnauthenticatedCipherError):
+            cipher.decrypt(stored, aad=b"cell")
+    kept = [
+        InvalidRequest(errors=["invalid key version"]),
+        InvalidRequest(errors=["ciphertext version is disallowed by policy (too old)"]),
+        InvalidRequest(errors=["invalid ciphertext: no prefix"]),
+        InvalidRequest(errors=[aead, "invalid key version"]),
+        InvalidRequest(errors=[]),
+        InvalidRequest(aead),  # the text alone, in no errors list, is not read
+        Forbidden(errors=[aead]),
+        InvalidPath(errors=[aead]),
+        requests.exceptions.ConnectionError("connection refused"),
+    ]
+    for exc in kept:
+        transit.decrypt_data = raising(exc)
+        with pytest.raises(CipherError) as refused:
+            cipher.decrypt(stored, aad=b"cell")
+        assert not isinstance(refused.value, UnauthenticatedCipherError), exc
+    transit.encrypt_data = raising(InvalidRequest(errors=[aead]))
+    with pytest.raises(CipherError) as sealing:
+        cipher.encrypt("SYNTH", aad=b"cell")
+    assert not isinstance(sealing.value, UnauthenticatedCipherError)
+
+    # End to end: Transit's AEAD refusal of a moved message cell is drift through open_tagged_cell.
+    transit.decrypt_data = raising(InvalidRequest(errors=[aead]))
+    with pytest.raises(CellTagError) as moved:
+        open_message_cell(cipher, "raw", stored, message_id="tr1", channel_id="B")
+    assert moved.value.drift and not isinstance(moved.value, CorruptCellError)
+    transit.decrypt_data = raising(InvalidRequest(errors=["invalid key version"]))
+    with pytest.raises(CipherError) as version:
+        open_message_cell(cipher, "raw", stored, message_id="tr1", channel_id="B")
+    assert not isinstance(version.value, CellTagError)
+
+
+def test_transit_batch_decrypt_names_an_aead_refusal_as_decrypt_does() -> None:
+    """BACKLOG #5650: a batch reply's per-value error gives the class a single decrypt gives it."""
+    from messagefoundry.store.crypto_transit import TransitCipher
+
+    class _Transit:
+        def decrypt_data(self, **_kw: Any) -> Any:
+            return {
+                "data": {
+                    "batch_results": [
+                        {"reference": "0", "error": "cipher: message authentication failed"},
+                        {"reference": "1", "error": "invalid key version"},
+                    ]
+                }
+            }
+
+    client = type("C", (), {"secrets": type("S", (), {"transit": _Transit()})()})()
+    cipher = TransitCipher(client, "mefor-store")
+    first, second = cipher.decrypt_many(
+        [("mfenc:v3:vault:v1:AAAA", b"a"), ("mfenc:v3:vault:v1:BBBB", b"b")]
+    )
+    assert isinstance(first, UnauthenticatedCipherError)
+    assert isinstance(second, CipherError) and not isinstance(second, UnauthenticatedCipherError)
 
 
 def test_a_failed_cell_is_reported_once_per_interval() -> None:

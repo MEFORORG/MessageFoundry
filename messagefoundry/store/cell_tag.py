@@ -24,7 +24,8 @@ the cipher's tag-failure hook. The store writes the audit row once the read has 
 transaction (:func:`audits_cell_tag`). A list-shaped read withholds the failed row's cells and keeps the
 row, so its plaintext columns still list and nothing is silently dropped. A corrupt cell under a held
 key raises :class:`CorruptCellError`: it is contained the same way, but only logged, since it is not
-drift.
+drift. An unmarked value the cipher refuses raises :class:`UnmarkedCellError`: drift, audited and
+contained, with the cipher's own refusal as its alert (BACKLOG #5650).
 
 **The store id.** No store id is minted yet, so every tag carries
 :data:`~messagefoundry.store.crypto.NO_STORE_ID`, as the queue tag does.
@@ -46,7 +47,9 @@ import annotationlib
 from messagefoundry.store.crypto import (
     NO_STORE_ID,
     CipherError,
+    CipherUnavailableError,
     UnauthenticatedCipherError,
+    UnmarkedCipherError,
     cell_aad,
 )
 from messagefoundry.store.queue_tag import is_tag_failure
@@ -64,6 +67,7 @@ __all__ = [
     "CellTagError",
     "CellTagSink",
     "CorruptCellError",
+    "UnmarkedCellError",
     "audits_cell_tag",
     "dead_letter_on_cell_tag",
     "dead_letters_on_cell_tag",
@@ -187,9 +191,13 @@ class CellTagError(CipherError):
     A subclass of :class:`CipherError`, so every path that already refuses an undecryptable cell
     refuses this one the same way. Names the cell and a short row-id prefix, never a row value."""
 
-    #: Whether this is tag drift: the cell was sealed for another row. Only drift raises the
-    #: ``integrity_drift`` alert and writes the tag-failed audit row.
+    #: Whether this is tag drift: the cell was sealed for another row, or changed outside the
+    #: store's writers. Only drift writes the tag-failed audit row and raises the
+    #: ``integrity_drift`` alert.
     drift: ClassVar[bool] = True
+    #: Whether the cipher already alerted and logged the refusal this error wraps, so
+    #: :func:`open_tagged_cell` raises no second alert and logs no second WARNING.
+    cipher_alerted: ClassVar[bool] = False
 
     def __init__(self, table: str, column: str, row_id: str, channel_id: str | None) -> None:
         if table not in _TAG_FAILED_ACTION:
@@ -226,6 +234,44 @@ class CorruptCellError(CellTagError):
         )
 
 
+class UnmarkedCellError(CellTagError):
+    """A non-blank unmarked value in a tagged cell of a keyed store, which the cipher refused
+    (:class:`~messagefoundry.store.crypto.UnmarkedCipherError`): a stripped marker or a planted row
+    (BACKLOG #5650). The store's writers never write one, so, like a cell sealed for another row,
+    it is a change made outside them.
+
+    It counts as drift, so it writes the tag-failed audit row and is contained as drift is: a list
+    withholds the row, a handoff dead-letters it. Its alert is the cipher's own unmarked-value
+    refusal, already raised when the cipher refused it, so :func:`open_tagged_cell` raises no
+    second, ``integrity_drift``, alert for it and logs no second WARNING."""
+
+    cipher_alerted = True
+
+    def _describe(self) -> str:
+        return (
+            f"integrity: the {self.table}.{self.column} cell of row {self.row_ref} holds an"
+            " unmarked value, which the store's writers never write"
+        )
+
+
+def _tag_failure_kind(cipher: Cipher, stored: str, exc: CipherError) -> type[CellTagError] | None:
+    """The :class:`CellTagError` class a failed open of ``stored`` raises, or ``None`` to keep the
+    cipher's own error: an outage, a key or a format problem."""
+    if isinstance(exc, CipherUnavailableError):
+        return None  # the key service gave no verdict, so nothing is known about the cell
+    if isinstance(exc, UnmarkedCipherError):
+        return UnmarkedCellError
+    if not is_tag_failure(cipher, stored):
+        return None
+    # Only a tag that failed under every held key can mean the cell was sealed elsewhere. A cipher
+    # that cannot name its keys (Vault Transit) still says when the value's own tag failed: its
+    # UnauthenticatedCipherError is Transit's AEAD refusal, and nothing else it raises is a corrupt
+    # row it can vouch for, so it keeps its own error there.
+    if isinstance(exc, UnauthenticatedCipherError):
+        return CellTagError
+    return CorruptCellError if callable(getattr(cipher, "holds_key_for", None)) else None
+
+
 def open_tagged_cell(
     cipher: Cipher,
     stored: str | None,
@@ -240,10 +286,14 @@ def open_tagged_cell(
     the cipher's own policy, as the store's ``_dec`` does.
 
     A marked value whose AEAD tag fails under a key this process holds (:func:`is_tag_failure`)
-    raises :class:`CellTagError` and raises the ``integrity_drift`` alert. Under such a key, a
-    corrupt row (bad base64, or a verified plaintext that is not UTF-8) raises
-    :class:`CorruptCellError`, which is contained the same way but is not drift. A key or format
-    problem raises the cipher's own error."""
+    raises :class:`CellTagError` and raises the ``integrity_drift`` alert. So does one the Vault
+    Transit cipher, which cannot name its keys, refuses with
+    :class:`~messagefoundry.store.crypto.UnauthenticatedCipherError` (BACKLOG #5650). Under a held
+    key, a corrupt row (bad base64, or a verified plaintext that is not UTF-8) raises
+    :class:`CorruptCellError`, which is contained the same way but is not drift. An unmarked value
+    the cipher refuses raises :class:`UnmarkedCellError`, with the cipher's own alert only. An
+    outage (:class:`~messagefoundry.store.crypto.CipherUnavailableError`), and a key or format
+    problem, raise the cipher's own error."""
     # Checked on every open, not only on a failure: a CellTagError for an unknown table would raise
     # ValueError instead, losing the alert and escaping every containment.
     if table not in _TAG_FAILED_ACTION:
@@ -253,17 +303,12 @@ def open_tagged_cell(
     try:
         return cipher.decrypt(stored, aad=aad)
     except CipherError as exc:
-        # Only an in-process keyring can say it holds the key a marker names. A cipher that cannot
-        # (Vault Transit) also wraps an unreachable provider in CipherError, so there a failure keeps
-        # the cipher's own error rather than reading as an integrity failure.
-        if not callable(getattr(cipher, "holds_key_for", None)) or not is_tag_failure(
-            cipher, stored
-        ):
+        kind = _tag_failure_kind(cipher, stored, exc)
+        if kind is None:
             raise
-        # Only a tag that failed under every held key can mean the cell was sealed elsewhere.
-        kind = CellTagError if isinstance(exc, UnauthenticatedCipherError) else CorruptCellError
         err = kind(table, column, row_id, channel_id)
-        _alert(cipher, err)
+        if not err.cipher_alerted:
+            _alert(cipher, err)
         raise err from exc
 
 

@@ -447,7 +447,8 @@ class _UnmarkedPolicy:
             _log.debug("cipher refusal hook raised; the refusal itself still stands")
 
     def _pass_unmarked(self, stored: str, aad: bytes | None, allow_unmarked: bool) -> str:
-        """Return an unmarked ``stored`` when policy permits it, else raise :class:`CipherError`."""
+        """Return an unmarked ``stored`` when policy permits it, else raise
+        :class:`UnmarkedCipherError`."""
         if not stored or allow_unmarked or self._allow_unmarked:
             return stored
         table, column = aad_cell_name(aad)
@@ -469,7 +470,7 @@ class _UnmarkedPolicy:
             "refused an unmarked value in cipher column %s.%s: %s; %s", table, column, cause, fix
         )
         self.report_unmarked(table, column)
-        raise CipherError(
+        raise UnmarkedCipherError(
             f"refused an unmarked value in cipher column {table}.{column} ({cause}); {fix}"
         )
 
@@ -646,8 +647,12 @@ class UnauthenticatedCipherError(CipherError):
     :class:`AesGcmCipher` raises it, and only it can mean the cell was sealed for another place:
     wrong associated data, or a key that is not supplied. Bad base64 and a verified plaintext that is
     not UTF-8 stay plain :class:`CipherError`, since they are a corrupt row, so
-    :func:`~messagefoundry.store.cell_tag.open_tagged_cell` never reads them as tag drift. The Vault
-    Transit cipher does not raise it; ``open_tagged_cell`` never reads a Transit failure as drift."""
+    :func:`~messagefoundry.store.cell_tag.open_tagged_cell` never reads them as tag drift.
+
+    The Vault Transit cipher raises it from ``decrypt`` and ``decrypt_many`` only for Vault's HTTP
+    400 whose reason is the AEAD's own authentication failure (BACKLOG #5650); every other Transit
+    failure, a key-version refusal, a 403 and a 404 among them, stays plain :class:`CipherError`,
+    and an outage is :class:`CipherUnavailableError`."""
 
 
 class CipherUnavailableError(CipherError):
@@ -671,6 +676,16 @@ class CipherUnavailableError(CipherError):
     only this module, can tell it apart: the upload routes answer it 503 with ``Retry-After``, where
     a refused value answers 423. Still a :class:`CipherError`, so every other caller handles it as
     it did before."""
+
+
+class UnmarkedCipherError(CipherError):
+    """A keyed cipher refused a non-blank unmarked value in a covered column: a stripped marker or
+    a planted row (BACKLOG #1169). Raised by the unmarked-value seam, which has already logged the
+    refusal and fired the refusal hook, so a reader that contains it raises no second alert
+    (BACKLOG #5650). Its own class, so
+    :func:`~messagefoundry.store.cell_tag.open_tagged_cell` can tell it from a key or format
+    problem without reading its text. The name keeps the ``CipherError`` token, as
+    :class:`UnauthenticatedCipherError`'s does."""
 
 
 class AuditKeyVersionRefusedError(CipherError):

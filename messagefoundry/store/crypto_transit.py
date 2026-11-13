@@ -68,6 +68,7 @@ from messagefoundry.store.crypto import (
     CipherItem,
     CipherUnavailableError,
     TransitSealRefused,
+    UnauthenticatedCipherError,
     _UnmarkedPolicy,
     b64_chars,
     batch_chars,
@@ -143,6 +144,32 @@ _NOT_VERSION_TEXTS = frozenset({"missing input for hmac", "encryption key not fo
 #: body would be parsed whole on the audit walk, and a MemoryError there would turn a row's break
 #: into a walk that could not run. A longer body is not read as a version refusal.
 _REPARSED_BODY_MAX_CHARS = 64 * 1024
+#: The texts Vault and OpenBao Transit answer a data-key ``decrypt`` with, lower-cased, when the
+#: value's AEAD tag does not verify under its associated data (BACKLOG #5650): Go's own AEAD error
+#: texts, ``crypto/cipher``'s GCM for ``aes256-gcm96`` and ``golang.org/x/crypto``'s
+#: ``chacha20poly1305`` for both ChaCha key types, the three
+#: :data:`~messagefoundry.store.keyprovider_vault.TRANSIT_KEY_TYPES_DATA` admits. Transit returns
+#: the error's text as the 400's one reason. Matched whole, never as a substring.
+_AEAD_FAILURE_TEXTS = frozenset(
+    {"cipher: message authentication failed", "chacha20poly1305: message authentication failed"}
+)
+
+
+def _reply_errors(exc: Exception) -> tuple[object, int | None]:
+    """A Vault error's ``errors`` value, and, when it went unread because the body is too long,
+    that body's length. hvac fills ``exc.errors`` only when the reply's Content-Type is exactly
+    ``application/json``, so a proxy that adds a charset leaves the same JSON in ``exc.text``;
+    that is parsed when hvac parsed no JSON (``exc.json`` is None) and the body is at most
+    :data:`_REPARSED_BODY_MAX_CHARS` long. Callers read only a list."""
+    errors: object = getattr(exc, "errors", None)
+    body: object = getattr(exc, "text", None)
+    if errors is None and getattr(exc, "json", None) is None and isinstance(body, str):
+        if len(body) > _REPARSED_BODY_MAX_CHARS:
+            return None, len(body)
+        parsed, refused = json_loads_or_refusal(body)
+        if refused is None and isinstance(parsed, dict):
+            errors = parsed.get("errors")
+    return errors, None
 
 
 def _names_no_version_reason(exc: Exception) -> bool:
@@ -161,21 +188,16 @@ def _names_no_version_reason(exc: Exception) -> bool:
     JSON in ``exc.text``; that is read the same way, but only when hvac parsed no JSON
     (``exc.json`` is None) and the body is at most :data:`_REPARSED_BODY_MAX_CHARS` long. A longer
     body is True, unparsed."""
-    errors: object = getattr(exc, "errors", None)
-    body: object = getattr(exc, "text", None)
-    if errors is None and getattr(exc, "json", None) is None and isinstance(body, str):
-        if len(body) > _REPARSED_BODY_MAX_CHARS:
-            # Too long to be Vault's own refusal, and never parsed (BACKLOG #6707).
-            log.warning(
-                "an audit MAC verify got a 400 whose %d-character body is past the %d-character "
-                "bound; not read as a version refusal",
-                len(body),
-                _REPARSED_BODY_MAX_CHARS,
-            )
-            return True
-        parsed, refused = json_loads_or_refusal(body)
-        if refused is None and isinstance(parsed, dict):
-            errors = parsed.get("errors")
+    errors, oversize = _reply_errors(exc)
+    if oversize is not None:
+        # Too long to be Vault's own refusal, and never parsed (BACKLOG #6707).
+        log.warning(
+            "an audit MAC verify got a 400 whose %d-character body is past the %d-character "
+            "bound; not read as a version refusal",
+            oversize,
+            _REPARSED_BODY_MAX_CHARS,
+        )
+        return True
     if not isinstance(errors, list):
         return True  # no errors list, so nothing in the reply is read
     texts = [text.strip().lower() for text in errors if isinstance(text, str)]
@@ -276,24 +298,47 @@ _VERSION_PROBE_BYTES = b"messagefoundry audit key version probe"
 _VERSION_PROBE_INPUT = base64.b64encode(_VERSION_PROBE_BYTES).decode("ascii")
 
 
-def _transit_failure(op: str, key: str, exc: Exception) -> CipherError:
+def _is_aead_failure_text(text: object) -> bool:
+    """Whether ``text`` is, whole once stripped and lower-cased, one of
+    :data:`_AEAD_FAILURE_TEXTS`."""
+    return isinstance(text, str) and text.strip().lower() in _AEAD_FAILURE_TEXTS
+
+
+def _names_aead_failure(exc: Exception) -> bool:
+    """Whether a data-key ``decrypt`` failure is Vault's HTTP 400 whose every reason is the AEAD's
+    own authentication failure (BACKLOG #5650): the value's tag did not verify under its
+    associated data. Only an ``errors`` list is read (:func:`_reply_errors`). Any other 400, a
+    key-version refusal or a malformed ciphertext among them, and any other status, is False."""
+    if not is_vault_bad_request(exc):
+        return False
+    errors, _oversize = _reply_errors(exc)
+    return isinstance(errors, list) and bool(errors) and all(map(_is_aead_failure_text, errors))
+
+
+def _transit_failure(op: str, key: str, exc: Exception, *, decrypting: bool = False) -> CipherError:
     """The error an ``encrypt`` or ``decrypt`` raises for ``exc``: :class:`CipherUnavailableError`
-    where Transit gave no verdict on the value, else plain :class:`CipherError` (BACKLOG #3734).
-    The audit HMAC keeps plain :class:`CipherError`; this split is for the data key alone.
+    where Transit gave no verdict on the value (BACKLOG #3734); for a ``decrypt`` (``decrypting``),
+    :class:`UnauthenticatedCipherError` where Vault refused the value's AEAD tag
+    (:func:`_names_aead_failure`, BACKLOG #5650); else plain :class:`CipherError`. The audit HMAC
+    keeps plain :class:`CipherError`; this split is for the data key alone, and the tag refusal for
+    its decrypt alone.
 
     The outage's text is the key id and ``exc``'s type name only, a reply refusal's fixed text
     left out, because the upload routes log it; a refusal keeps :func:`vault_failure_text`.
 
     Runs inside the caller's ``except``, so a classifier fault must not replace the type-only
-    error: anything it raises reads as a refusal, the side the split keeps when it cannot tell."""
+    error: anything it raises reads as a plain refusal, the side the split keeps when it cannot
+    tell."""
     try:
         unavailable = is_vault_unavailable(exc)
+        unauthenticated = decrypting and not unavailable and _names_aead_failure(exc)
     except Exception as fault:  # noqa: BLE001 -- see the docstring; the caller raises CipherError
         log.warning("Transit failure classifier raised %s; read as a refusal", type(fault).__name__)
-        unavailable = False
+        unavailable = unauthenticated = False
     if unavailable:
         return CipherUnavailableError(f"Transit {op} failed (key={key!r}): {type(exc).__name__}")
-    return CipherError(f"Transit {op} failed (key={key!r}): {vault_failure_text(exc)}")
+    refused = f"Transit {op} failed (key={key!r}): {vault_failure_text(exc)}"
+    return UnauthenticatedCipherError(refused) if unauthenticated else CipherError(refused)
 
 
 class TransitCipher(_UnmarkedPolicy):
@@ -375,9 +420,10 @@ class TransitCipher(_UnmarkedPolicy):
             plaintext_b64 = response["data"]["plaintext"]
         except Exception as exc:
             # Covers a failed AEAD tag (wrong cell AAD / corrupt blob) AND transport failure — both fail
-            # closed, and only the second is CipherUnavailableError (BACKLOG #3734). Type-only: a
-            # Transit error can echo ciphertext, and we never surface key material.
-            raise _transit_failure("decrypt", self._key, exc) from exc
+            # closed: the first is UnauthenticatedCipherError (BACKLOG #5650), the second
+            # CipherUnavailableError (BACKLOG #3734). Type-only: a Transit error can echo
+            # ciphertext, and we never surface key material.
+            raise _transit_failure("decrypt", self._key, exc, decrypting=True) from exc
         # Refused OUTSIDE the handler: a UnicodeDecodeError's .object is the decrypted plaintext, so
         # chaining it would put the PHI this cipher protects on the error (BACKLOG #2085).
         plaintext = _plaintext(plaintext_b64)
@@ -499,9 +545,11 @@ class TransitCipher(_UnmarkedPolicy):
             return _unasked(mismatch, len(batch))
         opened = []
         for reply in replies:
-            if reply.get("error"):
-                # Vault's own text is not quoted: it is a reply this process did not write.
-                opened.append(CipherError(f"Transit refused the value (key={self._key!r})"))
+            if error := reply.get("error"):
+                # Vault's own text is not quoted: it is a reply this process did not write. It is
+                # read only to give the value the class decrypt gives it (BACKLOG #5650).
+                kind = UnauthenticatedCipherError if _is_aead_failure_text(error) else CipherError
+                opened.append(kind(f"Transit refused the value (key={self._key!r})"))
                 continue
             plaintext = _plaintext(reply.get("plaintext"))
             opened.append(plaintext if plaintext is not None else self._malformed_plaintext())
