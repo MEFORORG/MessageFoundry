@@ -23,6 +23,7 @@ import pytest
 
 from messagefoundry.auth.trust_anchors import registry_anchor_specs
 from messagefoundry.config import wiring
+from messagefoundry.config.models import bool_setting
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     _COMPOSER_BOOL_SETTINGS,
@@ -141,9 +142,147 @@ def test_a_none_on_a_bool_setting_takes_the_setting_default(key: str, want: bool
 
 def test_a_literal_is_not_read_here() -> None:
     # Every pre-resolve reader (the loosening registers, the build-time capture checks) reads the
-    # spec's literal, so reading it differently in the resolved copy would split one setting.
+    # spec's literal, so reading it differently in the resolved copy would split one setting. A
+    # literal that is not a bool is refused at load instead (the tests below).
     out = resolve_env_settings({"tls_allow_expired": "false", "verify_tls": None}, {})
     assert out == {"tls_allow_expired": "false", "verify_tls": None}
+
+
+# --- a code-first literal that is not a bool is refused at load (#3234 step 1, code-first route) ----
+
+_LITERAL_CASES = [
+    pytest.param(
+        "from messagefoundry import MLLP, inbound\n"
+        "inbound('IB_X', MLLP(port=0, no_ack='false'), router='r')\n",
+        "inbound connection 'IB_X': setting 'no_ack' must be true or false, not str",
+        id="inbound-mllp-str",
+    ),
+    pytest.param(
+        "from messagefoundry import Rest, outbound\n"
+        "from messagefoundry.transports.smart import with_smart_backend\n"
+        "outbound('OB_X', with_smart_backend(Rest(url='https://partner.example.org/in'), "
+        "token_url='https://t', client_id='c', private_key='k', enabled=None))\n",
+        "outbound connection 'OB_X': setting 'smart_enabled' must be true or false, not NoneType",
+        id="composer-none",
+    ),
+    pytest.param(
+        "from messagefoundry import Rest, outbound\n"
+        "outbound('OB_X', Rest(url='https://partner.example.org/in', verify_tls=0, "
+        "tls_ca_file='ca.pem', tls_ca_pin='" + "a" * 64 + "'))\n",
+        "outbound connection 'OB_X': setting 'verify_tls' must be true or false, not int",
+        id="before-the-pin-check",
+    ),
+    pytest.param(
+        "from messagefoundry import Rest, outbound\n"
+        "outbound('OB_X', Rest(url='https://partner.example.org/in', tls_allow_expired='false'))\n",
+        "outbound connection 'OB_X': setting 'tls_allow_expired' must be true or false, not str",
+        id="rest-str",
+    ),
+    pytest.param(
+        "from messagefoundry import MLLP, outbound\n"
+        "outbound('OB_X', MLLP(host='h.example.org', port=1, persistent='false'))\n",
+        "outbound connection 'OB_X': setting 'persistent' must be true or false, not str",
+        id="mllp-str",
+    ),
+    pytest.param(
+        "from messagefoundry import MLLP, outbound\n"
+        "outbound('OB_X', MLLP(host='h.example.org', port=1, persistent=0))\n",
+        "outbound connection 'OB_X': setting 'persistent' must be true or false, not int",
+        id="mllp-int",
+    ),
+    pytest.param(
+        "from messagefoundry import DatabaseLookup\n"
+        "DatabaseLookup('clar', server='db.example.org', database='d', "
+        "trust_server_certificate='no')\n",
+        "database lookup 'clar': setting 'trust_server_certificate' must be true or false, not str",
+        id="db-lookup-str",
+    ),
+    pytest.param(
+        "from messagefoundry import DatabaseRef, Reference\n"
+        "Reference('codes', source=DatabaseRef(server='db.example.org', database='d', "
+        "statement='SELECT code FROM t', key_column='code', encrypt='false'))\n",
+        "reference set 'codes': setting 'encrypt' must be true or false, not str",
+        id="db-ref-str",
+    ),
+    pytest.param(
+        "from messagefoundry import FhirLookup\n"
+        "from messagefoundry.transports.smart import with_smart_backend\n"
+        "with_smart_backend(FhirLookup('epic', url='https://fhir.example.org/fhir'), "
+        "token_url='https://t', client_id='c', private_key='k', enabled='false')\n",
+        "fhir lookup 'epic': setting 'smart_enabled' must be true or false, not str",
+        id="composer-after-registration",
+    ),
+    pytest.param(
+        "from messagefoundry import MLLP, outbound\n"
+        "outbound('OB_X', MLLP(host='h.example.org', port=1, persistent='maybe'))\n",
+        "outbound connection 'OB_X': setting 'persistent' must be true or false, not str",
+        id="mllp-str-not-a-false-spelling",
+    ),
+    pytest.param(
+        # A truthy capture_out_params forced capture on, and a capture check then refused the
+        # statement as if the author had set it.
+        "from messagefoundry import Database, outbound\n"
+        "outbound('OB_X', Database(server='db.example.org', database='d', "
+        "statement='INSERT INTO t VALUES (?)', capture_out_params='false'))\n",
+        "outbound connection 'OB_X': setting 'capture_out_params' must be true or false, not str",
+        id="capture-out-params-before-the-desugar",
+    ),
+    pytest.param(
+        # Both desugars in outbound() overwrite capture_response with True, so the refusal must
+        # judge what the author wrote before they run.
+        "from messagefoundry import Rest, outbound\n"
+        "outbound('OB_X', Rest(url='https://partner.example.org/in', capture_response='false', "
+        "reingress_to='IB_LB'))\n",
+        "outbound connection 'OB_X': setting 'capture_response' must be true or false, not str",
+        id="capture-response-beside-reingress",
+    ),
+]
+
+_QUOTED_FALSE_HINT = "(a false spelling in quotes reads as true)"
+
+
+@pytest.mark.parametrize(("module", "says"), _LITERAL_CASES)
+def test_a_code_first_literal_that_is_not_a_bool_is_refused_at_load(
+    tmp_path: Path, module: str, says: str
+) -> None:
+    # A connector reads most flags with bool() or plain truthiness, so "false" would read True. The
+    # load refuses it, so no path that loads the graph, check, dryrun and serve alike, runs it.
+    (tmp_path / "cfg.py").write_text(module, encoding="utf-8")
+    with pytest.raises(WiringError) as ei:
+        load_config(tmp_path, allow_empty=True)
+    msg = str(ei.value)
+    assert says in msg
+    # The hint only where it applies: a false spelling in quotes.
+    quoted_false = any(f"='{w}'" in module for w in ("false", "no", "off", "0"))
+    assert (_QUOTED_FALSE_HINT in msg) == quoted_false
+    diagnostics = wiring.validate_config(tmp_path, allow_empty=True)
+    assert any(says in d.message for d in diagnostics)
+
+
+def test_a_literal_none_or_bool_loads_and_none_reads_as_the_setting_default(tmp_path: Path) -> None:
+    # The control. An explicit None is the setting's default to bool_setting, so verify_tls=None
+    # verifies (vault BACKLOG #3230); a real bool is what it says.
+    (tmp_path / "cfg.py").write_text(
+        "from messagefoundry import MLLP, Rest, outbound\n"
+        "outbound('OB_R', Rest(url='https://partner.example.org/in', verify_tls=None))\n"
+        "outbound('OB_M', MLLP(host='h.example.org', port=1, persistent=False))\n",
+        encoding="utf-8",
+    )
+    reg = load_config(tmp_path, allow_empty=True)
+    assert bool_setting(_dest(reg, "OB_R", {}), "verify_tls", default=True) is True
+    assert _dest(reg, "OB_M", {})["persistent"] is False
+
+
+@pytest.mark.parametrize(("value", "want"), [(None, True), (False, False), (True, True)])
+def test_require_called_ae_title_reads_none_as_its_default_of_on(value: Any, want: bool) -> None:
+    # bool(None) was False, the side that accepts any called AE title.
+    pytest.importorskip("pynetdicom")
+    from messagefoundry.config.models import ConnectorType, Source
+    from messagefoundry.transports.dicom import DicomScpSource
+
+    settings = {"ae_title": "SCP", "host": "127.0.0.1", "port": 0, "require_called_ae_title": value}
+    scp = DicomScpSource(Source(type=ConnectorType.DIMSE, settings=settings))
+    assert scp._require_called_ae_title is want
 
 
 def test_every_bool_setting_name_is_bool_on_every_factory_that_declares_it() -> None:
@@ -410,9 +549,35 @@ def test_an_env_ftp_tls_unknown_spelling_is_refused_value_withheld() -> None:
     assert planted not in str(di.value)
 
 
-def test_a_literal_ftp_tls_is_mapped_as_before() -> None:
+def test_a_literal_bool_ftp_tls_is_mapped() -> None:
     assert Ftp(host="h", remote_dir="/in", tls=True).settings["protocol"] == "ftps"
     assert Ftp(host="h", remote_dir="/in").settings["protocol"] == "ftp"
+
+
+@pytest.mark.parametrize(("value", "kind"), [("false", "str"), (None, "NoneType"), (1, "int")])
+def test_a_literal_ftp_tls_that_is_not_a_bool_is_refused(value: Any, kind: str) -> None:
+    # bool() read tls="false" as FTPS and tls=None as plain FTP, the insecure side (#3234). The
+    # refusal comes first, so a CA beside it does not get the plain-FTP refusal instead.
+    for ca in (None, "ca.pem"):
+        with pytest.raises(WiringError) as ei:
+            Ftp(host="h", remote_dir="/in", tls=value, tls_ca_file=ca)
+        msg = str(ei.value)
+        assert f"Ftp: setting 'tls' must be true or false, not {kind}" in msg
+        assert (_QUOTED_FALSE_HINT in msg) == (value == "false")
+
+
+def test_capture_response_beside_reingress_to_is_still_forced_on_when_it_is_a_bool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The control for the capture-response-beside-reingress case: a real bool, False included, or
+    # None is still desugared on, as before.
+    for written in (False, True, None):
+        registry = wiring.Registry()
+        monkeypatch.setattr(wiring, "_active", registry)
+        spec = Rest(url="https://partner.example.org/in", reingress_to="IB_LB")
+        spec.settings["capture_response"] = written
+        wiring.outbound("OB_X", spec)
+        assert registry.outbound["OB_X"].spec.settings["capture_response"] is True
 
 
 def test_the_derived_ftp_protocol_ref_has_a_stable_repr() -> None:

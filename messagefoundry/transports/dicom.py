@@ -78,7 +78,7 @@ from io import BytesIO
 from typing import Any, ClassVar, NamedTuple, assert_never, cast
 
 from messagefoundry.auth.trust_anchors import inbound_ca_cadata, refuse_an_unread_ca_pin
-from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.config.models import ConnectorType, Destination, Source, bool_setting
 from messagefoundry.config.tls_policy import (
     RevocationHopGuard,
     TrustAnchorPolicy,
@@ -1862,7 +1862,7 @@ class DicomScpSource(SourceConnector):
         )
         allow = s.get("calling_ae_allowlist")
         self._calling_ae_allowlist: list[str] | None = [str(a) for a in allow] if allow else None
-        self._require_called_ae_title = bool(s.get("require_called_ae_title", True))
+        self._require_called_ae_title = bool_setting(s, "require_called_ae_title", default=True)
         sa = s.get("source_ip_allowlist")
         self._source_ip_allowlist: list[str] | None = [str(x) for x in sa] if sa else None
         # BACKLOG #1910: never accept an object the engine's ingress would refuse. The shipped 128 MiB
