@@ -2412,7 +2412,8 @@ Properties of the anonymizer:
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
   loose string search. A component or subcomponent is a site code when it is one whole as
   written or trimmed, or decoded from its escape sequences, with `\H\` and `\N\` kept as `_` or
-  dropped, and then trimmed, whole or split again on the delimiters or on whitespace, which a
+  dropped, and then trimmed, whole or split again on the delimiters, the escape character or on
+  whitespace, which a
   break command such as `\.br\` decodes to. So a code joined to `\S\`, padded with `\X20\` or written with a hex escape is replaced,
   escapes and all, by digits of the same width (BACKLOG #5632). The surrogate is keyed on the
   part as written, so one code written two ways gets two unrelated surrogates. With no site prefix loaded it matches nothing, and
@@ -2462,8 +2463,10 @@ reading the first one where a component has several. An escape can pair across t
 separator in the first reading and not in the second, so the check takes both. The shape
 detectors read each unmapped value as written, then each of its components decoded whole and each
 of its subcomponents decoded on its own. The MRN-typed check reads the id type as written,
-decoded whole, and as each of its subcomponents, in the same readings the site-code scrub takes
-(below), so `X&MR`, `MR\X20\` and `X\S\MR` count (BACKLOG #5654). The check for a shape cut
+decoded whole, and as each of its subcomponents, in the readings the site-code scrub takes
+(above) except the split on whitespace, so `X&MR`, `MR\X20\` and `X\S\MR` count and the word in
+`MR BRAIN W\T\WO` does not. An id type set apart only by a break command, such as `X\.br\MR`,
+passes (BACKLOG #5654). The check for a shape cut
 across fields reads each line as written and with each field decoded a subcomponent and a
 component at a time, and counts a cut only where two fields meet (BACKLOG #5533 item 8). The
 token scan reads the whole message as written, then decoded a subcomponent at a time, then

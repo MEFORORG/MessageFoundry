@@ -17,6 +17,8 @@ from types import ModuleType
 
 import pytest
 
+import messagefoundry_toolkit.anon as engine_anon
+import tee.anon as tee_anon
 from messagefoundry_toolkit.anon import leak as engine_leak
 from messagefoundry_toolkit.anon.rules import DEFAULT_RULES
 from tee.anon import leak as tee_leak
@@ -45,7 +47,6 @@ def _zpd(value: str, head: str = _HEAD) -> str:
         "M1^^^H^ MR ",
         "M1^^^H^X\\S\\MR",
         "M1^^^H^MR\\H\\",
-        "M1^^^H^X\\.br\\MR",
     ],
     ids=[
         "second-sub",
@@ -56,7 +57,6 @@ def _zpd(value: str, head: str = _HEAD) -> str:
         "spaces",
         "escaped-component-separator",
         "highlighting-dropped",
-        "after-a-break-command",
     ],
 )
 def test_an_mrn_type_past_the_first_subcomponent_or_padded_is_a_hit(
@@ -70,6 +70,33 @@ def test_an_mrn_type_past_the_first_subcomponent_or_padded_is_a_hit(
 @pytest.mark.parametrize("value", ["M1^^^H^X&MRX", "M1^^^H^X&M R", "^^^H^X&MR"])
 def test_a_near_miss_or_an_mrn_type_with_no_id_is_no_hit(leak: ModuleType, value: str) -> None:
     assert leak.structural_phi_hits(_zpd(value), {"PID-3", "PID-5"}) == []
+
+
+_ORDINARY_MR_TEXT = pytest.mark.parametrize(
+    "segment",
+    [
+        "OBR|1|ORD1||70553^MR BRAIN W\\T\\WO CONTRAST^C4",
+        "OBX|1|TX|123^MR HEAD\\T\\NECK^L",
+        "OBR|1|ORD1||70553^X^C4|||||||||Prior Mr Smith study\\.br\\see notes",
+    ],
+    ids=["obr-4-procedure", "obx-3-observation", "obr-13-note"],
+)
+
+
+@_LEAKS
+@_ORDINARY_MR_TEXT
+def test_the_word_mr_in_ordinary_escaped_text_is_no_mrn(leak: ModuleType, segment: str) -> None:
+    """The MRN-typed check splits a decoded part on escaped delimiters, never on whitespace, so the
+    word ``MR`` or ``Mr`` in a procedure name or a note is not an id type."""
+    hits = leak.structural_phi_hits(f"{_HEAD}\r{segment}", {"PID-3", "PID-5"})
+    assert not any("MRN" in hit for hit in hits), hits
+
+
+@_NO_SCANNER
+@pytest.mark.parametrize("anon", [engine_anon, tee_anon], ids=["engine", "tee"])
+@_ORDINARY_MR_TEXT
+def test_anonymize_checked_passes_ordinary_mr_text(anon: ModuleType, segment: str) -> None:
+    assert anon.anonymize_checked(f"{_HEAD}\r{segment}", salt="b224-5654-salt-0123456789abcdef")
 
 
 def test_a_message_subcomponent_read_sees_the_type() -> None:
