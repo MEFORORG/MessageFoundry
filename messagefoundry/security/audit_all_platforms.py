@@ -91,13 +91,16 @@ MessageFoundry package, a package the lock does not pin, or every pin, or that h
 or an abbreviation of it that is no abbreviation of a pip-audit option, in the ``=`` form or not;
 and any other word after the lock that holds ``=`` and is not ``--option=value`` for a pip-audit
 option that takes a value, named in full (``_after_lock_refusal``), since pip-audit's usage error
-would print a ``NAME=value`` typed there; and a lock path that holds ``=``. No refusal quotes a
+would print a ``NAME=value`` typed there; and a pip-audit option after the lock that can exit 0
+on pins it did not audit, ``-r`` among them, as ``_FAIL_OPEN_LONG`` says of each, short,
+abbreviated or in the ``=`` form; and a lock path that holds ``=``. No refusal quotes a
 word that holds ``=``, and the module's own usage error quotes nothing once a word holds one. A free-text value after the lock that holds ``=``, as in ``--index-url=URL``, still
 reaches pip-audit, which can print it in its own output. It does not judge
 whether a non-empty lock is complete; released-line-audit carries its own floor for that.
 
 It reads lines as pip does: a requirement or option is any line that does not continue the one
-before it (a line ending in a backslash continues, unless it is a comment), indented or not. It
+before it (a line ending in a backslash continues, unless it is a comment), indented or not, and
+a line of only indentation and backslashes starts none, since pip's ``join_lines`` strips them. It
 decodes the lock as pip 26 does (vault BACKLOG #3786 L3): by its UTF-8, UTF-16 or UTF-32
 byte-order mark; failing one, by a PEP 263 ``coding:`` declaration in a comment on either of the
 first two lines, and the copy is written in that encoding too; failing that, as UTF-8, and as the
@@ -167,20 +170,25 @@ def _kinds(lines: list[str]) -> list[str]:
     ``requirement`` or ``option`` where a logical line starts; ``continued`` where a requirement
     goes on to a line that is neither a hash or other option nor a comment, so a marker there would
     escape the strip; ``other`` for the rest. A line ending in a backslash continues onto the next,
-    unless it is a comment.
+    unless it is a comment. pip's ``join_lines`` strips the backslashes from both ends of a line it
+    joins, so a line of nothing but indentation and backslashes adds nothing: the logical line starts
+    on the line after it (vault BACKLOG #3786 R1, R2).
     """
     kinds: list[str] = []
     continued = in_requirement = False
     for line in lines:
         body = _body(line)
         head = body.lstrip()
+        continues = body.endswith("\\") and not head.startswith("#")
         if not continued:
-            in_requirement = is_requirement_line(head)
-            kind = "requirement" if in_requirement else "option" if head[:1] == "-" else "other"
+            start = (body.strip("\\") if continues else body).lstrip()
+            in_requirement = is_requirement_line(start)
+            kind = "requirement" if in_requirement else "option" if start[:1] == "-" else "other"
+            continues = continues and bool(start)
         else:
             kind = "continued" if in_requirement and head[:1] not in ("", "-", "#") else "other"
         kinds.append(kind)
-        continued = body.endswith("\\") and not head.startswith("#")
+        continued = continues
     return kinds
 
 
@@ -491,13 +499,17 @@ def _drop(
     dropping = continued = False
     for line, kind in zip(lines, kinds, strict=True):
         body = _body(line)
-        if not continued:
+        # A requirement starts only where _kinds says one does, which may be after a line of
+        # backslashes that this loop's own reading counts as continuing.
+        if kind == "requirement":
             head = body.lstrip()
-            match = _NAME.match(head) if kind == "requirement" else None
+            match = _NAME.match(head)
             name = canonical_name(match[0]) if match else ""
             dropping = bool(name) and name in names
             if dropping:
                 dropped.append((name, head.removesuffix("\\").rstrip()))
+        elif not continued:
+            dropping = False
         if not dropping:
             out.append(line)
         continued = body.endswith("\\") and not body.lstrip().startswith("#")
@@ -598,9 +610,10 @@ _OWN_OPTIONS = ("--skip-private", "--pass-environment")
 #: pip-audit options refused after the lock. A dry run without
 #: ``--fix``, help and version audit nothing and exit 0. ``--fix`` audits, then rewrites every
 #: requirements file pip-audit was given, the copy included, to fixed versions; it can exit 0 on a
-#: vulnerable lock.
-_FAIL_OPEN_LONG = ("--dry-run", "--fix", "--help", "--version")
-_FAIL_OPEN_SHORT = frozenset("dhV")
+#: vulnerable lock. ``--requirement`` hands pip-audit a second file, which it reads with its markers
+#: in place and none of its pins counted (vault BACKLOG #3786 R3).
+_FAIL_OPEN_LONG = ("--dry-run", "--fix", "--help", "--version", "--requirement")
+_FAIL_OPEN_SHORT = frozenset("dhVr")
 
 
 def _opens_the_gate(head: str) -> bool:
@@ -709,6 +722,28 @@ def _run(cmd: list[str], *, pass_environment: Sequence[str] = ()) -> int:
     # copy's path is a fresh directory under $RUNNER_TEMP, or the system temp folder, then that
     # lock's file name. Each is one argv item, and each path follows -r as its value.
     return subprocess.run(cmd, check=False, env=env).returncode  # nosec B603 - argv list, no shell
+
+
+def _distinct_count(requirements: Sequence[str]) -> int:
+    """How many of ``requirements`` pip-audit audits as separate pins (vault BACKLOG #3786 R4).
+
+    pip-audit 2.10.1's ``_collect_preresolved_deps`` audits a name once and passes over a second
+    requirement with the same name and specifier, which a lock that pinned one version under two
+    markers holds once they are stripped; a second with another specifier fails the audit. So this
+    counts canonical names, or the whole string where none starts it, which counts one where a lock
+    spells one name two ways, and pip-audit audits each spelling.
+    """
+    return len(
+        {canonical_name(m[0]) if (m := _NAME.match(r.lstrip())) else r for r in requirements}
+    )
+
+
+def _print_out(text: str) -> None:
+    """Print ``text`` to stdout, a character its encoding lacks written as a backslash escape, as
+    stderr writes one (vault BACKLOG #3786 R5): the lock's own text, printed with ``strict``
+    errors on a cp1252 console, raised a traceback that quoted it."""
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    print(text.encode(encoding, "backslashreplace").decode(encoding))
 
 
 def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | None = None) -> int:
@@ -832,14 +867,14 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | No
     stripped = [
         e for e in stripped if not (m := _NAME.match(e)) or canonical_name(m[0]) not in private
     ]
-    print(
-        f"{lock}: {counted} pinned requirements audited, {len(stripped)} "
+    _print_out(
+        f"{lock}: {_distinct_count(read)} pinned requirements audited, {len(stripped)} "
         "un-gated from a marker the host would have evaluated:"
     )
     for entry in stripped:
-        print(f"  {entry}")
+        _print_out(f"  {entry}")
     for _, entry in skipped:
-        print(f"  not audited, named by --skip-private: {entry}")
+        _print_out(f"  not audited, named by --skip-private: {entry}")
     sys.stdout.flush()
     if run is None:
         run = functools.partial(_run, pass_environment=tuple(args.pass_environment))
