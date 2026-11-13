@@ -25,6 +25,7 @@ from typing import Any, cast
 import pytest
 
 import harness.fuzz.cli as fuzz_cli
+from harness import drivers
 from harness.__main__ import main
 from harness.endpoints import Endpoints
 from harness.fuzz import (
@@ -236,6 +237,9 @@ class _ManglingTransport(Transport):
             return Exchange(REPLY, (b"MSH|^~\\&|X|Y\rZZZ|1\r",))
         return exchange
 
+    def probe(self) -> str:
+        return self.real.probe()
+
 
 def test_a_malformed_reply_fails_and_exits_one(
     server: tuple[str, Endpoints],
@@ -391,6 +395,9 @@ class _EchoTransport(Transport):
         self.sent.append(data)
         replies = tuple(_plain_ack(payload) for payload in frames(data))
         return Exchange(REPLY if replies else CLOSED, replies)
+
+    def probe(self) -> str:
+        return ""
 
 
 class _FakeClient:
@@ -625,36 +632,19 @@ def test_replay_refuses_a_file_for_another_transport(tmp_path: Path) -> None:
         replay(cast(EngineClient, client), transport, [stray], config, emit=lambda _: None)
 
 
-@pytest.mark.parametrize("kind", ["file", "http", "tcp", "x12", "dicom"])
-def test_only_the_mllp_driver_builds_a_transport(kind: str, tmp_path: Path) -> None:
-    # BACKLOG #5638, #5639: a stock driver has no inbound probe and no reply invariant of its own
-    # kind, so a campaign through one could pass with nothing checked. It is refused before any
-    # case is built or sent, and so before anything lands at the endpoint.
-    eps = Endpoints({"file_in": str(tmp_path / "in")})
-    with pytest.raises(KeyError, match="only the 'mllp' driver"):
-        build_transport(kind, eps, "file_in", timeout=1.0)
-    assert not (tmp_path / "in").exists()
+@pytest.mark.parametrize("kind", sorted(set(drivers.registry()) - {"mllp"}))
+def test_only_the_mllp_driver_builds_a_transport(kind: str) -> None:
+    # BACKLOG #5638, #5639: every other harness driver lacks an inbound probe and a reply invariant
+    # for its kind, so a campaign through one could pass with nothing checked.
+    with pytest.raises(ValueError, match="accepts only mllp"):
+        build_transport(kind, Endpoints({}), None, timeout=1.0)
+    # Control: the refusal is about the kind, not the call -- mllp builds with the same arguments.
+    assert build_transport("mllp", Endpoints({}), None, timeout=1.0).kind == "mllp"
 
 
-def test_a_non_mllp_driver_is_a_setup_error(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    rc = main(
-        [
-            "--fuzz",
-            "--engine",
-            "http://127.0.0.1:9",
-            "--endpoint",
-            f"file_in={tmp_path / 'in'}",
-            "--fuzz-driver",
-            "file",
-            "--fuzz-endpoint",
-            "file_in",
-        ]
-    )
-    assert rc == 2
-    assert "only the 'mllp' driver" in capsys.readouterr().err
-    assert not (tmp_path / "in").exists()
+def test_the_refusal_covers_real_driver_kinds() -> None:
+    # Control for the parametrization above: it is not vacuous over an empty or stale registry.
+    assert {"file", "http", "tcp"} <= set(drivers.registry()) - {"mllp"}
 
 
 # --- CLI setup errors ----------------------------------------------------------------------------
@@ -668,8 +658,8 @@ def test_fuzz_and_scenario_are_mutually_exclusive(capsys: pytest.CaptureFixture[
 @pytest.mark.parametrize(
     ("extra", "expected"),
     [
-        (["--fuzz-driver", "carrier-pigeon", "--fuzz-endpoint", "mllp_in"], "only the 'mllp'"),
-        (["--fuzz-driver", "file"], "only the 'mllp' driver"),
+        (["--fuzz-driver", "carrier-pigeon", "--fuzz-endpoint", "mllp_in"], "accepts only mllp"),
+        (["--fuzz-driver", "file", "--fuzz-endpoint", "file_in"], "accepts only mllp"),
         (["--fuzz-endpoint", "no_such_endpoint"], "no_such_endpoint"),
         (["--fuzz-seed", "-1"], "non-negative"),
         (["--endpoint", "garbage"], "KEY=VALUE"),

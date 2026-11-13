@@ -10,11 +10,13 @@ closes, so a two-frame case is answered and counted twice, and it tells a clean 
 timeout, a reset, a reply cut off mid-frame and bytes outside any frame, which the stock driver
 folds together. Its probe connects to the inbound before the first case.
 
-Every other driver kind is refused as a setup error (BACKLOG #5638, #5639). The invariants read
-every reply as an HL7 v2 ACK and match the store to the acknowledgements, and a stock driver has no
-inbound probe. An HTTP, DIMSE or X12 reply would fail as "not an ACK", and a fire-and-forget send,
-such as a file drop, gets no reply at all, so a campaign through one would check nothing and pass,
-even against an endpoint no inbound polls. A kind joins only with its own probe and reply invariant.
+**Why only mllp.** Every other driver kind is refused as a setup error (BACKLOG #5638, #5639); this
+paragraph is the one statement of why, which the invariants module and the harness README point
+at. The invariants read every reply as an HL7 v2 ACK and match the store to the acknowledgements,
+and a stock driver has neither an inbound probe nor a per-frame reply count. So an HTTP, DIMSE or
+X12 reply would fail as "not an ACK", and a send that got no reply -- a file drop always, any other
+kind whenever the engine stays silent -- would pass with nothing checked, even against an endpoint
+no inbound polls. A kind joins only with its own probe and a reply invariant for its own shape.
 """
 
 from __future__ import annotations
@@ -66,10 +68,11 @@ class Transport(abc.ABC):
     @abc.abstractmethod
     def send(self, data: bytes) -> Exchange: ...
 
+    @abc.abstractmethod
     def probe(self) -> str:
         """Empty when the inbound is there to fuzz; otherwise why not. Checked once, before the
-        first case, so a wrong port is a setup error rather than an invariant failure."""
-        return ""
+        first case, so a wrong port is a setup error rather than an invariant failure. Abstract, so
+        a new transport cannot inherit a probe that reports every endpoint as there."""
 
 
 class WireMLLPDriver(MLLPDriver):
@@ -155,13 +158,12 @@ def build_transport(
     kind: str, endpoints: Endpoints, key: str | None, *, timeout: float
 ) -> Transport:
     """The transport for driver ``kind`` aimed at endpoint ``key`` (``mllp_in`` when None).
-    Raises KeyError for any kind but ``mllp`` (the module docstring says why) and for an endpoint
-    no family declares; ValueError for a bad port value. ``timeout`` bounds one MLLP reply."""
+    Raises ValueError for any kind but ``mllp`` (the module docstring says why) and for a bad port
+    value; KeyError for an endpoint no family declares. ``timeout`` bounds one MLLP reply."""
     if kind != "mllp":
-        raise KeyError(
-            f"the fuzz harness drives only the 'mllp' driver, not {kind!r}: no other kind has an "
-            "inbound probe or a reply invariant of its own, so a campaign through it would check "
-            "nothing"
+        raise ValueError(
+            f"--fuzz-driver accepts only mllp, not {kind!r}: no other driver has an inbound probe "
+            "and a reply invariant for its kind (harness/fuzz/transport.py says why)"
         )
     port = endpoints.port(DEFAULT_ENDPOINT if key is None else key)
     return _WireTransport(WireMLLPDriver(endpoints.host, port, timeout=timeout))

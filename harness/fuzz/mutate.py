@@ -108,9 +108,10 @@ def make_case(seed: int, iteration: int) -> Case:
     payload = str(message).encode("utf-8")
     if layer == BYTE:
         mutation, payload = _mutate_bytes(rng, payload)
-    data = frame(payload)
     if layer == FRAME:
         mutation, data = _mutate_frame(rng, payload)
+    else:
+        data = frame(payload)
     return Case(
         seed=seed,
         iteration=iteration,
