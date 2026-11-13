@@ -466,9 +466,10 @@ class RelayStore:
         counts if the scrub does not finish. Returning the counts then would read as a clean purge
         that did not happen. relay_log rows count too: their ``detail`` can carry partner ACK text
         that names a patient. A run that deleted no row still scrubs when residue remains (see
-        :meth:`_has_residue`), so re-running a purge whose scrub failed finishes it; it skips the
-        scrub only when there is none, so a routine sweep does not rewrite the DB for nothing.
-        :meth:`scrub` runs the scrub alone.
+        :meth:`_has_residue`). So a plain re-run after a failed scrub scrubs only while free pages
+        or a non-empty -wal remain; a failed VACUUM can leave neither, and :meth:`scrub` (``purge
+        --scrub-only``) always runs the whole scrub and raises if it does not finish. A run with no deletes and no residue
+        skips the scrub, so a routine sweep does not rewrite the DB for nothing.
         """
         async with self._lock:
             # NB: a bare `DELETE FROM t` (no WHERE) hits SQLite's truncate optimization, which makes
@@ -496,8 +497,10 @@ class RelayStore:
 
     async def _has_residue(self) -> bool:
         """Whether an earlier delete may have left bytes the scrub has not removed: the DB has free
-        pages, or the -wal is not empty. Either holds after a scrub that did not finish. A live
-        relay's writes also leave the -wal non-empty, so a sweep beside one scrubs anyway."""
+        pages, or the -wal is not empty. A scrub that did not finish can leave neither, for
+        example a failed VACUUM after a delete that freed no whole page, so this can miss residue;
+        ``purge --scrub-only`` does not depend on it. A live relay's writes also leave the -wal
+        non-empty, so a sweep beside one scrubs anyway."""
         async with self._db.execute("PRAGMA freelist_count") as cur:
             row = await cur.fetchone()
         if row is not None and int(row[0]) > 0:

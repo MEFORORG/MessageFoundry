@@ -187,7 +187,9 @@ names a patient. `VACUUM` is part of the scrub. The store zeroes deleted content
 only where that costs no extra I/O, and leaves a freed page as it was. A B-tree rebalance can also
 leave a stale copy of a deleted row in a page's unused space. Only the rebuild removes these. A
 run that deletes no row still scrubs if residue remains: the DB has free pages, or the `-wal` file
-is not empty. So re-running a purge whose scrub failed finishes the scrub. A live relay's writes
+is not empty. So a plain re-run after a failed scrub scrubs only while free pages or a non-empty
+`-wal` remain. A failed `VACUUM` can leave neither, so use `purge --scrub-only`, which always runs
+the whole scrub and exits 1 if it still does not finish. A live relay's writes
 keep the `-wal` non-empty, so a sweep beside a running relay scrubs every time. Only a run with no
 deletes and no residue skips the scrub.
 
