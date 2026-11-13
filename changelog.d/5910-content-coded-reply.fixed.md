@@ -6,7 +6,8 @@
   `reply_dropped` event where it is not. A SOAP or FHIR delivery that reads a coded non-2xx body
   logs a WARNING and classifies on the status alone; REST and DICOMweb do not read a non-2xx
   body. Other reads that check reply framing refuse a coded body too, at least the OIDC token
-  and JWKS reads and `fhir_lookup` with their own error, and the SMART and OAuth2 token reads
-  with the shared misframed-reply error. The replies the coding check skips are listed on
+  and JWKS reads and `fhir_lookup` with their own error. The SMART and OAuth2 token reads raise
+  `AmbiguousFramingError`, a transient `DeliveryError` that a delivery retries, not a
+  `reply-misframed` refusal. The replies the coding check skips are listed on
   `reply_framing_fault`; they include at least a `204`, a `Content-Length: 0` reply and a reply to
   `HEAD`. (`BACKLOG #5910`)
