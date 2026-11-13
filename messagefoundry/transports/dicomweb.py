@@ -20,14 +20,12 @@ It needs **no** ``pydicom``: the object rides as opaque bytes, so DICOMweb works
   single-instance MVP; multi-instance batching is deferred).
 - ``POST {base}/studies`` (the server assigns the study) or ``POST {base}/studies/{study_uid}`` (store
   into a known study) when a ``study_uid`` is configured. ``Accept: application/dicom+json``.
-- Response classification refines the HTTP-status retry model: a 2xx whose ``application/dicom+json`` body
-  carries a per-instance **FailedSOPSequence** (``00081198``) → the instance was rejected → permanent
-  dead-letter. So is a 2xx body that is not parseable dicom+json, and a 202 that names no stored
-  instance; an empty 2xx other than a 202, and a 200 dataset with no ReferencedSOPSequence, are
-  still delivered (:func:`_stowrs_refusal` holds the rule; docs/CONNECTIONS.md *DICOMweb*, *Status
-  classification*, states it in full). Other 4xx, a 409 (all instances failed) or a refused 3xx is
-  permanent; 5xx / 408 / 429 / connection-timeout is a transient retry. **A 5xx stays transient.**
-  The HTTP status no longer wins over a 2xx body that refuses it (BACKLOG #5914).
+- Response classification refines the HTTP-status retry model: some 2xx replies are a permanent
+  refusal, a per-instance **FailedSOPSequence** (``00081198``) among them, though not every 2xx that
+  fails to confirm the store. :func:`_stowrs_refusal` holds the rule, and docs/CONNECTIONS.md
+  *DICOMweb*, *Status classification*, states it in full. Other 4xx, a 409 (all instances failed)
+  or a refused 3xx is permanent; 5xx / 408 / 429 / connection-timeout is a transient retry. **A
+  5xx stays transient**, but a 2xx is not always a delivery (BACKLOG #5914).
 
 **PHI:** a STOW-RS ``dicom+json`` response can name patient/study identifiers, so it is **never** echoed
 into a log/error — only the HTTP status and a redacted URL are. **Idempotency:** delivery is
@@ -112,8 +110,10 @@ _FAILED_SOP_SEQUENCE = "00081198"
 # see _names_an_instance.
 _REFERENCED_SOP_SEQUENCE = "00081199"
 _REFERENCED_SOP_INSTANCE_UID = "00081155"
-# PS3.18 Annex F: these carry an element's value as bulk data, which a sequence (SQ) never does.
-_SQ_FORBIDDEN_KEYS = frozenset({"BulkDataURI", "InlineBinary"})
+# PS3.18 Annex F: the only keys a sequence (SQ) or UID (UI) element may carry. BulkDataURI and
+# InlineBinary are for binary VRs only, so an element read here carrying any other key is malformed
+# and fails closed -- an allow-list, so a misspelt "value" cannot read as an empty sequence.
+_ELEMENT_KEYS = frozenset({"vr", "Value"})
 # Written by name, never as a raw character an editor can silently drop (as fhir.py's _BOM).
 _BOM = "\N{ZERO WIDTH NO-BREAK SPACE}"
 _JSON_WHITESPACE = (
@@ -141,6 +141,20 @@ _UID_DIGITS = frozenset("0123456789")
 _DICOM_UID_MAX_LEN = 64
 
 
+def _uid_components_ok(value: str) -> bool:
+    """True when every dot-separated component is non-empty and entirely ASCII digits."""
+    # Requiring non-empty is what makes '..', a leading dot and a trailing dot illegal -- they are
+    # excluded STRUCTURALLY, not by enumeration. A trailing newline is excluded for free (it lands
+    # inside the final component and is not a digit), which is the hole a `$`-anchored regex would
+    # have left open -- #1240's defect.
+    return all(part and _UID_DIGITS.issuperset(part) for part in value.split("."))
+
+
+def _is_uid(value: object) -> bool:
+    """True when ``value`` is a string in the PS3.5 UID grammar :func:`_reject_non_uid` gates."""
+    return isinstance(value, str) and len(value) <= _DICOM_UID_MAX_LEN and _uid_components_ok(value)
+
+
 def _reject_non_uid(value: str, field: str) -> None:
     """Gate a configured DICOM UID to its PS3.5 grammar before it flows into the URL path.
 
@@ -159,11 +173,7 @@ def _reject_non_uid(value: str, field: str) -> None:
         raise ValueError(
             f"DICOMweb {field} is longer than the {_DICOM_UID_MAX_LEN}-character UID limit of DICOM"
         )
-    # Every component must be non-empty and entirely ASCII digits. Requiring non-empty is what makes
-    # '..', a leading dot and a trailing dot illegal -- they are excluded STRUCTURALLY, not by
-    # enumeration. A trailing newline is excluded for free (it lands inside the final component and is
-    # not a digit), which is the hole a `$`-anchored regex would have left open -- #1240's defect.
-    if not all(part and _UID_DIGITS.issuperset(part) for part in value.split(".")):
+    if not _uid_components_ok(value):
         raise ValueError(
             f"DICOMweb {field} is not a valid UID for DICOM (dot-separated digits, no other characters)"
         )
@@ -187,16 +197,15 @@ def _reply_is_empty(body: str) -> bool:
 def _sequence_items(datasets: list[dict[str, Any]], tag: str) -> list[Any] | None:
     """Every item of the ``tag`` sequence across the datasets, in order, or ``None`` when the
     element is present in a shape dicom+json does not allow (not an object, a ``Value`` that is
-    not an array, or a ``BulkDataURI`` or ``InlineBinary`` key). An absent element, or one with no
-    ``Value`` and neither bulk-data key, is an empty sequence (PS3.18 F.2.5). Only the shape is
-    read, never an item's contents (PHI-safe)."""
+    not an array, or any key but ``vr`` and ``Value``). An absent element, or one with no
+    ``Value`` and no other key, is an empty sequence (PS3.18 F.2.5). Only the shape is read,
+    never an item's contents (PHI-safe)."""
     items: list[Any] = []
     for ds in datasets:
         if tag not in ds:
             continue
         element = ds[tag]
-        # A sequence never carries bulk data, so one that does is malformed rather than empty.
-        if not isinstance(element, dict) or not _SQ_FORBIDDEN_KEYS.isdisjoint(element):
+        if not isinstance(element, dict) or not element.keys() <= _ELEMENT_KEYS:
             return None
         value = element.get("Value", [])
         if not isinstance(value, list):
@@ -206,25 +215,24 @@ def _sequence_items(datasets: list[dict[str, Any]], tag: str) -> list[Any] | Non
 
 
 def _names_an_instance(item: Any) -> bool:
-    """True when a ReferencedSOPSequence item is a dataset whose ReferencedSOPInstanceUID has a
-    ``Value`` of one or more strings, none empty or blank. A UID with no Value, an empty or null
-    Value, or a non-string entry confirms nothing (BACKLOG #5914). Reads no UID beyond its type."""
+    """True when a ReferencedSOPSequence item is a dataset whose ReferencedSOPInstanceUID element
+    carries only ``vr`` and ``Value``, and whose ``Value`` is exactly one string (the attribute's VM
+    is 1) that passes :func:`_is_uid`. Anything else confirms nothing (BACKLOG #5914): no Value, an
+    empty or null one, a blank, non-string or non-UID entry, or more than one entry. The UID is
+    tested, never logged or returned (PHI-safe)."""
     if not isinstance(item, dict):
         return False
     element = item.get(_REFERENCED_SOP_INSTANCE_UID)
-    if not isinstance(element, dict):
+    if not isinstance(element, dict) or not element.keys() <= _ELEMENT_KEYS:
         return False
     value = element.get("Value")
-    return (
-        isinstance(value, list)
-        and bool(value)
-        and all(isinstance(uid, str) and uid.strip() for uid in value)
-    )
+    return isinstance(value, list) and len(value) == 1 and _is_uid(value[0])
 
 
 def _stowrs_refusal(body: str, status: int) -> tuple[str, str] | None:
-    """The refusal for a 2xx STOW-RS reply that does not confirm the store, or ``None`` when
-    it does. Every code is permanent: a re-send would get the same reply.
+    """The refusal for a 2xx STOW-RS reply, or ``None`` when it is a delivery. Not every reply
+    that fails to confirm the store is refused (see the last paragraph). Every code is permanent: a
+    re-send would get the same reply.
 
     - ``unparseable-reply``: the body is not JSON, repeats a key at any depth (``json.loads`` keeps
       the last of two, so a FailedSOPSequence could be read two ways), is nested past json's
@@ -233,13 +241,12 @@ def _stowrs_refusal(body: str, status: int) -> tuple[str, str] | None:
     - ``failed-sop``: a FailedSOPSequence (``00081198``) with any item, or in a shape dicom+json
       does not allow -- that direction fails closed.
     - ``unconfirmed-202``: a 202 (stored with warnings, or some instances failed) whose reply names
-      no stored instance: no ReferencedSOPSequence (``00081199``) item that is a dataset whose
-      ReferencedSOPInstanceUID (``00081155``) has a non-empty string Value
-      (:func:`_names_an_instance`). An empty 202 is one.
+      no stored instance: no ReferencedSOPSequence (``00081199``) item that names one by its
+      ReferencedSOPInstanceUID (``00081155``; :func:`_names_an_instance`). An empty 202 is one.
 
     An empty reply (:func:`_reply_is_empty`) on any other 2xx is not refused. A 200 is not held to
-    the ReferencedSOPSequence rule (BACKLOG #5914 ruling), so a 200 whose dataset confirms nothing,
-    ``{}`` included, is delivered. docs/CONNECTIONS.md *DICOMweb*, *Status classification*, states
+    the ReferencedSOPSequence rule (BACKLOG #5914 ruling), so a 200 dataset that confirms nothing
+    and is not refused above, ``{}`` included, is delivered. docs/CONNECTIONS.md *DICOMweb*, *Status classification*, states
     the rule in full.
 
     Returned as ``(code, reason)``; both are fixed strings that name no reply content."""
@@ -479,7 +486,7 @@ class DicomWebDestination(DestinationConnector):
         dicom_bytes = recover_dicom_object_bytes(payload, label="DICOMweb STOW-RS")
         # urllib is blocking — keep it off the event loop (the delivery worker awaits this).
         body, status = await asyncio.to_thread(self._post, dicom_bytes)
-        # A non-2xx, or a 2xx that does not confirm the store, already raised inside _post (transient
+        # A non-2xx, or a 2xx that _stowrs_refusal refuses, already raised inside _post (transient
         # retry / permanent dead-letter).
         if not self.capture_response:
             return None

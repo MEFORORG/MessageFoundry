@@ -3809,13 +3809,15 @@ again: see *A 2xx reply over the byte bound* under [REST](#rest--rest). Each of 
 also a permanent refusal, in both capture modes (BACKLOG #5914): a non-empty 2xx body that is not
 parseable JSON, repeats a key at any depth, is nested too deep, or is not a dataset object or a
 non-empty array of them (code `unparseable-reply`); a FailedSOPSequence that is not an object, has a
-`Value` that is not an array, or carries a `BulkDataURI` or `InlineBinary` key (code `failed-sop`);
-and a 202 with no **ReferencedSOPSequence** (`00081199`) item whose ReferencedSOPInstanceUID
-(`00081155`) has a `Value` of one or more non-blank strings, an empty 202 included (code
-`unconfirmed-202`). **Not every 2xx that fails to confirm the store is refused.** A 200 is not
-required to carry a ReferencedSOPSequence, so a 200 whose dataset confirms nothing, `{}` included,
-is delivered; and an empty 2xx other than a 202 (empty, or JSON whitespace after a leading BOM) is
-delivered, `no_reply` when capturing. **PHI:** the response can
+`Value` that is not an array, or carries any key but `vr` and `Value` (code `failed-sop`); and a
+202 with no **ReferencedSOPSequence** (`00081199`) item whose ReferencedSOPInstanceUID (`00081155`)
+element carries only `vr` and `Value`, with a `Value` of exactly one string in the UID grammar
+(dot-separated ASCII digits, at most 64 characters), an empty 202 included (code
+`unconfirmed-202`). A ReferencedSOPSequence that is malformed in the ways a FailedSOPSequence can
+be names no instance. **Not every 2xx that fails to confirm the store is refused.** A 200 is not
+required to carry a ReferencedSOPSequence, so a 200 dataset that confirms nothing and is not
+refused above, `{}` included, is delivered; and an empty 2xx other than a 202 (empty, or JSON
+whitespace after a leading BOM) is delivered, `no_reply` when capturing. **PHI:** the response can
 name patient/study identifiers, so it is never logged — only the HTTP status and a redacted URL are.
 
 ```python

@@ -487,27 +487,38 @@ async def test_dicomweb_unparseable_2xx_reply_is_a_permanent_refusal(
 
 
 # ReferencedSOPInstanceUID elements that name no instance, so confirm no 202 store (BACKLOG #5914).
-_UNCONFIRMING_UIDS: list[object] = [
-    {"vr": "UI"},
-    {"vr": "UI", "Value": []},
-    {"vr": "UI", "Value": None},
-    {"vr": "UI", "Value": [None]},
-    {"vr": "UI", "Value": [""]},
-    {"vr": "UI", "Value": ["  "]},
-    {"vr": "UI", "Value": [42]},
-    {"vr": "UI", "Value": "1.2.3.4.5"},
-    "1.2.3.4.5",
-]
-_UNCONFIRMING_UID_IDS = [
-    "no-value",
-    "empty-value",
-    "null-value",
-    "null-entry",
-    "empty-string",
-    "blank-string",
-    "non-string",
-    "value-not-array",
-    "element-not-object",
+def _uid_body(uid: object) -> str:
+    return json.dumps({"00081199": {"vr": "SQ", "Value": [{"00081155": uid}]}})
+
+
+_UNCONFIRMING_UID_BODIES = [
+    pytest.param(_uid_body(uid), id=f"uid-{name}")
+    for name, uid in [
+        ("no-value", {"vr": "UI"}),
+        ("empty-value", {"vr": "UI", "Value": []}),
+        ("null-value", {"vr": "UI", "Value": None}),
+        ("null-entry", {"vr": "UI", "Value": [None]}),
+        ("empty-string", {"vr": "UI", "Value": [""]}),
+        ("blank-string", {"vr": "UI", "Value": ["  "]}),
+        ("zero-width-space", {"vr": "UI", "Value": ["​"]}),
+        ("bom", {"vr": "UI", "Value": ["﻿"]}),
+        ("not-a-uid", {"vr": "UI", "Value": ["N/A"]}),
+        ("empty-component", {"vr": "UI", "Value": ["1..2"]}),
+        ("over-64", {"vr": "UI", "Value": ["1." * 32 + "1"]}),
+        ("two-values", {"vr": "UI", "Value": ["1.2", "3.4"]}),
+        ("one-blank-of-two", {"vr": "UI", "Value": ["1.2.3", ""]}),
+        ("non-string", {"vr": "UI", "Value": [42]}),
+        ("value-not-array", {"vr": "UI", "Value": "1.2.3.4.5"}),
+        ("element-not-object", "1.2.3.4.5"),
+        ("uid-with-bulk-uri", {"vr": "UI", "Value": ["1.2"], "BulkDataURI": "x"}),
+        ("misspelt-value", {"vr": "UI", "value": ["1.2"]}),
+    ]
+] + [
+    pytest.param(json.dumps({"00081199": seq}), id=f"seq-{name}")
+    for name, seq in [
+        ("bulk-uri", {"vr": "SQ", "BulkDataURI": "https://pacs.example.test/bulk/1"}),
+        ("inline-binary", {"vr": "SQ", "InlineBinary": "AAAA"}),
+    ]
 ]
 
 
@@ -526,10 +537,7 @@ _UNCONFIRMING_UID_IDS = [
         json.dumps([{"00081199": {"vr": "SQ", "Value": []}}]),
         json.dumps({"00081199": {"vr": "SQ", "Value": [{}]}}),  # an item naming no instance
         # BACKLOG #5914 repair: a ReferencedSOPInstanceUID key alone confirms no store.
-        *(
-            json.dumps({"00081199": {"vr": "SQ", "Value": [{"00081155": uid}]}})
-            for uid in _UNCONFIRMING_UIDS
-        ),
+        *_UNCONFIRMING_UID_BODIES,
     ],
     ids=[
         "empty",
@@ -542,7 +550,7 @@ _UNCONFIRMING_UID_IDS = [
         "non-dataset-items",
         "list-empty-sequence",
         "item-without-instance-uid",
-        *(f"uid-{name}" for name in _UNCONFIRMING_UID_IDS),
+        *(p.id for p in _UNCONFIRMING_UID_BODIES),
     ],
 )
 async def test_dicomweb_202_without_a_referenced_sop_is_a_permanent_refusal(
@@ -554,6 +562,14 @@ async def test_dicomweb_202_without_a_referenced_sop_is_a_permanent_refusal(
         await dest.send(PAYLOAD)
     assert exc.value.permanent is True
     assert exc.value.code == "unconfirmed-202"
+
+
+@pytest.mark.parametrize("body", _UNCONFIRMING_UID_BODIES)
+async def test_dicomweb_200_is_not_held_to_the_202_confirmation_rule(body: str) -> None:
+    # The ruling: a 200 whose ReferencedSOPSequence confirms nothing is still a delivery.
+    dest = _dest()
+    dest._opener = _FakeOpener(body=body.encode(), status=200)  # type: ignore[assignment]
+    assert await dest.send(PAYLOAD) is None
 
 
 async def test_dicomweb_202_with_a_referenced_sop_delivers() -> None:
@@ -619,8 +635,17 @@ async def test_dicomweb_a_2xx_that_is_not_a_dataset_is_unparseable(body: str) ->
         '{"vr": "SQ", "BulkDataURI": "https://pacs.example.test/bulk/1"}',
         '{"vr": "SQ", "InlineBinary": "AAAA"}',
         '{"vr": "SQ", "Value": [], "InlineBinary": "AAAA"}',
+        '{"vr": "SQ", "value": [{"00081197": {"vr": "US", "Value": [272]}}]}',
     ],
-    ids=["not-object", "value-object", "value-null", "bulk-uri", "inline-binary", "value-and-bulk"],
+    ids=[
+        "not-object",
+        "value-object",
+        "value-null",
+        "bulk-uri",
+        "inline-binary",
+        "value-and-bulk",
+        "misspelt-value",
+    ],
 )
 @pytest.mark.parametrize("status", [200, 202])
 async def test_dicomweb_a_malformed_failed_sop_sequence_fails_closed(
