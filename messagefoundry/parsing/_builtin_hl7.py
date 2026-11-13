@@ -76,7 +76,7 @@ __all__ = [
     "MAX_COUNTED_ESCAPE_OPENERS",
     "message_escape_char",
     "raise_if_blank_segment_scan",
-    "scan_segment_index",
+    "addressable_segment_ids",
 ]
 
 
@@ -262,16 +262,18 @@ def _ensure_split(msg: ParsedMessage, seg_index: int) -> None:
 def _segment_index(msg: ParsedMessage, seg_id: str, occurrence: int) -> int | None:
     """List index of the ``occurrence``-th (1-based) segment with ``seg_id``, or None if absent.
 
-    Tolerant scan (mirrors the ``str(segment[0])`` iteration python-hl7's legacy ``Message`` read and
-    presence path used), and since BACKLOG #5917 also the scan every :func:`set_field` write resolves
-    through: a fieldless bare segment counts as an occurrence, and this scan never raises on a blank
-    segment. The *raising* check python-hl7 does for ``segment()``/``extract_field``/whole-field
-    assignment lives in :func:`raise_if_blank_segment_scan`, which :func:`set_field` still calls first
-    at occurrence 1.
+    The one occurrence scan every by-id path resolves through: ``Message`` reads, its presence check,
+    :func:`set_field`, and the ``Peek`` path (:func:`extract_field`). It uses python-hl7's
+    ``segments()`` matcher, ``seg[0][0] == id``, which **skips a fieldless bare segment** (see
+    :func:`_is_fieldless`), so a bare ``PID`` directly before a populated ``PID`` leaves the populated
+    one occurrence 1, and a lone bare ``PID`` reads, counts and writes as an absent segment (BACKLOG
+    #5917; the history is in ADR 0054). This scan never raises; the blank
+    segment blow-up python-hl7's matcher also has lives in :func:`raise_if_blank_segment_scan`, which
+    the raising paths call first.
     """
     seen = 0
     for i, seg in enumerate(msg["segments"]):
-        if seg["id"] == seg_id:
+        if seg["id"] == seg_id and not _is_fieldless(msg, i):
             seen += 1
             if seen == occurrence:
                 return i
@@ -282,7 +284,7 @@ def _is_fieldless(msg: ParsedMessage, seg_index: int) -> bool:
     """Whether a segment line carries **no field separator at all** (just a bare id like ``PID``).
 
     This is the distinction python-hl7's ``segments()`` matcher turns on (see
-    :func:`scan_segment_index`): a fieldless line parses such that ``segment[0]`` is a plain ``str``
+    :func:`_segment_index`): a fieldless line parses such that ``segment[0]`` is a plain ``str``
     (the id) rather than a ``Field``, so ``segment[0][0]`` is the id's first *character* — which never
     equals the id, so the segment is silently skipped by an id lookup. A line with even an empty
     trailing field (``PID|``) is *not* fieldless. Detected from the lazy raw line (no field sep) or,
@@ -303,10 +305,11 @@ def raise_if_blank_segment_scan(msg: ParsedMessage) -> None:
     aborting the lookup **regardless of where the blank segment sits relative to the target**. Every
     by-id resolution that routes through that scan (``segment()``, ``extract_field``, whole-field
     assignment via ``msg["SEG.Fn"] = …``) therefore raises whenever the message carries any blank
-    segment. The tolerant ``str(segment[0])`` iteration (reads, presence, occurrence>1 writes) does
-    **not** — so this guard is invoked only on the raising paths to preserve that exact asymmetry.
-    :func:`set_field` keeps only this blank-segment raise at occurrence 1; it no longer resolves the
-    segment through the ``segments()`` matcher (BACKLOG #5917).
+    segment. python-hl7's tolerant ``str(segment[0])`` iteration (its legacy ``Message`` reads,
+    presence and occurrence>1 writes) does **not** — so this guard is invoked only on the raising
+    paths (:func:`extract_field`, and :func:`set_field` at occurrence 1) to keep that asymmetry. It is
+    independent of the fieldless-segment skip, which every by-id path shares (:func:`_segment_index`,
+    BACKLOG #5917): a blank line raises here, a bare id never does.
 
     **Only a truly empty line raises** (BACKLOG #1594). A line that merely *starts* with the field
     separator (``|foo``) also has id ``""`` here, but python-hl7 parses it into a segment whose
@@ -325,28 +328,6 @@ def _is_blank_line(msg: ParsedMessage, seg_index: int) -> bool:
     if lazy_raw is not None:
         return lazy_raw == ""
     return msg["segments"][seg_index]["fields"] in ([], [""])
-
-
-def scan_segment_index(msg: ParsedMessage, seg_id: str, occurrence: int) -> int | None:
-    """List index of the ``occurrence``-th id match using python-hl7's **``segments()`` matcher**.
-
-    The raising by-id read path (``Peek.field`` → :func:`extract_field`) resolves the segment through
-    python-hl7's ``Sequence(seg for seg in self if seg[0][0] == id)`` — which (a) blows up on any blank
-    segment (handled by :func:`raise_if_blank_segment_scan`, called first) and (b) **skips a fieldless
-    bare segment** (``seg[0][0]`` is the id's first character, never the id) so it is not counted as an
-    occurrence. So a bare ``PID`` directly before a populated ``PID`` makes the populated one
-    occurrence 1, exactly as the legacy path selects it. The ``Message`` reads and writes
-    (:func:`set_field` included, BACKLOG #5917) use :func:`_segment_index`, and ``Message``'s presence
-    check counts the same way, so all three count the bare segment. That keeps the legacy
-    read↔extract split while keeping a write on the segment its read and presence check name.
-    """
-    seen = 0
-    for i, seg in enumerate(msg["segments"]):
-        if seg["id"] == seg_id and not _is_fieldless(msg, i):
-            seen += 1
-            if seen == occurrence:
-                return i
-    return None
 
 
 def _field_text(entry: str | FieldEntry) -> str:
@@ -435,10 +416,9 @@ def extract_field(
     """
     raise_if_blank_segment_scan(msg)
     # python-hl7's ``extract_field`` resolves the segment through ``segments()``, which skips a
-    # fieldless bare segment — so use the same matcher (a bare ``PID`` is not occurrence 1 when a
-    # populated ``PID`` follows). A zero-match segments() raises KeyError in python-hl7, mapped to None
-    # at the Peek layer; returning None here yields the identical observable result.
-    seg_index = scan_segment_index(msg, seg_id, occurrence)
+    # fieldless bare segment, as :func:`_segment_index` does. A zero-match segments() raises KeyError
+    # in python-hl7, mapped to None at the Peek layer; returning None here is the same result.
+    seg_index = _segment_index(msg, seg_id, occurrence)
     if seg_index is None:
         return None
     _ensure_split(msg, seg_index)
@@ -539,8 +519,23 @@ def extract_part(
 
 
 def segment_ids(msg: ParsedMessage) -> list[str]:
-    """Ordered segment ids (``["MSH", "EVN", "PID", ...]``); an empty/blank segment is ``""``."""
+    """Ordered segment ids (``["MSH", "EVN", "PID", ...]``); an empty/blank segment is ``""``.
+
+    Positional: one entry per line, a fieldless bare segment included, so an index here is an index
+    for :func:`add_segment_line` and :func:`delete_segment_at`. To count or number occurrences, use
+    :func:`addressable_segment_ids`, which agrees with :func:`_segment_index`.
+    """
     return [seg["id"] for seg in msg["segments"]]
+
+
+def addressable_segment_ids(msg: ParsedMessage) -> list[str | None]:
+    """:func:`segment_ids` with each fieldless bare segment replaced by ``None``.
+
+    The same length and positions as :func:`segment_ids`, but an entry matches an id only where
+    :func:`_segment_index` counts that line as an occurrence, so a count or an occurrence translation
+    built on it agrees with every by-id read and write (BACKLOG #5917).
+    """
+    return [None if _is_fieldless(msg, i) else seg["id"] for i, seg in enumerate(msg["segments"])]
 
 
 def separators(msg: ParsedMessage) -> tuple[str, str, str, str, str]:
@@ -967,16 +962,13 @@ def set_field(
     verbatim as a bare ``str`` (re-componentized lazily on a later read). Marks the message dirty so
     the next :func:`encode` rebuilds the raw. Raises ``KeyError`` if the segment occurrence is absent.
 
-    Every occurrence resolves through the tolerant :func:`_segment_index` scan, the one the read and
-    presence paths use, so a fieldless bare segment counts as an occurrence here too: a bare ``PID``
-    before a populated one is occurrence 1, and a write at occurrence 1 extends that bare segment in
-    place (BACKLOG #5917). python-hl7's whole-field assignment skipped the bare segment at occurrence
-    1, so a write landed on the populated segment the read side calls occurrence 2, while a component,
-    repetition or ``add_repetition`` write read its base from the bare one and overwrote the populated
-    field with it. That legacy skip is deliberately not kept. For ``occurrence == 1`` a blank segment
-    anywhere still raises ``IndexError`` (:func:`raise_if_blank_segment_scan`, byte-parity with
-    python-hl7's ``segments()`` scan); the ``Message`` layer drops empty lines before parsing, so only
-    a tree-held blank segment reaches it.
+    Every occurrence resolves through :func:`_segment_index`, the scan the reads and the ``Message``
+    presence check use, so a fieldless bare segment is skipped here too: a bare ``PID`` before a
+    populated one leaves the write on the populated one, and a lone bare ``PID`` is a ``KeyError``
+    (BACKLOG #5917). For ``occurrence == 1`` a blank segment anywhere still raises ``IndexError``
+    (:func:`raise_if_blank_segment_scan`), byte-parity with python-hl7's whole-field assignment
+    (``msg["SEG.Fn"] = …`` → the raising ``segments()`` scan); the ``Message`` layer drops empty lines
+    before parsing, so only a tree-held blank segment reaches it.
     """
     if occurrence == 1:
         raise_if_blank_segment_scan(msg)

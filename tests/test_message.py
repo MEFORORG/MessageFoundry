@@ -8,7 +8,7 @@ from collections.abc import Callable
 
 import pytest
 
-from messagefoundry.parsing import Message, Peek
+from messagefoundry.parsing import Message, Peek, _builtin_hl7
 
 ADT = (
     "MSH|^~\\&|SENDAPP|SENDFAC|RECVAPP|RECVFAC|20260101||ADT^A01^ADT_A01|MSG1|P|2.5.1\r"
@@ -343,18 +343,13 @@ def test_add_segment_custom_separators() -> None:
     assert Message.parse(m.encode()).field("ODS-2.2") == "Regular"
 
 
-def test_add_segment_bare_id_is_normalized_and_settable() -> None:
-    # A bare segment id (no field separator) grafts a settable segment, normalized to the
-    # trailing-separator form, so Peek (which skips a fieldless line) numbers the graft as Message does.
+def test_add_segment_bare_id_is_settable() -> None:
+    # Regression: a bare segment id (no field separator) must graft a SETTABLE segment. Previously
+    # count_segments() saw it but a subsequent set() raised "cannot set absent segment" because the
+    # grafted segment had no data field for the write path to address.
     m = Message.parse(ORU)
     m.add_segment("ZAL")  # bare id, no fields
     assert m.count_segments("ZAL") == 1
-    assert m.encode().split("\r")[-2] == "ZAL|"  # the normalization itself
-    # A graft before a populated ZAL: Peek's occurrence 1 is the graft, as it is for Message.
-    g = Message.parse(ORU + "ZAL|1|second\r")
-    g.add_segment("ZAL", index=1)
-    assert Peek.parse(g.encode()).field("ZAL-2") is None
-    assert g.field("ZAL-2") is None and g.field("ZAL-2", occurrence=2) == "second"
     m.set("ZAL-2", "hello")
     assert m.field("ZAL-2") == "hello"
     assert Message.parse(m.encode()).field("ZAL-2") == "hello"
@@ -365,68 +360,108 @@ def test_add_segment_bare_id_is_normalized_and_settable() -> None:
     assert m.encode() == m2.encode()
 
 
-# A fieldless bare ``PID`` line directly before a populated one (BACKLOG #5917). Reads, presence and
-# count_segments() all treat the bare line as occurrence 1, so every write at occurrence 1 must edit
-# that same bare line and leave the populated second ``PID`` untouched.
-BARE_THEN_POPULATED = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\rPID\rPID|1||X^Y~Q\r"
-_POPULATED_PID = "PID|1||X^Y~Q"
+# A fieldless bare ``PID`` line (no field separator) directly before a populated one (BACKLOG #5917).
+# Message skips a fieldless line for every occurrence-addressed read, presence check, count and write,
+# as Peek does, so a sender who plants a bare ``PID`` cannot steer a default-occurrence write (a
+# Handler's whole-field scrub, say) off the populated segment.
+_MSH = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\r"
+BARE_THEN_POPULATED = _MSH + "PID\rPID|1||X^Y~Q||DOE^JANE\r"
 
 
 def _pid_lines(m: Message) -> list[str]:
     return [line for line in m.encode().split("\r") if line.startswith("PID")]
 
 
+def test_a_fieldless_line_is_not_an_occurrence() -> None:
+    m = Message.parse(BARE_THEN_POPULATED)
+    assert m.count_segments("PID") == 1
+    assert m.field("PID-3") == "X^Y~Q"
+    assert m.field("PID-3", occurrence=2) is None
+    assert m.repetitions("PID-3") == ["X^Y", "Q"]
+    # segments() stays positional: it lists every line, the fieldless one included, as Peek's does.
+    assert m.segments() == ["MSH", "PID", "PID"]
+    assert Peek.parse(BARE_THEN_POPULATED).segments() == m.segments()
+
+
 @pytest.mark.parametrize(
-    ("label", "op", "bare_after"),
+    ("label", "op", "populated_after"),
     [
-        ("whole-field", lambda m: m.set("PID-3", "NEW"), "PID|||NEW"),
-        ("component", lambda m: m.set("PID-3.2", "NEW"), "PID|||^NEW"),
-        ("subcomponent", lambda m: m.set("PID-3.1.2", "S"), "PID|||&S"),
-        ("repetition", lambda m: m.set("PID-3", "Z", repetition=2), "PID|||~Z"),
-        ("set-data", lambda m: m.set_data("PID-3", "A^B"), "PID|||A\\S\\B"),
-        ("add-repetition", lambda m: m.add_repetition("PID-3", "R"), "PID|||R"),
+        ("whole-field scrub", lambda m: m.set("PID-5", ""), "PID|1||X^Y~Q||"),
+        ("whole-field", lambda m: m.set("PID-3", "NEW"), "PID|1||NEW||DOE^JANE"),
+        ("component", lambda m: m.set("PID-3.2", "NEW"), "PID|1||X^NEW~Q||DOE^JANE"),
+        ("subcomponent", lambda m: m.set("PID-3.1.2", "S"), "PID|1||X&S^Y~Q||DOE^JANE"),
+        ("repetition", lambda m: m.set("PID-3", "Z", repetition=2), "PID|1||X^Y~Z||DOE^JANE"),
+        ("set-data", lambda m: m.set_data("PID-5", "A^B"), "PID|1||X^Y~Q||A\\S\\B"),
+        ("add-repetition", lambda m: m.add_repetition("PID-3", "R"), "PID|1||X^Y~Q~R||DOE^JANE"),
     ],
 )
-def test_occurrence_one_write_lands_on_a_bare_segment(
-    label: str, op: Callable[[Message], None], bare_after: str
+def test_an_occurrence_one_write_skips_a_fieldless_line(
+    label: str, op: Callable[[Message], None], populated_after: str
 ) -> None:
     m = Message.parse(BARE_THEN_POPULATED)
-    # The read side's view of occurrence 1: the bare line, empty.
-    assert m.count_segments("PID") == 2
-    assert m.field("PID-3") is None
     op(m)
-    assert _pid_lines(m) == [bare_after, _POPULATED_PID], label
-    # The write reads back at occurrence 1, before and after a round trip, and occurrence 2 is intact.
-    written = m.field("PID-3")
-    assert written is not None and written == bare_after.removeprefix("PID|||"), label
+    # The bare line is untouched (no empty field copied over the populated PID), and the write
+    # landed on the populated PID, the one Peek also calls occurrence 1.
+    assert _pid_lines(m) == ["PID", populated_after], label
     reparsed = Message.parse(m.encode())
-    assert reparsed.field("PID-3") == written
-    assert reparsed.field("PID-3", occurrence=2) == "X^Y~Q"
+    peek = Peek.parse(m.encode())
+    for path in ("PID-1", "PID-3", "PID-5"):
+        assert peek.field(path) == reparsed.field(path), (label, path)
 
 
-def test_peek_counts_a_written_bare_line_as_occurrence_one() -> None:
-    # Peek skips a fieldless line, so before any write its occurrence 1 is the populated PID. Any
-    # write to the bare line, an empty value included, gives it a field separator, and Peek's
-    # occurrence 1 on the re-encoded message becomes that line (recorded in ADR 0054).
-    assert Peek.parse(BARE_THEN_POPULATED).field("PID-3") == "X^Y~Q"
+def test_message_and_peek_number_occurrences_alike_around_fieldless_lines() -> None:
+    # Peek reads occurrence 1 only; the occurrence-addressed Peek path is extract_field, so compare
+    # Message against it at every occurrence, before and after a write.
+    raw = _MSH + "OBX\rOBX|1|ST|A\rOBX\rOBX\rOBX|2|ST|B\r"
+    m = Message.parse(raw)
+    assert Peek.parse(raw).field("OBX-3") == m.field("OBX-3") == "A"
+    assert m.count_segments("OBX") == 2
+
+    def peek_at(message: Message, occurrence: int) -> str | None:
+        parsed = _builtin_hl7.parse(message.encode())
+        return _builtin_hl7.extract_field(parsed, "OBX", 3, None, None, occurrence=occurrence)
+
+    assert [m.field("OBX-3", occurrence=o) for o in (1, 2, 3)] == ["A", "B", None]
+    assert [peek_at(m, o) for o in (1, 2, 3)] == ["A", "B", None]
+    m.set("OBX-3", "second", occurrence=2)
+    assert peek_at(m, 2) == m.field("OBX-3", occurrence=2) == "second"
+    assert _builtin_hl7.segment_ids(_builtin_hl7.parse(m.encode())).count("OBX") == 5
+    with pytest.raises(KeyError, match="occurrence 3"):
+        m.set("OBX-3", "x", occurrence=3)
+
+
+def test_a_lone_fieldless_line_is_an_absent_segment() -> None:
+    # A fieldless line is not an occurrence, so a lone one reads, counts and writes as an absent
+    # segment: None, 0, and the normal missing-segment KeyError. delete_segments still removes it.
+    m = Message.parse(_MSH + "PID\r")
+    assert m.count_segments("PID") == 0
+    assert m.field("PID-3") is None
+    with pytest.raises(KeyError, match="cannot set absent segment 'PID'"):
+        m.set("PID-3", "NEW")
+    with pytest.raises(KeyError, match="cannot set absent segment 'PID'"):
+        m.set_data("PID-3", "NEW")
+    with pytest.raises(KeyError, match="cannot add a repetition to absent segment 'PID'"):
+        m.add_repetition("PID-3", "NEW")
+    assert m.delete_segments("PID") == 1
+    assert m.segments() == ["MSH"]
+
+
+def test_delete_segments_removes_a_fieldless_line() -> None:
     m = Message.parse(BARE_THEN_POPULATED)
-    m.set("PID-3", "")
-    assert _pid_lines(m) == ["PID|||", _POPULATED_PID]
-    assert Peek.parse(m.encode()).field("PID-3") is None
+    assert m.delete_segments("PID") == 2
+    assert m.segments() == ["MSH"]
 
 
-def test_occurrence_one_write_on_a_lone_bare_segment() -> None:
-    # A lone bare segment is present to the write guard, so the write must not raise KeyError.
-    m = Message.parse("MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\rPID\r")
-    m.set("PID-3", "NEW")
-    assert _pid_lines(m) == ["PID|||NEW"]
-    assert m.field("PID-3") == "NEW"
-
-
-def test_occurrence_two_write_still_targets_the_populated_segment() -> None:
-    m = Message.parse(BARE_THEN_POPULATED)
-    m.set("PID-3.2", "NEW", occurrence=2)
-    assert _pid_lines(m) == ["PID", "PID|1||X^NEW~Q"]
+def test_groups_skip_a_fieldless_boundary_and_member() -> None:
+    # A fieldless OBR is not a boundary and a fieldless OBX is not a member occurrence, so a group's
+    # reads translate to the same message-wide occurrence Message.field uses.
+    raw = _MSH + "OBR\rOBX|0|ST|PRE\rOBR|1\rOBX\rOBX|1|ST|A\r"
+    m = Message.parse(raw)
+    groups = m.groups("OBR")
+    assert len(groups) == 1
+    assert groups[0].count("OBX") == 1
+    assert groups[0].field("OBX-3") == "A"
+    assert groups[0].field("OBR-1") == "1"
 
 
 def test_delete_segments() -> None:

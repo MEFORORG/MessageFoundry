@@ -69,7 +69,15 @@ class SegmentGroup:
         ``start`` is the boundary segment's row; ``end`` is the next boundary's row (or the segment
         count). Raises :class:`LookupError` if the group no longer exists (e.g. it was deleted),
         which is the honest signal that a stale view is being used."""
-        ids = self._m.segments()
+        start, end, _ids = self._span_ids()
+        return start, end
+
+    def _span_ids(self) -> tuple[int, int, list[str | None]]:
+        """:meth:`_span` plus the addressable id list it was derived from, so a caller that also
+        counts ids builds the list once."""
+        # Addressable ids, so a fieldless bare boundary line (``OBR`` alone) starts no group, matching
+        # count_segments(), which groups_of() sizes the group list from (BACKLOG #5917).
+        ids = self._m._addressable_segment_ids()
         seen = 0
         start = -1
         for i, seg_id in enumerate(ids):
@@ -87,7 +95,7 @@ class SegmentGroup:
             if ids[j] == self._boundary:
                 end = j
                 break
-        return start, end
+        return start, end, ids
 
     # --- read ----------------------------------------------------------------
 
@@ -116,8 +124,10 @@ class SegmentGroup:
 
     def count(self, segment_id: str) -> int:
         """How many segments of ``segment_id`` are in this group — e.g. the OBX count for *this*
-        order, which the flat :meth:`Message.count_segments` (whole-message) can't give."""
-        return sum(1 for sid in self.segment_ids() if sid == segment_id)
+        order, which the flat :meth:`Message.count_segments` (whole-message) can't give. Like it,
+        this skips a fieldless bare line, which :meth:`segment_ids` still lists."""
+        start, end, ids = self._span_ids()
+        return ids[start:end].count(segment_id)
 
     def field(self, path: str, *, occurrence: int = 1, repetition: int | None = None) -> str | None:
         """Read a field within this group, with ``occurrence`` scoped to the group.
@@ -204,10 +214,10 @@ class SegmentGroup:
         Counts how many ``segment_id`` segments precede this group's span, then adds the in-group
         offset — so a group-scoped read maps cleanly onto the existing flat primitive instead of
         duplicating field-extraction logic."""
-        start, end = self._span()
-        ids = self._m.segments()
-        before = sum(1 for sid in ids[:start] if sid == segment_id)
-        in_group = sum(1 for sid in ids[start:end] if sid == segment_id)
+        # Addressable ids, so a fieldless bare line is skipped here as Message.field skips it.
+        start, end, ids = self._span_ids()
+        before = ids[:start].count(segment_id)
+        in_group = ids[start:end].count(segment_id)
         if group_occurrence > in_group:
             return None
         return before + group_occurrence
