@@ -96,6 +96,7 @@ from harness.load.shardcert import (
     run_shardcert_engine,
     rung_fidelity,
 )
+from messagefoundry.terminal_text import escape_for_terminal
 
 log = logging.getLogger(__name__)
 
@@ -3477,6 +3478,7 @@ async def run_drive_ladder(
     sink_host: str,
     base_coord: FileDropCoord,
     allow_insecure: bool = False,
+    cacert: str | None = None,
     # NB: the DEFAULT is a real 300s soak — the "off" switch is ``do_soak=False`` (CLI ``--no-soak``), NOT a
     # dropped/zero ``soak_hold_seconds`` (0 arms a degenerate 0s soak, it does not skip).
     soak_hold_seconds: float = 300.0,
@@ -3537,6 +3539,7 @@ async def run_drive_ladder(
                 coord=rung_coord,
                 drain_timeout=rung.drain_timeout,
                 allow_insecure=allow_insecure,
+                cacert=cacert,
                 shards_ready_timeout=shards_ready_timeout,
                 await_engine_drained=True,
                 engine_drained_timeout=engine_drained_timeout,
@@ -3554,7 +3557,7 @@ async def run_drive_ladder(
             # posting a fabricated collapse. LADDER_STOP is polled only BETWEEN rungs; this is per-rung.
             rung_coord.post(RUNG_ABORTED, {"reason": "drive_aborted", "detail": str(exc)})
             notes.append(
-                f"{rung.run_suffix}: drive aborted ({exc}) — posted LADDER_STOP + RUNG_ABORTED, setup-abort"
+                f"{rung.run_suffix}: drive aborted ({escape_for_terminal(str(exc), single_line=True)}) — posted LADDER_STOP + RUNG_ABORTED, setup-abort"
             )
             climb_aborted = True
             stopped = True
@@ -3635,6 +3638,7 @@ async def run_drive_ladder(
                 coord=soak_coord,
                 drain_timeout=soak_drain_timeout,
                 allow_insecure=allow_insecure,
+                cacert=cacert,
                 shards_ready_timeout=shards_ready_timeout,
                 await_engine_drained=True,
                 engine_drained_timeout=engine_drained_timeout,
@@ -3661,7 +3665,7 @@ async def run_drive_ladder(
             soak_aborted = True
             soak_coord.post(RUNG_ABORTED, {"reason": "soak_drive_aborted", "detail": str(exc)})
             notes.append(
-                f"soak: drive aborted ({exc}) — soak ABORTED (setup-degraded, not a bench result)"
+                f"soak: drive aborted ({escape_for_terminal(str(exc), single_line=True)}) — soak ABORTED (setup-degraded, not a bench result)"
             )
 
     if stopped and not climb_aborted:
