@@ -147,6 +147,7 @@ from messagefoundry.childenv import (
     pass_environment_refusal,
     python_module_argv,
 )
+from messagefoundry.console_streams import harden_console_streams
 from messagefoundry.redaction import safe_exc
 
 
@@ -169,7 +170,9 @@ def _kinds(lines: list[str]) -> list[str]:
 
     ``requirement`` or ``option`` where a logical line starts; ``continued`` where a requirement
     goes on to a line that is neither a hash or other option nor a comment, so a marker there would
-    escape the strip; ``other`` for the rest. A line ending in a backslash continues onto the next,
+    escape the strip; ``other`` for any other line that starts a logical line (blank, a comment, or
+    only backslashes); ``joined`` for any other line that continues one. A line ending in a
+    backslash continues onto the next,
     unless it is a comment. pip's ``join_lines`` strips the backslashes from both ends of a line it
     joins, so a line of nothing but indentation and backslashes adds nothing: the logical line starts
     on the line after it (vault BACKLOG #3786 R1, R2).
@@ -186,10 +189,14 @@ def _kinds(lines: list[str]) -> list[str]:
             kind = "requirement" if in_requirement else "option" if start[:1] == "-" else "other"
             continues = continues and bool(start)
         else:
-            kind = "continued" if in_requirement and head[:1] not in ("", "-", "#") else "other"
+            kind = "continued" if in_requirement and head[:1] not in ("", "-", "#") else "joined"
         kinds.append(kind)
         continued = continues
     return kinds
+
+
+#: The kinds :func:`_kinds` gives a line that starts a logical line.
+_STARTS = frozenset({"requirement", "option", "other"})
 
 
 def _classify(text: str) -> tuple[list[str], list[str]]:
@@ -491,28 +498,27 @@ def canonical_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
+def _pin_name(requirement: str) -> str | None:
+    """The canonical name that starts ``requirement``, or ``None`` where none does."""
+    match = _NAME.match(requirement)
+    return canonical_name(match[0]) if match else None
+
+
 def _drop(
     lines: list[str], kinds: list[str], names: Collection[str]
 ) -> tuple[list[str], list[tuple[str, str]]]:
     out: list[str] = []
     dropped: list[tuple[str, str]] = []
-    dropping = continued = False
+    dropping = False
     for line, kind in zip(lines, kinds, strict=True):
-        body = _body(line)
-        # A requirement starts only where _kinds says one does, which may be after a line of
-        # backslashes that this loop's own reading counts as continuing.
-        if kind == "requirement":
-            head = body.lstrip()
-            match = _NAME.match(head)
-            name = canonical_name(match[0]) if match else ""
-            dropping = bool(name) and name in names
-            if dropping:
+        if kind in _STARTS:
+            head = _body(line).lstrip()
+            name = _pin_name(head) if kind == "requirement" else None
+            dropping = name is not None and name in names
+            if dropping and name is not None:
                 dropped.append((name, head.removesuffix("\\").rstrip()))
-        elif not continued:
-            dropping = False
         if not dropping:
             out.append(line)
-        continued = body.endswith("\\") and not body.lstrip().startswith("#")
     return out, dropped
 
 
@@ -733,20 +739,13 @@ def _distinct_count(requirements: Sequence[str]) -> int:
     counts canonical names, or the whole string where none starts it, which counts one where a lock
     spells one name two ways, and pip-audit audits each spelling.
     """
-    return len(
-        {canonical_name(m[0]) if (m := _NAME.match(r.lstrip())) else r for r in requirements}
-    )
-
-
-def _print_out(text: str) -> None:
-    """Print ``text`` to stdout, a character its encoding lacks written as a backslash escape, as
-    stderr writes one (vault BACKLOG #3786 R5): the lock's own text, printed with ``strict``
-    errors on a cp1252 console, raised a traceback that quoted it."""
-    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
-    print(text.encode(encoding, "backslashreplace").decode(encoding))
+    return len({_pin_name(r.lstrip()) or r for r in requirements})
 
 
 def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | None = None) -> int:
+    # The lock's own text reaches stdout, which on a cp1252 console raised a traceback quoting a
+    # character it could not encode (vault BACKLOG #3786 R5).
+    harden_console_streams()
     words = list(sys.argv[1:] if argv is None else argv)
     parser = _UnquotingParser(words, description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument(
@@ -864,17 +863,15 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | No
         print(f"::error::{lock}: {_MARKER_REFUSAL}", file=sys.stderr)
         return 2
     # A skipped pin is neither counted nor listed as audited.
-    stripped = [
-        e for e in stripped if not (m := _NAME.match(e)) or canonical_name(m[0]) not in private
-    ]
-    _print_out(
+    stripped = [e for e in stripped if (name := _pin_name(e)) is None or name not in private]
+    print(
         f"{lock}: {_distinct_count(read)} pinned requirements audited, {len(stripped)} "
         "un-gated from a marker the host would have evaluated:"
     )
     for entry in stripped:
-        _print_out(f"  {entry}")
+        print(f"  {entry}")
     for _, entry in skipped:
-        _print_out(f"  not audited, named by --skip-private: {entry}")
+        print(f"  not audited, named by --skip-private: {entry}")
     sys.stdout.flush()
     if run is None:
         run = functools.partial(_run, pass_environment=tuple(args.pass_environment))

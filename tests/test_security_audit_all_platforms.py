@@ -13,6 +13,7 @@ pip-audit). ``tests/test_audit_all_platforms.py`` pins the engine's workflows to
 from __future__ import annotations
 
 import codecs
+import io
 import locale
 import os
 import re
@@ -964,16 +965,10 @@ def test_an_include_after_a_backslash_line_is_refused_as_an_option(
 
 def test_skip_private_finds_a_pin_after_a_backslash_line(tmp_path: Path) -> None:
     """The pin a line of backslashes comes before is a requirement to ``--skip-private`` too."""
-    src = tmp_path / "x.lock"
-    src.write_text(f"\\\npriv==1 --hash=sha256:{_DIGEST}\n{_EVIL}\n", encoding="utf-8")
-    seen: list[str] = []
-
-    def run(cmd: list[str]) -> int:
-        seen.append(Path(cmd[cmd.index("-r") + 1]).read_text(encoding="utf-8-sig"))
-        return 0
-
-    assert main(["--skip-private", "priv", str(src)], run=run) == 0
-    assert seen[-1] == f"\\\n{_EVIL}\n"
+    lock = f"\\\npriv==1 --hash=sha256:{_DIGEST}\n{_EVIL}\n"
+    status, seen = _seen_by(tmp_path, ["--skip-private", "priv"], lock)
+    assert status == 0
+    assert seen[-1][1] == f"\\\n{_EVIL}\n"
 
 
 def test_identical_pins_are_counted_once_as_pip_audit_audits_them(
@@ -996,9 +991,7 @@ def test_a_lock_character_stdout_cannot_encode_is_escaped_not_raised(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """R5: the summary went to stdout with ``strict`` errors, so a lock character a cp1252 console
-    lacks raised a traceback that quoted it. It is escaped, as stderr escapes one."""
-    import io
-
+    lacks raised a traceback that quoted it. ``main`` hardens its console streams first."""
     raw = io.BytesIO()
     out = io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
     monkeypatch.setattr(sys, "stdout", out)
@@ -1007,14 +1000,16 @@ def test_a_lock_character_stdout_cannot_encode_is_escaped_not_raised(
     ran, run = _recorder(0)
     assert main([str(src)], run=run) == 0
     out.flush()
-    assert "sys_platform == '\\u4e2d'" in raw.getvalue().decode("cp1252")
+    assert "foo==1 ; sys_platform == '?'" in raw.getvalue().decode("cp1252")
     assert len(ran) == 2
 
 
-def _seen_by(tmp_path: Path, argv: list[str]) -> tuple[int, list[tuple[list[str], str]]]:
-    """Run ``main`` on ``LOCK`` with ``argv`` before the lock path; each command and its -r file."""
+def _seen_by(
+    tmp_path: Path, argv: list[str], lock: str = LOCK
+) -> tuple[int, list[tuple[list[str], str]]]:
+    """Run ``main`` on ``lock`` with ``argv`` before the lock path; each command and its -r file."""
     src = tmp_path / "x.lock"
-    src.write_text(LOCK, encoding="utf-8")
+    src.write_text(lock, encoding="utf-8")
     seen: list[tuple[list[str], str]] = []
 
     def run(cmd: list[str]) -> int:
