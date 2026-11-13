@@ -8,8 +8,9 @@ tags then cost the square of its length, and on the 2xx path that cost ran on th
 
 Three things are pinned here: what the new extraction reads, its time grows linearly, and the 2xx
 classification runs in the worker thread. BACKLOG #5913 adds a fourth at the end of the file: the
-WS-* envelope wrap and the body-secret substitution run in that same worker hop, before the POST. The old patterns are kept below, verbatim, as the positive
-control for the second, and inside the reference for the first.
+WS-* envelope wrap and the body-secret substitution run in that same worker hop, before the POST.
+The old patterns are kept below, verbatim, as the positive control for the second, and inside the
+reference for the first.
 
 The new extraction is NOT the old one everywhere. The old patterns read the first faultcode anywhere
 in the reply, else the first Value, the Header included, and an empty ``<faultcode/>`` took the next element's text as its

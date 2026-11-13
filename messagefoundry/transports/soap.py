@@ -1023,10 +1023,11 @@ class SoapDestination(DestinationConnector):
         fragment gate and lint first, then the secrets, then the POST, so a refused fragment or a
         token that does not appear exactly once raises before a byte crosses, and the refusal
         reaches ``send`` with its type unchanged. The GIL caveat below holds for these passes too:
-        at least the fragment's case-folded copy, its encode, the envelope concatenation and each
+        at least the fragment's lower-cased copy, its encode, the envelope concatenation and each
         token's ``str.count`` and ``str.replace`` are single full-length C calls that can hold the
-        loop while they run. Moving them here bounds that wait by the payload's size; it does not
-        remove it.
+        loop while they run. On the loop's thread the loop waited for the sum of these passes; here
+        it waits, at worst, for the longest one in turn, each linear in the payload. That shortens
+        the wait; it does not remove it.
 
         A fault can arrive inside a 2xx body, so the reply is classified. Transport-level faults
         (non-2xx, URL/timeout) already raised inside _post, for both modes. The RAW reply is
