@@ -112,8 +112,9 @@ _MAX_QUEUE = 1000
 # How long a cancelled drain waits for its alert sends to end their cancel cleanup (BACKLOG #5907).
 # Short and fixed, so a send that swallows the cancel or cleans up slowly cannot hold the drain,
 # and with it aclose(), much past its caller's timeout; a send still running then is left and
-# logged. It stays under the API teardown's cut grace (api/app.py _CUT_GRACE_SECONDS, 0.1 s), so a
-# close the teardown cuts still ends inside that grace; test_alert_sinks pins the order.
+# logged. It stays under the API teardown's cut grace (api/app.py _CUT_GRACE_SECONDS, 0.1 s), so the
+# drain's part of a close the teardown cuts ends inside that grace; test_alert_sinks pins the order.
+# It bounds only the sends: aclose()'s wait for control tasks is not bounded by it.
 _DRAIN_CANCEL_GRACE_SECONDS = 0.05
 
 
@@ -2731,12 +2732,17 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _DRAIN_CANCEL_GRACE_SECONDS
         pending = {task for task in sends if not task.done()}
+        repeated = False
         while pending and (remaining := deadline - loop.time()) > 0:
             try:
                 _, pending = await asyncio.wait(pending, timeout=remaining)
             except asyncio.CancelledError:
                 # A repeat of the drain's cancel: it reaches the sends as the first did, and the
-                # grace, not the repeat, still ends this wait.
+                # grace, not the repeat, still ends this wait. Noted once, as a source that
+                # re-delivers a cancel on every await would otherwise log a line per pass.
+                if not repeated:
+                    repeated = True
+                    log.info("alert drain cancelled again while its sends end; passed on to them")
                 for task in pending:
                     task.cancel()
                 pending = {task for task in pending if not task.done()}

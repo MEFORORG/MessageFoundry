@@ -239,9 +239,10 @@ async def test_a_lost_send_is_logged_while_a_sibling_still_hangs(
 
 
 async def test_a_cut_drain_waits_for_every_send_to_finish_its_cancel_cleanup() -> None:
-    """A drain cancelled while two sends wait ends only once both sends' tasks have ended. One
-    send's cancel ends at once and the other's async cleanup awaits; the drain used to end with the
-    first, leaving the second's cleanup running after aclose() returned."""
+    """A drain cancelled while two sends wait ends only once both sends' tasks have ended, where
+    each ends inside the grace. One send's cancel ends at once and the other's async cleanup
+    awaits; the drain used to end with the first, leaving the second's cleanup running after
+    aclose() returned."""
     cleanup_done = asyncio.Event()
     quick_ended_first: list[bool] = []
 
@@ -250,7 +251,8 @@ async def test_a_cut_drain_waits_for_every_send_to_finish_its_cancel_cleanup() -
             try:
                 await super().send(event, **kw)
             except asyncio.CancelledError:
-                await asyncio.sleep(0.01)  # under _DRAIN_CANCEL_GRACE_SECONDS
+                for _ in range(3):  # an async cleanup that ends well inside the grace
+                    await asyncio.sleep(0)
                 quick_ended_first.append(quick.cancelled)
                 cleanup_done.set()
                 raise
@@ -305,9 +307,9 @@ async def test_a_send_that_swallows_the_cancel_does_not_hold_a_cut_close(
             await asyncio.wait_for(sink.aclose(), bound)
         elapsed = time.monotonic() - started
         assert swallowed  # the control: the send did swallow the cancel
-        assert not release.is_set()  # and it is still running
-        # The bound and one grace, with slack for a loaded runner; the old wait never ended at all.
-        assert elapsed < bound + _DRAIN_CANCEL_GRACE_SECONDS + 1.0, elapsed
+        assert sink._left_sends and not any(t.done() for t in sink._left_sends)  # and still runs
+        # The bound and one grace, with slack for a loaded runner, under the 1.22 s measured.
+        assert elapsed < bound + _DRAIN_CANCEL_GRACE_SECONDS + 0.5, elapsed
         assert sink._task is None
         left = [r for r in caplog.records if "alert send task(s) still running" in r.getMessage()]
         assert left and left[0].levelname == "WARNING", caplog.text
@@ -347,16 +349,20 @@ async def test_a_repeat_drain_cancel_reaches_a_send_in_its_cancel_cleanup(
     assert drain is not None
     sink.connection_stopped("OB_X", detail="boom")
     await asyncio.wait_for(slow.entered.wait(), 5.0)
-    drain.cancel()
-    for _ in range(3):
-        await asyncio.sleep(0)
-    assert seen == [1]  # the control: the first cancel reached the send, and it is cleaning up
-    drain.cancel()
-    await asyncio.wait_for(asyncio.gather(drain, return_exceptions=True), 5.0)
-    assert drain.cancelled()
-    assert seen == [1, 2]
-    assert "alert send task(s) still running" not in caplog.text
-    assert not sink._left_sends
+    try:
+        drain.cancel()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert seen == [1]  # the control: the first cancel reached the send, and it is cleaning up
+        drain.cancel()
+        await asyncio.wait_for(asyncio.gather(drain, return_exceptions=True), 5.0)
+        assert drain.cancelled()
+        assert seen == [1, 2]
+        assert "alert send task(s) still running" not in caplog.text
+        assert not sink._left_sends
+    finally:
+        drain.cancel()
+        await asyncio.gather(drain, *sink._left_sends, return_exceptions=True)
 
 
 def test_the_drain_grace_nests_inside_the_teardown_cut_grace() -> None:
