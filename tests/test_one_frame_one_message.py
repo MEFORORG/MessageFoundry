@@ -205,20 +205,26 @@ async def test_both_tcp_send_paths_refuse_before_any_dial(
 # --- rule 2: a leaf write never emits a raw control character -----------------------------------
 
 
+# The rule 2 probes copy a component: copy_field reads its decoded value and writes it back as data,
+# so the write has to hex-escape the control again. convert_case no longer exercises that, because
+# it keeps an escape as sent and never hands escape_leaf a decoded control (BACKLOG #5928).
+
+
 def test_P2_a_hex_escaped_frame_byte_survives_a_component_edit_escaped() -> None:
     msg = Message.parse(MSH + CR + "PID|1||111^^^MRN||doe" + HEX_EB_SB + "x^jane" + CR)
-    actions.convert_case(msg, "PID-5.1", "upper")
+    actions.copy_field(msg, "PID-5.1", "PID-5.3")
     encoded = msg.encode()
     assert SB not in encoded and EB not in encoded
-    assert "DOE" + HEX_EB_SB + "X^jane" in encoded
+    assert _pid5(msg) == "doe" + HEX_EB_SB + "x^jane^doe" + HEX_EB_SB + "x"
     # The read side still decodes it, so the round trip is faithful rather than lossy.
-    assert msg.field("PID-5.1") == "DOE" + EB + SB + "X"
+    assert msg.field("PID-5.3") == "doe" + EB + SB + "x"
 
 
 def test_P2_a_hex_escaped_nul_does_not_re_enter_raw() -> None:
     msg = Message.parse(MSH + CR + "PID|1||111||doe" + BS + "X00" + BS + "^jane" + CR)
-    actions.convert_case(msg, "PID-5.1", "upper")
+    actions.copy_field(msg, "PID-5.1", "PID-5.3")
     assert NUL not in msg.encode()
+    assert msg.field("PID-5.3") == "doe" + NUL
 
 
 def test_P2_control_a_decoded_cr_is_still_refused() -> None:
@@ -233,6 +239,11 @@ def test_P2_control_a_decoded_cr_is_still_refused() -> None:
     before = msg.encode()
     with pytest.raises(ValueError, match="segment separator"):
         msg.set("PID-5.1", "doe" + CR + "EVN")
+    # A CR decoded from the message itself, not only a literal one: copy_field reads the \X0D\ in
+    # PID-5.1 as a CR and writes it back as data, so that write refuses it too.
+    assert msg.field("PID-5.1") == "DOE" + CR + "EVN"
+    with pytest.raises(ValueError, match="segment separator"):
+        actions.copy_field(msg, "PID-5.1", "PID-5.3")
     with pytest.raises(ValueError, match="segment separator"):
         actions.replace_literal(msg, "PID-5.1", "DOE", "doe" + CR + "EVN")
     assert msg.encode() == before
@@ -250,7 +261,8 @@ def test_P10_mllp_in_edit_mllp_out_is_one_frame() -> None:
     )
     assert len(_frames(MLLP_CODEC, MLLP_CODEC.frame(Message.parse(body).encode()))) == 1
     msg = Message.parse(body)
-    actions.convert_case(msg, "PID-18.1", "upper")
+    actions.copy_field(msg, "PID-18.1", "PID-19.1")
+    assert msg.field("PID-19.1") == "last" + EB + SB
     assert len(_frames(MLLP_CODEC, MLLP_CODEC.frame(msg.encode()))) == 1
 
 

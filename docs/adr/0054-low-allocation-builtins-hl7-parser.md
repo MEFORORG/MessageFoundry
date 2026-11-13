@@ -320,6 +320,9 @@ What that costs, stated so nobody reads the record as more than it is:
   One case in the record, `adv:empty-fields`, carries a fieldless line, a lone bare `EVN` that no
   mutation writes to. Its recorded answers still hold, because python-hl7 already read that
   line's fields as `None`; only its count would now be 0, and the record holds no count.
+  *(Note 2026-11-13, vault BACKLOG #5928: `actions.copy_segment` now resolves its occurrence
+  through `segment_index`, so it skips a fieldless line as the `Message` reads do, and the example
+  above no longer holds for it.)*
 
 ### Other things that moved with it
 

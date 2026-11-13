@@ -195,6 +195,12 @@ separators raw).
   -> `tests/test_one_frame_one_message.py::test_P2_a_hex_escaped_frame_byte_survives_a_component_edit_escaped`,
   `tests/test_one_frame_one_message.py::test_P2_a_hex_escaped_nul_does_not_re_enter_raw`,
   `tests/test_one_frame_one_message.py::test_P10_mllp_in_edit_mllp_out_is_one_frame`
+  *(Note 2026-11-13, vault BACKLOG #5928: the three probes now edit with `copy_field` from a
+  component, which reads the decoded value and writes it back as data, so the write passes the
+  decoded control through the leaf escaper. They used `convert_case`, which now keeps an escape
+  as sent and never hands the escaper a decoded control, so a change that stopped it hex-escaping
+  controls passed them. With `copy_field`, that change turns all three red. The criterion is
+  unchanged.)*
 - **AC-6** -- WHEN a leaf write holds a C0 character or DEL other than TAB, THE SYSTEM SHALL write it
   as a hex escape in all three leaf escapers, and SHALL keep refusing CR and LF.
   -> `tests/test_one_frame_one_message.py::test_every_leaf_escaper_hex_escapes_c0_and_del_except_tab`,
@@ -203,8 +209,9 @@ separators raw).
   *(Note 2026-11-13, vault BACKLOG #5928: `convert_case` now edits the wire text and keeps a
   `\X0D\` escape as sent, so it no longer raises on one. The second test above now asserts that
   the edit keeps the escape and writes no raw CR, and that a decoded CR written as data is still
-  refused with the message unchanged: by `msg.set` on a component, and by `replace_literal` when a
-  match would write a `new` holding it. A `replace_literal` that matches nothing writes nothing and
+  refused with the message unchanged: by `msg.set` on a component, by `copy_field` from a
+  component whose `\X0D\` decodes to a CR, and by `replace_literal` when a match would write a
+  `new` holding it. A `replace_literal` that matches nothing writes nothing and
   does not check `new`. The criterion is unchanged.)*
 - **AC-7** -- IF a whole-field write, `add_repetition` or `add_segment` holds `0x0B`, `0x1C` or NUL,
   THEN THE SYSTEM SHALL raise `ValueError` and write nothing.
