@@ -1568,7 +1568,9 @@ class StageDispatcher:
             self._book_lane_episode(_episode_start_ns, _episode_end_ns, rows=0, service=False)
             st.infra_error_streak = 0
             st.lane_stuck_alerted = False
-            if self._stop_voided(lane):
+            # Only with every claimed row re-pended: a READY lane's next claim would pass any still
+            # in flight. Not asked otherwise, so the runner's record stays for its next item to clear.
+            if not unlanded and self._stop_voided(lane):
                 self._to_ready(lane, woken=True)  # as the reload's notify_work would have
             else:
                 self._to_stopped(lane, st, f"{self._stage.value} lane stopped")

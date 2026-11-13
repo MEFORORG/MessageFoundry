@@ -627,10 +627,11 @@ class _Race:
         monkeypatch.setattr(store, "mark_failed", mark_failed)
         real_release = runner._release_tail_on_stop
 
-        async def release(worker: str, name: str, ids: Any) -> None:
-            await real_release(worker, name, ids)
+        async def release(worker: str, name: str, ids: Any) -> bool:
+            released = await real_release(worker, name, ids)
             if worker == "transform":
                 await self._restore_in("release_tail")
+            return released
 
         monkeypatch.setattr(runner, "_release_tail_on_stop", release)
         real_buildup = runner._pooled_maybe_buildup
@@ -682,6 +683,61 @@ async def test_a_reload_that_restores_the_inbound_while_its_lane_stops_keeps_it_
         assert race.restored, "the restoring reload never ran in its window"
         assert calls == ["ran"]
         assert not _lane_down(runner), "the transform lane is down with its inbound deployed"
+    finally:
+        await runner.stop()
+
+
+async def test_a_restore_does_not_keep_a_worker_draining_past_a_tail_it_could_not_release(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The same race with a batch tail whose release fails: those rows stay in flight, and only a
+    # worker that returns has them recovered by the reload-time backstop. A worker that kept
+    # draining would claim the newer row past them, so it must stop, restore or not.
+    calls: list[str] = []
+    full = _registry(calls)
+    message_ids = []
+    for _ in range(4):
+        message_id = await store.enqueue_ingress(channel_id=LOOP, raw=RAW)
+        ingress = await store.claim_next_fifo(LOOP, stage=Stage.INGRESS.value)
+        assert ingress is not None
+        await store.route_handoff(
+            ingress_id=ingress.id,
+            message_id=message_id,
+            channel_id=LOOP,
+            handlers=[(HANDLER, RAW)],
+            disposition=MessageStatus.ROUTED,
+        )
+        message_ids.append(message_id)
+    runner = RegistryRunner(
+        full,
+        store,
+        poll_interval=0.02,
+        claim_mode="per_lane",
+        fifo_claim_batch=3,
+        egress=EgressSettings(deny_by_default=False),
+    )
+    race = _Race(monkeypatch, store, runner, full, restore="mark_failed")
+
+    async def release_claimed(ids: Any) -> None:
+        raise RuntimeError("store fault")
+
+    monkeypatch.setattr(store, "release_claimed", release_claimed)
+    await runner.start()
+    try:
+
+        async def down() -> bool:
+            return race.restored and _lane_down(runner)
+
+        assert await _until(down), "the worker kept draining past a tail it could not release"
+        await asyncio.sleep(0.2)  # well past the revert's backoff
+        assert calls == [], "a row was transformed past rows still in flight"
+        statuses = [await _routed_status(store, m) for m in message_ids]
+        assert statuses == [
+            OutboxStatus.PENDING.value,
+            OutboxStatus.INFLIGHT.value,
+            OutboxStatus.INFLIGHT.value,
+            OutboxStatus.PENDING.value,
+        ]
     finally:
         await runner.stop()
 

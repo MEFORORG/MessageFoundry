@@ -2231,7 +2231,7 @@ class RegistryRunner:
         self._stop_hold_logged: set[tuple[Direction, str]] = set()
         # BACKLOG #5708: inbounds whose transform lane's last routed row stopped it because the inbound
         # was missing from the graph, recorded by _apply_routed and read once by whatever ends that
-        # STOP (_transform_stop_rearmed). A content STOP never records one.
+        # STOP (_take_voided_transform_stop). A content STOP never records one.
         self._transform_gone_stops: set[str] = set()
         # ADR 0071 B5 thread-hop fusion. FROZEN intent read ONCE here; a /config/reload never re-reads it
         # (restart to change, exactly like claim_mode). ``_fusion_active`` is the EFFECTIVE decision,
@@ -7626,7 +7626,7 @@ class RegistryRunner:
             on_lane_paused=(self._mark_outbound_quiesced if stage is Stage.OUTBOUND else None),
             on_lane_stopped=self._pooled_stop_hold(stage),
             # BACKLOG #5708: only the transform stage records a STOP a reload can void.
-            stop_rearmed=(self._transform_stop_rearmed if stage is Stage.ROUTED else None),
+            stop_rearmed=(self._take_voided_transform_stop if stage is Stage.ROUTED else None),
             empty_counter=self._empty_claims,
             infra_fault_policy=self._infra_fault_policy,
             infra_fault_stop_after=self._infra_fault_stop_after,
@@ -9903,7 +9903,7 @@ class RegistryRunner:
             if ended is not None:
                 return ended
 
-    async def _release_tail_on_stop(self, worker: str, name: str, ids: Sequence[str]) -> None:
+    async def _release_tail_on_stop(self, worker: str, name: str, ids: Sequence[str]) -> bool:
         """Best-effort release of the batch tail a per-lane worker still holds when it RETURNS on a
         STOPPED outcome (ADR 0157 Inc 2, BACKLOG #1497) -- the per-lane twin of the pooled
         ``_run_lane`` tail release, so one ``internal_error`` STOP leaves the same queue state in both
@@ -9920,9 +9920,16 @@ class RegistryRunner:
         Without this the tail stayed INFLIGHT, invisible to every claim, and a worker re-armed by an
         operator ``start_*`` / ``restart_*`` (or an alert rule's auto-restart) drained newer rows past
         it until the next start. A failure here logs and leaves the rows for the reload-time backstop
-        (:meth:`_recover_stopped_worker_residue`) or the next start."""
-        if not ids or not self._coordinator.is_leader():
-            return
+        (:meth:`_recover_stopped_worker_residue`) or the next start.
+
+        Returns whether the tail is free: True with nothing to release or once the release lands,
+        False when it was skipped on a node that lost leadership or failed. A worker that would
+        rather keep draining than return must return on False (BACKLOG #5708): its next claim
+        would pass the rows still in flight, and the backstop recovers only a worker that returned."""
+        if not ids:
+            return True
+        if not self._coordinator.is_leader():
+            return False
         try:
             await self.store.release_claimed(list(ids))
         except Exception:  # noqa: BLE001 — a stopping worker must not raise out of its return
@@ -9934,6 +9941,8 @@ class RegistryRunner:
                 len(ids),
                 exc_info=True,
             )
+            return False
+        return True
 
     def _inbound_log_halted(self, name: str) -> bool:
         """Whether the #122 halt (ADR 0162) holds inbound ``name``'s internal stages: the gate the
@@ -11691,18 +11700,16 @@ class RegistryRunner:
                 # is enabled this overlaps a message's sibling rows' transforms while keeping the handoff
                 # serial + in claim order; default (concurrency 1 / single row / fused) it is the exact
                 # sequential per-item loop. Returns True iff the lane must halt (STOP policy / missing
-                # inbound), matching the old `for item in items` early return.
+                # inbound), matching the old `for item in items` early return, unless a reload has
+                # voided a missing-inbound STOP by then (below).
                 self._transform_gone_stops.discard(name)  # only this batch's STOP may set it
                 if await self._process_routed_batch(name, items):
-                    await self._release_tail_on_stop("transform", name, claimed)
-                    if self._transform_stop_rearmed(name):
+                    released = await self._release_tail_on_stop("transform", name, claimed)
+                    if released and self._take_voided_transform_stop(name):
                         # BACKLOG #5708: a reload deployed the missing inbound again while this
                         # STOP ran, and found this worker alive, so it spawned none. Keep draining,
-                        # as the worker it would have spawned does. The tail is already released.
-                        log.info(
-                            "transform worker %r: inbound redeployed while stopping; continuing",
-                            name,
-                        )
+                        # as the worker it would have spawned does. Only with the tail released:
+                        # otherwise the next claim would pass rows still in flight.
                         claimed = []
                         continue
                     return
@@ -11975,11 +11982,12 @@ class RegistryRunner:
             return _RoutedPrep(missing_handler=True)
         return None
 
-    def _transform_stop_rearmed(self, name: str) -> bool:
-        """Whether the transform lane STOP that is ending now was for a missing inbound that a reload
-        has deployed again since (BACKLOG #5708), so the lane must keep running. Asked once, with no
-        await, by what ends the STOP: the per-lane worker after it releases its batch tail, and the
-        pooled ROUTED dispatcher at its terminal transition. Reads and clears the record.
+    def _take_voided_transform_stop(self, name: str) -> bool:
+        """Take the record of a transform lane STOP for a missing inbound, and say whether a reload
+        has deployed that inbound again since (BACKLOG #5708), so the lane must keep running. A
+        destructive read: only the first call after the STOP can return True. Made once, with no
+        await, by what ends the STOP once its tail is released: the per-lane worker, and the pooled
+        ROUTED dispatcher at its terminal transition.
 
         Such a reload lands while the lane still runs, in the revert's ``mark_failed`` or in the
         tail release after it. Then :meth:`_ensure_inbound_workers` finds the worker alive, and a
@@ -11990,7 +11998,10 @@ class RegistryRunner:
         if name not in self._transform_gone_stops:
             return False
         self._transform_gone_stops.discard(name)
-        return name in self.registry.inbound
+        if name not in self.registry.inbound:
+            return False
+        log.info("transform lane %r: inbound redeployed while its lane stopped; continuing", name)
+        return True
 
     async def _loopback_prep(
         self, name: str, item: OutboxItem
@@ -12223,7 +12234,7 @@ class RegistryRunner:
             )
             # A reload that restores the inbound during that await, or before this STOP ends, finds
             # the lane still running and re-arms nothing. Record why it stops, so whatever ends the
-            # STOP keeps the lane up if the inbound is back by then (_transform_stop_rearmed).
+            # STOP keeps the lane up if the inbound is back by then (_take_voided_transform_stop).
             self._transform_gone_stops.add(name)
             return _ItemOutcome.STOPPED, None
         if prep.missing_handler:
