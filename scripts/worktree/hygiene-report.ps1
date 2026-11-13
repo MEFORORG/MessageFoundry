@@ -17,7 +17,8 @@
     (`git -C $x status ...`), never a splatted verb, or that scan cannot see what runs.
 
     WHAT IT WRITES ON PURPOSE: refs and FETCH_HEAD from the `git fetch origin main` in each clone, and
-    the report files in -OutDir. The fetch passes --no-auto-maintenance, so it cannot start a
+    the report files in -OutDir, and, when root.toml names a UNC shared root that does not answer,
+    coord-root.ps1's own unreachable-root cache in the clone's mefor-coord. The fetch passes --no-auto-maintenance, so it cannot start a
     `gc --auto` (which would expire reflogs and prune worktree records), and never --prune, so it
     deletes no ref. Status passes --no-optional-locks, so it does not rewrite any worktree's index.
     That last one matters beyond tidiness: prune-merged.ps1 reads the index mtime as recent activity,
@@ -66,7 +67,14 @@
       * it is not locked, contains no other registered worktree, and the shared liveness fence
         (scripts\coord\occupancy.ps1, the one prune-merged.ps1 uses) could look and found no session
         in it or in a worktree nested inside it. A DEAD record there holds it too: once the tree is
-        gone that record is unplaceable, and occupancy.ps1 then keeps the fence unavailable.
+        gone that record is unplaceable, and occupancy.ps1 then keeps the fence unavailable;
+      * it holds nothing the removal would take beyond the files git status lists, and nobody holds it
+        (BACKLOG #5647): no file flagged skip-worktree or assume-unchanged, no commit only its HEAD
+        reflog or its own refs/worktree, refs/bisect or refs/rewritten hold, no allocation naming it
+        whose item is not provably on origin/main (the retired-allocator tombstone aside), and no
+        claim naming it. An unreadable registry or record holds it too. Get-ReportHolds says why
+        this has to be here: remove.ps1 -Path refuses every .claude/worktrees tree, so the owner
+        cannot be routed through it instead.
 
     THE FENCE SEES A SESSION BY THE CWD IT LAUNCHED IN. A session writing into a worktree by absolute
     path from somewhere else, or relocated into it after launch, is invisible to it. The activity
@@ -76,11 +84,14 @@
 
     WHY THIS IS NOT prune-merged.ps1 -Json. That tool decides for the `<repo>-<name>` siblings only and
     excludes `.claude/worktrees` by design. This report covers every registered worktree of each clone
-    and only proposes. Its predicate is deliberately stricter on the merge (the exact tip) and has no
-    reflog read; a prune-merged fix to occupancy lands here through occupancy.ps1, which both share.
+    and only proposes. Its predicate is deliberately stricter on the merge (the exact tip). A
+    prune-merged fix to occupancy lands here through occupancy.ps1, and a fix to the claim,
+    allocation, flagged-file or worktree-only-commit reader through worktree-gates.ps1, which the
+    nightly .claude/worktrees removal shares.
 
     COST IS BOUNDED. One `git status` per existing worktree, run with -Throttle in parallel, plus a
-    fixed handful of calls per clone. No network call is made per worktree.
+    fixed handful of calls per clone, plus a handful of local reads for each MERGED tree that exists.
+    No network call is made per worktree.
 
     OUTPUT. `hygiene-<yyyy-MM-dd>.md` and `.json` in -OutDir, one pair per day (a later run the same day
     replaces it), plus `latest.md` and `latest.json`. Nothing here deletes old reports.
@@ -162,6 +173,11 @@ $env:GCM_INTERACTIVE = 'never'
 . "$PSScriptRoot\..\coord\occupancy.ps1"
 # Read-only by the same rule as this file; the lock WRITES live in seat-lock.ps1, which is not loaded.
 . "$PSScriptRoot\worktree-audit.ps1"
+# The coordination root resolver, and the shared removal gates: the claim, allocation, flagged-file and
+# worktree-only-commit readers the nightly removal also judges a tree by (BACKLOG #5647). Both are held
+# to this file's read-only rule by the same scan.
+. "$PSScriptRoot\..\coord\coord-root.ps1"
+. "$PSScriptRoot\worktree-gates.ps1"
 
 if (-not $Gh) { $Gh = if ($env:MEFOR_HYGIENE_GH) { $env:MEFOR_HYGIENE_GH } else { 'gh' } }
 if (-not $RepoRoot) { $RepoRoot = $PSScriptRoot }
@@ -271,6 +287,27 @@ function Get-PrivateGitActivity([string]$Worktree) {
     return $newest
 }
 
+# WHAT `git worktree remove` WOULD TAKE WITH A TREE BEYOND THE FILES git status LISTS, AND WHO MAY
+# STILL HOLD IT (BACKLOG #5647; the header's predicate list names each hold). Each reason holds a merged
+# tree for a human. The owner cannot be routed through remove.ps1 instead: its -Path refuses every
+# .claude/worktrees tree, and the command this report proposes is a raw `git worktree remove`.
+# CANNOT-TELL HOLDS. The flagged-file read and Get-OwnershipHolds are worktree-gates.ps1's, the ones the
+# nightly removal judges a tree by, so the two cannot drift. Returns the reasons, none for a tree that passes.
+function Get-ReportHolds {
+    param([string]$Primary, [string]$Path, [string]$Branch, $Coord)
+    $out = [System.Collections.Generic.List[string]]::new()
+    $flagged = Get-FlaggedFileCount $Path
+    if ($flagged -lt 0) { $out.Add('its files flagged skip-worktree or assume-unchanged could not be read') }
+    elseif ($flagged -gt 0) { $out.Add("$flagged file(s) flagged skip-worktree or assume-unchanged, whose edits git status cannot see") }
+    if ($Coord.Error) {
+        # Held already, so the remaining reads would add reasons to a tree no list proposes.
+        $out.Add("the coordination root could not be resolved, so its claims and allocations are unknown: $($Coord.Error)")
+        return , $out
+    }
+    $out.AddRange([string[]]@(Get-OwnershipHolds -Primary $Primary -Path $Path -Branch $Branch `
+                -OwnClaimsDir (Join-Path $Coord.Path 'claims') -AllocDir (Join-Path $Coord.Path 'alloc')))
+    return , $out
+}
 function Get-CloneReport($R) {
     # The liveness fence first: it also parses `worktree list` (with HEAD) and names the primary, so
     # this report reads the same worktree set and the same primary as prune-merged.ps1.
@@ -396,6 +433,8 @@ function Get-CloneReport($R) {
     }
 
     $now = [DateTimeOffset]::Now
+    # Resolved and probed once per clone, for every merged tree's claim and allocation reads.
+    $coord = Resolve-CoordSharedRoot -From $root
     $rows = [System.Collections.Generic.List[object]]::new()
     foreach ($e in $others) {
         $norm = ConvertTo-Norm $e.Path
@@ -444,6 +483,7 @@ function Get-CloneReport($R) {
             if ($e.Locked) { $reasons.Add("locked$(if ($e.LockReason) { ": $($e.LockReason)" })") }
             $nested = @(Get-NestedWorktrees -Occupancy $occ -Path $e.Path)
             if ($nested.Count -gt 0) { $reasons.Add("contains $($nested.Count) other registered worktree(s); removing it would take them too") }
+            foreach ($held in (Get-ReportHolds -Primary $root -Path $e.Path -Branch $e.Branch -Coord $coord)) { $reasons.Add($held) }
             if (-not $occ.Available) { $reasons.Add("the liveness fence could not look: $($occ.Detail)") }
             else {
                 $occupants = @(Get-WorktreeOccupants -Occupancy $occ -Path $e.Path -IncludeNested)
@@ -651,7 +691,7 @@ foreach ($c in $report.clones) {
     $md.Add("")
     if ($c.cleanup.remove.Count -eq 0) { $md.Add("No worktree passes every check, so nothing is proposed.") }
     else {
-        $md.Add("Each of these sits at the exact head of a merged PR, older than $HoldHours h. None has files ``git status`` lists, a lock, a nested worktree, or a session record the fence can see.")
+        $md.Add("Each of these sits at the exact head of a merged PR, older than $HoldHours h. None has files ``git status`` lists, a lock, a nested worktree, or a session record the fence can see. None has a file flagged skip-worktree or assume-unchanged, a commit only its HEAD reflog or its own refs hold, an allocation not on origin/$MainBranch, or a claim.")
         $md.Add($(if ($IdleHours -gt 0) { "None shows git activity in the last $IdleHours h." } else { "**The activity window is OFF (-IdleHours 0), so recent git activity was not checked.**" }))
         $md.Add("``git worktree remove`` also deletes gitignored files: a ``.venv`` and caches, but also any local ``.env`` or store file. Run them from a plain terminal:")
         $md.Add("")
@@ -660,7 +700,7 @@ foreach ($c in $report.clones) {
         $md.Add('```')
         if ($c.claimReconcile) {
             $md.Add("")
-            $md.Add("Afterwards, release the claims those worktrees held. Run it without -Apply first; see docs/WORKTREES.md:")
+            $md.Add("None of them held a claim when this report ran. A claim taken in one since then is left behind by its removal, so reconcile afterwards. Run it without -Apply first; see docs/WORKTREES.md:")
             $md.Add("")
             $md.Add('```powershell')
             $md.Add($c.claimReconcile)

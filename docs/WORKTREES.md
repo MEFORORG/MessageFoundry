@@ -758,6 +758,13 @@ A merged worktree is proposed for removal only when all of these hold:
 - `git status` lists nothing. An untracked `.venv` alone is held too, because removing it needs
   `--force`.
 - No lock, no nested worktree, and no session record in it, live or dead.
+- Nothing the removal would take that `git status` does not show, and nobody holding it (BACKLOG
+  #5647): no file flagged skip-worktree or assume-unchanged, no commit that only its HEAD reflog or
+  its own `refs/worktree`, `refs/bisect` or `refs/rewritten` hold, no allocation naming it whose
+  item is not provably on `origin/main` (the retired-allocator tombstone aside), and no claim naming
+  it. A registry or record that cannot be read holds it too. The readers are the ones the nightly
+  `.claude/worktrees` removal uses, in `worktree-gates.ps1`. Routing the removal through
+  `remove.ps1` instead would not help: `-Path` refuses every tree under `.claude/worktrees`.
 
 Any merged worktree that fails one of those goes to NEEDS A HUMAN LOOK with its reasons. The session
 check is the liveness fence `prune-merged.ps1` uses, with the same limit. It cannot see a session
@@ -783,8 +790,9 @@ pwsh -NoProfile -File scripts\worktree\register-hygiene-task.ps1 -Unregister
 ```
 
 The task runs the **primary checkout's** copy of the report, as you, at run level Limited. It refuses
-to register or unregister from inside Claude Code. After you run the proposed removals, run `claim-reconcile.ps1`
-(below) to release the claims those worktrees held.
+to register or unregister from inside Claude Code. A proposed worktree held no claim when the report
+ran. After you run the proposed removals, run `claim-reconcile.ps1` (below) to release any claim
+taken in one since then.
 
 The Lander owns the hygiene its own merges leave (see CLAUDE.md section 5). After it lands a PR that
 changes a hook, it flags that the installed hooks are stale. It also reports merged branches whose

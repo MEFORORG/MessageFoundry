@@ -17,7 +17,10 @@
     for them), Get-ReflogLastEntry, Get-WorktreeActivity (occupancy signal 2; prune-merged.ps1's header
     says what it can and cannot see), Test-WorktreeClean, Get-TipHolders, Test-ClaudeManagedPath,
     Get-FlaggedFileCount, Get-WorkingTreeActivity, Get-WorktreeOnlyCommitCount, Read-CoordRecord,
-    Get-ClaimedWorktreeIndex, Test-RegistryPresentOrThrow, $CACHE_DATA_NAME_PATTERN, Get-NestedHazard,
+    Get-ClaimedWorktreeIndex, Test-RegistryPresentOrThrow, Get-AllocationRefusal, Get-TreeClaimsDirs
+    and Get-OwnershipHolds (moved here from finished-worktree-removal.ps1, so hygiene-report.ps1 reads
+    them too), Get-FlaggedFiles,
+    $CACHE_DATA_NAME_PATTERN, Get-NestedHazard,
     Get-InProgressOperation, Get-UnsafeIgnoredEntries, Test-PlainDirectory, Test-PlainDirectoryItem,
     Get-ItemOrThrow, Test-ConfirmedGoneOrThrow, Test-PlainFile, $GIT_REDIRECT_NAMES, Assert-NoGitRedirect,
     $GIT_CONFIG_CARRIER_PATTERN, Get-GitConfigCarriers and $SEAT_LOCAL_REL.
@@ -25,8 +28,8 @@
 
 #: The variables that falsify a `git -C <path>` reading: the first three point git at another
 #: repository or working tree, and GIT_INDEX_FILE compares the tree against another index, which can make
-#: a dirty tree read clean. The same base list remove.ps1 refuses on its -Path, -List and -Discard routes
-#: (not on a plain -Name; -Discard adds two object-store names, since only it writes objects);
+#: a dirty tree read clean. The same base list remove.ps1 refuses on every route (a plain -Name since
+#: BACKLOG #5648; -Discard adds two object-store names, since only it writes objects);
 #: tests/test_worktree_finished_claude_removal.py pins the two equal, because remove.ps1 reads its own
 #: before it dot-sources this file.
 $GIT_REDIRECT_NAMES = @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE')
@@ -211,11 +214,10 @@ function Test-WorktreeClean {
     if (-not (Test-Path -LiteralPath $Path)) {
         return @{ Clean = $false; Reasons = @('directory is missing (already half-removed? investigate before pruning)') }
     }
-    # Built as an explicit array. `$x = if (...) { @('--flag') }` unrolls to a bare STRING, and splatting
-    # a string hands git one character per argument -- which git reads as pathspecs, matches nothing, and
-    # reports clean. Measured while writing this: a dirty tree read clean.
-    $statusArgs = @('-C', $Path, '--no-optional-locks', 'status', '--porcelain')
-    if ($AllUntracked) { $statusArgs += '--untracked-files=all' }
+    # Two LITERAL calls, never a splat: hygiene-report.ps1 dot-sources this file, and its read-only scan
+    # (tests/test_worktree_hygiene_report.py) cannot see the verb a splat carries. A splat had its own
+    # trap too: `$x = if (...) { @('--flag') }` unrolls to a bare STRING, and splatting a string hands
+    # git one character per argument, which git reads as pathspecs; a dirty tree read clean.
     # The "could not open" warning below is matched as TEXT, so git is run untranslated: a localised
     # build would print it in another language, the match would miss, and an unreadable folder would
     # read clean. LC_ALL=C also makes gettext ignore LANGUAGE; LANGUAGE is cleared anyway.
@@ -225,7 +227,8 @@ function Test-WorktreeClean {
         [Environment]::SetEnvironmentVariable('LC_ALL', 'C')
         [Environment]::SetEnvironmentVariable('LANG', 'C')
         [Environment]::SetEnvironmentVariable('LANGUAGE', $null)
-        $raw = @(& git @statusArgs 2>&1)
+        if ($AllUntracked) { $raw = @(& git -C $Path --no-optional-locks status --porcelain --untracked-files=all 2>&1) }
+        else { $raw = @(& git -C $Path --no-optional-locks status --porcelain 2>&1) }
         $statusExit = $LASTEXITCODE
     }
     finally {
@@ -275,9 +278,17 @@ function Test-ClaudeManagedPath([string]$Path) {
 # status does not show an edit to either, and neither does git's own check in `worktree remove`, so an
 # edit there would go with the tree unseen. Returns the count, or -1 when it cannot be read.
 function Get-FlaggedFileCount([string]$Path) {
+    $lines = Get-FlaggedFiles $Path
+    if ($null -eq $lines) { return -1 }
+    return $lines.Count
+}
+
+# The flagged `ls-files -v` lines themselves (tag, space, path), for a caller that names them; $null
+# when they cannot be read. Wrap nothing: the array comes back whole, empty included.
+function Get-FlaggedFiles([string]$Path) {
     $lines = @(& git -C $Path ls-files -v 2>$null)
-    if ($LASTEXITCODE -ne 0) { return -1 }
-    return @($lines | Where-Object { $_ -cmatch '^([a-z]|S) ' }).Count
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return , @($lines | Where-Object { $_ -cmatch '^([a-z]|S) ' })
 }
 
 # The newest write to the WORKING TREE: the tree's own folder, each entry directly under it, and the
@@ -428,6 +439,100 @@ function Get-ClaimedWorktreeIndex([string[]]$ClaimsDir, [switch]$RequireParent) 
         }
     }
     return @{ Claimed = $claimed; Unreadable = $unreadable }
+}
+
+# Allocation records (alloc.ps1) naming the tree, by any of -Norms, whose item is not provably on
+# origin/main. Removing the tree does not burn such a number outright: ledger_check.py's owns() falls
+# back to the recorded BRANCH once the recorded path is gone, and neither caller deletes a branch. But
+# ownership then rests on that branch alone, and a later branch deletion (prune-merged.ps1's, or a
+# hand's) strands the number with nothing reporting it. remove.ps1 refuses the same case (BACKLOG #1293).
+# CANNOT-TELL IS AT-RISK: an unreadable record or registry, a backlog number (no longer answerable from
+# this repo), or an origin/main that cannot be listed all refuse. Returns '' or the refusal.
+# Shared by finished-worktree-removal.ps1's re-check and hygiene-report.ps1's removal predicate
+# (BACKLOG #5647), with Get-TreeClaimsDirs below. Needs coord-root.ps1 loaded for Resolve-CoordDir.
+function Get-AllocationRefusal {
+    param([string]$Primary, [string[]]$Norms, [string]$AllocDir)
+    # Through the throwing readers, so an unreachable registry refuses rather than reading as empty.
+    try {
+        if (-not (Test-RegistryPresentOrThrow $AllocDir 'the allocation directory')) { return '' }
+        $entries = @(Get-EntriesOrThrow $AllocDir 'allocations' -Recurse)
+    }
+    catch { return "the allocation registry could not be read, so an allocation may name it: $($_.Exception.Message)" }
+    # The walk never descends a linked DIRECTORY, so the records under one (alloc/adr as a junction) would
+    # read as none. A linked file is read through like any other record, so it does not refuse.
+    $link = @($entries | Where-Object { $_ -is [System.IO.DirectoryInfo] -and ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) }) | Select-Object -First 1
+    if ($link) { return "the allocation registry could not be read in full: $($link.FullName) is a link, which the walk does not follow" }
+    $files = @($entries | Where-Object { $_ -is [System.IO.FileInfo] -and $_.Name -like '*.json' })
+    $atRisk = @()
+    foreach ($f in $files) {
+        $r = Read-CoordRecord $f.FullName
+        if ($r.Tombstone) { continue }
+        if ($r.Problem) { return "allocation record $($f.Name) cannot be read ($($r.Problem)), and it might name this tree" }
+        if ($Norms -notcontains $r.Holder) { continue }
+        $kind = [string]$r.Record.kind
+        $number = [string]$r.Record.number
+        $onMain = $null
+        # A number that is not all digits cannot name an ADR file, so it stays cannot-tell. Escaped
+        # anyway, so the record's text is never read as a pattern.
+        if ($kind -eq 'adr' -and $number -match '\A\d+\z') {
+            $pad = [regex]::Escape($number.PadLeft(4, '0'))
+            $listed = @(& git -C $Primary ls-tree -r --name-only origin/main docs/adr/ 2>$null)
+            if ($LASTEXITCODE -eq 0) { $onMain = [bool]@($listed | Where-Object { $_ -match "/$pad-" }).Count }
+        }
+        if ($onMain -ne $true) { $atRisk += "$kind #$number" }
+    }
+    if ($atRisk.Count -gt 0) { return "it owns allocation(s) not provably on origin/main ($($atRisk -join ', ')); removing it would leave them owned through the branch alone" }
+    return ''
+}
+
+# The claims directories a claim naming this tree can be in: this clone's registry, plus the one hop
+# claim.ps1 follows when the tree sets mefor.claimsRoot. Returns @{ Dirs; Error }.
+function Get-TreeClaimsDirs {
+    param([string]$Path, [string]$OwnClaimsDir)
+    $setting = "$(& git -C $Path config --get mefor.claimsRoot 2>$null)".Trim()
+    $code = $LASTEXITCODE
+    # Exit 1 is "not set". Anything else is a config git could not read, which could hide the key.
+    if ($code -ne 0 -and $code -ne 1) { return @{ Dirs = @(); Error = "git could not read mefor.claimsRoot (exit $code)" } }
+    $dirs = @($OwnClaimsDir)
+    if ($code -eq 0 -and $setting) {
+        if (-not [System.IO.Path]::IsPathFullyQualified($setting)) { return @{ Dirs = @(); Error = "mefor.claimsRoot is the relative path '$setting'" } }
+        $top = "$(& git -C $setting rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $top) { return @{ Dirs = @(); Error = "mefor.claimsRoot names '$setting', which is not a git repository" } }
+        $hop = Resolve-CoordDir -From $top -Kind 'claims'
+        if ($hop.Error) { return @{ Dirs = @(); Error = "the claim registry of '$top' could not be resolved ($($hop.Error))" } }
+        $dirs += $hop.Path
+    }
+    return @{ Dirs = $dirs; Error = '' }
+}
+
+# What a removal would take with the tree beyond its files, and who may hold it: commits only its own
+# HEAD reflog and refs hold, allocations naming it, and claims naming it. Every reason, in that order,
+# or only the first with -First. ONE copy, so the nightly removal's refusal and hygiene-report.ps1's
+# removal list cannot drift apart (BACKLOG #5647). Needs coord-root.ps1 and occupancy.ps1 loaded.
+function Get-OwnershipHolds {
+    param([string]$Primary, [string]$Path, [string]$Branch, [string]$OwnClaimsDir, [string]$AllocDir, [switch]$First)
+    $out = [System.Collections.Generic.List[string]]::new()
+    $only = Get-WorktreeOnlyCommitCount -Path $Path -Repo $Primary -Branch $Branch
+    if ($only -lt 0) { $out.Add('the commits its HEAD reflog and own refs hold could not be checked') }
+    elseif ($only -gt 0) { $out.Add("$only commit(s) held only by its HEAD reflog or its own refs, which the removal deletes") }
+    if ($First -and $out.Count -gt 0) { return $out.ToArray() }
+
+    # A record may name the tree by either spelling remove.ps1 matches: the path `git worktree list`
+    # gives, or the toplevel git prints inside it, which is what claim.ps1 and alloc.ps1 record.
+    $top = "$(& git -C $Path rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $top) {
+        $out.Add('git could not name its toplevel, so a record naming it by that spelling cannot be matched')
+        return $out.ToArray()
+    }
+    $norms = @(@((ConvertTo-Norm $Path), (ConvertTo-Norm $top)) | Sort-Object -Unique)
+    $alloc = Get-AllocationRefusal -Primary $Primary -Norms $norms -AllocDir $AllocDir
+    if ($alloc) { $out.Add($alloc); if ($First) { return $out.ToArray() } }
+    $dirs = Get-TreeClaimsDirs -Path $Path -OwnClaimsDir $OwnClaimsDir
+    if ($dirs.Error) { $out.Add("claims are unknown: $($dirs.Error)"); return $out.ToArray() }
+    $claims = Get-ClaimedWorktreeIndex $dirs.Dirs -RequireParent
+    if ($claims.Unreadable) { $out.Add('a claim file or directory could not be read, so any tree may be claimed') }
+    elseif (@($norms | Where-Object { $claims.Claimed.ContainsKey($_) }).Count -gt 0) { $out.Add('a coordination claim names it') }
+    return $out.ToArray()
 }
 
 #: Data a tolerated cache directory should never hold. git status does not read inside an ignored

@@ -1010,6 +1010,11 @@ if ($Discard -and $untrackedNested.Count -gt 0) {
     throw "-Discard cannot park a git repository inside the tree. Nothing was removed."
 }
 
+# Files flagged skip-worktree (S) or assume-unchanged (lower case), read once for both routes. git status
+# does not look at one, so an edit to one is invisible to every status read above.
+$flagged = Get-FlaggedFiles $WorktreePath
+if ($null -eq $flagged) { throw "git ls-files failed in '$WorktreePath'. Nothing was removed." }
+
 if ($byPath) {
     # EVERYTHING GIT WOULD DELETE IS SHOWN, whatever status.showUntrackedFiles says: tracked changes,
     # untracked files and ignored files all refuse without -Force. A -Path target is often another
@@ -1045,10 +1050,6 @@ if ($byPath) {
     # git status does not look at a file flagged skip-worktree (S) or assume-unchanged (lower case), so
     # an edit to one is invisible above. Count every flagged file as pending: nothing here can tell an
     # edited one from an untouched one without reading it.
-    $flagged = @(& git -C $WorktreePath ls-files -v 2>$null | Where-Object { $_ -cmatch '^(S|[a-z]) ' })
-    if ($LASTEXITCODE -ne 0) {
-        throw "git ls-files failed in '$WorktreePath' (exit $LASTEXITCODE). Nothing was removed."
-    }
     $pending += @($flagged | ForEach-Object { "flagged $($_.Substring(2))" })
     # -Discard parks tracked changes and untracked files: exactly the status lines that are not
     # ignored. Named by what may be parked, so a line of any other kind, added later or not, refuses.
@@ -1092,10 +1093,6 @@ else {
     # every flagged file refuses. -Force overrides, as it does for tracked changes, and the run names
     # each file it let go so the override leaves a record in the caller's output. -Discard refuses
     # them whatever -Force says, in its own block below.
-    $flagged = @(& git -C $WorktreePath ls-files -v 2>$null | Where-Object { $_ -cmatch '^(S|[a-z]) ' })
-    if ($LASTEXITCODE -ne 0) {
-        throw "git ls-files failed in '$WorktreePath' (exit $LASTEXITCODE). Nothing was removed."
-    }
     if ($flagged.Count -gt 0 -and -not $Discard) {
         if (-not $Force) {
             $flagged | Select-Object -First 20 | ForEach-Object { Write-Host "flagged $($_.Substring(2))" }

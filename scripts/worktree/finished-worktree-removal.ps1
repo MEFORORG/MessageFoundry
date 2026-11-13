@@ -141,67 +141,8 @@
 . "$PSScriptRoot\..\coord\coord-root.ps1"
 . "$PSScriptRoot\worktree-gates.ps1"
 
-# Allocation records (alloc.ps1) naming the tree, by any of -Norms, whose item is not provably on
-# origin/main. Removing the tree does not burn such a number outright: ledger_check.py's owns() falls
-# back to the recorded BRANCH once the recorded path is gone, and this step never deletes a branch. But
-# ownership then rests on that branch alone, and a later branch deletion (prune-merged.ps1's, or a
-# hand's) strands the number with nothing reporting it. remove.ps1 refuses the same case (BACKLOG #1293).
-# CANNOT-TELL IS AT-RISK: an unreadable record or registry, a backlog number (no longer answerable from
-# this repo), or an origin/main that cannot be listed all refuse. Returns '' or the refusal.
-function Get-AllocationRefusal {
-    param([string]$Primary, [string[]]$Norms, [string]$AllocDir)
-    # Through the throwing readers, so an unreachable registry refuses rather than reading as empty.
-    try {
-        if (-not (Test-RegistryPresentOrThrow $AllocDir 'the allocation directory')) { return '' }
-        $entries = @(Get-EntriesOrThrow $AllocDir 'allocations' -Recurse)
-    }
-    catch { return "the allocation registry could not be read, so an allocation may name it: $($_.Exception.Message)" }
-    # The walk never descends a linked DIRECTORY, so the records under one (alloc/adr as a junction) would
-    # read as none. A linked file is read through like any other record, so it does not refuse.
-    $link = @($entries | Where-Object { $_ -is [System.IO.DirectoryInfo] -and ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) }) | Select-Object -First 1
-    if ($link) { return "the allocation registry could not be read in full: $($link.FullName) is a link, which the walk does not follow" }
-    $files = @($entries | Where-Object { $_ -is [System.IO.FileInfo] -and $_.Name -like '*.json' })
-    $atRisk = @()
-    foreach ($f in $files) {
-        $r = Read-CoordRecord $f.FullName
-        if ($r.Tombstone) { continue }
-        if ($r.Problem) { return "allocation record $($f.Name) cannot be read ($($r.Problem)), and it might name this tree" }
-        if ($Norms -notcontains $r.Holder) { continue }
-        $kind = [string]$r.Record.kind
-        $number = [string]$r.Record.number
-        $onMain = $null
-        # A number that is not all digits cannot name an ADR file, so it stays cannot-tell. Escaped
-        # anyway, so the record's text is never read as a pattern.
-        if ($kind -eq 'adr' -and $number -match '\A\d+\z') {
-            $pad = [regex]::Escape($number.PadLeft(4, '0'))
-            $listed = @(& git -C $Primary ls-tree -r --name-only origin/main docs/adr/ 2>$null)
-            if ($LASTEXITCODE -eq 0) { $onMain = [bool]@($listed | Where-Object { $_ -match "/$pad-" }).Count }
-        }
-        if ($onMain -ne $true) { $atRisk += "$kind #$number" }
-    }
-    if ($atRisk.Count -gt 0) { return "it owns allocation(s) not provably on origin/main ($($atRisk -join ', ')); removing it would leave them owned through the branch alone" }
-    return ''
-}
-
-# The claims directories a claim naming this tree can be in: this clone's registry, plus the one hop
-# claim.ps1 follows when the tree sets mefor.claimsRoot. Returns @{ Dirs; Error }.
-function Get-TreeClaimsDirs {
-    param([string]$Path, [string]$OwnClaimsDir)
-    $setting = "$(& git -C $Path config --get mefor.claimsRoot 2>$null)".Trim()
-    $code = $LASTEXITCODE
-    # Exit 1 is "not set". Anything else is a config git could not read, which could hide the key.
-    if ($code -ne 0 -and $code -ne 1) { return @{ Dirs = @(); Error = "git could not read mefor.claimsRoot (exit $code)" } }
-    $dirs = @($OwnClaimsDir)
-    if ($code -eq 0 -and $setting) {
-        if (-not [System.IO.Path]::IsPathFullyQualified($setting)) { return @{ Dirs = @(); Error = "mefor.claimsRoot is the relative path '$setting'" } }
-        $top = "$(& git -C $setting rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
-        if ($LASTEXITCODE -ne 0 -or -not $top) { return @{ Dirs = @(); Error = "mefor.claimsRoot names '$setting', which is not a git repository" } }
-        $hop = Resolve-CoordDir -From $top -Kind 'claims'
-        if ($hop.Error) { return @{ Dirs = @(); Error = "the claim registry of '$top' could not be resolved ($($hop.Error))" } }
-        $dirs += $hop.Path
-    }
-    return @{ Dirs = $dirs; Error = '' }
-}
+# Get-AllocationRefusal and Get-TreeClaimsDirs live in worktree-gates.ps1, shared with hygiene-report.ps1
+# (BACKLOG #5647), so the report holds back the same trees this step refuses.
 
 # A tree root that is a junction or symlink: every gate below, and git, would read through it into a
 # directory somewhere else. A root that is not there is left to the gates after this one, which refuse
@@ -298,27 +239,13 @@ function Get-FinishedWorktreeRefusal {
     return Get-FenceRefusal -Primary $Primary -Path $Path
 }
 
-# What the removal would take with the tree beyond its files, and who may hold it: commits only its own
-# HEAD reflog and refs hold, allocations naming it, and claims naming it. Run in the first pass and again
-# in the late pass. Returns '' or the refusal.
+# What the removal would take with the tree beyond its files, and who may hold it. Run in the first pass
+# and again in the late pass. Returns '' or the refusal. The reads are worktree-gates.ps1's
+# Get-OwnershipHolds, shared with hygiene-report.ps1 (BACKLOG #5647); this step takes the first.
 function Get-OwnershipRefusal {
     param([string]$Primary, [string]$Path, [string]$Branch, [string]$OwnClaimsDir, [string]$AllocDir)
-    $only = Get-WorktreeOnlyCommitCount -Path $Path -Repo $Primary -Branch $Branch
-    if ($only -ne 0) { return $(if ($only -lt 0) { 'the commits its HEAD reflog and own refs hold could not be checked' } else { "$only commit(s) held only by its HEAD reflog or its own refs, which the removal deletes" }) }
-
-    # A record may name the tree by either spelling remove.ps1 matches: the path `git worktree list`
-    # gives, or the toplevel git prints inside it, which is what claim.ps1 and alloc.ps1 record.
-    $top = "$(& git -C $Path rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $top) { return 'git could not name its toplevel, so a record naming it by that spelling cannot be matched' }
-    $norms = @(@((ConvertTo-Norm $Path), (ConvertTo-Norm $top)) | Sort-Object -Unique)
-    $alloc = Get-AllocationRefusal -Primary $Primary -Norms $norms -AllocDir $AllocDir
-    if ($alloc) { return $alloc }
-    $dirs = Get-TreeClaimsDirs -Path $Path -OwnClaimsDir $OwnClaimsDir
-    if ($dirs.Error) { return "claims are unknown: $($dirs.Error)" }
-    $claims = Get-ClaimedWorktreeIndex $dirs.Dirs -RequireParent
-    if ($claims.Unreadable) { return 'a claim file or directory could not be read, so any tree may be claimed' }
-    if (@($norms | Where-Object { $claims.Claimed.ContainsKey($_) }).Count -gt 0) { return 'a coordination claim names it' }
-    return ''
+    $holds = @(Get-OwnershipHolds -Primary $Primary -Path $Path -Branch $Branch -OwnClaimsDir $OwnClaimsDir -AllocDir $AllocDir -First)
+    return $(if ($holds.Count -gt 0) { $holds[0] } else { '' })
 }
 
 # The fence, read FRESH for this path and LAST in each pass, so the window between it and the removal is
