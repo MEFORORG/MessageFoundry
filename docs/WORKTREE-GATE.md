@@ -146,10 +146,8 @@ mention before the real command, or a second command, let a governed worktree be
 so `git -C <elsewhere> status && git reset --hard` run in the primary is refused. A `-C` on another
 command or inside a quoted message no longer stops the `cd <primary>` reading, for a `cd` written on
 the same line before the command. At least these are not covered: a `cd` on an earlier line, and a
-chdir the hook cannot follow when the command has no absolute `-C` of its own. Rule 3b is also handed
-each later invocation whose directory the hook can read, not only the first one carrying a verb; an
-invocation after such an unfollowable chdir gets only the first-verb reading. Both closed under
-BACKLOG #5655.
+chdir the hook cannot follow when the command has no absolute `-C` of its own. Rule 3b is handed every
+invocation on the line, not only the first one carrying a verb. Both closed under BACKLOG #5655.
 
 This list is not the whole rule set. The hook itself,
 [`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1), is the source of record.

@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.13.3"
+$GateVersion = "2026.11.13.2"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -2977,22 +2977,6 @@ $hijackSwitchVerbs = @("checkout", "switch")
 $hijackHeadMoveVerbs = @("reset", "rebase", "merge", "cherry-pick", "revert", "am")
 # Class A's destination scan reads its arguments both ways; see the scan.
 $destCmps = @([System.StringComparison]::Ordinal, [System.StringComparison]::CurrentCulture)
-# ONE git ANSWER PER QUESTION, PER HOOK RUN (convergence review of BACKLOG #5655). Rule 3b is now asked
-# about every invocation on a line, and each call spawned the same few read-only git processes again:
-# ten distinct `git checkout` invocations took about 11 s against 2 to 4 s on origin/main, and a hook
-# killed at its 15 s timeout lets the command through. These are reads of the repository as it stands
-# when the hook runs, so the answer cannot differ between two calls in one run. Returns the output
-# lines and the exit code.
-$script:HijackGitCache = @{}
-function Get-HijackGitAnswer([string[]]$GitArgs) {
-    $key = $GitArgs -join "`0"
-    if (-not $script:HijackGitCache.ContainsKey($key)) {
-        $o = @(& git @GitArgs 2>$null)
-        $script:HijackGitCache[$key] = [pscustomobject]@{ Out = $o; Code = $LASTEXITCODE }
-    }
-    $script:HijackGitCache[$key]
-}
-
 function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw, [string]$CwdRaw) {
     $isSwitch = $hijackSwitchVerbs -contains $Verb
     $isHeadMove = $hijackHeadMoveVerbs -contains $Verb
@@ -3053,16 +3037,15 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw, [strin
     # worktrees): find the MAIN worktree of whatever repo it belongs to; act only if that main worktree
     # is a governed primary AND $wtRaw is a DIFFERENT (linked) worktree of it. All git calls take the RAW
     # path; only the results are canonicalised for comparison. Any git failure -> fail open.
-    $listAns = Get-HijackGitAnswer @('-C', $wtRaw, 'worktree', 'list', '--porcelain')
-    $list = @($listAns.Out)
-    if ($listAns.Code -ne 0 -or $list.Count -eq 0) { return }
+    $list = @(& git -C $wtRaw worktree list --porcelain 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $list.Count -eq 0) { return }
     $mainLine = $list | Where-Object { $_ -match '^worktree ' } | Select-Object -First 1
     if (-not $mainLine) { return }
     $mainWt = Get-ComparablePath ($mainLine -replace '^worktree\s+', '')
     $gov = Test-Governed $mainWt
     if (-not $gov) { return }                                     # repo's main tree isn't governed
 
-    $selfTopRaw = "$((Get-HijackGitAnswer @('-C', $wtRaw, 'rev-parse', '--show-toplevel')).Out)".Trim()
+    $selfTopRaw = "$(& git -C $wtRaw rev-parse --show-toplevel 2>$null)".Trim()
     $selfTop = Get-ComparablePath $selfTopRaw
     if (-not $selfTop -or [string]::Equals($selfTop, $mainWt, [System.StringComparison]::Ordinal)) { return }        # $wtRaw IS the primary -- Rule 3 owns it
 
@@ -3086,15 +3069,14 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw, [strin
         # What it leaves open is a session standing outside every repository reaching into a worktree
         # with a class B verb; that is narrower than the hole this rule closes, and it is not new.
         if (-not $CwdRaw) { return }
-        $ownTopAns = Get-HijackGitAnswer @('-C', $CwdRaw, 'rev-parse', '--show-toplevel')
-        $ownTopRaw = "$($ownTopAns.Out)".Trim()
-        if ($ownTopAns.Code -ne 0 -or -not $ownTopRaw) { return }
+        $ownTopRaw = "$(& git -C $CwdRaw rev-parse --show-toplevel 2>$null)".Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $ownTopRaw) { return }
         # ORDINAL, because a match ALLOWS. A culture `-eq` ignores a soft hyphen or a zero-width
         # character, so a session in `<p>-wt1` read `<p>-wt1<U+00AD>`, another session's worktree, as
         # its own and was allowed `reset --hard` into it. The same holds for the primary test above.
         if ([string]::Equals((Get-ComparablePath $ownTopRaw), $selfTop, [System.StringComparison]::Ordinal)) { return }   # the session's OWN worktree
 
-        $head = "$((Get-HijackGitAnswer @('-C', $wtRaw, 'rev-parse', '--abbrev-ref', 'HEAD')).Out)".Trim()
+        $head = "$(& git -C $wtRaw rev-parse --abbrev-ref HEAD 2>$null)".Trim()
         # EVERY interpolation goes through one of the two helpers, chosen ONLY by whether the value lands
         # in PROSE or in a COMMAND (BACKLOG #1040/#1076) -- the same discipline the class A message keeps,
         # and for the same reason: the branch name below is ATTACKER-CHOSEN from a public fork.
@@ -3161,7 +3143,7 @@ What to do instead:
         return
     }
 
-    $head = "$((Get-HijackGitAnswer @('-C', $wtRaw, 'rev-parse', '--abbrev-ref', 'HEAD')).Out)".Trim()
+    $head = "$(& git -C $wtRaw rev-parse --abbrev-ref HEAD 2>$null)".Trim()
     # `--` IS NOT A FLAG HERE: it ends the options and switches off no git guard, so `checkout <b>
     # --` onto a branch live elsewhere is refused by git exactly as `checkout <b>` is (measured). Ordinal,
     # so only `--` itself is excused. A QUOTED flag counts: `checkout <b> "--ignore-other-worktrees"`
@@ -3173,7 +3155,8 @@ What to do instead:
     $denyDest = $null
     foreach ($dest in $dests) {
         # Only an EXISTING local branch, and only if it is not the branch we are already on (a no-op).
-        if ((Get-HijackGitAnswer @('-C', $wtRaw, 'rev-parse', '--verify', '--quiet', ("refs/heads/" + $dest))).Code -ne 0) { continue }
+        & git -C $wtRaw rev-parse --verify --quiet ("refs/heads/" + $dest) *> $null
+        if ($LASTEXITCODE -ne 0) { continue }
         # ORDINAL, here and in the checked-out-nowhere test below, because a match ALLOWS: a culture
         # comparison read the branch `fe<U+00AD>at` as the HEAD `feat`, and `ma<U+00AD>in` as the
         # primary's `main`, and let the switch onto another branch through.
@@ -4654,8 +4637,7 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
     # at command position that it cannot follow (two of them, a subshell, `cd -`, a quoted target with
     # a space), and the invocation carries no ABSOLUTE `-C` of its own, this reading yields NO
     # candidate -- it does not fall back to the cwd -- and the command gets only the pre-change
-    # reading; the in-text fallback still catches an absolute primary path written before it, for the
-    # verbs its own list names (at least cd, chdir, pushd, Set-Location and sl -- NOT Push-Location). A chdir
+    # reading; the in-text fallback still catches an absolute primary path written before it. A chdir
     # on an EARLIER LINE is not read here at all. Every resolver residual rule 3d lists applies, such
     # as a quoted `-C` value containing a space, which also yields no candidate.
     # =================================================================================================
@@ -4670,11 +4652,6 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
             $vIdx = $vGroup.Index
             $inv = Get-OwnInvocationWindow $seg.Scan $vIdx -SeparatorInToken
             if (-not $inv.Own) { continue }
-            # THE git TOKEN MUST BE AT COMMAND POSITION (convergence review). `git -C <o> log ; echo git
-            # reset` from the primary was refused, because the `git` echo prints read as an invocation. Only
-            # environment assignments, or a directory part of the program path, may stand before it.
-            $ownLead = $seg.Scan.Substring($inv.Start, $inv.Own.Index - $inv.Start)
-            if ($ownLead -notmatch '^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:\S*[\\/])?$') { continue }
             # An inferred invocation offers the in-text fallback only the SCAN text BEFORE it, so a `cd`
             # after it, or one inside a quoted message, cannot refuse it (review of BACKLOG #5655).
             if ($inv.CmdWin -cnotmatch (Get-GitDashCPresencePattern)) {

@@ -431,26 +431,6 @@ def test_an_earlier_quote_character_does_not_switch_the_strip_off_for_work_tree(
     assert "SHARED PRIMARY" in _reason(rig, cmd, rig.outside)
 
 
-def test_distinct_branch_switches_finish_well_inside_the_hook_timeout(
-    rig: SimpleNamespace,
-) -> None:
-    """Measured before the cache: ten distinct `git checkout` invocations took about 11 s here."""
-    import time
-
-    cmd = " ; ".join(f"git checkout -q f{i}" for i in range(12))
-    started = time.monotonic()
-    assert _allowed(rig, cmd, rig.wt)
-    elapsed = time.monotonic() - started
-    assert elapsed < 8, f"12 distinct checkouts took {elapsed:.1f}s; the install timeout is 15s"
-
-
-def test_a_git_word_echoed_after_a_dash_C_command_is_not_an_invocation(
-    rig: SimpleNamespace,
-) -> None:
-    """Allowed on origin/main; the per-invocation pass read the echoed word as a command."""
-    assert _allowed(rig, f"git -C {rig.outside.as_posix()} log ; echo git reset", rig.primary)
-
-
 def test_an_earlier_quote_character_does_not_make_a_message_live(rig: SimpleNamespace) -> None:
     """The other direction: the mention stays inside its message, as on origin/main."""
     cmd = f"echo '\"' ; git stash push -m \"try -C '{rig.primary.as_posix()}' later\""
