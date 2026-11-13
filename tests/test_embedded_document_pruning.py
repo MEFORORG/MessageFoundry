@@ -568,8 +568,9 @@ async def test_a_failed_audit_of_refused_cells_still_logs_what_was_committed(
 async def test_a_key_service_outage_stops_the_pass(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #5651: a decrypt the key service gave no verdict on ends the pass at the first row,
-    rather than failing, and timing out, once per row."""
+    """BACKLOG #5651: a decrypt the key service gave no verdict on ends the strip call at the first
+    row, rather than failing, and timing out, once per row. The call returns, flagged
+    ``ended_early``, instead of raising."""
     for i in range(3):
         await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=float(i), control=f"C-O{i}")
     calls: list[str] = []
@@ -580,12 +581,163 @@ async def test_a_key_service_outage_stops_the_pass(
 
     monkeypatch.setattr(document_strip, "open_message_cell", unavailable)
 
-    with pytest.raises(CipherUnavailableError):
-        await store.strip_embedded_documents(
-            older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
-        )
+    result = await store.strip_embedded_documents(
+        older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+    )
 
+    assert result == StripResult(ended_early=True)
     assert len(calls) == 1
+
+
+async def test_a_key_service_outage_ends_only_the_strip_phase_of_a_retention_pass(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5651: an outage in the strip phase does not fail the retention pass: the pass
+    completes and still writes its single ``retention_purge`` audit row, here for a body purge the
+    same pass made."""
+    # Two days old: past its one-day strip window, inside the three-day body window.
+    kept = await _delivered(store, channel_id="IB_PRUNE", raw=MFB64_BODY, now=3 * DAY, control="O1")
+    # Five days old: its body is purged by the same pass.
+    await _delivered(store, channel_id="IB_KEEP", raw=MFB64_BODY, now=0.0, control="O2")
+    calls: list[str] = []
+
+    def unavailable(*_args: Any, message_id: str, **_kwargs: Any) -> str:
+        calls.append(message_id)
+        raise CipherUnavailableError("synthetic: the key service is unreachable")
+
+    monkeypatch.setattr(document_strip, "open_message_cell", unavailable)
+    reg = _registry()
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(messages_days=3),
+        clock=lambda: 5 * DAY,
+        registry_source=lambda: reg,
+    )
+
+    result = await runner.run_once()
+
+    assert calls == [kept]  # the strip phase ran, and stopped at its first row
+    assert result.messages_purged == 1 and result.documents_messages_stripped == 0
+    audit = [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"]
+    assert len(audit) == 1
+
+
+_LOCK_ROW = {"id": "M-LOCK", "channel_id": "IB", "raw": MFB64_BODY, "received_at": 0.0}
+
+
+async def test_the_postgres_write_locks_messages_then_queue_inside_its_transaction() -> None:
+    """BACKLOG #5651: the Postgres write takes ``FOR UPDATE`` on the batch's message rows, then
+    ``FOR SHARE`` on their queue rows, both inside the batch transaction and before any guarded
+    UPDATE. No server runs here, so a recording connection stands in for one; deleting either lock
+    statement, or moving it out of the transaction, fails this."""
+    from messagefoundry.store.postgres import PostgresStore
+
+    calls: list[tuple[str, bool]] = []
+    state = {"in_txn": False}
+
+    class Txn:
+        async def __aenter__(self) -> None:
+            state["in_txn"] = True
+
+        async def __aexit__(self, *_exc: object) -> None:
+            state["in_txn"] = False
+
+    class Conn:
+        def transaction(self) -> Txn:
+            return Txn()
+
+        async def execute(self, sql: str, *_args: Any) -> str:
+            calls.append((sql, state["in_txn"]))
+            return "UPDATE 1" if sql.startswith("UPDATE") else "SELECT 1"
+
+    @contextlib.asynccontextmanager
+    async def acquire(**_kwargs: Any) -> AsyncIterator[Conn]:
+        yield Conn()
+
+    pages = [[_LOCK_ROW], []]
+
+    async def fetchall(_sql: str, *_args: Any) -> list[Any]:
+        return pages.pop(0)
+
+    store: Any = object.__new__(PostgresStore)
+    store._cipher = IdentityCipher()
+    store._timed_acquire = acquire
+    store._fetchall = fetchall
+
+    result = await store.strip_embedded_documents(
+        older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+    )
+
+    assert result.messages_stripped == 1
+    kinds = [
+        (
+            "messages-lock"
+            if "FROM messages" in s and "FOR UPDATE" in s
+            else "queue-lock"
+            if "FROM queue" in s and "FOR SHARE" in s
+            else "update"
+            if s.startswith("UPDATE messages")
+            else s,
+            txn,
+        )
+        for s, txn in calls
+    ]
+    assert kinds == [("messages-lock", True), ("queue-lock", True), ("update", True)]
+
+
+async def test_the_sqlserver_write_locks_messages_then_clustered_queue_rows_before_commit() -> None:
+    """BACKLOG #5651: the SQL Server write takes ``UPDLOCK`` on the batch's message rows, then on
+    their queue rows by a column outside ``ix_queue_message``, both before any guarded UPDATE and
+    before the commit, and its guard's subquery reads under ``READCOMMITTEDLOCK``. No server runs
+    here, so a recording cursor stands in for one; deleting either lock fails this."""
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    events: list[str] = []
+
+    class Cur:
+        def __init__(self) -> None:
+            self.last = ""
+
+        async def execute(self, sql: str, _params: Any = ()) -> None:
+            self.last = sql
+            events.append(sql)
+
+        async def fetchall(self) -> list[Any]:
+            return [("M-LOCK",)] if self.last.startswith("UPDATE") else []
+
+    @contextlib.asynccontextmanager
+    async def acquire() -> AsyncIterator[object]:
+        yield object()
+
+    @contextlib.asynccontextmanager
+    async def cursor(_conn: object) -> AsyncIterator[Cur]:
+        yield Cur()
+
+    async def commit(_conn: object) -> None:
+        events.append("COMMIT")
+
+    pages = [[dict(_LOCK_ROW)], []]
+
+    async def fetchall(_sql: str, _params: Any = ()) -> list[dict[str, Any]]:
+        return pages.pop(0)
+
+    store: Any = object.__new__(SqlServerStore)
+    store._cipher = IdentityCipher()
+    store._acquire = acquire
+    store._cursor = cursor
+    store._commit = commit
+    store._fetchall = fetchall
+
+    result = await store.strip_embedded_documents(
+        older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+    )
+
+    assert result.messages_stripped == 1
+    assert len(events) == 4 and events[3] == "COMMIT"
+    messages_lock, queue_lock, update = events[:3]
+    assert "FROM messages m WITH (UPDLOCK" in messages_lock
+    assert "SELECT q.status FROM queue q WITH (UPDLOCK" in queue_lock
+    assert update.startswith("UPDATE messages") and "READCOMMITTEDLOCK" in update
 
 
 def test_a_refused_cell_is_returned_with_its_traceback_cleared(

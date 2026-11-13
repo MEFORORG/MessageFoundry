@@ -5,10 +5,13 @@
   content. Each write-back now applies only while the row is still unpruned, still holds the exact
   stored cell the strip read, and still has no pending or in-flight queue row, so a purge or a
   re-seal that lands in between wins; a row counts as stripped only when its own update changed
-  it. On PostgreSQL and SQL Server the batch also locks the message's existing queue rows until it
-  commits, so a replay that re-pends one either lands first and wins, or waits for the batch. The
+  it. On PostgreSQL and SQL Server the batch also locks its message rows and then their existing
+  queue rows until it commits, in the order a body purge takes them, so a replay that re-pends one
+  either lands first and wins, or waits for the batch; a replay, which takes them in the other
+  order, can instead deadlock with the batch, and the server aborts one of the two. The
   pass also reads candidates in keyset batches ordered by received time and message id instead of
   all at once, and runs the decrypt, strip and encrypt in a worker thread with no store connection
-  held, rather than on the event loop. A key-service outage stops the pass rather than failing
-  every row in turn. Each batch commits on its own, so a pass that fails part way logs, at WARNING,
+  held, rather than on the event loop. A key-service outage ends the strip phase with what it had
+  committed, rather than failing every row in turn; the rest of the retention pass, and its audit
+  row, still run. Each batch commits on its own, so a pass that fails part way logs, at WARNING,
   what earlier batches had already stripped.

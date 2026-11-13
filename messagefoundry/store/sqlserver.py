@@ -863,6 +863,17 @@ _MSSQL_APPROVAL_INSERT: Final = (
 )
 #: Reports through ``OUTPUT``, which a session-wide ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283),
 #: rather than ``cursor.rowcount`` (vault BACKLOG #3193).
+#: The embedded-document strip's write locks, taken in this order inside its batch transaction
+#: (BACKLOG #5651): the message rows first, as a body purge takes them, then their queue rows.
+#: ``q.status`` is not in ``ix_queue_message``, so the queue read reaches, and update-locks, the
+#: clustered rows a replay updates. ``{marks}`` is only ``?`` placeholders, one per message id.
+_MSSQL_STRIP_LOCK_MESSAGES: Final = (
+    "SELECT m.id FROM messages m WITH (UPDLOCK, ROWLOCK) WHERE m.id IN ({marks})"
+)
+_MSSQL_STRIP_LOCK_QUEUE: Final = (
+    "SELECT q.status FROM queue q WITH (UPDLOCK, ROWLOCK) WHERE q.message_id IN ({marks})"
+)
+
 _MSSQL_APPROVAL_UPDATE: Final = (
     "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?, claim_owner = ?,"
     " seal = ? OUTPUT inserted.id"
@@ -10266,16 +10277,18 @@ class SqlServerStore:
             async with self._acquire() as conn:
                 try:
                     async with self._cursor(conn) as cur:
-                        # The in-flight NOT EXISTS alone reads committed data only, so it could
-                        # pass for a row a replay re-pends before this transaction commits. Update
-                        # locks, held to the commit, on the batch's queue rows make such a replay
-                        # wait for it (document_strip says why that suffices).
-                        marks = ", ".join("?" * len(updates))
-                        await cur.execute(
-                            "SELECT q.id FROM queue q WITH (UPDLOCK, HOLDLOCK)"
-                            f" WHERE q.message_id IN ({marks})",
-                            tuple(u.message_id for u in updates),
-                        )
+                        # The in-flight NOT EXISTS alone may read a row version (RCSI), so it could
+                        # pass for a row a replay re-pends before this transaction commits. The
+                        # batch takes update locks, held to the commit, on its message rows and
+                        # then on their clustered queue rows (q.status is outside the message_id
+                        # index, so the read reaches them), in the order a body purge takes
+                        # them; the guard's subquery reads under locks too. document_strip states
+                        # what that covers.
+                        ids = tuple(u.message_id for u in updates)
+                        marks = ", ".join("?" * len(ids))
+                        await cur.execute(_MSSQL_STRIP_LOCK_MESSAGES.format(marks=marks), ids)
+                        await cur.fetchall()
+                        await cur.execute(_MSSQL_STRIP_LOCK_QUEUE.format(marks=marks), ids)
                         await cur.fetchall()
                         for u in updates:
                             await cur.execute(
@@ -10283,7 +10296,7 @@ class SqlServerStore:
                                 " WHERE id=? AND documents_pruned IS NULL"
                                 " AND (raw + N'|') COLLATE Latin1_General_100_BIN2"
                                 " = (CAST(? AS NVARCHAR(MAX)) + N'|')"
-                                " AND NOT EXISTS (SELECT 1 FROM queue q"
+                                " AND NOT EXISTS (SELECT 1 FROM queue q WITH (READCOMMITTEDLOCK)"
                                 " WHERE q.message_id=messages.id AND q.status IN (?, ?))",
                                 (u.new_cell, stamp, u.message_id, u.stored, *inflight),
                             )

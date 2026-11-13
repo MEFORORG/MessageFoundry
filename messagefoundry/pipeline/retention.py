@@ -628,7 +628,12 @@ class RetentionRunner:
                 messages_stripped=strip.messages_stripped + part.messages_stripped,
                 documents_stripped=strip.documents_stripped + part.documents_stripped,
                 bytes_reclaimed=strip.bytes_reclaimed + part.bytes_reclaimed,
+                ended_early=part.ended_early,
             )
+            if part.ended_early:
+                # A key-service outage (BACKLOG #5651): every later threshold group would meet it
+                # too. End only this phase; the rest of the pass and its audit row still run.
+                break
         state_purged = 0
         if not _deadline_hit() and s.state_max_age_days > 0:
             state_purged = await self._store.purge_state(

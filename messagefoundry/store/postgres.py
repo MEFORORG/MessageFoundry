@@ -11785,13 +11785,12 @@ class PostgresStore:
             landed: list[StripUpdate] = []
             async with self._timed_acquire() as conn, conn.transaction():
                 # Statements here read committed data only, so the in-flight NOT EXISTS alone could
-                # pass for a row a replay re-pends before this transaction commits. FOR SHARE on the
-                # batch's queue rows makes such a replay wait for the commit (document_strip says
-                # why that suffices).
-                await conn.execute(
-                    "SELECT 1 FROM queue WHERE message_id = ANY($1::text[]) ORDER BY id FOR SHARE",
-                    [u.message_id for u in updates],
-                )
+                # pass for a row a replay re-pends before this transaction commits. The batch locks
+                # its message rows, then their queue rows, in the order a body purge takes them;
+                # document_strip states what that covers.
+                ids = [u.message_id for u in updates]
+                await conn.execute(_PG_STRIP_LOCK_MESSAGES, ids)
+                await conn.execute(_PG_STRIP_LOCK_QUEUE, ids)
                 for u in updates:
                     tag = await conn.execute(
                         "UPDATE messages SET raw=$1, documents_pruned=$2"
@@ -12215,6 +12214,16 @@ class PostgresStore:
         else:
             return  # only terminal non-dead non-outbound rows (shouldn't occur) — leave as-is
         await conn.execute("UPDATE messages SET status=$1 WHERE id=$2", status, message_id)
+
+
+#: The embedded-document strip's write locks, taken in this order inside its batch transaction
+#: (BACKLOG #5651): the message rows first, as a body purge takes them, then their queue rows.
+_PG_STRIP_LOCK_MESSAGES: Final = (
+    "SELECT 1 FROM messages WHERE id = ANY($1::text[]) ORDER BY id FOR UPDATE"
+)
+_PG_STRIP_LOCK_QUEUE: Final = (
+    "SELECT 1 FROM queue WHERE message_id = ANY($1::text[]) ORDER BY id FOR SHARE"
+)
 
 
 def _rowcount(command_tag: str) -> int:
