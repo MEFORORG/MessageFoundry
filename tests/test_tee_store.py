@@ -4,13 +4,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+import pickle
 import sqlite3
 import stat
 from pathlib import Path
 
 import pytest
 
+import tee.store as tee_store
+from tee.__main__ import main as tee_main
 from tee.store import PurgeIncompleteError, RelayStore
 
 
@@ -246,8 +250,9 @@ async def test_purge_leaves_no_body_bytes_in_wal_or_db(tmp_path: Path) -> None:
     # checkpoints and deletes the -wal, which would hide residue that a live peer keeps on disk.
     db_path = tmp_path / "tee.db"
     store = await RelayStore.open(str(db_path))
-    peer = sqlite3.connect(db_path)
+    peer: sqlite3.Connection | None = None
     try:
+        peer = sqlite3.connect(db_path)
         peer.execute("SELECT COUNT(*) FROM relay_log").fetchall()  # attach to the WAL, no txn held
         await store.record_capture(direction="corepoint_copy", control_id="C5637", raw=_MARKER_BODY)
         assert _MARKER in _on_disk(db_path)  # positive control: the instrument sees the body
@@ -255,41 +260,96 @@ async def test_purge_leaves_no_body_bytes_in_wal_or_db(tmp_path: Path) -> None:
         assert _MARKER not in _on_disk(db_path)
         assert Path(f"{db_path}-wal").stat().st_size == 0  # TRUNCATE checkpoint emptied the WAL
     finally:
-        peer.close()
+        if peer is not None:
+            peer.close()
         await store.close()
 
 
+@pytest.fixture
+def fast_checkpoint_poll(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two checkpoint tries with no sleep, so a pinned WAL fails in milliseconds rather than ~5 s."""
+    monkeypatch.setattr(tee_store, "_CHECKPOINT_ATTEMPTS", 2)
+    monkeypatch.setattr(tee_store, "_CHECKPOINT_POLL_SECONDS", 0.0)
+
+
+@pytest.mark.usefixtures("fast_checkpoint_poll")
 async def test_purge_refuses_to_report_clean_when_checkpoint_is_busy(tmp_path: Path) -> None:
     # A peer holding a read transaction pins the WAL, so a TRUNCATE checkpoint cannot finish. Purge
     # must say so rather than return counts that read as a clean purge.
     db_path = tmp_path / "tee.db"
     store = await RelayStore.open(str(db_path))
-    await store._db.execute("PRAGMA busy_timeout=0")  # noqa: SLF001 - keep the busy wait short
-    await store.record_capture(direction="corepoint_copy", control_id="C5637", raw=_MARKER_BODY)
-    peer = sqlite3.connect(db_path, isolation_level=None)
+    peer: sqlite3.Connection | None = None
     try:
+        await store.record_capture(direction="corepoint_copy", control_id="C5637", raw=_MARKER_BODY)
+        peer = sqlite3.connect(db_path, isolation_level=None)
         peer.execute("BEGIN")
         peer.execute("SELECT COUNT(*) FROM relay_capture").fetchall()  # holds the read snapshot
         with pytest.raises(PurgeIncompleteError) as excinfo:
             await store.purge(captures_only=True)
         assert (excinfo.value.log_rows, excinfo.value.capture_rows) == (0, 1)
+        assert _MARKER in _on_disk(db_path)  # the residue the error reports is really there
         peer.execute("COMMIT")
         # Once the reader lets go, a re-run completes and scrubs the residue.
         assert await store.purge(captures_only=True) == (0, 0)
         assert _MARKER not in _on_disk(db_path)
     finally:
-        peer.close()
+        if peer is not None:
+            peer.close()
         await store.close()
 
 
-async def test_secure_delete_is_on(tmp_path: Path) -> None:
+def test_purge_incomplete_error_round_trips_through_pickle() -> None:
+    err = pickle.loads(pickle.dumps(PurgeIncompleteError(2, 3)))
+    assert (err.log_rows, err.capture_rows) == (2, 3)
+    assert str(err) == str(PurgeIncompleteError(2, 3))
+
+
+@pytest.mark.usefixtures("fast_checkpoint_poll")
+def test_purge_cli_reports_a_busy_checkpoint_as_an_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Sync test: tee's main() runs its own event loop.
+    db_path = tmp_path / "tee.db"
+
+    async def seed() -> None:
+        store = await RelayStore.open(str(db_path))
+        try:
+            await store.record_capture(direction="corepoint_copy", control_id="C", raw=_MARKER_BODY)
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    peer = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        peer.execute("BEGIN")
+        peer.execute("SELECT COUNT(*) FROM relay_capture").fetchall()
+        rc = tee_main(["purge", "--db", str(db_path), "--captures-only", "-y"])
+    finally:
+        peer.close()
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "error: purge deleted 0 log row(s) and 1 capture row(s)" in captured.err
+    assert "purged " not in captured.out
+
+
+async def test_secure_delete_is_on_and_vacuum_temp_stays_in_memory(tmp_path: Path) -> None:
     store = await _open(tmp_path)
     try:
-        cur = await store._db.execute("PRAGMA secure_delete")  # noqa: SLF001 - test introspection
-        row = await cur.fetchone()
-        assert row is not None and int(row[0]) == 1
+        for pragma, want in (("secure_delete", 1), ("temp_store", 2)):  # 2 is MEMORY
+            async with store._db.execute(f"PRAGMA {pragma}") as cur:  # noqa: SLF001
+                row = await cur.fetchone()
+            assert row is not None and int(row[0]) == want, pragma
     finally:
         await store.close()
+
+
+async def _set_journal_mode(store: RelayStore, mode: str) -> str:
+    # Read the result and close the cursor: an unread PRAGMA statement left open makes SQLite refuse
+    # the next journal-mode change silently, returning the old mode.
+    async with store._db.execute(f"PRAGMA journal_mode={mode}") as cur:  # noqa: SLF001
+        row = await cur.fetchone()
+    assert row is not None
+    return str(row[0])
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits; the Windows DACL half is open")
@@ -299,15 +359,16 @@ async def test_wal_siblings_recreated_after_open_inherit_owner_only_mode(tmp_pat
     # chmod are 0600 even under a permissive umask. Switching the journal mode away and back removes
     # both siblings, and the next write re-creates them after _secure_file has already run.
     db_path = tmp_path / "tee.db"
+    wal, shm = Path(f"{db_path}-wal"), Path(f"{db_path}-shm")
     old_umask = os.umask(0)
     try:
         store = await RelayStore.open(str(db_path))
         try:
-            await store._db.execute("PRAGMA journal_mode=DELETE")  # noqa: SLF001
-            assert not Path(f"{db_path}-wal").exists()
-            await store._db.execute("PRAGMA journal_mode=WAL")  # noqa: SLF001
+            assert await _set_journal_mode(store, "DELETE") == "delete"
+            assert not wal.exists() and not shm.exists()
+            assert await _set_journal_mode(store, "WAL") == "wal"
             await store.record_capture(direction="corepoint_copy", control_id="C", raw=b"MSH|x")
-            for sibling in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+            for sibling in (db_path, wal, shm):
                 assert sibling.exists(), sibling
                 assert stat.S_IMODE(sibling.stat().st_mode) == 0o600, sibling
         finally:

@@ -68,7 +68,7 @@ from tee.anon.surrogates import site_prefixes_loaded
 from tee.correlate import CorepointOutput, CorrelateConfig
 from tee.relay import Endpoint, RelayConfig, TeeRelay
 from tee.report import build_report
-from tee.store import RelayStore
+from tee.store import PurgeIncompleteError, RelayStore
 
 # Shown prominently at every start. ASCII-only so it renders on legacy Windows consoles (cp1252).
 _STARTUP_WARNING = """\
@@ -474,6 +474,9 @@ async def _purge(args: argparse.Namespace) -> int:
     store = await RelayStore.open(args.db)
     try:
         log_n, cap_n = await store.purge(before=args.before, captures_only=args.captures_only)
+    except PurgeIncompleteError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     finally:
         await store.close()
     print(f"purged {log_n} log row(s) and {cap_n} capture row(s)")

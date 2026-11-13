@@ -175,6 +175,13 @@ consequences follow from it:
 the captured bodies (the PHI-bearing table) and keeps the NAK/leg log. It **prompts for confirmation**
 (or refuses, in a non-interactive shell) unless you pass `-y`.
 
+The DB runs in WAL mode, where deleted rows stay readable in the `-wal` file until a checkpoint copies
+the zeroed pages back. Purge therefore deletes and commits, runs a `TRUNCATE` checkpoint, then
+`VACUUM` and a second checkpoint. If another connection holds a read transaction open, or another
+writer or checkpoint runs, for about 5 s, the first checkpoint cannot finish: purge then prints
+`error: ...` with the counts it already deleted and exits 1. The rows are gone at that point but
+their bytes may still be in the `-wal` file, so re-run purge once the other reader has finished.
+
 ```bash
 python -m tee purge --db ./tee.db --before 7d -y          # retention sweep
 python -m tee purge --db ./tee.db --captures-only -y      # drop only the captured bodies
