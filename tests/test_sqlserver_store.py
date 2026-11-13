@@ -1450,9 +1450,21 @@ async def test_writes_keyed_to_an_account_queue_behind_its_delete(store, write: 
         await store.remember_login_address(account, "10.0.0.1", now=2.0)
         await store.create_session(token_hash=token, user_id=account, expires_at=9e9, now=2.0)
 
-    outcome = await _race_a_held_user_delete(store, account, steps[write], seed=_seed)
+    real_write = store._write_session
+    written: list[Any] = []
+
+    async def _spy(cur: Any, token_hash: str, change: Any) -> Any:
+        written.append(await real_write(cur, token_hash, change))
+        return written[-1]
+
+    store._write_session = _spy
+    try:
+        outcome = await _race_a_held_user_delete(store, account, steps[write], seed=_seed)
+    finally:
+        del store._write_session
     if write == "mark_session_mfa_verified":
-        assert outcome is None, outcome  # the session went with the account: nothing stamped
+        # The session went with the account, so the stamp found no row and wrote nothing.
+        assert outcome is None and written == [None], (outcome, written)
     else:
         assert isinstance(outcome, Exception) and _is_integrity_refusal(outcome), outcome
     assert await store.list_known_login_addresses(account, since=0.0) == []

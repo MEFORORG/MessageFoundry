@@ -428,7 +428,8 @@ async def _hold_then_race(
     session; then release ``first`` and return both results, ``first``'s first.
 
     ``attr`` names a helper called ``(handle, key, ...)``: ``_write_user``, ``_write_session``, or
-    SQL Server's ``_delete_user_rows``. Only the first call for ``key`` pauses. With ``pause_before``, the pause
+    SQL Server's ``_delete_user_rows``. Only the first call for ``key`` pauses. With
+    ``pause_before``, the pause
     comes inside that call instead, just before the handle runs the first statement starting with
     that text, so ``first`` holds what the helper's locked read took and has written nothing yet.
     The race is hooked, not timed: without the probe a pass could come from a ``second`` that never

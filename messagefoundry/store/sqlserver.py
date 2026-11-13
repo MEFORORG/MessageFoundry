@@ -2185,9 +2185,11 @@ _ORPHAN_SWEEP_HEAD: Final = (
 async def _log_orphans_deleted(cur: Any) -> None:
     """Log the row a :func:`_trusted_user_key` batch ends with, when it deleted any rows (BACKLOG
     #2733). The count only, per table: the deleted rows name accounts, and the line names none.
-    It only reports, so a batch that returned no row fails nothing: the delete has already run."""
+    It only reports, so a row it cannot read fails nothing, since the delete has already run; it
+    says so instead."""
     rows = await cur.fetchall()
-    if not rows:
+    if not rows or len(rows[0]) < 2:
+        log.warning("sqlserver: an orphan sweep before a user key returned no count row")
         return
     table, deleted = str(rows[0][0]), int(rows[0][1])
     if deleted:
@@ -2203,10 +2205,8 @@ _AccountRowHints = Literal["UPDLOCK, ROWLOCK", "HOLDLOCK, ROWLOCK", "XLOCK, ROWL
 
 
 async def _hold_account_row(cur: Any, user_id: str, hints: _AccountRowHints) -> None:
-    """Lock the account's ``users`` row under ``hints`` inside the caller's transaction, the one
-    spelling of the account-first lock every write keyed to an account takes before its own row
-    (BACKLOG #2733, #4974): ``UPDLOCK`` for a writer of the account or its sessions, ``HOLDLOCK``
-    for a sign-in address write, and ``XLOCK`` for the user delete. The row is drained, not read."""
+    """Lock the account's ``users`` row under ``hints`` inside the caller's transaction, draining
+    the row unread. ``_delete_user_rows`` says which writes take it and why (BACKLOG #2733)."""
     await cur.execute(f"SELECT id FROM users WITH ({hints}) WHERE id=?", (user_id,))
     await cur.fetchall()
 
@@ -2801,8 +2801,8 @@ _SCHEMA: list[str] = [
         CREATE INDEX ix_user_roles_role ON user_roles(role_id)""",
     # BACKLOG #2733: see _trusted_user_key. The primary key, which leads with user_id, serves its
     # check on a user delete. Every role write holds the account row under
-    # UPDLOCK (_read_user_record), and the delete under XLOCK, so the two never interleave. The role key
-    # above stays WITH NOCHECK: a grant row names a live account whose seal covers it, so
+    # UPDLOCK (_read_user_record), and the delete under XLOCK, so the two never
+    # interleave. The role key above stays WITH NOCHECK: a grant row names a live account whose seal covers it, so
     # deleting one would make that account fail its seal, and the write path drops it instead.
     _trusted_user_key("user_roles", "fk_user_roles_user"),
     """IF OBJECT_ID('ad_group_role_map','U') IS NULL CREATE TABLE ad_group_role_map (
@@ -16550,14 +16550,19 @@ class SqlServerStore:
         change: Callable[[SessionRecord], SessionRecord],
         *,
         landed: Callable[[Any], Awaitable[None]] | None = None,
+        account_lock: _AccountRowHints = "HOLDLOCK, ROWLOCK",
         after_commit: bool = False,
     ) -> SessionRecord | None:
         """:meth:`_write_session` in a transaction of its own, committed before it returns.
-        It takes the session's account row under ``UPDLOCK, ROWLOCK`` first, the lock order
+        It takes the session's account row under ``account_lock`` first, the lock order
         :meth:`rotate_session` states: the rewrite sets ``user_id``, so the session key's check
         can read the account row, and a sweep or a user delete holding that row while it waits on
-        the session row would otherwise deadlock with it (BACKLOG #4974, #2733). The account is
-        read unlocked: ``user_id`` never changes, and a session already gone locks nothing.
+        the session row would otherwise deadlock with it (BACKLOG #4974, #2733). Shared by
+        default, as ``create_session``'s unguarded read is: a stamp writes no account row, so
+        stamps of one account do not wait on each other or on an account writer's ``UPDLOCK``
+        read, and a writer that converts to an X lock or a delete still waits for the stamp. The
+        account is read unlocked: ``user_id`` never changes, and a session already gone locks
+        nothing.
         ``landed`` runs on the same cursor, in the same transaction, only when the write landed.
         ``after_commit`` borrows through :meth:`_acquire_after_commit`; only ``rotate_session``
         passes it."""
@@ -16567,7 +16572,7 @@ class SqlServerStore:
                 await cur.execute("SELECT user_id FROM sessions WHERE token_hash=?", (token_hash,))
                 owners = await cur.fetchall()
                 if owners:
-                    await self._lock_account_row(cur, str(owners[0][0]))
+                    await _hold_account_row(cur, str(owners[0][0]), account_lock)
                 updated = await self._write_session(cur, token_hash, change)
                 if updated is not None and landed is not None:
                     await landed(cur)
@@ -16673,6 +16678,7 @@ class SqlServerStore:
         rotated = await self._write_session_txn(
             token_hash,
             lambda s: replace(s, token_hash=new_token_hash),
+            account_lock="UPDLOCK, ROWLOCK",
             landed=_link,
             after_commit=True,
         )
