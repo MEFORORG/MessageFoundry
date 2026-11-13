@@ -314,15 +314,20 @@ def test_the_messagefoundry_launcher_may_sit_between_nssm_and_the_engine() -> No
     assert service_env_refusal(read_service_env_posture(probe=probe, environ={})) is not None
 
 
-def test_a_console_script_launcher_under_nssm_names_only_the_unobservable_entry() -> None:
-    """docs/SECURITY-LOOSENING.md says a console-script launcher such as ``uvicorn.exe`` between
-    NSSM and the interpreter is neither a Python interpreter nor ``messagefoundry.exe``, so the
-    engine does not find its service and ``secret_in_service_environment`` is not named."""
-    probe = _Probe(
+def _console_script_probe() -> _Probe:
+    """A console-script launcher, ``uvicorn.exe``, between NSSM and the interpreter."""
+    return _Probe(
         ancestors=[(300, "python.exe"), (250, "uvicorn.exe"), (100, "nssm.exe")],
         services={100: "MessageFoundry"},
         entries=[f"MEFOR_STORE_ENCRYPTION_KEY={_KEY_VALUE}"],
     )
+
+
+def test_a_console_script_launcher_under_nssm_names_only_the_unobservable_entry() -> None:
+    """docs/SECURITY-LOOSENING.md says a console-script launcher such as ``uvicorn.exe`` between
+    NSSM and the interpreter is neither a Python interpreter nor ``messagefoundry.exe``, so the
+    engine does not find its service and ``secret_in_service_environment`` is not named."""
+    probe = _console_script_probe()
     posture = read_service_env_posture(
         probe=probe, environ={"MEFOR_STORE_ENCRYPTION_KEY": _KEY_VALUE}
     )
@@ -545,12 +550,7 @@ async def test_an_app_built_around_an_engine_refuses_a_listed_secret(
 #: A console-script launcher between NSSM and the interpreter reads UNOBSERVABLE with no service,
 #: so ``serve`` does not refuse there (the ``uvicorn.exe`` test above), and an app builds as at main.
 _CONSOLE_SCRIPT_LAUNCHER = read_service_env_posture(
-    probe=_Probe(
-        ancestors=[(300, "python.exe"), (250, "uvicorn.exe"), (100, "nssm.exe")],
-        services={100: "MessageFoundry"},
-        entries=[f"MEFOR_STORE_ENCRYPTION_KEY={_KEY_VALUE}"],
-    ),
-    environ={"MEFOR_STORE_ENCRYPTION_KEY": _KEY_VALUE},
+    probe=_console_script_probe(), environ={"MEFOR_STORE_ENCRYPTION_KEY": _KEY_VALUE}
 )
 
 
