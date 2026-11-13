@@ -33,7 +33,8 @@ import aiosqlite
 __all__ = ["RelayStore", "NakRow", "CaptureRow", "PurgeIncompleteError"]
 
 # Bound the stored detail (an MSA-3 reason or an error string) so a hostile/huge field can't bloat the
-# log, and scrub control characters that could corrupt a terminal when an operator reads it back.
+# log, and replace each character below U+0020 except tab with a space so a C0 control cannot
+# corrupt a terminal when an operator reads it back. DEL and C1 controls pass unchanged.
 _MAX_DETAIL = 500
 
 _SCHEMA = """
@@ -154,7 +155,7 @@ class CaptureRow:
 
 
 def _clean_detail(detail: str | None) -> str | None:
-    """Scrub control characters and bound the length of a logged detail string."""
+    """Replace characters below U+0020 except tab with a space, and bound the length."""
     if detail is None:
         return None
     cleaned = "".join(ch if ch >= " " or ch == "\t" else " " for ch in detail)
@@ -610,8 +611,8 @@ class RelayStore:
 
         Returns ``{"summary": {...}, "rows": [...]}`` — never the captured message **bodies** (only the
         leg metadata: outcomes, ACK codes, control ids, types, sizes, details). It is **not**
-        PHI-safe: ``detail`` is emitted verbatim (control characters scrubbed, 500 characters at
-        most) and can carry at least the partner's MSA-3 ACK text or a transport error string,
+        PHI-safe: ``detail`` is emitted verbatim (500 characters at most; each character below
+        U+0020 except tab became a space, while DEL and C1 controls pass unchanged) and can carry at least the partner's MSA-3 ACK text or a transport error string,
         and either can name a patient, so treat an export as PHI. The summary
         aggregates the whole time window; ``rows`` is optionally narrowed to NAKs and the most-recent
         ``limit``. Filtering is done in Python (the log is small), so the SQL stays static."""

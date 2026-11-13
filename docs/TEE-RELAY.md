@@ -130,8 +130,8 @@ invisible record of anything a downstream rejected for a message Epic was told `
 `python -m tee export` writes the log as **JSON** — a `summary` (counts by leg / outcome / ACK code,
 NAK count, distinct messages, time range) plus the matching `rows`. It never holds the captured
 message bodies, but it is **not PHI-safe**: a row's `detail` can carry at least the partner's
-MSA-3 ACK text or a transport error string, written verbatim apart from control characters and a
-500-character cap, and either can name a patient. `python -m tee naks` prints the same detail. Treat an export as PHI, and check it before you hand it to a reviewer or an AI session.
+MSA-3 ACK text or a transport error string, written verbatim apart from a 500-character cap and
+each character below U+0020 except tab, which becomes a space (DEL and C1 controls pass unchanged), and either can name a patient. `python -m tee naks` prints the same detail. Treat an export as PHI, and check it before you hand it to a reviewer or an AI session.
 Default is stdout; use
 `--out FILE` to write a file. Narrow it with `--since` / `--before` (an age like `24h`/`7d` or a UTC date
 `YYYY-MM-DD`), `--naks-only`, and `--limit N`.

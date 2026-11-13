@@ -2120,7 +2120,8 @@ with materially different PHI profiles, so they get their own rows; stream 4 is 
 WebSocket are **live telemetry, not log records** — neither retains a per-event record. The standalone
 **`tee` MLLP relay** is a separate application shipped in this repo with its own SQLite store and its own
 logging (`relay_log` — direction/leg/control id/type/size/outcome/ack code + a 500-char detail
-with control characters scrubbed, never a body, but able to carry at least partner ACK text or a
+in which each character below U+0020 except tab is replaced with a space (DEL and C1 controls pass
+unchanged), never a body, but able to carry at least partner ACK text or a
 transport error string that names a patient; and `relay_capture`, whose `raw` column holds the **full message** and is written only when
 `--capture-bodies` is passed). Its process logging is a bare `logging.basicConfig` to stderr with **none**
 of the filters above. It is **out of scope for this section** — but treat **every** tee DB,
