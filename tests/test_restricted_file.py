@@ -1400,9 +1400,10 @@ def _serve(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str) -> int:
 def test_serve_mints_a_tls_key_it_accepts_in_a_store_directory_a_group_may_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A store directory made under umask 002, or on an fsGroup volume, is group-writable. The
-    engine mints its key into a 0700 directory of its own there, so its own check passes it on the
-    first start and every later one (vault BACKLOG #5636)."""
+    """A store directory made under umask 002 is group-writable. The engine mints its key into a
+    0700 directory of its own there, so its own check passes it on the first start and the next
+    (vault BACKLOG #5636). An fsGroup volume is not this case: the kubelet widens the key and its
+    directory again on every mount, so a later start refuses them."""
     from messagefoundry.api.tls import _generated_pair
 
     tmp_path.chmod(0o775)
@@ -1419,6 +1420,47 @@ def test_serve_mints_a_tls_key_it_accepts_in_a_store_directory_a_group_may_write
     assert broad_access_problem(key) is None
     assert "is not restricted" not in capsys.readouterr().err
     assert _serve(tmp_path, monkeypatch, PHI_GATE_PROVISIONS_TOML) == 0  # and it reuses the pair
+
+
+@pytest.mark.parametrize(("platform", "mode"), [("linux", 0o700), ("win32", None)])
+def test_cert_commands_ask_for_an_owner_only_out_dir_on_posix_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str, mode: int | None
+) -> None:
+    """The seam, on every platform: POSIX asks for 0700, Windows for no mode so the directory
+    inherits its parent's access list. The real create runs without a mode, so no protected list
+    is attached to this test's directory."""
+    import messagefoundry.__main__ as cli
+
+    seen: list[object] = []
+    real_mkdir = Path.mkdir
+
+    def record(self: Path, **kwargs: Any) -> None:
+        seen.append(kwargs.pop("mode", None))
+        real_mkdir(self, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", record)
+    # The key write has its own per-platform arms, which the faked platform must not reach.
+    monkeypatch.setattr(cli, "_write_private_key", lambda path, pem: path.write_bytes(pem))
+    monkeypatch.setattr(sys, "platform", platform)
+    out = tmp_path / "tls"
+    assert cli._write_cert_files(out, out / "k.pem", b"KEY-STAND-IN\n", [], as_json=False) is None
+    monkeypatch.undo()
+    assert seen == [mode]
+
+
+@posix_only
+def test_cert_self_signed_makes_its_out_dir_owner_only_whatever_the_umask(tmp_path: Path) -> None:
+    """Under umask 002 a plain mkdir gives 0775, and the key-file gate refuses the key the
+    engine's own tool wrote there (vault BACKLOG #5636)."""
+    out = tmp_path / "tls"
+    old = os.umask(0o002)
+    try:
+        assert main(["cert", "self-signed", "--cn", "dev.local", "--out-dir", str(out)]) == 0
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(out.stat().st_mode) == 0o700
+    [key] = [p for p in out.iterdir() if "key" in p.name]
+    assert broad_access_problem(key) is None
 
 
 def test_serve_refuses_a_generated_tls_key_a_broad_account_can_read(

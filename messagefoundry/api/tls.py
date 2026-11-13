@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import ssl
+import sys
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -196,7 +197,8 @@ def _attach_issuer_index(ctx: ssl.SSLContext, cadata: str, cert_map: Mapping[str
 #: ``[api].tls_generated_dir`` setting: a knob for a question with one sensible answer.
 _GENERATED_CERT_NAME = GENERATED_CERT_NAME
 _GENERATED_KEY_NAME = "api-generated-key.pem"
-#: The directory the generated KEY is minted into, inside the state dir, created at ``0o700``. The
+#: The directory the generated KEY is minted into, inside the state dir, created at ``0o700`` on
+#: POSIX and inheriting the state dir's access list on Windows (:func:`_make_key_directory`). The
 #: key-file gate refuses a POSIX key in a directory a group or other account may write (vault
 #: BACKLOG #5636), and the state dir's mode is whatever the operator's umask or volume gave it, so a
 #: key minted straight into it could be refused by the engine's own next check. The certificate is
@@ -676,9 +678,6 @@ def ensure_api_tls_material(
     events = replacements if replacements is not None else []
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
-        # The key's own directory, owner-only whatever the umask (see _GENERATED_KEY_DIR_NAME). An
-        # existing one keeps its mode, and the key-file gate judges it.
-        key_path.parent.mkdir(mode=0o700, exist_ok=True)
         with _generated_pair_lock(state_dir):
             _settle_under_the_lock(api, cert_path, key_path, events, renew=renew)
     except OSError as exc:
@@ -712,6 +711,7 @@ def _settle_under_the_lock(
     Re-decided here: a process that waited for the lock finds the pair the holder just minted or
     renewed, and reuses it. Only here may a failed check lead to a discard.
     """
+    _make_key_directory(key_path.parent)
     _discard_staged_leftovers(cert_path, key_path)
     if cert_path.exists() and key_path.exists():
         reason = _why_generated_pair_is_unusable(cert_path, key_path)
@@ -730,6 +730,20 @@ def _settle_under_the_lock(
     new = _mint_generated_pair(api, cert_path, key_path)
     if recovered is not None:
         events.append(_replaced(recovered, cert_path, old, new))
+
+
+def _make_key_directory(key_dir: Path) -> None:
+    """Make the generated key's own directory if it is missing. Call only under the lock.
+
+    POSIX: at ``0o700``, owner-only whatever the umask (see :data:`_GENERATED_KEY_DIR_NAME`).
+    Windows: with no mode, so it inherits the data directory's access list, the service account's
+    grant included; CPython 3.13 and later give a directory made with ``mode=0o700`` a protected list
+    of its own instead, which would shut that account out. An existing directory is left as it is,
+    and the key-file gate judges it."""
+    if sys.platform == "win32":
+        key_dir.mkdir(exist_ok=True)
+    else:
+        key_dir.mkdir(mode=0o700, exist_ok=True)
 
 
 def _still_serves(cert_path: Path, key_path: Path) -> bool:

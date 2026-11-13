@@ -4385,7 +4385,7 @@ def test_a_failed_cert_write_leaves_no_orphaned_key(
         ensure_api_tls_material(api, state_dir=tmp_path)
 
     monkeypatch.undo()  # read the directory with the real Path again
-    key_path = tmp_path / tls_mod._GENERATED_KEY_NAME
+    _cert_path, key_path = tls_mod._generated_pair(tmp_path)
     cert_path = tmp_path / tls_mod._GENERATED_CERT_NAME
     assert not key_path.exists(), "a lone key.pem would make every later start die on O_EXCL"
     assert not cert_path.exists()
@@ -4770,6 +4770,22 @@ def test_a_pair_the_engine_cannot_read_is_refused_not_deleted(
     assert (Path(cert).read_bytes(), Path(key).read_bytes()) == before
 
 
+@pytest.mark.parametrize(("platform", "mode"), [("linux", 0o700), ("win32", None)])
+def test_the_key_directory_is_owner_only_on_posix_and_inherits_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str, mode: int | None
+) -> None:
+    """Vault BACKLOG #5636. On Windows, CPython gives a directory made with ``mode=0o700`` a
+    protected access list of its own, which would shut out the service account the data directory
+    grants; so no mode is passed there, and the directory inherits as the key's old home did."""
+    from messagefoundry.api import tls as tls_mod
+
+    seen: list[dict[str, object]] = []
+    monkeypatch.setattr(Path, "mkdir", lambda _self, **kwargs: seen.append(kwargs))
+    monkeypatch.setattr(tls_mod.sys, "platform", platform)
+    tls_mod._make_key_directory(tmp_path / "keys")
+    assert seen == [{"exist_ok": True} if mode is None else {"mode": mode, "exist_ok": True}]
+
+
 def test_a_hung_mint_holder_times_out_with_a_named_lock_and_mints_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4784,7 +4800,9 @@ def test_a_hung_mint_holder_times_out_with_a_named_lock_and_mints_nothing(
     ):
         ensure_api_tls_material(ApiSettings(), state_dir=tmp_path)
     assert not (tmp_path / _GENERATED_CERT_NAME).exists()
-    assert not (tmp_path / tls_mod._GENERATED_KEY_NAME).exists()
+    _cert_path, key_path = tls_mod._generated_pair(tmp_path)
+    # Nothing at all: the key's directory too is made only under the lock.
+    assert not key_path.exists() and not key_path.parent.exists()
 
 
 _HOLD_THE_LOCK = """
@@ -5122,7 +5140,7 @@ def test_a_generated_pair_renews_inside_its_last_third_and_not_before(
     renewed = [r for r in caplog.records if "renewed the generated" in r.getMessage()]
     assert len(renewed) == 1 and renewed[0].levelno == logging.WARNING
     assert "PRIVATE KEY" not in caplog.text
-    assert not list(tmp_path.glob("*.renewing"))  # nothing staged is left behind
+    assert not list(tmp_path.rglob("*.renewing"))  # nothing staged is left behind
 
 
 def test_a_second_start_after_a_renewal_reuses_the_renewed_pair(tmp_path: Path) -> None:
@@ -5273,7 +5291,7 @@ def test_a_renewal_interrupted_between_its_replaces_recovers_and_is_reported(
     _load_pair(cert, key)
     assert [e.reason for e in events] == ["unusable"]
     assert events[0].old_sha256 is not None  # the half-installed new certificate, identified
-    assert not list(tmp_path.glob("*.renewing"))
+    assert not list(tmp_path.rglob("*.renewing"))
 
 
 @pytest.mark.parametrize(("left", "keeps_old"), [(65, True), (-5, False)])
@@ -5309,7 +5327,7 @@ def test_a_renewal_that_fails_before_any_replace_keeps_a_still_valid_pair(
                 ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=events)
     assert _snapshot(cert, key) == before
     assert events == []
-    assert not list(tmp_path.glob("*.renewing"))
+    assert not list(tmp_path.rglob("*.renewing"))
 
 
 @pytest.mark.parametrize("damage", ["foreign_cert", "lone_key", "lone_cert"])

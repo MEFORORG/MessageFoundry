@@ -396,14 +396,19 @@ than a path is not checked
   --grant-account` refuses the same list, and refuses a name that is a group or a domain.
 - On Windows it does not vet the file's owner or an account you granted yourself. LOCAL SERVICE
   and NETWORK SERVICE are accounts that many services share, and the check does not report them.
-- On POSIX the check refuses a key file reached through a link, one owned by an account other than
-  the engine's own or root, one whose mode has a group or other read or write bit, whoever is in
-  the group, and one held in a directory that another account owns or that a group or other may
-  write without the sticky bit (vault BACKLOG #5636). Only the directory that holds the file is
-  read, not the ones above it. The engine mints its own TLS key into a directory of its own,
-  `api-generated-key.d` beside the store, created at `0700`, so a group-writable store directory
-  does not refuse it. A volume that makes every file group-readable on each mount, such as a
-  Kubernetes volume with `fsGroup`, makes every start after the first refuse a key on it.
+- On POSIX the check refuses a key file whose own name is a link, one owned by an account other
+  than the engine's own or root, one whose mode has a group or other read or write bit, whoever is
+  in the group, and one held in a directory that another account owns or that a group or other may
+  write without the sticky bit (vault BACKLOG #5636). Only the last part of the path is read
+  without following a link: a link in a directory above it is followed, and the directory that
+  holds the file is judged as the one the link leads to. Only that directory is read, not the ones
+  above it. The engine mints its own TLS key into a directory of its own, `api-generated-key.d`
+  beside the store, created at `0700`, so the key check passes in a store directory a group may
+  write. That directory is still a hazard: its group can replace the certificate clients pin, the
+  mint lock and the store itself, and the check does not look at any of them. Keep the store
+  directory owner-only. A volume that makes every file group-readable on each mount, such as a
+  Kubernetes volume with `fsGroup`, widens the key and its directory again on every mount, so every
+  start after the first refuses a key on it, the engine's own included.
   Supplying your own certificate does not avoid this under `"enforce"`: an `[api].tls_key_file`
   on such a volume is judged by the same test. A Kubernetes Secret volume is one such volume, and
   it serves each file as a link. The shipped manifests (`docker/k8s/statefulset.yaml`,

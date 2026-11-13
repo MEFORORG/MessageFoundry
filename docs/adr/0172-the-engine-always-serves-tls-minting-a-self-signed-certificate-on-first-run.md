@@ -121,6 +121,13 @@ one sensible answer. *Rejected outright:* the engine writing `tls_cert_file` int
 service TOML. An engine that edits operator configuration is a surprising side effect, and it was
 not needed once the scheme stopped being conditional.
 
+*Amended (vault BACKLOG #5636):* the certificate and the mint lock stay beside the store database,
+but the KEY is minted into `api-generated-key.d`, a directory of its own beside the store, created
+at `0700` on POSIX and inheriting the store directory's access list on Windows. The POSIX key-file
+check refuses a key in a directory a group or other account may write, and the store directory's
+mode is the operator's umask or volume, so a key minted straight into it could be refused by the
+engine's own next start.
+
 **Lifetime:** 365 days, inheriting the `cert self-signed` CLI default rather than inventing a
 second lifetime for the same primitive.
 

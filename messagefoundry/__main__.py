@@ -6092,7 +6092,13 @@ def _write_cert_files(
     from messagefoundry.restricted_file import unlink_generated
 
     try:
-        out_dir.mkdir(parents=True, exist_ok=True)
+        # POSIX: owner-only whatever the umask, because the key-file gate refuses a key in a
+        # directory a group may write (vault BACKLOG #5636). Windows: no mode, so the directory
+        # inherits its parent's access list, which a mode would replace with a protected one.
+        if sys.platform == "win32":
+            out_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            out_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     except OSError as exc:
         return _cert_fail(f"cannot create --out-dir {str(out_dir)!r}: {exc}", as_json=as_json)
     written: list[Path] = []
