@@ -5252,11 +5252,11 @@ def Ftp(
     # vault BACKLOG #3234: a literal tls is turned into the protocol below, so the load's
     # bool_literal_problems never sees it. bool() read "false" as FTPS and None as plain FTP, the
     # insecure side, so anything but a bool is refused first, before the CA check reads it too.
-    if not isinstance(tls, EnvRef):
-        try:
-            require_flag(tls, "setting 'tls'")
-        except ValueError as exc:  # names the key and the type, never the value
-            raise WiringError(f"Ftp: {exc}{_bool_remedy(tls)}") from None
+    # require_flag's wording, raised outside any handler (tests/test_from_none_is_not_redaction.py).
+    if not isinstance(tls, (bool, EnvRef)):
+        raise WiringError(
+            f"Ftp: setting 'tls' must be true or false, not {type(tls).__name__}{_bool_remedy(tls)}"
+        )
     # An env() tls is truthy here. Once resolved, ``refuse_resolved_verify_off`` refuses a CA beside
     # plain ftp, and ``unread_ca_reason`` a pin beside it in the anchor preflight (#3234).
     _check_tls_ca_file(
