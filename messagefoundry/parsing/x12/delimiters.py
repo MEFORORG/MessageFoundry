@@ -79,6 +79,7 @@ _SEGMENT_TERM_OFFSET = 105
 _REPETITION_SEP_OFFSET = 82  # ISA11
 _VERSION_START, _VERSION_END = 84, 89  # ISA12 (5 chars), e.g. "00501"
 _REPETITION_MIN_VERSION = "00501"  # ISA11 is a repetition separator from 005010 onward
+_REPETITION_MIN_VERSION_BYTES = _REPETITION_MIN_VERSION.encode("ascii")
 # Cosmetic whitespace tolerated before a segment (a pretty-printed feed puts a newline after each one).
 _SEGMENT_WHITESPACE = " \t\r\n\x0b\x0c"
 
@@ -122,10 +123,15 @@ def find_isa_start(raw: str, start: int = 0) -> int:
 
 def isa_separators_line_up(buf: str | bytes | bytearray, isa: int) -> bool:
     """Whether the ``ISA`` at ``isa`` could open an interchange: every fixed element-separator
-    position present in ``buf`` holds the character at +3. Positions past the end of ``buf`` are not
-    yet known, so a short header passes. Structural only, the same positions as the sanity gate in
-    :func:`discover_delimiters`: it never reads element data, so an ISA with a delimiter inside an
-    element still passes and the parse refuses it (BACKLOG #5536, #5921)."""
+    position present in ``buf`` holds the character at +3, and the element separator, the component
+    separator (+104), the segment terminator (+105) and, from 00501, the repetition separator (+82)
+    that are present are mutually distinct. Positions past the end of ``buf`` are not yet known, so a
+    short header passes. The distinctness check is what fails "ISA" followed by a run of one
+    character, such as padded "VISA" text, which lines up at every separator position.
+
+    Structural only, the same positions and distinctness rule as :func:`discover_delimiters`: it never
+    reads element data, so an ISA with a delimiter inside an element still passes and the parse
+    refuses it (BACKLOG #5536, #5921)."""
     sep = buf[isa + 3 : isa + 4]
     for offset in _GATE_SEP_OFFSETS:
         found = buf[isa + offset : isa + offset + 1]
@@ -133,7 +139,22 @@ def isa_separators_line_up(buf: str | bytes | bytearray, isa: int) -> bool:
             return True
         if found != sep:
             return False
-    return True
+    # Every gate position is present, so ISA12 (offsets 84 to 88, before the last gate at 103) is too.
+    delims = [
+        sep,
+        buf[isa + _COMPONENT_SEP_OFFSET : isa + _COMPONENT_SEP_OFFSET + 1],
+        buf[isa + _SEGMENT_TERM_OFFSET : isa + _SEGMENT_TERM_OFFSET + 1],
+    ]
+    version = buf[isa + _VERSION_START : isa + _VERSION_END]
+    if isinstance(version, str):
+        has_repetition = version >= _REPETITION_MIN_VERSION
+    else:
+        has_repetition = version >= _REPETITION_MIN_VERSION_BYTES
+    if has_repetition:
+        delims.append(buf[isa + _REPETITION_SEP_OFFSET : isa + _REPETITION_SEP_OFFSET + 1])
+    present = [d for d in delims if d]
+    # Compared pairwise rather than through a set: a bytearray slice is not hashable.
+    return all(present[i] != d for i in range(len(present)) for d in present[i + 1 :])
 
 
 def discover_delimiters(raw: str, isa_start: int | None = None) -> Delimiters:

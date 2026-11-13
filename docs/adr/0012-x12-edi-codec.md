@@ -161,7 +161,8 @@ defining one at `+3`) — must equal the element separator. (Derive these in cod
 not a hand-typed list.) No ISA element's data may hold the element separator or the segment terminator
 (either character of a `CR+LF` one). On a delimiter collision, a sanity-gate failure or such a delimiter
 in ISA element data, the codec's delimiter discovery (`discover_delimiters`, which `X12Peek`,
-`X12Message`, `split` and `check_integrity` run) raises
+`X12Message` and `check_integrity` run; `split` returns such an ISA as its own malformed element, per
+the 2026-11-13 amendment below) raises
 **`X12PeekError`** — the Router routes the message to the **error/dead-letter** path (status `ERROR`) rather
 than guessing, honouring the count-and-log invariant (never accept-and-drop). Hardcoding `*~:^` is **wrong** —
 trading partners legitimately vary all four.
@@ -170,8 +171,10 @@ Every codec tokenizer, at least `iter_segments` (which `X12Peek`, `X12Message` a
 read through), `split` and `X12FrameReader`, starts the body past the ISA, so the fixed-width header is
 never read as more than one segment (BACKLOG #5536). `X12FrameReader` counts the ISA in bytes, not
 characters, so that holds for it only while every ISA character is one byte; a multi-byte character in
-ISA element data moves the byte it reads as the terminator. It runs none of the ISA checks above: it
-frames such an ISA whole, and the codec refuses it only where something peeks or parses it. The strict
+ISA element data moves the byte it reads as the terminator. Of the ISA checks above it runs only the
+structural ones, through `isa_separators_line_up` (the 2026-11-13 amendment below), never the
+element-data check: it frames such an ISA whole, and at least the shared ingress guards and anything
+that peeks or parses the frame may refuse it later. The strict
 `validate()` in `parsing/x12/validate.py` runs neither the delimiter discovery nor these tokenizers. It
 hands the raw text to pyx12, which reads its delimiters from the fixed-width ISA but then splits from
 the start of the ISA on the one character at `+105`, so a segment forged in ISA element data can reach
@@ -312,6 +315,20 @@ real failure mode), so it is rejected.
    (documented as not guaranteed byte-identical when cosmetic whitespace was present).
 6. **Sample fixtures. → SYNTHETIC `.edi` SAMPLES.** Create synthetic PHI-free `samples/messages/*.edi` (270
    now, 837P/835 later) plus a `samples/config` X12 inbound example module.
+
+## Amendment (2026-11-13) — framing never drops or swallows data around a bad ISA (BACKLOG #5921)
+
+`split` and `X12FrameReader` both run `isa_separators_line_up` (in `parsing/x12/delimiters.py`) on
+each `ISA` to decide whether it opens an interchange. It is the structural part of section 4's checks:
+every fixed element-separator position holds the separator, and the element, component and segment
+delimiters, plus the repetition separator from 00501, are mutually distinct. It never reads element
+data. An `ISA` that fails it, such as a trigram in noise, padded "VISA" text, or a corrupted header, is
+framed through its own `IEA` or up to the next `ISA` that passes, whichever comes first. The walk of
+an `ISA` that passes ends at its `IEA` or at a later passing `ISA` that opens a segment, so an
+interchange with no `IEA` cannot swallow the next one. `split` returns every run as an element, and an
+`ISA` that passes but that `discover_delimiters` refuses, for a delimiter in its element data (BACKLOG
+#5536), is one such element, framed whole, so the parse of it still refuses it. `split` no longer
+raises for the whole buffer. The reader still discards a run that does not open with `ISA`.
 
 ---
 
