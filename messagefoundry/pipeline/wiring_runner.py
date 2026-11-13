@@ -11906,9 +11906,10 @@ class RegistryRunner:
         if raw_meta:
             meta, hint = json_loads_or_refusal(raw_meta)
             if hint is not None:
-                if raw_meta.startswith(MARKER_PREFIX):
-                    # A keyed cipher either decrypts an mfenc: cell or raises CipherError, so
-                    # ciphertext back means no key is configured: every such row would fail alike.
+                if raw_meta.startswith(MARKER_PREFIX) and not self.store.cipher().encrypts:
+                    # The identity cipher hands an mfenc: cell back unchanged, so this is a store
+                    # opened without its key, and every such row would fail alike. Under a keyed
+                    # cipher the same text is a decrypted value that is corrupt: the row's fault.
                     raise StoreKeylessError(
                         "store table 'messages' carries encrypted metadata (mfenc: markers) but no "
                         "store encryption key is configured; set MEFOR_STORE_ENCRYPTION_KEY to the "
@@ -11951,32 +11952,6 @@ class RegistryRunner:
             return _RoutedPrep(missing_handler=True)
         return None
 
-    def _rearm_transform_if_restored(self, name: str) -> None:
-        """Re-arm this inbound's transform worker once it returns, when a reload has already put the
-        inbound back (BACKLOG #5708). Called as the worker settles a row for a missing inbound and is
-        about to STOP. That decision can be stale: the concurrent batch path decides it in prepare
-        and applies it only after earlier siblings' handoffs await, and the revert itself awaits. A
-        reload that restores the inbound in that window calls :meth:`_ensure_inbound_workers` while
-        this worker is still alive, so it spawns nothing, and the worker's normal return is never
-        respawned. Without this the restored inbound's transform lane would stay down, with its
-        row reverted, until the next reload or operator start. Per-lane mode only: pooled mode has
-        no per-inbound worker to re-arm."""
-        if self._claim_mode == "pooled" or name not in self.registry.inbound:
-            return
-        task = asyncio.current_task()
-        workers = self._inbound_worker_dict("transform")
-        if task is None or workers.get(name) is not task:
-            return
-
-        def _rearm(done: asyncio.Task[Any]) -> None:
-            if self._stop.is_set() or not self._running or done.cancelled():
-                return
-            # Still this worker's slot (a crash respawn replaces it first) and still deployed.
-            if workers.get(name) is done and name in self.registry.inbound:
-                self._ensure_inbound_workers(name)
-
-        task.add_done_callback(_rearm)
-
     async def _loopback_prep(
         self, name: str, item: OutboxItem
     ) -> tuple[dict[str, Any] | None, _RoutedPrep | None]:
@@ -11985,18 +11960,24 @@ class RegistryRunner:
         its metadata cell failed its row tag (BACKLOG #2593), its correlation could not be read, or
         a reload dropped its inbound or handler while the read awaited (BACKLOG #5708). The split
         and the fused paths both call this, so their mapping cannot drift. An INFRA fault (a store
-        or key-service failure) propagates."""
+        or key-service failure) propagates. A reload that dropped the inbound or handler wins over a
+        refusal of the row, inbound first, as on entry to :meth:`_prepare_routed`: a dropped feed
+        reverts its rows rather than dead-lettering them."""
+        view: dict[str, Any] | None = None
+        refused: _RoutedPrep | None = None
         try:
             view = await self._loopback_response_view(item)
         except CellTagError as err:
-            return None, _RoutedPrep(tag_failure=err)
+            refused = _RoutedPrep(tag_failure=err)
         except _UnreadableLoopbackRow as err:
             # Dropped with the traceback, whose frames hold the decrypted metadata as locals.
-            return None, _RoutedPrep(unreadable=err.with_traceback(None))
+            refused = _RoutedPrep(unreadable=err.with_traceback(None))
         # The read awaited, so a reload may have dropped the inbound or the handler since.
         dropped = self._dropped_by_reload(name, item)
         if dropped is not None:
             return None, dropped
+        if refused is not None:
+            return None, refused
         return view, None
 
     async def _prepare_routed(
@@ -12149,7 +12130,8 @@ class RegistryRunner:
         :meth:`_process_routed_item` exactly: a loopback metadata cell that failed its tag →
         dead-letter and audit (``PROCESSED``); an unreadable loopback correlation → dead-letter
         (``PROCESSED``); inbound gone → revert retry-forever (``STOPPED``); handler-missing →
-        dead-letter (``PROCESSED``); handler raise → internal-error policy (``STOP``/``CONTINUE``);
+        dead-letter (``PROCESSED``), each of those two re-prepared instead when the live graph has
+        the inbound and handler again; handler raise → internal-error policy (``STOP``/``CONTINUE``);
         else ``transform_handoff`` + lane wakes (``PROCESSED``). Returns ``(outcome, None)`` — the
         routed path never re-pends-with-backoff."""
         if prep.tag_failure is not None:
@@ -12164,6 +12146,15 @@ class RegistryRunner:
             )
             await self.store.dead_letter_now(item.id, str(prep.unreadable))
             return _ItemOutcome.PROCESSED, None
+        if (prep.inbound_gone or prep.missing_handler) and self._dropped_by_reload(
+            name, item
+        ) is None:
+            # BACKLOG #5708: a STALE decision. The concurrent batch path decides this in prepare and
+            # applies it only after earlier siblings' handoffs await, so a reload can have put the
+            # inbound or handler back since. Settling it anyway would STOP a lane the restoring
+            # reload found alive and so never re-armed, or dead-letter a row whose handler is
+            # deployed. Nothing has run, so prepare it again under the graph that is live now.
+            return await self._apply_routed(name, item, await self._prepare_routed(name, item))
         if prep.inbound_gone:
             # Inbound removed; nothing to transform with until a reload restores it (which
             # re-arms this worker). Revert the row (retry-forever) and exit (mirrors the
@@ -12177,7 +12168,6 @@ class RegistryRunner:
             await self.store.mark_failed(
                 item.id, "inbound not in registry", RetryPolicy(max_attempts=None)
             )
-            self._rearm_transform_if_restored(name)
             return _ItemOutcome.STOPPED, None
         if prep.missing_handler:
             # Handler gone (removed/renamed since routing). Can't transform this row;

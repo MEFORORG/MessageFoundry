@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -387,41 +388,67 @@ async def test_a_key_service_outage_re_pends_rather_than_dead_letters(
     assert await _routed_status(store, item.message_id) == OutboxStatus.INFLIGHT.value
 
 
-async def test_a_stale_inbound_gone_re_arms_a_lane_a_reload_restored(
+@pytest.mark.parametrize("stale", ["inbound_gone", "missing_handler"])
+async def test_a_stale_settle_decision_runs_the_row_under_the_restored_graph(
+    store: MessageStore, stale: str
+) -> None:
+    # The concurrent path decides a missing inbound or handler in prepare and applies it later,
+    # after earlier siblings' handoffs await. A reload that put them back in that window must not
+    # see the row reverted with its lane STOPPED (that reload found the worker alive and re-armed
+    # nothing) or dead-lettered: nothing ran, so the row runs under the graph that is live now.
+    calls: list[str] = []
+    runner = RegistryRunner(
+        _registry(calls), store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
+    item = await _routed_item(store)
+
+    prep = (
+        _RoutedPrep(inbound_gone=True)
+        if stale == "inbound_gone"
+        else _RoutedPrep(missing_handler=True)
+    )
+    outcome = await runner._apply_routed(LOOP, item, prep)
+
+    assert outcome == (_ItemOutcome.PROCESSED, None)
+    assert calls == ["ran"]
+    assert await _routed_status(store, item.message_id) is None, "the routed row was not handed off"
+
+
+async def test_a_reload_during_an_unreadable_read_reverts_rather_than_dead_letters(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The concurrent path decides `inbound_gone` in prepare and applies it later, after earlier
-    # siblings' handoffs await. A reload that restores the inbound in that window finds this
-    # worker alive and spawns nothing, so the worker must re-arm its lane as it returns.
+    # A reload that drops the whole feed while the read awaits wins over the row's own refusal,
+    # inbound first, as on entry: the row reverts with its feed rather than being dead-lettered.
+    calls: list[str] = []
     runner = RegistryRunner(
-        _registry([]),
-        store,
-        poll_interval=0.02,
-        claim_mode="per_lane",
-        egress=EgressSettings(deny_by_default=False),
+        _registry(calls), store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
     )
-    await runner.start()
-    try:
-        # Quiesce the lane's own workers so the row below is this test's alone.
-        for workers in (runner._router_workers, runner._transform_workers):
-            task = workers[LOOP]
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-        item = await _routed_item(store)
+    item = await _routed_item(store)
 
-        async def stale_apply() -> None:
-            outcome = await runner._apply_routed(LOOP, item, _RoutedPrep(inbound_gone=True))
-            assert outcome[0] is _ItemOutcome.STOPPED
+    async def unreadable_during_a_reload(message_id: str) -> str | None:
+        runner.registry = _swapped_graph("inbound")
+        return "{not json"
 
-        # Run the apply AS the transform worker, as the batch path does, with the inbound present.
-        stand_in = asyncio.ensure_future(stale_apply())
-        runner._transform_workers[LOOP] = stand_in
-        await stand_in
-        await asyncio.sleep(0)
-        rearmed = runner._transform_workers[LOOP]
-        assert rearmed is not stand_in and not rearmed.done(), "the restored lane stayed down"
-        # Reverted retry-forever, never dead-lettered.
-        assert await _routed_status(store, item.message_id) == OutboxStatus.PENDING.value
-    finally:
-        await runner.stop()
+    monkeypatch.setattr(store, "message_metadata_json", unreadable_during_a_reload)
+
+    prep = await runner._prepare_routed(LOOP, item)
+
+    assert prep.inbound_gone and prep.unreadable is None
+
+
+async def test_mfenc_text_under_a_keyed_cipher_is_the_rows_fault(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Only the identity cipher hands an mfenc: cell back unchanged. A keyed cipher that decrypted
+    # a value to mfenc: text decrypted a corrupt value, so the row dead-letters rather than
+    # re-pending forever under a false "no key is configured".
+    runner = RegistryRunner(
+        _registry([]), store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+    )
+    item = await _routed_item(store)
+    monkeypatch.setattr(store, "message_metadata_json", _metadata("mfenc:v4:AAAA"))
+    monkeypatch.setattr(store, "cipher", lambda: SimpleNamespace(encrypts=True))
+
+    prep = await runner._prepare_routed(LOOP, item)
+
+    assert prep.unreadable is not None and "not JSON" in str(prep.unreadable)
