@@ -196,7 +196,9 @@ keeps its own record. So any later `purge`, even one that deletes nothing, or `p
 --scrub-only`, finishes an unfinished scrub, or exits 1 if it still cannot. A run that deletes
 nothing also scrubs, at least, when the DB has free pages or its `-wal` file is not empty;
 SQLite reuses the `-wal` without shrinking it, so a sweep beside a running relay usually scrubs.
-A run skips the scrub only when it deletes nothing, no scrub is owed, and neither of those holds.
+Such a scrub, with nothing deleted and nothing owed, logs a warning if it cannot finish and the
+run still exits 0, since it removed nothing. A run skips the scrub only when it deletes nothing,
+no scrub is owed, and neither of those holds.
 `--scrub-only` always attempts the whole scrub.
 
 **The scrub is file-level only.** A checkpoint frees the `-wal` file's blocks and `VACUUM` shrinks

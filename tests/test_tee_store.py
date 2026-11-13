@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import pickle
 import sqlite3
@@ -17,6 +18,8 @@ import pytest
 import tee.store as tee_store
 from tee.__main__ import main as tee_main
 from tee.store import PurgeIncompleteError, RelayStore
+
+BUMP = "UPDATE scrub_state SET generation = generation + 1 WHERE id = 1"
 
 
 async def _open(tmp_path: Path) -> RelayStore:
@@ -675,10 +678,12 @@ async def test_vacuum_runs_with_temp_store_file_then_default(
         await store.close()
 
 
-def _user_version(db_path: Path) -> int:
+def _owed(db_path: Path) -> bool:
+    """Whether the scrub-pending record says a scrub is owed, read by a separate connection."""
     conn = sqlite3.connect(db_path)
     try:
-        return int(conn.execute("PRAGMA user_version").fetchone()[0])
+        row = conn.execute("SELECT generation > scrubbed_through FROM scrub_state").fetchone()
+        return bool(row[0])
     finally:
         conn.close()
 
@@ -703,7 +708,7 @@ async def test_rerun_finishes_a_busy_scrub_after_the_reader_closed_and_removed_t
     finally:
         peer.close()
     assert not Path(f"{db_path}-wal").exists()  # the last close removed it: no hint left
-    assert _user_version(db_path) == 1  # the flag survived
+    assert _owed(db_path)  # the record survived
     store = await RelayStore.open(str(db_path))
     try:
         assert not await store._has_residue()  # noqa: SLF001 - the hint alone would skip
@@ -712,7 +717,7 @@ async def test_rerun_finishes_a_busy_scrub_after_the_reader_closed_and_removed_t
         assert "VACUUM" in ran
     finally:
         await store.close()
-    assert _user_version(db_path) == 0  # cleared once the scrub finished
+    assert not _owed(db_path)  # recorded as scrubbed once the scrub finished
 
 
 async def test_rerun_finishes_a_scrub_whose_vacuum_failed_after_a_small_delete(
@@ -738,7 +743,7 @@ async def test_rerun_finishes_a_scrub_whose_vacuum_failed_after_a_small_delete(
         assert "VACUUM" in ran
     finally:
         await store.close()
-    assert _user_version(db_path) == 0
+    assert not _owed(db_path)
 
 
 async def test_a_purge_that_ran_alongside_a_scrub_keeps_its_scrub_pending_record(
@@ -755,8 +760,7 @@ async def test_a_purge_that_ran_alongside_a_scrub_keeps_its_scrub_pending_record
 
         def execute(sql: str, *args: Any) -> Any:
             if sql == "VACUUM":
-                current = peer.execute("PRAGMA user_version").fetchone()[0]
-                peer.execute(f"PRAGMA user_version={current + 1}")  # purge B's delete lands
+                peer.execute(BUMP)  # purge B's delete lands
             return real_execute(sql, *args)
 
         monkeypatch.setattr(store._db, "execute", execute)  # noqa: SLF001
@@ -765,7 +769,7 @@ async def test_a_purge_that_ran_alongside_a_scrub_keeps_its_scrub_pending_record
     finally:
         peer.close()
         await store.close()
-    assert _user_version(db_path) != 0  # B's record survives A's clear
+    assert _owed(db_path)  # B's record survives A's clear
 
 
 @pytest.mark.usefixtures("fast_checkpoint_poll")
@@ -775,7 +779,7 @@ async def test_a_failed_scrub_only_leaves_a_scrub_pending_record(tmp_path: Path)
     peer: sqlite3.Connection | None = None
     try:
         await store.record_capture(direction="corepoint_copy", control_id="C", raw=b"MSH|keep")
-        assert _user_version(db_path) == 0  # nothing owed yet
+        assert not _owed(db_path)  # nothing owed yet
         peer = sqlite3.connect(db_path, isolation_level=None)
         peer.execute("BEGIN")
         peer.execute("SELECT COUNT(*) FROM relay_capture").fetchall()  # pins the WAL
@@ -786,7 +790,7 @@ async def test_a_failed_scrub_only_leaves_a_scrub_pending_record(tmp_path: Path)
         if peer is not None:
             peer.close()
         await store.close()
-    assert _user_version(db_path) != 0  # the next purge or --scrub-only will scrub
+    assert _owed(db_path)  # the next purge or --scrub-only will scrub
 
 
 async def test_a_failing_checkpoint_after_the_clear_does_not_report_a_failed_purge(
@@ -809,4 +813,84 @@ async def test_a_failing_checkpoint_after_the_clear_does_not_report_a_failed_pur
         assert calls["n"] == 3
     finally:
         await store.close()
-    assert _user_version(tmp_path / "tee.db") == 0
+    assert not _owed(tmp_path / "tee.db")
+
+
+async def test_a_stale_scrub_does_not_erase_a_later_purges_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The reviewer's three-purge interleaving. A deletes (generation 1) and its scrub starts from 1.
+    # During A's VACUUM, B deletes and scrubs to completion (generation 2, scrubbed through 2), then
+    # C deletes (generation 3). A then records its own scrub; C must still be owed.
+    db_path = tmp_path / "tee.db"
+    store = await RelayStore.open(str(db_path))
+    peer = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        await store.record_capture(direction="corepoint_copy", control_id="C", raw=_MARKER_BODY)
+        real_execute = store._db.execute  # noqa: SLF001
+
+        def execute(sql: str, *args: Any) -> Any:
+            if sql == "VACUUM":
+                peer.execute(BUMP)  # B's delete
+                peer.execute("UPDATE scrub_state SET scrubbed_through = generation")  # B's scrub
+                peer.execute(BUMP)  # C's delete
+            return real_execute(sql, *args)
+
+        monkeypatch.setattr(store._db, "execute", execute)  # noqa: SLF001
+        assert await store.purge(captures_only=True) == (0, 1)
+        monkeypatch.undo()
+    finally:
+        peer.close()
+        await store.close()
+    assert _owed(db_path)  # C's record survives A's stale clear
+
+
+async def test_a_failure_after_the_delete_rolls_it_back_with_its_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The delete and its scrub-pending record are one transaction: if the record cannot be written,
+    # the delete must not become durable through a later commit on the same store.
+    db_path = tmp_path / "tee.db"
+    store = await RelayStore.open(str(db_path))
+    try:
+        await store.record_capture(direction="corepoint_copy", control_id="C", raw=_MARKER_BODY)
+        real_execute = store._db.execute  # noqa: SLF001
+
+        def execute(sql: str, *args: Any) -> Any:
+            if sql == BUMP or sql.startswith("PRAGMA user_version="):
+                raise sqlite3.OperationalError("disk I/O error")
+            return real_execute(sql, *args)
+
+        monkeypatch.setattr(store._db, "execute", execute)  # noqa: SLF001
+        with pytest.raises(sqlite3.OperationalError):
+            await store.purge(captures_only=True)
+        monkeypatch.undo()
+        await _record(store)  # a later write on the same store commits
+        assert await _count(store, "relay_capture") == 1  # the delete did not land
+    finally:
+        await store.close()
+
+
+@pytest.mark.usefixtures("fast_checkpoint_poll")
+async def test_a_hint_only_scrub_that_stays_busy_logs_and_does_not_fail(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Nothing deleted and nothing owed: only the -wal hint starts this scrub. A reader keeps it
+    # busy, which is no failure of a purge that removed nothing.
+    db_path = tmp_path / "tee.db"
+    store = await RelayStore.open(str(db_path))
+    peer: sqlite3.Connection | None = None
+    try:
+        await store.record_capture(direction="corepoint_copy", control_id="C", raw=b"MSH|keep")
+        assert not _owed(db_path)
+        peer = sqlite3.connect(db_path, isolation_level=None)
+        peer.execute("BEGIN")
+        peer.execute("SELECT COUNT(*) FROM relay_capture").fetchall()  # pins the WAL
+        with caplog.at_level(logging.WARNING, logger="tee.store"):
+            assert await store.purge(before=0.0) == (0, 0)
+        assert "the scrub the residue hint started did not finish" in caplog.text
+        peer.execute("END")
+    finally:
+        if peer is not None:
+            peer.close()
+        await store.close()
