@@ -571,8 +571,14 @@ All against an in-process fake Transit client with key versions, never a real se
    `CipherError` and the walk could not run, for each failure it reads as a break; on the genesis
    row at open, such a break is logged by `settle_audit_ranges` and the store opens. Transit's
    `valid: false` is a break. A reply with no bool `valid` is a `CipherError`.
+   **[AMENDED 2026-11-13, BACKLOG #8222: a second failure that is an HTTP 408 or 504, after a
+   first failure that was not a 413, is now a `CipherError` and the walk could not run, not a
+   break; on the genesis row at open it refuses the open. A 413 on either ask is still a break.
+   See *Amendment 2026-11-13*, item 1. The words above are kept as decided.]**
 5. **A range row's handover tag is not moved.** `_audit_tag_ok` still regenerates the tag under
-   the outgoing key and compares it.
+   the outgoing key and compares it. **[AMENDED 2026-11-13, BACKLOG #8222: a non-empty reply that
+   is no well-formed MAC is now logged and read as a tag that does not match, in the walk and at
+   open. See *Amendment 2026-11-13*, item 2.]**
 6. **The in-process key paths are unchanged.** A plain MAC provider, an in-heap key and the keyless
    mode still recompute and compare in constant time.
 
@@ -604,9 +610,10 @@ Item 1's append refusal is pinned in `tests/test_crypto_transit.py`:
    (`keyprovider_vault._build_client`) now records each failed reply's status on hvac's error
    (`_record_reply_status`), whichever class hvac raised, `TypeError` or `AttributeError` for a
    JSON body it cannot read among them. `_recheck_refused_row` raises a plain `CipherError` when
-   the second ask fails with a 408 or 504 (`is_vault_timeout_reply`), so the walk could not run and
-   no tamper alert fires. A timeout that clears on the second ask is read as that answer. Every
-   other second failure, a 413 among them, and one with no recorded status, is read as item 4
+   the second ask fails with a 408 or 504 (`is_vault_timeout_reply`) and the first did not fail
+   with a 413 (`is_vault_too_large_reply`), so the walk could not run and no tamper alert fires.
+   The decision is on the second ask, so a timeout that clears there is read as that answer. A 413
+   on either ask, every other second failure, and one with no recorded status, are read as item 4
    says, so a planted oversize row stays a break. On the genesis row at open, a persistent timeout
    now refuses the open, as any outage there does, where item 4 logged a break and opened.
 2. **A malformed reply to a handover tag is a tag that does not match.** Item 1 above makes
@@ -624,6 +631,7 @@ Evidence, in `tests/test_transit_bound_attestation.py`:
 `test_a_timeout_on_one_rows_verify_could_not_run_though_the_fixed_input_verifies`,
 `test_a_timeout_that_clears_on_the_second_ask_is_not_a_break`,
 `test_a_413_on_one_rows_verify_is_still_a_break`,
+`test_a_413_on_either_ask_beside_a_timeout_is_a_break`,
 `test_a_persistent_504_on_one_rows_verify_could_not_run_on_the_startup_walk`,
 `test_the_store_vault_client_records_the_reply_status_on_hvacs_error`,
 `test_a_504_hvac_could_not_parse_still_reads_as_a_timeout`,

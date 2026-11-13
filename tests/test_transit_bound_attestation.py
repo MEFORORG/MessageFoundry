@@ -1067,6 +1067,17 @@ def test_a_timeout_on_one_rows_verify_could_not_run_though_the_fixed_input_verif
     assert real_fixed(), "the control: the fixed input verifies"
 
 
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [pytest.param(413, 504, id="413-then-504"), pytest.param(504, 413, id="504-then-413")],
+)
+def test_a_413_on_either_ask_beside_a_timeout_is_a_break(first: int, second: int) -> None:
+    """A 413 on either ask is evidence about the row, so a timeout on the other ask does not turn
+    it into a check that could not run (BACKLOG #8222)."""
+    cipher = _scripted_cipher([_status_error(first), _status_error(second)])
+    assert cipher.verify_audit_hmac(b"row", cipher.audit_hmac(b"row")) is False
+
+
 def test_a_timeout_that_clears_on_the_second_ask_is_not_a_break() -> None:
     """A 504 on the first ask that clears on the second is read as the second answer: a clean row
     stays clean, and the check does not fail (BACKLOG #8222)."""
@@ -1343,15 +1354,21 @@ async def test_a_malformed_handover_reply_at_open_opens_the_store_with_a_logged_
         "INSERT INTO audit_log (seq, ts, actor, action, detail, row_hash) VALUES (?, ?, ?, ?, ?, ?)",
         (seq, time.time(), "cli:tester", AUDIT_KEY_EPOCH_ACTION, detail, "0" * 64),
     )
+    malformed = f"key-range row at seq={seq} with no well-formed MAC"
     with caplog.at_level(logging.WARNING, logger="messagefoundry.store.store"):
         store = await _transit_store(db)
-    try:
-        ok, msg = await store.verify_audit_chain()
-    finally:
-        await store.close()
-    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        caplog.clear()
+        try:
+            ok, msg = await store.verify_audit_chain()
+        finally:
+            await store.close()
+    walk_lines = [r.getMessage() for r in caplog.records]
     assert any(f"seq={seq} is not authorised by the key it closes" in m for m in errors), errors
     assert not ok and f"seq={seq}," in str(msg), msg
+    # The walk itself read the malformed reply at that row as a tag that does not match, rather
+    # than any other break the planted row also carries.
+    assert any(malformed in line for line in walk_lines), walk_lines
 
 
 #: Vault's own text for an audit-MAC call refused for its version, as hvac carries it.

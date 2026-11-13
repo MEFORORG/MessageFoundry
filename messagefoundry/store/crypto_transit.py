@@ -86,6 +86,7 @@ from messagefoundry.store.keyprovider_vault import (
     is_vault_bad_request,
     is_vault_forbidden,
     is_vault_timeout_reply,
+    is_vault_too_large_reply,
     is_vault_unavailable,
     require_transit_key_type,
     store_vault_hop,
@@ -686,7 +687,8 @@ class TransitCipher(_UnmarkedPolicy):
         (:meth:`_recheck_refused_row`, which says how the second ask is read). Where that reads
         the row as refused, the answer is ``False``, a break at that row, as a forged MAC is; a
         Vault that answers HTTP 413 past ``max_request_size`` to a planted oversize row is one
-        such case; an HTTP 408 or 504 on the second ask is not (BACKLOG #8222). Every other
+        such case, a 413 on either ask included; an HTTP 408 or 504 on the second ask, after a
+        first ask that was not a 413, is not (BACKLOG #8222). Every other
         failure, a failed fixed-input verify among them, and a reply of an
         unexpected shape, raises plain :class:`CipherError`, so the walk could not run and no
         tamper alert fires. Blocking."""
@@ -766,7 +768,9 @@ class TransitCipher(_UnmarkedPolicy):
         answer is read as usual, and a failure goes through :meth:`_settled_verify_failure` again.
         A failure that leaves unsettled is ``False``, logged, only when a verify over fixed input
         succeeds once more after it and it is not an HTTP 408 or 504
-        (:func:`is_vault_timeout_reply`); otherwise it raises :class:`CipherError`, since the
+        (:func:`is_vault_timeout_reply`) after a first ask that was not an HTTP 413
+        (:func:`is_vault_too_large_reply`), since a 413 on either ask is evidence about the row;
+        otherwise it raises :class:`CipherError`, since the
         service failed between the asks or timed out on the row. A timeout that cleared on the
         second ask is read as that answer, so a passing blip is not a walk that could not run
         (BACKLOG #8222, owner ruling 2026-11-13). Blocking."""
@@ -782,7 +786,8 @@ class TransitCipher(_UnmarkedPolicy):
             again = exc.with_traceback(None)
         if again is None:
             return self._verify_answer(response)
-        if is_vault_timeout_reply(again) or not self._fixed_input_verifies():
+        timed_out = is_vault_timeout_reply(again) and not is_vault_too_large_reply(failed)
+        if timed_out or not self._fixed_input_verifies():
             raise self._verify_failed(again) from again
         log.warning(
             "Transit refused the audit MAC verify of one row twice while a verify over fixed "
