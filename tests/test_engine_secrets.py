@@ -608,21 +608,48 @@ def test_a_directory_link_on_windows_is_refused_before_anything_follows_it(
     assert followed == []
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX judges the directory a link names")
-def test_a_posix_link_to_a_directory_is_followed_and_a_link_to_a_file_is_refused(
-    tmp_path: Path,
-) -> None:
-    """On POSIX the access check follows a link, so a link to a restricted directory is accepted,
-    and a link to a restricted file passes the access check and is then refused as no directory."""
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="a POSIX symbolic link, which needs no privilege"
+)
+def test_a_posix_link_to_a_directory_or_a_file_is_refused_as_a_link(tmp_path: Path) -> None:
+    """On POSIX, as on Windows, the access check judges a link as itself and refuses it, so a link
+    to a restricted directory is no longer accepted on the strength of what it names (vault
+    BACKLOG #5636). The directory itself is the control."""
     directory = _directory(tmp_path)
+    assert open_secrets_directory(_env(directory)) is not None  # the control
     to_directory = tmp_path / "to_directory"
     to_directory.symlink_to(directory, target_is_directory=True)
-    assert open_secrets_directory(_env(to_directory)) is not None
+    with pytest.raises(SecretsDirectoryError, match="it is a link"):
+        open_secrets_directory(_env(to_directory))
 
     to_file = tmp_path / "to_file"
     to_file.symlink_to(_put(tmp_path, "restricted_file", "not a directory"))
-    with pytest.raises(SecretsDirectoryError, match="is not a directory, or does not exist"):
+    with pytest.raises(SecretsDirectoryError, match="it is a link"):
         open_secrets_directory(_env(to_file))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes")
+def test_a_posix_secret_file_linked_from_elsewhere_is_refused(tmp_path: Path) -> None:
+    directory = _directory(tmp_path)
+    elsewhere = _put(tmp_path, "restricted_elsewhere", _FROM_FILE)
+    (directory / "MEFOR_STORE_PASSWORD").symlink_to(elsewhere)
+    with pytest.raises(SecretsDirectoryError, match="it is a link"):
+        secret_setting("MEFOR_STORE_PASSWORD", environ=_env(directory))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes")
+def test_a_posix_secrets_directory_whose_parent_others_may_write_is_refused(
+    tmp_path: Path,
+) -> None:
+    """Whoever may write the directory above may rename the secrets directory away and put
+    another in its place, whatever the secrets directory's own mode (vault BACKLOG #5656)."""
+    parent = tmp_path / "parent"
+    parent.mkdir(mode=0o700)
+    directory = _directory(parent)
+    assert open_secrets_directory(_env(directory)) is not None  # the control
+    parent.chmod(0o777)
+    with pytest.raises(SecretsDirectoryError, match="with no sticky bit"):
+        open_secrets_directory(_env(directory))
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="a directory junction is a Windows link")

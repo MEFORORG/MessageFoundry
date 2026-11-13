@@ -6092,7 +6092,13 @@ def _write_cert_files(
     from messagefoundry.restricted_file import unlink_generated
 
     try:
-        out_dir.mkdir(parents=True, exist_ok=True)
+        # POSIX: owner-only whatever the umask, because the key-file gate refuses a key in a
+        # directory a group may write (vault BACKLOG #5636). Windows: no mode, so the directory
+        # inherits its parent's access list, which a mode would replace with a protected one.
+        if sys.platform == "win32":
+            out_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            out_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     except OSError as exc:
         return _cert_fail(f"cannot create --out-dir {str(out_dir)!r}: {exc}", as_json=as_json)
     written: list[Path] = []
@@ -7951,6 +7957,44 @@ def _store_key_file_gate(settings: ServiceSettings, *, enforcing: bool) -> bool:
     )
 
 
+def _engine_account_name() -> str:
+    """The POSIX account this process runs as, by name, or its uid when it has none. POSIX only."""
+    if sys.platform == "win32":
+        raise RuntimeError("an account name by uid is read on POSIX only")
+    import os
+    import pwd
+
+    uid = os.geteuid()
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:  # a uid with no passwd entry, as in a container run with --user
+        return str(uid)
+
+
+def _generated_tls_key_remedy(state_dir: Path) -> str:
+    """What :func:`_generated_tls_key_gate` tells the operator to do. On POSIX it also covers the
+    store directory the key sits in, which the check judges there and nowhere else (vault BACKLOG
+    #5636), with the path shell-quoted so the command can be pasted as printed."""
+    import shlex
+
+    remedy = (
+        "Restrict it to the account the engine runs as, or delete it and its certificate so "
+        "the next start mints a new pair. "
+    )
+    if sys.platform != "win32":
+        directory = shlex.quote(str(state_dir))
+        remedy += (
+            "Where the refusal names the directory that holds it, that is the store's directory. "
+            f"Where it names the directory's mode, remove the write bits: chmod go-w {directory}. "
+            "Where it names the directory's owner, give it to the account the engine runs as: "
+            f"chown {shlex.quote(_engine_account_name())} {directory}. "
+        )
+    return remedy + (
+        "If the volume itself widens the file on every mount, "
+        "set [api].tls_cert_file to a certificate of your own"
+    )
+
+
 def _generated_tls_key_gate(settings: ServiceSettings, state_dir: Path, *, enforcing: bool) -> bool:
     """:func:`_key_file_access_gate` for the TLS private key the engine minted into ``state_dir``.
 
@@ -7965,11 +8009,7 @@ def _generated_tls_key_gate(settings: ServiceSettings, state_dir: Path, *, enfor
     return _key_file_access_gate(
         plan.key_file,
         what=f"the generated TLS private key {plan.key_file}",
-        remedy=(
-            "Restrict it to the account the engine runs as, or delete it and its certificate so "
-            "the next start mints a new pair. If the volume itself widens the file on every "
-            "mount, set [api].tls_cert_file to a certificate of your own"
-        ),
+        remedy=_generated_tls_key_remedy(state_dir),
         enforcing=enforcing,
     )
 
