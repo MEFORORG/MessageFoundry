@@ -1424,17 +1424,24 @@ def test_the_engine_asks_for_a_state_dir_no_one_else_may_write_on_posix_only(
 def test_the_generated_key_remedy_names_the_store_dir_on_posix_only(
     monkeypatch: pytest.MonkeyPatch, platform: str
 ) -> None:
-    """The chmod is a POSIX command, and the store directory is judged on POSIX only, so the
-    clause is printed there alone, with the path shell-quoted so it can be pasted as printed."""
+    """The chmod and chown are POSIX commands, and the store directory is judged on POSIX only, so
+    the clause is printed there alone, with the paths shell-quoted so they can be pasted as printed.
+    A mode cause gets chmod go-w, an owner cause gets chown to the engine's account, and moving the
+    store, which would start a new, empty one, is not offered."""
     import messagefoundry.__main__ as cli
 
+    monkeypatch.setattr(cli, "_engine_account_name", lambda: "mefor svc")
     monkeypatch.setattr(sys, "platform", platform)
     remedy = cli._generated_tls_key_remedy(Path("/srv/mefor data"))
+    assert "[store].path" not in remedy
     if platform == "win32":
-        assert "chmod" not in remedy
+        assert "chmod" not in remedy and "chown" not in remedy
     else:
         # The space makes shlex quote the whole path; Path spells the separators per host.
-        assert f"chmod go-w '{Path('/srv/mefor data')}'" in remedy
+        quoted = f"'{Path('/srv/mefor data')}'"
+        assert f"names the directory's mode, remove the write bits: chmod go-w {quoted}" in remedy
+        assert "names the directory's owner" in remedy
+        assert f"chown 'mefor svc' {quoted}" in remedy
 
 
 def _write_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str) -> None:

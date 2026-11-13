@@ -411,8 +411,10 @@ than a path is not checked
   configured. A store directory that already existed keeps its mode, and if a group or other
   account may write it without the sticky bit, the generated-key check reports it as it reports
   the key: under `"enforce"` the start is refused with exit 2, under `"warn"` it is a warning.
-  Remove the write bits with `chmod go-w` on the directory, or point `[store].path` at a directory
-  that does not exist yet. A group that may write the store directory could also replace the
+  Remove the write bits with `chmod go-w` on the directory, or, where the refusal names its owner,
+  `chown` it to the account the engine runs as. The log spool, which often creates the store
+  directory first, gives the directories it makes above its own no group or other write bit too.
+  A group that may write the store directory could also replace the
   certificate clients pin, the mint lock and the store itself, which this check does not look at.
   A volume that makes every file group-readable on each mount, such as a Kubernetes volume with
   `fsGroup`, widens the key and its directory again on every mount, so every start after the first

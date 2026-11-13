@@ -7957,6 +7957,20 @@ def _store_key_file_gate(settings: ServiceSettings, *, enforcing: bool) -> bool:
     )
 
 
+def _engine_account_name() -> str:
+    """The POSIX account this process runs as, by name, or its uid when it has none. POSIX only."""
+    if sys.platform == "win32":
+        raise RuntimeError("an account name by uid is read on POSIX only")
+    import os
+    import pwd
+
+    uid = os.geteuid()
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:  # a uid with no passwd entry, as in a container run with --user
+        return str(uid)
+
+
 def _generated_tls_key_remedy(state_dir: Path) -> str:
     """What :func:`_generated_tls_key_gate` tells the operator to do. On POSIX it also covers the
     store directory the key sits in, which the check judges there and nowhere else (vault BACKLOG
@@ -7968,11 +7982,12 @@ def _generated_tls_key_remedy(state_dir: Path) -> str:
         "the next start mints a new pair. "
     )
     if sys.platform != "win32":
+        directory = shlex.quote(str(state_dir))
         remedy += (
-            "Where the refusal names the directory that holds it, that is the store's directory: "
-            f"remove the group and other write bits with chmod go-w {shlex.quote(str(state_dir))}, "
-            "or point [store].path at a directory that does not exist yet, which the engine then "
-            "creates with no such bit. "
+            "Where the refusal names the directory that holds it, that is the store's directory. "
+            f"Where it names the directory's mode, remove the write bits: chmod go-w {directory}. "
+            "Where it names the directory's owner, give it to the account the engine runs as: "
+            f"chown {shlex.quote(_engine_account_name())} {directory}. "
         )
     return remedy + (
         "If the volume itself widens the file on every mount, "

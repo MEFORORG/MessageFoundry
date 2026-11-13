@@ -208,10 +208,13 @@ class LogSpool:
             self._created_lock = not lock_path.exists()
             # One level at a time, recording a directory only when THIS call made it: a level
             # another process created in between is not ours to remove, and a failure partway
-            # leaves a true list of what to take back. Owner-only for the leaf, as before.
+            # leaves a true list of what to take back. Owner-only for the leaf, as before. A parent
+            # gets no group or other write bit whatever the umask: the first one is often the store
+            # directory, where the key-file check refuses the minted TLS key in a directory others
+            # may write (vault BACKLOG #5636). Windows ignores the mode unless it is 0o700.
             for directory in reversed(missing):
                 try:
-                    os.mkdir(directory, 0o700 if directory == self.directory else 0o777)
+                    os.mkdir(directory, 0o700 if directory == self.directory else 0o755)
                 except FileExistsError:
                     continue
                 self._created_dirs.insert(0, directory)
