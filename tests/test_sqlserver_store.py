@@ -1244,7 +1244,9 @@ async def test_rotation_racing_a_sweep_is_swept(store) -> None:
     await _assert_rotation_waits_for_a_bind(store, **_lock_wait_probes(store))
 
 
-async def test_the_user_keys_are_trusted_and_an_upgrade_removes_their_orphans(store) -> None:
+async def test_the_user_keys_are_trusted_and_an_upgrade_removes_their_orphans(
+    store, caplog: pytest.LogCaptureFixture
+) -> None:
     """BACKLOG #2733 on the real SQL Server backend: the three ``users(id)`` keys are trusted, and a
     store an earlier batch left with untrusted keys over orphaned rows is repaired by the next full
     run. The plant is what that batch could leave: each key dropped and re-added ``WITH NOCHECK``,
@@ -1314,10 +1316,20 @@ async def test_the_user_keys_are_trusted_and_an_upgrade_removes_their_orphans(st
     for table in keys:
         assert await _rows(table) == {"kept", "ghost"}, table
 
-    assert await store._ensure_schema() is True  # pre-marker DB: the full batch really ran
+    with caplog.at_level("WARNING", logger="messagefoundry.store.sqlserver"):
+        assert await store._ensure_schema() is True  # pre-marker DB: the full batch really ran
     assert await _untrusted() == dict.fromkeys(keys.values(), False)
     for table in keys:
         assert await _rows(table) == {"kept"}, table
+    # One line per table, with its count and no account id (BACKLOG #2733).
+    swept = [r.getMessage() for r in caplog.records if "naming an account" in r.getMessage()]
+    assert sorted(swept) == sorted(
+        f"sqlserver: deleted 1 {table} row(s) naming an account that does not exist, before"
+        " trusting the table's user key"
+        for table in keys
+    ), swept
+    assert not any("ghost" in line for line in swept)
+    caplog.clear()
     # Trusted keys refuse every later orphan, here a session and a role grant.
     async with store._pool.acquire() as conn:
         cur = await conn.cursor()
@@ -1337,9 +1349,11 @@ async def test_the_user_keys_are_trusted_and_an_upgrade_removes_their_orphans(st
         await cur.execute("DELETE FROM schema_meta")
         await conn.commit()
         await cur.close()
-    assert await store._ensure_schema() is True
+    with caplog.at_level("WARNING", logger="messagefoundry.store.sqlserver"):
+        assert await store._ensure_schema() is True
     for table in keys:
         assert await _rows(table) == {"kept"}, table
+    assert not [r for r in caplog.records if "naming an account" in r.getMessage()]
 
 
 async def test_a_session_for_a_missing_account_is_refused(store) -> None:
@@ -1348,6 +1362,148 @@ async def test_a_session_for_a_missing_account_is_refused(store) -> None:
     from tests._webauthn_store_contract import assert_a_session_for_a_missing_account_is_refused
 
     await assert_a_session_for_a_missing_account_is_refused(store)
+
+
+async def _race_a_held_user_delete(
+    store: Any, account: str, step: Callable[[], Awaitable[Any]]
+) -> BaseException | Any:
+    """Hold ``delete_user(account)`` right after it takes the account row, before it deletes any
+    row keyed to it; start ``step``; require that ``step`` really queues behind the delete's server
+    session; release the delete, which must complete; return ``step``'s result, or the exception
+    it raised. The race is hooked, not timed: the probe reads ``sys.dm_exec_requests``, as the
+    lock-order tests above do (BACKLOG #2733)."""
+    from tests._federated_unbind_store_contract import (
+        _PROBE_INTERVAL,
+        _PROBE_POLLS,
+        _STEP_TIMEOUT,
+    )
+
+    probes = _lock_wait_probes(store)
+    real_rows = store._delete_user_rows
+    holding, release = asyncio.Event(), asyncio.Event()
+    holder: list[object] = []
+
+    class _Paused:
+        def __init__(self, cur: Any) -> None:
+            self._cur = cur
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._cur, name)
+
+        async def execute(self, sql: str, *args: Any) -> Any:
+            if not holder and sql.startswith("DELETE FROM user_roles"):
+                holder.append(await probes["holder_of"](self._cur))
+                holding.set()
+                await release.wait()
+            return await self._cur.execute(sql, *args)
+
+    async def _paused_rows(cur: Any, user_id: str) -> None:
+        await real_rows(_Paused(cur), user_id)
+
+    store._delete_user_rows = _paused_rows
+    tasks: list[asyncio.Task[Any]] = []
+    try:
+        deleting = asyncio.create_task(store.delete_user(account))
+        tasks.append(deleting)
+        await asyncio.wait_for(holding.wait(), timeout=_STEP_TIMEOUT)
+        stepping = asyncio.create_task(step())
+        tasks.append(stepping)
+        queued = False
+        for _ in range(_PROBE_POLLS):
+            if stepping.done():
+                break
+            if await probes["is_blocking"](holder[0]):
+                queued = True
+                break
+            await asyncio.sleep(_PROBE_INTERVAL)
+        if stepping.done():
+            raise AssertionError(
+                f"the step finished while the delete held the account row: {stepping!r}"
+            )
+        assert queued, "the step never queued behind the delete, so the race did not run"
+        release.set()
+        await asyncio.wait_for(deleting, timeout=_STEP_TIMEOUT)  # the delete completes, no 547
+        try:
+            return await asyncio.wait_for(stepping, timeout=_STEP_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 - returned for the caller to classify
+            return exc
+    finally:
+        release.set()
+        del store._delete_user_rows  # the instance attribute only; the static method is untouched
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _account_for_the_delete_race(store: Any, account: str) -> None:
+    await store.create_user(
+        user_id=account,
+        username=account,
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
+        audits=(),
+    )
+
+
+async def test_a_sign_in_inside_a_user_delete_waits_and_is_refused(store) -> None:
+    """BACKLOG #2733: a sign-in started while ``delete_user`` holds the account row waits for the
+    delete, then is refused by the session key for the missing account, and the delete completes.
+    The delete took the row under ``UPDLOCK``, which the sign-in's ``HOLDLOCK`` read shares, so
+    the session committed inside the delete and the delete's last statement failed with error 547;
+    on that code the step finishes while the delete is held, and this test fails there."""
+    from messagefoundry.auth.service import _is_integrity_refusal
+
+    account = "del-sign-in"
+    await _account_for_the_delete_race(store, account)
+    outcome = await _race_a_held_user_delete(
+        store,
+        account,
+        lambda: store.create_session(token_hash="d" * 64, user_id=account, expires_at=9e9, now=2.0),
+    )
+    assert isinstance(outcome, Exception) and _is_integrity_refusal(outcome), outcome
+    assert await store.get_user(account) is None
+    assert await store.get_session("d" * 64) is None
+
+
+async def test_writes_keyed_to_an_account_queue_behind_its_delete(store) -> None:
+    """BACKLOG #2733: the delete holds the account row under ``XLOCK`` before any row keyed to it,
+    so each write of such a row must take the account row first, or it can hold its own row while
+    its key check waits on the delete, which waits on that row: a deadlock the server ends. The
+    sign-in address writes and the session stamps take the account row first; each here queues
+    behind a held delete and then finds the account gone, and the delete completes."""
+    from messagefoundry.auth.service import _is_integrity_refusal
+
+    remembered = "del-remember"
+    await _account_for_the_delete_race(store, remembered)
+    await store.remember_login_address(remembered, "10.0.0.1", now=2.0)
+    outcome = await _race_a_held_user_delete(
+        store, remembered, lambda: store.remember_login_address(remembered, "10.0.0.2", now=3.0)
+    )
+    assert isinstance(outcome, Exception) and _is_integrity_refusal(outcome), outcome
+
+    reset = "del-reset"
+    await _account_for_the_delete_race(store, reset)
+    await store.remember_login_address(reset, "10.0.0.1", now=2.0)
+    outcome = await _race_a_held_user_delete(
+        store, reset, lambda: store.reset_login_addresses(reset)
+    )
+    assert isinstance(outcome, Exception) and _is_integrity_refusal(outcome), outcome
+
+    stamped = "del-stamp"
+    await _account_for_the_delete_race(store, stamped)
+    await store.create_session(token_hash="s" * 64, user_id=stamped, expires_at=9e9, now=2.0)
+    outcome = await _race_a_held_user_delete(
+        store, stamped, lambda: store.mark_session_mfa_verified("s" * 64, now=3.0)
+    )
+    assert outcome is None, outcome  # the session went with the account, so nothing was stamped
+
+    for account in (remembered, reset, stamped):
+        assert await store.get_user(account) is None
+    assert await store.list_known_login_addresses(remembered, since=0.0) == []
+    assert await store.get_session("s" * 64) is None
 
 
 async def test_directory_binding_column_is_unconstrained_and_username_is_not(store) -> None:

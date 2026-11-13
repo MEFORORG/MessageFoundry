@@ -52,6 +52,43 @@ def test_sqlserver_passkeys_carry_the_user_foreign_key() -> None:
         assert f"ADD CONSTRAINT {name} FOREIGN KEY (user_id) REFERENCES users(id)" in schema[fk]
         assert "CASCADE" not in schema[fk]
         assert fk > first("CREATE TABLE users (") and fk > first(f"CREATE TABLE {table} (")
+        # The orphan count (BACKLOG #2733): the batch opens with the head _ensure_schema reads it
+        # by, counts the delete, and ends with its one row after putting NOCOUNT back.
+        assert schema[fk].startswith(sqlserver._ORPHAN_SWEEP_HEAD)
+        assert "SET @orphans = @@ROWCOUNT" in schema[fk]
+        assert (
+            schema[fk].rstrip().endswith(f"SELECT N'{table}' AS orphan_table, @orphans AS orphans")
+        )
+        assert schema[fk].index("SET NOCOUNT OFF") > schema[fk].rindex("END")
+    heads = [stmt for stmt in schema if stmt.startswith(sqlserver._ORPHAN_SWEEP_HEAD)]
+    assert len(heads) == 3, len(heads)
+
+
+@pytest.mark.parametrize("deleted", [0, 2])
+async def test_sqlserver_orphan_sweep_logs_a_count_per_table_and_no_account(
+    deleted: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #2733: the schema step's orphan delete was silent. Its row is logged when it deleted
+    any rows, as a count and the table, never an account id; a sweep that deleted none logs
+    nothing."""
+    sqlserver = pytest.importorskip(
+        "messagefoundry.store.sqlserver", reason="requires the sqlserver extra (aioodbc)"
+    )
+
+    class _Cursor:
+        async def fetchall(self) -> list[tuple[str, int]]:
+            return [("sessions", deleted)]
+
+    with caplog.at_level("WARNING", logger="messagefoundry.store.sqlserver"):
+        await sqlserver._log_orphans_deleted(_Cursor())
+    lines = [r.getMessage() for r in caplog.records]
+    if deleted:
+        assert lines == [
+            "sqlserver: deleted 2 sessions row(s) naming an account that does not exist, before"
+            " trusting the table's user key"
+        ]
+    else:
+        assert lines == []
 
 
 def test_postgres_schema_hash_tracks_ddl(monkeypatch: pytest.MonkeyPatch) -> None:
