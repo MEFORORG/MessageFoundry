@@ -1052,7 +1052,7 @@ def test_the_real_tree_default_sweep_reads_every_packaging_pyproject() -> None:
             "in-tree build backend",
         ),
         ("[tool.hatch.build.hooks.custom]\n", "in-tree build hook"),
-        ("[tool.hatch.build.targets.wheel.hooks.thing]\npath = 'hook.py'\n", "in-tree build hook"),
+        ("[tool.hatch.build.targets.wheel.hooks.custom]\npath = 'hook.py'\n", "in-tree build hook"),
         ("[project]\ndynamic = 'dependencies'\n", "not a list"),
         ("[tool.uv.dependency-metadata]\nname = 'x'\n", "not a list"),
     ],
@@ -1069,7 +1069,7 @@ def test_the_real_tree_default_sweep_reads_every_packaging_pyproject() -> None:
         "uv-workspace",
         "backend-path",
         "hatch-custom-hook",
-        "hatch-hook-with-path",
+        "hatch-target-custom-hook",
         "dynamic-not-a-list",
         "dependency-metadata-not-an-array",
     ],
@@ -1104,6 +1104,74 @@ def test_hatch_and_uv_metadata_requirements_are_swept() -> None:
     )
     assert findings == []
     assert set(declared) == {"globalbuilddep", "targetdep", "targethookdep", "hookdep", "metadep"}
+
+
+def test_hatchlings_builtin_version_hook_is_not_refused() -> None:
+    """Its `path` names the file it WRITES; only the `custom` hook loads code from the tree."""
+    declared, findings = _gate.scan(
+        "[tool.hatch.build.hooks.version]\npath = 'messagefoundry/_version.py'\n"
+        "[tool.hatch.build.targets.wheel.hooks.version]\npath = 'x/_version.py'\n"
+    )
+    assert (declared, findings) == ({}, [])
+
+
+def test_an_in_tree_metadata_hook_is_refused() -> None:
+    """A custom metadata hook can rewrite [project].dependencies from code the gate never reads."""
+    _, findings = _gate.scan("[tool.hatch.metadata.hooks.custom]\n")
+    assert [f.problem for f in findings] == ["in-tree metadata hook"], findings
+
+
+def test_hatch_toml_is_merged_over_tool_hatch_as_hatchling_does() -> None:
+    """hatchling loads hatch.toml beside the pyproject and shallow-merges it over [tool.hatch]."""
+    pyproject = "[tool.hatch.build.targets.wheel]\ndependencies = ['replaced-by-hatch-toml>=1']\n"
+    hatch_toml = (
+        "[build.targets.wheel]\ndependencies = ['invented-helper>=1']\n[build.hooks.custom]\n"
+    )
+    declared, findings = _gate.scan(pyproject, hatch_toml_text=hatch_toml)
+    assert set(declared) == {"invented-helper"}, "the shallow merge replaces [tool.hatch].build"
+    assert [f.problem for f in findings] == ["in-tree build hook"], findings
+
+
+def test_main_reads_a_hatch_toml_beside_a_pyproject(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n', encoding="utf-8"
+    )
+    (tmp_path / "hatch.toml").write_text(
+        "[build.targets.wheel]\ndependencies = ['invented-helper>=1']\n", encoding="utf-8"
+    )
+    asked = _stub_registry(monkeypatch, absent=frozenset({"invented-helper"}))
+    assert main(["--pyproject", str(project)]) == 1
+    assert sorted(asked) == ["fastapi", "invented-helper"]
+
+
+def test_refusals_already_collected_print_before_a_later_parse_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    first = tmp_path / "a.toml"
+    first.write_text('[project]\nname = "x"\ndependencies = ["./x.whl"]\n', encoding="utf-8")
+    broken = tmp_path / "b.toml"
+    broken.write_text("[project\n", encoding="utf-8")
+    _stub_registry(monkeypatch)
+    assert main(["--pyproject", str(first), "--pyproject", str(broken)]) == 2
+    assert "unnameable entry" in capsys.readouterr().err
+
+
+def test_the_no_packaging_error_is_escaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "café%x"  # a newline is not a legal Windows path character; % is
+    root.mkdir()
+    (root / "pyproject.toml").write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(_gate, "_ROOT", root)
+    _stub_registry(monkeypatch)
+    assert main([]) == 2
+    err = capsys.readouterr().err
+    assert err.isascii() and "caf\\xe9%25x" in err, err
 
 
 def test_a_file_whose_every_entry_is_refused_exits_1_not_2(

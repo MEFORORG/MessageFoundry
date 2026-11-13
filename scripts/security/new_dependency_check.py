@@ -34,10 +34,12 @@ entry the gate cannot name (a bare URL, a path, a non-string, a table or list of
 type); a direct reference (``name @ url``), whose bytes come from the URL rather than from the PyPI
 project the name would be vetted against; ``[project].dynamic`` naming the dependency lists, which a
 build plugin fills from a file this gate never opens; an in-tree build backend
-(``backend-path``) or an in-tree hatch hook (``custom``, or one with a ``path``), either of which can
-return build requirements from code; a non-empty source or index key in ``[tool.uv]`` or
+(``backend-path``) or an in-tree hatch ``custom`` build or metadata hook, any of which can
+return requirements from code; a non-empty source or index key in ``[tool.uv]`` or
 ``[tool.uv.pip]``, which sends a vetted name somewhere other than pypi.org; and a
-``[tool.uv].workspace``, whose members this gate does not sweep. A ``uv.toml`` is not read. This repository's own distributions
+``[tool.uv].workspace``, whose members this gate does not sweep. A ``hatch.toml`` beside a swept
+pyproject is read and merged over ``[tool.hatch]`` the way hatchling merges it; a ``uv.toml`` is not
+read. This repository's own distributions
 (``FIRST_PARTY``) are excluded by exact name, each with its reason and what the exclusion gives up.
 
 NOT SWEPT, at least: npm manifests (``ide/package.json``, ``ci/npm-tools/package.json``), and tools
@@ -209,9 +211,13 @@ _UV_SOURCE_KEYS = ("sources", "index", "index-url", "extra-index-url", "find-lin
 
 
 def scan(
-    pyproject_text: str, *, source: str = "pyproject.toml"
+    pyproject_text: str, *, source: str = "pyproject.toml", hatch_toml_text: str | None = None
 ) -> tuple[dict[str, str], list[Finding]]:
     """One pass over a pyproject: (``declared_distributions``, ``unnameable_entries``) for it.
+
+    ``hatch_toml_text`` is a ``hatch.toml`` beside the pyproject. hatchling loads it and merges its
+    top-level tables over ``[tool.hatch]`` with a shallow ``dict.update``, so this does the same: a
+    ``build`` table there REPLACES ``[tool.hatch.build]`` rather than adding to it.
 
     The findings are what used to be dropped in silence (BACKLOG #5641): a string that names no
     distribution, a non-string entry, and a table or list of the wrong TOML type, which a plain
@@ -365,7 +371,20 @@ def scan(
             "a workspace member's pyproject is resolved into uv.lock, and this gate sweeps only the "
             "root and packaging/*/pyproject.toml, so a member's dependencies would go unvetted.",
         )
-    hatch_build = table(table(tool, "hatch", "[tool.hatch]"), "build", "[tool.hatch.build]")
+    hatch = dict(table(tool, "hatch", "[tool.hatch]"))
+    if hatch_toml_text is not None:
+        hatch.update(tomllib.loads(hatch_toml_text))
+    metadata_hooks = table(
+        table(hatch, "metadata", "[tool.hatch.metadata]"), "hooks", "[tool.hatch.metadata.hooks]"
+    )
+    if "custom" in metadata_hooks:
+        refuse(
+            "[tool.hatch.metadata.hooks].custom",
+            "in-tree metadata hook",
+            "an in-tree hatch metadata hook can rewrite the declared dependencies from code this "
+            "gate never reads. Declare the requirements statically in [project].",
+        )
+    hatch_build = table(hatch, "build", "[tool.hatch.build]")
     requirements(hatch_build.get("dependencies", []), "[tool.hatch.build].dependencies")
     hooks = [("[tool.hatch.build.hooks]", table(hatch_build, "hooks", "[tool.hatch.build.hooks]"))]
     for target, config in table(hatch_build, "targets", "[tool.hatch.build.targets]").items():
@@ -379,8 +398,10 @@ def scan(
         for hook, config in hook_table.items():
             if isinstance(config, dict):
                 requirements(config.get("dependencies", []), f"{prefix}.{hook}.dependencies")
-                if hook == "custom" or "path" in config:
-                    # An in-tree hook's dependencies() method returns requirements from code.
+                # Only the `custom` hook loads code from the tree; its dependencies() method can
+                # return requirements. A built-in hook's `path`, such as the version hook's, names a
+                # file it writes, not code it runs.
+                if hook == "custom":
                     refuse(
                         f"{prefix}.{hook}",
                         "in-tree build hook",
@@ -749,9 +770,11 @@ def main(argv: list[str] | None = None) -> int:
     files: list[Path] = list(dict.fromkeys(args.pyproject or default_pyprojects(_ROOT)))
     if not args.pyproject and len(files) == 1:
         print(
-            f"::error::found no packaging/*/pyproject.toml under {_ROOT}. The default sweep reads "
-            "every one, so finding none means the tree moved under the gate. This is a broken gate, "
-            "not a clean sweep.",
+            _annotation(
+                f"::error::found no packaging/*/pyproject.toml under {_ROOT}. The default sweep "
+                "reads every one, so finding none means the tree moved under the gate. This is a "
+                "broken gate, not a clean sweep."
+            ),
             file=sys.stderr,
         )
         return 2
@@ -761,9 +784,19 @@ def main(argv: list[str] | None = None) -> int:
     for path in files:
         # A file that cannot be read or parsed is "could not see" (2), never "failed vetting" (1),
         # which is what a traceback would exit with.
+        hatch_toml = path.parent / "hatch.toml"
         try:
-            names, problems = scan(path.read_text(encoding="utf-8"), source=str(path))
+            names, problems = scan(
+                path.read_text(encoding="utf-8"),
+                source=str(path),
+                hatch_toml_text=(
+                    hatch_toml.read_text(encoding="utf-8") if hatch_toml.is_file() else None
+                ),
+            )
         except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            # The refusals from the files already read are named too, so one run reports both.
+            for finding in unnameable:
+                _print_finding(finding)
             print(
                 _annotation(
                     f"::error::could not read {path} ({type(exc).__name__}: {exc}). This is a "
