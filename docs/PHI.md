@@ -417,7 +417,8 @@ than a path is not checked
 - **The folders above a key file** (vault BACKLOG #5656, #5657). On every platform the check walks
   the folders on the key file's path, from the root down, and refuses a key file with a junction
   or a link among them, as it refuses a key file that is itself a link: the file is then wherever
-  that link leads. A folder a volume is mounted on reads as a junction, and is refused too. On
+  that link leads. On Windows a folder a volume is mounted on reads as a junction, and is refused
+  too; a POSIX mount point is not a link and passes. On
   Windows it also reads the access list of the directory that holds the file, and refuses it when
   one of the groups above or an application package may delete a file in it, change its access
   list or take it over (`FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`), or when
@@ -426,8 +427,10 @@ than a path is not checked
   inherits that folder's grant to Users, passes. A path spelled as a network share
   (`\\host\share\...`) is walked no further than the share, so a junction behind it is not seen,
   `\\localhost\C$\...` included; the file's own access list is still read. A mapped drive letter
-  is walked like a local volume. A walk that stops for any other reason, such as a folder it
-  cannot read, is refused. An inherit-only entry on the directory is read as if it applied to the
+  is walked like a local volume, but the file server resolves its own junctions, so one on the
+  server is not seen either. A walk that stops for any other reason, such as a folder it cannot
+  read, is refused, and so is a holder whose access list the engine's account may not read: give
+  that account read access to the folder's permissions. An inherit-only entry on the directory is read as if it applied to the
   directory itself, so such an entry granting a broad group one of those rights refuses it too. It
   does not read, at least: whether a broad group may rename the directory that holds the file or a
   folder above it (`DELETE` on that folder, as a data drive's root often grants Authenticated

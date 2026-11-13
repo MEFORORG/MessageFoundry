@@ -439,8 +439,8 @@ def _screened_principal(sid: str) -> str | None:
     """What ``sid`` is, when a key file may name it neither as a read grant nor as its owner: an
     application package, or a broad group. ``None`` when it may be named. One screen for both on
     the create, so a later screen reaches grants and owners alike there. The check before a key file
-    is used, :func:`_windows_access_problem`, calls the two predicates itself, for the entries and
-    for the owner."""
+    is used, :func:`_windows_access_problem`, calls the two predicates itself for the entries, and
+    this screen for the owner."""
     if _is_package_sid(sid):
         return "an application package"
     if _is_broad_group(sid):
@@ -742,7 +742,8 @@ def broad_access_problem(
     group's right to delete a file inside it (FILE_DELETE_CHILD) is a problem too. On POSIX the
     group and other write bits, which the check already refuses, are that right. With
     ``holder_judged``, the caller has already judged the directory that holds ``path``, with
-    ``directory``, so neither it nor the folders above it are read again.
+    ``directory``, so the folders above it are not walked again, nor, on Windows, its access list
+    read again; the POSIX holder's owner and mode, one stat, are still read.
 
     Windows: an allow entry that lets a known broad group read the file, change it, or take it
     over, and an owner that is such a group. The groups are at least Everyone, Authenticated Users
@@ -779,9 +780,11 @@ def broad_access_problem(
             return problem
         return _windows_surroundings_problem(path, read_path)
     own = _posix_own_problem(mode=status.st_mode, uid=status.st_uid, euid=os.geteuid())
-    if own is not None or holder_judged:
+    if own is not None:
         return own
-    problem = _posix_ancestor_link_problem(path)
+    # The holder's owner and mode are one stat, so they are read again even when holder_judged:
+    # a directory widened since its own check is still caught at the read.
+    problem = None if holder_judged else _posix_ancestor_link_problem(path)
     if problem is not None:
         return problem
     try:

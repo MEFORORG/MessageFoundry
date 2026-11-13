@@ -154,8 +154,9 @@ _CUSTODY_KEYS: Final = frozenset(_name_key(name) for name in CUSTODY_FILE_NAMES)
 def _check(path: Path, what: str, *, directory: bool = False) -> None:
     """Refuse ``path`` when a known broad group can reach it: the rule key files get. For the
     directory, a broad right to delete a file inside it is refused too, since deleting a file sends
-    its setting back to the environment. The directory's own check reads the folders above it; a
-    file's does not read them again, because the directory that holds it is the one just judged."""
+    its setting back to the environment. The directory's own check walks the folders above it; a
+    file's does not walk them again, because the directory that holds it is the one just judged
+    (on POSIX that directory's owner and mode are still read for each file)."""
     from messagefoundry.restricted_file import broad_access_problem
 
     problem = broad_access_problem(path, directory=directory, holder_judged=not directory)

@@ -1631,11 +1631,12 @@ def test_the_engine_asks_for_a_state_dir_no_one_else_may_write_on_posix_only(
 
 
 @pytest.mark.parametrize("platform", ["linux", "win32"])
-def test_the_generated_key_remedy_names_the_store_dir_on_posix_only(
+def test_the_generated_key_remedy_names_the_store_dir_with_commands_on_posix_only(
     monkeypatch: pytest.MonkeyPatch, platform: str
 ) -> None:
-    """The chmod and chown are POSIX commands, and the store directory is judged on POSIX only, so
-    the clause is printed there alone, with the paths shell-quoted so they can be pasted as printed.
+    """The store directory is judged on every platform (vault BACKLOG #5636, #5657), so each remedy
+    names it. The chmod and chown are POSIX commands, so they are printed there alone, with the
+    paths shell-quoted so they can be pasted as printed.
     A mode cause gets chmod go-w, an owner cause gets chown to the engine's account, and moving the
     store, which would start a new, empty one, is not offered."""
     import messagefoundry.__main__ as cli

@@ -7993,10 +7993,11 @@ def _generated_tls_key_remedy(state_dir: Path) -> str:
         )
     else:
         remedy += (
-            "Where the refusal names the directory that holds it, or a folder on its path, that is "
-            "the store's directory: remove a broad group's right to delete files in it or change "
-            "its access list, or keep the store where no junction or link is on its path, since "
-            "a new pair would be minted there again. "
+            "Where the refusal names the directory that holds it, that is the store's directory: "
+            "remove a broad group's right to delete files in it or change its access list, and "
+            "give it an owner that is not such a group. Where it names a folder on its path, keep "
+            "the store where no junction or link is above it. A new pair would be minted in the "
+            "same place again. "
         )
     return remedy + (
         "If the volume itself widens the file on every mount, "

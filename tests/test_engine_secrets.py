@@ -802,10 +802,25 @@ def test_the_folders_above_the_directory_are_read_for_it_and_not_again_for_each_
         asked.append((path.name, directory, holder_judged))
         return real(path, directory=directory, holder_judged=holder_judged)
 
+    walked: list[str] = []
+    walk_name = (
+        "_windows_surroundings_problem"
+        if sys.platform == "win32"
+        else "_posix_ancestor_link_problem"
+    )
+    real_walk = getattr(restricted_file, walk_name)
+
+    def walk(path: Path, *args: Any) -> str | None:
+        walked.append(path.name)
+        answer: str | None = real_walk(path, *args)
+        return answer
+
     monkeypatch.setattr(restricted_file, "broad_access_problem", spy)
+    monkeypatch.setattr(restricted_file, walk_name, walk)
     opened = open_secrets_directory(_env(directory))
     assert opened is not None
     assert opened.read("MEFOR_STORE_PASSWORD") == opened.read("MEFOR_AI_API_KEY") == _FROM_FILE
+    assert walked == ["secrets"]  # the directory's folders are walked once, and no file's
     assert asked == [
         ("secrets", True, False),
         ("MEFOR_STORE_PASSWORD", False, True),
