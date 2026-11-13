@@ -153,11 +153,15 @@ _WSSE_FAULT_RE = re.compile(
 # from every start tag lacking a close, so a partner reply of repeated start tags cost the square of
 # its length. _code_text finds the `>` and `</` with str.find, once, from the leftmost name, and only
 # inside the Fault _FAULT_RE matched, up to that Fault's close tag (_FAULT_END_RE) or the reply's end.
+# BACKLOG #5912: a Value is read only inside the SOAP 1.2 Code element (_CODE_RE), up to its close
+# tag (_CODE_END_RE), and only when Code or faultcode is the Fault's first child; _fault_code says why.
 _FAULTCODE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?faultcode\b", re.IGNORECASE)
+_CODE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Code(?=[\s/>])", re.IGNORECASE)
 _CODEVALUE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Value\b", re.IGNORECASE)
 # The close tags, with the start tags' optional prefix. Literal, so tests/test_security_static.py
 # can read them.
 _FAULTCODE_END_RE = re.compile(r"</\s*(?:[\w.\-]+:)?faultcode\s*>", re.IGNORECASE)
+_CODE_END_RE = re.compile(r"</\s*(?:[\w.\-]+:)?Code\s*>", re.IGNORECASE)
 _CODEVALUE_END_RE = re.compile(r"</\s*(?:[\w.\-]+:)?Value\s*>", re.IGNORECASE)
 _FAULT_END_RE = re.compile(r"</\s*(?:[\w.\-]+:)?Fault\s*>", re.IGNORECASE)
 # A `<` that opens neither a comment, a CDATA section nor a processing instruction: another element.
@@ -230,12 +234,17 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
     BACKLOG #2827: read only inside ``fault``, the ``_FAULT_RE`` match (:func:`_find_fault`'s when
     not given), from its start tag to its close tag or, with none, the reply's end, so a ``faultcode``
     or ``Value`` outside it, in the Header say, does not decide the fault's class. A self-closing
-    Fault holds no code. The first ``faultcode`` or ``Value`` start tag in that range is the code
-    element: SOAP 1.2's Code/Value and SOAP 1.1's faultcode come before a Detail that may carry an
-    element of the other name. Only that first tag is read. Where it has no ``>`` or no ``</``
-    after it, no later one has either, since a later start tag's ``>`` is no earlier than its.
-    Where it cannot hold a code, a later tag is still not tried: that is a choice, so the code
-    stays the Fault's first code element."""
+    Fault holds no code.
+
+    BACKLOG #5912: the code element is the Fault's first child element, a comment or processing
+    instruction before it skipped: SOAP 1.1's ``faultcode`` or SOAP 1.2's ``Code``, which both
+    schemas put first. For ``Code`` the code is its first ``Value``, read only up to the Code's close
+    tag; that is the Code's own Value, or a Subcode's Value where a Subcode comes first. A ``Value``
+    anywhere else in the Fault, in a Reason, Node, Role or Detail, never decides permanent versus
+    retryable. Where the first child is neither, or the code element cannot hold a code, the code
+    is ``""``, and :func:`_classify_soap` reads that as a permanent fault, never as delivered: a
+    later element is not tried, so a Detail cannot stand in for a missing or misplaced code. Each
+    step is one scan forward from the Fault, so the read stays linear in the reply."""
     if fault is None:
         fault, _ = _find_fault(body)
         if fault is None:
@@ -246,13 +255,22 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
         return ""
     fault_end = _FAULT_END_RE.search(body, start)
     end = len(body) if fault_end is None else fault_end.start()
-    faultcode = _FAULTCODE_RE.search(body, start, end)
-    value = _CODEVALUE_RE.search(body, start, end if faultcode is None else faultcode.start())
-    if value is not None:
-        return _code_text(value, _CODEVALUE_END_RE, body, end)
+    child = _TAG_OPEN_RE.search(body, gt + 1, end)
+    if child is None:
+        return ""
+    faultcode = _FAULTCODE_RE.match(body, child.start(), end)
     if faultcode is not None:
         return _code_text(faultcode, _FAULTCODE_END_RE, body, end)
-    return ""
+    code = _CODE_RE.match(body, child.start(), end)
+    if code is None:
+        return ""
+    code_gt = body.find(">", code.end(), end)
+    if code_gt < 0 or body[code_gt - 1] == "/":
+        return ""
+    code_end = _CODE_END_RE.search(body, code_gt + 1, end)
+    stop = end if code_end is None else code_end.start()
+    value = _CODEVALUE_RE.search(body, code_gt + 1, stop)
+    return "" if value is None else _code_text(value, _CODEVALUE_END_RE, body, stop)
 
 
 def _classify_soap(status: int, body: str) -> DeliveryError | None:

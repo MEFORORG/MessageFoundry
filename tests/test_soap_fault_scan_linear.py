@@ -16,7 +16,10 @@ The new extraction is NOT the old one everywhere. The old patterns read the firs
 in the reply, else the first Value, the Header included, and an empty ``<faultcode/>`` took the next element's text as its
 code. Both could make a permanent fault read as a Receiver one and retry until the attempt limit;
 the named tests below pin each, with a control. The Fault is searched for from the SOAP Body start
-tag, ``_find_fault`` says how, and the Body tests pin that, each with a control.
+tag, ``_find_fault`` says how, and the Body tests pin that, each with a control. BACKLOG #5912
+narrows the code read to the Fault's first child, a faultcode or a Code and the Value inside that
+Code, so a Value anywhere else in the Fault decides nothing; its tests pin that against the PR 2790
+reading, which took the Fault's first Value.
 
 The third is about which thread runs the scan, not about the loop staying responsive.
 ``SoapDestination._post_and_classify`` says why the two differ, and what bounds the difference.
@@ -54,18 +57,36 @@ def _old_fault_code(body: str, fault: object = None) -> str:
     return m.group(1) if m else ""
 
 
-# The reference reading: the old patterns, run on the text between the first Fault start tag after
-# the first Body start tag (or anywhere, with no Body start tag or no Fault after it) and the
-# Fault's close tag, the
-# earlier of the two names taken, with an element that cannot hold a code read as empty. It reuses
-# the production close-tag and nested-tag patterns, so it re-checks the str.find bounds and
-# captures, not those patterns; the named shapes pin what they read.
+# The reference reading: the old patterns, run on the Fault's first child element, a comment or
+# processing instruction before it skipped. The Fault is the first Fault start tag after the first
+# Body start tag (or anywhere, with no Body start tag or no Fault after it), read to its close tag.
+# A faultcode child is read whole; a Code child is read up to its close tag and its first Value
+# taken (BACKLOG #5912). An element that cannot hold a code reads as empty. It reuses the
+# production faultcode and Value close-tag patterns and the nested-tag pattern, so it re-checks the
+# str.find bounds and captures, not those patterns; the named shapes pin what they read. The Code
+# start and close tags are written out here, independently of _CODE_RE and _CODE_END_RE.
 _REF_BODY_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Body[\s/>](.*)", re.IGNORECASE | re.DOTALL)
 _REF_FAULT_RE = re.compile(
     r"<\s*(?:[\w.\-]+:)?Fault[\s/>](.*?)(?:</\s*(?:[\w.\-]+:)?Fault\s*>|\Z)",
     re.IGNORECASE | re.DOTALL,
 )
 _REF_START_TAG_RE = re.compile(r"[^>]*>")
+_REF_BEFORE_THE_CHILD_RE = re.compile(r"(?:[^<]|<[!?])*")
+_REF_CODE_RE = re.compile(
+    r"<\s*(?:[\w.\-]+:)?Code(?=[\s/>])([^>]*>)(.*?)(?:</\s*(?:[\w.\-]+:)?Code\s*>|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _ref_code_text(m: re.Match[str] | None, inner: str, own_close: re.Pattern[str]) -> str:
+    if m is None:
+        return ""
+    code = m.group(1)
+    self_closing = inner[m.start(1) - 2] == "/"
+    holds_an_element = soap._TAG_OPEN_RE.search(code) is not None
+    if self_closing or holds_an_element or not own_close.match(inner, m.end() - 2):
+        return ""
+    return code
 
 
 def _ref_fault_code(body: str) -> str:
@@ -78,24 +99,17 @@ def _ref_fault_code(body: str) -> str:
     fault_tag = _REF_START_TAG_RE.match(body, fault.start(1) - 1)
     if fault_tag is None or fault_tag.group().endswith("/>"):
         return ""
-    inner = fault.group(1)
-    found = [
-        (m, close)
-        for m, close in (
-            (_OLD_FAULTCODE_RE.search(inner), soap._FAULTCODE_END_RE),
-            (_OLD_CODEVALUE_RE.search(inner), soap._CODEVALUE_END_RE),
-        )
-        if m is not None
-    ]
-    if not found:
+    inner = body[fault_tag.end() : fault.end(1)]
+    lead = _REF_BEFORE_THE_CHILD_RE.match(inner)
+    child = inner[lead.end() :] if lead is not None else ""
+    faultcode = _OLD_FAULTCODE_RE.match(child)
+    if faultcode is not None:
+        return _ref_code_text(faultcode, child, soap._FAULTCODE_END_RE)
+    code = _REF_CODE_RE.match(child)
+    if code is None or code.group(1).endswith("/>"):
         return ""
-    m, own_close = min(found, key=lambda pair: pair[0].start())
-    code = m.group(1)
-    self_closing = inner[m.start(1) - 2] == "/"
-    holds_an_element = soap._TAG_OPEN_RE.search(code) is not None
-    if self_closing or holds_an_element or not own_close.match(inner, m.end() - 2):
-        return ""
-    return code
+    in_code = code.group(2)
+    return _ref_code_text(_OLD_CODEVALUE_RE.search(in_code), in_code, soap._CODEVALUE_END_RE)
 
 
 # --- what the extraction reads ------------------------------------------------------------------
@@ -132,8 +146,26 @@ _NAMED_SHAPES = {
         "<!-- c -->soap:Server",
     ),
     "multiline": ("<Fault><faultcode>\n  soap:Client\n</faultcode></Fault>", "\n  soap:Client\n"),
-    "faultcode-unclosed-then-value": ("<Fault><Value>x:Sender</Value><faultcode>y", "x:Sender"),
-    "name-only-prefix-match": ("<Fault><faultcodeX>a</faultcodeX><Value>v</Value></Fault>", "v"),
+    # BACKLOG #5912: a Value outside a Code element is not a code, and the Fault's first child is
+    # the only candidate.
+    "bare-value-then-faultcode": ("<Fault><Value>x:Sender</Value><faultcode>y", ""),
+    "name-only-prefix-match": ("<Fault><faultcodeX>a</faultcodeX><Value>v</Value></Fault>", ""),
+    "code-name-prefix-match": ("<Fault><CodeX><Value>v</Value></CodeX></Fault>", ""),
+    "code-then-faultcode": (
+        "<Fault><Code><Value>env:Sender</Value></Code><faultcode>soap:Server</faultcode></Fault>",
+        "env:Sender",
+    ),
+    "faultcode-then-code": (
+        "<Fault><faultcode>soap:Client</faultcode><Code><Value>Receiver</Value></Code></Fault>",
+        "soap:Client",
+    ),
+    "comment-before-the-code": (
+        "<env:Fault><!-- c --><env:Code><env:Value>env:Sender</env:Value></env:Code></env:Fault>",
+        "env:Sender",
+    ),
+    "code-without-value": ("<Fault><Code><Subcode/></Code><Detail><Value>v</Value></Detail>", ""),
+    "self-closing-code": ("<Fault><Code/><Detail><Value>Receiver</Value></Detail></Fault>", ""),
+    "unclosed-code": ("<Fault><Code><Value>env:Sender</Value>", "env:Sender"),
     # The first code element decides: an empty one is not passed over for the Value after it.
     "empty": ("<Fault><faultcode></faultcode><Value>x:Sender</Value></Fault>", ""),
     "nested": ("<Fault><faultcode><b>soap:Client</b></faultcode></Fault>", ""),
@@ -237,6 +269,63 @@ def test_an_empty_code_element_yields_no_code(body: str) -> None:
     assert failure.code == "soap-fault"
 
 
+# BACKLOG #5912: a Value outside the Fault's Code element decided the class. The PR 2790 reading
+# took the Fault's first Value before any faultcode, so a Value in a Reason, Node, Role or Detail,
+# or one ahead of a SOAP 1.1 faultcode (#6664 item 5), could make a fault read as a Receiver one
+# and retry. Each shape reads ``env:Receiver``-like text outside a Code.
+_VALUE_OUTSIDE_THE_CODE = {
+    "soap12-detail-value-no-code": (
+        "<env:Body><env:Fault><env:Reason><env:Text>bad</env:Text></env:Reason><env:Detail>"
+        "<app:Value>Receiver</app:Value></env:Detail></env:Fault></env:Body>"
+    ),
+    "soap12-role-before-the-code": (
+        "<env:Body><env:Fault><env:Role><x:Value>Receiver</x:Value></env:Role><env:Code>"
+        "<env:Value>env:Sender</env:Value></env:Code></env:Fault></env:Body>"
+    ),
+    "soap12-node-value-no-code": (
+        "<env:Fault><env:Node><x:Value>Server</x:Value></env:Node></env:Fault>"
+    ),
+    "soap11-detail-value-before-faultcode": (
+        "<soap:Body><soap:Fault><detail><Value>Server</Value></detail>"
+        "<faultcode>soap:Client</faultcode></soap:Fault></soap:Body>"
+    ),
+    "soap11-bare-value-before-faultcode": (
+        "<soap:Fault><Value>Server</Value><faultcode>soap:Client</faultcode></soap:Fault>"
+    ),
+}
+
+
+def _pr2790_fault_code(body: str) -> str:
+    """The PR 2790 reading, kept as this test's control: the Fault's first Value before any
+    faultcode, else that faultcode."""
+    fault, _ = soap._find_fault(body)
+    if fault is None:
+        return ""
+    end_match = soap._FAULT_END_RE.search(body, fault.end())
+    end = len(body) if end_match is None else end_match.start()
+    faultcode = soap._FAULTCODE_RE.search(body, fault.end(), end)
+    value = soap._CODEVALUE_RE.search(
+        body, fault.end(), end if faultcode is None else faultcode.start()
+    )
+    if value is not None:
+        return soap._code_text(value, soap._CODEVALUE_END_RE, body, end)
+    if faultcode is not None:
+        return soap._code_text(faultcode, soap._FAULTCODE_END_RE, body, end)
+    return ""
+
+
+@pytest.mark.parametrize(
+    "body", list(_VALUE_OUTSIDE_THE_CODE.values()), ids=list(_VALUE_OUTSIDE_THE_CODE)
+)
+def test_a_value_outside_the_code_does_not_decide_the_fault(body: str) -> None:
+    """Red on the PR 2790 reading, which retried each of these as a Receiver fault. Now no code is
+    read, and the fault is permanent: an ambiguous code never reads as retryable or delivered."""
+    assert soap._RECEIVER_RE.search(_pr2790_fault_code(body)), "the shape must exercise the defect"
+    assert _fault_code(body) == ""
+    assert _outcome(_classify_soap(200, body)) == "soap-fault"
+    assert _outcome(_classify_soap(500, body)) == "soap-fault"
+
+
 _STILL_RECEIVER = {
     "header-sender-fault-receiver": (
         "<env:Envelope><env:Header><x:Value>Sender</x:Value></env:Header><env:Body>"
@@ -246,6 +335,11 @@ _STILL_RECEIVER = {
     "faultcode-then-faultstring": (
         "<soap:Fault><faultcode>soap:Server</faultcode><faultstring>Client busy</faultstring>"
         "</soap:Fault>"
+    ),
+    # BACKLOG #5912: a Value in the Detail does not override the Code's.
+    "code-receiver-detail-sender": (
+        "<env:Fault><env:Code><env:Value>env:Receiver</env:Value></env:Code><env:Detail>"
+        "<x:Value>Sender</x:Value></env:Detail></env:Fault>"
     ),
 }
 
@@ -376,10 +470,14 @@ def test_with_no_fault_after_the_body_the_whole_reply_is_read(body: str, outcome
 _FRAGMENTS = (
     "<", ">", "</", "/>", " ", "\n", "faultcode", "FaultCode", "Value", "VALUE", "Fault",
     "soap:", "SOAP-ENV:", "a.b:", ":", "x", "Client", "Receiver", '"', "'", "=", "<!--", "-->",
-    "<![CDATA[", "]]>", "faultcodes", "Values", "Body", "<x:Body>",
+    "<![CDATA[", "]]>", "faultcodes", "Values", "Body", "<x:Body>", "Code", "<Code>", "</Code>",
 )  # fmt: skip
-#: What goes before the Body: the fragments, and Fault-named elements the Body anchor must skip.
-_HEAD_FRAGMENTS = _FRAGMENTS + ("<x:Fault>", "<x:Fault/>", "</x:Fault>", "<!-- <Fault/> -->")
+#: What goes before the Body: the fragments, and Fault-named elements the Body anchor must skip,
+#: two of them holding a code so the anchor changes what is read.
+_HEAD_FRAGMENTS = _FRAGMENTS + (
+    "<x:Fault>", "<x:Fault/>", "</x:Fault>", "<!-- <Fault/> -->",
+    "<x:Fault><x:faultcode>Server</x:faultcode>", "<x:Fault><x:Code><x:Value>Receiver</x:Value>",
+)  # fmt: skip
 #: Each envelope's text before its head fragments, and from there to its Fault's first child. The
 #: last has no envelope, so a Body-named fragment after its Fault comes after the Fault.
 _ENVELOPES = (
@@ -423,7 +521,9 @@ def test_random_replies_yield_the_reference_reading() -> None:
     differently when the Fault is searched for from the reply's start, and at least one in fifty
     has a Body start tag with no Fault after it. Without them a sample of bodies that yield no
     code, or that never reach the anchor or its fallback, would pass any extraction (the seeded
-    sample read about 54%, 6.8% and 4.5% on 2026-11-04)."""
+    sample read about 54%, 6.8% and 4.5% on 2026-11-04, and 26.6%, 12.1% and 4.6% after BACKLOG
+    #5912 on 2026-11-13: a Value outside a Code, and a code element that is not the Fault's first
+    child, now yield none, and the head fragments gained two Faults that hold a code)."""
     rng = random.Random(2827)
     total, with_a_code, anchored, fallback = 5_000, 0, 0, 0
     for _ in range(total):
@@ -465,6 +565,10 @@ _PATHOLOGICAL_REPLIES: dict[str, Callable[[int], str]] = {
     # for a nested start tag, over a long run of comment openers.
     "long-code-close-prefix": lambda k: "<Fault><faultcode>x</" + "a." * (k // 2),
     "long-code-text": lambda k: "<Fault><faultcode>" + "<!x" * (k // 3) + "</faultcode>",
+    # BACKLOG #5912: the SOAP 1.2 Code read, over unterminated Value start tags inside one Code,
+    # and its close-tag scan over close tags with no colon.
+    "unterminated-value-tags-in-a-code": lambda k: "<Fault><Code>" + "<Value " * (k // 7),
+    "long-code-close-prefixes": lambda k: "<Fault><Code>x" + ("</" + "a." * 50) * (k // 102),
     # The Body anchor's scan, ``_BODY_RE``, over the same prefix runs and a run of ``<``, before a
     # Body that holds the Fault.
     "long-prefixes-before-the-body": lambda k: ("<" + "a." * 50) * (k // 101) + "<Body><Fault>",

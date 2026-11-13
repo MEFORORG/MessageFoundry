@@ -62,7 +62,8 @@ invariants can't silently regress.
   ``transports/soap.py`` triages SOAP faults with regexes and ``str.find`` over the XML response
   body. Its fault-code patterns, ``_FAULTCODE_RE``/``_CODEVALUE_RE``, each match a ``<``, optional
   whitespace, an optional prefix of word characters, dots and hyphens ending in ``:``, and the name
-  ``faultcode`` or ``Value`` in any case with no word character after it. So they also match a
+  ``faultcode`` or ``Value`` in any case with no word character after it (``_CODE_RE``, the SOAP 1.2
+  ``Code`` a Value is read inside, needs whitespace, ``/`` or ``>`` after its name). So they also match a
   longer name that goes on with at least ``.``, ``-`` or ``:``, such as ``<faultcode.detail>`` or
   ``<Value-x>``.
   ``_code_text`` takes the text from the next ``>`` after a match to the next ``</``. Which match,
