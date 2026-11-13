@@ -4,7 +4,8 @@
 revoke the store refuses on every attempt is audited.
 
 ``revoke_user_sessions`` runs after its caller's change has committed: a password change or reset,
-an MFA reset, a disable, a role, scope or custom-role change, or a directory map save. A store
+an MFA reset, a disable, a role, scope or custom-role change, a directory map save, a directory
+sign-in's role resync, or the ``provision-admin`` repair. A store
 refusal there, such as ``StoreAcquireTimeout`` at the acquire limit, a statement timeout or a lost
 connection, used to end the request with a 500, the account's other sessions live, and no row
 recording either. Each caller now goes through ``AuthService._revoke_after_commit``.
@@ -27,6 +28,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.auth import service as service_module
+from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.service import SESSIONS_REVOKE_FAILED_ACTION, AuthService
 from messagefoundry.auth.tokens import hash_token
@@ -39,6 +41,9 @@ _NEW_PASSWORD = "An0ther-Synthetic-Pass!!"
 
 #: A caller under test: it takes the service, the store and the account's own login identity.
 Caller = Callable[[AuthService, MessageStore, Any], Awaitable[None]]
+#: The account a caller changes: it builds the service, and returns it with the account's login
+#: identity, where the caller needs one, and the hashes of its two live sessions.
+Account = Callable[[MessageStore], Awaitable[tuple[AuthService, Any, list[str]]]]
 
 
 async def _change_password(service: AuthService, _store: MessageStore, identity: Any) -> None:
@@ -84,29 +89,154 @@ async def _custom_role_edit(service: AuthService, store: MessageStore, _i: Any) 
     )
 
 
-#: Each caller, the change name its miss row records, and the audit row it writes once the revoke
-#: lands.
+async def _provision_admin(service: AuthService, _s: MessageStore, _i: Any) -> None:
+    await service.provision_first_administrator(
+        username="bob", password=_NEW_PASSWORD, notify_email="ops@example.org", actor="host"
+    )
+
+
+async def _ad_sign_in(service: AuthService, _s: MessageStore, _i: Any) -> None:
+    await service._complete_ad_login(_PRINCIPAL, None, mfa_verified=True)
+
+
+async def _ad_role_map_save(service: AuthService, _s: MessageStore, _i: Any) -> None:
+    await service.set_ad_group_map([(_GROUP, "operator")], actor="admin")
+
+
+async def _account(store: MessageStore) -> tuple[AuthService, Any, list[str]]:
+    """Local account u1 with two live sessions; returns the service, the account's identity and
+    both session hashes."""
+    service = AuthService(store, AuthSettings(require_mfa=False))
+    identity, hashes = await _local_account(store, service)
+    return service, identity, hashes
+
+
+async def _roleless_account(store: MessageStore) -> tuple[AuthService, Any, list[str]]:
+    """Local account u1, holding no role, with two live sessions: the row ``provision-admin``
+    repairs."""
+    service = AuthService(store, AuthSettings(require_mfa=False))
+    await service.initialize()  # seeds the Administrator role the grant writes
+    await store.create_user(
+        user_id="u1",
+        username="bob",
+        auth_provider="local",
+        email="bob@example.org",
+        password_hash=hash_password(_PASSWORD),
+        password_generated=False,
+        audits=(),
+    )
+    return service, None, await _sessions(store, "u1")
+
+
+_GROUP = "cn=mf-ops,dc=x"
+_PRINCIPAL = AdPrincipal(
+    username="bob",
+    display_name=None,
+    email="bob@example.org",
+    dn="CN=bob,DC=x",
+    groups=frozenset({_GROUP}),
+    directory_object_id="0b6c2a52-3f1e-5a8d-9b7c-1d2e3f4a5b6c",
+)
+
+
+async def _directory_account(store: MessageStore) -> tuple[AuthService, Any, list[str]]:
+    """Directory account u1, holding viewer, with two live sessions, and a role map that maps its
+    group to operator, written through the store so the setup ends no session."""
+    service = AuthService(
+        store,
+        AuthSettings(
+            require_mfa=False,
+            ad_enabled=True,
+            ad_server="ldaps://x",
+            ad_user_search_base="DC=x",
+            ad_bind_dn="CN=svc,DC=x",
+            ad_bind_password="x",
+        ),
+    )
+    await service.initialize()
+    await _directory_user(store, "u1", "bob", _PRINCIPAL.directory_object_id)
+    await store.set_user_roles("u1", ["viewer"], assigned_by="test", audits=())
+    await store.set_ad_group_role_map([(_GROUP, "operator")])
+    return service, None, await _sessions(store, "u1")
+
+
+async def _directory_user(store: MessageStore, user_id: str, name: str, object_id: Any) -> None:
+    await store.create_user(
+        user_id=user_id,
+        username=name,
+        auth_provider="ad",
+        directory_object_id=object_id,
+        now=1.0,
+        password_generated=False,
+        audits=(),
+    )
+
+
+async def _sessions(store: MessageStore, user_id: str) -> list[str]:
+    """Two live sessions for ``user_id``; returns their hashes."""
+    hashes = []
+    for n in (1, 2):
+        token_hash = f"{user_id}{n}".encode().hex().ljust(64, "0")
+        await store.create_session(token_hash=token_hash, user_id=user_id, expires_at=9e9)
+        hashes.append(token_hash)
+    return hashes
+
+
+#: Each caller, the change name its miss row records, the audit row it writes once the revoke
+#: lands, and the account it changes.
 CALLERS = [
     pytest.param(
-        _change_password, "password_changed", "auth.password_changed", id="change_password"
+        _change_password,
+        "password_changed",
+        "auth.password_changed",
+        _account,
+        id="change_password",
     ),
     pytest.param(
-        _admin_reset_password, "password_reset", "auth.password_reset", id="admin_reset_password"
+        _admin_reset_password,
+        "password_reset",
+        "auth.password_reset",
+        _account,
+        id="admin_reset_password",
     ),
-    pytest.param(_admin_reset_mfa, "mfa_reset", "auth.mfa_reset", id="admin_reset_mfa"),
-    pytest.param(_disable, "account_disabled", "user.updated", id="disable"),
-    pytest.param(_set_roles, "roles_changed", "user.roles_changed", id="set_roles"),
+    pytest.param(_admin_reset_mfa, "mfa_reset", "auth.mfa_reset", _account, id="admin_reset_mfa"),
+    pytest.param(_disable, "account_disabled", "user.updated", _account, id="disable"),
+    pytest.param(_set_roles, "roles_changed", "user.roles_changed", _account, id="set_roles"),
     pytest.param(
         _set_channel_scope,
         "channel_scope_changed",
         "user.channel_scope_changed",
+        _account,
         id="set_channel_scope",
     ),
-    pytest.param(_custom_role_edit, "custom_role_saved", "role.updated", id="custom_role_edit"),
+    pytest.param(
+        _custom_role_edit, "custom_role_saved", "role.updated", _account, id="custom_role_edit"
+    ),
+    pytest.param(
+        _provision_admin,
+        "first_administrator_repair",
+        "auth.first_administrator_provisioned",
+        _roleless_account,
+        id="provision_admin",
+    ),
+    pytest.param(
+        _ad_sign_in,
+        "ad_roles_resynced",
+        "auth.ad_roles_resynced",
+        _directory_account,
+        id="ad_sign_in_resync",
+    ),
+    pytest.param(
+        _ad_role_map_save,
+        "ad_role_map_saved",
+        "ad_group_map.updated",
+        _directory_account,
+        id="ad_role_map_save",
+    ),
 ]
 
 
-async def _account(store: MessageStore, service: AuthService) -> tuple[Any, list[str]]:
+async def _local_account(store: MessageStore, service: AuthService) -> tuple[Any, list[str]]:
     """Account u1 with two live sessions; returns its identity and both session hashes."""
     for role in ("viewer", "operator"):
         await store.upsert_role(role_id=role, display_name=role)
@@ -164,14 +294,13 @@ def _no_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(service_module, "_POST_COMMIT_REVOKE_BACKOFF_SECONDS", 0.0)
 
 
-@pytest.mark.parametrize(("caller", "change", "audited"), CALLERS)
+@pytest.mark.parametrize(("caller", "change", "audited", "account"), CALLERS)
 async def test_a_refused_revoke_after_the_change_is_retried(
-    caller: Caller, change: str, audited: str
+    caller: Caller, change: str, audited: str, account: Account
 ) -> None:
     store = await MessageStore.open(":memory:")
     try:
-        service = AuthService(store, AuthSettings(require_mfa=False))
-        identity, hashes = await _account(store, service)
+        service, identity, hashes = await account(store)
         assert await _live(store, hashes) == hashes  # the control: both sessions are live
         calls = _refusing(store, 1)
         await caller(service, store, identity)
@@ -184,14 +313,13 @@ async def test_a_refused_revoke_after_the_change_is_retried(
         await store.close()
 
 
-@pytest.mark.parametrize(("caller", "change", "audited"), CALLERS)
+@pytest.mark.parametrize(("caller", "change", "audited", "account"), CALLERS)
 async def test_a_revoke_refused_on_every_attempt_is_audited_and_raised(
-    caller: Caller, change: str, audited: str
+    caller: Caller, change: str, audited: str, account: Account
 ) -> None:
     store = await MessageStore.open(":memory:")
     try:
-        service = AuthService(store, AuthSettings(require_mfa=False))
-        identity, hashes = await _account(store, service)
+        service, identity, hashes = await account(store)
         calls = _refusing(store, None)
         with pytest.raises(StoreAcquireTimeout):
             await caller(service, store, identity)
@@ -244,7 +372,7 @@ async def test_a_refusal_that_is_not_a_store_fault_is_raised_at_once() -> None:
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings(require_mfa=False))
-        await _account(store, service)
+        await _local_account(store, service)
         calls = [0]
 
         async def broken(user_id: str, **kwargs: Any) -> Any:
@@ -270,7 +398,7 @@ async def test_a_refusal_past_the_budget_is_recorded_without_a_re_run(
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings(require_mfa=False))
-        await _account(store, service)
+        await _local_account(store, service)
         calls = _refusing(store, None)
         with pytest.raises(StoreAcquireTimeout):
             await service.set_roles("u1", ["operator"], actor="admin")
@@ -320,24 +448,62 @@ def _refusing_for(store: MessageStore, refused_id: str) -> None:
     store.revoke_user_sessions = revoke  # type: ignore[method-assign]
 
 
-async def test_a_batch_stops_at_the_account_given_up_on_and_counts_the_rest() -> None:
-    """A custom-role edit revokes each holder in turn. The first holder's revoke refused every time
-    is recorded and raised at once, so a failing store costs one account's wait, not one per
-    account; its row counts the holder it did not reach."""
+async def _custom_role_batch(
+    store: MessageStore,
+) -> tuple[Callable[[], Awaitable[None]], list[str]]:
+    """A custom-role edit by alice over holders h1 and h2."""
+    service = AuthService(store, AuthSettings(require_mfa=False))
+    role_id, sessions = await _two_holders_of_a_custom_role(store, service)
+
+    async def edit() -> None:
+        await service.update_custom_role(
+            role_id,
+            display_name="Synthetic",
+            description=None,
+            permissions=["messages:view_summary"],
+            actor="alice",
+        )
+
+    return edit, list(sessions.values())
+
+
+async def _ad_role_map_batch(
+    store: MessageStore,
+) -> tuple[Callable[[], Awaitable[None]], list[str]]:
+    """An AD role-map save by alice over directory accounts h1 and h2."""
+    service = AuthService(store, AuthSettings(require_mfa=False))
+    await service.initialize()  # seeds the role the map names
+    hashes = []
+    for n in ("h1", "h2"):
+        await _directory_user(store, n, f"dir-{n}", f"guid-{n}")
+        hashes += await _sessions(store, n)
+
+    async def save() -> None:
+        await service.set_ad_group_map([(_GROUP, "operator")], actor="alice")
+
+    return save, hashes
+
+
+@pytest.mark.parametrize(
+    "batch",
+    [
+        pytest.param(_custom_role_batch, id="custom_role_edit"),
+        pytest.param(_ad_role_map_batch, id="ad_role_map_save"),
+    ],
+)
+async def test_a_batch_stops_at_the_account_given_up_on_and_counts_the_rest(
+    batch: Callable[[MessageStore], Awaitable[tuple[Callable[[], Awaitable[None]], list[str]]]],
+) -> None:
+    """A custom-role edit or an AD role-map save revokes each account in turn. The first account's
+    revoke refused every time is recorded and raised at once, so a failing store costs one
+    account's wait, not one per account; its row counts the account it did not reach."""
     store = await MessageStore.open(":memory:")
     try:
-        service = AuthService(store, AuthSettings(require_mfa=False))
-        role_id, sessions = await _two_holders_of_a_custom_role(store, service)
+        change, hashes = await batch(store)
         _refusing_for(store, "h1")
         with pytest.raises(StoreAcquireTimeout):
-            await service.update_custom_role(
-                role_id,
-                display_name="Synthetic",
-                description=None,
-                permissions=["messages:view_summary"],
-                actor="alice",
-            )
-        assert await _live(store, list(sessions.values())) == list(sessions.values())
+            await change()
+        assert await _live(store, hashes) == hashes
         [missed] = [
             r for r in await _actions(store) if r["action"] == SESSIONS_REVOKE_FAILED_ACTION
         ]
@@ -354,7 +520,7 @@ async def test_a_defect_is_raised_at_once_and_not_recorded_as_a_refusal() -> Non
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(store, AuthSettings(require_mfa=False))
-        await _account(store, service)
+        await _local_account(store, service)
         calls = [0]
 
         async def broken(user_id: str, **kwargs: Any) -> Any:
