@@ -147,19 +147,24 @@ async def _empty_code_goes_to_reauth(
     the gate would spend it and ``""`` would be checked, writing a false ``auth.mfa_failed`` row
     and drawing the attempt budget (BACKLOG #5931). Declared ahead of the gate, so it runs first.
 
-    A post with no session cookie, under the opt-out (no grant to spend), or with a code returns
-    at once, and the gate answers as before. Otherwise the origin is checked and the gate's base
-    runs, so at least sign-in, must-change, the pending refusal with its audit row and the
-    admin-write charge still apply. The new-address signal is recorded as the gate would. The post
-    then goes to the re-auth with no grant spent and no code checked. That re-auth is still asked
-    for when a grant was held, and mints a fresh grant over it. Starlette caches the body, so the
-    route reads it again."""
-    if not session_token(request) or not auth.action_step_up_required:
+    A post under the opt-out (no grant to spend), or whose cookie signs nothing in, returns at once
+    and the gate answers as before; the session is resolved before the body is read, the console's
+    sign-in-before-body order. A post with a code returns too, before the base, so the gate's base
+    runs once and charges the admin-write budget once. Otherwise the gate's base runs first, so
+    sign-in, must-change, the pending refusal with its audit row, the origin check and the
+    admin-write charge apply in the gate's order, and then the route's own origin check. The
+    new-address signal is recorded as the gate would. The post then goes to the re-auth with no
+    grant spent and no code checked. That re-auth is still asked for when a grant was held, and
+    mints a fresh grant over it. Starlette caches the body, so the route reads it again."""
+    if not auth.action_step_up_required:
+        return
+    # activity=False: a probe, not the request's use of the session; the base refreshes the clock.
+    if await auth.identity_for_token(session_token(request), activity=False) is None:
         return
     if dict(await _form_pairs(request)).get("code", "").strip():
         return
-    assert_same_origin(request)
     await _confirm_gate_base()(request)
+    assert_same_origin(request)
     await auth.flag_new_client_ip(session_token(request), client_ip(request), path=request.url.path)
     raise _reauth_redirect(request, "/ui/account/mfa/confirm")
 

@@ -10,7 +10,7 @@ import time
 
 import httpx
 import pytest
-from _ui_clients import create_local_user_chosen
+from _ui_clients import HEADERLESS_UI_REQUEST, create_local_user_chosen
 from _webui_support import (
     PW,
     _add,
@@ -24,7 +24,7 @@ from _webui_support import (
 from messagefoundry.api import create_app
 from messagefoundry.api.security import is_route_gate
 from messagefoundry.auth import Role, totp
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import STEP_UP_ACTION_MFA_CONFIRM, AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
@@ -38,6 +38,8 @@ from messagefoundry_webconsole.routes import account as account_routes
 # POST (/verify) is body-carrying with a standalone GET form (/confirm) as its unlock re-entry point.
 
 NEW_PW = "another-strong-test-passphrase"
+#: Sent as a program would: no Sec-Fetch-Site, no Origin, so the origin check refuses it.
+HEADERLESS = {HEADERLESS_UI_REQUEST: True}
 
 
 async def test_account_page_renders(engine: Engine) -> None:
@@ -442,9 +444,58 @@ def test_the_empty_code_check_runs_the_verify_gates_own_base(engine: Engine) -> 
         k: v for k, v in copy.items() if k != "pending_refusal"
     }
     real_pending = inspect.getclosurevars(real["pending_refusal"]).nonlocals
-    assert real_pending["action"] == gate_vars["action"]
+    assert gate_vars["action"] == STEP_UP_ACTION_MFA_CONFIRM
+    assert real_pending["action"] == STEP_UP_ACTION_MFA_CONFIRM
     assert real_pending["reauth_next"](None) == "/ui/account/mfa/confirm"
     assert copy["pending_refusal"] is account_routes._refuse_pending_confirm
+
+
+async def test_an_empty_code_from_a_dead_cookie_gets_the_gates_login_redirect(
+    engine: Engine,
+) -> None:
+    """A cookie that signs nothing in gets the gate's login redirect for an empty code exactly as
+    for a real one, never the origin 403: the session is resolved before the body or the origin
+    (the console's sign-in-before-body order, BACKLOG #5931).
+
+    RED when: the empty-code check reads the body or checks the origin before the session."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        c.cookies.set("mf_session", "not-a-session-token")
+        answers = []
+        for data in ({"code": "123456"}, {"code": ""}, {}):
+            r = await c.post("/ui/account/mfa/verify", data=data, extensions=HEADERLESS)
+            answers.append((r.status_code, r.headers.get("location")))
+        assert answers[0][0] == 303 and answers[0][1] is not None
+        assert answers[0][1].startswith("/ui/login")
+        assert answers[1] == answers[0] and answers[2] == answers[0]
+
+
+async def test_an_empty_code_from_a_must_change_session_gets_its_confinement(
+    engine: Engine,
+) -> None:
+    """A must-change session posting an empty code with no Origin is sent to its change-password
+    page, as the gate sends it for a real code, not refused by the origin check first (BACKLOG
+    #5931).
+
+    RED when: the empty-code check runs the origin check before the gate's base."""
+    service = await _service(engine)
+    await create_local_user_chosen(
+        service,
+        username="fresh",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[Role.VIEWER.value],
+        actor="test",
+    )  # create_local_user leaves must_change_password=True
+    async with _client(engine, service) as c:
+        r = await _cookie_login(c, "fresh")
+        assert r.headers["location"] == "/ui/account/password"
+        for data in ({"code": "123456"}, {"code": ""}, {}):
+            r = await c.post("/ui/account/mfa/verify", data=data, extensions=HEADERLESS)
+            assert r.status_code == 303, data
+            assert r.headers["location"] == "/ui/account/password", data
 
 
 async def test_an_empty_code_under_the_opt_out_is_checked_as_before(engine: Engine) -> None:
