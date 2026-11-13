@@ -2020,8 +2020,11 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         """Wire (or clear) the #144 (ADR 0128) connection-control callback. The ``api/app.py`` lifespan
         calls this once the engine/runner exist, since :func:`notifier_from_settings` builds the sink
         before them. The sink NEVER imports :class:`RegistryRunner` — the callback is injected DOWN.
-        None disables control actions (a ``control_action`` rule then no-ops, logged)."""
+        None disables control actions (a ``control_action`` rule then no-ops, logged). Wiring a
+        callback ends a :meth:`stop_control`, so a later clear logs as a wiring fault again."""
         self._control_cb = cb
+        if cb is not None:
+            self._control_stopped = False
 
     def set_delivery_observer(self, observer: Callable[[str, dict[str, Any]], None] | None) -> None:
         """Wire (or clear) a callback told ``(transport name, event)`` each time a transport's send
@@ -2512,31 +2515,33 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     # --- #144 (ADR 0128) connection-control action (off-worker, never-raise) --
 
-    async def stop_control(self) -> None:
-        """End connection control for shutdown (BACKLOG #5909): clear the callback, so no later
-        rule dispatches a control task, then cancel every control task still running and wait for
-        it to end. A task dispatched before the clear holds the callback it captured, so clearing
-        alone would leave its restart running into the engine's stop. The lifespan calls this
-        before engine.stop(); :meth:`aclose` calls it again, which is then a no-op."""
+    def stop_control(self) -> None:
+        """Clear the control callback for shutdown (BACKLOG #5909), so no rule fires a restart
+        from here on, and a rule that would have logs that the engine is shutting down rather
+        than a wiring fault. A control task dispatched before this keeps running: cancelling a
+        restart partway could leave a listener the runner no longer tracks, so it is left to
+        finish, and the runner's stop waits for it on the reload lock. :meth:`aclose` cancels any
+        still running once the engine has stopped."""
         self._control_cb = None
         self._control_stopped = True
-        pending = [task for task in self._control_tasks if not task.done()]
-        for task in pending:
-            task.cancel()
-        if pending:
-            log.warning(
-                "%d alert control_action task(s) still running at shutdown were cancelled",
-                len(pending),
-            )
-            await asyncio.gather(*pending, return_exceptions=True)
 
     async def aclose(self) -> None:
-        """Drain and stop the delivery task, then end connection control (:meth:`stop_control`),
-        so no control task outlives the sink. Runs even when the sink was never started."""
+        """Drain and stop the delivery task, then cancel every control task still running and wait
+        for it to end (BACKLOG #5909), so none outlives the sink. The lifespan closes this sink
+        after engine.stop(), so such a task can only meet a stopped runner. Runs even when the sink
+        was never started."""
         try:
             await super().aclose()
         finally:
-            await self.stop_control()
+            pending = [task for task in self._control_tasks if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                log.warning(
+                    "%d alert control_action task(s) still running at shutdown were cancelled",
+                    len(pending),
+                )
+                await asyncio.gather(*pending, return_exceptions=True)
 
     def _dispatch_control(self, action: str, target: str, *, default_target: bool) -> None:
         """Schedule the injected connection-control callback OFF the delivery worker (a fire-and-forget

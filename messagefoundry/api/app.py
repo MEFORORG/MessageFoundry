@@ -1679,16 +1679,16 @@ def _managed_teardown_steps(
     if notifier is not None:
         # BACKLOG #5909: a control_action rule firing on an alert the engine's own stop raises must
         # not restart a listener or worker on the runner being stopped. The runner refuses that
-        # itself once stopped (BACKLOG #5702), but a restart already under way when the stop
-        # begins holds the runner's reload lock, which the stop then waits on. So the callback is
-        # cleared and every control task still running is cancelled and awaited first. Never cut,
-        # as engine.stop() is not: a cut would leave the restart holding the lock the stop waits
-        # on, and the NSSM window has no room for another cut grace.
+        # itself once stopped (BACKLOG #5702); clearing the callback first means no restart is
+        # attempted. A restart already under way is left to finish, since the stop waits for it
+        # on the reload lock and a cancel partway could strand a listener; the notifier's close
+        # below cancels any control task still running. A synchronous call cannot overrun, so it
+        # is never cut and adds no cut grace to the budget.
         steps.append(
             _TeardownStep(
                 "the alert control callback's removal",
                 0.0,
-                lambda _b: notifier.stop_control(),
+                _sync(lambda: notifier.stop_control()),
                 bounded=False,
             )
         )
@@ -1730,8 +1730,8 @@ async def _unwind_failed_start(store: Store, notifier: NotifierAlertSink | None)
     an alert raised before it would normally have started (the reason the start failed) is sent.
     Its drain is never cut, as the per-span guards this replaced never cut it: a failed start has
     no stop window to fit, and each transport bounds its own send. Its alert-state writes are then
-    given the bounded drain engine.stop() gives them, so the alert that explains the refusal is
-    recorded before the store closes."""
+    given a bounded drain, as engine.stop() gives them, so the alert that explains the refusal is
+    recorded before the store closes. The budget below bounds only that drain."""
     steps: list[_TeardownStep] = []
     if notifier is not None:
 

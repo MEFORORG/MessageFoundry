@@ -285,11 +285,7 @@ async def test_the_control_callback_removal_stops_control_on_its_own_notifier() 
     """BACKLOG #5909: the step ends connection control on the notifier it was built for, and is
     never cut, so it adds no cut grace to the NSSM window the test below counts."""
     stopped: list[str] = []
-
-    async def _stop_control() -> None:
-        stopped.append("stop_control")
-
-    notifier: Any = SimpleNamespace(stop_control=_stop_control)
+    notifier: Any = SimpleNamespace(stop_control=lambda: stopped.append("stop_control"))
     steps = _every_managed_step(harness=False, notifier=notifier)
     [step] = [s for s in steps if s.label == "the alert control callback's removal"]
     assert not step.bounded
@@ -595,7 +591,7 @@ async def test_an_engine_stop_that_raises_does_not_skip_the_steps_after_it(
 
 
 async def test_control_is_stopped_before_engine_stop_runs(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #5909: the managed lifespan wires the notifier's control callback after
     engine.start() and, before this, never cleared it, so a control_action rule firing on an alert
@@ -607,35 +603,28 @@ async def test_control_is_stopped_before_engine_stop_runs(
         alerts_settings=AlertsSettings(),
         egress_settings=EgressSettings(deny_by_default=False),
     )
-    seen_at_stop: list[tuple[object, bool]] = []
-    entered = asyncio.Event()
+    seen_at_stop: list[tuple[object, int]] = []
+    caplog.set_level(logging.INFO, logger="messagefoundry.pipeline.alert_sinks")
     async with app.router.lifespan_context(app):
         # The control: the lifespan wired a callback for the running engine.
         assert notifier._control_cb is not None
         engine = app.state.engine
         real_stop = engine.stop
-        wired = notifier._control_cb
-
-        async def _hung_restart(action: str, target: str, *, default_target: bool) -> None:
-            entered.set()
-            await asyncio.Event().wait()
-
-        # A restart dispatched before the shutdown, still running when it begins. It holds the
-        # callback it captured, so clearing the callback alone would not stop it.
-        notifier._control_cb = _hung_restart
-        notifier._dispatch_control("restart", "IB_TEST_ADT", default_target=False)
-        [inflight] = list(notifier._control_tasks)
-        notifier._control_cb = wired
-        await asyncio.wait_for(entered.wait(), _WAIT_S)
 
         async def _stop() -> None:
-            seen_at_stop.append((notifier._control_cb, inflight.done()))
+            # A control_action rule firing on an alert the stop raises, as the sink's decision
+            # path dispatches it.
+            notifier._dispatch_control("restart", "IB_TEST_ADT", default_target=False)
+            seen_at_stop.append((notifier._control_cb, len(notifier._control_tasks)))
             await real_stop()
 
         engine.stop = _stop
-    assert seen_at_stop == [(None, True)], (
-        "engine.stop() ran with the control callback wired or a control task still running"
+    assert seen_at_stop == [(None, 0)], (
+        "engine.stop() ran with the control callback wired, so the rule dispatched a restart"
     )
+    # Logged as the shutdown it is, not as a missing wiring.
+    assert "not run: shutting down" in caplog.text
+    assert "no control callback is wired" not in caplog.text
 
 
 async def test_the_notifier_close_cancels_a_control_task_still_running() -> None:
@@ -656,6 +645,20 @@ async def test_the_notifier_close_cancels_a_control_task_still_running() -> None
     await asyncio.wait_for(sink.aclose(), _WAIT_S)
     assert task.cancelled()
     assert not sink._control_tasks
+
+
+def test_wiring_a_callback_again_ends_the_shutdown_clear() -> None:
+    """A sink whose control was stopped and then wired again logs a later clear as the wiring
+    fault it is, not as a shutdown."""
+    sink = NotifierAlertSink([])
+
+    async def _cb(action: str, target: str, *, default_target: bool) -> None:
+        return None
+
+    sink.stop_control()
+    assert sink._control_stopped
+    sink.set_control_callback(_cb)
+    assert not sink._control_stopped
 
 
 async def test_the_retention_runner_s_stop_waits_less_than_its_step_s_bound(

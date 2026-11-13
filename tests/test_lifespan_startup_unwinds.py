@@ -322,6 +322,7 @@ async def test_a_cancel_in_an_unguarded_startup_span_closes_the_store_and_notifi
         assert opened.store_closed, "a cancel left the store open"
         assert opened.notifier is not None and opened.notifier._task is None
         assert opened.notifier_drained
+        assert opened.state_drained_after_close
         assert opened.engine_stops == 0
     finally:
         await _close_leftovers(opened)
