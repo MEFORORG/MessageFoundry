@@ -367,8 +367,10 @@ _DIRECTORY_REACH_MASK = _REACH_MASK | 0x00000040  # FILE_DELETE_CHILD
 #: Rights on the directory that HOLDS a key file that let their holder replace the file: delete it
 #: whatever its own access list says (FILE_DELETE_CHILD), or give itself that right (WRITE_DAC,
 #: WRITE_OWNER; GENERIC_ALL holds all three). Narrower than :data:`_DIRECTORY_REACH_MASK` on
-#: purpose: listing, traversing and adding a file replace nothing, and ordinary folders grant Users
-#: those, ``C:\\ProgramData`` included (vault BACKLOG #5657).
+#: purpose: listing, traversing and adding a file do not remove a file already there, and ordinary
+#: folders grant Users those, ``C:\\ProgramData`` included (vault BACKLOG #5657). So a file a broad
+#: group added before the engine first looked, or a holder it renamed away with DELETE, is not
+#: caught here; ``docs/PHI.md`` section 2 says so.
 _HOLDER_REPLACE_MASK = (
     0x00000040  # FILE_DELETE_CHILD
     | 0x00040000  # WRITE_DAC
@@ -610,7 +612,10 @@ def _posix_ancestor_link_problem(path: Path) -> str | None:
     #5656). Each folder is read with ``lstat``, from the root down, the last part left out: the
     caller reads that itself. Nothing is normalized first, because ``..`` after a link leads where
     the link's target says; a folder already read is no link, so ``..`` after it is lexical."""
-    full = path if path.is_absolute() else Path(os.getcwd()) / path
+    try:
+        full = path if path.is_absolute() else Path(os.getcwd()) / path
+    except OSError as exc:  # a working directory that was removed
+        return f"its path could not be examined ({exc.strerror or type(exc).__name__})"
     folder = Path(full.anchor)
     for name in full.parts[1:-1]:
         folder /= name

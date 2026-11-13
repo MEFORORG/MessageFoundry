@@ -775,7 +775,7 @@ def test_a_secrets_directory_beneath_a_junction_or_a_link_is_refused(tmp_path: P
     """Vault BACKLOG #5656 and #5657: the check read the directory alone, never the folders on its
     path, so one reached through a junction or a link passed."""
     real = tmp_path / "real"
-    real.mkdir()
+    real.mkdir(mode=0o700)  # owner-only whatever the umask, so the POSIX holder rule passes it
     directory = _directory(real)
     _put(directory, "MEFOR_STORE_PASSWORD", _FROM_FILE)
     opened = open_secrets_directory(_env(directory))  # the control

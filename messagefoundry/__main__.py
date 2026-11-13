@@ -7951,7 +7951,8 @@ def _store_key_file_gate(settings: ServiceSettings, *, enforcing: bool) -> bool:
         what="the store key file named by [store].encryption_key_file",
         remedy=(
             "Restrict it to the account the engine runs as, SYSTEM and Administrators, or write "
-            "the key again with `messagefoundry protect-key` to a new path"
+            "the key again with `messagefoundry protect-key` to a new path in a folder no broad "
+            "group may delete a file in, with no junction or link on its path"
         ),
         enforcing=enforcing,
     )
@@ -7972,9 +7973,10 @@ def _engine_account_name() -> str:
 
 
 def _generated_tls_key_remedy(state_dir: Path) -> str:
-    """What :func:`_generated_tls_key_gate` tells the operator to do. On POSIX it also covers the
-    store directory the key sits in, which the check judges there and nowhere else (vault BACKLOG
-    #5636), with the path shell-quoted so the command can be pasted as printed."""
+    """What :func:`_generated_tls_key_gate` tells the operator to do. It also covers the store
+    directory the key sits in, which the check judges on every platform (vault BACKLOG #5636,
+    #5657): on POSIX with the commands to fix its mode and owner, the path shell-quoted so they can
+    be pasted as printed, and on Windows in words, since a new pair would land in it again."""
     import shlex
 
     remedy = (
@@ -7988,6 +7990,13 @@ def _generated_tls_key_remedy(state_dir: Path) -> str:
             f"Where it names the directory's mode, remove the write bits: chmod go-w {directory}. "
             "Where it names the directory's owner, give it to the account the engine runs as: "
             f"chown {shlex.quote(_engine_account_name())} {directory}. "
+        )
+    else:
+        remedy += (
+            "Where the refusal names the directory that holds it, or a folder on its path, that is "
+            "the store's directory: remove a broad group's right to delete files in it or change "
+            "its access list, or keep the store where no junction or link is on its path, since "
+            "a new pair would be minted there again. "
         )
     return remedy + (
         "If the volume itself widens the file on every mount, "

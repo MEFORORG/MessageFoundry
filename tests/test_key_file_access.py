@@ -281,7 +281,7 @@ def test_a_key_beneath_a_junction_or_a_link_is_refused(tmp_path: Path) -> None:
     """Vault BACKLOG #5656 and #5657: the check judged the key file, and on POSIX the directory a
     link led to, but never the folders on its path. A junction needs no privilege on Windows."""
     real = tmp_path / "real"
-    real.mkdir()
+    real.mkdir(mode=0o700)  # owner-only whatever the umask, so the POSIX holder rule passes it
     key = _key(real / "client.key", broad=False)
     assert connection_key_file_problem(_soap_graph(key), {}) is None  # the control
     linked = tmp_path / "linked"

@@ -625,9 +625,11 @@ def test_a_key_file_whose_owner_could_not_be_read_is_refused() -> None:
     assert "its owner could not be read" in str(restricted_file._windows_access_problem(listed))
 
 
-def test_a_holder_like_programdata_or_a_data_drive_lets_no_broad_group_replace_a_key() -> None:
+def test_a_holder_like_programdata_or_a_data_drive_holds_no_right_the_holder_rule_refuses() -> None:
     """The controls for the holder refusals below: listing, traversing, adding a file, and the
-    Modify a data drive's root hands Authenticated Users, delete no file in the directory."""
+    Modify a data drive's root hands Authenticated Users, delete no file already in the directory.
+    Modify does carry DELETE, which lets its holder rename the directory away; the rule does not
+    read that, and docs/PHI.md section 2 says so."""
     assert restricted_file._windows_holder_problem(_security(*_PROGRAMDATA_ACES)) is None
     modify = _security((_ALLOW, _FULL, _SYSTEM), (_ALLOW, 0x001301BF, "S-1-5-11"))
     assert restricted_file._windows_holder_problem(modify) is None
@@ -1644,6 +1646,8 @@ def test_the_generated_key_remedy_names_the_store_dir_on_posix_only(
     assert "[store].path" not in remedy
     if platform == "win32":
         assert "chmod" not in remedy and "chown" not in remedy
+        # The Windows check judges the store directory too (vault BACKLOG #5657).
+        assert "the store's directory" in remedy and "junction" in remedy
     else:
         # The space makes shlex quote the whole path; Path spells the separators per host.
         quoted = f"'{Path('/srv/mefor data')}'"

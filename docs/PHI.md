@@ -423,13 +423,18 @@ than a path is not checked
   list or take it over (`FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`), or when
   its owner is such a group or cannot be read. A right to list or traverse the directory, or to add
   a file to it, is not refused, so a store directory the engine makes under `C:\ProgramData`, which
-  inherits that folder's grant to Users, passes. A walk that reaches a network share stops there:
-  the share's folders are not walked, and the file's own access list is still read. A walk that
-  stops for any other reason, such as a folder it cannot read, is refused. It does not read, at
-  least: whether a broad group may rename the directory that holds the file or a folder above it
-  (`DELETE` on that folder, as a data drive's root often grants Authenticated Users, or
-  `FILE_DELETE_CHILD` on the folder above), the access lists of the folders above the one that
-  holds the file, or what one named account may do to any of them. Restrict those folders yourself.
+  inherits that folder's grant to Users, passes. A path spelled as a network share
+  (`\\host\share\...`) is walked no further than the share, so a junction behind it is not seen,
+  `\\localhost\C$\...` included; the file's own access list is still read. A mapped drive letter
+  is walked like a local volume. A walk that stops for any other reason, such as a folder it
+  cannot read, is refused. An inherit-only entry on the directory is read as if it applied to the
+  directory itself, so such an entry granting a broad group one of those rights refuses it too. It
+  does not read, at least: whether a broad group may rename the directory that holds the file or a
+  folder above it (`DELETE` on that folder, as a data drive's root often grants Authenticated
+  Users, or `FILE_DELETE_CHILD` on the folder above); a file a broad group added to the directory,
+  which the add-file right it may hold allows, before the engine first minted its own TLS pair
+  there, which the engine would then reuse; the access lists of the folders above the one that
+  holds the file; or what one named account may do to any of them. Restrict those folders yourself.
 - On POSIX the check refuses a key file whose own name is a link, one owned by an account other
   than the engine's own or root, one whose mode has a group or other read or write bit, whoever is
   in the group, and one held in a directory that another account owns or that a group or other may
