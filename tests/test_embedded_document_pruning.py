@@ -17,10 +17,14 @@ for parity (AC-4): SQLite always; Postgres / SQL Server skipif-gated on ``MEFOR_
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
-from collections.abc import AsyncIterator
+import sqlite3
+import threading
+from collections.abc import AsyncIterator, Callable
+from typing import Any
 
 import pytest
 
@@ -33,7 +37,8 @@ from messagefoundry.config.wiring import (
 from messagefoundry.parsing import binary
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.retention import RetentionRunner
-from messagefoundry.store import MessageStore
+from messagefoundry.store import MessageStore, document_strip
+from messagefoundry.store.document_strip import StripResult
 
 DAY = 86_400.0
 PRUNED_AT = 1_700_000_000.0
@@ -52,6 +57,7 @@ def _hl7_with_ed() -> str:
 
 
 HL7_ED_BODY = _hl7_with_ed()
+_DB_NAME = "embedded_doc_pruning.db"
 
 
 # --- backend fixtures (SQLite always; PG/SQLServer skipif-gated) ---------------
@@ -67,7 +73,7 @@ _MSSQL = pytest.mark.skipif(
 
 
 async def _open_sqlite(tmp_path) -> MessageStore:
-    return await MessageStore.open(tmp_path / "embedded_doc_pruning.db")
+    return await MessageStore.open(tmp_path / _DB_NAME)
 
 
 async def _open_postgres(_tmp_path):  # pragma: no cover - only runs when gated on
@@ -332,6 +338,145 @@ async def test_unreadable_delimiters_skip_is_logged_once_per_strip_call(
     assert str(readable) not in text
     for piece in ("SEND", "RECV", "MSG0001", "ORU", "^~", DOC.decode()[:20], "C-UNR"):
         assert piece not in text, piece
+
+
+# --- BACKLOG #5651: the write-back is guarded, batched, and off the loop --------
+
+
+def _spy_strip(monkeypatch: pytest.MonkeyPatch, before: Callable[[], None]) -> list[int]:
+    """Wrap ``strip_documents`` so ``before`` runs ahead of each call, on whatever thread the strip
+    runs it on, and return the thread idents the calls ran on."""
+    real = binary.strip_documents
+    threads: list[int] = []
+
+    def spy(*args: Any, **kwargs: Any) -> tuple[str, int, int]:
+        threads.append(threading.get_ident())
+        before()
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(document_strip, "strip_documents", spy)
+    return threads
+
+
+async def _rewrite_raw_sql(store: Any, mid: str, value: str) -> None:
+    """Set one stored ``raw`` cell, as another writer would, on a server backend."""
+    async with store._pool.acquire() as conn:
+        if type(store).__name__ == "PostgresStore":
+            await conn.execute("UPDATE messages SET raw=$1 WHERE id=$2", value, mid)
+            return
+        cur = await conn.cursor()
+        await cur.execute("UPDATE messages SET raw=? WHERE id=?", (value, mid))
+        await conn.commit()
+
+
+def _concurrent_writer(
+    store: Any, tmp_path: Any, mid: str, value: str, loop: asyncio.AbstractEventLoop
+) -> Callable[[], None]:
+    """A callable that, the first time it runs, commits ``raw = value`` for ``mid`` as a separate
+    writer: called from inside the strip's transform, it lands between the strip's read of that row
+    and its write-back."""
+    done: list[bool] = []
+    loop_thread = threading.get_ident()
+
+    def write() -> None:
+        if done:
+            return
+        done.append(True)
+        if isinstance(store, MessageStore):
+            with sqlite3.connect(tmp_path / _DB_NAME, timeout=30) as db:
+                db.execute("UPDATE messages SET raw=? WHERE id=?", (value, mid))
+            return
+        if threading.get_ident() == loop_thread:
+            pytest.fail("the strip ran its transform on the event loop thread")
+        asyncio.run_coroutine_threadsafe(_rewrite_raw_sql(store, mid, value), loop).result(30)
+
+    return write
+
+
+@pytest.mark.parametrize(
+    "after",
+    [
+        pytest.param("", id="body-purged"),
+        pytest.param(binary.encode(b"RE-SEALED-SYNTHETIC " * 300), id="body-re-sealed"),
+    ],
+)
+async def test_a_write_between_the_strips_read_and_write_back_wins(
+    store: MessageStore, tmp_path: Any, monkeypatch: pytest.MonkeyPatch, after: str
+) -> None:
+    """BACKLOG #5651: a body purge (``raw`` emptied) or a key rotation (``raw`` re-sealed) that
+    commits after the strip read a row and before it writes the row back wins. The strip must not
+    write the stripped copy of the old body over it, must not set the row's ``documents_pruned``
+    flag, and must not count it. The other writer runs from inside the strip's own transform, so the
+    interleaving is forced rather than left to a scheduler."""
+    mid = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=0.0, control="C-RACE")
+    _spy_strip(
+        monkeypatch, _concurrent_writer(store, tmp_path, mid, after, asyncio.get_running_loop())
+    )
+
+    result = await store.strip_embedded_documents(
+        older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+    )
+
+    assert result == StripResult()
+    rec = await _get(store, mid)
+    assert rec["raw"] == after  # the other writer's value stands
+    assert rec["documents_pruned"] is None
+
+
+async def test_the_transform_runs_off_the_event_loop(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5651: the decrypt, strip and encrypt of a pass run in a worker thread, never on the
+    event loop thread."""
+    await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=0.0, control="C-THREAD")
+    threads = _spy_strip(monkeypatch, lambda: None)
+
+    result = await store.strip_embedded_documents(
+        older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+    )
+
+    assert result.messages_stripped == 1
+    assert threads and threading.get_ident() not in threads
+
+
+async def test_the_scan_reads_candidates_in_bounded_keyset_batches(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5651: the pass reads at most ``STRIP_BATCH_ROWS`` candidates at a time and walks the
+    whole candidate set by id, so every eligible row is still stripped and counted once. An
+    in-flight row and a row on a keep-forever connection, among them, stay as stored."""
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 2)
+    batches: list[int] = []
+    real = document_strip.transform_strip_batch
+
+    def spy(cipher: Any, rows: Any, **kwargs: Any) -> Any:
+        batches.append(len(rows))
+        return real(cipher, rows, **kwargs)
+
+    monkeypatch.setattr(document_strip, "transform_strip_batch", spy)
+    eligible = [
+        await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=0.0, control=f"C-B{i}")
+        for i in range(5)
+    ]
+    in_flight = await store.enqueue_message(
+        channel_id="IB", raw=MFB64_BODY, deliveries=[("OB", "p")], control_id="C-BINF", now=0.0
+    )
+    kept = await _delivered(store, channel_id="IB_KEEP", raw=MFB64_BODY, now=0.0, control="C-BK")
+
+    result = await store.strip_embedded_documents(
+        older_than=float("-inf"),
+        now=PRUNED_AT,
+        connection_cutoffs={"IB": 4 * DAY, "IB_KEEP": float("-inf")},
+    )
+
+    assert (result.messages_stripped, result.documents_stripped) == (5, 5)
+    # Five eligible rows and the keep-forever row pass the loose scan bound; the in-flight row never.
+    assert batches and max(batches) <= 2 and sum(batches) == 6
+    for mid in eligible:
+        assert binary.is_document_tombstone((await _get(store, mid))["raw"])
+    for mid in (in_flight, kept):
+        rec = await _get(store, mid)
+        assert rec["raw"] == MFB64_BODY and rec["documents_pruned"] is None
 
 
 # --- AC-5: one audit row per pass via the runner, recording counts -------------
