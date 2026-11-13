@@ -75,7 +75,6 @@ __all__ = [
     "must_enrol_first",
     "oidc_flow_cookie_name",
     "reauth_landing",
-    "refuse_unless_ui_action_proof_held",
     "register_ui_action",
     "rekey_continuations",
     "rotation_comes_first",
@@ -1529,25 +1528,14 @@ async def ui_action_proof_held(request: Request, action: str) -> bool:
     WITHOUT spending anything: the session holds the live grant, or the org opted out and the
     window is fresh. ``True`` with no auth service, as the gates are no-ops then.
 
-    For a page that collects input for a body-carrying POST, so it can ask for the proof before
-    the operator types rather than drop what they typed (BACKLOG #5931). The gate's new-client-IP
-    refusal is not run, because it records the address, so a submit from a new address can still
-    be sent to re-auth."""
+    For a page that would render a form for a body-carrying POST, so it can offer the re-auth
+    before the operator types rather than drop what they typed (BACKLOG #5931). Decides only what
+    renders: the gate still spends the proof. Its new-client-IP refusal is not run here, because it
+    records the address, so a submit from a new address can still be sent to re-auth."""
     auth = get_auth(request)
     return auth is None or await _ui_action_step_up_ok(
         auth, session_token(request), action, spend=False
     )
-
-
-async def refuse_unless_ui_action_proof_held(request: Request, action: str) -> None:
-    """Send an action-bound unlock page's GET to ``/ui/reauth`` while its proof is not held.
-
-    The refusal a non-spending gate on the page would make: it issues this page as the
-    continuation, exactly as :func:`_reauth_redirect` does for a gate, so the re-auth mints the
-    grant and lands back here, where the proof is then held and the page renders. Spends nothing,
-    so it cannot loop the way a spending gate on the page would (ADR 0077)."""
-    if not await ui_action_proof_held(request, action):
-        raise _reauth_redirect(request)
 
 
 async def _refuse_from_new_address(

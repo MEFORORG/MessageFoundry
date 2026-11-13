@@ -36,10 +36,6 @@ from messagefoundry.pipeline import Engine
 
 NEW_PW = "another-strong-test-passphrase"
 
-#: The link a page shows in place of the confirm-code form while the session holds no MFA_CONFIRM
-#: proof (BACKLOG #5931).
-_CONFIRM_LINK = 'href="/ui/account/mfa/confirm"'
-
 
 async def test_account_page_renders(engine: Engine) -> None:
     service = await _service(engine)
@@ -182,13 +178,13 @@ async def test_mfa_enroll_confirm_disable_lifecycle(engine: Engine) -> None:
             await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
         ).status_code == 303
         await _mint_action(c, "/ui/account/mfa/enroll")
-        # Enroll: stages a secret and renders it once. The enroll proof is spent, so the page links
-        # to the confirm re-auth in place of a code form that would drop the code (BACKLOG #5931).
+        # Enroll: stages a secret and renders it once. The enroll proof is spent, so the page posts
+        # a code-less Continue to the confirm gate in place of a code form that would drop the code
+        # (BACKLOG #5931).
         r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
         assert r.status_code == 200
         assert "Secret:" in r.text and "otpauth://" in r.text
-        assert _CONFIRM_LINK in r.text
-        assert 'action="/ui/account/mfa/verify"' not in r.text
+        assert 'action="/ui/account/mfa/verify"' in r.text and 'name="code"' not in r.text
         uid = await _uid(service, "op")
         secret = await service.store.get_totp_secret(uid)
         # The staged secret is what the page shows: the bare key, without the parameters the cell
@@ -271,18 +267,10 @@ async def test_mfa_confirm_form_is_unlock_reentry(engine: Engine) -> None:
         await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
         uid = await _uid(service, "op")
         secret = await service.store.get_totp_secret(uid)
-        # No confirm proof yet: the page sends the operator to the re-auth before taking a code
-        # the verify gate would drop (BACKLOG #5931).
-        r = await c.get("/ui/account/mfa/confirm", headers={"Sec-Fetch-Site": "same-origin"})
-        assert r.status_code == 303
-        assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/confirm"
-        # With the proof held, the page is the code form, and rendering it spends nothing.
-        await _mint_action(c, "/ui/account/mfa/confirm")
-        for _ in range(2):
-            r = await c.get("/ui/account/mfa/confirm")
-            assert r.status_code == 200
-            assert secret is not None and secret not in r.text  # the secret is never re-shown
-            assert 'action="/ui/account/mfa/verify"' in r.text
+        r = await c.get("/ui/account/mfa/confirm")
+        assert r.status_code == 200
+        assert secret is not None and secret not in r.text  # the secret is never re-shown
+        assert 'action="/ui/account/mfa/verify"' in r.text
 
 
 async def test_first_enrolment_code_is_accepted_after_the_confirm_reauth(engine: Engine) -> None:
@@ -291,7 +279,8 @@ async def test_first_enrolment_code_is_accepted_after_the_confirm_reauth(engine:
 
     RED when: the enroll page renders the code form while the session holds no MFA_CONFIRM grant,
     so the code posts into the confirm gate, which 303s to re-auth and drops it. Driven through the
-    page's own link, with no test-side continuation, so the confirm page's GET is what issued it."""
+    page's own Continue button, with no test-side continuation, so the gate's refusal of that
+    code-less post is what issued it."""
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
@@ -299,9 +288,9 @@ async def test_first_enrolment_code_is_accepted_after_the_confirm_reauth(engine:
         await _mint_action(c, "/ui/account/mfa/enroll")
         r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
         assert r.status_code == 200 and "Secret:" in r.text
-        assert _CONFIRM_LINK in r.text and "It is not shown again." in r.text
         assert 'name="code"' not in r.text  # nowhere to type a code the gate would drop
-        r = await c.get("/ui/account/mfa/confirm", headers={"Sec-Fetch-Site": "same-origin"})
+        assert 'action="/ui/account/mfa/verify"' in r.text and ">Continue<" in r.text
+        r = await c.post("/ui/account/mfa/verify", headers={"Sec-Fetch-Site": "same-origin"})
         assert r.status_code == 303
         assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/confirm"
         # The re-auth page continues (a password form, not the open-it-from-the-console page).
@@ -358,8 +347,8 @@ async def test_enrolment_still_takes_two_separate_single_use_proofs(engine: Engi
         assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/confirm"
         user = await service.store.get_user(uid)
         assert user is not None and not user.totp_enabled
-        # Proof 2 is single-use: a refused code spends it, and the re-rendered page links back to
-        # the confirm page (and so to a fresh re-auth) rather than taking a code the gate would drop.
+        # Proof 2 is single-use: a refused code spends it, and the re-rendered page offers the
+        # Continue to a fresh re-auth rather than taking a code the gate would drop.
         await _mint_action(c, "/ui/account/mfa/confirm")
         r = await c.post(
             "/ui/account/mfa/verify",
@@ -367,7 +356,7 @@ async def test_enrolment_still_takes_two_separate_single_use_proofs(engine: Engi
             headers={"Sec-Fetch-Site": "same-origin"},
         )
         assert r.status_code == 400 and "Invalid code." in r.text
-        assert _CONFIRM_LINK in r.text and 'name="code"' not in r.text
+        assert ">Continue<" in r.text and 'name="code"' not in r.text
         r = await c.post(
             "/ui/account/mfa/verify",
             data={"code": _totp_not_near_a_step_boundary(secret)},
@@ -397,11 +386,17 @@ async def test_enroll_page_keeps_the_code_form_under_the_opt_out(engine: Engine)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
         r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
-        assert r.status_code == 200 and 'action="/ui/account/mfa/verify"' in r.text
-        assert _CONFIRM_LINK not in r.text
+        assert r.status_code == 200 and 'name="code"' in r.text
         uid = await _uid(service, "op")
         secret = await service.store.get_totp_secret(uid)
         assert secret is not None
+        # A wrong code keeps the form too: the window still holds, so no re-auth is owed.
+        r = await c.post(
+            "/ui/account/mfa/verify",
+            data={"code": "badcod"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 400 and 'name="code"' in r.text
         r = await c.post(
             "/ui/account/mfa/verify",
             data={"code": _totp_not_near_a_step_boundary(secret)},
