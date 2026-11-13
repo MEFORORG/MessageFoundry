@@ -38,6 +38,8 @@ from messagefoundry.store.backup_codec import decrypt_stream, encrypt_stream
 from messagefoundry.store.crypto import (
     CipherError,
     UnauthenticatedCipherError,
+    UnmarkedCipherError,
+    cell_aad,
     generate_key,
     make_cipher,
 )
@@ -595,7 +597,11 @@ def test_a_decrypt_miss_renders_the_cipher_error_token_restore_verify_reads() ->
     with pytest.raises(CipherError) as corrupt:
         reader.decrypt(sealed.rsplit(":", 1)[0] + ":AAAA", aad=aad)
     assert type(corrupt.value) is CipherError
-    for err in (miss.value, corrupt.value):
+    # BACKLOG #5650 gave the unmarked-value refusal its own subclass too; it keeps the token.
+    with pytest.raises(CipherError) as unmarked:
+        reader.decrypt("PID|1||SYNTH-0001", aad=cell_aad("messages", "raw", "m1"))
+    assert type(unmarked.value) is UnmarkedCipherError
+    for err in (miss.value, corrupt.value, unmarked.value):
         name = type(err).__name__
         rendered = safe_exc(err)
         assert rendered.startswith(f"{name}: "), rendered

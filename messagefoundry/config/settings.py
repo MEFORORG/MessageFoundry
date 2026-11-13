@@ -10361,10 +10361,10 @@ def security_loosenings(
     :func:`messagefoundry.serviceenv.service_env_posture`: whether the engine runs under an NSSM
     Windows service, whether its registry-held environment lists could be read, and whether a
     store key reaches it through its environment. An engine secret in those lists refuses the
-    start of ``serve`` and ``supervise``, which never reach this registry then; an engine neither
-    started names what they refuse here as ``secret_in_service_environment``, where it finds its
-    service. ``None`` has the
-    meaning it has for ``remote_debug``.
+    start of ``serve`` and ``supervise``, and the build of ``create_app`` and
+    ``create_managed_app``, which never reach this registry then; a caller that reads it with no
+    refusal of its own gets what they refuse as ``secret_in_service_environment``, where the
+    engine finds its service. ``None`` has the meaning it has for ``remote_debug``.
 
     The sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares

@@ -256,16 +256,26 @@ async def test_sqlserver_rotate_reads_its_output_rowset_not_the_row_count(
 
 _OWNER_READ = "SELECT user_id FROM sessions WHERE token_hash=?"
 _ACCOUNT_LOCK = "SELECT id FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?"
+_ACCOUNT_SHARE = "SELECT id FROM users WITH (HOLDLOCK, ROWLOCK) WHERE id=?"
+_ACCOUNT_DELETE_LOCK = "SELECT id FROM users WITH (XLOCK, ROWLOCK) WHERE id=?"
+
+
+#: Each session write that rewrites the whole row, ``user_id`` included, through
+#: ``_write_session_txn``.
+_SESSION_REWRITES = ("rotate_session", "mark_session_reauthed", "mark_session_mfa_verified")
 
 
 @pytest.mark.parametrize("owner", [None, "u"])
-async def test_sqlserver_rotate_locks_the_account_row_before_the_session_row(
-    owner: str | None,
+@pytest.mark.parametrize("call", _SESSION_REWRITES)
+async def test_sqlserver_session_rewrites_lock_the_account_row_before_the_session_row(
+    owner: str | None, call: str
 ) -> None:
-    """BACKLOG #4974: the re-key takes its account's ``users`` row under ``UPDLOCK, ROWLOCK``
-    before it reads its session row under the same hint, the order every whole-account sweep
-    takes them in, so a sweep cannot meet the row mid-move. Where the session has no row, there is
-    no account to lock, and nothing is locked: the control."""
+    """BACKLOG #4974 and #2733: each rewrite takes its account's ``users`` row under ``UPDLOCK,
+    ROWLOCK`` before it reads its session row under the same hint, the order every whole-account
+    sweep and the user delete take them in. The rewrite sets ``user_id``, so the session key's
+    check reads the account row, and a rewrite holding its session row while a sweep or a delete
+    held the account row would deadlock with it; a re-key could also be met mid-move. Where the
+    session has no row, there is no account to lock, and nothing is locked: the control."""
     seen: list[tuple[str, tuple[Any, ...]]] = []
     store = _mssql_store(seen)
 
@@ -281,16 +291,46 @@ async def test_sqlserver_rotate_locks_the_account_row_before_the_session_row(
     async def _acquire() -> AsyncIterator[_MssqlConn]:
         yield _OwnerConn(seen)
 
+    store._acquire = _acquire
     store._acquire_after_commit = _acquire
-    await store.rotate_session(_HASH, new_token_hash=_OTHER)
+    await _CALLS[call](store)
     statements = [sql for sql, _ in seen]
     assert seen[0] == (_OWNER_READ, (_HASH,))
     if owner is None:
-        assert _ACCOUNT_LOCK not in statements
+        assert not [sql for sql in statements if sql.startswith("SELECT id FROM users")]
         assert _reads_session_row(statements[1])
     else:
         assert seen[1] == (_ACCOUNT_LOCK, (owner,))
         assert statements[2].startswith("SELECT * FROM sessions WITH (UPDLOCK, ROWLOCK)")
+
+
+@pytest.mark.parametrize(
+    ("call", "lock"),
+    [
+        (lambda s: s.delete_user("u"), _ACCOUNT_DELETE_LOCK),
+        (
+            lambda s: s.remember_login_address("u", "10.0.0.1", now=_NOW),
+            _ACCOUNT_SHARE,
+        ),
+        (
+            lambda s: s.reset_login_addresses("u"),
+            _ACCOUNT_SHARE,
+        ),
+    ],
+    ids=["delete_user", "remember_login_address", "reset_login_addresses"],
+)
+async def test_sqlserver_account_row_is_held_before_any_row_keyed_to_it(
+    call: Callable[[Any], Awaitable[Any]], lock: str
+) -> None:
+    """BACKLOG #2733: the user delete holds the account row under ``XLOCK``, which a sign-in's
+    ``HOLDLOCK`` read cannot share, so a sign-in inside a delete waits and is then refused for the
+    missing account rather than commit a session that fails the delete with error 547. Each write
+    of a sign-in address row holds the account row first, so it cannot hold its address row while
+    its key check waits on a delete that waits on that row. The first statement each runs is the
+    lock; the live interleavings run on the SQL Server leg (``tests/test_sqlserver_store.py``)."""
+    seen: list[tuple[str, tuple[Any, ...]]] = []
+    await call(_mssql_store(seen))
+    assert seen[0] == (lock, ("u",)), seen[0]
 
 
 @pytest.mark.parametrize("revoked", [0, 3])

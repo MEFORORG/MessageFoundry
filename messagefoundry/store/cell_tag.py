@@ -24,7 +24,8 @@ the cipher's tag-failure hook. The store writes the audit row once the read has 
 transaction (:func:`audits_cell_tag`). A list-shaped read withholds the failed row's cells and keeps the
 row, so its plaintext columns still list and nothing is silently dropped. A corrupt cell under a held
 key raises :class:`CorruptCellError`: it is contained the same way, but only logged, since it is not
-drift.
+drift. An unmarked value the cipher refuses raises :class:`UnmarkedCellError`: drift, audited and
+contained, with the cipher's own refusal as its alert (BACKLOG #5650).
 
 **The store id.** No store id is minted yet, so every tag carries
 :data:`~messagefoundry.store.crypto.NO_STORE_ID`, as the queue tag does.
@@ -47,7 +48,9 @@ from messagefoundry.store.crypto import (
     NO_STORE_ID,
     CipherError,
     UnauthenticatedCipherError,
+    UnmarkedCipherError,
     cell_aad,
+    gave_no_verdict,
 )
 from messagefoundry.store.queue_tag import is_tag_failure
 from messagefoundry.store.row_seal import seal_bytes
@@ -64,6 +67,7 @@ __all__ = [
     "CellTagError",
     "CellTagSink",
     "CorruptCellError",
+    "UnmarkedCellError",
     "audits_cell_tag",
     "dead_letter_on_cell_tag",
     "dead_letters_on_cell_tag",
@@ -187,9 +191,14 @@ class CellTagError(CipherError):
     A subclass of :class:`CipherError`, so every path that already refuses an undecryptable cell
     refuses this one the same way. Names the cell and a short row-id prefix, never a row value."""
 
-    #: Whether this is tag drift: the cell was sealed for another row. Only drift raises the
-    #: ``integrity_drift`` alert and writes the tag-failed audit row.
+    #: Whether this is tag drift: the cell was sealed for another row, or changed outside the
+    #: store's writers. Only drift writes the tag-failed audit row and raises the
+    #: ``integrity_drift`` alert.
     drift: ClassVar[bool] = True
+    #: Whether the cipher already alerted on the refusal this error wraps, so
+    #: :func:`open_tagged_cell` raises no second alert; it still audits each row and logs a WARNING
+    #: once per cell column per interval.
+    cipher_alerted: ClassVar[bool] = False
 
     def __init__(self, table: str, column: str, row_id: str, channel_id: str | None) -> None:
         if table not in _TAG_FAILED_ACTION:
@@ -226,6 +235,57 @@ class CorruptCellError(CellTagError):
         )
 
 
+class UnmarkedCellError(CellTagError):
+    """A non-blank unmarked value in a tagged cell of a keyed store, which the cipher refused
+    (:class:`~messagefoundry.store.crypto.UnmarkedCipherError`), BACKLOG #5650. A keyed writer
+    never writes one. It is at least a stripped marker, a planted row, or a value a keyless run of
+    an already keyed store wrote; nothing here tells those apart.
+
+    It counts as drift, so it writes the tag-failed audit row and is contained as drift is: a list
+    withholds the row, a handoff dead-letters it. Its alert is the cipher's own unmarked-value
+    refusal, already raised when the cipher refused it, so :func:`open_tagged_cell` raises no
+    second, ``integrity_drift``, alert for it. Its audit row is written per row, once per interval,
+    as a moved cell's is. Its WARNING is logged once per cell column per interval, naming the first
+    row met: a keyless run can leave one in every row it wrote."""
+
+    cipher_alerted = True
+
+    def _describe(self) -> str:
+        return (
+            f"integrity: the {self.table}.{self.column} cell of row {self.row_ref} holds an"
+            " unmarked value, which a keyed writer does not write"
+        )
+
+
+def _tag_failure_kind(cipher: Cipher, stored: str, exc: CipherError) -> type[CellTagError] | None:
+    """The :class:`CellTagError` class a failed open of ``stored`` raises, or ``None`` to keep the
+    cipher's own error: an outage, a key or a format problem."""
+    if gave_no_verdict(exc):
+        return None  # the key service gave no verdict, so nothing is known about the cell
+    if isinstance(exc, UnmarkedCipherError):
+        return UnmarkedCellError
+    if not is_tag_failure(cipher, stored):
+        return None
+    if callable(getattr(cipher, "holds_key_for", None)):
+        # Only a tag that failed under every held key can mean the cell was sealed elsewhere.
+        return CellTagError if isinstance(exc, UnauthenticatedCipherError) else CorruptCellError
+    # A cipher that cannot name its keys says when the value's own tag failed only when it
+    # declares that it does (Vault Transit, whose UnauthenticatedCipherError is Transit's AEAD
+    # refusal). A wrapper that just forgot holds_key_for may raise it for a key that is not
+    # supplied, so its error stays its own. Other errors are not told apart by class, a corrupt
+    # row among them, so they keep their own error too.
+    if isinstance(exc, UnauthenticatedCipherError) and _declares_tag_refusals(cipher):
+        return CellTagError
+    return None
+
+
+def _declares_tag_refusals(cipher: object) -> bool:
+    """Whether ``cipher``, which cannot name its keys, declares that its
+    :class:`~messagefoundry.store.crypto.UnauthenticatedCipherError` is the value's own tag
+    failing, never a key it does not hold (``names_no_keys``, set by the Vault Transit cipher)."""
+    return getattr(cipher, "names_no_keys", False) is True
+
+
 def open_tagged_cell(
     cipher: Cipher,
     stored: str | None,
@@ -240,10 +300,14 @@ def open_tagged_cell(
     the cipher's own policy, as the store's ``_dec`` does.
 
     A marked value whose AEAD tag fails under a key this process holds (:func:`is_tag_failure`)
-    raises :class:`CellTagError` and raises the ``integrity_drift`` alert. Under such a key, a
-    corrupt row (bad base64, or a verified plaintext that is not UTF-8) raises
-    :class:`CorruptCellError`, which is contained the same way but is not drift. A key or format
-    problem raises the cipher's own error."""
+    raises :class:`CellTagError` and raises the ``integrity_drift`` alert. So does one the Vault
+    Transit cipher, which cannot name its keys, refuses with
+    :class:`~messagefoundry.store.crypto.UnauthenticatedCipherError` (BACKLOG #5650). Under a held
+    key, a corrupt row (bad base64, or a verified plaintext that is not UTF-8) raises
+    :class:`CorruptCellError`, which is contained the same way but is not drift. An unmarked value
+    the cipher refuses raises :class:`UnmarkedCellError`, with the cipher's own alert only. An
+    outage (:class:`~messagefoundry.store.crypto.CipherUnavailableError`), and a key or format
+    problem, raise the cipher's own error."""
     # Checked on every open, not only on a failure: a CellTagError for an unknown table would raise
     # ValueError instead, losing the alert and escaping every containment.
     if table not in _TAG_FAILED_ACTION:
@@ -253,15 +317,9 @@ def open_tagged_cell(
     try:
         return cipher.decrypt(stored, aad=aad)
     except CipherError as exc:
-        # Only an in-process keyring can say it holds the key a marker names. A cipher that cannot
-        # (Vault Transit) also wraps an unreachable provider in CipherError, so there a failure keeps
-        # the cipher's own error rather than reading as an integrity failure.
-        if not callable(getattr(cipher, "holds_key_for", None)) or not is_tag_failure(
-            cipher, stored
-        ):
+        kind = _tag_failure_kind(cipher, stored, exc)
+        if kind is None:
             raise
-        # Only a tag that failed under every held key can mean the cell was sealed elsewhere.
-        kind = CellTagError if isinstance(exc, UnauthenticatedCipherError) else CorruptCellError
         err = kind(table, column, row_id, channel_id)
         _alert(cipher, err)
         raise err from exc
@@ -327,7 +385,7 @@ def withhold_message_cells(
 _REPORT_INTERVAL_S: Final = 3600.0
 #: The most cells remembered; the oldest is forgotten first.
 _REPORTED_MAX: Final = 4096
-type _Key = tuple[str, str, str, bool]
+type _Key = tuple[str, str, str, type[CellTagError]]
 type _Memo = dict[_Key, float]
 _reported: _Memo = {}
 _reported_audit: _Memo = {}
@@ -337,7 +395,17 @@ _reported_lock = threading.Lock()
 
 
 def _memo_key(err: CellTagError) -> _Key:
-    return (err.table, err.column, err.row_ref, err.drift)  # a corrupt read never mutes drift
+    # By class, not only by drift: a corrupt or unmarked read never mutes a moved cell (BACKLOG #5650).
+    return (err.table, err.column, err.row_ref, type(err))
+
+
+def _warning_key(err: CellTagError) -> _Key:
+    # An unmarked value's WARNING is per cell column, not per row: a keyless run can leave one in
+    # every row it wrote, and a list over them would otherwise log each. Its audit row stays per
+    # row (_memo_key), so every row is still audited in its own scope (BACKLOG #5650).
+    if isinstance(err, UnmarkedCellError):
+        return (err.table, err.column, "", type(err))
+    return _memo_key(err)
 
 
 def _is_recent(memo: _Memo, key: _Key, now: float) -> bool:
@@ -352,9 +420,10 @@ def _remember(memo: _Memo, key: _Key, now: float) -> None:
         memo.pop(next(iter(memo)))
 
 
-def _first_in_interval(memo: _Memo, err: CellTagError) -> bool:
-    """Whether ``err``'s cell has not been reported in ``memo`` within the interval; records it."""
-    key, now = _memo_key(err), time.monotonic()
+def _first_in_interval(memo: _Memo, err: CellTagError, key: _Key | None = None) -> bool:
+    """Whether ``err``'s cell (or ``key``) has not been reported in ``memo`` within the interval;
+    records it."""
+    key, now = (key if key is not None else _memo_key(err)), time.monotonic()
     with _reported_lock:
         if _is_recent(memo, key, now):
             return False
@@ -363,12 +432,13 @@ def _first_in_interval(memo: _Memo, err: CellTagError) -> bool:
 
 
 def _alert(cipher: object, err: CellTagError) -> None:
-    """Log a WARNING and, for drift, raise ``integrity_drift`` through the cipher's tag-failure hook,
-    once per cell per interval. Never raises."""
-    if not _first_in_interval(_reported, err):
+    """Log a WARNING and, for drift the cipher did not already alert on, raise ``integrity_drift``
+    through the cipher's tag-failure hook, once per cell per interval. Never raises."""
+    if not _first_in_interval(_reported, err, _warning_key(err)):
         return
-    if not err.drift:
-        _log.warning("%s; the read was refused", err)
+    if not err.drift or err.cipher_alerted:
+        # The text, not the error: a record keeps its args, and the error's chain reaches PHI.
+        _log.warning("%s; the read was refused", str(err))
         return
     reason = f"a {err.table}.{err.column} cell failed its integrity tag (row {err.row_ref})"
     _log.warning("%s; the read was refused", reason)

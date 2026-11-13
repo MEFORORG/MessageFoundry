@@ -1284,6 +1284,56 @@ def test_open_removes_only_the_directories_it_made_when_it_fails_partway(
     assert list(tmp_path.iterdir()) == []  # the parent it made on the way is gone too
 
 
+def test_open_makes_its_parents_with_no_group_or_other_write_bit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #5636. The spool sits under the store directory and often creates it, before
+    the TLS mint does, so a parent gets 0o755 and the leaf 0o700: never a mode that lets the umask
+    leave a group write bit on the directory the engine's own key goes into."""
+    target = tmp_path / "store" / "log-spool" / "engine"
+    real_mkdir = os.mkdir
+    asked: dict[Path, int] = {}
+
+    def _mkdir(path: Any, mode: int = 0o777) -> None:
+        asked[Path(path)] = mode
+        real_mkdir(path, mode)
+
+    monkeypatch.setattr(os, "mkdir", _mkdir)
+    spool = LogSpool(target, max_bytes=1_000)
+    spool.open()
+    spool.close()
+    monkeypatch.undo()
+    assert asked == {
+        tmp_path / "store": 0o755,
+        tmp_path / "store" / "log-spool": 0o755,
+        target: 0o700,
+    }
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX modes and umask")
+def test_a_store_directory_the_spool_makes_under_umask_002_passes_the_key_check(
+    tmp_path: Path,
+) -> None:
+    """The same, for real: under umask 002 the store directory the spool creates is 0755, and a
+    key the engine mints there passes the key-file check."""
+    import stat
+
+    from messagefoundry.restricted_file import broad_access_problem, write_restricted_file
+
+    store = tmp_path / "store"
+    old = os.umask(0o002)
+    try:
+        spool = LogSpool(store / "log-spool" / "engine", max_bytes=1_000)
+        spool.open()
+        spool.close()
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(store.stat().st_mode) == 0o755
+    key = store / "api-generated-key.pem"
+    write_restricted_file(key, b"KEY-MATERIAL-STAND-IN")
+    assert broad_access_problem(key) is None
+
+
 def test_a_replayed_lone_surrogate_is_sent_escaped_not_dropped(spool_dir: Path) -> None:
     """BACKLOG #2279 item 2a. The spool writes a raw caller's lone surrogate (the encode fallback),
     but the send's UTF-8 encode refused it, so replay dropped the entry as undeliverable. Replay
