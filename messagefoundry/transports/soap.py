@@ -156,7 +156,8 @@ _WSSE_FAULT_RE = re.compile(
 # only inside the Fault _FAULT_RE matched, up to that Fault's close tag (_FAULT_END_RE) or the reply's
 # end. BACKLOG #5912: the code element is the Fault's first child, a faultcode or a Code (_CODE_RE),
 # and for a Code the Value that is its own first child, up to its close tag (_CODE_END_RE);
-# _fault_code says why.
+# _fault_code says why. The Fault and Code close tags are searched for outside markup, with
+# _FAULT_END_OUTSIDE_MARKUP_RE and _CODE_END_OUTSIDE_MARKUP_RE, which hold these two patterns.
 _FAULTCODE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?faultcode\b", re.IGNORECASE)
 _CODE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Code(?=[\s/>])", re.IGNORECASE)
 _CODEVALUE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Value\b", re.IGNORECASE)
@@ -170,6 +171,14 @@ _FAULT_END_RE = re.compile(r"</\s*(?:[\w.\-]+:)?Fault\s*>", re.IGNORECASE)
 _TAG_OPEN_RE = re.compile(r"<(?![!?])")
 # Markup that is not an element, and its terminator: what _first_child steps over whole.
 _NON_ELEMENT_MARKUP = (("<!--", "-->"), ("<![CDATA[", "]]>"), ("<?", "?>"))
+_MARKUP_CLOSER = dict(_NON_ELEMENT_MARKUP)
+# BACKLOG #5912: _FAULT_RE, _FAULT_END_RE and _CODE_END_RE, each with the openers of that markup as
+# alternatives, so _search_outside_markup can step over a comment, CDATA section or processing
+# instruction that holds a Fault start tag or a Fault or Code close tag. The openers stay
+# case-sensitive, as XML has them; only each tag is matched in any case.
+_FAULT_OUTSIDE_MARKUP_RE = re.compile(r"<!--|<!\[CDATA\[|<\?|(?i:<\s*(?:[\w.\-]+:)?Fault[\s/>])")
+_FAULT_END_OUTSIDE_MARKUP_RE = re.compile(r"<!--|<!\[CDATA\[|<\?|(?i:</\s*(?:[\w.\-]+:)?Fault\s*>)")
+_CODE_END_OUTSIDE_MARKUP_RE = re.compile(r"<!--|<!\[CDATA\[|<\?|(?i:</\s*(?:[\w.\-]+:)?Code\s*>)")
 # A <…:Header> element (any/no namespace prefix) smuggled into a <Body> fragment (purity-leak lint).
 _HEADER_EL_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Header[\s/>]", re.IGNORECASE)
 
@@ -237,16 +246,57 @@ def _first_child(body: str, pos: int, end: int) -> int:
             return -1 if body.startswith("<!", lt, end) else lt
 
 
+def _search_outside_markup(
+    pattern: re.Pattern[str], body: str, pos: int, end: int
+) -> re.Match[str] | None:
+    """The first match of ``pattern``'s tag in ``body[pos:end]`` that is not inside a comment, a
+    CDATA section or a processing instruction, or ``None``. ``pattern`` is one of the
+    ``*_OUTSIDE_MARKUP_RE`` patterns, whose other alternatives are those markups' openers.
+
+    BACKLOG #5912: each markup is stepped over whole, as :func:`_first_child` steps over it. An
+    opener with no terminator before ``end`` is read as text, and so is every later opener of its
+    kind, since none of them can have a terminator either: so the search resumes after each step
+    and stays linear in the reply."""
+    unterminated: set[str] = set()
+    while (m := pattern.search(body, pos, end)) is not None:
+        opener = m.group()
+        closer = _MARKUP_CLOSER.get(opener)
+        if closer is None:
+            return m
+        pos = m.end()
+        close = -1 if opener in unterminated else body.find(closer, pos, end)
+        if close < 0:
+            unterminated.add(opener)
+        else:
+            pos = close + len(closer)
+    return None
+
+
 def _find_fault(body: str) -> tuple[re.Match[str] | None, int]:
-    """The first ``_FAULT_RE`` match from where the fault searches start, and that start: the end of
+    """The first Fault start tag from where the fault searches start, and that start: the end of
     the first ``_BODY_RE`` match where a Fault follows it, else ``0``, the whole reply.
 
-    BACKLOG #2827: so a Fault-named element before the Body, in the Header or a comment say, does
-    not decide the class of the Body's fault. The first Body start tag is taken even when it sits in
-    a comment, a CDATA section or the Header. With no Body start tag, or no Fault after it, the
-    reply is searched whole, as it was before the anchor: a Fault reply with no envelope may carry a
-    Body-named element in its detail, and a Fault found only before the Body still reads as one."""
+    BACKLOG #2827: so a Fault-named element before the Body, in the Header say, does not decide the
+    class of the Body's fault. The first Body start tag is taken even when it sits in a comment, a
+    CDATA section or the Header. With no Body start tag, or no Fault after it, the reply is searched
+    whole, as it was before the anchor: a Fault reply with no envelope may carry a Body-named
+    element in its detail, and a Fault found only before the Body still reads as one.
+
+    BACKLOG #5912: a Fault start tag inside a comment, a CDATA section or a processing instruction
+    is stepped over (:func:`_search_outside_markup`), so the real Fault after it is the one read.
+    Only where every Fault start tag is inside such markup are they searched for as before, with
+    ``_FAULT_RE`` alone, so such a reply still reads as a fault and never newly as delivered."""
+    if _FAULT_RE.search(body) is None:
+        # Every match below is a _FAULT_RE match, so a reply with none, the delivered case, takes
+        # one scan.
+        return None, 0
     m = _BODY_RE.search(body)
+    # The whole reply is searched again from 0, not only before the Body start tag: markup opened
+    # before that tag decides what is inside markup after it.
+    for start in (0,) if m is None else (m.end(), 0):
+        fault = _search_outside_markup(_FAULT_OUTSIDE_MARKUP_RE, body, start, len(body))
+        if fault is not None:
+            return fault, start
     if m is not None:
         fault = _FAULT_RE.search(body, m.end())
         if fault is not None:
@@ -272,7 +322,9 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
     cannot hold a code, the code is ``""``, and :func:`_classify_soap` reads that as a permanent
     fault, never as delivered: a later element is not tried, so a Detail cannot stand in for a
     missing or misplaced code, and a SOAP 1.1 Fault whose faultcode is not its first child reads as
-    permanent. Each step is one scan forward from the Fault, so the read stays linear in the reply."""
+    permanent. Each step is one scan forward from the Fault, so the read stays linear in the reply.
+    A Fault or Code close tag inside a comment, a CDATA section or a processing instruction does not
+    end either element (:func:`_search_outside_markup`)."""
     if fault is None:
         fault, _ = _find_fault(body)
         if fault is None:
@@ -281,7 +333,7 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
     gt = _start_tag_gt(body, start - 1, len(body))
     if gt < 0:
         return ""
-    fault_end = _FAULT_END_RE.search(body, start)
+    fault_end = _search_outside_markup(_FAULT_END_OUTSIDE_MARKUP_RE, body, gt + 1, len(body))
     end = len(body) if fault_end is None else fault_end.start()
     child = _first_child(body, gt + 1, end)
     if child < 0:
@@ -293,7 +345,7 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
     code_gt = -1 if code is None else _start_tag_gt(body, code.end(), end)
     if code_gt < 0:
         return ""
-    code_end = _CODE_END_RE.search(body, code_gt + 1, end)
+    code_end = _search_outside_markup(_CODE_END_OUTSIDE_MARKUP_RE, body, code_gt + 1, end)
     stop = end if code_end is None else code_end.start()
     child = _first_child(body, code_gt + 1, stop)
     value = None if child < 0 else _CODEVALUE_RE.match(body, child, stop)

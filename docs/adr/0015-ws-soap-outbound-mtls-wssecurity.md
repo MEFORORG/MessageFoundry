@@ -157,7 +157,7 @@ in the reply, else the first Value, the Header included, and an empty `<faultcod
 whitespace, `/` or `>`, so `<Code.x>` does not match, and `_CODE_END_RE` is its close tag. Each of the
 three start-tag patterns is tried at most once, anchored: `faultcode` and `Code` at the Fault's first
 child element, `Value` at the Code's first child. Only a `faultcode` or `Value` match reaches
-`_code_text`; the `_fault_code` docstring says how. This decision is unchanged.)* There is no `xml.etree` / `ElementTree` / `lxml` / `defusedxml` import anywhere under
+`_code_text`; the `_fault_code` docstring says how. The Fault start-tag search and the Fault and Code close-tag searches step over a comment, a CDATA section or a processing instruction whole, with `str.find`, as the first-child search does; `_search_outside_markup` says how. This decision is unchanged.)* There is no `xml.etree` / `ElementTree` / `lxml` / `defusedxml` import anywhere under
 `messagefoundry/`. *(Corrected 2026-11-04: that sentence, the "regex-only" premise and the heading's
 "no XML parser" are no longer true of the codebase. The engine imports XML parsers, and
 `tests/test_security_static.py` keeps the allowlist of where. `transports/soap.py` is on it: it imports

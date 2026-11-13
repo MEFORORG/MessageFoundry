@@ -60,23 +60,33 @@ def _old_fault_code(body: str, fault: object = None) -> str:
 # The reference reading: the old patterns, run on the Fault's first child element, a comment, CDATA
 # section or processing instruction before it skipped whole. The Fault is the first Fault start tag after the first
 # Body start tag (or anywhere, with no Body start tag or no Fault after it), read to its close tag.
+# BACKLOG #5912: the Fault start tag, and the Fault and Code close tags, are found outside markup,
+# each markup taken whole; only where every Fault start tag is inside markup is the first one taken.
 # A faultcode child is read whole; a Code child is read up to its close tag, and its own first child
 # must be the Value (BACKLOG #5912). An element that cannot hold a code reads as empty. It reuses the
 # production faultcode and Value close-tag patterns and the nested-tag pattern, so it re-checks the
 # str.find bounds and captures, not those patterns; the named shapes pin what they read. The Code
 # start and close tags are written out here, independently of _CODE_RE and _CODE_END_RE.
+#: Markup that is not an element, whole: what the first-child search steps over and, BACKLOG
+#: #5912, what the Fault search and the Fault and Code close-tag searches step over.
+_REF_MARKUP = r"<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>"
 _REF_BODY_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Body[\s/>](.*)", re.IGNORECASE | re.DOTALL)
-_REF_FAULT_RE = re.compile(
-    r"<\s*(?:[\w.\-]+:)?Fault[\s/>](.*?)(?:</\s*(?:[\w.\-]+:)?Fault\s*>|\Z)",
-    re.IGNORECASE | re.DOTALL,
+#: Text read lazily, each markup taken whole; atomic, so no backtrack lets a tag inside one match.
+_REF_TEXT = rf"(?:(?>{_REF_MARKUP}|.))*?"
+_REF_FAULT_TAG = r"(?i:<\s*(?:[\w.\-]+:)?Fault[\s/>])"
+#: The first Fault start tag outside markup, and, failing one, the first anywhere.
+_REF_FAULT_OUTSIDE_MARKUP_RE = re.compile(rf"{_REF_TEXT}({_REF_FAULT_TAG})", re.DOTALL)
+_REF_FAULT_ANYWHERE_RE = re.compile(_REF_FAULT_TAG)
+#: From the end of the Fault start tag to its close tag outside markup, or the reply's end.
+_REF_FAULT_INNER_RE = re.compile(
+    rf"({_REF_TEXT})(?:(?i:</\s*(?:[\w.\-]+:)?Fault\s*>)|\Z)", re.DOTALL
 )
 _REF_START_TAG_RE = re.compile(r"[^>]*>")
-_REF_BEFORE_THE_CHILD_RE = re.compile(
-    r"(?:[^<]|<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>)*", re.DOTALL
-)
+_REF_BEFORE_THE_CHILD_RE = re.compile(rf"(?:[^<]|{_REF_MARKUP})*", re.DOTALL)
 _REF_CODE_RE = re.compile(
-    r"<\s*(?:[\w.\-]+:)?Code(?=[\s/>])([^>]*>)(.*?)(?:</\s*(?:[\w.\-]+:)?Code\s*>|\Z)",
-    re.IGNORECASE | re.DOTALL,
+    rf"(?i:<\s*(?:[\w.\-]+:)?Code(?=[\s/>]))([^>]*>)({_REF_TEXT})"
+    r"(?:(?i:</\s*(?:[\w.\-]+:)?Code\s*>)|\Z)",
+    re.DOTALL,
 )
 
 
@@ -91,17 +101,32 @@ def _ref_code_text(m: re.Match[str] | None, inner: str, own_close: re.Pattern[st
     return code
 
 
-def _ref_fault_code(body: str) -> str:
+def _ref_fault_tag_end(body: str) -> tuple[str, int] | None:
+    """The text the Fault is read from, and where its start tag's name ends in it: from the Body,
+    else the whole reply, outside markup first and, failing that, anywhere (BACKLOG #5912)."""
     in_body = _REF_BODY_RE.search(body)
-    if in_body is not None and _REF_FAULT_RE.search(in_body.group(1)):
-        body = in_body.group(1)
-    fault = _REF_FAULT_RE.search(body)
-    if fault is None:
+    texts = [body] if in_body is None else [in_body.group(1), body]
+    for text in texts:
+        outside = _REF_FAULT_OUTSIDE_MARKUP_RE.match(text)
+        if outside is not None:
+            return text, outside.end(1)
+    for text in texts:
+        anywhere = _REF_FAULT_ANYWHERE_RE.search(text)
+        if anywhere is not None:
+            return text, anywhere.end()
+    return None
+
+
+def _ref_fault_code(body: str) -> str:
+    found = _ref_fault_tag_end(body)
+    if found is None:
         return ""
-    fault_tag = _REF_START_TAG_RE.match(body, fault.start(1) - 1)
+    body, name_end = found
+    fault_tag = _REF_START_TAG_RE.match(body, name_end - 1)
     if fault_tag is None or fault_tag.group().endswith("/>"):
         return ""
-    inner = body[fault_tag.end() : fault.end(1)]
+    fault_inner = _REF_FAULT_INNER_RE.match(body, fault_tag.end())
+    inner = "" if fault_inner is None else fault_inner.group(1)
     lead = _REF_BEFORE_THE_CHILD_RE.match(inner)
     child = inner[lead.end() :] if lead is not None else ""
     faultcode = _OLD_FAULTCODE_RE.match(child)
@@ -419,16 +444,6 @@ _BEFORE_THE_BODY = {
         "transient",
         "soap-fault",
     ),
-    "comment-before-the-envelope": (
-        "<!-- <Fault/> --><soap:Envelope>" + _SOAP11_RECEIVER_BODY,
-        "transient",
-        "soap-fault",
-    ),
-    "comment-before-the-body": (
-        "<env:Envelope><!-- <Fault/> -->" + _SOAP12_RECEIVER_BODY,
-        "transient",
-        "soap-fault",
-    ),
     "header-wsse-code": (
         "<env:Envelope><env:Header><x:Note>MessageExpired</x:Note></env:Header>"
         + _SOAP12_RECEIVER_BODY,
@@ -474,6 +489,102 @@ def test_the_fault_is_read_from_the_body(
     assert _outcome(_classify_soap(200, body)) == outcome
     monkeypatch.setattr(soap, "_BODY_RE", _NO_BODY_ANCHOR)
     assert _outcome(_classify_soap(200, body)) == unanchored
+
+
+#: BACKLOG #5912, the PR 2936 hold: a Fault start tag, or a Fault or Code close tag, inside a
+#: comment, a CDATA section or a processing instruction is not markup the Fault search, or its
+#: close-tag searches, may stop at. Each shape holds a real Receiver or Server fault that engine
+#: main retried, and its outcome.
+_FAULT_TAG_IN_MARKUP = {
+    "comment-fault-before-a-server-fault": (
+        "<soap:Envelope><soap:Body><!-- <soap:Fault> --><soap:Fault><faultcode>soap:Server"
+        "</faultcode><faultstring>busy</faultstring></soap:Fault></soap:Body></soap:Envelope>",
+        "transient",
+    ),
+    "cdata-fault-before-a-server-fault": (
+        "<soap:Envelope><soap:Body><![CDATA[<soap:Fault>]]><soap:Fault><faultcode>soap:Server"
+        "</faultcode></soap:Fault></soap:Body></soap:Envelope>",
+        "transient",
+    ),
+    "pi-fault-before-a-server-fault": (
+        "<soap:Envelope><soap:Body><?note <soap:Fault>?><soap:Fault><faultcode>soap:Server"
+        "</faultcode></soap:Fault></soap:Body></soap:Envelope>",
+        "transient",
+    ),
+    "comment-fault-before-a-receiver-fault": (
+        "<env:Envelope><env:Body><!-- <env:Fault> --><env:Fault><env:Code><env:Value>env:Receiver"
+        "</env:Value></env:Code></env:Fault></env:Body></env:Envelope>",
+        "transient",
+    ),
+    "comment-fault-no-envelope": (
+        "<!-- <Fault> --><Fault><faultcode>soap:Server</faultcode></Fault>",
+        "transient",
+    ),
+    "comment-before-the-envelope": (
+        "<!-- <Fault/> --><soap:Envelope>" + _SOAP11_RECEIVER_BODY,
+        "transient",
+    ),
+    "comment-before-the-body": (
+        "<env:Envelope><!-- <Fault/> -->" + _SOAP12_RECEIVER_BODY,
+        "transient",
+    ),
+    "comment-fault-close-before-the-code": (
+        "<soap:Body><soap:Fault><!-- </soap:Fault> --><faultcode>soap:Server</faultcode>"
+        "</soap:Fault></soap:Body>",
+        "transient",
+    ),
+    "comment-code-close-before-the-value": (
+        "<env:Body><env:Fault><env:Code><!-- </env:Code> --><env:Value>env:Receiver</env:Value>"
+        "</env:Code></env:Fault></env:Body>",
+        "transient",
+    ),
+    # Controls: a Sender fault after a commented Fault still dead-letters.
+    "comment-fault-before-a-client-fault": (
+        "<soap:Body><!-- <soap:Fault> --><soap:Fault><faultcode>soap:Client</faultcode>"
+        "</soap:Fault></soap:Body>",
+        "soap-sender",
+    ),
+    # With every Fault start tag in markup the search reads as it did before: the reply is never
+    # newly read as delivered.
+    "only-a-commented-fault": (
+        "<soap:Body><!-- <soap:Fault><faultcode>soap:Client</faultcode></soap:Fault> -->"
+        "<m:Ack/></soap:Body>",
+        "soap-sender",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("body", "outcome"), list(_FAULT_TAG_IN_MARKUP.values()), ids=list(_FAULT_TAG_IN_MARKUP)
+)
+def test_a_fault_tag_inside_markup_does_not_decide_the_fault(body: str, outcome: str) -> None:
+    """Red at PR 2936 head adfdcd5d31, which found the commented Fault start tag, or stopped at a
+    commented close tag, read the code as empty and dead-lettered a retryable fault. Control: each
+    shape has a Fault-named tag inside markup, which the plain patterns match."""
+    spans = [m.span() for m in re.finditer(_REF_MARKUP, body, re.DOTALL)]
+    tags = (soap._FAULT_RE, soap._FAULT_END_RE, soap._CODE_END_RE)
+    assert any(a < m.start() < b for rx in tags for m in rx.finditer(body) for a, b in spans), (
+        "the shape must hold a Fault-named tag inside markup"
+    )
+    assert _outcome(_classify_soap(200, body)) == outcome
+    assert _outcome(_classify_soap(500, body)) == outcome
+    assert _fault_code(body) == _ref_fault_code(body)
+
+
+def test_each_outside_markup_pattern_is_its_tag_and_the_markup_openers() -> None:
+    """The three patterns are literal, so this pins that each is the markup openers the first-child
+    search steps over and the plain tag pattern, in any case: a markup kind or a tag rule changed in
+    one place only would otherwise drift silently."""
+    openers = r"<!--|<!\[CDATA\[|<\?"
+    assert [re.fullmatch(openers, o) is not None for o, _ in soap._NON_ELEMENT_MARKUP] == [True] * 3
+    for outside, tag in (
+        (soap._FAULT_OUTSIDE_MARKUP_RE, soap._FAULT_RE),
+        (soap._FAULT_END_OUTSIDE_MARKUP_RE, soap._FAULT_END_RE),
+        (soap._CODE_END_OUTSIDE_MARKUP_RE, soap._CODE_END_RE),
+    ):
+        assert tag.flags & re.IGNORECASE
+        assert outside.pattern == openers + "|(?i:" + tag.pattern + ")"
+    assert set(soap._MARKUP_CLOSER) == {o for o, _ in soap._NON_ELEMENT_MARKUP}
 
 
 _NO_FAULT_AFTER_THE_BODY = {
@@ -634,6 +745,13 @@ _PATHOLOGICAL_REPLIES: dict[str, Callable[[int], str]] = {
     # Body that holds the Fault.
     "long-prefixes-before-the-body": lambda k: ("<" + "a." * 50) * (k // 101) + "<Body><Fault>",
     "lt-run-before-the-body": lambda k: "<" * k + "<Body><Fault><faultcode>",
+    # BACKLOG #5912: the Fault search's step over markup, terminated and not, and the close-tag
+    # searches' step over comments holding a close tag.
+    "commented-faults-before-the-fault": lambda k: "<!-- <Fault> -->" * (k // 16) + "<Fault>",
+    "unterminated-markup-before-the-fault": lambda k: "<![CDATA[<?<!--" * (k // 15) + "<Fault>",
+    "commented-close-tags-in-a-code": lambda k: (
+        "<Fault><Code>" + "<!-- </Code></Fault> -->" * (k // 24)
+    ),
     # The fallback when no Fault follows the Body: the search after it, then the one before it.
     "lt-runs-around-a-trailing-body": lambda k: (
         "<Fault>" + "<" * (k // 2) + "<Body>" + "<" * (k // 2)
