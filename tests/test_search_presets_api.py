@@ -525,8 +525,12 @@ async def _layered_with_decrypt_raising(
             raise exc
 
         caplog.set_level(logging.WARNING, logger="messagefoundry.api.app")
-        with monkeypatch.context() as patched:  # undoes the decrypt patch alone
+        with monkeypatch.context() as patched:  # undoes these patches alone
             patched.setattr(cipher, "decrypt", _raise)
+            # Transit only ever decrypts a marked value, so the stand-in says the cell is one, for
+            # the recall alone: open_tagged_cell then classifies by the error's class, not by a
+            # plaintext cell's is_tag_failure short cut (BACKLOG #5650).
+            patched.setattr(cipher, "is_encrypted", lambda _stored: True)
             r = await c.get("/search/layered", params={"presets": pid}, headers=h)
     return r, raised, pid
 
@@ -588,9 +592,6 @@ async def test_a_transit_tag_refusal_on_the_criteria_is_an_audited_integrity_ref
     the tag-failed audit row. The decrypt is patched, as above, on a cipher with no
     ``holds_key_for``, which is Transit's shape."""
     refusal = UnauthenticatedCipherError("Transit decrypt failed (key='mf-store-secret'): MRN999")
-    # Transit only ever decrypts a marked value; the keyless cipher stands in, so it says so too.
-    assert isinstance(engine.store, MessageStore)
-    monkeypatch.setattr(engine.store._cipher, "is_encrypted", lambda _stored: True)
     r, raised, pid = await _layered_with_decrypt_raising(engine, monkeypatch, caplog, refusal)
     assert r.status_code == 423, r.text
     assert r.json()["detail"] == f"preset {pid} failed its integrity check and cannot be used"

@@ -112,7 +112,10 @@ audit row and raises an `integrity_drift` alert, with at least these exceptions.
 `vault_transit`, a message or saved-search cell that Transit refuses with its AEAD authentication
 failure is refused, audited and alerted as any other moved cell is, but Transit's other refusals
 and its outages keep the cipher's own error for such a cell, with no integrity audit row or alert
-(BACKLOG #5650). A queue payload cell still classifies through `is_tag_failure`, which counts every
+(BACKLOG #5650). That reading holds only while Vault or OpenBao returns the AEAD library's own
+error text, unwrapped, as the 400's only reason. That shape was not read from either project's
+source at a commit, so a release that wraps or prefixes the text would turn such a refusal back
+into the cipher's own error, unaudited and unalerted. A queue payload cell still classifies through `is_tag_failure`, which counts every
 marked Transit value as held, so under `vault_transit` any failure to open one, an outage
 included, reads as a queue tag failure. Transit gives the same AEAD refusal when the data key it is
 pointed at is not the one that sealed the cell, so a recreated key, or another Vault's key of the
