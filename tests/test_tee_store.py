@@ -526,8 +526,8 @@ async def test_only_a_purge_that_deleted_no_row_skips_the_scrub(
         assert checkpoints == []  # the scrub never ran
         with pytest.raises(PurgeIncompleteError):  # control: the reader really pins the WAL
             await store.scrub()
-        # The empty -wal lets the first checkpoint pass; the reader pins the VACUUM's frames.
-        assert checkpoints == [True, False]
+        # scrub() writes its scrub-pending record first, so the reader pins the first checkpoint.
+        assert checkpoints == [False]
     finally:
         if peer is not None:
             peer.close()
@@ -739,3 +739,74 @@ async def test_rerun_finishes_a_scrub_whose_vacuum_failed_after_a_small_delete(
     finally:
         await store.close()
     assert _user_version(db_path) == 0
+
+
+async def test_a_purge_that_ran_alongside_a_scrub_keeps_its_scrub_pending_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Purge A's scrub is under way when purge B's delete lands (B's increment, made here by a second
+    # connection just before A's VACUUM). A's finished scrub must not erase B's record.
+    db_path = tmp_path / "tee.db"
+    store = await RelayStore.open(str(db_path))
+    peer = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        await store.record_capture(direction="corepoint_copy", control_id="C", raw=_MARKER_BODY)
+        real_execute = store._db.execute  # noqa: SLF001
+
+        def execute(sql: str, *args: Any) -> Any:
+            if sql == "VACUUM":
+                current = peer.execute("PRAGMA user_version").fetchone()[0]
+                peer.execute(f"PRAGMA user_version={current + 1}")  # purge B's delete lands
+            return real_execute(sql, *args)
+
+        monkeypatch.setattr(store._db, "execute", execute)  # noqa: SLF001
+        assert await store.purge(captures_only=True) == (0, 1)
+        monkeypatch.undo()
+    finally:
+        peer.close()
+        await store.close()
+    assert _user_version(db_path) != 0  # B's record survives A's clear
+
+
+@pytest.mark.usefixtures("fast_checkpoint_poll")
+async def test_a_failed_scrub_only_leaves_a_scrub_pending_record(tmp_path: Path) -> None:
+    db_path = tmp_path / "tee.db"
+    store = await RelayStore.open(str(db_path))
+    peer: sqlite3.Connection | None = None
+    try:
+        await store.record_capture(direction="corepoint_copy", control_id="C", raw=b"MSH|keep")
+        assert _user_version(db_path) == 0  # nothing owed yet
+        peer = sqlite3.connect(db_path, isolation_level=None)
+        peer.execute("BEGIN")
+        peer.execute("SELECT COUNT(*) FROM relay_capture").fetchall()  # pins the WAL
+        with pytest.raises(PurgeIncompleteError):
+            await store.scrub()
+        peer.execute("END")
+    finally:
+        if peer is not None:
+            peer.close()
+        await store.close()
+    assert _user_version(db_path) != 0  # the next purge or --scrub-only will scrub
+
+
+async def test_a_failing_checkpoint_after_the_clear_does_not_report_a_failed_purge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = await _open(tmp_path)
+    try:
+        await store.record_capture(direction="corepoint_copy", control_id="C", raw=_MARKER_BODY)
+        real = store._checkpoint_truncate  # noqa: SLF001
+        calls = {"n": 0}
+
+        async def checkpoint() -> bool:
+            calls["n"] += 1
+            if calls["n"] == 3:  # the best-effort one after the scrub-pending clear
+                raise sqlite3.OperationalError("disk I/O error")
+            return await real()
+
+        monkeypatch.setattr(store, "_checkpoint_truncate", checkpoint)
+        assert await store.purge(captures_only=True) == (0, 1)
+        assert calls["n"] == 3
+    finally:
+        await store.close()
+    assert _user_version(tmp_path / "tee.db") == 0

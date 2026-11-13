@@ -188,19 +188,16 @@ names a patient. `VACUUM` is part of the scrub. The store zeroes deleted content
 only where that costs no extra I/O, and leaves a freed page as it was. A B-tree rebalance can also
 leave a stale copy of a deleted row in a page's unused space. Only the rebuild removes these.
 
-A run that deletes rows records a scrub-pending flag in the DB, in the same transaction as the
-delete, and only a scrub that finishes clears it. So after any unfinished scrub, a re-run of
-`purge`, even one that deletes nothing, or `purge --scrub-only`, finishes it, or exits 1 again if it
-still cannot. A run that deletes nothing also scrubs, at least, when the DB has free pages or its
-`-wal` file is not empty. A running relay's writes leave the `-wal` non-empty, so a sweep beside a
-relay that has written since the last checkpoint scrubs too. A run skips the scrub only when it
-deletes nothing, the flag is clear, and neither of those holds.
-
-`purge --scrub-only` is the command that always runs the scrub, whatever the flag and the hints
-say, and it exits 1 if the scrub cannot finish. **Run purges one at a time.** A scrub clears the
-flag when it finishes, so it can also clear a flag that another purge, running at the same time,
-set for rows the scrub did not cover. A later plain purge then skips the scrub unless a hint
-holds; `--scrub-only` still runs it.
+**When purge scrubs, and what finishes an unfinished scrub.** This is the one statement of it;
+the code's docstrings link here. A run that deletes rows records that a scrub is owed, in the
+same transaction as the delete, and `purge --scrub-only` records it before it starts. A scrub
+that finishes clears only what was owed when it started, so a purge that ran at the same time
+keeps its own record. So any later `purge`, even one that deletes nothing, or `purge
+--scrub-only`, finishes an unfinished scrub, or exits 1 if it still cannot. A run that deletes
+nothing also scrubs, at least, when the DB has free pages or its `-wal` file is not empty;
+SQLite reuses the `-wal` without shrinking it, so a sweep beside a running relay usually scrubs.
+A run skips the scrub only when it deletes nothing, no scrub is owed, and neither of those holds.
+`--scrub-only` always attempts the whole scrub.
 
 **The scrub is file-level only.** A checkpoint frees the `-wal` file's blocks and `VACUUM` shrinks
 the DB file, but neither overwrites the freed blocks. So the bytes can stay readable on the raw
@@ -235,9 +232,9 @@ prints no counts; and an error while closing the store after a scrub error, whic
 `error: ...` line with the counts and then a traceback.
 
 To finish an unfinished scrub without deleting anything, run
-`python -m tee purge --db ./tee.db --scrub-only` once the cause is gone; a plain re-run of the purge
-also finishes it, as above, but deletes under its own arguments. It deletes nothing and needs no `-y`, and it refuses a `--db` path that does not exist. It attempts the whole scrub, exits 1 with
-`error: ...` if the scrub still does not finish, and prints `scrubbed <db>` when it does.
+`python -m tee purge --db ./tee.db --scrub-only` once the cause is gone. A plain re-run of the
+purge works too, as above, but deletes under its own arguments. `--scrub-only` needs no `-y`,
+refuses a `--db` path that does not exist, and prints `scrubbed <db>` when the scrub finishes.
 
 ```bash
 python -m tee purge --db ./tee.db --before 7d -y          # retention sweep
