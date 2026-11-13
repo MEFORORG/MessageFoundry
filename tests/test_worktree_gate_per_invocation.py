@@ -385,3 +385,53 @@ def test_a_single_quoted_spacey_chdir_is_not_guessed_as_the_cwd(rig: SimpleNames
         ["git", "init", "-q", "-b", "main", str(spacey)], check=True, capture_output=True
     )
     assert _allowed(rig, f"cd '{spacey.as_posix()}' && git reset --hard", rig.primary)
+
+
+# ------------------------------------------------------------------ Manager convergence round
+
+
+def test_sixty_invocations_finish_well_inside_the_hook_timeout(rig: SimpleNamespace) -> None:
+    """A hook killed by its 15 s timeout lets the command through, so cost is a control here.
+
+    Measured before this round: about 30 s for sixty `git reset` invocations from the session's own
+    linked worktree, against about 3 s on origin/main, because rule 3b judged every one of them.
+    """
+    import time
+
+    cmd = " ; ".join(["git reset -q --soft HEAD"] * 60)
+    started = time.monotonic()
+    assert _allowed(rig, cmd, rig.wt)
+    elapsed = time.monotonic() - started
+    assert elapsed < 10, f"60 invocations took {elapsed:.1f}s; the install timeout is 15s"
+
+
+_DISARM = "core." + "hooksPath /nope"
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "echo '\"' ; git -C '{p}' config {k}",
+        "echo '\"' ; git --git-dir='{p}/.git' config {k}",
+        "echo '\"' ; GIT_DIR='{p}/.git' git config {k}",
+    ],
+)
+def test_an_earlier_quote_character_does_not_switch_the_strip_off(
+    rig: SimpleNamespace, template: str
+) -> None:
+    """The quote count read `'"'` as opening a double-quoted span; the scanner does not."""
+    reason = _reason(rig, template.format(p=rig.primary.as_posix(), k=_DISARM), rig.outside)
+    assert "SHARED git configur" in reason, reason
+
+
+def test_an_earlier_quote_character_does_not_switch_the_strip_off_for_work_tree(
+    rig: SimpleNamespace,
+) -> None:
+    cmd = f"echo '\"' ; git --work-tree='{rig.primary.as_posix()}' reset --hard"
+    assert "SHARED PRIMARY" in _reason(rig, cmd, rig.outside)
+
+
+def test_an_earlier_quote_character_does_not_make_a_message_live(rig: SimpleNamespace) -> None:
+    """The other direction: the mention stays inside its message, as on origin/main."""
+    cmd = f"echo '\"' ; git stash push -m \"try -C '{rig.primary.as_posix()}' later\""
+    assert _allowed(rig, cmd, rig.outside)

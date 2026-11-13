@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.13.1"
+$GateVersion = "2026.11.13.2"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -636,16 +636,41 @@ function ConvertFrom-RawDashCValue([string]$Value) {
 # git LITERALLY. Stripping that second layer read it as `..` and allowed commands the gate had denied.
 # So the character before the group decides: a `"` there means the shell's quote is gone already.
 #
-# AND NOT INSIDE A DOUBLE-QUOTED SPAN (review of BACKLOG #5642, round 3). On a RAW line the readers also
-# match inside a message: `git stash push -m "try -C '<primary>' later"` captured `'<primary>'`, the
-# strip made it a live path, and an ordinary stash was refused. An odd count of unescaped `"` before the
-# capture means it sits inside such a span, and the capture is returned as it was before #5642. That
-# is a COUNT, not a parse, and it errs toward the pre-change reading in both directions.
+# AND NOT INSIDE A QUOTED SPAN THE SCANNER BLANKS (review of BACKLOG #5642, rounds 3 and ad5ddc94). On a
+# RAW line the readers also match inside a message: `git stash push -m "try -C '<primary>' later"`
+# captured `'<primary>'`, the strip made it a live path, and an ordinary stash was refused. Such a
+# capture is returned as it was before #5642.
+#
+# DECIDED BY Remove-QuotedSpans ITSELF, through its -Map, not by counting quotes. The count it replaces
+# ignored single-quoted spans and read a backslash as an escape on every host, so `echo '"' ; git -C
+# '<primary>' config core.hooksPath x` flipped the parity and allowed the disarm. A raw index the scan
+# maps to no character lies inside a span it blanked; a quoted bare word is unmasked and mapped, so it
+# still counts as a token. A capture that opens its own span is judged on that span's opener or first
+# character, because the scanner maps a blanked pair's opener and an unmasked word's interior only. The convention is the host's, $script:CaptureConvention, which for a
+# recursed interpreter payload is an approximation in its escape character only.
+$script:CaptureConvention = 'none'
+$script:BlankedMapCache = @{}
+function Test-InsideBlankedSpan([string]$Text, [int]$Index) {
+    $key = "$($script:CaptureConvention)`0$Text"
+    if (-not $script:BlankedMapCache.ContainsKey($key)) {
+        $m = [System.Collections.Generic.List[int]]::new()
+        [void](Remove-QuotedSpans $Text $script:CaptureConvention $m)
+        $script:BlankedMapCache[$key] = [System.Collections.Generic.HashSet[int]]::new($m)
+    }
+    -not $script:BlankedMapCache[$key].Contains($Index)
+}
+
 function Get-UnquotedCapture([System.Text.RegularExpressions.Group]$Group, [string]$Text, [switch]$RawDashC) {
     $value = $Group.Value.Trim()
     if ($Group.Index -gt 0 -and $Text[$Group.Index - 1] -eq [char]'"') { return $value }
-    $before = $Text.Substring(0, $Group.Index)
-    if (([regex]::Matches($before, '(?<![\\`])"')).Count % 2 -eq 1) { return $value }
+    # A capture that OPENS its own quoted span is outside every other span when the scanner kept either
+    # that opener (a blanked pair) or the first character after it (an unmasked bare word).
+    $inside = Test-InsideBlankedSpan $Text $Group.Index
+    if ($inside -and $Group.Value.Length -gt 1 -and
+        ($Group.Value[0] -eq [char]"'" -or $Group.Value[0] -eq [char]'"')) {
+        $inside = Test-InsideBlankedSpan $Text ($Group.Index + 1)
+    }
+    if ($inside) { return $value }
     if ($RawDashC) { return (ConvertFrom-RawDashCValue $value) }
     Remove-OuterQuotePair $value
 }
@@ -2620,6 +2645,7 @@ function Get-SessionRoot([string]$CwdCmp, [string]$CwdRaw) {
 }
 
 $tool   = [string]$hook.tool_name
+$script:CaptureConvention = Get-HostConvention $tool
 $cwd    = Get-ComparablePath ([string]$hook.cwd)   # canonicalised: allowlist comparison only
 $cwdRaw = [string]$hook.cwd                        # original case: for `git -C` in rule 3b
 
@@ -4805,11 +4831,24 @@ worktree gate blocked it." The primary's HEAD belongs to the user, not to a sess
         # so its INPUT moved where those did, and nothing else about it. It judged only the
         # first verb-bearing segment, so `git -C <ungoverned> clean -fd ; git switch <branch>` in
         # another session's worktree was allowed. Each call denies and exits, or returns.
-        # An exact repeat is skipped: each call can spawn several git processes.
+        # A REPEAT OF A VERDICT ALREADY REACHED IS SKIPPED, and the key is what the verdict depends on
+        # (review of BACKLOG #5655, round ad5ddc94). Each call can spawn several git processes, and a
+        # hook killed by its 15 s timeout lets the command through: keyed on the whole invocation text,
+        # sixty `git reset` invocations took 30 s here against 3 s on origin/main. A class B verb is
+        # judged on its TARGET alone (and the session cwd, which is fixed), so its key is the target. A
+        # class A verb also reads its destination, so its key adds the verb and its arguments up to the
+        # next separator, the same span Test-WorktreeHijack parses. The set is SEEDED with the call above.
         # ORDINAL: a PowerShell hashtable folds case, so `switch FOO` and `switch foo` would collide.
         $judged = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+        $hijackKey = {
+            param([string]$KVerb, [string]$KText, [string]$KTarget)
+            if ($hijackHeadMoveVerbs -contains $KVerb) { return "B`0$KTarget" }
+            $kArgs = ($KText -replace ('(?s)^.*?\b' + [regex]::Escape($KVerb) + '\b'), '')
+            "A`0$KVerb`0$KTarget`0$(($kArgs -split '(?:&&|\|\||;|\|)', 2)[0])"
+        }
+        [void]$judged.Add((& $hijackKey $verb $verbLine $targetRaw))
         foreach ($iv in $invocations) {
-            if (-not $iv.Target -or -not $judged.Add("$($iv.Verb)`0$($iv.Target)`0$($iv.Text)")) { continue }
+            if (-not $iv.Target -or -not $judged.Add((& $hijackKey $iv.Verb $iv.Text $iv.Target))) { continue }
             Test-WorktreeHijack $iv.Verb $iv.Text $iv.Target $cwdRaw
         }
         exit 0

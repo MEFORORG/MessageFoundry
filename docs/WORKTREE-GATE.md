@@ -128,10 +128,13 @@ for the checkouts named in its allowlist:
    its own text: there is no checked route for a move.
 
 **How rules 3 to 3d read a path.** A path given to `cd`, `-C`, `--work-tree`, `GIT_WORK_TREE`,
-`--git-dir` or `GIT_DIR` is read the same whether it is bare, double-quoted or single-quoted. Until
-BACKLOG #5642 a single-quoted path kept its quotes, named nothing, and was allowed. A quoted path that
-contains a space is still truncated at the space; that residual is listed in the hook beside rule 3d.
-A single-quoted path inside a double-quoted message is left as it was read before #5642.
+`--git-dir` or `GIT_DIR` as one whole word -- bare, double-quoted or single-quoted -- is read the same
+under each spelling. Until BACKLOG #5642 a single-quoted path kept its quotes, named nothing, and was
+allowed. At least these spellings are still NOT read as the shell reads them, and some are allowed:
+a quoted path that contains a space, which is truncated at the space (the residual listed in the hook
+beside rule 3d); a path with an adjacent quoted piece, such as `'<path>'/` or `<path>''`, which keeps
+its quotes; and `Push-Location <x>; Pop-Location`, which is read as standing in `<x>`. A quoted path
+inside a quoted message, such as a commit message, keeps its own quotes, as it did before #5642.
 
 **Rule 3d judges every invocation on the line.** Each `git worktree remove` or `move` outside quotes is
 judged. Its victim is resolved against the line's first `-C`, and also against that invocation's
