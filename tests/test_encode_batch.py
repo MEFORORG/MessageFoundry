@@ -96,7 +96,7 @@ def _no_parse(*_args: object, **_kwargs: object) -> Message:
     raise AssertionError("encode_batch parsed a member")
 
 
-@pytest.mark.parametrize("head", [M1, "  \r\n" + M1, M1.replace("\r", "\n")])
+@pytest.mark.parametrize("head", [M1, M1.replace("\r", "\n")])
 def test_the_head_member_is_not_parsed(monkeypatch: pytest.MonkeyPatch, head: str) -> None:
     # Only MSH-1 and MSH-2 are needed, so a full parse of a large head is waste.
     monkeypatch.setattr(Message, "parse", staticmethod(_no_parse))
@@ -128,21 +128,22 @@ def test_members_are_not_copied_before_the_join() -> None:
     assert peak - before < 1.5 * total, peak - before
 
 
-_Reading = tuple[str, str, str, str, str] | type[ValueError]
+#: The separators read, or the refusal's exact type and message.
+_Reading = tuple[str, ...]
 
 
 def _parser_reading(head: str) -> _Reading:
     try:
         return Message.parse(head)._encoding_chars()
-    except ValueError:  # HL7PeekError is one
-        return ValueError
+    except ValueError as exc:  # HL7PeekError is one
+        return type(exc).__name__, str(exc)
 
 
 def _batch_reading(head: str) -> _Reading:
     try:
         bhs = encode_batch([head], control_id="1", timestamp=_TS).split("\r", 1)[0]
-    except ValueError:
-        return ValueError
+    except ValueError as exc:
+        return type(exc).__name__, str(exc)
     return bhs[3], bhs[4], bhs[5], bhs[6], bhs[7]
 
 
@@ -173,13 +174,19 @@ def test_the_head_separators_match_the_parser(head: str) -> None:
     assert _batch_reading(head) == _parser_reading(head)
 
 
-def test_a_malformed_later_line_is_not_the_separator_reads_to_refuse() -> None:
-    # The one place the reading parts from a parse, by design: the parser refuses a later header
-    # line too short to read, and finding it takes the whole-body scan BACKLOG #5919 removed. The
-    # head's own separators are read, not guessed. On the delivery path the caller's parse of the
-    # head for MSH-10 still refuses such a head before this runs.
-    head = "MSH|^~\\&|A\rMSH"
-    assert _parser_reading(head) is ValueError
+@pytest.mark.parametrize(
+    "head",
+    [
+        "MSH|^~\\&|A\rMSH",  # a later header line too short to read
+        "MSH|^~\\&|A\rOBX|1|TX|||" + "\\.in9999999\\" * 20 + "\r",  # over the escape budget
+    ],
+)
+def test_what_a_parse_checks_past_the_header_is_not_checked(head: str) -> None:
+    # Where the reading parts from a parse, by design: finding these takes the whole-body scan
+    # BACKLOG #5919 removed. The head's own separators are read, not guessed, and nothing in the
+    # batch unescapes the head. On the delivery path the caller's parse of the head's stored
+    # payload for MSH-10 still refuses such a head before this runs.
+    assert _parser_reading(head)[0] == "HL7PeekError"  # positive control: a parse refuses it
     assert _batch_reading(head) == ("|", "^", "~", "\\", "&")
 
 

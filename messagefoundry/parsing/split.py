@@ -285,12 +285,13 @@ def encode_batch(messages: list[Message | str], *, control_id: str, timestamp: s
         raise ValueError("encode_batch requires at least one message")
     # Read the batch separators from the HEAD member's own MSH (never hardcode |^~\&). The head drives
     # the whole envelope's framing; mixed-delimiter members in one batch are not a real feed shape.
-    texts = [m.encode() if isinstance(m, Message) else normalize(m) for m in messages]
     head = messages[0]
     if isinstance(head, Message):
         field_sep, comp_sep, rep_sep, esc, sub_sep = head._encoding_chars()
+        head_text = head.encode()
     else:
-        field_sep, comp_sep, rep_sep, esc, sub_sep = _head_separators(texts[0])
+        head_text = normalize(head)
+        field_sep, comp_sep, rep_sep, esc, sub_sep = _head_separators(head_text)
     enc = (
         comp_sep + rep_sep + esc + sub_sep
     )  # MSH-2 / BHS-2: component^repetition~escape\subcomponent
@@ -301,9 +302,9 @@ def encode_batch(messages: list[Message | str], *, control_id: str, timestamp: s
     # Every piece carries its own trailing CR, so for a member that ends with one CR the join is
     # the only copy: a strip of each member and a CR added to the joined envelope each copied it
     # again (BACKLOG #5919).
-    pieces = [bhs, "\r"]
-    for text in texts:
-        pieces.extend(_framed(text))
+    pieces = [bhs, "\r", *_framed(head_text)]
+    for m in messages[1:]:
+        pieces.extend(_framed(m.encode() if isinstance(m, Message) else normalize(m)))
     pieces += [bts, "\r"]
     return "".join(pieces)
 
@@ -316,21 +317,28 @@ def _head_separators(norm: str) -> tuple[str, str, str, str, str]:
     """The ``(field, component, repetition, escape, subcomponent)`` delimiters of a batch's head
     member, normalized as ``norm``, as :meth:`Message._encoding_chars` reads them after a parse.
 
-    For a head that opens with ``MSH`` after whitespace, the shape every member a frame check
-    passed has, they are read from that line's first few characters alone, through the parser's
-    own window (:func:`~messagefoundry.parsing._builtin_hl7._first_line_head`) and separator read
-    (BACKLOG #5919): a full parse of a large hydrated head to read eight characters cost its whole
-    size in time and memory. Any other head, an ``FHS``/``BHS``-led one or one the parser refuses,
-    such as a byte order mark before its ``MSH``, is parsed as before, so it frames or is refused
-    exactly as it was. Raises ``ValueError``, as ``_encoding_chars`` does, when MSH-1 or four
-    encoding characters are missing, rather than guess."""
+    For a head that opens with ``MSH`` after whitespace, with MSH-1 and four encoding characters,
+    they are read from that line's first few characters alone, through the parser's own window
+    (:func:`~messagefoundry.parsing._builtin_hl7._first_line_head`) and separator read (BACKLOG
+    #5919): a full parse of a large hydrated head to read eight characters cost its whole size in
+    time and memory. Every other head, such as an ``FHS``/``BHS``-led one, one led by a byte order
+    mark, a non-HL7 one or one whose MSH-2 is short, is parsed as before, so it frames or raises
+    exactly as it did, ``ValueError`` and its message included.
+
+    The read is of the header alone, so what a parse checks in the rest of the head is not
+    checked here: at least a later header line too short to read, and the escape expansion
+    budget. Nothing in the batch path unescapes the head, and the delivery path's caller parses
+    the head's stored payload for MSH-10 before this runs."""
     line = _first_line_head(norm)
-    if not line.startswith(_MSH):
-        return Message.parse(norm)._encoding_chars()
     # _extract_separators fills a short MSH-2 with defaults, where _encoding_chars refuses one, so
-    # the line must hold MSH-1 and four encoding characters with no field separator among them.
-    if len(line) < _SEPARATORS_WIDTH or line.find(line[3], 4, _SEPARATORS_WIDTH) != -1:
-        raise ValueError("cannot determine HL7 separators: the head's MSH-1 or MSH-2 is short")
+    # the line must hold MSH-1 and four encoding characters with no field separator among them. A
+    # window narrower than that only sends every head to the parse.
+    if (
+        not line.startswith(_MSH)
+        or len(line) < _SEPARATORS_WIDTH
+        or line.find(line[3], 4, _SEPARATORS_WIDTH) != -1
+    ):
+        return Message.parse(norm)._encoding_chars()
     field_sep, comp_sep, rep_sep, sub_sep, esc = _extract_separators(line)
     return field_sep, comp_sep, rep_sep, esc, sub_sep
 
