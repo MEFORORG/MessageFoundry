@@ -164,9 +164,9 @@ EXPOSURE = (
     "CI only, and narrower than the workflow's triggers. The bundle executes in "
     ".github/workflows/cla.yml on pull_request_target, and on issue_comment when the comment is on "
     "a pull request and its body is 'recheck' or the sign-off sentence (GitHub compares the text "
-    "ignoring case) -- a privileged context holding a repository token. The workflow is also triggered by merge_group, where the step's own `if:` skips the "
-    "bundle rather than running it. It is not packaged into the wheel or sdist and no engine "
-    "deployment carries it."
+    "ignoring case) -- a privileged context holding a repository token. The workflow is also "
+    "triggered by merge_group, where the step's own `if:` skips the bundle "
+    "rather than running it. It is not packaged into the wheel or sdist and no engine deployment carries it."
 )
 
 #: The vendored bundle, and the lockfile it is audited against. Named once because both the keys of

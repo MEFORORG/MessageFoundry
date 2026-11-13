@@ -219,14 +219,16 @@ def _evaluate(
     # Whitelist BEFORE evaluating. The input is this repository's own workflow, so this is not a
     # trust boundary -- it is a guard against grading an expression that grew syntax this function
     # does not model.
-    if not re.fullmatch(r"[\s()a-z0-9_=!]+", expr):
+    # `!a == b` is `(!a) == b` on GitHub and `not (a == b)` in Python, so it raises rather than
+    # being graded with the wrong precedence.
+    if re.search(r"\bnot\s+\w+\s*[=!]=", expr) or not re.fullmatch(r"[\s()a-z0-9_=!]+", expr):
         raise AssertionError(
             f"the roll-up condition uses syntax this reader does not model: {condition!r}. Teach "
             "_evaluate the new form rather than loosening this check -- an unmodelled operator "
             "silently changes what the gate is graded against."
         )
     # GitHub's `==` compares strings ignoring case, so every string is case-folded before Python's
-    # case-sensitive `==` sees it. NOT modelled: `!` binding tighter than `==` (`!a == b`).
+    # case-sensitive `==` sees it.
     names = {
         key: value.casefold() if isinstance(value, str) else value
         for key, value in {**(_DEFAULT_CONTEXT if context is None else context), **literals}.items()

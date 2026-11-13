@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import functools
 import http.client
+import io
 import json
 import urllib.request
 from collections.abc import Mapping
@@ -48,11 +49,31 @@ def _scenarios() -> dict[str, Any]:
     return loaded
 
 
+def _first_100_linked() -> Mapping[str, Any]:
+    """The page the fixture names "first_100_linked": 100 commits by one linked account."""
+    octo = {
+        "name": "Octo Contributor",
+        "user": {"databaseId": 90000001, "login": "octo-contributor"},
+    }
+    nodes = [
+        {"commit": {"oid": f"{i:040x}", "author": octo, "committer": octo}} for i in range(1, 101)
+    ]
+    commits = {
+        "totalCount": 101,
+        "pageInfo": {"endCursor": "Y3Vyc29yOjEwMA==", "hasNextPage": True},
+        "nodes": nodes,
+    }
+    return {"data": {"repository": {"pullRequest": {"headRefOid": _HEAD, "commits": commits}}}}
+
+
 class _Replay:
     """Serve one scenario's pages in order, recording the variables of every call."""
 
     def __init__(self, scenario: str) -> None:
-        self.pages: list[Mapping[str, Any]] = list(_scenarios()[scenario])
+        self.pages: list[Mapping[str, Any]] = [
+            _first_100_linked() if page == "first_100_linked" else page
+            for page in _scenarios()[scenario]
+        ]
         self.calls: list[dict[str, object]] = []
 
     def __call__(self, query: str, variables: Mapping[str, object]) -> Mapping[str, Any]:
@@ -159,7 +180,30 @@ def test_a_linked_author_wins_over_an_actions_bot_committer() -> None:
 
 def test_a_read_short_of_total_count_is_refused_not_excused() -> None:
     refusals, _ = _verdict("short_read")
-    assert len(refusals) == 1 and "2 of the pull request's 300" in refusals[0]
+    assert (
+        len(refusals) == 1
+        and "read 2 distinct commits where the pull request has 300" in refusals[0]
+    )
+
+
+def test_a_repeated_commit_does_not_count_as_the_one_it_displaced() -> None:
+    refusals, _ = _verdict("repeated_commit")
+    assert len(refusals) == 1 and "100 distinct commits" in refusals[0]
+
+
+def test_an_author_first_seen_past_the_hundredth_commit_is_refused() -> None:
+    """BACKLOG #5645: the action never reads commit 101, so its new author is never checked."""
+    refusals, _ = _verdict("new_author_past_100")
+    assert len(refusals) == 1 and "new-person" in refusals[0]
+
+
+def test_an_unlinked_name_folded_into_the_dropped_bot_entry_is_refused() -> None:
+    """The action keys both commits under github-actions[bot] and drops that id, whatever the
+    allowlist says, so the fold refuses even with the bot left off the allowlist."""
+    read = fetch_commits(
+        _Replay("unlinked_folds_into_actions_bot"), "MEFORORG", "MessageFoundry", 7
+    )
+    assert len(evaluate(read, ["wshallwshall"]).refusals) == 1
 
 
 @pytest.mark.parametrize(
@@ -179,7 +223,9 @@ def test_wildcard_and_empty_entries_match_as_the_action_matches() -> None:
     assert matches_allowlist("wshallwshall", [" wshallwshall "])
     assert not matches_allowlist("wshallwshal", ["wshallwshall"])
     assert matches_allowlist("", parse_allowlist("a,,b"))
-    assert not matches_allowlist("a\rb", ["a*b"])
+    for separator in ("\r", "\n", " ", " "):
+        assert not matches_allowlist(f"a{separator}b", ["a*b"])
+    assert matches_allowlist("a\tb", ["a*b"])
 
 
 def test_run_exit_codes_and_annotations(capsys: pytest.CaptureFixture[str]) -> None:
@@ -232,12 +278,24 @@ def test_a_truncated_reply_is_a_fault_and_not_a_refusal(monkeypatch: pytest.Monk
     def truncated(*_args: object, **_kwargs: object) -> object:
         raise http.client.IncompleteRead(b"")
 
-    monkeypatch.setattr(urllib.request, "urlopen", truncated)
+    monkeypatch.setattr(cla_precheck._OPENER, "open", truncated)
     transport = cla_precheck.urllib_transport(
         "https://example.test/graphql", "synthetic-token-value"
     )
     with pytest.raises(PrecheckFault):
         transport("query", {})
+
+
+def test_a_redirect_is_refused_rather_than_followed_with_the_token() -> None:
+    """urllib's default handler re-sends Authorization to the redirect's target."""
+    installed: list[object] = getattr(cla_precheck._OPENER, "handlers")  # noqa: B009 -- untyped
+    handlers = [h for h in installed if isinstance(h, urllib.request.HTTPRedirectHandler)]
+    assert handlers and all(isinstance(h, cla_precheck._NoRedirect) for h in handlers)
+    request = urllib.request.Request("https://example.test/graphql")
+    with pytest.raises(PrecheckFault):
+        handlers[0].redirect_request(
+            request, io.BytesIO(), 302, "Found", http.client.HTTPMessage(), "http://other.test/"
+        )
 
 
 def test_a_commit_name_cannot_open_a_workflow_command_of_its_own(
@@ -277,4 +335,5 @@ def test_the_script_reads_event_data_from_the_environment_only() -> None:
     """zizmor's template-injection rule: a workflow passes event data through `env:`, never by
     templating it into the command line, so the script must not read argv at all."""
     source = Path(cla_precheck.__file__).read_text(encoding="utf-8")
-    assert "sys.argv" not in source and "argparse" not in source
+    for reader in ("argv", "argparse", "getopt", "optparse", "fileinput"):
+        assert reader not in source, f"cla_precheck.py names {reader!r}"

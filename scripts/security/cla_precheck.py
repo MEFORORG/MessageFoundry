@@ -21,8 +21,10 @@ WHAT THE VENDORED ACTION DOES, read from ``.github/actions/cla-assistant-lite/di
 
 So a commit authored and committed under unlinked emails, with the git name set to an allowlisted
 login, is dropped as allowlisted and never needs a signature. This script finds that commit and
-refuses. It reads EVERY commit, paging on ``hasNextPage``, refuses when it read fewer commits than
-GitHub's ``totalCount`` reports, and faults when the pull request's head moved while it read.
+refuses, and so it does for an unlinked name the action folds into a linked entry it skips. It
+reads EVERY commit, paging on ``hasNextPage``, and refuses an author first seen past the 100 commits
+the action reads, or a read with fewer distinct commits than GitHub's ``totalCount``. It faults when
+the pull request's head moved while it read.
 
 WHAT IT DOES NOT DO. It is NOT WIRED INTO ANY WORKFLOW. Adding a fail-closed step to the required
 ``cla`` context is an owner decision, because a fault in the step would wedge every pull request,
@@ -32,7 +34,7 @@ that. It reports as a NOTICE, without refusing, at least these shapes the owner 
   * an unlinked author attributed to a linked, allowlisted committer;
   * an unlinked author whose commit the action drops because the committer is ``github-actions[bot]``;
   * an unlinked commit whose git name equals the login of a linked commit in the same pull
-    request, which the action folds into that account.
+    request; the action keeps one entry under that name, from whichever commit comes first.
 
 It CANNOT see a commit linked through a spoofed email. GitHub links a commit to an account by its
 email alone, so an author email set to an allowlisted account's address reads as that account, here
@@ -42,8 +44,8 @@ UNMEASURED: whether GitHub caps a pull request's commit connection (its REST lis
 and, if it does, whether ``totalCount`` reports the capped or the real count. The short-read refusal
 holds only where ``totalCount`` is the real count.
 
-INPUT COMES ONLY FROM THE ENVIRONMENT, never from argv or a templated ``run:`` line, so a workflow
-step can pass event data through ``env:`` (zizmor's template-injection rule):
+INPUT COMES ONLY FROM THE ENVIRONMENT, never from the command line or a templated ``run:`` line,
+so a workflow step can pass event data through ``env:`` (zizmor's template-injection rule):
 
   GITHUB_TOKEN        a token that can read the pull request
   GITHUB_REPOSITORY   ``owner/name``
@@ -106,7 +108,7 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
 Transport = Callable[[str, Mapping[str, object]], Mapping[str, Any]]
 
 # JavaScript's `.` matches anything but these four; Python's misses only the newline.
-_JS_DOT_STAR = "[^\n\r  ]*"
+_JS_DOT_STAR = "[^\n\r\u2028\u2029]*"
 _SHA = re.compile(r"[0-9a-f]{40}")
 _REPOSITORY = re.compile(r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)")
 
@@ -223,9 +225,7 @@ def fetch_commits(transport: Transport, owner: str, name: str, number: int) -> P
             nodes = connection["nodes"]
             page_info = connection["pageInfo"]
         except (KeyError, TypeError) as exc:
-            raise PrecheckFault(
-                f"the GraphQL reply has no {exc} where the commits should be"
-            ) from exc
+            raise PrecheckFault("the GraphQL reply holds no pull request commits") from exc
         if not isinstance(nodes, list) or not isinstance(page_info, Mapping):
             raise PrecheckFault("the GraphQL reply's commit nodes or pageInfo have the wrong shape")
         if not isinstance(page_head, str) or (head is not None and page_head != head):
@@ -238,6 +238,12 @@ def fetch_commits(transport: Transport, owner: str, name: str, number: int) -> P
             commits.append(commit)
         if not page_info.get("hasNextPage"):
             break
+        reported = connection.get("totalCount")
+        # Bounds the loop: every page that asks for another must add commits, short of totalCount.
+        if not nodes or not isinstance(reported, int) or len(commits) >= reported:
+            raise PrecheckFault(
+                "a page asks for another although it added nothing or reached totalCount"
+            )
         next_cursor = page_info.get("endCursor")
         if not isinstance(next_cursor, str) or not next_cursor or next_cursor in seen_cursors:
             raise PrecheckFault("a page reports more commits but gives no new cursor to read them")
@@ -252,26 +258,45 @@ def fetch_commits(transport: Transport, owner: str, name: str, number: int) -> P
 def evaluate(read: PullRequestRead, allowlist: Sequence[str]) -> Verdict:
     refusals: list[str] = []
     notices: list[str] = []
-    if len(read.commits) != read.total:
+    distinct = len({str(commit.get("oid", "")) for commit in read.commits})
+    if distinct != read.total:
         refusals.append(
-            f"read {len(read.commits)} of the pull request's {read.total} commits; an unread commit "
-            "cannot be checked"
+            f"read {distinct} distinct commits where the pull request has {read.total}; a commit "
+            "not read once cannot be checked"
         )
     attributions = [attribute(commit) for commit in read.commits]
-    linked_logins = {who.name for who in attributions if who.author_linked or who.committer_linked}
+    # The action reads the first 100 only. An author first seen past them is never asked to sign.
+    seen_by_action = {who.name for who in attributions[:100]}
+    for who in attributions[100:]:
+        skipped_anyway = who.database_id == ACTIONS_BOT_ID or matches_allowlist(who.name, allowlist)
+        if who.name not in seen_by_action and not skipped_anyway:
+            seen_by_action.add(who.name)
+            refusals.append(
+                f"commit {who.oid} is past the 100 commits the action reads, and its author "
+                f"{who.name!r} appears in none of them, so the action never checks that author"
+            )
+    linked = [who for who in attributions if who.author_linked or who.committer_linked]
+    linked_keys = {who.name for who in linked}
+    # Keys whose linked entry the action skips: allowlisted, or the id it drops.
+    skipped_keys = {
+        who.name
+        for who in linked
+        if who.database_id == ACTIONS_BOT_ID or matches_allowlist(who.name, allowlist)
+    }
     for who in attributions:
         if who.author_linked:
             continue
         if not who.committer_linked:
-            if matches_allowlist(who.name, allowlist):
+            if matches_allowlist(who.name, allowlist) or who.name in skipped_keys:
                 refusals.append(
                     f"commit {who.oid} is linked to no GitHub account, and its git author name "
-                    f"{who.name!r} matches the CLA allowlist, so the action would skip it unsigned"
+                    f"{who.name!r} is a name the action skips, so it would pass unsigned"
                 )
-            elif who.name in linked_logins:
+            elif who.name in linked_keys:
                 notices.append(
                     f"commit {who.oid} is linked to no GitHub account, and its git author name "
-                    f"{who.name!r} is the login of a linked commit here, which the action folds it into"
+                    f"{who.name!r} is the login of a linked commit here; the action keeps one "
+                    "entry under that name, whichever commit comes first"
                 )
         elif who.database_id == ACTIONS_BOT_ID:
             notices.append(
@@ -291,6 +316,18 @@ def _escape_command(text: str) -> str:
     return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect: urllib would re-send the Authorization header to wherever it points."""
+
+    def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
+        raise PrecheckFault(
+            "GraphQL answered with a redirect, which this pre-check does not follow"
+        )
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def urllib_transport(url: str, token: str, timeout: float = 30.0) -> Transport:
     def call(query: str, variables: Mapping[str, object]) -> Mapping[str, Any]:
         body = json.dumps({"query": query, "variables": dict(variables)}).encode("utf-8")
@@ -305,7 +342,7 @@ def urllib_transport(url: str, token: str, timeout: float = 30.0) -> Transport:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
+            with _OPENER.open(request, timeout=timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             raise PrecheckFault(f"GraphQL answered HTTP {exc.code}") from exc
