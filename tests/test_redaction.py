@@ -2124,17 +2124,37 @@ _MALFORMED_END_TAGS = {
     "multi-line-tag": ("<family>Smith</family Johnathan\n>", "Johnathan", "</family"),
     "nested-child": ("<name><given>Smith</given SSN123456789></name>", "SSN123456789", "</given"),
     "kept-child": (
-        '<identifier><system value="urn:x"></system Johnathan><value value="1"/></identifier>',
+        "<identifier><system>urn</system Johnathan><value>1</value></identifier>",
         "Johnathan",
         "</system",
     ),
     "unopened-name": ("<family>Smith</other Johnathan></family>", "Johnathan", "</other"),
-    # Content that opens with whitespace or punctuation reads as prose unless the element closes, and
-    # an end tag with text inside it is a close the walk honours, so it is evidence too.
-    "space-led-content": ("<family> Smith</family Johnathan>", "Johnathan", "</family"),
-    "punctuation-led-content": ("<given>(Smith)</given Johnathan>", "Johnathan", "</given"),
-    "colon-after-name": ("<family> Smith</family: Johnathan>", "Johnathan", "</family"),
 }
+
+#: Malformed end tags whose remainder stays, as it did before #5925. An element only a malformed end
+#: tag would close is still read as prose when its text opens with whitespace or punctuation, since
+#: counting that tag as a close made the first stage scrub a widened trigger away
+#: (``test_an_end_tag_scrub_redacts_at_least_what_main_did`` found it). And a remainder with a label
+#: character near it stays, at least ``=``, ``:``, ``(`` and ``@``, so a label another reader needs
+#: is never the text the scrub takes.
+_KEPT_END_TAG_REMAINDERS = {
+    "space-led-content": "<family> Smith</family Johnathan>",
+    "punctuation-led-content": "<given>(Smith)</given Johnathan>",
+    "colon-after-name": "<family> Smith</family: Johnathan>",
+    "attribute-after": (
+        '<identifier><system value="urn:x"></system Johnathan><value value="1"/></identifier>'
+    ),
+    "label-on-a-later-line": "<family>Smith</family Johnathan>\nid=7",
+}
+
+
+@pytest.mark.parametrize(
+    "text", list(_KEPT_END_TAG_REMAINDERS.values()), ids=list(_KEPT_END_TAG_REMAINDERS)
+)
+def test_a_malformed_end_tag_near_a_label_is_a_stated_residual(text: str) -> None:
+    out = redact(text)
+    assert "Johnathan" in out, out
+    assert redact(out) == out
 
 
 @pytest.mark.parametrize(
@@ -2225,6 +2245,235 @@ def test_the_kept_remainder_is_byte_identical() -> None:
 def test_an_end_tag_keeps_its_name_and_whitespace(text: str, want: str) -> None:
     for widened in (False, True):
         assert redaction._redact_xml_elements(text, widened=widened) == want
+
+
+# The XML element pass as it stood before #5925, at origin/main 8c13c9ae03, vendored so the arms below
+# compare against the walk itself rather than a switch in the code under test. Only the end-tag
+# remainder and ``_XML_PHI_END`` differ from the shipped walk; the helpers it calls are unchanged.
+_PRE_5925_END_TAG_REST = re.compile(r"[^<>]*+>?")
+_PRE_5925_PHI_END = re.compile(
+    r"</(?:[A-Za-z_][\w.-]*+:)?(family|given|name|birthDate|address|identifier|telecom)\s*+>"
+)
+
+
+def _pre_5925_scrub_xml_element(
+    text: str, match: re.Match[str], last_close: dict[str, int]
+) -> tuple[str, int]:
+    r = redaction
+    out = [match.group()]
+    policy = r._VALUE_TOP if match.group(2) in r._PHI_VALUE_KEYS else r._LEAF
+    pos, how, attributed = r._walk_xml_tag(text, match.end(), policy, out)
+    if how != r._TAG_OPEN:
+        return "".join(out), pos
+    if not (
+        last_close.get(match.group(2), -1) >= pos
+        or attributed
+        or r._XML_CONTENT_EVIDENCE.match(text, pos)
+    ):
+        return "".join(out), pos
+    stack = [(match.group(1), policy)]
+    open_names = {match.group(1): 1}
+    n = len(text)
+    while stack:
+        tag = r._XML_TAG.search(text, pos)
+        stop = tag.start() if tag is not None else n
+        if stop > pos:
+            out.append(r._xml_text(text[pos:stop], stack[-1][1]))
+        if tag is None:
+            return "".join(out), n
+        qname = tag.group(2)
+        if tag.group(1):
+            rest = _PRE_5925_END_TAG_REST.match(text, tag.end())
+            pos = rest.end() if rest is not None else tag.end()
+            out.append(text[tag.start() : pos])
+            if open_names.get(qname):
+                while stack:
+                    name, _ = stack.pop()
+                    open_names[name] -= 1
+                    if name == qname:
+                        break
+            continue
+        out.append(tag.group())
+        parent = stack[-1][1]
+        child = r._LEAF if parent == r._LEAF else r._vocabulary_policy(tag.group(3), True)
+        child = r._LEAF if child == r._STRUCTURE_ONLY else child
+        pos, how, _ = r._walk_xml_tag(text, tag.end(), child, out)
+        if how == r._TAG_OPEN:
+            stack.append((qname, child))
+            open_names[qname] = open_names.get(qname, 0) + 1
+    return "".join(out), pos
+
+
+def _pre_5925_redact_xml_elements(text: str, *, widened: bool) -> str:
+    del widened  # the pass read both stages the same before #5925
+    if "<" not in text:
+        return text
+    out: list[str] = []
+    pos = 0
+    last_close: dict[str, int] | None = None
+    while (match := redaction._XML_PHI_ELEMENT.search(text, pos)) is not None:
+        if last_close is None:
+            last_close = {c.group(1): c.start() for c in _PRE_5925_PHI_END.finditer(text)}
+        replacement, end = _pre_5925_scrub_xml_element(text, match, last_close)
+        out.append(text[pos : match.start()])
+        out.append(replacement)
+        pos = end
+    if not out:
+        return text
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _end_tag_readings(text: str) -> tuple[str, ...]:
+    """``text`` by every log path :func:`_every_log_path` names, and through :func:`redact` then the
+    credential filter."""
+    return *_every_log_path(text).values(), secretscrub.scrub_credentials(redact(text))
+
+
+def _pre_5925_readings(text: str, monkeypatch: pytest.MonkeyPatch) -> tuple[str, ...]:
+    with monkeypatch.context() as patched:
+        patched.setattr(redaction, "_redact_xml_elements", _pre_5925_redact_xml_elements)
+        return _end_tag_readings(text)
+
+
+@pytest.mark.parametrize(
+    ("text", "value"),
+    [
+        # Counting a malformed end tag as a close walked this element in the first stage, which
+        # scrubbed the ``(0010,1000)`` the widened stage needed, so that stage never ran.
+        ("<family>(0010,1000) Doe</family Zqxa> Vornb", "Vornb"),
+        # Labels the credential filters read and a credential-shape screen missed.
+        ("<family>Smith</family %2Cpassword: <s3cr3tvalue99>", "s3cr3tvalue99"),
+        ("<family>Smith</family ;sslpassword=<s3cr3tvalue99>", "s3cr3tvalue99"),
+        ("<family>Smith</family MyPassword: <s3cr3tvalue99>", "s3cr3tvalue99"),
+        ("<family>Smith</family privatekey=<s3cr3tvalue99>", "s3cr3tvalue99"),
+        # A scrub that took a separator left a token the second handler's field run no longer read,
+        # and the kept tag name in it stayed.
+        ("<name>1980</family:Qwerty12Qwerty12^Kplm7\nQwerty12|", "Qwerty12"),
+    ],
+)
+def test_an_end_tag_scrub_regression_redacts_what_main_did(
+    text: str, value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each was a value an earlier head of the #5925 branch left in view and main did not. Compared
+    path by path, since main itself keeps some of them on a path that redacts twice."""
+    before = _pre_5925_readings(text, monkeypatch)
+    assert any(value not in old for old in before), "the control: main scrubbed it on some path"
+    for old, new in zip(before, _end_tag_readings(text), strict=True):
+        assert value in old or value not in new, new
+
+
+def test_an_end_tag_scrub_keeps_a_declared_separator(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A separator only the text's MSH declares keeps the remainder as a default one does."""
+    text = "MSH*$~\\#*A\n<name>Kplm7</family:Qwerty12$Kplm7*x"
+    assert all("Qwerty12" not in out for out in _pre_5925_readings(text, monkeypatch))
+    assert all("Qwerty12" not in out for out in _end_tag_readings(text))
+    # The positive control: with no separator sniffed, the scrub takes ``$`` and the name stays.
+    monkeypatch.setattr(redaction, "_sniff_delimiters", lambda _text: frozenset())
+    assert any("Qwerty12" in out for out in _end_tag_readings(text))
+
+
+def test_a_credential_elsewhere_keeps_no_other_end_tag_remainder() -> None:
+    """The decision is per end tag: a credential far from one does not keep its remainder."""
+    text = "<family>Smith</family Johnathan>" + " " * 300 + "token=<abc123def456>"
+    out = redact(text)
+    assert "Johnathan" not in out, out
+    assert "abc123def456" not in secretscrub.scrub_credentials(out)
+
+
+_DIFF_VALUES = ("Zqxa", "Vornb", "s3cr3tvalue99", "Kplm7", "Qwerty12")
+_DIFF_STARTS = (
+    "<family>", "<given>", "<name>", "<family> ", "<family>(", "<ns:family>", "<name><given>",
+    '<identifier><system value="urn:x">', "<telecom>", "x <family>",
+)  # fmt: skip
+_DIFF_CONTENT = ("Smith", " Smith", "(0010,1000) Doe", "", "Smith ", "1980", "Doe\n")
+_DIFF_ENDS = ("</family", "</given", "</other", "</ns:family", "</name", "</system", "</family:")
+_DIFF_LABELS = (
+    "password:", "password: ", "%2Cpassword:", ";sslpassword=", "MyPassword:", "privatekey=",
+    "token=", "Authorization: Bearer ", "Bearer ", "bearer ", "nonnumeric port: '", "@host",
+    '"name": "', "'name': '", "(0010,1000) ", "(0010,0010) ", "PatientName=", "PatientName: ",
+    "PatientID: ", "MRN ", "MRN: ", "mrn=", "id=", "%7C", "user:", "pw@", 'OtherPatientIDs="',
+    "api_key=", "secret ", "passwd ", "pwd=", "key: ", "MEFOR_DB_PASSWORD=", "postgres://u:",
+    "Pass ", "PatientName ", "Patient Name ", "password ", "token ", "MRN#",
+)  # fmt: skip
+_DIFF_SEPARATORS = (
+    " ", " ", "", "\t", "\n", "\r\n", "<", "<b>", ">", "> ", "</family>", "<given>", '"', "'", ",",
+    ";", "&", "|", "^", "\n\n",
+)  # fmt: skip
+
+
+def _diff_text(rand: random.Random) -> str:
+    """A vocabulary element, a malformed end tag, then labels, values and separators after it, with
+    a label and value sometimes past the window :func:`redaction._end_tag_rest_kept` reads."""
+    parts = [rand.choice(_DIFF_STARTS), rand.choice(_DIFF_CONTENT), rand.choice(_DIFF_ENDS)]
+    for _ in range(rand.randint(1, 7)):
+        pick = rand.random()
+        pool = _DIFF_SEPARATORS if pick < 0.35 else _DIFF_LABELS if pick < 0.65 else _DIFF_VALUES
+        parts.append(rand.choice(pool))
+    if rand.random() < 0.3:
+        parts.append(rand.choice(("", "\n", " ")) + rand.choice(_DIFF_LABELS))
+        parts.append(rand.choice(_DIFF_SEPARATORS) + rand.choice(_DIFF_VALUES))
+    if rand.random() < 0.15:
+        parts.append(" " * rand.randint(200, 300) + rand.choice(_DIFF_LABELS))
+        parts.append(rand.choice(_DIFF_VALUES))
+    return "".join(parts)
+
+
+def _end_tag_differential(
+    trials: int, monkeypatch: pytest.MonkeyPatch, kept: Callable[..., bool] | None = None
+) -> tuple[list[tuple[str, str]], int, list[str]]:
+    """``(leaks, gains, unsettled)`` over ``trials`` texts: a planted value the shipped redactor
+    leaves in view and the pre-#5925 one does not, how often the reverse holds, and texts where the
+    pre-#5925 redactor is a fixed point and the shipped one is not. ``kept`` replaces
+    :func:`redaction._end_tag_rest_kept`, for the control."""
+    rand = random.Random(5925)  # seeded: a flaky PHI arm gets muted, so this one cannot flake
+    leaks: list[tuple[str, str]] = []
+    unsettled: list[str] = []
+    gains = 0
+    for _ in range(trials):
+        text = _diff_text(rand)
+        before = _pre_5925_readings(text, monkeypatch)
+        with monkeypatch.context() as patched:
+            if kept is not None:
+                patched.setattr(redaction, "_end_tag_rest_kept", kept)
+            after = _end_tag_readings(text)
+            once = redact(text)
+            if redact(once) != once:
+                with monkeypatch.context() as old:
+                    old.setattr(redaction, "_redact_xml_elements", _pre_5925_redact_xml_elements)
+                    old_once = redact(text)
+                    if redact(old_once) == old_once:
+                        unsettled.append(text)
+        for value in _DIFF_VALUES:
+            for new, old_out in zip(after, before, strict=True):
+                if value in new and value not in old_out:
+                    leaks.append((text, value))
+                elif value in old_out and value not in new:
+                    gains += 1
+    return leaks, gains, unsettled
+
+
+def test_an_end_tag_scrub_redacts_at_least_what_main_did(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE GATE for #5925: over generated end tags with planted labels and values, no value the
+    pre-#5925 walk scrubbed survives the shipped one, through :func:`redact` and the log filter
+    chain, and the shipped one is a fixed point wherever the old one was.
+
+    **The control is a scrub that never keeps a remainder.** It takes labels the credential filters
+    and the widened stage read and leaves their values, so the corpus can produce the leak this arm
+    asserts absent. Measured at 3,000 trials: 0 here and 131 on the control at the same count, with
+    658 values the shipped walk scrubs that the old one left. 150,000 trials over this seed and four
+    others, run by hand, also found 0 leaks and 0 texts that stopped being a fixed point. These are
+    measurements of this corpus, not a proof for every input.
+
+    **The two-handler path is what found the separator rule** (:data:`redaction._END_TAG_LABEL_SHAPE`):
+    with only :func:`redact` and one handler the corpus found 0, and the scrub still lost a value
+    the old walk's field run took on the second handler's pass."""
+    leaks, gains, unsettled = _end_tag_differential(3_000, monkeypatch)
+    control, _, _ = _end_tag_differential(500, monkeypatch, kept=lambda *_, **__: False)
+    assert control, "the never-keep control leaked nothing, so the corpus cannot produce the leak"
+    assert gains, "the shipped walk scrubbed nothing the old one left, so #5925 is not exercised"
+    assert not leaks, leaks[:5]
+    assert not unsettled, unsettled[:5]
 
 
 # --- json_loads_or_refusal (BACKLOG #2048) ------------------------------------
