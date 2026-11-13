@@ -34,7 +34,8 @@ N``. Where the structure has HL7's "any HL7 segment" slot, which hl7apy's tables
 ``ANYHL7SEGMENT`` and its grouping never fills (MFN_M01 and QVR_Q17 among others), a dropped
 segment whose ID the message's version defines, followed by a field separator, is not refused; it
 is listed in :attr:`ValidationResult.unvalidated_segments`, but only when the comparison runs,
-which is when no earlier check refused the message (a Z-segment is always listed). A dropped ID
+which is when no earlier check refused the message (a Z-segment is listed whenever hl7apy parsed
+the message, and nothing is listed for a size, segment-cap or parse refusal). A dropped ID
 the version does not define, and a dropped bare defined ID with no field separator, are still
 refused. The exemption is per structure, not per slot: it does not count against the slot's
 cardinality or position. It holds only where MSH-9.1 names the structure's own message code, so a

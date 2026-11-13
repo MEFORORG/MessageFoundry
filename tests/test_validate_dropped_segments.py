@@ -154,6 +154,16 @@ def test_a_defined_segment_in_an_any_hl7_segment_slot_is_not_refused_and_is_list
     assert result.unvalidated_segments == listed
 
 
+def test_exempted_segments_are_listed_only_when_the_comparison_runs() -> None:
+    """A refusal by the comparison itself still lists them; an earlier refusal lists Z alone."""
+    refused_here = validate(_MFN_M01 + "\rLOC|1\rFOO|1")
+    assert refused_here.errors == ["unknown segment at line 5"]
+    assert refused_here.unvalidated_segments == (("LOC", 4),)
+    refused_earlier = validate(_MFN_M01 + "\rLOC|1\rZLC|1", expected_version="2.4")
+    assert not refused_earlier.ok
+    assert refused_earlier.unvalidated_segments == (("ZLC", 5),)
+
+
 def test_a_bare_defined_id_in_an_any_segment_message_is_refused() -> None:
     """A lone ``ORC`` line, with no field separator, is refused as it is in any other message."""
     result = validate(_MFN_M01 + "\rORC")
