@@ -66,33 +66,33 @@ def test_sqlserver_passkeys_carry_the_user_foreign_key() -> None:
     assert len(heads) == 3, len(heads)
 
 
+@pytest.mark.parametrize("deleted", [0, 2])
 async def test_sqlserver_orphan_sweep_logs_a_count_per_table_and_no_account(
-    caplog: pytest.LogCaptureFixture,
+    deleted: int, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #2733: the schema step's orphan delete was silent. When it deleted rows, its row is
-    logged at WARNING as a count and the table. The fake row carries an account-shaped value past
-    the two the reader uses, and no captured record at WARNING or above, from any logger, holds
-    it: every such record is the one expected line."""
+    logged at WARNING as a count and the table; when it deleted none, nothing is. The test reads
+    the captured messages only, at WARNING and above: the one expected line, or none."""
     sqlserver = pytest.importorskip(
         "messagefoundry.store.sqlserver", reason="requires the sqlserver extra (aioodbc)"
     )
-    account = "acct-orphan-0001"
 
     class _Cursor:
-        async def fetchall(self) -> list[tuple[str, int, str]]:
-            return [("sessions", 2, account)]
+        async def fetchall(self) -> list[tuple[str, int]]:
+            return [("sessions", deleted)]
 
     with caplog.at_level("WARNING", logger=sqlserver.log.name):
         await sqlserver._log_orphans_deleted(_Cursor())
         # The capture sees a WARNING sent through the store's logger when the probe runs, right
         # after the act; the helper takes its probe back out of the records.
         assert_capture_sees(caplog, sqlserver.log)
-    lines = [r.getMessage() for r in caplog.records]
-    assert lines == [
-        "sqlserver: deleted 2 sessions row(s) naming an account that does not exist, before"
-        " trusting the table's user key"
-    ]
-    assert not any(account in line for line in lines)
+    if deleted:
+        assert caplog.messages == [
+            "sqlserver: deleted 2 sessions row(s) naming an account that does not exist, before"
+            " trusting the table's user key"
+        ]
+    else:
+        assert caplog.messages == []
 
 
 def test_postgres_schema_hash_tracks_ddl(monkeypatch: pytest.MonkeyPatch) -> None:
