@@ -362,7 +362,8 @@ async def test_a_hung_notifier_transport_does_not_keep_the_store_open(
             closed.append(loop.time())
 
     store: Any = _Store()
-    caplog.set_level(logging.ERROR, logger="messagefoundry.api.app")
+    # Every level and logger, so the content check below covers them all.
+    caplog.set_level(logging.DEBUG)
     began = loop.time()
     await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 10.0)
     # The control: the drain did reach the hung send, so the cut is what ended it.
@@ -372,10 +373,29 @@ async def test_a_hung_notifier_transport_does_not_keep_the_store_open(
     assert closed[0] - began <= 1.0 + appmod._CUT_GRACE_SECONDS + 0.5
     errors = [r for r in caplog.records if "did not drain" in r.getMessage()]
     assert len(errors) == 1, caplog.text
-    assert "2 alert(s) left undelivered" in errors[0].getMessage()
+    assert "2 alert(s) not confirmed delivered" in errors[0].getMessage()
     # A count only, never the alert's content.
     assert "PROBE-DETAIL-TEXT" not in caplog.text
     assert "IB_TEST_ADT" not in caplog.text
     # The teardown did not also cut the step: the notifier's own wait ended first.
     assert "cutting it" not in caplog.text
+    assert sink._task is None
+
+
+async def test_a_close_cancelled_on_a_full_queue_still_stops_the_drain() -> None:
+    """BACKLOG #5907: a close cancelled while its sentinel waited on a full queue left the drain
+    task delivering, so the unwind's cut did not stop it."""
+    transport = _BlackholedTransport()
+    sink = NotifierAlertSink([transport])
+    sink._queue = asyncio.Queue(maxsize=1)  # full after one queued alert
+    sink.start()
+    sink.connection_stopped("IB_TEST_ADT", detail="probe")
+    await asyncio.wait_for(transport.entered.wait(), 10.0)
+    sink.connection_stopped("IB_TEST_ORU", detail="probe")  # fills the queue
+    task = sink._task
+    assert task is not None
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(sink.aclose(), 0.2)
+    await asyncio.wait((task,), timeout=10.0)
+    assert task.cancelled()
     assert sink._task is None

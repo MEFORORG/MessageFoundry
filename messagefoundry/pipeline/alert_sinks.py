@@ -361,12 +361,16 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
             self._task = asyncio.create_task(self._run())
 
     async def aclose(self) -> None:
-        if self._task is None:
+        task = self._task
+        if task is None:
             return
-        await self._queue.put(None)  # sentinel: drain what's queued, then stop
         try:
-            await self._task
+            await self._queue.put(None)  # sentinel: drain what's queued, then stop
+            await task
         finally:
+            # A close cancelled while the sentinel waits on a full queue still stops the drain
+            # (BACKLOG #5907), rather than leaving it delivering after the caller moved on.
+            task.cancel()
             self._task = None
 
     async def _run(self) -> None:

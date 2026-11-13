@@ -1628,14 +1628,10 @@ def _managed_teardown_steps(
     steps against the real list (vault BACKLOG #3740 items 15 and 16)."""
     steps: list[_TeardownStep] = []
     if notifier is not None:
-        # BACKLOG #5909: first, before any drain. A control_action rule firing on an alert the
-        # shutdown raises must not restart a listener or worker on the runner being stopped, and a
-        # restart begun during the drains would take the reload lock engine.stop() then waits on.
-        # The runner refuses a restart itself once stopped (BACKLOG #5702); clearing the callback
-        # first means none is attempted. A restart already under way is left to finish, since a
-        # cancel partway could strand a listener; the notifier's close at the end cancels any
-        # control task still running. A synchronous call cannot overrun, so it is never cut and
-        # adds no cut grace to the budget.
+        # BACKLOG #5909: first, before any drain, so no control_action restart begins during a
+        # drain and takes the reload lock engine.stop() then waits on. stop_control's docstring
+        # says what happens to a restart already under way. A synchronous call cannot overrun, so
+        # it is never cut and adds no cut grace to the budget.
         steps.append(
             _TeardownStep(
                 "the alert control callback's removal",
@@ -1737,11 +1733,14 @@ async def _unwind_failed_start(store: Store, notifier: NotifierAlertSink | None)
     alert that explains the refusal is recorded before the store closes.
 
     The delivery drain is bounded by most of the unwind's budget, everything but the alert-state
-    drain's floor, and not by the shutdown teardown's notifier floor: the crash-loop page that
-    explains the refusal is pinned (test_the_alert_fires_even_when_the_start_then_fails, #2597),
-    and a tight cut would drop it. A blackholed webhook or SMTP host would otherwise hold the store
-    open past NSSM's stop window (#1257). Its own wait ends at _INNER_SHARE of that bound and logs
-    one ERROR with the undelivered count, before the teardown would cut the step."""
+    drain's floor, and not by the shutdown teardown's notifier floor: a crash loop pages on every
+    attempt (#2597; test_the_alert_fires_even_when_the_start_then_fails pins that only for failures
+    at or after engine.start(), which the managed teardown unwinds, not this), and a tight cut here
+    would drop the page that explains this refusal. A blackholed webhook or SMTP host would
+    otherwise hold the store open past NSSM's stop window (#1257). Its own wait ends at
+    _INNER_SHARE of that bound and logs one ERROR with the count not confirmed delivered, before
+    the teardown would cut the step. The cut ends only the asyncio side: a transport's send running
+    in a worker thread runs on to its own socket timeout."""
     budget = _SHUTDOWN_BUDGET_SECONDS - _ENGINE_STOP_RESERVE_SECONDS
     steps: list[_TeardownStep] = []
     if notifier is not None:
@@ -1750,13 +1749,15 @@ async def _unwind_failed_start(store: Store, notifier: NotifierAlertSink | None)
             notifier.start()
             wait = bound * _INNER_SHARE
             try:
-                async with asyncio.timeout(wait):
+                async with asyncio.timeout(wait) as deadline:
                     await notifier.aclose()
             except TimeoutError:
+                if not deadline.expired():
+                    raise
                 # A count only: an alert's content can carry a partner's text (docs/PHI.md).
                 _log.error(
                     "startup unwind: the alert notifier did not drain within %.2fs; %d alert(s) "
-                    "left undelivered",
+                    "not confirmed delivered",
                     wait,
                     notifier.undelivered,
                 )
