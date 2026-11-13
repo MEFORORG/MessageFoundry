@@ -482,10 +482,12 @@ def _reads_as_site_code(part: str, seps: Seps, field_sep: str) -> bool:
     ``Call 971234 today``, reads as no site code. A part that holds one is also read split on
     whitespace and on escaped delimiters, so ``Call 971234 today\\.br\\`` reads as a site code,
     and :func:`scrub_site_codes` then replaces the whole part. Each escape body as written, the
-    text between an escape character and the next, is read too, also without the letter or
-    dotted command that opens it, so a site code inside a body that decodes to nothing, such as
-    ``\\Z971234\\`` or ``\\.sp971234\\``, is found: a raw viewer, or a receiver that defines the
-    escape, shows it."""
+    text between an escape character and the next, is read in three positions only: whole,
+    without its first character, and without its first three when it opens with a dot. So a
+    site code that is the whole rest of a body that decodes to nothing, such as ``\\Z971234\\``
+    or ``\\.sp971234\\``, is found: a raw viewer, or a receiver that defines the escape, shows
+    it. A body is never split, so a code elsewhere in one passes, such as ``\\Z971234 x\\``,
+    ``\\ZZ971234\\`` or ``\\.ti+971234\\``."""
     forms = [trim(part), *decoded_readings(part, seps, field_sep, resplit=True)]
     if seps.escape and seps.escape in part:
         # The odd pieces are the escape bodies; the text around them is already read decoded.
