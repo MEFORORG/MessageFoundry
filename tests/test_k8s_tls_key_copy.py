@@ -213,7 +213,13 @@ def _refused(files: dict[str, _Seen]) -> dict[str, str]:
     account would see them."""
     refused: dict[str, str] = {}
     for path, f in files.items():
-        problem = _posix_key_file_problem(f.mode, f.uid, f.parent_mode, f.parent_uid, _ENGINE_UID)
+        problem = _posix_key_file_problem(
+            mode=f.mode,
+            uid=f.uid,
+            parent_mode=f.parent_mode,
+            parent_uid=f.parent_uid,
+            euid=_ENGINE_UID,
+        )
         if problem is not None:
             refused[path] = problem
     return refused
@@ -347,8 +353,12 @@ def test_copy_tls_can_read_the_root_owned_secret(name: str, pod: dict[str, Any])
 def test_fsgroup_widens_a_0400_secret_the_engine_would_mount() -> None:
     """The control for the fsGroup widening: a 0400 Secret on the engine is still refused."""
     pod = yaml.safe_load(_PRE_FIX_POD.replace("defaultMode: 0440", "defaultMode: 0400"))
-    assert _secret_mode(pod, _volumes(pod)["tls"], "api.key") == 0o440
+    mode = _secret_mode(pod, _volumes(pod)["tls"], "api.key")
+    assert mode == 0o440
     assert "/etc/mefor/tls/api.key" in _refused(_engine_tls_files(pod))
+    # The widened mode is refused on its own, apart from the link the kubelet serves it through.
+    widened = _Seen(stat.S_IFREG | mode, 0, *_KUBELET_VOLUME_ROOT)
+    assert "0440" in _refused({"api.key": widened})["api.key"]
 
 
 @pytest.mark.parametrize(("name", "pod"), _PODS, ids=_IDS)

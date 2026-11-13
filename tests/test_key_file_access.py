@@ -231,6 +231,16 @@ def test_a_key_path_holding_a_nul_is_refused_not_raised() -> None:
     assert problem is not None and "could not be examined" in problem
 
 
+def test_the_remedies_are_one_line_and_name_the_posix_causes() -> None:
+    """A refusal is printed and logged as one line, so neither remedy may hold a line break, and
+    each names the link and directory causes the POSIX check refuses (vault BACKLOG #5636)."""
+    from messagefoundry import engine_secrets
+
+    for remedy in (key_file_access.KEY_FILE_REMEDY, engine_secrets._REMEDY):
+        assert "\n" not in remedy and "\r" not in remedy
+        assert "link" in remedy and "sticky bit" in remedy
+
+
 _posix_only = pytest.mark.skipif(
     sys.platform == "win32", reason="the POSIX arm; the ubuntu-latest leg runs it"
 )

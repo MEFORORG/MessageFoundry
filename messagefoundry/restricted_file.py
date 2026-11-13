@@ -9,7 +9,8 @@ Two entry points, and both fail closed (vault BACKLOG #2601):
   that could not be created that way is never left behind, and there is no fallback to writing the
   file first and tightening it afterwards.
 * :func:`broad_access_problem` answers, before a key file is used, whether a known broad group or
-  an application package can read it or change it.
+  an application package can read it or change it, and on POSIX also whether it is a link, another
+  account owns it, or the directory holding it lets another account replace it.
 
 :func:`key_file_handle_problem` is the stricter Windows read check the key custody reads use: the
 owner and the exact list, read through the open handle.
@@ -470,7 +471,7 @@ _POSIX_ROOT_UID = 0
 
 
 def _posix_key_file_problem(
-    mode: int, uid: int, parent_mode: int, parent_uid: int, euid: int
+    *, mode: int, uid: int, parent_mode: int, parent_uid: int, euid: int
 ) -> str | None:
     """Why a POSIX key file is open beyond the account ``euid``, or ``None`` (vault BACKLOG #5636).
 
@@ -661,7 +662,11 @@ def broad_access_problem(path: Path, *, directory: bool = False) -> str | None:
             f"({exc.strerror or type(exc).__name__})"
         )
     return _posix_key_file_problem(
-        status.st_mode, status.st_uid, parent.st_mode, parent.st_uid, os.geteuid()
+        mode=status.st_mode,
+        uid=status.st_uid,
+        parent_mode=parent.st_mode,
+        parent_uid=parent.st_uid,
+        euid=os.geteuid(),
     )
 
 

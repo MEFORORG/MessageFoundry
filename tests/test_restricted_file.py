@@ -522,7 +522,9 @@ def _posix_key(
     parent_mode: int = _HOLDER,
     parent_uid: int = _ENGINE_UID,
 ) -> str | None:
-    return restricted_file._posix_key_file_problem(mode, uid, parent_mode, parent_uid, _ENGINE_UID)
+    return restricted_file._posix_key_file_problem(
+        mode=mode, uid=uid, parent_mode=parent_mode, parent_uid=parent_uid, euid=_ENGINE_UID
+    )
 
 
 def test_the_posix_key_file_decision_passes_an_owner_only_file_in_an_owner_only_directory() -> None:
