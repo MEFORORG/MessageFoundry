@@ -2242,6 +2242,11 @@ class _HostProxy:
             handlers.append(self.config.digest.build())
         return tuple(handlers)
 
+    @property
+    def answers_digest(self) -> bool:
+        """Whether :meth:`opener_handlers` puts a proxy Digest handler on this host's opener."""
+        return self.credentialed and self.config.digest is not None
+
     def auth_headers(self) -> dict[str, str]:
         """The pre-emptive proxy-auth header(s) to add to each request (Basic; empty for Digest/none)."""
         return dict(self.config.auth_header) if self.credentialed else {}

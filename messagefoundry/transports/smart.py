@@ -350,11 +350,7 @@ class _TokenEndpointProvider(abc.ABC):
         token_proxy = proxy.for_host(token_url) if proxy else None
         # Decided here, from the configuration the opener is built from, so the CONNECT 407 match
         # in request_token never depends on what the opener exposes (BACKLOG #2989).
-        self._digest_proxy = (
-            token_proxy is not None
-            and token_proxy.credentialed
-            and token_proxy.config.digest is not None
-        )
+        self._digest_proxy = token_proxy is not None and token_proxy.answers_digest
         # #1660: a PER-PROVIDER opener whenever the token hop needs a handler the shared one lacks (a
         # forward proxy) OR a trust anchor that ``narrows`` -- read through the one ``narrows``
         # predicate, exactly as the four HTTP-family destinations do, so the token hop cannot drift
