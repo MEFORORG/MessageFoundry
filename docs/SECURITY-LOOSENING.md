@@ -2603,18 +2603,19 @@ count is above `0` (vault BACKLOG #2613).
   refuse a store key in their own environment when they found their service but could not read
   its lists, since the key most likely came from there; another secret in their own environment is
   not refused then.
-- **`secret_in_service_environment`: what `serve` and `supervise` refuse, in an engine neither
-  started.** An application that builds the API without them, for example with
-  `create_app(engine)`, runs no such refusal and is not refused. It is named, with the refusal's
-  finding and remedy, only where the refusal would fire (`messagefoundry/serviceenv.py`): the
-  engine found its service, the way the bullet *How the engine finds its own service* below
+- **`secret_in_service_environment`: what `serve` and `supervise` refuse, read where no refusal
+  ran.** An application that builds the API without them, with `create_app` or
+  `create_managed_app`, refuses on the same finding: the factory raises as it is built. The entry
+  is named, with the refusal's finding and remedy, only where the refusal would fire
+  (`messagefoundry/serviceenv.py`): the engine found its service, the way the bullet *How the engine finds its own service* below
   says, and either an engine secret is in that service's lists or the lists could not be read and a
   store key is in the engine's own environment. A console-script launcher such as `uvicorn.exe`
   or `hypercorn.exe` between NSSM and the interpreter is neither a Python interpreter nor
   `messagefoundry.exe`, so the engine does not find its service there and this entry is not
-  named. It is reported only in that application's process, at least in `GET /security/posture`
-  and in the loosenings its audit rows record. An engine embedded with no API has no posture to
-  name it in. Clear it the way the refusal says.
+  named. `serve`, `supervise` and both factories refuse before they list loosenings, so the entry
+  reaches only a caller that reads them itself, through `security_loosenings` with a service reading, and never a
+  running app's `GET /security/posture`. An engine embedded with no API has no posture to name it
+  in. Clear it the way the refusal says.
 - **`store_key_in_service_environment`: a store key reaches the service through its
   environment.** It is named wherever the key came from, once the engine knows its service. The
   machine-wide environment is readable by every local user too. Under `serve` and `supervise` a

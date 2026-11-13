@@ -518,7 +518,11 @@ from messagefoundry.remotedebug import (
     remote_debug_posture,
 )
 from messagefoundry.service_status import query_service_state
-from messagefoundry.serviceenv import ServiceEnvPosture, service_env_posture
+from messagefoundry.serviceenv import (
+    ServiceEnvPosture,
+    service_env_posture,
+    service_env_refusal,
+)
 from messagefoundry.startupcode import StartupPosture, startup_posture
 from messagefoundry.store import Row, open_store, sqlite_settings
 from messagefoundry.store.base import (
@@ -4516,6 +4520,17 @@ _FASTAPI_TELEMETRY_OFF: TelemetryConfig = {
 }
 
 
+def _refuse_a_secret_in_the_service_environment(caller: str) -> None:
+    """Raise where ``serve`` would refuse to start on its own Windows service environment.
+
+    The rule is ``serve``'s and ``supervise``'s, :func:`service_env_refusal`, so an app built here
+    without either of them refuses on the same finding (vault BACKLOG #2595, #8212 item 1).
+    ``service_env_posture`` says what the reading covers, and when it cannot read the lists."""
+    refused = service_env_refusal(service_env_posture())
+    if refused is not None:
+        raise RuntimeError(f"{caller}: refusing to start: {refused}")
+
+
 def create_app(
     engine: Engine | None = None,
     *,
@@ -4562,6 +4577,7 @@ def create_app(
     # messagefoundry/remotedebug.py says what the hook does, and why a repeat call adds no copy and
     # no second unraisable-hook wrapper (the Lander's finding 2 on engine PR 2573).
     install_remote_debug_guard()
+    _refuse_a_secret_in_the_service_environment("create_app")
     # The open mode is the opt-in with no service, and nothing else (vault BACKLOG #2825). Beside a
     # service the opt-in would leave a live open-mode flag on a signed-in app, so it is refused.
     if allow_no_auth and auth is not None:
@@ -12358,6 +12374,7 @@ def create_managed_app(
     start: the trust-anchor preflight refuses it, or, if that passes, the first one is raised
     marked ``unaudited``.
     """
+    _refuse_a_secret_in_the_service_environment("create_managed_app")
     if store_settings is None:
         if db_path is None:
             raise ValueError("create_managed_app requires either store_settings or db_path")

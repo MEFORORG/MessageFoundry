@@ -454,10 +454,11 @@ def test_the_old_named_not_refused_entry_is_gone_and_only_the_refusals_twin_name
     ]
 
 
-@pytest.mark.parametrize(
+#: The postures the refusal refuses.
+_REFUSED_POSTURES = pytest.mark.parametrize(
     "posture",
     [
-        _service(["MEFOR_STORE_PASSWORD=x"]),
+        _service([f"MEFOR_STORE_PASSWORD={_PASSWORD_VALUE}"]),
         _service([f"MEFOR_STORE_ENCRYPTION_KEY={_KEY_VALUE}"]),
         read_service_env_posture(
             probe=_Probe(ancestors=_UNDER_NSSM, services={100: "MessageFoundry"}, unreadable=True),
@@ -466,29 +467,65 @@ def test_the_old_named_not_refused_entry_is_gone_and_only_the_refusals_twin_name
     ],
     ids=["store-password-listed", "store-key-listed", "unreadable-list-key-in-environment"],
 )
+
+
+@_REFUSED_POSTURES
 def test_every_posture_serve_refuses_is_named_where_serve_did_not_run(
     posture: ServiceEnvPosture,
 ) -> None:
-    """An engine ``serve`` did not start, such as an embedder's ``create_app(engine)``, ran no
-    refusal. The removed ``service_environment_secret`` entry used to name a listed secret there,
-    so the loosening registry names each posture the refusal refuses, with the refusal's finding
-    and remedy, rather than going quiet."""
+    """A caller that reads the loosening registry with no refusal of its own is told what the
+    refusal refuses. The removed ``service_environment_secret`` entry used to name a listed secret
+    there, so the registry names each posture the refusal refuses, with the refusal's finding and
+    remedy, rather than going quiet."""
     refusal = service_env_refusal(posture)
     assert refusal is not None
     entries = dict(_registry_entries(posture))
     _assert_twin_of(refusal, entries["secret_in_service_environment"])
 
 
-async def test_an_embedded_app_names_a_listed_secret_in_its_posture(
+def _build_embedded(factory: str, tmp_path: Path) -> object:
+    """Build an app the way an embedder does, with neither ``serve`` nor ``supervise``."""
+    from messagefoundry.api.app import create_app, create_managed_app
+    from messagefoundry.config.settings import EgressSettings
+
+    if factory == "create_app":
+        return create_app(allow_no_auth=True)
+    return create_managed_app(
+        db_path=tmp_path / "embedded.db",
+        egress_settings=EgressSettings(deny_by_default=False),
+        allow_no_auth=True,
+    )
+
+
+_FACTORIES = pytest.mark.parametrize("factory", ["create_app", "create_managed_app"])
+
+
+@_FACTORIES
+@_REFUSED_POSTURES
+def test_an_embedded_app_refuses_where_serve_would(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, factory: str, posture: ServiceEnvPosture
+) -> None:
+    """Vault BACKLOG #8212 item 1: an app built without ``serve`` refuses on ``serve``'s own
+    finding, as it is built, and opens nothing first. The message is the refusal's, value-free."""
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    monkeypatch.setattr("messagefoundry.api.app.service_env_posture", lambda: posture)
+    with pytest.raises(RuntimeError) as raised:
+        _build_embedded(factory, tmp_path)
+    assert str(raised.value) == f"{factory}: refusing to start: {refusal}"
+    assert _KEY_VALUE not in str(raised.value)
+    assert _PASSWORD_VALUE not in str(raised.value)
+    assert not any(tmp_path.iterdir()), sorted(p.name for p in tmp_path.iterdir())
+
+
+async def test_an_app_built_around_an_engine_refuses_a_listed_secret(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The embedder path end to end: ``GET /security/posture`` on an app built with
-    ``create_app(engine)`` names a secret-class setting in the service's list, and never its
-    value."""
+    """The embedder shape the module docstring used to exempt, ``create_app(engine)``, refuses
+    too."""
+    from messagefoundry.api.app import create_app
     from messagefoundry.config.settings import EgressSettings
     from messagefoundry.pipeline import Engine
-    from tests.test_api_security_posture import _add_viewer, _app_and_client, _token
-    from tests.test_api_security_posture import _service as _auth_service
 
     listed = _service([f"MEFOR_STORE_PASSWORD={_PASSWORD_VALUE}"])
     monkeypatch.setattr("messagefoundry.api.app.service_env_posture", lambda: listed)
@@ -498,21 +535,44 @@ async def test_an_embedded_app_names_a_listed_secret_in_its_posture(
         egress_settings=EgressSettings(deny_by_default=False),
     )
     try:
-        auth = await _auth_service(engine)
-        await _add_viewer(auth, "vw")
-        _app, client = _app_and_client(
-            engine, auth, ai_settings=AiSettings(), security_settings=SecuritySettings()
-        )
-        async with client as c:
-            body = (await c.get("/security/posture", headers=await _token(c, "vw"))).json()
+        with pytest.raises(RuntimeError) as raised:
+            create_app(engine, allow_no_auth=True)
     finally:
         await engine.stop()
-    risks = {row["switch"]: row["risk"] for row in body["loosenings"]}
-    assert (
-        "MEFOR_STORE_PASSWORD (in Parameters\\AppEnvironmentExtra) is set in"
-        in (risks["secret_in_service_environment"])
-    )
-    assert _PASSWORD_VALUE not in str(body)
+    assert str(raised.value) == f"create_app: refusing to start: {service_env_refusal(listed)}"
+
+
+#: A console-script launcher between NSSM and the interpreter reads UNOBSERVABLE with no service,
+#: so ``serve`` does not refuse there (the ``uvicorn.exe`` test above), and an app builds as at main.
+_CONSOLE_SCRIPT_LAUNCHER = read_service_env_posture(
+    probe=_Probe(
+        ancestors=[(300, "python.exe"), (250, "uvicorn.exe"), (100, "nssm.exe")],
+        services={100: "MessageFoundry"},
+        entries=[f"MEFOR_STORE_ENCRYPTION_KEY={_KEY_VALUE}"],
+    ),
+    environ={"MEFOR_STORE_ENCRYPTION_KEY": _KEY_VALUE},
+)
+
+
+@_FACTORIES
+@pytest.mark.parametrize(
+    "posture",
+    [
+        _CONSOLE_SCRIPT_LAUNCHER,
+        ServiceEnvPosture(ServiceEnvStatus.NOT_A_SERVICE),
+        _service(["MEFOR_VALUE_PARTNER_HOST=example.test"]),
+        _service([], MEFOR_STORE_ENCRYPTION_KEY=_KEY_VALUE),
+    ],
+    ids=["console-script-launcher", "not-a-service", "no-listed-secret", "key-from-elsewhere"],
+)
+def test_an_embedded_app_builds_where_serve_would_not_refuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, factory: str, posture: ServiceEnvPosture
+) -> None:
+    """The control: with no listed secret, and where the reading is UNOBSERVABLE with no known
+    service, ``serve`` does not refuse, and an app builds as it did before the refusal."""
+    assert service_env_refusal(posture) is None
+    monkeypatch.setattr("messagefoundry.api.app.service_env_posture", lambda: posture)
+    _build_embedded(factory, tmp_path)
 
 
 def test_a_non_secret_variable_in_the_nssm_list_is_neither_refused_nor_named() -> None:
