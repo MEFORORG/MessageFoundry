@@ -23,6 +23,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from email.message import Message
 from pathlib import Path
@@ -904,7 +905,8 @@ def test_build_system_requires_is_swept() -> None:
 
 
 def test_the_uv_dependency_tables_are_swept() -> None:
-    """S28-09: uv resolves and installs these. None is used in this tree today, so it is synthetic."""
+    """S28-09: dev-dependencies adds packages; a constraint or override constrains or replaces one
+    already in the graph. All are vetted. None is used in this tree today, so this is synthetic."""
     declared = declared_distributions(
         """
         [tool.uv]
@@ -972,8 +974,8 @@ def test_main_exits_1_on_an_unnameable_entry(
     assert "unnameable entry" in capsys.readouterr().err
 
 
-def test_first_party_names_are_excluded_with_a_reason_and_not_counted() -> None:
-    """This repository's own distributions are ours: existence and age say nothing about them."""
+def test_first_party_names_are_exempt_from_the_age_floor_only() -> None:
+    """A sibling's first upload is recent by construction; every other check still runs on it."""
     first_party = _gate.FIRST_PARTY
     assert {normalize(n) for n in first_party} >= {
         "messagefoundry",
@@ -983,21 +985,40 @@ def test_first_party_names_are_excluded_with_a_reason_and_not_counted() -> None:
     }
     assert all(len(reason) > 40 for reason in first_party.values())
 
-    def exploding(name: str) -> dict:
-        raise AssertionError(f"first-party {name!r} must not reach the registry")
-
-    findings, examined = vet(
-        declared_distributions('[project]\ndependencies = ["messagefoundry_toolkit==0.5.2"]\n'),
-        exploding,
-        now=_NOW,
+    declared = declared_distributions(
+        '[project]\ndependencies = ["messagefoundry_toolkit==0.5.2"]\n'
     )
-    assert (findings, examined) == ([], 0)
+    fresh = lambda name: _payload(name, first_release=_NOW - timedelta(days=1))  # noqa: E731
+    assert vet(declared, fresh, now=_NOW) == ([], 1), "vetted and counted, the floor alone waived"
 
 
-def test_a_first_party_name_outside_packaging_is_vetted(
+@pytest.mark.parametrize(
+    ("fetch", "problem"),
+    [
+        (lambda _name: None, "does not exist on PyPI"),
+        (
+            lambda name: _payload(
+                name, first_release=_NOW - timedelta(days=2000), canonical="someone-else"
+            ),
+            "resolves to a different project",
+        ),
+        (lambda name: _payload(name, first_release=None), "no release history"),
+    ],
+    ids=["absent", "other-canonical", "no-files"],
+)
+def test_a_first_party_name_still_gets_every_other_check(
+    fetch: Callable[[str], dict | None], problem: str
+) -> None:
+    """An unclaimed sibling name is the squat risk: an install from PyPI takes whoever registers it."""
+    findings, examined = vet({"messagefoundry-harness": "messagefoundry-harness"}, fetch, now=_NOW)
+    assert examined == 1
+    assert [f.problem for f in findings] == [problem]
+
+
+def test_a_first_party_name_is_vetted_in_every_table_and_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The exclusion is for sibling wheels. A root extra an end user installs from PyPI is not one."""
+    """No table-scoped exclusion: a sibling reference, a root extra and a build table are all asked."""
     (tmp_path / "pyproject.toml").write_text(
         '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n'
         '[project.optional-dependencies]\nconsole = ["messagefoundry-webconsole>=0.5"]\n',
@@ -1006,43 +1027,38 @@ def test_a_first_party_name_outside_packaging_is_vetted(
     sub = tmp_path / "packaging" / "messagefoundry-harness"
     sub.mkdir(parents=True)
     (sub / "pyproject.toml").write_text(
+        '[build-system]\nrequires = ["hatchling==1.33.0", "messagefoundry"]\n'
         '[project]\nname = "messagefoundry-harness"\ndependencies = ["messagefoundry-toolkit==1"]\n',
         encoding="utf-8",
     )
     monkeypatch.setattr(_gate, "_ROOT", tmp_path)
-    asked = _stub_registry(monkeypatch, absent=frozenset({"messagefoundry-webconsole"}))
+    asked = _stub_registry(monkeypatch, absent=frozenset({"messagefoundry-toolkit"}))
     assert main([]) == 1
-    assert sorted(asked) == ["fastapi", "messagefoundry-webconsole"], "the sibling stays excluded"
+    assert sorted(asked) == [
+        "fastapi",
+        "hatchling",
+        "messagefoundry",
+        "messagefoundry-toolkit",
+        "messagefoundry-webconsole",
+    ]
 
 
-@pytest.mark.parametrize(
-    "build_table",
-    [
-        '[build-system]\nrequires = ["hatchling==1.33.0", "messagefoundry-webconsole"]\n',
-        '[tool.uv]\nconstraint-dependencies = ["messagefoundry-webconsole<1"]\n',
-        '[tool.hatch.build.targets.wheel]\ndependencies = ["messagefoundry-webconsole"]\n',
-    ],
-    ids=["build-system-requires", "uv-constraint", "hatch-target-dependencies"],
-)
-def test_a_first_party_name_in_a_packaging_build_table_is_vetted(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, build_table: str
+def test_main_refuses_a_root_whose_runtime_tables_yield_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A build frontend fetches a build-time table from the index, so the sibling reason fails."""
+    """hatchling in [build-system].requires must not mask a lost [project] table."""
     (tmp_path / "pyproject.toml").write_text(
-        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n', encoding="utf-8"
-    )
-    sub = tmp_path / "packaging" / "messagefoundry-harness"
-    sub.mkdir(parents=True)
-    (sub / "pyproject.toml").write_text(
-        f'{build_table}[project]\nname = "messagefoundry-harness"\n'
-        'dependencies = ["messagefoundry-toolkit==1"]\n',
+        '[build-system]\nrequires = ["hatchling==1.33.0"]\n[project]\nname = "x"\n',
         encoding="utf-8",
     )
+    sub = tmp_path / "packaging" / "messagefoundry-thing"
+    sub.mkdir(parents=True)
+    (sub / "pyproject.toml").write_text(
+        '[build-system]\nrequires = ["hatchling==1.33.0"]\n', encoding="utf-8"
+    )
     monkeypatch.setattr(_gate, "_ROOT", tmp_path)
-    asked = _stub_registry(monkeypatch, absent=frozenset({"messagefoundry-webconsole"}))
-    assert main([]) == 1
-    assert "messagefoundry-webconsole" in asked
-    assert "messagefoundry-toolkit" not in asked, "the runtime sibling reference stays excluded"
+    _stub_registry(monkeypatch)
+    assert main([]) == 2
 
 
 def test_a_near_miss_of_a_first_party_name_is_still_vetted() -> None:

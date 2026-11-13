@@ -36,17 +36,17 @@ an in-tree hatch ``custom`` build or metadata hook, any of which can return requ
 non-empty source or index key in ``[tool.uv]`` or ``[tool.uv.pip]``, which sends a vetted name
 somewhere other than pypi.org; and a ``[tool.uv].workspace``, whose members this gate does not sweep.
 
-EXCLUDED: this repository's own distributions (``FIRST_PARTY``), by exact PEP 503 name, and only
-where every declaration of the name is in the ``[project].dependencies`` or
-``[project.optional-dependencies]`` of a ``packaging/*/pyproject.toml``. The comment above
-``FIRST_PARTY`` gives the reason and what the exclusion gives up.
+EXEMPT FROM THE AGE FLOOR ONLY: this repository's own distributions (``FIRST_PARTY``), by exact PEP
+503 name, wherever declared. Every other check still runs on them; the comment above ``FIRST_PARTY``
+gives the reason. Nothing is skipped outright except a reviewed ``ALLOWLIST`` entry.
 
 NOT SWEPT, at least: npm manifests (``ide/package.json``, ``ci/npm-tools/package.json``); tools a
 workflow or script installs by command line (a ``pipx install`` or ``uv tool install``); hatch
 environment tables; any requirements file; a ``uv.toml``; a ``setup.py``, whose ``setup_requires``
-runs under a setuptools backend; and a hatch custom builder target
-(``[tool.hatch.build.targets.custom]``), which runs in-tree code that can return build requirements.
-An invented name in any of these passes this gate. For npm, ``npm audit`` answers known advisories,
+runs under a setuptools backend; and the BUILDER of a hatch custom target
+(``[tool.hatch.build.targets.custom]``), in-tree code that can return build requirements. That
+target's ``dependencies`` list is read like any other target's, but the builder is not refused, as
+the ``custom`` hook is. An invented name supplied by any of these passes this gate. For npm, ``npm audit`` answers known advisories,
 the npm counterpart of pip-audit, and so shares its blindness to a freshly registered name. The npm
 boundary is pinned by a named test in ``tests/test_new_dependency_check.py``.
 
@@ -147,22 +147,17 @@ _SAFE_NAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$")
 # adding one shows up in a diff with its justification attached.
 ALLOWLIST: dict[str, str] = {}
 
-# This repository's OWN distributions -> why each is excluded. A packaging/*/pyproject.toml declares
-# its siblings by name (the harness wheel requires messagefoundry and messagefoundry-toolkit). Each is
-# built from this tree, so "did a model invent this name" is not a question to ask of it, and a sibling
-# not yet uploaded, or first uploaded in a recent release, would read as absent or "freshly
-# registered" and red the gate on every pull request. Matched by exact PEP 503 name only, so a
-# near-miss of one of these names is fetched and vetted like any other. ``main`` applies it only to a
-# name declared solely in the [project].dependencies or [project.optional-dependencies] of a
-# packaging/*/pyproject.toml; declared anywhere else, a build-time table there included, it is vetted.
-#
-# WHAT THIS EXCLUSION GIVES UP, stated so nobody reads it as covered: release.yml does not upload every
-# one of these on every release (the harness and the web console are each behind their own switch), so
-# a name here may be unclaimed on PyPI, and this gate does not check who holds it there. An install of
-# one of these from PyPI before this project has uploaded it would take whoever registered the name.
+# This repository's OWN distributions -> why each is exempt from the AGE FLOOR, and from nothing else.
+# A packaging/*/pyproject.toml declares its siblings by name (the harness wheel requires messagefoundry
+# and messagefoundry-toolkit), and a sibling's first upload is recent by construction, so the floor
+# would red the gate on a release this project cut itself. Every other check still runs on these
+# names, wherever they are declared: PyPI must serve the project, under this canonical name, with
+# release files. So a sibling name nobody has uploaded fails as "does not exist", which is the point:
+# an install from PyPI would take whoever registers it first. Matched by exact PEP 503 name, so a
+# near-miss of one of these is vetted like any other name, age floor included.
 _FIRST_PARTY_REASON = (
-    "built from this repository, so the question this gate asks of an outside name does not apply; "
-    "whether the PyPI name is held by this project is not checked here"
+    "built and uploaded by this repository, so a recent first upload is expected; existence, "
+    "canonical name and release files are still checked"
 )
 FIRST_PARTY: dict[str, str] = {
     "messagefoundry": f"the engine, from the root pyproject.toml; {_FIRST_PARTY_REASON}",
@@ -201,8 +196,10 @@ class Finding:
     detail: str
 
 
-# The [tool.uv] keys holding PEP 508 requirement lists that uv resolves or installs. A constraint or
-# override names a distribution uv will fetch as surely as a dependency does.
+# The [tool.uv] keys holding PEP 508 requirement lists. dev-dependencies adds packages uv installs; a
+# constraint or override does not add a package, it constrains or replaces one already in the graph.
+# They are vetted anyway: an override's name and spec are what uv then installs for that package, and
+# vetting a constraint costs one request.
 _UV_REQUIREMENT_LISTS = (
     "dev-dependencies",
     "constraint-dependencies",
@@ -213,21 +210,10 @@ _UV_REQUIREMENT_LISTS = (
 _UV_SOURCE_KEYS = ("sources", "index", "index-url", "extra-index-url", "find-links")
 
 
-_RUNTIME_TABLES = ("[project].dependencies", "[project.optional-dependencies]")
-
-
 def scan(
-    pyproject_text: str,
-    *,
-    source: str = "pyproject.toml",
-    hatch_toml_text: str | None = None,
-    build_time_names: set[str] | None = None,
+    pyproject_text: str, *, source: str = "pyproject.toml", hatch_toml_text: str | None = None
 ) -> tuple[dict[str, str], list[Finding]]:
     """One pass over a pyproject: (``declared_distributions``, ``unnameable_entries``) for it.
-
-    ``build_time_names``, when given, receives every PEP 503 name declared in a table other than
-    ``[project].dependencies`` and ``[project.optional-dependencies]``: the names a build frontend or
-    uv fetches from the index whatever this tree builds, which ``main`` never excludes as first-party.
 
     ``hatch_toml_text`` is a ``hatch.toml`` beside the pyproject. hatchling loads it and merges its
     top-level tables over ``[tool.hatch]`` with a shallow ``dict.update``, so this does the same: a
@@ -265,8 +251,6 @@ def scan(
             )
         else:
             declared.setdefault(normalize(name), spec)
-            if build_time_names is not None and not where.startswith(_RUNTIME_TABLES):
-                build_time_names.add(normalize(name))
 
     def table(container: dict[str, object], key: str, where: str) -> dict[str, object]:
         value = container.get(key, {})
@@ -516,17 +500,17 @@ def vet(
     now: datetime,
     min_age_days: int = DEFAULT_MIN_AGE_DAYS,
     allowlist: dict[str, str] | None = None,
-    first_party: dict[str, str] | None = None,
 ) -> tuple[list[Finding], int]:
     """Vet every declared distribution. Returns (findings, number examined).
 
     The count is returned rather than inferred so the caller can prove the sweep was not empty --
     "zero findings" and "nothing was checked" are indistinguishable from the exit code alone. An
-    allowlisted or FIRST_PARTY name is skipped and not counted.
+    allowlisted name is skipped and not counted. A FIRST_PARTY name is vetted and counted, and is
+    exempt from the age floor alone.
     """
     allowed = allowlist if allowlist is not None else ALLOWLIST
-    own = first_party if first_party is not None else FIRST_PARTY
-    skipped = {normalize(k) for k in allowed} | {normalize(k) for k in own}
+    skipped = {normalize(k) for k in allowed}
+    own = {normalize(k) for k in FIRST_PARTY}
     findings: list[Finding] = []
     examined = 0
 
@@ -583,7 +567,7 @@ def vet(
             continue
 
         age_days = (now - first).days
-        if age_days < min_age_days:
+        if age_days < min_age_days and normalize(name) not in own:
             findings.append(
                 Finding(
                     name,
@@ -769,6 +753,24 @@ def _print_finding(finding: Finding) -> None:
     )
 
 
+def _runtime_names(pyproject_text: str) -> set[str]:
+    """The PEP 503 names in ``[project].dependencies`` and ``[project.optional-dependencies]``."""
+    project = tomllib.loads(pyproject_text).get("project")
+    if not isinstance(project, dict):
+        return set()
+    core = project.get("dependencies", [])
+    specs: list[object] = list(core) if isinstance(core, list) else []
+    extras = project.get("optional-dependencies", {})
+    for value in extras.values() if isinstance(extras, dict) else []:
+        if isinstance(value, list):
+            specs.extend(value)
+    return {
+        normalize(name)
+        for spec in specs
+        if isinstance(spec, str) and (name := requirement_name(spec)) is not None
+    }
+
+
 def default_pyprojects(root: Path) -> list[Path]:
     """The files the gate sweeps when none is named: the root pyproject, then every packaging one."""
     return [root / "pyproject.toml", *sorted((root / "packaging").glob("*/pyproject.toml"))]
@@ -802,22 +804,22 @@ def main(argv: list[str] | None = None) -> int:
     declared: dict[str, str] = {}
     declared_in: dict[str, Path] = {}
     unnameable: list[Finding] = []
-    outside_packaging: set[str] = set()
-    packaging_dir = (_ROOT / "packaging").resolve()
-    for path in files:
+    root_runtime: set[str] = set()
+    for index, path in enumerate(files):
         # A file that cannot be read or parsed is "could not see" (2), never "failed vetting" (1),
         # which is what a traceback would exit with.
         hatch_toml = path.parent / "hatch.toml"
-        build_time: set[str] = set()
         try:
+            text = path.read_text(encoding="utf-8")
             names, problems = scan(
-                path.read_text(encoding="utf-8"),
+                text,
                 source=str(path),
                 hatch_toml_text=(
                     hatch_toml.read_text(encoding="utf-8") if hatch_toml.is_file() else None
                 ),
-                build_time_names=build_time,
             )
+            if not args.pyproject and index == 0:
+                root_runtime = _runtime_names(text)
         except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
             # The refusals from the files already read are named too, so one run reports both.
             for finding in unnameable:
@@ -830,20 +832,26 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        sibling_file = path.resolve().is_relative_to(packaging_dir)
         for name, spec in names.items():
             declared.setdefault(name, spec)
             declared_in.setdefault(name, path)
-        outside_packaging |= build_time if sibling_file else set(names)
         unnameable.extend(problems)
-    # The exclusion exists for one packaging wheel's RUNTIME requirement naming a sibling. A
-    # first-party name anywhere else -- a root extra an end user installs from PyPI, or a build-time
-    # table a build frontend always fetches from the index -- is vetted like any other, because there
-    # the name may be unclaimed and existence is exactly the question.
-    first_party = {k: v for k, v in FIRST_PARTY.items() if normalize(k) not in outside_packaging}
     # Named before PyPI is asked anything, so an unreachable PyPI cannot hide them.
     for finding in unnameable:
         _print_finding(finding)
+    # Liveness that a build-time name cannot satisfy: every file declares hatchling in
+    # [build-system].requires, so a global count stays above zero even if the root's runtime tables
+    # stopped being read. Their own count must be non-zero.
+    if not args.pyproject and not root_runtime - {normalize(k) for k in ALLOWLIST}:
+        print(
+            _annotation(
+                f"::error::{files[0]} yielded no name from [project].dependencies or "
+                "[project.optional-dependencies]. The engine's runtime closure cannot be empty, so "
+                "the schema moved under the parser. This is a broken gate, not a clean sweep."
+            ),
+            file=sys.stderr,
+        )
+        return 2
     # FAIL CLOSED on both branches below. Passing here would mean "PyPI was unreachable (or answered
     # nonsense), so every dependency is fine". Either one escaping as a traceback would exit 1, the
     # code that means "a dependency failed vetting", rather than 2, "could not see".
@@ -853,7 +861,6 @@ def main(argv: list[str] | None = None) -> int:
             functools.partial(_http_fetch, budget=RetryBudget()),
             now=datetime.now(UTC),
             min_age_days=args.min_age_days,
-            first_party=first_party,
         )
     except UnreadableReply as exc:
         print(
