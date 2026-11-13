@@ -182,6 +182,9 @@ class _LeaseCoordinator(NullCoordinator):
     def is_leader(self) -> bool:
         return self.leader
 
+    def is_clustered(self) -> bool:
+        return True  # as a real cluster coordinator is, so the clustered branches run
+
 
 async def _lease_lost_runner(
     store: MessageStore, tmp_path: Path, claim_mode: str
@@ -198,9 +201,13 @@ async def _lease_lost_runner(
         coordinator=coordinator,
     )
     await runner.start()
-    assert runner.running and _IN in runner._sources  # the control: the graph really runs
-    coordinator.leader = False
-    assert runner.running  # the window: the lease is gone and the graph is not yet stopped
+    try:
+        assert runner.running and _IN in runner._sources  # the control: the graph really runs
+        coordinator.leader = False
+        assert runner.running  # the window: the lease is gone and the graph is not yet stopped
+    except BaseException:
+        await runner.stop()
+        raise
     return runner, coordinator
 
 
@@ -251,7 +258,7 @@ async def test_the_scheduler_starts_nothing_on_a_node_that_lost_its_lease(
 
 
 async def test_a_lease_lost_while_a_window_open_waits_on_the_lock_is_not_a_failed_start(
-    store: MessageStore, tmp_path: Path
+    store: MessageStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The scheduler's own lease read is a fast path taken before the reload lock. A lease lost
     while the tick waits on that lock reaches the door's refusal, which is still not recorded as a
@@ -271,9 +278,30 @@ async def test_a_lease_lost_while_a_window_open_waits_on_the_lock_is_not_a_faile
                 await asyncio.sleep(0)  # both ticks pass their lease read and wait on the lock
             assert not any(t.done() for t in ticks)
             coordinator.leader = False
+        caplog.set_level("INFO")
         await asyncio.gather(*ticks)  # neither raises
         assert _IN not in runner._sources and _OUT in runner._outbound_paused
         assert ("inbound", _IN) not in runner._failed
+        # The premise: both ticks got past their own lease read and met the door's refusal, rather
+        # than first running after the flip and taking the fast path.
+        assert sum("not started" in r.getMessage() for r in caplog.records) == 2
+    finally:
+        await runner.stop()
+
+
+async def test_a_lease_lost_restart_is_refused_before_its_stop_half(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """A live listener and a delivering lane keep their state: the refusal comes before the stop
+    half of either restart, so nothing is unbound or turned into an operator pause."""
+    runner, _ = await _lease_lost_runner(store, tmp_path, "pooled")
+    try:
+        assert _IN in runner._sources and _OUT not in runner._outbound_paused  # the premise
+        with pytest.raises(RunnerLeaseLostError):
+            await runner.restart_inbound(_IN, operator=True)
+        with pytest.raises(RunnerLeaseLostError):
+            await runner.restart_outbound(_OUT)
+        assert _IN in runner._sources and _OUT not in runner._outbound_paused
     finally:
         await runner.stop()
 
@@ -334,6 +362,12 @@ async def test_a_leader_takes_the_start_doors_as_before(
         await runner.start_inbound(_IN, operator=True)
         await runner.start_outbound(_OUT)
         assert _IN in runner._sources and _OUT not in runner._outbound_paused
+        # The scheduler's positive control: the same window-open calls the lease-lost test makes
+        # do start an engine-stopped inbound here.
+        await runner.stop_inbound(_IN)
+        always: Any = SimpleNamespace(is_active=lambda _now: True)
+        await runner._reconcile_schedule(_IN, "inbound", always)
+        assert _IN in runner._sources
     finally:
         await runner.stop()
 
