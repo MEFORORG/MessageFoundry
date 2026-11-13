@@ -62,7 +62,7 @@ from dataclasses import replace
 from functools import partial
 from time import perf_counter
 from types import MappingProxyType
-from typing import Any, Final, assert_never
+from typing import Any, Final, Literal, assert_never
 from uuid import uuid4
 
 from messagefoundry.config.models import RetryPolicy
@@ -2154,16 +2154,61 @@ def _trusted_user_key(table: str, name: str) -> str:
     it, so a re-run is a no-op. The deleted rows belong to no account, so nothing can use them: a
     passkey, a session or a role grant of a deleted account. ``sys.foreign_keys`` is read, since
     ``OBJECT_ID`` alone cannot tell a trusted key from an untrusted one. EXEC keeps the two ALTERs
-    out of the batch's compile, as for the ``credential_id_hash`` rebuild."""
-    return f"""IF OBJECT_ID('{name}','F') IS NULL OR EXISTS (SELECT 1 FROM sys.foreign_keys
+    out of the batch's compile, as for the ``credential_id_hash`` rebuild. The batch ends with one
+    row, the table and how many rows it deleted, which ``_ensure_schema`` logs when it is not zero
+    (:func:`_log_orphans_deleted`)."""
+    return f"""{_ORPHAN_SWEEP_HEAD}
+    IF OBJECT_ID('{name}','F') IS NULL OR EXISTS (SELECT 1 FROM sys.foreign_keys
         WHERE object_id = OBJECT_ID('{name}','F') AND (is_not_trusted = 1 OR is_disabled = 1))
     BEGIN
         DELETE FROM {table} WHERE NOT EXISTS (SELECT 1 FROM users WHERE users.id = {table}.user_id);
+        SET @orphans = @@ROWCOUNT;
         IF OBJECT_ID('{name}','F') IS NOT NULL
             EXEC(N'ALTER TABLE {table} DROP CONSTRAINT {name}');
         EXEC(N'ALTER TABLE {table} WITH CHECK
                ADD CONSTRAINT {name} FOREIGN KEY (user_id) REFERENCES users(id)');
-    END"""
+    END
+    IF @nocount_was = 0 SET NOCOUNT OFF;
+    SELECT N'{table}' AS orphan_table, @orphans AS orphans"""
+
+
+#: How each :func:`_trusted_user_key` batch opens, which is how ``_ensure_schema`` knows to read its
+#: one row. NOCOUNT keeps the DELETE's rows-affected result from arriving ahead of that row. The
+#: batch is unparameterized, so a SET in it outlives it on the pooled connection; it puts back the
+#: setting it found before its last statement (``@@OPTIONS`` bit 512 is NOCOUNT).
+_ORPHAN_SWEEP_HEAD: Final = (
+    "DECLARE @nocount_was BIT = CASE WHEN @@OPTIONS & 512 = 512 THEN 1 ELSE 0 END;"
+    " SET NOCOUNT ON; DECLARE @orphans INT = 0;"
+)
+
+
+async def _log_orphans_deleted(cur: Any) -> None:
+    """Log the row a :func:`_trusted_user_key` batch ends with, when it deleted any rows (BACKLOG
+    #2733). The count only, per table: the deleted rows name accounts, and the line names none.
+    It only reports, so a row it cannot read fails nothing, since the delete has already run; it
+    says so instead."""
+    rows = await cur.fetchall()
+    if not rows or len(rows[0]) < 2:
+        log.warning("sqlserver: an orphan sweep before a user key returned no count row")
+        return
+    table, deleted = str(rows[0][0]), int(rows[0][1])
+    if deleted:
+        log.warning(
+            "sqlserver: deleted %d %s row(s) naming an account that does not exist, before"
+            " trusting the table's user key",
+            deleted,
+            table,
+        )
+
+
+_AccountRowHints = Literal["UPDLOCK, ROWLOCK", "HOLDLOCK, ROWLOCK", "XLOCK, ROWLOCK"]
+
+
+async def _hold_account_row(cur: Any, user_id: str, hints: _AccountRowHints) -> None:
+    """Lock the account's ``users`` row under ``hints`` inside the caller's transaction, draining
+    the row unread. ``_delete_user_rows`` says which writes take it and why (BACKLOG #2733)."""
+    await cur.execute(f"SELECT id FROM users WITH ({hints}) WHERE id=?", (user_id,))
+    await cur.fetchall()
 
 
 _SCHEMA: list[str] = [
@@ -2756,8 +2801,8 @@ _SCHEMA: list[str] = [
         CREATE INDEX ix_user_roles_role ON user_roles(role_id)""",
     # BACKLOG #2733: see _trusted_user_key. The primary key, which leads with user_id, serves its
     # check on a user delete. Every role write holds the account row under
-    # UPDLOCK (_read_user_record), as the delete does, so the two never interleave. The role key
-    # above stays WITH NOCHECK: a grant row names a live account whose seal covers it, so
+    # UPDLOCK (_read_user_record), and the delete under XLOCK, so the two never
+    # interleave. The role key above stays WITH NOCHECK: a grant row names a live account whose seal covers it, so
     # deleting one would make that account fail its seal, and the write path drops it instead.
     _trusted_user_key("user_roles", "fk_user_roles_user"),
     """IF OBJECT_ID('ad_group_role_map','U') IS NULL CREATE TABLE ad_group_role_map (
@@ -2814,13 +2859,8 @@ _SCHEMA: list[str] = [
     """IF INDEXPROPERTY(OBJECT_ID('sessions'),'ix_sessions_user','IndexID') IS NULL
         CREATE INDEX ix_sessions_user ON sessions(user_id)""",
     # BACKLOG #2733: see _trusted_user_key. ix_sessions_user above serves its check on a user
-    # delete. _delete_user_rows deletes the sessions first, under UPDLOCK on the account
-    # row, and create_session's HOLDLOCK read is compatible with that lock. So a sign-in that
-    # commits while a delete runs now makes the delete fail here and roll back whole, nothing
-    # deleted, where before the delete committed and left the session behind for a missing
-    # account. Taking the account row with XLOCK instead would close that, but it would deadlock
-    # remember_login_address and reset_login_addresses, which write a child row before their key
-    # check reads the account row.
+    # delete. _delete_user_rows holds the account row under XLOCK before it deletes the sessions,
+    # so a sign-in started inside a delete waits for it, then meets this key and is refused.
     _trusted_user_key("sessions", "fk_sessions_user"),
     """IF INDEXPROPERTY(OBJECT_ID('sessions'),'ix_sessions_expires','IndexID') IS NULL
         CREATE INDEX ix_sessions_expires ON sessions(expires_at)""",
@@ -5274,6 +5314,8 @@ class SqlServerStore:
                         await cur.execute(f"SET LOCK_TIMEOUT {_schema_applock_timeout_ms(wait)}")
                         for statement in _SCHEMA:
                             await cur.execute(statement)
+                            if statement.startswith(_ORPHAN_SWEEP_HEAD):
+                                await _log_orphans_deleted(cur)
                         # BACKLOG #1720: before the marker, on this cursor and under its lifted
                         # query timeout. Every guarded CREATE above skips a name that is already
                         # taken, so only a read of the live catalog can say the batch built what
@@ -15007,8 +15049,7 @@ class SqlServerStore:
         Transit Outage tripped still holds every account row before its session sweep, the lock
         order :meth:`revoke_all_sessions` relies on (decision d20261109T200352805-599b24, item
         2)."""
-        await cur.execute("SELECT id FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?", (user_id,))
-        await cur.fetchall()
+        await _hold_account_row(cur, user_id, "UPDLOCK, ROWLOCK")
 
     async def reseal_user_records(self) -> tuple[int, int]:
         """Re-seal every user record under the active key, for ``rotate-key`` (BACKLOG #2592);
@@ -15558,9 +15599,11 @@ class SqlServerStore:
     async def remember_login_address(self, user_id: str, address: str, *, now: float) -> None:
         """See :meth:`messagefoundry.store.base.AuthStore.remember_login_address`. ``HOLDLOCK``
         makes the MERGE's match-then-insert one decision, so two concurrent sign-ins from one host
-        cannot both take the insert branch and collide on the key."""
+        cannot both take the insert branch and collide on the key. The account row is held
+        first, as :meth:`_share_account_row` says."""
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
+                await self._share_account_row(cur, user_id)
                 await cur.execute(
                     "MERGE known_login_addresses WITH (HOLDLOCK) AS t"
                     " USING (SELECT ? AS user_id, ? AS address, ? AS seen) AS s"
@@ -15577,6 +15620,17 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
 
+    @staticmethod
+    async def _share_account_row(cur: Any, user_id: str) -> None:
+        """Hold the account row under a shared lock to the commit, before a sign-in address row is
+        written (BACKLOG #2733). The address key's check reads the account row, and a user delete
+        holds it under XLOCK (:meth:`_delete_user_rows`) before it deletes the address rows. A write
+        that took its address row first could then wait on the delete's account row while the
+        delete waits on that address row: a deadlock. Shared, as ``create_session``'s unguarded read
+        is, so parallel sign-ins of one account do not wait on each other; nothing that takes it
+        writes the account row, so no two holders can each wait to convert it."""
+        await _hold_account_row(cur, user_id, "HOLDLOCK, ROWLOCK")
+
     async def forget_login_addresses(self, user_id: str, *, before: float) -> None:
         """See :meth:`messagefoundry.store.base.AuthStore.forget_login_addresses`."""
         await self._execute(
@@ -15585,9 +15639,11 @@ class SqlServerStore:
         )
 
     async def reset_login_addresses(self, user_id: str) -> None:
-        """See :meth:`messagefoundry.store.base.AuthStore.reset_login_addresses`."""
+        """See :meth:`messagefoundry.store.base.AuthStore.reset_login_addresses`. The account row
+        is held first, as :meth:`_share_account_row` says."""
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
+                await self._share_account_row(cur, user_id)
                 await cur.execute("DELETE FROM known_login_addresses WHERE user_id=?", (user_id,))
                 # A MERGE under HOLDLOCK, as remember_login_address's: a concurrent reset of the
                 # account may have committed its marker meanwhile, and that is the record this
@@ -15740,11 +15796,19 @@ class SqlServerStore:
     @staticmethod
     async def _delete_user_rows(cur: Any, user_id: str) -> None:
         """Delete the account and every row keyed to it, inside the caller's transaction."""
-        # BACKLOG #2733: hold the account row first, as every passkey write does
-        # (_read_user_record). Otherwise an enrolment committing between the passkey delete and the
-        # users delete below would fail fk_webauthn_credentials_user and the whole delete with it.
-        await cur.execute("SELECT id FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?", (user_id,))
-        await cur.fetchall()
+        # BACKLOG #2733: hold the account row first, before any row keyed to it, so no write can
+        # add a child row between the deletes below and the users delete, whose key checks would
+        # then refuse it and fail the whole delete with a raw 547. XLOCK, not UPDLOCK: a sign-in's
+        # HOLDLOCK read (create_session) shares a U lock, so a session could commit inside the
+        # delete; it cannot share X, so it waits and then finds the account gone, the lock rule
+        # create_session states (#1474, #2592). A write whose statement checks a key against the
+        # account row, an INSERT of a row keyed to it or an UPDATE that sets user_id, would hold its
+        # row while that check waited on this lock, and this delete waits on that row. Each such
+        # write read for this change takes the account row first: the passkey and role writes
+        # (_read_user_record), the sign-in, the session rewrites (_write_session_txn) and the
+        # sign-in address writes (remember_login_address, reset_login_addresses). Writes that set no
+        # user_id run no such check, so they hold their row only until they commit.
+        await _hold_account_row(cur, user_id, "XLOCK, ROWLOCK")
         await cur.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
         await cur.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
         await cur.execute("DELETE FROM webauthn_credentials WHERE user_id=?", (user_id,))
@@ -16485,20 +16549,28 @@ class SqlServerStore:
         token_hash: str,
         change: Callable[[SessionRecord], SessionRecord],
         *,
-        first: Callable[[Any], Awaitable[None]] | None = None,
         landed: Callable[[Any], Awaitable[None]] | None = None,
         after_commit: bool = False,
     ) -> SessionRecord | None:
         """:meth:`_write_session` in a transaction of its own, committed before it returns.
-        ``first`` runs on the same cursor, in the same transaction, before the write.
+        It takes the session's account row under ``UPDLOCK, ROWLOCK`` first, the lock order
+        :meth:`rotate_session` states: the rewrite sets ``user_id``, so the session key's check
+        can read the account row, and a sweep or a user delete holding that row while it waits on
+        the session row would otherwise deadlock with it (BACKLOG #4974, #2733). Not shared: a
+        passkey enrolment for a session holds the account row under ``UPDLOCK`` and that session's
+        row, then converts the account row to X, so a stamp holding it shared while it waited on
+        the session row would close a cycle. The account is read unlocked: ``user_id`` never
+        changes, and a session already gone locks nothing.
         ``landed`` runs on the same cursor, in the same transaction, only when the write landed.
         ``after_commit`` borrows through :meth:`_acquire_after_commit`; only ``rotate_session``
         passes it."""
         borrow = self._acquire_after_commit() if after_commit else self._acquire()
         async with borrow as conn, self._cursor(conn) as cur:
             try:
-                if first is not None:
-                    await first(cur)
+                await cur.execute("SELECT user_id FROM sessions WHERE token_hash=?", (token_hash,))
+                owners = await cur.fetchall()
+                if owners:
+                    await self._lock_account_row(cur, str(owners[0][0]))
                 updated = await self._write_session(cur, token_hash, change)
                 if updated is not None and landed is not None:
                     await landed(cur)
@@ -16597,15 +16669,6 @@ class SqlServerStore:
         not against the TOTP re-enrolment's. docs/SECURITY.md, *Limits of the session sweep*, says
         which are raced and which are not."""
 
-        async def _account_first(cur: Any) -> None:
-            await cur.execute("SELECT user_id FROM sessions WHERE token_hash=?", (token_hash,))
-            owners = await cur.fetchall()
-            if owners:
-                await cur.execute(
-                    "SELECT id FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?", (str(owners[0][0]),)
-                )
-                await cur.fetchall()
-
         async def _link(cur: Any) -> None:
             retired_at = time.time() if now is None else now
             await cur.execute(_SESSION_LINEAGE_INSERT, (token_hash, new_token_hash, retired_at))
@@ -16613,7 +16676,6 @@ class SqlServerStore:
         rotated = await self._write_session_txn(
             token_hash,
             lambda s: replace(s, token_hash=new_token_hash),
-            first=_account_first,
             landed=_link,
             after_commit=True,
         )
