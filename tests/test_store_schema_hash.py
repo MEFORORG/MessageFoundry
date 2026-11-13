@@ -79,9 +79,14 @@ async def test_sqlserver_orphan_sweep_logs_a_count_per_table_and_no_account(
         async def fetchall(self) -> list[tuple[str, int]]:
             return [("sessions", deleted)]
 
+    control = "control line: the capture reads this logger"
     with caplog.at_level("WARNING", logger="messagefoundry.store.sqlserver"):
+        sqlserver.log.warning(control)
         await sqlserver._log_orphans_deleted(_Cursor())
-    lines = [r.getMessage() for r in caplog.records]
+    # Positive control: the capture holds the control line, so an empty result below is the
+    # reader logging nothing, not a capture that saw nothing.
+    assert len(caplog.records) >= 1
+    lines = [r.getMessage() for r in caplog.records if r.getMessage() != control]
     if deleted:
         assert lines == [
             "sqlserver: deleted 2 sessions row(s) naming an account that does not exist, before"
