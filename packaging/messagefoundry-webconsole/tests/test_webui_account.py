@@ -368,6 +368,54 @@ async def test_enrolment_still_takes_two_separate_single_use_proofs(engine: Engi
         assert user is not None and not user.totp_enabled
 
 
+async def test_empty_code_continue_with_a_held_grant_spends_nothing(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5931 (Lander hold on PR 2933): the code-less Continue posted while the confirm grant
+    is already held, from another tab or after Back, goes to the re-auth and costs nothing.
+
+    RED when: the empty code reaches the confirm gate or ``confirm_mfa_enrollment``. The gate would
+    spend the held grant, the check of ``""`` would write a false ``auth.mfa_failed`` row and draw
+    the per-actor attempt budget, and the operator would owe a second re-auth."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    uid = await _uid(service, "op")
+    charged: list[str] = []
+    allow = service.allow_reauth_attempt
+
+    def counting_allow(actor: str) -> bool:
+        charged.append(actor)
+        return allow(actor)
+
+    monkeypatch.setattr(service, "allow_reauth_attempt", counting_allow)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        await _mint_action(c, "/ui/account/mfa/enroll")
+        r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 200 and ">Continue<" in r.text
+        secret = await service.store.get_totp_secret(uid)
+        assert secret is not None
+        await _mint_action(c, "/ui/account/mfa/confirm")  # the grant is now held
+        charged.clear()
+        for data in ({}, {"code": ""}, {"code": "   "}):
+            r = await c.post(
+                "/ui/account/mfa/verify", data=data, headers={"Sec-Fetch-Site": "same-origin"}
+            )
+            assert r.status_code == 303
+            assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/confirm"
+        assert await engine.store.list_audit(action="auth.mfa_failed", limit=50) == []
+        assert charged == []
+        # The grant was not spent: the first real code still turns TOTP on with no new re-auth.
+        r = await c.post(
+            "/ui/account/mfa/verify",
+            data={"code": _totp_not_near_a_step_boundary(secret)},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 200 and "shown once" in r.text
+        user = await service.store.get_user(uid)
+        assert user is not None and user.totp_enabled
+
+
 async def test_enroll_page_keeps_the_code_form_under_the_opt_out(engine: Engine) -> None:
     """Under ``[auth].require_action_step_up = false`` the confirm gate is the session window, which
     the enroll re-auth left fresh, so the enroll page keeps its code form and the first code turns
