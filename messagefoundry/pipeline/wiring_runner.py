@@ -10718,7 +10718,9 @@ class RegistryRunner:
         # payload-agnostic, ADR 0004, so a non-hl7v2 feed can reach here) routes to the internal-error
         # policy below (dead-letter / STOP) instead of stranding every claimed row INFLIGHT forever with
         # no send and no disposition. Members are carried VERBATIM (the head too — never re-encoded); only
-        # the head is PARSED, for the BHS separators + the BHS-11 control id.
+        # the head is PARSED here, for the BHS-11 control id. How encode_batch reads the BHS
+        # separators, parsing the head where its MSH line alone does not hold them, is in
+        # parsing/split.py, _head_separators (BACKLOG #5919).
         refused: list[_RefusedMember] = []
         # The outbox id of the member whose own step is running, set before each per-member step and
         # cleared before a batch-wide one, so every arm below names the member a fault came from,
@@ -10789,9 +10791,9 @@ class RegistryRunner:
                 parsed = await asyncio.to_thread(Message.parse, first.payload)
                 control_id = parsed.control_id or first.id  # stable
                 timestamp = _hl7_batch_timestamp(first.created_at)
-                # encode_batch parses the HYDRATED head for the separators and normalizes every
-                # member, in one call, so a fault inside it cannot be told apart by member; the
-                # send is the whole envelope's. Neither names one.
+                # encode_batch reads the HYDRATED head's MSH-1 and MSH-2 and frames every member in
+                # one call, so a fault inside it cannot be told apart by member; the send is the
+                # whole envelope's. Neither names one.
                 current = None
                 envelope = await asyncio.to_thread(
                     encode_batch, members, control_id=control_id, timestamp=timestamp

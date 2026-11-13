@@ -26,8 +26,9 @@ import itertools
 import re
 from dataclasses import dataclass
 
+from messagefoundry.parsing._builtin_hl7 import _extract_separators, _first_line_head
 from messagefoundry.parsing.message import Message
-from messagefoundry.parsing.peek import normalize, starts_with_msh
+from messagefoundry.parsing.peek import enforce_expansion_budget, normalize, starts_with_msh
 from messagefoundry.parsing.sniff import _LEADING_WS_STR
 
 __all__ = [
@@ -284,8 +285,13 @@ def encode_batch(messages: list[Message | str], *, control_id: str, timestamp: s
         raise ValueError("encode_batch requires at least one message")
     # Read the batch separators from the HEAD member's own MSH (never hardcode |^~\&). The head drives
     # the whole envelope's framing; mixed-delimiter members in one batch are not a real feed shape.
-    head = messages[0] if isinstance(messages[0], Message) else Message.parse(messages[0])
-    field_sep, comp_sep, rep_sep, esc, sub_sep = head._encoding_chars()
+    head = messages[0]
+    if isinstance(head, Message):
+        field_sep, comp_sep, rep_sep, esc, sub_sep = head._encoding_chars()
+        head_text = head.encode()
+    else:
+        head_text = normalize(head)
+        field_sep, comp_sep, rep_sep, esc, sub_sep = _head_separators(head_text)
     enc = (
         comp_sep + rep_sep + esc + sub_sep
     )  # MSH-2 / BHS-2: component^repetition~escape\subcomponent
@@ -293,14 +299,67 @@ def encode_batch(messages: list[Message | str], *, control_id: str, timestamp: s
     bhs_tail = ["", "", "", "", timestamp, "", "", "", control_id]  # BHS-3, -4, -5, -6, -7, …, -11
     bhs = "BHS" + field_sep + enc + field_sep + field_sep.join(bhs_tail)
     bts = "BTS" + field_sep + str(len(messages))
-    parts = [bhs]
-    for m in messages:
-        text = m.encode() if isinstance(m, Message) else normalize(m)
-        parts.append(
-            text.strip("\r")
-        )  # the member's segments, no leading/trailing CR (kept verbatim otherwise)
-    parts.append(bts)
-    return "\r".join(parts) + "\r"
+    # Every piece carries its own trailing CR, so for a member that ends with one CR the join is
+    # the only copy: a strip of each member and a CR added to the joined envelope each copied it
+    # again (BACKLOG #5919).
+    pieces = [bhs, "\r", *_framed(head_text)]
+    for m in messages[1:]:
+        pieces.extend(_framed(m.encode() if isinstance(m, Message) else normalize(m)))
+    pieces += [bts, "\r"]
+    return "".join(pieces)
+
+
+#: How wide an MSH line's opening must be to hold MSH-1 and four encoding characters.
+_SEPARATORS_WIDTH = len(_MSH) + 1 + 4
+
+
+def _head_separators(norm: str) -> tuple[str, str, str, str, str]:
+    """The ``(field, component, repetition, escape, subcomponent)`` delimiters of a batch's head
+    member, normalized as ``norm``, as :meth:`Message._encoding_chars` reads them after a parse.
+
+    For a head that opens with ``MSH`` after whitespace, with MSH-1 and four encoding characters,
+    they are read from that line's first few characters alone, through the parser's own window
+    (:func:`~messagefoundry.parsing._builtin_hl7._first_line_head`) and separator read (BACKLOG
+    #5919): a full parse of a large hydrated head to read eight characters copied the whole head
+    at least twice. Every other head, such as an ``FHS``/``BHS``-led one, one led by a byte order mark, a
+    non-HL7 one or one whose MSH-2 is short, is parsed as before, so it frames or raises exactly as
+    it did, ``ValueError`` and its message included.
+
+    A head read from its MSH line is still checked against the parser's own escape expansion
+    budget (:func:`~messagefoundry.parsing.peek.enforce_expansion_budget`, ASVS 1.3.3), run on
+    ``norm`` itself, the text encode_batch frames: a head a parse refuses for its escapes raises
+    the same ``HL7PeekError`` here, whatever its caller checked. On the delivery path that text is
+    the hydrated head, and the caller's own parse of the head's stored payload checks the same
+    budget first, so there this is a second check, not the only one. What else a parse checks in the
+    rest of the head is not checked: at least a later header line too short to read."""
+    line = _first_line_head(norm)
+    # _extract_separators fills a short MSH-2 with defaults, where _encoding_chars refuses one, so
+    # the line must hold MSH-1 and four encoding characters with no field separator among them. A
+    # window narrower than that only sends every head to the parse.
+    if (
+        not line.startswith(_MSH)
+        or len(line) < _SEPARATORS_WIDTH
+        or line.find(line[3], 4, _SEPARATORS_WIDTH) != -1
+    ):
+        return Message.parse(norm)._encoding_chars()
+    # A parse checks the budget before it reads anything, so a head it refuses for its escapes is
+    # refused here too, with the same error. The parse above checks it for itself.
+    enforce_expansion_budget(norm)
+    field_sep, comp_sep, rep_sep, sub_sep, esc = _extract_separators(line)
+    return field_sep, comp_sep, rep_sep, esc, sub_sep
+
+
+def _framed(text: str) -> tuple[str, ...]:
+    """The pieces that frame one member's ``text`` in a batch: its segments with no leading or
+    trailing CR, then one CR. ``text`` itself when it already has that shape, so the common
+    member, which ends with one CR, is not copied."""
+    if text.startswith("\r"):
+        return text.strip("\r"), "\r"
+    if not text.endswith("\r"):
+        return text, "\r"
+    if not text.endswith("\r\r"):
+        return (text,)
+    return text.rstrip("\r"), "\r"
 
 
 def _non_blank(lines: list[str]) -> list[str]:
