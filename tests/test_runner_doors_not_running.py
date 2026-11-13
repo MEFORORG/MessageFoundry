@@ -12,6 +12,7 @@ restart doors also ask the coordinator for leadership (BACKLOG #5906, #8214 item
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -247,6 +248,78 @@ async def test_the_scheduler_starts_nothing_on_a_node_that_lost_its_lease(
         assert ("inbound", _IN) not in runner._failed
     finally:
         await runner.stop()
+
+
+async def test_a_lease_lost_while_a_window_open_waits_on_the_lock_is_not_a_failed_start(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """The scheduler's own lease read is a fast path taken before the reload lock. A lease lost
+    while the tick waits on that lock reaches the door's refusal, which is still not recorded as a
+    failed start and does not escape the tick."""
+    runner, coordinator = await _lease_lost_runner(store, tmp_path, "pooled")
+    always: Any = SimpleNamespace(is_active=lambda _now: True)
+    try:
+        await runner.stop_inbound(_IN)
+        await runner.stop_outbound(_OUT)
+        coordinator.leader = True  # the lease is held when each tick reads it
+        async with runner._reload_lock:
+            ticks = [
+                asyncio.ensure_future(runner._reconcile_schedule(_IN, "inbound", always)),
+                asyncio.ensure_future(runner._reconcile_schedule(_OUT, "outbound", always)),
+            ]
+            for _ in range(5):
+                await asyncio.sleep(0)  # both ticks pass their lease read and wait on the lock
+            assert not any(t.done() for t in ticks)
+            coordinator.leader = False
+        await asyncio.gather(*ticks)  # neither raises
+        assert _IN not in runner._sources and _OUT in runner._outbound_paused
+        assert ("inbound", _IN) not in runner._failed
+    finally:
+        await runner.stop()
+
+
+async def test_the_control_route_answers_503_on_a_node_that_lost_its_lease(
+    tmp_path: Path,
+) -> None:
+    """The API's existing RunnerNotRunningError arms take the subclass: a 503 naming the lease,
+    and a refused-control audit row, while the stops still answer 200."""
+    engine = await Engine.create(
+        tmp_path / "api.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    engine.add_registry(_unsharded_registry(tmp_path))
+    await engine.start()
+    try:
+        rr = engine.registry_runner
+        assert rr is not None and rr.running
+        coordinator = _LeaseCoordinator()
+        coordinator.leader = False
+        rr._coordinator = coordinator  # the lease is gone; _stop_graph has not run yet
+        transport = httpx.ASGITransport(app=create_app(engine, allow_no_auth=True))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            assert (await c.post(f"/connections/{_IN}/stop")).status_code == 200
+            assert (await c.post(f"/connections/{_OUT}/stop")).status_code == 200
+            for name, action in (
+                (_IN, "start"),
+                (_IN, "restart"),
+                (_OUT, "start"),
+                (_OUT, "restart"),
+            ):
+                r = await c.post(f"/connections/{name}/{action}")
+                assert r.status_code == 503, (name, action, r.text)
+                assert "lease" in r.text and "graph is not running" not in r.text
+        assert _IN not in rr._sources and _OUT in rr._outbound_paused
+        details = [
+            json.loads(row["detail"] or "{}")
+            for row in await engine.store.list_audit(action="connection_control")
+        ]
+        refused = sorted((d["connection"], d["action"]) for d in details if d.get("refused"))
+        assert refused == sorted(
+            [(_IN, "start"), (_IN, "restart"), (_OUT, "start"), (_OUT, "restart")]
+        )
+    finally:
+        await engine.stop()
 
 
 async def test_a_leader_takes_the_start_doors_as_before(

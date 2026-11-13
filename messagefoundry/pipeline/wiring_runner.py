@@ -4314,7 +4314,12 @@ class RegistryRunner:
         why. Any other control, a start or restart, also needs this node to hold the leader lease,
         with :class:`RunnerLeaseLostError` (BACKLOG #5906): a node that lost it before
         ``Engine._stop_graph`` ran still reads running. The single-node ``NullCoordinator`` always
-        leads, so nothing changes there. A stop needs no lease, since it only takes work down."""
+        leads, so nothing changes there. A stop needs no lease, since it only takes work down.
+
+        Only the ``_running`` read is fixed by the lock. The lease read is point in time: the
+        coordinator's own task can drop the lease without the lock, during the awaits a start makes
+        after this check. This door is not the fence there; at least a source's ``leader_gate``,
+        the store's epoch fence and ``_stop_graph`` itself are."""
         if not self._running and not (stop and self.has_residual_state):
             raise RunnerNotRunningError(name)
         if not stop and not self._coordinator.is_leader():
@@ -4412,7 +4417,12 @@ class RegistryRunner:
         neither an operator nor an alert rule changes how that lane is held (vault BACKLOG #3067).
 
         ``hold_on_store_fault`` is the operator control route's alone, as on :meth:`start_outbound`.
-        The stop half has run by then, so a raise leaves the lane paused."""
+        The stop half has run by then, so a raise leaves the lane paused.
+
+        The run-state door is the exception to stop-first: a graph that is not running, or a node
+        that lost its lease (:class:`RunnerLeaseLostError`), refuses the whole restart before the
+        stop half, so the lane keeps the state it had. Delivery on such a node is already gated on
+        leadership, and its graph is coming down."""
         async with self._reload_lock:
             self._require_owned_destination(name)
             self._require_running(name)
@@ -5342,9 +5352,10 @@ class RegistryRunner:
         if would_start and self._log_halt_holds(name, kind):
             return
         # A node that lost its lease while its graph still runs: the start door refuses it
-        # (RunnerLeaseLostError, BACKLOG #5906), and the inbound arm below would record that
-        # refusal as a failed start that pages. The graph stops shortly; the leader keeps the
-        # calendar. The park branch still runs, since a stop only takes work down.
+        # (RunnerLeaseLostError, BACKLOG #5906). The graph stops shortly; the leader keeps the
+        # calendar. The park branch still runs, since a stop only takes work down. This read is a
+        # fast path that skips the start log line; the door, read under the reload lock, is the
+        # authority, and the start arms below catch its refusal for a lease lost while they wait.
         if would_start and not self._coordinator.is_leader():
             return
         if active and not running:
@@ -5365,13 +5376,18 @@ class RegistryRunner:
                 kind,
                 name,
             )
-            if kind == "inbound":
-                try:
-                    await self.start_inbound(name)
-                except Exception as exc:
-                    self._record_window_open_failure(name, exc)
-            else:
-                await self.start_outbound(name)
+            try:
+                if kind == "inbound":
+                    try:
+                        await self.start_inbound(name)
+                    except RunnerNotRunningError:
+                        raise  # a refusal, not a failed start: no record, no page
+                    except Exception as exc:
+                        self._record_window_open_failure(name, exc)
+                else:
+                    await self.start_outbound(name)
+            except RunnerNotRunningError as exc:
+                log.info("schedule: %s connection %r not started: %s", kind, name, exc)
         elif not active and running:
             log.info(
                 "schedule: %s connection %r leaving active window — parking (clean stop)",
