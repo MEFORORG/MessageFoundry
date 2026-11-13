@@ -17,8 +17,8 @@ in the reply, else the first Value, the Header included, and an empty ``<faultco
 code. Both could make a permanent fault read as a Receiver one and retry until the attempt limit;
 the named tests below pin each, with a control. The Fault is searched for from the SOAP Body start
 tag, ``_find_fault`` says how, and the Body tests pin that, each with a control. BACKLOG #5912
-narrows the code read to the Fault's first child, a faultcode or a Code and the Value inside that
-Code, so a Value anywhere else in the Fault decides nothing; its tests pin that against the PR 2790
+narrows the code read to the Fault's first child, a faultcode or a Code and the Value that is that
+Code's first child, so a Value anywhere else in the Fault decides nothing; its tests pin that against the PR 2790
 reading, which took the Fault's first Value.
 
 The third is about which thread runs the scan, not about the loop staying responsive.
@@ -57,11 +57,11 @@ def _old_fault_code(body: str, fault: object = None) -> str:
     return m.group(1) if m else ""
 
 
-# The reference reading: the old patterns, run on the Fault's first child element, a comment or
-# processing instruction before it skipped. The Fault is the first Fault start tag after the first
+# The reference reading: the old patterns, run on the Fault's first child element, a comment, CDATA
+# section or processing instruction before it skipped whole. The Fault is the first Fault start tag after the first
 # Body start tag (or anywhere, with no Body start tag or no Fault after it), read to its close tag.
-# A faultcode child is read whole; a Code child is read up to its close tag and its first Value
-# taken (BACKLOG #5912). An element that cannot hold a code reads as empty. It reuses the
+# A faultcode child is read whole; a Code child is read up to its close tag, and its own first child
+# must be the Value (BACKLOG #5912). An element that cannot hold a code reads as empty. It reuses the
 # production faultcode and Value close-tag patterns and the nested-tag pattern, so it re-checks the
 # str.find bounds and captures, not those patterns; the named shapes pin what they read. The Code
 # start and close tags are written out here, independently of _CODE_RE and _CODE_END_RE.
@@ -71,7 +71,9 @@ _REF_FAULT_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _REF_START_TAG_RE = re.compile(r"[^>]*>")
-_REF_BEFORE_THE_CHILD_RE = re.compile(r"(?:[^<]|<[!?])*")
+_REF_BEFORE_THE_CHILD_RE = re.compile(
+    r"(?:[^<]|<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>)*", re.DOTALL
+)
 _REF_CODE_RE = re.compile(
     r"<\s*(?:[\w.\-]+:)?Code(?=[\s/>])([^>]*>)(.*?)(?:</\s*(?:[\w.\-]+:)?Code\s*>|\Z)",
     re.IGNORECASE | re.DOTALL,
@@ -109,7 +111,9 @@ def _ref_fault_code(body: str) -> str:
     if code is None or code.group(1).endswith("/>"):
         return ""
     in_code = code.group(2)
-    return _ref_code_text(_OLD_CODEVALUE_RE.search(in_code), in_code, soap._CODEVALUE_END_RE)
+    lead = _REF_BEFORE_THE_CHILD_RE.match(in_code)
+    child = in_code[lead.end() :] if lead is not None else ""
+    return _ref_code_text(_OLD_CODEVALUE_RE.match(child), child, soap._CODEVALUE_END_RE)
 
 
 # --- what the extraction reads ------------------------------------------------------------------
@@ -166,6 +170,44 @@ _NAMED_SHAPES = {
     "code-without-value": ("<Fault><Code><Subcode/></Code><Detail><Value>v</Value></Detail>", ""),
     "self-closing-code": ("<Fault><Code/><Detail><Value>Receiver</Value></Detail></Fault>", ""),
     "unclosed-code": ("<Fault><Code><Value>env:Sender</Value>", "env:Sender"),
+    # Markup that is not an element is stepped over whole, so a tag inside it is not the child.
+    "comment-holding-a-faultcode": (
+        "<soap:Fault><!-- <faultcode>soap:Server</faultcode> --><faultcode>soap:Client</faultcode>"
+        "</soap:Fault>",
+        "soap:Client",
+    ),
+    "pi-holding-a-faultcode": (
+        "<Fault><?pi <faultcode>Server</faultcode>?><faultcode>soap:Client</faultcode></Fault>",
+        "soap:Client",
+    ),
+    "cdata-holding-a-faultcode": (
+        "<Fault><![CDATA[<faultcode>Server</faultcode>]]><faultcode>soap:Client</faultcode></Fault>",
+        "soap:Client",
+    ),
+    "comment-in-the-code": (
+        "<Fault><Code><!-- <Value>Receiver</Value> --><Value>Sender</Value></Code></Fault>",
+        "Sender",
+    ),
+    "unterminated-comment": ("<Fault><!-- <faultcode>Server</faultcode></Fault>", ""),
+    "doctype-before-the-code": ("<Fault><!DOCTYPE x><faultcode>Server</faultcode></Fault>", ""),
+    # The Code's own first child must be its Value; a Subcode's Value is not the code.
+    "subcode-first": (
+        "<Fault><Code><Subcode><Value>Receiver</Value></Subcode><Value>Sender</Value></Code></Fault>",
+        "",
+    ),
+    "unclosed-code-then-detail": (
+        "<Fault><Code><Reason><Text>t</Text></Reason><Detail><Value>Receiver</Value></Detail></Fault>",
+        "",
+    ),
+    # A Value start tag that runs past the Code's close tag is read only up to it.
+    "value-tag-past-the-code": ("<Fault><Code><Value</Code>Receiver</Value></Fault>", ""),
+    # The faultcode name ends at a non-word character.
+    "faultcode-name-boundary": ("<Fault><faultcodeX>Server</faultcode></Fault>", ""),
+    # SOAP 1.1's schema puts faultcode first; a faultcode after a faultstring is not read.
+    "faultstring-before-faultcode": (
+        "<soap:Fault><faultstring>busy</faultstring><faultcode>soap:Server</faultcode></soap:Fault>",
+        "",
+    ),
     # The first code element decides: an empty one is not passed over for the Value after it.
     "empty": ("<Fault><faultcode></faultcode><Value>x:Sender</Value></Fault>", ""),
     "nested": ("<Fault><faultcode><b>soap:Client</b></faultcode></Fault>", ""),
@@ -568,6 +610,10 @@ _PATHOLOGICAL_REPLIES: dict[str, Callable[[int], str]] = {
     # BACKLOG #5912: the SOAP 1.2 Code read, over unterminated Value start tags inside one Code,
     # and its close-tag scan over close tags with no colon.
     "unterminated-value-tags-in-a-code": lambda k: "<Fault><Code>" + "<Value " * (k // 7),
+    # The first-child search's step over comments, processing instructions and unterminated ones.
+    "comment-run": lambda k: "<Fault>" + "<!---->" * (k // 7),
+    "unterminated-comments": lambda k: "<Fault>" + "<!--" * (k // 4),
+    "pi-run-in-a-code": lambda k: "<Fault><Code>" + "<?a?>" * (k // 5),
     "long-code-close-prefixes": lambda k: "<Fault><Code>x" + ("</" + "a." * 50) * (k // 102),
     # The Body anchor's scan, ``_BODY_RE``, over the same prefix runs and a run of ``<``, before a
     # Body that holds the Fault.
