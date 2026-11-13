@@ -302,24 +302,69 @@ async def test_a_second_app_leaves_the_first_apps_live_release_executing(engine:
     assert str((await _row(engine, live))["status"]) == "approved"
 
 
-async def test_a_second_app_leaves_an_unsettled_claim_of_this_life(engine: Engine) -> None:
-    """Residual 5: a claim this process made after its first gate was built, that no gate runs
-    and that never settled (both settle writes failed, say), is not left over from an earlier
-    life. A second app's start leaves it 'executing' rather than record an engine_restart that
-    never happened. Control: a row claimed before the first gate still moves."""
+class _SettlesFail(_StandingStore):
+    """Both of _settle's writes fail, so the release ends with its row still 'executing'."""
+
+    async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
+        if kw["status"] == "approved":
+            raise OSError("PROBE: store unreachable")
+        return bool(await self._store.decide_pending_approval(approval_id, **kw))
+
+
+async def _claim_left_unsettled(gate: ApprovalGate) -> str:
+    """A release ``gate`` claims and runs, whose outcome it never records."""
+    gate.register("dead_letter_replay", "op", _runs, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await gate.guard(
+        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
+    )
+    assert approval_id is not None
+    await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
+    assert approval_id not in gate._releasing, "the release has ended"
+    return approval_id
+
+
+async def _runs(_p: Mapping[str, Any]) -> dict[str, Any]:
+    return {"ran": True}
+
+
+async def test_a_later_start_leaves_an_unsettled_claim_of_this_life(engine: Engine) -> None:
+    """Residual 5: a claim this process made, that no gate runs and that never settled, is not
+    left over from an earlier life, whatever order the apps were built and started in. Here app1
+    is built first and starts last, after app2 claimed. Its start leaves the row 'executing' and
+    writes no approval.interrupted row: no engine_restart happened. Control: rows this process
+    never claimed still move, at either start."""
     before = await _stranded(engine, "engine")
-    first = create_app(engine, approvals=ON)
-    async with first.router.lifespan_context(first):
+    app1 = create_app(engine, approvals=ON)
+    app2 = create_app(engine, approvals=ON)
+    async with app2.router.lifespan_context(app2):
         assert str((await _row(engine, before))["status"]) == "interrupted"
-        earlier = await _stranded(engine, "engine")  # claimed before the first gate was built
-        this_life = await _claimed_directly(
-            engine.store, claim_owner="engine", claimed_at=time.time() + 1.0
-        )
-        second = create_app(engine, approvals=ON)
-        async with second.router.lifespan_context(second):
+        gate2: ApprovalGate = app2.state.approval_gate
+        gate2._store = _SettlesFail(engine.store)
+        gate2._resolve_identity = _resolve
+        this_life = await _claim_left_unsettled(gate2)
+        assert str((await _row(engine, this_life))["status"]) == "executing"
+        leftover = await _stranded(engine, "engine")  # never claimed by this process
+        async with app1.router.lifespan_context(app1):
             assert str((await _row(engine, this_life))["status"]) == "executing"
-            assert str((await _row(engine, earlier))["status"]) == "interrupted"
+            assert str((await _row(engine, leftover))["status"]) == "interrupted"
     assert await _audit(engine, "approval.interrupted", this_life) == []
+
+
+async def test_a_clock_step_neither_hides_a_leftover_nor_exposes_a_claim(engine: Engine) -> None:
+    """Residual 5: the reconcile reads no clock. A claim this process made with its clock stepped
+    far back stays 'executing' at a later start, and a leftover whose claim time is ahead of now
+    still moves."""
+    stepped = ApprovalGate(engine.store, ON, resolve_identity=_resolve, clock=lambda: 1_000.0)
+    stepped._store = _SettlesFail(engine.store)
+    this_life = await _claim_left_unsettled(stepped)
+    assert float((await _row(engine, this_life))["decided_at"]) == 1_000.0
+    later = ApprovalGate(engine.store, ON, resolve_identity=_resolve)
+    ahead = await _claimed_directly(
+        engine.store, claim_owner="engine", claimed_at=time.time() + 3_600.0
+    )
+    found = await later.reconcile_after_restart()
+    assert found.interrupted == (ahead,)
+    assert str((await _row(engine, this_life))["status"]) == "executing"
 
 
 # --- GET /approvals/executing and the three tiers (residuals 1 and 4) ------------------------------

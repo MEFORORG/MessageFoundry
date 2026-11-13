@@ -3207,9 +3207,11 @@ unsupported anyway.
 
 An app embedded around an engine (`create_app(engine=...)`) can start before its engine holds its
 graph, when the engine shard's name is not known yet. Its start then puts the reconcile off, and
-the first queue read that finds the owner known runs it, over rows claimed before the process's
-first app over that engine started (BACKLOG #3252). A release made before the engine holds its graph claims under `engine` and keeps
-that owner for the app's life, so start the engine before the app serves approvals.
+the first queue read that finds the owner known runs it (BACKLOG #3252). Neither that reconcile nor
+the one at start moves a row an approval gate in this process claimed over that store, whatever
+order the apps were built and started in. A release made before the engine holds its graph claims
+under `engine` and keeps that owner for the app's life, so start the engine before the app serves
+approvals.
 
 **A request must also be old enough before it can be approved (ASVS 2.4.2).** The expiry is a
 ceiling. `[approvals].min_dwell_seconds` is the floor, default **2 s**. An approve that arrives sooner

@@ -2698,6 +2698,7 @@ async def test_a_put_off_reconcile_never_takes_this_lifes_claim_for_a_leftover(
     assert await _status_of(engine, old) == "executing"  # put off: the owner is not known
     assert gate._owner_for_claim() == "engine"  # what approve() does just before it claims
     mine = await _claimed_directly(engine.store, claim_owner="engine", claimed_at=time.time() + 1)
+    gate._note_claim(mine)  # and notes the claim, as approve() does before it writes it
     await gate.list_pending()
     assert await _status_of(engine, old) == "interrupted"
     assert await _status_of(engine, mine) == "executing"
