@@ -3206,18 +3206,16 @@ own. Two plain `serve` processes over one store would share the `engine` owner; 
 unsupported anyway.
 
 An app embedded around an engine (`create_app(engine=...)`) can start before its engine holds its
-graph, when the engine shard's name is not known yet. Its start then puts the reconcile off, and
-the first queue read that finds the owner known runs it, over rows claimed before its gate was
-built (BACKLOG #3252). Neither that reconcile nor the one at start moves a row an approval gate in
-this process claimed over the same store object, or a release any gate in this process is
-running, whatever order the apps were built and started in. Two Engine objects over one database in
-one process are not protected: each has its own store object, so one's unsettled claim that no
-gate is running reads as a leftover to the other. A later app start in the same process does not
-recover an unsettled claim of this life that no gate is running. An operator can move it only with
-`interrupt_stranded`'s `attest_owner_stopped`, an attestation that is false while this process
-runs; otherwise it stays `executing` until the process restarts. A release made before the engine holds its graph claims under `engine` and keeps
-that owner for the app's life, so start the engine before the app serves
-approvals.
+graph, when the engine shard's name is not known yet. Its start then puts the reconcile off, and the
+first queue read that finds the owner known runs it, over rows claimed before its gate was built
+(BACKLOG #3252). Neither that reconcile nor the one at start moves a row an approval gate in this
+process claimed over the same store object, or a release any gate in this process is running,
+whatever order the apps were built and started in. Two Engine objects over one database in one
+process are not protected: each has its own store object, so one's unsettled claim that no gate is
+running reads as a leftover to the other. A later app start in the same process does not recover an
+unsettled claim of this life that no gate is running. A release made before the engine holds its
+graph claims under `engine` and keeps that owner for the app's life, so start the engine before the
+app serves approvals.
 
 **A request must also be old enough before it can be approved (ASVS 2.4.2).** The expiry is a
 ceiling. `[approvals].min_dwell_seconds` is the floor, default **2 s**. An approve that arrives sooner
