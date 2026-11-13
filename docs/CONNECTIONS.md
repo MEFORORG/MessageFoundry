@@ -3164,7 +3164,7 @@ these messages, and the SMTP relay accepts them before anyone tries.
 | `signing_key` | — (required) | path to the sender's PEM/DER signing **private key** |
 | `signing_key_password` | — | passphrase for an encrypted `signing_key` — a **secret**, via `env()`; it must meet the [wrap floor](#encrypted-private-keys-must-meet-the-wrap-floor) |
 | `recipient_cert` | — (required) | path to the partner's PEM/DER **encryption** certificate (the encryption target). Must carry an **RSA** key: the S/MIME envelope supports RSA key transport only, so any other key type (EC included) is refused at construction |
-| `trust_anchor` | — (required) | path to the PEM/DER CA the `recipient_cert` must chain to |
+| `trust_anchor` | — (required) | path to the PEM/DER CA the `recipient_cert` must chain to, or the `recipient_cert` itself for a pinned self-signed correspondent. What the check refuses is under **Recipient trust** below |
 | `port` | `587` | `587` = STARTTLS submission; `465` = implicit TLS (`SMTP_SSL`) |
 | `subject` | `""` | static `Subject` |
 | `username` / `password` | — | optional SMTP `AUTH` credentials (secrets — via `env()`). Setting a `username` makes the relay a credential hop: to an off-box host it is then **refused on a stock instance** unless `[tls].crl_file` reaches the hop or the connection declares `tls_revocation_attested` with a reason (BACKLOG #2193). With no `username` the relay carries no revocation gate |
@@ -3185,10 +3185,35 @@ The connector then signs and encrypts one fixed synthetic body.
 So a fault that would fail every S/MIME build also fails here. That covers at least a crypto library or
 OpenSSL build that refuses the algorithms, and a line break inside `subject`. It does not cover the SMTP hop:
 the relay can still refuse a `sender` or recipient at send time.
-The trust check is deliberately **one level** (the recipient cert chains directly to a supplied anchor, or is
-a self-signed correspondent cert pinned as its own anchor) — full multi-level path building is deferred. No
-hostname/SAN match is done: a Direct address is an email, not a TLS SNI. Errors name the *setting* only,
-never the material or a cert subject (which can identify a patient's provider).
+
+**Recipient trust (BACKLOG #5631).** The issuance check is deliberately **one level**: the recipient cert
+chains directly to a supplied anchor, or is a self-signed correspondent cert pinned as its own anchor. Full
+multi-level path building is deferred. On top of issuance, construction refuses at least:
+
+- a `recipient_cert`, or the `trust_anchor` that issues it, that has **expired** or is **not yet valid**. A
+  bundle may hold an expired CA beside its renewed successor; the successor is used;
+- an issuing `trust_anchor` that is **not a CA** (no `basicConstraints` asserting `CA=true`), or whose
+  `keyUsage` does not assert `keyCertSign`. A recipient cert pinned as its own anchor (the same certificate)
+  is exempt from both, because it issues nothing else;
+- a `recipient_cert` whose `keyUsage` does not assert `keyEncipherment`, or whose `extendedKeyUsage` does
+  not list `emailProtection`. Each is checked **only where the cert carries it**: a cert with neither
+  extension is accepted;
+- a `recipient_cert` that does not name **every** `recipients` entry. An address is named by a
+  `subjectAltName` `rfc822Name` equal to it, or a `dNSName` equal to its domain (an organisation
+  certificate). The domain compares case-insensitively and the local part exactly. A CA issues many
+  subscribers' certificates, so issuance alone does not say this one belongs to the mailbox the message
+  goes to. A cert with no `subjectAltName` names no address and is refused.
+
+Errors name the *setting* and the property that failed (and, for an unnamed address, the entry's position in
+`recipients`), never the material, a cert subject or a `subjectAltName` value, any of which can identify a
+patient's provider.
+
+**Validity is checked again at every send.** A recipient cert or issuing anchor that expires while the
+engine runs refuses every queued message alike, and a renewed certificate fixes them all, so the send raises
+a permanent `NegativeAckError` marked as a configuration fault (code `direct-cert-validity`) before anything
+is built or dialled. Under the default `credential_fault_policy = "stop"` the delivery worker stops the lane
+and keeps the queue; under `credential_fault_policy = "dead_letter"` the message dead-letters, as other
+configuration faults do.
 
 **Delivery semantics.** Egress is gated by **`[egress].allowed_direct`** — kept separate from
 `allowed_smtp` so a Direct HISP relay can be permitted without opening the general mail relay. An SMTP
