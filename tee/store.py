@@ -62,6 +62,11 @@ CREATE INDEX IF NOT EXISTS ix_capture_at ON relay_capture(at);
 # An ACK code that means the partner rejected the message (vs AA/CA accepted). Used to flag NAK rows.
 _NAK_CODES = ("AE", "AR", "CE", "CR")
 
+# PRAGMA user_version holds the scrub-pending flag: purge sets it in the delete's own transaction,
+# so it is durable exactly when the delete is, and only a scrub whose final checkpoint succeeded
+# clears it. VACUUM keeps user_version, so a failed scrub leaves the flag set for the next run.
+_SCRUB_PENDING = 1
+
 # A TRUNCATE checkpoint takes the writer lock, copies the WAL back and waits for readers while
 # holding it, so a long busy wait would stall the live relay's writes for as long. Purge instead
 # polls with no busy wait, which releases the lock between tries, for about the store's usual 5 s
@@ -438,10 +443,26 @@ class RelayStore:
             cause = cause or exc
         if failures:
             raise PurgeIncompleteError(log_rows, capture_rows, "; then ".join(failures)) from cause
+        try:
+            await self._pragma("user_version=0")
+            await self._db.commit()
+            # The clear is one more WAL frame; truncate it too, best effort, so a later sweep's
+            # residue hint is not set by the clear alone. A busy one only costs that sweep a scrub.
+            await self._checkpoint_truncate()
+        except (sqlite3.Error, MemoryError) as exc:
+            raise PurgeIncompleteError(
+                log_rows, capture_rows, f"clearing the scrub-pending flag failed: {_describe(exc)}"
+            ) from exc
+
+    async def _scrub_pending(self) -> bool:
+        async with self._db.execute("PRAGMA user_version") as cur:
+            row = await cur.fetchone()
+        return row is not None and int(row[0]) == _SCRUB_PENDING
 
     async def scrub(self) -> None:
-        """Run the scrub alone, deleting nothing: the recovery step after a purge whose scrub did
-        not finish. Raises :class:`PurgeIncompleteError` (with zero counts) as :meth:`_scrub` says."""
+        """Attempt the scrub alone, deleting nothing: the recovery step after a purge whose scrub
+        did not finish. Raises :class:`PurgeIncompleteError` (with zero counts) as :meth:`_scrub`
+        says; the scrub-pending flag then stays set."""
         async with self._lock:
             await self._scrub(0, 0)
 
@@ -458,18 +479,19 @@ class RelayStore:
 
         ``before=None`` purges **everything**; ``before=<epoch>`` purges only rows older than it.
         ``captures_only`` leaves the relay_log (the NAK/leg audit) intact and drops only the captured
-        message bodies (the PHI-bearing table). Returns ``(relay_log rows, relay_capture rows)`` deleted.
+        message bodies (log rows can carry PHI too, see ``detail``). Returns ``(relay_log rows, relay_capture rows)`` deleted.
 
         In WAL mode a delete writes new pages to the -wal file and leaves the old frames, body
         bytes included, on disk until a checkpoint, so once the delete commits, a run that deleted
         any row runs :meth:`_scrub`, which raises :class:`PurgeIncompleteError` with the deleted
         counts if the scrub does not finish. Returning the counts then would read as a clean purge
         that did not happen. relay_log rows count too: their ``detail`` can carry partner ACK text
-        that names a patient. A run that deleted no row still scrubs when residue remains (see
-        :meth:`_has_residue`). So a plain re-run after a failed scrub scrubs only while free pages
-        or a non-empty -wal remain; a failed VACUUM can leave neither, and :meth:`scrub` (``purge
-        --scrub-only``) always runs the whole scrub and raises if it does not finish. A run with no deletes and no residue
-        skips the scrub, so a routine sweep does not rewrite the DB for nothing.
+        that names a patient. A delete sets the scrub-pending flag (``_SCRUB_PENDING``) in its own
+        transaction, and only a finished scrub clears it, so a later purge, even one that deletes
+        nothing, or :meth:`scrub` finishes any unfinished scrub, or raises again if it still cannot.
+        A run also scrubs on the :meth:`_has_residue` hint. It skips the scrub only when it deleted
+        nothing, the flag is clear and the hint is not set, so a routine sweep does not rewrite the
+        DB for nothing.
         """
         async with self._lock:
             # NB: a bare `DELETE FROM t` (no WHERE) hits SQLite's truncate optimization, which makes
@@ -490,17 +512,20 @@ class RelayStore:
                 )
             cap_n = cap.rowcount
             log_n = 0 if log is None else log.rowcount
+            if log_n or cap_n:
+                await self._pragma(
+                    f"user_version={_SCRUB_PENDING}"
+                )  # same transaction as the delete
             await self._db.commit()
-            if log_n or cap_n or await self._has_residue():
+            if log_n or cap_n or await self._scrub_pending() or await self._has_residue():
                 await self._scrub(log_n, cap_n)
         return (log_n, cap_n)
 
     async def _has_residue(self) -> bool:
-        """Whether an earlier delete may have left bytes the scrub has not removed: the DB has free
-        pages, or the -wal is not empty. A scrub that did not finish can leave neither, for
-        example a failed VACUUM after a delete that freed no whole page, so this can miss residue;
-        ``purge --scrub-only`` does not depend on it. A live relay's writes also leave the -wal
-        non-empty, so a sweep beside one scrubs anyway."""
+        """A secondary hint, beside the scrub-pending flag, that bytes may remain: the DB has free
+        pages, or the -wal is not empty. It can be wrong both ways: an unfinished scrub can leave
+        neither, which the flag covers, and a live relay's writes leave the -wal non-empty, so a
+        sweep beside a relay that has written since the last checkpoint scrubs."""
         async with self._db.execute("PRAGMA freelist_count") as cur:
             row = await cur.fetchone()
         if row is not None and int(row[0]) > 0:

@@ -173,10 +173,11 @@ consequences follow from it:
 
 ### Purge
 
-`python -m tee purge` clears the log DB. It reclaims disk (`VACUUM`) only when a run deletes a
-row, and `--scrub-only`, below, reclaims it on demand. With no `--before` it purges
+`python -m tee purge` clears the log DB, then scrubs and reclaims disk (`VACUUM`) when the
+paragraphs below say so; `--scrub-only`, below, does that on demand. With no `--before` it purges
 **everything**; `--before <age|date>` deletes only older rows (retention); `--captures-only` drops just
-the captured bodies (the PHI-bearing table) and keeps the NAK/leg log. It **prompts for confirmation**
+the captured bodies and keeps the NAK/leg log. That is not a PHI purge: log rows can carry
+patient-naming ACK text too. It **prompts for confirmation**
 (or refuses, in a non-interactive shell) unless you pass `-y`.
 
 The DB runs in WAL mode, so a deleted row stays in the DB file or its `-wal` file until the
@@ -185,13 +186,15 @@ a `TRUNCATE` checkpoint, `VACUUM`, and a second checkpoint. That includes a run 
 log rows. A log row holds no message body, but its detail can carry partner ACK text that
 names a patient. `VACUUM` is part of the scrub. The store zeroes deleted content inside a page
 only where that costs no extra I/O, and leaves a freed page as it was. A B-tree rebalance can also
-leave a stale copy of a deleted row in a page's unused space. Only the rebuild removes these. A
-run that deletes no row still scrubs if residue remains: the DB has free pages, or the `-wal` file
-is not empty. So a plain re-run after a failed scrub scrubs only while free pages or a non-empty
-`-wal` remain. A failed `VACUUM` can leave neither, so use `purge --scrub-only`, which always runs
-the whole scrub and exits 1 if it still does not finish. A live relay's writes
-keep the `-wal` non-empty, so a sweep beside a running relay scrubs every time. Only a run with no
-deletes and no residue skips the scrub.
+leave a stale copy of a deleted row in a page's unused space. Only the rebuild removes these.
+
+A run that deletes rows records a scrub-pending flag in the DB, in the same transaction as the
+delete, and only a scrub that finishes clears it. So after any unfinished scrub, a re-run of
+`purge`, even one that deletes nothing, or `purge --scrub-only`, finishes it, or exits 1 again if it
+still cannot. A run that deletes nothing also scrubs, at least, when the DB has free pages or its
+`-wal` file is not empty. A running relay's writes leave the `-wal` non-empty, so a sweep beside a
+relay that has written since the last checkpoint scrubs too. A run skips the scrub only when it
+deletes nothing, the flag is clear, and neither of those holds.
 
 **The scrub is file-level only.** A checkpoint frees the `-wal` file's blocks and `VACUUM` shrinks
 the DB file, but neither overwrites the freed blocks. So the bytes can stay readable on the raw
@@ -225,9 +228,10 @@ before the commit, such as the delete itself timing out, deletes nothing. Other 
 prints no counts; and an error while closing the store after a scrub error, which prints the
 `error: ...` line with the counts and then a traceback.
 
-To finish an unfinished scrub, run `python -m tee purge --db ./tee.db --scrub-only` once the cause
-is gone. It deletes nothing and needs no `-y`, and it refuses a `--db` path that does not exist. It exits 1 with `error: ...` if the scrub still
-does not finish, and prints `scrubbed <db>` when it does.
+To finish an unfinished scrub without deleting anything, run
+`python -m tee purge --db ./tee.db --scrub-only` once the cause is gone; a plain re-run of the purge
+also finishes it, as above, but deletes under its own arguments. It deletes nothing and needs no `-y`, and it refuses a `--db` path that does not exist. It attempts the whole scrub, exits 1 with
+`error: ...` if the scrub still does not finish, and prints `scrubbed <db>` when it does.
 
 ```bash
 python -m tee purge --db ./tee.db --before 7d -y          # retention sweep

@@ -612,16 +612,18 @@ async def test_each_truncate_checkpoint_is_preceded_by_a_passive_one(
                 "PRAGMA wal_checkpoint(PASSIVE)",
                 "PRAGMA wal_checkpoint(TRUNCATE)",
             ]
-            * 2
+            * 3  # before VACUUM, after it, and after the scrub-pending flag is cleared
         )
     finally:
         await store.close()
 
 
 @pytest.mark.usefixtures("fast_checkpoint_poll")
-async def test_rerunning_a_purge_whose_scrub_failed_finishes_the_scrub(tmp_path: Path) -> None:
+async def test_rerun_finishes_a_busy_scrub_while_the_reader_still_holds_the_wal(
+    tmp_path: Path,
+) -> None:
     # The natural retry deletes nothing, but the residue the failed scrub left must still be
-    # scrubbed, not reported as a clean purge.
+    # scrubbed, not reported as a clean purge. Here the peer stays open, so the -wal survives.
     db_path = tmp_path / "tee.db"
     store = await RelayStore.open(str(db_path))
     peer: sqlite3.Connection | None = None
@@ -671,3 +673,69 @@ async def test_vacuum_runs_with_temp_store_file_then_default(
         assert ran[i + 1] == "PRAGMA temp_store=DEFAULT"
     finally:
         await store.close()
+
+
+def _user_version(db_path: Path) -> int:
+    conn = sqlite3.connect(db_path)
+    try:
+        return int(conn.execute("PRAGMA user_version").fetchone()[0])
+    finally:
+        conn.close()
+
+
+@pytest.mark.usefixtures("fast_checkpoint_poll")
+async def test_rerun_finishes_a_busy_scrub_after_the_reader_closed_and_removed_the_wal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The reviewer's reproduction: the reader that made the scrub busy closes last, which
+    # checkpoints and deletes the -wal, so no residue hint is left. The flag still is.
+    db_path = tmp_path / "tee.db"
+    store = await RelayStore.open(str(db_path))
+    peer = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        await store.record_capture(direction="corepoint_copy", control_id="C5637", raw=_MARKER_BODY)
+        peer.execute("BEGIN")
+        peer.execute("SELECT COUNT(*) FROM relay_capture").fetchall()
+        with pytest.raises(PurgeIncompleteError):
+            await store.purge(captures_only=True)
+        await store.close()
+        peer.execute("COMMIT")
+    finally:
+        peer.close()
+    assert not Path(f"{db_path}-wal").exists()  # the last close removed it: no hint left
+    assert _user_version(db_path) == 1  # the flag survived
+    store = await RelayStore.open(str(db_path))
+    try:
+        assert not await store._has_residue()  # noqa: SLF001 - the hint alone would skip
+        ran = _spy_execute(store, monkeypatch, fail_on="", error=RuntimeError())
+        assert await store.purge(captures_only=True) == (0, 0)
+        assert "VACUUM" in ran
+    finally:
+        await store.close()
+    assert _user_version(db_path) == 0  # cleared once the scrub finished
+
+
+async def test_rerun_finishes_a_scrub_whose_vacuum_failed_after_a_small_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "tee.db"
+    store = await RelayStore.open(str(db_path))
+    try:
+        await store._db.execute(  # noqa: SLF001 - two log rows sharing one leaf page
+            "INSERT INTO relay_log (at,direction,leg,size_bytes,outcome) VALUES"
+            " (1000.0,'d','corepoint',1,'accepted'), (9000.0,'d','corepoint',1,'accepted')"
+        )
+        await store._db.commit()  # noqa: SLF001
+        _spy_execute(
+            store, monkeypatch, "VACUUM", sqlite3.OperationalError("database or disk is full")
+        )
+        with pytest.raises(PurgeIncompleteError):
+            await store.purge(before=5000.0)  # deletes one row and frees no whole page
+        monkeypatch.undo()
+        assert not await store._has_residue()  # noqa: SLF001 - the hint alone would skip
+        ran = _spy_execute(store, monkeypatch, fail_on="", error=RuntimeError())
+        assert await store.purge(before=5000.0) == (0, 0)
+        assert "VACUUM" in ran
+    finally:
+        await store.close()
+    assert _user_version(db_path) == 0
