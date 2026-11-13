@@ -262,6 +262,11 @@ that `_handle` **pops before the fan-out loop** and hands to each transport's `s
 `EmailTransport` sends to the override (falling back to its own global recipients when `None`); the
 webhook **ignores** it. `recipients = None` (the default) is byte-identical to before.
 
+> **Note (2026-11-13, BACKLOG #5907).** The fan-out is no longer a loop: `_handle` now runs each
+> event's sends concurrently, one child task per transport, each with its own shallow copy of the
+> event, and handles the next event once every send has ended. The pop still happens before any
+> `send`, so this decision and the posture below are unchanged.
+
 **PHI / secret posture.** Recipient addresses are **operator config, not PHI** — but they are still an
 **internal routing key that never crosses the webhook wire**: `_handle` pops `_recipients` before any
 `send`, and `WebhookTransport._post` additionally strips **every** `_`-prefixed key from the serialized
