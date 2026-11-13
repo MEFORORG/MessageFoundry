@@ -523,12 +523,14 @@ async def test_edit_resend_refuses_an_unlisted_terminator_style(
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
         await _mint_action(c, f"/ui/messages/{mid}/edit")
-        r = await c.post(
-            f"/ui/messages/{mid}/edit-resend", data={**form, "eol": "nel"}, headers=same_origin
-        )
-        assert r.status_code == 400
-        assert "invalid input" in r.text
-        assert await engine.store.count_messages(allowed_channels=None) == 1  # nothing resubmitted
+        # An unlisted value, and one present but empty, which parse_qsl would otherwise drop.
+        for bad in ("nel", ""):
+            r = await c.post(
+                f"/ui/messages/{mid}/edit-resend", data={**form, "eol": bad}, headers=same_origin
+            )
+            assert r.status_code == 400, bad
+            assert "invalid input" in r.text
+            assert await engine.store.count_messages(allowed_channels=None) == 1  # nothing sent
         # The refusal spent no proof: the same grant carries the listed style through.
         r = await c.post(
             f"/ui/messages/{mid}/edit-resend", data={**form, "eol": "cr"}, headers=same_origin

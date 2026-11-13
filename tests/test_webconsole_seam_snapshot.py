@@ -516,6 +516,32 @@ def test_a_gate_body_or_a_helper_it_calls_moves_the_rendering(
     assert module._render_callable(gate, {}) != helper_before
 
 
+def test_a_weaker_resubmit_terminator_restore_moves_the_edit_resend_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_resubmit_form`` rewrites the edited body's line breaks through ``restore_eol``, so the
+    repeat key and the spend key hash what is resubmitted (BACKLOG #5930). A body change to that
+    helper, under the same name, must move the edit-resend row; it did not while the route called
+    it as a module attribute, which the helper walk does not follow."""
+    route = "POST /ui/messages/{message_id}/edit-resend"
+    module = _load_script(monkeypatch, "_seam_gen_restore_eol")
+    rows = dict(module.console_route_gates())
+    with module.repo_console() as console:
+        core = importlib.import_module(".routes.core", console.__name__)
+        original = core.restore_eol
+
+        def weaker(raw: str, eol: str) -> str | None:
+            return raw
+
+        weaker.__module__ = original.__module__
+        weaker.__qualname__ = original.__qualname__
+        monkeypatch.setattr(core, "restore_eol", weaker)
+    planted = dict(module.console_route_gates())
+    assert planted[route] != rows[route]
+    # The control: the plant changed the edit-resend row and nothing else.
+    assert {k for k in rows if rows[k] != planted[k]} == {route}
+
+
 def test_a_rebound_engine_function_or_a_wrapped_body_moves_the_rendering(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
