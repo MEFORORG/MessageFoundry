@@ -2696,6 +2696,8 @@ class ApprovalGate:
         (d20261029T205247402-81159c) rules what this does, in three tiers:
 
         - a release THIS process is running, or whose outcome it is still writing, is refused, 409;
+          one this process claimed over this store and no longer runs (``ended_here``) moves with
+          no attestation;
         - a release a cluster node claimed (``node:<id>``) is refused while that node's heartbeat is
           fresh, 409, and when the heartbeats cannot be read, 503, or are not read by this engine,
           409. A lapsed heartbeat, or no such node, lets it move. A node whose ``node_id`` was not
@@ -2791,6 +2793,10 @@ class ApprovalGate:
         tiers). ``heartbeats`` caches each node's verdict across one listing."""
         if _releasing_in_process(row.id):
             return "releasing_here"
+        if self._claimed_in_process(row.id):
+            # Claimed by this process (_CLAIMED_HERE) and run by none of its gates: the release
+            # has ended here without an outcome, so no attestation is needed to say so.
+            return "ended_here"
         prefix, _, node_id = (row.claim_owner or "").partition(":")
         if prefix != "node" or not node_id:
             return "attestation_required"

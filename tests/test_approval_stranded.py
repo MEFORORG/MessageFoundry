@@ -350,6 +350,56 @@ async def test_a_later_start_leaves_an_unsettled_claim_of_this_life(engine: Engi
     assert await _audit(engine, "approval.interrupted", this_life) == []
 
 
+async def test_an_ended_claim_of_this_life_is_interrupted_without_attestation(
+    engine: Engine,
+) -> None:
+    """Residual 5's way out: a claim this process made that no gate runs any more is listed as
+    ``ended_here`` by a second app over the same engine, and its interrupt moves it with no
+    attestation, writing approval.interrupted. Controls: a release this process is running is
+    still refused 409, and a row this process never claimed still needs the attestation."""
+    first = create_app(engine, approvals=ON)
+    async with first.router.lifespan_context(first):
+        gate1: ApprovalGate = first.state.approval_gate
+        gate1._store = _SettlesFail(engine.store)
+        gate1._resolve_identity = _resolve
+        ended = await _claim_left_unsettled(gate1)
+        second = create_app(engine, approvals=ON)
+        async with second.router.lifespan_context(second):
+            gate2: ApprovalGate = second.state.approval_gate
+            gate2._store = _StandingStore(engine.store)
+            gate2._resolve_identity = _resolve
+            foreign = await _stranded(engine, "shard:other")
+            live, release, leave = await _running_release(gate2)
+            try:
+                listed = {r["id"]: r for r in await gate2.list_executing()}
+                assert listed[ended]["liveness"] == "ended_here"
+                assert listed[ended]["interrupt"] == "allowed"
+                out = await gate2.interrupt_stranded(
+                    ended, actor="operator", actor_user_id="operator-id"
+                )
+                assert out["status"] == "interrupted" and out["liveness"] == "ended_here"
+                [row] = await _audit(engine, "approval.interrupted", ended)
+                detail = json.loads(str(row["detail"]))
+                assert detail["reason"] == "operator_interrupt"
+                assert detail["owner_stopped_attested"] is False
+                with pytest.raises(ApprovalError) as running:
+                    await gate2.interrupt_stranded(
+                        live, actor="operator", actor_user_id="operator-id"
+                    )
+                assert running.value.status == 409
+                assert "is running this release now" in running.value.detail
+                with pytest.raises(ApprovalError) as unattested:
+                    await gate2.interrupt_stranded(
+                        foreign, actor="operator", actor_user_id="operator-id"
+                    )
+                assert unattested.value.status == 409
+                assert "attest_owner_stopped" in unattested.value.detail
+                assert str((await _row(engine, foreign))["status"]) == "executing"
+            finally:
+                leave.set()
+                await asyncio.wait_for(release, 10.0)
+
+
 async def test_a_release_running_over_another_store_object_is_not_reconciled(
     engine: Engine,
 ) -> None:
