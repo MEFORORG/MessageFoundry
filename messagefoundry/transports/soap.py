@@ -247,23 +247,29 @@ def _first_child(body: str, pos: int, end: int) -> int:
 
 
 def _search_outside_markup(
-    pattern: re.Pattern[str], body: str, pos: int, end: int
+    pattern: re.Pattern[str], body: str, pos: int, end: int, first: int = 0
 ) -> re.Match[str] | None:
     """The first match of ``pattern``'s tag in ``body[pos:end]`` that is not inside a comment, a
-    CDATA section or a processing instruction, or ``None``. ``pattern`` is one of the
-    ``*_OUTSIDE_MARKUP_RE`` patterns, whose other alternatives are those markups' openers.
+    CDATA section or a processing instruction, and starts at or after ``first``, or ``None``.
+    ``pattern`` is one of the ``*_OUTSIDE_MARKUP_RE`` patterns, whose other alternatives are those
+    markups' openers. ``pos`` must itself be outside such markup: the scan knows only the markup it
+    opens, which is why a search past a tag that may sit in markup, the Body start tag say, starts
+    from ``0`` and passes that tag's end as ``first``.
 
-    BACKLOG #5912: each markup is stepped over whole, as :func:`_first_child` steps over it. An
-    opener with no terminator before ``end`` is read as text, and so is every later opener of its
-    kind, since none of them can have a terminator either: so the search resumes after each step
-    and stays linear in the reply."""
+    BACKLOG #5912: each markup is stepped over whole, as :func:`_first_child` steps over it, except
+    for an opener with no terminator before ``end``: :func:`_first_child` reads that as no child,
+    and this reads it as text, as it reads every later opener of its kind, since none of them can
+    have a terminator either. So the search resumes after each step and stays linear in the
+    reply."""
     unterminated: set[str] = set()
     while (m := pattern.search(body, pos, end)) is not None:
         opener = m.group()
         closer = _MARKUP_CLOSER.get(opener)
-        if closer is None:
-            return m
         pos = m.end()
+        if closer is None:
+            if m.start() >= first:
+                return m
+            continue
         close = -1 if opener in unterminated else body.find(closer, pos, end)
         if close < 0:
             unterminated.add(opener)
@@ -282,34 +288,38 @@ def _find_fault(body: str) -> tuple[re.Match[str] | None, int]:
     whole, as it was before the anchor: a Fault reply with no envelope may carry a Body-named
     element in its detail, and a Fault found only before the Body still reads as one.
 
-    BACKLOG #5912: a Fault start tag inside a comment, a CDATA section or a processing instruction
-    is stepped over (:func:`_search_outside_markup`), so the real Fault after it is the one read.
-    Only where every Fault start tag is inside such markup are they searched for as before, with
-    ``_FAULT_RE`` alone, so such a reply still reads as a fault and never newly as delivered."""
-    if _FAULT_RE.search(body) is None:
+    BACKLOG #5912: on each side of the Body start tag, a Fault start tag inside a comment, a CDATA
+    section or a processing instruction is stepped over (:func:`_search_outside_markup`), so the
+    real Fault after it is the one read. Only where every Fault start tag on that side is inside
+    such markup is the first of them read, as before, so the Body side still comes first and such a
+    reply still reads as a fault, never newly as delivered."""
+    plain = _FAULT_RE.search(body)
+    if plain is None:
         # Every match below is a _FAULT_RE match, so a reply with none, the delivered case, takes
         # one scan.
         return None, 0
+    # One scan from 0, so markup opened before the Body start tag is known after it.
+    outside = _search_outside_markup(_FAULT_OUTSIDE_MARKUP_RE, body, 0, len(body))
     m = _BODY_RE.search(body)
-    # The whole reply is searched again from 0, not only before the Body start tag: markup opened
-    # before that tag decides what is inside markup after it.
-    for start in (0,) if m is None else (m.end(), 0):
-        fault = _search_outside_markup(_FAULT_OUTSIDE_MARKUP_RE, body, start, len(body))
-        if fault is not None:
-            return fault, start
-    if m is not None:
-        fault = _FAULT_RE.search(body, m.end())
-        if fault is not None:
-            return fault, m.end()
-        # Any Fault is before the Body start tag, so the whole-reply search need not pass it again.
-        return _FAULT_RE.search(body, 0, m.start()), 0
-    return _FAULT_RE.search(body), 0
+    if m is None:
+        return outside or plain, 0
+    after = outside
+    if after is not None and after.start() < m.end():
+        after = _search_outside_markup(
+            _FAULT_OUTSIDE_MARKUP_RE, body, after.end(), len(body), first=m.end()
+        )
+    if after is None:
+        after = plain if plain.start() >= m.end() else _FAULT_RE.search(body, m.end())
+    if after is not None:
+        return after, m.end()
+    # No Fault follows the Body start tag, so any Fault is before it.
+    return outside or (plain if plain.start() < m.start() else None), 0
 
 
 def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
     """The fault code text (e.g. ``soap:Client`` / ``soap:Receiver``), SOAP 1.1 or 1.2, or ``""``.
 
-    BACKLOG #2827: read only inside ``fault``, the ``_FAULT_RE`` match (:func:`_find_fault`'s when
+    BACKLOG #2827: read only inside ``fault``, a Fault start-tag match (:func:`_find_fault`'s when
     not given), from its start tag to its close tag or, with none, the reply's end, so a ``faultcode``
     or ``Value`` outside it, in the Header say, does not decide the fault's class. A self-closing
     Fault holds no code.
