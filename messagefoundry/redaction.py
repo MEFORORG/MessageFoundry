@@ -1550,11 +1550,11 @@ _XML_PHI_ELEMENT = re.compile(
 )
 #: Any start or end tag, for the walk through an element's content.
 _XML_TAG = re.compile(r"<(/?)((?:[A-Za-z_][\w.-]*+:)?([A-Za-z_][\w.-]*+))")
-#: The rest of an end tag after its name, up to its ``>``: the whitespace XML allows there, anything
-#: else (which well-formed XML never has, so the walk scrubs it), and the ``>`` if there is one. A
-#: bracketless end tag's rest runs to the next ``<`` or the end of the text, the fail-closed edge
-#: (BACKLOG #5925).
-_XML_END_TAG_REST = re.compile(r"(\s*+)([^<>]*+)(>?)")
+#: The rest of an end tag after its name: the whitespace XML allows there (its S production), anything
+#: else (which well-formed XML never has, so the walk scrubs it), and the ``>`` if there is one
+#: (BACKLOG #5925). Without a ``>``, the rest ends at the next ``<`` or line break, so a bracketless
+#: tag loses the rest of its own line and the lines after it keep their diagnostics.
+_XML_END_TAG_REST = re.compile(r"([ \t\r\n]*+)([^<>\r\n]*+)(>?)")
 #: One part of a start tag after its name: whitespace, the tag's end, an attribute and the opening of
 #: its quoted value (the value itself is read by :data:`_XML_ATTR_VALUE`), or anything else.
 #:
@@ -1581,9 +1581,11 @@ _XML_ATTR_VALUE = {'"': re.compile(r'[^"<]*+"?'), "'": re.compile(r"[^'<]*+'?")}
 #: evidence: ``usage: tool <name> <address>`` is prose.
 _XML_CONTENT_EVIDENCE = re.compile(r"<|[ \t]*+\r?\n\s*+<|\w")
 #: Every end tag of a vocabulary element, located once per call so a placeholder that never closes
-#: costs a lookup rather than a search to the end of the text.
+#: costs a lookup rather than a search to the end of the text. It counts every end tag the walk would
+#: close the element on -- the name, then no further name character -- so ``</family Doe>`` and a
+#: bracketless ``</family`` are evidence too (BACKLOG #5925).
 _XML_PHI_END = re.compile(
-    r"</(?:[A-Za-z_][\w.-]*+:)?(family|given|name|birthDate|address|identifier|telecom)\s*+>"
+    r"</(?:[A-Za-z_][\w.-]*+:)?(family|given|name|birthDate|address|identifier|telecom)(?![\w.:-])"
 )
 
 #: How a start tag ended: ``>``, ``/>``, or not at all.
@@ -1640,9 +1642,10 @@ def _xml_text(chunk: str, policy: int) -> str:
 
 
 def _scrub_xml_element(
-    text: str, match: re.Match[str], last_close: dict[str, int]
+    text: str, match: re.Match[str], last_close: dict[str, int], keep_junk: bool
 ) -> tuple[str, int]:
-    """``(replacement, end)`` for the vocabulary element starting at ``match``."""
+    """``(replacement, end)`` for the vocabulary element starting at ``match``. ``keep_junk`` keeps
+    what follows an end tag's name as it stands, for :func:`_redact_xml_elements` to say when."""
     out = [match.group()]
     policy = _VALUE_TOP if match.group(2) in _PHI_VALUE_KEYS else _LEAF
     pos, how, attributed = _walk_xml_tag(text, match.end(), policy, out)
@@ -1672,9 +1675,10 @@ def _scrub_xml_element(
             if rest is None:  # unreachable: the pattern matches the empty string
                 pos = tag.end()
             else:
-                ws, junk, bracket = rest.groups()
-                out.append(f"{ws}{_REDACTED if junk else ''}{bracket}")
                 pos = rest.end()
+                ws, junk, bracket = rest.groups()
+                scrub = junk and not keep_junk
+                out.append(f"{ws}{_REDACTED}{bracket}" if scrub else rest.group())
             if open_names.get(qname):
                 while stack:
                     name, _ = stack.pop()
@@ -1694,7 +1698,7 @@ def _scrub_xml_element(
     return "".join(out), pos
 
 
-def _redact_xml_elements(text: str) -> str:
+def _redact_xml_elements(text: str, *, widened: bool) -> str:
     """Scrub the content and attribute values of every vocabulary element in an XML payload -- FHIR's
     ``<family value="..."/>``, a text-content ``<family>...</family>``, with or without a namespace
     prefix -- keeping every tag name, and inside ``<identifier>``/``<telecom>`` keeping everything but
@@ -1707,7 +1711,13 @@ def _redact_xml_elements(text: str) -> str:
     carries an attribute, or its content opens with a child tag or a word character. That is where the
     fail-closed rule has exceptions, at least these: a cut that strands ``<family> Van`` (text opening
     with whitespace) or ``<family>(Van`` (opening with punctuation) reads as prose, and the fragment
-    before the cut survives. A closed element is always scrubbed, whatever its text opens with."""
+    before the cut survives. A closed element is always scrubbed, whatever its text opens with.
+
+    **Text after an end tag's name is scrubbed, but in the first stage only on text the widened stage
+    will not read** (BACKLOG #5925). Running to the next ``<``, that scrub could take a label only the
+    widened stage reads -- ``</family {"name": "<Zqxa"}`` lost its ``"name":`` key and kept the value
+    -- so where :func:`_needs_widened_stage` holds, the first stage leaves it as it stands and the
+    widened stage, which then runs, scrubs it after its own passes have read the text."""
     if "<" not in text:
         return text
     out: list[str] = []
@@ -1715,10 +1725,12 @@ def _redact_xml_elements(text: str) -> str:
     #: Where the LAST end tag of each vocabulary name starts, built on the first match: whether an
     #: element closes anywhere later is then one lookup, not a search to the end of the text.
     last_close: dict[str, int] | None = None
+    keep_junk = False
     while (match := _XML_PHI_ELEMENT.search(text, pos)) is not None:
         if last_close is None:
             last_close = {close.group(1): close.start() for close in _XML_PHI_END.finditer(text)}
-        replacement, end = _scrub_xml_element(text, match, last_close)
+            keep_junk = not widened and _needs_widened_stage(text)
+        replacement, end = _scrub_xml_element(text, match, last_close, keep_junk)
         out.append(text[pos : match.start()])
         out.append(replacement)
         pos = end
@@ -1739,7 +1751,7 @@ def _redact_structured(text: str, *, widened: bool) -> str:
     body = _redact_json_fields(body, widened=widened)
     body = _redact_dicom_tags(body, widened=widened)
     body = _redact_dicom_labels(body, widened=widened)
-    return _redact_xml_elements(body) + tail
+    return _redact_xml_elements(body, widened=widened) + tail
 
 
 def redact(text: str) -> str:

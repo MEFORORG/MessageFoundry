@@ -2114,32 +2114,64 @@ def test_a_cut_after_whitespace_or_punctuation_led_xml_text_is_a_stated_residual
 # whatever the XML pass does, and the arm would pass for the wrong reason.
 
 _MALFORMED_END_TAGS = {
-    "text-inside": ("<family>Smith</family Johnathan>", "Johnathan"),
-    "no-bracket-at-end": ("<family>Smith</family Johnathan", "Johnathan"),
-    "no-bracket-before-tag": ("<family>Smith</family SSN123456789<given>x</given>", "SSN123456789"),
-    "no-bracket-newline": ("<family>Smith</family\nJohnathan", "Johnathan"),
-    "nested-child": ("<name><given>Smith</given SSN123456789></name>", "SSN123456789"),
+    "text-inside": ("<family>Smith</family Johnathan>", "Johnathan", "</family"),
+    "no-bracket-at-end": ("<family>Smith</family Johnathan", "Johnathan", "</family"),
+    "no-bracket-before-tag": (
+        "<family>Smith</family SSN123456789<given>x</given>",
+        "SSN123456789",
+        "</family",
+    ),
+    "no-bracket-newline": ("<family>Smith</family\nJohnathan", "Johnathan", "</family"),
+    "nested-child": ("<name><given>Smith</given SSN123456789></name>", "SSN123456789", "</given"),
     "kept-child": (
         '<identifier><system value="urn:x"></system Johnathan><value value="1"/></identifier>',
         "Johnathan",
+        "</system",
     ),
-    "unopened-name": ("<family>Smith</other Johnathan></family>", "Johnathan"),
+    "unopened-name": ("<family>Smith</other Johnathan></family>", "Johnathan", "</other"),
+    # Content that opens with whitespace or punctuation reads as prose unless the element closes, and
+    # an end tag with text inside it is a close the walk honours, so it is evidence too.
+    "space-led-content": ("<family> Smith</family Johnathan>", "Johnathan", "</family"),
+    "punctuation-led-content": ("<given>(Smith)</given Johnathan>", "Johnathan", "</given"),
 }
 
 
 @pytest.mark.parametrize(
-    ("text", "token"), list(_MALFORMED_END_TAGS.values()), ids=list(_MALFORMED_END_TAGS)
+    ("text", "token", "end_tag"), list(_MALFORMED_END_TAGS.values()), ids=list(_MALFORMED_END_TAGS)
 )
 def test_a_malformed_end_tag_strands_nothing(
-    text: str, token: str, monkeypatch: pytest.MonkeyPatch
+    text: str, token: str, end_tag: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     out = redact(text)
     assert token not in out, out
     assert redact(out) == out
-    assert "</" in out  # the tag's name stays; only its remainder goes
+    assert end_tag in out  # the tag's name stays; only its remainder goes
     # The positive control: the token is the XML pass's to catch, not a neighbour's.
     monkeypatch.setattr(redaction, "_redact_xml_elements", lambda t, *_, **__: t)
     assert token in redact(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '<family>Smith</family {"name": "<Zqxa"}',
+        '<family>Smith</family OtherPatientIDs="<b>Zqxa"',
+        "<family>Smith</family (0010,1000) <Zqxa",
+    ],
+)
+def test_an_end_tag_scrub_takes_no_label_the_widened_stage_reads(text: str) -> None:
+    """Scrubbed in the first stage, the text after a bracketless end tag took a label only the widened
+    stage reads, and the value after the next ``<`` then survived. The first stage leaves it, and the
+    widened stage scrubs it once its own passes have read the text."""
+    out = redact(text)
+    assert "Zqxa" not in out, out
+    assert "[redacted]" in out.partition("</family")[2], out
+    assert redact(out) == out
+
+
+def test_a_bracketless_end_tag_spares_the_lines_after_it() -> None:
+    out = redact("<family>Smith</family Johnathan\nretry 3 of 5 after 200 ms")
+    assert out == "<family>[redacted]</family [redacted]\nretry 3 of 5 after 200 ms"
 
 
 @pytest.mark.parametrize(
@@ -2152,10 +2184,11 @@ def test_a_malformed_end_tag_strands_nothing(
     ],
 )
 def test_an_end_tag_keeps_its_name_and_whitespace(text: str, want: str) -> None:
-    assert redaction._redact_xml_elements(text) == want
+    for widened in (False, True):
+        assert redaction._redact_xml_elements(text, widened=widened) == want
 
 
-# --- json_loads_or_refusal (BACKLOG #2048)------------------------------------
+# --- json_loads_or_refusal (BACKLOG #2048) ------------------------------------
 
 
 def test_json_loads_or_refusal_returns_the_value_and_no_hint() -> None:
