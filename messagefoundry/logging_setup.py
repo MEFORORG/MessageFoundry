@@ -1503,10 +1503,12 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
             last = self._last_send_failure_report
             # Throttled for the same reason as the report above. The count is a running total, so
             # failures inside the window are in the next report's figure rather than lost. During
-            # the shutdown drain too: the line then reaches the local sinks only, and close()
-            # counts nothing a failed send cost. It cannot park this thread, because the queue
-            # handler's handle() takes no lock (BACKLOG #5923). ERROR, not WARNING, so it
-            # survives [logging].level = "ERROR", as the stdlib's stderr traceback did.
+            # the shutdown drain too, unless the throttle holds it: the line then reaches the local
+            # sinks only, and close() counts nothing a failed send cost. It does not wait on the
+            # queue handler's lock, which logging.shutdown holds, because the queue handler's
+            # handle() skips that lock on this thread (BACKLOG #5923); another root handler's lock,
+            # or logging's module lock, can still hold it. ERROR, not WARNING, so it survives
+            # [logging].level = "ERROR", as the stdlib's stderr traceback did.
             if last is None or now - last >= _FORWARD_DROP_REPORT_INTERVAL:
                 self._last_send_failure_report = now
                 _log.error(
@@ -1767,14 +1769,18 @@ class _ForwardQueueHandler(logging.handlers.QueueHandler):
         return tuple(self._listener.handlers)
 
     def handle(self, record: logging.LogRecord) -> bool:
-        """``Handler.handle`` without the handler lock (BACKLOG #5923).
+        """``Handler.handle`` without the handler lock on the listener thread (BACKLOG #5923).
 
         ``logging.shutdown`` holds this handler's lock across :meth:`close`, which joins the
-        listener thread. A report the listener logs during that join (a failed or undeliverable
-        send) reaches this handler through the root logger, and under the stdlib ``handle`` it
-        would wait on that lock until the join gave up, leaving the listener running and the tail
-        unsent. Nothing here needs the lock: the filters run outside it in the stdlib too,
-        ``put_nowait`` is thread-safe, and the drop counters carry their own lock."""
+        listener thread. A record the listener logs then, at least its failed-send, undeliverable,
+        spool-drop and spool-read-fault reports, reaches this handler through the root logger, and
+        under the stdlib ``handle`` it would wait on that lock until the join gave up, leaving the
+        listener running and the tail unsent. On that thread the lock is skipped: the filters run
+        outside it in the stdlib too, ``put_nowait`` is thread-safe, and the drop counters carry
+        their own lock. Every other thread still takes it, so a producer cannot read
+        ``_accepting`` before close() and enqueue after close() counted the tail."""
+        if threading.current_thread() is not self._listener._thread:
+            return super().handle(record)
         rv = self.filter(record)
         if isinstance(rv, logging.LogRecord):
             record = rv
@@ -2049,7 +2055,8 @@ class ForwarderStatus:
     #: so ``lost`` can then stay at zero while every record is lost on the wire. What the engine
     #: can see there is at least a ``sendto`` that raises on this host (BACKLOG #5923), and queue
     #: and spool losses. A network error such as ``ENETUNREACH`` sets ``send_failing``; a datagram
-    #: too large to send (``EMSGSIZE``) is counted in ``undeliverable`` and never sets ``send_failing``.
+    #: too large to send (``EMSGSIZE``) is counted in ``undeliverable`` and never sets
+    #: ``send_failing``.
     delivery_confirmed: bool = True
     #: Whether the last send hit a network error. Also true from a deferred start, where the
     #: connect failed, until the first good send. A spool keeps the records while it has room.

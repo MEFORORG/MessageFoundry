@@ -1509,7 +1509,6 @@ def test_a_failed_send_during_the_shutdown_drain_does_not_deadlock() -> None:
     # back through this queue handler, as it does in a running engine.
     root = logging.getLogger()
     root.addHandler(fwd)
-    fwd.handle(logging.makeLogRecord({"msg": "one", "levelname": "WARNING"}))
     done: list[bool] = []
 
     def _shutdown_like() -> None:
@@ -1520,11 +1519,14 @@ def test_a_failed_send_during_the_shutdown_drain_does_not_deadlock() -> None:
             fwd.release()
         done.append(True)
 
-    closer = threading.Thread(target=_shutdown_like, daemon=True)
-    started = time.monotonic()
-    closer.start()
-    closer.join(30.0)
-    root.removeHandler(fwd)
+    try:
+        fwd.handle(logging.makeLogRecord({"msg": "one", "levelname": "WARNING"}))
+        closer = threading.Thread(target=_shutdown_like, daemon=True)
+        started = time.monotonic()
+        closer.start()
+        closer.join(30.0)
+    finally:
+        root.removeHandler(fwd)
     assert done == [True], "close() under the queue handler's lock did not return"
     # Not just "returned": a listener parked on the lock would return only after the join gave up
     # (about 11 s here), and would be left running.
@@ -1607,5 +1609,7 @@ def test_a_send_report_raised_while_shutdown_holds_the_lock_does_not_park_the_li
         root.removeHandler(seen)
     assert reported.is_set(), "the listener never reported the failed send"
     assert fwd._listener._thread is None, "the listener did not stop cleanly"
-    assert elapsed < 1.0, f"close() took {elapsed:.1f}s"
+    # Measured well under 1 s; a parked listener holds close() for about 11 s. The bound sits
+    # between the two with room for a loaded runner.
+    assert elapsed < 3.0, f"close() took {elapsed:.1f}s"
     assert fwd.dropped == 0, "the listener's own report was counted as a queue-full drop"
