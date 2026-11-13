@@ -100,26 +100,40 @@ _FileSig = tuple[int, int]
 #: ``(st_dev, st_ino)``: which file a handle or a name leads to. On Windows ``os.stat`` fills them from
 #: the volume serial number and the file ID, so the compare works the same there (BACKLOG #2535).
 _FileId = tuple[int, int]
-#: ``(size, mtime_ns, st_dev, st_ino)`` from one ``lstat``: a stuck reject's memory (BACKLOG #5717).
-#: The identity half tells a new file dropped under the same name, with the same size and mtime, from
-#: the one that could not be moved. Where a share reports no file ID it is zero, and size and mtime
-#: carry the compare alone.
+#: ``(size, mtime_ns, st_dev, st_ino)``: a stuck reject's memory (BACKLOG #5717). The identity half
+#: tells a new file dropped under the same name, with the same size and mtime, from the one that could
+#: not be moved. Where a volume reports no file ID, or one that a new file can reuse (FAT, exFAT), that
+#: compare is weak, and only ``STUCK_RETRY_SECONDS`` bounds how long such a new file waits.
 _FileMark = tuple[int, int, int, int]
+#: ``(mark, monotonic time remembered, scans in a row that did not list it)``.
+_Stuck = tuple[_FileMark, float, int]
 
 # Failures that may clear by themselves, so a reject whose move hit one is NOT remembered as stuck and
 # is examined again on the next scan, as before BACKLOG #5717. At least: another process holds the file
 # open or locked, the file vanished, the disk or quota is full, or a share timed out or dropped. Any
-# other failure (access denied, a read-only volume, a link) is taken as lasting until the file changes.
+# other failure (access denied, a read-only volume, a link) is taken as lasting, and
+# ``STUCK_RETRY_SECONDS`` bounds what a wrong guess costs.
 _TRANSIENT_ERRNOS = frozenset(
     getattr(errno, name)
     for name in (
         "EAGAIN",
         "EBUSY",
+        "ECONNABORTED",
+        "ECONNRESET",
         "EDQUOT",
+        "EHOSTDOWN",
+        "EHOSTUNREACH",
         "EINTR",
         "EIO",
+        "EMFILE",
+        "ENETDOWN",
+        "ENETUNREACH",
+        "ENFILE",
         "ENOENT",
+        "ENOLCK",
+        "ENOMEM",
         "ENOSPC",
+        "ENOTCONN",
         "ESTALE",
         "ETIMEDOUT",
         "ETXTBSY",
@@ -127,9 +141,12 @@ _TRANSIENT_ERRNOS = frozenset(
     )
     if hasattr(errno, name)
 )
-# ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION, ERROR_NETNAME_DELETED, ERROR_SEM_TIMEOUT. Windows maps
-# the first two to EACCES, which alone would read as lasting, so the Windows code is checked first.
-_TRANSIENT_WINERRORS = frozenset({32, 33, 64, 121})
+# Windows maps several of these to EACCES or EINVAL, which alone would read as lasting, so the Windows
+# code is checked first: ERROR_NOT_READY 21, ERROR_SHARING_VIOLATION 32, ERROR_LOCK_VIOLATION 33,
+# ERROR_BAD_NETPATH 53, ERROR_UNEXP_NET_ERR 59, ERROR_NETNAME_DELETED 64, ERROR_BAD_NET_NAME 67,
+# ERROR_SEM_TIMEOUT 121, ERROR_VC_DISCONNECTED 240, ERROR_NETWORK_UNREACHABLE 1231,
+# ERROR_CONNECTION_ABORTED 1236, ERROR_NO_SYSTEM_RESOURCES 1450.
+_TRANSIENT_WINERRORS = frozenset({21, 32, 33, 53, 59, 64, 67, 121, 240, 1231, 1236, 1450})
 
 # Cap a single inbound file read so a multi-GB drop can't OOM the engine (DoS guard). None/0 in
 # settings, in any spelling, disables the cap; see docs/CONNECTIONS.md.
@@ -154,6 +171,13 @@ SETTLE_SEEN_MAX = 100_000
 # unreadable, a transient stat error that makes is_file() False) does not wipe a sighting and restart
 # the wait; a failed listing returns no candidates rather than raising.
 SETTLE_MISS_LIMIT = 3
+
+# How long a reject that could not be moved to .error is skipped before it is read and tried again
+# (BACKLOG #5717). Without a limit, fixing the cause outside the file (an .error made writable again, a
+# share remounted read-write, a failure judged lasting that was not) would leave every remembered reject
+# in place until a restart. A retry reads and charges the file as on its first scan, so with the default
+# poll it costs about one scan in 300 of the budget such files take.
+STUCK_RETRY_SECONDS = 300.0
 
 # When `decompress=` is set, this bounds the *decompressed* output (ADR 0123): `max_file_bytes` only
 # caps the COMPRESSED input (`st_size`), so a small gzip can expand to gigabytes (a decompression bomb).
@@ -776,11 +800,10 @@ class FileSource(SourceConnector):
         # BACKLOG #2507: paths already refused as links, so each is warned about once. See
         # _log_unconfined. In memory only and never logged.
         self._refused: set[str] = set()
-        # BACKLOG #5717: rejects whose move to .error failed for a lasting reason, keyed by path, with
-        # the lstat mark each showed when it was examined. Under move and delete only. A scan skips
-        # such a file unread and uncharged until its mark changes. Bounded like _refused and forgets a
-        # path once a scan no longer lists it. In memory only and never logged.
-        self._stuck: dict[str, _FileMark] = {}
+        # BACKLOG #5717: rejects whose move to .error failed for a lasting reason, keyed by path. Under
+        # move and delete only. See _skip_stuck. Bounded like _refused, and pruned like the settle map.
+        # In memory only and never logged.
+        self._stuck: dict[str, _Stuck] = {}
         # The connection, as the `.processed` age sweep names it in a log line (BACKLOG #1188).
         self._label = config.name or str(self.directory)
         # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
@@ -1069,12 +1092,11 @@ class FileSource(SourceConnector):
             0  # #142: files marked processed THIS tick — gates a single end-of-tick prune
         )
         candidates = await self._run_fs(self._candidates)
-        self._prune_settle(candidates)
-        if self._refused or self._stuck:
+        if self._settle_seen or self._refused or self._stuck:
             listed = {str(p) for p in candidates}
+            self._prune_settle(listed)
             self._refused.intersection_update(listed)
-            for key in self._stuck.keys() - listed:
-                del self._stuck[key]
+            self._prune_stuck(listed)
         disposed = 0  # files this tick finished with — the per-tick ceiling's budget (_at_ceiling)
         for position, path in enumerate(candidates):
             if self._stop.is_set():
@@ -1090,7 +1112,7 @@ class FileSource(SourceConnector):
                 self._log_unreadable(path, exc)
                 continue
             before: _FileSig = mark[:2]
-            if self._stuck and self._still_stuck(path, mark):
+            if self._stuck and self._skip_stuck(path, mark):
                 # BACKLOG #5717: a reject that could not be moved to .error, unchanged since. Not read,
                 # moved or charged, so it cannot hold back the healthy drops behind it.
                 continue
@@ -1128,7 +1150,7 @@ class FileSource(SourceConnector):
                 await self._quarantine(
                     path,
                     exc.file_id,
-                    mark,
+                    before,
                     "file_oversize",
                     f"{exc} exceeds max_file_bytes {self.max_file_bytes}",
                 )
@@ -1178,7 +1200,7 @@ class FileSource(SourceConnector):
                     await self._quarantine(
                         path,
                         read_id,
-                        mark,
+                        before,
                         "file_decompress_failed",
                         safe_exc(exc, file_name=path.name),
                     )
@@ -1205,7 +1227,7 @@ class FileSource(SourceConnector):
                 await self._quarantine(
                     path,
                     read_id,
-                    mark,
+                    before,
                     "file_content_mismatch",
                     f"does not match declared content type {declared}",
                 )
@@ -1226,7 +1248,7 @@ class FileSource(SourceConnector):
                     safe_exc(exc, file_name=path.name),
                 )
                 await self._quarantine(
-                    path, read_id, mark, "file_scan_rejected", safe_exc(exc, file_name=path.name)
+                    path, read_id, before, "file_scan_rejected", safe_exc(exc, file_name=path.name)
                 )
                 disposed += 1
                 continue
@@ -1290,22 +1312,23 @@ class FileSource(SourceConnector):
                 await self.processed_ledger.prune()
 
     async def _quarantine(
-        self, path: Path, read_id: _FileId | None, mark: _FileMark, kind: str, reason: str
+        self, path: Path, read_id: _FileId, before: _FileSig, kind: str, reason: str
     ) -> None:
         """Move a rejected file to ``.error``, record the event when a copy was archived, and remember
         the file as stuck when it stays for a lasting reason (BACKLOG #5717).
 
         The caller charges the per-tick budget whatever happened here, so a scan still reads at most
         ``poll_max_files`` files that end in a reject. Before #5717 a reject that could not be moved
-        was read and charged again on every scan, so enough of them sorting first spent the whole
-        budget each time and the healthy drops behind them were never reached. Remembered here, it is
-        read and charged once, then skipped (:meth:`_still_stuck`) until it changes.
+        was read and charged again on later scans, so enough of them sorting first could spend the
+        whole budget each time and hold back the healthy drops behind them. Remembered here, it is
+        skipped unread and uncharged (:meth:`_skip_stuck`) until it changes or
+        ``STUCK_RETRY_SECONDS`` pass.
 
-        ``mark`` is the stat taken before the read, so a file that changed since is examined again.
-        Only ``move`` and ``delete`` remember. ``leave`` keeps examining such a file on every scan, as
-        it always has: there a read-only share is expected, and nothing here changes it. A failure that
-        may clear by itself (:data:`_TRANSIENT_WINERRORS`, :data:`_TRANSIENT_ERRNOS`) is not
-        remembered either, so the next scan tries the move again."""
+        The mark is ``before``, the stat the read was checked against, with ``read_id``, the identity
+        of the file the read handle held, so it describes the file judged. Only ``move`` and ``delete``
+        remember. ``leave`` keeps examining such a file as it always has: there a read-only share is
+        expected, and nothing here changes it. A failure that may clear by itself
+        (:func:`_lasting`) is not remembered either, so a later scan tries the move again."""
         archived, stays = await self._run_fs(self._archive_to, path, self.error_dir, read_id)
         if archived:
             await self._emit_event(kind, reason=reason)
@@ -1313,23 +1336,25 @@ class FileSource(SourceConnector):
             return
         key = str(path)
         if key not in self._stuck and len(self._stuck) >= SETTLE_SEEN_MAX:
-            return  # full: this one is examined again next scan, as before #5717
-        self._stuck[key] = mark
+            return  # full: this one is examined again, as before #5717
+        self._stuck[key] = ((*before, *read_id), time.monotonic(), 0)
         logger.warning(
             "file source %s: rejected file %s stays in place; it is not read again until it changes "
-            "or the engine restarts",
+            "or %d seconds pass",
             self.directory,
             safe_name(path.name),
+            STUCK_RETRY_SECONDS,
         )
 
-    def _still_stuck(self, path: Path, mark: _FileMark) -> bool:
-        """True when ``path`` is a remembered stuck reject that still shows ``mark``. A changed file
-        is forgotten here, so it settles and is examined afresh (BACKLOG #5717)."""
+    def _skip_stuck(self, path: Path, mark: _FileMark) -> bool:
+        """True when ``path`` is a remembered stuck reject that still shows ``mark`` and is not yet due
+        a retry, so the scan skips it. Otherwise the entry is FORGOTTEN here, so the file settles and
+        is examined afresh (BACKLOG #5717)."""
         key = str(path)
         seen = self._stuck.get(key)
         if seen is None:
             return False
-        if seen == mark:
+        if seen[0] == mark and time.monotonic() - seen[1] < STUCK_RETRY_SECONDS:
             if logger.isEnabledFor(logging.DEBUG):  # safe_name hashes, so skip it unread
                 logger.debug("file source: still skipping stuck reject %s", safe_name(path.name))
             return True
@@ -1388,9 +1413,11 @@ class FileSource(SourceConnector):
 
         A reject charges even when its move to ``.error`` fails, so a scan still reads at most
         ``poll_max_files`` files that end in a reject. Under ``move`` and ``delete`` such a file, when
-        the failure is a lasting one, is then remembered and skipped unread and uncharged until it
-        changes (:meth:`_quarantine`, BACKLOG #5717), so it is charged once rather than on every scan.
-        Under ``leave`` it is read and charged on every scan, as before.
+        the failure looks lasting, is then remembered and skipped unread and uncharged until it changes
+        or ``STUCK_RETRY_SECONDS`` pass (:meth:`_quarantine`, BACKLOG #5717). At least a failure that
+        looks transient, a full memory and a restart leave it read and charged again on a later scan.
+        Under ``leave`` nothing is remembered, as before. The ``remaining`` count logged below includes
+        remembered rejects, which the next scan skips.
 
         This bounds the INGEST, not the listing: ``_candidates`` still globs and sorts the whole
         directory, because picking the first N in name/mtime order requires seeing all of them. The
@@ -1511,14 +1538,12 @@ class FileSource(SourceConnector):
             return True
         return False
 
-    def _prune_settle(self, candidates: list[Path]) -> None:
+    def _prune_settle(self, listed: set[str]) -> None:
         """Forget a file once ``SETTLE_MISS_LIMIT`` scans in a row have not listed it (moved, deleted,
         renamed away), so the settle map is bounded by the drop directory rather than by every name it
         ever held. A file listed again has its count reset. Waiting for several misses, rather than
-        forgetting on the first, keeps a listing that fails now and then from restarting every wait."""
-        if not self._settle_seen:
-            return
-        listed = {str(p) for p in candidates}
+        forgetting on the first, keeps a listing that fails now and then from restarting every wait.
+        ``listed`` is the scan's candidates as strings."""
         for key, (sig, missed) in list(self._settle_seen.items()):
             if key in listed:
                 if missed:
@@ -1527,6 +1552,18 @@ class FileSource(SourceConnector):
                 del self._settle_seen[key]
             else:
                 self._settle_seen[key] = (sig, missed + 1)
+
+    def _prune_stuck(self, listed: set[str]) -> None:
+        """:meth:`_prune_settle`'s rule for the stuck-reject memory (BACKLOG #5717), so a listing that
+        fails now and then does not make every remembered reject be read and charged again."""
+        for key, (mark, since, missed) in list(self._stuck.items()):
+            if key in listed:
+                if missed:
+                    self._stuck[key] = (mark, since, 0)
+            elif missed + 1 >= SETTLE_MISS_LIMIT:
+                del self._stuck[key]
+            else:
+                self._stuck[key] = (mark, since, missed + 1)
 
     async def _leave_already_ingested(self, forms: tuple[str, ...]) -> bool:
         """True if this leave-in-place file was already ingested — the bounded in-process cache first (no
@@ -1869,8 +1906,10 @@ class FileSource(SourceConnector):
         with pin:
             if stamp:
                 self._stamp_archive_time(pin, path)
+            opened = False
             try:
                 with _open_dest(dest_dir, self.directory, self._root_real) as dest:
+                    opened = True
                     gone = _archive(pin, dest, path.name)
             except OSError as exc:
                 # A stuck file (locked / dest unwritable) stays and is re-read; log it (FILE-4).
@@ -1882,7 +1921,7 @@ class FileSource(SourceConnector):
                     dest_dir.name,
                     _describe_os_error(exc, file_name=path.name),
                 )
-                return False, _lasting(exc)
+                return False, _lasting(exc, archive_dir=not opened)
             if not gone:
                 try:
                     _remove_pinned(pin)
@@ -3386,15 +3425,26 @@ def _file_sig(path: Path) -> _FileSig:
 
 
 def _file_mark(path: Path) -> _FileMark:
-    """:func:`_file_sig` and the file's identity from the same ``lstat`` (BACKLOG #5717). May raise
+    """:func:`_file_sig` and :func:`_file_id` from the same ``lstat`` (BACKLOG #5717). May raise
     ``OSError`` if the file is gone."""
     st = path.lstat()
-    return st.st_size, st.st_mtime_ns, st.st_dev, st.st_ino
+    return st.st_size, st.st_mtime_ns, *_file_id(st)
 
 
-def _lasting(exc: OSError) -> bool:
-    """Whether a failed move or delete is expected to fail the same way until the file or its
-    directory changes, as opposed to clearing by itself (BACKLOG #5717)."""
+def _lasting(exc: OSError, *, archive_dir: bool = False) -> bool:
+    """Whether a failed move or delete is expected to fail the same way on the next scan, as opposed
+    to clearing by itself (BACKLOG #5717). A guess either way: ``STUCK_RETRY_SECONDS`` bounds what a
+    wrong True costs, and a wrong False costs what it did before #5717.
+
+    A file replaced since the read is not lasting: the next scan reads the new one. A link is. A
+    missing file is not, unless ``archive_dir`` says it is the archive directory that is missing,
+    which nothing recreates while the source runs."""
+    if isinstance(exc, _Replaced):
+        return False
+    if isinstance(exc, _Unconfined):
+        return True
+    if archive_dir and exc.errno in (errno.ENOENT, errno.ENOTDIR):
+        return True
     if getattr(exc, "winerror", None) in _TRANSIENT_WINERRORS:
         return False
     return exc.errno not in _TRANSIENT_ERRNOS

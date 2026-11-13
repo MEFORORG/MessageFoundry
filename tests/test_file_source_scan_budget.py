@@ -297,3 +297,68 @@ async def test_leave_mode_still_reads_and_charges_an_unmovable_reject_every_scan
     assert [await rig.scan() for _ in range(9)] == _MAIN_SEQUENCE
     assert rig.handed_off == [_HL7]
     assert rig.source._stuck == {}
+
+
+async def test_a_stuck_reject_is_retried_after_the_retry_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cause fixed outside the file (an ``.error`` made writable again) is picked up without a
+    restart: once ``STUCK_RETRY_SECONDS`` pass the reject settles, is read, and is moved.
+
+    Mutation: drop the time test from ``_skip_stuck``. Red: the reject is never read again."""
+    rig = _Rig(tmp_path, monkeypatch, cap=10)
+    rig.drop("a.hl7", _PDF)
+    await rig.scan()
+    assert await rig.scan() == ["a.hl7"]
+    assert await rig.scan() == []
+
+    rig.fail_errno = None
+    key, (mark, since, missed) = next(iter(rig.source._stuck.items()))
+    rig.source._stuck[key] = (mark, since - file_mod.STUCK_RETRY_SECONDS, missed)
+    assert await rig.scan() == [], "the retried file settles first"
+    assert await rig.scan() == ["a.hl7"]
+    assert (rig.inbox / ".error" / "a.hl7").exists()
+    assert rig.source._stuck == {}
+
+
+async def test_a_failed_listing_does_not_wipe_the_stuck_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pruned like the settle map: one scan whose listing fails does not forget the rejects, so they
+    are not all read and charged again once the listing recovers."""
+    rig = _Rig(tmp_path, monkeypatch, cap=10)
+    rig.drop("a.hl7", _PDF)
+    await rig.scan()
+    assert await rig.scan() == ["a.hl7"]
+
+    real_candidates = FileSource._candidates
+
+    def no_listing(_self: FileSource) -> list[Path]:
+        return []
+
+    monkeypatch.setattr(FileSource, "_candidates", no_listing)
+    await rig.scan()
+    monkeypatch.setattr(FileSource, "_candidates", real_candidates)
+    assert await rig.scan() == []
+    assert len(rig.source._stuck) == 1
+
+
+async def test_a_missing_error_directory_is_a_lasting_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing recreates ``.error`` while the source runs, so ENOENT opening it is remembered, unlike
+    ENOENT for a source file that vanished."""
+    rig = _Rig(tmp_path, monkeypatch, cap=10, fail_errno=errno.ENOENT)
+    rig.drop("a.hl7", _PDF)
+    await rig.scan()
+    assert await rig.scan() == ["a.hl7"]
+    assert await rig.scan() == []
+    assert len(rig.source._stuck) == 1
+
+
+def test_lasting_reads_the_engines_own_refusals() -> None:
+    assert not file_mod._lasting(file_mod._Replaced("not the file that was read"))
+    assert file_mod._lasting(file_mod._Unconfined("a link"))
+    assert file_mod._lasting(OSError("no errno at all"))
+    assert not file_mod._lasting(OSError(errno.ENOENT, "gone"))
+    assert file_mod._lasting(OSError(errno.ENOENT, "gone"), archive_dir=True)

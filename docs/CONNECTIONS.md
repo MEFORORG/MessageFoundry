@@ -4899,12 +4899,14 @@ tick and starve the healthy items behind it. Only an item the tick finished with
 quarantined to the error directory — charges. **One gap in that rule:** a quarantine whose move to
 the error directory fails still charges, although the file stays where it was. A file that can never
 be quarantined would therefore spend the budget on every tick, which is the starvation this rule exists
-to prevent. On `File(...)` under `after_read` `move` or `delete` (BACKLOG #5717), such a file is
-charged once: when the move failed for a reason that does not clear by itself, such as access denied,
+to prevent. On `File(...)` under `after_read` `move` or `delete` (BACKLOG #5717) the gap is
+narrowed, not closed. When the move failed for a reason that looks lasting, such as access denied,
 the source remembers the file and skips it unread and uncharged until its size, modification time or
-file identity changes, or the engine restarts, so the drops behind it are reached. A failure that may
-clear by itself, at least a locked file or a full disk, is not remembered, and the move is tried again.
-Under `leave`, and on `Sftp(...)`/`Ftp(...)`, the gap stands as described.
+file identity changes, or 300 seconds pass, so the drops behind it are reached between retries. A
+failure that looks transient, at least a locked file, a file another process holds open, or a full
+disk, is not remembered, so such a file still charges on later scans as before. At least a restart of
+the connection and a memory that is full (100,000 files) also leave a file charged again. Under
+`leave`, and on `Sftp(...)`/`Ftp(...)`, the gap stands as described.
 
 **A database row that cannot become a body does not spend it either, and the two sources reach that
 by different routes.** A file source charges on **completion**, so it simply does not count an item it
