@@ -263,10 +263,11 @@ def _segment_index(msg: ParsedMessage, seg_id: str, occurrence: int) -> int | No
     """List index of the ``occurrence``-th (1-based) segment with ``seg_id``, or None if absent.
 
     Tolerant scan (mirrors the ``str(segment[0])`` iteration python-hl7's legacy ``Message`` read and
-    presence path used), and since BACKLOG #5917 also the scan every :func:`set_field` write uses: a
-    fieldless bare segment counts as an occurrence, and a blank segment is never an error. The
-    *raising* scan python-hl7 does for ``segment()``/``extract_field``/whole-field assignment lives in
-    :func:`raise_if_blank_segment_scan`.
+    presence path used), and since BACKLOG #5917 also the scan every :func:`set_field` write resolves
+    through: a fieldless bare segment counts as an occurrence, and this scan never raises on a blank
+    segment. The *raising* check python-hl7 does for ``segment()``/``extract_field``/whole-field
+    assignment lives in :func:`raise_if_blank_segment_scan`, which :func:`set_field` still calls first
+    at occurrence 1.
     """
     seen = 0
     for i, seg in enumerate(msg["segments"]):
@@ -304,6 +305,8 @@ def raise_if_blank_segment_scan(msg: ParsedMessage) -> None:
     assignment via ``msg["SEG.Fn"] = …``) therefore raises whenever the message carries any blank
     segment. The tolerant ``str(segment[0])`` iteration (reads, presence, occurrence>1 writes) does
     **not** — so this guard is invoked only on the raising paths to preserve that exact asymmetry.
+    :func:`set_field` keeps only this blank-segment raise at occurrence 1; it no longer resolves the
+    segment through the ``segments()`` matcher (BACKLOG #5917).
 
     **Only a truly empty line raises** (BACKLOG #1594). A line that merely *starts* with the field
     separator (``|foo``) also has id ``""`` here, but python-hl7 parses it into a segment whose

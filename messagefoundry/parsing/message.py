@@ -288,8 +288,8 @@ class Message:
         ``occurrence`` (1-based) selects which segment of that id to write — ``occurrence=2`` edits
         the **second** ``OBX``. It counts the way :meth:`field` and :meth:`count_segments` do, so a
         fieldless bare line such as ``PID`` is an occurrence and a write to it extends it in place
-        (``Peek.field`` skips such a line, as python-hl7 did). ``repetition`` (1-based) scopes the write to one field repetition: a
-        component write edits that repetition (padding earlier reps if needed) and preserves the
+        (``Peek.field`` skips such a line, as python-hl7 did). ``repetition`` (1-based) scopes the
+        write to one field repetition: a component write edits that repetition (padding earlier reps if needed) and preserves the
         others (default — and ``repetition=1`` — edit the first, preserve the rest; review H-9); a
         whole-field write with ``repetition`` replaces just that repetition's text (and the value may
         then not contain the repetition separator). Without ``repetition``, a whole-field write
@@ -569,13 +569,9 @@ class Message:
     def _segment_present(self, segment_id: str, occurrence: int = 1) -> bool:
         """Whether the ``occurrence``-th (1-based) segment with ``segment_id`` exists — the presence
         check used by the write/repetition guards."""
-        seen = 0
-        for sid in _builtin_hl7.segment_ids(self._m):
-            if sid == segment_id:
-                seen += 1
-                if seen == occurrence:
-                    return True
-        return False
+        # The same scan the write resolves through, so the guard and the write cannot disagree on
+        # which segment is the ``occurrence``-th (BACKLOG #5917).
+        return _builtin_hl7._segment_index(self._m, segment_id, occurrence) is not None
 
     def _assign_field(self, seg: str, fld: int, occurrence: int, raw_value: str) -> None:
         """Write the whole raw field text at ``seg``/``fld`` for the given segment ``occurrence``.

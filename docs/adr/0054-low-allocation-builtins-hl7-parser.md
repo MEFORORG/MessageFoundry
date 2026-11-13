@@ -305,9 +305,9 @@ What that costs, stated so nobody reads the record as more than it is:
   it. A `Message` write at any occurrence now counts it too, so a write lands on the segment the
   read side names, and a component or repetition write no longer copies a bare line's empty
   field over the populated segment that follows. The blank-line `IndexError` at occurrence 1 is
-  kept. `Peek.field` still skips a fieldless line, as python-hl7 did, so after a write that
-  populates a bare line, `Peek` numbers that line as occurrence 1. No case in the record writes to a
-  segment id that has a fieldless line.
+  kept. `Peek.field` still skips a fieldless line, as python-hl7 did. Any write to a bare line, an
+  empty value included, gives it a field separator, so on the re-encoded message `Peek` numbers that
+  line as occurrence 1. No case in the record writes to a segment id that has a fieldless line.
 
 ### Other things that moved with it
 

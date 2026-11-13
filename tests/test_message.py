@@ -8,7 +8,7 @@ from collections.abc import Callable
 
 import pytest
 
-from messagefoundry.parsing import Message
+from messagefoundry.parsing import Message, Peek
 
 ADT = (
     "MSH|^~\\&|SENDAPP|SENDFAC|RECVAPP|RECVFAC|20260101||ADT^A01^ADT_A01|MSG1|P|2.5.1\r"
@@ -343,13 +343,18 @@ def test_add_segment_custom_separators() -> None:
     assert Message.parse(m.encode()).field("ODS-2.2") == "Regular"
 
 
-def test_add_segment_bare_id_is_settable() -> None:
+def test_add_segment_bare_id_is_normalized_and_settable() -> None:
     # A bare segment id (no field separator) grafts a settable segment, normalized to the
     # trailing-separator form, so Peek (which skips a fieldless line) numbers the graft as Message does.
     m = Message.parse(ORU)
     m.add_segment("ZAL")  # bare id, no fields
     assert m.count_segments("ZAL") == 1
     assert m.encode().split("\r")[-2] == "ZAL|"  # the normalization itself
+    # A graft before a populated ZAL: Peek's occurrence 1 is the graft, as it is for Message.
+    g = Message.parse(ORU + "ZAL|1|second\r")
+    g.add_segment("ZAL", index=1)
+    assert Peek.parse(g.encode()).field("ZAL-2") is None
+    assert g.field("ZAL-2") is None and g.field("ZAL-2", occurrence=2) == "second"
     m.set("ZAL-2", "hello")
     assert m.field("ZAL-2") == "hello"
     assert Message.parse(m.encode()).field("ZAL-2") == "hello"
@@ -397,6 +402,17 @@ def test_occurrence_one_write_lands_on_a_bare_segment(
     reparsed = Message.parse(m.encode())
     assert reparsed.field("PID-3") == written
     assert reparsed.field("PID-3", occurrence=2) == "X^Y~Q"
+
+
+def test_peek_counts_a_written_bare_line_as_occurrence_one() -> None:
+    # Peek skips a fieldless line, so before any write its occurrence 1 is the populated PID. Any
+    # write to the bare line, an empty value included, gives it a field separator, and Peek's
+    # occurrence 1 on the re-encoded message becomes that line (recorded in ADR 0054).
+    assert Peek.parse(BARE_THEN_POPULATED).field("PID-3") == "X^Y~Q"
+    m = Message.parse(BARE_THEN_POPULATED)
+    m.set("PID-3", "")
+    assert _pid_lines(m) == ["PID|||", _POPULATED_PID]
+    assert Peek.parse(m.encode()).field("PID-3") is None
 
 
 def test_occurrence_one_write_on_a_lone_bare_segment() -> None:
