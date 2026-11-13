@@ -1639,7 +1639,8 @@ def _read_bool_setting(value: Any, default: bool | None) -> bool | None:
 def _bool_literal_problem(key: str, value: Any) -> str | None:
     """Why the literal ``value`` may not stand on the boolean setting ``key``, or ``None`` when it
     may (vault BACKLOG #3234). :meth:`Registry.bool_literal_problems` says what is refused and why;
-    :func:`outbound` asks it too, for a flag it is about to overwrite. The value is withheld.
+    :func:`_refuse_bool_literals` asks it too, before a connection's own checks read a flag. The
+    value is withheld.
 
     Raises :class:`WiringError` when a factory's annotations do not resolve (:func:`_bool_settings`)."""
     strict = _bool_settings().defaults
@@ -1650,16 +1651,31 @@ def _bool_literal_problem(key: str, value: Any) -> str | None:
     try:
         require_flag(value, f"setting {key!r}")
     except ValueError as exc:  # names the key and the type, never the value
-        return f"{exc}{_quoted_false_hint(value)}; write True or False"
+        composer = (
+            " (the enabled= flag of a with_* composer)" if key in _COMPOSER_BOOL_SETTINGS else ""
+        )
+        return f"{exc}{composer}{_bool_remedy(value)}"
     return None
 
 
-def _quoted_false_hint(value: object) -> str:
-    """A hint for a false spelling in quotes, which every lax read takes as true; empty for any
-    other value, where it would not apply. It says the value is a false spelling, never which."""
+def _bool_remedy(value: object) -> str:
+    """The remedy every refusal of a non-bool literal ends with. A false spelling in quotes, which
+    every lax read takes as true, gets a hint that says so; it says the value is a false spelling,
+    never which."""
+    hint = ""
     if isinstance(value, str) and _BOOL_SPELLINGS.get(value.strip().lower()) is False:
-        return " (a false spelling in quotes reads as true)"
-    return ""
+        hint = " (a false spelling in quotes reads as true)"
+    return f"{hint}; write True, False or an env() reference"
+
+
+def _refuse_bool_literals(settings: Mapping[str, Any], where: str) -> None:
+    """Refuse the first non-bool literal on a boolean setting, before a connection's own checks
+    or desugars read one (vault BACKLOG #3234). Those read flags by truthiness, so a quoted false
+    would otherwise be refused as if it were set, or overwritten (``reingress_to`` sets
+    ``capture_response``) before the load's :meth:`Registry.bool_literal_problems` could see it."""
+    for key, value in settings.items():
+        if (bad := _bool_literal_problem(key, value)) is not None:
+            raise WiringError(f"{where}: {bad}")
 
 
 def resolve_env_settings(
@@ -5240,9 +5256,7 @@ def Ftp(
         try:
             require_flag(tls, "setting 'tls'")
         except ValueError as exc:  # names the key and the type, never the value
-            raise WiringError(
-                f"Ftp: {exc}{_quoted_false_hint(tls)}; write True, False or an env() reference"
-            ) from None
+            raise WiringError(f"Ftp: {exc}{_bool_remedy(tls)}") from None
     # An env() tls is truthy here. Once resolved, ``refuse_resolved_verify_off`` refuses a CA beside
     # plain ftp, and ``unread_ca_reason`` a pin beside it in the anchor preflight (#3234).
     _check_tls_ca_file(
@@ -6924,7 +6938,7 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
         for oc in registry.outbound.values()
         if _listed(oc.tls_hop_attested)
     ]
-    settings_carriers: list[tuple[str, Mapping[str, Any], bool]] = [
+    hop_carriers: list[tuple[str, Mapping[str, Any], bool]] = [
         *(
             (fhir_lookup_record_name(s.name), s.settings, s.cleartext_accepted)
             for s in registry.fhir_lookups.values()
@@ -6938,7 +6952,7 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
             _attested_reason_text(settings.get("tls_hop_attested_reason")),
             _refused(name, settings, accepted),
         )
-        for name, settings, accepted in settings_carriers
+        for name, settings, accepted in hop_carriers
         if _listed(settings.get("tls_hop_attested"))
     ]
     return sorted(out, key=lambda hop: hop.name)
@@ -8281,6 +8295,7 @@ def build_inbound_connection(
     the caller is responsible for ``add_inbound``. ``content_type`` accepts a :class:`ContentType`
     member **or** its bare string value (``"x12"``, ``"json"``, …); it is coerced to the enum here so a
     raw string can't reach the pipeline and crash later."""
+    _refuse_bool_literals(spec.settings, f"inbound connection {name!r}")
     content_type = _coerce_content_type(name, content_type)
     if (
         spec.type
@@ -8674,6 +8689,7 @@ def build_outbound_connection(
 
     The shared core of code-first :func:`outbound` **and** the ``connections.toml`` loader (ADR 0007).
     Pure — it does not touch the active registry; the caller is responsible for ``add_outbound``."""
+    _refuse_bool_literals(spec.settings, f"outbound connection {name!r}")
     # ADR 0153 decision 2: the cleartext-acceptance pair is coherence-checked HERE, the one choke point
     # both authoring surfaces pass through, so a flag with no reason (or a reason with no flag) fails at
     # `messagefoundry check` / dry-run rather than at connector construction. Re-raised as a WiringError
@@ -8761,14 +8777,6 @@ def build_outbound_connection(
     # capture-validity guards below also gate a re-ingress declaration; the cross-registry check that
     # reingress_to names an existing Loopback() inbound runs in build_check_registry (it sees the whole
     # registry). A re-ingress on FILE/REMOTEFILE therefore fails with the "no synchronous response" error.
-    # vault BACKLOG #3234: both desugars below overwrite capture_response with True, the second on
-    # a truthy capture_out_params, and the capture checks after them read both. The load's
-    # bool_literal_problems runs later, so it would only see the True, or a refusal about a flag the
-    # author set false would come first. Judge what the author wrote, first.
-    for flag in ("capture_response", "capture_out_params"):
-        bad = _bool_literal_problem(flag, spec.settings.get(flag))
-        if bad is not None:
-            raise WiringError(f"outbound connection {name!r}: {bad}")
     reingress_to = spec.settings.get("reingress_to")
     if reingress_to is not None:
         if not isinstance(reingress_to, str) or not reingress_to.strip():
