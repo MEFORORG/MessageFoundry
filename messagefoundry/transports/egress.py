@@ -863,8 +863,10 @@ def syslog_forward_refusal(host: str, port: int, egress: EgressSettings) -> str 
 
 
 def host_port_allowed(host: str, port: object, allowed: list[str]) -> bool:
+    """True if an entry in ``allowed`` names ``host`` and either names no port or names ``port``.
+    A ``port`` of ``None`` matches only an entry that names no port, never one spelled ``None``."""
     return any(
-        not allow_port or str(port) == allow_port
+        not allow_port or (port is not None and str(port) == allow_port)
         for allow_port in _allowed_ports_for(host, allowed)
     )
 
@@ -874,24 +876,19 @@ _CanonicalHost = ipaddress.IPv4Address | ipaddress.IPv6Address | str
 
 
 def _canonical_host(text: str) -> _CanonicalHost | None:
-    """``text``, a host, in the form the allowlist compares, or ``None`` when no entry may match it
-    (BACKLOG #5915).
+    """``text``, a host as a connection names it, in the form the allowlist compares, or ``None``
+    when no entry may match it (BACKLOG #5915).
 
-    An IP literal compares as its address, so ``0:0:0:0:0:0:0:1`` is ``::1``. A bracketed IPv6
-    literal is that literal. Anything else holding a ``:`` is not a host, and a name compares
-    lowercased. Canonical equivalence only, never looser: an IPv4-mapped IPv6 address is not the
-    IPv4 address, a trailing-dot name is not the dotless one, and shorthand IPv4 such as ``127.1``
-    is a name, since :mod:`ipaddress` reads only the dotted quad. A ``%`` zone id gets ``None``:
-    :mod:`ipaddress` reads ``fe80::1%eth0`` as ``fe80::1`` with a scope, and a URL's zone id is
-    still percent-encoded where it is read, so either way the zone would be dropped from the
-    comparison and not from the dial."""
+    An IP literal compares as its address, so ``0:0:0:0:0:0:0:1`` is ``::1``. Anything else
+    holding a ``:`` is not a host, a bracketed ``[::1]`` included, since the socket dialers read
+    that as a name they cannot resolve. A name compares lowercased. Canonical equivalence only,
+    never looser: an IPv4-mapped IPv6 address is not the IPv4 address, a trailing-dot name is not
+    the dotless one, and shorthand IPv4 such as ``127.1`` is a name, since :mod:`ipaddress` reads
+    only the dotted quad. A ``%`` zone id gets ``None``: :mod:`ipaddress` reads ``fe80::1%eth0``
+    as ``fe80::1`` with a scope, and a URL's zone id is still percent-encoded where it is read, so
+    either way the zone would be dropped from the comparison and not from the dial."""
     if not text or "%" in text:
         return None
-    if text.startswith("[") and text.endswith("]"):
-        try:
-            return ipaddress.IPv6Address(text[1:-1])
-        except ValueError:
-            return None
     try:
         return ipaddress.ip_address(text)
     except ValueError:
@@ -902,25 +899,30 @@ def _parse_allow_entry(entry: str) -> tuple[_CanonicalHost, str] | None:
     """``entry`` read as ``(host, port text)``, the port text ``""`` where it names none, or
     ``None`` for an entry that matches nothing (BACKLOG #5915).
 
-    ``host``, ``host:port``, ``[v6]`` and ``[v6]:port`` are read. An unbracketed entry holding more
-    than one ``:``, such as ``::1`` or ``fe80::1:443``, is ambiguous, so it matches nothing: the
-    last group is never read as a port, and the entry is not read as a host with no port. Brackets
-    hold an IPv6 literal and nothing else. The host is read by :func:`_canonical_host`."""
+    ``host``, ``host:port``, ``[v6]`` and ``[v6]:port`` are read. Brackets hold an IPv6 literal and
+    nothing else. An unbracketed entry holding more than one ``:``, such as ``::1`` or
+    ``fe80::1:443``, is ambiguous, so it matches nothing: the last group is never read as a port,
+    and the entry is not read as a host with no port. A ``:`` with no port after it, such as
+    ``[::1]:`` or ``db:`` (an ``env()`` that expanded to nothing), matches nothing too, rather
+    than any port. The host is read by :func:`_canonical_host`."""
     text = entry.strip()
     if text.startswith("["):
         close = text.find("]")
         if close == -1:
             return None
-        rest = text[close + 1 :]
-        if rest and not rest.startswith(":"):
+        inner, rest = text[1:close], text[close + 1 :]
+        if (rest and not rest.startswith(":")) or ":" not in inner:
             return None
-        host, port = text[: close + 1], rest[1:]
+        host, sep, port = inner, rest[:1], rest[1:]
     elif text.count(":") > 1:
         return None
     else:
-        host, _, port = text.partition(":")
+        host, sep, port = text.partition(":")
+    port = port.strip()
     canonical = _canonical_host(host.strip())
-    return None if canonical is None else (canonical, port.strip())
+    if canonical is None or (sep and not port):
+        return None
+    return canonical, port
 
 
 def _allowed_ports_for(host: str, allowed: list[str]) -> list[str]:

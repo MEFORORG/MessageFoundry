@@ -4,9 +4,10 @@
 IP literals by their canonical form (BACKLOG #5915).
 
 The shipped matcher split every entry at its first colon and compared lowercased host text, so
-``[::1]:8123`` (the form docs/CONFIGURATION.md documents) and every other IPv6 entry matched
-nothing, and ``0:0:0:0:0:0:0:1`` did not match ``[::1]``. It is a security matcher, so the change
-is canonical equivalence only: each case under "never equated" stays a refusal.
+every IPv6 entry, ``[::1]:6432`` included, matched nothing, and ``0:0:0:0:0:0:0:1`` could not
+match ``[::1]``. (``[egress].allowed_ech_sidecar`` has its own parse, ``pinned_host_port``, and was
+never read here.) It is a security matcher, so the change is canonical equivalence only: each case
+under "never equated" stays a refusal.
 
 Every case runs through both users of the one parse: the egress gate's ``host_port_allowed`` and
 the AI broker's ``endpoint_host_allowed``, so the two cannot drift.
@@ -86,11 +87,43 @@ def test_unbracketed_ipv6_entry_matches_nothing(match: Match, entry: str) -> Non
 
 
 @pytest.mark.parametrize(
-    "entry", ["[::1", "[::1]x", "[::1]8123", "[db.example.org]", "[127.0.0.1]", "[]", ":443", ""]
+    "entry",
+    [
+        "[::1",
+        "[::1]x",
+        "[::1]8123",
+        "[db.example.org]",
+        "[127.0.0.1]",
+        "[]",
+        ":443",
+        "",
+        # A colon with no port after it, as an env() that expanded to nothing leaves: not any port.
+        "[::1]:",
+        "[::1]: ",
+        "db.example.org:",
+        "127.0.0.1:",
+    ],
 )
 def test_malformed_entry_matches_nothing(match: Match, entry: str) -> None:
     for host in ("::1", "127.0.0.1", "db.example.org"):
         assert match(host, 443, [entry]) is False
+
+
+def test_no_port_never_matches_a_pin_spelled_none() -> None:
+    assert host_port_allowed("::1", None, ["[::1]:None"]) is False
+    assert host_port_allowed("db.example.org", None, ["db.example.org:None"]) is False
+    assert host_port_allowed("::1", None, ["[::1]"]) is True
+
+
+def test_bracketed_host_value_is_not_an_address() -> None:
+    # A connection's `host` of `[::1]` is a name to a socket dialer, which cannot resolve it.
+    assert host_port_allowed("[::1]", 2575, ["[::1]"]) is False
+
+
+@pytest.mark.parametrize("url", ["https://ai.internal:abc/x", "https://ai.internal:99999/x"])
+def test_broker_unreadable_port_is_refused_not_raised(url: str) -> None:
+    # BACKLOG #1793: the ValueError quotes the port text, which can be a password's head.
+    assert endpoint_host_allowed(url, ["ai.internal"]) is False
 
 
 # --- never equated: each is a different host as far as this matcher is concerned ----------------
@@ -139,10 +172,15 @@ def _check_db(server: str, entry: str) -> None:
     check_egress_allowed(dest, EgressSettings(allowed_db=[entry]))
 
 
-@pytest.mark.parametrize("server", ["::1", "0:0:0:0:0:0:0:1", "[::1]"])
+@pytest.mark.parametrize("server", ["::1", "0:0:0:0:0:0:0:1"])
 @pytest.mark.parametrize("entry", ["[::1]:6432", "[::1]"])
 def test_database_ipv6_server_matches_its_bracketed_entry(server: str, entry: str) -> None:
     _check_db(server, entry)
+
+
+def test_database_bracketed_server_is_unlisted() -> None:
+    with pytest.raises(WiringError, match=r"is not in the \[egress\]\.allowed_db allowlist$"):
+        _check_db("[::1]", "[::1]")
 
 
 def test_database_ipv6_server_off_the_pin_is_refused() -> None:

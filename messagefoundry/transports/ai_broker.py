@@ -71,7 +71,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.controlchars import has_control_char, has_lone_surrogate
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.transports.bounded_read import EgressReplyError, read_bounded_text
-from messagefoundry.transports.egress import host_port_allowed
+from messagefoundry.transports.egress import _http_egress_allowed
 
 # Reuse rest.py's hardened, TLS-verifying, no-redirect opener + URL redaction (no new HTTP plumbing) —
 # exactly as smart.py / fhir.py / soap.py do. No import cycle: rest.py never imports this module.
@@ -161,12 +161,11 @@ class AiBrokerError(ValueError):
 
 def endpoint_host_allowed(url: str, allowed: list[str]) -> bool:
     """True if ``url``'s host (and port, when an allow entry pins one) is on ``allowed``, through the
-    egress gate's own :func:`~messagefoundry.transports.egress.host_port_allowed`, so ``[v6]`` and
-    ``[v6]:port`` entries read as they do there (BACKLOG #5915). Applied FAIL-CLOSED by the caller:
-    an empty ``allowed`` matches nothing, and so does a URL with no host."""
-    parts = urllib.parse.urlsplit(url)
-    host = parts.hostname or ""
-    return bool(allowed and host) and host_port_allowed(host, parts.port, allowed)
+    egress gate's own HTTP matcher, so ``[v6]`` and ``[v6]:port`` entries read as they do there
+    (BACKLOG #5915). Applied FAIL-CLOSED by the caller: an empty ``allowed`` matches nothing, and
+    so does a URL with no host, or one whose port or authority ``urlsplit`` cannot read; this never
+    raises, as the egress matcher never does (BACKLOG #1793)."""
+    return _http_egress_allowed(url, allowed)
 
 
 def _endpoint_opener(
