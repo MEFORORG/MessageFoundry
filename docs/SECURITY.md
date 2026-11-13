@@ -8108,9 +8108,10 @@ hold. Transit refuses it with HTTP 400 while it still answers under the latest v
 then reports a break at that row and keeps going. `audit-verify` names the row and exits 1. With
 `[integrity].audit_verify_on_start` on, the startup check also raises its `audit-chain` alert.
 So is a row whose own request Transit refuses, such as one Vault answers with HTTP 413 past
-`max_request_size`; ADR 0193's 2026-11-11 amendment, item 4, says how a refusal is told from the
-service failing. Other failures still stop the walk as a check that could not run. Those include
-at least an outage and a dropped connection.
+`max_request_size`; ADR 0193's 2026-11-11 amendment, item 4, as its 2026-11-13 amendment, item
+1, amends it, says how a refusal is told from the service failing. Other failures still stop the
+walk as a check that could not run. Those include at least an outage, a dropped connection, and an
+HTTP 408 or 504 on both asks of a row's verify, in the walk only.
 
 **Retiring an old version of the audit key breaks the chain.** Transit's verify also refuses a
 version below the key's `min_decryption_version`, or one trimmed away. Every audit row sealed under

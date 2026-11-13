@@ -1007,6 +1007,395 @@ def test_a_refused_version_on_the_second_ask_keeps_its_label() -> None:
         cipher.verify_audit_hmac(b"row", _PLANTED)
 
 
+# --- BACKLOG #8222 items 1 and 5: in the walk, a timeout on both asks is an outage and a malformed
+# handover reply a break; the open reads both as engine PR 2903 (686c5f7443) did ---------------------
+
+
+def _status_error(status: int) -> Exception:
+    """hvac's ``UnexpectedError`` for an HTTP ``status`` it does not name, as the store's Vault
+    client raises it: through the adapter's ``_raise_for_error``, which records the status."""
+    _needs_hvac()
+    import requests
+
+    from messagefoundry.store.keyprovider_vault import _record_reply_status
+
+    class _Adapter:
+        def _raise_for_error(self, method: str, url: str, response: Any) -> None:
+            from hvac import utils
+
+            utils.raise_for_error(method, url, response.status_code, "the reply")
+
+    class _Client:
+        adapter = _Adapter()
+
+    client = _Client()
+    _record_reply_status(client)
+    reply = requests.Response()
+    reply.status_code = status
+    try:
+        client.adapter._raise_for_error("POST", "https://vault.example.test/v1/x", reply)
+    except Exception as exc:  # noqa: BLE001 -- the error under test, returned for the caller
+        return exc
+    raise AssertionError("hvac raised nothing")
+
+
+@pytest.mark.parametrize("status", [504, 408])
+def test_a_timeout_on_one_rows_verify_could_not_run_though_the_fixed_input_verifies(
+    status: int,
+) -> None:
+    """A 504 or 408 on both asks of one row's verify, while the verify over fixed input succeeds,
+    raises :class:`AuditVerifyTimedOutError`, which the chain walk reads as could not run; other
+    callers read it as not verifying (BACKLOG #8222 item 1). Before this it returned ``False``."""
+    _needs_hvac()
+    from hvac.exceptions import UnexpectedError
+
+    from messagefoundry.store.crypto import AuditKeyVersionRefusedError, AuditVerifyTimedOutError
+
+    cipher = _scripted_cipher([_status_error(status), _status_error(status)])
+    rechecked: list[bool] = []
+    real_fixed = cipher._fixed_input_verifies
+
+    def counted() -> bool:
+        rechecked.append(True)
+        return bool(real_fixed())
+
+    cipher._fixed_input_verifies = counted
+    with pytest.raises(AuditVerifyTimedOutError) as caught:
+        cipher.verify_audit_hmac(b"row", cipher.audit_hmac(b"row"))
+    assert not isinstance(caught.value, AuditKeyVersionRefusedError)
+    assert isinstance(caught.value.__cause__, UnexpectedError)
+    assert rechecked, "the fixed input was checked between the asks"
+    assert real_fixed(), "the control: the fixed input verifies"
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        pytest.param(400, 504, id="400-then-504"),
+        pytest.param(413, 504, id="413-then-504"),
+        pytest.param(504, 413, id="504-then-413"),
+        pytest.param(504, 400, id="504-then-400"),
+    ],
+)
+def test_a_timeout_on_only_one_ask_is_still_a_break(first: int, second: int) -> None:
+    """A timeout on one ask beside a 400 or a 413 on the other, while the fixed input verifies,
+    is a break: only a 408 or 504 on both asks reads as could not run (BACKLOG #8222)."""
+    cipher = _scripted_cipher([_status_error(first), _status_error(second)])
+    assert cipher.verify_audit_hmac(b"row", cipher.audit_hmac(b"row")) is False
+
+
+def test_a_timeout_that_clears_on_the_second_ask_is_not_a_break() -> None:
+    """A 504 on the first ask that clears on the second is read as the second answer: a clean row
+    stays clean, and the check does not fail (BACKLOG #8222)."""
+    cipher = _scripted_cipher([_status_error(504), None])
+    assert cipher.verify_audit_hmac(b"row", cipher.audit_hmac(b"row")) is True
+
+
+def test_a_504_hvac_could_not_parse_still_reads_as_a_timeout() -> None:
+    """hvac raises ``TypeError`` or ``AttributeError``, not ``UnexpectedError``, for a 504 whose
+    JSON ``errors`` it cannot join; the recorded status still makes it a timeout (BACKLOG #8222)."""
+    _needs_hvac()
+    import requests
+
+    from messagefoundry.store import keyprovider_vault
+    from messagefoundry.store.keyprovider_vault import is_vault_timeout_reply
+
+    client = keyprovider_vault._build_client(
+        "https://vault.example.test:8200", "s.synthetic-token", revocation_attested=True
+    )
+    for body in (b'{"errors":[{"message":"upstream timed out"}]}', b"null", b"[]"):
+        reply = requests.Response()
+        reply.status_code = 504
+        reply.headers["Content-Type"] = "application/json"
+        reply._content = body
+        with pytest.raises(Exception) as caught:
+            client.adapter._raise_for_error("POST", "https://vault.example.test:8200/v1/x", reply)
+        assert is_vault_timeout_reply(caught.value), (body, type(caught.value))
+
+
+def test_a_413_on_one_rows_verify_is_still_a_break() -> None:
+    """A 413 is what Vault answers a planted oversize row, so it stays evidence about that row: a
+    break, not a check that could not run, though hvac raises it as the same class as a 504."""
+    cipher = _scripted_cipher([_status_error(413), _status_error(413)])
+    assert cipher.verify_audit_hmac(b"row", cipher.audit_hmac(b"row")) is False
+
+
+async def test_a_persistent_504_on_one_rows_verify_could_not_run_on_the_startup_walk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The startup walk over a clean chain whose last row's verify answers 504 every time, while
+    the fixed input and every other row verify: no tamper alert, and the walk could not run
+    (BACKLOG #8222 item 1)."""
+    _needs_hvac()
+    from messagefoundry.store.crypto_transit import _VERSION_PROBE_INPUT
+
+    transit = _RotatingTransit()
+    _use_fake(monkeypatch, transit)
+    store = await _transit_store(tmp_path / "timeout.db")
+    try:
+        await store.record_audit("test.clean", actor="cli:tester")
+        real_verify = transit.verify_signed_data
+        last_mac = _dml_last_row_hash(tmp_path / "timeout.db")
+        others: list[str] = []
+
+        def timing_out(*, hash_input: str, hmac: str, **kw: Any) -> dict[str, Any]:
+            if hash_input != _VERSION_PROBE_INPUT and hmac == last_mac:
+                raise _status_error(504)
+            if hash_input != _VERSION_PROBE_INPUT:
+                others.append(hmac)
+            return real_verify(hash_input=hash_input, hmac=hmac, **kw)
+
+        monkeypatch.setattr(transit, "verify_signed_data", timing_out)
+        sink, lines = await _walk_on_start(store, caplog)
+    finally:
+        await store.close()
+    assert others, "the control: the rows before the last one verified"
+    assert sink.events == []
+    assert any("could not run" in line for line in lines), lines
+
+
+async def test_a_both_asks_timeout_on_the_genesis_verify_at_open_logs_a_break_and_opens(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """At store open the timeout reading does not apply (BACKLOG #8222: the open path is unruled):
+    a 504 on both asks of the genesis row's verify, while the fixed input verifies, is read as
+    engine PR 2903 (``686c5f7443``) read it, a genesis row that does not verify, logged, on a
+    store that opens."""
+    _needs_hvac()
+    from messagefoundry.store.crypto_transit import _VERSION_PROBE_INPUT
+
+    transit = _RotatingTransit()
+    _use_fake(monkeypatch, transit)
+    db = tmp_path / "genesis-timeout.db"
+    store = await _transit_store(db)
+    await store.close()
+    real_verify = transit.verify_signed_data
+
+    def timing_out(*, hash_input: str, **kw: Any) -> dict[str, Any]:
+        if hash_input == _VERSION_PROBE_INPUT:
+            return real_verify(hash_input=hash_input, **kw)
+        raise _status_error(504)
+
+    monkeypatch.setattr(transit, "verify_signed_data", timing_out)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.store.store"):
+        store = await _transit_store(db)
+    await store.close()
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("genesis row does not verify under the key it names" in m for m in errors), errors
+
+
+def _dml_last_row_hash(db: Path) -> str:
+    """The stored MAC of the newest audit row, read directly from the SQLite file."""
+    with sqlite3.connect(db) as conn:
+        row = conn.execute("SELECT row_hash FROM audit_log ORDER BY seq DESC LIMIT 1").fetchone()
+    assert row is not None and isinstance(row[0], str)
+    return row[0]
+
+
+def test_a_504_through_the_store_clients_request_path_reads_as_a_timeout() -> None:
+    """A Transit ``verify`` call made through the store's real hvac client, whose session answers
+    504, raises an error that reads as a timeout: hvac's request path goes through the recorded
+    ``_raise_for_error`` (BACKLOG #8222)."""
+    _needs_hvac()
+    import requests
+
+    from messagefoundry.store import keyprovider_vault
+    from messagefoundry.store.keyprovider_vault import is_vault_timeout_reply
+
+    client = keyprovider_vault._build_client(
+        "https://vault.example.test:8200", "s.synthetic-token", revocation_attested=True
+    )
+
+    def answer_504(*_a: Any, **_kw: Any) -> requests.Response:
+        reply = requests.Response()
+        reply.status_code = 504
+        reply._content = b"<html>gateway timeout</html>"
+        return reply
+
+    client.adapter.session.request = answer_504
+    with pytest.raises(Exception) as caught:
+        client.secrets.transit.verify_signed_data(
+            name=_KEY_NAME, hash_input="cm93", hmac="vault:v1:AAAA", hash_algorithm="sha2-256"
+        )
+    assert is_vault_timeout_reply(caught.value), type(caught.value)
+
+
+def test_the_store_vault_client_records_the_reply_status_on_hvacs_error() -> None:
+    """The client the store's Transit cipher is built from records each failed reply's status, so
+    a 504 is told from a 413 that hvac raises as the same class (BACKLOG #8222)."""
+    _needs_hvac()
+    import requests
+    from hvac.exceptions import UnexpectedError
+
+    from messagefoundry.store import keyprovider_vault
+    from messagefoundry.store.keyprovider_vault import is_vault_timeout_reply
+
+    client = keyprovider_vault._build_client(
+        "https://vault.example.test:8200", "s.synthetic-token", revocation_attested=True
+    )
+    for status, timeout in ((504, True), (408, True), (413, False), (412, False)):
+        reply = requests.Response()
+        reply.status_code = status
+        with pytest.raises(UnexpectedError) as caught:
+            client.adapter._raise_for_error("POST", "https://vault.example.test:8200/v1/x", reply)
+        assert is_vault_timeout_reply(caught.value) is timeout, status
+    assert not is_vault_timeout_reply(UnexpectedError("no status recorded"))
+
+
+def _transit_to_in_heap_chain(cipher: Any) -> tuple[list[dict[str, Any]], dict[str, bytes]]:
+    """A chain whose first range is MAC'd in Transit under ``cipher`` and whose second is under an
+    in-heap key, so its range row carries a handover tag Transit made."""
+    from messagefoundry.store.crypto import audit_key_id, generate_key
+    from messagefoundry.store.store import (
+        AUDIT_KEY_EPOCH_ACTION,
+        AUDIT_TRANSIT_KEY_ID,
+        audit_genesis_detail,
+        audit_handover_tag,
+        audit_range_closing,
+        audit_row_hash,
+        audit_scheme_for,
+    )
+    from tests.audit_chain_cases import _mac_key, epoch_record
+
+    mac_fn = cipher.audit_mac_fn()
+    b_mac = _mac_key(generate_key())
+    b_id = audit_key_id(b_mac)
+    rows: list[dict[str, Any]] = []
+
+    def add(action: str, detail: str, key: bytes | None) -> None:
+        row: dict[str, Any] = {
+            "id": len(rows) + 1,
+            "seq": len(rows) + 1,
+            "ts": float(len(rows) + 1),
+            "actor": "u",
+            "action": action,
+            "channel_id": None,
+            "detail": detail,
+            "client": None,
+        }
+        prev = rows[-1]["row_hash"] if rows else ""
+        fields = {k: v for k, v in row.items() if k != "id"}
+        row["row_hash"] = audit_row_hash(
+            prev, **fields, key=key, mac=None if key is not None else mac_fn
+        )
+        rows.append(row)
+
+    add(AUDIT_KEY_EPOCH_ACTION, audit_genesis_detail(AUDIT_TRANSIT_KEY_ID), None)
+    add("act", "{}", None)
+    closes = audit_range_closing(rows, key_id=AUDIT_TRANSIT_KEY_ID, from_seq=1, prev_hash="")
+    scheme = audit_scheme_for(b_id)
+    tag = audit_handover_tag(b_id, closes, (None, mac_fn), scheme=scheme)
+    add(AUDIT_KEY_EPOCH_ACTION, epoch_record(b_id, closes, tag, scheme), b_mac)
+    add("act", "{}", b_mac)
+    return rows, {b_id: b_mac}
+
+
+def _malformed_handover_walk(reply: object) -> Any:
+    """The walk over :func:`_transit_to_in_heap_chain` once Transit answers every ``hmac`` with
+    ``reply``, the regenerated handover tag among them."""
+    from messagefoundry.store.crypto_transit import TransitCipher
+    from messagefoundry.store.store import verify_audit_rows
+    from tests.test_crypto_transit import _FakeClient
+
+    transit = _RotatingTransit()
+    cipher = TransitCipher(_FakeClient(transit), _KEY_NAME)
+    rows, keys = _transit_to_in_heap_chain(cipher)
+    ok, message = verify_audit_rows(rows, mac_keys=keys, mac_fn=cipher.audit_mac_fn(), capable=True)
+    assert ok, message  # the control: the chain verifies while Transit answers well-formed MACs
+
+    def malformed(**_kw: Any) -> dict[str, Any]:
+        return {"data": {"hmac": reply}}
+
+    transit.generate_hmac = malformed  # type: ignore[method-assign]
+    return verify_audit_rows(rows, mac_keys=keys, mac_fn=cipher.audit_mac_fn(), capable=True)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        pytest.param("vault:not-a-version", id="names-no-version"),
+        pytest.param("vault:v1:AAAA", id="short-digest"),
+    ],
+)
+def test_a_malformed_transit_reply_to_a_handover_tag_is_a_break_in_the_walk(reply: str) -> None:
+    """A non-empty Transit reply that is no well-formed MAC, such as one naming no key version,
+    to the walk's regeneration of a range row's handover tag reads as a tag that does not match: a
+    break at that range row, as before engine PR 2903, never a walk that could not run (BACKLOG
+    #8222 item 5, owner ruling 2026-11-13)."""
+    ok, message = _malformed_handover_walk(reply)
+    assert not ok and "seq=3" in (message or "") and "not authorised" in (message or ""), message
+
+
+@pytest.mark.parametrize("reply", [pytest.param("", id="empty"), pytest.param(None, id="none")])
+def test_an_empty_or_non_text_transit_reply_to_a_handover_tag_still_could_not_run(
+    reply: object,
+) -> None:
+    """An empty or non-string reply raised a plain cipher error before engine PR 2903 too, so it
+    still ends the walk as one that could not run."""
+    from messagefoundry.store.crypto import AuditMacMalformedError
+
+    with pytest.raises(CipherError) as caught:
+        _malformed_handover_walk(reply)
+    assert not isinstance(caught.value, AuditMacMalformedError)
+
+
+class _MalformedHandoverTransit(_RotatingTransit):
+    """``_RotatingTransit`` that answers the ``hmac`` of a handover tag, and nothing else, with a
+    non-empty string naming no key version."""
+
+    def generate_hmac(self, *, hash_input: str, **kw: Any) -> dict[str, Any]:
+        from messagefoundry.store.store import _AUDIT_HANDOVER_INFO
+
+        if base64.b64decode(hash_input).startswith(_AUDIT_HANDOVER_INFO):
+            return {"data": {"hmac": "vault:not-a-version"}}
+        return super().generate_hmac(hash_input=hash_input, **kw)
+
+
+async def test_a_malformed_handover_reply_at_open_still_refuses_the_open(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A planted range row closing the Transit range, whose handover tag Transit answers with no
+    well-formed MAC, still refuses the store open, as on engine PR 2903: the open path is unruled
+    and on the owner's queue (BACKLOG #8222 item 5). It pins the limit: here the open's check
+    reaches the row and refuses, so no walk runs to read the row as a break."""
+    _needs_hvac()
+    from messagefoundry.store.crypto import audit_key_id, generate_key
+    from messagefoundry.store.store import (
+        AUDIT_KEY_EPOCH_ACTION,
+        AUDIT_TRANSIT_KEY_ID,
+        audit_range_closing,
+        audit_scheme_for,
+    )
+    from tests.audit_chain_cases import _mac_key, epoch_record
+
+    _use_fake(monkeypatch, _MalformedHandoverTransit())
+    db = tmp_path / "handover.db"
+    store = await _transit_store(db)
+    try:
+        await store.record_audit("test.before", actor="cli:tester")
+    finally:
+        await store.close()
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = [dict(r) for r in con.execute("SELECT * FROM audit_log ORDER BY seq")]
+    finally:
+        con.close()
+    b_id = audit_key_id(_mac_key(generate_key()))
+    closes = audit_range_closing(rows, key_id=AUDIT_TRANSIT_KEY_ID, from_seq=1, prev_hash="")
+    seq = len(rows) + 1
+    detail = epoch_record(b_id, closes, "vault:v1:planted", audit_scheme_for(b_id))
+    _dml(
+        db,
+        "INSERT INTO audit_log (seq, ts, actor, action, detail, row_hash) VALUES (?, ?, ?, ?, ?, ?)",
+        (seq, time.time(), "cli:tester", AUDIT_KEY_EPOCH_ACTION, detail, "0" * 64),
+    )
+    from messagefoundry.store.crypto import AuditMacMalformedError
+
+    with pytest.raises(AuditMacMalformedError):
+        await _transit_store(db)
+
+
 #: Vault's own text for an audit-MAC call refused for its version, as hvac carries it.
 _VERSION_400 = ("key version does not exist; latest key version is 2",)
 #: A proxy's or WAF's own 400 page: no Vault JSON at all.
