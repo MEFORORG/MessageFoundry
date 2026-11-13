@@ -335,6 +335,7 @@ from messagefoundry.store.store import (
     check_executing_owner_filter,
     check_open_store_pin,
     check_password_generated,
+    cleanup_failed_open,
     conditional_way_past,
     create_batch_failure,
     delivery_key,
@@ -4266,6 +4267,8 @@ class SqlServerStore:
         )
         store._pool_executor = executor
         store._read_only = read_only
+        # Set once the salt bind holds: only then is the reserved block this store's to settle.
+        salt_bound = False
         try:
             await store._ensure_schema(create=create, read_only=read_only)
             # Right after the schema, so a later open step that fails still leaves the report
@@ -4287,6 +4290,7 @@ class SqlServerStore:
                 # reserved next and every value sealed after it land under this store's own data
                 # sub-key. A read-only handle seals nothing; every stored value names its own salt.
                 await bind_store_salt(store._cipher, store._ensure_store_salt)
+                salt_bound = True
                 # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the
                 # first block BEFORE anything on this handle encrypts — the at-rest migration below
                 # included, since on a store that is having a key enabled for the first time it is
@@ -4307,22 +4311,31 @@ class SqlServerStore:
                 # ADR 0005 read-through cache warm-up
                 await store._load_state_cache_noting(folded)
                 await store._load_reference_cache()  # ADR 0006 reference-snapshot read cache
-        except Exception:
-            # Don't leak the pool if first-open initialization fails (M-6). The executor is released
-            # in a finally, same as close() above: wait_closed() cannot complete while the pool is
-            # wedged, so releasing the executor only on the success path would leak its threads in
-            # exactly the case this except exists for.
-            try:
+        except BaseException as exc:
+            # Don't leak the pool if first-open initialization fails (M-6), a cancel included, and
+            # settle the block this open reserved rather than forfeit it (BACKLOG #5720). The
+            # executor is released in a finally, same as close() above: wait_closed() cannot
+            # complete while the pool is wedged, so releasing the executor only on the success path
+            # would leak its threads in exactly the case this except exists for.
+            async def _release() -> None:
                 try:
-                    pool.close()
-                    await pool.wait_closed()
-                finally:
-                    executor.shutdown(wait=False)
-            except Exception as cleanup:
-                # Logged by class, so it never replaces the open's own error (vault BACKLOG #3054).
-                log.warning(
-                    "closing the pool after a failed open also failed (%s)", type(cleanup).__name__
-                )
+                    try:
+                        pool.close()
+                        await pool.wait_closed()
+                    finally:
+                        executor.shutdown(wait=False)
+                except Exception as cleanup:  # noqa: BLE001 — never mask the open's error
+                    # Logged by class, so it never replaces the open's own error (vault #3054).
+                    log.warning(
+                        "closing the pool after a failed open also failed (%s)",
+                        type(cleanup).__name__,
+                    )
+
+            await cleanup_failed_open(
+                exc,
+                _release,
+                checkpoint=store.checkpoint_cipher_invocations if salt_bound else None,
+            )
             raise
         return store
 
@@ -5565,9 +5578,10 @@ class SqlServerStore:
                 # LOGIN timeout (SQL_ATTR_LOGIN_TIMEOUT). The DSN cannot carry it (#1626).
                 timeout=settings.connect_timeout,
             )
-        except Exception:
+        except BaseException:
             # Same M-6 leak, one call earlier: nothing references the executor yet if the pool itself
-            # never comes up (bad DSN, connect timeout, auth failure), so it has to be released here too.
+            # never comes up (bad DSN, connect timeout, auth failure, a cancel), so it has to be
+            # released here too (BACKLOG #5720).
             executor.shutdown(wait=False)
             raise
         return pool, executor

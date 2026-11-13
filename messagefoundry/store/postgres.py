@@ -328,6 +328,7 @@ from messagefoundry.store.store import (
     check_executing_owner_filter,
     check_open_store_pin,
     check_password_generated,
+    cleanup_failed_open,
     conditional_way_past,
     create_batch_failure,
     delivery_key,
@@ -2219,6 +2220,8 @@ class PostgresStore:
             message_events=message_events,
         )
         store._read_only = read_only
+        # Set once the salt bind holds: only then is the reserved block this store's to settle.
+        salt_bound = False
         try:
             await store._ensure_schema(create=create, read_only=read_only)
             if not read_only:
@@ -2227,6 +2230,7 @@ class PostgresStore:
                 # reserved next and every value sealed after it land under this store's own data
                 # sub-key. A read-only handle seals nothing; every stored value names its own salt.
                 await bind_store_salt(store._cipher, store._ensure_store_salt)
+                salt_bound = True
                 # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the
                 # first block BEFORE anything on this handle encrypts — the at-rest migration below
                 # included, since on a store that is having a key enabled for the first time it is
@@ -2250,15 +2254,25 @@ class PostgresStore:
                 await (
                     store._load_reference_cache()
                 )  # populate the reference-snapshot read cache (ADR 0006)
-        except Exception:
-            # Don't leak the pool if first-open initialization fails (M-6). A cleanup that fails is
-            # logged by class, so it never replaces the open's own error (vault BACKLOG #3054).
-            try:
-                await pool.close()
-            except Exception as cleanup:
-                log.warning(
-                    "closing the pool after a failed open also failed (%s)", type(cleanup).__name__
-                )
+        except BaseException as exc:
+            # Don't leak the pool if first-open initialization fails (M-6), a cancel included, and
+            # settle the block this open reserved rather than forfeit it (BACKLOG #5720). A cleanup
+            # that fails is logged by class, so it never replaces the open's own error (vault
+            # BACKLOG #3054).
+            async def _release() -> None:
+                try:
+                    await pool.close()
+                except Exception as cleanup:  # noqa: BLE001 — never mask the open's error
+                    log.warning(
+                        "closing the pool after a failed open also failed (%s)",
+                        type(cleanup).__name__,
+                    )
+
+            await cleanup_failed_open(
+                exc,
+                _release,
+                checkpoint=store.checkpoint_cipher_invocations if salt_bound else None,
+            )
             raise
         return store
 

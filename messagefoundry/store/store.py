@@ -1948,6 +1948,38 @@ async def _run_to_completion(
     return cancelled, failure
 
 
+async def cleanup_failed_open(
+    exc: BaseException,
+    release: Callable[[], Awaitable[None]],
+    *,
+    checkpoint: Callable[..., Awaitable[object]] | None = None,
+) -> None:
+    """Run a failed store open's cleanup to completion through :func:`_run_to_completion`, so a
+    cancel cannot cut it short and leak what the open built (BACKLOG #5720). ``settle`` is the
+    store's ``checkpoint_cipher_invocations``, passed only once the open has bound the cipher to
+    this store's salt: it then squares the block the open reserved. ``release`` closes what the
+    open built and logs its own failures by class. A settle failure is logged by class too, so
+    neither replaces the open's error (vault BACKLOG #3054). Raises a cancel that landed during
+    the cleanup when ``exc`` is not one; the caller re-raises ``exc`` otherwise."""
+
+    async def body() -> None:
+        if checkpoint is not None:
+            try:
+                await checkpoint(settle=True)
+            except Exception as failure:  # noqa: BLE001 — cleanup must never mask the open's error
+                log.warning(
+                    "could not settle the AES-GCM invocation bound after a failed store open (%s)",
+                    type(failure).__name__,
+                )
+        await release()
+
+    # body() catches Exception, so _run_to_completion's revoke wording can only be logged for a
+    # BaseException that is not one, or a cancel of the body's own task.
+    cancelled, _failure = await _run_to_completion(body)
+    if cancelled and not isinstance(exc, asyncio.CancelledError):
+        raise asyncio.CancelledError from exc
+
+
 async def raise_account_epoch(
     write: Callable[[EpochBump], Awaitable[UserAuthzRecord | None]],
     outcome: RevokeSealOutcome,
@@ -11248,15 +11280,15 @@ class MessageStore:
             )
             store._read_only = read_only
             if not read_only:
+                # Foreign until the bind below holds: close() must not settle a cipher this open
+                # has not bound, a failure before the bind included (BACKLOG #5720).
+                store._cipher_foreign = True
                 await check_open_store_pin(store)  # vault BACKLOG #3411: before any write
                 # ADR 0196: bind this store's salt BEFORE the first checkpoint, so the block
                 # reserved next and every value sealed after it land under this store's own data
                 # sub-key. A read-only handle seals nothing; every stored value names its own salt.
-                try:
-                    await bind_store_salt(cipher, store._ensure_store_salt)
-                except BaseException:
-                    store._cipher_foreign = True
-                    raise
+                await bind_store_salt(cipher, store._ensure_store_salt)
+                store._cipher_foreign = False
                 # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the
                 # first block BEFORE anything on this handle encrypts — the at-rest migration below
                 # included, since on a store that is having a key enabled for the first time it is
@@ -11283,26 +11315,37 @@ class MessageStore:
             if store._group_commit is not None:
                 store._group_commit.start()  # spin the committer coroutine (needs the running loop)
             return store
-        except BaseException:
+        except BaseException as exc:
             # Close the store when one was constructed — it owns the read pool's connections too,
             # each with its own worker thread — then the writer either way. `Connection.close` is
             # idempotent (it returns immediately once the connection is gone), so the second call
             # after a successful `store.close()` is a no-op. Both are best-effort: a failure while
-            # cleaning up must never replace the error the caller needs to see.
-            if store is not None:
+            # cleaning up must never replace the error the caller needs to see, so each is logged
+            # by class (vault BACKLOG #3054). Run to completion, so a cancel cannot cut it short
+            # and leave a non-daemon worker thread behind (BACKLOG #5720).
+            async def _release() -> None:
+                if store is not None:
+                    try:
+                        await store.close()
+                    except Exception as failure:  # noqa: BLE001 — never mask the real failure
+                        log.warning(
+                            "error closing a partially-opened store (%s)", type(failure).__name__
+                        )
                 try:
-                    await store.close()
-                except Exception:  # noqa: BLE001 — cleanup must never mask the real failure
-                    log.warning("error closing a partially-opened store", exc_info=True)
-            try:
-                await db.close()
-                # `close` returns before the worker thread it stops has left `threading.enumerate()`
-                # (see :func:`_await_connection_worker_exit`). A failed open is the shortest path
-                # there is — one PRAGMA, then straight out — so the caller most often wins that race
-                # here, and the caller of a raising `open` is entitled to find nothing left behind.
-                await _await_connection_worker_exit(db)
-            except Exception:  # noqa: BLE001 — cleanup must never mask the real failure
-                log.warning("error closing the connection after a failed store open", exc_info=True)
+                    await db.close()
+                    # `close` returns before the worker thread it stops has left
+                    # `threading.enumerate()` (see :func:`_await_connection_worker_exit`). A failed
+                    # open is the shortest path there is — one PRAGMA, then straight out — so the
+                    # caller most often wins that race here, and the caller of a raising `open` is
+                    # entitled to find nothing left behind.
+                    await _await_connection_worker_exit(db)
+                except Exception as failure:  # noqa: BLE001 — never mask the real failure
+                    log.warning(
+                        "error closing the connection after a failed store open (%s)",
+                        type(failure).__name__,
+                    )
+
+            await cleanup_failed_open(exc, _release)
             raise
 
     @classmethod
@@ -11417,10 +11460,12 @@ class MessageStore:
                 conn = await aiosqlite.connect(uri, uri=True)
             else:
                 conn = await aiosqlite.connect(path)
+            # Tracked before its first PRAGMA, so close() reaches it, and its non-daemon worker
+            # thread, when a PRAGMA fails (BACKLOG #5720).
+            self._read_conns.append(conn)
             conn.row_factory = aiosqlite.Row
             await conn.execute("PRAGMA query_only=ON")  # defence in depth: a read conn never writes
             await conn.execute("PRAGMA busy_timeout=5000")
-            self._read_conns.append(conn)
             pool.put_nowait(conn)
         self._read_pool = pool
 
