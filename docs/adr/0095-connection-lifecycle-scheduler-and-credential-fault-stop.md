@@ -378,8 +378,10 @@ reads the status of the proxy's reply and a flag the hop sets when it is built, 
 handler never sees that 407, so no retry can answer it, whatever the proxy's challenge says. The
 error carries no challenge, so a Digest-set-up proxy that challenges the `CONNECT` with Basic is
 read the same way; the engine holds no Basic credential there to answer it with. The remedies
-are a bypass for the token host, which sends no proxy credential, or `proxy_auth_type = "basic"`,
-which urllib sends on the `CONNECT` in recoverable form, where Digest never sends the password.
+are a route to the token host that crosses no authenticating proxy, or `proxy_auth_type =
+"basic"`, which urllib sends on the `CONNECT` in recoverable form, where Digest never sends the
+password. A per-host bypass is such a route only where no environment or system proxy then
+carries the request.
 A `CONNECT` 407 on a token hop with no Digest set up, a rejected pre-emptive Basic credential
 among them, still reads as unreachable and retries, which keeps the Basic case above. Any other
 `CONNECT` status retries too. The case needs a loopback `http://` destination, since proxy Digest

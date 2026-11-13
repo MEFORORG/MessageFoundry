@@ -355,12 +355,10 @@ AUTH_CHALLENGE_REFUSED = (
 
 #: The FIXED text for the one case no Digest handler sees: the token hop's web proxy, set up for
 #: Digest, answered the ``CONNECT`` for an ``https`` token endpoint with 407. Nothing was screened,
-#: so :data:`AUTH_CHALLENGE_REFUSED`'s hash and challenge words would be false here. It names the
-#: proxy, then the remedy that sends no credential, and points at ADR 0095 Amendment B.1, which
-#: also gives Basic proxy auth and what that costs.
+#: so :data:`AUTH_CHALLENGE_REFUSED`'s hash and challenge words would be false here. It states the
+#: fault only; ADR 0095 Amendment B.1 gives the remedy.
 AUTH_CHALLENGE_REFUSED_ON_CONNECT = (
-    "met a 407 from its web proxy on the CONNECT, which Digest cannot answer; "
-    "bypass the proxy for this host (ADR 0095 B.1)"
+    "met a 407 from its web proxy on the CONNECT, which Digest cannot answer (ADR 0095 B.1)"
 )
 
 

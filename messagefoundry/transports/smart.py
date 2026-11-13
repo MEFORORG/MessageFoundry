@@ -190,12 +190,12 @@ def _read_token_reply(
     except (TimeoutError, OSError) as exc:
         raise DeliveryError(f"{endpoint} failed: {exc}") from exc
     except HttpAuthError as exc:
-        # BACKLOG #1171: this opener carries the web proxy's Digest handler, which refuses a 407 it will
-        # not answer (a hash other than SHA-256, or a challenge it cannot parse) with an HttpAuthError.
-        # That is a ValueError, and it escaped this function's DeliveryError contract. Fixed text: the
-        # refusal names the peer's own algorithm token, which stays on the cause only.
-        # BACKLOG #2989: the same classification the delivery hop gives this refusal. A plain
-        # DeliveryError here retried a refusal that no retry can clear.
+        # BACKLOG #1171, #2989: the proxy Digest handler's refusal, classified as the delivery hop
+        # classifies it. No built configuration reaches this arm now: an http:// token endpoint must
+        # be loopback and is dialled direct, and an https:// one meets the proxy only on a CONNECT,
+        # which the URLError arm above takes (ADR 0095 B.1). Kept so a refusal that did arrive would
+        # still be this fault rather than escape the DeliveryError contract as a ValueError. Fixed
+        # text: the peer's algorithm token stays on the cause only.
         raise auth_challenge_refused(endpoint) from exc
     except EgressReplyError:
         # A bare CR in the reply head raises MalformedReplyHeadError, which is an HTTPException as

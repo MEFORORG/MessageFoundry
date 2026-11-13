@@ -861,7 +861,8 @@ def test_the_connect_407_match_reads_the_status_and_the_built_digest_setup(
 ) -> None:
     """The match takes the status from ``ProxyTunnelRefusedError`` and the Digest setup from the
     hop's build, and reads no text: a bare ``OSError`` carrying ``_tunnel``'s 407 text does not
-    match, because every engine opener raises the typed error for a refused CONNECT."""
+    match, because the strict https connection the token hop dials raises the typed error for a
+    refused CONNECT."""
     match = ProxyTunnelRefusedError(_TUNNEL_407, status=407)
     assert is_refused_proxy_digest_tunnel(urllib.error.URLError(match), digest_proxy=True)
     refused = urllib.error.URLError(reason)  # type: ignore[arg-type]
