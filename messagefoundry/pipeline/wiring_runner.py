@@ -9795,9 +9795,8 @@ class RegistryRunner:
         re-pend in :meth:`~messagefoundry.pipeline.stage_dispatcher.StageDispatcher._run_lane`.
         Returns how the hold ended. Only ``STOPPED``, the runner stopping with the rows still held,
         makes the caller return rather than claim again; every other end leaves the rows INFLIGHT
-        and the worker loops on, as it did before step 2 after one failed write. The one exception
-        is the transform worker's retry of a voided STOP's tail release (BACKLOG #5708), which was
-        returning anyway: it goes on only on ``LANDED``, and returns on every other end.
+        and the worker loops on, as it did before step 2 after one failed write. Not every caller
+        does: at least the voided-STOP retry in :meth:`_transform_worker` goes on only on ``LANDED``.
 
         The claim is its own committed transaction, so a fault in the handoff that follows leaves the
         claimed row INFLIGHT. Every claim path selects ``status='pending'``, so a worker that went on
@@ -11710,11 +11709,13 @@ class RegistryRunner:
                 self._transform_gone_stops.discard(name)  # only this batch's STOP may set it
                 if await self._process_routed_batch(name, items):
                     released = await self._release_tail_on_stop("transform", name, claimed)
-                    if not released and self._transform_stop_voidable(name):
+                    if not released and fence.may_write() and self._transform_stop_voidable(name):
                         # The STOP is void, but its one release failed. A store fault there must not
                         # leave the lane down with its inbound deployed, so re-pend the tail as the
                         # except arm below does: retried while this worker holds the lane, so no
                         # claim passes those rows. Only LANDED frees them; any other end returns.
+                        # Not under a lease other than the claim's: this is a second write, and a
+                        # successor may hold the rows (RependFence).
                         held = await self._repend_claimed_on_fault(
                             "transform",
                             name,

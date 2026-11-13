@@ -752,15 +752,24 @@ async def test_a_restore_does_not_keep_a_worker_draining_past_a_tail_it_could_no
         await runner.stop()
 
 
-@pytest.mark.parametrize("repend", ["lands", "fails"])
-@pytest.mark.parametrize("window", ["mark_failed", "release_tail"])
+@pytest.mark.parametrize(
+    ("window", "repend"),
+    [
+        ("mark_failed", "lands"),
+        ("mark_failed", "fails"),
+        ("release_tail", "lands"),
+        ("release_tail", "fails"),
+        (None, "lands"),
+    ],
+)
 async def test_a_per_lane_release_fault_in_the_restore_window_does_not_take_the_lane_down(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch, window: str, repend: str
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, window: str | None, repend: str
 ) -> None:
     # The restore lands while the per-lane worker stops, and its one release of the batch tail
     # fails. The STOP is void, so the worker re-pends the tail, held, as its except arm does. Once
     # that lands, the lane keeps running and drains every row, as it does when the release lands.
     # While it fails, the worker holds the lane and transforms nothing past the rows in flight.
+    # With no restore (None) the STOP is not void: no re-pend is sent and the worker returns.
     monkeypatch.setattr(wiring_runner, "_WORKER_ERROR_BACKOFF_SECONDS", 0.01)
     calls: list[str] = []
     full = _registry(calls)
@@ -781,15 +790,35 @@ async def test_a_per_lane_release_fault_in_the_restore_window_does_not_take_the_
         raise RuntimeError("store fault")
 
     monkeypatch.setattr(store, "release_claimed", release_claimed)
-    if repend == "fails":
+    real_reschedule = store.reschedule_claimed
 
-        async def reschedule_claimed(ids: Any, when: float) -> None:
-            faults["reschedule_claimed"] += 1
+    async def reschedule_claimed(ids: Any, when: float) -> Any:
+        faults["reschedule_claimed"] += 1
+        if repend == "fails":
             raise RuntimeError("store fault")
+        return await real_reschedule(ids, when)
 
-        monkeypatch.setattr(store, "reschedule_claimed", reschedule_claimed)
+    monkeypatch.setattr(store, "reschedule_claimed", reschedule_claimed)
     await runner.start()
     try:
+        if window is None:
+
+            async def down() -> bool:
+                return _lane_down(runner)
+
+            assert await _until(down), "a lane whose inbound is gone kept running"
+            await asyncio.sleep(0.2)  # well past the revert's backoff
+            assert faults["reschedule_claimed"] == 0, "a STOP that is not void re-pended its tail"
+            assert calls == []
+            statuses = [await _routed_status(store, m) for m in message_ids]
+            assert statuses == [
+                OutboxStatus.PENDING.value,
+                OutboxStatus.INFLIGHT.value,
+                OutboxStatus.INFLIGHT.value,
+                OutboxStatus.PENDING.value,
+            ]
+            assert faults["release_claimed"] >= 1, "the tail release never failed"
+            return
         if repend == "lands":
 
             async def drained() -> bool:
@@ -881,6 +910,7 @@ async def test_a_pooled_stop_whose_tail_release_did_not_land_stays_stopped(
         assert statuses == {OutboxStatus.PENDING.value}
     else:
         assert dispatcher.stopped(LOOP), f"{end}: a lane holding rows in flight was re-armed"
+        assert asked == [], f"{end}: the runner's STOP record was taken for a lane left stopped"
         assert statuses == {OutboxStatus.INFLIGHT.value}
 
 

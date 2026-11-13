@@ -103,8 +103,8 @@ class HoldResult(Enum):
     caller returns. Every other end sends no further retry of that write, leaves its rows
     INFLIGHT, and lets the caller go on as it did before step 2 after its one failed write: a
     per-lane worker loops, a pooled serializer runs its terminal transition, after at most one
-    tail release (``_run_lane`` says when). The per-lane transform worker's retry of a voided
-    STOP's tail release is the exception: it loops only on ``LANDED`` (BACKLOG #5708)."""
+    tail release (``_run_lane`` says when). ``RegistryRunner._repend_claimed_on_fault`` names
+    at least one caller that differs."""
 
     LANDED = auto()  # the write landed
     STOPPED = auto()  # the engine is stopping: the rows stay INFLIGHT for the next start
