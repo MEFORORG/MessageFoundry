@@ -1433,3 +1433,142 @@ async def test_a_failed_open_waits_for_its_connection_worker_thread(tmp_path, mo
     assert still_running == [], (
         f"a failed open returned with live aiosqlite worker(s): {', '.join(still_running)}"
     )
+
+
+async def _workers_left(watched: set[threading.Thread], *, within: float = 2.0) -> list[str]:
+    """The watched aiosqlite workers still alive after ``within`` seconds. A leaked connection's
+    worker never exits, so the deadline tells it apart from one already on its way out."""
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline and any(t.is_alive() for t in watched):
+        await asyncio.sleep(0.01)
+    return sorted(t.name for t in watched if t.is_alive())
+
+
+async def test_a_read_pool_pragma_failure_closes_that_connection(tmp_path, monkeypatch) -> None:
+    """BACKLOG #5720: ``_open_read_pool`` ran both PRAGMAs before it tracked the connection, so a
+    PRAGMA that raised left a connection ``close()`` never reached, and its non-daemon worker
+    outlived the failed open. Red before the fix: that one worker is still running."""
+    watched: set[threading.Thread] = set()
+    opened = _watch_aiosqlite_connects(monkeypatch, watched)
+    to_the_file: list[aiosqlite.Connection] = []
+    watched_connect = aiosqlite.connect
+
+    def failing_pool_connect(*args, **kwargs):
+        conn = watched_connect(*args, **kwargs)
+        # The schema check may open a ":memory:" scratch connection, cached across tests.
+        if args and str(args[0]) == ":memory:":
+            return conn
+        if to_the_file:  # the writer connects first; every later one to the file is the pool's
+            real_execute = conn.execute
+
+            def execute(sql, *a, **k):
+                if sql == "PRAGMA query_only=ON":
+                    raise sqlite3.OperationalError("query_only boom")
+                return real_execute(sql, *a, **k)
+
+            conn.execute = execute  # type: ignore[method-assign]
+        to_the_file.append(conn)
+        return conn
+
+    monkeypatch.setattr(aiosqlite, "connect", failing_pool_connect)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="query_only boom"):
+            await MessageStore.open(tmp_path / "pool.db")
+        left = await _workers_left(watched)
+    finally:
+        for conn in opened:  # so a red run does not hang interpreter exit on the leaked worker
+            await conn.close()
+    assert len(to_the_file) == 2, f"expected the writer and one pool connection: {to_the_file}"
+    assert left == [], f"a failed open left live aiosqlite worker(s): {', '.join(left)}"
+
+
+async def test_a_cancel_during_a_failed_opens_cleanup_still_closes_every_connection(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """BACKLOG #5720: the failed open's cleanup ran unshielded, so a cancel landing inside
+    ``store.close()`` skipped the rest of it, the writer's close included, and left non-daemon
+    workers behind. Red before the fix: workers are still running. The cancel is still raised,
+    and the open's own failure is not logged with its text (vault BACKLOG #3054)."""
+    watched: set[threading.Thread] = set()
+    opened = _watch_aiosqlite_connects(monkeypatch, watched)
+    closing = asyncio.Event()
+    real_close = MessageStore.close
+
+    async def slow_close(self: MessageStore) -> None:
+        closing.set()
+        await asyncio.sleep(0.2)
+        await real_close(self)
+
+    async def boom(self: MessageStore) -> None:
+        raise RuntimeError("reference cache boom with driver text")
+
+    monkeypatch.setattr(MessageStore, "close", slow_close)
+    monkeypatch.setattr(MessageStore, "_load_reference_cache", boom)
+    task = asyncio.create_task(MessageStore.open(tmp_path / "cancel.db"))
+    try:
+        await asyncio.wait_for(closing.wait(), 10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+        left = await _workers_left(watched)
+    finally:
+        for conn in opened:  # so a red run does not hang interpreter exit on a leaked worker
+            await conn.close()
+    assert left == [], f"a cancelled cleanup left live aiosqlite worker(s): {', '.join(left)}"
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert "driver text" not in caplog.text
+
+
+async def test_a_failed_opens_cleanup_logs_by_class_only(tmp_path, monkeypatch, caplog) -> None:
+    """BACKLOG #5720, vault BACKLOG #3054: a failure while the failed open cleans up is logged by
+    its class, never its text, which may carry a path or a driver's detail."""
+
+    async def boom(self: MessageStore) -> None:
+        raise RuntimeError("reference cache boom")
+
+    async def failing_close(self: MessageStore) -> None:
+        raise OSError("close failed on C:/secret/path")
+
+    monkeypatch.setattr(MessageStore, "_load_reference_cache", boom)
+    monkeypatch.setattr(MessageStore, "close", failing_close)
+    with pytest.raises(RuntimeError, match="reference cache boom"):
+        await MessageStore.open(tmp_path / "logged.db")
+    assert "error closing a partially-opened store (OSError)" in caplog.text
+    assert "secret" not in caplog.text
+
+
+async def test_a_pin_refused_open_settles_nothing(tmp_path, monkeypatch) -> None:
+    """BACKLOG #5720: a writable open that fails BEFORE its salt bind (here the pin check) must not
+    settle, because the cipher is not yet this store's. Red before the fix: the close the failed
+    open runs settles once."""
+    settles: list[bool] = []
+
+    async def record(self: MessageStore, *, settle: bool = False) -> None:
+        settles.append(settle)
+
+    async def refused(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("pin refused")
+
+    monkeypatch.setattr(MessageStore, "checkpoint_cipher_invocations", record)
+    monkeypatch.setattr("messagefoundry.store.store.check_open_store_pin", refused)
+    with pytest.raises(RuntimeError, match="pin refused"):
+        await MessageStore.open(tmp_path / "refused.db")
+    assert settles == []
+
+
+async def test_a_failed_open_after_the_bind_still_settles(tmp_path, monkeypatch) -> None:
+    """BACKLOG #5720, the other side of the guard: once the bind holds, the failed open's close
+    settles the block the open reserved, as on main."""
+    settles: list[bool] = []
+
+    async def record(self: MessageStore, *, settle: bool = False) -> None:
+        settles.append(settle)
+
+    async def boom(self: MessageStore) -> None:
+        raise RuntimeError("reference cache boom")
+
+    monkeypatch.setattr(MessageStore, "checkpoint_cipher_invocations", record)
+    monkeypatch.setattr(MessageStore, "_load_reference_cache", boom)
+    with pytest.raises(RuntimeError, match="reference cache boom"):
+        await MessageStore.open(tmp_path / "bound.db")
+    assert settles == [False, True]

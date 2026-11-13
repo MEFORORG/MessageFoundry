@@ -24,6 +24,7 @@ that probe FAILS the open when it cannot verify RCSI, and this test is about wha
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 import types
@@ -199,3 +200,152 @@ async def test_open_shuts_down_the_executor_when_create_pool_itself_fails(
         await SqlServerStore.open(_settings())
 
     assert fake_executor.shutdown_calls == [False]
+
+
+def _keyed_open_steps(monkeypatch: pytest.MonkeyPatch, settles: list[bool]) -> None:
+    """Stand the writable open's at-open steps down to no-ops, recording each invocation checkpoint
+    by its ``settle`` flag, so a test can fail exactly one later step (BACKLOG #5720)."""
+
+    async def _noop(*_args: object, **_kwargs: object) -> Any:
+        return None
+
+    async def _checkpoint(self: SqlServerStore, *, settle: bool = False) -> None:
+        settles.append(settle)
+
+    monkeypatch.setattr(SqlServerStore, "_ensure_schema", _noop)
+    monkeypatch.setattr(SqlServerStore, "_report_state_key_collation", _noop)
+    monkeypatch.setattr(sqlserver_module, "check_open_store_pin", _noop)
+    monkeypatch.setattr(sqlserver_module, "bind_store_salt", _noop)
+    monkeypatch.setattr(SqlServerStore, "checkpoint_cipher_invocations", _checkpoint)
+
+
+async def _sweep_boom(self: SqlServerStore) -> None:
+    raise RuntimeError("at-rest sweep boom")
+
+
+def _fake_executor(monkeypatch: pytest.MonkeyPatch) -> _FakeExecutor:
+    executor = _FakeExecutor()
+    monkeypatch.setattr(
+        sqlserver_module, "_build_pool_executor", lambda settings, maxsize=None: executor
+    )
+    return executor
+
+
+async def test_a_cancelled_open_closes_the_pool_and_releases_the_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720: a cancel is a ``BaseException``, so the ``except Exception`` cleanup let it
+    pass, and the pool and the executor's threads stayed. Red before the fix: nothing closed."""
+    pool = _FakePool()
+    _install_fake_aioodbc(monkeypatch, pool)
+    executor = _fake_executor(monkeypatch)
+
+    async def _cancelled(self: SqlServerStore, **_kwargs: object) -> bool:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(SqlServerStore, "_ensure_schema", _cancelled)
+
+    with pytest.raises(asyncio.CancelledError):
+        await SqlServerStore.open(_settings())
+
+    assert pool.closed == 1
+    assert pool.wait_closed_called == 1
+    assert executor.shutdown_calls == [False]
+
+
+async def test_a_cancelled_create_pool_releases_the_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720: ``_create_pool`` released the executor on an ``Exception`` only, so a cancel
+    while the pool connected leaked its threads. Red before the fix: no shutdown call."""
+
+    async def _create_pool(**kwargs: Any) -> Any:
+        raise asyncio.CancelledError
+
+    module = types.ModuleType("aioodbc")
+    module.connect = _connect_rcsi_on  # type: ignore[attr-defined]
+    module.create_pool = _create_pool  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "aioodbc", module)
+    executor = _fake_executor(monkeypatch)
+
+    with pytest.raises(asyncio.CancelledError):
+        await SqlServerStore.open(_settings())
+
+    assert executor.shutdown_calls == [False]
+
+
+async def test_a_failed_keyed_open_settles_the_block_it_reserved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720: the cleanup closed the pool without settling the block the open reserved.
+    Red before the fix: ``settles`` is ``[False]``."""
+    pool = _FakePool()
+    _install_fake_aioodbc(monkeypatch, pool)
+    executor = _fake_executor(monkeypatch)
+    settles: list[bool] = []
+    _keyed_open_steps(monkeypatch, settles)
+    monkeypatch.setattr(SqlServerStore, "_encrypt_existing_rows", _sweep_boom)
+
+    with pytest.raises(RuntimeError, match="at-rest sweep boom"):
+        await SqlServerStore.open(_settings())
+
+    assert settles == [False, True]
+    assert pool.closed == 1
+    assert executor.shutdown_calls == [False]
+
+
+@pytest.mark.parametrize("step", ["check_open_store_pin", "bind_store_salt"])
+async def test_an_open_that_fails_at_or_before_the_salt_bind_settles_nothing(
+    monkeypatch: pytest.MonkeyPatch, step: str
+) -> None:
+    """BACKLOG #5720, the guard on the settlement: the cipher is not this store's until the bind
+    holds, so the cleanup settles nothing before then."""
+    pool = _FakePool()
+    _install_fake_aioodbc(monkeypatch, pool)
+    executor = _fake_executor(monkeypatch)
+    settles: list[bool] = []
+    _keyed_open_steps(monkeypatch, settles)
+
+    async def _refused(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError(f"{step} refused")
+
+    monkeypatch.setattr(sqlserver_module, step, _refused)
+
+    with pytest.raises(RuntimeError, match=f"{step} refused"):
+        await SqlServerStore.open(_settings())
+
+    assert settles == []
+    assert pool.closed == 1
+    assert executor.shutdown_calls == [False]
+
+
+async def test_a_cancel_during_the_cleanup_still_releases_everything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720: a cancel landing while the failed open settles must not skip the pool close
+    or the executor release, and the caller still sees the cancel."""
+    pool = _FakePool()
+    _install_fake_aioodbc(monkeypatch, pool)
+    executor = _fake_executor(monkeypatch)
+    settles: list[bool] = []
+    _keyed_open_steps(monkeypatch, settles)
+    settling = asyncio.Event()
+
+    async def _slow_checkpoint(self: SqlServerStore, *, settle: bool = False) -> None:
+        settles.append(settle)
+        if settle:
+            settling.set()
+            await asyncio.sleep(0.2)
+
+    monkeypatch.setattr(SqlServerStore, "checkpoint_cipher_invocations", _slow_checkpoint)
+    monkeypatch.setattr(SqlServerStore, "_encrypt_existing_rows", _sweep_boom)
+
+    task = asyncio.create_task(SqlServerStore.open(_settings()))
+    await asyncio.wait_for(settling.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert settles == [False, True]
+    assert pool.closed == 1
+    assert executor.shutdown_calls == [False]
