@@ -328,35 +328,67 @@ def test_an_earlier_quote_character_does_not_make_a_message_live(rig: SimpleName
     assert _allowed(rig, cmd, rig.outside)
 
 
-# ------------------------------------------------------------------ re-cut round: rule 3e and leftovers
+# ------------------------------------------------------------------ rule 3e: the time budget
+#
+# A hook killed by its 15 s timeout lets the command through, so each shape below must come back
+# DENIED, by any rule, well inside that timeout. The bound includes pwsh start-up, which the gate's own
+# clock cannot see. Each was measured past 15 s before the budget, with the trailing reset unjudged.
+
+_HOOK_BOUND_S = 13
 
 
-def test_a_line_of_150_worktree_removes_is_refused_fast_rather_than_timing_out(
-    rig: SimpleNamespace,
-) -> None:
-    """Measured before rule 3e: 24.3 s, past the 15 s kill, after which the trailing reset runs."""
+def _denied_in_time(rig: SimpleNamespace, cmd: str, cwd: Path) -> str:
     import time
 
+    started = time.monotonic()
+    reason = _reason(rig, cmd, cwd)
+    elapsed = time.monotonic() - started
+    assert elapsed < _HOOK_BOUND_S, f"the verdict took {elapsed:.1f}s; the install timeout is 15s"
+    return reason
+
+
+def test_a_line_of_150_worktree_removes_is_refused_in_time(rig: SimpleNamespace) -> None:
+    """Measured 24.3 s before."""
     removes = " ; ".join(f"git worktree remove {rig.tmp.as_posix()}/nope{i}" for i in range(150))
-    started = time.monotonic()
-    reason = _reason(rig, f"{removes} ; git reset --hard", rig.primary)
-    elapsed = time.monotonic() - started
-    assert "git invocations" in reason, reason
-    assert elapsed < 10, f"the refusal took {elapsed:.1f}s; the install timeout is 15s"
+    _denied_in_time(rig, f"{removes} ; git reset --hard", rig.primary)
 
 
-def test_twenty_git_invocations_are_still_judged_well_inside_the_timeout(
+def test_one_git_token_with_200_worktree_remove_words_is_refused_in_time(
     rig: SimpleNamespace,
 ) -> None:
-    """The cap's own measurement: twenty removes, the most rule 3e lets through, judged in full."""
-    import time
+    """Measured 18.7 s before: a count of git tokens saw two."""
+    words = " ".join(f"worktree remove {rig.tmp.as_posix()}/n{i}" for i in range(200))
+    _denied_in_time(rig, f"git {words} ; git reset --hard", rig.primary)
 
-    removes = " ; ".join(f"git worktree remove {rig.tmp.as_posix()}/nope{i}" for i in range(20))
-    started = time.monotonic()
-    assert _allowed(rig, removes, rig.primary)
-    elapsed = time.monotonic() - started
-    assert elapsed < 10, f"twenty removes took {elapsed:.1f}s; the install timeout is 15s"
-    assert "git invocations" in _reason(rig, removes + " ; git status", rig.primary)
+
+def test_twenty_removes_behind_a_97_kb_prefix_are_refused_in_time(rig: SimpleNamespace) -> None:
+    """Measured 25.7 s before: every invocation rescanned its own long prefix."""
+    filler = " ".join(f"'w{i:05d}'" for i in range(97 * 1024 // 9))
+    removes = " && ".join(f"git worktree remove ../n{i}" for i in range(19))
+    cmd = (
+        f"cd '{rig.outside.as_posix()}' && echo {filler} && {removes} && "
+        f"git -C {rig.primary.as_posix()} reset --hard"
+    )
+    _denied_in_time(rig, cmd, rig.outside)
+
+
+def test_200_identical_remove_lines_are_refused_in_time(rig: SimpleNamespace) -> None:
+    """Measured 24.0 s before: a count over distinct lines saw one."""
+    lines = "\n".join([f"git worktree remove {rig.tmp.as_posix()}/nope"] * 200)
+    _denied_in_time(rig, f"{lines}\ngit reset --hard", rig.primary)
+
+
+def test_commits_with_two_line_messages_are_not_double_counted(rig: SimpleNamespace) -> None:
+    """The count read the physical and the logical view of each commit, refusing 11 commits."""
+    cmd = "\n".join(f'git commit --allow-empty -q -m "a{i}\nb{i}"' for i in range(11))
+    assert _allowed(rig, cmd, rig.outside)
+
+
+def test_a_quote_pair_joined_to_a_further_piece_is_not_stripped(rig: SimpleNamespace) -> None:
+    """git receives `<tmp>/Outside/../Primary`, the primary. DENY on origin/main; stripping the pair
+    alone read the ungoverned `<tmp>/Outside` and allowed it."""
+    cmd = f"git -C '{rig.outside.as_posix()}'\"/../Primary\" reset --hard"
+    assert_denied(run_gate(shell(cmd, rig.primary), rig.repos))
 
 
 def test_a_quoted_cd_mention_in_a_message_is_not_a_chdir(rig: SimpleNamespace) -> None:

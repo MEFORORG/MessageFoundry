@@ -138,9 +138,11 @@ its quotes; and `Push-Location <x>; Pop-Location`, which is read as standing in 
 inside a quoted message, such as a commit message, keeps its own quotes, as it did before #5642,
 and so does a quoted path after a quote the line never closes.
 
-**A command with more than 20 git invocations is refused (rule 3e).** The hook has a fixed time to run,
-and a hook that runs out of time lets the command through unjudged, so past that count the gate refuses
-and asks for the command to be split. A git word inside a quoted message is not counted.
+**A command too costly to judge in time is refused (rule 3e).** The hook is killed after 15 s, and a
+killed hook lets the command through unjudged. So the gate keeps its own clock: once 7 s are spent,
+it stops judging before its next git call or scan, refuses, and asks for the command to be split. The
+clock does not interrupt a single step already running, so one git call against an unreachable host can
+still outlast the timeout.
 
 **Rule 3d judges every invocation on the line.** Each `git worktree remove` or `move` outside quotes is
 judged. Its victim is resolved against the line's first `-C`, and also against that invocation's

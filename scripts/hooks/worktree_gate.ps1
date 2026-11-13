@@ -73,10 +73,47 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.13.4"
+$GateVersion = "2026.11.13.5"
+# THE HOOK'S OWN CLOCK (rule 3e, review of BACKLOG #5643). Started first, so it covers everything this
+# script does; Assert-GateBudget reads it.
+$script:GateClock = [System.Diagnostics.Stopwatch]::StartNew()
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
+
+# -----------------------------------------------------------------------------------------------------
+# Rule 3e -- A COMMAND TOO COSTLY TO JUDGE IN TIME IS REFUSED (review of BACKLOG #5643). The install
+# gives this hook 15 s, and a hook killed by its timeout lets the command through. Rules 3, 3b, 3c and
+# 3d ask git per candidate, per victim and per base, and rescan text per invocation, so a long enough
+# line could outlast the timeout and carry a gated command past every rule. Measured on this branch:
+# 150 removes then `git reset --hard` 24.3 s; one git token with 200 `worktree remove` words 18.7 s;
+# 20 removes behind a 97 KB prefix 25.7 s; 200 identical remove lines 24.0 s; 200 `-C` tokens on one
+# `git config` 16.4 s. A count of git tokens bounded none of the last four.
+#
+# SO THE BOUND IS THE CLOCK, NOT A COUNT. $script:GateClock starts with the script; this is called
+# before every git call those rules make and before each costly rescan. Once 7 s are spent the gate
+# stops judging and refuses. 7 rather than 8 leaves room for pwsh start-up, which the clock cannot
+# see, and for one more rescan already under way. A command refused here was not judged at all.
+#
+# WHAT IT DOES NOT BOUND: a single PowerShell call that itself runs past the timeout (one rescan of an
+# enormous line, or one git call against an unreachable UNC host) is not interrupted, only the next
+# step is refused. Get-SegmentView's own 100,000-character cap limits the first.
+# -----------------------------------------------------------------------------------------------------
+$script:GateBudgetMs = 7000
+function Assert-GateBudget {
+    if ($null -eq $script:GateClock -or $script:GateClock.ElapsedMilliseconds -le $script:GateBudgetMs) { return }
+    Write-Deny -Rule "3e" -Detail "budget $($script:GateBudgetMs) ms spent" -Reason @"
+BLOCKED: the worktree gate ran out of time judging this command, so it refuses it rather than let it
+through unjudged.
+
+The gate has a fixed time to run, and a gate killed by its timeout lets the command through. This
+command needed more git checks or more scanning than fit in that time. Nothing about the command
+itself was found wrong.
+
+What to do instead:
+  * Split it into several shorter commands. Each is then judged in full, by the same rules.
+"@
+}
 
 function Write-Deny([string]$Reason, [string]$Rule = "?", [string]$Detail = "") {
     # Leave a RECEIPT before denying. Until this existed the gate was unfalsifiable: it wrote its decision
@@ -653,6 +690,7 @@ $script:BlankedMapCache = @{}
 function Test-InsideBlankedSpan([string]$Text, [int]$Index) {
     $key = "$($script:CaptureConvention)`0$Text"
     if (-not $script:BlankedMapCache.ContainsKey($key)) {
+        Assert-GateBudget
         $m = [System.Collections.Generic.List[int]]::new()
         $open = [System.Collections.Generic.List[int]]::new()
         [void](Remove-QuotedSpans $Text $script:CaptureConvention $m $open)
@@ -679,7 +717,13 @@ function Get-UnquotedCapture([System.Text.RegularExpressions.Group]$Group, [stri
         $inside = Test-InsideBlankedSpan $Text ($Group.Index + 1)
     }
     if ($inside) { return $value }
-    if ($RawDashC) { return (ConvertFrom-RawDashCValue $value) }
+    # A PAIR JOINED TO A FURTHER PIECE IS NOT THE WHOLE WORD (review round 6733bca6). For `-C
+    # '<a>'"/../b"` the reader stops at the `"`, and stripping the pair read the shorter `<a>`, while git
+    # receives `<a>/../b`: a governed target read as an ungoverned one, DENY to ALLOW. So a pair is
+    # stripped only when whitespace, a separator or the end of the text follows the capture.
+    $after = $Group.Index + $Group.Length
+    if ($after -lt $Text.Length -and $Text[$after] -notmatch '[\s;&|()]') { return $value }
+    if ($RawDashC){ return (ConvertFrom-RawDashCValue $value) }
     Remove-OuterQuotePair $value
 }
 
@@ -855,6 +899,7 @@ function Get-OwnInvocationWindow([string]$Scan, [int]$At, [switch]$SeparatorInTo
 # that is wrong would slice the raw line at the wrong place, which is the defect this exists to close.
 function Get-ScanRawIndexMap($Seg) {
     if ($null -eq $Seg -or $null -eq $Seg.Conv) { return $null }
+    Assert-GateBudget
     $map = [System.Collections.Generic.List[int]]::new()
     $again = Remove-QuotedSpans ([string]$Seg.Raw) ([string]$Seg.Conv) $map
     if ($again -cne [string]$Seg.Scan -or $map.Count -ne $again.Length) { return $null }
@@ -2651,7 +2696,7 @@ function Get-SessionRoot([string]$CwdCmp, [string]$CwdRaw) {
     # RAW path, never the Get-ComparablePath form: that one is lowercased, and this file warns twice that
     # a lowercased path handed to `git -C` passes on Windows and misses the real directory on a
     # case-sensitive filesystem. Any git failure just means "no answer", which is $null.
-    $common = "$(& git -C $CwdRaw rev-parse --git-common-dir 2>$null)".Trim()
+    $common = "$(Assert-GateBudget; & git -C $CwdRaw rev-parse --git-common-dir 2>$null)".Trim()
     if ($LASTEXITCODE -ne 0 -or -not $common) { return $null }
     $commonCmp = Get-ComparablePath $common $CwdRaw
     if (-not $commonCmp) { return $null }
@@ -2796,13 +2841,13 @@ function Get-RootCommonDirCmp($Root) {
     # lowercased path handed to `git -C` passes on Windows and misses the real directory on a
     # case-sensitive filesystem. Any git failure just means "no answer", which is the empty string.
     $where = $Root.Display
-    $top = "$(& git -C $where rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
+    $top = "$(Assert-GateBudget; & git -C $where rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
     # CULTURE, LEFT AS IT WAS. Ordinal here would send more roots to rule 3c's path test, which denies
     # more only while the root's git dir sits under it; a separate git dir breaks that, so the change
     # is not shown to deny at least as much. Git reports the toplevel of the directory it was handed,
     # so the two spellings differing by an ignorable character is not a shape this is known to meet.
     if ($LASTEXITCODE -eq 0 -and $top -and (Get-ComparablePath $top) -eq $key) {
-        $common = "$(& git -C $where rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
+        $common = "$(Assert-GateBudget; & git -C $where rev-parse --path-format=absolute --git-common-dir 2>$null)".Trim()
         if ($LASTEXITCODE -eq 0 -and $common) { $value = Get-ComparablePath $common }
     }
     $rootCommonCache[$key] = $value
@@ -3055,7 +3100,7 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw, [strin
     # worktrees): find the MAIN worktree of whatever repo it belongs to; act only if that main worktree
     # is a governed primary AND $wtRaw is a DIFFERENT (linked) worktree of it. All git calls take the RAW
     # path; only the results are canonicalised for comparison. Any git failure -> fail open.
-    $list = @(& git -C $wtRaw worktree list --porcelain 2>$null)
+    $list = @(Assert-GateBudget; & git -C $wtRaw worktree list --porcelain 2>$null)
     if ($LASTEXITCODE -ne 0 -or $list.Count -eq 0) { return }
     $mainLine = $list | Where-Object { $_ -match '^worktree ' } | Select-Object -First 1
     if (-not $mainLine) { return }
@@ -3063,7 +3108,7 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw, [strin
     $gov = Test-Governed $mainWt
     if (-not $gov) { return }                                     # repo's main tree isn't governed
 
-    $selfTopRaw = "$(& git -C $wtRaw rev-parse --show-toplevel 2>$null)".Trim()
+    $selfTopRaw = "$(Assert-GateBudget; & git -C $wtRaw rev-parse --show-toplevel 2>$null)".Trim()
     $selfTop = Get-ComparablePath $selfTopRaw
     if (-not $selfTop -or [string]::Equals($selfTop, $mainWt, [System.StringComparison]::Ordinal)) { return }        # $wtRaw IS the primary -- Rule 3 owns it
 
@@ -3087,14 +3132,14 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw, [strin
         # What it leaves open is a session standing outside every repository reaching into a worktree
         # with a class B verb; that is narrower than the hole this rule closes, and it is not new.
         if (-not $CwdRaw) { return }
-        $ownTopRaw = "$(& git -C $CwdRaw rev-parse --show-toplevel 2>$null)".Trim()
+        $ownTopRaw = "$(Assert-GateBudget; & git -C $CwdRaw rev-parse --show-toplevel 2>$null)".Trim()
         if ($LASTEXITCODE -ne 0 -or -not $ownTopRaw) { return }
         # ORDINAL, because a match ALLOWS. A culture `-eq` ignores a soft hyphen or a zero-width
         # character, so a session in `<p>-wt1` read `<p>-wt1<U+00AD>`, another session's worktree, as
         # its own and was allowed `reset --hard` into it. The same holds for the primary test above.
         if ([string]::Equals((Get-ComparablePath $ownTopRaw), $selfTop, [System.StringComparison]::Ordinal)) { return }   # the session's OWN worktree
 
-        $head = "$(& git -C $wtRaw rev-parse --abbrev-ref HEAD 2>$null)".Trim()
+        $head = "$(Assert-GateBudget; & git -C $wtRaw rev-parse --abbrev-ref HEAD 2>$null)".Trim()
         # EVERY interpolation goes through one of the two helpers, chosen ONLY by whether the value lands
         # in PROSE or in a COMMAND (BACKLOG #1040/#1076) -- the same discipline the class A message keeps,
         # and for the same reason: the branch name below is ATTACKER-CHOSEN from a public fork.
@@ -3161,7 +3206,7 @@ What to do instead:
         return
     }
 
-    $head = "$(& git -C $wtRaw rev-parse --abbrev-ref HEAD 2>$null)".Trim()
+    $head = "$(Assert-GateBudget; & git -C $wtRaw rev-parse --abbrev-ref HEAD 2>$null)".Trim()
     # `--` IS NOT A FLAG HERE: it ends the options and switches off no git guard, so `checkout <b>
     # --` onto a branch live elsewhere is refused by git exactly as `checkout <b>` is (measured). Ordinal,
     # so only `--` itself is excused. A QUOTED flag counts: `checkout <b> "--ignore-other-worktrees"`
@@ -3173,6 +3218,7 @@ What to do instead:
     $denyDest = $null
     foreach ($dest in $dests) {
         # Only an EXISTING local branch, and only if it is not the branch we are already on (a no-op).
+        Assert-GateBudget
         & git -C $wtRaw rev-parse --verify --quiet ("refs/heads/" + $dest) *> $null
         if ($LASTEXITCODE -ne 0) { continue }
         # ORDINAL, here and in the checked-out-nowhere test below, because a match ALLOWS: a culture
@@ -3504,37 +3550,7 @@ if ($tool -in @("Bash", "PowerShell")) {
     $cmd = [string]$hook.tool_input.command
     if (-not $cmd) { exit 0 }
 
-    # -----------------------------------------------------------------------------------------------
-    # Rule 3e -- A LINE TOO LONG TO JUDGE IN TIME IS REFUSED (review of BACKLOG #5643). Rules 3c and 3d
-    # ask git once per disarm and once per `worktree remove|move` victim, and the install gives this hook
-    # 15 s. A hook killed by its timeout lets the command through, so a line with enough git invocations
-    # could outlast it and carry a gated command past every rule: measured, 150 removes followed by
-    # `git reset --hard` took 24.3 s on the gate before this rule. So past a fixed count the gate does
-    # not try: it refuses, and says to split the command.
-    #
-    # THE COUNT IS OF GIT TOKENS ON THE SCAN STRINGS, each distinct segment once, so a quoted mention of
-    # git is not counted and the second, logical-line view does not double one line. 20 was measured on
-    # this file, to stay well inside the timeout; see tests/test_worktree_gate_per_invocation.py.
-    # -----------------------------------------------------------------------------------------------
-    $maxGitInvocations = 20
-    $seenScans = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-    $gitInvocationCount = 0
-    foreach ($capSeg in (Get-ScannableSegments $cmd (Get-HostConvention $tool))) {
-        if (-not $seenScans.Add([string]$capSeg.Scan)) { continue }
-        $gitInvocationCount += [regex]::Matches($capSeg.Scan, $gitInvocation).Count
-    }
-    if ($gitInvocationCount -gt $maxGitInvocations) {
-        Write-Deny -Rule "3e" -Detail "$gitInvocationCount git invocations" -Reason @"
-BLOCKED: this command holds $gitInvocationCount git invocations, and the worktree gate judges at most $maxGitInvocations in one call.
-
-The gate has a fixed time to run, and a gate that runs out of time lets the command through unjudged.
-So a longer command is refused rather than half-checked. Nothing about the command itself was judged.
-
-What to do instead:
-  * Split it into several shorter commands, each with at most $maxGitInvocations git invocations. Each is then
-    judged in full, by the same rules.
-"@
-    }
+    # Rule 3e, the time budget, is Assert-GateBudget: see its definition beside Write-Deny.
 
     # -----------------------------------------------------------------------------------------------
     # Rule 3c -- a git CONFIG write that disarms the SHARED repository. `config` changes no tree, so the
@@ -3554,6 +3570,7 @@ What to do instead:
     # -----------------------------------------------------------------------------------------------
     $dangerKeys = 'core\.hookspath|core\.worktree|alias\.[\w.-]+|include\.path|includeif\.'
     foreach ($seg in (Get-ScannableSegments $cmd (Get-HostConvention $tool))) {
+        Assert-GateBudget
         if ($seg.Scan -cnotmatch $gitInvocation) { continue }
         # [regex]::Match RATHER THAN `-notmatch`, FOR ITS INDEX (BACKLOG #1065). The pattern STRING is
         # unchanged; what is new is that the rule can now ask WHERE on the line the disarm sits, which is
@@ -3931,7 +3948,7 @@ What to do instead:
             if ($answered -and $candIndex -lt $where.Count) { continue }
             $candRaw = Get-FullPathRaw $cand $cwdRaw
             if (-not $candRaw) { continue }
-            $common = "$(& git -C $candRaw rev-parse --git-common-dir 2>$null)".Trim()
+            $common = "$(Assert-GateBudget; & git -C $candRaw rev-parse --git-common-dir 2>$null)".Trim()
             if ($LASTEXITCODE -ne 0 -or -not $common) { continue }
             $commonCmp = Get-ComparablePath $common $candRaw
             # GOVERNANCE IS REPOSITORY IDENTITY, NOT A PATH PREFIX (BACKLOG #1067). This compared the
@@ -4123,6 +4140,7 @@ What to do instead:
         $map = Get-ScanRawIndexMap $seg
         if ($null -ne $map) {
             foreach ($sm in [regex]::Matches($seg.Scan, '\bworktree\s+(?<wtverb>remove|move)(?=\s|$)')) {
+                Assert-GateBudget
                 $inv = Get-OwnInvocationWindow $seg.Scan $sm.Index -SeparatorInToken
                 # A `worktree remove` with no git token in front of it, or with a separator between that
                 # token and it, is not a git subcommand: `echo worktree remove x` and `git status ; echo
@@ -4155,6 +4173,7 @@ What to do instead:
         $added
     }
     foreach ($wtTarget in @($wtTargets)) {
+        Assert-GateBudget
         $seg = $wtTarget.Seg
         $wtVerb = $wtTarget.WtVerb
         $victimRaw = $wtTarget.VictimRaw
@@ -4257,7 +4276,7 @@ What to do instead:
             if ($triedAbs -ccontains $victimAbs) { continue }
             $triedAbs += $victimAbs
 
-            $victimCommon = "$(& git -C $victimAbs rev-parse --git-common-dir 2>$null)".Trim()
+            $victimCommon = "$(Assert-GateBudget; & git -C $victimAbs rev-parse --git-common-dir 2>$null)".Trim()
             if ($LASTEXITCODE -ne 0 -or -not $victimCommon) { continue }
             $victimCmp = Get-ComparablePath $victimCommon $victimAbs
             # CULTURE OR ORDINAL, as in Test-Governed: a match denies, so each half only adds denies. The
@@ -4287,10 +4306,10 @@ What to do instead:
         # resolved against the hook process's cwd and returned nothing for every relative spelling,
         # leaving $isSelf false and both branches emitting the generic deny. That is the identical
         # defect the note above this line already records for the $cwd/$cwdRaw case, one call down.
-        $victimTopRaw = "$(& git -C $victimAbs rev-parse --show-toplevel 2>$null)".Trim()
+        $victimTopRaw = "$(Assert-GateBudget; & git -C $victimAbs rev-parse --show-toplevel 2>$null)".Trim()
         if (-not $victimTopRaw) { $victimTopRaw = $victimAbs }
         $victimTop = Get-ComparablePath $victimTopRaw
-        $selfTop = Get-ComparablePath "$(& git -C $cwdRaw rev-parse --show-toplevel 2>$null)".Trim()
+        $selfTop = Get-ComparablePath "$(Assert-GateBudget; & git -C $cwdRaw rev-parse --show-toplevel 2>$null)".Trim()
         $isSelf = $victimTop -and $selfTop -and [string]::Equals($victimTop, $selfTop, [System.StringComparison]::Ordinal)
 
         # FOLD THE OPERATOR'S SPELLING BEFORE IT ENTERS A REASON, which every other rule in this file
@@ -4588,6 +4607,7 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
     # the tree is untouched, and the deny text must say what does move.
     $headRoot = $null ; $headVerb = $null
     foreach ($seg in (Get-ScannableSegments $cmd (Get-HostConvention $tool))) {
+        Assert-GateBudget
         # Match a git invocation however it is spelled: git, git.exe, or an absolute path to either.
         if ($seg.Scan -cnotmatch $gitInvocation) { continue }
         if ($seg.Scan -cnotmatch $verbHunt) { continue }
@@ -4646,6 +4666,7 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
         # GIT_DIR set by an earlier tool call is invisible.
         if (-not $headRoot) {
             foreach ($vm in @([regex]::Matches($seg.Scan, $verbHunt))) {
+                Assert-GateBudget
                 $vGroup = $vm.Groups['verb']
                 $vIdx = $vGroup.Index
                 if (-not (Test-VerbMovesHead $vGroup.Value $seg.Scan.Substring($vIdx + $vGroup.Length))) { continue }
