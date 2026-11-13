@@ -196,7 +196,8 @@ class CellTagError(CipherError):
     #: ``integrity_drift`` alert.
     drift: ClassVar[bool] = True
     #: Whether the cipher already alerted on the refusal this error wraps, so
-    #: :func:`open_tagged_cell` raises no second alert; it still logs the row's WARNING.
+    #: :func:`open_tagged_cell` raises no second alert; it still audits each row and logs a WARNING
+    #: once per cell column per interval.
     cipher_alerted: ClassVar[bool] = False
 
     def __init__(self, table: str, column: str, row_id: str, channel_id: str | None) -> None:

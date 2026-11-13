@@ -470,8 +470,8 @@ class _UnmarkedPolicy:
         if (table, column) not in _ROW_TAGGED_CELLS or _first_unmarked_in_interval(table, column):
             # A tagged message or preset cell logs once per column per interval: a list over a
             # keyless run's rows meets one in every row, this names no row, and the cell-tag
-            # layer logs and audits each row itself (BACKLOG #5650). Every other column, an upload
-            # among them, logs on every refusal.
+            # layer audits each row and logs once per column per interval (BACKLOG #5650). Every
+            # other column, an upload among them, logs on every refusal.
             _log.warning(
                 "refused an unmarked value in cipher column %s.%s: %s; %s",
                 table,
@@ -686,8 +686,9 @@ class UnauthenticatedCipherError(CipherError):
 
     The Vault Transit cipher gives it where Vault's reason for refusing a value is wholly the AEAD's
     own authentication failure (BACKLOG #5650): ``decrypt`` raises it for an HTTP 400 that says so,
-    and ``decrypt_many`` returns it for a batch result whose per-value ``error`` says so, whatever
-    the batch reply's status. Only the single ``decrypt`` reaches
+    and ``decrypt_many`` returns it for a batch result whose per-value ``error`` says so, read only
+    from a 2xx batch reply: a batch Vault refuses is asked for value by value through ``decrypt``,
+    and its body is never read. Only the single ``decrypt`` reaches
     :func:`~messagefoundry.store.cell_tag.open_tagged_cell`; for the batch, read only by the
     cipher-cell walk, the per-value text changes only the error's class, and so the class name a
     reason line renders, never containment, audit or alert. Its other failures include at least an outage
@@ -725,7 +726,8 @@ class UnmarkedCipherError(CipherError):
     a planted row (BACKLOG #1169). Raised by the unmarked-value seam, which has already fired the
     refusal hook, so a reader that contains it raises no second alert (BACKLOG #5650). The seam
     logs a WARNING for every refusal, except in a tagged message or preset cell, where it logs once
-    per column per interval and the cell-tag layer logs and audits the row. Its own class, so
+    per column per interval, and the cell-tag layer audits each row and logs once per column per
+    interval. Its own class, so
     :func:`~messagefoundry.store.cell_tag.open_tagged_cell` can tell it from a key or format
     problem without reading its text. The name keeps the ``CipherError`` token, as
     :class:`UnauthenticatedCipherError`'s does."""
