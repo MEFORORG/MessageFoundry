@@ -9,6 +9,9 @@ round-trippable back through ``split_batch``.
 
 from __future__ import annotations
 
+import random
+import tracemalloc
+
 import pytest
 
 from messagefoundry.parsing import encode_batch, split_batch
@@ -93,71 +96,99 @@ def _no_parse(*_args: object, **_kwargs: object) -> Message:
     raise AssertionError("encode_batch parsed a member")
 
 
-def test_the_head_member_is_not_parsed(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("head", [M1, "  \r\n" + M1, M1.replace("\r", "\n")])
+def test_the_head_member_is_not_parsed(monkeypatch: pytest.MonkeyPatch, head: str) -> None:
     # Only MSH-1 and MSH-2 are needed, so a full parse of a large head is waste.
     monkeypatch.setattr(Message, "parse", staticmethod(_no_parse))
-    env = encode_batch([M1, M2], control_id="1", timestamp=_TS)
+    env = encode_batch([head, M2], control_id="1", timestamp=_TS)
     assert env.startswith("BHS|^~\\&|")
 
 
 def test_members_are_not_copied_before_the_join() -> None:
     # The envelope's own join is the one copy a member needs. A strip of each member and a CR
     # appended to the whole envelope each copied it again, multiplying peak memory.
-    import tracemalloc
-
     body = "OBX|1|ED|DOC||" + "A" * (4 * 1024 * 1024) + "\r"
     members: list[Message | str] = [
         f"MSH|^~\\&|A|B|C|D|{_TS}||ORU^R01|M{i}|P|2.5.1\r{body}" for i in range(3)
     ]
     total = sum(len(m) for m in members if isinstance(m, str))
-    tracemalloc.start()
+    started_here = not tracemalloc.is_tracing()
+    if started_here:
+        tracemalloc.start()
+    tracemalloc.reset_peak()
+    before, _ = tracemalloc.get_traced_memory()
     try:
         env = encode_batch(members, control_id="1", timestamp=_TS)
         _, peak = tracemalloc.get_traced_memory()
     finally:
-        tracemalloc.stop()
+        if started_here:
+            tracemalloc.stop()
     assert len(env) > total  # positive control: the envelope holds every member
     # An ASCII str costs about one byte per character; one envelope is about `total` bytes.
-    assert peak < 1.5 * total, peak
+    assert peak - before < 1.5 * total, peak - before
+
+
+_Reading = tuple[str, str, str, str, str] | type[ValueError]
+
+
+def _parser_reading(head: str) -> _Reading:
+    try:
+        return Message.parse(head)._encoding_chars()
+    except ValueError:  # HL7PeekError is one
+        return ValueError
+
+
+def _batch_reading(head: str) -> _Reading:
+    try:
+        bhs = encode_batch([head], control_id="1", timestamp=_TS).split("\r", 1)[0]
+    except ValueError:
+        return ValueError
+    return bhs[3], bhs[4], bhs[5], bhs[6], bhs[7]
 
 
 @pytest.mark.parametrize(
     "head",
     [
         "  \r\n" + M1,  # leading whitespace, as the parser strips it
-        "\N{ZERO WIDTH NO-BREAK SPACE}" + M1,  # a byte order mark, as split_batch reads past it
         M1.replace("\r", "\n"),  # LF line endings
         "MSH|^~\\&#|A|B|C|D|20260101||ADT^A01|MSG1|P|2.7\r",  # MSH-2 with a fifth char (v2.7)
-        "BHS|^~\\&\rMSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\r",  # the parser's first MSH
+        "MSH#@~\\&#A#B\r",  # custom delimiters
+        "MSH|^~\\&",  # MSH-2 and nothing more
+        "MSH|^~\\ \r",  # a trailing space the parser's strip removes, leaving MSH-2 short
+        "MSH|^~\\\t",
+        "MSH|^~\\ \rPID|1\r",  # the same space kept, as more follows it
+        "MSH\r",
+        "MSH|^~\r",
+        "MSH|^~|A|B\r",
+        "MSH|",
+        "not an HL7 message",
+        "\N{ZERO WIDTH NO-BREAK SPACE}" + M1,  # a byte order mark, which the parser refuses
+        "BHS|^~\\&\rMSH#@~\\&#A#B\r",  # an envelope-led head, parsed as before
+        "BHS|^~\\&\rPID|1\r",
     ],
 )
 def test_the_head_separators_match_the_parser(head: str) -> None:
-    env = encode_batch([head], control_id="1", timestamp=_TS)
-    assert env.startswith("BHS|^~\\&|")
+    # The contract Message._encoding_chars kept: the separators it reads, or a refusal rather than
+    # a guess.
+    assert _batch_reading(head) == _parser_reading(head)
 
 
-def test_a_custom_delimiter_head_after_an_envelope_header_uses_its_msh() -> None:
-    head = "BHS|^~\\&\rMSH#@~\\&#A#B#C#D#20260101##ADT@A01#MSGX#P#2.5.1\r"
-    assert Message.parse(head)._encoding_chars()[:2] == ("#", "@")  # the parser's reading
-    env = encode_batch([head], control_id="1", timestamp=_TS)
-    assert env.startswith("BHS#@~\\&#")
+def test_a_malformed_later_line_is_not_the_separator_reads_to_refuse() -> None:
+    # The one place the reading parts from a parse, by design: the parser refuses a later header
+    # line too short to read, and finding it takes the whole-body scan BACKLOG #5919 removed. The
+    # head's own separators are read, not guessed. On the delivery path the caller's parse of the
+    # head for MSH-10 still refuses such a head before this runs.
+    head = "MSH|^~\\&|A\rMSH"
+    assert _parser_reading(head) is ValueError
+    assert _batch_reading(head) == ("|", "^", "~", "\\", "&")
 
 
-@pytest.mark.parametrize(
-    "head",
-    [
-        "not an HL7 message",
-        "MSH\r",  # no MSH-1
-        "MSH|^~\r",  # MSH-2 shorter than four characters
-        "MSH|^~|A|B\r",  # MSH-2 cut short by the field separator
-        "MSH|",  # MSH-1 and nothing more
-        "BHS|^~\\&\rPID|1\r",  # an envelope header and no MSH
-    ],
-)
-def test_an_undeterminable_head_raises_value_error(head: str) -> None:
-    # The contract Message._encoding_chars kept: refuse rather than guess the separators.
-    with pytest.raises(ValueError, match="cannot determine HL7 separators"):
-        encode_batch([head], control_id="1", timestamp=_TS)
+def test_the_head_separators_match_the_parser_over_random_heads() -> None:
+    rng = random.Random(5919)
+    alphabet = "MSH|^~\\&# \t\r\nA"
+    for _ in range(5000):
+        head = "MSH" + "".join(rng.choice(alphabet) for _ in range(rng.randrange(0, 12)))
+        assert _batch_reading(head) == _parser_reading(head), repr(head)
 
 
 @pytest.mark.parametrize(

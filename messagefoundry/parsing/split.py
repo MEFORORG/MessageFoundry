@@ -26,8 +26,7 @@ import itertools
 import re
 from dataclasses import dataclass
 
-from messagefoundry.parsing._builtin_hl7 import _SEPARATOR_HEAD, _extract_separators
-from messagefoundry.parsing.binary import _FIRST_MSH
+from messagefoundry.parsing._builtin_hl7 import _extract_separators, _first_line_head
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import normalize, starts_with_msh
 from messagefoundry.parsing.sniff import _LEADING_WS_STR
@@ -286,11 +285,12 @@ def encode_batch(messages: list[Message | str], *, control_id: str, timestamp: s
         raise ValueError("encode_batch requires at least one message")
     # Read the batch separators from the HEAD member's own MSH (never hardcode |^~\&). The head drives
     # the whole envelope's framing; mixed-delimiter members in one batch are not a real feed shape.
+    texts = [m.encode() if isinstance(m, Message) else normalize(m) for m in messages]
     head = messages[0]
     if isinstance(head, Message):
         field_sep, comp_sep, rep_sep, esc, sub_sep = head._encoding_chars()
     else:
-        field_sep, comp_sep, rep_sep, esc, sub_sep = _head_separators(head)
+        field_sep, comp_sep, rep_sep, esc, sub_sep = _head_separators(texts[0])
     enc = (
         comp_sep + rep_sep + esc + sub_sep
     )  # MSH-2 / BHS-2: component^repetition~escape\subcomponent
@@ -298,47 +298,39 @@ def encode_batch(messages: list[Message | str], *, control_id: str, timestamp: s
     bhs_tail = ["", "", "", "", timestamp, "", "", "", control_id]  # BHS-3, -4, -5, -6, -7, …, -11
     bhs = "BHS" + field_sep + enc + field_sep + field_sep.join(bhs_tail)
     bts = "BTS" + field_sep + str(len(messages))
-    # Every piece carries its own trailing CR, so the one join is the only copy of a member: a strip
-    # of each member and a CR added to the joined envelope each copied it again (BACKLOG #5919).
+    # Every piece carries its own trailing CR, so for a member that ends with one CR the join is
+    # the only copy: a strip of each member and a CR added to the joined envelope each copied it
+    # again (BACKLOG #5919).
     pieces = [bhs, "\r"]
-    for m in messages:
-        pieces.extend(_framed(m.encode() if isinstance(m, Message) else normalize(m)))
+    for text in texts:
+        pieces.extend(_framed(text))
     pieces += [bts, "\r"]
     return "".join(pieces)
 
 
-#: A line break in a member that is not normalized.
-_LINE_BREAK = re.compile(r"[\r\n]")
+#: How wide an MSH line's opening must be to hold MSH-1 and four encoding characters.
+_SEPARATORS_WIDTH = len(_MSH) + 1 + 4
 
 
-def _head_separators(head: str) -> tuple[str, str, str, str, str]:
-    """The ``(field, component, repetition, escape, subcomponent)`` delimiters of a batch's ``head``
-    member, as :meth:`Message._encoding_chars` reads them, from its first ``MSH`` line's first
-    :data:`_SEPARATOR_HEAD` characters alone (BACKLOG #5919). A full parse of a large hydrated head
-    to read eight characters cost its whole size in time and memory.
+def _head_separators(norm: str) -> tuple[str, str, str, str, str]:
+    """The ``(field, component, repetition, escape, subcomponent)`` delimiters of a batch's head
+    member, normalized as ``norm``, as :meth:`Message._encoding_chars` reads them after a parse.
 
-    The ``MSH`` line is the one the head opens with, past whitespace and any byte order mark, as
-    :func:`split_batch` reads a member; or, past an ``FHS``/``BHS`` envelope header, the first line
-    that starts with ``MSH``, as the parser reads one. Raises ``ValueError``, as
-    ``_encoding_chars`` does, when there is no such line or it holds no field separator or fewer
-    than four encoding characters, rather than guess."""
-    lead = _LEADS_WITH_MSH_PAST_BOM.match(head)
-    if lead is not None:
-        start = lead.end() - len(_MSH)
-    else:
-        first = _FIRST_KEPT.search(head)
-        later = None
-        if first is not None and head.startswith(_ENVELOPE_HEADERS, first.start()):
-            later = _FIRST_MSH.search(head, first.start())
-        if later is None:
-            raise ValueError("cannot determine HL7 separators: the head member holds no MSH line")
-        start = later.start() + 1
-    # The window is a few characters, so neither cut copies the member.
-    line = _LINE_BREAK.split(head[start : start + _SEPARATOR_HEAD], maxsplit=1)[0]
+    For a head that opens with ``MSH`` after whitespace, the shape every member a frame check
+    passed has, they are read from that line's first few characters alone, through the parser's
+    own window (:func:`~messagefoundry.parsing._builtin_hl7._first_line_head`) and separator read
+    (BACKLOG #5919): a full parse of a large hydrated head to read eight characters cost its whole
+    size in time and memory. Any other head, an ``FHS``/``BHS``-led one or one the parser refuses,
+    such as a byte order mark before its ``MSH``, is parsed as before, so it frames or is refused
+    exactly as it was. Raises ``ValueError``, as ``_encoding_chars`` does, when MSH-1 or four
+    encoding characters are missing, rather than guess."""
+    line = _first_line_head(norm)
+    if not line.startswith(_MSH):
+        return Message.parse(norm)._encoding_chars()
     # _extract_separators fills a short MSH-2 with defaults, where _encoding_chars refuses one, so
-    # the window must hold MSH-1 and four encoding characters with no field separator among them.
-    if len(line) < _SEPARATOR_HEAD or line.find(line[3], 4) != -1:
-        raise ValueError(f"cannot determine HL7 separators: the head's MSH line opens {line!r}")
+    # the line must hold MSH-1 and four encoding characters with no field separator among them.
+    if len(line) < _SEPARATORS_WIDTH or line.find(line[3], 4, _SEPARATORS_WIDTH) != -1:
+        raise ValueError("cannot determine HL7 separators: the head's MSH-1 or MSH-2 is short")
     field_sep, comp_sep, rep_sep, sub_sep, esc = _extract_separators(line)
     return field_sep, comp_sep, rep_sep, esc, sub_sep
 
@@ -347,16 +339,13 @@ def _framed(text: str) -> tuple[str, ...]:
     """The pieces that frame one member's ``text`` in a batch: its segments with no leading or
     trailing CR, then one CR. ``text`` itself when it already has that shape, so the common
     member, which ends with one CR, is not copied."""
-    lo, hi = 0, len(text)
-    while lo < hi and text[lo] == "\r":
-        lo += 1
-    while hi > lo and text[hi - 1] == "\r":
-        hi -= 1
-    if lo == 0 and hi == len(text):
+    if text.startswith("\r"):
+        return text.strip("\r"), "\r"
+    if not text.endswith("\r"):
         return text, "\r"
-    if lo == 0 and hi == len(text) - 1:
+    if not text.endswith("\r\r"):
         return (text,)
-    return text[lo:hi], "\r"
+    return text.rstrip("\r"), "\r"
 
 
 def _non_blank(lines: list[str]) -> list[str]:
