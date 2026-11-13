@@ -14,6 +14,7 @@ import pytest
 from messagefoundry.config.settings import AlertRule, AlertsSettings, load_settings
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.pipeline.alert_sinks import (
+    _DRAIN_CANCEL_GRACE_SECONDS,
     EmailTransport,
     NotifierAlertSink,
     WebhookTransport,
@@ -268,6 +269,53 @@ async def test_a_cut_drain_waits_for_every_send_to_finish_its_cancel_cleanup() -
         assert cleanup_done.is_set()
         assert sink._task is None
     finally:
+        if sink._task is not None:
+            sink._task.cancel()
+            await asyncio.gather(sink._task, return_exceptions=True)
+
+
+async def test_a_send_that_swallows_the_cancel_does_not_hold_a_cut_close(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A drain cancelled while a send swallows every cancel and goes on waiting ends within the
+    grace, not when that send ends: the send held aclose() past its caller's bound, so a probe
+    returned after 1.22 s against a 0.2 s bound. The send left past the grace is logged as a count,
+    with no alert content."""
+    release = asyncio.Event()
+    swallowed: list[bool] = []
+
+    class _Swallows(_HungTransport):
+        async def send(self, event: dict[str, Any], **kw: Any) -> None:
+            self.entered.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    swallowed.append(True)
+
+    stubborn = _Swallows("webhook")
+    sink = NotifierAlertSink([stubborn])
+    sink.start()
+    try:
+        sink.connection_stopped("OB_SECRETNAME", detail="boom")
+        await asyncio.wait_for(stubborn.entered.wait(), 5.0)
+        bound = 0.2
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(sink.aclose(), bound)
+        elapsed = time.monotonic() - started
+        assert swallowed  # the control: the send did swallow the cancel
+        assert not release.is_set()  # and it is still running
+        # The bound, one grace (aclose's second cancel of the drain does not restart it), and slack.
+        assert elapsed < bound + _DRAIN_CANCEL_GRACE_SECONDS + 0.3, elapsed
+        assert sink._task is None
+        left = [r for r in caplog.records if "still running" in r.getMessage()]
+        assert left and left[0].levelname == "WARNING", caplog.text
+        assert "1 alert send task(s)" in left[0].getMessage()
+        assert all("OB_SECRETNAME" not in r.getMessage() for r in left)
+    finally:
+        release.set()
+        await asyncio.sleep(0.05)
         if sink._task is not None:
             sink._task.cancel()
             await asyncio.gather(sink._task, return_exceptions=True)

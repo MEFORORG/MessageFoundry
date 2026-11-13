@@ -109,6 +109,11 @@ class ControlCallback(Protocol):
 # excess events are dropped with a warning rather than stalling the worker that enqueues them.
 _MAX_QUEUE = 1000
 
+# How long a cancelled drain waits for its alert sends to end their cancel cleanup (BACKLOG #5907).
+# Short and fixed, so a send that swallows the cancel or cleans up slowly cannot hold the drain,
+# and with it aclose(), past its caller's timeout; a send still running then is left and logged.
+_DRAIN_CANCEL_GRACE_SECONDS = 0.2
+
 
 class _AlertStateStore(Protocol):
     """The narrow alert-state slice (ADR 0044, #56) the sink uses — a structural subset of the store's
@@ -327,9 +332,10 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
     must push any blocking I/O off the loop (``asyncio.to_thread``), and must be **best-effort** — it
     swallows its own errors and never raises, since an exception out of ``_handle`` would kill the
     drain loop. Items are handled one at a time; :class:`NotifierAlertSink` runs each item's sends
-    concurrently inside its :meth:`_handle` (BACKLOG #5907), and a cancel of the drain task returns
-    from that only once every one of those sends' tasks has ended. A cancel does not stop a worker
-    thread a send started with ``asyncio.to_thread``, so that runs on to its own timeout.
+    concurrently inside its :meth:`_handle` (BACKLOG #5907). A cancel of the drain task is passed on
+    to those sends and returns from there once they have ended, or after a short fixed grace, which
+    leaves any send still running and logs how many. A cancel does not stop a worker thread a send
+    started with ``asyncio.to_thread``, so that runs on to its own timeout.
     Lifecycle: :meth:`start` once an event loop is running (the ASGI lifespan does this),
     :meth:`aclose` on shutdown (enqueues a ``None`` sentinel, drains what's queued, then stops)."""
 
@@ -389,8 +395,9 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
 class AlertTransport(Protocol):
     """One delivery channel for an alert event. ``send`` does the actual (blocking) I/O — the
     :class:`NotifierAlertSink` always calls it from a background task, never inline on a worker.
-    Each event's sends run concurrently, one child task per transport (BACKLOG #5907), so a send
-    must not rely on a sibling's having run first; each gets its own shallow copy of the event.
+    Each event's sends run concurrently, one child task per transport the rule selected (BACKLOG
+    #5907), so a send must not rely on a sibling's having run first; each gets its own shallow copy
+    of the event.
     A send that raises ``CancelledError`` without the drain being cancelled loses that transport's
     alert, logged, and the siblings go on.
 
@@ -1350,6 +1357,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # control wired (a control_action rule then no-ops, logged). The sink NEVER imports the runner.
         self._control_cb: ControlCallback | None = None
         self._control_tasks: set[asyncio.Task[None]] = set()
+        # BACKLOG #5907: send tasks a cut drain left still running past its grace.
+        self._left_sends: set[asyncio.Task[None]] = set()
         # BACKLOG #5909: set by stop_control, so a rule firing after the shutdown clear logs why.
         self._control_stopped = False
         # Vault BACKLOG #3849: told (transport name, event) after each send that returned without
@@ -2627,13 +2636,14 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         }
 
         # The task handling this event, and its cancel count on entry. Each send runs in a child
-        # task of the gather below, and a transport can cancel that child itself with
+        # task made below, and a transport can cancel that child itself with
         # current_task().cancel(), so only a rise in the drain's own count marks the drain's cancel.
         drain = asyncio.current_task()
-        baseline = drain.cancelling() if drain is not None else 0
+        assert drain is not None  # _handle runs only on the drain task
+        baseline = drain.cancelling()
 
         def drain_cancelled() -> bool:
-            return drain is None or drain.cancelling() > baseline
+            return drain.cancelling() > baseline
 
         async def deliver(transport: AlertTransport) -> None:
             # A shallow copy per send: the sends run at once, some in worker threads, so a top-level
@@ -2676,28 +2686,58 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 except Exception:
                     log.warning("alert delivery observer failed", exc_info=True)
 
-        # BACKLOG #5907: concurrently, with the limit the class docstring states. gather runs each
-        # send in a child task and passes every cancel of this task on to every send.
-        # return_exceptions=True makes it wait for every child task to end, a send's async cancel
-        # cleanup included, before the drain's cancel leaves here: without it the first send to
-        # end would return the cancel at once, and a sibling's cleanup could outlive aclose().
-        # (The class docstring says what a cancel does not stop.)
+        # BACKLOG #5907: concurrently, one child task per transport the rule selected. Without a
+        # drain cancel this waits for every send to end. A drain cancel is passed on to every send,
+        # and the sends get _DRAIN_CANCEL_GRACE_SECONDS for their cancel cleanup, so a short async
+        # cleanup still ends before aclose() returns, while a send that swallows the cancel or
+        # cleans up slowly cannot hold aclose() past its caller's bound. (The _BackgroundDispatcher
+        # docstring says what a cancel does not stop.)
         chosen = [t for t in self._transports if targets is None or t.name in targets]
-        results = await asyncio.gather(*(deliver(t) for t in chosen), return_exceptions=True)
-        for transport, result in zip(chosen, results, strict=True):
-            if isinstance(result, asyncio.CancelledError):
-                # A drain cancel during the gather is raised by the gather itself, so this is a
-                # child that ended cancelled outside the send's own handler: at least a send that
-                # cancelled its own task and returned before the cancel landed, or an observer
-                # that raised CancelledError. Say so rather than drop it; the drain goes on.
+        if not chosen:
+            return
+        sends = [asyncio.create_task(deliver(t)) for t in chosen]
+        try:
+            await asyncio.wait(sends)
+        except asyncio.CancelledError:
+            for task in sends:
+                task.cancel()
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + _DRAIN_CANCEL_GRACE_SECONDS
+            pending = set(sends)
+            while pending and (remaining := deadline - loop.time()) > 0:
+                try:
+                    _, pending = await asyncio.wait(pending, timeout=remaining)
+                except asyncio.CancelledError:
+                    continue  # a repeat of the drain's cancel (aclose makes one); the grace bounds it
+            if pending:
+                # A count only: the event's type and connection stay off this line, since the
+                # sends left are named by nothing an operator could act on here.
+                log.warning(
+                    "%d alert send task(s) still running %.2fs after the drain was cancelled were left",
+                    len(pending),
+                    _DRAIN_CANCEL_GRACE_SECONDS,
+                )
+                # Hold a reference so the loop does not drop a task still running.
+                self._left_sends.update(pending)
+                for task in pending:
+                    task.add_done_callback(self._left_sends.discard)
+            raise
+        for transport, task in zip(chosen, sends, strict=True):
+            if task.cancelled():
+                # The drain was not cancelled, so this is a child that ended cancelled outside the
+                # send's own handler: at least a send that cancelled its own task and returned
+                # before the cancel landed, or an observer that raised CancelledError. Say so
+                # rather than drop it; the drain goes on.
                 log.warning(
                     "alert transport %s ended cancelled after its send for %s/%r",
                     transport.name,
                     event.get("type"),
                     event.get("connection"),
                 )
-            elif isinstance(result, BaseException):
-                raise result  # what deliver let out, raised once every send has ended
+        # Read every send's exception, so the loop reports none as never retrieved.
+        escaped = [e for t in sends if not t.cancelled() and (e := t.exception()) is not None]
+        if escaped:
+            raise escaped[0]  # what deliver let out, raised once every send has ended
 
 
 def configured_alert_transport_names(alerts: AlertsSettings) -> set[str]:
