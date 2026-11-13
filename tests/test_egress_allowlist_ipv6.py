@@ -5,8 +5,8 @@ IP literals by their canonical form (BACKLOG #5915).
 
 The shipped matcher split every entry at its first colon and compared lowercased host text, so
 no IPv6 entry, ``[::1]:6432`` included, could match an IPv6 host: the host it read held no colon,
-and ``[::1]:6432`` matched only a host spelled ``[``. (``[egress].allowed_ech_sidecar`` has its own parse, ``pinned_host_port``, and was
-never read here.) It is a security matcher, so the change is canonical equivalence only: each case
+and ``[::1]:6432`` matched only a host spelled ``[``. (``[egress].allowed_ech_sidecar`` has its own
+parse, ``pinned_host_port``, and was never read here.) It is a security matcher, so the change is canonical equivalence only: each case
 under "never equated" stays a refusal.
 
 Each case taking the ``match`` fixture runs through both the egress gate's ``host_port_allowed``
@@ -27,7 +27,11 @@ from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Database, WiringError
 from messagefoundry.transports.ai_broker import endpoint_host_allowed
-from messagefoundry.transports.egress import check_egress_allowed, host_port_allowed
+from messagefoundry.transports.egress import (
+    check_egress_allowed,
+    check_lookup_allowed,
+    host_port_allowed,
+)
 
 Match = Callable[[str, int | None, list[str]], bool]
 
@@ -163,19 +167,18 @@ def test_zone_id_in_the_host_matches_nothing() -> None:
     ("host", "entry"), [("fe80::1%eth0", "[fe80::1%eth0]"), ("::1%31", "[::1%31]:8443")]
 )
 def test_the_same_zone_on_both_sides_matches_nothing(host: str, entry: str) -> None:
-    # ipaddress reads both sides as one scoped address, so only the `%` refusal stops this. A URL's
-    # zone stays percent-encoded where it is read and urllib.request decodes it before the dial, so
-    # `[::1%31]` would be compared as one host and dialled as `::11`.
+    # ipaddress reads both sides as one scoped address, so only the `%` refusal stops this; why it
+    # must is in `_canonical_host`'s docstring.
     assert host_port_allowed(host, 8443, [entry]) is False
     assert endpoint_host_allowed(f"https://[{host}]:8443/x", [entry]) is False
 
 
 def test_a_percent_encoded_zone_is_dialled_as_another_address() -> None:
-    # Why a `%` is refused rather than compared: the zone is compared encoded and dialled decoded.
+    # The premise `_canonical_host`'s docstring states for refusing a `%`.
     url = "https://[::1%31]:8443/x"
     read = urllib.parse.urlsplit(url).hostname
-    assert read is not None
-    assert ipaddress.ip_address(read) == ipaddress.ip_address("::1%31")
+    assert read == "::1%31"
+    assert ipaddress.ip_address(read) != ipaddress.ip_address("::1")  # the zone is compared
     assert urllib.request.Request(url).host == "[::11]:8443"
 
 
@@ -184,19 +187,22 @@ def test_a_percent_encoded_zone_is_dialled_as_another_address() -> None:
 _UNLISTED = r"is not in the \[egress\]\.allowed_db allowlist$"
 
 
-_DIALECTS: dict[str, dict[str, Any]] = {
-    "generic": {
-        "dialect": "generic",
-        "odbc_driver": "PostgreSQL Unicode",
-        "odbc_params": {"PORT": "6432"},
-    },
-    "sqlserver": {"port": 6432},
-}
+_DIALECTS = ("generic", "sqlserver")
+
+
+def _db_settings(server: str, dialect: str) -> dict[str, Any]:
+    kw: dict[str, Any] = (
+        {"dialect": "generic", "odbc_driver": "PostgreSQL Unicode", "odbc_params": {"PORT": "6432"}}
+        if dialect == "generic"
+        else {"port": 6432}
+    )
+    return dict(Database(statement="INSERT INTO t (a) VALUES (:a)", server=server, **kw).settings)
 
 
 def _check_db(server: str, entry: str, *, dialect: str = "generic") -> None:
-    db = Database(statement="INSERT INTO t (a) VALUES (:a)", server=server, **_DIALECTS[dialect])
-    dest = Destination(name="OB_DB_V6", type=ConnectorType.DATABASE, settings=db.settings)
+    dest = Destination(
+        name="OB_DB_V6", type=ConnectorType.DATABASE, settings=_db_settings(server, dialect)
+    )
     check_egress_allowed(dest, EgressSettings(allowed_db=[entry]))
 
 
@@ -204,12 +210,21 @@ def _check_db(server: str, entry: str, *, dialect: str = "generic") -> None:
 @pytest.mark.parametrize("server", ["::1", "0:0:0:0:0:0:0:1", "fe80::1:443", "[::1]"])
 @pytest.mark.parametrize("entry", ["[::1]:6432", "[::1]", "::1"])
 def test_database_ipv6_server_is_unlisted(server: str, entry: str, dialect: str) -> None:
-    # Unbracketed or bracketed: the SQL Server preset would send `SERVER=::1,6432` or
-    # `SERVER=[::1],6432`, and how a driver reads either is unverified, so it matches nothing.
+    # Unbracketed or bracketed; docs/CONNECTIONS.md, allowed_db, says why.
     with pytest.raises(WiringError, match=_UNLISTED):
         _check_db(server, entry, dialect=dialect)
+
+
+@pytest.mark.parametrize("server", ["::1", "[::1]"])
+def test_database_lookup_ipv6_server_is_unlisted(server: str) -> None:
+    # db_lookup and DatabaseRef always build the SQL Server preset, through their own gate.
+    with pytest.raises(WiringError, match=_UNLISTED):
+        check_lookup_allowed(
+            "LK_V6", _db_settings(server, "sqlserver"), EgressSettings(allowed_db=["[::1]"])
+        )
 
 
 @pytest.mark.parametrize("dialect", _DIALECTS)
 def test_database_named_server_still_matches_its_entry(dialect: str) -> None:
     _check_db("db.example.org", "DB.Example.Org:6432", dialect=dialect)
+    _check_db("127.0.0.1", "127.0.0.1:6432", dialect=dialect)  # an IPv4 literal is still listed
