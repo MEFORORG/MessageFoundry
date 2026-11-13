@@ -28,12 +28,14 @@ import re
 from collections.abc import Iterator
 
 from messagefoundry.parsing.x12.delimiters import (
+    _GATE_SEP_OFFSETS,
     _LEADING_NOISE,
     _SEGMENT_TERM_OFFSET,
     _SEGMENT_WHITESPACE,
     ISA_SEGMENT_LEN,
     discover_delimiters,
     find_isa_start,
+    isa_delimiters_distinct,
     isa_separators_line_up,
     iter_segments,
     skip_leading_noise,
@@ -75,10 +77,12 @@ def split(raw: str) -> list[str]:
       the terminator at its +105), and returned verbatim through that ``IEA`` segment's terminator.
       This holds even where :func:`discover_delimiters` refuses it, for a delimiter inside ISA
       element data (BACKLOG #5536): the element is the whole interchange, never cut at a forged
-      segment, so the parse of it refuses it. If a segment opening with a literal ``ISA`` comes
-      first (after this interchange's terminator and any whitespace), passing or not, the element
-      ends at the terminator before it, verbatim, so an interchange with no ``IEA`` does not
-      swallow the next one; that ``ISA`` starts the next element. A later ``ISA`` behind anything
+      segment, so the parse of it refuses it. If a segment opening with an ``ISA`` that passes
+      comes first (after this interchange's terminator and any whitespace), the element ends at
+      the terminator before it, verbatim, so an interchange with no ``IEA`` does not swallow the
+      next one; that ``ISA`` starts the next element. A segment that opens with a literal ``ISA``
+      that fails, such as ``ISA~`` or a ``<terminator>ISA`` in binary data, is data in this
+      interchange, so a complete one is never cut there. A later ``ISA`` behind anything
       else, such as a BOM or junk, does not end the walk. A passing interchange that reaches the
       end of the buffer with neither is the final element.
     * An ``ISA`` that fails, or one too short to hold a header, is a malformed interchange. One
@@ -110,7 +114,7 @@ def split(raw: str) -> list[str]:
         if start == n:
             break
         if start == good or _isa_complete_str(raw, start):
-            end, _ = _walk_str(raw, start, cut_at_isa=True)
+            end, at_iea = _walk_str(raw, start, cut_at_isa=True)
             if end is None:
                 # Unterminated final interchange — surface it, don't lose it.
                 out.append(raw[start:])
@@ -118,6 +122,9 @@ def split(raw: str) -> list[str]:
             # Kept verbatim, as the reader frames it, whether it ends at its IEA or at a later ISA.
             out.append(raw[start:end])
             pos = end
+            if not at_iea:
+                # The walk ended at an ISA that passes, after whitespace only: it is not checked again.
+                good = skip_leading_noise(raw, end)
             continue
         if good <= start:
             good = _next_isa_str(raw, start + 1)
@@ -181,12 +188,13 @@ def _walk_str(
     True, or None and False if that is not complete before ``bound``. ``IEA`` is matched only at a
     segment boundary.
 
-    With ``cut_at_isa``, a segment that opens with a literal ``ISA`` after any whitespace ends the
-    walk too, passing or not: it returns that segment's start, just past the terminator before it,
-    and False, so the whitespace before that ``ISA`` falls between the two elements. The same rule
-    as :class:`X12FrameReader`'s passing walk. It is checked at each segment start the walk reaches
-    anyway, never by a search ahead, so a chain of interchanges is walked once, however they are
-    separated."""
+    With ``cut_at_isa``, a segment that opens, after any whitespace, with an ``ISA`` that
+    :func:`_isa_complete_str` accepts ends the walk too: it returns that segment's start, just past
+    the terminator before it, and False, so the whitespace before that ``ISA`` falls between the
+    two elements. A literal ``ISA`` that fails is data, and the walk goes on. The same rule as
+    :class:`X12FrameReader`'s passing walk. It is checked at each segment start the walk reaches
+    anyway, never by a search ahead, and the check stops at the first gate position that differs,
+    so a chain of interchanges is walked once, however they are separated."""
     terminator = _terminator_str(raw, isa)
     if not terminator:
         return None, False
@@ -199,7 +207,9 @@ def _walk_str(
         if cut_at_isa and seg_start > ws_end:
             run = _SEGMENT_WS_RUN_STR.match(raw, seg_start, end)
             ws_end = seg_start if run is None else run.end()  # a star pattern: never None
-            if raw.startswith("ISA", ws_end, end):
+            # Only an ISA that passes ends the walk; one that fails, such as an "ISA~" segment, is
+            # data. The check stops at the first gate that differs, so it stays bounded.
+            if _isa_complete_str(raw, ws_end):
                 return seg_start, False
         idx = raw.find(terminator, seg_start, end)
         if idx == -1:
@@ -223,9 +233,11 @@ class X12FrameReader:
     header) is framed through its own ``IEA`` or up to the next ``ISA`` that passes, whichever comes
     first, so it cannot swallow that interchange and is not dropped either (BACKLOG #5921). An
     interchange whose ``ISA`` passes is framed through its ``IEA`` or through the terminator before
-    a later segment that opens with a literal ``ISA``, passing or not (only that terminator and
-    whitespace before it), so one with no ``IEA`` does not swallow a next one that follows it that
-    way; the whitespace between is discarded as noise. Such a cut frame still parses;
+    a later segment that opens with an ``ISA`` that passes (only that terminator and whitespace
+    before it), so one with no ``IEA`` does not swallow a next one that follows it that way; the
+    whitespace between is discarded as noise. A segment opening with a literal ``ISA`` that fails,
+    such as ``ISA~``, is data in the interchange; one whose header has not all arrived is held
+    until it has. Such a cut frame still parses;
     :func:`check_integrity` reports its missing trailers. This reader refuses
     no frame for its content. At least the shared ingress guards (the charset decode, the NUL check
     and the size bound) and a Router or Handler that peeks or parses the frame may refuse it later.
@@ -256,6 +268,10 @@ class X12FrameReader:
         # once rather than once per feed.
         self._seg_decided = False
         self._seg_ws = 0
+        # How many gate positions of an ISA opening that segment have been read and hold its
+        # separator, so a header still arriving is checked once rather than once per feed. Nonzero
+        # only while that ISA is undecided: deciding it, or taking the frame, resets it.
+        self._isa_gate = 0
         #: Line-end bytes the last completed interchange may still take as its ending; 0 once any
         #: other byte has followed it. See :data:`_FRAME_TAIL_BYTES`.
         self._tail_left = 0
@@ -346,11 +362,13 @@ class X12FrameReader:
         # so they always describe this interchange. Each byte is searched about once in total.
         while True:
             if not self._suspect and not self._seg_decided:
-                # A passing walk ends at a segment that opens with a literal "ISA", passing or not,
-                # so an interchange with no IEA does not swallow the next one (BACKLOG #5921). The
-                # frame ends at the terminator before it; the whitespace between is noise. Checked
-                # at each segment start the walk reaches, never by a search ahead, so it stays
-                # linear however the interchanges are separated. split ends its walk the same way.
+                # A passing walk ends at a segment that opens with an ISA that passes, so an
+                # interchange with no IEA does not swallow the next one (BACKLOG #5921). The frame
+                # ends at the terminator before it; the whitespace between is noise. A literal
+                # "ISA" that fails is data, so a complete interchange holding an "ISA~" segment is
+                # not cut. Checked at each segment start the walk reaches, never by a search ahead,
+                # so it stays linear however the interchanges are separated. split ends its walk
+                # the same way.
                 run = _SEGMENT_WS_RUN.match(buf, self._seg_ws)
                 self._seg_ws = ws = self._seg_ws if run is None else run.end()
                 if len(buf) < ws + 3 and b"ISA".startswith(buf[ws:]):
@@ -360,11 +378,19 @@ class X12FrameReader:
                     self._check_cap(ws)
                     return None
                 if buf.startswith(b"ISA", ws):
-                    # The whitespace before the cut is charged as the wait above charges it, so
-                    # whether the cap refuses this frame does not depend on how reads split it.
-                    self._check_cap(ws)
-                    return self._take(self._seg_start)
-                self._seg_decided = True
+                    passes = self._isa_passes(ws)
+                    if passes is None:
+                        # Not enough of the header has arrived to tell an ISA that passes from
+                        # data, so hold. The bytes from it are not charged: at most one header.
+                        self._check_cap(ws)
+                        return None
+                    if passes:
+                        # The whitespace before the cut is charged as the wait above charges it, so
+                        # whether the cap refuses this frame does not depend on how reads split it.
+                        self._check_cap(ws)
+                        return self._take(self._seg_start)
+                    # An "ISA" that fails, such as an "ISA~" segment, is data in this interchange.
+                self._seg_decided, self._isa_gate = True, 0
             idx = buf.find(terminator, self._scan, bound)
             if idx == -1:
                 if confirmed:
@@ -385,6 +411,29 @@ class X12FrameReader:
             # here ends at the same byte, already found not to be "ISA", so it is not read again.
             if self._seg_start > self._seg_ws:
                 self._seg_ws, self._seg_decided = self._seg_start, False
+
+    def _isa_passes(self, isa: int) -> bool | None:
+        """Whether the ``ISA`` at ``isa``, opening the segment a passing walk is at, passes
+        :func:`isa_separators_line_up` as a whole header: True or False, or None while the bytes
+        that decide it have not arrived. The gate positions are read in order and resumed from
+        :attr:`_isa_gate` on the next feed, so a header trickled in is read about once, and the
+        first that differs ends the check: an ``ISA~`` segment fails at its +6."""
+        buf = self._buf
+        sep = buf[isa + 3 : isa + 4]
+        if not sep:
+            return None
+        while self._isa_gate < len(_GATE_SEP_OFFSETS):
+            at = isa + _GATE_SEP_OFFSETS[self._isa_gate]
+            found = buf[at : at + 1]
+            if not found:
+                return None
+            if found != sep:
+                return False
+            self._isa_gate += 1
+        if len(buf) < isa + ISA_SEGMENT_LEN:
+            return None
+        # Every gate holds the separator, so only the distinctness rule is left.
+        return isa_delimiters_distinct(buf, isa)
 
     def _take(self, end: int) -> bytes:
         """Cut the frame ``_buf[:end]`` off the front and reset the walk for what follows it."""
@@ -431,7 +480,7 @@ class X12FrameReader:
         self._dropped += n
 
     def _reset_walk(self) -> None:
-        self._seg_start = self._scan = self._seg_ws = 0
+        self._seg_start = self._scan = self._seg_ws = self._isa_gate = 0
         self._seg_decided = False
         self._suspect = False
 

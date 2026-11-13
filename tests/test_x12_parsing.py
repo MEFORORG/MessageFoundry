@@ -601,15 +601,22 @@ def test_check_integrity_reports_a_trailer_a_new_header_opens_over(
 
 
 class _CountingStr(str):
-    """A ``str`` that totals how far its ``find`` calls scan."""
+    """A ``str`` that totals how far its ``find`` calls scan, and how much its slices read."""
 
     scanned = 0
+    read = 0
 
     def find(self, sub: Any, start: Any = 0, end: Any = None) -> int:
         stop = len(self) if end is None else end
         idx = super().find(sub, start, stop)
         type(self).scanned += max(0, (stop if idx == -1 else idx + len(sub)) - start)
         return idx
+
+    def __getitem__(self, key: Any) -> str:
+        # Every slice or index read, such as the ISA check's, is tallied in ``read``.
+        got = super().__getitem__(key)
+        type(self).read += len(got)
+        return got
 
 
 def test_split_walks_a_chain_of_interchanges_with_no_iea_linearly() -> None:
@@ -647,17 +654,23 @@ def test_split_and_reader_stay_linear_when_noise_precedes_each_isa(between: str)
         assert scanned < 4 * len(data), (k, scanned)
 
 
-def test_a_failing_isa_that_opens_a_segment_ends_a_passing_walk() -> None:
-    # Any literal ISA that opens a segment ends the walk, passing or not, so an interchange with no
-    # IEA does not swallow a corrupted one after it. That one is its own malformed element.
+def test_a_passing_isa_that_opens_a_segment_ends_a_passing_walk() -> None:
+    # Only an ISA that passes ends the walk, so an interchange with no IEA does not swallow a good one
+    # after it. A corrupted ISA there fails, so it is data in the walk before it: the two are framed
+    # together, through the corrupted one's IEA. That is the price of never cutting a complete
+    # interchange at a body segment that only starts with "ISA".
     a = _without_iea(interchange())
     bad = _corrupt(interchange(control="000000002"))
     good = interchange(control="000000003")
     for between in ("", "\r\n"):
-        raw = a + between + bad + good
-        assert split(raw) == [a, bad, good]
+        raw = a + between + good
+        assert split(raw) == [a, good]
+        swallowed = a + between + bad
+        assert split(swallowed + good) == [swallowed, good]
         for chunk in (4096, 7, 1):
-            assert _frames_of(raw.encode(), chunk) == [a.encode(), bad.encode(), good.encode()]
+            assert _frames_of(raw.encode(), chunk) == [a.encode(), good.encode()]
+            frames = _frames_of((swallowed + good).encode(), chunk)
+            assert frames == [swallowed.encode(), good.encode()]
 
 
 def test_split_takes_a_lowercase_isa_as_data_as_the_reader_does() -> None:
@@ -693,28 +706,47 @@ def test_split_checks_a_chain_of_interchanges_with_no_iea_once_each() -> None:
     assert calls <= 50, calls
 
 
-@pytest.mark.parametrize("segment", ["ISA~", "ISAX*1~", "ISA*00*~"])
-@pytest.mark.parametrize("chunk", [4096, 1])
-def test_a_short_segment_opening_with_isa_cuts_an_interchange_in_two(
-    segment: str, chunk: int
+# Body segments that open with a literal "ISA" but fail the check: a short segment, a note, and a
+# terminator then "ISA" inside BIN binary data, which the walk reads as a segment start.
+_ISA_LIKE_SEGMENTS = [
+    pytest.param("ISA~", id="isa-alone"),
+    pytest.param("ISAX*1~", id="isax"),
+    pytest.param("ISA*NOTE*~", id="isa-note"),
+    pytest.param("BIN*9*ab~ISAcd~", id="bin-holding-terminator-isa"),
+]
+
+
+@pytest.mark.parametrize("term", ["~", "\n"])
+@pytest.mark.parametrize("segment", _ISA_LIKE_SEGMENTS)
+def test_a_segment_opening_with_a_failing_isa_does_not_cut_an_interchange(
+    segment: str, term: str
 ) -> None:
-    # Any literal "ISA" that opens a segment ends a passing walk, whether or not it passes, so a
-    # body segment that only starts like an ISA cuts the interchange there. split returns both
-    # parts. The reader yields the first at once, but the rest is a suspect shorter than a header:
-    # it is held until a next ISA bounds it, and lost if the connection ends first. That is a known
-    # gap (ADR 0012, 2026-11-13 amendment); this test pins it so a change to it is deliberate.
-    raw = interchange().replace("GE*", segment + "GE*", 1)
-    cut = raw.index(segment)
-    assert split(raw) == [raw[:cut], raw[cut:]]
-    reader = X12FrameReader()
+    # A segment that only starts with "ISA" used to end the walk, cutting a complete interchange in
+    # two: the reader yielded the head and held the tail, with the real IEA, as a suspect that could
+    # be lost at the frame deadline. Only an ISA that passes ends the walk now (BACKLOG #5921), so
+    # the interchange frames whole on both surfaces, however the reads split it. An LF terminator
+    # used to lose the tail's own IEA terminator in split too, where the tail was cut off.
+    raw = interchange(term=term).replace("GE*", segment.replace("~", term) + "GE*", 1)
+    assert split(raw) == [raw]
     data = raw.encode()
-    frames: list[bytes] = []
-    for i in range(0, len(data), chunk):
-        frames.extend(reader.feed(data[i : i + chunk]))
-    assert frames == [raw[:cut].encode()]
-    assert reader.in_frame  # the held rest
-    nxt = interchange(control="000000002").encode()
-    assert list(reader.feed(nxt)) == [raw[cut:].encode(), nxt]
+    for chunk in range(1, len(data) + 1):
+        assert _frames_of(data, chunk) == [data], chunk
+    # With a good interchange after it, both are framed, at every read size.
+    nxt = interchange(control="000000002", term=term).encode()
+    assert split(raw + nxt.decode()) == [raw, nxt.decode()]
+    for chunk in range(1, len(data) + len(nxt) + 1):
+        assert _frames_of(data + nxt, chunk) == [data, nxt], chunk
+
+
+def test_a_passing_walk_holds_at_an_isa_until_its_header_has_arrived() -> None:
+    # An ISA that opens a segment is not decided until the bytes that decide it arrive: the reader
+    # holds the open frame rather than cut it or walk past it, and cuts once the header passes.
+    a = _without_iea(interchange()).encode()
+    b = interchange(control="000000002").encode()
+    reader = X12FrameReader()
+    assert list(reader.feed(a + b[:60])) == [] and reader.in_frame
+    assert list(reader.feed(b[60:105])) == []
+    assert list(reader.feed(b[105:])) == [a, b]
     assert not reader.in_frame
 
 
@@ -970,9 +1002,10 @@ def _assert_open_interchange_refused_at_cap(chunk: bytes) -> None:
 
 
 class _CountingBuffer(bytearray):
-    """A bytearray that tallies how many bytes each ``find`` call examines."""
+    """A bytearray that tallies how many bytes each ``find`` call examines, and its slices read."""
 
     scanned = 0
+    read = 0
 
     def find(self, sub: object, start: object = 0, end: object = None) -> int:
         assert isinstance(sub, bytes) and isinstance(start, int)
@@ -982,11 +1015,20 @@ class _CountingBuffer(bytearray):
         self.scanned += max(0, (stop if idx == -1 else idx + len(sub)) - start)
         return idx
 
+    def __getitem__(self, key: Any) -> Any:
+        # Every slice or index read, such as the ISA check's, is tallied in ``read``.
+        got = super().__getitem__(key)
+        self.read += len(got) if isinstance(got, bytearray) else 1
+        return got
 
-def _drip(data: bytes, chunk: int) -> tuple[list[bytes], int]:
-    """Feed ``data`` ``chunk`` bytes at a time; return the frames and the bytes ``find`` examined."""
+
+def _drip(
+    data: bytes, chunk: int, counter: _CountingBuffer | None = None
+) -> tuple[list[bytes], int]:
+    """Feed ``data`` ``chunk`` bytes at a time; return the frames and the bytes ``find`` examined.
+    Pass ``counter`` to read its other tallies afterwards."""
     reader = X12FrameReader()
-    counter = _CountingBuffer()
+    counter = _CountingBuffer() if counter is None else counter
     reader._buf = counter  # the seam: every scan the reader does goes through this buffer
     frames: list[bytes] = []
     for i in range(0, len(data), chunk):
@@ -1028,6 +1070,41 @@ def test_frame_reader_scan_work_grows_linearly_with_input() -> None:
     _, small_work = _drip(small, 16)
     _, large_work = _drip(large, 16)
     assert large_work <= 2.5 * small_work, (small_work, large_work)
+
+
+@pytest.mark.parametrize(
+    "segment",
+    [
+        # Fails at +6, the first gate read.
+        pytest.param("ISA~", id="fails-early"),
+        # A whole header whose every gate holds the separator, refused only by the distinctness
+        # rule: the most a body segment can make the check read.
+        pytest.param(isa(comp="*"), id="fails-last"),
+    ],
+)
+@pytest.mark.parametrize("chunk", [4096, 7, 1])
+def test_the_isa_check_at_each_segment_start_stays_linear(segment: str, chunk: int) -> None:
+    # A passing walk checks a literal ISA at each segment start, and a reader holds while the header
+    # arrives. Re-reading it from the start on each feed, or searching past it, would make a body of
+    # many such segments quadratic, or 100 times the input in one-byte reads. Count every byte the
+    # slices read, the separator check's included, and every byte find scans.
+    raw = interchange().replace("GE*", segment * 400 + "GE*", 1)
+    data = raw.encode()
+    counter = _CountingBuffer()
+    frames, _ = _drip(data, chunk, counter)
+    assert frames == [data]
+    # One-byte reads cost about four bytes read and four scanned per input byte with or without
+    # these segments; re-reading each held header from its first gate on every feed reads about ten.
+    assert counter.read < 6 * len(data) and counter.scanned < 5 * len(data), (
+        counter.read,
+        counter.scanned,
+    )
+    _CountingStr.scanned = _CountingStr.read = 0
+    assert split(_CountingStr(raw)) == [raw]
+    assert _CountingStr.read + _CountingStr.scanned < 6 * len(raw), (
+        _CountingStr.read,
+        _CountingStr.scanned,
+    )
 
 
 # --- integrity ---------------------------------------------------------------
