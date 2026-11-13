@@ -2250,6 +2250,11 @@ class RegistryRunner:
         # Per-inbound rather than one process-wide flag because the RE-ARM is per-connection: a
         # restart of inbound A must not silently re-arm B's processing while B's listener stays down.
         self._log_halted: set[str] = set()
+        # Bumped by every #122 halt as it latches, and by every start and teardown (BACKLOG #5704).
+        # A halt waits for the reload lock before it stops anything, and it stops nothing if this
+        # moved meanwhile: a newer halt owns the break, or a stop or start has replaced the run it
+        # latched in, and pausing lanes into that run would make the next start come up paused.
+        self._log_halt_epoch = 0
         # The DELIVERY tier's counterpart is :attr:`_delivery_halted`, a derived read below rather
         # than a field here — see that property for why the tier links to the process latch instead
         # of restating it.
@@ -5850,7 +5855,13 @@ class RegistryRunner:
         un-errored rather than dead-lettering them. Fix the disk, reload, and the backlog drains."""
         if self._log_write_stopped:
             return  # latched: one halt per break
+        # THE LATCH IS THE SOURCE-SIDE HALF (BACKLOG #5704), set before any await. The stop below
+        # waits for the reload lock, and a reload holding it has unbound every listener and rebinds
+        # them. Its rebind gate, :meth:`_resume_inbound_processing`, refuses while this latch is set,
+        # so it cannot rebind a listener over the internal stages this halt is about to shut down.
         self._log_write_stopped = True
+        self._log_halt_epoch += 1
+        epoch = self._log_halt_epoch
         detail = f"application log sink {sink!r} is unwritable ({reason})"
         inbounds = [name for name in self.registry.inbound if name in self._sources]
         outbounds = [
@@ -5868,6 +5879,19 @@ class RegistryRunner:
             stopped=len(inbounds) + len(outbounds),
         )
         async with self._reload_lock:
+            if epoch != self._log_halt_epoch or not self._log_write_stopped:
+                # Something ran while this waited for the lock (BACKLOG #5704). A stop or a start
+                # has replaced the run this latched in: a start probes the log itself, and lanes
+                # paused into a stopped run would come back paused at the next start. A newer halt
+                # latched, and it alone stops this break, once. Or a recovery probe re-validated the
+                # log by writing to it and cleared the latch, so the log works and stopping now would
+                # halt a healthy engine. The page above has gone out; nothing else happens.
+                log.warning(
+                    "log-failure halt for sink %r stood down: a stop, a start, a newer halt or a "
+                    "log re-validation ran while it waited for the reload lock",
+                    sink,
+                )
+                return
             # THE INTERNAL STAGES FIRST, and they are not an afterthought — they are the half that
             # makes this an enforcement. See :meth:`_halt_inbound_processing`.
             #
@@ -6152,11 +6176,25 @@ class RegistryRunner:
         **REFUSES while the log is still unwritable** (:meth:`_log_recovery_ok`). Re-arming there
         would hand back exactly the state the halt exists to prevent — measured: a restart with the
         sinks still dead resumed the whole pipeline and drove a message to PROCESSED with no
-        application log behind it, and neither latch could ever fire again."""
-        if name not in self._log_halted:
+        application log behind it, and neither latch could ever fire again.
+
+        **It also refuses an inbound that is not halted YET while the latch is set** (BACKLOG
+        #5704). The halt latches before it waits for the reload lock, and fills :attr:`_log_halted`
+        only once it holds it. A reload holding the lock in that window has unbound every listener
+        and rebinds them through here, so a gate that read :attr:`_log_halted` alone let it rebind
+        each one over internal stages the halt was about to shut down, and the halt, which read its
+        bound list before the lock, left them bound and ACKing into halted lanes. The same holds for
+        an inbound a reload adds after a halt. A refused inbound is halted here, so its own workers
+        stop at their gate whether or not a halt is still to come."""
+        halted = name in self._log_halted
+        if not halted and not self._log_write_stopped:
             return True
         if not self._log_recovery_ok():
+            if not halted:
+                self._halt_inbound_processing([name])
             return False
+        if not halted:
+            return True  # the probe cleared the latch: the log works, and nothing here was halted
         self._log_halted.discard(name)
         for stage in (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE):
             dispatcher = self._dispatchers.get(stage)
@@ -6330,6 +6368,9 @@ class RegistryRunner:
                 # enters it.
                 await self._teardown_unsafe(TeardownReason.SHUTDOWN)
             self._stop.clear()
+            # This start probes the log itself below, so a halt still waiting for the lock from an
+            # earlier run stands down (BACKLOG #5704; see _log_halt_epoch).
+            self._log_halt_epoch += 1
             if self._dr_threshold is None:
                 # As in reload: with the profile off the threshold parks no outbound, and a
                 # marker left by a run under it would otherwise refuse doors until the next reload
@@ -7059,6 +7100,9 @@ class RegistryRunner:
         re-runs teardown on residual state and ``_reconcile_graph`` carries a ``has_residual_state``
         branch (ADR 0157 D7).
         """
+        # A halt still waiting for the reload lock stands down rather than pause lanes into a run
+        # this teardown ends (BACKLOG #5704; see _log_halt_epoch).
+        self._log_halt_epoch += 1
         demote = reason is TeardownReason.DEMOTE
         budget = (
             max(
