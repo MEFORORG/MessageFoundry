@@ -883,7 +883,7 @@ SITES: dict[str, Site] = {
         "entry before the driver is given that folder.",
     ),
     "messagefoundry/transports/database.py::_libpq_homes": Site(
-        2,
+        3,
         INTERNAL,
         "The fixed names `postgresql` and `.postgresql` under the engine process's own homes: the "
         "roaming application-data folder the Windows shell names, else $HOME and the effective "

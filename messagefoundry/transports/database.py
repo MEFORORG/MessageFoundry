@@ -1511,22 +1511,16 @@ _LIBPQ_ROOT_CERT = "root.crt"
 def _libpq_root_certs() -> list[tuple[str, str]]:
     """The ``(setting, path)`` of each root certificate the installed libpq could read from the
     engine's environment when no ``sslrootcert`` is given, which the generic dialect never gives
-    (BACKLOG #3090, step 3). The engine cannot tell which libpq psqlODBC loads, so each file a
-    libpq version would read is named, and the caller refuses on any of them.
-
-    ``PGSSLROOTCERT`` when it is set and not empty, which every version reads. Its value
-    ``system`` is libpq 16's name for the platform's own store, which is no file, but a libpq
-    older than 16 opens it as a file named ``system`` in the working directory, so that file is
-    named. Without it, ``root.crt`` in each of :func:`_libpq_homes`: none when no home can be
-    named, where libpq reads no default either. Raises ``OSError`` when the working directory or
-    the Windows home cannot be named."""
+    (BACKLOG #3090, step 3), for the caller to refuse on any of them: ``PGSSLROOTCERT`` when it
+    is set and not empty, else ``root.crt`` in each of :func:`_libpq_homes`. None for ``system``,
+    libpq 16's name for the platform's own store, which is no file, and when no home can be named,
+    where libpq reads no default either. A libpq older than 16 reads ``system`` as a file in its
+    working directory, and that file is not read here. Raises ``OSError`` when the Windows home
+    cannot be named."""
     named = os.environ.get("PGSSLROOTCERT")
     if named:
         # Not "DATABASE PGSSLROOTCERT": the log redaction scrubs two adjacent ALL-CAPS tokens.
-        if named == "system":
-            setting = "libpq root certificate PGSSLROOTCERT=system, a file to libpq 15 and older"
-            return [(setting, os.path.abspath(named))]
-        return [("libpq root certificate PGSSLROOTCERT", named)]
+        return [] if named == "system" else [("libpq root certificate PGSSLROOTCERT", named)]
     return [
         (f"libpq's default root certificate{label}", os.path.join(home, _LIBPQ_ROOT_CERT))
         for label, home in _libpq_homes()
@@ -1550,19 +1544,25 @@ def _libpq_homes() -> list[tuple[str, str]]:
     made (:func:`_windows_roaming_appdata`)."""
     if sys.platform == "win32":
         appdata = _windows_roaming_appdata()
-        return [] if appdata is None else [("", os.path.join(appdata or os.sep, "postgresql"))]
+        # The ANSI call writes "?" for a character its code page cannot hold, and "?" is not a
+        # character a Windows name can hold, so libpq's open of that path finds no file.
+        if appdata is None or "?" in appdata:
+            return []
+        return [("", os.path.join(appdata or os.sep, "postgresql"))]
     import pwd
 
+    # Keyed by the joined directory, so a home with a trailing separator is not a second one. No
+    # lexical normpath: past a link, its ".." names another directory than the system resolves.
     named: dict[str, str] = {}
     env_home = os.environ.get("HOME")
     if env_home:
-        named[env_home] = " in HOME"
+        named[os.path.join(env_home, ".postgresql")] = " in HOME"
     with contextlib.suppress(KeyError):  # no password-file entry: libpq 14 and older name none
-        named.setdefault(pwd.getpwuid(os.geteuid()).pw_dir, " in the password-file home")
-    return [
-        (label if len(named) > 1 else "", os.path.join(home or os.sep, ".postgresql"))
-        for home, label in named.items()
-    ]
+        password_home = pwd.getpwuid(os.geteuid()).pw_dir
+        named.setdefault(
+            os.path.join(password_home or os.sep, ".postgresql"), " in the password-file home"
+        )
+    return [(label if len(named) > 1 else "", home) for home, label in named.items()]
 
 
 #: ``CSIDL_APPDATA``: the roaming application-data folder libpq asks the Windows shell for.
