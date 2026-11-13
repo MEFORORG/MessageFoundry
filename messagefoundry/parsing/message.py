@@ -446,10 +446,11 @@ class Message:
             raise ValueError(f"segment must begin with a 3-char segment id, got {segment_id!r}")
         if segment_id == "MSH":
             raise ValueError("refusing to add a second MSH segment")
-        # A bare segment id (no field separator -> a single token) grafts a segment with no data
-        # field: the backend counts it, but the write path can't address it, so a later set()/field
-        # write raises "cannot set absent segment" even though count_segments() sees it. Normalize a
-        # bare id to a settable empty segment (id + one empty field) — identical to add_segment("TXA|").
+        # A bare segment id (no field separator -> a single token) would graft a fieldless segment,
+        # which Peek.field's python-hl7 matcher skips once the message is re-encoded, so a router
+        # would not see the segment a handler grafted. Normalize a bare id to an empty segment (id +
+        # one empty field), identical to add_segment("TXA|"). (The Message write path itself counts a
+        # fieldless segment since BACKLOG #5917, so this is not what makes the segment settable.)
         if len(tokens) == 1:
             tokens.append("")
         self._ensure_owned()  # copy-on-write before mutating (ADR 0104)

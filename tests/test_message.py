@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 
 from messagefoundry.parsing import Message
@@ -356,6 +358,55 @@ def test_add_segment_bare_id_is_settable() -> None:
     m2.add_segment("ZAL|")
     m2.set("ZAL-2", "hello")
     assert m.encode() == m2.encode()
+
+
+# A fieldless bare ``PID`` line directly before a populated one (BACKLOG #5917). Reads, presence and
+# count_segments() all treat the bare line as occurrence 1, so every write at occurrence 1 must edit
+# that same bare line and leave the populated second ``PID`` untouched.
+BARE_THEN_POPULATED = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\rPID\rPID|1||X^Y~Q\r"
+_POPULATED_PID = "PID|1||X^Y~Q"
+
+
+def _pid_lines(m: Message) -> list[str]:
+    return [line for line in m.encode().split("\r") if line.startswith("PID")]
+
+
+@pytest.mark.parametrize(
+    ("label", "op", "bare_after"),
+    [
+        ("whole-field", lambda m: m.set("PID-3", "NEW"), "PID|||NEW"),
+        ("component", lambda m: m.set("PID-3.2", "NEW"), "PID|||^NEW"),
+        ("subcomponent", lambda m: m.set("PID-3.1.2", "S"), "PID|||&S"),
+        ("repetition", lambda m: m.set("PID-3", "Z", repetition=2), "PID|||~Z"),
+        ("set-data", lambda m: m.set_data("PID-3", "A^B"), "PID|||A\\S\\B"),
+        ("add-repetition", lambda m: m.add_repetition("PID-3", "R"), "PID|||R"),
+    ],
+)
+def test_occurrence_one_write_lands_on_a_bare_segment(
+    label: str, op: Callable[[Message], None], bare_after: str
+) -> None:
+    m = Message.parse(BARE_THEN_POPULATED)
+    # The read side's view of occurrence 1: the bare line, empty.
+    assert m.count_segments("PID") == 2
+    assert m.field("PID-3") is None
+    op(m)
+    assert _pid_lines(m) == [bare_after, _POPULATED_PID], label
+    # The write reads back where the read side looks for it.
+    assert Message.parse(m.encode()).field("PID-3", occurrence=2) == "X^Y~Q"
+
+
+def test_occurrence_one_write_on_a_lone_bare_segment() -> None:
+    # A lone bare segment is present to the write guard, so the write must not raise KeyError.
+    m = Message.parse("MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\rPID\r")
+    m.set("PID-3", "NEW")
+    assert _pid_lines(m) == ["PID|||NEW"]
+    assert m.field("PID-3") == "NEW"
+
+
+def test_occurrence_two_write_still_targets_the_populated_segment() -> None:
+    m = Message.parse(BARE_THEN_POPULATED)
+    m.set("PID-3.2", "NEW", occurrence=2)
+    assert _pid_lines(m) == ["PID", "PID|1||X^NEW~Q"]
 
 
 def test_delete_segments() -> None:

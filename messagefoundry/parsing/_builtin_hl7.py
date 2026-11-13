@@ -326,14 +326,15 @@ def _is_blank_line(msg: ParsedMessage, seg_index: int) -> bool:
 def scan_segment_index(msg: ParsedMessage, seg_id: str, occurrence: int) -> int | None:
     """List index of the ``occurrence``-th id match using python-hl7's **``segments()`` matcher**.
 
-    The raising by-id paths (``Peek.field`` → :func:`extract_field`, and whole-field assignment →
-    :func:`set_field` at occurrence 1) resolve the segment through python-hl7's
-    ``Sequence(seg for seg in self if seg[0][0] == id)`` — which (a) blows up on any blank segment
-    (handled by :func:`raise_if_blank_segment_scan`, called first) and (b) **skips a fieldless bare
-    segment** (``seg[0][0]`` is the id's first character, never the id) so it is not counted as an
+    The raising by-id read path (``Peek.field`` → :func:`extract_field`) resolves the segment through
+    python-hl7's ``Sequence(seg for seg in self if seg[0][0] == id)`` — which (a) blows up on any blank
+    segment (handled by :func:`raise_if_blank_segment_scan`, called first) and (b) **skips a fieldless
+    bare segment** (``seg[0][0]`` is the id's first character, never the id) so it is not counted as an
     occurrence. So a bare ``PID`` directly before a populated ``PID`` makes the populated one
-    occurrence 1, exactly as the legacy path selects it. The tolerant read/presence path keeps using
-    :func:`_segment_index` (which counts the bare segment), preserving the legacy read↔extract split.
+    occurrence 1, exactly as the legacy path selects it. The ``Message`` read, presence and write paths
+    (:func:`set_field` included, BACKLOG #5917) use :func:`_segment_index`, which counts the bare
+    segment, preserving the legacy read↔extract split while keeping a write on the segment its read
+    and presence check name.
     """
     seen = 0
     for i, seg in enumerate(msg["segments"]):
@@ -962,18 +963,20 @@ def set_field(
     verbatim as a bare ``str`` (re-componentized lazily on a later read). Marks the message dirty so
     the next :func:`encode` rebuilds the raw. Raises ``KeyError`` if the segment occurrence is absent.
 
-    For ``occurrence == 1`` this routes through python-hl7's whole-field assignment
-    (``msg["SEG.Fn"] = …`` → the raising ``segments()`` scan): a blank segment anywhere makes it raise
-    ``IndexError``, a fieldless bare segment is skipped (so a bare ``PID`` before a populated one edits
-    the populated), and a zero-match raises ``KeyError`` — all for byte-parity. A later occurrence uses
-    the tolerant :func:`_segment_index` scan (counts the bare segment, no blank-raise). (The ``Message`` write
-    guard's tolerant presence check runs first, so a wholly-absent target is already a ``KeyError``.)
+    Every occurrence resolves through the tolerant :func:`_segment_index` scan, the one the read and
+    presence paths use, so a fieldless bare segment counts as an occurrence here too: a bare ``PID``
+    before a populated one is occurrence 1, and a write at occurrence 1 extends that bare segment in
+    place (BACKLOG #5917). python-hl7's whole-field assignment skipped the bare segment at occurrence
+    1, so a write landed on the populated segment the read side calls occurrence 2, while a component,
+    repetition or ``add_repetition`` write read its base from the bare one and overwrote the populated
+    field with it. That legacy skip is deliberately not kept. For ``occurrence == 1`` a blank segment
+    anywhere still raises ``IndexError`` (:func:`raise_if_blank_segment_scan`, byte-parity with
+    python-hl7's ``segments()`` scan); the ``Message`` layer drops empty lines before parsing, so only
+    a tree-held blank segment reaches it.
     """
     if occurrence == 1:
         raise_if_blank_segment_scan(msg)
-        seg_index = scan_segment_index(msg, seg_id, occurrence)
-    else:
-        seg_index = _segment_index(msg, seg_id, occurrence)
+    seg_index = _segment_index(msg, seg_id, occurrence)
     if seg_index is None:
         raise KeyError(f"cannot set absent segment {seg_id!r} occurrence {occurrence}")
     _ensure_split(msg, seg_index)
