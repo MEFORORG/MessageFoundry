@@ -82,3 +82,94 @@ def test_empty_list_raises() -> None:
 def test_message_objects_and_strings_both_accepted() -> None:
     env = encode_batch([Message.parse(M1), M2], control_id="3", timestamp="20260101120000")
     assert "MSG1" in env and "MSG2" in env and "BTS|2" in env
+
+
+# --- BACKLOG #5919: the head is read for MSH-1/MSH-2 alone, and no member is copied ---------------
+
+_TS = "20260101120000"
+
+
+def _no_parse(*_args: object, **_kwargs: object) -> Message:
+    raise AssertionError("encode_batch parsed a member")
+
+
+def test_the_head_member_is_not_parsed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Only MSH-1 and MSH-2 are needed, so a full parse of a large head is waste.
+    monkeypatch.setattr(Message, "parse", staticmethod(_no_parse))
+    env = encode_batch([M1, M2], control_id="1", timestamp=_TS)
+    assert env.startswith("BHS|^~\\&|")
+
+
+def test_members_are_not_copied_before_the_join() -> None:
+    # The envelope's own join is the one copy a member needs. A strip of each member and a CR
+    # appended to the whole envelope each copied it again, multiplying peak memory.
+    import tracemalloc
+
+    body = "OBX|1|ED|DOC||" + "A" * (4 * 1024 * 1024) + "\r"
+    members: list[Message | str] = [
+        f"MSH|^~\\&|A|B|C|D|{_TS}||ORU^R01|M{i}|P|2.5.1\r{body}" for i in range(3)
+    ]
+    total = sum(len(m) for m in members if isinstance(m, str))
+    tracemalloc.start()
+    try:
+        env = encode_batch(members, control_id="1", timestamp=_TS)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert len(env) > total  # positive control: the envelope holds every member
+    # An ASCII str costs about one byte per character; one envelope is about `total` bytes.
+    assert peak < 1.5 * total, peak
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        "  \r\n" + M1,  # leading whitespace, as the parser strips it
+        "\N{ZERO WIDTH NO-BREAK SPACE}" + M1,  # a byte order mark, as split_batch reads past it
+        M1.replace("\r", "\n"),  # LF line endings
+        "MSH|^~\\&#|A|B|C|D|20260101||ADT^A01|MSG1|P|2.7\r",  # MSH-2 with a fifth char (v2.7)
+        "BHS|^~\\&\rMSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\r",  # the parser's first MSH
+    ],
+)
+def test_the_head_separators_match_the_parser(head: str) -> None:
+    env = encode_batch([head], control_id="1", timestamp=_TS)
+    assert env.startswith("BHS|^~\\&|")
+
+
+def test_a_custom_delimiter_head_after_an_envelope_header_uses_its_msh() -> None:
+    head = "BHS|^~\\&\rMSH#@~\\&#A#B#C#D#20260101##ADT@A01#MSGX#P#2.5.1\r"
+    assert Message.parse(head)._encoding_chars()[:2] == ("#", "@")  # the parser's reading
+    env = encode_batch([head], control_id="1", timestamp=_TS)
+    assert env.startswith("BHS#@~\\&#")
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        "not an HL7 message",
+        "MSH\r",  # no MSH-1
+        "MSH|^~\r",  # MSH-2 shorter than four characters
+        "MSH|^~|A|B\r",  # MSH-2 cut short by the field separator
+        "MSH|",  # MSH-1 and nothing more
+        "BHS|^~\\&\rPID|1\r",  # an envelope header and no MSH
+    ],
+)
+def test_an_undeterminable_head_raises_value_error(head: str) -> None:
+    # The contract Message._encoding_chars kept: refuse rather than guess the separators.
+    with pytest.raises(ValueError, match="cannot determine HL7 separators"):
+        encode_batch([head], control_id="1", timestamp=_TS)
+
+
+@pytest.mark.parametrize(
+    ("member", "framed"),
+    [
+        ("MSH|^~\\&|A\rPID|1\r", "MSH|^~\\&|A\rPID|1\r"),
+        ("MSH|^~\\&|A\rPID|1", "MSH|^~\\&|A\rPID|1\r"),  # no trailing CR
+        ("MSH|^~\\&|A\rPID|1\r\r\r", "MSH|^~\\&|A\rPID|1\r"),  # several trailing CRs
+        ("MSH|^~\\&|A\r\nPID|1\n", "MSH|^~\\&|A\rPID|1\r"),  # LF line endings
+        ("\r\rMSH|^~\\&|A\r", "MSH|^~\\&|A\r"),  # leading CRs
+    ],
+)
+def test_each_member_is_framed_with_one_trailing_cr(member: str, framed: str) -> None:
+    env = encode_batch([M1, member], control_id="1", timestamp=_TS)
+    assert env == "BHS|^~\\&|||||" + _TS + "||||1\r" + M1 + framed + "BTS|2\r"

@@ -10789,9 +10789,10 @@ class RegistryRunner:
                 parsed = await asyncio.to_thread(Message.parse, first.payload)
                 control_id = parsed.control_id or first.id  # stable
                 timestamp = _hl7_batch_timestamp(first.created_at)
-                # encode_batch parses the HYDRATED head for the separators and normalizes every
-                # member, in one call, so a fault inside it cannot be told apart by member; the
-                # send is the whole envelope's. Neither names one.
+                # encode_batch reads the HYDRATED head's MSH-1 and MSH-2 and frames every member,
+                # without a parse or a copy of any (BACKLOG #5919), in one call, so a fault inside
+                # it cannot be told apart by member; the send is the whole envelope's. Neither
+                # names one.
                 current = None
                 envelope = await asyncio.to_thread(
                     encode_batch, members, control_id=control_id, timestamp=timestamp
