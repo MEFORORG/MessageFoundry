@@ -4902,8 +4902,8 @@ be quarantined would therefore spend the budget on every tick, which is the star
 to prevent. On `File(...)` under `after_read` `move` or `delete` (BACKLOG #5717) the gap is
 narrowed, not closed. When the move failed for a reason that looks lasting, such as access denied,
 the source remembers the file and skips it unread and uncharged until its size, modification time or
-file identity changes, or 300 seconds pass, so the drops behind it are reached between retries. A
-failure that looks transient, at least a locked file, a file another process holds open, or a full
+file identity changes. Every 300 seconds it tries the move alone again, still unread and uncharged.
+A failure that looks transient, at least a locked file, a file another process holds open, or a full
 disk, is not remembered, so such a file still charges on later scans as before. At least a restart of
 the connection and a memory that is full (100,000 files) also leave a file charged again. Under
 `leave`, and on `Sftp(...)`/`Ftp(...)`, the gap stands as described.

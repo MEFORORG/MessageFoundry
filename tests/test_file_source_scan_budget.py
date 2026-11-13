@@ -3,11 +3,12 @@
 """A FILE source reaches healthy drops behind rejects it cannot move (BACKLOG #5717).
 
 Every quarantine arm charges the per-tick budget whether or not the move to ``.error`` worked. Before
-#5717 a reject that could not be moved stayed in place and was read and charged again on every scan,
-so ``poll_max_files`` such rejects sorting first spent the whole budget each time and the healthy
-drops behind them were never reached. Under ``move`` and ``delete`` a reject that stays for a lasting
-reason is now remembered by path and ``lstat`` mark and skipped unread and uncharged until it changes.
-A transient failure is not remembered, and ``leave`` is unchanged.
+#5717 a reject that could not be moved stayed in place and was read and charged again on later scans,
+so ``poll_max_files`` such rejects sorting first could spend the whole budget and hold back the
+healthy drops behind them. Under ``move`` and ``delete`` a reject that stays for a lasting reason is
+now remembered by path and mark and skipped unread and uncharged until it changes, while its move
+alone is retried every ``STUCK_RETRY_SECONDS``. A transient failure is not remembered, and ``leave``
+is unchanged.
 
 Deliberately ASCII-only: pytest echoes a failing body to a cp1252 console on Windows.
 """
@@ -130,7 +131,7 @@ async def test_healthy_drop_is_reached_behind_unmovable_rejects(
     """The probe from the review of the first build: before #5717 the healthy drop was never handed
     off while ``stuck >= cap``. Each reject is read once, and no scan reads more than ``cap``.
 
-    Mutation: drop the ``_still_stuck`` skip in ``_scan_once``. Red: never handed off."""
+    Mutation: drop the ``_stuck_handled`` skip in ``_scan_once``. Red: never handed off."""
     rig = _Rig(tmp_path, monkeypatch, cap=cap, after_read=after_read)
     for n in range(stuck):
         rig.drop(f"a_reject{n:03d}.hl7", _PDF)
@@ -221,13 +222,16 @@ async def test_a_windows_sharing_violation_is_transient_although_errno_says_eacc
     assert getattr(exc, "winerror", None) == 32
     assert not file_mod._lasting(exc)
     assert file_mod._lasting(OSError(errno.EACCES, "denied", None, 5))
+    # A dropped share stays transient even where the archive directory failed to open.
+    assert not file_mod._lasting(OSError(errno.ENOENT, "bad netpath", None, 53), archive_dir=True)
+    assert file_mod._lasting(OSError(errno.ENOENT, "path not found", None, 3))
 
 
 async def test_an_archived_copy_whose_original_cannot_be_removed_is_remembered(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A copy in ``.error`` with the original left behind for good is recorded once, and the original
-    is not copied into ``.error`` again on every scan."""
+    is not copied into ``.error`` again, not even when a retry would be due."""
     rig = _Rig(tmp_path, monkeypatch, cap=10, fail_errno=None)
     archives: list[str] = []
 
@@ -250,6 +254,8 @@ async def test_an_archived_copy_whose_original_cannot_be_removed_is_remembered(
     await rig.scan()
     for _ in range(3):
         await rig.scan()
+    _age_stuck(rig)
+    await rig.scan()
     assert archives == ["a.hl7"]
     assert events == ["file_content_mismatch"]
     assert rig.reads == ["a.hl7"]
@@ -303,22 +309,59 @@ async def test_a_stuck_reject_is_retried_after_the_retry_interval(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A cause fixed outside the file (an ``.error`` made writable again) is picked up without a
-    restart: once ``STUCK_RETRY_SECONDS`` pass the reject settles, is read, and is moved.
+    restart: once ``STUCK_RETRY_SECONDS`` pass the move alone is tried again, unread, and records the
+    remembered event when it archives the file.
 
-    Mutation: drop the time test from ``_skip_stuck``. Red: the reject is never read again."""
+    Mutation: drop the time test from ``_stuck_handled``. Red: the move is never tried again."""
     rig = _Rig(tmp_path, monkeypatch, cap=10)
+    events: list[str] = []
+
+    async def sink(kind: str, _peer: str | None, _reason: str | None) -> None:
+        events.append(kind)
+
+    rig.source.on_connection_event = sink
     rig.drop("a.hl7", _PDF)
     await rig.scan()
     assert await rig.scan() == ["a.hl7"]
-    assert await rig.scan() == []
+    _age_stuck(rig)
+    assert await rig.scan() == [], "a retry that fails again reads nothing"
+    assert len(rig.source._stuck) == 1
 
     rig.fail_errno = None
-    key, (mark, since, missed) = next(iter(rig.source._stuck.items()))
-    rig.source._stuck[key] = (mark, since - file_mod.STUCK_RETRY_SECONDS, missed)
-    assert await rig.scan() == [], "the retried file settles first"
-    assert await rig.scan() == ["a.hl7"]
+    assert await rig.scan() == [], "not due again yet"
+    assert not (rig.inbox / ".error" / "a.hl7").exists()
+    _age_stuck(rig)
+    assert await rig.scan() == []
     assert (rig.inbox / ".error" / "a.hl7").exists()
+    assert events == ["file_content_mismatch"]
     assert rig.source._stuck == {}
+    assert rig.reads == ["a.hl7"]
+
+
+async def test_due_retries_never_crowd_a_healthy_drop_out_of_a_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retry is uncharged, so however many stuck rejects come due in one scan, the healthy drop
+    behind them is still handed off in that scan."""
+    rig = _Rig(tmp_path, monkeypatch, cap=1)
+    for n in range(5):
+        rig.drop(f"a_reject{n}.hl7", _PDF)
+    await rig.scan()
+    for _ in range(5):
+        await rig.scan()
+    assert len(rig.source._stuck) == 5
+    rig.drop("b_healthy.hl7", _HL7)
+    await rig.scan()  # the healthy drop's settle poll
+    _age_stuck(rig)
+    assert await rig.scan() == ["b_healthy.hl7"]
+    assert rig.handed_off == [_HL7]
+    assert len(rig.source._stuck) == 5
+
+
+def _age_stuck(rig: _Rig) -> None:
+    """Make every remembered reject due for its retry."""
+    for entry in rig.source._stuck.values():
+        entry.since -= file_mod.STUCK_RETRY_SECONDS
 
 
 async def test_a_failed_listing_does_not_wipe_the_stuck_memory(

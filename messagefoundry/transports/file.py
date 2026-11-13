@@ -102,17 +102,34 @@ _FileSig = tuple[int, int]
 _FileId = tuple[int, int]
 #: ``(size, mtime_ns, st_dev, st_ino)``: a stuck reject's memory (BACKLOG #5717). The identity half
 #: tells a new file dropped under the same name, with the same size and mtime, from the one that could
-#: not be moved. Where a volume reports no file ID, or one that a new file can reuse (FAT, exFAT), that
-#: compare is weak, and only ``STUCK_RETRY_SECONDS`` bounds how long such a new file waits.
+#: not be moved. It is weak where a volume reports no file ID, and where a file system hands a freed
+#: ID to the next file created, which at least FAT, exFAT, ext4 and XFS can do. A new file of the same
+#: size and mtime there may be skipped as the stuck one until the retried move archives it.
 _FileMark = tuple[int, int, int, int]
-#: ``(mark, monotonic time remembered, scans in a row that did not list it)``.
-_Stuck = tuple[_FileMark, float, int]
+
+
+class _Stuck:
+    """A reject whose move to ``.error`` failed for a lasting reason (BACKLOG #5717). ``kind`` and
+    ``reason`` are the connection event a retried move records if it archives the file. ``copied``
+    says a copy already sits in ``.error`` and only the original could not be removed, so the move is
+    never retried: a retry would write another copy. In memory only and never logged."""
+
+    __slots__ = ("copied", "kind", "mark", "missed", "reason", "since")
+
+    def __init__(self, mark: _FileMark, kind: str, reason: str, *, copied: bool) -> None:
+        self.mark = mark
+        self.kind = kind
+        self.reason = reason
+        self.copied = copied
+        self.since = time.monotonic()  # when the move last failed
+        self.missed = 0  # scans in a row that did not list the file
+
 
 # Failures that may clear by themselves, so a reject whose move hit one is NOT remembered as stuck and
 # is examined again on the next scan, as before BACKLOG #5717. At least: another process holds the file
 # open or locked, the file vanished, the disk or quota is full, or a share timed out or dropped. Any
-# other failure (access denied, a read-only volume, a link) is taken as lasting, and
-# ``STUCK_RETRY_SECONDS`` bounds what a wrong guess costs.
+# other failure (access denied, a read-only volume, a link) is taken as lasting, and the move alone is
+# retried every ``STUCK_RETRY_SECONDS``, which bounds what a wrong guess costs.
 _TRANSIENT_ERRNOS = frozenset(
     getattr(errno, name)
     for name in (
@@ -144,9 +161,15 @@ _TRANSIENT_ERRNOS = frozenset(
 # Windows maps several of these to EACCES or EINVAL, which alone would read as lasting, so the Windows
 # code is checked first: ERROR_NOT_READY 21, ERROR_SHARING_VIOLATION 32, ERROR_LOCK_VIOLATION 33,
 # ERROR_BAD_NETPATH 53, ERROR_UNEXP_NET_ERR 59, ERROR_NETNAME_DELETED 64, ERROR_BAD_NET_NAME 67,
-# ERROR_SEM_TIMEOUT 121, ERROR_VC_DISCONNECTED 240, ERROR_NETWORK_UNREACHABLE 1231,
-# ERROR_CONNECTION_ABORTED 1236, ERROR_NO_SYSTEM_RESOURCES 1450.
-_TRANSIENT_WINERRORS = frozenset({21, 32, 33, 53, 59, 64, 67, 121, 240, 1231, 1236, 1450})
+# ERROR_DEV_NOT_EXIST 55, ERROR_SEM_TIMEOUT 121, ERROR_VC_DISCONNECTED 240,
+# ERROR_NO_NET_OR_BAD_PATH 1222, ERROR_NETWORK_UNREACHABLE 1231, ERROR_HOST_UNREACHABLE 1232,
+# ERROR_CONNECTION_ABORTED 1236, ERROR_NO_SYSTEM_RESOURCES 1450, ERROR_NOT_CONNECTED 2250.
+_TRANSIENT_WINERRORS = frozenset(
+    {21, 32, 33, 53, 55, 59, 64, 67, 121, 240, 1222, 1231, 1232, 1236, 1450, 2250}
+)
+# ERROR_PATH_NOT_FOUND. Windows maps it to ENOENT, which alone would read as a vanished file, but a move
+# by handle of a file the engine already holds meets it only when the archive directory is missing.
+_WIN_PATH_NOT_FOUND = 3
 
 # Cap a single inbound file read so a multi-GB drop can't OOM the engine (DoS guard). None/0 in
 # settings, in any spelling, disables the cap; see docs/CONNECTIONS.md.
@@ -172,11 +195,11 @@ SETTLE_SEEN_MAX = 100_000
 # the wait; a failed listing returns no candidates rather than raising.
 SETTLE_MISS_LIMIT = 3
 
-# How long a reject that could not be moved to .error is skipped before it is read and tried again
-# (BACKLOG #5717). Without a limit, fixing the cause outside the file (an .error made writable again, a
-# share remounted read-write, a failure judged lasting that was not) would leave every remembered reject
-# in place until a restart. A retry reads and charges the file as on its first scan, so with the default
-# poll it costs about one scan in 300 of the budget such files take.
+# How often the move of a reject that could not be moved to .error is tried again (BACKLOG #5717).
+# Without a retry, fixing the cause outside the file (an .error made writable again, a share remounted
+# read-write, a failure judged lasting that was not) would leave every remembered reject in place until
+# a restart. The retry is the move alone: the file is unchanged, so its verdict stands, and it is not
+# read or charged, so retries cannot crowd healthy drops out of a scan however many rejects are stuck.
 STUCK_RETRY_SECONDS = 300.0
 
 # When `decompress=` is set, this bounds the *decompressed* output (ADR 0123): `max_file_bytes` only
@@ -801,8 +824,8 @@ class FileSource(SourceConnector):
         # _log_unconfined. In memory only and never logged.
         self._refused: set[str] = set()
         # BACKLOG #5717: rejects whose move to .error failed for a lasting reason, keyed by path. Under
-        # move and delete only. See _skip_stuck. Bounded like _refused, and pruned like the settle map.
-        # In memory only and never logged.
+        # move and delete only. See _stuck_handled. Bounded like _refused, and pruned like the settle
+        # map. In memory only and never logged.
         self._stuck: dict[str, _Stuck] = {}
         # The connection, as the `.processed` age sweep names it in a log line (BACKLOG #1188).
         self._label = config.name or str(self.directory)
@@ -1112,9 +1135,9 @@ class FileSource(SourceConnector):
                 self._log_unreadable(path, exc)
                 continue
             before: _FileSig = mark[:2]
-            if self._stuck and self._skip_stuck(path, mark):
-                # BACKLOG #5717: a reject that could not be moved to .error, unchanged since. Not read,
-                # moved or charged, so it cannot hold back the healthy drops behind it.
+            if self._stuck and await self._stuck_handled(path, mark):
+                # BACKLOG #5717: a reject that could not be moved to .error, unchanged since. Not read
+                # or charged, so it cannot hold back the healthy drops behind it.
                 continue
             # #142 leave-in-place dedup: skip a file this connection already ingested. In-memory set
             # first (no I/O), then the durable ledger (survives restart / a fresh process). Keyed on a
@@ -1320,15 +1343,14 @@ class FileSource(SourceConnector):
         The caller charges the per-tick budget whatever happened here, so a scan still reads at most
         ``poll_max_files`` files that end in a reject. Before #5717 a reject that could not be moved
         was read and charged again on later scans, so enough of them sorting first could spend the
-        whole budget each time and hold back the healthy drops behind them. Remembered here, it is
-        skipped unread and uncharged (:meth:`_skip_stuck`) until it changes or
-        ``STUCK_RETRY_SECONDS`` pass.
+        whole budget each time and hold back the healthy drops behind them. Remembered here, it is not
+        read or charged again until it changes (:meth:`_stuck_handled`).
 
         The mark is ``before``, the stat the read was checked against, with ``read_id``, the identity
         of the file the read handle held, so it describes the file judged. Only ``move`` and ``delete``
         remember. ``leave`` keeps examining such a file as it always has: there a read-only share is
         expected, and nothing here changes it. A failure that may clear by itself
-        (:func:`_lasting`) is not remembered either, so a later scan tries the move again."""
+        (:func:`_lasting`) is not remembered either, so a later scan reads the file and tries again."""
         archived, stays = await self._run_fs(self._archive_to, path, self.error_dir, read_id)
         if archived:
             await self._emit_event(kind, reason=reason)
@@ -1337,29 +1359,45 @@ class FileSource(SourceConnector):
         key = str(path)
         if key not in self._stuck and len(self._stuck) >= SETTLE_SEEN_MAX:
             return  # full: this one is examined again, as before #5717
-        self._stuck[key] = ((*before, *read_id), time.monotonic(), 0)
+        self._stuck[key] = _Stuck((*before, *read_id), kind, reason, copied=archived)
         logger.warning(
-            "file source %s: rejected file %s stays in place; it is not read again until it changes "
-            "or %d seconds pass",
+            "file source %s: rejected file %s stays in place; it is not read again until it changes%s",
             self.directory,
             safe_name(path.name),
-            STUCK_RETRY_SECONDS,
+            " (a copy is in the error directory)"
+            if archived
+            else f", and the move is retried every {STUCK_RETRY_SECONDS:.0f} seconds",
         )
 
-    def _skip_stuck(self, path: Path, mark: _FileMark) -> bool:
-        """True when ``path`` is a remembered stuck reject that still shows ``mark`` and is not yet due
-        a retry, so the scan skips it. Otherwise the entry is FORGOTTEN here, so the file settles and
-        is examined afresh (BACKLOG #5717)."""
+    async def _stuck_handled(self, path: Path, mark: _FileMark) -> bool:
+        """True when ``path`` is a remembered stuck reject that still shows ``mark``, so the scan
+        skips it unread and uncharged (BACKLOG #5717). A changed file is FORGOTTEN here and this
+        returns False, so it settles and is examined afresh.
+
+        Every ``STUCK_RETRY_SECONDS`` the move alone is tried again, against the identity the read
+        held, and records the remembered event if it archives the file. A failure that looks transient
+        this time forgets the file, so a later scan reads it as before #5717. A ``copied`` entry is
+        never retried."""
         key = str(path)
-        seen = self._stuck.get(key)
-        if seen is None:
+        entry = self._stuck.get(key)
+        if entry is None:
             return False
-        if seen[0] == mark and time.monotonic() - seen[1] < STUCK_RETRY_SECONDS:
+        if entry.mark != mark:
+            del self._stuck[key]
+            return False
+        if entry.copied or time.monotonic() - entry.since < STUCK_RETRY_SECONDS:
             if logger.isEnabledFor(logging.DEBUG):  # safe_name hashes, so skip it unread
                 logger.debug("file source: still skipping stuck reject %s", safe_name(path.name))
             return True
-        del self._stuck[key]
-        return False
+        archived, stays = await self._run_fs(self._archive_to, path, self.error_dir, mark[2:])
+        if archived:
+            await self._emit_event(entry.kind, reason=entry.reason)
+        if not stays:
+            del self._stuck[key]
+        else:
+            entry.copied = archived
+            entry.since = time.monotonic()
+        return True
 
     async def _emit_event(self, kind: str, *, reason: str | None = None) -> None:
         """Record a quarantine in the connection-event log (BACKLOG #1621), **fail-soft**.
@@ -1413,9 +1451,10 @@ class FileSource(SourceConnector):
 
         A reject charges even when its move to ``.error`` fails, so a scan still reads at most
         ``poll_max_files`` files that end in a reject. Under ``move`` and ``delete`` such a file, when
-        the failure looks lasting, is then remembered and skipped unread and uncharged until it changes
-        or ``STUCK_RETRY_SECONDS`` pass (:meth:`_quarantine`, BACKLOG #5717). At least a failure that
-        looks transient, a full memory and a restart leave it read and charged again on a later scan.
+        the failure looks lasting, is then remembered and skipped unread and uncharged until it changes,
+        while its move alone is retried (:meth:`_stuck_handled`, BACKLOG #5717). At least a failure
+        that looks transient, a full memory and a restart leave it read and charged again on a later
+        scan.
         Under ``leave`` nothing is remembered, as before. The ``remaining`` count logged below includes
         remembered rejects, which the next scan skips.
 
@@ -1556,14 +1595,13 @@ class FileSource(SourceConnector):
     def _prune_stuck(self, listed: set[str]) -> None:
         """:meth:`_prune_settle`'s rule for the stuck-reject memory (BACKLOG #5717), so a listing that
         fails now and then does not make every remembered reject be read and charged again."""
-        for key, (mark, since, missed) in list(self._stuck.items()):
+        for key, entry in list(self._stuck.items()):
             if key in listed:
-                if missed:
-                    self._stuck[key] = (mark, since, 0)
-            elif missed + 1 >= SETTLE_MISS_LIMIT:
+                entry.missed = 0
+            elif entry.missed + 1 >= SETTLE_MISS_LIMIT:
                 del self._stuck[key]
             else:
-                self._stuck[key] = (mark, since, missed + 1)
+                entry.missed += 1
 
     async def _leave_already_ingested(self, forms: tuple[str, ...]) -> bool:
         """True if this leave-in-place file was already ingested — the bounded in-process cache first (no
@@ -3433,8 +3471,8 @@ def _file_mark(path: Path) -> _FileMark:
 
 def _lasting(exc: OSError, *, archive_dir: bool = False) -> bool:
     """Whether a failed move or delete is expected to fail the same way on the next scan, as opposed
-    to clearing by itself (BACKLOG #5717). A guess either way: ``STUCK_RETRY_SECONDS`` bounds what a
-    wrong True costs, and a wrong False costs what it did before #5717.
+    to clearing by itself (BACKLOG #5717). A guess either way: a wrong True costs a retried move every
+    ``STUCK_RETRY_SECONDS``, and a wrong False costs what it did before #5717.
 
     A file replaced since the read is not lasting: the next scan reads the new one. A link is. A
     missing file is not, unless ``archive_dir`` says it is the archive directory that is missing,
@@ -3443,10 +3481,13 @@ def _lasting(exc: OSError, *, archive_dir: bool = False) -> bool:
         return False
     if isinstance(exc, _Unconfined):
         return True
+    winerror = getattr(exc, "winerror", None)
+    if winerror in _TRANSIENT_WINERRORS:
+        return False
+    if winerror == _WIN_PATH_NOT_FOUND:
+        return True
     if archive_dir and exc.errno in (errno.ENOENT, errno.ENOTDIR):
         return True
-    if getattr(exc, "winerror", None) in _TRANSIENT_WINERRORS:
-        return False
     return exc.errno not in _TRANSIENT_ERRNOS
 
 
