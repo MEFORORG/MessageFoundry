@@ -70,7 +70,6 @@ from messagefoundry.transports.bounded_read import (
 # Reuse rest.py's hardened opener + URL redaction (no new HTTP plumbing) — exactly as fhir.py/soap.py
 # do. rest.py imports this module's provider LAZILY (inside __init__) so there is no import cycle.
 from messagefoundry.transports.rest import (
-    AUTH_CHALLENGE_REFUSED_ON_CONNECT,
     ECH_HOP_WAYS_ACROSS,
     HttpAuthError,
     ProxyConfig,
@@ -186,7 +185,7 @@ def _read_token_reply(
     except urllib.error.URLError as exc:  # DNS / connection refused / TLS / timeout
         if is_refused_proxy_digest_tunnel(exc, digest_proxy=digest_proxy):
             # ADR 0095 B.1 says why no retry can clear it (BACKLOG #2989).
-            raise auth_challenge_refused(endpoint, AUTH_CHALLENGE_REFUSED_ON_CONNECT) from exc
+            raise auth_challenge_refused(endpoint, on_connect=True) from exc
         raise DeliveryError(f"{endpoint} unreachable: {exc.reason}") from exc
     except (TimeoutError, OSError) as exc:
         raise DeliveryError(f"{endpoint} failed: {exc}") from exc

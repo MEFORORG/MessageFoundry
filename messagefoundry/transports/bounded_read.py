@@ -719,9 +719,9 @@ class ProxyTunnelRefusedError(OSError):
         super().__init__(message)
         self.status = status
 
-    def __reduce__(self) -> tuple[Any, tuple[str]]:
-        # OSError's own reduce passes the args alone, and status is keyword-only.
-        return functools.partial(type(self), status=self.status), (str(self),)
+    def __reduce__(self) -> tuple[object, ...]:
+        # As AmbiguousFramingError: the keyword-only status travels with the constructor.
+        return (functools.partial(type(self), status=self.status), self.args, self.__dict__)
 
 
 class _StrictHTTPSConnection(http.client.HTTPSConnection):
@@ -744,7 +744,7 @@ class _StrictHTTPSConnection(http.client.HTTPSConnection):
         try:
             super()._tunnel()  # type: ignore[misc]
         except OSError as exc:
-            status = replies[-1].status_read if replies else None
+            status = getattr(replies[-1], "status_read", None) if replies else None
             # _tunnel's own refusal of a status is a bare OSError with no errno. A socket error
             # while reading the head carries an errno or is a subclass, and keeps its own type.
             if status is None or status == 200 or type(exc) is not OSError or exc.errno is not None:

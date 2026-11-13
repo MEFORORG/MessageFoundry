@@ -356,15 +356,15 @@ AUTH_CHALLENGE_REFUSED = (
 #: The FIXED text for the one case no Digest handler sees: the token hop's web proxy, set up for
 #: Digest, answered the ``CONNECT`` for an ``https`` token endpoint with 407. Nothing was screened,
 #: so :data:`AUTH_CHALLENGE_REFUSED`'s hash and challenge words would be false here. It names the
-#: proxy and, right after, the two remedies ADR 0095 Amendment B.1 gives, so a long token URL
-#: before it costs the reason at the tail before it costs a remedy.
+#: proxy, then the remedy that sends no credential, and points at ADR 0095 Amendment B.1, which
+#: also gives Basic proxy auth and what that costs.
 AUTH_CHALLENGE_REFUSED_ON_CONNECT = (
-    "met a 407 from its web proxy on the CONNECT: use Basic proxy auth or bypass this host "
-    "(Digest cannot answer it)"
+    "met a 407 from its web proxy on the CONNECT, which Digest cannot answer; "
+    "bypass the proxy for this host (ADR 0095 B.1)"
 )
 
 
-def auth_challenge_refused(label: str, reason: str = AUTH_CHALLENGE_REFUSED) -> NegativeAckError:
+def auth_challenge_refused(label: str, *, on_connect: bool = False) -> NegativeAckError:
     """The delivery failure for a wire-time :class:`HttpAuthError` on ``label``'s hop (BACKLOG #2323).
 
     ``HttpAuthError`` is a ``ValueError``, so each send's ``(ValueError, InvalidURL)`` arm caught it
@@ -372,9 +372,11 @@ def auth_challenge_refused(label: str, reason: str = AUTH_CHALLENGE_REFUSED) -> 
     and would send an operator looking for a bad header or URL. The fault is the connection's, so
     this is a configuration fault: under the default ``credential_fault_policy`` the delivery
     worker stops the lane and keeps the queue. ADR 0095 Amendment B is the source of record for
-    why a stop was chosen over a retry, and for where that reasoning is weak. ``reason`` is the
-    fixed text after the label; the token hop passes :data:`AUTH_CHALLENGE_REFUSED_ON_CONNECT` for
-    the case :func:`is_refused_proxy_digest_tunnel` names (BACKLOG #2989)."""
+    why a stop was chosen over a retry, and for where that reasoning is weak. The text after the
+    label is always one of the two fixed ones; ``on_connect`` picks
+    :data:`AUTH_CHALLENGE_REFUSED_ON_CONNECT`, for the case :func:`is_refused_proxy_digest_tunnel`
+    names (BACKLOG #2989)."""
+    reason = AUTH_CHALLENGE_REFUSED_ON_CONNECT if on_connect else AUTH_CHALLENGE_REFUSED
     return NegativeAckError(
         f"{label} {reason}",
         code=AUTH_CHALLENGE_REFUSED_CODE,

@@ -881,17 +881,18 @@ class _ConnectReply:
 
 
 @pytest.mark.parametrize(
-    ("raised", "typed"),
+    ("status_line", "raised", "typed"),
     [
-        (OSError("Tunnel connection failed: 407 x"), True),
-        (ConnectionResetError(104, "reset while reading the head"), False),
-        (OSError(113, "no route"), False),
-        (TimeoutError("timed out"), False),
+        (b"HTTP/1.1 407 x\r\n", OSError("Tunnel connection failed: 407 x"), True),
+        (b"HTTP/1.1 407 x\r\n", ConnectionResetError(104, "reset while reading the head"), False),
+        (b"HTTP/1.1 407 x\r\n", OSError(113, "no route"), False),
+        (b"HTTP/1.1 407 x\r\n", TimeoutError("timed out"), False),
+        (b"HTTP/1.1 200 OK\r\n", OSError("closed after the tunnel opened"), False),
     ],
-    ids=["tunnel-refusal", "reset-after-status", "errno-oserror", "timeout"],
+    ids=["tunnel-refusal", "reset-after-status", "errno-oserror", "timeout", "status-200"],
 )
 def test_the_strict_connection_types_only_its_own_tunnel_refusal(
-    monkeypatch: pytest.MonkeyPatch, raised: OSError, typed: bool
+    monkeypatch: pytest.MonkeyPatch, status_line: bytes, raised: OSError, typed: bool
 ) -> None:
     """The pass-through arms of ``_StrictHTTPSConnection._tunnel``. A socket error after the
     proxy's 407 status line was read keeps its own type, so it stays the transient it was rather
@@ -900,7 +901,7 @@ def test_the_strict_connection_types_only_its_own_tunnel_refusal(
     from messagefoundry.transports import bounded_read
 
     def tunnel(self: http.client.HTTPConnection) -> None:
-        response = self.response_class(_ConnectReply(b"HTTP/1.1 407 x\r\n"))  # type: ignore[arg-type]
+        response = self.response_class(_ConnectReply(status_line))  # type: ignore[arg-type]
         response._read_status()  # type: ignore[attr-defined]
         raise raised
 
@@ -917,14 +918,42 @@ def test_the_strict_connection_types_only_its_own_tunnel_refusal(
     assert "response_class" not in vars(conn), "the CONNECT reply hook outlived the tunnel"
 
 
+def test_the_strict_tunnel_restores_an_instance_response_class(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A response class set on the connection itself reads the CONNECT reply and is put back."""
+    from messagefoundry.transports import bounded_read
+
+    seen: list[type] = []
+
+    def tunnel(self: http.client.HTTPConnection) -> None:
+        response = self.response_class(_ConnectReply(b"HTTP/1.1 403 x\r\n"))  # type: ignore[arg-type]
+        seen.append(type(response))
+        response._read_status()  # type: ignore[attr-defined]
+        raise OSError("Tunnel connection failed: 403 x")
+
+    class _Own(bounded_read.StrictHTTPResponse):
+        pass
+
+    monkeypatch.setattr(http.client.HTTPConnection, "_tunnel", tunnel)
+    conn = bounded_read._StrictHTTPSConnection("proxy.invalid")
+    conn.response_class = _Own
+    with pytest.raises(ProxyTunnelRefusedError) as ei:
+        conn._tunnel()
+    assert ei.value.status == 403
+    assert seen == [_Own]
+    assert vars(conn)["response_class"] is _Own
+
+
 def test_the_typed_tunnel_refusal_survives_a_copy() -> None:
     import copy
     import pickle
 
     err = ProxyTunnelRefusedError("Tunnel connection failed: 407 x", status=407)
+    err.add_note("kept")
     for clone in (copy.copy(err), pickle.loads(pickle.dumps(err))):  # noqa: S301
         assert isinstance(clone, ProxyTunnelRefusedError)
-        assert (clone.status, str(clone)) == (407, str(err))
+        assert (clone.status, str(clone), clone.__notes__) == (407, str(err), ["kept"])
 
 
 @pytest.mark.usefixtures("no_bypass")
@@ -946,8 +975,9 @@ def test_no_built_http_token_endpoint_reaches_the_web_proxy() -> None:
             client_id="cid",
             client_secret="s3cr3t",
             proxy=proxy_config,
+            timeout_seconds=2,
         )
-        with pytest.raises(DeliveryError) as ei:
+        with pytest.raises(DeliveryError, match=" unreachable: ") as ei:
             provider.access_token()
     assert type(ei.value) is DeliveryError
     assert proxy.requests == 0
