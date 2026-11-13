@@ -219,8 +219,8 @@ def _secure_file(path: str) -> None:
         try:  # noqa: SIM105 - suppress() would drop the rationale recorded in the handler below
             os.chmod(sibling, 0o600)
         except OSError:
-            # Non-fatal: on some filesystems / Windows ACLs chmod is a partial no-op. Deployments that
-            # enable body capture should place the DB on a protected volume regardless.
+            # Non-fatal: on some filesystems / Windows ACLs chmod is a partial no-op. Every tee DB,
+            # capture on or off, should be on a protected volume regardless (module docstring).
             pass
 
 
@@ -244,9 +244,11 @@ class RelayStore:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA synchronous=NORMAL")
         await db.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
-        # Zero freed content instead of only unlinking it, so a deleted capture body leaves no
-        # readable bytes in a free page. Per-connection, so set on the store's one connection.
-        async with db.execute("PRAGMA secure_delete=ON"):
+        # FAST zeroes deleted content inside a page where that costs no extra I/O, but leaves a
+        # freed page as it was. ON would write a zeroed WAL frame for every freed page before the
+        # delete commits, so a purge to free space on a full volume would fail and delete nothing.
+        # The scrub's VACUUM removes what FAST leaves. Per-connection, so set on the store's one.
+        async with db.execute("PRAGMA secure_delete=FAST"):
             pass
         await db.executescript(_SCHEMA)
         await db.commit()
@@ -390,8 +392,9 @@ class RelayStore:
         """TRUNCATE checkpoint, VACUUM, TRUNCATE checkpoint; raise if any of them does not finish.
 
         The first checkpoint writes the pages secure_delete zeroed back into the main file and
-        empties the -wal. VACUUM is part of the scrub too: B-tree rebalancing can leave stale
-        copies of a deleted cell in a page's unused space, which only its rebuild removes, and only
+        empties the -wal. VACUUM is part of the scrub too: secure_delete=FAST leaves freed pages
+        as they were, and B-tree rebalancing can leave stale copies of a deleted cell in a page's
+        unused space; only VACUUM's rebuild removes them, and only
         once the second checkpoint writes the rebuilt pages over the old ones. That checkpoint runs
         even after a failed VACUUM, to truncate the frames the VACUUM spilled into the -wal.
 
@@ -403,10 +406,10 @@ class RelayStore:
         This is a file-level scrub. A TRUNCATE frees the -wal's blocks and VACUUM's checkpoint
         shrinks the DB file without overwriting either, so the bytes can stay in freed filesystem
         blocks, and nothing here reaches a copy or backup taken before the purge."""
-        # temp_store stays at its default, so VACUUM may build its rebuilt copy in a temp file in
-        # SQLite's temp directory, which may sit off the DB's volume. In memory, a large capture DB
-        # would fail every purge with out of memory. docs/TEE-RELAY.md, Purge, says how an operator
-        # points that directory at a protected volume.
+        # temp_store=FILE for the VACUUM, so its rebuilt copy goes to a temp file in SQLite's temp
+        # directory, as docs/TEE-RELAY.md, Purge, says, even on a build whose default is memory: in
+        # memory a large capture DB would fail every purge. A build compiled with
+        # SQLITE_TEMP_STORE=3 keeps it in memory whatever this says.
         try:
             scrubbed = await self._checkpoint_truncate()
         except (sqlite3.Error, MemoryError) as exc:
@@ -418,8 +421,12 @@ class RelayStore:
         failures: list[str] = []
         cause: BaseException | None = None
         try:
-            async with self._db.execute("VACUUM"):
-                pass
+            await self._pragma("temp_store=FILE")
+            try:
+                async with self._db.execute("VACUUM"):
+                    pass
+            finally:
+                await self._pragma("temp_store=DEFAULT")
         except (sqlite3.Error, MemoryError) as exc:
             failures.append(f"VACUUM failed: {_describe(exc)}")
             cause = exc
@@ -457,10 +464,11 @@ class RelayStore:
         bytes included, on disk until a checkpoint, so once the delete commits, a run that deleted
         any row runs :meth:`_scrub`, which raises :class:`PurgeIncompleteError` with the deleted
         counts if the scrub does not finish. Returning the counts then would read as a clean purge
-        that did not happen. relay_log rows count too: their ``detail`` keeps the partner's MSA-3
-        text, which can name a patient. A run that deleted no row skips the scrub, since it freed
-        nothing to scrub, and a routine sweep should not rewrite the DB or contend with a reader
-        for nothing. :meth:`scrub` runs the scrub alone, to recover.
+        that did not happen. relay_log rows count too: their ``detail`` can carry partner ACK text
+        that names a patient. A run that deleted no row still scrubs when residue remains (see
+        :meth:`_has_residue`), so re-running a purge whose scrub failed finishes it; it skips the
+        scrub only when there is none, so a routine sweep does not rewrite the DB for nothing.
+        :meth:`scrub` runs the scrub alone.
         """
         async with self._lock:
             # NB: a bare `DELETE FROM t` (no WHERE) hits SQLite's truncate optimization, which makes
@@ -482,9 +490,24 @@ class RelayStore:
             cap_n = cap.rowcount
             log_n = 0 if log is None else log.rowcount
             await self._db.commit()
-            if log_n or cap_n:
+            if log_n or cap_n or await self._has_residue():
                 await self._scrub(log_n, cap_n)
         return (log_n, cap_n)
+
+    async def _has_residue(self) -> bool:
+        """Whether an earlier delete may have left bytes the scrub has not removed: the DB has free
+        pages, or the -wal is not empty. Either holds after a scrub that did not finish. A live
+        relay's writes also leave the -wal non-empty, so a sweep beside one scrubs anyway."""
+        async with self._db.execute("PRAGMA freelist_count") as cur:
+            row = await cur.fetchone()
+        if row is not None and int(row[0]) > 0:
+            return True
+        if self._path == ":memory:":
+            return False
+        try:
+            return os.path.getsize(self._path + "-wal") > 0
+        except FileNotFoundError:
+            return False
 
     async def export(
         self,

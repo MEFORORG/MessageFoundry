@@ -179,29 +179,35 @@ row, and `--scrub-only`, below, reclaims it on demand. With no `--before` it pur
 the captured bodies (the PHI-bearing table) and keeps the NAK/leg log. It **prompts for confirmation**
 (or refuses, in a non-interactive shell) unless you pass `-y`.
 
-The DB runs in WAL mode, so a deleted row stays in the DB file or its `-wal` file until a
-checkpoint writes the zeroed pages back. When a run deletes at least one row, purge then scrubs:
+The DB runs in WAL mode, so a deleted row stays in the DB file or its `-wal` file until the
+scrub removes it. When a run deletes at least one row, purge then scrubs:
 a `TRUNCATE` checkpoint, `VACUUM`, and a second checkpoint. That includes a run that deletes only
-log rows. A log row holds no message body, but its detail keeps the partner's ACK text, which can
-name a patient. `VACUUM` is part of the scrub. A B-tree rebalance can leave a stale copy of a
-deleted row in a page's unused space, and only the rebuild removes it. A run that deletes no row,
-such as a sweep with nothing old enough, skips the scrub.
+log rows. A log row holds no message body, but its detail can carry partner ACK text that
+names a patient. `VACUUM` is part of the scrub. The store zeroes deleted content inside a page
+only where that costs no extra I/O, and leaves a freed page as it was. A B-tree rebalance can also
+leave a stale copy of a deleted row in a page's unused space. Only the rebuild removes these. A
+run that deletes no row still scrubs if residue remains: the DB has free pages, or the `-wal` file
+is not empty. So re-running a purge whose scrub failed finishes the scrub. A live relay's writes
+keep the `-wal` non-empty, so a sweep beside a running relay scrubs every time. Only a run with no
+deletes and no residue skips the scrub.
 
 **The scrub is file-level only.** A checkpoint frees the `-wal` file's blocks and `VACUUM` shrinks
 the DB file, but neither overwrites the freed blocks. So the bytes can stay readable on the raw
 volume, and nothing here touches a copy or backup taken before the purge. [PHI.md section
-8](PHI.md#8-retention--purge) states the same limit for the engine store. Put a volume that holds
-captured bodies under full-disk encryption, as [section 10](PHI.md#10-secure-deployment--operations-checklist) advises.
+8](PHI.md#8-retention--purge) states the same limit for the engine store. Put the volume of every
+tee DB, capture on or off, under full-disk encryption, as [section 10](PHI.md#10-secure-deployment--operations-checklist) advises.
 
-`VACUUM` may build its rebuilt copy in a temp file in SQLite's temp directory. That directory can
-be on another volume. Purge does not keep the copy in memory, because a large capture DB would
-then fail every purge. To keep the copy on a protected volume, point SQLite's temp directory there
+`VACUUM` builds its rebuilt copy in a temp file in SQLite's temp directory, which can be on
+another volume. Purge sets `temp_store=FILE` for the `VACUUM`, because in memory a large capture DB
+would fail every purge. A SQLite build compiled to keep temp files in memory
+(`SQLITE_TEMP_STORE=3`) ignores that setting. To keep the copy on a protected volume, point SQLite's temp directory there
 before you run purge. On POSIX, SQLite tries `SQLITE_TMPDIR`, then `TMPDIR`, then its default
 directories such as `/var/tmp` and `/tmp`, and silently skips one that is missing or not
 writable, so a mistyped setting puts the copy in a default directory with nothing reported. On
-Windows it takes the directory from `TMP` (then `TEMP`) without checking it, so a missing
-directory makes `VACUUM` fail and the scrub report `VACUUM failed`. Check that the directory
-exists and the purge account can write to it.
+Windows it takes the first of `TMP`, `TEMP` and `USERPROFILE` that is set, then the Windows
+directory, without checking that it exists. A missing directory then makes `VACUUM` fail, and the
+scrub report `VACUUM failed`, but only once the copy outgrows SQLite's page cache: a small test DB
+can `VACUUM` without error. Check that the directory exists and the purge account can write to it.
 
 If the scrub does not finish, purge prints `error: ...` and exits 1. The error names the counts it
 deleted and the step that failed. At least these failures do that:

@@ -333,12 +333,12 @@ def test_purge_cli_reports_a_busy_checkpoint_as_an_error(
     assert "purged " not in captured.out
 
 
-async def test_secure_delete_is_on(tmp_path: Path) -> None:
+async def test_secure_delete_is_fast(tmp_path: Path) -> None:
     store = await _open(tmp_path)
     try:
         async with store._db.execute("PRAGMA secure_delete") as cur:  # noqa: SLF001
             row = await cur.fetchone()
-        assert row is not None and int(row[0]) == 1
+        assert row is not None and int(row[0]) == 2  # 2 is FAST
     finally:
         await store.close()
 
@@ -511,6 +511,7 @@ async def test_only_a_purge_that_deleted_no_row_skips_the_scrub(
                 (1000.0, "epic_to_corepoint", "corepoint", 10, "accepted"),
             )
             await store._db.commit()  # noqa: SLF001
+        assert await store._checkpoint_truncate()  # noqa: SLF001 - no residue: the -wal is empty
         peer = sqlite3.connect(db_path, isolation_level=None)
         peer.execute("BEGIN")
         peer.execute("SELECT COUNT(*) FROM relay_capture").fetchall()  # pins the WAL
@@ -525,7 +526,8 @@ async def test_only_a_purge_that_deleted_no_row_skips_the_scrub(
         assert checkpoints == []  # the scrub never ran
         with pytest.raises(PurgeIncompleteError):  # control: the reader really pins the WAL
             await store.scrub()
-        assert checkpoints == [False]  # it stopped at the first busy checkpoint
+        # The empty -wal lets the first checkpoint pass; the reader pins the VACUUM's frames.
+        assert checkpoints == [True, False]
     finally:
         if peer is not None:
             peer.close()
@@ -612,5 +614,60 @@ async def test_each_truncate_checkpoint_is_preceded_by_a_passive_one(
             ]
             * 2
         )
+    finally:
+        await store.close()
+
+
+@pytest.mark.usefixtures("fast_checkpoint_poll")
+async def test_rerunning_a_purge_whose_scrub_failed_finishes_the_scrub(tmp_path: Path) -> None:
+    # The natural retry deletes nothing, but the residue the failed scrub left must still be
+    # scrubbed, not reported as a clean purge.
+    db_path = tmp_path / "tee.db"
+    store = await RelayStore.open(str(db_path))
+    peer: sqlite3.Connection | None = None
+    try:
+        await store.record_capture(direction="corepoint_copy", control_id="C5637", raw=_MARKER_BODY)
+        peer = sqlite3.connect(db_path, isolation_level=None)
+        peer.execute("BEGIN")
+        peer.execute("SELECT COUNT(*) FROM relay_capture").fetchall()  # pins the WAL
+        with pytest.raises(PurgeIncompleteError):
+            await store.purge(captures_only=True)
+        peer.execute("COMMIT")
+        assert _MARKER in _on_disk(db_path)  # positive control: residue before the retry
+        assert await store.purge(captures_only=True) == (0, 0)
+        assert _MARKER not in _on_disk(db_path)
+    finally:
+        if peer is not None:
+            peer.close()
+        await store.close()
+
+
+async def test_a_large_delete_does_not_write_a_zeroed_frame_per_freed_page(tmp_path: Path) -> None:
+    # With secure_delete=ON the delete itself wrote about as many WAL bytes as it freed, so a purge
+    # to free space on a full volume failed before it committed. FAST leaves freed pages alone.
+    db_path = tmp_path / "tee.db"
+    store = await RelayStore.open(str(db_path))
+    try:
+        big = b"MSH|^~\\&|TEE|TEST\r" + b"Z" * (4 * 1024 * 1024)
+        await store.record_capture(direction="corepoint_copy", control_id="C", raw=big)
+        assert await store._checkpoint_truncate()  # noqa: SLF001
+        await store._db.execute("DELETE FROM relay_capture WHERE 1")  # noqa: SLF001
+        await store._db.commit()  # noqa: SLF001
+        assert Path(f"{db_path}-wal").stat().st_size < 1024 * 1024
+    finally:
+        await store.close()
+
+
+async def test_vacuum_runs_with_temp_store_file_then_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = await _open(tmp_path)
+    try:
+        await store.record_capture(direction="corepoint_copy", control_id="C", raw=_MARKER_BODY)
+        ran = _spy_execute(store, monkeypatch, fail_on="", error=RuntimeError())
+        await store.purge(captures_only=True)
+        i = ran.index("VACUUM")
+        assert ran[i - 1] == "PRAGMA temp_store=FILE"
+        assert ran[i + 1] == "PRAGMA temp_store=DEFAULT"
     finally:
         await store.close()
