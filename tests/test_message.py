@@ -344,9 +344,8 @@ def test_add_segment_custom_separators() -> None:
 
 
 def test_add_segment_bare_id_is_settable() -> None:
-    # Regression: a bare segment id (no field separator) must graft a SETTABLE segment. Previously
-    # count_segments() saw it but a subsequent set() raised "cannot set absent segment" because the
-    # grafted segment had no data field for the write path to address.
+    # Regression: a bare segment id (no field separator) must graft a SETTABLE segment. A fieldless
+    # graft would be no occurrence at all (BACKLOG #5917), so add_segment normalizes it to "ZAL|".
     m = Message.parse(ORU)
     m.add_segment("ZAL")  # bare id, no fields
     assert m.count_segments("ZAL") == 1
@@ -374,8 +373,10 @@ def _pid_lines(m: Message) -> list[str]:
 
 def test_a_fieldless_line_is_not_an_occurrence() -> None:
     m = Message.parse(BARE_THEN_POPULATED)
+    assert Peek.parse(BARE_THEN_POPULATED).field("PID-5") == "DOE^JANE"
     assert m.count_segments("PID") == 1
     assert m.field("PID-3") == "X^Y~Q"
+    assert m.field("PID-5") == "DOE^JANE"
     assert m.field("PID-3", occurrence=2) is None
     assert m.repetitions("PID-3") == ["X^Y", "Q"]
     # segments() stays positional: it lists every line, the fieldless one included, as Peek's does.
@@ -452,16 +453,32 @@ def test_delete_segments_removes_a_fieldless_line() -> None:
     assert m.segments() == ["MSH"]
 
 
-def test_groups_skip_a_fieldless_boundary_and_member() -> None:
-    # A fieldless OBR is not a boundary and a fieldless OBX is not a member occurrence, so a group's
-    # reads translate to the same message-wide occurrence Message.field uses.
-    raw = _MSH + "OBR\rOBX|0|ST|PRE\rOBR|1\rOBX\rOBX|1|ST|A\r"
+def test_groups_stay_positional_and_number_members_as_message_does() -> None:
+    # A fieldless OBR still opens a group (as it opens a split_by_obr part), so a group edit never
+    # reaches past it into the next order; a fieldless OBX is no member occurrence, so a group read
+    # translates to the occurrence Message.field uses.
+    raw = _MSH + "OBR|1\rOBX|1|ST|A\rOBR\rOBX\rOBX|2|ST|B\rOBR|2\rOBX|3|ST|C\r"
     m = Message.parse(raw)
     groups = m.groups("OBR")
-    assert len(groups) == 1
-    assert groups[0].count("OBX") == 1
-    assert groups[0].field("OBX-3") == "A"
-    assert groups[0].field("OBR-1") == "1"
+    assert [g.segment_ids() for g in groups] == [
+        ["OBR", "OBX"],
+        ["OBR", "OBX", "OBX"],
+        ["OBR", "OBX"],
+    ]
+    assert groups[1].field("OBR-1") is None
+    assert groups[1].count("OBX") == 1
+    assert groups[1].field("OBX-3") == "B"
+    assert groups[2].field("OBR-1") == "2" and groups[2].field("OBX-3") == "C"
+    groups[0].rebuild(["OBX|1|ST|NEW"])
+    assert m.encode().split("\r")[1:-1] == [
+        "OBR|1",
+        "OBX|1|ST|NEW",
+        "OBR",
+        "OBX",
+        "OBX|2|ST|B",
+        "OBR|2",
+        "OBX|3|ST|C",
+    ]
 
 
 def test_delete_segments() -> None:

@@ -68,16 +68,12 @@ class SegmentGroup:
 
         ``start`` is the boundary segment's row; ``end`` is the next boundary's row (or the segment
         count). Raises :class:`LookupError` if the group no longer exists (e.g. it was deleted),
-        which is the honest signal that a stale view is being used."""
-        start, end, _ids = self._span_ids()
-        return start, end
+        which is the honest signal that a stale view is being used.
 
-    def _span_ids(self) -> tuple[int, int, list[str | None]]:
-        """:meth:`_span` plus the addressable id list it was derived from, so a caller that also
-        counts ids builds the list once."""
-        # Addressable ids, so a fieldless bare boundary line (``OBR`` alone) starts no group, matching
-        # count_segments(), which groups_of() sizes the group list from (BACKLOG #5917).
-        ids = self._m._addressable_segment_ids()
+        Positional: a fieldless bare boundary line (``OBR`` alone) still opens a group, as it opens a
+        part in ``split_by_obr``, so a group edit never reaches past it into the next order's
+        segments. Only occurrence numbering inside a group skips a fieldless line (BACKLOG #5917)."""
+        ids = self._m.segments()
         seen = 0
         start = -1
         for i, seg_id in enumerate(ids):
@@ -95,7 +91,7 @@ class SegmentGroup:
             if ids[j] == self._boundary:
                 end = j
                 break
-        return start, end, ids
+        return start, end
 
     # --- read ----------------------------------------------------------------
 
@@ -126,8 +122,8 @@ class SegmentGroup:
         """How many segments of ``segment_id`` are in this group — e.g. the OBX count for *this*
         order, which the flat :meth:`Message.count_segments` (whole-message) can't give. Like it,
         this skips a fieldless bare line, which :meth:`segment_ids` still lists."""
-        start, end, ids = self._span_ids()
-        return ids[start:end].count(segment_id)
+        start, end = self._span()
+        return self._m._addressable_segment_ids()[start:end].count(segment_id)
 
     def field(self, path: str, *, occurrence: int = 1, repetition: int | None = None) -> str | None:
         """Read a field within this group, with ``occurrence`` scoped to the group.
@@ -214,8 +210,10 @@ class SegmentGroup:
         Counts how many ``segment_id`` segments precede this group's span, then adds the in-group
         offset — so a group-scoped read maps cleanly onto the existing flat primitive instead of
         duplicating field-extraction logic."""
-        # Addressable ids, so a fieldless bare line is skipped here as Message.field skips it.
-        start, end, ids = self._span_ids()
+        # Addressable ids, so a fieldless bare line is skipped here as Message.field skips it; a
+        # group opened by a fieldless boundary line reads its boundary fields as absent.
+        start, end = self._span()
+        ids = self._m._addressable_segment_ids()
         before = ids[:start].count(segment_id)
         in_group = ids[start:end].count(segment_id)
         if group_occurrence > in_group:
@@ -234,5 +232,7 @@ def groups_of(message: Message, boundary: str = DEFAULT_BOUNDARY) -> list[Segmen
         # MSH is the singleton header; treating it as a boundary would make the whole message one
         # "group" and contradicts the header-belongs-to-no-group rule.
         raise ValueError("MSH cannot be a group boundary")
-    count = message.count_segments(boundary)
+    # Positional, like _span: a fieldless boundary line opens a group, so count every line, not
+    # count_segments(), which skips a fieldless one (BACKLOG #5917).
+    count = message.segments().count(boundary)
     return [SegmentGroup(message, boundary, ordinal) for ordinal in range(1, count + 1)]

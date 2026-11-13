@@ -175,12 +175,12 @@ class Message:
         A fieldless bare line such as ``PID`` (no field separator) is not counted, as no read or
         write numbers it as an occurrence (BACKLOG #5917), so ``range(1, count + 1)`` visits every
         segment a write can reach. :meth:`segments` still lists it."""
-        return self._addressable_segment_ids().count(segment_id)
+        return _builtin_hl7.count_segments(self._m, segment_id)
 
     def _addressable_segment_ids(self) -> list[str | None]:
         """:meth:`segments` with each fieldless bare line as ``None``: positional like
         :meth:`segments`, but an entry matches an id only where a by-occurrence read or write counts
-        that line. Group views number their boundaries and members from it (BACKLOG #5917)."""
+        that line. Group views number their member occurrences from it (BACKLOG #5917)."""
         return _builtin_hl7.addressable_segment_ids(self._m)
 
     @property
@@ -584,7 +584,7 @@ class Message:
         check used by the write/repetition guards."""
         # The scan the write resolves through, so the guard and the write cannot disagree on which
         # segment is the ``occurrence``-th (BACKLOG #5917).
-        return _builtin_hl7._segment_index(self._m, segment_id, occurrence) is not None
+        return _builtin_hl7.segment_index(self._m, segment_id, occurrence) is not None
 
     def _assign_field(self, seg: str, fld: int, occurrence: int, raw_value: str) -> None:
         """Write the whole raw field text at ``seg``/``fld`` for the given segment ``occurrence``.

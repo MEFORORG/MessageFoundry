@@ -77,6 +77,8 @@ __all__ = [
     "message_escape_char",
     "raise_if_blank_segment_scan",
     "addressable_segment_ids",
+    "count_segments",
+    "segment_index",
 ]
 
 
@@ -262,8 +264,11 @@ def _ensure_split(msg: ParsedMessage, seg_index: int) -> None:
 def _segment_index(msg: ParsedMessage, seg_id: str, occurrence: int) -> int | None:
     """List index of the ``occurrence``-th (1-based) segment with ``seg_id``, or None if absent.
 
-    The one occurrence scan every by-id path resolves through: ``Message`` reads, its presence check,
-    :func:`set_field`, and the ``Peek`` path (:func:`extract_field`). It uses python-hl7's
+    The occurrence scan at least these by-id paths resolve through: ``Message`` reads, its presence
+    check, :func:`set_field`, and the ``Peek`` path (:func:`extract_field`); :func:`count_segments`
+    and :func:`addressable_segment_ids` apply the same skip. Code outside this package that numbers
+    occurrences from encoded lines or :func:`segment_ids` does not, unless it calls
+    :data:`segment_index`. It uses python-hl7's
     ``segments()`` matcher, ``seg[0][0] == id``, which **skips a fieldless bare segment** (see
     :func:`_is_fieldless`), so a bare ``PID`` directly before a populated ``PID`` leaves the populated
     one occurrence 1, and a lone bare ``PID`` reads, counts and writes as an absent segment (BACKLOG
@@ -278,6 +283,11 @@ def _segment_index(msg: ParsedMessage, seg_id: str, occurrence: int) -> int | No
             if seen == occurrence:
                 return i
     return None
+
+
+#: The public name of :func:`_segment_index`, for a caller outside this module that must number
+#: occurrences exactly as ``Message`` and ``Peek`` do (BACKLOG #5917).
+segment_index = _segment_index
 
 
 def _is_fieldless(msg: ParsedMessage, seg_index: int) -> bool:
@@ -536,6 +546,16 @@ def addressable_segment_ids(msg: ParsedMessage) -> list[str | None]:
     built on it agrees with every by-id read and write (BACKLOG #5917).
     """
     return [None if _is_fieldless(msg, i) else seg["id"] for i, seg in enumerate(msg["segments"])]
+
+
+def count_segments(msg: ParsedMessage, seg_id: str) -> int:
+    """How many ``seg_id`` segments :func:`_segment_index` can reach, so a fieldless bare line is not
+    counted. Tests fieldlessness only on lines whose id matches, so no list is built."""
+    return sum(
+        1
+        for i, seg in enumerate(msg["segments"])
+        if seg["id"] == seg_id and not _is_fieldless(msg, i)
+    )
 
 
 def separators(msg: ParsedMessage) -> tuple[str, str, str, str, str]:

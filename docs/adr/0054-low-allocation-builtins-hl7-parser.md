@@ -303,9 +303,13 @@ What that costs, stated so nobody reads the record as more than it is:
   `segments()` matcher skips a line with no field separator, such as a bare `PID`, so `Peek.field`,
   `extract_field` and an occurrence-1 whole-field write never counted it. Its tolerant iteration,
   which the `Message` reads, presence check, `count_segments` and later-occurrence writes mirrored,
-  did count it. The built-in parser now has one occurrence scan, `_segment_index`, and it skips a
-  fieldless line on every by-id path, so `Message` and `Peek` number occurrences alike and a write
-  lands on the segment a read names. On a body with a bare `PID` before a populated one, a
+  did count it. The built-in parser's occurrence scan, `_segment_index` (public as
+  `segment_index`), now skips a fieldless line, and at least the `Message` reads, presence check,
+  writes, `count_segments` and group member occurrences and the `Peek` reads apply that skip, so
+  `Message` and `Peek` number occurrences alike and a write lands on the segment a read names.
+  Code that numbers occurrences from `segments()` or from encoded lines does not, for example
+  `actions.copy_segment` at the time of this change; group spans and `split_by_obr` stay
+  positional on purpose, so a fieldless `OBR` still opens a group and a split part. On a body with a bare `PID` before a populated one, a
   `Message` read at occurrence 1 now returns the populated segment where python-hl7's `Message`
   would have returned the empty bare line. `segments()` stays positional and still lists the bare
   line; `delete_segments` still removes it. The blank-line `IndexError` on the raising paths
