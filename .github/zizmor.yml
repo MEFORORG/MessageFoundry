@@ -193,4 +193,4 @@ rules:
       # Re-anchor if the line moves; do not broaden it to the file. The pin below catches a moved line
       # (see the header).
       # anchor-pin: uses: ./.github/actions/cla-assistant-lite
-      - cla.yml:186
+      - cla.yml:221

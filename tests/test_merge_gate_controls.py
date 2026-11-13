@@ -239,6 +239,23 @@ def _evaluate(
         raise AssertionError(f"{condition!r} names something its context does not: {exc}") from exc
 
 
+def test_the_evaluator_folds_case_lifts_literals_and_refuses_bang_equals() -> None:
+    """BACKLOG #5645's three additions to `_evaluate`, each pinned directly: GitHub's `==` ignores
+    case; a literal with spaces, capitals and a period survives the whitelist; and `!a == b`, which
+    GitHub reads as `(!a) == b`, raises rather than being graded as `not (a == b)`."""
+    ctx: dict[str, object] = {"event": "Pull_Request", "body": None, "issue_pr": None}
+    assert _evaluate("github.event_name == 'pull_request'", [], ctx)
+    assert _evaluate("github.event_name == 'PULL_REQUEST'", [], ctx)
+    assert not _evaluate("github.event_name != 'pull_request'", [], ctx)
+    ctx["body"] = "I have read it. Yes!"
+    assert _evaluate("github.event.comment.body == 'i HAVE read it. yes!'", [], ctx)
+    for form in ("!github.event_name == 'push'", "!github.event_name != 'push'"):
+        with pytest.raises(AssertionError, match="does not model"):
+            _evaluate(form, [], ctx)
+    # The neighbour that must keep working: `!` on a parenthesised comparison is unambiguous.
+    assert _evaluate("!(github.event_name == 'push')", [], ctx)
+
+
 def _rollup_fires(condition: str, results: list[str]) -> bool:
     """Does this one condition fire on this results vector?"""
     return _evaluate(condition, results)
@@ -1417,6 +1434,48 @@ def test_the_cla_step_keeps_its_pull_request_target_arm_and_merge_group_skip() -
     # GitHub's `==` ignores case, so a shouted recheck on a pull request runs the step too.
     assert _cla_step_runs(condition, "issue_comment", "RECHECK", on_pull_request=True)
     assert not _cla_step_runs(condition, "issue_comment", "RECHECK", on_pull_request=False)
+
+
+def _cla_steps() -> tuple[dict[str, Any], dict[str, Any]]:
+    """The pre-check step and the CLA action step, in that order."""
+    steps = jobs_of("cla.yml")["cla"]["steps"]
+    names = [str(s.get("name", "")) for s in steps]
+    pre = [i for i, n in enumerate(names) if n.startswith("CLA pre-check")]
+    act = [i for i, s in enumerate(steps) if "allowlist" in (s.get("with") or {})]
+    assert len(pre) == 1 and len(act) == 1, f"expected one pre-check and one CLA step: {names}"
+    assert pre[0] < act[0], "the CLA pre-check must run before the CLA action"
+    return steps[pre[0]], steps[act[0]]
+
+
+def test_the_cla_pre_check_reads_the_same_allowlist_and_sign_text_as_the_action() -> None:
+    """BACKLOG #5644. Two copies of one list: if CLA_ALLOWLIST drifts from the action's
+    `allowlist:`, the pre-check refuses or passes on a different list from the one the action
+    skips. And the sign text the `if:` matches must be the one the action tells people to post."""
+    pre, act = _cla_steps()
+    assert str(pre["env"]["CLA_ALLOWLIST"]) == str(act["with"]["allowlist"])
+    assert str(act["with"]["custom-pr-sign-comment"]) == _CLA_SIGN_TEXT
+    assert str(pre["if"]) == str(act["if"]), "the pre-check must run exactly when the action does"
+
+
+def test_the_cla_pre_check_fails_open_on_a_fault_only(tmp_path: Path) -> None:
+    """Owner ruling 2026-11-13, "Wire, fail-open on fault": exit 2 passes with a warning; exit 1
+    and any other non-zero fail. Run the step's own script with a stub in place of the pre-check,
+    so the wrapper is what is measured. Event data stays in `env:`, never in `run:`."""
+    pre, _ = _cla_steps()
+    script = str(pre["run"])
+    assert "${{" not in script, "event data must reach the pre-check through env:, not run:"
+    call = "python3 scripts/security/cla_precheck.py"
+    assert script.count(call) == 1, f"the step must call the pre-check exactly once: {script!r}"
+    bash = _require_bash(tmp_path)
+    for code, expect in ((0, 0), (1, 1), (2, 0), (3, 3)):
+        # GitHub runs a bash `run:` with `-e`, so the wrapper must survive it.
+        wrapped = "set -e\n" + script.replace(call, f"(exit {code})")
+        proc = subprocess.run(  # noqa: S603 -- the repository's own workflow script, under test
+            [bash, "-c", wrapped], capture_output=True, check=False, cwd=tmp_path, timeout=60
+        )
+        assert proc.returncode == expect, (code, proc.returncode, _text(proc))
+        if code == 2:
+            assert "::warning title=CLA pre-check not enforced::" in _text(proc)
 
 
 # ===================================================================================================

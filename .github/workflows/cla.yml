@@ -170,6 +170,41 @@ jobs:
           # It needs the action's FILES on disk, which this checkout still provides.
           persist-credentials: false
 
+      # WHAT THE VENDORED ACTION CANNOT SEE (BACKLOG #5644, #5645). The action reads one page of 100
+      # commits, and matches its allowlist on a commit's free-text git name when no account is
+      # linked. scripts/security/cla_precheck.py reads every commit and refuses what the action would
+      # pass unsigned; its docstring lists what it refuses and what it only reports. Same `if:` as
+      # the action's step, so it runs exactly when that step does.
+      #
+      # FAIL-OPEN ON A FAULT, BY OWNER RULING 2026-11-13 ("Wire, fail-open on fault"). Exit 1 is a
+      # refusal, or a traceback, and fails the required `cla` context. Exit 2 is a fault -- a GitHub
+      # outage, a malformed reply, bad input -- and warns and passes, because this workflow runs from
+      # the DEFAULT branch: a step that failed on every fault would wedge every pull request,
+      # including the one reverting it. Event data reaches the script through `env:` only, never a
+      # templated `run:` line (zizmor's template-injection rule). CLA_ALLOWLIST must equal the
+      # action's `allowlist:` below; tests/test_merge_gate_controls.py pins the two equal.
+      - name: CLA pre-check (every commit, unlinked allowlisted names)
+        if: >-
+          (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+           (github.event.comment.body == 'recheck' ||
+            github.event.comment.body == 'I have read the CLA and I agree to its terms.')) ||
+          github.event_name == 'pull_request_target'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLA_PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          CLA_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CLA_ALLOWLIST: 'wshallwshall,dependabot[bot],github-actions[bot]'
+        run: |
+          set +e
+          python3 scripts/security/cla_precheck.py
+          rc=$?
+          set -e
+          if [ "$rc" -eq 2 ]; then
+            echo "::warning title=CLA pre-check not enforced::the pre-check faulted (exit 2), so this run rests on the CLA action alone"
+            exit 0
+          fi
+          exit "$rc"
+
       # THE COMMENT ARM RUNS ONLY ON A PULL REQUEST'S COMMENTS (BACKLOG #5645). GitHub delivers
       # `issue_comment` for comments on plain issues AND on pull requests, and only the second carries
       # `github.event.issue.pull_request`. Without that test, a `recheck` or sign comment on a plain

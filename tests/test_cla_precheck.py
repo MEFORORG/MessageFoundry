@@ -197,6 +197,26 @@ def test_an_author_first_seen_past_the_hundredth_commit_is_refused() -> None:
     assert len(refusals) == 1 and "new-person" in refusals[0]
 
 
+def test_the_actions_view_is_the_first_page_however_short_it_is() -> None:
+    """The action reads one page, whatever its length. An author first seen on page two is never
+    checked, even though fewer than 100 commits came before it."""
+    read = fetch_commits(_Replay("short_first_page"), "MEFORORG", "MessageFoundry", 7)
+    assert read.first_page == 1
+    refusals = evaluate(read, _ALLOWLIST).refusals
+    assert (
+        len(refusals) == 1 and "new-person" in refusals[0] and "past the 1 commits" in refusals[0]
+    )
+
+
+def test_the_first_commit_seen_under_a_name_is_the_entry_the_action_keeps() -> None:
+    """An unlinked commit named github-actions[bot] BEFORE the linked bot commit becomes the
+    action's entry, with no id. With the bot off the allowlist the action asks it to sign, so
+    refusing would be false; with the bot on the allowlist the action skips it, so it refuses."""
+    read = fetch_commits(_Replay("bot_name_before_bot_commit"), "MEFORORG", "MessageFoundry", 7)
+    assert evaluate(read, ["wshallwshall"]).refusals == ()
+    assert len(evaluate(read, _ALLOWLIST).refusals) == 1
+
+
 def test_an_unlinked_name_folded_into_the_dropped_bot_entry_is_refused() -> None:
     """The action keys both commits under github-actions[bot] and drops that id, whatever the
     allowlist says, so the fold refuses even with the bot left off the allowlist."""
@@ -223,7 +243,7 @@ def test_wildcard_and_empty_entries_match_as_the_action_matches() -> None:
     assert matches_allowlist("wshallwshall", [" wshallwshall "])
     assert not matches_allowlist("wshallwshal", ["wshallwshall"])
     assert matches_allowlist("", parse_allowlist("a,,b"))
-    for separator in ("\r", "\n", " ", " "):
+    for separator in ("\r", "\n", "\u2028", "\u2029"):
         assert not matches_allowlist(f"a{separator}b", ["a*b"])
     assert matches_allowlist("a\tb", ["a*b"])
 
@@ -233,7 +253,7 @@ def test_run_exit_codes_and_annotations(capsys: pytest.CaptureFixture[str]) -> N
     assert run(_ENV, _Replay("impersonation_on_page_two")) == EXIT_REFUSED
     assert "::error title=CLA pre-check refused::" in capsys.readouterr().out
     assert run(_ENV, _Replay("graphql_error")) == EXIT_FAULT
-    assert "::error title=CLA pre-check fault::" in capsys.readouterr().out
+    assert "::warning title=CLA pre-check fault::" in capsys.readouterr().out
 
 
 def test_a_stale_head_is_a_fault(capsys: pytest.CaptureFixture[str]) -> None:
@@ -270,6 +290,29 @@ def test_without_a_transport_it_needs_a_token_and_https(capsys: pytest.CaptureFi
     assert run(env) == EXIT_FAULT
     out = capsys.readouterr().out
     assert "https" in out and secret not in out
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"GITHUB_TOKEN": "synthetic-token-é", "GITHUB_GRAPHQL_URL": ""},
+        {"GITHUB_TOKEN": "synthetic token", "GITHUB_GRAPHQL_URL": ""},
+        {"GITHUB_TOKEN": "synthetic-token-value", "GITHUB_GRAPHQL_URL": "https://[::1/graphql"},
+        {"GITHUB_TOKEN": "synthetic-token-value", "GITHUB_GRAPHQL_URL": "https:///graphql"},
+    ],
+)
+def test_a_malformed_token_or_url_is_a_fault_not_a_traceback(
+    override: dict[str, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A traceback exits 1, the refusal code; bad input is a fault, exit 2."""
+    assert run({**_ENV, **override}) == EXIT_FAULT
+    assert "synthetic-token" not in capsys.readouterr().out
+
+
+def test_a_header_urllib_cannot_encode_is_a_fault() -> None:
+    transport = cla_precheck.urllib_transport("https://example.test/graphql", "synthetic-é€")
+    with pytest.raises(PrecheckFault):
+        transport("query", {})
 
 
 def test_a_truncated_reply_is_a_fault_and_not_a_refusal(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -21,20 +21,24 @@ WHAT THE VENDORED ACTION DOES, read from ``.github/actions/cla-assistant-lite/di
 
 So a commit authored and committed under unlinked emails, with the git name set to an allowlisted
 login, is dropped as allowlisted and never needs a signature. This script finds that commit and
-refuses, and so it does for an unlinked name the action folds into a linked entry it skips. It
-reads EVERY commit, paging on ``hasNextPage``, and refuses an author first seen past the 100 commits
-the action reads, or a read with fewer distinct commits than GitHub's ``totalCount``. It faults when
-the pull request's head moved while it read.
+refuses, and so it does for any unlinked commit the action files under an entry it skips. It builds
+the action's committer list as the action does, from the FIRST PAGE only, first commit seen under
+each key. It reads EVERY commit, paging on ``hasNextPage``, and refuses an author the action's list
+never holds, or a read with fewer distinct commits than GitHub's ``totalCount``. It faults when the
+pull request's head moved while it read.
 
-WHAT IT DOES NOT DO. It is NOT WIRED INTO ANY WORKFLOW. Adding a fail-closed step to the required
-``cla`` context is an owner decision, because a fault in the step would wedge every pull request,
-its own revert included. It does not patch the vendored bundle either; the provenance gate forbids
-that. It reports as a NOTICE, without refusing, at least these shapes the owner has not ruled on:
+WHERE IT RUNS. ``.github/workflows/cla.yml`` runs it as a step of the required ``cla`` job, before
+the CLA action, FAIL-OPEN ON A FAULT (owner ruling 2026-11-13, "Wire, fail-open on fault"): exit 2
+warns and passes, so a GitHub outage or bad input cannot wedge every pull request, its own revert
+included; exit 1, a refusal or an unanticipated traceback, fails the check. It does not patch the
+vendored bundle; the provenance gate forbids that.
+
+WHAT IT DOES NOT REFUSE. It reports as a NOTICE, without refusing, at least these shapes the owner
+has not ruled on:
 
   * an unlinked author attributed to a linked, allowlisted committer;
   * an unlinked author whose commit the action drops because the committer is ``github-actions[bot]``;
-  * an unlinked commit whose git name equals the login of a linked commit in the same pull
-    request; the action keeps one entry under that name, from whichever commit comes first.
+  * an unlinked commit filed under a linked account's entry, which is checked in its place.
 
 It CANNOT see a commit linked through a spoofed email. GitHub links a commit to an account by its
 email alone, so an author email set to an allowlisted account's address reads as that account, here
@@ -68,6 +72,7 @@ import os
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -110,6 +115,7 @@ Transport = Callable[[str, Mapping[str, object]], Mapping[str, Any]]
 # JavaScript's `.` matches anything but these four; Python's misses only the newline.
 _JS_DOT_STAR = "[^\n\r\u2028\u2029]*"
 _SHA = re.compile(r"[0-9a-f]{40}")
+_TOKEN = re.compile(r"[\x21-\x7e]+")  # visible ASCII: what a header carries without re-encoding
 _REPOSITORY = re.compile(r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)")
 
 
@@ -133,6 +139,8 @@ class PullRequestRead:
     commits: list[Mapping[str, Any]]
     total: int
     head: str
+    #: How many commits the first page held. The action reads that page and no other.
+    first_page: int
 
 
 @dataclass(frozen=True)
@@ -214,6 +222,7 @@ def fetch_commits(transport: Transport, owner: str, name: str, number: int) -> P
     cursor: str | None = None
     seen_cursors: set[str] = set()
     head: str | None = None
+    first_page: int | None = None
     while True:
         reply = transport(QUERY, {"owner": owner, "name": name, "number": number, "cursor": cursor})
         if reply.get("errors"):
@@ -236,11 +245,13 @@ def fetch_commits(transport: Transport, owner: str, name: str, number: int) -> P
             if not isinstance(commit, Mapping):
                 raise PrecheckFault("a commit node holds no commit object")
             commits.append(commit)
+        if first_page is None:
+            first_page = len(nodes)
+        total = _total_count(connection)
         if not page_info.get("hasNextPage"):
             break
-        reported = connection.get("totalCount")
         # Bounds the loop: every page that asks for another must add commits, short of totalCount.
-        if not nodes or not isinstance(reported, int) or len(commits) >= reported:
+        if not nodes or len(commits) >= total:
             raise PrecheckFault(
                 "a page asks for another although it added nothing or reached totalCount"
             )
@@ -249,10 +260,14 @@ def fetch_commits(transport: Transport, owner: str, name: str, number: int) -> P
             raise PrecheckFault("a page reports more commits but gives no new cursor to read them")
         seen_cursors.add(next_cursor)
         cursor = next_cursor
+    return PullRequestRead(commits, total, head, first_page)
+
+
+def _total_count(connection: Mapping[str, Any]) -> int:
     total = connection.get("totalCount")
     if not isinstance(total, int) or isinstance(total, bool):
         raise PrecheckFault("the GraphQL reply has no integer totalCount")
-    return PullRequestRead(commits, total, head)
+    return total
 
 
 def evaluate(read: PullRequestRead, allowlist: Sequence[str]) -> Verdict:
@@ -265,40 +280,46 @@ def evaluate(read: PullRequestRead, allowlist: Sequence[str]) -> Verdict:
             "not read once cannot be checked"
         )
     attributions = [attribute(commit) for commit in read.commits]
-    # The action reads the first 100 only. An author first seen past them is never asked to sign.
-    seen_by_action = {who.name for who in attributions[:100]}
-    for who in attributions[100:]:
-        skipped_anyway = who.database_id == ACTIONS_BOT_ID or matches_allowlist(who.name, allowlist)
-        if who.name not in seen_by_action and not skipped_anyway:
-            seen_by_action.add(who.name)
-            refusals.append(
-                f"commit {who.oid} is past the 100 commits the action reads, and its author "
-                f"{who.name!r} appears in none of them, so the action never checks that author"
-            )
-    linked = [who for who in attributions if who.author_linked or who.committer_linked]
-    linked_keys = {who.name for who in linked}
-    # Keys whose linked entry the action skips: allowlisted, or the id it drops.
-    skipped_keys = {
-        who.name
-        for who in linked
-        if who.database_id == ACTIONS_BOT_ID or matches_allowlist(who.name, allowlist)
-    }
+
+    def skipped(entry: Attribution) -> bool:
+        """Does the action skip this committer entry: the id it drops, or an allowlisted name?"""
+        return entry.database_id == ACTIONS_BOT_ID or matches_allowlist(entry.name, allowlist)
+
+    # The action's committer list: the FIRST page only, one entry per `login || name`, first seen.
+    entries: dict[str, Attribution] = {}
+    for who in attributions[: read.first_page]:
+        entries.setdefault(who.name, who)
+    never_checked: set[str] = set()
     for who in attributions:
-        if who.author_linked:
-            continue
-        if not who.committer_linked:
-            if matches_allowlist(who.name, allowlist) or who.name in skipped_keys:
+        unlinked = not who.author_linked and not who.committer_linked
+        entry = entries.get(who.name)
+        if entry is None:
+            # Past the first page, under a name the action never saw, so it checks nobody here.
+            if unlinked and skipped(who):
                 refusals.append(
                     f"commit {who.oid} is linked to no GitHub account, and its git author name "
-                    f"{who.name!r} is a name the action skips, so it would pass unsigned"
+                    f"{who.name!r} is one the action skips, so it would pass unsigned"
                 )
-            elif who.name in linked_keys:
-                notices.append(
-                    f"commit {who.oid} is linked to no GitHub account, and its git author name "
-                    f"{who.name!r} is the login of a linked commit here; the action keeps one "
-                    "entry under that name, whichever commit comes first"
+            elif not skipped(who) and who.name not in never_checked:
+                never_checked.add(who.name)
+                refusals.append(
+                    f"commit {who.oid} is past the {read.first_page} commits the action reads, and "
+                    f"its author {who.name!r} appears in none of them, so the action never checks "
+                    "that author"
                 )
-        elif who.database_id == ACTIONS_BOT_ID:
+        elif unlinked and skipped(entry):
+            refusals.append(
+                f"commit {who.oid} is linked to no GitHub account, and the action files it under "
+                f"{who.name!r}, an entry it skips, so it would pass unsigned"
+            )
+        elif unlinked and entry is not who and (entry.author_linked or entry.committer_linked):
+            notices.append(
+                f"commit {who.oid} is linked to no GitHub account, and the action files it under "
+                f"the linked account {who.name!r}, which is checked in its place"
+            )
+        if who.author_linked or unlinked:
+            continue
+        if who.database_id == ACTIONS_BOT_ID:
             notices.append(
                 f"commit {who.oid} has an unlinked author and is committed by github-actions[bot], "
                 "so the action drops it from the CLA check"
@@ -331,17 +352,17 @@ _OPENER = urllib.request.build_opener(_NoRedirect)
 def urllib_transport(url: str, token: str, timeout: float = 30.0) -> Transport:
     def call(query: str, variables: Mapping[str, object]) -> Mapping[str, Any]:
         body = json.dumps({"query": query, "variables": dict(variables)}).encode("utf-8")
-        request = urllib.request.Request(  # nosec B310 -- run() refuses a URL that is not https
-            url,
-            data=body,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "User-Agent": "messagefoundry-cla-precheck",
-            },
-            method="POST",
-        )
         try:
+            request = urllib.request.Request(  # nosec B310 -- run() refuses a URL that is not https
+                url,
+                data=body,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "messagefoundry-cla-precheck",
+                },
+                method="POST",
+            )
             with _OPENER.open(request, timeout=timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
@@ -350,6 +371,10 @@ def urllib_transport(url: str, token: str, timeout: float = 30.0) -> Transport:
             raise PrecheckFault(f"GraphQL call failed ({type(exc).__name__})") from exc
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise PrecheckFault("GraphQL replied with something that is not UTF-8 JSON") from exc
+        except ValueError as exc:  # a URL or header urllib cannot form, UnicodeEncodeError included
+            raise PrecheckFault(
+                f"the GraphQL request could not be formed ({type(exc).__name__})"
+            ) from exc
         if not isinstance(payload, Mapping):
             raise PrecheckFault("GraphQL replied with JSON that is not an object")
         return payload
@@ -379,17 +404,22 @@ def run(env: Mapping[str, str], transport: Transport | None = None) -> int:
         if transport is None:
             token = env.get("GITHUB_TOKEN", "")
             url = env.get("GITHUB_GRAPHQL_URL", "") or DEFAULT_GRAPHQL_URL
-            if not token:
-                raise PrecheckFault("GITHUB_TOKEN is not set")
-            if not url.startswith("https://"):
-                raise PrecheckFault("GITHUB_GRAPHQL_URL is not https")
+            if not _TOKEN.fullmatch(token):
+                raise PrecheckFault("GITHUB_TOKEN is not set, or holds a character a header cannot")
+            try:
+                parts = urllib.parse.urlsplit(url)
+                host = parts.hostname
+            except ValueError as exc:
+                raise PrecheckFault("GITHUB_GRAPHQL_URL is not a URL") from exc
+            if parts.scheme != "https" or not host:
+                raise PrecheckFault("GITHUB_GRAPHQL_URL is not an https URL with a host")
             transport = urllib_transport(url, token)
         read = fetch_commits(transport, repository.group(1), repository.group(2), number)
         if expected_head and read.head != expected_head:
             raise PrecheckFault("the pull request's head is not CLA_HEAD_SHA; this run is stale")
         verdict = evaluate(read, allowlist)
     except PrecheckFault as exc:
-        print(f"::error title=CLA pre-check fault::{_escape_command(str(exc))}")
+        print(f"::warning title=CLA pre-check fault::{_escape_command(str(exc))}")
         return EXIT_FAULT
     for notice in verdict.notices:
         print(f"::notice title=CLA pre-check::{_escape_command(notice)}")
