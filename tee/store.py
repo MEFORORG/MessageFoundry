@@ -7,9 +7,11 @@ and the ACK code, so every NAK is durably captured and greppable (backlog #14's 
 is an **audit/log**, not a durable retry queue — the relay is fail-closed, not store-and-forward.
 
 PHI posture: the log stores message **identifiers** (MSH-10 control id, MSH-9 type) and **metadata**
-(size, outcome, ACK code) — never message bodies. The optional body capture (``--capture-bodies``)
-writes raw HL7 to a separate table and is **off by default**; when on, the DB holds PHI and must live
-on a protected volume (the file is ``chmod 0600`` best-effort on open).
+(size, outcome, ACK code) — never message bodies. Its ``detail`` column, though, can carry at least
+the partner's MSA-3 ACK text or a transport error string, and either can name a patient, so **every**
+tee DB holds PHI at rest, capture on or off, and must live on a protected volume (the file is
+``chmod 0600`` best-effort on open). The optional body capture (``--capture-bodies``) adds raw HL7
+in a separate table and is **off by default**.
 """
 
 from __future__ import annotations
@@ -143,7 +145,8 @@ def _is_nak(row: aiosqlite.Row) -> bool:
 
 def _row_to_dict(row: aiosqlite.Row) -> dict[str, Any]:
     """One relay_log row as a plain JSON-able dict. Never a message body, but ``detail`` is
-    emitted verbatim and can carry the partner's MSA-3 ACK text, which can name a patient."""
+    emitted verbatim and can carry at least the partner's MSA-3 ACK text or a transport error string,
+    and either can name a patient."""
     return {
         "at": row["at"],
         "at_iso": _iso(row["at"]),
@@ -496,8 +499,8 @@ class RelayStore:
         Returns ``{"summary": {...}, "rows": [...]}`` — never the captured message **bodies** (only the
         leg metadata: outcomes, ACK codes, control ids, types, sizes, details). It is **not**
         PHI-safe: ``detail`` is emitted verbatim (control characters scrubbed, 500 characters at
-        most) and can carry the partner's MSA-3 ACK text, which can name a patient, so treat an
-        export as PHI. The summary
+        most) and can carry at least the partner's MSA-3 ACK text or a transport error string,
+        and either can name a patient, so treat an export as PHI. The summary
         aggregates the whole time window; ``rows`` is optionally narrowed to NAKs and the most-recent
         ``limit``. Filtering is done in Python (the log is small), so the SQL stays static."""
         async with self._lock:

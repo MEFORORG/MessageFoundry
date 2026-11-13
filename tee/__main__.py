@@ -15,10 +15,11 @@ Examples::
     python -m tee run --listen-epic :6661 --corepoint corehost:5000 --mefor meforhost:2575 \
         --listen-corepoint-copy :6662 --capture-corepoint-copy --db ./tee.db
 
-    # Show the most recent NAKs / transport errors
+    # Show the most recent NAKs / transport errors (PHI: each detail can name a patient)
     python -m tee naks --db ./tee.db
 
-    # Export the log as JSON for review / AI analysis (metadata only — never message bodies)
+    # Export the log as JSON for review (never message bodies, but NOT PHI-safe: each row's
+    # detail can carry partner ACK text or an error string naming a patient; check before sharing)
     python -m tee export --db ./tee.db --naks-only --out ./tee-review.json
 
     # Purge the log DB (everything, or older than an age; --captures-only drops just the bodies)
@@ -229,12 +230,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--log-level", default="INFO")
 
-    naks = sub.add_parser("naks", help="show recently logged NAKs / transport errors")
+    naks = sub.add_parser(
+        "naks",
+        help="show recently logged NAKs / transport errors (PHI: a detail can name a patient)",
+    )
     naks.add_argument("--db", required=True, metavar="PATH", help="SQLite log database path")
     naks.add_argument("--limit", type=int, default=50)
 
     export = sub.add_parser(
-        "export", help="export the relay log as JSON (for review / AI analysis)"
+        "export",
+        help="export the relay log as JSON for review; NOT PHI-safe: a row's detail can carry"
+        " partner ACK text or an error string naming a patient, so check it before sharing",
     )
     export.add_argument("--db", required=True, metavar="PATH", help="SQLite log database path")
     export.add_argument(

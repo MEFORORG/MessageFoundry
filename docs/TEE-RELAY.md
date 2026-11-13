@@ -129,9 +129,9 @@ invisible record of anything a downstream rejected for a message Epic was told `
 
 `python -m tee export` writes the log as **JSON** — a `summary` (counts by leg / outcome / ACK code,
 NAK count, distinct messages, time range) plus the matching `rows`. It never holds the captured
-message bodies, but it is **not PHI-safe**: each row's `detail` is the partner's MSA-3 ACK text,
-written verbatim apart from control characters and a 500-character cap, and that text can name a
-patient. Treat an export as PHI, and check it before you hand it to a reviewer or an AI session.
+message bodies, but it is **not PHI-safe**: a row's `detail` can carry at least the partner's
+MSA-3 ACK text or a transport error string, written verbatim apart from control characters and a
+500-character cap, and either can name a patient. `python -m tee naks` prints the same detail. Treat an export as PHI, and check it before you hand it to a reviewer or an AI session.
 Default is stdout; use
 `--out FILE` to write a file. Narrow it with `--since` / `--before` (an age like `24h`/`7d` or a UTC date
 `YYYY-MM-DD`), `--naks-only`, and `--limit N`.
@@ -196,10 +196,12 @@ captured bodies under full-disk encryption, as [section 10](PHI.md#10-secure-dep
 `VACUUM` may build its rebuilt copy in a temp file in SQLite's temp directory. That directory can
 be on another volume. Purge does not keep the copy in memory, because a large capture DB would
 then fail every purge. To keep the copy on a protected volume, point SQLite's temp directory there
-before you run purge. SQLite reads `SQLITE_TMPDIR` on POSIX and `TMP` on Windows. If the directory
-you set is missing or not writable, SQLite silently falls back to its default temp directories,
-such as `/var/tmp` and `/tmp` on POSIX or `TEMP` on Windows, and nothing reports it. Check that the
-directory exists and the purge account can write to it.
+before you run purge. On POSIX, SQLite tries `SQLITE_TMPDIR`, then `TMPDIR`, then its default
+directories such as `/var/tmp` and `/tmp`, and silently skips one that is missing or not
+writable, so a mistyped setting puts the copy in a default directory with nothing reported. On
+Windows it takes the directory from `TMP` (then `TEMP`) without checking it, so a missing
+directory makes `VACUUM` fail and the scrub report `VACUUM failed`. Check that the directory
+exists and the purge account can write to it.
 
 If the scrub does not finish, purge prints `error: ...` and exits 1. The error names the counts it
 deleted and the step that failed. At least these failures do that:
@@ -227,7 +229,8 @@ python -m tee purge --db ./tee.db --captures-only -y      # drop only the captur
 ## Limits (by design, for the test-only scope)
 
 * **Test data only** — not hardened for production PHI (no at-rest encryption; the DB is `chmod 0600`
-  best-effort only). Enable `--capture-bodies` only on a protected volume with test data.
+  best-effort only). Keep every tee DB on a protected volume, capture on or off, because a log row's
+  detail can name a patient. Enable `--capture-bodies` only with test data.
 * **Not store-and-forward** — no durable retry queue; recovery of post-trip traffic is delegated to Epic's
   resend/queue (see *Fail-closed* above).
 * **One connection per forward** — the relay dials a fresh MLLP connection per forwarded message (simple
