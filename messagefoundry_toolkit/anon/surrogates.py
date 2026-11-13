@@ -486,8 +486,9 @@ def _reads_as_site_code(part: str, seps: Seps, field_sep: str) -> bool:
         return False
     decoded = unescape(part, seps, field_sep)
     delimiters = re.escape(field_sep + seps.component + seps.repetition + seps.subcomponent)
-    pieces = re.split(f"[{delimiters}]", decoded)
-    return any(SITE_CODE_RE.fullmatch(piece) for piece in (decoded, *pieces))
+    # A site code holds digits only, so the decoded part matches whole only when it splits to
+    # itself: the pieces cover that reading too.
+    return any(SITE_CODE_RE.fullmatch(piece) for piece in re.split(f"[{delimiters}]", decoded))
 
 
 def scrub_site_codes(value: str, keyer: Keyer, seps: Seps, field_sep: str = "|") -> str:
@@ -700,14 +701,22 @@ def unescaped_message(text: str, *, by_component: bool = False) -> str:
     lines: list[str] = []
     for line in text.replace("\r\n", "\r").replace("\n", "\r").split("\r"):
         fields = line.split(field_sep)
-        kept = 2 if fields[0].upper() in HEADER_SEGMENTS else 0
-        decoded = [
-            _unescape_field(field, seps, field_sep, by_component=by_component)
-            for field in fields[kept:]
-        ]
-        changed = changed or decoded != fields[kept:]
-        lines.append(field_sep.join(fields[:kept] + decoded))
+        decoded = unescaped_fields(fields, seps, field_sep, by_component=by_component)
+        changed = changed or decoded != fields
+        lines.append(field_sep.join(decoded))
     return "\r".join(lines) if changed else text
+
+
+def unescaped_fields(
+    fields: list[str], seps: Seps, field_sep: str, *, by_component: bool
+) -> list[str]:
+    """The split ``fields`` of one line, each decoded as :func:`unescaped_message` decodes it. The
+    segment id and encoding characters of a header line are left as written."""
+    kept = 2 if fields[0].upper() in HEADER_SEGMENTS else 0
+    return fields[:kept] + [
+        _unescape_field(field, seps, field_sep, by_component=by_component)
+        for field in fields[kept:]
+    ]
 
 
 def _date_output_test(rules: tuple[FieldRule, ...], seps: Seps) -> Callable[[list[str], int], bool]:

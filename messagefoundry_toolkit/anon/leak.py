@@ -62,6 +62,7 @@ from .surrogates import (
     message_has_site_code,
     read_message_seps,
     unescape,
+    unescaped_fields,
     unescaped_message,
 )
 
@@ -132,8 +133,6 @@ _ALLOWED_IPV6: tuple[ipaddress.IPv6Network, ...] = tuple(
     ipaddress.IPv6Network(net)
     for net in ("::/128", "::1/128", "fe80::/10", "fc00::/7", "ff00::/8", "2001:db8::/32")
 )
-#: The reason the publish guard's token scan gives for a routable IPv4 address.
-_IPV4_REASON = "routable IP address"
 #: The reason a routable IPv6 address gets (BACKLOG #5654).
 IPV6_REASON = "routable IPv6 address"
 
@@ -161,13 +160,16 @@ def _has_routable_ipv6(text: str, ipv4_is_routable: Callable[[str], bool]) -> bo
     return False
 
 
-def _with_ipv6(scan: Callable[[str], list[str]]) -> Callable[[str], list[str]]:
+def _with_ipv6(
+    scan: Callable[[str], list[str]], ipv4_allowed: re.Pattern[str]
+) -> Callable[[str], list[str]]:
     """``scan``, the token scan, with :data:`IPV6_REASON` added when :func:`_has_routable_ipv6`
-    finds an address. ``scan`` itself judges the IPv4 part of an IPv4-mapped address."""
+    finds an address. ``ipv4_allowed`` is the publish guard's own IPv4 allow list, which judges
+    the IPv4 part of an IPv4-mapped address."""
 
     def scan_with_ipv6(body: str) -> list[str]:
         hits = scan(body)
-        if _has_routable_ipv6(body, lambda ip: _IPV4_REASON in scan(ip)):
+        if _has_routable_ipv6(body, lambda ip: ipv4_allowed.match(ip) is None):
             hits.append(IPV6_REASON)
         return hits
 
@@ -577,14 +579,37 @@ def _walk(
             if a is not None and (v or a == _MALFORMED_LINE)
         )
         if split:
-            split_hits.extend(_split_shape_hits(seg, field_sep, addresses))
+            split_hits.extend(_split_shape_hits(fields, seps, field_sep, addresses))
     return out, split_hits
 
 
-def _split_shape_hits(line: str, field_sep: str, addresses: Sequence[str | None]) -> list[str]:
+def _line_readings(fields: list[str], seps: Seps, field_sep: str) -> list[list[str]]:
+    """The fields of one line as written, then with each field decoded a subcomponent at a time
+    and a component at a time, the readings :func:`unescaped_message` gives the token scan. The
+    segment id and encoding characters of a header line are left as written. A reading the same
+    as one before it is left out."""
+    readings = [fields]
+    if not seps.escape or not any(seps.escape in field for field in fields):
+        return readings
+    for by_component in (False, True):
+        decoded = unescaped_fields(fields, seps, field_sep, by_component=by_component)
+        if decoded not in readings:
+            readings.append(decoded)
+    return readings
+
+
+def _split_shape_hits(
+    fields: list[str], seps: Seps, field_sep: str, addresses: Sequence[str | None]
+) -> list[str]:
     """Hits for a punctuated shape (:data:`_SPLITTABLE_SHAPES`) that the field separator cuts
-    across fields of ``line``: a match on the line as written that holds the separator, so no one
-    field held it whole (BACKLOG #3465). Under ``|`` no such match exists.
+    across the ``fields`` of one line: a match on the line that runs across a separator between
+    two fields, so no one field held it whole (BACKLOG #3465). Under ``|`` no such match exists.
+
+    The line is read as written and with its fields decoded (:func:`_line_readings`), so a shape
+    whose own characters are escaped, such as ``123-45\\X2D\\6789`` under a field separator of
+    ``-``, is found too (#5533 item 8). A separator is only where the fields meet, so a field
+    separator a ``\\F\\`` decodes to inside a field never counts as a cut; the shape detectors
+    that read one field judge that one.
 
     ``addresses`` names each split index of the line, ``None`` for a field the check does not
     judge. A match is a hit when at least one field it reaches has an address, and the hit names
@@ -592,21 +617,31 @@ def _split_shape_hits(line: str, field_sep: str, addresses: Sequence[str | None]
     runs on into a field no rule rewrites: the shape reached the output whole. What still passes
     is listed once, in docs/PHI.md section 9."""
     hits: list[str] = []
-    cuts = [i for i, c in enumerate(line) if c == field_sep]
-    for pattern, reason in _SPLITTABLE_SHAPES:
-        for match in pattern.finditer(line):
-            if field_sep not in match.group():
-                continue
-            # The fields that hold a character of the match: the separators at or before its first
-            # character, and those before its last. A separator at its first character belongs
-            # to no field, so counting it starts at the next field. Positions are found once per
-            # line, so a long line costs a search per match, not a rescan.
-            first = bisect_right(cuts, match.start())
-            last = bisect_left(cuts, match.end() - 1)
-            named = [a for a in addresses[first : last + 1] if a is not None]
-            if named:
-                span = named[0] if len(named) == 1 else f"{named[0]} to {named[-1]}"
-                hits.append(f"{reason} across {span}, cut by the field separator")
+    for reading in _line_readings(fields, seps, field_sep):
+        line = field_sep.join(reading)
+        # Where each separator between two fields sits in ``line``, found once per reading, so a
+        # long line costs a search per match, not a rescan.
+        cuts: list[int] = []
+        at = -1
+        for field in reading[:-1]:
+            at += len(field) + 1
+            cuts.append(at)
+        for pattern, reason in _SPLITTABLE_SHAPES:
+            for match in pattern.finditer(line):
+                if bisect_left(cuts, match.start()) == bisect_left(cuts, match.end()):
+                    continue  # no separator inside the match: one field held it whole
+                # The fields that hold a character of the match: the separators at or before its
+                # first character, and those before its last. A separator at its first character
+                # belongs to no field, so counting it starts at the next field.
+                first = bisect_right(cuts, match.start())
+                last = bisect_left(cuts, match.end() - 1)
+                named = [a for a in addresses[first : last + 1] if a is not None]
+                if named:
+                    span = named[0] if len(named) == 1 else f"{named[0]} to {named[-1]}"
+                    hit = f"{reason} across {span}, cut by the field separator"
+                    # A decoded reading adds only what the reading as written did not find.
+                    if reading is fields or hit not in hits:
+                        hits.append(hit)
     return hits
 
 
@@ -889,7 +924,10 @@ def leak_report(
     # Over the text as written and decoded, so an escaped token is found too (BACKLOG #5532), with
     # the IPv6 check the guard does not run (BACKLOG #5654).
     token_hits = _merged_token_hits(
-        _with_ipv6(lambda body: [str(h) for h in scanner.scan_text(body, include_estate=True)]),
+        _with_ipv6(
+            lambda body: [str(h) for h in scanner.scan_text(body, include_estate=True)],
+            scanner._ALLOWED_IP,
+        ),
         text,
     )
     # The rules scope this check too: a field the DATE kind filled is not a site code (#2330).
