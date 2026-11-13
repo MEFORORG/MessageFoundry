@@ -37,6 +37,7 @@ decoded from its HL7 escape sequences as well as as written (BACKLOG #5532); doc
 from __future__ import annotations
 
 import importlib.util
+import ipaddress
 import re
 from bisect import bisect_left, bisect_right
 from collections import Counter
@@ -166,6 +167,58 @@ def _can_cut_a_shape(field_sep: str) -> bool:
     digit, whitespace, ``-``, ``(`` or ``)``. Under any other, ``|`` among them, no line can hold
     a cut shape, so the walk skips the line scan."""
     return field_sep.isdigit() or field_sep.isspace() or field_sep in "-()"
+
+
+#: A run of hex digits, colons and dots holding at least two colons: the text an IPv6 address can be
+#: written in. Each run is handed to ``ipaddress``, which decides whether it is one.
+_IPV6_CANDIDATE: re.Pattern[str] = re.compile(r"[0-9A-Fa-f.:]*:[0-9A-Fa-f.:]*:[0-9A-Fa-f.:]*")
+#: The IPv6 networks that identify no site: the unspecified and loopback addresses, link-local,
+#: unique-local, multicast and the documentation range. An IPv4-mapped address is judged by its
+#: IPv4 part instead (:func:`_has_routable_ipv6`).
+_ALLOWED_IPV6: tuple[ipaddress.IPv6Network, ...] = tuple(
+    ipaddress.IPv6Network(net)
+    for net in ("::/128", "::1/128", "fe80::/10", "fc00::/7", "ff00::/8", "2001:db8::/32")
+)
+#: The reason the publish guard's token scan gives for a routable IPv4 address.
+_IPV4_REASON = "routable IP address"
+#: The reason a routable IPv6 address gets (BACKLOG #5654).
+IPV6_REASON = "routable IPv6 address"
+
+
+def _has_routable_ipv6(text: str, ipv4_is_routable: Callable[[str], bool]) -> bool:
+    """True if ``text`` holds an IPv6 address outside :data:`_ALLOWED_IPV6` (BACKLOG #5654). An
+    IPv4-mapped address counts when ``ipv4_is_routable`` says its dotted IPv4 part is routable, so
+    the IPv4 allow list stays the publish guard's own. A run is tried as written and with the dots
+    and colons that end a sentence or a list taken off its ends, so ``2001:db8::`` still parses
+    and a trailing colon does not hide an address."""
+    for match in _IPV6_CANDIDATE.finditer(text):
+        run = match.group()
+        for candidate in dict.fromkeys((run, run.strip("."), run.strip(".:"))):
+            try:
+                address = ipaddress.IPv6Address(candidate)
+            except ValueError:
+                continue
+            mapped = address.ipv4_mapped
+            if mapped is not None:
+                if ipv4_is_routable(str(mapped)):
+                    return True
+            elif not any(address in net for net in _ALLOWED_IPV6):
+                return True
+            break
+    return False
+
+
+def _with_ipv6(scan: Callable[[str], list[str]]) -> Callable[[str], list[str]]:
+    """``scan``, the token scan, with :data:`IPV6_REASON` added when :func:`_has_routable_ipv6`
+    finds an address. ``scan`` itself judges the IPv4 part of an IPv4-mapped address."""
+
+    def scan_with_ipv6(body: str) -> list[str]:
+        hits = scan(body)
+        if _has_routable_ipv6(body, lambda ip: _IPV4_REASON in scan(ip)):
+            hits.append(IPV6_REASON)
+        return hits
+
+    return scan_with_ipv6
 
 
 #: HL7 CX id-type codes that mark a component as a medical-record number.
@@ -655,11 +708,13 @@ def _has_mrn_typed_identifier(value: str, seps: Seps, field_sep: str) -> bool:
 
 def _is_mrn_type(comp: str, seps: Seps, field_sep: str) -> bool:
     """True if ``comp`` is ``MR`` or ``MRN`` as written, decoded whole as a ``Message`` component
-    read decodes it, or as its first subcomponent decoded, which is what ``Peek`` reads for a
-    component that has subcomponents."""
-    first = comp.split(seps.subcomponent, 1)[0]
-    forms = (comp, unescape(comp, seps, field_sep), unescape(first, seps, field_sep))
-    return any(form.upper() in _MRN_TYPES for form in forms)
+    read decodes it, or as any one of its subcomponents, as written or decoded. ``Peek`` reads the
+    first subcomponent of a component that has them, and a ``Message`` subcomponent read can read
+    any of them, so each counts (BACKLOG #5654). Each reading is stripped of surrounding
+    whitespace, so a padded ``MR\\X20\\`` counts too."""
+    leaves = comp.split(seps.subcomponent)
+    decoded = [unescape(part, seps, field_sep) for part in (comp, *leaves)]
+    return any(form.strip().upper() in _MRN_TYPES for form in (comp, *leaves, *decoded))
 
 
 def _structural_reasons(value: str, seps: Seps, field_sep: str) -> list[str]:
@@ -874,8 +929,11 @@ def leak_report(
     ``anonymize`` passes the version of the INPUT (:func:`message_version`), because a rule may
     have rewritten MSH-12. Left out, the version is read from ``text`` (BACKLOG #3004).
     """
-    # Over the text as written and decoded, so an escaped token is found too (BACKLOG #5532).
-    token_hits = _merged_token_hits(lambda body: scan_text(body, include_estate=True), text)
+    # Over the text as written and decoded, so an escaped token is found too (BACKLOG #5532), with
+    # the IPv6 check the guard does not run (BACKLOG #5654).
+    token_hits = _merged_token_hits(
+        _with_ipv6(lambda body: scan_text(body, include_estate=True)), text
+    )
     # The rules scope this check too: a field the DATE kind filled is not a site code (#2330).
     if message_has_site_code(text, rules or ()):
         token_hits.append("site-code pattern")
