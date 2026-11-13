@@ -335,13 +335,6 @@ def is_vault_timeout_reply(exc: BaseException) -> bool:
     return getattr(exc, _REPLY_STATUS_ATTR, None) in _TIMEOUT_STATUSES
 
 
-def is_vault_too_large_reply(exc: BaseException) -> bool:
-    """Whether ``exc`` was raised for a reply of HTTP 413, by the status
-    :func:`_record_reply_status` recorded (BACKLOG #8222): Vault's answer past
-    ``max_request_size``, which on one audit row's verify is evidence about that row."""
-    return getattr(exc, _REPLY_STATUS_ATTR, None) == 413
-
-
 def is_vault_forbidden(exc: BaseException) -> bool:
     """Whether ``exc`` is Vault's HTTP 403, which hvac raises as ``Forbidden`` (ADR 0217: a token
     may hold no capability on a retired Transit key). ``False`` without the ``[vault]`` extra."""

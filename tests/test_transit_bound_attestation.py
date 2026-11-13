@@ -1069,11 +1069,16 @@ def test_a_timeout_on_one_rows_verify_could_not_run_though_the_fixed_input_verif
 
 @pytest.mark.parametrize(
     ("first", "second"),
-    [pytest.param(413, 504, id="413-then-504"), pytest.param(504, 413, id="504-then-413")],
+    [
+        pytest.param(400, 504, id="400-then-504"),
+        pytest.param(413, 504, id="413-then-504"),
+        pytest.param(504, 413, id="504-then-413"),
+        pytest.param(504, 400, id="504-then-400"),
+    ],
 )
-def test_a_413_on_either_ask_beside_a_timeout_is_a_break(first: int, second: int) -> None:
-    """A 413 on either ask is evidence about the row, so a timeout on the other ask does not turn
-    it into a check that could not run (BACKLOG #8222)."""
+def test_a_timeout_on_only_one_ask_is_still_a_break(first: int, second: int) -> None:
+    """Only a 408 or 504 on both asks reads as a check that could not run; a timeout on one ask
+    beside any other failure on the other keeps item 4's reading, a break (BACKLOG #8222)."""
     cipher = _scripted_cipher([_status_error(first), _status_error(second)])
     assert cipher.verify_audit_hmac(b"row", cipher.audit_hmac(b"row")) is False
 

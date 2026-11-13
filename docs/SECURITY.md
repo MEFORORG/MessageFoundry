@@ -8111,7 +8111,7 @@ So is a row whose own request Transit refuses, such as one Vault answers with HT
 `max_request_size`; ADR 0193's 2026-11-11 amendment, item 4, as its 2026-11-13 amendment, item
 1, amends it, says how a refusal is told from the service failing. Other failures still stop the
 walk as a check that could not run. Those include at least an outage, a dropped connection, and an
-HTTP 408 or 504 on the second ask of a row's verify after a first ask that was not a 413.
+HTTP 408 or 504 on both asks of a row's verify.
 
 **Retiring an old version of the audit key breaks the chain.** Transit's verify also refuses a
 version below the key's `min_decryption_version`, or one trimmed away. Every audit row sealed under
