@@ -372,7 +372,8 @@ def _where(posture: ServiceEnvPosture) -> str:
 
 
 def service_env_refusal(posture: ServiceEnvPosture) -> str | None:
-    """Why ``serve`` or ``supervise`` must not start, whatever the enforcement setting, or None.
+    """Why ``serve``, ``supervise`` or an API app factory must not start, whatever the enforcement
+    setting, or None.
 
     Every secret-class name in the service's environment lists refuses: a key-class name, and
     each name the secrets directory supplies. The owner's 2026-10-01 ruling refuses them always,

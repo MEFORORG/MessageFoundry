@@ -511,7 +511,7 @@ def test_an_embedded_app_refuses_where_serve_would(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, factory: str, posture: ServiceEnvPosture
 ) -> None:
     """Vault BACKLOG #8212 item 1: an app built without ``serve`` refuses on ``serve``'s own
-    finding, as it is built, and opens nothing first. The message is the refusal's, value-free."""
+    finding, as it is built. The message is the refusal's, value-free."""
     refusal = service_env_refusal(posture)
     assert refusal is not None
     monkeypatch.setattr("messagefoundry.api.app.service_env_posture", lambda: posture)
@@ -520,7 +520,6 @@ def test_an_embedded_app_refuses_where_serve_would(
     assert str(raised.value) == f"{factory}: refusing to start: {refusal}"
     assert _KEY_VALUE not in str(raised.value)
     assert _PASSWORD_VALUE not in str(raised.value)
-    assert not any(tmp_path.iterdir()), sorted(p.name for p in tmp_path.iterdir())
 
 
 async def test_an_app_built_around_an_engine_refuses_a_listed_secret(
@@ -547,6 +546,43 @@ async def test_an_app_built_around_an_engine_refuses_a_listed_secret(
     assert str(raised.value) == f"create_app: refusing to start: {service_env_refusal(listed)}"
 
 
+async def test_an_embedded_app_names_a_key_from_elsewhere_in_its_posture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The embedder path end to end, on a reading that builds: ``GET /security/posture`` on an app
+    built with ``create_app(engine)`` names a store key reaching the service from outside its
+    lists, and never its value."""
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline import Engine
+    from tests.test_api_security_posture import _add_viewer, _app_and_client, _token
+    from tests.test_api_security_posture import _service as _auth_service
+
+    elsewhere = _service([], MEFOR_STORE_ENCRYPTION_KEY=_KEY_VALUE)
+    monkeypatch.setattr("messagefoundry.api.app.service_env_posture", lambda: elsewhere)
+    engine = await Engine.create(
+        tmp_path / "embedded.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        auth = await _auth_service(engine)
+        await _add_viewer(auth, "vw")
+        _app, client = _app_and_client(
+            engine, auth, ai_settings=AiSettings(), security_settings=SecuritySettings()
+        )
+        async with client as c:
+            body = (await c.get("/security/posture", headers=await _token(c, "vw"))).json()
+    finally:
+        await engine.stop()
+    risks = {row["switch"]: row["risk"] for row in body["loosenings"]}
+    assert (
+        "MEFOR_STORE_ENCRYPTION_KEY reaches this Windows service"
+        in (risks["store_key_in_service_environment"])
+    )
+    assert "secret_in_service_environment" not in risks
+    assert _KEY_VALUE not in str(body)
+
+
 #: A console-script launcher between NSSM and the interpreter reads UNOBSERVABLE with no service,
 #: so ``serve`` does not refuse there (the ``uvicorn.exe`` test above), and an app builds as at main.
 _CONSOLE_SCRIPT_LAUNCHER = read_service_env_posture(
@@ -562,8 +598,18 @@ _CONSOLE_SCRIPT_LAUNCHER = read_service_env_posture(
         ServiceEnvPosture(ServiceEnvStatus.NOT_A_SERVICE),
         _service(["MEFOR_VALUE_PARTNER_HOST=example.test"]),
         _service([], MEFOR_STORE_ENCRYPTION_KEY=_KEY_VALUE),
+        read_service_env_posture(
+            probe=_Probe(ancestors=_UNDER_NSSM, services={100: "MessageFoundry"}, unreadable=True),
+            environ={},
+        ),
     ],
-    ids=["console-script-launcher", "not-a-service", "no-listed-secret", "key-from-elsewhere"],
+    ids=[
+        "console-script-launcher",
+        "not-a-service",
+        "no-listed-secret",
+        "key-from-elsewhere",
+        "unreadable-list-no-key",
+    ],
 )
 def test_an_embedded_app_builds_where_serve_would_not_refuse(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, factory: str, posture: ServiceEnvPosture

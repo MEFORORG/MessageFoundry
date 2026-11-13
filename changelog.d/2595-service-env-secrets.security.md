@@ -7,4 +7,5 @@
   every `[security].enforcement` setting. For these settings the refusal names the secrets
   directory as the way in. Where the engine knows its service but cannot read those values, they
   refuse only a store key or retired store key found in their own environment, never another
-  secret setting. The `service_environment_secret` loosening, which only named them, is gone. See [SERVICE.md](../docs/SERVICE.md). (`BACKLOG #2595`)
+  secret setting. The `service_environment_secret` loosening, which only named them, is gone.
+  See [SERVICE.md](../docs/SERVICE.md). (`BACKLOG #2595`)

@@ -2607,15 +2607,16 @@ count is above `0` (vault BACKLOG #2613).
   ran.** An application that builds the API without them, with `create_app` or
   `create_managed_app`, refuses on the same finding: the factory raises as it is built. The entry
   is named, with the refusal's finding and remedy, only where the refusal would fire
-  (`messagefoundry/serviceenv.py`): the engine found its service, the way the bullet *How the engine finds its own service* below
-  says, and either an engine secret is in that service's lists or the lists could not be read and a
-  store key is in the engine's own environment. A console-script launcher such as `uvicorn.exe`
-  or `hypercorn.exe` between NSSM and the interpreter is neither a Python interpreter nor
-  `messagefoundry.exe`, so the engine does not find its service there and this entry is not
-  named. `serve`, `supervise` and both factories refuse before they list loosenings, so the entry
-  reaches only a caller that reads them itself, through `security_loosenings` with a service reading, and never a
-  running app's `GET /security/posture`. An engine embedded with no API has no posture to name it
-  in. Clear it the way the refusal says.
+  (`messagefoundry/serviceenv.py`): the engine found its service, the way the bullet *How the
+  engine finds its own service* below says, and either an engine secret is in that service's lists
+  or the lists could not be read and a store key is in the engine's own environment. A
+  console-script launcher such as `uvicorn.exe` or `hypercorn.exe` between NSSM and the
+  interpreter is neither a Python interpreter nor `messagefoundry.exe`, so the engine does not
+  find its service there and this entry is not named. The reading is taken once per process, and
+  at least `serve`, `supervise` and both factories refuse on it before the engine serves, so the
+  entry reaches a caller that reads the loosenings itself, through `security_loosenings` with a
+  service reading. An engine embedded with no API has no posture to name it in. Clear it the way
+  the refusal says.
 - **`store_key_in_service_environment`: a store key reaches the service through its
   environment.** It is named wherever the key came from, once the engine knows its service. The
   machine-wide environment is readable by every local user too. Under `serve` and `supervise` a
