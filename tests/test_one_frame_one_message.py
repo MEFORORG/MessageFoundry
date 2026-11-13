@@ -726,10 +726,10 @@ async def test_the_tcp_listener_sends_one_frame_when_its_reply_holds_its_start_b
 # The shadow single-row case is the "two-messages" row of the shadow test above; the batch cases
 # are in tests/test_outbound_batch.py.
 
-#: TWO with each line-end shape a Handler may produce, with leading whitespace, and with byte
-#: order marks where two texts read without stripping them would put them.
 #: TWO with a byte order mark between its first message and its second MSH.
 MARKED = CLEAN + split._BOM + TWO[len(CLEAN) :]
+#: TWO with each line-end shape a Handler may produce, with leading whitespace, and with byte
+#: order marks where two texts read without stripping them would put them.
 TWO_VARIANTS = [
     pytest.param(TWO, id="cr"),
     pytest.param(TWO.replace(CR, "\n"), id="lf"),
@@ -908,3 +908,10 @@ def test_a_mark_inside_a_line_or_before_another_segment_is_not_a_boundary() -> N
         assert split._holds_more_than_one_message(body) is False
         assert split.split_batch(body) == [body]
         assert split._needs_a_decode(body.encode("utf-8"), "utf-8") is False
+
+
+def test_a_single_byte_charset_reads_a_utf8_mark_as_three_characters_it_keeps() -> None:
+    # The byte scan matches the mark's bytes under any ASCII-safe charset, but cp1252 decodes them
+    # to three characters that are not a mark, so the file is still one message, as before.
+    raw = MARKED.encode("utf-8")
+    assert split.split_batch_bytes(raw, "cp1252") == [raw]

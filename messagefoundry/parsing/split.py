@@ -24,7 +24,7 @@ from __future__ import annotations
 import codecs
 import itertools
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import normalize, starts_with_msh
@@ -65,42 +65,35 @@ class _Boundary[S: (str, bytes)]:
     """How one kind of text spells a boundary, for :func:`_next_boundary`.
 
     ``lines`` holds each line break that can end a line in that text, followed by ``msh``. Each
-    break is one character: :func:`_next_boundary` begins its searches one before the first
-    ``msh``, so a longer break would be missed, and ``__post_init__`` refuses one.
-    ``marked``, when set, is a mark and a pattern for a wider boundary: a line break, then one or
-    more of that mark, then ``msh``. The pattern is searched only when the text holds the mark past
-    the start, so a text without one never pays it."""
+    break is one character, since :func:`_next_boundary` reads the one before an ``msh`` (or its
+    marks), and ``__post_init__`` refuses a longer one. ``mark``, when set, widens the boundary to a
+    line break, then any run of that mark, then ``msh``."""
 
     msh: S
     lines: tuple[S, ...]
-    marked: tuple[S, re.Pattern[S]] | None = None
+    mark: S | None = None
+    breaks: tuple[S, ...] = field(init=False)
 
     def __post_init__(self) -> None:
         if not self.lines or any(
             len(line) != len(self.msh) + 1 or not line.endswith(self.msh) for line in self.lines
         ):
             raise ValueError("each boundary spelling is one line-break character, then MSH")
+        object.__setattr__(self, "breaks", tuple(line[:1] for line in self.lines))
 
 
-#: :data:`_BOM` as UTF-8 writes it, spelled as a literal so the bytes patterns stay static.
+#: :data:`_BOM` as UTF-8 writes it.
 _BOM_BYTES = b"\xef\xbb\xbf"
 
-# A later ``MSH`` line that marks lead is a boundary in every reading, as two texts read without
-# stripping their marks would join it (ADR 0206 rule 5, ADR 0209). ``_MSH`` and the mark hold no
-# regex metacharacter, so they go in unescaped: the static ReDoS scanner in
-# tests/test_security_static.py resolves a pattern composed from constants, but not one passed
-# through ``re.escape`` or built with ``.encode``, so the bytes pattern spells ``MSH`` itself.
+# A later ``MSH`` line that byte order marks lead is a boundary in every reading, as two texts read
+# without stripping their marks would join it (ADR 0206 rule 5, ADR 0209, BACKLOG #5918).
 
 #: Text :func:`~messagefoundry.parsing.peek.normalize` wrote, which ends every line with CR alone.
-_NORMALIZED = _Boundary(_MSH, (_CR_MSH,), (_BOM, re.compile("\r" + _BOM + "+" + _MSH)))
+_NORMALIZED = _Boundary(_MSH, (_CR_MSH,), _BOM)
 #: An outbound payload, which is not normalized, so a line may end with LF too.
-_OUTBOUND = _Boundary(_MSH, (_CR_MSH, _LF_MSH), (_BOM, re.compile(r"[\r\n]" + _BOM + "+" + _MSH)))
+_OUTBOUND = _Boundary(_MSH, (_CR_MSH, _LF_MSH), _BOM)
 #: A received file's bytes, before any decode, so a line may end with LF too. The mark is UTF-8's.
-_RAW_BYTES = _Boundary(
-    _MSH_BYTES,
-    (_CR_MSH_BYTES, _LF_MSH_BYTES),
-    (_BOM_BYTES, re.compile(rb"[\r\n](?:" + _BOM_BYTES + rb")+MSH")),
-)
+_RAW_BYTES = _Boundary(_MSH_BYTES, (_CR_MSH_BYTES, _LF_MSH_BYTES), _BOM_BYTES)
 
 
 def _next_boundary[S: (str, bytes)](text: S, start: int, boundary: _Boundary[S]) -> int:
@@ -108,39 +101,26 @@ def _next_boundary[S: (str, bytes)](text: S, start: int, boundary: _Boundary[S])
     is at ``start`` or later, or -1 when there is none. ``start`` is 0 or more: ``str.find`` reads
     a negative one from the end.
 
-    With one spelling, one scan answers. With more, a boundary's ``MSH`` is past ``start``, so one
-    scan for ``MSH`` settles a text holding none, rather than one scan per spelling. Otherwise the
-    first ``MSH`` it finds is the earliest a boundary can end with, so the line-break searches begin
-    one before it and read nothing that scan already passed, and each later one stops where an
-    earlier one hit. C-level scans and no copy."""
-    lines, marked = boundary.lines, boundary.marked
-    if marked is None and len(lines) == 1:
-        return text.find(lines[0], start)
-    first = text.find(boundary.msh, start + 1)
-    if first < 0:
-        return -1
-    at = first - 1  # first > start, so this is start or later
-    # A boundary at `at` ends with the first MSH, so no boundary, marked or not, begins earlier.
-    for line in lines:
-        if text.startswith(line, at):
-            return at
-    best = -1
-    for line in lines:
-        # Bounded so it can only find a boundary that begins before the one already found.
-        hit = text.find(line, at) if best < 0 else text.find(line, at, best + len(line) - 1)
-        if hit >= 0:
-            best = hit
-    # A marked boundary's marks sit between its break and its MSH, so its break can be before `at`,
-    # and its first mark is past `start`, so a mark in the lead alone does not start the search.
-    # One that begins before `best` also ends by it, since no line break follows its first
-    # character, so both searches stop there.
-    if marked is not None:
-        end = len(text) if best < 0 else best
-        if text.find(marked[0], start + 1, end) >= 0:
-            found = marked[1].search(text, start, end)
-            if found is not None:
-                best = found.start()
-    return best
+    Every boundary ends with an ``MSH`` past ``start``, so it walks the ``MSH`` occurrences in
+    order and asks of each whether a line break, past any marks, directly precedes it. The first
+    that does ends the earliest boundary: one that began earlier would end with an earlier
+    ``MSH``, or hold this one among its marks, which cannot be. Each scan resumes where the last
+    stopped and each run of marks is read once, so a call costs one pass up to its answer, and a
+    text holding no ``MSH`` one C-level scan. A call per boundary over a batch is therefore
+    linear, however the boundaries are spelled (BACKLOG #5918)."""
+    mark, breaks = boundary.mark, boundary.breaks
+    at = text.find(boundary.msh, start + 1)
+    while at >= 0:
+        cut = at
+        if mark is not None:
+            # The marks' first character is past `start`, so the break before them is at `start`
+            # or later.
+            while cut - len(mark) > start and text.startswith(mark, cut - len(mark)):
+                cut -= len(mark)
+        if text[cut - 1 : cut] in breaks:
+            return cut - 1
+        at = text.find(boundary.msh, at + 1)
+    return -1
 
 
 #: The first character the parser keeps: it strips the whitespace around a body before it reads it.
@@ -177,7 +157,8 @@ def _sends_more_than_one_message(payload: str) -> bool:
     and holds another line that starts with ``MSH``, or with marks and then ``MSH`` (ADR 0209). The
     payload is not normalized, so a line break is a CR or an LF, and on an ``MSH``-led payload with
     no mark in its lead the answer is :func:`_holds_more_than_one_message`'s on the normalized
-    text. A payload not led by ``MSH`` answers False. A payload with no ``MSH`` after its lead pays one scan."""
+    text. A payload not led by ``MSH`` answers False. A payload with no ``MSH`` after its lead
+    pays one scan."""
     lead = _LEADS_WITH_MSH_PAST_BOM.match(payload)
     return lead is not None and _next_boundary(payload, lead.end(), _OUTBOUND) >= 0
 
@@ -250,8 +231,8 @@ def split_batch_bytes(raw: bytes, encoding: str) -> list[bytes]:
     A file holding no ``MSH`` after a line break, with or without byte order marks between them,
     is one message the parser reads as it is. Under UTF-8 only, it must also not open with a byte
     order mark, which the split reads past. Under a single-byte charset the mark's bytes are three
-    characters the split keeps. Where a byte scan can tell (:func:`_needs_a_decode`), such a file is returned without a decode or a split, so the
-    common single-message file pays one scan."""
+    characters the split keeps. Where a byte scan can tell (:func:`_needs_a_decode`), such a file
+    is returned without a decode or a split, so the common single-message file pays one scan."""
     if not _needs_a_decode(raw, encoding):
         return [raw]
     try:

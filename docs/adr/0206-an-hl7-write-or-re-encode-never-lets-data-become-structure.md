@@ -549,20 +549,24 @@ advice half remained. Strict mode is unchanged.
 
 Rule 5 and the split read a boundary as a line break followed directly by `MSH`. ADR 0209's
 delivery reading already read past byte order marks (U+FEFF) between the line break and the
-`MSH`, as two texts joined without stripping their marks put them. So a body or file whose second
-message was led by a mark passed the file split and the ingress guard as one message, was
-acknowledged, and was then dead-lettered at the outbound frame. A deploying site would have hit it
-whenever a partner concatenated files that each carried a mark.
+`MSH`, as two texts joined without stripping their marks put them. So a listener body whose second
+message was led by a mark passed the ingress guard as one message and was acknowledged, and a file
+shaped the same way passed the file split as one message. Either was then dead-lettered at an MLLP
+or TCP outbound whose payload kept the mark. A deploying site would have hit it whenever a partner
+concatenated texts that each carried a mark.
 
 Now every reading in `messagefoundry/parsing/split.py` takes the wider boundary: a line break, one
-or more marks, then `MSH`. The `_Boundary` constants say so: `_NORMALIZED` (CR, marks, `MSH`) for
-the ingress guard and `split_batch`, and `_RAW_BYTES` (CR or LF, UTF-8 marks, `MSH`) for the
-whole-file byte scan, beside ADR 0209's `_OUTBOUND`. `split_batch` cuts past the marks, so each
+or more marks, then `MSH`. The `_Boundary` constants carry the mark: `_NORMALIZED` (CR, marks,
+`MSH`) for the ingress guard and `split_batch`, and `_RAW_BYTES` (CR or LF, UTF-8 marks, `MSH`) for
+the whole-file byte scan, beside ADR 0209's `_OUTBOUND`. `split_batch` cuts past the marks, so each
 later member starts with `MSH`; without that the parser would record it as an `ERROR`. The ingress
-guard refuses such a body from a listener, and the File and remote-file sources split it into its
-messages. A mark inside a line, or before another segment, is still not a boundary. Under a
-single-byte charset the byte scan's match costs a decode that finds one message, since the mark's
-bytes are three characters there.
+guard refuses such a body from a listener. The File and remote-file sources split such a file into
+its messages under a charset that decodes the mark to U+FEFF, such as UTF-8. Under a single-byte
+charset the mark's bytes decode to three other characters, so the file is still one message, as
+before; the byte scan's match there costs only the decode. A mark inside a line, or before another
+segment, is still not a boundary. `_next_boundary` now walks the `MSH` occurrences in order and
+reads back past any marks to the line break, so splitting a batch stays linear in its length
+however its boundaries are spelled.
 
 **Not changed.** The dry run's `split_messages` splits a latin-1 view of the bytes, where a UTF-8
 mark is three characters, so it does not cut at a marked later `MSH`. It hands the file over whole,
@@ -571,6 +575,8 @@ record two messages. That is a further case of the gap vault #2853 names, and it
 
 The tests: `tests/test_one_frame_one_message.py::test_the_ingress_guard_refuses_a_second_msh_that_marks_lead`,
 `::test_the_file_split_cuts_past_the_marks_before_a_later_msh` and
-`::test_a_mark_inside_a_line_or_before_another_segment_is_not_a_boundary`. The pinned readings in
+`::test_a_mark_inside_a_line_or_before_another_segment_is_not_a_boundary`,
+`::test_a_single_byte_charset_reads_a_utf8_mark_as_three_characters_it_keeps`, and
+`tests/test_msh_boundary_parity.py::test_walking_a_batch_reads_the_text_a_bounded_number_of_times`. The pinned readings in
 `tests/test_msh_boundary_parity.py` were edited to the new boundary, each line saying what it read
 before.

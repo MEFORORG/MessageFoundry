@@ -38,7 +38,8 @@ from messagefoundry.parsing.sniff import _LEADING_WS_STR
 
 BOM = "\N{ZERO WIDTH NO-BREAK SPACE}"
 
-# --- the readings as they stood at engine origin/main a0a5e4f5a4, verbatim but for names --------
+# --- the readings as they stood at engine origin/main a0a5e4f5a4, verbatim but for names and ---
+# --- the lines marked BACKLOG #5918, which widen the boundary ------------------------------------
 
 # BACKLOG #5918: was r"(?=\rMSH)"; byte order marks may now sit between the CR and the MSH.
 _OLD_MSH_BOUNDARY = re.compile(r"(?=\r" + BOM + r"*MSH)")
@@ -187,9 +188,9 @@ def _earliest(pattern: re.Pattern[Any], text: Any, start: int) -> int:
 
 @pytest.mark.parametrize("start", [0, 1, 3])
 def test_the_predicate_returns_the_earliest_boundary(start: int) -> None:
-    # The boolean readings throw the index away, and the split takes the one-spelling path, so the
-    # parity tests above would not see a multi-spelling search return a later boundary (BACKLOG
-    # #4972). Each answer is held to a plain regex for the same boundary.
+    # The boolean readings throw the index away, so the parity tests above would not see a search
+    # return a later boundary (BACKLOG #4972). Each answer is held to a plain regex for the same
+    # boundary, for each spelling.
     assert [
         text
         for text in CORPUS
@@ -253,3 +254,36 @@ def test_a_clean_outbound_payload_pays_one_scan() -> None:
     assert split._sends_more_than_one_message(clean) is False
     assert Counted.scans == 1
     assert split._sends_more_than_one_message(Counted("MSH|a\rPID|1\nMSH|b\r")) is True
+
+
+@pytest.mark.parametrize("lead", ["", BOM, BOM * 3])
+def test_walking_a_batch_reads_the_text_a_bounded_number_of_times(lead: str) -> None:
+    # BACKLOG #5918 review: with only marked boundaries, a search that scanned on for a plain
+    # boundary read to the end of the text on every call, so a split was quadratic. Walking every
+    # boundary of an N-message batch, as split_batch does, must read the text a bounded number of
+    # times in all. A str subclass totals the characters each find reads.
+    class Counted(str):
+        read = 0
+
+        def find(
+            self,
+            sub: str,
+            start: SupportsIndex | None = None,
+            end: SupportsIndex | None = None,
+            /,
+        ) -> int:
+            first = 0 if start is None else int(start)
+            last = len(self) if end is None else int(end)
+            hit = super().find(sub, start, end)
+            type(self).read += (last if hit < 0 else hit + len(sub)) - first
+            return hit
+
+    count = 200
+    text = Counted(("MSH|a\rOBX|1|MSH x\r" + lead) * count)
+    found = []
+    at = split._next_boundary(text, 0, split._NORMALIZED)
+    while at >= 0:
+        found.append(at)
+        at = split._next_boundary(text, at + 1, split._NORMALIZED)
+    assert len(found) == count - 1
+    assert Counted.read <= 3 * len(text)
