@@ -652,6 +652,12 @@ SITES: dict[str, Site] = {
         "can reach the join (vault BACKLOG #2595).",
         "messagefoundry/engine_secrets.py::open_secrets_directory",
     ),
+    "messagefoundry/restricted_file.py::_posix_parent": Site(
+        1,
+        INTERNAL,
+        "Joins the fixed name '..' to a path its caller already holds, to stat the directory above "
+        "it; no input chooses the joined part (vault BACKLOG #5636).",
+    ),
     "messagefoundry_toolkit/generators/_core.py::write_corpus": Site(
         2,
         OPERATOR,
