@@ -324,9 +324,19 @@ every fixed element-separator position holds the separator, and the element, com
 delimiters, plus the repetition separator from 00501, are mutually distinct. It never reads element
 data. An `ISA` that fails it, such as a trigram in noise, padded "VISA" text, or a corrupted header, is
 framed through its own `IEA` or up to the next `ISA` that passes, whichever comes first. The walk of
-an `ISA` that passes ends at its `IEA` or at a later passing `ISA` that opens a segment, meaning only
-the walk's own terminator and whitespace come before it, so an interchange with no `IEA` does not
-swallow the next one. A later `ISA` behind anything else, at least a BOM, is not found that way.
+an `ISA` that passes ends at its `IEA` or at a later segment that opens with a literal `ISA`,
+whether or not that `ISA` passes, meaning only the walk's own terminator and whitespace come before
+it, so an interchange with no `IEA` does not swallow the next one. The frame ends at that
+terminator, the whitespace between is discarded, and the `ISA` opens the next frame, malformed if it
+fails. Each segment start is checked as the walk reaches it, never by a search ahead, so the work
+stays linear however interchanges are separated. A later `ISA` behind anything else, at least a BOM,
+junk or MLLP envelope bytes, or one in the middle of a segment, does not end the walk: an
+interchange with no `IEA` followed that way is still framed together with what follows it, a known
+gap. A second known gap: "ISA", then 101 copies of one character, then CR LF passes the check for
+at least a space or a zero, because its component separator (CR) and terminator (LF) differ from
+that character and from each other, and the version that run spells reads as before 00501, so no
+repetition separator is compared. Such a line is walked as an interchange with an LF terminator. Closing it means reading
+element data, which the check must not do while #5536 frames a delimiter in ISA data whole.
 `X12Peek` and `X12Message` still parse a frame cut there; `check_integrity` reports its missing `SE`,
 `GE` or `IEA`. `split` returns every run other than inter-interchange whitespace/BOM as an element, and an
 `ISA` that passes but that `discover_delimiters` refuses, for a delimiter in its element data (BACKLOG

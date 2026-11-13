@@ -510,19 +510,32 @@ def test_frame_reader_cap_does_not_depend_on_read_size(first: bytes, cap: int) -
         assert not reader.in_frame
 
 
+@pytest.mark.parametrize("chunk", [4096, 1])
+def test_frame_reader_cap_holds_over_whitespace_after_a_segment(chunk: int) -> None:
+    # Whitespace after a terminator may open the next ISA, which would cut the frame before it, so
+    # the reader waits to see what follows. It is still charged, or a peer could grow the buffer
+    # with it without bound.
+    data = _without_iea(interchange()).encode() + b" " * 400
+    reader = X12FrameReader(max_interchange_bytes=300)
+    with pytest.raises(X12FrameError):
+        for i in range(0, len(data), chunk):
+            list(reader.feed(data[i : i + chunk]))
+
+
 @pytest.mark.parametrize("between", ["", "\r\n"])
 @pytest.mark.parametrize("next_term", ["~", "\n"])
 def test_an_interchange_with_no_iea_ends_at_the_next_interchange(
     between: str, next_term: str
 ) -> None:
     # A passing ISA with no IEA was walked to the end of the buffer, swallowing the interchange
-    # after it. Its walk now ends at the next passing ISA that opens a segment, whatever that
-    # interchange's own terminator. Both surfaces keep the frame verbatim, the whitespace too.
+    # after it. Its walk now ends at the next ISA that opens a segment, whatever that interchange's
+    # own terminator. Both surfaces keep the frame verbatim through its last terminator; the
+    # whitespace before the next ISA is between interchanges, so neither frame holds it.
     a = _without_iea(interchange())
     b = interchange(control="000000002", term=next_term)
-    assert split(a + between + b) == [a + between, b]
+    assert split(a + between + b) == [a, b]
     for chunk in (4096, 7, 1):
-        assert _frames_of((a + between + b).encode(), chunk) == [(a + between).encode(), b.encode()]
+        assert _frames_of((a + between + b).encode(), chunk) == [a.encode(), b.encode()]
     # The cut frame still parses, so check_integrity is what reports it.
     assert check_integrity(a) == ["no IEA segment"]
 
@@ -584,6 +597,55 @@ def test_split_walks_a_chain_of_interchanges_with_no_iea_linearly() -> None:
         assert _CountingStr.scanned < 4 * len(raw), (k, _CountingStr.scanned)
 
 
+@pytest.mark.parametrize(
+    "between",
+    [
+        pytest.param("﻿", id="bom"),
+        pytest.param("junk", id="junk"),
+        pytest.param("\x1c\r\x0b", id="mllp-envelope"),
+    ],
+)
+def test_split_and_reader_stay_linear_when_noise_precedes_each_isa(between: str) -> None:
+    # A passing walk used to search ahead for a later ISA that opens a segment before walking. With
+    # anything but terminator and whitespace before each next ISA, none opens one, so each of k
+    # interchanges searched to the end of the buffer: about k * k. Count what find scans.
+    one = interchange() + between
+    for k in (50, 400):
+        _CountingStr.scanned = 0
+        raw = _CountingStr(one * k)
+        assert len([p for p in split(raw) if p.startswith("ISA")]) == k
+        assert _CountingStr.scanned < 4 * len(raw), (k, _CountingStr.scanned)
+        data = (one * k).encode()
+        frames, scanned = _drip(data, len(data))
+        assert len(frames) == k
+        assert scanned < 4 * len(data), (k, scanned)
+
+
+def test_a_failing_isa_that_opens_a_segment_ends_a_passing_walk() -> None:
+    # Any literal ISA that opens a segment ends the walk, passing or not, so an interchange with no
+    # IEA does not swallow a corrupted one after it. That one is its own malformed element.
+    a = _without_iea(interchange())
+    bad = _corrupt(interchange(control="000000002"))
+    good = interchange(control="000000003")
+    for between in ("", "\r\n"):
+        raw = a + between + bad + good
+        assert split(raw) == [a, bad, good]
+        for chunk in (4096, 7, 1):
+            assert _frames_of(raw.encode(), chunk) == [a.encode(), bad.encode(), good.encode()]
+
+
+def test_split_takes_a_lowercase_isa_as_data_as_the_reader_does() -> None:
+    # The separator check never reads the literal. split took a lowercase "isa" header as an
+    # interchange and walked it past a passing ISA in its element data; the reader only starts a
+    # frame at a literal "ISA", so the two framed the same bytes differently.
+    body_isa = isa(control="000000009")
+    raw = interchange().replace("GS*HS*", "GS*HS" + body_isa + "*", 1)
+    lower = "isa" + raw[3:]
+    cut = lower.index(body_isa)
+    assert split(lower) == [lower[:cut], lower[cut:]]
+    assert split(raw) == [raw]  # the control: with a literal ISA it is one interchange
+
+
 def test_split_checks_a_chain_of_interchanges_with_no_iea_once_each() -> None:
     import messagefoundry.parsing.x12.interchange as interchange_mod
     from messagefoundry.parsing.x12 import delimiters
@@ -610,9 +672,22 @@ def test_a_short_segment_opening_with_isa_does_not_hold_a_complete_interchange(
 ) -> None:
     # A body segment that only starts like an ISA must not make the reader wait for a whole header
     # once the interchange's IEA has arrived: a sender waiting for an acknowledgment would stall.
+    # Any literal "ISA" that opens a segment ends a passing walk, whether or not it passes, so the
+    # interchange is cut there at once and the rest is its own malformed element, both whole.
     raw = interchange().replace("GE*", segment + "GE*", 1)
-    assert split(raw) == [raw]
-    assert _frames_of(raw.encode(), chunk) == [raw.encode()]
+    cut = raw.index(segment)
+    assert split(raw) == [raw[:cut], raw[cut:]]
+    reader = X12FrameReader()
+    data = raw.encode()
+    frames: list[bytes] = []
+    for i in range(0, len(data), chunk):
+        frames.extend(reader.feed(data[i : i + chunk]))
+    assert frames == [raw[:cut].encode()]
+    # The reader frames the short rest once the next interchange bounds it, as any short suspect;
+    # until then it is an open frame, which the listener's frame deadline covers.
+    nxt = interchange(control="000000002").encode()
+    assert list(reader.feed(nxt)) == [raw[cut:].encode(), nxt]
+    assert not reader.in_frame
 
 
 @pytest.mark.parametrize("chunk", [4096, 1])
@@ -665,10 +740,16 @@ def test_iea_segment_whitespace_matches_the_shared_set() -> None:
     literal equal to _SEGMENT_WHITESPACE, byte for byte, so the two cannot drift apart.
     """
     from messagefoundry.parsing.x12.delimiters import _SEGMENT_WHITESPACE
-    from messagefoundry.parsing.x12.interchange import _IEA_SEGMENT
+    from messagefoundry.parsing.x12.interchange import (
+        _IEA_SEGMENT,
+        _SEGMENT_WS_RUN,
+        _SEGMENT_WS_RUN_STR,
+    )
 
     skipped = {chr(b) for b in range(256) if _IEA_SEGMENT.fullmatch(bytes([b, b, *b"IEA"]))}
     assert skipped == set(_SEGMENT_WHITESPACE)
+    assert {chr(b) for b in range(256) if _SEGMENT_WS_RUN.fullmatch(bytes([b]))} == skipped
+    assert {chr(c) for c in range(0x10000) if _SEGMENT_WS_RUN_STR.fullmatch(chr(c))} == skipped
 
 
 def test_frame_reader_two_in_one_feed() -> None:
