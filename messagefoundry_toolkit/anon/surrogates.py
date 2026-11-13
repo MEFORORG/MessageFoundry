@@ -483,16 +483,19 @@ def _reads_as_site_code(part: str, seps: Seps, field_sep: str) -> bool:
     not split on whitespace, so a site-code run inside a longer value, such as ``Call 971234
     today``, reads as no site code. A part that holds one is also read split on
     whitespace and on escaped delimiters, so ``Call 971234 today\\.br\\`` reads as a site code,
-    and :func:`scrub_site_codes` then replaces the whole part. Each escape body is also read as
-    written, split at every character that is not a digit: a raw viewer, or a receiver that
-    defines the escape, shows the body's text, and a site code is digits only. docs/PHI.md
-    section 9, *Field-anchored site-code scrub*, states the rule and its consequences."""
+    and :func:`scrub_site_codes` then replaces the whole part. A part that holds one is also read
+    as written, split at the escape character, each piece trimmed and read whole, and each
+    escape body further split at every character that is not a digit: a raw viewer, or a
+    receiver that defines the escape, shows that text, and a site code is digits only.
+    docs/PHI.md section 9, *Field-anchored site-code scrub*, states the rule and its
+    consequences."""
     forms = [trim(part), trim(dropped(part)), *map(trim, _split_at_invisible(part))]
     forms += decoded_readings(part, seps, field_sep, resplit=True)
     if seps.escape and seps.escape in part:
-        # Every piece after an opening escape character is a body: the odd pieces of the split,
-        # an unclosed tail among them. The text around them is already read decoded.
-        for body in part.split(seps.escape)[1::2]:
+        pieces = part.split(seps.escape)
+        forms += map(trim, pieces)
+        # The odd pieces are the escape bodies, an unclosed tail among them.
+        for body in pieces[1::2]:
             forms += _NON_DIGITS.split(body)
     return any(SITE_CODE_RE.fullmatch(form) for form in forms)
 

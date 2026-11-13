@@ -2423,15 +2423,14 @@ Properties of the anonymizer:
   part as written, so one code written two ways gets two unrelated surrogates. The split on
   whitespace and escaped delimiters applies only to a part that holds an escape character: free
   text such as `Call 971234 today` keeps the code, while `Call 971234 today\.br\` loses the whole
-  part, text included, to digits. Each escape body in such a part, the text after an escape
-  character up to the next one or to the end of the part, is also read as written, split at every
-  character that is not a digit, since a raw viewer shows that text and a site code is digits
-  only. So `\Z971234\`, `\Z-971234\`, `\.Z971234\` and `\.sp971234 x\` are found, and so is a
+  part, text included, to digits. Such a part is also read as written, as a raw viewer shows
+  it: split at the escape character, each piece trimmed and read whole, and each escape body
+  (the text after an opening escape character) further split at every character that is not a
+  digit, since a site code is digits only. So `\X41\971234`, `\X2D\971234`, `971234\X2D\`,
+  `\Z971234\`, `\Z-971234\`, `\.Z971234\` and `\.sp971234 x\` are found, and so is a
   well-formed hex escape whose digits hold a code, such as `\X971234\`, which the scrub then
-  replaces although it decodes to other bytes. Text between two escape sequences is not a body:
-  it is read only decoded, with the sequences around it, so `\X41\971234`, which decodes to
-  `A971234`, passes, although a raw viewer shows `971234` after the escape character. With no site prefix loaded it matches nothing, and
-  `python -m tee anonymize-captures` prints a warning saying so (vault BACKLOG #3516).
+  replaces although it decodes to other bytes. With no site prefix loaded it matches nothing,
+  and `python -m tee anonymize-captures` prints a warning saying so (vault BACKLOG #3516).
 - **Fail-closed contract.** A message with **no parseable MSH / malformed** is **REFUSED** (raises
   `AnonError`) — it never emits an un-scrubbed body. So is a message holding a line no rule can
   reach. Plain `anonymize` and `anonymize_checked` both refuse it, in the toolkit and on the tee.
@@ -2507,25 +2506,18 @@ still pass:
   one in a component never pairs with a sequence in the next.
 - The site-code check and the scrub read no part wider than a component either, so a site code
   whose escape pairs across a component separator passes both (BACKLOG #5632).
-- The IPv6 check reads runs of hex digits, colons and dots, as written and decoded. An address
-  glued to other hex digits or letters, such as one written straight after a hex word, is not
-  read as an address, and nor is one a run joins to another. A leading label that ends in hex,
-  such as `Device:`, and a trailing `:port` are dropped only when the run as written holds no
-  address. An address split by `\H\` or `\N\` is read with them as `_`, so one a display that
-  drops highlighting would show whole passes (BACKLOG #5654).
+- The IPv6 check misses some routable addresses. At least these pass: one joined to an allowed
+  address, such as `fe80::1.4000:a1::5`, and one split by a highlighting or control escape, such
+  as `4000:a1:\H\:5` or `4000:a1\X00\::5` (BACKLOG #5654).
 - A hex escape decodes one byte to one character. A non-ASCII character a UTF-8 sender wrote as
   several hex pairs reads as several characters, so a token holding it is not found in that form.
 
-The IPv6 check also refuses some text that holds no routable address, under any separators. It
-reads any run of hex digits, colons and dots with two or more colons, so at least these refuse:
-any word whose trailing run of hex digits and letters is one to four characters long joined to
-`::`, such as `ADD::`, `Note::`, `ID::`, `std::bad_alloc` or `Code:: 12` (a longer run is no
-IPv6 group, so `Decade::` and `BADCAFE::` pass); such a word joined by a colon to an allowed address, such as
-`Feed:fe80::1`; a word that ends in hex digits joined to `::` and more hex, such as `abc 1::2`;
-eight colon-separated hex groups, such as a colon-written EUI-64 device id
-(`00:1A:2B:FF:FE:3C:4D:5E`); nine such groups, read as an address and a `:port`; and, in a
-message whose component separator is `:`, digits on either side of an empty component, such as
-`1::1234`.
+The IPv6 check also refuses some text that holds no routable address. It reads runs of hex
+characters (0-9 and A-F), colons and dots, so a word that ends in hex characters can read as an
+address when a `::` or more colons follow it. At least these refuse: `Note::` and a
+colon-written EUI-64 device id such as `00:1A:2B:FF:FE:3C:4D:5E`. At least these pass:
+`Decade::`, whose hex run is too long to be an address group, and `Xfe80::`, which reads as an
+allowed link-local address.
 
 In a message whose field separator is `:`, every IPv6 address is cut into separate fields, none
 of which holds it, and there is no cut-across-fields check for IPv6 as there is for the SSN and
