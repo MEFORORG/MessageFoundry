@@ -1552,9 +1552,11 @@ _XML_PHI_ELEMENT = re.compile(
 _XML_TAG = re.compile(r"<(/?)((?:[A-Za-z_][\w.-]*+:)?([A-Za-z_][\w.-]*+))")
 #: The rest of an end tag after its name: the whitespace XML allows there (its S production), anything
 #: else (which well-formed XML never has, so the walk scrubs it), and the ``>`` if there is one
-#: (BACKLOG #5925). Without a ``>``, the rest ends at the next ``<`` or line break, so a bracketless
-#: tag loses the rest of its own line and the lines after it keep their diagnostics.
-_XML_END_TAG_REST = re.compile(r"([ \t\r\n]*+)([^<>\r\n]*+)(>?)")
+#: (BACKLOG #5925). The whitespace crosses a line break only where it runs to a ``>``, and the rest
+#: ends at the next ``<`` or line break, so a bracketless tag loses at most the rest of its own line
+#: and the lines after it keep their diagnostics. The price: ``</family`` then a line break leaves
+#: the next line to the other passes, as before #5925.
+_XML_END_TAG_REST = re.compile(r"([ \t]*+(?:[\r\n][ \t\r\n]*+(?=>))?)([^<>\r\n]*+)(>?)")
 #: One part of a start tag after its name: whitespace, the tag's end, an attribute and the opening of
 #: its quoted value (the value itself is read by :data:`_XML_ATTR_VALUE`), or anything else.
 #:
@@ -1581,11 +1583,13 @@ _XML_ATTR_VALUE = {'"': re.compile(r'[^"<]*+"?'), "'": re.compile(r"[^'<]*+'?")}
 #: evidence: ``usage: tool <name> <address>`` is prose.
 _XML_CONTENT_EVIDENCE = re.compile(r"<|[ \t]*+\r?\n\s*+<|\w")
 #: Every end tag of a vocabulary element, located once per call so a placeholder that never closes
-#: costs a lookup rather than a search to the end of the text. It counts every end tag the walk would
-#: close the element on -- the name, then no further name character -- so ``</family Doe>`` and a
-#: bracketless ``</family`` are evidence too (BACKLOG #5925).
+#: costs a lookup rather than a search to the end of the text. It counts at least the end tags the walk
+#: closes the element on -- the name, then nothing that would make the walk read a longer name -- so
+#: ``</family Doe>``, ``</family: Doe>`` and a bracketless ``</family`` are evidence too (BACKLOG
+#: #5925).
 _XML_PHI_END = re.compile(
-    r"</(?:[A-Za-z_][\w.-]*+:)?(family|given|name|birthDate|address|identifier|telecom)(?![\w.:-])"
+    r"</(?:[A-Za-z_][\w.-]*+:)?(family|given|name|birthDate|address|identifier|telecom)"
+    r"(?![\w.-]|:[A-Za-z_])"
 )
 
 #: How a start tag ended: ``>``, ``/>``, or not at all.
@@ -1642,10 +1646,11 @@ def _xml_text(chunk: str, policy: int) -> str:
 
 
 def _scrub_xml_element(
-    text: str, match: re.Match[str], last_close: dict[str, int], keep_junk: bool
+    text: str, match: re.Match[str], last_close: dict[str, int], keep_junk: Callable[[], bool]
 ) -> tuple[str, int]:
-    """``(replacement, end)`` for the vocabulary element starting at ``match``. ``keep_junk`` keeps
-    what follows an end tag's name as it stands, for :func:`_redact_xml_elements` to say when."""
+    """``(replacement, end)`` for the vocabulary element starting at ``match``. Where ``keep_junk()``
+    holds, what follows an end tag's name stays as it stands; :func:`_redact_xml_elements` says when.
+    """
     out = [match.group()]
     policy = _VALUE_TOP if match.group(2) in _PHI_VALUE_KEYS else _LEAF
     pos, how, attributed = _walk_xml_tag(text, match.end(), policy, out)
@@ -1677,7 +1682,7 @@ def _scrub_xml_element(
             else:
                 pos = rest.end()
                 ws, junk, bracket = rest.groups()
-                scrub = junk and not keep_junk
+                scrub = bool(junk) and not keep_junk()
                 out.append(f"{ws}{_REDACTED}{bracket}" if scrub else rest.group())
             if open_names.get(qname):
                 while stack:
@@ -1713,11 +1718,16 @@ def _redact_xml_elements(text: str, *, widened: bool) -> str:
     with whitespace) or ``<family>(Van`` (opening with punctuation) reads as prose, and the fragment
     before the cut survives. A closed element is always scrubbed, whatever its text opens with.
 
-    **Text after an end tag's name is scrubbed, but in the first stage only on text the widened stage
-    will not read** (BACKLOG #5925). Running to the next ``<``, that scrub could take a label only the
-    widened stage reads -- ``</family {"name": "<Zqxa"}`` lost its ``"name":`` key and kept the value
-    -- so where :func:`_needs_widened_stage` holds, the first stage leaves it as it stands and the
-    widened stage, which then runs, scrubs it after its own passes have read the text."""
+    **Text after an end tag's name is scrubbed, but not where it could hold a label another reader
+    needs** (BACKLOG #5925). Running to the next ``<``, that scrub could take the label and leave its
+    value: ``</family {"name": "<Zqxa"}`` lost the ``"name":`` key only the widened stage reads, and
+    ``</family password: <secret>`` the label the credential filters after this module read. So the
+    remainder stays as it stands where the text holds a credential shape (:data:`_CREDENTIAL_AHEAD`,
+    :data:`_USERINFO_OPENER`) and, in the first stage, where :func:`_needs_widened_stage` holds; the
+    widened stage then scrubs it after its own passes have read the text. Those are residuals, no
+    worse than before #5925, at least these: a text with a credential shape anywhere keeps every
+    end tag's remainder, and a first stage that runs out of rounds after scrubbing away the only
+    widened trigger skips the stage that would have scrubbed it."""
     if "<" not in text:
         return text
     out: list[str] = []
@@ -1725,11 +1735,21 @@ def _redact_xml_elements(text: str, *, widened: bool) -> str:
     #: Where the LAST end tag of each vocabulary name starts, built on the first match: whether an
     #: element closes anywhere later is then one lookup, not a search to the end of the text.
     last_close: dict[str, int] | None = None
-    keep_junk = False
+    #: Whether end-tag remainders stay, decided on the first one: well-formed XML never has one.
+    kept: list[bool] = []
+
+    def keep_junk() -> bool:
+        if not kept:
+            kept.append(
+                _USERINFO_OPENER in text
+                or _CREDENTIAL_AHEAD.search(text) is not None
+                or (not widened and _needs_widened_stage(text))
+            )
+        return kept[0]
+
     while (match := _XML_PHI_ELEMENT.search(text, pos)) is not None:
         if last_close is None:
             last_close = {close.group(1): close.start() for close in _XML_PHI_END.finditer(text)}
-            keep_junk = not widened and _needs_widened_stage(text)
         replacement, end = _scrub_xml_element(text, match, last_close, keep_junk)
         out.append(text[pos : match.start()])
         out.append(replacement)
@@ -2358,7 +2378,9 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     it scrubbed itself is no longer one, BACKLOG #2312); an unquoted DICOM label value can take the truncation note with it; and
     (BACKLOG #2079) a JSON ``name``/``address`` key that ``limit`` leaves last has the count read as its
     value by a further pass, so ``{"name":…(+316 chars)`` becomes ``{"name":…([redacted] [redacted])``
-    and loses how much was cut. Before BACKLOG #1797 the limit cut the kept string itself and left it
+    and loses how much was cut; and (BACKLOG #5925) an XML end tag that ``limit`` leaves last has the
+    count read as the end tag's remainder, so ``</family…(+412 chars)`` becomes
+    ``</family[redacted]``. Before BACKLOG #1797 the limit cut the kept string itself and left it
     unterminated, which a further pass scrubbed the same way."""
     head, dropped = _clamp(text, _REDACT_WINDOW)
     message = redact(head).strip()

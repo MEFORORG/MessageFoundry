@@ -2121,7 +2121,7 @@ _MALFORMED_END_TAGS = {
         "SSN123456789",
         "</family",
     ),
-    "no-bracket-newline": ("<family>Smith</family\nJohnathan", "Johnathan", "</family"),
+    "multi-line-tag": ("<family>Smith</family Johnathan\n>", "Johnathan", "</family"),
     "nested-child": ("<name><given>Smith</given SSN123456789></name>", "SSN123456789", "</given"),
     "kept-child": (
         '<identifier><system value="urn:x"></system Johnathan><value value="1"/></identifier>',
@@ -2133,6 +2133,7 @@ _MALFORMED_END_TAGS = {
     # an end tag with text inside it is a close the walk honours, so it is evidence too.
     "space-led-content": ("<family> Smith</family Johnathan>", "Johnathan", "</family"),
     "punctuation-led-content": ("<given>(Smith)</given Johnathan>", "Johnathan", "</given"),
+    "colon-after-name": ("<family> Smith</family: Johnathan>", "Johnathan", "</family"),
 }
 
 
@@ -2169,9 +2170,47 @@ def test_an_end_tag_scrub_takes_no_label_the_widened_stage_reads(text: str) -> N
     assert redact(out) == out
 
 
-def test_a_bracketless_end_tag_spares_the_lines_after_it() -> None:
-    out = redact("<family>Smith</family Johnathan\nretry 3 of 5 after 200 ms")
-    assert out == "<family>[redacted]</family [redacted]\nretry 3 of 5 after 200 ms"
+@pytest.mark.parametrize(
+    ("text", "want"),
+    [
+        (
+            "<family>Smith</family Johnathan\nretry 3 of 5 after 200 ms",
+            "<family>[redacted]</family [redacted]\nretry 3 of 5 after 200 ms",
+        ),
+        # A tag that ends its line takes nothing from the next one, blank lines between or not.
+        (
+            "<family>Smith</family\n\nretry 3 of 5 after 200 ms",
+            "<family>[redacted]</family\n\nretry 3 of 5 after 200 ms",
+        ),
+    ],
+)
+def test_a_bracketless_end_tag_spares_the_lines_after_it(text: str, want: str) -> None:
+    assert redact(text) == want
+
+
+@pytest.mark.parametrize(
+    ("tail", "secret"),
+    [
+        ("password: <s3cr3tvalue99>", "s3cr3tvalue99"),
+        ("token=<abc123def456>", "abc123def456"),
+        ("Authorization: Bearer <eyJabc123>", "eyJabc123"),
+    ],
+)
+def test_an_end_tag_scrub_takes_no_credential_label(tail: str, secret: str) -> None:
+    """The credential filters run after :func:`redact` on the log chain and read the label, so a
+    scrub that took the label printed the value. The remainder stays for them, as before #5925."""
+    out = redact(f"<family>Smith</family {tail}")
+    assert out == f"<family>[redacted]</family {tail}"
+    assert secret not in secretscrub.scrub_credentials(out)
+
+
+def test_the_kept_remainder_is_byte_identical() -> None:
+    """With a credential shape in the text, both stages keep the remainder exactly: whitespace,
+    text and the closing bracket."""
+    text = "<family>Smith</family \t Johnathan > token=x"
+    for widened in (False, True):
+        out = redaction._redact_xml_elements(text, widened=widened)
+        assert out == "<family>[redacted]</family \t Johnathan > token=x"
 
 
 @pytest.mark.parametrize(
