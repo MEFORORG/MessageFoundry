@@ -1328,6 +1328,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # control wired (a control_action rule then no-ops, logged). The sink NEVER imports the runner.
         self._control_cb: ControlCallback | None = None
         self._control_tasks: set[asyncio.Task[None]] = set()
+        # BACKLOG #5909: set by stop_control, so a rule firing after the shutdown clear logs why.
+        self._control_stopped = False
         # Vault BACKLOG #3849: told (transport name, event) after each send that returned without
         # raising. None, as `serve` leaves it, changes nothing.
         self._delivery_observer: Callable[[str, dict[str, Any]], None] | None = None
@@ -2510,23 +2512,31 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     # --- #144 (ADR 0128) connection-control action (off-worker, never-raise) --
 
+    async def stop_control(self) -> None:
+        """End connection control for shutdown (BACKLOG #5909): clear the callback, so no later
+        rule dispatches a control task, then cancel every control task still running and wait for
+        it to end. A task dispatched before the clear holds the callback it captured, so clearing
+        alone would leave its restart running into the engine's stop. The lifespan calls this
+        before engine.stop(); :meth:`aclose` calls it again, which is then a no-op."""
+        self._control_cb = None
+        self._control_stopped = True
+        pending = [task for task in self._control_tasks if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            log.warning(
+                "%d alert control_action task(s) still running at shutdown were cancelled",
+                len(pending),
+            )
+            await asyncio.gather(*pending, return_exceptions=True)
+
     async def aclose(self) -> None:
-        """Drain and stop the delivery task, then cancel every control task still running and wait
-        for it to end (BACKLOG #5909). The lifespan closes this sink after engine.stop(), so a
-        restart such a task would still attempt meets a stopped runner; left running, the task
-        would also outlive the loop's shutdown. Runs even when the sink was never started."""
+        """Drain and stop the delivery task, then end connection control (:meth:`stop_control`),
+        so no control task outlives the sink. Runs even when the sink was never started."""
         try:
             await super().aclose()
         finally:
-            pending = [task for task in self._control_tasks if not task.done()]
-            for task in pending:
-                task.cancel()
-            if pending:
-                log.warning(
-                    "%d alert control_action task(s) still running at shutdown were cancelled",
-                    len(pending),
-                )
-                await asyncio.gather(*pending, return_exceptions=True)
+            await self.stop_control()
 
     def _dispatch_control(self, action: str, target: str, *, default_target: bool) -> None:
         """Schedule the injected connection-control callback OFF the delivery worker (a fire-and-forget
@@ -2534,6 +2544,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         task, never awaits the runner, so a slow/hung restart can never stall the worker that emitted the
         alert. A no-op when no callback is wired (logged once at emit)."""
         cb = self._control_cb
+        if cb is None and self._control_stopped:
+            # Shutdown cleared it on purpose (stop_control), so this is not a wiring fault.
+            log.info("alert control_action %s for %r not run: shutting down", action, target)
+            return
         if cb is None:
             log.warning(
                 "alert control_action %s for %r requested but no control callback is wired",

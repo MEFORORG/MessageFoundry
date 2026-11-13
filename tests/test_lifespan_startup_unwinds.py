@@ -171,6 +171,8 @@ class _Opened:
         self.store: Any = None
         self.store_closed = False
         self.notifier: Any = None
+        self.notifier_drained = False
+        self.state_drained_after_close = False
         self.engine_stops = 0
 
 
@@ -191,8 +193,27 @@ def _probed_app(
 
     def _notifier(*_args: Any, **_kwargs: Any) -> NotifierAlertSink:
         # A real sink with no transport: the lifespan builds none from bare AlertsSettings.
-        opened.notifier = NotifierAlertSink([])
-        return opened.notifier
+        sink: Any = NotifierAlertSink([])
+        real_aclose = sink.aclose
+
+        async def _aclose() -> None:
+            # Recorded only for a sink that was started, so it reads that the drain ran, which a
+            # never-started sink's empty task would not show.
+            if sink._task is not None:
+                opened.notifier_drained = True
+            await real_aclose()
+
+        sink.aclose = _aclose
+        real_drain_state = sink.drain_state
+
+        async def _drain_state(timeout: float) -> None:
+            # After the delivery drain, so an alert-state write it scheduled is waited for.
+            opened.state_drained_after_close = sink._task is None
+            await real_drain_state(timeout)
+
+        sink.drain_state = _drain_state
+        opened.notifier = sink
+        return sink
 
     real_stop = engine_module.Engine.stop
 
@@ -266,6 +287,9 @@ async def test_a_raise_in_an_unguarded_startup_span_closes_the_store_and_notifie
         assert opened.notifier is not None and opened.notifier._task is None, (
             f"{probe}: the notifier's drain task was left running"
         )
+        # Even where the probe fired before the notifier's own start: it is started and drained.
+        assert opened.notifier_drained, f"{probe}: the notifier was never drained"
+        assert opened.state_drained_after_close, f"{probe}: its alert-state writes were not drained"
         # The engine never started, so nothing stops it.
         assert opened.engine_stops == 0
     finally:
@@ -297,6 +321,7 @@ async def test_a_cancel_in_an_unguarded_startup_span_closes_the_store_and_notifi
             await asyncio.wait_for(task, 10.0)
         assert opened.store_closed, "a cancel left the store open"
         assert opened.notifier is not None and opened.notifier._task is None
+        assert opened.notifier_drained
         assert opened.engine_stops == 0
     finally:
         await _close_leftovers(opened)

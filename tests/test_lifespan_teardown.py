@@ -281,16 +281,20 @@ def _every_managed_step(*, harness: bool, notifier: Any = None) -> list[_Teardow
     )
 
 
-async def test_the_control_callback_removal_is_a_real_clear_and_never_cut() -> None:
-    """BACKLOG #5909: the step clears the callback on the notifier it was built for, and is
-    unbounded, so it adds no cut grace to the NSSM window the test below counts."""
-    cleared: list[object] = []
-    notifier: Any = SimpleNamespace(set_control_callback=cleared.append)
+async def test_the_control_callback_removal_stops_control_on_its_own_notifier() -> None:
+    """BACKLOG #5909: the step ends connection control on the notifier it was built for, and is
+    never cut, so it adds no cut grace to the NSSM window the test below counts."""
+    stopped: list[str] = []
+
+    async def _stop_control() -> None:
+        stopped.append("stop_control")
+
+    notifier: Any = SimpleNamespace(stop_control=_stop_control)
     steps = _every_managed_step(harness=False, notifier=notifier)
     [step] = [s for s in steps if s.label == "the alert control callback's removal"]
     assert not step.bounded
     await step.run(0.0)
-    assert cleared == [None]
+    assert stopped == ["stop_control"]
 
 
 def test_the_shutdown_budget_fits_the_nssm_stop_window() -> None:
@@ -590,7 +594,7 @@ async def test_an_engine_stop_that_raises_does_not_skip_the_steps_after_it(
     assert spies.calls == ["outliving", "approvals", "flush", "stop", "executor"]
 
 
-async def test_the_control_callback_is_cleared_before_engine_stop_runs(
+async def test_control_is_stopped_before_engine_stop_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BACKLOG #5909: the managed lifespan wires the notifier's control callback after
@@ -603,19 +607,35 @@ async def test_the_control_callback_is_cleared_before_engine_stop_runs(
         alerts_settings=AlertsSettings(),
         egress_settings=EgressSettings(deny_by_default=False),
     )
-    seen_at_stop: list[object] = []
+    seen_at_stop: list[tuple[object, bool]] = []
+    entered = asyncio.Event()
     async with app.router.lifespan_context(app):
         # The control: the lifespan wired a callback for the running engine.
         assert notifier._control_cb is not None
         engine = app.state.engine
         real_stop = engine.stop
+        wired = notifier._control_cb
+
+        async def _hung_restart(action: str, target: str, *, default_target: bool) -> None:
+            entered.set()
+            await asyncio.Event().wait()
+
+        # A restart dispatched before the shutdown, still running when it begins. It holds the
+        # callback it captured, so clearing the callback alone would not stop it.
+        notifier._control_cb = _hung_restart
+        notifier._dispatch_control("restart", "IB_TEST_ADT", default_target=False)
+        [inflight] = list(notifier._control_tasks)
+        notifier._control_cb = wired
+        await asyncio.wait_for(entered.wait(), _WAIT_S)
 
         async def _stop() -> None:
-            seen_at_stop.append(notifier._control_cb)
+            seen_at_stop.append((notifier._control_cb, inflight.done()))
             await real_stop()
 
         engine.stop = _stop
-    assert seen_at_stop == [None], "engine.stop() ran with the control callback still wired"
+    assert seen_at_stop == [(None, True)], (
+        "engine.stop() ran with the control callback wired or a control task still running"
+    )
 
 
 async def test_the_notifier_close_cancels_a_control_task_still_running() -> None:

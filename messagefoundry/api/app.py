@@ -1679,14 +1679,16 @@ def _managed_teardown_steps(
     if notifier is not None:
         # BACKLOG #5909: a control_action rule firing on an alert the engine's own stop raises must
         # not restart a listener or worker on the runner being stopped. The runner refuses that
-        # itself since BACKLOG #5702; clearing the callback first means no restart is attempted,
-        # and the notifier's close below cancels any control task still running. A synchronous
-        # call cannot overrun, so it is never cut and adds no cut grace to the budget.
+        # itself once stopped (BACKLOG #5702), but a restart already under way when the stop
+        # begins holds the runner's reload lock, which the stop then waits on. So the callback is
+        # cleared and every control task still running is cancelled and awaited first. Never cut,
+        # as engine.stop() is not: a cut would leave the restart holding the lock the stop waits
+        # on, and the NSSM window has no room for another cut grace.
         steps.append(
             _TeardownStep(
                 "the alert control callback's removal",
                 0.0,
-                _sync(lambda: notifier.set_control_callback(None)),
+                lambda _b: notifier.stop_control(),
                 bounded=False,
             )
         )
@@ -1716,31 +1718,35 @@ def _managed_teardown_steps(
     return steps
 
 
-async def _unwind_failed_start(
-    store: Store,
-    notifier: NotifierAlertSink | None,
-    remove_security_signals: Callable[[], None] | None,
-) -> None:
+async def _unwind_failed_start(store: Store, notifier: NotifierAlertSink | None) -> None:
     """Close what the managed lifespan opened before its startup failed, ahead of engine.start()
     (BACKLOG #5907). The engine never started, so it is not stopped: the store is closed directly.
+    The security signals are not removed here: their install is the guarded span's last statement,
+    so no failure the guard catches comes after it.
 
     Each part is a :func:`_run_teardown` step, so a cancel that arrives during the unwind, or one
     re-delivered on every await as an anyio cancel scope does, reaches no step and the store still
     closes. The notifier is started before it is drained, as the open_store failure path does, so
     an alert raised before it would normally have started (the reason the start failed) is sent.
-    It closes before the store, because it records alert state in the store."""
+    Its drain is never cut, as the per-span guards this replaced never cut it: a failed start has
+    no stop window to fit, and each transport bounds its own send. Its alert-state writes are then
+    given the bounded drain engine.stop() gives them, so the alert that explains the refusal is
+    recorded before the store closes."""
     steps: list[_TeardownStep] = []
-    if remove_security_signals is not None:
-        steps.append(
-            _TeardownStep("the security-signal removal", 0.05, _sync(remove_security_signals))
-        )
     if notifier is not None:
 
         async def _close_notifier(_bound: float) -> None:
             notifier.start()
             await notifier.aclose()
 
-        steps.append(_TeardownStep("the alert notifier's close", 0.5, _close_notifier))
+        steps.append(
+            _TeardownStep("the alert notifier's close", 0.0, _close_notifier, bounded=False)
+        )
+        steps.append(
+            _TeardownStep(
+                "the alert-state drain", 0.5, lambda b: notifier.drain_state(b * _INNER_SHARE)
+            )
+        )
     # Never cut: a store left open keeps aiosqlite's non-daemon worker alive (#1257).
     steps.append(_TeardownStep("the store's close", 0.0, lambda _b: store.close(), bounded=False))
     await _run_teardown(steps, _SHUTDOWN_BUDGET_SECONDS - _ENGINE_STOP_RESERVE_SECONDS)
@@ -12553,7 +12559,6 @@ def create_managed_app(
         # teardown's try below, so a raise or cancel anywhere in it closes the notifier and the
         # store; left open, aiosqlite's non-daemon worker holds the process at exit (#1257). The
         # engine has not started anywhere in this span, so the unwind never calls engine.stop().
-        remove_security_signals: Callable[[], None] | None = None
         try:
             # Offline uploaded-logs store (BACKLOG #125/#126, ADR 0134), on the LIVE store's cipher instance.
             # DISABLED (None) unless [store].uploads_dir is set, so no PHI-at-rest surface exists unless an
@@ -12991,7 +12996,7 @@ def create_managed_app(
                 engine, notifier or LoggingAlertSink(), alerts_settings, cluster_settings, app.state
             )
         except BaseException:
-            await _unwind_failed_start(store, notifier, remove_security_signals)
+            await _unwind_failed_start(store, notifier)
             raise
         # The teardown guards this ENTIRE span, not just the yield. Everything started below --
         # the engine, both notifiers, the retention runner, the tasks -- was otherwise
