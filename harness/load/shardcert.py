@@ -61,7 +61,13 @@ from harness.load.coord import (
 )
 from harness.load.corpus import SEQ_BASE_STRIDE, build_corpus
 from harness.load.correlator import Correlator
-from harness.load.enginepoll import EMPTY_POOL_STATS, SIGN_IN_ERRORS, EnginePoller, PoolStats
+from harness.load.enginepoll import (
+    EMPTY_POOL_STATS,
+    SIGN_IN_ERRORS,
+    EnginePoller,
+    EngineSample,
+    PoolStats,
+)
 from harness.load.failover import EngineNode, _get_status_json, _insecure_bind_args
 from harness.load.failover_track import FailoverTracker
 from harness.load.ids import SHARDCERT_IDS
@@ -2894,20 +2900,26 @@ class ShardCertEngineReport:
         return "\n".join(lines)
 
 
-def _count_balance(acked: int, delivering: int, sink_received: int, *, killed: bool) -> bool:
+def _count_balance(
+    acked: int, delivering: int, sink_received: int, *, killed: bool, timeouts: int = 0
+) -> bool:
     """The two-box tiers' sink count balance: the sink's socket-observed copies against the
-    accept-ACK'd intake fanned out (``acked * delivering``). Equal on a no-kill run; at least that
-    across a kill, where at-least-once may re-deliver. A fan-out below 1 balances nothing, so it
-    fails."""
+    accept-ACK'd intake fanned out (``acked * delivering``). At least that always; across a kill,
+    where at-least-once may re-deliver, nothing more is asked. On a no-kill run at most
+    ``(acked + timeouts) * delivering``: a send whose ACK this side never saw (``timeouts``) may
+    still have been committed and delivered, so its copies are not a duplicate. ``timeouts=0`` is
+    the strict equality. A fan-out below 1 balances nothing, so it fails."""
     if delivering < 1:
         return False
     expected = acked * delivering
-    return sink_received >= expected if killed else sink_received == expected
+    if sink_received < expected:
+        return False
+    return killed or sink_received <= (acked + max(timeouts, 0)) * delivering
 
 
 def _balance_word(ok: bool, sink_received: int, expected: int, delivering: int) -> str:
     """``OK``, ``UNCHECKED`` where no fan-out is known, or which way the balance missed: a SURPLUS
-    is a duplicate or a late, uncounted ACK, not a lost copy."""
+    (more copies than even the unACKed sends explain) is a duplicate, not a lost copy."""
     if ok:
         return "OK"
     if delivering < 1:
@@ -2942,19 +2954,27 @@ class ShardCertDriverReport:
     #: The routing shape SHARDS_READY named; without it ``delivering`` is ambiguous (see
     #: ``ShardCertDriveReport.routing``).
     routing: str
+    #: Sends whose ACK this side never saw (a connection closed, or the stop grace ran out). The
+    #: engine may still have committed and delivered them, so they bound the no-kill surplus.
+    timeouts: int = 0
     notes: list[str] = field(default_factory=list)
 
     @property
     def count_balance_ok(self) -> bool:
         """The sink's socket-observed copies (``S``) balance the accept-ACK'd intake fanned out
-        (``A * delivering``): equal on a no-kill run, at least that across a kill, where at-least-once
-        may re-deliver. Modelled on :attr:`ShardCertDriveReport.no_loss`.
+        (``A * delivering``): ``A*D <= S <= (A + timeouts)*D`` on a no-kill run, and at least ``A*D``
+        across a kill, where at-least-once may re-deliver. Modelled on
+        :attr:`ShardCertDriveReport.no_loss`, plus the timeout allowance (see :func:`_count_balance`).
 
         ``acked_not_delivered`` alone cannot see this loss: the tracker counts DISTINCT messages, so
         one copy of each reaching the sink clears it while the other ``delivering - 1`` copies are
         lost (BACKLOG #5640)."""
         return _count_balance(
-            self.acked, self.delivering, self.sink_received, killed=self.killed_shard is not None
+            self.acked,
+            self.delivering,
+            self.sink_received,
+            killed=self.killed_shard is not None,
+            timeouts=self.timeouts,
         )
 
     @property
@@ -2984,7 +3004,17 @@ class ShardCertDriverReport:
             f"sink_received={self.sink_received}",
             f"  routing={self.routing} fanout(delivering)={self.delivering}  "
             f"S={self.sink_received} (expect A*delivering={self.acked * self.delivering}"
-            f"{'' if self.killed_shard is None else ' or more, across the kill'}) -> "
+            + (
+                " or more, across the kill"
+                if self.killed_shard is not None
+                else (
+                    f" up to (A+timeouts={self.timeouts})*delivering="
+                    f"{(self.acked + self.timeouts) * self.delivering}"
+                    if self.timeouts > 0
+                    else ""
+                )
+            )
+            + ") -> "
             + _balance_word(
                 self.count_balance_ok,
                 self.sink_received,
@@ -3610,6 +3640,7 @@ async def run_shardcert_driver(
         drain_seconds=drain_s,
         delivering=delivering,
         routing=routing,
+        timeouts=ctr.timeouts,
         notes=notes,
     )
 
@@ -4585,12 +4616,19 @@ async def run_shardcert_drive(
         override=drive_complete_timeout,
     )
     try:
-        # (0) Sign in to the engine box's API before spawning any child, so a refusal is a setup error
-        #     rather than a failure after the whole hold with K+M children to reap. https and the
-        #     remote rig session unless --insecure; ``cacert`` is the engine box's certificate PEM.
-        poller = await _open_remote_poller(
-            engine_host, api_ports, allow_insecure=allow_insecure, cacert=cacert
-        )
+        # (0) Sign in to the engine box's API before spawning any child (https and the remote rig
+        #     session unless --insecure; ``cacert`` is the engine box's certificate PEM). This drive's
+        #     verdict never reads the poller (see ``ShardCertDriveReport.no_loss``), so a refusal is a
+        #     note and the run goes on with its advisory drain terms unread, rather than an abort.
+        try:
+            poller = await _open_remote_poller(
+                engine_host, api_ports, allow_insecure=allow_insecure, cacert=cacert
+            )
+        except RemoteEngineSignInError as exc:
+            notes.append(
+                "advisory /stats poller not opened, so drained/engine_done/engine_dead are unread: "
+                + escape_for_terminal(str(exc), single_line=True)
+            )
 
         # (1) Spawn the M sink children over CONTIGUOUS chunks of the [sink_base, sink_base+sink_ports)
         #     (== dests) band; await each SINK_BOUND.<m>.
@@ -4659,9 +4697,12 @@ async def run_shardcert_drive(
         driver_dones = await _await_indexed(
             coord, DRIVER_DONE, driver_count, timeout=driver_done_wait
         )
-        # The poller was opened, and signed in, at step (0).
-        drain_s = await poller.await_drain(timeout=drain_timeout, interval=0.5)
-        final = poller.final
+        # The poller was opened, and signed in, at step (0); without it the advisory terms stay unread.
+        drain_s: float | None = None
+        final: EngineSample | None = None
+        if poller is not None:
+            drain_s = await poller.await_drain(timeout=drain_timeout, interval=0.5)
+            final = poller.final
 
         # (4b) PR-C2 ladder drain gate (default OFF): before releasing the sinks to tally, wait for the
         # ENGINE half's RELIABLE store-truth drain signal. The remote poller above is advisory (zeroes

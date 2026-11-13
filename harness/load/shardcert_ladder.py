@@ -87,7 +87,6 @@ from harness.load.shardcert import (
     FIDELITY_SENT_FLOOR,
     INBOUND_BAND_CHECK_BASIS,
     PRODUCT_STORE_POOL_SIZE,
-    RemoteEngineSignInError,
     RungFidelity,
     ShardCertDriveReport,
     ShardCertEngineReport,
@@ -3545,7 +3544,7 @@ async def run_drive_ladder(
                 await_engine_drained=True,
                 engine_drained_timeout=engine_drained_timeout,
             )
-        except (CoordTimeout, RemoteEngineSignInError) as exc:
+        except CoordTimeout as exc:
             # The engine half never handed off this rung within the window (dead / desynced) — a two-box
             # RENDEZVOUS failure, NOT a bench result. Post LADDER_STOP so the engine stops climbing
             # IMMEDIATELY on its next pre-arm check instead of hanging on the next rung's DRIVE_START, and
@@ -3657,7 +3656,7 @@ async def run_drive_ladder(
                 soak_coord, timeout_seen=engine_rung_report_timeout
             )
             soak_outcome = build_rung_outcome(soak_rung, drive, gate, report_msg)
-        except (CoordTimeout, RemoteEngineSignInError) as exc:
+        except CoordTimeout as exc:
             # A soak rendezvous failure does NOT set climb_aborted (the CLIMB already pinned the ceiling), but
             # it IS a setup degradation: the soak never produced a measurement, so it must read as ABORTED
             # (exit 2), never a clean PASS with soak=null (B2). Also tell the ENGINE on the RUNG coord so its

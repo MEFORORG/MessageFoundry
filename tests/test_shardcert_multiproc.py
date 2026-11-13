@@ -1099,6 +1099,90 @@ async def test_coordinator_threads_allow_insecure_to_remote_poller(
         assert seen == [want], f"poller allow_insecure should be {want}, got {seen}"
 
 
+async def test_coordinator_signs_in_over_https_and_runs_on_when_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #5640 / #5977: the drive polls the engine box over https with the remote rig
+    session and ``cacert``. Its verdict never reads that poller, so a refused sign-in is a note
+    and the run goes on to its sink-truth verdict instead of aborting.
+
+    Mutation: let the refusal propagate. Red: the drive raises instead of reporting."""
+    import types
+
+    from harness.load.rigadmin import REMOTE_RIG_SESSION, RigSignInRefused
+
+    worker_tally = {
+        0: {"sent": 40, "acked": 40, "ack_p50_ms": 1.0, "ack_p99_ms": 2.0, "bands": [0]}
+    }
+    sink_tally = {
+        0: {
+            "sink_received": 40,
+            "lane_inversions": 0,
+            "lane_repeats": 0,
+            "lanes_observed": 2,
+            "ports": [3700],
+        }
+    }
+    spawned = _install_coordinator_fakes(
+        monkeypatch,
+        sink_tally=sink_tally,
+        worker_tally=worker_tally,
+        engine_final=types.SimpleNamespace(done=40, dead=0, in_pipeline=0),
+    )
+    built: list[dict[str, Any]] = []
+
+    class RefusingPoller:
+        def __init__(self, urls: Any, token: Any = None, **kw: Any) -> None:
+            built.append({"urls": list(urls), "token": token, **kw})
+
+        async def open(self) -> None:
+            raise RigSignInRefused("the engine refused the rig's sign-in")
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(sc, "EnginePoller", RefusingPoller)
+    coord = FileDropCoord(tmp_path, run_id="tlsdrive")
+    coord.post(
+        SHARDS_READY,
+        {
+            "shards": ["a"],
+            "inbound_base": 3600,
+            "lanes": 1,
+            "dests": 1,
+            "handlers": 1,
+            "delivering": 1,
+            "routing": "broadcast",
+            "api_ports": [9001],
+            "sink_base": 3700,
+            "sink_ports": 1,
+            "sink_port": 3700,
+        },
+    )
+    report = await sc.run_shardcert_drive(
+        engine_host="10.0.0.5",
+        aggregate_rate=20.0,
+        hold_seconds=1.0,
+        driver_count=1,
+        sink_count=1,
+        sink_host="10.0.0.9",
+        coord=coord,
+        cacert="engine-box.pem",
+    )
+    assert built == [
+        {
+            "urls": ["https://10.0.0.5:9001"],
+            "token": REMOTE_RIG_SESSION,
+            "origin": built[0]["origin"],
+            "cacert": "engine-box.pem",
+        }
+    ]
+    assert len(spawned) == 2, "the drive should have spawned its sink and sender children"
+    assert report.no_loss
+    assert report.drained is False  # the advisory drain went unread, and says so
+    assert any("advisory /stats poller not opened" in n for n in report.notes), report.notes
+
+
 async def test_coordinator_fails_loud_on_oversized_sink_count(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

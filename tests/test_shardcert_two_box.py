@@ -576,6 +576,17 @@ def test_driver_verdict_on_a_kill_run_allows_redelivery_but_not_loss() -> None:
     assert not _driver_report(killed_shard="a", sink_received=39).ok
 
 
+def test_driver_verdict_allows_copies_of_sends_whose_ack_was_lost() -> None:
+    """A send whose ACK this side never saw may still have been committed and delivered, so on a
+    no-kill run the sink may hold up to ``(A + timeouts) * D`` copies; past that is a duplicate.
+    Below ``A * D`` is still loss, timeouts or not."""
+    assert _driver_report(sink_received=44, timeouts=1).ok
+    beyond = _driver_report(sink_received=45, timeouts=1)
+    assert not beyond.ok
+    assert "up to (A+timeouts=1)*delivering=44) -> SURPLUS" in beyond.render()
+    assert not _driver_report(sink_received=39, timeouts=5).ok
+
+
 def test_driver_verdict_refuses_a_vacuous_fanout() -> None:
     """A fan-out below 1 balances 0 == 0 and would certify a run that delivered nothing."""
     assert not _driver_report(delivering=0, sink_received=0).ok
@@ -660,20 +671,19 @@ async def test_driver_kill_run_without_the_fanout_fails_the_balance(
     assert "-> UNCHECKED" in unknown.render()
 
 
-async def test_drive_ladder_threads_cacert_and_aborts_on_a_sign_in_refusal(
+async def test_drive_ladder_threads_cacert_and_escapes_an_abort_note(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A rung whose drive cannot sign in is a setup abort, as a rendezvous failure is: the engine
-    box is told to stop, and the report survives with exit code 2 rather than being lost."""
+    """Every rung's drive gets ``cacert``, and a rung abort's note is escaped before render prints
+    it: the abort text can carry a peer's control sequence."""
     import harness.load.shardcert_ladder as ladder
-    from harness.load.coord import LADDER_STOP
+    from harness.load.coord import LADDER_STOP, CoordTimeout
 
     seen: list[dict[str, Any]] = []
 
     async def refusing_drive(**kwargs: Any) -> Any:
         seen.append(kwargs)
-        # The engine's own reply text can ride the refusal; it must not reach the terminal raw.
-        raise sc.RemoteEngineSignInError("could not sign in: \x1b]0;forged\x07refused")
+        raise CoordTimeout("SHARDS_READY not seen: \x1b]0;forged\x07refused")
 
     monkeypatch.setattr(ladder, "run_shardcert_drive", refusing_drive)
     coord = FileDropCoord(tmp_path, run_id="lad")
@@ -790,38 +800,6 @@ async def test_driver_sign_in_refusal_is_a_named_setup_error_before_any_load(
     assert coord.read(DRIVE_START) is None, "the driver offered load to an engine it cannot poll"
 
 
-async def test_drive_coordinator_signs_in_over_https_before_spawning_children(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The multi-process drive shares the driver's helper: https, the remote rig session, the
-    ``cacert`` anchor, and a refusal raised before any child process is spawned."""
-    from harness.load.rigadmin import REMOTE_RIG_SESSION, RigSignInRefused
-
-    built: list[dict[str, Any]] = []
-    spawned: list[list[str]] = []
-
-    async def fake_spawn(argv: list[str]) -> Any:
-        spawned.append(argv)
-        raise AssertionError("a child was spawned before the poller signed in")
-
-    refusal = RigSignInRefused("the engine refused the rig's sign-in")
-    monkeypatch.setattr(sc, "EnginePoller", _refusing_poller(built, refusal))
-    monkeypatch.setattr(sc, "_spawn_proc", fake_spawn)
-    coord = FileDropCoord(tmp_path, run_id="drive")
-    _post_ready(coord)
-    with pytest.raises(sc.RemoteEngineSignInError, match="refused"):
-        await sc.run_shardcert_drive(
-            engine_host="10.0.0.5",
-            hold_seconds=0.05,
-            coord=coord,
-            cacert="engine-box.pem",
-        )
-    assert spawned == []
-    assert built[0]["urls"] == ["https://10.0.0.5:9001", "https://10.0.0.5:9002"]
-    assert built[0]["token"] is REMOTE_RIG_SESSION
-    assert built[0]["cacert"] == "engine-box.pem"
-
-
 def test_shardcert_driver_cli_threads_cacert_and_reports_a_sign_in_refusal(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -890,11 +868,11 @@ def test_shardcert_drive_cli_threads_cacert(
 ) -> None:
     captured: dict[str, object] = {}
 
-    async def refusing_drive(**kwargs: Any) -> Any:
+    async def fake_drive(**kwargs: Any) -> Any:
         captured.update(kwargs)
-        raise sc.RemoteEngineSignInError("could not sign in to the engine box's API: refused")
+        return types.SimpleNamespace(render=lambda: "", ok=True)
 
-    monkeypatch.setattr("harness.load.shardcert.run_shardcert_drive", refusing_drive)
+    monkeypatch.setattr("harness.load.shardcert.run_shardcert_drive", fake_drive)
     rc = hmain.main(
         [
             "shardcert-drive",
@@ -906,5 +884,44 @@ def test_shardcert_drive_cli_threads_cacert(
             str(tmp_path),
         ]
     )
-    assert rc == 2
+    assert rc == 0
     assert captured["cacert"] == "engine-box.pem"
+
+
+def test_shardcert_driver_cli_report_json_banks_the_count_balance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The driver's JSON artifact carries the count balance's inputs and verdict, and the notes
+    that record any fallback, so the banked run shows why it passed or failed.
+
+    Mutation: drop any of the keys from the JSON dump. Red: the assert names it."""
+    import json
+
+    report = _driver_report(
+        sink_received=41, timeouts=1, notes=["SHARDS_READY carried no `routing`"]
+    )
+
+    async def fake_driver(**kwargs: Any) -> Any:
+        return report
+
+    monkeypatch.setattr("harness.load.shardcert.run_shardcert_driver", fake_driver)
+    out = tmp_path / "driver.json"
+    rc = hmain.main(
+        [
+            "shardcert-driver",
+            "--engine-host",
+            "10.0.0.5",
+            "--coord-dir",
+            str(tmp_path),
+            "--report-json",
+            str(out),
+        ]
+    )
+    assert rc == 0
+    banked = json.loads(out.read_text(encoding="utf-8"))
+    assert banked["delivering"] == 4
+    assert banked["routing"] == BROADCAST
+    assert banked["timeouts"] == 1
+    assert banked["count_balance_ok"] is True
+    assert banked["notes"] == ["SHARDS_READY carried no `routing`"]
+    assert banked["verdict"] == "PASS"
