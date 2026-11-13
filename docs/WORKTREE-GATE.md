@@ -127,8 +127,9 @@ for the checkouts named in its allowlist:
    A governed checkout whose `remove.ps1` predates `-Path` gets a line saying so. A `move` gets
    its own text: there is no checked route for a move.
 
-**Rule 3d judges every invocation on the line.** Each `git worktree remove` or `move` outside quotes is
-judged. Its victim is resolved against the line's first `-C`, and also against that invocation's
+**Rule 3d judges at least every `git worktree remove` or `move` it can find on the line.** At least
+these are still not judged: one inside a quoted span, one with no git token before it, and one whose
+git token the gate does not recognise. Its victim is resolved against the line's first `-C`, and also against that invocation's
 own `-C` tokens where they can be read: a chdir before the invocation that the hook cannot follow, with
 no absolute `-C` of the invocation's own, leaves only the first reading, so at least there another
 command's `-C` can still decide where the victim is. Until BACKLOG #5643 only the first match on the

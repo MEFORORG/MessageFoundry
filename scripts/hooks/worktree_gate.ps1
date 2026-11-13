@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.13.7"
+$GateVersion = "2026.11.13.8"
 
 # THE SHELL ENTRY'S TIMEOUT, STATED ONCE (review round 56f5830e). Several notes below say the install
 # gives this hook 15 s and that a killed hook lets the command through. That is NOT true of the
@@ -4000,16 +4000,23 @@ What to do instead:
         if ($null -ne $map) {
             foreach ($sm in [regex]::Matches($seg.Scan, '\bworktree\s+(?<wtverb>remove|move)(?=\s|$)')) {
                 $inv = Get-OwnInvocationWindow $seg.Scan $sm.Index -SeparatorInToken
-                # A `worktree remove` with no git token in front of it, or with a separator between that
-                # token and it, is not a git subcommand: `echo worktree remove x` and `git status ; echo
-                # worktree remove x` both stop here.
+                # A `worktree remove` with no git token in front of it is not a git subcommand:
+                # `echo worktree remove x` stops here.
                 if (-not $inv.Own) { continue }
+                # A SEPARATOR-CLASS CHARACTER between that token and it is JUDGED, with the first base only
+                # (review round 329f8bf4). The class also matches `${HOME}`, `$(pwd)` and `2>&1`, which
+                # are inside the invocation, and skipping them let `echo 'git worktree remove x' ; git -C
+                # ${HOME} worktree remove <governed>` through. The window is not readable there, so no own
+                # base is offered; `git status ; echo worktree remove x` may now be judged too, which the
+                # first reading already did on its own.
                 $ownEnd = $inv.Own.Index + $inv.Own.Length
-                if ($ownEnd -gt $sm.Index -or
-                    $seg.Scan.Substring($ownEnd, $sm.Index - $ownEnd) -match '[;&|(){}]') { continue }
-                $win = [pscustomobject]@{
-                    ScanPrefix = $seg.Scan.Substring(0, $inv.Own.Index)
-                    DashCText  = $inv.CmdWin
+                $win = $null
+                if ($ownEnd -le $sm.Index -and
+                    $seg.Scan.Substring($ownEnd, $sm.Index - $ownEnd) -notmatch '[;&|(){}]') {
+                    $win = [pscustomobject]@{
+                        ScanPrefix = $seg.Scan.Substring(0, $inv.Own.Index)
+                        DashCText  = $inv.CmdWin
+                    }
                 }
                 $rawEnd = $map[$sm.Index + $sm.Length]
                 if ($rawEnd -eq $oldEnd) { $oldWindow = $win; continue }
@@ -4085,9 +4092,13 @@ What to do instead:
         #     then another command's `-C` still decides: measured, `git -C <o2> status ; cd "<wt>/a
         #     b/.." && git worktree remove ../Primary-wt2` from an ungoverned cwd is ALLOWED. Both
         #     shapes can also still cost a false deny through the first base, as before.
-        #   * A QUOTED MENTION BEFORE THE REAL COMMAND, and A SECOND INVOCATION ON ONE LINE -- FIXED
-        #     2026-11-12 (BACKLOG #5643). Every `worktree remove|move` found on SCAN is judged, not
-        #     only the first raw match.
+        #   * A QUOTED MENTION BEFORE THE REAL COMMAND, and A SECOND INVOCATION ON ONE LINE -- NARROWED
+        #     2026-11-12 (BACKLOG #5643), NOT proven fixed. At least every `worktree remove|move` found
+        #     on SCAN after a git token is now judged, not only the first raw match; one written with
+        #     `${...}`, `$(...)` or `2>&1` before it gets the first base only. Still NOT judged, at
+        #     least: a `worktree remove|move` inside a quoted span the scan blanks (an interpreter
+        #     payload is recursed separately), one with no git token before it on its segment, and
+        #     one whose git token the `$gitInvocation` pattern does not recognise.
         #   * A `cd` WHOSE TARGET LEAF IS LITERALLY `git`. The `$at` git-token regex below matches
         #     inside that PATH, so $pfx is truncated and the prefix is misread. A `~/git` or
         #     `C:\git` directory is ordinary on a developer's box, so this is the most reachable of

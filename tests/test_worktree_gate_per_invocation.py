@@ -131,3 +131,12 @@ def test_an_echoed_cd_does_not_move_rule_3ds_own_base(rig: SimpleNamespace) -> N
     """The real victim is the governed `<tmp>/Primary-wt2`; `echo cd` moves no shell."""
     cmd = f"echo cd {rig.outside2.as_posix()} && git worktree remove ../Primary-wt2"
     assert "worktree remove" in _reason(rig, cmd, rig.outside)
+
+
+@pytest.mark.parametrize("between", ["-C ${HOME}", "-C $(pwd)", "2>&1"])
+def test_a_remove_with_a_separator_class_character_before_it_is_judged(
+    rig: SimpleNamespace, between: str
+) -> None:
+    """Measured ALLOW before: the added reading skipped any `[;&|(){}]` between git and `worktree`."""
+    cmd = f"echo 'git worktree remove x' ; git {between} worktree remove {rig.wt2.as_posix()}"
+    assert "worktree remove" in _reason(rig, cmd, rig.outside)
