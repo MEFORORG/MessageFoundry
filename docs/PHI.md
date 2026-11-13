@@ -402,11 +402,16 @@ than a path is not checked
   write without the sticky bit (vault BACKLOG #5636). Only the last part of the path is read
   without following a link: a link in a directory above it is followed, and the directory that
   holds the file is judged as the one the link leads to. Only that directory is read, not the ones
-  above it. The engine mints its own TLS key beside the store. **A store directory the engine
-  creates itself is owner-only (`0700`) on POSIX, whatever the umask.** One that already existed
-  keeps its mode, and if a group or other account may write it, the generated-key check reports it
-  as it reports the key: under `"enforce"` the start is refused with exit 2, under `"warn"` it is a
-  warning. Restrict it with `chmod 0700` on the directory, or point `[store].path` at a directory
+  above it. A directory a group or other account may write is accepted when it has the sticky
+  bit, since that bit keeps them from deleting or renaming a file they do not own. The engine
+  mints its own TLS key beside the store. **When it mints its own pair and the store directory does
+  not exist yet, the engine creates it on POSIX with no group or other write bit (`0755` at most,
+  whatever the umask), so a client running as another account can still read the certificate it
+  pins.** It creates no directory when an operator certificate or an upstream terminator is
+  configured. A store directory that already existed keeps its mode, and if a group or other
+  account may write it without the sticky bit, the generated-key check reports it as it reports
+  the key: under `"enforce"` the start is refused with exit 2, under `"warn"` it is a warning.
+  Remove the write bits with `chmod go-w` on the directory, or point `[store].path` at a directory
   that does not exist yet. A group that may write the store directory could also replace the
   certificate clients pin, the mint lock and the store itself, which this check does not look at.
   A volume that makes every file group-readable on each mount, such as a Kubernetes volume with

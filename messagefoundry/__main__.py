@@ -7957,6 +7957,29 @@ def _store_key_file_gate(settings: ServiceSettings, *, enforcing: bool) -> bool:
     )
 
 
+def _generated_tls_key_remedy(state_dir: Path) -> str:
+    """What :func:`_generated_tls_key_gate` tells the operator to do. On POSIX it also covers the
+    store directory the key sits in, which the check judges there and nowhere else (vault BACKLOG
+    #5636), with the path shell-quoted so the command can be pasted as printed."""
+    import shlex
+
+    remedy = (
+        "Restrict it to the account the engine runs as, or delete it and its certificate so "
+        "the next start mints a new pair. "
+    )
+    if sys.platform != "win32":
+        remedy += (
+            "Where the refusal names the directory that holds it, that is the store's directory: "
+            f"remove the group and other write bits with chmod go-w {shlex.quote(str(state_dir))}, "
+            "or point [store].path at a directory that does not exist yet, which the engine then "
+            "creates with no such bit. "
+        )
+    return remedy + (
+        "If the volume itself widens the file on every mount, "
+        "set [api].tls_cert_file to a certificate of your own"
+    )
+
+
 def _generated_tls_key_gate(settings: ServiceSettings, state_dir: Path, *, enforcing: bool) -> bool:
     """:func:`_key_file_access_gate` for the TLS private key the engine minted into ``state_dir``.
 
@@ -7971,16 +7994,7 @@ def _generated_tls_key_gate(settings: ServiceSettings, state_dir: Path, *, enfor
     return _key_file_access_gate(
         plan.key_file,
         what=f"the generated TLS private key {plan.key_file}",
-        remedy=(
-            "Restrict it to the account the engine runs as, or delete it and its certificate so "
-            "the next start mints a new pair. "
-            "Where the refusal names the directory that holds it, that is the store's directory: "
-            f"restrict it with chmod 0700 {state_dir}, owned by the account the engine runs as, "
-            "or point [store].path at a directory that does not exist yet, which the engine then "
-            "creates at 0700 on POSIX. "
-            "If the volume itself widens the file on every mount, "
-            "set [api].tls_cert_file to a certificate of your own"
-        ),
+        remedy=_generated_tls_key_remedy(state_dir),
         enforcing=enforcing,
     )
 

@@ -1396,19 +1396,21 @@ def _serve(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str) -> int:
     return main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"])
 
 
-@pytest.mark.parametrize(("platform", "mode"), [("linux", 0o700), ("win32", None)])
-def test_the_engine_asks_for_an_owner_only_state_dir_on_posix_only(
+@pytest.mark.parametrize(("platform", "mode"), [("linux", 0o755), ("win32", None)])
+def test_the_engine_asks_for_a_state_dir_no_one_else_may_write_on_posix_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str, mode: int | None
 ) -> None:
-    """The seam, on every platform (vault BACKLOG #5636). Windows passes no mode, so the directory
-    inherits its parent's access list. The real create runs without a mode."""
+    """The seam, on every platform (vault BACKLOG #5636). POSIX asks for 0755: no group or other
+    write bit, and still readable, so a client running as another account can read the pinned
+    certificate. Windows passes no mode, so the directory inherits its parent's access list. The
+    real create runs without a mode."""
     from messagefoundry.api import tls as tls_mod
 
     seen: list[object] = []
     real_mkdir = Path.mkdir
 
-    def record(self: Path, **kwargs: Any) -> None:
-        seen.append(kwargs.pop("mode", None))
+    def record(self: Path, *args: Any, **kwargs: Any) -> None:
+        seen.append(kwargs.pop("mode", args[0] if args else None))
         real_mkdir(self, **kwargs)
 
     monkeypatch.setattr(Path, "mkdir", record)
@@ -1418,35 +1420,57 @@ def test_the_engine_asks_for_an_owner_only_state_dir_on_posix_only(
     assert seen == [mode] and (tmp_path / "store").is_dir()
 
 
-def _serve_with_store(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, store_dir: Path, toml: str
-) -> int:
-    """``serve`` with its store in ``store_dir`` and its settings file in ``tmp_path``, whose
-    folder the start-path guard requires owner-only."""
+@pytest.mark.parametrize("platform", ["linux", "win32"])
+def test_the_generated_key_remedy_names_the_store_dir_on_posix_only(
+    monkeypatch: pytest.MonkeyPatch, platform: str
+) -> None:
+    """The chmod is a POSIX command, and the store directory is judged on POSIX only, so the
+    clause is printed there alone, with the path shell-quoted so it can be pasted as printed."""
+    import messagefoundry.__main__ as cli
+
+    monkeypatch.setattr(sys, "platform", platform)
+    remedy = cli._generated_tls_key_remedy(Path("/srv/mefor data"))
+    if platform == "win32":
+        assert "chmod" not in remedy
+    else:
+        # The space makes shlex quote the whole path; Path spells the separators per host.
+        assert f"chmod go-w '{Path('/srv/mefor data')}'" in remedy
+
+
+def _write_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, toml: str) -> None:
+    """The settings file in ``tmp_path``, whose folder the start-path guard requires owner-only,
+    and the stubs ``serve`` needs. Written before any umask a test sets, so the file is not
+    group-writable."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "messagefoundry.toml").write_text(toml, encoding="utf-8")
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+
+
+def _serve_store(store_dir: Path) -> int:
+    """``serve`` with its store in ``store_dir``, after :func:`_write_settings`."""
     argv = ["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]
     return main([*argv, "--db", str(store_dir / "messagefoundry.db")])
 
 
 @posix_only
-def test_serve_under_umask_002_makes_its_store_dir_owner_only_and_starts(
+def test_serve_under_umask_002_makes_a_store_dir_no_group_may_write_and_starts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Vault BACKLOG #5636. A store directory the engine creates itself is owner-only, so the
-    key-file check passes the key it mints there, under umask 002 as under any other."""
+    """Vault BACKLOG #5636. A store directory the engine creates itself has no group or other
+    write bit, so the key-file check passes the key it mints there, under umask 002 as under any
+    other."""
     from messagefoundry.api.tls import _generated_pair
 
     store_dir = tmp_path / "store"
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    _write_settings(tmp_path, monkeypatch, PHI_GATE_PROVISIONS_TOML)
     old = os.umask(0o002)
     try:
-        assert _serve_with_store(tmp_path, monkeypatch, store_dir, PHI_GATE_PROVISIONS_TOML) == 0
+        assert _serve_store(store_dir) == 0
     finally:
         os.umask(old)
-    assert stat.S_IMODE(store_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(store_dir.stat().st_mode) == 0o755
     _cert, key = _generated_pair(store_dir)
     assert broad_access_problem(key) is None
     assert "is not restricted" not in capsys.readouterr().err
@@ -1463,14 +1487,16 @@ def test_serve_reports_an_existing_store_dir_a_group_may_write_by_enforcement(
     store_dir.mkdir()
     store_dir.chmod(0o775)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
-    assert _serve_with_store(tmp_path, monkeypatch, store_dir, PHI_GATE_PROVISIONS_TOML) == 2
+    _write_settings(tmp_path, monkeypatch, PHI_GATE_PROVISIONS_TOML)
+    assert _serve_store(store_dir) == 2
     err = capsys.readouterr().err
     assert "the directory that holds it has mode 0775 with no sticky bit" in err
-    assert f"chmod 0700 {store_dir}" in err and "refusing to start" in err
+    assert f"chmod go-w {store_dir}" in err and "refusing to start" in err
     assert stat.S_IMODE(store_dir.stat().st_mode) == 0o775  # never changed by the engine
 
     warn = 'security.enforcement = "warn"\n' + PHI_GATE_PROVISIONS_TOML
-    assert _serve_with_store(tmp_path, monkeypatch, store_dir, warn) == 0
+    _write_settings(tmp_path, monkeypatch, warn)
+    assert _serve_store(store_dir) == 0
     err = capsys.readouterr().err
     assert "warning: the generated TLS private key" in err and "mode 0775" in err
 

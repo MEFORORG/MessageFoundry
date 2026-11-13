@@ -689,16 +689,17 @@ def ensure_api_tls_material(
 
 
 def _make_state_dir(state_dir: Path) -> None:
-    """Make the state dir if it is missing. On POSIX the directory this creates is owner-only
-    whatever the umask, because the key-file check refuses the generated key in a directory a group
-    or other account may write (vault BACKLOG #5636); a missing parent above it gets the umask's
-    mode. On Windows no mode is passed, so the directory inherits its parent's access list, which a
-    mode would replace with a protected one. An existing directory is left as it is, and the
-    generated-key gate in ``serve`` and ``supervise`` judges it."""
+    """Make the state dir if it is missing. On POSIX the directory this creates is ``0o755`` at
+    most, whatever the umask: no group or other account may write it, because the key-file check
+    refuses the generated key in a directory they may (vault BACKLOG #5636). It stays readable, so
+    a client running as another account can still read the certificate it pins. A missing parent
+    above it gets the umask's mode. On Windows no mode is passed, so the directory inherits its
+    parent's access list, which a mode would replace with a protected one. An existing directory is
+    left as it is, and the generated-key gate in ``serve`` and ``supervise`` judges it."""
     if sys.platform == "win32":
         state_dir.mkdir(parents=True, exist_ok=True)
     else:
-        state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        state_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
 
 
 def _settle_under_the_lock(
