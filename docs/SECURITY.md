@@ -1012,11 +1012,14 @@ ERROR, so the row is the record of a miss only while the audit log accepts write
 custom-role edit, a directory map save, a directory sign-in's role or scope resync and the
 `provision-admin` repair end the account's sessions after their own change has committed. A
 custom-role delete revokes before it deletes, so a refusal there leaves the role in place and
-writes no such row; the directory reconciler's demotion is not covered yet. A store
+writes no such row. A store
 refusal of that revoke, such as a pool shortage at the acquire limit, a statement timeout or a lost
 connection, is run again, up to three attempts. A re-run starts only while less than 15 seconds
 have passed since the first attempt began, give or take its half-second pause, and nothing bounds
-how long one attempt runs. At the default `acquire_timeout` a SQL Server pool wait uses up that
+how long one attempt runs. The directory reconciler's revoke counts the same way, except that its
+first attempt carries its `auth.ad_session_revoked` row and its second, without the row, always
+runs, since the first one's error may be the row's. One it gives up on ends the pass, and its
+miss row counts the pass's later revocations as `accounts_not_attempted`. At the default `acquire_timeout` a SQL Server pool wait uses up that
 budget on its own, so it is recorded at once rather than run into the request deadline. A refusal
 that reads as a defect is raised at once, unretried and unrecorded: at least a store whose tables,
 columns or grants are not what the statement needs, and SQLite's `ProgrammingError`. A SQL syntax

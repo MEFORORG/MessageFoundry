@@ -3381,7 +3381,9 @@ SESSIONS_REVOKE_FAILED_ACTION: Final = "auth.sessions_revoke_failed"
 #: ends unrevoked rows and raises the account's session epoch, and a repeat does both again. A
 #: statement timeout or a lost connection fails fast and is re-run. The budget is checked when an
 #: attempt fails, before the pause, so a re-run can start up to half a second past it, and nothing
-#: bounds how long an attempt runs. A pool shortage on SQL Server
+#: bounds how long an attempt runs. The directory reconciler's first attempt carries its audit
+#: row, and its second, without the row, runs whatever the budget says, since the first one's
+#: error may be the row's (``AuthService._revoke_with_row``); the budget gates the third. A pool shortage on SQL Server
 #: fails only after waiting up to ``2 x acquire_timeout``, 60 s at the default, which is past the
 #: budget, so at the default it is recorded at once: a second such wait would reach the API's
 #: request deadline, which cancels the request before any row is written (vault BACKLOG #3802
@@ -10019,7 +10021,9 @@ class AuthService:
         commits with the write (step 7), rolls the rename back and is logged rather than raised.
         The login path leaves it off, so there a refused write still fails the sign-in, as it always
         has. It also lets a store fault on the ``held`` re-read skip the rename rather than raise
-        (BACKLOG #3070; the reason is at that read).
+        (BACKLOG #3070; the reason is at that read), and a ``RowSealError`` at the write be logged,
+        reported and paged rather than raised (vault BACKLOG #3069 note T2; the reason is at that
+        arm).
 
         **ONE implementation for two callers, deliberately.** The login path
         (:meth:`_upsert_ad_user`) and the ADR 0079 reconciler pass both reach a renamed account and
@@ -11140,9 +11144,9 @@ class AuthService:
         (:meth:`_note_refused_reconciler_row`).
 
         ``maps_held`` is :meth:`_apply_reconcile_revocation`'s: False adds ``map_unverified: true``
-        to the row (ADR 0217 (b)). The retry without the row is a second revoke, so the two run in
-        one :func:`~messagefoundry.store.store.deferred_revoke_reports` scope, and a seal refusal
-        both attempts met is reported once, by the one that commits (decision
+        to the row (ADR 0217 (b)). The retry without the row is a second revoke, or more, so they
+        all run in one :func:`~messagefoundry.store.store.deferred_revoke_reports` scope, and a
+        seal refusal the committing attempt met is reported once, by it (decision
         d20261110T063908944-857965, item 4).
 
         The retry without the row goes through :meth:`_revoke_after_commit` (vault BACKLOG #3023),

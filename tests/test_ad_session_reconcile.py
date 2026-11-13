@@ -6867,6 +6867,10 @@ async def test_a_reconciler_revoke_refused_twice_lands_on_its_third_attempt(
         assert calls[:3] == [calls[0]] * 3, "the first account's revoke was not run three times"
         assert await _live_sessions(store, hashes) == []
         assert not await store.list_audit(action=SESSIONS_REVOKE_FAILED_ACTION)
+        assert await _actors(store, "auth.ad_session_revoked") == ["asmith", "jdoe"], (
+            "a revoke that landed without its row did not write the row on its own"
+        )
+        assert plan.audit_refused == ()
     finally:
         await store.close()
 
