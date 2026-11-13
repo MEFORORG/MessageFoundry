@@ -69,9 +69,11 @@ any line it cannot fit into the message structure, and validates only what it ke
 tolerant parser forwards that line. So strict validation refuses an unknown segment, a known segment
 the structure has no place for (`ORC` in `ADT^A01`), a line that is not a segment at all, and a
 message type `hl7apy` has no structure for. So a Z message type (`ZZZ^Z01`) needs
-`validation.strict = false`. This refusal never quotes the line; a parse error `hl7apy` raises
-itself can still name a line's first three characters (`Invalid name for Segment: XXX`). The exact
-rule and wording are in the module docstring of
+`validation.strict = false`, unless its MSH-9.3 names a structure `hl7apy` knows, which is then
+what it is validated against. This refusal never quotes the line. A parse error `hl7apy` raises
+itself can quote message text: at least a line's first three characters (`Invalid name for
+Segment: XXX`) and a whole unsupported MSH-12 value. Segment order is not checked as such, so an
+out-of-order message may pass. The exact rule and wording are in the module docstring of
 [parsing/validate.py](../messagefoundry/parsing/validate.py).
 
 **A defined segment in a message whose structure has an "any HL7 segment" slot passes
@@ -79,8 +81,10 @@ unvalidated.** `hl7apy`'s table for the message's version marks that slot (in 2.
 `MFN_M01` and `QVR_Q17`; which structures carry it varies by version) but its grouping never fills
 it. So in such a message the comparison does not refuse a segment that version defines, in any
 number and wherever it sits, and does not list it in `unvalidated_segments`. A segment ID the
-version does not define is still refused. Where the slot is required, `hl7apy`'s own check can
-still refuse the message (`Missing required child ... ANYHL7SEGMENT`, `MFN_M03` for one).
+version does not define is still refused, and so is every dropped segment where MSH-9.3 borrows a
+slot-bearing structure for another message code (`ADT^A01^MFN_M01`). Where the slot is required
+and its group is present, `hl7apy`'s own check refuses every such message, since the slot is never
+filled (`Missing required child ... ANYHL7SEGMENT`; `MFN_M03` for one).
 
 **Z-segments are tolerated, unvalidated, and listed.** A Z-segment is left out of what strict
 validation checks, is forwarded without any check, and is listed in

@@ -34,7 +34,9 @@ N``. Where the structure has HL7's "any HL7 segment" slot, which hl7apy's tables
 ``ANYHL7SEGMENT`` and its grouping never fills (MFN_M01 and QVR_Q17 among others), a dropped
 segment whose ID the message's version defines is not refused, and passes unvalidated; an ID the
 version does not define is still refused. The exemption is per structure, not per slot: it does
-not count against the slot's cardinality or position. Segment order is not checked as such:
+not count against the slot's cardinality or position. It holds only where MSH-9.1 names the
+structure's own message code, so a structure borrowed through MSH-9.3 (``ADT^A01^MFN_M01``) gets
+none. Segment order is not checked as such:
 hl7apy keeps each segment where the message has it, so an out-of-order message may pass.
 
 It is slower and far stricter than :mod:`~messagefoundry.parsing.peek`, so it runs only when
@@ -336,6 +338,18 @@ def _has_any_segment_slot(name: str, classname: str, hl7_version: str) -> bool:
     return _holds_any_segment(load_reference(name, classname, hl7_version))
 
 
+def _exempts_defined_segments(message: Any) -> bool:
+    """True if ``message``'s structure has the "any HL7 segment" slot and is its own.
+
+    hl7apy takes the structure from MSH-9.3 when one is given, so ``ADT^A01^MFN_M01`` would
+    borrow MFN_M01's slot for an ADT body. The exemption holds only where MSH-9.1 names the
+    structure's own message code, which fails closed on a borrowed one."""
+    code = message.msh.msh_9.msh_9_1.to_er7()
+    return code == message.name.split("_", 1)[0] and _has_any_segment_slot(
+        message.name, message.classname, message.version
+    )
+
+
 # Structures whose tree the dropped-segment check could not read, so each is logged once.
 _compare_failures: set[tuple[str, str | None]] = set()
 
@@ -365,7 +379,7 @@ def _dropped_lines(lines: _Lines, message: Any) -> list[str]:
         elif _SEGMENT_ID.fullmatch(name) is None:
             refusals.append(f"unrecognised line {number}")
         elif name in defined:
-            if not _has_any_segment_slot(message.name, message.classname, message.version):
+            if not _exempts_defined_segments(message):
                 refusals.append(
                     f"segment {name} at line {number} has no place in this message's structure"
                 )

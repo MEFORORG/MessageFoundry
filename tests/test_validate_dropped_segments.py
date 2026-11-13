@@ -158,6 +158,24 @@ def test_a_wildcard_message_still_refuses_what_its_version_does_not_define(
     assert result.errors == [error]
 
 
+def test_a_structure_borrowed_through_msh_9_3_gets_no_exemption() -> None:
+    """hl7apy groups ``ADT^A01^MFN_M01`` as MFN_M01; its slot must not admit an ADT body."""
+    borrowed = _MFN_M01.replace("MFN^M01^MFN_M01", "ADT^A01^MFN_M01")
+    result = validate(borrowed + "\r" + _EVN + "\r" + _PID + "\r" + _PV1)
+    assert not result.ok
+    assert result.errors == [
+        "segment EVN at line 4 has no place in this message's structure (and 2 more)"
+    ]
+
+
+def test_a_version_whose_structure_has_no_slot_still_refuses() -> None:
+    """hl7apy's 2.4 MFN_M01 has no any-segment slot, so LOC there is still misplaced."""
+    message = _MFN_M01.replace("|2.5.1", "|2.4") + "\rLOC|LOC1^Loc||C"
+    result = validate(message)
+    assert not result.ok
+    assert result.errors == ["segment LOC at line 4 has no place in this message's structure"]
+
+
 def test_a_comparison_that_raises_is_logged_and_refused(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -168,7 +186,8 @@ def test_a_comparison_that_raises_is_logged_and_refused(
     monkeypatch.setattr(validate_module, "_compare_failures", set())  # logged once per structure
     with caplog.at_level("WARNING", logger=validate_module.logger.name):
         result = validate(_adt(_MSH, _EVN, _PID, _PV1))
-    assert not result.ok
+        again = validate(_adt(_MSH, _EVN, _PID, _PV1))
+    assert not result.ok and not again.ok
     assert result.errors == ["could not compare the parsed tree with the message (RuntimeError)"]
     [record] = [r for r in caplog.records if "dropped-segment check" in r.getMessage()]
     assert record.levelname == "WARNING"
