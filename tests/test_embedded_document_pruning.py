@@ -503,20 +503,19 @@ async def test_the_scan_reads_candidates_in_bounded_keyset_batches(
         assert rec["raw"] == MFB64_BODY and rec["documents_pruned"] is None
 
 
-async def test_a_batch_that_fails_ends_the_call_with_what_had_committed(
+async def test_a_batch_that_fails_is_passed_over_and_the_scan_goes_on(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #5651: each batch commits on its own, so when a later batch fails, the earlier
-    batches' strips stay committed. The call then returns them, flagged ``ended_early``, so the
-    runner can audit them, and says so at WARNING with the error's type and the counts, never the
-    error's text or a byte of a body."""
+    """BACKLOG #5651: a batch whose transform fails is logged and passed over, and the keyset goes
+    on past it, so no row can stall the strip for good. The WARNING names the error's type, never
+    its text or a byte of a body."""
     monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
     real = document_strip.transform_strip_batch
     calls: list[int] = []
 
     def flaky(cipher: Any, rows: Any, **kwargs: Any) -> Any:
         calls.append(len(rows))
-        if len(calls) == 2:
+        if len(calls) == 1:
             raise RuntimeError("synthetic transform failure SECRET-TEXT")
         return real(cipher, rows, **kwargs)
 
@@ -529,13 +528,70 @@ async def test_a_batch_that_fails_ends_the_call_with_what_had_committed(
             older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
         )
 
-    assert (result.messages_stripped, result.ended_early) == (1, True)
-    assert binary.is_document_tombstone((await _get(store, first))["raw"])  # batch one committed
-    assert (await _get(store, second))["raw"] == MFB64_BODY
-    [record] = [r for r in caplog.records if "ended early" in r.getMessage()]
+    assert (result.messages_stripped, result.ended_early) == (1, False)
+    assert (await _get(store, first))["raw"] == MFB64_BODY  # its batch failed
+    assert binary.is_document_tombstone((await _get(store, second))["raw"])  # the scan went on
+    [record] = [r for r in caplog.records if "passed over a batch" in r.getMessage()]
     text = record.getMessage()
-    assert "RuntimeError" in text and "1 documents in 1 messages" in text
-    assert "SECRET-TEXT" not in text and DOC.decode()[:20] not in text
+    assert "RuntimeError" in text and "SECRET-TEXT" not in text and DOC.decode()[:20] not in text
+
+
+async def test_one_row_that_fails_to_strip_is_skipped(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5651: a row whose own strip raises is logged and skipped; the rows around it are
+    still stripped."""
+    bad = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=0.0, control="C-SB1")
+    good = await _delivered(store, channel_id="IB", raw=HL7_ED_BODY, now=1.0, control="C-SB2")
+    real = binary.strip_documents
+
+    def one_bad(raw: str, **kwargs: Any) -> tuple[str, int, int]:
+        if raw == MFB64_BODY:
+            raise ValueError("synthetic strip failure")
+        return real(raw, **kwargs)
+
+    monkeypatch.setattr(document_strip, "strip_documents", one_bad)
+
+    result = await store.strip_embedded_documents(
+        older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+    )
+
+    assert (result.messages_stripped, result.ended_early) == (1, False)
+    assert (await _get(store, bad))["raw"] == MFB64_BODY
+    assert (await _get(store, good))["raw"] != HL7_ED_BODY
+
+
+async def test_a_verdict_between_no_verdict_rows_resets_the_outage_count(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5651: only ``OUTAGE_ROWS`` no-verdict rows with no verdict of any kind between them
+    end the call. A refused cell between them is a verdict, so scattered failures are skipped."""
+    ids = [
+        await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=float(i), control=f"C-RS{i}")
+        for i in range(5)
+    ]
+    calls: list[str] = []
+
+    def alternate(*_args: Any, message_id: str, channel_id: str, **_kwargs: Any) -> str:
+        calls.append(message_id)
+        if ids.index(message_id) % 2:
+            raise CellTagError("messages", "raw", message_id, channel_id)
+        raise CipherUnavailableError("synthetic: no verdict")
+
+    monkeypatch.setattr(document_strip, "open_message_cell", alternate)
+    backend = sys.modules[type(store).__module__]
+
+    async def no_audit(*_args: Any) -> None:
+        return None
+
+    monkeypatch.setattr(backend, "report_cell_tag_failures", no_audit)
+
+    result = await store.strip_embedded_documents(
+        older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+    )
+
+    assert result == StripResult()  # not ended early
+    assert calls == ids
 
 
 async def test_a_failed_audit_of_refused_cells_still_logs_what_was_committed(
@@ -650,37 +706,82 @@ async def test_a_key_service_outage_ends_only_the_strip_phase_of_a_retention_pas
     assert result.messages_purged == 1 and result.documents_messages_stripped == 0
     assert result.documents_strip_ended_early
     audit = [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"]
-    assert len(audit) == 1
+    assert len(audit) == 1  # written for the body purge
     assert json.loads(audit[0]["detail"])["documents_strip_ended_early"] is True
+
+
+async def test_an_outage_alone_writes_no_retention_audit_row(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5651: an early end is not work for the audit row: a pass whose only event is a
+    key-service outage in its strip phase writes no audit row, since that row would go through the
+    failing key service too. The strip logs the early end at WARNING."""
+    for i in range(document_strip.OUTAGE_ROWS):
+        await _delivered(store, channel_id="IB_PRUNE", raw=MFB64_BODY, now=0.0, control=f"OA{i}")
+
+    def unavailable(*_args: Any, **_kwargs: Any) -> str:
+        raise CipherUnavailableError("synthetic: the key service is unreachable")
+
+    monkeypatch.setattr(document_strip, "open_message_cell", unavailable)
+    reg = _registry()
+    no_floor = RetentionSettings(
+        min_free_disk_mb=0, wal_checkpoint_seconds=0, audit_log_warn_rows=0
+    )
+    runner = RetentionRunner(store, no_floor, clock=lambda: 5 * DAY, registry_source=lambda: reg)
+
+    result = await runner.run_once()
+
+    assert result.documents_strip_ended_early and not result.did_work
+    assert not [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"]
 
 
 _LOCK_ROW = {"id": "M-LOCK", "channel_id": "IB", "raw": MFB64_BODY, "received_at": 0.0}
 
 
-async def test_the_postgres_write_locks_messages_then_queue_inside_its_transaction() -> None:
-    """BACKLOG #5651: the Postgres write takes ``FOR UPDATE`` on the batch's message rows, then
-    ``FOR SHARE`` on their queue rows, both inside the batch transaction and before any guarded
-    UPDATE. No server runs here, so a recording connection stands in for one; deleting either lock
-    statement, or moving it out of the transaction, fails this."""
+def _kind(sql: str) -> str:
+    """Name a recorded statement of the strip's server write by what it does."""
+    if sql.startswith("UPDATE messages"):
+        return "update"
+    if "FROM messages" in sql:
+        return "messages-lock"
+    if "FROM queue" in sql and ("SKIP LOCKED" in sql or "READPAST" in sql):
+        return "queue-lock"
+    if "FROM queue" in sql:
+        return "queue-census"
+    return sql
+
+
+async def test_the_postgres_write_locks_without_waiting_inside_its_transaction() -> None:
+    """BACKLOG #5651: the Postgres write takes ``FOR NO KEY UPDATE SKIP LOCKED`` on the batch's
+    message rows, then ``FOR SHARE SKIP LOCKED`` on their queue rows, then a census of their queue
+    rows, all inside the batch transaction and before any guarded UPDATE. No server runs here, so a
+    recording connection stands in for one; deleting either lock, or moving it out of the
+    transaction, fails this."""
     from messagefoundry.store.postgres import PostgresStore
 
-    calls: list[tuple[str, bool]] = []
-    state = {"in_txn": False}
+    calls: list[tuple[str, int]] = []
+    depth = {"n": 0}
 
     class Txn:
         async def __aenter__(self) -> None:
-            state["in_txn"] = True
+            depth["n"] += 1
 
         async def __aexit__(self, *_exc: object) -> None:
-            state["in_txn"] = False
+            depth["n"] -= 1
 
     class Conn:
         def transaction(self) -> Txn:
             return Txn()
 
+        async def fetch(self, sql: str, *_args: Any) -> list[dict[str, str]]:
+            calls.append((sql, depth["n"]))
+            if "FROM messages" in sql:
+                return [{"id": "M-LOCK"}]
+            return [{"id": "Q-1", "message_id": "M-LOCK"}]
+
         async def execute(self, sql: str, *_args: Any) -> str:
-            calls.append((sql, state["in_txn"]))
-            return "UPDATE 1" if sql.startswith("UPDATE") else "SELECT 1"
+            calls.append((sql, depth["n"]))
+            return "UPDATE 1"
 
     @contextlib.asynccontextmanager
     async def acquire(**_kwargs: Any) -> AsyncIterator[Conn]:
@@ -701,30 +802,30 @@ async def test_the_postgres_write_locks_messages_then_queue_inside_its_transacti
     )
 
     assert result.messages_stripped == 1
-    kinds = [
-        (
-            "messages-lock"
-            if "FROM messages" in s and "FOR UPDATE" in s
-            else "queue-lock"
-            if "FROM queue" in s and "FOR SHARE" in s
-            else "update"
-            if s.startswith("UPDATE messages")
-            else s,
-            txn,
-        )
-        for s, txn in calls
+    assert [(_kind(s), n > 0) for s, n in calls] == [
+        ("messages-lock", True),
+        ("queue-lock", True),
+        ("queue-census", True),
+        ("update", True),
     ]
-    assert kinds == [("messages-lock", True), ("queue-lock", True), ("update", True)]
+    assert "FOR NO KEY UPDATE SKIP LOCKED" in calls[0][0]
+    assert "FOR SHARE SKIP LOCKED" in calls[1][0]
 
 
-async def test_the_sqlserver_write_locks_messages_then_clustered_queue_rows_before_commit() -> None:
-    """BACKLOG #5651: the SQL Server write takes ``UPDLOCK`` on the batch's message rows, then on
-    their queue rows by a column outside ``ix_queue_message``, both before any guarded UPDATE and
-    before the commit, and its guard's subquery reads under ``READCOMMITTEDLOCK``. No server runs
-    here, so a recording cursor stands in for one; deleting either lock fails this."""
+async def test_the_sqlserver_write_locks_without_waiting_before_commit() -> None:
+    """BACKLOG #5651: the SQL Server write takes ``UPDLOCK, ROWLOCK, READPAST`` on the batch's
+    message rows, then on their queue rows by a column outside ``ix_queue_message``, then a
+    ``NOLOCK`` census, all before any guarded UPDATE and before the commit. No server runs here, so a
+    recording cursor stands in for one; deleting either lock fails this."""
     from messagefoundry.store.sqlserver import SqlServerStore
 
     events: list[str] = []
+    answers: dict[str, list[Any]] = {
+        "messages-lock": [("M-LOCK",)],
+        "queue-lock": [("Q-1", "M-LOCK", "done")],
+        "queue-census": [("Q-1", "M-LOCK")],
+        "update": [("M-LOCK",)],
+    }
 
     class Cur:
         def __init__(self) -> None:
@@ -735,7 +836,7 @@ async def test_the_sqlserver_write_locks_messages_then_clustered_queue_rows_befo
             events.append(sql)
 
         async def fetchall(self) -> list[Any]:
-            return [("M-LOCK",)] if self.last.startswith("UPDATE") else []
+            return answers.get(_kind(self.last), [])
 
     @contextlib.asynccontextmanager
     async def acquire() -> AsyncIterator[object]:
@@ -765,11 +866,31 @@ async def test_the_sqlserver_write_locks_messages_then_clustered_queue_rows_befo
     )
 
     assert result.messages_stripped == 1
-    assert len(events) == 4 and events[3] == "COMMIT"
-    messages_lock, queue_lock, update = events[:3]
-    assert "FROM messages m WITH (UPDLOCK" in messages_lock
-    assert "SELECT q.status FROM queue q WITH (UPDLOCK" in queue_lock
-    assert update.startswith("UPDATE messages") and "READCOMMITTEDLOCK" in update
+    assert [_kind(e) for e in events] == [
+        "messages-lock",
+        "queue-lock",
+        "queue-census",
+        "update",
+        "COMMIT",
+    ]
+    assert "UPDLOCK, ROWLOCK, READPAST" in events[0] and "UPDLOCK, ROWLOCK, READPAST" in events[1]
+    assert "SELECT q.id, q.message_id, q.status FROM queue" in events[1]
+
+
+def test_a_message_with_a_queue_row_another_writer_holds_is_not_written() -> None:
+    """BACKLOG #5651: a server write applies an update only when it locked the message row and
+    every queue row the census lists for it; anything another writer holds is left for a later
+    pass."""
+    updates = [
+        document_strip.StripUpdate(m, "old", "new", 1, 1) for m in ("M-OK", "M-MSG", "M-QUEUE")
+    ]
+    kept = document_strip.locked_whole(
+        updates,
+        held_messages=["M-OK", "M-QUEUE"],  # M-MSG's row is held elsewhere
+        locked_queue=[("Q-1", "M-OK"), ("Q-2", "M-QUEUE")],
+        queue_census=[("Q-1", "M-OK"), ("Q-2", "M-QUEUE"), ("Q-3", "M-QUEUE")],  # Q-3 skipped
+    )
+    assert [u.message_id for u in kept] == ["M-OK"]
 
 
 def test_a_refused_cell_is_returned_with_its_traceback_cleared(

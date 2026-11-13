@@ -146,6 +146,8 @@ from messagefoundry.store.document_strip import (
     StripCursor,
     StripResult,
     StripUpdate,
+    locked_whole,
+    log_row_write_skip,
     run_strip_pass,
 )
 from messagefoundry.store.gcm_bound import (
@@ -851,14 +853,20 @@ _MSSQL_USER_RESEAL: Final = (
     " OUTPUT inserted.id WHERE id=? AND authz_seal=?"
 )
 #: The embedded-document strip's write locks, taken in this order inside its batch transaction
-#: (BACKLOG #5651): the message rows first, as a body purge takes them, then their queue rows.
-#: ``q.status`` is not in ``ix_queue_message``, so the queue read reaches, and update-locks, the
-#: clustered rows a replay updates. ``{marks}`` is only ``?`` placeholders, one per message id.
+#: (BACKLOG #5651): the message rows first, then their queue rows, each skipping (READPAST) a row
+#: another writer holds rather than waiting on it. ``q.status`` is not in ``ix_queue_message``, so
+#: the queue read reaches, and update-locks, the clustered rows a replay updates. The census then
+#: lists every queue row of those messages without waiting (NOLOCK, which also sees an uncommitted
+#: insert, so it errs toward leaving a message out). ``{marks}`` is only ``?`` placeholders.
 _MSSQL_STRIP_LOCK_MESSAGES: Final = (
-    "SELECT m.id FROM messages m WITH (UPDLOCK, ROWLOCK) WHERE m.id IN ({marks})"
+    "SELECT m.id FROM messages m WITH (UPDLOCK, ROWLOCK, READPAST) WHERE m.id IN ({marks})"
 )
 _MSSQL_STRIP_LOCK_QUEUE: Final = (
-    "SELECT q.status FROM queue q WITH (UPDLOCK, ROWLOCK) WHERE q.message_id IN ({marks})"
+    "SELECT q.id, q.message_id, q.status FROM queue q WITH (UPDLOCK, ROWLOCK, READPAST)"
+    " WHERE q.message_id IN ({marks})"
+)
+_MSSQL_STRIP_QUEUE_ROWS: Final = (
+    "SELECT q.id, q.message_id FROM queue q WITH (NOLOCK) WHERE q.message_id IN ({marks})"
 )
 # The approval statements (BACKLOG #2592); store.py's twins state the contract. The writes are used
 # only by `_write_approval`.
@@ -10280,26 +10288,34 @@ class SqlServerStore:
                         # pass for a row a replay re-pends before this transaction commits. The
                         # batch takes update locks, held to the commit, on its message rows and
                         # then on their clustered queue rows (q.status is outside the message_id
-                        # index, so the read reaches them), in the order a body purge takes
-                        # them; the guard's subquery reads under locks too. document_strip states
-                        # what that covers.
+                        # index, so the read reaches them), skipping with READPAST any row
+                        # another writer holds, and writes only the messages it locked whole.
+                        # document_strip states what that covers.
                         ids = tuple(u.message_id for u in updates)
                         marks = ", ".join("?" * len(ids))
                         await cur.execute(_MSSQL_STRIP_LOCK_MESSAGES.format(marks=marks), ids)
-                        await cur.fetchall()
+                        held = [r[0] for r in await cur.fetchall()]
                         await cur.execute(_MSSQL_STRIP_LOCK_QUEUE.format(marks=marks), ids)
-                        await cur.fetchall()
-                        for u in updates:
-                            await cur.execute(
-                                "UPDATE messages SET raw=?, documents_pruned=? OUTPUT inserted.id"
-                                " WHERE id=? AND documents_pruned IS NULL"
-                                " AND (raw + N'|') COLLATE Latin1_General_100_BIN2"
-                                " = (CAST(? AS NVARCHAR(MAX)) + N'|')"
-                                " AND NOT EXISTS (SELECT 1 FROM queue q WITH (READCOMMITTEDLOCK)"
-                                " WHERE q.message_id=messages.id AND q.status IN (?, ?))",
-                                (u.new_cell, stamp, u.message_id, u.stored, *inflight),
-                            )
-                            if await cur.fetchall():
+                        locked = [(r[0], r[1]) for r in await cur.fetchall()]
+                        await cur.execute(_MSSQL_STRIP_QUEUE_ROWS.format(marks=marks), ids)
+                        census = [(r[0], r[1]) for r in await cur.fetchall()]
+                        for u in locked_whole(updates, held, locked, census):
+                            try:
+                                await cur.execute(
+                                    "UPDATE messages SET raw=?, documents_pruned=?"
+                                    " OUTPUT inserted.id"
+                                    " WHERE id=? AND documents_pruned IS NULL"
+                                    " AND (raw + N'|') COLLATE Latin1_General_100_BIN2"
+                                    " = (CAST(? AS NVARCHAR(MAX)) + N'|')"
+                                    " AND NOT EXISTS (SELECT 1 FROM queue q"
+                                    " WHERE q.message_id=messages.id AND q.status IN (?, ?))",
+                                    (u.new_cell, stamp, u.message_id, u.stored, *inflight),
+                                )
+                                wrote = bool(await cur.fetchall())
+                            except Exception as exc:  # one row's failure skips only that row
+                                log_row_write_skip(u.message_id, exc)
+                                continue
+                            if wrote:
                                 landed.append(u)
                     await self._commit(conn)
                 except Exception:

@@ -155,6 +155,7 @@ from messagefoundry.store.document_strip import (
     StripCursor,
     StripResult,
     StripUpdate,
+    log_row_write_skip,
     run_strip_pass,
 )
 from messagefoundry.store.gcm_bound import (
@@ -21141,13 +21142,17 @@ class MessageStore:
             landed: list[StripUpdate] = []
             async with _writer_txn(self._db, self._lock):
                 for u in updates:
-                    cur = await self._db.execute(
-                        "UPDATE messages SET raw=?, documents_pruned=? "
-                        "WHERE id=? AND documents_pruned IS NULL AND raw=? "
-                        "AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id = messages.id "
-                        "AND q.status IN (?, ?))",
-                        (u.new_cell, stamp, u.message_id, u.stored, *inflight),
-                    )
+                    try:
+                        cur = await self._db.execute(
+                            "UPDATE messages SET raw=?, documents_pruned=? "
+                            "WHERE id=? AND documents_pruned IS NULL AND raw=? "
+                            "AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id = messages.id "
+                            "AND q.status IN (?, ?))",
+                            (u.new_cell, stamp, u.message_id, u.stored, *inflight),
+                        )
+                    except sqlite3.Error as exc:  # one row's failure skips only that row
+                        log_row_write_skip(u.message_id, exc)
+                        continue
                     if cur.rowcount == 1:
                         landed.append(u)
                 await self._commit()
