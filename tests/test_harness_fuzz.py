@@ -634,17 +634,22 @@ def test_replay_refuses_a_file_for_another_transport(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("kind", sorted(set(drivers.registry()) - {"mllp"}))
 def test_only_the_mllp_driver_builds_a_transport(kind: str) -> None:
-    # BACKLOG #5638, #5639: every other harness driver lacks an inbound probe and a reply invariant
-    # for its kind, so a campaign through one could pass with nothing checked.
+    # BACKLOG #5638, #5639; harness/fuzz/transport.py's module docstring says why.
     with pytest.raises(ValueError, match="accepts only mllp"):
-        build_transport(kind, Endpoints({}), None, timeout=1.0)
-    # Control: the refusal is about the kind, not the call -- mllp builds with the same arguments.
-    assert build_transport("mllp", Endpoints({}), None, timeout=1.0).kind == "mllp"
+        build_transport(kind, Endpoints({}, environ={}), None, timeout=1.0)
 
 
-def test_the_refusal_covers_real_driver_kinds() -> None:
-    # Control for the parametrization above: it is not vacuous over an empty or stale registry.
+def test_the_refusal_covers_real_driver_kinds_and_spares_mllp() -> None:
+    # Controls for the test above: it is not vacuous over an empty or stale registry, and the
+    # refusal is about the kind, not the call -- mllp builds with the same arguments.
     assert {"file", "http", "tcp"} <= set(drivers.registry()) - {"mllp"}
+    built = build_transport("mllp", Endpoints({}, environ={}), None, timeout=1.0)
+    assert built.kind == "mllp"
+
+
+def test_a_transport_must_define_its_own_probe() -> None:
+    # A probe inherited as "always there" is the gap BACKLOG #5639 names; it stays abstract.
+    assert "probe" in Transport.__abstractmethods__
 
 
 # --- CLI setup errors ----------------------------------------------------------------------------

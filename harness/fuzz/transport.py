@@ -14,7 +14,7 @@ folds together. Its probe connects to the inbound before the first case.
 paragraph is the one statement of why, which the invariants module and the harness README point
 at. The invariants read every reply as an HL7 v2 ACK and match the store to the acknowledgements,
 and a stock driver has neither an inbound probe nor a per-frame reply count. So an HTTP, DIMSE or
-X12 reply would fail as "not an ACK", and a send that got no reply -- a file drop always, any other
+X12 reply would fail as not parsing as HL7, and a send that got no reply -- a file drop always, any other
 kind whenever the engine stays silent -- would pass with nothing checked, even against an endpoint
 no inbound polls. A kind joins only with its own probe and a reply invariant for its own shape.
 """
@@ -160,10 +160,10 @@ def build_transport(
     """The transport for driver ``kind`` aimed at endpoint ``key`` (``mllp_in`` when None).
     Raises ValueError for any kind but ``mllp`` (the module docstring says why) and for a bad port
     value; KeyError for an endpoint no family declares. ``timeout`` bounds one MLLP reply."""
-    if kind != "mllp":
+    if kind != _WireTransport.kind:
         raise ValueError(
-            f"--fuzz-driver accepts only mllp, not {kind!r}: no other driver has an inbound probe "
-            "and a reply invariant for its kind (harness/fuzz/transport.py says why)"
+            f"--fuzz-driver accepts only {_WireTransport.kind}, not {kind!r} "
+            "(the harness/fuzz/transport.py module docstring says why)"
         )
     port = endpoints.port(DEFAULT_ENDPOINT if key is None else key)
     return _WireTransport(WireMLLPDriver(endpoints.host, port, timeout=timeout))

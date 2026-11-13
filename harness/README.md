@@ -232,8 +232,8 @@ python -m harness --fuzz-replay <path printed by the failure> --engine URL --cac
 `--fuzz-driver KIND` and `--fuzz-endpoint KEY` pick the driver and the endpoint (`mllp_in` by
 default). `mllp` is the only driver the fuzzer accepts; any other `KIND` is a setup error (exit 2).
 The `harness/fuzz/transport.py` module docstring says why. Point the mllp driver at an inbound that
-answers in HL7: one
-with `ack_mode = "none"` never replies, and every case would fail the reply rule. The store checks read
+answers in HL7: one with `ack_mode = "none"` never replies, and every case would fail the reply
+rule. The store checks read
 `GET /messages` about twice per case, so on an auth-enabled engine the per-user read limit (120 a
 minute by default) sets the pace: the fuzzer waits out a 429 rather than failing. Exit 0 when every
 invariant held, 1 when one broke, 2 on a setup error (including a 4xx mid-run). A failure prints the
