@@ -4901,12 +4901,19 @@ the error directory fails still charges, although the file stays where it was. A
 be quarantined would therefore spend the budget on every tick, which is the starvation this rule exists
 to prevent. On `File(...)` under `after_read` `move` or `delete` (BACKLOG #5717) the gap is
 narrowed, not closed. When the move failed for a reason that looks lasting, such as access denied,
-the source remembers the file and skips it unread and uncharged until its size, modification time or
-file identity changes. Every 300 seconds it tries the move alone again, still unread and uncharged.
-A failure that looks transient, at least a locked file, a file another process holds open, or a full
-disk, is not remembered, so such a file still charges on later scans as before. At least a restart of
-the connection and a memory that is full (100,000 files) also leave a file charged again. Under
-`leave`, and on `Sftp(...)`/`Ftp(...)`, the gap stands as described.
+the source remembers the file and skips it unread and uncharged, at least until its size,
+modification time or file identity changes. After `STUCK_RETRY_SECONDS` it examines the file again in
+full: it settles, is read and judged afresh, and charges as before. A file that now passes, for
+example because a scanner no longer rejects it, is ingested. A file that was copied into the error
+directory but whose original could not be removed is examined the same way, so its retry may write a
+second copy and record a second event. Retries run after every other candidate in the scan, and
+`FileSource._retry_allowance` bounds how many one scan takes; the per-tick ceiling's log line does
+not count them. A failure that looks transient, at least a locked file, a file another process holds
+open, or a full disk, is not remembered, so such a file still charges on later scans as before. At
+least a restart of the connection and a full memory also leave a file charged again; a full memory
+is logged once. The constants are in
+[`transports/file.py`](../messagefoundry/transports/file.py). Under `leave`, and on
+`Sftp(...)`/`Ftp(...)`, the gap stands as described.
 
 **A database row that cannot become a body does not spend it either, and the two sources reach that
 by different routes.** A file source charges on **completion**, so it simply does not count an item it

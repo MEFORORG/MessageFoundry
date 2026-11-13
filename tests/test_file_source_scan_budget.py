@@ -6,8 +6,8 @@ Every quarantine arm charges the per-tick budget whether or not the move to ``.e
 #5717 a reject that could not be moved stayed in place and was read and charged again on later scans,
 so ``poll_max_files`` such rejects sorting first could spend the whole budget and hold back the
 healthy drops behind them. Under ``move`` and ``delete`` a reject that stays for a lasting reason is
-now remembered by path and mark and skipped unread and uncharged until it changes, while its move
-alone is retried every ``STUCK_RETRY_SECONDS``. A transient failure is not remembered, and ``leave``
+now remembered by path and mark and skipped unread and uncharged until it changes; after
+``STUCK_RETRY_SECONDS`` it is examined again in full, after the other candidates. A transient failure is not remembered, and ``leave``
 is unchanged.
 
 Deliberately ASCII-only: pytest echoes a failing body to a cp1252 console on Windows.
@@ -25,7 +25,7 @@ import pytest
 
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.transports import file as file_mod
-from messagefoundry.transports.file import FileSource, set_scan_hook
+from messagefoundry.transports.file import FileSource, ScanRejected, set_scan_hook
 
 _HL7 = b"MSH|^~\\&|SND|FAC|RCV|FAC|20260101120000||ADT^A01|CTL5717|P|2.5.1\rPID|1||12345\r"
 _PDF = b"%PDF-1.7 not an HL7 message"
@@ -46,7 +46,7 @@ class _Rig:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         *,
-        cap: int,
+        cap: int | None,
         after_read: str = "move",
         fail_errno: int | None = errno.EACCES,
     ) -> None:
@@ -131,7 +131,7 @@ async def test_healthy_drop_is_reached_behind_unmovable_rejects(
     """The probe from the review of the first build: before #5717 the healthy drop was never handed
     off while ``stuck >= cap``. Each reject is read once, and no scan reads more than ``cap``.
 
-    Mutation: drop the ``_stuck_handled`` skip in ``_scan_once``. Red: never handed off."""
+    Mutation: make ``_stuck_step`` return None for an unchanged reject. Red: never handed off."""
     rig = _Rig(tmp_path, monkeypatch, cap=cap, after_read=after_read)
     for n in range(stuck):
         rig.drop(f"a_reject{n:03d}.hl7", _PDF)
@@ -223,15 +223,21 @@ async def test_a_windows_sharing_violation_is_transient_although_errno_says_eacc
     assert not file_mod._lasting(exc)
     assert file_mod._lasting(OSError(errno.EACCES, "denied", None, 5))
     # A dropped share stays transient even where the archive directory failed to open.
-    assert not file_mod._lasting(OSError(errno.ENOENT, "bad netpath", None, 53), archive_dir=True)
-    assert file_mod._lasting(OSError(errno.ENOENT, "path not found", None, 3))
+    bad_netpath = OSError(errno.ENOENT, "bad netpath", None, 53)
+    assert not file_mod._lasting(bad_netpath, stage="archive_dir")
+    # ERROR_PATH_NOT_FOUND is lasting only on the move into the archive directory.
+    path_not_found = OSError(errno.ENOENT, "path not found", None, 3)
+    assert file_mod._lasting(path_not_found, stage="archive")
+    assert not file_mod._lasting(path_not_found)
 
 
-async def test_an_archived_copy_whose_original_cannot_be_removed_is_remembered(
+async def test_an_archived_copy_whose_original_cannot_be_removed_is_retried_in_full(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A copy in ``.error`` with the original left behind for good is recorded once, and the original
-    is not copied into ``.error`` again, not even when a retry would be due."""
+    """A copy in ``.error`` with the original left behind is remembered, so it is not copied again on
+    every scan. When its retry falls due it takes the whole path, which archives a second copy and
+    records a second event: accepted, rather than a remove-only retry that could delete unarchived
+    bytes."""
     rig = _Rig(tmp_path, monkeypatch, cap=10, fail_errno=None)
     archives: list[str] = []
 
@@ -244,21 +250,21 @@ async def test_an_archived_copy_whose_original_cannot_be_removed_is_remembered(
 
     monkeypatch.setattr(file_mod, "_archive", archive)
     monkeypatch.setattr(file_mod, "_remove_pinned", remove)
-    events: list[str] = []
-
-    async def sink(kind: str, _peer: str | None, _reason: str | None) -> None:
-        events.append(kind)
-
-    rig.source.on_connection_event = sink
+    events = _sink(rig)
     rig.drop("a.hl7", _PDF)
-    await rig.scan()
-    for _ in range(3):
+    for _ in range(4):
         await rig.scan()
-    _age_stuck(rig)
-    await rig.scan()
     assert archives == ["a.hl7"]
     assert events == ["file_content_mismatch"]
     assert rig.reads == ["a.hl7"]
+
+    _age_stuck(rig)
+    await rig.scan()  # the retry settles
+    await rig.scan()  # and is read and judged again
+    assert archives == ["a.hl7", "a.hl7"]
+    assert events == ["file_content_mismatch", "file_content_mismatch"]
+    assert rig.reads == ["a.hl7", "a.hl7"]
+    assert len(rig.source._stuck) == 1
 
 
 @pytest.mark.usefixtures("_no_scan_hook")
@@ -305,63 +311,159 @@ async def test_leave_mode_still_reads_and_charges_an_unmovable_reject_every_scan
     assert rig.source._stuck == {}
 
 
-async def test_a_stuck_reject_is_retried_after_the_retry_interval(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A cause fixed outside the file (an ``.error`` made writable again) is picked up without a
-    restart: once ``STUCK_RETRY_SECONDS`` pass the move alone is tried again, unread, and records the
-    remembered event when it archives the file.
-
-    Mutation: drop the time test from ``_stuck_handled``. Red: the move is never tried again."""
-    rig = _Rig(tmp_path, monkeypatch, cap=10)
+def _sink(rig: _Rig) -> list[str]:
+    """Record the kind of every connection event the source emits."""
     events: list[str] = []
 
     async def sink(kind: str, _peer: str | None, _reason: str | None) -> None:
         events.append(kind)
 
     rig.source.on_connection_event = sink
-    rig.drop("a.hl7", _PDF)
-    await rig.scan()
-    assert await rig.scan() == ["a.hl7"]
-    _age_stuck(rig)
-    assert await rig.scan() == [], "a retry that fails again reads nothing"
-    assert len(rig.source._stuck) == 1
-
-    rig.fail_errno = None
-    assert await rig.scan() == [], "not due again yet"
-    assert not (rig.inbox / ".error" / "a.hl7").exists()
-    _age_stuck(rig)
-    assert await rig.scan() == []
-    assert (rig.inbox / ".error" / "a.hl7").exists()
-    assert events == ["file_content_mismatch"]
-    assert rig.source._stuck == {}
-    assert rig.reads == ["a.hl7"]
-
-
-async def test_due_retries_never_crowd_a_healthy_drop_out_of_a_scan(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A retry is uncharged, so however many stuck rejects come due in one scan, the healthy drop
-    behind them is still handed off in that scan."""
-    rig = _Rig(tmp_path, monkeypatch, cap=1)
-    for n in range(5):
-        rig.drop(f"a_reject{n}.hl7", _PDF)
-    await rig.scan()
-    for _ in range(5):
-        await rig.scan()
-    assert len(rig.source._stuck) == 5
-    rig.drop("b_healthy.hl7", _HL7)
-    await rig.scan()  # the healthy drop's settle poll
-    _age_stuck(rig)
-    assert await rig.scan() == ["b_healthy.hl7"]
-    assert rig.handed_off == [_HL7]
-    assert len(rig.source._stuck) == 5
+    return events
 
 
 def _age_stuck(rig: _Rig) -> None:
-    """Make every remembered reject due for its retry."""
-    for entry in rig.source._stuck.values():
-        entry.since -= file_mod.STUCK_RETRY_SECONDS
+    """Make every remembered reject due its retry."""
+    stuck = rig.source._stuck
+    for key, ((mark, since), missed) in list(stuck.items()):
+        stuck[key] = ((mark, since - file_mod.STUCK_RETRY_SECONDS), missed)
+
+
+async def test_a_due_retry_takes_the_whole_path_and_is_quarantined_once_the_move_works(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cause fixed outside the file (an ``.error`` made writable again) is picked up without a
+    restart: once ``STUCK_RETRY_SECONDS`` pass the reject settles, is read and judged afresh, and is
+    moved.
+
+    Mutation: drop the time test from ``_stuck_step``. Red: the reject is never read again."""
+    rig = _Rig(tmp_path, monkeypatch, cap=10)
+    events = _sink(rig)
+    rig.drop("a.hl7", _PDF)
+    await rig.scan()
+    assert await rig.scan() == ["a.hl7"]
+    assert await rig.scan() == []
+
+    rig.fail_errno = None
+    _age_stuck(rig)
+    assert await rig.scan() == [], "the retried file settles first"
+    assert len(rig.source._stuck) == 1, "still remembered, and still due"
+    assert await rig.scan() == ["a.hl7"]
+    assert (rig.inbox / ".error" / "a.hl7").exists()
+    assert events == ["file_content_mismatch"]
+    assert rig.source._stuck == {}
+
+
+@pytest.mark.usefixtures("_no_scan_hook")
+async def test_a_retry_that_now_passes_the_verdict_is_ingested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The retry judges the file afresh: a scanner that rejected it and has since changed its mind
+    lets it through, and it is handed off and archived to ``.processed``."""
+    rig = _Rig(tmp_path, monkeypatch, cap=10)
+    verdicts = {"reject": True}
+
+    def hook(_raw: bytes, _source: str) -> None:
+        if verdicts["reject"]:
+            raise ScanRejected("test signature")
+
+    set_scan_hook(hook)
+    rig.drop("a.hl7", _HL7)
+    await rig.scan()
+    assert await rig.scan() == ["a.hl7"]
+    assert rig.handed_off == []
+    assert len(rig.source._stuck) == 1
+
+    verdicts["reject"] = False
+    _age_stuck(rig)
+    await rig.scan()
+    assert await rig.scan() == ["a.hl7"]
+    assert rig.handed_off == [_HL7]
+    assert (rig.inbox / ".processed" / "a.hl7").exists()
+    assert rig.source._stuck == {}
+
+
+async def test_due_retries_run_after_the_fresh_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retries sorting first are examined after every other candidate, so a healthy drop behind
+    them is read first.
+
+    Mutation: examine a due retry in the fresh pass. Red: the rejects are read first."""
+    rig = _Rig(tmp_path, monkeypatch, cap=10)
+    for n in range(3):
+        rig.drop(f"a_reject{n}.hl7", _PDF)
+    await rig.scan()
+    await rig.scan()
+    assert len(rig.source._stuck) == 3
+    rig.drop("b_healthy.hl7", _HL7)
+    _age_stuck(rig)
+    assert await rig.scan() == [], "the healthy drop and the retries all settle"
+    assert await rig.scan() == ["b_healthy.hl7", "a_reject0.hl7", "a_reject1.hl7", "a_reject2.hl7"]
+    assert rig.handed_off == [_HL7]
+    assert len(rig.source._stuck) == 3, "still stuck, so remembered again"
+
+
+async def test_due_retries_are_capped_per_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """At most ``STUCK_RETRIES_PER_SCAN_MAX`` retries are examined in one scan; the rest stay due.
+
+    Mutation: drop the slice in ``_scan_once``'s retry pass. Red: all four are read in one scan."""
+    monkeypatch.setattr(file_mod, "STUCK_RETRIES_PER_SCAN_MAX", 2)
+    rig = _Rig(tmp_path, monkeypatch, cap=None)
+    for n in range(4):
+        rig.drop(f"a{n}.hl7", _PDF)
+    await rig.scan()
+    await rig.scan()
+    assert len(rig.source._stuck) == 4
+    _age_stuck(rig)
+    await rig.scan()  # a0 and a1 settle; a2 and a3 wait, still due
+    assert await rig.scan() == ["a0.hl7", "a1.hl7"]
+    await rig.scan()  # a2 and a3 settle
+    assert await rig.scan() == ["a2.hl7", "a3.hl7"]
+    assert len(rig.source._stuck) == 4
+
+
+@pytest.mark.parametrize(
+    ("cap", "disposed", "allowed"),
+    [
+        (None, 0, 100),  # no ceiling: the absolute constant alone
+        (500, 500, 50),  # the budget is spent: a tenth is held back for retries
+        (500, 100, 100),  # the leftover is larger, but the constant caps it
+        (500, 470, 50),
+        (200, 150, 50),  # the leftover beats a tenth
+        (9, 9, 0),  # under ten nothing is held back
+        (9, 6, 3),  # so retries use only the leftover
+    ],
+)
+def test_the_retry_allowance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cap: int | None,
+    disposed: int,
+    allowed: int,
+) -> None:
+    rig = _Rig(tmp_path, monkeypatch, cap=cap)
+    assert file_mod.STUCK_RETRIES_PER_SCAN_MAX == 100
+    assert rig.source._retry_allowance(disposed) == allowed
+
+
+async def test_a_retry_deferred_past_the_allowance_survives_pruning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A due reject the allowance leaves for later is still listed, so pruning keeps it however many
+    scans it waits."""
+    rig = _Rig(tmp_path, monkeypatch, cap=1)
+    rig.drop("a.hl7", _PDF)
+    await rig.scan()
+    await rig.scan()
+    _age_stuck(rig)
+    for n in range(5):
+        rig.drop(f"b{n}.hl7", _HL7)
+    for _ in range(6):  # each scan spends its budget of one on a healthy drop
+        await rig.scan()
+    assert len(rig.source._stuck) == 1
 
 
 async def test_a_failed_listing_does_not_wipe_the_stuck_memory(
@@ -399,9 +501,27 @@ async def test_a_missing_error_directory_is_a_lasting_failure(
     assert len(rig.source._stuck) == 1
 
 
+async def test_a_full_memory_is_logged_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(file_mod, "SETTLE_SEEN_MAX", 1)
+    rig = _Rig(tmp_path, monkeypatch, cap=10)
+    for n in range(3):
+        rig.drop(f"a{n}.hl7", _PDF)
+    await rig.scan()
+    await rig.scan()
+    await rig.scan()
+    assert len(rig.source._stuck) == 1
+    full = [
+        r for r in caplog.records if "memory of rejects that cannot be moved is full" in r.message
+    ]
+    assert len(full) == 1
+
+
 def test_lasting_reads_the_engines_own_refusals() -> None:
     assert not file_mod._lasting(file_mod._Replaced("not the file that was read"))
     assert file_mod._lasting(file_mod._Unconfined("a link"))
     assert file_mod._lasting(OSError("no errno at all"))
     assert not file_mod._lasting(OSError(errno.ENOENT, "gone"))
-    assert file_mod._lasting(OSError(errno.ENOENT, "gone"), archive_dir=True)
+    assert file_mod._lasting(OSError(errno.ENOENT, "gone"), stage="archive_dir")
+    assert not file_mod._lasting(OSError(errno.ENOENT, "gone"), stage="archive")
