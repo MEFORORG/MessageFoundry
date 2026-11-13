@@ -166,9 +166,11 @@ async def test_a_failing_transport_does_not_stop_a_slower_sibling() -> None:
     assert heard == ["slow"]
 
 
-async def test_a_send_cancelled_on_its_own_does_not_end_the_drain() -> None:
+async def test_a_send_cancelled_on_its_own_does_not_end_the_drain(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """A send that ends cancelled without the drain being cancelled leaves its sibling to finish,
-    and the drain goes on to the next alert."""
+    and the drain goes on to the next alert. The lost send is logged, not dropped in silence."""
 
     class _SelfCancelled(_RecordingTransport):
         async def send(self, event: dict[str, Any], **kw: Any) -> None:
@@ -180,6 +182,8 @@ async def test_a_send_cancelled_on_its_own_does_not_end_the_drain() -> None:
     sink.connection_stopped("OB_Y", detail="boom")
     await asyncio.wait_for(_drain(sink), 5.0)
     assert [e["connection"] for e in good.events] == ["OB_X", "OB_Y"]
+    lost = [r for r in caplog.records if "alert transport odd was cancelled" in r.getMessage()]
+    assert len(lost) == 2, caplog.text
 
 
 async def test_realert_throttle_suppresses_repeats() -> None:
