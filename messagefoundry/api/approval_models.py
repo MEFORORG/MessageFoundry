@@ -19,14 +19,11 @@ from messagefoundry.api.request_model import RequestModel
 
 #: What ``ApprovalGate.interrupt_stranded`` judges of a release's owner, under the owner-delegated
 #: decision of 2026-10-29 (d20261029T205247402-81159c), in three tiers: the release is live in THIS
-#: process, or this process claimed it and no longer runs it (``ended_here``, added on a Lander
-#: hold on engine PR 2930, not by that decision); or a cluster node owns it, and its heartbeat
-#: decides; or its owner is a name no heartbeat covers, which only an operator's recorded
-#: attestation can vouch is stopped. One type for the gate and the wire, so the route cannot answer
-#: a value its model refuses.
+#: process; or a cluster node owns it, and its heartbeat decides; or its owner is a name no
+#: heartbeat covers, which only an operator's recorded attestation can vouch is stopped. One type
+#: for the gate and the wire, so the route cannot answer a value its model refuses.
 OwnerLiveness = Literal[
     "releasing_here",
-    "ended_here",
     "owner_heartbeat_fresh",
     "owner_heartbeat_unreadable",
     "owner_heartbeat_unavailable",
@@ -63,9 +60,9 @@ class ExecutingApprovalList(BaseModel):
 
 class ApprovalInterruptRequest(RequestModel):
     """``attest_owner_stopped`` is the operator's word that the process owning the claim is not
-    running. Only an owner with no heartbeat to read needs it, and not for a release judged
-    ``ended_here``; the audit row records it either way. Strict: only JSON ``true`` or ``false``,
-    so ``"yes"``, ``"true"`` or ``1`` is a 422, never an attestation."""
+    running. Only an owner with no heartbeat to read needs it; the audit row records it either
+    way. Strict: only JSON ``true`` or ``false``, so ``"yes"``, ``"true"`` or ``1`` is a 422,
+    never an attestation."""
 
     attest_owner_stopped: StrictBool = False
 

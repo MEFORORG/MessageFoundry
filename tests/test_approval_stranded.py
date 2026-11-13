@@ -327,251 +327,30 @@ async def _runs(_p: Mapping[str, Any]) -> dict[str, Any]:
     return {"ran": True}
 
 
-async def test_a_later_start_leaves_an_unsettled_claim_of_this_life(engine: Engine) -> None:
-    """Residual 5: a claim this process made, that no gate runs and that never settled, is not
-    left over from an earlier life, whatever order the apps were built and started in. Here app1
-    is built first and starts last, after app2 claimed. Its start leaves the row 'executing' and
-    writes no approval.interrupted row: no engine_restart happened. Control: rows this process
-    never claimed still move, at either start."""
-    before = await _stranded(engine, "engine")
-    app1 = create_app(engine, approvals=ON)
-    app2 = create_app(engine, approvals=ON)
-    async with app2.router.lifespan_context(app2):
-        assert str((await _row(engine, before))["status"]) == "interrupted"
-        gate2: ApprovalGate = app2.state.approval_gate
-        gate2._store = _SettlesFail(engine.store)
-        gate2._resolve_identity = _resolve
-        this_life = await _claim_left_unsettled(gate2)
-        assert str((await _row(engine, this_life))["status"]) == "executing"
-        leftover = await _stranded(engine, "engine")  # never claimed by this process
-        async with app1.router.lifespan_context(app1):
-            assert str((await _row(engine, this_life))["status"]) == "executing"
-            assert str((await _row(engine, leftover))["status"]) == "interrupted"
-    assert await _audit(engine, "approval.interrupted", this_life) == []
-
-
-async def test_an_ended_claim_of_this_life_is_interrupted_without_attestation(
-    engine: Engine,
-) -> None:
-    """Residual 5's way out: a claim this process made that no gate runs any more is listed as
-    ``ended_here`` by a second app over the same engine, and its interrupt moves it with no
-    attestation, writing approval.interrupted. Controls: a release this process is running is
-    still refused 409, and a row this process never claimed still needs the attestation."""
+async def test_a_second_app_recovers_an_unsettled_claim_no_gate_runs(engine: Engine) -> None:
+    """As on main: a claim of this life that no gate runs any more (both settle writes failed) is
+    moved to 'interrupted' by a second app's start, with reason engine_restart. Only a release a
+    gate in this process is running is left alone."""
     first = create_app(engine, approvals=ON)
     async with first.router.lifespan_context(first):
         gate1: ApprovalGate = first.state.approval_gate
         gate1._store = _SettlesFail(engine.store)
         gate1._resolve_identity = _resolve
-        ended = await _claim_left_unsettled(gate1)
+        unsettled = await _claim_left_unsettled(gate1)
+        assert str((await _row(engine, unsettled))["status"]) == "executing"
         second = create_app(engine, approvals=ON)
         async with second.router.lifespan_context(second):
-            gate2: ApprovalGate = second.state.approval_gate
-            gate2._store = _StandingStore(engine.store)
-            gate2._resolve_identity = _resolve
-            foreign = await _stranded(engine, "shard:other")
-            live, release, leave = await _running_release(gate2)
-            try:
-                listed = {r["id"]: r for r in await gate2.list_executing()}
-                assert listed[ended]["liveness"] == "ended_here"
-                assert listed[ended]["interrupt"] == "allowed"
-                out = await gate2.interrupt_stranded(
-                    ended, actor="operator", actor_user_id="operator-id"
-                )
-                assert out["status"] == "interrupted" and out["liveness"] == "ended_here"
-                [row] = await _audit(engine, "approval.interrupted", ended)
-                detail = json.loads(str(row["detail"]))
-                assert detail["reason"] == "operator_interrupt"
-                assert detail["owner_stopped_attested"] is False
-                with pytest.raises(ApprovalError) as running:
-                    await gate2.interrupt_stranded(
-                        live, actor="operator", actor_user_id="operator-id"
-                    )
-                assert running.value.status == 409
-                assert "is running this release now" in running.value.detail
-                with pytest.raises(ApprovalError) as unattested:
-                    await gate2.interrupt_stranded(
-                        foreign, actor="operator", actor_user_id="operator-id"
-                    )
-                assert unattested.value.status == 409
-                assert "attest_owner_stopped" in unattested.value.detail
-                assert str((await _row(engine, foreign))["status"]) == "executing"
-            finally:
-                leave.set()
-                await asyncio.wait_for(release, 10.0)
-
-
-async def test_a_claim_lost_to_a_live_peer_is_not_ended_here(engine: Engine) -> None:
-    """A claim this process tried and lost is not its own: the release a peer cluster node won
-    and runs, with a fresh heartbeat, is judged on that heartbeat and refused, not taken for
-    ``ended_here``."""
-
-    class _PeerClaimsFirst(_StandingStore):
-        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
-            if kw.get("claim_owner") == "node:me":
-                # The peer's claim lands between this gate's read and its claim.
-                assert await self._store.decide_pending_approval(
-                    approval_id,
-                    status="executing",
-                    approver="peer-approver",
-                    decided_at=time.time(),
-                    claim_owner="node:peer",
-                )
-            return bool(await self._store.decide_pending_approval(approval_id, **kw))
-
-    gate = _gate(engine, owner="node:me", liveness=_liveness(True))
-    gate._store = _PeerClaimsFirst(engine.store)
-    gate.register("dead_letter_replay", "op", _runs, permission=Permission.MESSAGES_REPLAY)
-    approval_id = await gate.guard(
-        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
-    )
-    assert approval_id is not None
-    with pytest.raises(ApprovalError) as lost:
-        await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
-    assert lost.value.status == 409
-    [listed] = [r for r in await gate.list_executing() if r["id"] == approval_id]
-    assert listed["liveness"] == "owner_heartbeat_fresh"
-    with pytest.raises(ApprovalError) as refused:
-        await gate.interrupt_stranded(approval_id, actor="operator", actor_user_id="operator-id")
-    assert refused.value.status == 409
-    assert str((await _row(engine, approval_id))["status"]) == "executing"
-
-
-async def test_a_losing_approve_cannot_wipe_the_winners_claim(engine: Engine) -> None:
-    """Two approves of one request race to the claim; the loser's 409 leaves the winner's record
-    alone. When the winner later ends unsettled, its row reads ``ended_here``, and a second gate's
-    start reconcile over the same store object leaves it 'executing'."""
-    arrived: list[str] = []
-    both = asyncio.Event()
-    entered, leave = asyncio.Event(), asyncio.Event()
-
-    class _BothClaimAtOnce(_SettlesFail):
-        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
-            if kw.get("status") == "executing":
-                arrived.append(approval_id)
-                if len(arrived) == 2:
-                    both.set()
-                await both.wait()  # both approves read the row as pending first
-            return await super().decide_pending_approval(approval_id, **kw)
-
-    async def _holds(_p: Mapping[str, Any]) -> dict[str, Any]:
-        entered.set()
-        await leave.wait()
-        return {"ran": True}
-
-    gate = ApprovalGate(engine.store, ON, resolve_identity=_resolve)
-    gate._store = _BothClaimAtOnce(engine.store)
-    gate.register("dead_letter_replay", "op", _holds, permission=Permission.MESSAGES_REPLAY)
-    approval_id = await gate.guard(
-        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
-    )
-    assert approval_id is not None
-    first = asyncio.create_task(
-        gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
-    )
-    second = asyncio.create_task(
-        gate.approve(approval_id, approver="checker-2", approver_user_id="checker-2-id")
-    )
-    try:
-        await asyncio.wait_for(entered.wait(), 10.0)  # the winner runs, and holds
-        done, _ = await asyncio.wait(
-            {first, second}, timeout=10.0, return_when=asyncio.FIRST_COMPLETED
-        )
-        [lost] = done  # the loser, refused while the winner still runs
-        with pytest.raises(ApprovalError) as refused:
-            lost.result()
-        assert refused.value.status == 409
-    finally:
-        leave.set()
-        await asyncio.wait({first, second}, timeout=10.0)
-    assert str((await _row(engine, approval_id))["status"]) == "executing"  # settles failed
-    [listed] = [r for r in await gate.list_executing() if r["id"] == approval_id]
-    assert listed["liveness"] == "ended_here"
-    found = await ApprovalGate(engine.store, ON).reconcile_after_restart()
-    assert approval_id not in found.interrupted
-    assert str((await _row(engine, approval_id))["status"]) == "executing"
-
-
-async def test_a_cancelled_lost_claim_does_not_make_a_siblings_row_ended_here(
-    engine: Engine,
-) -> None:
-    """An approve cancelled while it claims, whose claim then loses to a sibling under the same
-    owner that is running the release, is not this process's claim: the sibling's live row still
-    needs the attestation, never ``ended_here``."""
-    reached, let_go = asyncio.Event(), asyncio.Event()
-
-    class _SiblingWinsWhileCancelled(_StandingStore):
-        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
-            if kw.get("status") == "executing" and kw.get("approver") == "checker":
-                assert await self._store.decide_pending_approval(
-                    approval_id,
-                    status="executing",
-                    approver="sibling-approver",
-                    decided_at=time.time(),
-                    claim_owner="engine",
-                )
-                reached.set()
-                await let_go.wait()
-            return bool(await self._store.decide_pending_approval(approval_id, **kw))
-
-    gate = ApprovalGate(engine.store, ON, resolve_identity=_resolve)
-    gate._store = _SiblingWinsWhileCancelled(engine.store)
-    gate.register("dead_letter_replay", "op", _runs, permission=Permission.MESSAGES_REPLAY)
-    approval_id = await gate.guard(
-        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
-    )
-    assert approval_id is not None
-    task = asyncio.create_task(
-        gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
-    )
-    await asyncio.wait_for(reached.wait(), 10.0)
-    task.cancel()
-    let_go.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    await gate.drain()
-    row = await _row(engine, approval_id)
-    assert str(row["status"]) == "executing" and row["approver"] == "sibling-approver"
-    [listed] = [r for r in await gate.list_executing() if r["id"] == approval_id]
-    assert listed["liveness"] == "attestation_required"
-    with pytest.raises(ApprovalError) as refused:
-        await gate.interrupt_stranded(approval_id, actor="operator", actor_user_id="operator-id")
-    assert refused.value.status == 409 and "attest_owner_stopped" in refused.value.detail
-
-
-async def test_a_claim_whose_reply_was_lost_is_still_claimed_here(engine: Engine) -> None:
-    """A claim whose COMMIT landed but whose reply raised is this process's: the row reads
-    ``ended_here``, and a second gate's start reconcile over the same store object leaves it."""
-
-    class _ReplyLost(_StandingStore):
-        async def decide_pending_approval(self, approval_id: str, **kw: Any) -> bool:
-            landed = bool(await self._store.decide_pending_approval(approval_id, **kw))
-            if kw.get("status") == "executing":
-                raise OSError("PROBE: the reply was lost")
-            return landed
-
-    gate = ApprovalGate(engine.store, ON, resolve_identity=_resolve)
-    gate._store = _ReplyLost(engine.store)
-    gate.register("dead_letter_replay", "op", _runs, permission=Permission.MESSAGES_REPLAY)
-    approval_id = await gate.guard(
-        "dead_letter_replay", {}, requester="maker", requester_user_id="maker-id"
-    )
-    assert approval_id is not None
-    with pytest.raises(ApprovalError) as fault:
-        await gate.approve(approval_id, approver="checker", approver_user_id="checker-id")
-    assert fault.value.status == 503
-    assert str((await _row(engine, approval_id))["status"]) == "executing"
-    [listed] = [r for r in await gate.list_executing() if r["id"] == approval_id]
-    assert listed["liveness"] == "ended_here"
-    found = await ApprovalGate(engine.store, ON).reconcile_after_restart()
-    assert approval_id not in found.interrupted
+            assert str((await _row(engine, unsettled))["status"]) == "interrupted"
+    [row] = await _audit(engine, "approval.interrupted", unsettled)
+    assert json.loads(str(row["detail"]))["reason"] == "engine_restart"
 
 
 async def test_a_release_running_over_another_store_object_is_not_reconciled(
     engine: Engine,
 ) -> None:
-    """Residual 5: a gate built over a different store object for the same database shares no
-    claimed-id set, but a release it is running is still left alone, as the interrupt route
-    leaves it. Control: a row no gate in this process claimed still moves."""
+    """Residual 5: a release a gate in this process is running is left alone even when that gate
+    was built over a different store object for the same database, as the interrupt route leaves
+    it. Control: a row no gate in this process runs still moves."""
     wrapped = _gate(engine)  # built over a _StandingStore, a store object of its own
     live, release, leave = await _running_release(wrapped)
     leftover = await _stranded(engine, "engine")
@@ -582,23 +361,6 @@ async def test_a_release_running_over_another_store_object_is_not_reconciled(
     finally:
         leave.set()
         await asyncio.wait_for(release, 10.0)
-
-
-async def test_a_clock_step_neither_hides_a_leftover_nor_exposes_a_claim(engine: Engine) -> None:
-    """Residual 5: the reconcile reads no clock. A claim this process made with its clock stepped
-    far back stays 'executing' at a later start, and a leftover whose claim time is ahead of now
-    still moves."""
-    stepped = ApprovalGate(engine.store, ON, resolve_identity=_resolve, clock=lambda: 1_000.0)
-    stepped._store = _SettlesFail(engine.store)
-    this_life = await _claim_left_unsettled(stepped)
-    assert float((await _row(engine, this_life))["decided_at"]) == 1_000.0
-    later = ApprovalGate(engine.store, ON, resolve_identity=_resolve)
-    ahead = await _claimed_directly(
-        engine.store, claim_owner="engine", claimed_at=time.time() + 3_600.0
-    )
-    found = await later.reconcile_after_restart()
-    assert found.interrupted == (ahead,)
-    assert str((await _row(engine, this_life))["status"]) == "executing"
 
 
 # --- GET /approvals/executing and the three tiers (residuals 1 and 4) ------------------------------
