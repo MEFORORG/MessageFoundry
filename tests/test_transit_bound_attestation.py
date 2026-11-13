@@ -1008,7 +1008,7 @@ def test_a_refused_version_on_the_second_ask_keeps_its_label() -> None:
 
 
 # --- BACKLOG #8222 items 1 and 5: in the walk, a timeout on both asks is an outage and a malformed
-# handover reply a break; the open reads both as origin/main does ---------------------------------
+# handover reply a break; the open reads both as engine PR 2903 (686c5f7443) did ---------------------
 
 
 def _status_error(status: int) -> Exception:
@@ -1159,7 +1159,8 @@ async def test_a_both_asks_timeout_on_the_genesis_verify_at_open_logs_a_break_an
 ) -> None:
     """At store open the timeout reading does not apply (BACKLOG #8222: the open path is unruled):
     a 504 on both asks of the genesis row's verify, while the fixed input verifies, is read as
-    origin/main reads it, a genesis row that does not verify, logged, on a store that opens."""
+    engine PR 2903 (``686c5f7443``) read it, a genesis row that does not verify, logged, on a
+    store that opens."""
     _needs_hvac()
     from messagefoundry.store.crypto_transit import _VERSION_PROBE_INPUT
 
