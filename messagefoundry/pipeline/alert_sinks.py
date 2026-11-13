@@ -2619,8 +2619,11 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         }
 
         async def deliver(transport: AlertTransport) -> None:
+            # A copy per send: the sends run at once, some in worker threads, so a transport or
+            # the observer changing its event cannot break a sibling iterating its own.
+            sent = dict(event)
             try:
-                await transport.send(event, recipients=recipients, context=context)
+                await transport.send(sent, recipients=recipients, context=context)
             except Exception:
                 # Best-effort: a failing transport must not drop the event for the others, nor
                 # ever propagate into the engine. The line names the event's type and connection,
@@ -2636,19 +2639,16 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             observer = self._delivery_observer
             if observer is not None:
                 try:
-                    observer(transport.name, event)
+                    observer(transport.name, sent)
                 except Exception:
                     log.warning("alert delivery observer failed", exc_info=True)
 
         # BACKLOG #5907: concurrently, with the limit the class docstring states. A cancel of this
-        # task reaches every send.
-        await asyncio.gather(
-            *(
-                deliver(transport)
-                for transport in self._transports
-                if targets is None or transport.name in targets
-            )
-        )
+        # task reaches every send; a send that ends cancelled on its own leaves its siblings running.
+        async with asyncio.TaskGroup() as group:
+            for transport in self._transports:
+                if targets is None or transport.name in targets:
+                    group.create_task(deliver(transport))
 
 
 def configured_alert_transport_names(alerts: AlertsSettings) -> set[str]:

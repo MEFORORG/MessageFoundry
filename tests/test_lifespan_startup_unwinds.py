@@ -416,6 +416,7 @@ async def test_a_blackholed_webhook_does_not_stop_the_email_in_the_unwind(
     await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 10.0)
     assert webhook.entered.is_set()  # the control: the webhook did hang
     assert [e["connection"] for e in email.events] == ["IB_TEST_ADT"]
+    # Both are counted: the webhook had not finished the first when the email took it.
     assert sink.undelivered == 2
 
 

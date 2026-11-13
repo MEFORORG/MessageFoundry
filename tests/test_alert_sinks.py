@@ -69,7 +69,7 @@ async def test_one_failing_transport_does_not_starve_the_others() -> None:
 
 async def test_the_delivery_observer_hears_only_sends_that_returned() -> None:
     """Vault BACKLOG #3849, repair 3: the observer is told of a send that returned, and not of one
-    that raised; an observer that raises is logged and the drain goes on to the next transport."""
+    that raised; an observer that raises is logged and the other transports still get the event."""
     good, bad, last = (
         _RecordingTransport("good"),
         _RecordingTransport("bad", fail=True),
@@ -86,8 +86,9 @@ async def test_the_delivery_observer_hears_only_sends_that_returned() -> None:
     sink.connection_stopped("OB_X", detail="boom")
     sink.connection_stopped("OB_Y", detail="boom")
     await _drain(sink)
-    # The observer raised after `good`, and `last` still got each event.
-    assert heard == ["good", "last", "good", "last"]
+    # The observer raised for `good`, and `last` still got each event. The sends run at once, so
+    # the order across transports is not promised (BACKLOG #5907).
+    assert sorted(heard) == ["good", "good", "last", "last"]
     assert len(last.events) == 2
 
 
@@ -123,34 +124,62 @@ async def test_a_hung_transport_does_not_hold_the_alert_from_a_healthy_one() -> 
     sink = NotifierAlertSink([hung, good])
     sink.set_delivery_observer(observe)
     sink.start()
-    sink.connection_stopped("OB_X", detail="boom")
-    await asyncio.wait_for(delivered.wait(), 5.0)
-    assert hung.entered.is_set() and not hung.cancelled  # the control: still hung
-    assert len(good.events) == 1
-    assert heard == ["email"]  # only the send that returned
-    # A close cut at its bound cancels the drain, and that cancel reaches the hung send.
-    with pytest.raises(TimeoutError):
-        await asyncio.wait_for(sink.aclose(), 0.2)
-    assert hung.cancelled
-    assert sink._task is None
+    try:
+        sink.connection_stopped("OB_X", detail="boom")
+        await asyncio.wait_for(delivered.wait(), 5.0)
+        assert hung.entered.is_set() and not hung.cancelled  # the control: still hung
+        assert len(good.events) == 1
+        assert heard == ["email"]  # only the send that returned
+        # A close cut at its bound cancels the drain, and that cancel reaches the hung send.
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(sink.aclose(), 0.2)
+        assert hung.cancelled
+        assert sink._task is None
+    finally:
+        if sink._task is not None:
+            sink._task.cancel()
+            await asyncio.gather(sink._task, return_exceptions=True)
 
 
 async def test_a_failing_transport_does_not_stop_a_slower_sibling() -> None:
-    """A send that raises while a sibling's send is still running leaves that sibling to finish."""
+    """A send that raises while a sibling's send is still running leaves that sibling to finish.
+    The first send finishes only once the second has raised, so in-turn sends would never end."""
+    raised = asyncio.Event()
 
     class _Slow(_RecordingTransport):
         async def send(self, event: dict[str, Any], **kw: Any) -> None:
-            await asyncio.sleep(0.05)
+            await raised.wait()
             await super().send(event, **kw)
 
-    bad, slow = _RecordingTransport("bad", fail=True), _Slow("slow")
+    class _Bad(_RecordingTransport):
+        async def send(self, event: dict[str, Any], **kw: Any) -> None:
+            raised.set()
+            raise RuntimeError("transport down")
+
+    slow, bad = _Slow("slow"), _Bad("bad")
     heard: list[str] = []
-    sink = NotifierAlertSink([bad, slow])
+    sink = NotifierAlertSink([slow, bad])
     sink.set_delivery_observer(lambda name, _event: heard.append(name))
     sink.connection_stopped("OB_X", detail="boom")
-    await _drain(sink)
+    await asyncio.wait_for(_drain(sink), 5.0)
     assert len(slow.events) == 1
     assert heard == ["slow"]
+
+
+async def test_a_send_cancelled_on_its_own_does_not_end_the_drain() -> None:
+    """A send that ends cancelled without the drain being cancelled leaves its sibling to finish,
+    and the drain goes on to the next alert."""
+
+    class _SelfCancelled(_RecordingTransport):
+        async def send(self, event: dict[str, Any], **kw: Any) -> None:
+            raise asyncio.CancelledError
+
+    odd, good = _SelfCancelled("odd"), _RecordingTransport("good")
+    sink = NotifierAlertSink([odd, good])
+    sink.connection_stopped("OB_X", detail="boom")
+    sink.connection_stopped("OB_Y", detail="boom")
+    await asyncio.wait_for(_drain(sink), 5.0)
+    assert [e["connection"] for e in good.events] == ["OB_X", "OB_Y"]
 
 
 async def test_realert_throttle_suppresses_repeats() -> None:

@@ -1740,7 +1740,9 @@ async def _unwind_failed_start(store: Store, notifier: NotifierAlertSink | None)
     runs the managed teardown, not this. The drain's own wait ends at _INNER_SHARE of its bound,
     before the teardown would cut it. It then logs one ERROR with the count not confirmed delivered.
     A blackholed webhook does not hold the alert being sent from a healthy email relay, though an
-    alert queued behind it is still lost to the cut (NotifierAlertSink's docstring). The cut ends only the asyncio side: a send in a worker thread runs on to its socket timeout."""
+    alert queued behind it is still lost to the cut (NotifierAlertSink's docstring). The count
+    includes an alert one transport delivered while another had not finished. The cut ends only
+    the asyncio side: a send in a worker thread runs on to its socket timeout."""
     budget = _SHUTDOWN_BUDGET_SECONDS - _ENGINE_STOP_RESERVE_SECONDS
     steps: list[_TeardownStep] = []
     if notifier is not None:
