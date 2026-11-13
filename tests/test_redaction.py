@@ -2183,8 +2183,9 @@ def test_a_malformed_end_tag_strands_nothing(
 )
 def test_an_end_tag_scrub_takes_no_label_the_widened_stage_reads(text: str) -> None:
     """Scrubbed in the first stage, the text after a bracketless end tag took a label only the widened
-    stage reads, and the value after the next ``<`` then survived. The first stage leaves it, and the
-    widened stage scrubs it once its own passes have read the text."""
+    stage reads, and the value after the next ``<`` then survived. The remainder now stays, as on
+    main, since the text holds punctuation; the ``[redacted]`` after the tag is the widened passes'
+    own scrub of the value, so this pins the value, not a remainder scrub."""
     out = redact(text)
     assert "Zqxa" not in out, out
     assert "[redacted]" in out.partition("</family")[2], out
@@ -2322,19 +2323,20 @@ def _pre_5925_redact_xml_elements(text: str) -> str:
 
 
 def _end_tag_readings(text: str) -> tuple[str, ...]:
-    """``text`` by every log path :func:`_every_log_path` names, and through :func:`redact` then the
-    credential filter.
-
-    **No reading at a short limit, and that is a stated exception.** A scrub changes the length, so
-    :func:`safe_text` at a limit cuts its output somewhere else, and text the old cut dropped can
-    print. That text is :func:`redact` output either way, since the limit cuts after redaction, so it
-    is only text the redactor keeps; the limit is a length bound, not a redaction."""
+    """``text`` by every log path :func:`_every_log_path` names, through :func:`redact` then the
+    credential filter, the support bundle's sweep, and :func:`safe_exc` and :func:`safe_text` at
+    their default limits and a short one. A scrub that shortened the text moved a limit's cut later,
+    so text main's cut dropped printed; the padded placeholder is what keeps those readings here."""
     once = _through_the_log_filter_chain(text)
     return (
         *_every_log_path(text).values(),
         secretscrub.scrub_credentials(redact(text)),
         # The support bundle re-reads a written log line with its own sweeps.
         support_redact.redact_log_text(once),
+        # The default limits, the store's among them: a scrub must not move the cut later.
+        safe_exc(ValueError(text)),
+        _through_the_log_filter_chain(safe_text(text)),
+        safe_text(text, limit=60),
     )
 
 
@@ -2393,6 +2395,8 @@ def test_an_end_tag_scrub_regression_redacts_what_main_did(
         # A base64 token glued to a tag name by ``/``, split under the support bundle's floor.
         ("<family>Smith</QUJDREVGR0hJS0xN/TU9QUVJTVFVWV1hZWgabcdefghij", "QUJDREVGR0hJS0xN"),
         ("<family>Smith</familyQUJDREVGR0hJSkt/TU5PUFFSU1RVVldYWVo>", "QUJDREVGR0hJSkt"),
+        # A long remainder scrubbed shorter moved safe_exc's default cut, the store's, past a value.
+        ("<family>Smith</family " + "w " * 120 + "> Zqxa1980", "Zqxa1980"),
     ],
 )
 def test_an_end_tag_scrub_takes_no_punctuation_a_reader_needs(
@@ -2542,16 +2546,16 @@ def test_an_end_tag_scrub_redacts_at_least_what_main_did(monkeypatch: pytest.Mon
 
     **The control is a scrub that never keeps a remainder.** It takes labels the credential filters
     and the widened stage read and leaves their values, so the corpus can produce the leak this arm
-    asserts absent. Measured at 3,000 trials: 0 here and 173 on the control at the same count, with
-    62 values the shipped walk scrubs that the old one left. 125,000 trials over this seed and four
+    asserts absent. Measured at 3,000 trials: 0 here and 203 on the control at the same count, with
+    50 values the shipped walk scrubs that the old one left. 100,000 trials over this seed and four
     others, run by hand, also found 0 leaks and 0 texts that stopped being a fixed point. These are
     measurements of this corpus, not a proof for every input.
 
     **The corpus grew with each leak class a review found** that the one before could not produce:
     a scrub that took an HL7 separator, seen only on the two-handler path; a label, quote or brace
     opened BEFORE the element; and a second malformed end tag after a label. Each review's leaks
-    are also pinned as single inputs above. A cut that moves because the scrub changed the length is
-    the stated exception :func:`_end_tag_readings` names."""
+    are also pinned as single inputs above, a cut that moved because the scrub shortened the text
+    among them."""
     leaks, gains, unsettled = _end_tag_differential(3_000, monkeypatch)
     control, _, _ = _end_tag_differential(500, monkeypatch, kept=lambda *_, **__: False)
     assert control, "the never-keep control leaked nothing, so the corpus cannot produce the leak"

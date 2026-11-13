@@ -1706,8 +1706,13 @@ def _scrub_xml_element(
             parts = _XML_END_TAG_PARTS.match(text, tag.end())
             if parts is not None and parts.group(2) and not kept():
                 # Only the remainder's own line changes: what follows it is copied as before
-                # #5925, so every later line reads as it did.
-                out.append(f"{parts.group(1)}{_REDACTED}{parts.group(3)}{text[parts.end() : pos]}")
+                # #5925, so every later line reads as it did. The placeholder is padded to the
+                # remainder's length, so a limit cuts the output no later than it cut main's and
+                # admits nothing main's cut dropped (``safe_exc``'s default 200 is the store's).
+                pad = " " * (len(parts.group(2)) - len(_REDACTED))
+                out.append(
+                    f"{parts.group(1)}{_REDACTED}{pad}{parts.group(3)}{text[parts.end() : pos]}"
+                )
             else:  # as before #5925: the remainder, to the next ``<`` or ``>``, as it stands
                 out.append(text[tag.end() : pos])
             if open_names.get(qname):
