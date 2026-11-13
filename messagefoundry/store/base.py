@@ -1815,7 +1815,13 @@ class QueueStore(StoreLifecycle, Protocol):
         :meth:`purge_message_bodies` (per-connection-or-global cutoff AND not in-flight); ``min_bytes``
         skips a sub-threshold embed; ``content_types`` (channel_id -> declared content_type) labels a
         bare-mfb64 tombstone. Idempotent (an already-tombstoned body is skipped). Returns a
-        :class:`StripResult` (counts + bytes reclaimed; no message content)."""
+        :class:`StripResult` (counts + bytes reclaimed; no message content).
+
+        Every backend runs it through :func:`~messagefoundry.store.document_strip.run_strip_pass`
+        (BACKLOG #5651): keyset batches by id, the crypto in a worker thread with no connection
+        held, and a write-back guarded on the row still being unpruned and still holding the exact
+        stored ``raw`` the batch read. A body purge or key rotation that commits between the read
+        and the write wins, and the row is not counted."""
         ...
 
     async def purge_dead_letters(

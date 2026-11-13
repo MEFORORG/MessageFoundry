@@ -96,7 +96,6 @@ from messagefoundry.config.tls_policy import (
     narrow_to_approved_suites,
 )
 from messagefoundry.connection_events import check_connection_event_kind
-from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.store import server_schema_verify
 from messagefoundry.store.audit_exclusion import AuditExclusion
@@ -156,8 +155,8 @@ from messagefoundry.store.crypto import (
 )
 from messagefoundry.store.document_strip import (
     StripResult,
-    cutoff_for,
-    log_unreadable_skips,
+    StripUpdate,
+    run_strip_pass,
 )
 from messagefoundry.store.gcm_bound import (
     bind_store_salt,
@@ -11757,94 +11756,52 @@ class PostgresStore:
         OBX-5 ED embed with a self-describing tombstone, keeps the message parseable, and sets
         ``documents_pruned``. Eligibility mirrors :meth:`purge_message_bodies` (per-connection-or-global
         cutoff AND not in-flight). Returns a :class:`StripResult` (counts + bytes; no PHI)."""
-        now = time.time() if now is None else now
-        content_types = content_types or {}
+        stamp = time.time() if now is None else now
         inflight = [OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value]
-        # Bound the candidate scan with the LOOSEST finite cutoff (a keep-forever -inf never widens it);
-        # the precise per-connection cutoff is re-checked per row in Python (cutoff_for).
-        finite = [
-            c for c in [older_than, *(connection_cutoffs or {}).values()] if c != float("-inf")
-        ]
-        if not finite:
-            return StripResult()  # everything keep-forever ⇒ nothing to scan
-        scan_cutoff = max(finite)
-        async with self._timed_acquire() as conn:
-            rows = await conn.fetch(
+
+        async def fetch(scan_cutoff: float, after: str, limit: int) -> list[Any]:
+            # BACKLOG #5651: one keyset batch, with the cutoff and the in-flight guard on each;
+            # _fetchall gives the connection back before the crypto runs.
+            return await self._fetchall(
                 "SELECT m.id, m.channel_id, m.raw, m.received_at FROM messages m"
                 " WHERE m.raw <> '' AND m.documents_pruned IS NULL AND m.received_at < $1"
+                " AND m.id > $3"
                 " AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id = m.id"
-                " AND q.status = ANY($2::text[]))",
+                " AND q.status = ANY($2::text[])) ORDER BY m.id LIMIT $4",
                 scan_cutoff,
                 inflight,
+                after,
+                limit,
             )
-            msgs = 0
-            docs = 0
-            reclaimed = 0
-            updates: list[tuple[str, float, str]] = []
-            failures: list[CellTagError] = []
-            unreadable: list[object] = []
-            for row in rows:
-                cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
-                if row["received_at"] >= cutoff:
-                    continue
-                try:
-                    raw = open_message_cell(
-                        self._cipher,
-                        "raw",
-                        row["raw"],
-                        message_id=row["id"],
-                        channel_id=row["channel_id"],
+
+        async def write(updates: Sequence[StripUpdate]) -> list[StripUpdate]:
+            # Each row is written only while it is unpruned and holds the exact stored cell the
+            # batch read, so a purge or key rotation that committed in between wins.
+            landed: list[StripUpdate] = []
+            async with self._timed_acquire() as conn, conn.transaction():
+                for u in updates:
+                    tag = await conn.execute(
+                        "UPDATE messages SET raw=$1, documents_pruned=$2"
+                        " WHERE id=$3 AND documents_pruned IS NULL AND raw=$4",
+                        u.new_cell,
+                        stamp,
+                        u.message_id,
+                        u.stored,
                     )
-                except CipherError as exc:
-                    # Contain ONE row, as the claim sites do: a refused (unmarked) or undecryptable body
-                    # must not abort the whole retention pass. The row is left exactly as found; the
-                    # message names only the cell and the message id, never the body (BACKLOG #1169).
-                    if isinstance(exc, CellTagError):
-                        # BACKLOG #2593: the read already logged and alerted it, once per hour; it is
-                        # audited below. No second WARNING on every pass.
-                        failures.append(exc)
-                        continue
-                    log.warning(
-                        "document strip skipped message %s: its body could not be read: %s",
-                        row["id"],
-                        exc,
-                    )
-                    continue
-                assert raw is not None  # raw is NOT NULL
-                new_raw, n_docs, n_bytes = _strip_documents(
-                    raw,
-                    pruned_at=now,
-                    min_bytes=min_bytes,
-                    content_type=content_types.get(row["channel_id"]),
-                    on_unreadable=functools.partial(unreadable.append, row["id"]),
-                )
-                if n_docs == 0:
-                    continue
-                updates.append(
-                    (
-                        self._cipher.encrypt(
-                            new_raw,
-                            aad=message_cell_aad(
-                                "raw", message_id=row["id"], channel_id=row["channel_id"]
-                            ),
-                        ),
-                        now,
-                        row["id"],
-                    )
-                )
-                msgs += 1
-                docs += n_docs
-                reclaimed += n_bytes
-            # Before the write, so a failed write does not lose the record of the skips.
-            log_unreadable_skips(unreadable)
-            if updates:
-                async with conn.transaction():
-                    await conn.executemany(
-                        "UPDATE messages SET raw=$1, documents_pruned=$2 WHERE id=$3", updates
-                    )
-        await report_cell_tag_failures(self, failures)
-        return StripResult(
-            messages_stripped=msgs, documents_stripped=docs, bytes_reclaimed=reclaimed
+                    if _rowcount(tag) == 1:
+                        landed.append(u)
+            return landed
+
+        return await run_strip_pass(
+            self._cipher,
+            fetch=fetch,
+            write=write,
+            report=functools.partial(report_cell_tag_failures, self),
+            now=stamp,
+            older_than=older_than,
+            connection_cutoffs=connection_cutoffs,
+            min_bytes=min_bytes,
+            content_types=content_types or {},
         )
 
     async def purge_connection_events(self, *, older_than: float, now: float | None = None) -> int:

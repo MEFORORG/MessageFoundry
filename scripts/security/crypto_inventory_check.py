@@ -581,6 +581,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     # preset's criteria (bound to its owner) are sealed under, and opens those cells through the store
     # cipher seam. No key of its own.
     "messagefoundry/store/cell_tag.py": frozenset({"messagefoundry.store.crypto"}),
+    # BACKLOG #5651: the embedded-document strip's shared batch transform opens each candidate's raw
+    # cell through cell_tag and re-seals the stripped body through the store cipher, under the row's
+    # tag. It imports store.crypto only for the Cipher type and CipherError. No key of its own.
+    "messagefoundry/store/document_strip.py": frozenset({"messagefoundry.store.crypto"}),
     # ADR 0064: hashlib = the sha256 CONTENT hash of the shipped schema-DDL batch, stored in the
     # schema_meta marker so a current DB's open can skip the batch + the exclusive schema lock.
     # Content addressing / cache invalidation — not a security control, no secret material involved.
@@ -1661,6 +1665,12 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # BACKLOG #2593: opens a message cell or a preset's criteria (AES-GCM decrypt through the store
     # cipher) under the tag its row's id and channel or owner build.
     "messagefoundry/store/cell_tag.py": frozenset({"cipher:.decrypt()"}),
+    # BACKLOG #5651: the strip's batch transform opens a message's raw cell (through cell_tag) and
+    # encrypts the stripped body under the same row tag, in a worker thread. The AEAD runs inside
+    # the store cipher.
+    "messagefoundry/store/document_strip.py": frozenset(
+        {"cipher:.encrypt()", "cipher:via messagefoundry.store.cell_tag"}
+    ),
     # BACKLOG #1174: a per-process 256-bit key (os.urandom) and 4-byte nonce prefix; AESGCM
     # encrypt/decrypt of each cache value with counter nonces; the key is built (and fingerprinted,
     # sha256) by store.crypto._install_key.
