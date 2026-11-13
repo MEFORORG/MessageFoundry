@@ -1650,9 +1650,9 @@ class StageDispatcher:
     def _hold_abandoned(self, lane: str) -> bool:
         """Whether a ``pause_lane`` waits on this lane, so its hold ends and the terminal transition
         reaches PAUSED. On every stage: at least a stop or pause of an outbound (an operator's, a
-        schedule window's or a DR park's) pauses an OUTBOUND lane, and the #122 fail-closed halt
-        (application log unwritable) pauses the INGRESS, ROUTED and RESPONSE lanes of each halted
-        inbound (``RegistryRunner._pause_internal_lanes``)."""
+        schedule window's or a DR park's) pauses an OUTBOUND lane. The #122 fail-closed halt
+        pauses no INGRESS, ROUTED or RESPONSE lane: it is a claim gate in the runner's adapters
+        (BACKLOG #5704), so a hold there runs on until its re-pend lands."""
         st = self._states.get(lane)
         return st is not None and st.pause_pending
 

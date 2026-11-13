@@ -1384,8 +1384,8 @@ async def test_a_pause_ends_a_held_delivery_lane_so_purge_is_not_refused(
         (Stage.ROUTED, "transform_handoff", "transform"),
     ],
 )
-@pytest.mark.parametrize("variant", ["shipped", "control-deaf-to-the-halt"])
-async def test_the_log_halt_ends_a_held_internal_lane(
+@pytest.mark.parametrize("variant", ["halted", "control-no-halt"])
+async def test_the_log_halt_leaves_a_held_internal_lane_to_land_and_then_gates_it(
     store: MessageStore,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1395,30 +1395,19 @@ async def test_the_log_halt_ends_a_held_internal_lane(
     kind: str,
     variant: str,
 ) -> None:
-    """The #122 fail-closed halt (application log unwritable) pauses a router or transform lane in
-    the pooled claim mode and returns the per-lane worker at its loop-top gate. A lane HELD on a
-    failed re-pend must read that halt too, or it keeps retrying under it until the store heals.
-    The handoff faults and the re-pend keeps failing on a 30 s backoff; the halt must end the hold
-    within 2 s: the pooled lane reaches PAUSED, the per-lane worker returns cleanly. The row stays
-    in flight, as one failed write left it before step 2. The control passes no abandon predicate
-    to the backoff, which was the shipped code for these lanes, and the hold outlives the 2 s."""
+    """The #122 fail-closed halt (application log unwritable) is a CLAIM GATE (BACKLOG #5704): it
+    does not end a lane HELD on a failed re-pend. The hold writes only to the store and processes
+    nothing, so it runs on until the re-pend lands, and then no row is stranded in flight, which
+    ending it left behind under a worker or lane that later claims past it. Once landed, the gate
+    keeps the row from being processed again. The control, with no halt, re-processes it."""
     _fast_backoffs(monkeypatch)
     monkeypatch.setattr(stage_dispatcher, "_LANE_ERROR_BACKOFF_SECONDS", 0.05)
     monkeypatch.setattr(wiring_runner, "_WORKER_ERROR_BACKOFF_SECONDS", 0.05)
-    # Every backoff 30 s, so only the halt can end the hold inside the test.
-    monkeypatch.setattr(stage_dispatcher, "_capped_backoff", lambda base, exp, cap: 30.0)
-    monkeypatch.setattr(wiring_runner, "_capped_backoff", lambda base, exp, cap: 30.0)
-    if variant == "control-deaf-to-the-halt":
-        real_wait = stage_dispatcher.wait_to_retry
-
-        async def deaf(delay: float, *, abandon: Any, **k: Any) -> Any:
-            return await real_wait(delay, abandon=None, **k)
-
-        monkeypatch.setattr(stage_dispatcher, "wait_to_retry", deaf)
-        monkeypatch.setattr(wiring_runner, "wait_to_retry", deaf)
+    monkeypatch.setattr(stage_dispatcher, "_capped_backoff", lambda base, exp, cap: 0.1)
+    monkeypatch.setattr(wiring_runner, "_capped_backoff", lambda base, exp, cap: 0.1)
     calls: dict[str, int] = {}
     _fail_while(monkeypatch, store, handoff, calls)
-    _fail_while(monkeypatch, store, "reschedule_claimed", calls)
+    repend_down = _fail_while(monkeypatch, store, "reschedule_claimed", calls)
     runner = RegistryRunner(
         _registry(tmp_path),
         store,
@@ -1435,29 +1424,33 @@ async def test_the_log_halt_ends_a_held_internal_lane(
             return calls.get("reschedule_claimed", 0) >= 1
 
         await _until(holding)
-        await asyncio.sleep(0.2)  # inside the 30 s backoff
-        runner._halt_inbound_processing(["IB"])
-        if claim_mode == "pooled":
-            states = runner._dispatchers[stage]._states
+        if variant == "halted":
+            await runner._stop_all_for_log_failure(sink="file", reason="disk full")
+        await asyncio.sleep(0.3)
+        assert await _inflight_at(store, stage) == 1  # still held: the halt did not end the hold
+        handoffs = calls[handoff]
+        repend_down.clear()  # the store heals: the held re-pend lands
 
-            async def ended() -> bool:
-                return states["IB"].phase is stage_dispatcher._LanePhase.PAUSED
+        async def landed() -> bool:
+            return await _inflight_at(store, stage) == 0
 
-        else:
-            worker = runner._inbound_worker_dict(kind)["IB"]
+        if variant == "control-no-halt":
 
-            async def ended() -> bool:
-                return worker.done()
+            async def reprocessed() -> bool:
+                return calls[handoff] > handoffs
 
-        if variant == "control-deaf-to-the-halt":
-            with pytest.raises(AssertionError, match="timed out"):
-                await _until(ended, timeout=2.0)
+            await _until(reprocessed)
             return
-        await _until(ended, timeout=2.0)
-        assert calls["reschedule_claimed"] == 1  # the hold sent no retry after the halt
-        assert await _inflight_at(store, stage) == 1
+        await _until(landed)
+        # Many backoffs: a gated lane claims and hands back, and never processes.
+        await asyncio.sleep(0.5)
+        assert calls[handoff] == handoffs, "a gated row was processed"
         if claim_mode == "per_lane":
-            assert worker.exception() is None  # returned at its halt gate, not crashed
+            worker = runner._inbound_worker_dict(kind)["IB"]
+            assert not worker.done(), "the worker left its lane instead of waiting at the gate"
+        else:
+            phase = runner._dispatchers[stage]._states["IB"].phase
+            assert phase is not stage_dispatcher._LanePhase.PAUSED, "the halt paused the lane"
     finally:
         await runner.stop()
 
