@@ -3207,8 +3207,8 @@ unsupported anyway.
 
 An app embedded around an engine (`create_app(engine=...)`) can start before its engine holds its
 graph, when the engine shard's name is not known yet. Its start then puts the reconcile off, and
-the first queue read that finds the owner known runs it, over rows claimed before the app started
-(BACKLOG #3252). A release made before the engine holds its graph claims under `engine` and keeps
+the first queue read that finds the owner known runs it, over rows claimed before the process's
+first app over that engine started (BACKLOG #3252). A release made before the engine holds its graph claims under `engine` and keeps
 that owner for the app's life, so start the engine before the app serves approvals.
 
 **A request must also be old enough before it can be approved (ASVS 2.4.2).** The expiry is a
