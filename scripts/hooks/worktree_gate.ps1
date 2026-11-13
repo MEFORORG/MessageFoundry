@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.12.4"
+$GateVersion = "2026.11.12.5"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -630,6 +630,18 @@ function ConvertFrom-RawDashCValue([string]$Value) {
     Remove-OuterQuotePair $Value
 }
 
+# A READER'S CAPTURE, with its one outer pair stripped ONLY IF THE PATTERN DID NOT ALREADY CONSUME A
+# QUOTE (review of BACKLOG #5642). Every reader spells `"?` before its capture, so for `-C "'..'"` the
+# pattern has already taken the shell's double quotes and the capture is `'..'`, text the shell hands
+# git LITERALLY. Stripping that second layer read it as `..` and allowed commands the gate had denied.
+# So the character before the group decides: a `"` there means the shell's quote is gone already.
+function Get-UnquotedCapture([System.Text.RegularExpressions.Group]$Group, [string]$Text, [switch]$RawDashC) {
+    $value = $Group.Value
+    if ($Group.Index -gt 0 -and $Text[$Group.Index - 1] -eq [char]'"') { return $value }
+    if ($RawDashC) { return (ConvertFrom-RawDashCValue $value) }
+    Remove-OuterQuotePair $value
+}
+
 function Get-ChdirTargetRaw([string]$Text) {
     if (-not $Text) { return "" }
     if ($Text -match '(?:^|\s)(?:popd|cd\s+-(?:\s|$))') { return "" }
@@ -645,7 +657,10 @@ function Get-ChdirTargetRaw([string]$Text) {
         "(?:^|\s)(?:$chdirComposeVerbs)\s+`"?([^`"&|;]+?)`"?\s*(?:&&|;|\||`$)",
         [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
     if ($cds.Count -ne 1) { return "" }
-    Remove-OuterQuotePair $cds[0].Groups[1].Value.Trim()
+    $chdirTo = $cds[0].Groups[1]
+    $chdirVal = $chdirTo.Value.Trim()
+    if ($chdirTo.Index -gt 0 -and $Text[$chdirTo.Index - 1] -eq [char]'"') { return $chdirVal }
+    Remove-OuterQuotePair $chdirVal
 }
 
 # git's global `-C <path>`, as the resolver and rule 3c's window fold both spell it. One spelling of the
@@ -808,7 +823,10 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     <#
     UPDATED BY BACKLOG #5643 AND #5655: rules 3 and 3d now ALSO call this with -OwnWindow, on a second
     reading added after their unchanged three-argument call; see that switch below. The paragraph that
-    follows describes the three-argument call, and is otherwise as written.
+    follows describes the three-argument call as it was designed. It is NO LONGER byte-identical to
+    before: under BACKLOG #5642 its `-C`, `--git-dir`, `GIT_DIR`, `--work-tree`, `GIT_WORK_TREE` and
+    chdir captures pass through Get-UnquotedCapture, so a single-quoted value reads as the shell
+    reads it, and those verdicts moved in both directions (named at Remove-OuterQuotePair).
 
     THREE OPT-IN SWITCHES, ALL DEFAULT OFF. Rules 3 and 3d call this with three positional arguments
     and are therefore byte-identical to before; only rule 3c opts in. That is deliberate blast-radius
@@ -912,17 +930,25 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     # first match it also shadowed a real `-C` later in the same command.
     $dashCPattern = Get-GitDashCPattern
     $dashCs = @()
+    # A CHDIR THE PREFIX HOLDS BUT CANNOT FOLLOW IS AN UNKNOWN DIRECTORY, so the own-window reading
+    # answers nothing rather than the cwd (review of BACKLOG #5655). On the scan prefix a quoted target
+    # with a space in it is a blanked pair, so `cd "C:/a b" && git reset --hard` fell back to the cwd and
+    # denied a command that runs in `C:/a b`. Rule 3c's $pfxFollowable asks the same question.
+    if ($OwnWindow -and -not $cd -and
+        $Prefix -match '(?:^|[\s;&|(){}])(?:cd|chdir|pushd|popd|sl|set-location|push-location|pop-location)(?:\s|$)') {
+        return
+    }
     if ($OwnWindow) {
         $winHits = @([regex]::Matches($DashCText, $dashCPattern))
         if ($winHits.Count -ne [regex]::Matches($DashCText, (Get-GitDashCPresencePattern)).Count) { return }
-        $dashCs = @($winHits | ForEach-Object { Remove-OuterQuotePair $_.Groups[1].Value })
+        $dashCs = @($winHits | ForEach-Object { Get-UnquotedCapture $_.Groups[1] $DashCText })
         foreach ($wc in $dashCs) { if ($wc -match '[''"]') { return } }
     } elseif ($AllTargets) {
         # [regex]::Matches is case-SENSITIVE by default, which is the same reading `-cmatch` gives, so
         # this changes WHICH MATCHES ARE KEPT and nothing about which text matches.
-        $dashCs = @([regex]::Matches($Line, $dashCPattern) | ForEach-Object { ConvertFrom-RawDashCValue $_.Groups[1].Value })
+        $dashCs = @([regex]::Matches($Line, $dashCPattern) | ForEach-Object { Get-UnquotedCapture $_.Groups[1] $Line -RawDashC })
     } elseif ($Line -cmatch $dashCPattern) {
-        $dashCs = @(ConvertFrom-RawDashCValue $Matches[1])
+        $dashCs = @(Get-UnquotedCapture ([regex]::Match($Line, $dashCPattern)).Groups[1] $Line -RawDashC)
     }
     # COLLECTED SEPARATELY RATHER THAN PUSHED STRAIGHT INTO $out (BACKLOG #1379 class one). These
     # used to land in $out here, ahead of everything, and the caller takes the first candidate git
@@ -1010,7 +1036,7 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     # ===================================================================================================
     $promoted = @()
     foreach ($pat in @('(?:^|\s)--git-dir[=\s]+"?([^"\s]+)"?', '(?:^|\s)GIT_DIR="?([^"\s]+)"?')) {
-        $hits = @([regex]::Matches($Line, $pat) | ForEach-Object { Remove-OuterQuotePair $_.Groups[1].Value })
+        $hits = @([regex]::Matches($Line, $pat) | ForEach-Object { Get-UnquotedCapture $_.Groups[1] $Line })
         [array]::Reverse($hits)
         foreach ($hit in $hits) {
             # $postC, NOT $cd: a relative `--git-dir` resolves against the post-`-C` directory. With no
@@ -1072,8 +1098,11 @@ function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$Cwd
     }
 
     $explicit = @()
-    if ($Line -cmatch '(?:^|\s)--work-tree[=\s]+"?([^"\s]+)"?') { $explicit += (Remove-OuterQuotePair $Matches[1]); $explicit += $CwdRaw }
-    if ($Line -cmatch '(?:^|\s)GIT_WORK_TREE="?([^"\s]+)"?')    { $explicit += (Remove-OuterQuotePair $Matches[1]); $explicit += $CwdRaw }
+    foreach ($wtPat in @('(?:^|\s)--work-tree[=\s]+"?([^"\s]+)"?', '(?:^|\s)GIT_WORK_TREE="?([^"\s]+)"?')) {
+        # [regex]::Match is case-sensitive, the reading the -cmatch it replaces gave.
+        $wtHit = [regex]::Match($Line, $wtPat)
+        if ($wtHit.Success) { $explicit += (Get-UnquotedCapture $wtHit.Groups[1] $Line); $explicit += $CwdRaw }
+    }
 
     # THE SWITCH IS OPT-IN AND DEFAULT-OFF, so rules 3 and 3d keep the exact list they had: the `-C`
     # candidates, then the base, then the explicit WORKING-TREE tokens. Only rule 3c opts in. Same
@@ -4553,7 +4582,8 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
     #
     # ADDED AFTER THE LOOP ABOVE, which is unchanged, so no deny it made is lost. Each invocation's
     # window comes from Get-OwnInvocationWindow, the helper rule 3c uses, read off SCAN. A window with no
-    # `-C` of its own marks the target INFERRED. The candidates come from the resolver's opt-in
+    # `-C` of its own marks the target INFERRED, and offers the in-text fallback only the scan text
+    # before it. The candidates come from the resolver's opt-in
     # -OwnWindow reading, which folds the invocation's own `-C` tokens over the single chdir before it
     # and otherwise falls back to the cwd. Every invocation is also queued for rule 3b below, which
     # judged only the first verb-bearing segment.
@@ -4564,6 +4594,7 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
     # applies, such as a quoted `-C` value containing a space, which yields no candidate at all.
     # =================================================================================================
     $invocations = @()
+    $inferredBefore = @()
     foreach ($seg in (Get-ScannableSegments $cmd (Get-HostConvention $tool))) {
         if ($root) { break }
         if ($seg.Scan -cnotmatch $gitInvocation) { continue }
@@ -4573,7 +4604,11 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
             $vIdx = $vGroup.Index
             $inv = Get-OwnInvocationWindow $seg.Scan $vIdx -SeparatorInToken
             if (-not $inv.Own) { continue }
-            if ($inv.CmdWin -cnotmatch (Get-GitDashCPresencePattern)) { $anyInferredTarget = $true }
+            # An inferred invocation offers the in-text fallback only the SCAN text BEFORE it, so a `cd`
+            # after it, or one inside a quoted message, cannot refuse it (review of BACKLOG #5655).
+            if ($inv.CmdWin -cnotmatch (Get-GitDashCPresencePattern)) {
+                $inferredBefore += $seg.Scan.Substring(0, $inv.Own.Index)
+            }
             $invCands = @(Get-GitTargetCandidatesRaw $seg.Raw $seg.Scan.Substring(0, $inv.Own.Index) $cwdRaw `
                               -OwnWindow -DashCText $inv.CmdWin)
             # Rule 3b reads the text from the verb on, so a verb spelled inside an earlier path or
@@ -4596,8 +4631,11 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
 
     # `cd <primary>; git checkout ...` and `pushd` defeat both of the above, so also treat any command
     # that NAMES a governed primary as targeting it -- but only where the target was inferred.
-    if (-not $root -and $anyInferredTarget) {
-        $normalized = ($cmd -replace '\\', '/').ToLowerInvariant()
+    if (-not $root -and ($anyInferredTarget -or $inferredBefore.Count -gt 0)) {
+        # The whole command where the pre-change flag fired, as before; otherwise only the scan text
+        # before each inferred invocation the per-invocation pass found (BACKLOG #5655).
+        $fallbackTexts = @(if ($anyInferredTarget) { $cmd } else { $inferredBefore })
+        $normalizedAll = @($fallbackTexts | ForEach-Object { ($_ -replace '\\', '/').ToLowerInvariant() })
         foreach ($r in $roots) {
             # Match the primary path only at a DIRECTORY BOUNDARY, never as a raw prefix substring. A
             # sibling worktree is named `<primary>-<task>`, so its path CONTAINS the primary's as a prefix
@@ -4697,7 +4735,7 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
             # command has stepped into the primary this hook stops reasoning about where it stepped next.
             $dirChange = '(?:^|[;&|(]|\s)(?:cd|chdir|pushd|set-location|sl)' +
                 '(?:\s+(?:/d|-path|-literalpath))?\s+["'']?' + $boundary
-            if ($normalized -match $dirChange) { $root = $r; break }
+            if (@($normalizedAll | Where-Object { $_ -match $dirChange }).Count -gt 0) { $root = $r; break }
         }
     }
     if (-not $root -and $headRoot) {
@@ -4741,7 +4779,8 @@ worktree gate blocked it." The primary's HEAD belongs to the user, not to a sess
         if ($targetRooted) { $targetRaw = $targetRooted }
         Test-WorktreeHijack $verb $verbLine $targetRaw $cwdRaw
         # THEN EVERY INVOCATION, each with its own verb, text and target (BACKLOG #5655). The call above
-        # is the pre-change one, unchanged and first, so its verdict cannot move; it judged only the
+        # is the pre-change one, first; its target is now rooted and its `-C` reading changed under #5642,
+        # so its INPUT moved where those did, and nothing else about it. It judged only the
         # first verb-bearing segment, so `git -C <ungoverned> clean -fd ; git switch <branch>` in
         # another session's worktree was allowed. Each call denies and exits, or returns.
         # An exact repeat is skipped: each call can spawn several git processes.

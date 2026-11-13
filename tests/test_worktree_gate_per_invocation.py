@@ -140,7 +140,8 @@ def test_a_single_quoted_ungoverned_git_dir_from_the_primary_matches_its_double_
     o = rig.outside.as_posix()
     double = f'git --git-dir="{o}/.git" config core.hooksPath /nope'
     single = f"git --git-dir='{o}/.git' config core.hooksPath /nope"
-    assert _allowed(rig, double, rig.primary) == _allowed(rig, single, rig.primary)
+    assert _allowed(rig, double, rig.primary)
+    assert _allowed(rig, single, rig.primary)
 
 
 # ------------------------------------------------------------------ BACKLOG #5643, rule 3d per invocation
@@ -286,3 +287,42 @@ def test_a_later_invocations_relative_dash_C_is_rooted_at_the_session_cwd(
 ) -> None:
     cmd = f"git -C {rig.outside.as_posix()} status ; git -C ../Primary-wt switch {rig.other}"
     assert "LINKED WORKTREE" in _reason(rig, cmd, rig.outside)
+
+
+# ------------------------------------------------------------------ review round two, same rows
+
+
+def _quoted_dotdot_dir(rig: SimpleNamespace) -> None:
+    """A directory literally named `'..'` inside the primary, which the shell can name with `"'..'"`."""
+    (rig.primary / "'..'").mkdir()
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "git -C \"'..'\" config core.hooksPath /nope",
+        "cd \"'..'\" && git config core.hooksPath /nope",
+        "git -C \"'..'\" reset --hard",
+    ],
+)
+def test_a_literal_quote_inside_double_quotes_is_not_stripped(
+    rig: SimpleNamespace, template: str
+) -> None:
+    """The shell keeps the inner `'..'` as text; stripping it as a quote allowed what main denied."""
+    _quoted_dotdot_dir(rig)
+    assert_denied(run_gate(shell(template, rig.primary), rig.repos))
+
+
+def test_a_spacey_quoted_chdir_is_not_guessed_as_the_cwd(rig: SimpleNamespace) -> None:
+    """A blanked chdir target is unknown, so the added reading answers nothing rather than the cwd."""
+    spacey = rig.tmp / "a b"
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(spacey)], check=True, capture_output=True
+    )
+    assert _allowed(rig, f'cd "{spacey.as_posix()}" && git reset --hard', rig.primary)
+    assert _allowed(rig, f'cd "{spacey.as_posix()}" && git worktree remove Primary-wt2', rig.tmp)
+
+
+def test_a_cd_after_an_inferred_invocation_does_not_refuse_it(rig: SimpleNamespace) -> None:
+    cmd = f"git stash && cd {rig.primary.as_posix()} && git -C {rig.outside.as_posix()} rebase main"
+    assert _allowed(rig, cmd, rig.outside)
