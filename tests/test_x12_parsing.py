@@ -510,16 +510,42 @@ def test_frame_reader_cap_does_not_depend_on_read_size(first: bytes, cap: int) -
         assert not reader.in_frame
 
 
-@pytest.mark.parametrize("chunk", [4096, 1])
+def _feed_all(reader: X12FrameReader, data: bytes, chunk: int) -> list[bytes]:
+    frames: list[bytes] = []
+    for i in range(0, len(data), chunk):
+        frames.extend(reader.feed(data[i : i + chunk]))
+    return frames
+
+
+@pytest.mark.parametrize("chunk", [4096, 7, 1])
 def test_frame_reader_cap_holds_over_whitespace_after_a_segment(chunk: int) -> None:
     # Whitespace after a terminator may open the next ISA, which would cut the frame before it, so
     # the reader waits to see what follows. It is still charged, or a peer could grow the buffer
-    # with it without bound.
-    data = _without_iea(interchange()).encode() + b" " * 400
-    reader = X12FrameReader(max_interchange_bytes=300)
+    # with it without bound: refused one byte past the cap, and not at the cap.
+    open_frame = _without_iea(interchange()).encode()
+    data = open_frame + b" " * 400
     with pytest.raises(X12FrameError):
-        for i in range(0, len(data), chunk):
-            list(reader.feed(data[i : i + chunk]))
+        _feed_all(X12FrameReader(max_interchange_bytes=len(data) - 1), data, chunk)
+    reader = X12FrameReader(max_interchange_bytes=len(data))
+    assert _feed_all(reader, data, chunk) == [] and reader.in_frame
+
+
+@pytest.mark.parametrize("chunk", [4096, 150, 7, 1])
+def test_frame_reader_cap_over_whitespace_before_a_cut_does_not_depend_on_read_size(
+    chunk: int,
+) -> None:
+    # The whitespace before an ISA that cuts a frame with no IEA is charged whether the reader saw
+    # it while waiting or all at once, though the frame it takes leaves that whitespace out.
+    first = _without_iea(interchange()).encode()
+    ws = b" " * 120
+    good = interchange(control="000000002").encode()
+    data = first + ws + good
+    charged = len(first) + len(ws)
+    with pytest.raises(X12FrameError):
+        _feed_all(X12FrameReader(max_interchange_bytes=charged - 1), data, chunk)
+    reader = X12FrameReader(max_interchange_bytes=charged)
+    assert _feed_all(reader, data, chunk) == [first, good]
+    assert not reader.in_frame
 
 
 @pytest.mark.parametrize("between", ["", "\r\n"])
@@ -600,7 +626,7 @@ def test_split_walks_a_chain_of_interchanges_with_no_iea_linearly() -> None:
 @pytest.mark.parametrize(
     "between",
     [
-        pytest.param("﻿", id="bom"),
+        pytest.param("\ufeff", id="bom"),
         pytest.param("junk", id="junk"),
         pytest.param("\x1c\r\x0b", id="mllp-envelope"),
     ],
@@ -643,6 +669,8 @@ def test_split_takes_a_lowercase_isa_as_data_as_the_reader_does() -> None:
     lower = "isa" + raw[3:]
     cut = lower.index(body_isa)
     assert split(lower) == [lower[:cut], lower[cut:]]
+    # The reader discards the lowercase run as noise and starts its frame at the same ISA.
+    assert _frames_of(lower.encode(), 4096) == [lower[cut:].encode()]
     assert split(raw) == [raw]  # the control: with a literal ISA it is one interchange
 
 
@@ -667,13 +695,14 @@ def test_split_checks_a_chain_of_interchanges_with_no_iea_once_each() -> None:
 
 @pytest.mark.parametrize("segment", ["ISA~", "ISAX*1~", "ISA*00*~"])
 @pytest.mark.parametrize("chunk", [4096, 1])
-def test_a_short_segment_opening_with_isa_does_not_hold_a_complete_interchange(
+def test_a_short_segment_opening_with_isa_cuts_an_interchange_in_two(
     segment: str, chunk: int
 ) -> None:
-    # A body segment that only starts like an ISA must not make the reader wait for a whole header
-    # once the interchange's IEA has arrived: a sender waiting for an acknowledgment would stall.
-    # Any literal "ISA" that opens a segment ends a passing walk, whether or not it passes, so the
-    # interchange is cut there at once and the rest is its own malformed element, both whole.
+    # Any literal "ISA" that opens a segment ends a passing walk, whether or not it passes, so a
+    # body segment that only starts like an ISA cuts the interchange there. split returns both
+    # parts. The reader yields the first at once, but the rest is a suspect shorter than a header:
+    # it is held until a next ISA bounds it, and lost if the connection ends first. That is a known
+    # gap (ADR 0012, 2026-11-13 amendment); this test pins it so a change to it is deliberate.
     raw = interchange().replace("GE*", segment + "GE*", 1)
     cut = raw.index(segment)
     assert split(raw) == [raw[:cut], raw[cut:]]
@@ -683,8 +712,7 @@ def test_a_short_segment_opening_with_isa_does_not_hold_a_complete_interchange(
     for i in range(0, len(data), chunk):
         frames.extend(reader.feed(data[i : i + chunk]))
     assert frames == [raw[:cut].encode()]
-    # The reader frames the short rest once the next interchange bounds it, as any short suspect;
-    # until then it is an open frame, which the listener's frame deadline covers.
+    assert reader.in_frame  # the held rest
     nxt = interchange(control="000000002").encode()
     assert list(reader.feed(nxt)) == [raw[cut:].encode(), nxt]
     assert not reader.in_frame

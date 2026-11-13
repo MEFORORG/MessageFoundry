@@ -328,7 +328,10 @@ an `ISA` that passes ends at its `IEA` or at a later segment that opens with a l
 whether or not that `ISA` passes, meaning only the walk's own terminator and whitespace come before
 it, so an interchange with no `IEA` does not swallow the next one. The frame ends at that
 terminator, the whitespace between is discarded, and the `ISA` opens the next frame, malformed if it
-fails. Each segment start is checked as the walk reaches it, never by a search ahead, so the work
+fails. That holds for a body segment that only starts with "ISA", such as `ISA~`, too: it cuts a
+complete interchange in two. `split` returns both parts; the reader yields the first at once but
+holds the rest, shorter than a header, until a next passing `ISA` bounds it, so it is lost if the
+connection ends first, a known gap. Each segment start is checked as the walk reaches it, never by a search ahead, so the work
 stays linear however interchanges are separated. A later `ISA` behind anything else, at least a BOM,
 junk or MLLP envelope bytes, or one in the middle of a segment, does not end the walk: an
 interchange with no `IEA` followed that way is still framed together with what follows it, a known

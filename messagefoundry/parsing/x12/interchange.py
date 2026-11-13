@@ -202,7 +202,12 @@ def _walk_str(
         idx = raw.find(terminator, seg_start, end)
         if idx == -1:
             return None, False
-        if raw[seg_start:idx].lstrip(_SEGMENT_WHITESPACE)[:3] == "IEA":
+        if (
+            # With cut_at_isa the segment's opening whitespace has been read already.
+            raw.startswith("IEA", ws_end, idx)
+            if cut_at_isa
+            else raw[seg_start:idx].lstrip(_SEGMENT_WHITESPACE)[:3] == "IEA"
+        ):
             return idx + len(terminator), True
         seg_start = idx + len(terminator)
 
@@ -353,6 +358,9 @@ class X12FrameReader:
                     self._check_cap(ws)
                     return None
                 if buf.startswith(b"ISA", ws):
+                    # The whitespace before the cut is charged as the wait above charges it, so
+                    # whether the cap refuses this frame does not depend on how reads split it.
+                    self._check_cap(ws)
                     return self._take(self._seg_start)
                 self._seg_decided = True
             idx = buf.find(terminator, self._scan, bound)
@@ -363,7 +371,12 @@ class X12FrameReader:
                 self._scan = max(self._seg_start, bound - len(terminator) + 1)
                 self._check_cap(bound)
                 return None  # IEA not complete yet
-            if _IEA_SEGMENT.match(buf, self._seg_start, idx):
+            if (
+                # A passing walk has read this segment's opening whitespace already.
+                buf.startswith(b"IEA", self._seg_ws, idx)
+                if not self._suspect
+                else _IEA_SEGMENT.match(buf, self._seg_start, idx)
+            ):
                 return self._take(idx + len(terminator))
             self._seg_start = self._scan = idx + len(terminator)
             # A whitespace terminator can end a segment inside the run already read: the run from
@@ -442,7 +455,10 @@ class X12FrameReader:
         # pins the walk's cap twice, with and without "IEA" in element data; keep both if this moves.
         # ``bound`` is where the open frame must end, at a later ISA: the bytes past it belong to that
         # ISA, which is never more than one header still arriving, so they are not charged to this
-        # frame. Charging them made the refusal depend on how the stream was split into reads. With
+        # frame. Charging them made the refusal depend on how the stream was split into reads. A
+        # passing walk passes the end of the whitespace that may come before a next ISA instead: it
+        # charges that whitespace both while it waits and when it cuts there, so the refusal still
+        # does not depend on the reads, though the frame it then takes leaves the whitespace out. With
         # no later ISA yet, a trailing "I" or "IS" may be the start of one, so it is not charged
         # either; a frame that really ends in them is still measured whole by _take.
         buf = self._buf
