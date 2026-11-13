@@ -414,6 +414,37 @@ def test_convert_case_keeps_a_hex_escaped_cr_escaped_and_never_raw() -> None:
     assert m.count_segments("EVN") == 0
 
 
+def test_replace_literal_keeps_a_zero_width_escape_at_a_match() -> None:
+    m = _with_pid("a\\.fi\\bc")
+    replace_literal(m, "PID-5.1", "bc", "X")
+    assert m["PID-5"] == "a\\.fi\\X"
+
+
+def test_substring_field_keeps_a_zero_width_escape_outside_the_slice() -> None:
+    m = _with_pid("\\C2842\\abc\\.fi\\")
+    substring_field(m, "PID-5.1", 1, 2)
+    assert m["PID-5"] == "\\C2842\\b\\.fi\\"
+
+
+def test_substring_field_refuses_a_cut_that_leaves_a_bare_cr() -> None:
+    m = _with_pid("\\.sp2\\z")
+    with pytest.raises(ValueError, match="CR/LF"):
+        substring_field(m, "PID-5.1", 1)
+    assert m["PID-5"] == "\\.sp2\\z"
+
+
+def test_transforms_refuse_a_batch_header_delimiter_field() -> None:
+    m = Message.parse("BHS|^~\\&|SENDAPP\r" + _MSH + "PID|1||X\r")
+    with pytest.raises(ValueError, match="delimiters"):
+        replace_literal(m, "BHS-2", "", "x")
+
+
+def test_convert_case_unhashable_mode_raises_value_error() -> None:
+    m = _msg()
+    with pytest.raises(ValueError, match="convert_case mode"):
+        convert_case(m, "PID-5.1", ["upper"])  # type: ignore[arg-type]  # outside the declared set: the refusal is the subject
+
+
 @pytest.mark.parametrize(
     "raw",
     ["plain", "a\\.br\\b", "\\X4142\\C", "x\\\\y", "SMITH\\", "JO\\E", "\\H\\hi\\N\\", "\\.in3\\z"],

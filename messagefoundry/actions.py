@@ -29,6 +29,7 @@ Rules (ADR 0076 §2):
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from typing import Literal
@@ -98,10 +99,12 @@ def convert_case(msg: Message, path: str, mode: Literal["upper", "lower", "title
     is the text a hex escape carries, though title case still reads what an escape decodes to when
     it decides whether the next letter starts a word. A no-op on an absent field; raises
     :class:`ValueError` on an unknown mode (fail loud rather than silently leaving the value), or on
-    ``MSH-1`` or ``MSH-2``, which hold the delimiters themselves."""
-    convert = _CASE_CONVERTERS.get(mode)
-    if convert is None:
+    field 1 or 2 of ``MSH``, ``BHS`` or ``FHS``, which hold the delimiters themselves."""
+    # A tuple test, not a dict one, so an unhashable mode from config raises the documented
+    # ValueError rather than a TypeError.
+    if mode not in tuple(_CASE_CONVERTERS):
         raise ValueError(f"convert_case mode must be 'upper', 'lower', or 'title', got {mode!r}")
+    convert = _CASE_CONVERTERS[mode]
     _edit_value(msg, path, lambda raw, seps: _case_leaf(raw, convert, seps), whole_value=False)
 
 
@@ -186,16 +189,19 @@ def substring_field(msg: Message, path: str, start: int, end: int | None = None)
 
     ``start``/``end`` index the **decoded** field value with ordinary Python slice semantics (negatives
     count from the end; ``end=None`` runs to the end), so an escape sequence counts as the characters
-    it decodes to, and one wholly inside the slice is kept as sent. A no-op on an absent field. The
-    value must be one leaf: a field or component holding a component, repetition or subcomponent
-    separator raises :class:`ValueError`, since a slice of it has no single meaning, so address the
-    part to cut instead (``PID-5.1``). ``MSH-1`` and ``MSH-2`` raise :class:`ValueError` too."""
+    it decodes to, and one wholly inside the slice is kept as sent. An escape that decodes to nothing,
+    such as ``\\.fi\\``, is kept wherever it sits. A no-op on an absent field. The value must be one
+    leaf: a field or component holding a component, repetition or subcomponent separator raises
+    :class:`ValueError`, since a slice of it has no single meaning, so address the part to cut
+    instead (``PID-5.1``). It also raises on field 1 or 2 of ``MSH``, ``BHS`` or ``FHS``, and on a
+    slice that cuts an escape such as ``\\.sp2\\`` so that a bare CR or LF would remain."""
 
     def cut(raw: str, seps: _Seps) -> str:
-        units = _leaf_units(raw, seps)
-        total = len(_decoded(units))
-        lo, hi, _step = slice(start, end).indices(total)
-        return _span(units, lo, max(lo, hi), total, seps)
+        leaf = _Leaf(raw, seps)
+        lo, hi, _step = slice(start, end).indices(leaf.total)
+        hi = max(lo, hi)
+        # The cut removes text; an escape outside the slice that decodes to nothing stays.
+        return leaf.zero_width(0, lo) + leaf.span(lo, hi) + leaf.zero_width(hi, leaf.total + 1)
 
     _edit_value(msg, path, cut, whole_value=True)
 
@@ -208,23 +214,24 @@ def pad_field(
     ``side="left"`` right-justifies (e.g. zero-pad an MRN); ``side="right"`` left-justifies. ``width``
     counts the **decoded** value, so an escape sequence counts as the characters it decodes to, and
     ``fill`` is written as data: a ``fill`` of ``^`` pads with an escaped ``^``, never a new
-    component. A value already ``>= width`` is left unchanged. A no-op on an absent field. Raises
-    :class:`ValueError` on an unknown ``side`` (fail loud rather than silently leaving the value), on
-    a ``fill`` holding a CR or LF, on ``MSH-1`` or ``MSH-2``, and on a field or component holding a
-    component, repetition or subcomponent separator, as :func:`substring_field` does."""
+    component. A value already ``>= width`` is left unchanged. A no-op on an absent field, once the
+    arguments pass. Raises :class:`ValueError` on an unknown ``side`` (fail loud rather than silently
+    leaving the value) or a ``fill`` holding a CR or LF, whether or not the field is present; and on
+    field 1 or 2 of ``MSH``, ``BHS`` or ``FHS`` and a field or component holding a component,
+    repetition or subcomponent separator, as :func:`substring_field` does."""
     if side not in ("left", "right"):
         raise ValueError(f"pad_field side must be 'left' or 'right', got {side!r}")
     _refuse_crlf(fill)
 
     def pad(raw: str, seps: _Seps) -> str:
-        units = _leaf_units(raw, seps)
-        total = len(_decoded(units))
+        leaf = _Leaf(raw, seps)
         # rjust refuses a fill that is not one character even when nothing needs padding, as the
         # old value.rjust(width, fill) did.
-        padding = "".rjust(width - total, fill)
+        padding = "".rjust(width - leaf.total, fill)
         if not padding:
             return raw
-        body = _span(units, 0, total, total, seps)
+        # Rebuilt rather than ``raw``, so an unclosed trailing escape cannot pair with the filler.
+        body = leaf.span(0, leaf.total) + leaf.zero_width(leaf.total, leaf.total + 1)
         filler = _escape_data(padding, seps)
         return filler + body if side == "left" else body + filler
 
@@ -243,7 +250,9 @@ def replace_literal(msg: Message, path: str, old: str, new: str) -> None:
     escape sequence is never matched as if it were data. ``new`` is written as data, as
     :meth:`~messagefoundry.parsing.message.Message.set_data` writes it (ADR 0206), so a ``new``
     holding ``^`` cannot create a component. A no-op on an absent field. Raises :class:`ValueError`
-    on a ``new`` holding a CR or LF, and on ``MSH-1`` or ``MSH-2``."""
+    on a ``new`` holding a CR or LF, on field 1 or 2 of ``MSH``, ``BHS`` or ``FHS``, and on a match
+    that cuts an escape such as ``\\.sp2\\`` so that a bare CR or LF would remain. An escape that
+    decodes to nothing, such as ``\\.fi\\``, is kept even inside a match, just before ``new``."""
     _refuse_crlf(new)
     _edit_value(msg, path, lambda raw, seps: _replace_leaf(raw, old, new, seps), whole_value=False)
 
@@ -410,8 +419,8 @@ def _edit_value(
     ``edit`` gets it whole. Otherwise ``edit`` gets each leaf in turn, and the separators between
     them are kept. A no-op when the value is absent or empty, or when nothing changed."""
     seg, fld, comp, sub = parse_path(path)
-    if seg == "MSH" and fld in (1, 2):
-        raise ValueError(f"cannot transform {path}: MSH-1 and MSH-2 hold the delimiters themselves")
+    if seg in ("MSH", "BHS", "FHS") and fld in (1, 2):
+        raise ValueError(f"cannot transform {path}: fields 1 and 2 hold the delimiters themselves")
     seps = _seps(msg)
     _field_sep, comp_sep, rep_sep, sub_sep, _esc = seps
     whole = f"{seg}-{fld}"
@@ -503,39 +512,65 @@ def _refuse_crlf(value: str) -> None:
 
 
 def _escape_data(text: str, seps: _Seps) -> str:
-    """The raw form of a leaf that decodes to ``text``: the delimiters and controls escaped, and a CR
-    or LF, which here only a cut-up escape such as ``\\.sp2\\`` yields, as a hex escape."""
-    esc = seps[4]
-    escaped = _builtin_hl7.escape_leaf(text, seps)
-    return escaped.replace("\r", f"{esc}X0D{esc}").replace("\n", f"{esc}X0A{esc}")
+    """The raw form of a leaf that decodes to ``text``: the delimiters and controls escaped by the
+    one leaf escaper. A CR or LF, which here only a cut-up escape such as ``\\.sp2\\`` yields, is
+    refused, as every leaf write refuses it (ADR 0205 rule 2)."""
+    _refuse_crlf(text)
+    return _builtin_hl7.escape_leaf(text, seps)
 
 
-def _span(units: Sequence[_Unit], start: int, end: int, total: int, seps: _Seps) -> str:
-    """Raw text that decodes to ``decoded[start:end]`` of the leaf ``units`` make up.
+class _Leaf:
+    """One leaf's units with each unit's decoded offsets, so a range finds its units by bisection
+    and a pass over many ranges stays linear in the leaf."""
 
-    A literal run is cut as it is, and an escape sequence wholly inside the range is kept as sent.
-    An escape the range cuts, and an unclosed trailing escape character, are written as escaped
-    data, so text placed after them cannot pair with them. An escape that decodes to nothing belongs
-    to the range that starts at it, or to the range that ends the leaf."""
-    out: list[str] = []
-    pos = 0
-    for raw, decoded, kind in units:
-        lo, hi = pos, pos + len(decoded)
-        pos = hi
-        if lo == hi:
-            if start <= lo and (lo < end or lo == end == total):
+    def __init__(self, raw: str, seps: _Seps) -> None:
+        self.raw = raw
+        self.seps = seps
+        self.units = _leaf_units(raw, seps)
+        self.los: list[int] = []
+        self.his: list[int] = []
+        pos = 0
+        for _raw, decoded, _kind in self.units:
+            self.los.append(pos)
+            pos += len(decoded)
+            self.his.append(pos)
+        self.total = pos
+
+    def span(self, start: int, end: int) -> str:
+        """Raw text that decodes to ``decoded[start:end]``, with the escapes that decode to nothing
+        and start inside the range.
+
+        A literal run is cut as it is, and an escape sequence wholly inside the range is kept as
+        sent. An escape the range cuts, and an unclosed trailing escape character, are written as
+        escaped data, so text placed after them cannot pair with them."""
+        out: list[str] = []
+        index = bisect_left(self.los, start)
+        if index > 0 and self.his[index - 1] > start:
+            index -= 1  # the unit that straddles ``start``
+        while index < len(self.units) and self.los[index] < end:
+            raw, decoded, kind = self.units[index]
+            lo, hi = self.los[index], self.his[index]
+            index += 1
+            cut_lo, cut_hi = max(lo, start), min(hi, end)
+            if lo == hi or (kind == "esc" and (cut_lo, cut_hi) == (lo, hi)):
                 out.append(raw)
-            continue
-        cut_lo, cut_hi = max(lo, start), min(hi, end)
-        if cut_lo >= cut_hi:
-            continue
-        if kind == "lit":
-            out.append(raw[cut_lo - lo : cut_hi - lo])
-        elif kind == "esc" and (cut_lo, cut_hi) == (lo, hi):
-            out.append(raw)
-        else:
-            out.append(_escape_data(decoded[cut_lo - lo : cut_hi - lo], seps))
-    return "".join(out)
+            elif kind == "lit":
+                out.append(raw[cut_lo - lo : cut_hi - lo])
+            else:
+                out.append(_escape_data(decoded[cut_lo - lo : cut_hi - lo], self.seps))
+        return "".join(out)
+
+    def zero_width(self, start: int, end: int) -> str:
+        """The escapes that decode to nothing and start in ``[start, end)``, as sent. A cut or a
+        match removes text, and these carry none (``\\.fi\\``, a ``\\C..\\`` charset switch), so
+        they are kept wherever they sit."""
+        out: list[str] = []
+        index = bisect_left(self.los, start)
+        while index < len(self.units) and self.los[index] < end:
+            if self.los[index] == self.his[index]:
+                out.append(self.units[index][0])
+            index += 1
+        return "".join(out)
 
 
 def _case_leaf(raw: str, convert: Callable[[str, bool], str], seps: _Seps) -> str:
@@ -560,11 +595,10 @@ def _case_leaf(raw: str, convert: Callable[[str, bool], str], seps: _Seps) -> st
 def _replace_leaf(raw: str, old: str, new: str, seps: _Seps) -> str:
     """One leaf with each non-overlapping ``old`` in its decoded text replaced by ``new`` as data,
     left to right as :meth:`str.replace` does, an empty ``old`` included."""
-    units = _leaf_units(raw, seps)
-    decoded = _decoded(units)
+    leaf = _Leaf(raw, seps)
+    decoded = _decoded(leaf.units)
     if old not in decoded:
         return raw
-    total = len(decoded)
     starts: list[int] = []
     if old:
         found = decoded.find(old)
@@ -572,13 +606,16 @@ def _replace_leaf(raw: str, old: str, new: str, seps: _Seps) -> str:
             starts.append(found)
             found = decoded.find(old, found + len(old))
     else:
-        starts = list(range(total + 1))
+        starts = list(range(leaf.total + 1))
     replacement = _escape_data(new, seps)
     out: list[str] = []
     prev = 0
     for found in starts:
-        out.append(_span(units, prev, found, total, seps))
+        out.append(leaf.span(prev, found))
+        # A match removes text; an escape inside it that decodes to nothing stays, before ``new``.
+        out.append(leaf.zero_width(found, found + len(old)))
         out.append(replacement)
         prev = found + len(old)
-    out.append(_span(units, prev, total, total, seps))
+    out.append(leaf.span(prev, leaf.total))
+    out.append(leaf.zero_width(leaf.total, leaf.total + 1))
     return "".join(out)
