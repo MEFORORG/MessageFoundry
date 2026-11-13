@@ -131,23 +131,22 @@ for the checkouts named in its allowlist:
 `--git-dir` or `GIT_DIR` as one whole word -- bare, double-quoted or single-quoted -- is read the same
 under each spelling. Until BACKLOG #5642 a single-quoted path kept its quotes, named nothing, and was
 allowed. At least these spellings are still NOT read as the shell reads them, and some are allowed:
-a quoted path that contains a space, which is truncated at the space (the residual listed in the hook
-beside rule 3d); a path with an adjacent quoted piece, such as `'<path>'/` or `<path>''`, which keeps
+a quoted `-C`, `--work-tree`, `GIT_WORK_TREE`, `--git-dir` or `GIT_DIR` value that contains a space,
+which is truncated at the space (the residual listed in the hook beside rule 3d; a quoted `cd` target
+with a space is read whole); a path with an adjacent quoted piece, such as `'<path>'/` or `<path>''`, which keeps
 its quotes; and `Push-Location <x>; Pop-Location`, which is read as standing in `<x>`. A quoted path
-inside a quoted message, such as a commit message, keeps its own quotes, as it did before #5642.
+inside a quoted message, such as a commit message, keeps its own quotes, as it did before #5642,
+and so does a quoted path after a quote the line never closes.
+
+**A command with more than 20 git invocations is refused (rule 3e).** The hook has a fixed time to run,
+and a hook that runs out of time lets the command through unjudged, so past that count the gate refuses
+and asks for the command to be split. A git word inside a quoted message is not counted.
 
 **Rule 3d judges every invocation on the line.** Each `git worktree remove` or `move` outside quotes is
 judged. Its victim is resolved against the line's first `-C`, and also against that invocation's
 own `-C` tokens where they can be read: a chdir before the invocation that the hook cannot follow, with
 no absolute `-C` of the invocation's own, leaves only the first reading. Until BACKLOG #5643 only the first match on the raw line was judged, so a quoted
 mention before the real command, or a second command, let a governed worktree be removed.
-
-**Rules 3 and 3b judge every invocation too.** Each git command is also read with only its own `-C`,
-so `git -C <elsewhere> status && git reset --hard` run in the primary is refused. A `-C` on another
-command or inside a quoted message no longer stops the `cd <primary>` reading, for a `cd` written on
-the same line before the command. At least these are not covered: a `cd` on an earlier line, and a
-chdir the hook cannot follow when the command has no absolute `-C` of its own. Rule 3b is handed every
-invocation on the line, not only the first one carrying a verb. Both closed under BACKLOG #5655.
 
 This list is not the whole rule set. The hook itself,
 [`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1), is the source of record.

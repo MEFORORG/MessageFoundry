@@ -11,8 +11,11 @@ from the wrong place, so the gate judged a different path from the one the shell
 * BACKLOG #5643 -- rule 3d sliced the raw line at its FIRST `worktree remove|move` and judged one
   invocation, resolving a relative victim from the line's first `-C`, so a quoted mention, a second
   invocation or another command's `-C` let a governed linked worktree be removed or moved.
-* BACKLOG #5655 -- rule 3 let any earlier or quoted `-C` on a line decide where a later command ran,
-  and rule 3b judged only the first verb-bearing segment.
+* A line holding more git invocations than the gate can judge inside its hook timeout is refused,
+  because a killed hook lets the command through (review of BACKLOG #5643).
+
+(BACKLOG #5655, per-invocation rules 3 and 3b, was taken back out of this branch and goes to a
+ later Builder as one design; its tests went with it.)
 
 Each deny row was measured ALLOW on the gate before its fix, and each has an ALLOW control beside it
 so a gate that denied everything could not pass.
@@ -197,62 +200,6 @@ def test_rule_3d_controls_stay_allowed(rig: SimpleNamespace, template: str) -> N
     assert _allowed(rig, cmd, rig.tmp)
 
 
-# ------------------------------------------------------------------ BACKLOG #5655, rules 3 and 3b
-#
-# Rule 3 read `-C` off the WHOLE raw line and set its inferred-target flag the same way, so any
-# earlier or quoted `-C` decided where a later command ran; rule 3b judged only the first
-# verb-bearing segment. Each deny row below was measured ALLOW before.
-
-
-def test_an_earlier_commands_dash_C_does_not_move_a_later_reset_off_the_primary(
-    rig: SimpleNamespace,
-) -> None:
-    cmd = f"git -C {rig.outside.as_posix()} status && git reset --hard"
-    assert "SHARED PRIMARY" in _reason(rig, cmd, rig.primary)
-
-
-def test_an_earlier_dash_C_does_not_suppress_the_chdir_fallback(rig: SimpleNamespace) -> None:
-    cmd = f"git -C {rig.outside.as_posix()} status ; cd {rig.primary.as_posix()} ; git reset --hard"
-    assert "SHARED PRIMARY" in _reason(rig, cmd, rig.outside)
-
-
-def test_a_quoted_dash_C_does_not_suppress_the_chdir_fallback(rig: SimpleNamespace) -> None:
-    cmd = f"git commit -m 'x -C y' ; cd {rig.primary.as_posix()} ; git reset --hard"
-    assert "SHARED PRIMARY" in _reason(rig, cmd, rig.outside)
-
-
-@pytest.mark.parametrize("sep", [" ; ", "\n"])
-def test_rule_3b_judges_a_later_invocation(rig: SimpleNamespace, sep: str) -> None:
-    cmd = f"git -C {rig.outside.as_posix()} clean -fd{sep}git switch {rig.other}"
-    assert "LINKED WORKTREE" in _reason(rig, cmd, rig.wt)
-
-
-def test_rule_3b_judges_a_later_invocations_own_dash_C(rig: SimpleNamespace) -> None:
-    cmd = (
-        f"git -C {rig.outside.as_posix()} status ; git -C {rig.wt.as_posix()} checkout {rig.other}"
-    )
-    assert "LINKED WORKTREE" in _reason(rig, cmd, rig.outside)
-
-
-@pytest.mark.parametrize(
-    ("template", "where"),
-    [
-        ("cd {p} && git -C {o} rebase main", "outside"),
-        ("git -C {o} status && git -C {o} reset --hard", "primary"),
-        ("git -C {o} status ; git reset --hard", "wt"),
-        ("git status ; git reset --hard", "outside"),
-        ("git -C {o} status ; git switch -c brand-new", "wt"),
-    ],
-)
-def test_rule_3_and_3b_controls_stay_allowed(
-    rig: SimpleNamespace, template: str, where: str
-) -> None:
-    """An invocation's OWN `-C` still decides, and a session's own worktree is still its own."""
-    cmd = template.format(p=rig.primary.as_posix(), o=rig.outside.as_posix())
-    cwd = {"outside": rig.outside, "primary": rig.primary, "wt": rig.wt}[where]
-    assert _allowed(rig, cmd, cwd)
-
-
 # ------------------------------------------------------------------ review round one, same rows
 
 
@@ -267,26 +214,6 @@ def test_an_empty_single_quoted_dash_C_in_a_linked_worktree_is_rule_3bs(
     rig: SimpleNamespace,
 ) -> None:
     assert "LINKED WORKTREE" in _reason(rig, f"git -C '' switch {rig.other}", rig.wt)
-
-
-def test_a_backtick_substitution_does_not_borrow_the_outer_dash_C(rig: SimpleNamespace) -> None:
-    cmd = f"echo -C {rig.outside.as_posix()} `git reset --hard`"
-    assert "SHARED PRIMARY" in _reason(rig, cmd, rig.primary)
-
-
-def test_a_later_invocations_quoted_destination_is_read_raw(rig: SimpleNamespace) -> None:
-    subprocess.run(
-        ["git", "-C", str(rig.primary), "branch", "feat(x)"], check=True, capture_output=True
-    )
-    cmd = f"git -C {rig.outside.as_posix()} clean -fd ; git switch 'feat(x)'"
-    assert "LINKED WORKTREE" in _reason(rig, cmd, rig.wt)
-
-
-def test_a_later_invocations_relative_dash_C_is_rooted_at_the_session_cwd(
-    rig: SimpleNamespace,
-) -> None:
-    cmd = f"git -C {rig.outside.as_posix()} status ; git -C ../Primary-wt switch {rig.other}"
-    assert "LINKED WORKTREE" in _reason(rig, cmd, rig.outside)
 
 
 # ------------------------------------------------------------------ review round two, same rows
@@ -323,38 +250,17 @@ def test_a_spacey_quoted_chdir_is_not_guessed_as_the_cwd(rig: SimpleNamespace) -
     assert _allowed(rig, f'cd "{spacey.as_posix()}" && git worktree remove Primary-wt2', rig.tmp)
 
 
-def test_a_cd_after_an_inferred_invocation_does_not_refuse_it(rig: SimpleNamespace) -> None:
-    cmd = f"git stash && cd {rig.primary.as_posix()} && git -C {rig.outside.as_posix()} rebase main"
-    assert _allowed(rig, cmd, rig.outside)
-
-
 # ------------------------------------------------------------------ Manager repair round, same rows
-
-
-def test_an_absolute_own_dash_C_is_read_after_an_unfollowable_chdir(rig: SimpleNamespace) -> None:
-    o, o2, p = rig.outside.as_posix(), rig.outside2.as_posix(), rig.primary.as_posix()
-    cmd = f"cd {o} && git -C {o2} fetch && cd {o2} && git -C {p} reset --hard"
-    assert "SHARED PRIMARY" in _reason(rig, cmd, rig.outside)
-
-
-def test_an_absolute_own_dash_C_into_a_linked_worktree_after_pushd_popd(
-    rig: SimpleNamespace,
-) -> None:
-    o, o2, w = rig.outside.as_posix(), rig.outside2.as_posix(), rig.wt.as_posix()
-    cmd = f"pushd {o} ; popd ; git -C {o2} status ; git -C {w} checkout {rig.other}"
-    assert "LINKED WORKTREE" in _reason(rig, cmd, rig.outside)
 
 
 @pytest.mark.parametrize(
     ("template", "where", "text"),
     [
-        ("git -C {o} status ; echo cd ; git reset --hard", "primary", "SHARED PRIMARY"),
         (
             "git -C {o2} status ; echo cd ; git worktree remove Primary-wt2",
             "tmp",
             "worktree remove",
         ),
-        ("git -C {o} clean -fd ; echo cd ; git switch {b}", "wt", "LINKED WORKTREE"),
     ],
 )
 def test_a_chdir_word_that_is_only_an_argument_does_not_switch_the_reading_off(
@@ -390,21 +296,6 @@ def test_a_single_quoted_spacey_chdir_is_not_guessed_as_the_cwd(rig: SimpleNames
 # ------------------------------------------------------------------ Manager convergence round
 
 
-def test_sixty_invocations_finish_well_inside_the_hook_timeout(rig: SimpleNamespace) -> None:
-    """A hook killed by its 15 s timeout lets the command through, so cost is a control here.
-
-    Measured before this round: about 30 s for sixty `git reset` invocations from the session's own
-    linked worktree, against about 3 s on origin/main, because rule 3b judged every one of them.
-    """
-    import time
-
-    cmd = " ; ".join(["git reset -q --soft HEAD"] * 60)
-    started = time.monotonic()
-    assert _allowed(rig, cmd, rig.wt)
-    elapsed = time.monotonic() - started
-    assert elapsed < 10, f"60 invocations took {elapsed:.1f}s; the install timeout is 15s"
-
-
 _DISARM = "core." + "hooksPath /nope"
 
 
@@ -435,3 +326,48 @@ def test_an_earlier_quote_character_does_not_make_a_message_live(rig: SimpleName
     """The other direction: the mention stays inside its message, as on origin/main."""
     cmd = f"echo '\"' ; git stash push -m \"try -C '{rig.primary.as_posix()}' later\""
     assert _allowed(rig, cmd, rig.outside)
+
+
+# ------------------------------------------------------------------ re-cut round: rule 3e and leftovers
+
+
+def test_a_line_of_150_worktree_removes_is_refused_fast_rather_than_timing_out(
+    rig: SimpleNamespace,
+) -> None:
+    """Measured before rule 3e: 24.3 s, past the 15 s kill, after which the trailing reset runs."""
+    import time
+
+    removes = " ; ".join(f"git worktree remove {rig.tmp.as_posix()}/nope{i}" for i in range(150))
+    started = time.monotonic()
+    reason = _reason(rig, f"{removes} ; git reset --hard", rig.primary)
+    elapsed = time.monotonic() - started
+    assert "git invocations" in reason, reason
+    assert elapsed < 10, f"the refusal took {elapsed:.1f}s; the install timeout is 15s"
+
+
+def test_twenty_git_invocations_are_still_judged_well_inside_the_timeout(
+    rig: SimpleNamespace,
+) -> None:
+    """The cap's own measurement: twenty removes, the most rule 3e lets through, judged in full."""
+    import time
+
+    removes = " ; ".join(f"git worktree remove {rig.tmp.as_posix()}/nope{i}" for i in range(20))
+    started = time.monotonic()
+    assert _allowed(rig, removes, rig.primary)
+    elapsed = time.monotonic() - started
+    assert elapsed < 10, f"twenty removes took {elapsed:.1f}s; the install timeout is 15s"
+    assert "git invocations" in _reason(rig, removes + " ; git status", rig.primary)
+
+
+def test_a_quoted_cd_mention_in_a_message_is_not_a_chdir(rig: SimpleNamespace) -> None:
+    """Allowed on origin/main. The prefix cut inside the message left an unclosed quote, which the
+    blanked-span test read as outside every span, so the mention became a live chdir."""
+    p = rig.primary.as_posix()
+    cmd = f"echo \"then cd '{p}' && git log\" ; git config {_DISARM}"
+    assert _allowed(rig, cmd, rig.outside)
+
+
+def test_an_echoed_cd_does_not_move_rule_3ds_own_base(rig: SimpleNamespace) -> None:
+    """The real victim is the governed `<tmp>/Primary-wt2`; `echo cd` moves no shell."""
+    cmd = f"echo cd {rig.outside2.as_posix()} && git worktree remove ../Primary-wt2"
+    assert "worktree remove" in _reason(rig, cmd, rig.outside)
